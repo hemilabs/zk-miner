@@ -1,0 +1,456 @@
+//! Single worker process handle.
+//!
+//! Manages the lifecycle of a subprocess worker: spawn, handshake, IPC, shutdown.
+
+use std::collections::HashMap;
+use std::io::{BufReader, BufWriter};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// When true, worker stderr forwarding is suppressed (TUI mode).
+static SUPPRESS_WORKER_STDERR: AtomicBool = AtomicBool::new(false);
+
+/// Suppress worker stderr forwarding to prevent TUI corruption.
+pub fn suppress_worker_stderr(suppress: bool) {
+    SUPPRESS_WORKER_STDERR.store(suppress, Ordering::Relaxed);
+}
+
+use anyhow::{bail, Context, Result};
+use zkminer_prover_protocol::{
+    read_message, write_message, FrameError, WorkerCommand, WorkerResponse, PROTOCOL_VERSION,
+};
+
+/// Typed error indicating the worker process died (EOF on its stdout pipe).
+/// Used instead of string matching to distinguish "worker died" from "stream corrupted".
+#[derive(Debug)]
+pub struct WorkerDied {
+    pub backend: String,
+}
+
+impl std::fmt::Display for WorkerDied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Worker {} process died (EOF)", self.backend)
+    }
+}
+
+impl std::error::Error for WorkerDied {}
+
+/// Timeout for the initial Hello handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Handle to a running worker subprocess.
+pub struct WorkerHandle {
+    pub backend: String,
+    pub path: PathBuf,
+    pub sdk_version: Option<String>,
+    pub worker_version: Option<String>,
+    child: Child,
+    reader: BufReader<ChildStdout>,
+    writer: BufWriter<ChildStdin>,
+    stderr_task: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WorkerHandle {
+    /// Spawn a new worker process and perform the Hello handshake.
+    pub fn spawn(
+        backend: &str,
+        path: &PathBuf,
+        env_overrides: &HashMap<String, String>,
+    ) -> Result<Self> {
+        tracing::info!("Spawning worker {backend} from {}", path.display());
+
+        let mut cmd = Command::new(path);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        for (k, v) in env_overrides {
+            cmd.env(k, v);
+        }
+
+        // Kill worker if parent process dies (prevents orphan GPU processes after host crash).
+        // PR_SET_PDEATHSIG is Linux-specific.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                // Put the worker in its own process group (pgid == its own pid) so
+                // the dispatcher's watchdogs can SIGKILL the ENTIRE group via
+                // kill(-pgid) on timeout. Without this, a worker that forks a GPU
+                // or helper child hands that child a copy of the stdout pipe's
+                // write end; killing only the main worker PID then leaves the pipe
+                // open, so the dispatcher's blocking read never sees EOF and hangs
+                // forever.
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to spawn worker {backend} at {}", path.display()))?;
+
+        let child_stdout = child
+            .stdout
+            .take()
+            .context("Failed to capture worker stdout")?;
+        let child_stdin = child
+            .stdin
+            .take()
+            .context("Failed to capture worker stdin")?;
+        let child_stderr = child.stderr.take();
+
+        let reader = BufReader::new(child_stdout);
+        let writer = BufWriter::new(child_stdin);
+
+        // Spawn stderr reader thread that forwards to tracing
+        let backend_name = backend.to_string();
+        let stderr_task = child_stderr.map(|stderr| {
+            std::thread::Builder::new()
+                .name(format!("worker-stderr-{backend_name}"))
+                .spawn(move || {
+                    use std::io::BufRead;
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines() {
+                        match line {
+                            Ok(line) if !line.is_empty() => {
+                                // DIAGNOSTIC: surface WITSUM / EVALCHECK_DIFF lines directly to stderr
+                                // (the test harness installs no tracing subscriber, so warn is dropped).
+                                if line.starts_with("[WITSUM]") || line.starts_with("[EVALCHECK_DIFF]") {
+                                    eprintln!("[worker:{backend_name}] {line}");
+                                }
+                                if !SUPPRESS_WORKER_STDERR.load(Ordering::Relaxed) {
+                                    tracing::warn!(target: "worker", "[worker:{backend_name}] {line}");
+                                }
+                            }
+                            Err(_) => break,
+                            _ => {}
+                        }
+                    }
+                })
+                .ok()
+        }).flatten();
+
+        let mut handle = Self {
+            backend: backend.to_string(),
+            path: path.clone(),
+            sdk_version: None,
+            worker_version: None,
+            child,
+            reader,
+            writer,
+            stderr_task,
+        };
+
+        // Perform Hello handshake
+        handle.handshake()?;
+
+        Ok(handle)
+    }
+
+    fn handshake(&mut self) -> Result<()> {
+        let cmd = WorkerCommand::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        };
+        self.send(&cmd)?;
+
+        // Spawn a watchdog thread that SIGKILLs the child if the handshake
+        // doesn't complete within HANDSHAKE_TIMEOUT. This is necessary because
+        // recv() calls read_exact() which blocks indefinitely on a pipe — there
+        // is no way to set a read timeout on a pipe fd. When the child is killed,
+        // read_exact() returns UnexpectedEof, unblocking this thread.
+        let child_pid = self.child.id();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = cancel.clone();
+        let backend = self.backend.clone();
+
+        #[cfg(unix)]
+        let watchdog = std::thread::Builder::new()
+            .name(format!("handshake-watchdog-{backend}"))
+            .spawn(move || {
+                let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+                while Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if cancel_clone.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+                if !cancel_clone.load(Ordering::Relaxed) {
+                    tracing::error!(
+                        "Handshake watchdog: worker {backend} (PID {child_pid}) did not respond \
+                         within {HANDSHAKE_TIMEOUT:?}, killing"
+                    );
+                    // Kill the worker's whole process group (see setpgid in spawn)
+                    // so any forked child dies too and releases the stdout pipe,
+                    // unblocking the recv() read below.
+                    unsafe {
+                        libc::kill(-(child_pid as i32), libc::SIGKILL);
+                        libc::kill(child_pid as i32, libc::SIGKILL);
+                    }
+                }
+            })
+            .ok();
+
+        let result = self.recv();
+
+        // Cancel the watchdog regardless of outcome
+        cancel.store(true, Ordering::Relaxed);
+        #[cfg(unix)]
+        if let Some(handle) = watchdog {
+            let _ = handle.join();
+        }
+
+        let resp = result.map_err(|e| {
+            anyhow::anyhow!(
+                "Handshake with worker {} failed (timeout={:?}): {e}",
+                self.backend, HANDSHAKE_TIMEOUT
+            )
+        })?;
+
+        match resp {
+            WorkerResponse::HelloAck {
+                protocol_version,
+                backend,
+                sdk_version,
+                worker_version,
+            } => {
+                if protocol_version != PROTOCOL_VERSION {
+                    bail!(
+                        "Protocol version mismatch with {}: expected {PROTOCOL_VERSION}, got {protocol_version}",
+                        self.backend
+                    );
+                }
+                if backend != self.backend {
+                    tracing::warn!(
+                        "Worker reports backend '{backend}' but expected '{}'",
+                        self.backend
+                    );
+                }
+                self.sdk_version = Some(sdk_version.clone());
+                self.worker_version = Some(worker_version.clone());
+                tracing::info!(
+                    "Worker {} connected: {sdk_version} (worker v{worker_version})",
+                    self.backend
+                );
+                Ok(())
+            }
+            other => {
+                bail!(
+                    "Expected HelloAck from worker {}, got: {other:?}",
+                    self.backend
+                );
+            }
+        }
+    }
+
+    /// Send a command to the worker.
+    pub fn send(&mut self, cmd: &WorkerCommand) -> Result<()> {
+        write_message(&mut self.writer, cmd).map_err(|e| anyhow::anyhow!("Send error: {e}"))
+    }
+
+    /// Receive a response from the worker.
+    pub fn recv(&mut self) -> Result<WorkerResponse> {
+        read_message(&mut self.reader).map_err(|e| match e {
+            FrameError::UnexpectedEof => WorkerDied {
+                backend: self.backend.clone(),
+            }.into(),
+            other => anyhow::anyhow!("Recv error from {}: {other}", self.backend),
+        })
+    }
+
+    /// Receive proof responses, forwarding Progress updates via callback.
+    /// Returns on ProofResult, Error, or Cancelled matching `expected_request_id`.
+    /// Stale responses from previous requests are discarded with a warning.
+    pub fn recv_proof(
+        &mut self,
+        expected_request_id: u64,
+        on_progress: &Option<Box<dyn Fn(f64) + Send>>,
+    ) -> Result<WorkerResponse> {
+        const MAX_STALE_DISCARDS: u32 = 16;
+        let mut stale_count: u32 = 0;
+
+        loop {
+            let resp = self.recv()?;
+            match &resp {
+                WorkerResponse::Progress { request_id, fraction, .. } => {
+                    if *request_id == expected_request_id {
+                        if let Some(cb) = on_progress {
+                            cb(*fraction);
+                        }
+                    }
+                    // Continue reading (don't count progress toward stale limit)
+                }
+                WorkerResponse::ProofResult { request_id, .. }
+                | WorkerResponse::Error { request_id, .. }
+                | WorkerResponse::Cancelled { request_id, .. } => {
+                    if *request_id == expected_request_id {
+                        return Ok(resp);
+                    }
+                    // Stale response from a previous request — discard
+                    stale_count += 1;
+                    tracing::warn!(
+                        "Discarding stale response for request {request_id} \
+                         (expected {expected_request_id}) [{stale_count}/{MAX_STALE_DISCARDS}]"
+                    );
+                    if stale_count >= MAX_STALE_DISCARDS {
+                        bail!(
+                            "Worker {} protocol desync: discarded {MAX_STALE_DISCARDS} stale \
+                             responses while waiting for request {expected_request_id}",
+                            self.backend,
+                        );
+                    }
+                }
+                other => {
+                    tracing::warn!(
+                        "Unexpected response from worker {} during proving: {other:?}",
+                        self.backend
+                    );
+                }
+            }
+        }
+    }
+
+    /// Receive benchmark responses, forwarding BenchmarkProgress updates via callback.
+    /// Returns the final BenchmarkResult response.
+    pub fn recv_benchmark(
+        &mut self,
+        on_progress: &dyn Fn(&zkminer_prover_protocol::BenchmarkEntry, u32, u32),
+    ) -> Result<WorkerResponse> {
+        loop {
+            let resp = self.recv()?;
+            match &resp {
+                WorkerResponse::BenchmarkProgress {
+                    entry,
+                    program_index,
+                    total_programs,
+                } => {
+                    on_progress(entry, *program_index, *total_programs);
+                }
+                WorkerResponse::BenchmarkResult { .. } | WorkerResponse::Error { .. } => {
+                    return Ok(resp);
+                }
+                other => {
+                    tracing::warn!(
+                        "Unexpected response from worker {} during benchmarking: {other:?}",
+                        self.backend
+                    );
+                }
+            }
+        }
+    }
+
+    /// Check if the worker process is still alive.
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Get the worker's PID.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// SIGKILL the worker's ENTIRE process group, then reap it.
+    ///
+    /// The worker calls `setpgid(0,0)` at spawn, so this kills any forked
+    /// GPU/helper child too — most importantly SP1's `sp1-gpu-server` (moongate),
+    /// which holds GPU VRAM (~18.6 GB). Killing only the main PID (`child.kill()`)
+    /// orphans that child, leaking VRAM across proofs and, if it inherited the
+    /// stdout write end, hanging the dispatcher's `recv_proof`. Mirrors the
+    /// timeout-watchdog kill path in the dispatcher.
+    fn force_kill_group(&mut self) {
+        let pid = self.child.id();
+        #[cfg(unix)]
+        {
+            // pid is a live spawned child's id, hence non-zero; guard anyway so
+            // kill(-pid) can never degenerate into kill(0)/kill(-1).
+            if pid != 0 {
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+
+    /// Immediate kill: SIGKILL the worker (and its whole process group) without a
+    /// graceful shutdown. Used for stream corruption recovery and OOM recovery.
+    pub fn kill(&mut self) {
+        tracing::warn!("Killing worker {} (PID {})", self.backend, self.child.id());
+        self.force_kill_group();
+    }
+
+    /// Graceful shutdown: send Shutdown command, wait up to 5s, then SIGKILL.
+    pub fn shutdown(&mut self) {
+        tracing::info!("Shutting down worker {}", self.backend);
+
+        // Try graceful shutdown
+        let _ = self.send(&WorkerCommand::Shutdown);
+
+        // Wait up to 5 seconds for the process to exit
+        let start = Instant::now();
+        let timeout = Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    tracing::info!("Worker {} exited with {status}", self.backend);
+                    return;
+                }
+                Ok(None) => {
+                    if start.elapsed() > timeout {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    tracing::warn!("Error waiting for worker {}: {e}", self.backend);
+                    break;
+                }
+            }
+        }
+
+        // Force kill (whole process group — reaps any forked GPU server child).
+        tracing::warn!("Worker {} did not exit gracefully, killing", self.backend);
+        self.force_kill_group();
+    }
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        // Best-effort shutdown
+        let _ = self.send(&WorkerCommand::Shutdown);
+
+        // Wait briefly then kill
+        let start = Instant::now();
+        let timeout = Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if start.elapsed() < timeout => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => {
+                    self.force_kill_group();
+                    break;
+                }
+            }
+        }
+
+        // Join stderr thread
+        if let Some(handle) = self.stderr_task.take() {
+            let _ = handle.join();
+        }
+    }
+}

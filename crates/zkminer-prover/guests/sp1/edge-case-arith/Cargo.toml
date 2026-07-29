@@ -1,0 +1,9 @@
+[package]
+name = "edge-case-arith-sp1-guest"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+sp1-zkvm = "6.0"

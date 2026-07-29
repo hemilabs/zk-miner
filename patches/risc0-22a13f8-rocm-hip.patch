@@ -1,0 +1,98 @@
+diff --git a/risc0/circuit/keccak-sys/build.rs b/risc0/circuit/keccak-sys/build.rs
+index 73623227..19d9a00f 100644
+--- a/risc0/circuit/keccak-sys/build.rs
++++ b/risc0/circuit/keccak-sys/build.rs
+@@ -175,6 +175,16 @@ fn build_rocm_kernels() {
+     let mut supra_amalg = String::new();
+     for cu in &cu_files {
+         let name = cu.file_name().unwrap().to_str().unwrap();
++        // eval_check_combined.cu is a full amalgamation that already #includes
++        // ffi_supra.cu AND eval_check_0..N.cu. Compiling any of those in the same
++        // TU too would double-define their symbols (keccak_*, eval_check,
++        // risc0_circuit_keccak_cuda_eval_check). So emit ONLY eval_check_combined.cu
++        // for the supra group (mirrors the CUDA path, which compiles just it).
++        if (name.starts_with("eval_check") && name != "eval_check_combined.cu")
++            || name == "ffi_supra.cu"
++        {
++            continue;
++        }
+         let abs = std::fs::canonicalize(cu).unwrap();
+         let line = format!("#include \"{}\"\n", abs.display());
+         if name == "ffi_supra.cu" || name.starts_with("eval_check") {
+diff --git a/risc0/circuit/keccak-sys/kernels/cuda/ffi_supra.cu b/risc0/circuit/keccak-sys/kernels/cuda/ffi_supra.cu
+index ead71190..0b745253 100644
+--- a/risc0/circuit/keccak-sys/kernels/cuda/ffi_supra.cu
++++ b/risc0/circuit/keccak-sys/kernels/cuda/ffi_supra.cu
+@@ -35,8 +35,16 @@ __global__ __launch_bounds__(256, 1) void eval_check(Fp* check,
+   uint32_t stride = blockDim.x * gridDim.x;
+   for (uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x; cycle < domain; cycle += stride) {
+     FpExt tot = poly_fp(cycle, domain, ctrl, out, data, mix, accum, poly_mix);
++#ifdef __HIPCC__
++    // HIP/clang cmath pow() overloads are ambiguous with bb31_t; use the field's
++    // operator^ (== exponentiation, see supra/fp.h pow()). Mirrors the rv32im
++    // eval_check_combined.cu HIP path.
++    Fp x = rou ^ (unsigned)cycle;
++    Fp y = (Fp(3) * x) ^ (unsigned)(1 << po2);
++#else
+     Fp x = pow(rou, cycle);
+     Fp y = pow(Fp(3) * x, 1 << po2);
++#endif
+     FpExt ret = tot * inv(y - Fp(1));
+     check[domain * 0 + cycle] = ret[0];
+     check[domain * 1 + cycle] = ret[1];
+diff --git a/risc0/circuit/rv32im-sys/kernels/cuda/eval_check_combined.cu b/risc0/circuit/rv32im-sys/kernels/cuda/eval_check_combined.cu
+index b0f4bd27..889956f9 100644
+--- a/risc0/circuit/rv32im-sys/kernels/cuda/eval_check_combined.cu
++++ b/risc0/circuit/rv32im-sys/kernels/cuda/eval_check_combined.cu
+@@ -68,7 +68,10 @@ __global__ void eval_check(Fp* check,
+                            uint32_t domain) {
+   // Enable shared memory spilling: trades STACK for SHARED, improving L1 cache
+   // utilization. With CUDA 12.9+: REG:255 STACK:8560 SHARED:16384 (~5% speedup).
++  // PTX-only directive; HIP/clang rejects it as "unknown directive".
++#ifndef __HIPCC__
+   asm volatile (".pragma \"enable_smem_spilling\";");
++#endif
+   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
+   if (cycle < domain) {
+     FpExt tot = poly_fp(cycle, domain, ctrl, out, data, mix, accum);
+@@ -188,8 +191,17 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
+     // next prove_begin is correctly ordered even when this sync is skipped.
+     static int s_cc_major = -1;
+     if (s_cc_major < 0) {
++#ifdef __HIPCC__
++      // AMD/HIP GPUs have no CUDA compute capability, and cudaDevAttrCompute-
++      // CapabilityMajor is undeclared under HIP. Force the sync path (>=12) so
++      // AMD keeps the safe, non-pipelined eval_check<->witgen behavior (matches
++      // the prior unconditional-sync behavior on ROCm). Still overridable via
++      // RISC0_EVAL_CHECK_SKIP_SYNC / RISC0_EVAL_CHECK_FORCE_SYNC below.
++      s_cc_major = 12;
++#else
+       int dev = getCachedDevice();
+       cudaDeviceGetAttribute(&s_cc_major, cudaDevAttrComputeCapabilityMajor, dev);
++#endif
+     }
+     static int s_force_sync = -1;
+     static int s_skip_sync = -1;
+diff --git a/risc0/circuit/rv32im-sys/kernels/cuda/ffi.cu b/risc0/circuit/rv32im-sys/kernels/cuda/ffi.cu
+index b1646007..33da2a1f 100644
+--- a/risc0/circuit/rv32im-sys/kernels/cuda/ffi.cu
++++ b/risc0/circuit/rv32im-sys/kernels/cuda/ffi.cu
+@@ -158,6 +158,10 @@ struct DeviceCache {
+     // keep them resident across kernel launches.
+     CUDA_OK(cudaMallocAsync(&d_tableU8, (1 << 8) * sizeof(uint32_t), stream));
+     CUDA_OK(cudaMallocAsync(&d_tableU16, (1 << 16) * sizeof(uint32_t), stream));
++#ifndef __HIPCC__
++    // CUDA-only persisting-L2 cache tuning (Ada+). HIP/AMD has no equivalent of
++    // cudaLimitPersistingL2CacheSize / cudaStreamAttributeAccessPolicyWindow, so
++    // skip this pure performance optimization on ROCm.
+     {
+       static bool s_persisting_set = false;
+       if (!s_persisting_set) {
+@@ -178,6 +182,7 @@ struct DeviceCache {
+       attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+       (void)cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+     }
++#endif
+   }
+ 
+   // Grow-only reallocation for variable-size preflight buffers

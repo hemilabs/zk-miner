@@ -1,0 +1,19 @@
+[package]
+name = "zkminer-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zkminer-chain = { workspace = true }
+zkminer-prover = { workspace = true }
+zkminer-prover-protocol = { workspace = true }
+zkminer-strategy = { workspace = true }
+zkminer-config = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+alloy-primitives = { workspace = true }
+nvml-wrapper = { workspace = true }

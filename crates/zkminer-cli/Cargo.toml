@@ -1,0 +1,38 @@
+[package]
+name = "zkminer-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "zkminer"
+path = "src/main.rs"
+
+[dependencies]
+zkminer-contracts = { workspace = true }
+zkminer-chain = { workspace = true }
+zkminer-prover = { workspace = true }
+zkminer-prover-protocol = { workspace = true }
+zkminer-strategy = { workspace = true }
+zkminer-tui = { workspace = true }
+zkminer-config = { workspace = true }
+alloy = { workspace = true }
+alloy-primitives = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+dirs = { workspace = true }
+# Only needed by the optional `sp1-demo` command; made optional so the `zkminer`
+# binary (and the RISC0 prover path) builds without the SP1 native toolchain.
+sp1-sdk = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd", default-features = false, features = ["blocking"], optional = true }
+
+[features]
+default = []
+# Enables the `zkminer sp1-demo` command (requires the SP1 build toolchain).
+sp1-demo = ["dep:sp1-sdk"]

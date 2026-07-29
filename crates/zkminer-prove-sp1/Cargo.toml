@@ -1,0 +1,25 @@
+[package]
+name = "zkminer-prove-sp1"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "zkminer-prove-sp1"
+path = "src/main.rs"
+
+[dependencies]
+zkminer-prover-protocol = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+bincode = "1"
+libc = "0.2"
+# Needed only to drop the CudaProver / proving keys inside a runtime context at
+# shutdown (the SDK does async teardown of the sp1-gpu-server). sp1-sdk already
+# pulls tokio, so the feature set is unified — no extra compile cost.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time"] }
+sp1-sdk = { version = "6.0", features = ["blocking", "cuda"] }
+
+[build-dependencies]
+sp1-build = "6.0"

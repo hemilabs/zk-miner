@@ -1,0 +1,300 @@
+[
+  {
+    "type": "constructor",
+    "inputs": [
+      {
+        "name": "hemiProve_",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "_onProofVerifiedExternal",
+    "inputs": [
+      {
+        "name": "context",
+        "type": "tuple",
+        "internalType": "struct ProofContext",
+        "components": [
+          {
+            "name": "jobId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "programId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "proofSystemId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "prover",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "caller",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "settledPrice",
+            "type": "uint96",
+            "internalType": "uint96"
+          },
+          {
+            "name": "bonusAmount",
+            "type": "uint96",
+            "internalType": "uint96"
+          },
+          {
+            "name": "actualCycles",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "reopenCount",
+            "type": "uint8",
+            "internalType": "uint8"
+          },
+          {
+            "name": "trust",
+            "type": "uint8",
+            "internalType": "enum VerifierTrust"
+          }
+        ]
+      },
+      {
+        "name": "publicValues",
+        "type": "bytes",
+        "internalType": "bytes"
+      },
+      {
+        "name": "extraData",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "getPublicValues",
+    "inputs": [
+      {
+        "name": "jobId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "hasResult",
+    "inputs": [
+      {
+        "name": "jobId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "hemiProve",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "onProofVerified",
+    "inputs": [
+      {
+        "name": "context",
+        "type": "tuple",
+        "internalType": "struct ProofContext",
+        "components": [
+          {
+            "name": "jobId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "programId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "proofSystemId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "prover",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "caller",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "settledPrice",
+            "type": "uint96",
+            "internalType": "uint96"
+          },
+          {
+            "name": "bonusAmount",
+            "type": "uint96",
+            "internalType": "uint96"
+          },
+          {
+            "name": "actualCycles",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "reopenCount",
+            "type": "uint8",
+            "internalType": "uint8"
+          },
+          {
+            "name": "trust",
+            "type": "uint8",
+            "internalType": "enum VerifierTrust"
+          }
+        ]
+      },
+      {
+        "name": "publicValues",
+        "type": "bytes",
+        "internalType": "bytes"
+      },
+      {
+        "name": "extraData",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "accepted",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "results",
+    "inputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "programId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "proofSystemId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "prover",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "fulfilledAt",
+        "type": "uint40",
+        "internalType": "uint40"
+      },
+      {
+        "name": "publicValuesHash",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "publicValues",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "event",
+    "name": "ResultStored",
+    "inputs": [
+      {
+        "name": "jobId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "programId",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "publicValuesHash",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "error",
+    "name": "OnlyHemiProve",
+    "inputs": []
+  }
+]

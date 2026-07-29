@@ -1,0 +1,83 @@
+[
+  {
+    "type": "function",
+    "name": "onProofVerified",
+    "inputs": [
+      {
+        "name": "context",
+        "type": "tuple",
+        "internalType": "struct ProofContext",
+        "components": [
+          {
+            "name": "jobId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "programId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "proofSystemId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "prover",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "caller",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "settledPrice",
+            "type": "uint96",
+            "internalType": "uint96"
+          },
+          {
+            "name": "bonusAmount",
+            "type": "uint96",
+            "internalType": "uint96"
+          },
+          {
+            "name": "actualCycles",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "reopenCount",
+            "type": "uint8",
+            "internalType": "uint8"
+          },
+          {
+            "name": "trust",
+            "type": "uint8",
+            "internalType": "enum VerifierTrust"
+          }
+        ]
+      },
+      {
+        "name": "publicValues",
+        "type": "bytes",
+        "internalType": "bytes"
+      },
+      {
+        "name": "extraData",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "accepted",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  }
+]

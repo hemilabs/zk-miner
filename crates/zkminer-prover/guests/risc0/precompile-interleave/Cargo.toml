@@ -1,0 +1,20 @@
+[package]
+name = "precompile-interleave"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+# precompile-interleave is a STD guest: risc0-bigint2 is not a no_std crate, so
+# the guest must run with risc0's std runtime to avoid a duplicate panic_impl.
+risc0-zkvm = { version = "3.0", default-features = false, features = ["std"] }
+risc0-bigint2 = "1.4"
+sha2 = "0.10"
+# tiny-keccak does NOT trigger the risc0 keccak precompile — it runs the
+# software (pure-Rust) keccak implementation. This is intentional: it still
+# exercises interleaving a compute-heavy path between precompile calls.
+tiny-keccak = { version = "2", features = ["keccak"] }
+
+[patch.crates-io]
+sha2 = { git = "https://github.com/risc0/RustCrypto-hashes", tag = "sha2-v0.10.6-risczero.0" }

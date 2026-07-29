@@ -1,0 +1,24 @@
+# Build artifacts (root and nested)
+target/
+target-*/
+**/target/
+
+# Not needed for Docker builds
+contracts/
+.git/
+**/.git/
+*.md
+.claude/
+dist/
+benches/
+zkresearch/
+
+# Secrets
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.keystore
+.zkminer/
+*.log

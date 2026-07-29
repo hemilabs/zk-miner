@@ -1,0 +1,47 @@
+[package]
+name = "zkminer-prove-risc0"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "zkminer-prove-risc0-cuda"
+path = "src/main.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "zkminer-prove-risc0-rocm"
+path = "src/main.rs"
+required-features = ["rocm"]
+
+[features]
+cuda = ["risc0-zkvm/cuda"]
+rocm = ["risc0-zkvm/rocm"]
+
+[dependencies]
+zkminer-prover-protocol = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+bincode = "1"
+risc0-zkvm = { version = "3.0", default-features = false, features = ["prove"] }
+
+[package.metadata.risc0]
+methods = [
+    "../zkminer-prover/guests/risc0/fibonacci",
+    "../zkminer-prover/guests/risc0/sha256-chain",
+    "../zkminer-prover/guests/risc0/ecdsa-verify",
+    "../zkminer-prover/guests/risc0/bigint-mul",
+    "../zkminer-prover/guests/risc0/memory-merkle",
+    "../zkminer-prover/guests/risc0/chacha-mix",
+    "../zkminer-prover/guests/risc0/rv32im-torture",
+    "../zkminer-prover/guests/risc0/edge-case-arith",
+    "../zkminer-prover/guests/risc0/memory-stress",
+    "../zkminer-prover/guests/risc0/precompile-interleave",
+    "../zkminer-prover/guests/risc0/segment-boundary",
+    "../zkminer-prover/guests/risc0/babybear-stress",
+    "../zkminer-prover/guests/risc0/minimal-proof",
+]
+
+[build-dependencies]
+risc0-build = "3.0"

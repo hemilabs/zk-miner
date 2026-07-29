@@ -1,0 +1,41 @@
+# ── Rust build artifacts (rebuildable; ~130G across target dirs) ──────────────
+/target
+/target-cuda
+**/target/
+*.rlib
+*.rmeta
+
+# ── Built GPU prover binaries (~1G; rebuild from the hemilabs forks + patches/) ─
+/dist
+
+# ── Benchmark data / outputs ─────────────────────────────────────────────────
+/benches
+
+# ── Session scratch: soak logs + throwaway test binaries ─────────────────────
+/scratchpad
+*.log
+
+# ── Large handoff archives (extracted copies live in hemiprove-*/ dirs) ──────
+*.zip
+
+# ── Nested git repos — independently versioned; they ride along with the ─────
+#    directory/VM transfer, NOT this parent repo's history:
+#      contracts/           Foundry Solidity project (own .git + submodules)
+/contracts
+#      vendor/risc0-sppark/  NO LONGER VENDORED. Cargo.toml now patches sppark to a
+#                            pinned git rev of hemilabs/risc0-sppark, so cargo fetches
+#                            it and a clean clone builds with no extra steps. A local
+#                            checkout here is ignored so it can be used for testing
+#                            (point the patch at a path temporarily) without being
+#                            committed and silently diverging from upstream.
+/vendor
+
+# ── Editor / OS noise ────────────────────────────────────────────────────────
+*.swp
+.DS_Store
+
+# ── Foundry build outputs in the vendored contract reference (regenerable) ───
+hemiprove-source/out/
+hemiprove-source/out-deploy/
+hemiprove-source/broadcast/
+hemiprove-source/cache/

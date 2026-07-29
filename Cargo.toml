@@ -1,0 +1,162 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zkminer-contracts",
+    "crates/zkminer-chain",
+    "crates/zkminer-prover",
+    "crates/zkminer-prover-protocol",
+    "crates/zkminer-strategy",
+    "crates/zkminer-tui",
+    "crates/zkminer-config",
+    "crates/zkminer-cli",
+    "crates/zkminer-prove-risc0",
+    "crates/zkminer-prove-sp1",
+    "crates/zkminer-prove-openvm",
+]
+default-members = [
+    "crates/zkminer-contracts",
+    "crates/zkminer-chain",
+    "crates/zkminer-prover",
+    "crates/zkminer-prover-protocol",
+    "crates/zkminer-strategy",
+    "crates/zkminer-tui",
+    "crates/zkminer-config",
+    "crates/zkminer-cli",
+]
+exclude = [
+    "crates/zkminer-prover/guests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Ethereum
+alloy = { version = "1", features = ["full", "signer-local", "provider-ws"] }
+alloy-primitives = "1"
+alloy-sol-types = "1"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI & TUI
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# GPU management
+nvml-wrapper = "0.11"
+
+# Security
+zeroize = "1"
+
+# Misc
+dirs = "6"
+hex = "0.4"
+chrono = "0.4"
+rand = "0.8"
+
+# Internal crates
+zkminer-contracts = { path = "crates/zkminer-contracts" }
+zkminer-chain = { path = "crates/zkminer-chain" }
+zkminer-prover = { path = "crates/zkminer-prover" }
+zkminer-prover-protocol = { path = "crates/zkminer-prover-protocol" }
+zkminer-strategy = { path = "crates/zkminer-strategy" }
+zkminer-tui = { path = "crates/zkminer-tui" }
+zkminer-config = { path = "crates/zkminer-config" }
+
+# Patch risc0 crates to use hemilabs fork (AMD + NVIDIA GPU support)
+[patch.crates-io]
+risc0-zkvm = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-build = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-zkp = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-sys = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-core = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-binfmt = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-groth16 = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+# Pinned by immutable REV, not a branch: a branch head can silently move the build
+# off a validated commit (which is why the risc0/sp1 patches below carry a
+# do-not-cargo-update warning). 32f2101 = c5d2d7a (AMD HIP LDS-race fix) plus the
+# cuda/std/array HIP shim and the 0.1.14 version bump Cargo.lock pins.
+sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "32f2101" }
+
+# Patch SP1 crates to use hemilabs fork (AMD GPU + PLONK optimizations)
+sp1-sdk = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-build = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-cuda = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-prover = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-prover-types = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-core-executor = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-core-machine = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-curves = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-derive = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-hypercube = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-jit = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-primitives = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+sp1-verifier = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "debuginfo"
+
+# Third-party deps: parallel codegen units for faster builds.
+# Thin LTO still optimizes across crate boundaries at link time.
+[profile.release.package."*"]
+codegen-units = 16
+
+# Workspace crates: single codegen unit for maximum intra-crate optimization.
+[profile.release.package.zkminer-cli]
+codegen-units = 1
+[profile.release.package.zkminer-chain]
+codegen-units = 1
+[profile.release.package.zkminer-contracts]
+codegen-units = 1
+[profile.release.package.zkminer-config]
+codegen-units = 1
+[profile.release.package.zkminer-prover]
+codegen-units = 1
+[profile.release.package.zkminer-prover-protocol]
+codegen-units = 1
+[profile.release.package.zkminer-strategy]
+codegen-units = 1
+[profile.release.package.zkminer-tui]
+codegen-units = 1
+[profile.release.package.zkminer-prove-risc0]
+codegen-units = 1
+[profile.release.package.zkminer-prove-sp1]
+codegen-units = 1
+[profile.release.package.zkminer-prove-openvm]
+codegen-units = 1

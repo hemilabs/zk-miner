@@ -1,0 +1,248 @@
+# syntax=docker/dockerfile:1
+#
+# Multi-stage portable Linux build for zkminer binaries.
+# Usage: docker build -f Dockerfile.build --target dist-cli --output type=local,dest=dist/ .
+#
+# All binaries link against glibc 2.35 (Ubuntu 22.04) for broad compatibility.
+
+# ---------------------------------------------------------------------------
+# Build args (all overridable)
+# ---------------------------------------------------------------------------
+ARG RUST_VERSION=1.93.0
+ARG CUDA_VERSION=12.8.0
+ARG ROCM_IMAGE=rocm/dev-ubuntu-22.04:6.4
+ARG UBUNTU_VERSION=22.04
+
+# ===========================================================================
+# Stage: rust-base — Ubuntu 22.04 + Rust toolchain
+# ===========================================================================
+# ubuntu:22.04 — pinned 2026-03-05
+FROM ubuntu:${UBUNTU_VERSION}@sha256:3ba65aa20f86a0fad9df2b2c259c613df006b2e6d0bfcc8a146afb8c525a9751 AS rust-base
+ARG RUST_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git curl ca-certificates cmake pkg-config \
+        protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
+    && rustup show
+
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
+
+WORKDIR /build
+
+# ===========================================================================
+# Stage: build-cli — the main zkminer CLI binary
+# ===========================================================================
+FROM rust-base AS build-cli
+
+COPY . .
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-cli,target=/build/target \
+    cargo build --release -p zkminer-cli --bin zkminer \
+    && cp target/release/zkminer /zkminer
+
+# ===========================================================================
+# Stage: build-cli-windows — Windows CLI via cargo-xwin cross-compilation
+# ===========================================================================
+FROM rust-base AS build-cli-windows
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang lld llvm \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add x86_64-pc-windows-msvc \
+    && cargo install cargo-xwin
+
+COPY . .
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-cli-windows,target=/build/target \
+    cargo xwin build --release --target x86_64-pc-windows-msvc \
+        -p zkminer-cli --bin zkminer \
+    && cp target/x86_64-pc-windows-msvc/release/zkminer.exe /zkminer.exe
+
+# ===========================================================================
+# Stage: build-openvm — OpenVM prover binary
+# ===========================================================================
+FROM rust-base AS build-openvm
+
+COPY . .
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-openvm,target=/build/target \
+    cargo build --release -p zkminer-prove-openvm --bin zkminer-prove-openvm \
+    && cp target/release/zkminer-prove-openvm /zkminer-prove-openvm
+
+# ===========================================================================
+# Stage: cuda-base — NVIDIA CUDA + Rust toolchain
+# ===========================================================================
+# nvidia/cuda:12.8.0-devel-ubuntu22.04 — pinned 2026-03-05
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04@sha256:54f18e2a8e1b3d03f77b9a6dc905533da46ac93a5513f10e8ba8e560db9fa5ab AS cuda-base
+ARG RUST_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git curl ca-certificates cmake pkg-config \
+        protobuf-compiler libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
+    && rustup show
+
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
+
+WORKDIR /build
+
+# ===========================================================================
+# Stage: build-cuda — RISC Zero CUDA prover (multi-arch portable)
+# ===========================================================================
+FROM cuda-base AS build-cuda
+
+# Full list: sm_75 (Turing) sm_80 (A100) sm_86 (3090) sm_89 (4090) sm_90 (H100) sm_100 (B200) compute_120 (5090+)
+# Testing subset: 4090 (sm_89) + 5090 (sm_120)
+ENV NVCC_APPEND_FLAGS="-gencode arch=compute_89,code=sm_89 -gencode arch=compute_120,code=compute_120"
+
+COPY . .
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-cuda,target=/build/target \
+    cargo build --release -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda \
+    && cp target/release/zkminer-prove-risc0-cuda /zkminer-prove-risc0-cuda
+
+# ===========================================================================
+# Stage: build-sp1 — SP1 prover (requires CUDA base, sp1-sdk hardcodes cuda)
+# ===========================================================================
+FROM cuda-base AS build-sp1
+
+# Install succinct/sp1 toolchain (pinned to match sp1-sdk version in Cargo.lock)
+RUN curl -L https://sp1up.succinct.xyz | bash \
+    && /root/.sp1/bin/sp1up --version 6.0.1
+
+ENV PATH="/root/.sp1/bin:${PATH}"
+
+COPY . .
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-sp1,target=/build/target \
+    cargo build --release -p zkminer-prove-sp1 --bin zkminer-prove-sp1 \
+    && cp target/release/zkminer-prove-sp1 /zkminer-prove-sp1
+
+# ===========================================================================
+# Stage: rocm-base — AMD ROCm + Rust toolchain
+# ===========================================================================
+# rocm/dev-ubuntu-22.04:6.4 — pinned 2026-03-05
+FROM ${ROCM_IMAGE}@sha256:79aa43981a4296ca45f6827a0d0bcdc8239824c8e97643a7a86c1ce2c9dddc8b AS rocm-base
+ARG RUST_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git curl ca-certificates cmake pkg-config \
+        protobuf-compiler libclang-dev \
+        hipcub-dev rocthrust-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
+    && rustup show
+
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
+
+WORKDIR /build
+
+# ===========================================================================
+# Stage: build-rocm — RISC Zero ROCm prover (multi-arch portable)
+# ===========================================================================
+FROM rocm-base AS build-rocm
+
+# Full list: gfx900,gfx906,gfx908,gfx90a,gfx942,gfx1030,gfx1031,gfx1032,gfx1100,gfx1101,gfx1200,gfx1201
+# Testing subset: 7900 XTX (gfx1100) + 9070 XT (gfx1201)
+ENV RISC0_HIP_ARCH="gfx1100,gfx1201"
+ENV NVCC=off
+
+COPY . .
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-rocm,target=/build/target \
+    cargo build --release -p zkminer-prove-risc0 --features rocm --bin zkminer-prove-risc0-rocm \
+    && cp target/release/zkminer-prove-risc0-rocm /zkminer-prove-risc0-rocm
+
+# ===========================================================================
+# Stage: intel-base — Intel oneAPI + Rust toolchain
+# ===========================================================================
+# Intel oneAPI base toolkit for SYCL/Level Zero GPU compute.
+# Used for future Intel GPU prover builds (Arc, Data Center Max).
+FROM intel/oneapi-basekit:2025.1.1-0-devel-ubuntu22.04 AS intel-base
+ARG RUST_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git curl ca-certificates cmake pkg-config \
+        protobuf-compiler libclang-dev \
+        level-zero-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
+    && rustup show
+
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
+
+WORKDIR /build
+
+# ===========================================================================
+# Stage: build-intel — Intel GPU prover (placeholder, requires sppark SYCL port)
+# ===========================================================================
+# FROM intel-base AS build-intel
+#
+# COPY . .
+#
+# RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+#     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+#     --mount=type=cache,id=target-intel,target=/build/target \
+#     cargo build --release -p zkminer-prove-risc0 --features intel --bin zkminer-prove-risc0-intel \
+#     && cp target/release/zkminer-prove-risc0-intel /zkminer-prove-risc0-intel
+
+# ===========================================================================
+# Dist stages — scratch containers for --output extraction
+# ===========================================================================
+FROM scratch AS dist-cli
+COPY --from=build-cli /zkminer /zkminer
+
+FROM scratch AS dist-cli-windows
+COPY --from=build-cli-windows /zkminer.exe /zkminer.exe
+
+FROM scratch AS dist-openvm
+COPY --from=build-openvm /zkminer-prove-openvm /zkminer-prove-openvm
+
+FROM scratch AS dist-cuda
+COPY --from=build-cuda /zkminer-prove-risc0-cuda /zkminer-prove-risc0-cuda
+
+FROM scratch AS dist-sp1
+COPY --from=build-sp1 /zkminer-prove-sp1 /zkminer-prove-sp1
+
+FROM scratch AS dist-rocm
+COPY --from=build-rocm /zkminer-prove-risc0-rocm /zkminer-prove-risc0-rocm

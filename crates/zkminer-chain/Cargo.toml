@@ -1,0 +1,25 @@
+[package]
+name = "zkminer-chain"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zkminer-contracts = { workspace = true }
+zkminer-config = { workspace = true }
+alloy = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+reqwest = "0.12"
+dirs = { workspace = true }
+tower = "0.4"
+alloy-json-rpc = "1"
+
+[dev-dependencies]
+zkminer-prover = { workspace = true }

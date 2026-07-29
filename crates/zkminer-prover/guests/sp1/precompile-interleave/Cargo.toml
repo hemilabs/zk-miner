@@ -1,0 +1,19 @@
+[package]
+name = "precompile-interleave-sp1-guest"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+sp1-zkvm = "6.0"
+sha2 = "0.10"
+tiny-keccak = { version = "2", features = ["keccak"] }
+
+# k256 removed: was a dead dependency (never called in the guest).
+
+# Patch sha2 and tiny-keccak with SP1 forks to trigger precompile acceleration.
+# Without these patches, SHA-256 and Keccak-256 run as pure software.
+[patch.crates-io]
+sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "patch-sha2-0.10.8-sp1-6.0.0" }
+tiny-keccak = { git = "https://github.com/sp1-patches/tiny-keccak", tag = "patch-2.0.2-sp1-6.0.0" }

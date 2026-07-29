@@ -1,0 +1,17 @@
+[package]
+name = "zkminer-prove-openvm"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "zkminer-prove-openvm"
+path = "src/main.rs"
+
+[dependencies]
+zkminer-prover-protocol = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+bincode = "1"
+openvm-sdk = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.5.0-rc.1" }

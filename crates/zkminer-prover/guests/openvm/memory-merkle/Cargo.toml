@@ -1,0 +1,10 @@
+[package]
+name = "memory-merkle-openvm-guest"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+openvm = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.5.0-rc.1" }
+sha2 = { version = "0.10", default-features = false }

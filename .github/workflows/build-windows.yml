@@ -1,0 +1,135 @@
+name: Build Windows Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_cli:
+        description: 'Build CLI (.exe)'
+        type: boolean
+        default: true
+      build_cuda:
+        description: 'Build CUDA prover (.exe)'
+        type: boolean
+        default: true
+
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: '1.93.0'
+  CUDA_VERSION: '12.8.0'
+
+jobs:
+  # -----------------------------------------------------------------------
+  # CLI — cross-compiled from Linux (fast, ~5 min)
+  # -----------------------------------------------------------------------
+  cli-windows:
+    if: ${{ github.event_name == 'push' || inputs.build_cli }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y lld llvm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cli-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-cli-
+
+      - name: Install cargo-xwin
+        run: cargo install cargo-xwin
+
+      - name: Cross-compile CLI for Windows
+        env:
+          RUSTFLAGS: '-C target-cpu=x86-64-v3 -C target-feature=+crt-static'
+        run: |
+          cargo xwin build --release --target x86_64-pc-windows-msvc \
+            -p zkminer-cli --bin zkminer
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp target/x86_64-pc-windows-msvc/release/zkminer.exe dist/
+          cd dist && sha256sum zkminer.exe > zkminer.exe.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zkminer-windows-cli
+          path: dist/zkminer.exe*
+
+  # -----------------------------------------------------------------------
+  # CUDA prover — native Windows build (requires MSVC + CUDA toolkit)
+  # -----------------------------------------------------------------------
+  cuda-windows:
+    if: ${{ github.event_name == 'push' || inputs.build_cuda }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.30
+        id: cuda-toolkit
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "thrust", "visual_studio_integration"]'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cuda-${{ hashFiles('Cargo.lock') }}-${{ env.CUDA_VERSION }}
+          restore-keys: windows-cuda-
+
+      - name: Build CUDA prover
+        env:
+          RISC0_SKIP_BUILD: '1'
+          RISC0_SKIP_BUILD_KERNELS: '1'
+          RUSTFLAGS: '-C target-cpu=x86-64-v3'
+          NVCC_APPEND_FLAGS: >-
+            -gencode arch=compute_75,code=sm_75
+            -gencode arch=compute_80,code=sm_80
+            -gencode arch=compute_86,code=sm_86
+            -gencode arch=compute_89,code=sm_89
+            -gencode arch=compute_90,code=sm_90
+            -gencode arch=compute_100,code=sm_100
+            -gencode arch=compute_120,code=compute_120
+        run: |
+          cargo build --release -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/zkminer-prove-risc0-cuda.exe dist/
+          cd dist && sha256sum zkminer-prove-risc0-cuda.exe > zkminer-prove-risc0-cuda.exe.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zkminer-windows-cuda
+          path: dist/zkminer-prove-risc0-cuda.exe*

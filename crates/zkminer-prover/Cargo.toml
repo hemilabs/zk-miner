@@ -1,0 +1,71 @@
+[package]
+name = "zkminer-prover"
+version.workspace = true
+edition.workspace = true
+
+[package.metadata.risc0]
+methods = [
+    "guests/risc0/fibonacci",
+    "guests/risc0/sha256-chain",
+    "guests/risc0/ecdsa-verify",
+    "guests/risc0/bigint-mul",
+    "guests/risc0/memory-merkle",
+    "guests/risc0/chacha-mix",
+    "guests/risc0/rv32im-torture",
+    "guests/risc0/edge-case-arith",
+    "guests/risc0/memory-stress",
+    "guests/risc0/precompile-interleave",
+    "guests/risc0/segment-boundary",
+    "guests/risc0/babybear-stress",
+    "guests/risc0/minimal-proof",
+]
+
+[[bin]]
+name = "mock-worker"
+path = "src/bin/mock_worker.rs"
+required-features = ["testing"]
+test = false
+bench = false
+
+[features]
+default = []
+testing = []
+risc0 = ["dep:risc0-zkvm", "dep:risc0-build"]
+sp1 = ["dep:sp1-sdk", "dep:sp1-build"]
+openvm = ["dep:openvm-sdk"]
+
+[dependencies]
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zkminer-config = { workspace = true }
+zkminer-prover-protocol = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+bincode = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Optional prover backends
+risc0-zkvm = { version = "3.0", default-features = false, features = ["prove"], optional = true }
+sp1-sdk = { version = "6.0", features = ["blocking"], optional = true }
+openvm-sdk = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.5.0-rc.1", optional = true }
+
+[dev-dependencies]
+sha2 = "0.10"
+tiny-keccak = { version = "2", features = ["keccak"] }
+# Correct, well-tested bignum for the host-side 256-bit modmul reference used to
+# verify the risc0-bigint2 precompile output (a hand-rolled reduction is too
+# error-prone to trust as the oracle).
+num-bigint = "0.4"
+
+[build-dependencies]
+risc0-build = { version = "3.0", optional = true }
+sp1-build = { version = "6.0", optional = true }
