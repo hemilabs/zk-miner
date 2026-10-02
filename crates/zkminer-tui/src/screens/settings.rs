@@ -130,8 +130,14 @@ fn render_devices(f: &mut Frame, area: Rect, state: &MinerState, focused: bool) 
 
     // GPU rows
     for (i, gpu) in state.hardware.gpus.iter().enumerate() {
-        let device_id = format!("gpu{}", gpu.index);
-        let enabled = !rs.disabled_devices.contains(&device_id);
+        let device_id = gpu_key(state, gpu);
+        // A card with no benchmark row cannot prove; show it, but never as
+        // "enabled for proving", and never joined to another card's row.
+        let provable = device_id.is_some();
+        let enabled = provable
+            && !device_id
+                .as_ref()
+                .is_some_and(|id| rs.disabled_devices.contains(id));
         let sel = focused
             && ui.active_section == SettingsSection::Devices
             && ui.row_index == i + 1;
@@ -305,6 +311,14 @@ fn render_parameters(f: &mut Frame, area: Rect, state: &MinerState, focused: boo
         (
             "Max Concurrent Proofs",
             format!("{}", rs.max_concurrent_proofs),
+        ),
+        (
+            "Queue Look-Ahead",
+            if rs.queue_horizon_secs == 0 {
+                "off (one job per GPU)".to_string()
+            } else {
+                format!("{}s of work per GPU", rs.queue_horizon_secs)
+            },
         ),
         (
             "Min Profit Rate",
@@ -572,7 +586,7 @@ fn render_gpu_tuning(f: &mut Frame, area: Rect, state: &MinerState, focused: boo
             .hardware
             .gpus
             .iter()
-            .find(|g| format!("gpu{}", g.index) == ts.caps.device_id);
+            .find(|g| crate::gpu_tuning::tuning_device_id(g) == ts.caps.device_id);
         let name = gpu
             .map(|g| g.name.as_str())
             .unwrap_or(&ts.caps.device_id);
@@ -614,7 +628,7 @@ fn render_gpu_tuning(f: &mut Frame, area: Rect, state: &MinerState, focused: boo
                 .hardware
                 .gpus
                 .iter()
-                .find(|g| format!("gpu{}", g.index) == ts.caps.device_id);
+                .find(|g| crate::gpu_tuning::tuning_device_id(g) == ts.caps.device_id);
             let name = gpu
                 .map(|g| g.name.clone())
                 .unwrap_or_else(|| ts.caps.device_id.clone());
@@ -738,10 +752,13 @@ fn render_gpu_tuning(f: &mut Frame, area: Rect, state: &MinerState, focused: boo
             let on_buttons = focused && ui.tuning_row_index == control_row;
             let btn_idx = ui.tuning_button_idx;
             let dirty = ts.dirty;
+            // `benchmark_device_in_progress` holds a BENCHMARK id; caps.device_id
+            // is a tuning id. Map across rather than comparing namespaces.
             let benchmarking = state
-                .benchmark_device_in_progress
-                .as_deref()
-                == Some(&ts.caps.device_id);
+                .benchmark_id_for_tuning_id(&ts.caps.device_id)
+                .is_some_and(|bid| {
+                    state.benchmark_device_in_progress.as_deref() == Some(bid.as_str())
+                });
 
             let mut spans: Vec<Span> = Vec::new();
             let cursor = if on_buttons { "> " } else { "  " };
@@ -1109,8 +1126,16 @@ fn all_devices(state: &MinerState) -> Vec<DeviceEntry> {
             GpuVendor::Intel => theme::intel_blue(),
             GpuVendor::Unknown => theme::text(),
         };
+        // Cards with no benchmark row are not proving targets; listing them here
+        // put a po2 knob on an idle card that silently retuned a different one.
+        let Some(id) = gpu_key(state, gpu) else {
+            continue;
+        };
         devices.push(DeviceEntry {
-            id: format!("gpu{}", gpu.index),
+            id,
+            // Label with the CARD NAME, not just "GPU{n}". The po2 rows rendered
+            // only the uppercased device key, so an override landing on the wrong
+            // card looked identical to one landing on the right card.
             label: format!("GPU{}  {}", gpu.index, gpu.name),
             color,
         });
@@ -1152,11 +1177,29 @@ fn enabled_backend_count(state: &MinerState) -> usize {
         .count()
 }
 
+/// The benchmark `device_id` for a physical card, or `None` when this card has
+/// no benchmark row (it is not a proving device, or has not been benchmarked).
+///
+/// Every device key in this screen MUST come from here. Building keys from
+/// `gpu.index` mixed the TUI's all-vendor display ordinal with the prover's
+/// per-vendor index space: on a box whose first DRM card is a non-proving AMD
+/// GPU, a po2 override typed against the row labelled "GPU1 RTX 5090" was
+/// stored as `gpu1` and applied to `risc0:cuda:1` -- the RTX 4090 -- pushing a
+/// 32GB-sized segment onto a 24GB card. A `None` here means the card is not a
+/// proving target and must be excluded from po2 and disable lists entirely.
+fn gpu_key(state: &MinerState, gpu: &crate::hardware::GpuInfo) -> Option<String> {
+    gpu.benchmark_device_id(state.benchmark_results.as_ref()?)
+}
+
 /// All device IDs.
 fn device_ids(state: &MinerState) -> Vec<String> {
     let mut ids = vec!["cpu".to_string()];
     for gpu in &state.hardware.gpus {
-        ids.push(format!("gpu{}", gpu.index));
+        if let Some(id) = gpu_key(state, gpu) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
     }
     ids
 }
@@ -1685,7 +1728,12 @@ fn toggle_device(state: &mut MinerState) {
     } else {
         let gpu_idx = idx - 1;
         if gpu_idx < state.hardware.gpus.len() {
-            format!("gpu{}", state.hardware.gpus[gpu_idx].index)
+            let gpu = &state.hardware.gpus[gpu_idx];
+            match gpu_key(state, gpu) {
+                Some(id) => id,
+                // Not a proving device -- nothing to enable or disable.
+                None => return,
+            }
         } else {
             return;
         }
@@ -1746,9 +1794,16 @@ fn adjust_param(state: &mut MinerState, dir: i32) {
             rs.max_concurrent_proofs = v.clamp(1, 16) as usize;
         }
         1 => {
-            rs.min_profit_threshold = (rs.min_profit_threshold + dir as f64).clamp(0.0, 1000.0);
+            // Queue look-ahead, in 30s steps. 0 means off, which is a distinct MODE (one job
+            // per GPU) rather than "a very short queue", so step from 0 straight to 30 and
+            // back again — there is nothing meaningful between them.
+            let v = rs.queue_horizon_secs as i64 + (dir as i64 * 30);
+            rs.queue_horizon_secs = v.clamp(0, 1800) as u64;
         }
         2 => {
+            rs.min_profit_threshold = (rs.min_profit_threshold + dir as f64).clamp(0.0, 1000.0);
+        }
+        3 => {
             let current_idx = STRATEGIES
                 .iter()
                 .position(|s| *s == rs.strategy)
@@ -1760,26 +1815,26 @@ fn adjust_param(state: &mut MinerState, dir: i32) {
             };
             rs.strategy = STRATEGIES[new_idx].to_string();
         }
-        3 => {
+        4 => {
             rs.electricity_cost_kwh =
                 ((rs.electricity_cost_kwh + dir as f64 * 0.01) * 100.0).round() / 100.0;
             rs.electricity_cost_kwh = rs.electricity_cost_kwh.clamp(0.0, 1.0);
         }
-        4 => {
+        5 => {
             let v = rs.system_power_watts + dir as f64 * 50.0;
             rs.system_power_watts = v.clamp(50.0, 5000.0);
         }
-        5 => {
+        6 => {
             rs.deadline_safety_margin =
                 ((rs.deadline_safety_margin + dir as f64 * 0.1) * 10.0).round() / 10.0;
             rs.deadline_safety_margin = rs.deadline_safety_margin.clamp(1.0, 5.0);
         }
-        6 => {
+        7 => {
             rs.token_price_usd =
                 ((rs.token_price_usd + dir as f64 * 0.05) * 100.0).round() / 100.0;
             rs.token_price_usd = rs.token_price_usd.clamp(0.01, 100.0);
         }
-        7 => {
+        8 => {
             rs.gas_cost_usd =
                 ((rs.gas_cost_usd + dir as f64 * 0.005) * 1000.0).round() / 1000.0;
             rs.gas_cost_usd = rs.gas_cost_usd.clamp(0.0, 10.0);
@@ -1810,4 +1865,68 @@ fn adjust_po2(state: &mut MinerState, dir: i32) {
 
     let new_val = (current as i32 + dir).clamp(14, 24) as u8;
     state.runtime_settings.po2_overrides.insert(key, new_val);
+}
+
+#[cfg(test)]
+mod param_row_tests {
+    use super::*;
+    use crate::state::MinerState;
+
+    /// `adjust_param` dispatches on the row INDEX of the parameter list, so inserting a row
+    /// silently re-points every arm below it at the wrong setting — and the symptom is that
+    /// editing one tunable changes another, which is invisible until an operator hits it.
+    /// This pins the mapping by driving each row and asserting the field it moved.
+    #[test]
+    fn each_row_adjusts_its_own_setting() {
+        let mut st = MinerState::default();
+        let before = st.runtime_settings.clone();
+
+        // Row 0: max concurrent proofs
+        st.settings_ui.row_index = 0;
+        adjust_param(&mut st, 1);
+        assert_eq!(
+            st.runtime_settings.max_concurrent_proofs,
+            before.max_concurrent_proofs + 1,
+            "row 0 must move max_concurrent_proofs"
+        );
+        assert_eq!(
+            st.runtime_settings.queue_horizon_secs, before.queue_horizon_secs,
+            "row 0 must NOT touch the queue horizon"
+        );
+
+        // Row 1: queue look-ahead, in 30s steps, 0 == off
+        let mut st = MinerState::default();
+        st.settings_ui.row_index = 1;
+        adjust_param(&mut st, 1);
+        assert_eq!(st.runtime_settings.queue_horizon_secs, 30, "0 -> 30s in one step");
+        assert_eq!(
+            st.runtime_settings.max_concurrent_proofs, before.max_concurrent_proofs,
+            "row 1 must NOT touch max_concurrent_proofs"
+        );
+        adjust_param(&mut st, -1);
+        assert_eq!(st.runtime_settings.queue_horizon_secs, 0, "and back to off");
+        adjust_param(&mut st, -1);
+        assert_eq!(st.runtime_settings.queue_horizon_secs, 0, "clamped at off, never negative");
+
+        // Row 2 must still be min profit, i.e. the insert shifted it correctly.
+        let mut st = MinerState::default();
+        st.settings_ui.row_index = 2;
+        adjust_param(&mut st, 1);
+        assert!(
+            st.runtime_settings.min_profit_threshold > before.min_profit_threshold,
+            "row 2 must be Min Profit Rate — if this fails the arms are off by one"
+        );
+        assert_eq!(st.runtime_settings.queue_horizon_secs, 0);
+    }
+
+    /// The horizon must be reachable across its whole documented range from the keyboard.
+    #[test]
+    fn the_horizon_is_adjustable_over_a_useful_range() {
+        let mut st = MinerState::default();
+        st.settings_ui.row_index = 1;
+        for _ in 0..100 {
+            adjust_param(&mut st, 1);
+        }
+        assert_eq!(st.runtime_settings.queue_horizon_secs, 1800, "clamps at 30 minutes");
+    }
 }

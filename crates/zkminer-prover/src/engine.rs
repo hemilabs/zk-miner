@@ -315,7 +315,12 @@ pub async fn prove_async(
         if let Some(ref backend_name) = prover.backend {
             if let Some(pool) = worker_pool() {
                 if pool.is_backend_healthy(backend_name) {
-                    return pool.prove(backend_name, &elf, &input_data, po2, timeout, on_progress);
+                    // engine's public callback is Fn(f64); the pool now also reports
+                    // the slot key. Drop it here rather than widening this API.
+                    let cb: Option<Box<dyn Fn(f64, &str) + Send>> = on_progress
+                        .map(|f| Box::new(move |p: f64, _slot: &str| f(p))
+                            as Box<dyn Fn(f64, &str) + Send>);
+                    return pool.prove(backend_name, &elf, &input_data, po2, timeout, cb);
                 }
             }
         }

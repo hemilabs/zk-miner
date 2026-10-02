@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::Provider;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::time::Duration;
 
 use crate::tx::TX_RECEIPT_TIMEOUT;
@@ -36,6 +36,29 @@ const CLAIM_BATCH_BASE_GAS: u64 = 80_000;
 // it is heavier and an under-provisioned OOG revert is treated as terminal → stranded.)
 const CLAIM_JOB_GAS_LIMIT: u64 = 300_000;
 
+/// Marker in the error text for "we cannot outbid the transaction resident at this
+/// nonce within the ratchet cap".
+///
+/// Diagnostic only — nothing matches on it. The claim gate keys off
+/// `ChainClient::signer_is_jammed`, which is set by the same bail arms; this string
+/// exists so the give-up is greppable in an operator log.
+pub const FEE_CAP_EXHAUSTED: &str = "fee cap exhausted";
+
+/// Log an exhausted-cap give-up uniformly across the four tx paths.
+///
+/// The bid is logged because the 2026-08-14 wedge was diagnosable only by re-deriving
+/// the arithmetic from the cap: 327 rejected sends over 4h24m and not one fee value in
+/// the log. Never make an operator infer the number that was actually on the wire.
+fn log_fee_cap_exhausted(what: &str, nonce: u64, state: &crate::nonce::FeeFloorState) {
+    tracing::error!(
+        "{what} at nonce {nonce}: fee cap EXHAUSTED — already broadcast \
+         max_fee={} tip={} against cap={}; no strictly-higher replacement is possible, \
+         so giving up instead of re-bidding a fee the node will reject forever. \
+         The resident tx must mine or be evicted before this nonce frees.",
+        state.broadcast.1, state.broadcast.0, state.cap,
+    );
+}
+
 /// Escalating EIP-1559 fees for re-broadcast `attempt` (1-based) given base fees.
 ///
 /// Bumps BOTH the priority fee and the max fee enough to clear a node's same-nonce
@@ -57,6 +80,60 @@ const CLAIM_JOB_GAS_LIMIT: u64 = 300_000;
 /// MAX_ATTEMPTS ceiling) so a release can out-bid — and thus displace at the same
 /// nonce — a fulfill tx parked at its top escalation. Equal to fulfill's MAX_ATTEMPTS.
 const FULFILL_ESCALATION_HEADROOM: u32 = 5;
+
+/// Raise `(tip, max_fee)` so it can DISPLACE whatever we last broadcast at `nonce`.
+///
+/// The escalation ladder is seeded per INVOCATION (`base_fees()` is fetched once per
+/// `claim_job`/`fulfill_job` call and `attempt` restarts at 1), so a fresh invocation that
+/// recycles a nonce through `freed` restarts at the UNBUMPED base and cannot clear the
+/// node's replacement threshold against a resident tx left at a previous invocation's top
+/// attempt. That made the retry loop arithmetically non-terminating and wedged the signer
+/// for ~10 minutes on 2026-08-01. Anchoring the floor to the NONCE fixes it: every send at
+/// that nonce is strictly above the last one, whoever sends it.
+///
+/// `REPLACEMENT_BUMP_NUM/DEN` is the margin over the recorded high-water. geth's default
+/// replacement rule needs +10%; 12.5% (= `+ v/8`) clears it with room for rounding, and
+/// matches the floor already used inside `escalated_fees`.
+/// Lift `(tip, max_fee)` over the recorded per-nonce floor so a re-broadcast can
+/// displace whatever we last put at this nonce.
+///
+/// Returns `None` when the ratchet cap is EXHAUSTED — no strictly-higher bid is
+/// possible, so any send would be rejected `replacement transaction underpriced`
+/// every time. Callers must stop rather than spin: re-bidding a losing fee is what
+/// wedged nonce 11589 for 4h24m on 2026-08-14 and stranded three jobs' collateral.
+fn fees_over_floor(
+    client: &ChainClient,
+    nonce: u64,
+    tip: u128,
+    max_fee: u128,
+) -> Option<(u128, u128)> {
+    fees_over_floor_state(client.nonce_fee_floor_state(nonce), tip, max_fee)
+}
+
+/// The pure core of [`fees_over_floor`], split out so it can be unit-tested without a
+/// chain client. It had zero test coverage while being the function that decides whether
+/// a money-path transaction is sent at all.
+fn fees_over_floor_state(
+    state: Option<crate::nonce::FeeFloorState>,
+    tip: u128,
+    max_fee: u128,
+) -> Option<(u128, u128)> {
+    let Some(state) = state else {
+        return Some((tip, max_fee));
+    };
+    if state.exhausted {
+        return None;
+    }
+    let (floor_tip, floor_max) = state.floor;
+    let over = |v: u128| v.saturating_add((v / 8).max(1));
+    let bid = (tip.max(over(floor_tip)), max_fee.max(over(floor_max)));
+    // A bid at or below what we already broadcast cannot displace it. Treat that as
+    // exhaustion too -- this is the exact shape the cap used to produce silently.
+    if bid.1 <= state.broadcast.1 && state.broadcast.1 > 0 {
+        return None;
+    }
+    Some(bid)
+}
 
 fn escalated_fees(base_tip: u128, base_max_fee: u128, attempt: u32) -> (u128, u128) {
     let steps = attempt.saturating_sub(1);
@@ -334,8 +411,9 @@ impl ChainClient {
 
         // Reserve the nonce once from the local cache (fetching only if unset) and
         // reuse it across re-broadcasts, so a timed-out tx is *replaced* at the same
-        // nonce rather than leaving a gap. Committed on success; invalidated (→
-        // re-sync from chain) on any error/give-up.
+        // nonce rather than leaving a gap. Committed on success; on any error/give-up the
+        // nonce is ABORTED (recycled as a gap for the next reservation) — not "invalidated":
+        // `invalidate` re-anchors the whole allocator and has no callers.
         let mut nonce = self.reserve_nonce().await?;
         // Seed fee escalation once; each attempt bumps fees so a re-broadcast can
         // displace a stuck same-nonce tx even under default (auto-gas) config.
@@ -348,11 +426,54 @@ impl ChainClient {
             let send_result = {
                 let _guard = self.tx_lock.lock().await;
                 let mut tx = core.claimJob(job_id).nonce(nonce).gas(CLAIM_JOB_GAS_LIMIT);
+                let mut bid = None;
                 if base_max_fee > 0 {
-                    let (tip, max_fee) = escalated_fees(base_tip, base_max_fee, attempt);
+                    let (tip, seed_max_fee) = escalated_fees(base_tip, base_max_fee, attempt);
+                    // Must exceed anything WE already put at this nonce, even if that came
+                    // from an earlier invocation with its own fresh ladder.
+                    let max_fee = seed_max_fee;
+                    let Some((tip, max_fee)) = fees_over_floor(self, nonce, tip, max_fee)
+                    else {
+                        // Cap exhausted: no strictly-higher bid exists, so every send from
+                        // here is rejected "replacement underpriced". Stop now rather than
+                        // burning the attempt ladder against a wall.
+                        if let Some(st) = self.nonce_fee_floor_state(nonce) {
+                            log_fee_cap_exhausted("claimJob", nonce, &st);
+                        }
+                        self.note_nonce_undisplaceable(nonce);
+                        // Leave abort EVIDENCE but do NOT offer the nonce back to
+                        // reservers. `abort` would push it to the HEAD of `freed`, and
+                        // `reserve_locked` hands the lowest freed nonce out first -- so the
+                        // next reserver (preferentially a deadline-critical release) would
+                        // draw this same poisoned nonce and bail again, in a loop.
+                        // `note_unresolved` writes `aborted_at` only: the gap detector's
+                        // branch (B) still nominates the nonce via `recently_aborted`, so
+                        // it stays visible and healable, while nothing is handed it.
+                        //
+                        // BEWARE: the healer this arms is the LIVE watchdog branch (B),
+                        // which is consumed UNGATED (client.rs `hole_we_own` and its
+                        // `frontier_has_executable_tx` gate are on the SHUTDOWN path only).
+                        // So roughly WEDGE_CHECK_TICKS + WEDGE_MIN_PERSIST after this, the
+                        // healer will try to evict the resident tx with a self-transfer --
+                        // and since that bid now lifts over the uncapped high-water, it
+                        // will SUCCEED. That is the intended unwedge, but it does mean a
+                        // live tx of ours at this nonce is deliberately displaced.
+                        self.note_nonce_unresolved(nonce);
+                        bail!("{FEE_CAP_EXHAUSTED} at nonce {nonce} (claimJob)");
+                    };
+                    bid = Some((tip, max_fee, seed_max_fee));
                     tx = tx.max_priority_fee_per_gas(tip).max_fee_per_gas(max_fee);
                 }
-                tx.send().await
+                let r = tx.send().await;
+                // Ratchet ONLY on an accepted broadcast: a rejected send (429, balance
+                // pre-check) never reached the mempool, and inflating the floor for it
+                // would raise later bids for nothing.
+                if r.is_ok() {
+                    if let Some((tip, max_fee, seed)) = bid {
+                        self.note_broadcast_fee(nonce, tip, max_fee, seed);
+                    }
+                }
+                r
             };
 
             let pending = match send_result {
@@ -367,6 +488,15 @@ impl ChainClient {
                         tracing::warn!(
                             "claimJob replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — bumping fee, keeping nonce"
                         );
+// Give the node a moment before re-bidding. Without this the
+                        // whole attempt ladder burns in well under a second, which learns
+                        // nothing (the resident tx has not moved) and, during the
+                        // 2026-08-14 wedge, produced 327 rejected sends in 4h24m. Linear in
+                        // the attempt so a transient collision still clears quickly.
+                        tokio::time::sleep(Duration::from_millis(
+                            250u64.saturating_mul(attempt as u64),
+                        ))
+                        .await;
                         continue;
                     }
                     // Genuine nonce mismatch (our nonce was consumed by an external tx):
@@ -483,8 +613,9 @@ impl ChainClient {
         // keeps escalating fees, a deadline-critical fulfill/release reserving the
         // same N is out-bid → walked to N+1 behind the stuck batch → its already-
         // locked job misses the deadline → keeper slash. Cap total wall time well
-        // under any fulfillment deadline; on give-up, invalidate the nonce so an
-        // urgent tx re-syncs and takes the lane. The batch's last tx may still mine —
+        // under any fulfillment deadline; on give-up the nonce is ABORTED — recycled as a
+        // gap so the next reservation refills it and an urgent tx takes the lane. (Not
+        // "invalidated": that re-anchors the whole allocator and has no callers.) The batch's last tx may still mine —
         // the background caller reconciles on-chain regardless, so cutting the retry
         // loop short never loses a lock we actually won.
         const WALL_CAP: Duration = Duration::from_secs(90);
@@ -518,18 +649,61 @@ impl ChainClient {
             // provisions and silently drops the tail job; see CLAIM_BATCH_PER_JOB_GAS).
             let gas_limit =
                 CLAIM_BATCH_BASE_GAS + CLAIM_BATCH_PER_JOB_GAS * ids.len() as u64;
+            let mut bid: Option<(u128, u128, u128)> = None;
             let send_result = {
                 let _guard = self.tx_lock.lock().await;
                 let mut tx = core.claimJobBatch(ids.clone()).nonce(nonce).gas(gas_limit);
                 if base_max_fee > 0 {
-                    let (tip, max_fee) = escalated_fees(base_tip, base_max_fee, attempt);
+                    let (tip, seed_max_fee) = escalated_fees(base_tip, base_max_fee, attempt);
+                    // Must exceed anything WE already put at this nonce. A recycled nonce
+                    // can carry a give-up claim/release floor, or a heal's >=4x self-transfer,
+                    // and this open-loop ladder can never clear those on its own.
+                    let max_fee = seed_max_fee;
+                    let Some((tip, max_fee)) = fees_over_floor(self, nonce, tip, max_fee)
+                    else {
+                        // Cap exhausted: no strictly-higher bid exists, so every send from
+                        // here is rejected "replacement underpriced". Stop now rather than
+                        // burning the attempt ladder against a wall.
+                        if let Some(st) = self.nonce_fee_floor_state(nonce) {
+                            log_fee_cap_exhausted("claimJobBatch", nonce, &st);
+                        }
+                        self.note_nonce_undisplaceable(nonce);
+                        // Leave abort EVIDENCE but do NOT offer the nonce back to
+                        // reservers. `abort` would push it to the HEAD of `freed`, and
+                        // `reserve_locked` hands the lowest freed nonce out first -- so the
+                        // next reserver (preferentially a deadline-critical release) would
+                        // draw this same poisoned nonce and bail again, in a loop.
+                        // `note_unresolved` writes `aborted_at` only: the gap detector's
+                        // branch (B) still nominates the nonce via `recently_aborted`, so
+                        // it stays visible and healable, while nothing is handed it.
+                        //
+                        // BEWARE: the healer this arms is the LIVE watchdog branch (B),
+                        // which is consumed UNGATED (client.rs `hole_we_own` and its
+                        // `frontier_has_executable_tx` gate are on the SHUTDOWN path only).
+                        // So roughly WEDGE_CHECK_TICKS + WEDGE_MIN_PERSIST after this, the
+                        // healer will try to evict the resident tx with a self-transfer --
+                        // and since that bid now lifts over the uncapped high-water, it
+                        // will SUCCEED. That is the intended unwedge, but it does mean a
+                        // live tx of ours at this nonce is deliberately displaced.
+                        self.note_nonce_unresolved(nonce);
+                        bail!("{FEE_CAP_EXHAUSTED} at nonce {nonce} (claimJobBatch)");
+                    };
+                    bid = Some((tip, max_fee, seed_max_fee));
                     tx = tx.max_priority_fee_per_gas(tip).max_fee_per_gas(max_fee);
                 }
                 tx.send().await
             };
 
             let pending = match send_result {
-                Ok(p) => p,
+                Ok(p) => {
+                    // Ratchet on an ACCEPTED send only, so the read above cannot flatten the
+                    // ladder (with a floor present, max() would pin every rung to one bid and
+                    // a self-displacing re-broadcast would be rejected forever).
+                    if let Some((t, m, seed)) = bid {
+                        self.note_broadcast_fee(nonce, t, m, seed);
+                    }
+                    p
+                }
                 Err(e) => {
                     let msg = format!("{e:#}");
                     // [H2] tx pending at this nonce → keep it, escalate; don't walk forward.
@@ -537,6 +711,15 @@ impl ChainClient {
                         tracing::warn!(
                             "claimJobBatch replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — bumping fee, keeping nonce"
                         );
+// Give the node a moment before re-bidding. Without this the
+                        // whole attempt ladder burns in well under a second, which learns
+                        // nothing (the resident tx has not moved) and, during the
+                        // 2026-08-14 wedge, produced 327 rejected sends in 4h24m. Linear in
+                        // the attempt so a transient collision still clears quickly.
+                        tokio::time::sleep(Duration::from_millis(
+                            250u64.saturating_mul(attempt as u64),
+                        ))
+                        .await;
                         continue;
                     }
                     if is_nonce_error(&msg) {
@@ -719,6 +902,7 @@ impl ChainClient {
 
             // Build + send under the nonce lock at the reserved nonce (escalating tip
             // lets a re-broadcast replace a stuck tx at the same nonce).
+            let mut bid: Option<(u128, u128, u128)> = None;
             let send_result = {
                 let _guard = self.tx_lock.lock().await;
                 let mut tx = fulfill
@@ -734,14 +918,56 @@ impl ChainClient {
                     // under-provisions it (INTERACTION_GUIDE §9).
                     .gas(self.fulfill_gas_limit);
                 if base_max_fee > 0 {
-                    let (tip, max_fee) = escalated_fees(base_tip, base_max_fee, attempt);
+                    let (tip, seed_max_fee) = escalated_fees(base_tip, base_max_fee, attempt);
+                    // Must exceed anything WE already put at this nonce. A recycled nonce
+                    // can carry a give-up claim/release floor, or a heal's >=4x self-transfer,
+                    // and this open-loop ladder can never clear those on its own.
+                    let max_fee = seed_max_fee;
+                    let Some((tip, max_fee)) = fees_over_floor(self, nonce, tip, max_fee)
+                    else {
+                        // Cap exhausted: no strictly-higher bid exists, so every send from
+                        // here is rejected "replacement underpriced". Stop now rather than
+                        // burning the attempt ladder against a wall.
+                        if let Some(st) = self.nonce_fee_floor_state(nonce) {
+                            log_fee_cap_exhausted("fulfillJob", nonce, &st);
+                        }
+                        self.note_nonce_undisplaceable(nonce);
+                        // Leave abort EVIDENCE but do NOT offer the nonce back to
+                        // reservers. `abort` would push it to the HEAD of `freed`, and
+                        // `reserve_locked` hands the lowest freed nonce out first -- so the
+                        // next reserver (preferentially a deadline-critical release) would
+                        // draw this same poisoned nonce and bail again, in a loop.
+                        // `note_unresolved` writes `aborted_at` only: the gap detector's
+                        // branch (B) still nominates the nonce via `recently_aborted`, so
+                        // it stays visible and healable, while nothing is handed it.
+                        //
+                        // BEWARE: the healer this arms is the LIVE watchdog branch (B),
+                        // which is consumed UNGATED (client.rs `hole_we_own` and its
+                        // `frontier_has_executable_tx` gate are on the SHUTDOWN path only).
+                        // So roughly WEDGE_CHECK_TICKS + WEDGE_MIN_PERSIST after this, the
+                        // healer will try to evict the resident tx with a self-transfer --
+                        // and since that bid now lifts over the uncapped high-water, it
+                        // will SUCCEED. That is the intended unwedge, but it does mean a
+                        // live tx of ours at this nonce is deliberately displaced.
+                        self.note_nonce_unresolved(nonce);
+                        bail!("{FEE_CAP_EXHAUSTED} at nonce {nonce} (fulfillJob)");
+                    };
+                    bid = Some((tip, max_fee, seed_max_fee));
                     tx = tx.max_priority_fee_per_gas(tip).max_fee_per_gas(max_fee);
                 }
                 tx.send().await
             };
 
             let pending = match send_result {
-                Ok(p) => p,
+                Ok(p) => {
+                    // Ratchet on an ACCEPTED send only, so the read above cannot flatten the
+                    // ladder (with a floor present, max() would pin every rung to one bid and
+                    // a self-displacing re-broadcast would be rejected forever).
+                    if let Some((t, m, seed)) = bid {
+                        self.note_broadcast_fee(nonce, t, m, seed);
+                    }
+                    p
+                }
                 Err(e) => {
                     let msg = format!("{e:#}");
                     // [H2] A tx is pending at our nonce (our own re-broadcast, or a stuck
@@ -751,6 +977,15 @@ impl ChainClient {
                     // path relies on. The top-of-loop status check confirms if it landed.
                     if is_same_nonce_pending(&msg) {
                         tracing::warn!("fulfillJob replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — bumping fee, keeping nonce");
+                        // Give the node a moment before re-bidding. Without this the
+                        // whole attempt ladder burns in well under a second, which learns
+                        // nothing (the resident tx has not moved) and, during the
+                        // 2026-08-14 wedge, produced 327 rejected sends in 4h24m. Linear in
+                        // the attempt so a transient collision still clears quickly.
+                        tokio::time::sleep(Duration::from_millis(
+                            250u64.saturating_mul(attempt as u64),
+                        ))
+                        .await;
                         continue;
                     }
                     // Genuine nonce mismatch ⇒ re-fetch and retry fast.
@@ -927,6 +1162,18 @@ impl ChainClient {
     /// after a release the job reopens (prover cleared) or is reclaimed by another
     /// prover — in every case our collateral is no longer tied to a lock we hold.
     pub async fn release_job(&self, job_id: B256) -> Result<()> {
+        self.release_job_with_nonce(job_id, None).await
+    }
+
+    /// As [`Self::release_job`], but starts from a nonce the CALLER already reserved.
+    ///
+    /// The shutdown abandon path releases several jobs concurrently. A single signer's txs
+    /// mine in strict NONCE order, so the nonce — not the spawn or send order — is a
+    /// release's on-chain priority; reserving inside each task instead orders them by
+    /// scheduling and RPC latency, which can put a job with hours of headroom ahead of one
+    /// about to strand. Reserving in deadline order and handing the nonce in fixes that.
+    /// The caller must recycle (`abort_nonce`) a pre-reserved nonce it never passes here.
+    pub async fn release_job_with_nonce(&self, job_id: B256, preassigned: Option<u64>) -> Result<()> {
         const MAX_ATTEMPTS: u32 = 5;
         let fulfill = IHemiProveFulfill::new(self.hemi_prove, &*self.provider);
         // [#45] If a fulfill for THIS job gave up with its tx likely still pending, reuse
@@ -938,17 +1185,41 @@ impl ChainClient {
         // unconditionally ~doubles the fee on every release and can trip the wallet
         // "insufficient funds" precheck during a base-fee spike → release never lands.
         let (mut nonce, mut displacing) = match self.take_abandoned_nonce(job_id) {
-            Some(n) => (n, true),
-            None => (self.reserve_nonce().await?, false),
+            Some(n) => {
+                // The stash WINS (it must displace the stuck fulfill at that exact nonce);
+                // recycle the caller's unused pre-reservation so it can't become a gap.
+                if let Some(p) = preassigned {
+                    self.abort_nonce(p);
+                }
+                (n, true)
+            }
+            // [M7] A pre-assigned nonce is a plain reservation, so `displacing` stays false
+            // and the fulfill-ceiling fee headroom is still only applied once we observe a
+            // stuck same-nonce tx.
+            None => match preassigned {
+                Some(p) => (p, false),
+                None => (self.reserve_nonce().await?, false),
+            },
         };
         let (base_tip, base_max_fee) = self.base_fees().await;
+        // [D1] Have we actually put a releaseJob on the wire yet? Before that, a
+        // `prover == ZERO` read (the job reads OPEN) is NOT proof our lock is gone — a claim
+        // still pending and a lagging replica are indistinguishable from a real reopen. That
+        // is the rule every other reader applies (`release_and_clean`'s own guard,
+        // `classify_reconcile`, recovery), and they all RETAIN the journal breadcrumb on it.
+        // This path is the one that DELETES it: our `Ok(())` makes `release_and_clean` drop
+        // the breadcrumb, which is the only record that collateral is locked — after which
+        // the drain union, the abandon list and the EX_TEMPFAIL exit gate (all
+        // `active_jobs ∪ journal`) can never see the lock again. Positive evidence (prover
+        // set to a DIFFERENT address) is still accepted immediately.
+        let mut broadcast = false;
 
         for attempt in 1..=MAX_ATTEMPTS {
             // Already released? (a prior attempt landed on a node whose receipt we
             // never saw, or the job was reopened/slashed out from under us). Our lock
             // being gone means our collateral is free — treat as success.
             if let Ok(view) = self.get_job_status_view(job_id).await {
-                if view.prover != self.address {
+                if view.prover != self.address && (broadcast || view.prover != Address::ZERO) {
                     // Our lock is gone (release landed, or the fulfill we were displacing
                     // actually mined) → success. Recycle the nonce; self-heals if consumed.
                     self.abort_nonce(nonce);
@@ -957,6 +1228,8 @@ impl ChainClient {
                 }
             }
 
+            // Recorded on an ACCEPTED send only (see below).
+            let mut bid: Option<(u128, u128, u128)> = None;
             let send_result = {
                 let _guard = self.tx_lock.lock().await;
                 let mut tx = fulfill.releaseJob(job_id).nonce(nonce);
@@ -965,15 +1238,91 @@ impl ChainClient {
                     // ABOVE fulfill's ceiling (it can only be evicted by a strictly higher
                     // fee). Otherwise escalate normally [M7].
                     let headroom = if displacing { FULFILL_ESCALATION_HEADROOM } else { 0 };
-                    let (tip, max_fee) =
+                    let (tip, seed_max_fee) =
                         escalated_fees(base_tip, base_max_fee, attempt + headroom);
+                    // Lift over anything WE already broadcast at this nonce — mirroring
+                    // claim_job. Without it this ladder is OPEN LOOP: it tops out at
+                    // attempt 5 + headroom 5 => 1.15^9 ~= 3.52x base, while a nonce-gap heal
+                    // bids >= 4x, and 4 / 1.125 = 3.556 > 3.52 — so a release racing a heal
+                    // at the same nonce could NEVER clear the replacement threshold. All five
+                    // attempts were rejected "replacement underpriced" and the releaseJob
+                    // never reached the wire, silently, losing the collateral at the lock
+                    // deadline. This is what made every heal-vs-release collision terminal
+                    // rather than recoverable.
+                    let max_fee = seed_max_fee;
+                    let Some((tip, max_fee)) = fees_over_floor(self, nonce, tip, max_fee)
+                    else {
+                        // Cap exhausted: no strictly-higher bid exists, so every send from
+                        // here is rejected "replacement underpriced". Stop now rather than
+                        // burning the attempt ladder against a wall.
+                        if let Some(st) = self.nonce_fee_floor_state(nonce) {
+                            log_fee_cap_exhausted("releaseJob", nonce, &st);
+                        }
+                        self.note_nonce_undisplaceable(nonce);
+                        // Leave abort EVIDENCE but do NOT offer the nonce back to
+                        // reservers. `abort` would push it to the HEAD of `freed`, and
+                        // `reserve_locked` hands the lowest freed nonce out first -- so the
+                        // next reserver (preferentially a deadline-critical release) would
+                        // draw this same poisoned nonce and bail again, in a loop.
+                        // `note_unresolved` writes `aborted_at` only: the gap detector's
+                        // branch (B) still nominates the nonce via `recently_aborted`, so
+                        // it stays visible and healable, while nothing is handed it.
+                        //
+                        // NOTE: unlike the other three arms, this does NOT hand the
+                        // nonce to the watchdog as an intended unwedge. This is the
+                        // collateral rescue; we move to a fresh nonce and keep driving it.
+                        self.note_nonce_unresolved(nonce);
+                        // release is the COLLATERAL RESCUE, so a give-up here is not the
+                        // same trade as on the other three paths. Unless we are
+                        // deliberately displacing a stashed fulfill at this exact nonce,
+                        // move to a FRESH nonce and keep going -- mirroring the
+                        // `is_nonce_error` arm below, which already handles the same
+                        // predicament correctly. A release at M > N is accepted
+                        // immediately and cascades the moment the heal at N mines;
+                        // bailing instead hands the retry to `recover_claimed_jobs` on a
+                        // ~5 min cadence and lets the watchdog evict our own valid,
+                        // pre-deadline releaseJob -- which, now that the heal bid wins,
+                        // actually succeeds.
+                        if !displacing {
+                            match self.reserve_nonce().await {
+                                Ok(n) => {
+                                    nonce = n;
+                                    displacing = false;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "releaseJob: cap exhausted at {nonce} and no fresh \
+                                         nonce available ({e:#})"
+                                    );
+                                }
+                            }
+                        }
+                        bail!("{FEE_CAP_EXHAUSTED} at nonce {nonce} (releaseJob)");
+                    };
+                    bid = Some((tip, max_fee, seed_max_fee));
                     tx = tx.max_priority_fee_per_gas(tip).max_fee_per_gas(max_fee);
                 }
                 tx.send().await
             };
 
             let pending = match send_result {
-                Ok(p) => p,
+                Ok(p) => {
+                    broadcast = true; // [D1] a ZERO read may now legitimately be our release
+                    // The read above is HALF the mechanism; without this write it is a
+                    // regression. With a floor present, `max()` pins every attempt to the
+                    // same bid, so a self-displacing re-broadcast after a receipt timeout is
+                    // rejected `is_same_nonce_pending` and all five rungs burn identically.
+                    // Writing on success restores strict monotonicity — exactly how claim_job
+                    // pairs its `fees_over_floor` read with `note_broadcast_fee`.
+                    //
+                    // Ratchet ONLY on an accepted send: recording a rejected bid would
+                    // inflate the floor for a tx that never reached the mempool.
+                    if let Some((t, m, seed)) = bid {
+                        self.note_broadcast_fee(nonce, t, m, seed);
+                    }
+                    p
+                }
                 Err(e) => {
                     let msg = format!("{e:#}");
                     // A tx is already pending at THIS nonce (e.g. a stuck fulfill we're
@@ -988,6 +1337,15 @@ impl ChainClient {
                             "releaseJob replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {msg} \
                              — bumping tip, keeping nonce"
                         );
+                        // Shorter backoff than the other three paths on purpose: this is
+                        // the deadline-critical collateral rescue, so the ladder must not
+                        // burn instantly (it learns nothing) but also must not dawdle.
+                        // ~1.5s total across five attempts, against a lock deadline
+                        // measured in hours.
+                        tokio::time::sleep(Duration::from_millis(
+                            100u64.saturating_mul(attempt as u64),
+                        ))
+                        .await;
                         continue;
                     }
                     if is_nonce_error(&msg) {
@@ -1000,7 +1358,18 @@ impl ChainClient {
                         // [M3] Don't abort the whole deadline-critical release on a single
                         // transient re-sync failure; keep the attempt budget and retry.
                         match self.reserve_nonce().await {
-                            Ok(n) => nonce = n,
+                            Ok(n) => {
+                                nonce = n;
+                                // [M7] A FRESH nonce has nothing of ours to displace, so the
+                                // fulfill-ceiling headroom must not carry over. Leaving it set
+                                // made attempt 2 bid `escalated_fees(base, 2 + 5)` ~= 2.31x
+                                // base against an empty nonce — overpaying on a
+                                // deadline-critical tx for no reason, and exactly what the
+                                // [M7] note at the top of this function forbids. `displacing`
+                                // is re-armed by the `is_same_nonce_pending` arm above if the
+                                // new nonce turns out to be occupied too.
+                                displacing = false;
+                            }
                             Err(e) => {
                                 tracing::warn!("releaseJob nonce re-sync failed (attempt {attempt}/{MAX_ATTEMPTS}): {e:#} — retrying");
                             }
@@ -1060,9 +1429,11 @@ impl ChainClient {
         }
 
         // Final state check before declaring failure — our lock may have cleared
-        // on the very last broadcast whose receipt we didn't catch.
+        // on the very last broadcast whose receipt we didn't catch. Same [D1] rule: if every
+        // attempt failed at `send` (persistent 429s) nothing was broadcast, so a ZERO read
+        // here is UNKNOWN, not success.
         if let Ok(view) = self.get_job_status_view(job_id).await {
-            if view.prover != self.address {
+            if view.prover != self.address && (broadcast || view.prover != Address::ZERO) {
                 self.abort_nonce(nonce);
                 tracing::info!("Job {} released (confirmed on final check)", job_id);
                 return Ok(());
@@ -1122,6 +1493,31 @@ impl ChainClient {
 #[cfg(test)]
 mod tests {
     use super::{escalated_fees, is_nonce_error, is_rate_limit_error, is_same_nonce_pending};
+
+    /// [cheap-1] A FRESH nonce has nothing of ours to displace, so the fulfill-ceiling
+    /// headroom must not carry over from a previous nonce. Leaving `displacing` set made
+    /// attempt 2 bid `escalated_fees(base, 2 + FULFILL_ESCALATION_HEADROOM)` against an empty
+    /// nonce — the overpay [M7] forbids. This pins the arithmetic that made it visible.
+    #[test]
+    fn headroom_must_not_apply_to_a_fresh_nonce() {
+        let (base_tip, base_max) = (1_000u128, 10_000u128);
+        // attempt 2 on a nonce we ARE displacing: 5 rungs of headroom on top.
+        let (_, displacing_bid) =
+            escalated_fees(base_tip, base_max, 2 + super::FULFILL_ESCALATION_HEADROOM);
+        // attempt 2 on a fresh nonce: no headroom.
+        let (_, fresh_bid) = escalated_fees(base_tip, base_max, 2);
+        // Pin the VALUES, not an inequality. `escalated_fees` increments by at least 1 per
+        // step, so `displacing_bid > fresh_bid` is a theorem of the function under test — it
+        // would hold no matter what FIX 1 did, which is the definition of a tautological
+        // assertion. (The previous `> fresh_bid * 2` was worse still: it passed by 0.56% and
+        // went red at HEADROOM = 4, hard-pinning a constant this test does not own.)
+        assert_eq!(fresh_bid, 11_500, "attempt 2, no headroom: exactly one 15% rung");
+        assert_eq!(
+            displacing_bid, 23_128,
+            "attempt 2 + 5 rungs of headroom — this is what a fresh nonce would have been \
+             overcharged before `displacing` was reset"
+        );
+    }
 
     /// attempt 1 is the initial send (not a replacement) → base fees unchanged.
     #[test]
@@ -1256,6 +1652,74 @@ mod tests {
         ] {
             assert!(!is_nonce_error(msg), "should NOT be a nonce error: {msg:?}");
             assert!(!is_same_nonce_pending(msg), "should NOT be pending: {msg:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod fees_over_floor_tests {
+    use super::*;
+    use crate::nonce::FeeFloorState;
+
+    fn st(broadcast_max: u128, cap: u128) -> Option<FeeFloorState> {
+        let capped = broadcast_max.min(cap);
+        Some(FeeFloorState {
+            floor: (0, capped),
+            broadcast: (0, broadcast_max),
+            cap,
+            exhausted: broadcast_max >= cap,
+        })
+    }
+
+    /// No floor recorded: the caller's own escalated bid passes through untouched.
+    #[test]
+    fn no_floor_passes_the_bid_through() {
+        assert_eq!(fees_over_floor_state(None, 5, 100), Some((5, 100)));
+    }
+
+    /// Below the cap: lift over the recorded high-water so the replacement can win.
+    #[test]
+    fn below_the_cap_lifts_over_the_high_water() {
+        // broadcast 1000, cap 8000 -> floor 1000 -> over() = 1125.
+        let got = fees_over_floor_state(st(1_000, 8_000), 0, 500).unwrap();
+        assert!(got.1 > 1_000, "must strictly exceed what we already broadcast, got {}", got.1);
+        assert_eq!(got.1, 1_125);
+    }
+
+    /// A caller bid already above the floor wins over the lift.
+    #[test]
+    fn a_higher_caller_bid_is_preserved() {
+        let got = fees_over_floor_state(st(1_000, 8_000), 0, 9_999).unwrap();
+        assert_eq!(got.1, 9_999);
+    }
+
+    /// AT the cap: exhausted. This is the boundary the livelock sat on.
+    #[test]
+    fn exactly_at_the_cap_is_exhausted() {
+        assert_eq!(fees_over_floor_state(st(8_000, 8_000), 0, 100), None);
+    }
+
+    /// Past the cap — the real steady state (~1.04x cap) — is exhausted.
+    #[test]
+    fn past_the_cap_is_exhausted() {
+        assert_eq!(fees_over_floor_state(st(8_332, 8_000), 0, 100), None);
+    }
+
+    /// THE LIVELOCK, stated as a property: whatever this returns must be strictly
+    /// greater than what is already on the wire. Returning an equal bid is precisely
+    /// what produced 327 rejected sends over 4h24m on 2026-08-14.
+    #[test]
+    fn a_returned_bid_always_strictly_exceeds_the_resident() {
+        for broadcast in [1u128, 999, 1_000, 4_000, 7_999, 8_000, 8_332, 100_000] {
+            for caller in [0u128, 1, 500, 9_999] {
+                if let Some((_, bid)) = fees_over_floor_state(st(broadcast, 8_000), 0, caller) {
+                    assert!(
+                        bid > broadcast,
+                        "bid {bid} does not exceed resident {broadcast} — that is the \
+                         rejected-forever fixed point"
+                    );
+                }
+            }
         }
     }
 }

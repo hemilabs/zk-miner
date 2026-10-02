@@ -15,8 +15,29 @@ use zkminer_prover::benchmark::BENCHMARK_PROGRAMS;
 /// CPU is always first, then gpu0, gpu1, etc.
 fn device_ids(state: &MinerState) -> Vec<String> {
     let mut ids = vec!["cpu".to_string()];
-    for gpu in &state.hardware.gpus {
-        ids.push(format!("gpu{}", gpu.index));
+    // Resolve each physical card to the benchmark id that actually belongs to it.
+    // Building these from `gpu.index` produced ids for cards that have no
+    // benchmark row at all (a non-proving AMD card) while omitting the id of a
+    // card that does -- so one row rendered another card's label and score, and
+    // the last card fell off the list.
+    if let Some(suite) = &state.benchmark_results {
+        for gpu in &state.hardware.gpus {
+            if let Some(id) = gpu.benchmark_device_id(suite) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    // Include any benchmark row we could not tie to a detected card (e.g. the
+    // TUI cannot see the card, or a legacy cache with an ambiguous name), so its
+    // data is still reachable rather than silently dropped.
+    if let Some(suite) = &state.benchmark_results {
+        for d in &suite.device_benchmarks {
+            if d.device_id.starts_with("gpu") && !ids.contains(&d.device_id) {
+                ids.push(d.device_id.clone());
+            }
+        }
     }
     ids
 }
@@ -286,10 +307,14 @@ fn render_device_benchmarks(f: &mut Frame, area: Rect, state: &MinerState) {
                     .map(|d| d.device_label.clone())
                     .unwrap_or_else(|| {
                         state
-                            .hardware
-                            .gpus
-                            .iter()
-                            .find(|g| format!("gpu{}", g.index) == *device_id)
+                            .benchmark_results
+                            .as_ref()
+                            .and_then(|suite| {
+                                state.hardware.gpus.iter().find(|g| {
+                                    g.benchmark_device_id(suite).as_deref()
+                                        == Some(device_id.as_str())
+                                })
+                            })
                             .map(|g| format!("GPU{} {}", g.index, g.name))
                             .unwrap_or_else(|| device_id.clone())
                     })
@@ -751,11 +776,13 @@ fn render_gpu_telemetry(
     let active_dev = tracker.devices.get(tracker.active_device_index);
 
     // Find the matching GPU in hardware state
-    let gpu = active_dev.and_then(|dev| {
-        dev.device_index().and_then(|idx| {
-            state.hardware.gpus.iter().find(|g| g.index == idx)
-        })
-    });
+    // Join on PCI bus id, not on the prover's device index. `dev.device_index()`
+    // is the prover's per-vendor ordinal; `g.index` is a display ordinal over all
+    // DRM cards. Matching them meant that while the RTX 5090 benchmarked at ~520W
+    // under a tab labelled "GPU0 NVIDIA GeForce RTX 5090", this panel rendered
+    // hardware.gpus[0] -- the idle AMD 7900 XTX at 9W, tagged "AMD" -- and the
+    // 4090's telemetry was unreachable from this screen entirely.
+    let gpu = active_dev.and_then(|dev| dev.resolve_gpu(&state.hardware.gpus));
 
     let lines: Vec<Line<'_>> = if let Some(gpu) = gpu {
         let temp = gpu.temp_junction_c.or(gpu.temp_edge_c).unwrap_or(0.0);

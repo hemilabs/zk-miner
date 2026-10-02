@@ -310,7 +310,7 @@ async fn job_generator(state: SharedState) {
             },
             status: MinerJobStatus::Open,
             current_price: min_price, // starts at min, will be updated by brain
-            gpu_index: None,
+            gpu_bus_id: None,
             prover_backend: required_backend,
             estimated_cycles: 0,
         };
@@ -375,10 +375,10 @@ async fn miner_brain(state: SharedState) {
 
         // Phase 2: Evaluate & claim (allow one job per device)
         // Collect device IDs already busy with an active job
-        let busy_devices: Vec<Option<u32>> = s
+        let busy_devices: Vec<Option<String>> = s
             .active_jobs
             .iter()
-            .map(|j| j.gpu_index)
+            .map(|j| j.gpu_bus_id.clone())
             .collect();
 
         let max_concurrent = s.runtime_settings.max_concurrent_proofs;
@@ -426,7 +426,7 @@ async fn miner_brain(state: SharedState) {
                 }
 
                 for device in &devices {
-                    if busy_devices.contains(&device.gpu_index) {
+                    if busy_devices.contains(&device.gpu_bus_id) {
                         continue;
                     }
                     // Skip disabled devices and device-backend combos
@@ -495,7 +495,7 @@ async fn miner_brain(state: SharedState) {
                     elapsed_secs: 0,
                 };
                 job.current_price = settled_price;
-                job.gpu_index = device.gpu_index;
+                job.gpu_bus_id = device.gpu_bus_id.clone();
                 // prover_backend was already set at job creation (required backend)
 
                 // Deduct collateral from available
@@ -745,8 +745,12 @@ struct DeviceChoice {
     device_id: String,
     /// Human-readable label.
     device_label: String,
-    /// `None` = CPU, `Some(i)` = GPU index.
-    gpu_index: Option<u32>,
+    /// `None` = CPU, `Some(bus)` = the GPU's PCI bus id.
+    ///
+    /// Was a `gpu_index` parsed out of `"gpuN"` -- the PROVER's namespace -- and
+    /// then compared against `GpuInfo.index`, a display ordinal. Those disagree on
+    /// any mixed-vendor box, so the mock attributed jobs to the wrong card.
+    gpu_bus_id: Option<String>,
     /// Prover backend this device will use.
     prover_backend: String,
     /// Throughput in cycles/sec for this (device, backend) pair.
@@ -757,17 +761,15 @@ struct DeviceChoice {
 
 impl DeviceChoice {
     fn from_benchmark(db: &DeviceBenchmark) -> Self {
-        let gpu_index = if db.device_id == "cpu" {
+        let gpu_bus_id = if db.device_id == "cpu" || db.pci_bus_id.is_empty() {
             None
         } else {
-            db.device_id
-                .strip_prefix("gpu")
-                .and_then(|s| s.parse::<u32>().ok())
+            Some(db.pci_bus_id.clone())
         };
         DeviceChoice {
             device_id: db.device_id.clone(),
             device_label: db.device_label.clone(),
-            gpu_index,
+            gpu_bus_id,
             prover_backend: db.prover_backend.clone(),
             throughput: db.throughput,
             power_watts: db.power_watts,
@@ -799,7 +801,7 @@ fn build_cost_params_for_device(
     system_overhead_watts: f64,
 ) -> CostParams {
     let cpu_watts = benchmarks.cpu_power_watts.unwrap_or(65.0);
-    let device_watts = if device.gpu_index.is_some() {
+    let device_watts = if device.gpu_bus_id.is_some() {
         device.power_watts // GPU draws additional power
     } else {
         0.0 // CPU power is already in cpu_watts
@@ -869,6 +871,7 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
                         &event.slot_key,
                         event.gpu_name.as_deref(),
                         event.device_index,
+                        event.pci_bus_id.as_deref(),
                         &event.gpu_tag,
                         &event.entry,
                         event.program_index,

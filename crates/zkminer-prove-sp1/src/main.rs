@@ -160,6 +160,15 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 po2: _, // SP1 does not use segment sizing
             } => {
                 tracing::info!("Proving request {request_id} ({} bytes ELF)", elf.len());
+                // Announce proof START so the miner can move the job from Queued to Proving.
+                // Without this the job displays "Queued (waiting for GPU)" for the whole proof.
+                let started = WorkerResponse::Progress {
+                    request_id,
+                    fraction: 0.0,
+                    elapsed_secs: 0.0,
+                    segments: None,
+                };
+                write_message(&mut stdout, &started)?;
                 match run_proof(get_prover!(prover), &mut pk_cache, &elf, &input_data) {
                     Ok((journal, seal, duration_secs, cycles)) => {
                         let resp = WorkerResponse::ProofResult {
@@ -204,6 +213,21 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     request_id,
                     kind: ErrorKind::Internal,
                     message: "SP1 does not support segment limit calibration".to_string(),
+                };
+                write_message(&mut stdout, &resp)?;
+            }
+
+            WorkerCommand::Execute { request_id, .. } => {
+                // Cycle measurement is implemented for risc0 only: it is the backend whose
+                // executor reports the same `total_cycles` the prover does, so the number is
+                // directly comparable to what proving will report. Decline explicitly rather
+                // than returning a fabricated count — a wrong cycle count would size the
+                // deadline check and the look-ahead queue, and silently claiming work we
+                // cannot finish loses collateral outright.
+                let resp = WorkerResponse::Error {
+                    request_id,
+                    kind: ErrorKind::InvalidInput,
+                    message: "cycle measurement not supported by the sp1 backend".to_string(),
                 };
                 write_message(&mut stdout, &resp)?;
             }

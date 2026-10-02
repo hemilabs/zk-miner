@@ -43,10 +43,25 @@ pub struct MemoryInfo {
 
 #[derive(Debug, Clone)]
 pub struct GpuInfo {
+    /// Display ordinal ONLY. Dense 0-based position in DRM card order across
+    /// ALL vendors, with non-GPU DRM nodes excluded.
+    ///
+    /// This is NOT an NVML/CUDA index, NOT a DRM card number, and NOT a
+    /// benchmark `gpuN` id. On a mixed-vendor box it agrees with none of them:
+    /// a non-proving AMD card ahead of the NVIDIA cards in DRM order shifts
+    /// every NVIDIA card by one. NEVER use it as a join key against benchmark
+    /// rows or worker slots -- join on `pci_bus_id` instead.
     pub index: u32,
     pub name: String,
     pub vendor: GpuVendor,
+    /// Vendor-local handle, NOT a PCI address: `nv:{nvml_index}` for NVIDIA,
+    /// the sysfs device id for AMD/Intel. Correct for vendor-local lookups
+    /// (`nvidia_smi_index`, `find_amd_card`); useless as a cross-crate key.
     pub pci_id: String,
+    /// Canonical lowercase 4-digit-domain PCI address, e.g. `0000:06:1b.0`.
+    /// The ONLY globally stable, vendor-neutral identity here, and the join
+    /// key against prover-side benchmark rows and worker slots.
+    pub pci_bus_id: String,
     pub gpu_clock_mhz: u32,
     pub mem_clock_mhz: u32,
     pub gpu_usage_percent: u32,
@@ -623,6 +638,9 @@ fn detect_gpus() -> Vec<GpuInfo> {
                 name,
                 vendor: GpuVendor::Amd,
                 pci_id: device_id,
+                pci_bus_id: read_pci_slot_from_uevent_path(&format!("{}/uevent", base))
+                    .map(|id| normalize_pci_bus_id(&id))
+                    .unwrap_or_default(),
                 gpu_clock_mhz: 0,
                 mem_clock_mhz: 0,
                 gpu_usage_percent: 0,
@@ -670,6 +688,9 @@ fn detect_gpus() -> Vec<GpuInfo> {
                 name,
                 vendor: GpuVendor::Intel,
                 pci_id: device_id,
+                pci_bus_id: read_pci_slot_from_uevent_path(&format!("{}/uevent", base))
+                    .map(|id| normalize_pci_bus_id(&id))
+                    .unwrap_or_default(),
                 gpu_clock_mhz: 0,
                 mem_clock_mhz: 0,
                 gpu_usage_percent: 0,
@@ -718,6 +739,7 @@ fn detect_gpus() -> Vec<GpuInfo> {
                 name: nv.name.clone(),
                 vendor: GpuVendor::Nvidia,
                 pci_id: format!("nv:{}", nv.nv_index),
+                pci_bus_id: pci_bus_id.clone(),
                 gpu_clock_mhz: 0,
                 mem_clock_mhz: 0,
                 gpu_usage_percent: 0,
@@ -759,7 +781,18 @@ fn detect_gpus() -> Vec<GpuInfo> {
             .iter()
             .filter(|(bus_id, _)| !matched.contains(*bus_id))
             .collect();
-        unmatched.sort_by_key(|(_, nv)| &nv.nv_index);
+        // nv_index is a String, so the natural sort_by_key is LEXICOGRAPHIC: on a
+        // 10+ GPU rig that orders 0,1,10,11,2,3 and GpuInfo.index stops matching
+        // the NVML index even on a pure-NVIDIA box. Sort numerically, falling back
+        // to the string form so unparseable values keep a deterministic order.
+        unmatched.sort_by(|(_, a), (_, b)| {
+            let na = a.nv_index.parse::<u32>().ok();
+            let nb = b.nv_index.parse::<u32>().ok();
+            match (na, nb) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                _ => a.nv_index.cmp(&b.nv_index),
+            }
+        });
 
         for (_, nv) in unmatched {
             let mut gpu = GpuInfo {
@@ -767,6 +800,7 @@ fn detect_gpus() -> Vec<GpuInfo> {
                 name: nv.name.clone(),
                 vendor: GpuVendor::Nvidia,
                 pci_id: format!("nv:{}", nv.nv_index),
+                pci_bus_id: normalize_pci_bus_id(&nv.pci_bus_id),
                 gpu_clock_mhz: 0,
                 mem_clock_mhz: 0,
                 gpu_usage_percent: 0,
@@ -1438,5 +1472,221 @@ mod tests {
             shorten_cpu_name("AMD Ryzen 9 7950X 16-Core Processor"),
             "R9 7950X 16 Core"
         );
+    }
+}
+
+impl GpuInfo {
+    /// The benchmark `device_id` belonging to THIS physical card, or `None` when
+    /// no benchmark row matches it.
+    ///
+    /// Resolution order:
+    ///  1. `pci_bus_id` — the real identity, written by current prover builds.
+    ///  2. GPU model name embedded in `device_label` — migrates caches written
+    ///     before the bus id existed, and only when the match is unambiguous.
+    ///
+    /// `None` means "no data for this card", and callers MUST render that as
+    /// blank rather than falling back to a positional guess. The bug this
+    /// replaces was exactly such a guess: joining on `format!("gpu{}", index)`
+    /// against rows keyed in the prover's per-vendor index space, so on a box
+    /// with a non-proving AMD card first in DRM order the AMD row displayed the
+    /// RTX 5090's throughput, the 5090 displayed the 4090's, and the 4090 --
+    /// which had no row at that index -- displayed nothing.
+    pub fn benchmark_device_id(
+        &self,
+        suite: &zkminer_prover::benchmark::BenchmarkSuite,
+    ) -> Option<String> {
+        let rows = &suite.device_benchmarks;
+
+        // 1. Exact PCI bus id.
+        if !self.pci_bus_id.is_empty() {
+            if let Some(d) = rows
+                .iter()
+                .find(|d| !d.pci_bus_id.is_empty() && d.pci_bus_id == self.pci_bus_id)
+            {
+                return Some(d.device_id.clone());
+            }
+        }
+
+        // 2. Legacy caches carry no bus id. Fall back to the model name in the
+        //    label, but ONLY when exactly one legacy row matches: on a 2x4090 box
+        //    the name is ambiguous, and guessing there is how the original bug
+        //    silently showed one card's numbers against another.
+        let want = normalize_gpu_name(&self.name);
+        if want.is_empty() {
+            return None;
+        }
+        let mut hits = rows
+            .iter()
+            .filter(|d| {
+                d.pci_bus_id.is_empty()
+                    && d.device_id.starts_with("gpu")
+                    && normalize_gpu_name(&d.device_label).contains(&want)
+            })
+            .map(|d| d.device_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter();
+        match (hits.next(), hits.next()) {
+            (Some(id), None) => Some(id),
+            _ => None,
+        }
+    }
+}
+
+/// Lowercase a GPU name and drop vendor prefixes and punctuation so the two
+/// crates' spellings compare equal.
+///
+/// The TUI strips a leading `"NVIDIA "` during detection and the prover does
+/// not, so `"GeForce RTX 5090"` and `"NVIDIA GeForce RTX 5090"` denote one card
+/// and must match.
+fn normalize_gpu_name(s: &str) -> String {
+    s.to_lowercase()
+        .replace("nvidia", " ")
+        .replace("geforce", " ")
+        .replace("advanced micro devices", " ")
+        .replace("amd", " ")
+        .replace("intel", " ")
+        .replace(['(', ')', ',', '-', '_'], " ")
+        .split_whitespace()
+        .filter(|w| !w.chars().all(|c| c.is_ascii_digit()) || w.len() >= 3)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod gpu_identity_tests {
+    use super::*;
+    use zkminer_prover::benchmark::{BenchmarkSuite, DeviceBenchmark};
+
+    fn gpu(index: u32, name: &str, vendor: GpuVendor, bus: &str) -> GpuInfo {
+        GpuInfo {
+            index,
+            name: name.to_string(),
+            vendor,
+            pci_id: String::new(),
+            pci_bus_id: bus.to_string(),
+            gpu_clock_mhz: 0,
+            mem_clock_mhz: 0,
+            gpu_usage_percent: 0,
+            mem_usage_percent: 0,
+            vram_used_bytes: 0,
+            vram_total_bytes: 0,
+            temp_edge_c: None,
+            temp_junction_c: None,
+            temp_mem_c: None,
+            fan_rpm: 0,
+            fan_max_rpm: 0,
+            power_watts: 0.0,
+            power_cap_watts: 0.0,
+            voltage_mv: 0,
+            pcie_speed: String::new(),
+            pcie_width: 0,
+            vbios: String::new(),
+        }
+    }
+
+    fn row(device_id: &str, label: &str, bus: &str, tp: f64) -> DeviceBenchmark {
+        DeviceBenchmark {
+            device_id: device_id.to_string(),
+            device_label: label.to_string(),
+            prover_backend: "risc0".to_string(),
+            throughput: tp,
+            power_watts: 0.0,
+            optimal_po2: 20,
+            memory_usage_bytes: 0,
+            max_feasible_po2: 20,
+            program_throughputs: Default::default(),
+            po2_samples: Vec::new(),
+            pci_bus_id: bus.to_string(),
+        }
+    }
+
+    fn suite(rows: Vec<DeviceBenchmark>) -> BenchmarkSuite {
+        let mut s = BenchmarkSuite::default();
+        s.device_benchmarks = rows;
+        s
+    }
+
+    /// The exact reported bug: a non-proving AMD card first in DRM order shifted
+    /// every NVIDIA card's benchmark row by one.
+    #[test]
+    fn non_proving_card_does_not_steal_a_neighbours_row() {
+        let amd = gpu(0, "Radeon RX 7900 XTX", GpuVendor::Amd, "0000:06:10.0");
+        let n5090 = gpu(1, "GeForce RTX 5090", GpuVendor::Nvidia, "0000:06:1b.0");
+        let n4090 = gpu(2, "GeForce RTX 4090", GpuVendor::Nvidia, "0000:08:0d.0");
+
+        // Benchmark rows exist ONLY for the two NVIDIA cards, keyed in the
+        // prover's own index space -- exactly what this box has on disk.
+        let s = suite(vec![
+            row("gpu0", "GPU0 NVIDIA GeForce RTX 5090", "0000:06:1b.0", 2_287_871.9),
+            row("gpu1", "GPU1 NVIDIA GeForce RTX 4090", "0000:08:0d.0", 1_504_981.0),
+        ]);
+
+        // The AMD card has no row and must resolve to nothing -- NOT to "gpu0",
+        // which is the 5090's row and is what it used to display.
+        assert_eq!(amd.benchmark_device_id(&s), None);
+        assert_eq!(n5090.benchmark_device_id(&s).as_deref(), Some("gpu0"));
+        assert_eq!(n4090.benchmark_device_id(&s).as_deref(), Some("gpu1"));
+    }
+
+    /// A legacy cache (written before pci_bus_id existed) still resolves, so the
+    /// migration does not cost measured po2 calibration.
+    #[test]
+    fn legacy_rows_without_bus_id_match_on_name() {
+        let n5090 = gpu(1, "GeForce RTX 5090", GpuVendor::Nvidia, "0000:06:1b.0");
+        let s = suite(vec![
+            row("gpu0", "GPU0 NVIDIA GeForce RTX 5090", "", 2_287_871.9),
+            row("gpu1", "GPU1 NVIDIA GeForce RTX 4090", "", 1_504_981.0),
+        ]);
+        // "GeForce RTX 5090" vs "NVIDIA GeForce RTX 5090" must compare equal.
+        assert_eq!(n5090.benchmark_device_id(&s).as_deref(), Some("gpu0"));
+    }
+
+    /// Two identical cards make a name match ambiguous. Resolve to None and show
+    /// nothing rather than guessing -- guessing is the original bug.
+    #[test]
+    fn ambiguous_legacy_name_resolves_to_nothing() {
+        let a = gpu(0, "GeForce RTX 4090", GpuVendor::Nvidia, "0000:01:00.0");
+        let s = suite(vec![
+            row("gpu0", "GPU0 NVIDIA GeForce RTX 4090", "", 1.0),
+            row("gpu1", "GPU1 NVIDIA GeForce RTX 4090", "", 2.0),
+        ]);
+        assert_eq!(a.benchmark_device_id(&s), None);
+    }
+
+    /// Several backends for ONE card is the normal case and must not read as
+    /// ambiguous -- otherwise every legacy row stops resolving.
+    #[test]
+    fn multiple_backends_for_one_card_are_not_ambiguous() {
+        let a = gpu(0, "GeForce RTX 4090", GpuVendor::Nvidia, "0000:01:00.0");
+        let mut r1 = row("gpu0", "GPU0 NVIDIA GeForce RTX 4090", "", 1.0);
+        r1.prover_backend = "risc0".to_string();
+        let mut r2 = row("gpu0", "GPU0 NVIDIA GeForce RTX 4090", "", 2.0);
+        r2.prover_backend = "sp1".to_string();
+        assert_eq!(a.benchmark_device_id(&suite(vec![r1, r2])).as_deref(), Some("gpu0"));
+    }
+
+    /// Bus id wins over a name that would match a different row.
+    #[test]
+    fn bus_id_takes_priority_over_name() {
+        let g = gpu(0, "GeForce RTX 4090", GpuVendor::Nvidia, "0000:08:0d.0");
+        let s = suite(vec![
+            row("gpu0", "GPU0 NVIDIA GeForce RTX 4090", "0000:01:00.0", 1.0),
+            row("gpu1", "GPU1 NVIDIA GeForce RTX 4090", "0000:08:0d.0", 2.0),
+        ]);
+        assert_eq!(g.benchmark_device_id(&s).as_deref(), Some("gpu1"));
+    }
+
+    /// Both crates must normalize a PCI address to the same string, or the join
+    /// silently matches AMD (4-digit sysfs) and misses NVIDIA (8-digit smi).
+    #[test]
+    fn pci_normalization_agrees_across_crates() {
+        for raw in ["00000000:06:1B.0", "0000:06:1b.0", "0000:06:1B.0"] {
+            assert_eq!(
+                normalize_pci_bus_id(raw),
+                zkminer_prover::discovery::normalize_pci_bus_id(raw),
+                "normalization disagreed for {raw}",
+            );
+            assert_eq!(normalize_pci_bus_id(raw), "0000:06:1b.0");
+        }
     }
 }

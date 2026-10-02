@@ -132,6 +132,21 @@ pub struct DeviceBenchmark {
     /// Only meaningful for risc0 backend; SP1/OpenVM ignore po2.
     #[serde(default)]
     pub po2_samples: Vec<Po2Sample>,
+    /// Canonical PCI bus id of the card this row was measured on, e.g.
+    /// `0000:06:1b.0`. Empty for CPU rows and for caches written before this
+    /// field existed.
+    ///
+    /// This is the identity the TUI joins on to line a row up with a physical
+    /// card. `device_id` is an ordinal in the prover's own per-vendor index
+    /// space and means nothing to a consumer that enumerated hardware
+    /// differently -- which is exactly how an NVIDIA card's throughput ended
+    /// up displayed against an AMD card.
+    ///
+    /// MUST stay `#[serde(default)]`: a required field makes every existing
+    /// benchmarks.json fail to deserialize, and the loader treats that as a
+    /// corrupt cache and discards hours of measured po2 calibration.
+    #[serde(default)]
+    pub pci_bus_id: String,
 }
 
 fn default_po2() -> u8 {
@@ -505,6 +520,7 @@ pub fn add_gpu_device_benchmarks(suite: &mut BenchmarkSuite, gpus: &[GpuDesc]) {
                 memory_usage_bytes,
                 max_feasible_po2: optimal_po2,
                 program_throughputs: std::collections::HashMap::new(),
+                pci_bus_id: String::new(),
                 po2_samples: Vec::new(),
             });
         }
@@ -678,11 +694,32 @@ fn read_rapl_msr_energy_uj() -> Option<u64> {
     None
 }
 
-/// Read instantaneous GPU power draw from hwmon (watts).
+/// PCI bus ids of the cards a set of worker benchmark results actually ran on.
+fn bus_ids_of(results: &[crate::dispatcher::SlotBenchmarkResult]) -> Vec<String> {
+    let mut ids: Vec<String> = results
+        .iter()
+        .filter_map(|r| r.pci_bus_id.clone())
+        .filter(|b| !b.is_empty())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Read instantaneous GPU power draw from hwmon (watts), restricted to the cards
+/// actually being benchmarked.
 ///
-/// Scans for AMD GPU hwmon devices and reads `power1_average` (microwatts → watts).
-/// Returns the sum across all detected GPUs, or `None` if no GPU power data is available.
-fn read_gpu_power_watts() -> Option<f64> {
+/// Only AMD exposes `power1_average` through hwmon; NVIDIA power comes from NVML.
+/// `proving_bus_ids` is the set of PCI bus ids the prover is using, and a card
+/// outside it is ignored.
+///
+/// That filter is the whole point. This used to sum EVERY AMD card on the box and
+/// stamp the total onto every device row regardless of vendor. On a machine whose
+/// only AMD card sits idle while two NVIDIA cards prove, it recorded 8.5 W for
+/// cards drawing ~520 W and ~270 W -- and because it "succeeded", it suppressed the
+/// 300 W fallback that would have been within 2x. Returning `None` when no proving
+/// card reports power is strictly better than returning a confidently wrong number.
+fn read_gpu_power_watts(proving_bus_ids: &[String]) -> Option<f64> {
     #[cfg(target_os = "linux")]
     {
         let mut total_watts = 0.0;
@@ -696,6 +733,19 @@ fn read_gpu_power_watts() -> Option<f64> {
             match std::fs::read_to_string(&vendor_path) {
                 Ok(v) if v.trim() == "0x1002" => {}
                 _ => continue,
+            }
+
+            // Only count a card the prover is actually using. An empty list means
+            // "no GPU bus ids known", in which case counting nothing is correct:
+            // a wrong power figure feeds the profitability model directly.
+            let bus = crate::discovery::normalize_pci_bus_id(
+                &crate::discovery::read_pci_slot_from_uevent(std::path::Path::new(&format!(
+                    "{device_path}/uevent"
+                )))
+                .unwrap_or_default(),
+            );
+            if bus.is_empty() || !proving_bus_ids.iter().any(|b| *b == bus) {
+                continue;
             }
 
             // Find hwmon directory and read power1_average
@@ -743,7 +793,10 @@ pub fn run_benchmark() -> BenchmarkSuite {
              To enable, run: sudo chmod o+r /dev/cpu/0/msr"
         );
     }
-    let gpu_power_before = read_gpu_power_watts();
+    let proving_bus_ids = crate::engine::worker_pool()
+        .map(|p| p.gpu_bus_ids())
+        .unwrap_or_default();
+    let gpu_power_before = read_gpu_power_watts(&proving_bus_ids);
     let power_start = Instant::now();
 
     let mut results = Vec::new();
@@ -797,7 +850,7 @@ pub fn run_benchmark() -> BenchmarkSuite {
     // Snapshot power counters after benchmarks
     let power_elapsed = power_start.elapsed();
     let rapl_after = read_rapl_energy_uj();
-    let gpu_power_after = read_gpu_power_watts();
+    let gpu_power_after = read_gpu_power_watts(&proving_bus_ids);
 
     // Compute average CPU power from RAPL energy delta
     let cpu_power_watts = match (rapl_before, rapl_after) {
@@ -852,6 +905,7 @@ pub fn run_benchmark() -> BenchmarkSuite {
                 memory_usage_bytes,
                 max_feasible_po2: optimal_po2,
                 program_throughputs: std::collections::HashMap::new(),
+                pci_bus_id: String::new(),
                 po2_samples: Vec::new(),
             }
         })
@@ -891,9 +945,6 @@ pub fn run_benchmark_gpu_only() -> BenchmarkSuite {
     let cpu_info = get_cpu_info();
     let timestamp = chrono::Utc::now().to_rfc3339();
 
-    // Read GPU power
-    let gpu_power_watts = read_gpu_power_watts();
-
     // Run GPU worker benchmarks only
     let worker_device_results = if let Some(pool) = crate::engine::worker_pool() {
         let device_results = pool.benchmark_all_with_device_info();
@@ -909,6 +960,10 @@ pub fn run_benchmark_gpu_only() -> BenchmarkSuite {
     } else {
         Vec::new()
     };
+
+    // Sample AFTER the load. Reading before the workers start records an idle
+    // figure and stores it as the proving draw.
+    let gpu_power_watts = read_gpu_power_watts(&bus_ids_of(&worker_device_results));
 
     // Build GPU device benchmarks from worker results
     let device_benchmarks = build_gpu_device_benchmarks_from_workers(
@@ -952,13 +1007,15 @@ pub fn run_benchmark_gpu_only_streaming(
 ) -> BenchmarkSuite {
     let cpu_info = get_cpu_info();
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let gpu_power_watts = read_gpu_power_watts();
 
     let worker_device_results = if let Some(pool) = crate::engine::worker_pool() {
         pool.benchmark_all_streaming(on_progress)
     } else {
         Vec::new()
     };
+    // Sample AFTER the load: reading before the workers start records an idle
+    // figure and calls it the proving draw.
+    let gpu_power_watts = read_gpu_power_watts(&bus_ids_of(&worker_device_results));
 
     let device_benchmarks = build_gpu_device_benchmarks_from_workers(
         &worker_device_results,
@@ -1038,7 +1095,10 @@ fn build_gpu_device_benchmarks_from_workers(
         }
 
         let idx = r.device_index.unwrap_or(0);
-        let device_id = format!("gpu{idx}");
+        // Tag-qualified: `device_index` is sequential WITHIN a vendor, so a cuda
+        // card and a rocm card both carry index 0 and the bare `gpu{idx}` form
+        // made them collide onto one row. Must match `WorkerPool::benchmark_device_id`.
+        let device_id = crate::dispatcher::WorkerPool::gpu_device_id(&r.gpu_tag, &idx.to_string());
         let device_label = match &r.gpu_name {
             Some(name) => format!("GPU{idx} {name}"),
             None => format!("GPU{idx} ({})", r.gpu_tag),
@@ -1108,6 +1168,7 @@ fn build_gpu_device_benchmarks_from_workers(
             max_feasible_po2: optimal_po2,
             program_throughputs,
             po2_samples: Vec::new(),
+            pci_bus_id: r.pci_bus_id.clone().unwrap_or_default(),
         });
     }
 
@@ -1162,7 +1223,12 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
     tracing::info!("Releasing worker GPU memory before po2 calibration");
     pool.shutdown_all();
 
-    for key in pool.registered_backends() {
+    // Sort: `registered_backends()` iterates a HashMap, so calibration order --
+    // and, before the tag fix, which colliding card's samples survived -- varied
+    // between runs on identical hardware. dispatcher.rs already sorts elsewhere.
+    let mut backend_keys: Vec<_> = pool.registered_backends();
+    backend_keys.sort();
+    for key in backend_keys {
         // Slot keys look like "risc0:cuda:0" — backend:gpu_tag:device_index.
         let mut parts = key.split(':');
         let (Some(backend), Some(gpu_tag), Some(idx)) =
@@ -1173,7 +1239,7 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
         if backend != "risc0" || gpu_tag == "generic" {
             continue;
         }
-        let device_id = format!("gpu{idx}");
+        let device_id = crate::dispatcher::WorkerPool::gpu_device_id(gpu_tag, idx);
 
         let Some(db) = suite
             .device_benchmarks
@@ -1636,9 +1702,16 @@ struct SavedBenchmark {
 pub fn hardware_fingerprint() -> String {
     let cpu = get_cpu_info();
     let cores = get_cpu_cores();
-    let ram = get_total_memory_bytes();
+    // Bucket RAM to whole GiB. `MemTotal` is not stable across reboots — the kernel
+    // reserves a slightly different amount each boot — so comparing raw bytes made the
+    // fingerprint mismatch on EVERY reboot and silently discarded the benchmark cache.
+    // Observed live: 39_936_479_232 -> 39_936_471_040, an 8 KiB drift out of 37 GiB, which
+    // threw away a ~10-minute `--calibrate` run and dropped proving back to the SDK's
+    // default segment size with only an INFO line to show for it.
+    // A real RAM change (adding/removing a DIMM) moves this by whole GiB and is still caught.
+    let ram_gib = get_total_memory_bytes() / (1024 * 1024 * 1024);
     let gpu = gpu_fingerprint();
-    format!("{cpu}|{cores}|{ram}|{gpu}")
+    format!("{cpu}|{cores}|{ram_gib}GiB|{gpu}")
 }
 
 /// Build the GPU portion of the hardware fingerprint.
@@ -1789,7 +1862,90 @@ pub fn load_cached_benchmark() -> Option<BenchmarkSuite> {
         return None;
     }
 
-    Some(saved.suite)
+    let mut suite = saved.suite;
+    migrate_device_identity(&mut suite);
+    Some(suite)
+}
+
+/// Backfill `pci_bus_id` on GPU rows written before that field existed, and
+/// re-key any row whose `device_id` no longer matches the slot its card occupies.
+///
+/// Migrate rather than invalidate: these rows carry measured po2 calibration that
+/// costs real GPU time to reproduce, and discarding the cache silently drops
+/// proving back to the SDK-default segment size. A row is only dropped when its
+/// identity cannot be established at all.
+///
+/// Matching is by GPU model name embedded in `device_label`, and only when
+/// exactly one current card and one legacy row agree -- on a box with two
+/// identical cards the name is ambiguous, and guessing there would reintroduce
+/// the very misattribution this is fixing.
+fn migrate_device_identity(suite: &mut BenchmarkSuite) {
+    let live = crate::discovery::detect_all_gpus();
+    if live.is_empty() {
+        return;
+    }
+
+    for gpu in &live {
+        let want = normalize_gpu_name_for_match(&gpu.name);
+        if want.is_empty() {
+            continue;
+        }
+        let correct_id =
+            crate::dispatcher::WorkerPool::gpu_device_id(&gpu.gpu_tag, &gpu.device_index.to_string());
+
+        // Only rows that carry no identity yet are candidates.
+        let matches: Vec<usize> = suite
+            .device_benchmarks
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| {
+                d.pci_bus_id.is_empty()
+                    && d.device_id.starts_with("gpu")
+                    && normalize_gpu_name_for_match(&d.device_label).contains(&want)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        // Ambiguous when the legacy rows under this name span more than one
+        // device_id -- several backends for ONE card is the normal case.
+        let distinct: std::collections::BTreeSet<&str> = matches
+            .iter()
+            .map(|i| suite.device_benchmarks[*i].device_id.as_str())
+            .collect();
+        if distinct.len() != 1 {
+            continue;
+        }
+
+        for i in matches {
+            let d = &mut suite.device_benchmarks[i];
+            if d.device_id != correct_id {
+                tracing::info!(
+                    "Benchmark cache: re-keying {} -> {} ({}, {})",
+                    d.device_id,
+                    correct_id,
+                    gpu.name,
+                    gpu.pci_bus_id
+                );
+                d.device_id = correct_id.clone();
+            }
+            d.pci_bus_id = gpu.pci_bus_id.clone();
+        }
+    }
+}
+
+/// Name normalization for cache migration. Mirrors the TUI's matching so both
+/// sides agree on whether two spellings denote the same card.
+fn normalize_gpu_name_for_match(s: &str) -> String {
+    s.to_lowercase()
+        .replace("nvidia", " ")
+        .replace("geforce", " ")
+        .replace("advanced micro devices", " ")
+        .replace("amd", " ")
+        .replace("intel", " ")
+        .replace(['(', ')', ',', '-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Save benchmark results to disk alongside the current hardware fingerprint.
@@ -1827,6 +1983,19 @@ pub fn save_benchmark(suite: &BenchmarkSuite) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_tolerates_reboot_ram_drift() {
+        // The fingerprint must not change for a few-KB MemTotal drift, or every reboot
+        // silently discards the benchmark cache (observed live 2026-08-02: an 8 KiB
+        // difference invalidated a 10-minute calibration run).
+        let a = 39_936_479_232u64 / (1024 * 1024 * 1024);
+        let b = 39_936_471_040u64 / (1024 * 1024 * 1024);
+        assert_eq!(a, b, "KB-scale drift must bucket to the same GiB");
+        // ...but a genuine DIMM change must still invalidate.
+        let c = (39_936_479_232u64 + 8 * 1024 * 1024 * 1024) / (1024 * 1024 * 1024);
+        assert_ne!(a, c, "a real 8 GiB change must still be detected");
+    }
 
     #[test]
     fn weights_sum_to_one() {
@@ -2321,6 +2490,7 @@ mod tests {
             memory_usage_bytes: 0,
             max_feasible_po2: 18,
             program_throughputs: std::collections::HashMap::new(),
+            pci_bus_id: String::new(),
             po2_samples: Vec::new(),
         };
         assert_eq!(db.throughput_cov(), 0.0);
@@ -2342,6 +2512,7 @@ mod tests {
             memory_usage_bytes: 0,
             max_feasible_po2: 18,
             program_throughputs: tp,
+            pci_bus_id: String::new(),
             po2_samples: Vec::new(),
         };
         assert_eq!(db.throughput_cov(), 0.0);
@@ -2363,6 +2534,7 @@ mod tests {
             memory_usage_bytes: 0,
             max_feasible_po2: 18,
             program_throughputs: tp,
+            pci_bus_id: String::new(),
             po2_samples: Vec::new(),
         };
         let cov = db.throughput_cov();
@@ -2376,6 +2548,7 @@ mod tests {
             slot_key: "risc0:cuda:0".to_string(),
             gpu_name: Some("Test GPU".to_string()),
             device_index: Some(0),
+            pci_bus_id: Some("0000:01:00.0".to_string()),
             gpu_tag: "cuda".to_string(),
             entries: vec![zkminer_prover_protocol::BenchmarkEntry {
                 program_name: "fibonacci".to_string(),
@@ -2576,6 +2749,7 @@ mod tests {
             memory_usage_bytes: 8 << 30,
             max_feasible_po2: 21,
             program_throughputs: std::collections::HashMap::new(),
+            pci_bus_id: String::new(),
             po2_samples: samples,
         };
 

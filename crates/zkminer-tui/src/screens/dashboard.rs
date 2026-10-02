@@ -357,13 +357,23 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
 
     // Per-GPU zkOP/s: scale from best GPU throughput relative to best CPU throughput
     let zkops_str = if let Some(suite) = &state.benchmark_results {
-        let device_id = format!("gpu{}", gpu.index);
-        let best_gpu_tp = suite
-            .device_benchmarks
-            .iter()
-            .filter(|d| d.device_id == device_id)
-            .map(|d| d.throughput)
-            .fold(0.0_f64, f64::max);
+        // Join on physical identity, NOT on `gpu.index`. `gpu.index` is a display
+        // ordinal over all DRM cards; benchmark rows are keyed in the prover's
+        // per-vendor index space. On a box whose first DRM card is a non-proving
+        // AMD GPU the two are off by one, and this column showed each card its
+        // neighbour's score. `None` = no row for this card; render "--", never a
+        // positional guess.
+        let best_gpu_tp = gpu
+            .benchmark_device_id(suite)
+            .map(|device_id| {
+                suite
+                    .device_benchmarks
+                    .iter()
+                    .filter(|d| d.device_id == device_id)
+                    .map(|d| d.throughput)
+                    .fold(0.0_f64, f64::max)
+            })
+            .unwrap_or(0.0);
         let best_cpu_tp = suite
             .device_benchmarks
             .iter()
@@ -384,7 +394,9 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
     let gpu_job = state
         .active_jobs
         .iter()
-        .find(|j| j.gpu_index == Some(gpu.index));
+        .find(|j| {
+            !gpu.pci_bus_id.is_empty() && j.gpu_bus_id.as_deref() == Some(gpu.pci_bus_id.as_str())
+        });
 
     let (job_str, progress_str, progress_style) = if let Some(job) = gpu_job {
         let id = format!("{}", job.info.job_id);
@@ -402,6 +414,14 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
                     Style::default().fg(theme::green()),
                 )
             }
+            // Explicit, not the `_ => "Pending"` catch-all: a queued job holds collateral
+            // and is waiting for a card, which an operator must be able to tell apart from
+            // one that is actually proving.
+            MinerJobStatus::Queued => (
+                id_short,
+                "Queued — waiting for a GPU".to_string(),
+                theme::dim(),
+            ),
             MinerJobStatus::Submitting => (
                 id_short,
                 "Submitting…".to_string(),
@@ -526,7 +546,48 @@ fn render_wallet_staking(f: &mut Frame, area: Rect, state: &MinerState) {
         // Line 3: staked / locked / liquid
         lines.push(Line::from(staking_spans));
 
-        // Line 4: utilization bar
+        // Line 4: the verdict — "can I actually feed all my GPUs?"
+        //
+        // ABOVE the utilization bar on purpose: this panel is `Constraint::Max(8) // shrinks
+        // first` (see render()), so the LAST line is the first to vanish. The bar is
+        // decorative; the verdict is the whole point of the panel.
+        //
+        // Split across two SHORT lines, not one. The panel is Percentage(50) of the terminal,
+        // so a 120-column terminal gives this widget ~58 cells — and the single-line version
+        // was 62, which rendered as "run `zkminer stake 4" at 120 cols: silently truncated to
+        // a valid, parseable, FLOORED amount. An operator would stop the miner, stake 4.00
+        // against a 4.25 shortfall, restart, and still be 1-of-2. Truncation must never be
+        // able to turn the remedy into a smaller legal number, so the command goes on its own
+        // line and is kept the shortest thing here.
+        if let Some(h) = &state.collateral_headroom {
+            let starved = h.is_starved();
+            lines.push(Line::from(vec![
+                Span::styled("Slots fundable ", theme::dim()),
+                Span::styled(
+                    format!("{}/{}", h.fundable, h.wanted),
+                    if starved { theme::warning() } else { theme::positive() },
+                ),
+                if starved {
+                    Span::styled(
+                        format!("  ⚠ short {}", zkminer_chain::staking::fmt_hemi_ceil(h.shortfall)),
+                        theme::warning(),
+                    )
+                } else {
+                    Span::styled(
+                        format!("  at {} per claim", format_token_amount(h.per_claim)),
+                        theme::dim(),
+                    )
+                },
+            ]));
+            if starved {
+                lines.push(Line::from(Span::styled(
+                    format!("→ zkminer stake {}", zkminer_chain::staking::fmt_hemi_ceil(h.shortfall)),
+                    theme::warning(),
+                )));
+            }
+        }
+
+        // Line 5: utilization bar
         lines.push(Line::from(vec![
             Span::styled(bar_filled, Style::default().fg(bar_color)),
             Span::styled(bar_empty, theme::dim()),
@@ -663,9 +724,18 @@ fn render_active_jobs(f: &mut Frame, area: Rect, state: &MinerState) {
         .map(|(i, job)| {
             let id_short = format!("{}...", &format!("{}", job.info.job_id)[..10]);
 
-            let gpu_str = match job.gpu_index {
-                Some(idx) => format!("GPU{}", idx),
-                None => "CPU".to_string(),
+            // Resolve the owning card by bus id. Unknown means "not yet dispatched",
+            // NOT "CPU" -- the old code printed CPU for every CUDA proof, on the same
+            // row whose Prover column read `risc0:cuda:1`.
+            let gpu_str = match job.gpu_bus_id.as_deref() {
+                Some(bus) => state
+                    .hardware
+                    .gpus
+                    .iter()
+                    .find(|g| g.pci_bus_id == bus)
+                    .map(|g| format!("GPU{}", g.index))
+                    .unwrap_or_else(|| "GPU?".to_string()),
+                None => "--".to_string(),
             };
 
             let cycles_str = format_compact(job.estimated_cycles as f64);
@@ -675,6 +745,9 @@ fn render_active_jobs(f: &mut Frame, area: Rect, state: &MinerState) {
                     let (filled, empty) = theme::progress_bar(*progress, 15);
                     format!("{}{} {:.0}%", filled, empty, progress * 100.0)
                 }
+                // Queued jobs hold collateral but are not on a card yet — say so plainly
+                // rather than falling through to a generic label.
+                MinerJobStatus::Queued => "Queued (waiting for GPU)".to_string(),
                 MinerJobStatus::Submitting => "Submitting...".to_string(),
                 MinerJobStatus::Fulfilled { payout } => {
                     format!("Fulfilled ({})", format_token_amount(*payout))
@@ -814,5 +887,144 @@ pub fn format_duration(secs: u64) -> String {
         format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
     } else {
         format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
+    }
+}
+
+#[cfg(test)]
+mod headroom_verdict_tests {
+    use super::*;
+    use crate::state::HeadroomView;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    const HEMI: u128 = 1_000_000_000_000_000_000;
+
+    /// Terminal widths to check. The panel is `Percentage(50)` of the terminal, so the widget
+    /// gets HALF of these — which is the trap the first version of this test fell into: it
+    /// called `render_wallet_staking(f, f.area(), ..)` and handed the widget 120 columns it
+    /// never gets in production (it gets 60). The single-line verdict passed that test and
+    /// still rendered "run `zkminer stake 4" on a real 120-column terminal.
+    const WIDTHS: [(u16, u16); 7] =
+        [(200, 40), (160, 40), (128, 40), (120, 40), (100, 30), (80, 40), (80, 20)];
+
+    fn state_with(headroom: Option<HeadroomView>) -> MinerState {
+        let mut state = MinerState::default();
+        state.stake_info = Some(zkminer_chain::staking::StakeInfo {
+            total_staked: 3750 * HEMI,
+            locked_collateral: 2955 * HEMI,
+            available_collateral: 295 * HEMI,
+            unstake_amount: 0,
+            unstake_request_time: 0,
+            deposit_block: 0,
+        });
+        state.collateral_headroom = headroom;
+        state
+    }
+
+    /// Render the WHOLE dashboard, exactly as `app.rs` does, and read the screen back.
+    fn screen(headroom: Option<HeadroomView>, w: u16, h: u16) -> Vec<String> {
+        let state = state_with(headroom);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render(f, f.area(), &state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    fn line_with<'a>(rows: &'a [String], needle: &str) -> Option<&'a String> {
+        rows.iter().find(|l| l.contains(needle))
+    }
+
+    /// THE fund-safety invariant: whatever amount reaches the screen must be the FULL amount.
+    ///
+    /// Truncation here is worse than omission. `parse_hemi` accepts "4" and "4.2" happily, so
+    /// a clipped "zkminer stake 4" is a legal command for a smaller number — the operator
+    /// stops the miner, stakes 4.00 against a 4.25 shortfall, restarts, and is still 1-of-2.
+    #[test]
+    fn the_remedy_amount_is_never_truncated_at_any_terminal_width() {
+        let shortfall = 4_250_000_000_000_000_000; // the 2026-08-08 incident
+        for (w, h) in WIDTHS {
+            let rows = screen(
+                Some(HeadroomView { fundable: 1, wanted: 2, per_claim: 150 * HEMI, shortfall }),
+                w, h,
+            );
+            let cmd = line_with(&rows, "zkminer stake")
+                .unwrap_or_else(|| panic!("{w}x{h}: no remedy on screen:\n{}", rows.join("\n")));
+            assert!(
+                cmd.contains("zkminer stake 4.25"),
+                "{w}x{h}: remedy truncated to a smaller legal amount: [{}]",
+                cmd.trim()
+            );
+        }
+    }
+
+    /// The verdict itself must survive too — it is the line that says there IS a problem.
+    #[test]
+    fn the_verdict_survives_at_every_terminal_width() {
+        for (w, h) in WIDTHS {
+            let rows = screen(
+                Some(HeadroomView {
+                    fundable: 1, wanted: 2, per_claim: 150 * HEMI,
+                    shortfall: 4_250_000_000_000_000_000,
+                }),
+                w, h,
+            );
+            let v = line_with(&rows, "Slots fundable")
+                .unwrap_or_else(|| panic!("{w}x{h}: verdict absent:\n{}", rows.join("\n")));
+            assert!(v.contains("1/2"), "{w}x{h}: counts lost: [{}]", v.trim());
+            assert!(v.contains("short 4.25"), "{w}x{h}: shortfall lost: [{}]", v.trim());
+        }
+    }
+
+    /// A shortfall that is not a clean cent must round UP on screen; the displayed number is
+    /// pasted into `zkminer stake`, and a floored one leaves the slot unfundable.
+    #[test]
+    fn displayed_shortfall_rounds_up() {
+        let rows = screen(
+            Some(HeadroomView {
+                fundable: 1, wanted: 2, per_claim: 150 * HEMI,
+                shortfall: 4_250_000_000_000_000_001,
+            }),
+            160, 40,
+        );
+        assert!(line_with(&rows, "zkminer stake 4.26").is_some(),
+            "must round up:\n{}", rows.join("\n"));
+    }
+
+    /// Healthy: a verdict, but no alarm and no command.
+    #[test]
+    fn healthy_verdict_is_quiet() {
+        let rows = screen(
+            Some(HeadroomView { fundable: 2, wanted: 2, per_claim: 50 * HEMI, shortfall: 0 }),
+            160, 40,
+        );
+        let v = line_with(&rows, "Slots fundable").expect("verdict missing");
+        assert!(v.contains("2/2"), "got: [{}]", v.trim());
+        assert!(line_with(&rows, "zkminer stake").is_none(), "must not nag when healthy");
+        assert!(line_with(&rows, "⚠").is_none(), "must not warn when healthy");
+    }
+
+    /// No observed per-claim price => no verdict. Better silent than a guessed green tick:
+    /// a false healthy reading is what hid the incident for hours.
+    #[test]
+    fn absent_headroom_renders_nothing_rather_than_guessing() {
+        let rows = screen(None, 160, 40);
+        assert!(line_with(&rows, "Slots fundable").is_none(), "invented a verdict");
+        assert!(line_with(&rows, "Staked").is_some(), "rest of the panel must still render");
+    }
+
+    /// The verdict must outlive the decorative utilization bar when the panel is squeezed —
+    /// it is ordered above it for exactly this reason.
+    #[test]
+    fn the_verdict_outlives_the_utilization_bar_when_squeezed() {
+        let rows = screen(
+            Some(HeadroomView {
+                fundable: 1, wanted: 2, per_claim: 150 * HEMI,
+                shortfall: 4_250_000_000_000_000_000,
+            }),
+            80, 20,
+        );
+        assert!(line_with(&rows, "Slots fundable").is_some(),
+            "verdict died before the bar:\n{}", rows.join("\n"));
     }
 }

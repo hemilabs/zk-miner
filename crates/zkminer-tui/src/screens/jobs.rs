@@ -25,6 +25,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
 
             let status = match &job.status {
                 MinerJobStatus::Open => "Open",
+                MinerJobStatus::Queued { .. } => "Queued",
                 MinerJobStatus::Proving { .. } => "Proving",
                 MinerJobStatus::Submitting => "Submitting",
                 MinerJobStatus::Fulfilled { .. } => "Fulfilled",

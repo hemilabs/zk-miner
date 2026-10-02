@@ -116,6 +116,21 @@ fn run_worker_loop() -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
+            WorkerCommand::Execute { request_id, .. } => {
+                // Cycle measurement is implemented for risc0 only: it is the backend whose
+                // executor reports the same `total_cycles` the prover does, so the number is
+                // directly comparable to what proving will report. Decline explicitly rather
+                // than returning a fabricated count — a wrong cycle count would size the
+                // deadline check and the look-ahead queue, and silently claiming work we
+                // cannot finish loses collateral outright.
+                let resp = WorkerResponse::Error {
+                    request_id,
+                    kind: ErrorKind::InvalidInput,
+                    message: "cycle measurement not supported by the openvm backend".to_string(),
+                };
+                write_message(&mut stdout, &resp)?;
+            }
+
             WorkerCommand::Shutdown => {
                 tracing::info!("Shutdown requested, exiting");
                 break;

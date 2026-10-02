@@ -149,6 +149,19 @@ impl Default for WalletConfig {
 pub struct ProverConfig {
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_proofs: usize,
+    /// Seconds of work to keep queued AHEAD on each GPU, so a finishing device always has its
+    /// next job already locked instead of idling for a claim round-trip (~15-30s).
+    ///
+    /// `0` (the default) disables look-ahead entirely and preserves the historical behaviour
+    /// exactly: one job per GPU, claimed only when that GPU is idle.
+    ///
+    /// This does NOT override deadline safety. A queued job is admitted only if it can finish
+    /// from the start time it would actually get — `max_concurrent_proofs` still caps how many
+    /// proofs run at once, and collateral still gates every claim. Raising it past a few
+    /// minutes mostly locks more collateral for little gain, since the idle window it removes
+    /// is bounded by the claim round-trip.
+    #[serde(default)]
+    pub queue_horizon_secs: u64,
     /// Minimum acceptable profit rate in HEMI/day.
     /// A proof taking T hours must net at least (threshold × T/24) HEMI after electricity costs.
     #[serde(default = "default_min_profit")]
@@ -248,6 +261,7 @@ impl Default for ProverConfig {
     fn default() -> Self {
         Self {
             max_concurrent_proofs: default_max_concurrent(),
+            queue_horizon_secs: 0, // look-ahead off by default: preserves one-job-per-GPU
             min_profit_threshold: default_min_profit(),
             deadline_safety_margin: default_deadline_safety(),
             strategy: default_strategy(),
@@ -326,6 +340,27 @@ impl ZkMinerConfig {
 
     /// Validate that required fields are set for production use.
     pub fn validate_for_chain(&self) -> Result<()> {
+        // `gas_price_gwei` reaches the client as `(g * 1e9).round() as u128`, which saturates
+        // a negative or NaN to 0 — and `base_fees` short-circuits `Some(0)` to `(0, 0)` BEFORE
+        // the [H2(c)] floor. Every escalation path is gated on `base_max_fee > 0`, so a zero
+        // here silently disables the whole fee ladder AND the per-nonce ratchet: a stuck tx can
+        // then never clear a node's +12.5% replacement threshold and strands. Reject it here
+        // rather than let it degrade a live money path in silence.
+        if let Some(g) = self.chain.gas_price_gwei {
+            // Mirror the CLIENT's conversion exactly — `(g * 1e9).round() as u128` — rather
+            // than testing `g > 0.0`. Any `0 < g < 5e-10` is positive and finite yet rounds to
+            // ZERO wei, so the naive check passed it straight through to the failure this
+            // validation exists to prevent.
+            let wei = (g * 1e9).round();
+            if !g.is_finite() || g <= 0.0 || wei < 1.0 {
+                anyhow::bail!(
+                    "chain.gas_price_gwei must be a positive finite number of at least 1 wei \
+                     (got {g}, which rounds to {} wei); omit it to use automatic EIP-1559 \
+                     estimation",
+                    wei.max(0.0) as u128
+                );
+            }
+        }
         if self.contracts.hemi_prove.is_empty() {
             anyhow::bail!(
                 "hemi_prove address not set. Run `zkminer init` and edit ~/.zkminer/config.toml"
@@ -345,3 +380,42 @@ impl ZkMinerConfig {
     }
 }
 
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    /// [cheap-5 / round-1 LOW-1] A positive, finite gwei value can still round to ZERO wei.
+    ///
+    /// The client converts with `(g * 1e9).round() as u128`, so any `0 < g < 5e-10` becomes
+    /// `Some(0)` — and `base_fees` short-circuits that to `(0, 0)` BEFORE its own floor,
+    /// disabling every `base_max_fee > 0` escalation gate and the whole per-nonce ratchet.
+    /// A bare `g > 0.0` check passed it straight through to the failure this validation
+    /// exists to prevent, so the validation must mirror the client's expression.
+    #[test]
+    fn a_sub_wei_gas_price_is_rejected() {
+        for g in [4e-10_f64, 1e-10, 1e-12] {
+            let mut c = ZkMinerConfig::default();
+            c.chain.gas_price_gwei = Some(g);
+            let err = c
+                .validate_for_chain()
+                .expect_err(&format!("gas_price_gwei={g} rounds to 0 wei and must be rejected"))
+                .to_string();
+            assert!(err.contains("at least 1 wei"), "wrong rejection reason for {g}: {err}");
+        }
+    }
+
+    /// The guard must not reject a genuine value — it is easy to write one that rejects all.
+    #[test]
+    fn a_normal_gas_price_passes_the_wei_guard() {
+        for g in [1.0_f64, 1.5, 0.001] {
+            let mut c = ZkMinerConfig::default();
+            c.chain.gas_price_gwei = Some(g);
+            if let Err(e) = c.validate_for_chain() {
+                assert!(
+                    !e.to_string().contains("at least 1 wei"),
+                    "rejected a valid {g} gwei: {e}"
+                );
+            }
+        }
+    }
+}
