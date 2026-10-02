@@ -21,7 +21,7 @@ FROM ubuntu:${UBUNTU_VERSION}@sha256:3ba65aa20f86a0fad9df2b2c259c613df006b2e6d0b
 ARG RUST_VERSION
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential git curl ca-certificates cmake pkg-config \
+        build-essential git curl ca-certificates cmake pkg-config libssl-dev \
         protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
@@ -106,6 +106,16 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
 
+RUN apt update
+RUN apt install -y curl 
+RUN curl -L https://risczero.com/install | bash
+RUN cat "/root/.bashrc"
+ENV PATH="$PATH:/root/.risc0/bin"
+RUN echo blah
+RUN rzup --help
+RUN rzup install --help
+RUN rzup install -f
+
 WORKDIR /build
 
 # ===========================================================================
@@ -129,6 +139,9 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 # Stage: build-sp1 — SP1 prover (requires CUDA base, sp1-sdk hardcodes cuda)
 # ===========================================================================
 FROM cuda-base AS build-sp1
+
+RUN apt update
+RUN apt install -y protobuf-compiler libprotobuf-dev
 
 # Install succinct/sp1 toolchain (pinned to match sp1-sdk version in Cargo.lock)
 RUN curl -L https://sp1up.succinct.xyz | bash \
@@ -167,6 +180,16 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
 
+RUN apt update
+RUN apt install -y curl 
+RUN curl -L https://risczero.com/install | bash
+RUN cat "/root/.bashrc"
+ENV PATH="$PATH:/root/.risc0/bin"
+RUN echo blah
+RUN rzup --help
+RUN rzup install --help
+RUN rzup install -f
+
 WORKDIR /build
 
 # ===========================================================================
@@ -177,6 +200,16 @@ FROM rocm-base AS build-rocm
 # Full list: gfx900,gfx906,gfx908,gfx90a,gfx942,gfx1030,gfx1031,gfx1032,gfx1100,gfx1101,gfx1200,gfx1201
 # Testing subset: 7900 XTX (gfx1100) + 9070 XT (gfx1201)
 ENV RISC0_HIP_ARCH="gfx1100,gfx1201"
+ENV HIPCC_COMPILE_FLAGS_APPEND="--offload-arch=gfx1100 --offload-arch=gfx1201"
+RUN printf '%s\n' \
+'#!/bin/sh' \
+'for a; do shift' \
+'  case "$a" in --offload-arch=native) set -- "$@" "--offload-arch=$RISC0_HIP_ARCH";;' \
+'                *) set -- "$@" "$a";; esac' \
+'done' \
+'exec /opt/rocm/bin/hipcc "$@"' > /usr/local/bin/hipcc-arch && \
+chmod +x /usr/local/bin/hipcc-arch
+ENV HIPCC=/usr/local/bin/hipcc-arch
 ENV NVCC=off
 
 COPY . .
@@ -210,6 +243,16 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && rustup show
 
 ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
+
+RUN apt update
+RUN apt install -y curl 
+RUN curl -L https://risczero.com/install | bash
+RUN cat "/root/.bashrc"
+ENV PATH="$PATH:/root/.risc0/bin"
+RUN echo blah
+RUN rzup --help
+RUN rzup install --help
+RUN rzup install -f
 
 WORKDIR /build
 
