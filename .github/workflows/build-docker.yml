@@ -6,11 +6,39 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # Lets any branch be built on demand. Without this, the only way to exercise
+  # this workflow is to open a PR against main — `branches:` on a pull_request
+  # trigger matches the BASE, not the head, so pushing a topic branch does
+  # nothing.
+  workflow_dispatch:
 
 jobs:
   build:
     # Docker actions require a Linux environment
     runs-on: ubuntu-latest
+    # One job per shippable artifact.
+    #
+    # `docker build -f Dockerfile.build .` with no --target builds only the LAST
+    # stage in the file and its dependencies. The last stage is dist-rocm, so a
+    # bare build compiled `zkminer-prove-risc0 --features rocm` and nothing else:
+    # the main zkminer CLI, the CUDA and SP1 provers, OpenVM and the Windows
+    # binary were all skipped while the check still reported success. Because
+    # zkminer-prove-risc0 depends only on zkminer-prover-protocol, a compile
+    # error in zkminer-cli, -chain, -tui, -strategy or -prover passed CI green.
+    name: ${{ matrix.target }}
+    timeout-minutes: 120
+    strategy:
+      # Build every target even after one fails — otherwise the first failure
+      # hides the state of the other five.
+      fail-fast: false
+      matrix:
+        target:
+          - dist-cli
+          - dist-cli-windows
+          - dist-openvm
+          - dist-cuda
+          - dist-sp1
+          - dist-rocm
 
     steps:
       - name: "Checkout repository"
@@ -19,5 +47,5 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: "Build Docker Image"
-        run: docker build -f Dockerfile.build .
+      - name: "Build ${{ matrix.target }}"
+        run: docker build -f Dockerfile.build --target ${{ matrix.target }} .
