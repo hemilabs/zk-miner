@@ -163,8 +163,9 @@ fn detect_nvidia_via_smi() -> Option<Vec<DetectedGpu>> {
                 continue;
             }
         }
-        // nvidia-smi outputs PCI bus ID like "00000000:01:00.0", normalize to lowercase
-        let pci_bus_id = parts[2].to_lowercase();
+        // nvidia-smi outputs an 8-digit domain ("00000000:01:00.0"); sysfs uses 4.
+        // Normalize so both sides of the cross-crate join produce the same string.
+        let pci_bus_id = normalize_pci_bus_id(parts[2]);
 
         gpus.push(DetectedGpu {
             gpu_tag: "cuda".to_string(),
@@ -227,7 +228,7 @@ fn detect_nvidia_via_proc() -> Vec<DetectedGpu> {
         gpus.push(DetectedGpu {
             gpu_tag: "cuda".to_string(),
             device_index: idx as u32,
-            pci_bus_id: bus_location.to_lowercase(),
+            pci_bus_id: normalize_pci_bus_id(&bus_location),
             name: if model.is_empty() {
                 "NVIDIA GPU".to_string()
             } else {
@@ -310,9 +311,9 @@ fn detect_intel_gpus() -> Vec<DetectedGpu> {
         }
 
         // Read PCI bus ID from uevent
-        let pci_bus_id = read_pci_slot_from_uevent(&device_dir.join("uevent"))
-            .unwrap_or_default()
-            .to_lowercase();
+        let pci_bus_id = normalize_pci_bus_id(
+            &read_pci_slot_from_uevent(&device_dir.join("uevent")).unwrap_or_default(),
+        );
         if pci_bus_id.is_empty() {
             continue;
         }
@@ -457,9 +458,9 @@ fn detect_amd_gpus() -> Vec<DetectedGpu> {
         }
 
         // Read PCI bus ID from uevent
-        let pci_bus_id = read_pci_slot_from_uevent(&device_dir.join("uevent"))
-            .unwrap_or_default()
-            .to_lowercase();
+        let pci_bus_id = normalize_pci_bus_id(
+            &read_pci_slot_from_uevent(&device_dir.join("uevent")).unwrap_or_default(),
+        );
         if pci_bus_id.is_empty() {
             continue;
         }
@@ -506,8 +507,33 @@ fn card_number(name: &str) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
+/// Normalize a PCI bus id to the canonical lowercase 4-digit-domain form,
+/// e.g. `0000:06:1b.0`.
+///
+/// This MUST agree byte-for-byte with `zkminer_tui::hardware::normalize_pci_bus_id`,
+/// because the two are joined as strings across the crate boundary: the TUI matches
+/// benchmark rows and worker slots to physical cards on this value.
+///
+/// The formats genuinely differ by source. `nvidia-smi` emits an 8-digit domain
+/// (`00000000:06:1B.0`) while sysfs `uevent` emits 4 (`0000:06:10.0`). Lowercasing
+/// alone -- which is all this did before -- leaves the two incomparable, so a
+/// bus-id join would match every AMD card and silently miss every NVIDIA one.
+pub fn normalize_pci_bus_id(id: &str) -> String {
+    let id = id.trim().to_lowercase();
+    let Some(first_colon) = id.find(':') else {
+        return id;
+    };
+    let (domain, rest) = id.split_at(first_colon);
+    // Trim an over-long domain to its last 4 hex digits ("00000000" -> "0000").
+    if domain.len() > 4 {
+        format!("{}{}", &domain[domain.len() - 4..], rest)
+    } else {
+        id
+    }
+}
+
 /// Parse PCI_SLOT_NAME from a uevent file.
-fn read_pci_slot_from_uevent(path: &Path) -> Option<String> {
+pub(crate) fn read_pci_slot_from_uevent(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     for line in content.lines() {
         if let Some(val) = line.strip_prefix("PCI_SLOT_NAME=") {
@@ -821,7 +847,12 @@ mod tests {
             }
             let index: u32 = parts[0].parse().unwrap();
             let name = parts[1].to_string();
-            let pci_bus_id = parts[2].to_lowercase();
+            // Use the REAL normalizer, not a bare lowercase. The production parser
+            // canonicalizes nvidia-smi's 8-digit domain to 4 so the id compares equal to
+            // the sysfs form the TUI reads; a test that lowercases only would keep passing
+            // if that normalization were dropped, while every NVIDIA card silently stopped
+            // matching its benchmark row.
+            let pci_bus_id = normalize_pci_bus_id(parts[2]);
             gpus.push(DetectedGpu {
                 gpu_tag: "cuda".to_string(),
                 device_index: index,
@@ -833,6 +864,9 @@ mod tests {
         assert_eq!(gpus[0].device_index, 0);
         assert_eq!(gpus[0].name, "GeForce RTX 4090");
         assert_eq!(gpus[1].device_index, 1);
-        assert_eq!(gpus[1].pci_bus_id, "00000000:41:00.0");
+        assert_eq!(gpus[1].pci_bus_id, "0000:41:00.0");
+        assert_eq!(gpus[0].pci_bus_id, "0000:01:00.0");
+        // And the canonical form must match what the TUI produces from sysfs.
+        assert_eq!(normalize_pci_bus_id("0000:41:00.0"), gpus[1].pci_bus_id);
     }
 }

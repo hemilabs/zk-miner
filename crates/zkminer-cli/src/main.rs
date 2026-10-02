@@ -24,6 +24,21 @@ struct Cli {
 enum Commands {
     /// Show prover status (balance, stake, stats)
     Status,
+    /// Add collateral so more GPU slots can be funded (approve + stake, in HEMI)
+    Stake {
+        /// Amount in HEMI (e.g. `500`, or `4.25`). NOT wei.
+        amount: String,
+        /// Print what would happen and send nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Stake even though this account has transactions in flight (the miner is
+        /// running). Risks displacing a pending fulfillJob and getting it slashed.
+        #[arg(long)]
+        force: bool,
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Run benchmarks to measure proving performance
     Benchmark {
         /// Output results as JSON instead of a formatted table
@@ -121,6 +136,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Status => commands::status::run(config_path).await,
+        Commands::Stake { amount, dry_run, force, yes } => {
+            commands::stake::run(config_path, amount, dry_run, force, yes).await
+        }
         Commands::Benchmark { json, calibrate } => {
             commands::benchmark::run(config_path, json, calibrate).await
         }

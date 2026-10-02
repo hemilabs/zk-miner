@@ -106,6 +106,20 @@ fn run_worker_loop() -> Result<()> {
                 po2,
             } => {
                 tracing::info!("Proving request {request_id} ({} bytes ELF, po2={po2:?})", elf.len());
+                // Announce that proving has STARTED. `WorkerResponse::Progress` had exactly one
+                // reference in the whole workspace — the arm that consumes it — so no worker
+                // ever emitted one and the dispatcher's `on_progress` callback was dead code.
+                // The miner uses that callback to move a job from Queued to Proving, so without
+                // this a job claimed ahead of a free GPU displayed "Queued (waiting for GPU)"
+                // for the entire proof: the opposite of the truth, and worse than the
+                // "Proving 0%" it replaced. Sent once, at the transition that matters.
+                let started = WorkerResponse::Progress {
+                    request_id,
+                    fraction: 0.0,
+                    elapsed_secs: 0.0,
+                    segments: None,
+                };
+                write_message(&mut stdout, &started)?;
                 match run_proof(&elf, &input_data, po2) {
                     Ok((journal, seal, duration_secs, cycles)) => {
                         let resp = WorkerResponse::ProofResult {
@@ -134,6 +148,40 @@ fn run_worker_loop() -> Result<()> {
                         let resp = WorkerResponse::Error {
                             request_id,
                             kind,
+                            message: msg,
+                        };
+                        write_message(&mut stdout, &resp)?;
+                    }
+                }
+            }
+
+            WorkerCommand::Execute {
+                request_id,
+                elf,
+                input_data,
+            } => {
+                tracing::info!("Execute request {request_id} ({} bytes ELF)", elf.len());
+                match run_execute(&elf, &input_data) {
+                    Ok((cycles, duration_secs)) => {
+                        tracing::info!(
+                            "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s"
+                        );
+                        let resp = WorkerResponse::ExecuteResult {
+                            request_id,
+                            cycles,
+                            duration_secs,
+                        };
+                        write_message(&mut stdout, &resp)?;
+                    }
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        // Execution failure is NOT proof failure: the guest may simply panic
+                        // on this input, which is a property of the job, not of this worker.
+                        // Report InvalidInput so the dispatcher does not kill and respawn a
+                        // perfectly healthy worker over a bad job.
+                        let resp = WorkerResponse::Error {
+                            request_id,
+                            kind: ErrorKind::InvalidInput,
                             message: msg,
                         };
                         write_message(&mut stdout, &resp)?;
@@ -216,6 +264,36 @@ fn detect_gpu() -> (bool, Option<String>) {
         }
     }
     (false, None)
+}
+
+/// Execute the guest WITHOUT proving, returning its true cycle count.
+///
+/// This is the RISC-V simulator: it runs the program to completion and reports
+/// `total_cycles` — the same quantity `ProofResult.cycles` carries — at execution cost
+/// rather than proving cost. On the measured rig a 92.8M-cycle job proves in ~40s on a 5090;
+/// executing it is a small fraction of that, because no STARK is generated.
+///
+/// Deliberately uses the default (CPU) executor: this is a sizing measurement, so it must not
+/// contend for the GPU that the proofs it sizes are running on.
+fn run_execute(elf: &[u8], input_data: &[u8]) -> anyhow::Result<(u64, f64)> {
+    use std::time::Instant;
+    let started = Instant::now();
+
+    let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
+    if !input_data.is_empty() {
+        env_builder.write_slice(input_data);
+    }
+    let env = env_builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("execute: env build failed: {e}"))?;
+
+    let session = risc0_zkvm::default_executor()
+        .execute(env, elf)
+        .map_err(|e| anyhow::anyhow!("execute: {e}"))?;
+
+    // `SessionInfo::cycles()` is the total cycle count, matching what proving reports.
+    let cycles = session.cycles();
+    Ok((cycles, started.elapsed().as_secs_f64()))
 }
 
 fn run_proof(elf: &[u8], input_data: &[u8], po2: Option<u8>) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {

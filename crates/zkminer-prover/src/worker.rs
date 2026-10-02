@@ -53,9 +53,82 @@ pub struct WorkerHandle {
     stderr_task: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Request to the spawner thread: build a worker, hand back the handle.
+struct SpawnRequest {
+    backend: String,
+    path: PathBuf,
+    env: HashMap<String, String>,
+    reply: std::sync::mpsc::Sender<Result<WorkerHandle>>,
+}
+
+/// Channel to the single, long-lived thread that forks EVERY worker.
+static SPAWNER: std::sync::OnceLock<std::sync::mpsc::Sender<SpawnRequest>> =
+    std::sync::OnceLock::new();
+
+/// Get (or start) the spawner thread.
+///
+/// WHY THIS EXISTS: workers are forked with `PR_SET_PDEATHSIG, SIGKILL` so they can't
+/// outlive a crashed miner. That signal is **thread-scoped** — the kernel delivers it
+/// when the thread that forked the child exits, NOT when the process dies. Respawns
+/// happen inside `tokio::task::spawn_blocking`, and tokio retires idle blocking threads
+/// (~10s), so every respawned worker was being SIGKILLed shortly after it went idle.
+///
+/// Symptom before this fix: the miner ran cleanly until the first 20-proof recycle
+/// forced a respawn, then ~90% of proofs were preceded by
+/// `Worker risc0:cuda died (killed by signal 9), will attempt respawn` — permanently,
+/// which also meant workers never survived to 20 proofs and the recycle hygiene the
+/// recycle exists to provide never actually ran.
+///
+/// Forking from one thread that lives for the whole process keeps the crash-cleanup
+/// guarantee (PDEATHSIG still fires if the miner dies, because this thread dies with it)
+/// while removing the spurious kills.
+fn spawner() -> &'static std::sync::mpsc::Sender<SpawnRequest> {
+    SPAWNER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<SpawnRequest>();
+        std::thread::Builder::new()
+            .name("worker-spawner".to_string())
+            .spawn(move || {
+                // Deliberately never returns: exiting would SIGKILL every worker this
+                // thread forked. It parks on the channel for the process lifetime.
+                for req in rx {
+                    let res =
+                        WorkerHandle::spawn_on_this_thread(&req.backend, &req.path, &req.env);
+                    let _ = req.reply.send(res);
+                }
+            })
+            .expect("failed to start worker-spawner thread");
+        tx
+    })
+}
+
 impl WorkerHandle {
-    /// Spawn a new worker process and perform the Hello handshake.
+    /// Spawn a worker via the long-lived spawner thread (see `spawner()`).
+    ///
+    /// Blocks the caller until the worker is up, so behaviour is otherwise identical
+    /// to spawning inline — including the handshake.
     pub fn spawn(
+        backend: &str,
+        path: &PathBuf,
+        env_overrides: &HashMap<String, String>,
+    ) -> Result<Self> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        spawner()
+            .send(SpawnRequest {
+                backend: backend.to_string(),
+                path: path.clone(),
+                env: env_overrides.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("worker-spawner thread is gone"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("worker-spawner thread dropped the request"))?
+    }
+
+    /// Spawn a new worker process and perform the Hello handshake.
+    /// Spawn on the caller's thread. PRIVATE: call `spawn()` instead, which routes
+    /// through the long-lived spawner thread. See `spawn()` for why that matters.
+    fn spawn_on_this_thread(
         backend: &str,
         path: &PathBuf,
         env_overrides: &HashMap<String, String>,
@@ -289,6 +362,7 @@ impl WorkerHandle {
                     // Continue reading (don't count progress toward stale limit)
                 }
                 WorkerResponse::ProofResult { request_id, .. }
+                | WorkerResponse::ExecuteResult { request_id, .. }
                 | WorkerResponse::Error { request_id, .. }
                 | WorkerResponse::Cancelled { request_id, .. } => {
                     if *request_id == expected_request_id {
@@ -350,6 +424,26 @@ impl WorkerHandle {
     /// Check if the worker process is still alive.
     pub fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Why the worker is no longer alive — the datum `is_alive()` throws away.
+    /// Distinguishes an external SIGKILL (signal 9) from a panic/abort (6/11), a
+    /// clean exit (code 0 = graceful Shutdown), and a `try_wait` Err (which would
+    /// make `is_alive()` report a LIVE process as dead).
+    pub fn exit_reason(&mut self) -> String {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        match self.child.try_wait() {
+            Ok(Some(st)) => {
+                #[cfg(unix)]
+                if let Some(sig) = st.signal() {
+                    return format!("killed by signal {sig}");
+                }
+                format!("exited with code {:?}", st.code())
+            }
+            Ok(None) => "still running (spurious)".to_string(),
+            Err(e) => format!("try_wait ERROR: {e}"),
+        }
     }
 
     /// Get the worker's PID.

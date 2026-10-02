@@ -37,6 +37,19 @@ pub enum WorkerCommand {
         /// Only meaningful for risc0; other backends accept but ignore.
         po2: Option<u8>,
     },
+    /// EXECUTE the guest without proving, to measure its true cycle count.
+    ///
+    /// Every scheduling decision in the miner — deadline feasibility, the look-ahead queue,
+    /// the proving timeout — is sized from `expectedCycles` on the job descriptor, which is
+    /// SUBMITTER-DECLARED and, on the observed market, always zero (298/298 jobs), leaving a
+    /// hardcoded 34e6 fallback that is ~8x too small against a 123s median. Executing is the
+    /// only way to learn the real number before committing collateral, and it costs execution
+    /// time rather than proving time — orders of magnitude cheaper than the proof it sizes.
+    Execute {
+        request_id: u64,
+        elf: Vec<u8>,
+        input_data: Vec<u8>,
+    },
     /// Cancel an in-flight proof. Worker should abort and send Cancelled or Error.
     Cancel { request_id: u64 },
     /// Graceful shutdown. Worker should exit after sending no further responses.
@@ -91,6 +104,15 @@ pub enum WorkerResponse {
         /// Proving duration in seconds (f64 to avoid Duration serialization issues).
         duration_secs: f64,
         cycles: u64,
+    },
+    /// Result of an `Execute`: the guest's true cycle count, with no proof produced.
+    ExecuteResult {
+        request_id: u64,
+        /// Total cycles reported by the executor — the same quantity `ProofResult.cycles`
+        /// carries, obtained without proving.
+        cycles: u64,
+        /// How long the execution itself took, so the caller can bound future ones.
+        duration_secs: f64,
     },
     /// Progress update during proving.
     Progress {

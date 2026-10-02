@@ -154,7 +154,79 @@ fn is_invalid_proof(msg: &str) -> bool {
 /// available. Tuned to the largest canonical benchmark (chacha-mix @ ~34M cycles)
 /// so the evaluator errs on the side of declaring jobs infeasible rather than
 /// under-estimating proving time and missing deadlines.
+/// How long a DRAIN waits for in-flight proofs before escalating to ABANDON.
+///
+/// [F3] The earlier 900s was derived from a false premise. The 600s proving watchdog is PER
+/// ATTEMPT and `MAX_PROVE_ATTEMPTS = 3`, and fulfil adds up to 5 x (120s receipt + 30s poll)
+/// = 750s, so a HEALTHY worst case is ~2850s. At 900s the drain would abandon jobs that were
+/// still progressing normally. Each lifecycle also self-bounds at
+/// `lock_deadline - DEADLINE_RELEASE_MARGIN_SECS` and self-releases on error, so a job cannot
+/// outlive its own deadline while held — this bound only stops an indefinite wait.
+/// Set when the shutdown was triggered by SIGTERM (a supervisor) rather than SIGINT.
+///
+/// systemd's default `TimeoutStopSec` is 90s and `docker stop` is 10s; both then SIGKILL.
+/// A drain that waits for a 1-5 minute proof therefore never reaches the release step, so
+/// a supervised stop would release NOTHING — strictly worse than the pre-drain code, which
+/// released within ~2s. Supervised stops get a short drain that auto-escalates.
+static SUPERVISED_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Drain budget for a supervised (SIGTERM) stop. DERIVED, not picked: the smallest common
+/// grace period is `docker stop` = 10s, and the ABANDON stage needs essentially all of it.
+/// One `releaseJob` broadcast costs ~5-6 RPC round trips (`release_and_clean`'s status view,
+/// then `release_job`'s `base_fees` + status view + estimateGas + sendRawTransaction), every
+/// one of them paced by the process-global 4 req/s throttle and contending with the brain /
+/// refresh / lifecycle tasks that keep running through shutdown, on an endpoint that 429s.
+/// A drain cannot buy any of that back: proofs run 60-477s so nothing finishes in seconds,
+/// and `Submitting` jobs are excluded from abandon [F2] anyway — so waiting for their fulfil
+/// cannot change what gets released. Budget = grace - release budget <= 0.
+/// Zero costs nothing when nothing is held: the loop still breaks at "drain complete" on its
+/// first pass; the budget was only ever spent in the case that needs the time for releases.
+const SUPERVISED_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::ZERO;
+
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3000);
+
+/// Extra drain grace granted ONLY when every outstanding job is `Submitting` — i.e. when the
+/// ABANDON stage has nothing to release ([F2] excludes them) and waiting therefore costs the
+/// release budget nothing. Sized to fit inside `docker stop`'s 10s grace: enough for a fulfil
+/// that is mid pre-broadcast to reach the wire, or to give up and stash its nonce for the
+/// lifecycle's own release. Without it a supervised stop (budget ZERO) exits before either,
+/// leaving the job neither fulfilled nor released.
+/// [O2] Cap on how long the ABANDON step waits for release RECEIPTS. The broadcasts have
+/// already gone out; this only bounds the confirmation wait so the exit verdict, the worker
+/// reap and the nonce heal are not stranded behind ~750s of retries that a supervisor's
+/// SIGKILL would cut short anyway. Sized to sit inside systemd's 90s default with room for
+/// the reap.
+const RELEASE_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// [A3] Interactive stops have NO supervisor deadline, so the 45s supervised cap must not
+/// apply: `release_job_with_nonce` runs 5 attempts x (120s receipt + 30s poll), meaning
+/// attempt 2 cannot even start before ~150s. Capping at 45s abandons the release BEFORE the
+/// first re-broadcast — earlier than the single-receipt-timeout give-up that jobs.rs:962-968
+/// calls out as "the exact failure that leaves collateral locked". The operator can always
+/// escalate with a third signal.
+const INTERACTIVE_RELEASE_JOIN_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(800);
+
+const SUBMITTING_FULFIL_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Longest a claim-intent breadcrumb (`lock_deadline` still 0) can plausibly belong to a LIVE
+/// claim: `claim_job` is 5 attempts x `TX_RECEIPT_TIMEOUT` (120s) plus the post-claim
+/// `DEADLINE_READ_RETRIES`. Past this, a zero-deadline entry has no lifecycle behind it and
+/// must not hold the drain open (see the drain union below).
+const CLAIM_INTENT_MAX_AGE_SECS: u64 = 900;
+
+/// Set once the shutdown sequence has begun. Deliberately NOT `state.paused`: the TUI's `p`
+/// key toggles `paused` too (zkminer-tui/src/app.rs), and there it means only "stop claiming
+/// new work" — gating RECOVERY on it would let an operator pause silently disable the only
+/// path that still releases a job whose earlier release failed on RPC.
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 const FALLBACK_ESTIMATED_CYCLES: u64 = 34_000_000;
+
+/// Bound on a single cycle measurement. Execution is far cheaper than proving, but a hostile
+/// or pathological guest must not hold a worker: the watchdog kills it at this point, and a
+/// job we cannot execute inside the budget is one we should not claim either.
+const MEASURE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Fallback fee rate (5%) used only if the adapter query fails.
 const FALLBACK_FEE_RATE_BPS: u16 = 500;
@@ -198,9 +270,36 @@ fn fmt_hemi(wei: u128) -> String {
     format!("{whole}.{cents:02}")
 }
 
+
+/// Build the collateral-starvation warning.
+///
+/// A FUNCTION, not two inline format! calls, because there are two output channels (the
+/// tracing log and the TUI log pane) and hand-maintaining the same sentence twice is
+/// precisely how the positional args rotated in the log copy only — it printed
+/// "4.25 GPU(s) will sit idle. Fix: run `zkminer stake 1`" while the TUI, on the same
+/// tick, correctly said 4.25. Headless operators saw only the wrong one.
+pub(crate) fn collateral_warning(
+    fundable: usize,
+    wanted: usize,
+    available: u128,
+    per_claim: u128,
+    shortfall: u128,
+) -> String {
+    let stake_cmd = zkminer_chain::staking::fmt_hemi_ceil(shortfall);
+    format!(
+        "Only {fundable} of {wanted} GPU slot(s) fundable — {avail} HEMI available, a claim \
+         locks up to {per} HEMI (short ~{stake_cmd}). {idle} GPU(s) will sit idle. \
+         Fix: run `zkminer stake {stake_cmd}`.",
+        avail = fmt_hemi(available),
+        per = fmt_hemi(per_claim),
+        idle = wanted.saturating_sub(fundable),
+    )
+}
+
 pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
+    let queue_horizon_secs = config.prover.queue_horizon_secs;
     let signer = load_signer(&config.wallet)?;
     let client = ChainClient::new(&config, signer).await?;
     let state = new_shared_state();
@@ -298,6 +397,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
             tracing::info!("max_concurrent_proofs=auto → {resolved} (one job per detected GPU)");
         }
         s.runtime_settings.max_concurrent_proofs = resolved;
+        s.runtime_settings.queue_horizon_secs = config.prover.queue_horizon_secs;
 
         // Resolve the RISC Zero groth16 seal selector (config override or the
         // built-in risc0 v3.0.x default) once, for on-chain seal prefixing.
@@ -495,7 +595,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                         },
                         status: MinerJobStatus::Open,
                         current_price: min_price,
-                        gpu_index: None,
+                        gpu_bus_id: None,
                         prover_backend: String::new(),
                         estimated_cycles: 0,
                     });
@@ -662,9 +762,18 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         }
     }
 
+    // [B2] The journal is the AUTHORITATIVE record of what we hold on-chain: a breadcrumb is
+    // written BEFORE every claim tx and removed only on fulfil or successful release, so it
+    // brackets the on-chain lock exactly. `active_jobs` does NOT — a job is pushed there only
+    // AFTER the claim mines and the post-claim status view returns, so during that window a
+    // job holds collateral while being invisible to both shutdown stages. Constructed here
+    // (rather than inside `miner_brain`) so the shutdown path can read it.
+
     // Miner brain: evaluates open jobs, claims, proves, and fulfills.
     let brain_client = client.clone();
     let brain_state = state.clone();
+    let journal: SharedJournal = Arc::new(Mutex::new(JobJournal::load()));
+    let brain_journal = journal.clone();
     let proving_timeout = Duration::from_secs(config.prover.proving_timeout_secs.max(60));
     let cost_params = CostParams {
         electricity_cost_kwh: config.prover.electricity_cost_kwh,
@@ -691,68 +800,904 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
             token_price_usd,
             skip_benchmark_gate,
             recovery_lookback,
+            brain_journal,
+            std::time::Duration::from_secs(queue_horizon_secs),
         )
         .await;
     });
 
+    // Escalating shutdown. Each signal advances one stage:
+    //   1st -> DRAIN   : stop claiming, let in-flight proofs FINISH and fulfil.
+    //   2nd -> ABANDON : stop waiting, release what can still be released.
+    //   3rd -> HARD    : exit immediately.
+    // Counter lives in a watch channel so the drain loop can observe escalation while it
+    // waits, rather than being committed to a mode chosen at the first signal.
+    let (sig_tx, mut sig_rx) = tokio::sync::watch::channel(0u8);
+    // Installed ONLY for headless. In TUI mode the terminal is in raw mode (ISIG cleared)
+    // and `run_tui` exits on a KEY event, not a signal — a handler here would swallow
+    // SIGTERM, leave the miner claiming through the supervisor's whole grace window, and
+    // then die to SIGKILL having released nothing. Without it, SIGTERM keeps its default
+    // disposition and terminates, which is what operators already rely on.
+    // ...but the TUI only OWNS the keyboard until `run_tui` returns. After that the process
+    // still has to drain, abandon and reap (up to DRAIN_TIMEOUT), and with no handler at all
+    // that whole window has the DEFAULT disposition: the operator's Ctrl+C on an apparently
+    // hung shutdown kills the process outright, skipping the release stage AND the worker
+    // reap (leaking the SP1 gpu-server's VRAM). So gate installation on the TUI exiting
+    // rather than skipping it entirely.
+    #[cfg(unix)]
+    let (tui_done_tx, tui_done_rx) = tokio::sync::oneshot::channel::<()>();
+    #[cfg(unix)]
+    {
+        let sig_tx = sig_tx.clone();
+        let sig_state = state.clone();
+        tokio::spawn(async move {
+            // [O1] Handlers are installed IMMEDIATELY — NOT after the TUI exits.
+            //
+            // The previous version awaited `tui_done_rx` here, but that only fires AFTER
+            // `run_tui` returns. So for the whole TUI session — and TUI is the DEFAULT mode
+            // — SIGTERM kept its default disposition and killed the process outright: no
+            // pause, no drain, no ABANDON, no release_and_clean, no exit 75, no worker reap.
+            // Every held job then rode to its 7200s lock deadline. That was strictly worse
+            // than both the original code and the first patch.
+            //
+            // Instead we install now and, in TUI mode, set `shutdown_requested` so the TUI
+            // event loop breaks and `run()` continues into the ladder. `run_tui` already
+            // breaks on a Quit action, so this reuses an existing, tested exit path.
+            let _ = &tui_done_rx; // kept only so the channel is not dropped early
+            use tokio::signal::unix::{signal, SignalKind};
+            // SIGINT must be a PERSISTENT `Signal`, not a fresh `tokio::signal::ctrl_c()`
+            // future per loop iteration. tokio registers a listener by subscribing to a watch
+            // channel, so a listener created AFTER the signal fired never observes it, and the
+            // registry clears its pending bit whether or not anyone was listening. Every SIGINT
+            // delivered while this task sits outside the `select!` (the store / println! /
+            // send window below) would therefore be swallowed — and since tokio's SIGINT
+            // handler stays installed process-wide it does not fall back to the default
+            // disposition either, so the operator's escalating Ctrl+C would silently no-op.
+            // `sigterm` is hoisted for exactly this reason; keep the two symmetric.
+            let mut sigint = signal(SignalKind::interrupt()).ok();
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Fail CLOSED: dropping sig_tx here would look like "shut down now" to
+                    // the waiter below and exit 0 immediately at startup.
+                    tracing::error!("cannot install SIGTERM handler: {e} — SIGINT only");
+                    loop {
+                        match sigint.as_mut() {
+                            Some(si) => {
+                                si.recv().await;
+                            }
+                            None => {
+                                tokio::signal::ctrl_c().await.ok();
+                            }
+                        }
+                        // Two statements, NOT `send(borrow() + 1)`: the `Ref` returned by
+                        // `borrow()` holds a read lock on the watch's inner RwLock until the
+                        // end of the enclosing statement, and `send()` takes the write lock —
+                        // same-thread read-then-write deadlocks, wedging the ONLY graceful
+                        // stop left in this degraded mode.
+                        let next = sig_tx.borrow().saturating_add(1);
+                        let _ = sig_tx.send(next);
+                    }
+                }
+            };
+            // In TUI mode the quit KEY already advanced the ladder to stage 1 (DRAIN is
+            // running by the time we get here), so the operator's first Ctrl+C must mean
+            // ABANDON — not a second "draining" message that does nothing.
+            let mut n = if headless { 0u8 } else { 1u8 };
+            loop {
+                // A supervisor (systemd/docker) sends exactly ONE catchable signal and then
+                // SIGKILLs after its grace period — nobody is there to press Ctrl+C twice.
+                // So SIGTERM gets a SHORT drain that auto-escalates to ABANDON, while SIGINT
+                // (a human at a terminal, who can escalate) keeps the long drain.
+                let supervised = match sigint.as_mut() {
+                    Some(si) => tokio::select! {
+                        _ = si.recv() => false,
+                        _ = sigterm.recv() => true,
+                    },
+                    // SIGINT registration failed: degrade to a per-iteration listener rather
+                    // than losing SIGINT entirely.
+                    None => tokio::select! {
+                        _ = tokio::signal::ctrl_c() => false,
+                        _ = sigterm.recv() => true,
+                    },
+                };
+                if supervised {
+                    SUPERVISED_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                // [O1] Break the TUI out of its event loop so `run()` reaches the ladder.
+                // No-op in headless (nothing reads it there).
+                {
+                    let mut st = sig_state.write().await;
+                    st.shutdown_requested = true;
+                    st.paused = true;
+                }
+                n = n.saturating_add(1);
+                match n {
+                    // [G3] Wording must match what actually happens: with
+                    // SUPERVISED_DRAIN_TIMEOUT == ZERO a supervised stop abandons on the same
+                    // tick, so promising "signal again to ABANDON" there would be a lie — and
+                    // this line is the only thing the operator sees.
+                    1 if supervised => println!(
+                        "\nSUPERVISED STOP — releasing held jobs now (no drain: a supervisor \
+                         will SIGKILL before any proof could finish)."
+                    ),
+                    1 => println!(
+                        "\nDRAINING — finishing in-flight proofs, no new claims. \
+                         Signal again to ABANDON (release jobs), a third time to force-exit."
+                    ),
+                    2 => println!("\nABANDONING — releasing jobs, nearest deadline first..."),
+                    _ => {
+                        eprintln!("\nForce exit — in-flight jobs left locked on-chain.");
+                        // [F4] Reap workers first. SP1's `sp1-gpu-server` is a GRANDCHILD
+                        // that does NOT die with us; measured precedent in this repo is
+                        // 11.5 GB of VRAM still held after the parent exited.
+                        //
+                        // BOUNDED, because `shutdown_all` is not: its phase 4 takes a
+                        // BLOCKING slot lock, while phases 2/3 skip any slot whose `pid` is
+                        // momentarily 0 — the respawn/recycle window (dispatcher.rs, where
+                        // the pid is zeroed before the handle is dropped and only restored
+                        // after `ensure_alive`). Such a worker is never signalled, so the
+                        // lock it holds is not released until its whole proof finishes (up
+                        // to the 600s watchdog) — and since the "Force exit" print used to
+                        // sit AFTER this call, the third Ctrl+C produced no output and never
+                        // exited. The third signal must terminate regardless: reap off-thread
+                        // and cap the wait (a normal reap takes ~2.2s).
+                        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+                        std::thread::spawn(move || {
+                            if let Some(pool) = zkminer_prover::engine::worker_pool() {
+                                pool.shutdown_all();
+                            }
+                            let _ = done_tx.send(());
+                        });
+                        if done_rx.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
+                            eprintln!(
+                                "worker reap did not finish in 10s — exiting anyway; check for \
+                                 an orphaned sp1-gpu-server holding VRAM."
+                            );
+                        }
+                        std::process::exit(130);
+                    }
+                }
+                let _ = sig_tx.send(n);
+            }
+        });
+    }
+
     if headless {
         println!("zkminer running in headless mode. Press Ctrl+C to stop.");
-
-        // Handle both SIGINT (Ctrl+C) and SIGTERM (systemd, docker)
+        // Wait for the FIRST signal.
         #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate())?;
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    println!("\nReceived SIGINT, shutting down...");
-                }
-                _ = sigterm.recv() => {
-                    println!("\nReceived SIGTERM, shutting down...");
-                }
+        while *sig_rx.borrow() == 0 {
+            if sig_rx.changed().await.is_err() {
+                break;
             }
         }
+        // [F7] Non-unix has no signal task; fall back to plain Ctrl-C so headless does not
+        // park forever waiting on a channel nothing ever sends to.
         #[cfg(not(unix))]
         {
             tokio::signal::ctrl_c().await?;
             println!("\nShutting down...");
         }
     } else {
-        // Run interactive TUI with chain client for setup actions
-        zkminer_tui::run_tui(state.clone(), Some(client.clone())).await?;
+        // Run interactive TUI with chain client for setup actions.
+        // Do NOT `?` here. `run_tui` is fallible at RUNTIME, not just at setup (the in-loop
+        // `terminal.draw()?`, and the raw-mode/alternate-screen restore at the operator's
+        // `q`), and every step of the shutdown sequence below — paused/SHUTTING_DOWN, the
+        // drain, the ABANDON/`release_and_clean` stage, the EX_TEMPFAIL verdict and the
+        // worker reap — lives after this line. Propagating the error returns straight out of
+        // `run()`, leaving held jobs Locked on-chain with nothing alive to release them (they
+        // then ride past the lock deadline, after which releaseJob reverts permanently) and
+        // the SP1 gpu-server grandchild holding its VRAM. Log and fall through instead.
+        let tui_result = zkminer_tui::run_tui(state.clone(), Some(client.clone())).await;
+        // Terminal is restored (raw mode off) and the TUI no longer owns the keyboard —
+        // release the signal handler so the drain below still has the abandon/force ladder.
+        #[cfg(unix)]
+        let _ = tui_done_tx.send(());
+        if let Err(e) = tui_result {
+            tracing::error!("TUI exited with an error: {e:#} — continuing into shutdown");
+        }
     }
 
-    // Graceful shutdown sequence:
-    // 1. Stop claiming new jobs
+    // ---- Shutdown -----------------------------------------------------------------
+    // 1. Stop taking on new work. Per-job lifecycles are INDEPENDENT spawned tasks (each
+    //    holding its own SlotGuard), so pausing the brain stops new claims without
+    //    disturbing work already under way.
     {
         let mut s = state.write().await;
         s.paused = true;
     }
-
-    // 2. Abort background tasks
-    brain_handle.abort();
+    // Distinct from `paused` (which the TUI's `p` key also sets, meaning only "stop
+    // claiming"): the shutdown-only gates below key off THIS flag.
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
     monitor_handle.abort();
     event_handle.abort();
-    refresh_handle.abort();
     hw_handle.abort();
+    // [B5] brain_handle is NOT aborted here. The claim of "per-job lifecycles are
+    // independent spawned tasks" holds for the normal and batch paths (spawn_lifecycle_task)
+    // but NOT for recovery: `recover_claimed_jobs` awaits `process_job_lifecycle` INLINE
+    // inside `miner_brain`, so aborting the brain drops a recovered job mid-prove or
+    // mid-fulfil. That job is already in `active_jobs` as Proving and nothing else can
+    // advance or remove it, so the drain would burn its whole budget on a zombie and only
+    // then release — crossing a lock deadline the pre-drain code would have met.
+    //
+    // `s.paused = true` already stops new claims, so letting the brain finish is safe. It is
+    // aborted at the end, alongside the other survivors.
+    let brain_deadline_note = "brain left running so inline recovery lifecycles can finish";
+    tracing::debug!("{brain_deadline_note}");
+    // `refresh_handle` is left running through the drain simply because it is harmless and
+    // keeps balances/UI fresh. NOTE: it does NOT advance job status — status transitions
+    // happen inside the per-job lifecycle (`active_jobs` mutation sites), so aborting it
+    // would not stall the drain. Stated explicitly because an earlier version of this
+    // comment claimed the opposite and would have misled a future edit.
 
-    // 3. Shutdown worker pool (sends Shutdown to all workers, SIGKILL after 5s)
-    if let Some(pool) = zkminer_prover::engine::worker_pool() {
-        tracing::info!("Shutting down worker pool");
-        pool.shutdown_all();
+    // 2. DRAIN — let in-flight proofs finish and fulfil.
+    //
+    //    The old sequence called `pool.shutdown_all()` HERE, before releasing. That kills
+    //    the workers, so every in-flight proof was destroyed unconditionally — on the
+    //    1-5 minute proofs this miner now runs that discarded up to five minutes of GPU
+    //    work and the claim gas, even at 99% complete, and the job then had to be
+    //    re-proved from scratch by the recovery path on the next start.
+    let mut exit_code = 0i32;
+    let supervised = SUPERVISED_STOP.load(std::sync::atomic::Ordering::SeqCst);
+    let drain_budget = if supervised { SUPERVISED_DRAIN_TIMEOUT } else { DRAIN_TIMEOUT };
+    if supervised {
+        tracing::warn!(
+            "supervised stop (SIGTERM): draining {}s then releasing — a supervisor will \
+             SIGKILL before a full drain could finish",
+            drain_budget.as_secs()
+        );
+    }
+    let drain_deadline = std::time::Instant::now() + drain_budget;
+    let mut abandoned = false;
+    loop {
+        if *sig_rx.borrow() >= 2 {
+            tracing::warn!("drain interrupted by second signal — abandoning");
+            abandoned = true;
+            break;
+        }
+        // Union of what the UI thinks is in flight AND what the journal says we hold
+        // on-chain. The journal alone is authoritative for "collateral is locked"; without
+        // it the loop declares "drain complete" while a claim is mid-flight. [B2]
+        let (mut outstanding, submitting_now): (Vec<B256>, std::collections::HashSet<B256>) = {
+            let s = state.read().await;
+            (
+                s.active_jobs
+                    .iter()
+                    .filter(|j| {
+                        matches!(
+                            j.status,
+                            MinerJobStatus::Proving { .. } | MinerJobStatus::Submitting
+                        )
+                    })
+                    .map(|j| j.info.job_id)
+                    .collect(),
+                s.active_jobs
+                    .iter()
+                    .filter(|j| matches!(j.status, MinerJobStatus::Submitting))
+                    .map(|j| j.info.job_id)
+                    .collect(),
+            )
+        };
+        let now_s = chrono::Utc::now().timestamp().max(0) as u64;
+        // A zero-deadline breadcrumb that is too old to be a live claim: see the filter below.
+        let mut stale_intent = false;
+        {
+            // std::sync::Mutex — guard must not cross an await; scope it tightly.
+            let held: Vec<B256> = {
+                let j = journal.lock().unwrap_or_else(|e| e.into_inner());
+                // Past-deadline entries are STRANDED, not draining. `release_and_clean`
+                // deliberately RETAINS their breadcrumb (releaseJob would revert) and only a
+                // keeper slash ever clears it, so an unfiltered union can never become empty
+                // on a miner that has ever stranded a job: the drain would burn its whole
+                // budget waiting on a job that has been dead for hours, delaying the abandon
+                // of jobs that CAN still be released. The abandon stage below skips these for
+                // exactly the same reason.
+                // An UNKNOWN deadline (0) is only "still draining" while a claim could
+                // genuinely still be in flight. Every breadcrumb is born at 0 (an open job's
+                // pre-claim snapshot deadline is 0) and only `mark_claimed` backfills it, while
+                // `release_and_clean`'s unconfirmed-claim arm deliberately RETAINS such an entry
+                // after dropping the job from `active_jobs` — and recovery is gated off during
+                // shutdown, so nothing can ever advance it. Since the nearest-deadline cut below
+                // cannot see a 0 either, keeping one here pins `outstanding` non-empty for the
+                // WHOLE budget: an interactive stop hangs for the full DRAIN_TIMEOUT with
+                // nothing actually in flight. Age it out instead — but it may still hold
+                // collateral (the claim tx can mine after we gave up), so hand it to ABANDON
+                // (which re-reads the chain) rather than exiting clean.
+                j.iter()
+                    .filter(|e| {
+                        if e.lock_deadline == 0 {
+                            let age = now_s.saturating_sub(e.claimed_at.max(0) as u64);
+                            let live = age <= CLAIM_INTENT_MAX_AGE_SECS;
+                            if !live {
+                                stale_intent = true;
+                            }
+                            live
+                        } else {
+                            e.lock_deadline > now_s
+                        }
+                    })
+                    .map(|e| e.job_id)
+                    .collect()
+            };
+            for id in held {
+                if !outstanding.contains(&id) {
+                    outstanding.push(id);
+                }
+            }
+        }
+        // A stale zero-deadline breadcrumb has no lifecycle behind it and is INVISIBLE to the
+        // nearest-deadline cut below (which filters `d > now_s`), so it must never leave by the
+        // CLEAN exit — that is the one drain exit that skips ABANDON, and ABANDON's on-chain
+        // re-check is the only thing that can still release it.
+        // But ONLY once nothing else is genuinely draining. Staleness is not urgency: such an
+        // entry is created by the ordinary RPC-failed-claim path (`release_and_clean` RETAINS a
+        // `Claiming` breadcrumb whose view reads prover == ZERO) and its only GC — recovery —
+        // is idle-gated AND skipped during shutdown, so on the miner that produced it the entry
+        // survives the whole session. Escalating unconditionally therefore aborted EVERY
+        // subsequent drain on iteration 1, discarding in-flight proofs seconds from fulfilling
+        // — for a lock that, having just aged out at CLAIM_INTENT_MAX_AGE_SECS (900s), still
+        // has most of its window left, far more than DRAIN_TIMEOUT + the release margin.
+        // `outstanding` already EXCLUDES stale entries (the filter above returns `live ==
+        // false`), so this condition means "the stale intent is the only thing we know about",
+        // and every OTHER exit from this loop already sets `abandoned = true`.
+        if stale_intent && outstanding.is_empty() {
+            tracing::warn!(
+                "drain cut short — a stale claim-intent breadcrumb (deadline unknown, so \
+                 invisible to the nearest-deadline cut) may still hold collateral; abandoning \
+                 so it gets an on-chain re-check and release"
+            );
+            abandoned = true;
+            break;
+        }
+        if outstanding.is_empty() {
+            // `outstanding` deliberately EXCLUDES past-deadline breadcrumbs (see the filter
+            // above) — those are STRANDED collateral, not draining work. "Nothing in flight"
+            // is therefore not the same as "nothing held", and in TUI mode this println is the
+            // only shutdown verdict an operator ever sees (tracing goes to a file), so an
+            // unconditional all-clear here asserts the opposite of the on-chain truth on every
+            // clean stop of a miner that has ever stranded a job.
+            let retained = {
+                let j = journal.lock().unwrap_or_else(|e| e.into_inner());
+                j.iter().count()
+            };
+            if retained == 0 {
+                tracing::info!("drain complete — no jobs in flight, journal empty");
+                if !headless {
+                    println!("Shutdown clean — no jobs held, no collateral at risk.");
+                }
+            } else {
+                tracing::warn!(
+                    "drain complete — no jobs in flight, but {retained} past-deadline journal \
+                     breadcrumb(s) remain: that collateral is STILL LOCKED until a keeper slash"
+                );
+                if !headless {
+                    println!(
+                        "Drain complete — nothing in flight, but {retained} past-deadline \
+                         breadcrumb(s) remain: that collateral is STILL LOCKED until a keeper \
+                         slash — details in ~/.zkminer/logs/zkminer.log"
+                    );
+                }
+            }
+            break;
+        }
+        // Never drain past the point where the nearest still-releasable job could still be
+        // released — `releaseJob` reverts at the lock deadline. The drain budget itself is
+        // deadline-blind, and its justification (each lifecycle self-bounds at
+        // `lock_deadline - DEADLINE_RELEASE_MARGIN_SECS`) does NOT cover a journal entry with
+        // no live lifecycle behind it: a release that failed on RPC retains the breadcrumb
+        // but drops the job from `active_jobs`, and recovery is gated off during shutdown, so
+        // nothing can advance it. Waiting that out converts a releasable lock into a
+        // permanent strand.
+        // Only entries the ABANDON stage would actually act on may cut the drain short. [F2]
+        // excludes `Submitting` jobs from the release list, so tripping on one aborts the drain
+        // for a job abandon then refuses to release — and the exit below kills the in-flight
+        // fulfil AND the lifecycle's own self-release, which fires at exactly this instant
+        // (fulfill's budget expires at `lock_deadline - DEADLINE_RELEASE_MARGIN_SECS`).
+        let soonest = {
+            let j = journal.lock().unwrap_or_else(|e| e.into_inner());
+            j.iter()
+                .filter(|e| !submitting_now.contains(&e.job_id))
+                .map(|e| e.lock_deadline)
+                .filter(|d| *d > now_s)
+                .min()
+        };
+        if let Some(d) = soonest {
+            if now_s.saturating_add(DEADLINE_RELEASE_MARGIN_SECS) >= d {
+                tracing::warn!(
+                    "drain cut short — nearest held lock deadline is {}s away (< {}s release \
+                     margin) — abandoning now while releaseJob can still land",
+                    d.saturating_sub(now_s),
+                    DEADLINE_RELEASE_MARGIN_SECS,
+                );
+                abandoned = true;
+                break;
+            }
+        }
+        // [F2] `Submitting` jobs are excluded from the ABANDON release list, so the DRAIN is
+        // the ONLY stage that can still free their collateral — by letting the fulfil land
+        // (or give up, stashing its nonce so the lifecycle's own release can displace it).
+        // `Submitting` is set BEFORE `fulfill_job`, whose pre-broadcast nonce reserve / fee
+        // read / status view are all paced by the global RPC throttle, so a ZERO supervised
+        // budget `process::exit`s the fulfil before it ever reaches the wire — the job ends
+        // up neither fulfilled NOR released, and an operator-initiated stop is not restarted
+        // by the [F5] exit code either. Grant a small grace, but ONLY when every outstanding
+        // job is `Submitting`: then `doomed` is empty and this costs the release budget
+        // nothing. A mixed set still exits at once — releasable collateral outranks a fulfil.
+        let effective_deadline = if !submitting_now.is_empty()
+            && outstanding.iter().all(|id| submitting_now.contains(id))
+        {
+            drain_deadline + SUBMITTING_FULFIL_GRACE
+        } else {
+            drain_deadline
+        };
+        if std::time::Instant::now() >= effective_deadline {
+            tracing::warn!(
+                "drain timeout ({}s) with {} job(s) still in flight — abandoning",
+                drain_budget.as_secs(),
+                outstanding.len()
+            );
+            abandoned = true;
+            break;
+        }
+        tracing::info!(
+            "draining: {} job(s) in flight ({}) — signal again to abandon",
+            outstanding.len(),
+            outstanding.iter().map(|j| short_id(*j)).collect::<Vec<_>>().join(", ")
+        );
+        // In TUI mode every line above goes to ~/.zkminer/logs/zkminer.log and NOTHING to the
+        // terminal, so the operator sees a blank screen for up to DRAIN_TIMEOUT and cannot tell
+        // a working drain from a wedged process — the usual response is a kill that strands
+        // collateral. The TUI has already restored the terminal by this point (the signal
+        // ladder above prints here too), so stdout is safe.
+        if !headless {
+            println!(
+                "draining: {} job(s) still proving — Ctrl+C to abandon and release now",
+                outstanding.len()
+            );
+        }
+        // Clamp the poll to the remaining budget. `drain_deadline` is only tested at loop
+        // TOP, so an unclamped 5s quantum rounds the 6s supervised budget up to 10s — i.e.
+        // `docker stop`'s ENTIRE grace period — and SIGKILL lands at the instant the loop
+        // first decides to abandon, so a supervised stop releases nothing (and never reaches
+        // the worker reap either). Zero is fine: the next iteration falls straight into the
+        // deadline branch above.
+        let poll = std::time::Duration::from_secs(5)
+            .min(effective_deadline.saturating_duration_since(std::time::Instant::now()));
+        tokio::select! {
+            _ = tokio::time::sleep(poll) => {}
+            _ = sig_rx.changed() => {}
+        }
     }
 
-    // 4. Release any claimed-but-unproven jobs on-chain
-    let s = state.read().await;
-    for job in &s.active_jobs {
-        if matches!(job.status, MinerJobStatus::Proving { .. }) {
-            tracing::info!("Releasing job {} on shutdown", job.info.job_id);
-            if let Err(e) = client.release_job(job.info.job_id).await {
-                tracing::error!("Failed to release job {}: {}", job.info.job_id, e);
+    // 3. ABANDON — release whatever is still ours, NEAREST DEADLINE FIRST.
+    //
+    //    Ordering is the whole game for collateral: `releaseJob` reverts once a job is past
+    //    its lock deadline, and the collateral is then locked until a keeper slashes. Every
+    //    second spent on a job with hours of headroom is a second not spent on one about to
+    //    expire, so releasing in deadline order is what actually minimises loss.
+    if abandoned {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Source of truth is the JOURNAL [B2]: it covers the claim window that `active_jobs`
+        // misses. `Submitting` jobs are deliberately EXCLUDED [F2] — they already have a
+        // valid proof and a fulfil in flight; releasing one races its own fulfil for the
+        // signer's nonce and can strand exactly what it was trying to save.
+        let submitting: std::collections::HashSet<B256> = {
+            let s = state.read().await;
+            s.active_jobs
+                .iter()
+                .filter(|j| matches!(j.status, MinerJobStatus::Submitting))
+                .map(|j| j.info.job_id)
+                .collect()
+        };
+        let mut doomed: Vec<(u64, B256)> = {
+            let j = journal.lock().unwrap_or_else(|e| e.into_inner());
+            j.iter()
+                .filter(|e| !submitting.contains(&e.job_id))
+                .map(|e| (e.lock_deadline, e.job_id))
+                .collect()
+        };
+        if !submitting.is_empty() {
+            tracing::info!(
+                "{} job(s) already submitting a proof — not releasing (their fulfil is in \
+                 flight; releasing would race it)",
+                submitting.len()
+            );
+        }
+        // Unknown (0) sorts LAST, not first: reading 0 as "expired at the epoch" would put
+        // the least-known jobs ahead of ones with a real, imminent deadline.
+        doomed.sort_by_key(|(d, _)| if *d == 0 { u64::MAX } else { *d });
+        let mut released = 0usize;
+        let mut stranded = 0usize;
+        // At most ONE frontier fetch for the whole burst, and it must be BOUNDED. This loop
+        // had ZERO network awaits by design — see the "SPAWN, don't await in-line" rule below
+        // — and past-deadline jobs sort FIRST, so anything slow here runs AHEAD of every
+        // still-savable release. A supervised stop gives the abandon stage the entire grace
+        // (SUPERVISED_DRAIN_TIMEOUT is ZERO) and nothing wraps this ladder in an outer
+        // timeout, so an unbounded fetch against a black-holing endpoint means no releaseJob
+        // is ever broadcast and every held collateral rides to its deadline. The mined
+        // frontier only advances, so one fetch covers every stash in the burst.
+        let mut stash_frontier_synced = false;
+        let mut releasing: Vec<(B256, tokio::task::JoinHandle<()>)> = Vec::new();
+        for (deadline, jid) in doomed {
+            // [F2] Re-read the live status per job: `submitting` was snapshotted BEFORE this
+            // loop and the per-job lifecycles are still running, so a job that was Proving at
+            // snapshot time can enter its fulfil while we are in here. `release_and_clean`'s
+            // on-chain guard only catches a fulfil that already MINED (status != Locked), not
+            // one that is merely pending — whose nonce a fresh releaseJob would queue behind.
+            let now_submitting = {
+                let s = state.read().await;
+                s.active_jobs
+                    .iter()
+                    .any(|j| j.info.job_id == jid && matches!(j.status, MinerJobStatus::Submitting))
+            };
+            if now_submitting {
+                tracing::info!(
+                    "job {} entered fulfil during abandon — not releasing (would race its own \
+                     fulfil for the signer's nonce)",
+                    short_id(jid)
+                );
+                continue;
+            }
+            if deadline != 0 && deadline <= now {
+                // Already expired: `releaseJob` would revert. Skip it rather than burn the
+                // budget of a job that CAN still be saved.
+                tracing::error!(
+                    "job {} already past its lock deadline — collateral stranded until a \
+                     keeper slash; not attempting release",
+                    short_id(jid)
+                );
+                // [#45] No release will EVER be attempted for this job — `releaseJob` would
+                // revert past the deadline — and `release_job_with_nonce` is the only consumer
+                // of the abandoned-fulfill stash. So a stashed nonce here has no future owner:
+                // it is in no set at all (not stashed for anyone, not in `freed`, no abort
+                // record), which is exactly the invisible-hole shape that wedges every higher
+                // nonce. The sibling arms in the recovery path carry this same drain.
+                //
+                // Deliberately NOT done in the `now_submitting` arm above: there the job's
+                // lifecycle is ALIVE and its release path is the intended consumer, so draining
+                // would break the fulfill->release displacement handoff the stash exists for.
+                if let Some(n) = client.take_abandoned_nonce(jid) {
+                    // Learn the mined frontier BEFORE recycling. The stash may already be
+                    // consumed on-chain — a past-deadline fulfill that mined as a revert still
+                    // has status 1, so neither state poll sees it and no receipt means no
+                    // `commit_nonce`. Without this, the abort inserts a dead nonce into
+                    // `freed`, and because past-deadline jobs sort FIRST in this
+                    // deadline-ordered burst, `reserve_locked` hands it straight to the
+                    // NEAREST-deadline live release, whose send is then rejected "nonce too
+                    // low". With the `consumed_below` watermark in place the abort then
+                    // correctly no-ops instead.
+                    //
+                    // BOUNDED and once per burst: on timeout we degrade to exactly the
+                    // pre-amendment behaviour, which costs one attempt of five inside an
+                    // already-spawned concurrent release — cheap, and recoverable by that
+                    // task's own nonce-error arm. Paying for it with the whole grace period
+                    // is not. Cancellation is safe: `resync_nonce` mutates the allocator only
+                    // after the RPC returns, so a dropped future changes no state.
+                    if !stash_frontier_synced {
+                        stash_frontier_synced = true;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_millis(1_500),
+                            client.resync_nonce(),
+                        )
+                        .await;
+                    }
+                    client.abort_nonce(n);
+                }
+                stranded += 1;
+                continue;
+            }
+            if deadline == 0 {
+                // Not "0s left" — the sort above deliberately ranked this LAST as the least
+                // urgent, and the expired-skip above declined to call it expired.
+                tracing::info!(
+                    "releasing job {} (deadline unknown — claim never confirmed)",
+                    short_id(jid)
+                );
+            } else {
+                tracing::info!(
+                    "releasing job {} ({}s of deadline left)",
+                    short_id(jid),
+                    deadline.saturating_sub(now)
+                );
+            }
+            // [F1] `release_and_clean`, not the raw client call: it re-checks the on-chain
+            // status (so a job that fulfilled underneath us is not released), re-reads the
+            // authoritative deadline, drains the abandoned-nonce stash, and clears the
+            // journal entry — none of which the raw call does.
+            //
+            // SPAWN, don't await in-line. `release_job` retries up to 5 x (120s receipt +
+            // 30s state poll) ~= 750s for ONE job, and `await_receipt` parks >= 6s before its
+            // first poll — while a supervised stop is SIGKILLed 10s (docker) / 90s (systemd)
+            // after SIGTERM. Serialised, only the FIRST job's releaseJob ever reaches the
+            // wire and every other held job strands; BROADCASTING is what frees the
+            // collateral (the tx mines whether or not we survive to see the receipt). Spawn
+            // order stays nearest-deadline-first and the client's `tx_lock` still serialises
+            // the actual sends — exactly as concurrent per-job lifecycles already do.
+            //
+            // Reserve the nonce HERE, though, not inside the task. A single signer's txs mine
+            // in strict NONCE order (a tx at n+1 sits in the queued pool until n mines), so
+            // the nonce IS the on-chain priority. Reserved inside the task it is assigned
+            // whenever that task's first throttled RPC happens to resolve — scheduling and
+            // 429-retry order, uncorrelated with the deadline sort above — so a job with
+            // hours of headroom can take the lower nonce and block the release of one about
+            // to strand. Reserving in this loop restores what the serialised version had.
+            // (In-memory fast path once the allocator is synced; a recycled gap is handed out
+            // first, which only ever LOWERS the urgent job's nonce.)
+            let pre_nonce = client.reserve_nonce().await.ok();
+            let (c, st, jr) = (client.clone(), state.clone(), journal.clone());
+            releasing.push((
+                jid,
+                tokio::spawn(async move {
+                    release_and_clean_with_nonce(&c, &st, &jr, jid, pre_nonce).await;
+                }),
+            ));
+        }
+        let release_txs_attempted = releasing.len();
+        // [O2] BOUND the join. Each `release_and_clean` is up to 5 attempts x (120s receipt +
+        // 30s poll) ~= 750s; joining them serially blocked everything downstream — the exit-75
+        // verdict, the worker reap (SP1's gpu-server keeps ~11.5 GB) and the nonce heal. Under
+        // a supervisor the SIGKILL landed INSIDE this join, so none of them ever ran.
+        //
+        // What matters for collateral is that the release tx is BROADCAST, which has already
+        // happened concurrently by the time we get here; waiting for receipts is a nicety.
+        // So cap the total wait and carry on — a job whose receipt we never saw is simply
+        // reported as still-held, which is exactly what the exit-75 path is for.
+        let join_budget = if supervised {
+            RELEASE_JOIN_BUDGET
+        } else {
+            INTERACTIVE_RELEASE_JOIN_BUDGET
+        };
+        let join_deadline = std::time::Instant::now() + join_budget;
+        for (jid, handle) in releasing {
+            let left = join_deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                tracing::warn!(
+                    "release-join budget exhausted; not waiting on job {} (its tx is already \
+                     broadcast — the journal is the source of truth for whether it landed)",
+                    short_id(jid)
+                );
+            } else if tokio::time::timeout(left, handle).await.is_err() {
+                tracing::warn!("release of job {} did not confirm within budget", short_id(jid));
+            }
+            // `release_and_clean` returns (); the JOURNAL is its outcome signal — it removes
+            // the breadcrumb only when the lock is provably gone (released, or no longer/
+            // never ours). A retained entry means the collateral is STILL LOCKED (release tx
+            // failed, or the job turned out to be past its on-chain deadline). Counting those
+            // as "released" made the shutdown summary claim success on precisely the cases
+            // that lose stake.
+            if journal_has(&journal, jid) {
+                tracing::error!(
+                    "job {} NOT released — collateral still locked on-chain (see the preceding \
+                     line for why)",
+                    short_id(jid)
+                );
+                stranded += 1;
+            } else {
+                released += 1;
+            }
+        }
+
+        // Every doomed job took a nonce at spawn time above, but the release is NOT
+        // guaranteed to be sent: `release_and_clean_with_nonce`'s three skip arms (lock not
+        // provably gone / not ours / past the on-chain deadline) and `release_job_with_nonce`'s
+        // own already-released early return all RECYCLE their nonce instead. Recycling only
+        // refills the on-chain sequence when a LATER reservation picks the nonce up — and
+        // these were all handed out in one burst before any task's first RPC resolved, so a
+        // skipped one leaves a HOLE BELOW the releaseJob txs we did broadcast. A signer's txs
+        // mine in strict nonce order, so those releases would sit in the queued pool unmined,
+        // and the process exits a few lines below with nothing left alive to heal the gap —
+        // the very collateral they were freeing then rides to its lock deadline, after which
+        // releaseJob reverts permanently. Fill it now; `heal_nonce_gap` self-checks and is a
+        // no-op (Ok(false)) when there is no gap.
+        //
+        // GUARD (`heal_nonce_gap`'s own doc): heal only a PROVEN hole. `nonce_gap_frontier`'s
+        // branch (B) (`is_freed` / `recently_aborted`) does NO pending check by design — it is
+        // meant to DISPLACE a stuck tx of ours — and `release_job_with_nonce`'s give-up path
+        // RECYCLES the nonce of a releaseJob it actually BROADCAST. Healing that nonce is not
+        // filling a hole: it replaces our own still-mineable release with a 0-value self-
+        // transfer (heal bids >= 4x base; the release ladder tops out far below that), and we
+        // `process::exit` a few lines below with nothing left alive to re-send it — stranding
+        // exactly the nearest-deadline job. `recently_aborted` is also sticky for 600s AFTER
+        // another task re-reserves the nonce, so a still-running lifecycle's live tx trips it
+        // too. When something is executable at the frontier there is no wedge to heal: the
+        // queued releases cascade as soon as it mines.
+        // [A4] Was `frontier_has_executable_tx()`, i.e. "anything executable at the mined
+        // frontier => don't heal". That excluded the case this whole block exists for: the
+        // skipped release leaves a hole ABOVE the frontier (our own broadcast release is
+        // executable AT it), so the probe said "busy" and we never healed, and the queued
+        // releases rode to their lock deadlines. `nonce_gap_safe_to_fill` keeps the original
+        // protection — it still refuses to displace an executable tx at the frontier — while
+        // allowing a hole above it, where by construction there is nothing to displace.
+        let heal_target = if release_txs_attempted > 0 {
+            match client.nonce_gap_safe_to_fill().await {
+                Ok(t) => t,
+                // Can't prove it's safe → never displace anything.
+                Err(e) => {
+                    tracing::warn!("post-abandon nonce frontier probe failed: {e:#} — not healing");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // [D3] `pending` reports only the LOWEST hole, and `heal_nonce_gap` fills one. With
+        // two or more skipped releases — routine when several jobs are doomed — plugging the
+        // first leaves the next one blocking every release above it, and we exit immediately
+        // with nothing alive to notice. The live watchdog walks holes one per ~2 min, which is
+        // fine for a running process and useless here. Loop, bounded: each pass is a handful
+        // of RPCs plus (for an above-frontier fill) no receipt wait, so this stays well inside
+        // the shutdown budget.
+        const MAX_SHUTDOWN_HEALS: usize = 3;
+        // [#6b] Bound in TIME as well as passes: a frontier-hole pass can still consume the
+        // full 30s HEAL_RECEIPT_BUDGET, and the shutdown budget is already 45s join + reap
+        // against a 90s supervisor kill. Overrunning costs the worker reap (SP1's gpu-server
+        // holds ~11.5 GB) and the exit-75 verdict — worse than an unfilled hole, which
+        // recovery re-drives on the next start.
+        const HEAL_LOOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+        let heal_deadline = std::time::Instant::now() + HEAL_LOOP_BUDGET;
+        let mut heal_target = heal_target;
+        let mut healed = 0usize;
+        while healed < MAX_SHUTDOWN_HEALS {
+            // [#1] Fill the nonce the GATE approved. `heal_nonce_gap()` re-derives from the
+            // ungated detector, which in a documented state nominates a different nonce —
+            // the executable releaseJob at the frontier.
+            let Some(target) = heal_target else { break };
+            // Pass the REMAINING budget down. A hard-coded 30s receipt wait inside this 20s
+            // budget is not a race but arithmetic: the first frontier pass always overruns and
+            // always fails this check, making the walk single-shot in exactly the shape it was
+            // written for — and pushing shutdown past the supervisor's kill, so the worker reap
+            // and the exit-75 verdict never run.
+            let left = heal_deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                tracing::warn!(
+                    "post-abandon heal budget spent with nonce {target} still open — leaving \
+                     it to recovery on the next start"
+                );
+                break;
+            }
+            healed += 1;
+            // The VETTED path: refuse if the nonce was re-reserved since the gate approved
+            // it. Ok(false) then breaks the loop, which is the right response.
+            match client.heal_owned_nonce_gap_at(target, left).await {
+                Ok(zkminer_chain::client::OwnedHealOutcome::Filled) => {
+                    tracing::warn!(
+                        "filled a nonce gap left by a skipped release — the releaseJob tx(es) \
+                         we broadcast can now mine"
+                    );
+                    // Re-probe: there may be another hole above the one just plugged. Any
+                    // error or ambiguity ends the loop rather than risking a spin.
+                    heal_target = client.nonce_gap_safe_to_fill().await.unwrap_or(None);
+                }
+                // A live owner took the nonce after the gate approved it. That owner will
+                // plug it, so this is NOT a reason to stop — the blocker is now the hole
+                // ABOVE it, and stopping here strands every release queued behind that one
+                // with most of the budget unspent.
+                Ok(zkminer_chain::client::OwnedHealOutcome::RefusedNotOurs) => {
+                    heal_target = client.nonce_gap_safe_to_fill().await.unwrap_or(None);
+                    if heal_target == Some(target) {
+                        // The gate re-nominated the same nonce we just refused; walking again
+                        // would spin. Leave it to recovery on the next start.
+                        break;
+                    }
+                }
+                // Sent but not confirmed — retrying only re-broadcasts at an escalating fee
+                // while the clock runs down.
+                Ok(zkminer_chain::client::OwnedHealOutcome::Unconfirmed) => break,
+                // The ONLY Err path is `send_transaction` itself, so this means "that one
+                // broadcast did not reach the node" (a 429, or the HTTP timeout) — not that
+                // the hole is unhealable. On the owned path the arm has already restored the
+                // `freed` entry, so the state is clean for an immediate retry, and the loop is
+                // bounded by MAX_SHUTDOWN_HEALS and the deadline. Breaking here threw away the
+                // rest of the budget on a transient failure, during a burst where 429s are the
+                // expected condition.
+                Err(e) => {
+                    tracing::warn!(
+                        "post-abandon nonce gap fill at {target} failed to send: {e:#} — \
+                         retrying within the remaining budget"
+                    );
+                    heal_target = client.nonce_gap_safe_to_fill().await.unwrap_or(None);
+                }
+            }
+        }
+        if heal_target.is_some() {
+            tracing::warn!(
+                "post-abandon: stopped after {healed} gap fill(s) with a hole still open — \
+                 remaining queued release(s) will be re-driven by recovery on the next start"
+            );
+        }
+
+        // [F5] Leave a machine-readable verdict and a NON-ZERO exit when anything is still
+        // held: every path previously returned Ok(()) -> exit 0, so `Restart=on-failure`
+        // saw success and did NOT restart — disabling the recovery path that is the actual
+        // remedy for a held job.
+        let (still_held, recoverable) = {
+            let j = journal.lock().unwrap_or_else(|e| e.into_inner());
+            let total = j.iter().count();
+            // Only entries a RESTART could still act on gate the exit code. A past-deadline
+            // breadcrumb is retained deliberately until a keeper slash flips the on-chain
+            // status, so counting it would make EX_TEMPFAIL permanently true on any miner
+            // that has ever stranded a job — a restart request that carries no information.
+            // Unknown (0) counts as recoverable: fail toward letting recovery re-read chain.
+            let rec = j
+                .iter()
+                .filter(|e| e.lock_deadline == 0 || e.lock_deadline > now)
+                .count();
+            (total, rec)
+        };
+        tracing::warn!(
+            "shutdown summary: {released} released, {stranded} still locked (past deadline or \
+             failed release), {still_held} breadcrumb(s) in the journal ({recoverable} \
+             recoverable on restart)"
+        );
+        // Mirror the verdict to the terminal: in TUI mode this is the ONLY way an operator
+        // learns that collateral was stranded rather than released (see the drain note above).
+        if !headless {
+            println!(
+                "shutdown summary: {released} released, {stranded} STILL LOCKED (past deadline \
+                 or failed release), {still_held} journal breadcrumb(s) ({recoverable} \
+                 recoverable on restart) — details in ~/.zkminer/logs/zkminer.log"
+            );
+        }
+        if recoverable > 0 {
+            // EX_TEMPFAIL. Keep it — but it only produces an AUTO-restart when the signal did
+            // NOT come from the supervisor's own stop job (`kill -TERM $MAINPID`, a wrapper, a
+            // liveness-probe kill). systemd never restarts a unit it stopped itself
+            // (`systemctl stop` leaves it `failed`), `docker stop` disables the restart policy
+            // until the container is started again, and k8s only SIGTERMs a container whose pod
+            // is already terminating — and SIGTERM is the ONLY thing that sets SUPERVISED_STOP.
+            // So on the supervised path this code is a VERDICT, not a remedy: recovery runs on
+            // the next START, and a human has to perform it. Say so where the human is looking.
+            exit_code = 75;
+            tracing::error!(
+                "{recoverable} job(s) still hold collateral — START THE MINER AGAIN to run \
+                 recovery. A supervisor-initiated stop (systemctl stop / docker stop / pod \
+                 delete) will NOT auto-restart despite exit 75, and the lock is unrecoverable \
+                 once its deadline passes."
+            );
+            if !headless {
+                println!(
+                    "{recoverable} job(s) STILL HOLD COLLATERAL — start the miner again to run \
+                     recovery; a supervisor will not necessarily restart it for you."
+                );
             }
         }
     }
 
+    // 4. Only now tear down the workers. Releasing needs nothing but the job id, so keeping
+    //    them alive until this point costs nothing and lets the drain path finish real work.
+    // BOUNDED, for the same reason as the [F4] hard-kill reap: `shutdown_all` phase 4 takes a
+    // BLOCKING slot lock while phases 2/3 skip any slot whose `pid` is momentarily 0 (the
+    // dispatcher's respawn/recycle window), so it can block for a whole proof (up to the 600s
+    // watchdog). On a SUPERVISED stop there is no third signal to reach the bounded copy, and
+    // the [F5] exit code below is gated behind this call — an unbounded reap means the
+    // supervisor SIGKILLs us before EX_TEMPFAIL is ever delivered and the sp1-gpu-server
+    // grandchild keeps its VRAM anyway. Off-thread so it also can't block a runtime worker.
+    {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            if let Some(pool) = zkminer_prover::engine::worker_pool() {
+                tracing::info!("shutting down worker pool");
+                pool.shutdown_all();
+            }
+            let _ = done_tx.send(());
+        });
+        if tokio::time::timeout(std::time::Duration::from_secs(10), done_rx).await.is_err() {
+            tracing::warn!(
+                "worker reap did not finish in 10s — exiting anyway; check for an orphaned \
+                 sp1-gpu-server holding VRAM."
+            );
+        }
+    }
+    brain_handle.abort();
+    refresh_handle.abort();
+
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
     Ok(())
 }
 
@@ -821,6 +1766,18 @@ impl Drop for SlotGuard {
     }
 }
 
+/// `f64::min`-fold helper: an empty fold yields INFINITY, which downstream would read as
+/// "infinitely fast" rather than "unknown". Collapse any non-finite result to a caller-chosen
+/// sentinel so the unknown case stays explicit.
+trait FiniteOr {
+    fn pipe_finite_or(self, fallback: f64) -> f64;
+}
+impl FiniteOr for f64 {
+    fn pipe_finite_or(self, fallback: f64) -> f64 {
+        if self.is_finite() { self } else { fallback }
+    }
+}
+
 /// Core miner brain: evaluates open jobs, claims, proves, and fulfills.
 ///
 /// On startup, loads the on-disk job journal and reconciles each claimed
@@ -839,12 +1796,15 @@ async fn miner_brain(
     token_price_usd: f64,
     skip_benchmark_gate: bool,
     recovery_lookback: u64,
+    journal: SharedJournal,
+    // Startup value, for the banner only. The loop reads the LIVE setting each tick so the
+    // settings screen can change it — do not use this for decisions.
+    initial_queue_horizon: Duration,
 ) {
-    // Load journal + recover previously-claimed jobs from prior runs. Recovery
+    // Journal is owned by `run()` (see [B2]) so the shutdown path can read it. Recovery
     // reconciles the on-disk journal AND scans the chain for locked positions the
     // journal never captured (crash before write, cleared journal, other machine),
     // so it always runs — not only when the journal is non-empty.
-    let journal: SharedJournal = Arc::new(Mutex::new(JobJournal::load()));
     {
         let n = journal.lock().unwrap_or_else(|p| p.into_inner()).entries.len();
         if n > 0 {
@@ -933,8 +1893,42 @@ async fn miner_brain(
     // neither resync nor reserve can heal. Every WEDGE_CHECK_TICKS we probe for the gap;
     // only when the SAME gap PERSISTS across two probes (so a transient reserved-but-unsent
     // nonce isn't mistaken for a hole) do we fill it with a self-transfer.
-    const WEDGE_CHECK_TICKS: u64 = 12; // ~60s
-    let mut last_gap: Option<u64> = None;
+    const WEDGE_CHECK_TICKS: u64 = 12; // ~60s between probes (iteration count, see below)
+    /// A nominated hole must survive at least this long in WALL CLOCK before it is filled.
+    const WEDGE_MIN_PERSIST: std::time::Duration = std::time::Duration::from_secs(45);
+    // (nonce, when it was FIRST seen) — see the WEDGE_MIN_PERSIST gate below.
+    let mut last_gap: Option<(u64, std::time::Instant)> = None;
+    // [queue] Per-device backlog, so look-ahead admission can ask "when would this job
+    // actually START" instead of assuming now. Self-correcting: entries decay with the wall
+    // clock and are dropped on completion, so a wrong estimate cannot accumulate.
+    // [cycles] Descriptor hash -> MEASURED cycle count, from executing the guest.
+    //
+    // Keyed on the descriptor hash, not the program id: cycles depend on the INPUT as well as
+    // the program, and the descriptor hash covers both. Same descriptor => same execution =>
+    // same count, so one measurement is valid forever.
+    //
+    // This exists because `expectedCycles` is submitter-declared and, on the observed market,
+    // always zero (298/298 jobs) — leaving a 34e6 constant that is ~8x below the measured
+    // median. Declaring it honestly costs the submitter a bond that scales with the count
+    // (~1 HEMI per 9M cycles), so an empty field is the rational default and will stay that
+    // way. Measuring it ourselves is the only reliable source.
+    // Shared so the background measurement task below can populate it while the brain runs.
+    let measured_cycles: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, u64>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // Descriptors already being measured, so N sightings of the same job spawn ONE execution.
+    let measuring: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut queue_model = zkminer_strategy::queue::QueueModel::new();
+    let mut queue_last_tick = std::time::Instant::now();
+    if !initial_queue_horizon.is_zero() {
+        tracing::info!(
+            "queue look-ahead: up to {}s of work queued per GPU (deadline-checked from the \
+             start time each job would actually get)",
+            initial_queue_horizon.as_secs()
+        );
+    }
 
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
@@ -944,21 +1938,98 @@ async fn miner_brain(
         // Reap finished job tasks before re-evaluating the concurrency budget.
         while let Ok(jid) = done_rx.try_recv() {
             in_flight.remove(&jid);
+            queue_model.settle(&jid.0);
+        }
+        {
+            // Advance the backlog model by real elapsed time, not by tick count: the brain
+            // loop awaits `recover_claimed_jobs` inline and can stall for minutes, and a
+            // count-based decay would leave stale work blocking a device that is long idle.
+            let now = std::time::Instant::now();
+            queue_model.tick(now.duration_since(queue_last_tick));
+            queue_last_tick = now;
         }
 
         // [nonce-review round 4] Nonce-gap watchdog (persistence-gated).
-        if tick_count % WEDGE_CHECK_TICKS == 0 {
-            match client.nonce_gap_frontier().await {
-                Ok(Some(gap)) if last_gap == Some(gap) => {
-                    // Same hole seen twice → real wedge → fill it.
-                    match client.heal_nonce_gap().await {
-                        Ok(true) => { last_gap = None; }
-                        Ok(false) => {} // fill not confirmed; retry next window
-                        Err(e) => tracing::warn!("nonce gap-fill failed: {e:#}"),
+        // [A1] Not during shutdown. The ABANDON stage guards its own heal with
+        // `frontier_has_executable_tx` precisely because a heal bids >= 4x base and would
+        // replace our own still-mineable releaseJob with a 0-value self-transfer — stranding
+        // exactly the nearest-deadline job it was trying to save. That guard was applied to
+        // one of the two heal call sites; this is the other one, and the brain deliberately
+        // keeps running through the drain, so it can fire mid-abandon. The abandon stage does
+        // its own guarded heal, so skipping here loses nothing.
+        if tick_count % WEDGE_CHECK_TICKS == 0 && !SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            // [#6a] Persist on ELAPSED TIME, not on two sightings.
+            //
+            // `WEDGE_CHECK_TICKS` counts loop ITERATIONS of a 5s `tokio::time::interval`
+            // whose default missed-tick behaviour is Burst, and `recover_claimed_jobs` awaits
+            // `process_job_lifecycle` INLINE in this same loop. A long recovery pass therefore
+            // replays the whole backlog at one instant, and two "sightings 60s apart" can land
+            // microseconds apart. That voids the invariant the ungated watchdog heal rests on
+            // — "a legit unsent reservation is sent within a tick, so a wedge that survives
+            // ~90s is a real hole" — and turns the persistence gate into no gate at all.
+            // A SEND-FREE EXIT from the exhausted-fee-cap state.
+            //
+            // `exhausted` is derived from purely local state (the recorded fee floor), and
+            // the only thing that can invalidate it is chain truth. But the bail arms give
+            // up BEFORE `tx.send()`, so no job path will ever learn that the resident tx
+            // finally mined -- the very send that ended the 2026-08-14 incident at
+            // 02:42:22 ("nonce too low: next nonce 11592" -> resync) no longer happens.
+            // Without this, a jam that used to self-heal in 4h24m self-heals only if some
+            // concurrent task happens to draw a fresh nonce and observe an error.
+            //
+            // One `eth_getTransactionCount(latest)` per WEDGE_CHECK_TICKS is enough:
+            // `resync` prunes `fee_floor`, `freed`, `aborted_at` AND `undisplaceable`
+            // below the mined frontier, so the moment the resident mines both the
+            // exhaustion and the jam evaporate. Deliberately NOT inside the bail arms:
+            // those run inside the `tx_lock` block expression and would hold the signer
+            // lock across an RPC.
+            // UNCONDITIONAL, deliberately not gated on `signer_is_jammed()`. Gating the
+            // probe on the jam made the only thing that can DISPROVE the jam conditional
+            // on believing in it -- and since the TTL sweep inside `is_jammed` deletes the
+            // record at 120s while nothing can re-create it, the sweep that opened the
+            // gate also switched the probe off. One `eth_getTransactionCount(latest)` per
+            // WEDGE_CHECK_TICKS is cheaper than the `nonce_gap_frontier` read below.
+            let jammed_before = client.jammed_nonce();
+            match client.resync_nonce().await {
+                Ok(chain) => {
+                    if let Some(j) = jammed_before {
+                        if chain > j {
+                            // AUTHORITATIVE clear. The TTL is only a backstop for "the
+                            // probe could not run"; chain truth outranks it.
+                            client.clear_jammed_nonce(j);
+                            tracing::info!(
+                                "signer jam at nonce {j} cleared — the frontier has passed it \
+                                 (chain={chain})"
+                            );
+                        } else {
+                            // Chain truth CONFIRMS the jam is still real, so refresh the
+                            // record. Without this the TTL means "time since first seen"
+                            // and the gate silently forgets a live wedge after 120s.
+                            client.refresh_jammed_nonce(j);
+                        }
                     }
                 }
-                Ok(Some(gap)) => last_gap = Some(gap), // first sighting; confirm next window
-                Ok(None) => last_gap = None,           // no gap
+                Err(e) => tracing::warn!("nonce resync probe failed: {e:#}"),
+            }
+
+            match client.nonce_gap_frontier().await {
+                Ok(Some(gap)) => match last_gap {
+                    Some((g, first_seen))
+                        if g == gap && first_seen.elapsed() >= WEDGE_MIN_PERSIST =>
+                    {
+                        // [#1] Same hole, and it has genuinely persisted → fill THIS nonce.
+                        match client.heal_nonce_gap_at(gap).await {
+                            Ok(true) => last_gap = None,
+                            Ok(false) => {} // fill not confirmed; retry next window
+                            Err(e) => tracing::warn!("nonce gap-fill failed: {e:#}"),
+                        }
+                    }
+                    // Same hole but not yet old enough. KEEP the original instant — load
+                    // bearing: refreshing it would let a tick burst reset the clock forever.
+                    Some((g, _)) if g == gap => {}
+                    _ => last_gap = Some((gap, std::time::Instant::now())),
+                },
+                Ok(None) => last_gap = None, // no gap
                 Err(e) => tracing::debug!("nonce gap probe failed: {e:#}"),
             }
         }
@@ -1008,8 +2079,22 @@ async fn miner_brain(
                     if due_deferred && !due_periodic { ", deferred-retry" } else { "" }
                 );
                 last_recovery_tick = tick_count;
-                recovery_deferred =
-                    recover_claimed_jobs(&client, &state, &journal, proving_timeout, recovery_lookback).await;
+                // [B5] Do not START a new recovery pass once shutdown has begun. Recovery
+                // drives `process_job_lifecycle` INLINE, so a pass begun here would add work
+                // the drain then has to wait for — and the `paused` gate below is checked
+                // AFTER this block, so it does not cover us.
+                // Gate on SHUTTING_DOWN, not `paused`: `paused` is also the TUI's operator
+                // pause toggle, and recovery is the ONLY thing that still releases a job whose
+                // earlier release failed on RPC (its breadcrumb is retained but it is gone from
+                // `active_jobs`). Keying this on `paused` let a routine operator pause silently
+                // disable that rescue until the lock deadline passed.
+                if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                    tracing::info!("recovery skipped — shutting down");
+                    recovery_deferred = false;
+                } else {
+                    recovery_deferred =
+                        recover_claimed_jobs(&client, &state, &journal, proving_timeout, recovery_lookback).await;
+                }
                 // Escalate the back-off on repeated deferrals; reset once a pass completes.
                 consecutive_defers = if recovery_deferred {
                     consecutive_defers.saturating_add(1)
@@ -1026,18 +2111,75 @@ async fn miner_brain(
             }
         }
 
-        let (paused, open_jobs, max_concurrent, benchmarks, stake_info) = {
+        let (paused, open_jobs, max_concurrent, queue_horizon, benchmarks, stake_info) = {
             let s = state.read().await;
             (
                 s.paused,
                 s.open_jobs.clone(),
                 s.runtime_settings.max_concurrent_proofs.max(1),
+                // LIVE, not the startup value: the settings screen can change this while the
+                // miner runs, exactly like max_concurrent_proofs. Reading the constructor
+                // parameter here would leave the control decorative.
+                std::time::Duration::from_secs(s.runtime_settings.queue_horizon_secs),
                 s.benchmark_results.clone(),
                 s.stake_info.clone(),
             )
         };
 
-        if paused || open_jobs.is_empty() || in_flight.len() >= max_concurrent {
+        if paused || open_jobs.is_empty() {
+            continue;
+        }
+        // The hard concurrency cap still applies: look-ahead queues CLAIMS, it does not run
+        // more proofs at once. With the horizon at zero this is exactly the old gate.
+        // The 3x ceiling is EARNED by look-ahead admission, so it must ride the same
+        // predicate. Gating the ceiling on the horizon alone while gating admission on the
+        // horizon AND having device rows left a wedge: no gpu benchmark rows means the planner
+        // never runs, yet the ceiling was still tripled — 3x capacity with nothing checking
+        // start time, which is strictly worse than the feature being off. Reachable on this
+        // box from a single NVIDIA driver bump: the benchmark cache is fingerprinted on driver
+        // version, a mismatch discards it, and the synthetic fallback carries no device rows.
+        //
+        // `.any(gpu)` and not `!is_empty()`: the suite on this rig has three cpu rows, which
+        // the slot builder drops.
+        let planner_active = !queue_horizon.is_zero()
+            && benchmarks.as_ref().is_some_and(|b| {
+                b.device_benchmarks.iter().any(|d| d.device_id.starts_with("gpu"))
+            });
+        let claim_ceiling = if !planner_active {
+            max_concurrent
+        } else {
+            // Enough headroom to hold the horizon's worth of work in reserve, bounded so a
+            // mis-estimate cannot run away and lock unbounded collateral.
+            max_concurrent.saturating_mul(3)
+        };
+        if in_flight.len() >= claim_ceiling {
+            continue;
+        }
+
+        // Do not take on new collateral while the signer is JAMMED by an undisplaceable
+        // nonce: nothing at or above it can mine, so a claim bonds collateral that no
+        // fulfill and no release can free. On 2026-08-14 a 4h24m jam let three jobs age
+        // past their lock deadline exactly this way, and past the deadline `releaseJob`
+        // REVERTS, so the collateral is stranded outright.
+        //
+        // Gated HERE, before the candidate loop, rather than after it: the loop DELETES
+        // each admitted job from `state.open_jobs` (which is fed by a forward-only monitor
+        // stream with no re-discovery), so discarding a built batch permanently drops
+        // those jobs -- and since candidates are sorted by descending price, it drops the
+        // most valuable ones first, for the life of the process. Gating early also skips
+        // the per-tick Multicall3 and adapter reads that would be spent building a batch
+        // we would only throw away.
+        //
+        // This gates only NEW work. Jobs already held keep being driven: their fulfill can
+        // still land the moment the jam clears, and that is the outcome worth protecting.
+        if client.signer_is_jammed() {
+            if tick_count % WEDGE_CHECK_TICKS == 0 {
+                tracing::warn!(
+                    "signer jammed at nonce {:?} — not claiming new work until it clears; \
+                     held jobs continue",
+                    client.jammed_nonce()
+                );
+            }
             continue;
         }
 
@@ -1128,6 +2270,28 @@ async fn miner_brain(
             }
         };
 
+        // [queue] GPU rows of the benchmark suite, as (dispatcher-visible id, cycles/sec).
+        // Keyed on the BENCHMARK device id (`gpu0`), not the dispatcher's (`risc0:cuda:0`):
+        // the model only needs stable, distinct keys, and these are what carry a throughput.
+        // A GPU with no benchmark row still appears, with 0.0, so the planner falls back to
+        // the suite average rather than silently excluding it.
+        let device_throughputs: Vec<(String, f64)> = {
+            let mut v: Vec<(String, f64)> = Vec::new();
+            for d in &benchmarks.device_benchmarks {
+                if !d.device_id.starts_with("gpu") {
+                    continue; // CPU rows are not proving slots here
+                }
+                match v.iter_mut().find(|(id, _)| *id == d.device_id) {
+                    // Several backends per device; keep the fastest, which is what the
+                    // dispatcher would pick for this job.
+                    Some((_, t)) => *t = t.max(d.throughput),
+                    None => v.push((d.device_id.clone(), d.throughput)),
+                }
+            }
+            v
+        };
+
+
         // Available collateral for NEW claims this tick = on-chain available MINUS our
         // in-flight reservations. This is deliberately FAIL-SAFE (it can under-count but
         // never over-commit), for a subtle reason:
@@ -1185,6 +2349,15 @@ async fn miner_brain(
         // job we had to skip purely for lack of available collateral — so an idle
         // miner tells the operator WHY (the per-job eval reason is DEBUG-only).
         let mut claimed_this_tick = false;
+        // [headroom] Collateral reserved by claims made THIS tick. `stake_info` is a
+        // tick-start snapshot and is never re-read, so it does not reflect them; pairing it
+        // with a post-claim `in_flight.len()` would count each claim twice.
+        let mut reserved_this_tick: u128 = 0;
+        // [headroom] Was ANY job affordable on collateral alone? NOT the same as
+        // `claimed_this_tick`: `Recommendation::Claim` also requires profit, risk and
+        // deadline feasibility, so a rich wallet that skips on profit would otherwise report
+        // "0 of N slots fundable — stake more".
+        let mut any_affordable = false;
         let mut cheapest_collateral_block: Option<u128> = None;
         let mut collateral_blocked_count: usize = 0;
 
@@ -1328,8 +2501,17 @@ async fn miner_brain(
             // Estimated cycles: trust the on-chain `expectedCycles` when set; otherwise
             // use a conservative fallback tuned to the largest canonical benchmark so
             // the evaluator errs on the side of declaring infeasible jobs infeasible.
+            // Preference order: the submitter's declaration, then our own MEASUREMENT, then
+            // the constant. A measured value beats the constant by ~8x in accuracy; the
+            // declaration is preferred only because it is backed by the submitter's bond.
             let estimated_cycles = if snapshot.expected_cycles > 0 {
                 snapshot.expected_cycles
+            } else if let Some(c) = measured_cycles
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&snapshot.descriptor_hash).copied())
+            {
+                c
             } else {
                 FALLBACK_ESTIMATED_CYCLES
             };
@@ -1423,6 +2605,11 @@ async fn miner_brain(
             // `deadline_feasible` avoids telling the operator to stake more for jobs
             // that would miss their deadline anyway (the evaluator reports the
             // collateral reason first, before checking the deadline).
+            // [headroom] Collateral alone was enough for this job, whatever else decided it.
+            // Distinguishes "we have no money" from "we declined on profit/risk/deadline".
+            if eval.collateral_sufficient {
+                any_affordable = true;
+            }
             if !eval.collateral_sufficient && eval.deadline_feasible {
                 collateral_blocked_count += 1;
                 cheapest_collateral_block = Some(
@@ -1430,7 +2617,160 @@ async fn miner_brain(
                         .map_or(required_collateral, |c| c.min(required_collateral)),
                 );
             }
-            if matches!(eval.recommendation, Recommendation::Claim) {
+            // [queue] Look-ahead admission. `evaluate_job` above answered "is this job worth
+            // doing and could it finish if it started NOW". That second half is exactly the
+            // assumption queueing breaks, so re-ask it against the start time the job would
+            // actually get. With `queue_horizon_secs = 0` the planner admits only an idle
+            // device, which is the historical one-job-per-GPU behaviour.
+            //
+            // Refusing here is NOT the same as `Recommendation::Skip`: the job may be perfectly
+            // profitable and simply not fit our queue yet, so it must not count toward the
+            // collateral-starvation signals below.
+            // The planner is ACTIVE only when look-ahead is on AND we actually know what the
+            // devices can do. Both guards are load-bearing:
+            //   * horizon 0 is the documented default and must behave exactly as before;
+            //   * `device_throughputs` is EMPTY in three shipped configurations — a fresh
+            //     install (skip_benchmark_gate defaults true, so the synthetic suite carries
+            //     no device rows and nothing auto-benchmarks headless), a CPU-only rig, and
+            //     any cached suite predating the field.
+            // Without this, `plan_admission` returned NoUsableDevice for every job forever and
+            // the miner claimed NOTHING, at the default config, visible only in a debug line.
+            // [round-2] Never queue AHEAD on a job whose cycle count we do not know.
+            //
+            // Measured across two soaks: 298 of 298 evaluations had `expected_cycles == 0`, so
+            // `estimated_cycles` was always FALLBACK_ESTIMATED_CYCLES (34e6). That estimates
+            // 14.9s on gpu0 against a real median of 123s — 8x under. The committed backlog
+            // then decays to zero within a few brain ticks while the proof runs for another
+            // ~100-290s, so `slots()` reports a busy card as idle, `HorizonFull` and
+            // `DeadlineInfeasible` become unreachable, and the ONLY surviving bound is the
+            // tripled ceiling. That is 3x depth gated by a start-now check — exactly the
+            // shape that loses collateral.
+            //
+            // A declared cycle count is the planner's whole input. Without one, fall through
+            // to the pre-feature idle-device rule rather than queue on a fiction.
+            // Measured counts as measurable: the planner needs a real number, and it does not
+            // care whether the submitter declared it or we executed the guest ourselves.
+            let measurable = snapshot.expected_cycles > 0
+                || measured_cycles
+                    .lock()
+                    .map(|m| m.contains_key(&snapshot.descriptor_hash))
+                    .unwrap_or(false);
+
+            // [cycles] Never measured this descriptor and the submitter did not declare one?
+            // Run the guest through the RISC-V executor in the background to learn its TRUE
+            // cycle count, so the NEXT sighting of this descriptor can be planned on a real
+            // number instead of the 34e6 constant. Deliberately does not block this tick:
+            // the job in front of us is claimed (or not) on today's information, and the
+            // measurement improves every future decision about the same work. The market
+            // recycles a small set of descriptors, so one execution each buys accurate
+            // sizing for everything that follows.
+            if !measurable {
+                let dh = snapshot.descriptor_hash;
+                let fresh = measuring.lock().map(|mut m| m.insert(dh)).unwrap_or(false);
+                if fresh {
+                    let (c2, st2, cache, inflight) = (
+                        client.clone(),
+                        state.clone(),
+                        measured_cycles.clone(),
+                        measuring.clone(),
+                    );
+                    let pid = job.info.program_id;
+                    tokio::spawn(async move {
+                        let outcome = measure_cycles(&c2, &st2, jid, dh, pid).await;
+                        match outcome {
+                            Ok(cycles) => {
+                                tracing::info!(
+                                    "measured {} cycles for descriptor {} by execution — \
+                                     future jobs with this descriptor will be sized on it",
+                                    cycles,
+                                    short_id(dh)
+                                );
+                                if let Ok(mut m) = cache.lock() {
+                                    m.insert(dh, cycles);
+                                }
+                            }
+                            Err(e) => tracing::debug!(
+                                "cycle measurement for {} failed: {e:#}",
+                                short_id(dh)
+                            ),
+                        }
+                        // Always clear the in-flight marker, so a transient failure does not
+                        // permanently prevent a retry.
+                        if let Ok(mut m) = inflight.lock() {
+                            m.remove(&dh);
+                        }
+                    });
+                }
+            }
+            // A bypassed claim occupies a GPU without being committed to the model, so the
+            // model then UNDER-reports that device and the planner would place a later job as
+            // though the card were idle — void at depth 1, not just depth 2. Refuse to plan
+            // against a model we know is incomplete rather than plan against a fiction.
+            let model_complete = queue_model.outstanding() == in_flight.len();
+            let admission = if planner_active
+                && measurable
+                && model_complete
+                && matches!(eval.recommendation, Recommendation::Claim)
+            {
+                let slots = queue_model.slots(&device_throughputs);
+                match zkminer_strategy::queue::plan_admission(
+                    &slots,
+                    queue_horizon,
+                    params.estimated_cycles,
+                    std::time::Duration::from_secs(time_remaining),
+                    deadline_safety_margin,
+                    // Fallback for a GPU with no benchmark row. Deliberately NOT
+                    // `average_throughput()`: that averages the 18 canonical results
+                    // INCLUDING cpu rows and comes out at ~3.03M cycles/s on this rig —
+                    // 2.11x the 4090's measured 1.44M. An unbenchmarked GPU would be modelled
+                    // as more than twice as fast as the slowest real card, so its estimate
+                    // would be under half the true duration and the deadline check would
+                    // admit work that cannot finish. Use the SLOWEST known GPU instead: for
+                    // an unknown device, pessimistic is the only safe direction.
+                    // NB: 0.0 when nothing is known, NOT infinity — an empty `min` fold
+                    // yields INFINITY, which would make every estimate zero-duration and
+                    // admit without limit. `plan_admission` treats 0.0 as NoUsableDevice and
+                    // refuses, which is the correct answer when we cannot estimate at all.
+                    device_throughputs
+                        .iter()
+                        .map(|(_, t)| *t)
+                        .filter(|t| t.is_finite() && *t > 0.0)
+                        .fold(f64::INFINITY, f64::min)
+                        .pipe_finite_or(0.0),
+                ) {
+                    Ok(a) => Some(a),
+                    Err(reason) => {
+                        // HorizonFull is the healthy saturated state; log the others, which
+                        // mean we are being offered work this rig cannot serve.
+                        if !matches!(reason, zkminer_strategy::queue::Rejection::HorizonFull) {
+                            tracing::debug!(
+                                "queue: not admitting {} ({:?}, cycles={}, {}s left)",
+                                short_id(jid), reason, params.estimated_cycles, time_remaining,
+                            );
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // When the planner is inactive the old gate is the whole gate: `claim_ceiling`
+            // equals `max_concurrent`, so this is byte-for-byte the pre-feature behaviour.
+            // A BYPASSED claim never faced `plan_admission`, so it has not earned the
+            // look-ahead headroom and must be held to the pre-feature cap.
+            //
+            // The previous version asserted exactly this in prose and did not deliver it:
+            // `claim_ceiling` rides `planner_active`, which is per-TICK, while `measurable` is
+            // per-JOB. On the only market ever observed — 298/298 jobs declaring zero cycles —
+            // turning the horizon on gave `claim_ceiling = max_concurrent * 3` with
+            // `plan_admission` never called and `queue_model` permanently empty: 3x claim depth and ZERO
+            // admission checking, strictly worse than the feature being off. That is the shape
+            // the round-2 fold graded critical and believed it had closed.
+            let queue_bypass = !planner_active || !measurable;
+            if (admission.is_some() || (queue_bypass && in_flight.len() < max_concurrent))
+                && matches!(eval.recommendation, Recommendation::Claim)
+            {
                 claimed_this_tick = true;
                 // Reserve the slot + collateral NOW (like the single-claim path always
                 // did): inserting into in_flight immediately makes the loop-top
@@ -1440,6 +2780,23 @@ async fn miner_brain(
                 // dispatched after the loop; a job that doesn't actually lock has its
                 // slot freed (done_tx) by the dispatch.
                 in_flight.insert(jid, required_collateral);
+                // [queue] Commit the admission to the backlog model, paired with the
+                // `in_flight` insert so the two can never disagree about what is outstanding.
+                // Without this the backlog stays at zero, every device looks idle, and the
+                // horizon check admits without limit — the one bug that would turn look-ahead
+                // into unbounded collateral lock-up. `settle` runs off the same done channel
+                // that removes from `in_flight`, and the dispatch path frees a job that fails
+                // to lock via `done_tx`, so both maps drain together.
+                if let Some(a) = &admission {
+                    // The FINISH OFFSET, not the work duration. `tick` decays every entry by
+                    // elapsed wall time, which is only meaningful for "time until this job
+                    // finishes"; storing work duration and SUMMING made a device holding k
+                    // jobs shed k seconds of modelled backlog per wall second, so the
+                    // planner's one invariant — feasible from the start it would actually get
+                    // — was void at any depth >= 2, i.e. the feature's own steady state.
+                    queue_model.commit(jid.0, &a.device_id, a.finishes_in);
+                }
+                reserved_this_tick = reserved_this_tick.saturating_add(required_collateral);
                 available_collateral = available_collateral.saturating_sub(required_collateral);
                 {
                     let mut s = state.write().await;
@@ -1450,13 +2807,71 @@ async fn miner_brain(
                 // Bound to free proving slots (never lock more than we can prove before
                 // their deadlines) and to the contract's MAX_BATCH_SIZE. in_flight now
                 // includes this tick's collected jobs, so its length is the capacity gate.
-                if in_flight.len() >= max_concurrent || batch.len() >= MAX_CLAIM_BATCH {
+                if in_flight.len() >= claim_ceiling || batch.len() >= MAX_CLAIM_BATCH {
                     break;
                 }
             }
         }
 
         // ── Dispatch the collected claim batch ───────────────────────────────────
+        // [B5] Re-check `paused` HERE. The snapshot taken at the top of this tick is many
+        // awaits old (the candidate status multicall + per-system adapter fetches), and since
+        // [B5] the brain is no longer aborted when shutdown begins — so a signal landing
+        // inside that window would let this straddling tick lock BRAND NEW collateral during
+        // the drain, which a 6s supervised budget can never fulfil. Nothing on-chain has
+        // happened yet (the breadcrumb and the tx both come after this point), so dropping
+        // the batch just returns the reserved slots.
+        if !batch.is_empty() && state.read().await.paused {
+            tracing::info!(
+                "shutdown began mid-tick — dropping {} pending claim(s), nothing locked",
+                batch.len()
+            );
+            // Put the candidates BACK. `state.open_jobs` is fed by a forward-only monitor
+            // stream with no re-discovery (see the collection loop), so a job removed here
+            // and not restored is gone for the life of the process -- and candidates are
+            // price-sorted descending, so this drops the most valuable ones first.
+            {
+                let mut s = state.write().await;
+                for (job, _, _) in batch.drain(..) {
+                    let jid = job.info.job_id;
+                    if !s.open_jobs.iter().any(|j| j.info.job_id == jid) {
+                        s.open_jobs.push(job);
+                    }
+                    let _ = done_tx.send(jid); // free the reserved in_flight slot
+                }
+            }
+            continue;
+        }
+        // Do not take on new collateral while the signer is JAMMED by an undisplaceable
+        // nonce. Nothing at or above that nonce can mine, so a claim here bonds collateral
+        // that no fulfill and no release can free -- on 2026-08-14 a 4h24m jam at nonce
+        // 11589 let three jobs age past their lock deadline exactly this way, and past the
+        // deadline releaseJob reverts, so the collateral is stranded outright.
+        //
+        // This gates only NEW work. Jobs already held keep being driven: their fulfill can
+        // still land the moment the jam clears, and that is the outcome worth protecting.
+        // Defence in depth: the primary gate is above the candidate loop. Reaching here
+        // means the jam arrived DURING this tick's collection, so the batch is already
+        // built and those jobs are already out of `open_jobs`.
+        if !batch.is_empty() && client.signer_is_jammed() {
+            tracing::warn!(
+                "signer jammed at nonce {:?} mid-tick — dropping {} pending claim(s) rather \
+                 than bonding collateral we cannot release; held jobs continue",
+                client.jammed_nonce(),
+                batch.len()
+            );
+            {
+                let mut s = state.write().await;
+                for (job, _, _) in batch.drain(..) {
+                    let jid = job.info.job_id;
+                    if !s.open_jobs.iter().any(|j| j.info.job_id == jid) {
+                        s.open_jobs.push(job);
+                    }
+                    let _ = done_tx.send(jid);
+                }
+            }
+            continue;
+        }
         if !batch.is_empty() {
             // [#10c] We passed the rate-limit pause + freshness gates and are claiming, so
             // the endpoint is healthy again → decay the escalated claim-pause window to base.
@@ -1534,6 +2949,25 @@ async fn miner_brain(
                         tx: done_tx_c.clone(),
                     };
 
+                    // [B5] Shutdown began between the brain's pre-dispatch `paused` gate and
+                    // this task's first RPC (spawn scheduling + `claim_job_batch`'s throttled
+                    // pre-send round trips are seconds wide). Nothing is on-chain yet, so drop
+                    // the intent breadcrumbs and bail BEFORE the broadcast: a claim landing now
+                    // locks brand-new collateral on an exiting process, and ABANDON cannot free
+                    // it (`release_and_clean` deliberately RETAINS a `Claiming` breadcrumb whose
+                    // claim tx is still pending), so it would ride to its lock deadline.
+                    if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                        tracing::warn!(
+                            "shutdown began before claimJobBatch broadcast — dropping {} pending \
+                             claim(s), nothing locked",
+                            jids.len()
+                        );
+                        for jid in &jids {
+                            journal_update(&journal_c, |jj| jj.remove(*jid));
+                        }
+                        return; // `reclaim` still holds every jid → its Drop frees the slots
+                    }
+
                     let batch_result = client_c.claim_job_batch(&jids).await;
 
                     // Reconcile per-job outcomes (partial-completion / lost races aren't
@@ -1600,6 +3034,32 @@ async fn miner_brain(
                         locked.len(), jids.len(), not_ours.len(), unknown
                     );
 
+                    // [B5] Shutdown began while this speculative batch was in flight. The
+                    // brain-side gate only stops a batch that has not been SPAWNED yet;
+                    // nothing stopped one already running, and this task lives ~100s (the
+                    // 90s claim wall cap plus the 3x3s reconcile). Do NOT dispatch lifecycles
+                    // now: the `unknown` branch below re-attempts a FRESH claim
+                    // (`claim_job_idempotent` claims when the view still reads open), locking
+                    // brand-new collateral on a process that is about to exit, and a `locked`
+                    // job cannot finish a multi-minute prove inside the drain budget. Every
+                    // breadcrumb is already recorded, so the abandon path (and, failing that,
+                    // recovery after the EX_TEMPFAIL restart) releases whatever we hold.
+                    if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                        tracing::warn!(
+                            "shutdown began mid-batch-claim — not dispatching {} lifecycle(s); \
+                             held job(s) left to the abandon path",
+                            batch_jobs.len()
+                        );
+                        for (job, _, _) in &batch_jobs {
+                            // Confirmed NOT ours: drop the breadcrumb so it can't inflate the
+                            // recoverable count. Locked/unknown keep theirs.
+                            if not_ours.contains(&job.info.job_id) {
+                                journal_update(&journal_c, |jj| jj.remove(job.info.job_id));
+                            }
+                        }
+                        // `reclaim` still holds every jid, so its Drop frees the slots.
+                        return;
+                    }
                     for (job, snapshot, _collateral) in batch_jobs {
                         let jid = job.info.job_id;
                         // Dispatched now (to a lifecycle SlotGuard or done_tx below), so the
@@ -1650,19 +3110,120 @@ async fn miner_brain(
         // → warn (throttled). The per-job eval reason is DEBUG-only, so without this an
         // idle miner gives no clue why. Only fires when at least one job was skipped
         // specifically for collateral (early skips / lost races don't trigger it).
-        if !claimed_this_tick {
+        // [headroom] Was `if !claimed_this_tick`, which only ever detected TOTAL starvation:
+        // in PARTIAL starvation the miner still funds one claim, so the flag was true on
+        // essentially every tick and the warning was suppressed. Live on 2026-08-08 that hid a
+        // 4.25 HEMI shortfall for hours — 2 GPUs, in_flight never above 1/2, 2,851 DEBUG skips
+        // and ZERO warnings, while 444,804 HEMI sat unstaked in the wallet.
+        //
+        // The capacity test below fires on partial starvation too. It is computed from the
+        // ON-CHAIN available figure, NOT the loop residual in scope here: `locked` already
+        // includes live in-flight locks (measured: in_flight 2/2 -> locked = baseline + 2x),
+        // and the brain deliberately subtracts them AGAIN as the documented D17 fail-safe, so
+        // the residual under-reports by up to a full reservation and would over-warn.
+        // Whether the headroom branch produced a verdict this tick; see the legacy warning
+        // below for why that suppresses it.
+        let mut headroom_reported = false;
+        {
+            let on_chain_avail = stake_info
+                .as_ref()
+                .map(|si| si.available_collateral)
+                .unwrap_or(0);
+            // Never advise staking for slots no GPU can serve: `resolve_max_concurrent`
+            // returns an explicit config value as-is and does not clamp to detected cards.
+            // `proving_gpu_count()` floors at 1, so a CPU-only box and a 1-GPU box are
+            // indistinguishable here — that floor is why we never advise staking for more
+            // than one slot on a box that reports one.
+            let detected = zkminer_prover::engine::worker_pool()
+                .map(|p| p.proving_gpu_count())
+                .unwrap_or(1)
+                .max(1);
+            let slots_wanted = max_concurrent.min(detected);
+            if let Some(per_claim) = cheapest_collateral_block {
+                let h = zkminer_chain::staking::collateral_headroom(
+                    // Net out this tick's own reservations so `available` and `funded`
+                    // describe the same instant (defect 1).
+                    on_chain_avail.saturating_sub(reserved_this_tick),
+                    per_claim,
+                    in_flight.len(),
+                    slots_wanted,
+                    any_affordable,
+                );
+                // NOTE: `cheapest_collateral_block.is_some()` proves ONE job was blocked on
+                // collateral — it does NOT prove the market was otherwise unaffordable. That
+                // is what `any_affordable` is for.
+                // Publish EVERY tick, not only when starved and not throttled: this is a
+                // status line, not an alert. Throttling it would leave a stale verdict on
+                // screen after the operator fixes the shortfall, and clearing it only on the
+                // warning path would leave "1 of 2" showing forever once the warning
+                // rate-limiter kicked in.
+                headroom_reported = true;
+                {
+                    let mut st = state.write().await;
+                    st.collateral_headroom = Some(zkminer_tui::state::HeadroomView {
+                        fundable: h.fundable,
+                        wanted: h.wanted,
+                        per_claim,
+                        shortfall: h.shortfall,
+                    });
+                }
+                if h.is_starved() {
+                    let now = std::time::Instant::now();
+                    let due = last_collateral_warn
+                        .map_or(true, |t| now.duration_since(t) >= COLLATERAL_WARN_EVERY);
+                    if due {
+                        last_collateral_warn = Some(now);
+                        let stake_cmd = zkminer_chain::staking::fmt_hemi_ceil(h.shortfall);
+                        tracing::warn!(
+                            "{}",
+                            collateral_warning(
+                                h.fundable, h.wanted, on_chain_avail, per_claim, h.shortfall,
+                            )
+                        );
+                        let mut st = state.write().await;
+                        st.add_log(
+                            LogLevel::Warn,
+                            format!(
+                                "Only {fundable}/{wanted} GPU slots fundable — run \
+                                 `zkminer stake {stake_cmd}`",
+                                fundable = h.fundable,
+                                wanted = h.wanted,
+                                stake_cmd = stake_cmd
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        // The legacy total-starvation warning. It shares `last_collateral_warn` with the
+        // headroom branch above, and the headroom branch runs FIRST — so whenever headroom
+        // warned, this is throttled out, and the only ticks it can still reach are the ones
+        // where headroom was NOT starved. It therefore used to appear exclusively next to a
+        // green "Slots fundable 2/2" verdict, quoting a DIFFERENT number for the same word:
+        // its `available_collateral` is the brain's D17 residual, while the dashboard's
+        // Liquid figure beside it is the on-chain value. Two answers for "available", in one
+        // frame, with the alarming one attached to the healthy verdict.
+        //
+        // Suppressed when a headroom verdict exists: that verdict is strictly better
+        // information (it knows how many slots are wanted and what the marginal ask is), and
+        // when it says "not starved" the right conclusion is that this tick's block was a
+        // transient reservation, not something the operator should stake against.
+        if !claimed_this_tick && !headroom_reported {
             if let Some(needed) = cheapest_collateral_block {
                 let now = std::time::Instant::now();
                 let due = last_collateral_warn
                     .map_or(true, |t| now.duration_since(t) >= COLLATERAL_WARN_EVERY);
                 if due {
                     last_collateral_warn = Some(now);
+                    // Labelled "spendable now" rather than "available": this is the residual
+                    // after the D17 fail-safe subtraction, deliberately smaller than both the
+                    // on-chain figure and the dashboard's Liquid line.
                     let avail_hemi = fmt_hemi(available_collateral);
                     let needed_hemi = fmt_hemi(needed);
                     tracing::warn!(
                         "Not claiming — {} open job(s) blocked by insufficient collateral: {} HEMI \
-                         available, cheapest needs {} HEMI. Stake more, or wait for locked collateral \
-                         to release.",
+                         spendable now (after reserving for jobs in flight), cheapest needs {} HEMI. \
+                         Stake more, or wait for locked collateral to release.",
                         collateral_blocked_count,
                         avail_hemi,
                         needed_hemi,
@@ -1671,7 +3232,7 @@ async fn miner_brain(
                     s.add_log(
                         LogLevel::Warn,
                         format!(
-                            "Insufficient collateral: {avail_hemi} HEMI available, cheapest of {collateral_blocked_count} blocked job(s) needs {needed_hemi} HEMI"
+                            "Insufficient collateral: {avail_hemi} HEMI spendable now, cheapest of {collateral_blocked_count} blocked job(s) needs {needed_hemi} HEMI"
                         ),
                     );
                 }
@@ -1803,6 +3364,27 @@ async fn process_job_lifecycle(
     let job_id = job.info.job_id;
     let program_id = job.info.program_id;
 
+    // [B5] Shutdown can begin between `spawn_lifecycle_task` and here. The brain's
+    // pre-dispatch `paused` gate only closes the window up to the SPAWN; this task is
+    // independent (`brain_handle.abort()` never reaches it, and it is not aborted at all) and
+    // runs concurrently with the whole shutdown, so without this a signal landing here
+    // broadcasts a fresh `claimJob` mid-drain — locking BRAND NEW collateral on a process
+    // that is exiting. Worse, for the whole window between the spawn and the breadcrumb at
+    // step 1 (which, with `claim_predicate_jobs=false`, is the predicate descriptor fetch —
+    // bounded only by FETCH_FALLBACK_TIMEOUT, and a config that also FORCES this path) the
+    // job is in neither `active_jobs` nor the journal, so the drain union reads straight past
+    // it and exits "drain complete"/0. Mirrors the batch path's guard. Nothing is on-chain
+    // yet, and `is_recovery` jobs are ALREADY locked so they must still be driven.
+    if !is_recovery && SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::warn!(
+            "shutdown began before claiming {} — dropping, nothing locked",
+            short_id(job_id)
+        );
+        let mut s = state.write().await;
+        s.open_jobs.retain(|j| j.info.job_id != job_id);
+        return Ok(());
+    }
+
     // 0. Predicate-job gate. A job with a non-zero `expectedJournalHash` (Phase-2
     //    predicate) reverts `JournalMismatch` at fulfill unless our proof's public
     //    values reproduce the committed journal — and we'd be slashed on timeout.
@@ -1855,6 +3437,26 @@ async fn process_job_lifecycle(
         }
     }
 
+    // [B5] Re-check HERE, not only at the top of this fn. The guard above runs BEFORE the
+    // predicate gate, whose `fetch_job_descriptor_checked` is bounded only by
+    // FETCH_FALLBACK_TIMEOUT (an open job's snapshot deadline is 0, so `deadline_proof_budget`
+    // yields no clamp) — and `claim_predicate_jobs=false` FORCES every claim onto that path.
+    // For that whole window the job is in neither `active_jobs` nor the journal, so the drain
+    // union reads straight past it, logs "drain complete"/exit 0 and skips ABANDON — while
+    // this task then broadcasts a brand-new claimJob that nothing is left alive to release
+    // (and exit 0 means `Restart=on-failure` never runs recovery either). Nothing is on-chain
+    // yet and there is no await between this load and the breadcrumb below, so dropping is
+    // free. `is_recovery` jobs are ALREADY locked and must still be driven.
+    if !is_recovery && SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::warn!(
+            "shutdown began during the predicate gate for {} — dropping, nothing locked",
+            short_id(job_id)
+        );
+        let mut s = state.write().await;
+        s.open_jobs.retain(|j| j.info.job_id != job_id);
+        return Ok(());
+    }
+
     // 1. Record claim intent BEFORE sending the claim tx, so a crash mid-claim
     //    still leaves breadcrumbs for recovery.
     journal_update(journal, |j| j.record_claim_intent(job_id, snapshot.lock_deadline));
@@ -1862,6 +3464,36 @@ async fn process_job_lifecycle(
     {
         let mut s = state.write().await;
         s.add_log(LogLevel::Info, format!("Claiming job {}...", short_id(job_id)));
+    }
+
+    // [B5] The two shutdown gates above are both `!is_recovery`, but the batch reconcile
+    // dispatches its UNKNOWN class with already_locked=true precisely BECAUSE ownership could
+    // not be established — and for those `claim_job_idempotent` broadcasts a FRESH claimJob
+    // whenever its pre-flight view still reads open. Nothing gates the window between that
+    // dispatch and here (a throttled pre-flight read plus `claim_job`'s retry ladder), so a
+    // signal landing in it locks BRAND-NEW collateral on an exiting process — and ABANDON
+    // cannot free it, because `release_and_clean` correctly RETAINS a pending-claim breadcrumb
+    // rather than releasing a job that reads open. Confirm ownership on-chain before claiming
+    // once shutdown has begun; if we cannot PROVE we hold it, leave it — the breadcrumb
+    // written above stays for ABANDON and for restart recovery. (The job is not in
+    // `active_jobs` yet — that push is at step 3 — so returning here leaves no zombie in the
+    // drain union.) Jobs we genuinely hold proceed exactly as before, at the cost of one extra
+    // view read during shutdown only.
+    if is_recovery && SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+        let held = matches!(
+            client.get_job_status_view(job_id).await,
+            Ok(v) if v.prover == client.address
+        );
+        if !held {
+            tracing::warn!(
+                "shutdown began before {} was confirmed ours — not (re)claiming; left to the \
+                 abandon path",
+                short_id(job_id)
+            );
+            let mut s = state.write().await;
+            s.open_jobs.retain(|j| j.info.job_id != job_id);
+            return Ok(());
+        }
     }
 
     // 2. Claim (idempotent).
@@ -1924,11 +3556,21 @@ async fn process_job_lifecycle(
     {
         let mut s = state.write().await;
         s.open_jobs.retain(|j| j.info.job_id != job_id);
+        // The monitor ingest hardcodes `lock_deadline: 0` (run.rs ~489), so without this
+        // backfill EVERY in-session job carries deadline 0 and the shutdown path's
+        // "nearest deadline first" release ordering sorts on all-zero keys — i.e. does not
+        // order anything, and its past-deadline skip can never fire. `lock_deadline` here is
+        // the authoritative value read from the post-claim status view a few lines above.
+        let mut claimed_info = job.info.clone();
+        claimed_info.lock_deadline = lock_deadline;
         s.active_jobs.push(TrackedJob {
-            info: job.info.clone(),
-            status: MinerJobStatus::Proving { progress: 0.0, elapsed_secs: 0 },
+            info: claimed_info,
+            // Queued, not Proving: this job holds collateral but has not started. Showing it
+            // as "Proving 0%" made a look-ahead queue indistinguishable from real work on a
+            // card, which is precisely what an operator needs to see.
+            status: MinerJobStatus::Queued,
             current_price: view.currentAuctionPrice.to::<u128>(),
-            gpu_index: None,
+            gpu_bus_id: None,
             prover_backend: String::new(),
             estimated_cycles: view.expectedCycles,
         });
@@ -2100,6 +3742,8 @@ async fn process_job_lifecycle(
             } else {
                 FALLBACK_ESTIMATED_CYCLES
             };
+        // Cloned for the progress callback below, which runs on the blocking thread.
+        let state_for_prove_progress = state.clone();
             let (proof_result, used_slot) = match tokio::task::spawn_blocking(move || {
                 let resolve_backend = backend_str.clone();
                 let po2_for_device = move |device_id: &str| -> Option<u8> {
@@ -2120,13 +3764,55 @@ async fn process_job_lifecycle(
                     )
                 };
                 let mut used = None;
+                // [queue] Flip Queued -> Proving the moment the dispatcher actually starts
+                // work. Until now `on_progress` was unused and the status was set to
+                // `Proving { progress: 0.0 }` at CLAIM time, so a job waiting for a card was
+                // indistinguishable from one running on it — which is exactly the thing
+                // look-ahead queueing makes common. This runs on the blocking thread, so a
+                // blocking write is correct here; `try_write` and skip on contention, because
+                // a missed cosmetic transition must never stall a proof.
+                let started_state = state_for_prove_progress.clone();
+                let started_id = job_id;
+                // Exactly ONE Progress message is sent per proof (at start), so unlike a
+                // progress STREAM a single missed lock strands the job in `Queued` for its
+                // whole run with no second chance. Retry briefly rather than fire-and-forget.
+                // Deliberately NOT `blocking_write()`: we are on a blocking thread so it would
+                // be legal, but if any async holder of this lock is itself awaiting this proof
+                // we would deadlock a real proof to fix a cosmetic label. A bounded retry
+                // cannot deadlock and lands the transition in practice.
+                let started_pool = pool.clone();
+                let mark_started = move |_p: f64, slot_key: &str| {
+                    // Which physical card took this job. Resolved through the pool
+                    // rather than any index, so the dashboard can attribute the job
+                    // to the right GPU row on a mixed-vendor box.
+                    let bus = started_pool.bus_id_for_slot(slot_key);
+                    for _ in 0..40 {
+                        if let Ok(mut st) = started_state.try_write() {
+                            if let Some(j) =
+                                st.active_jobs.iter_mut().find(|j| j.info.job_id == started_id)
+                            {
+                                if matches!(j.status, zkminer_tui::state::MinerJobStatus::Queued) {
+                                    j.status = zkminer_tui::state::MinerJobStatus::Proving {
+                                        progress: 0.0,
+                                        elapsed_secs: 0,
+                                    };
+                                }
+                                if j.gpu_bus_id.is_none() {
+                                    j.gpu_bus_id = bus.clone();
+                                }
+                            }
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                };
                 let r = pool.prove_min_vram(
                     &backend_str,
                     &elf_clone,
                     &input_clone,
                     None,
                     Some(effective_timeout),
-                    None,
+                    Some(Box::new(mark_started)),
                     mv,
                     &excl,
                     &mut used,
@@ -2288,7 +3974,22 @@ async fn process_job_lifecycle(
             fulfill_budget,
         )
         .await;
-    fulfill_result.map_err(|e| anyhow::anyhow!("fulfillJob failed: {e:#}"))?;
+    if let Err(e) = fulfill_result {
+        // [F2] `Submitting` is the shutdown's proxy for "a fulfil is IN FLIGHT": the drain
+        // excludes such a job from its nearest-deadline cut and ABANDON refuses to release it.
+        // The fulfil is OVER here, and the only remaining releaser is this task's own
+        // `release_and_clean` below — which the shutdown never joins and `process::exit` kills
+        // mid-flight (release_job retries for up to ~750s). Leaving the status at `Submitting`
+        // therefore makes the one job whose fulfil just failed the one job ABANDON will not
+        // release. Clear it so both stages see the job again.
+        {
+            let mut s = state.write().await;
+            if let Some(j) = s.active_jobs.iter_mut().find(|j| j.info.job_id == job_id) {
+                j.status = MinerJobStatus::Skipped { reason: "fulfil failed — releasing".into() };
+            }
+        }
+        return Err(anyhow::anyhow!("fulfillJob failed: {e:#}"));
+    }
 
     // 12. Success — drop from journal and move to completed_jobs.
     journal_update(journal, |j| j.remove(job_id));
@@ -2388,6 +4089,55 @@ fn ensure_deadline_room(lock_deadline: u64, margin_secs: u64) -> Result<()> {
     Ok(())
 }
 
+/// Measure a job's TRUE cycle count by running its guest through the RISC-V executor.
+///
+/// No proof is produced and no GPU is used — this is the simulator, so it costs execution time
+/// rather than proving time, and it must not contend with the proofs it exists to schedule.
+///
+/// Why this is needed at all: every scheduling decision (deadline feasibility, the look-ahead
+/// queue, the proving timeout) is sized from `expectedCycles` on the descriptor. That field is
+/// SUBMITTER-DECLARED and, across 298 of 298 observed jobs, zero — because declaring it
+/// honestly costs a `cycleCommitCollateral` bond that scales with the count (measured on-chain
+/// at roughly 1 HEMI per 9M cycles). An empty field is therefore the rational default for a
+/// submitter and will stay that way, leaving a hardcoded 34e6 constant that is ~8x below the
+/// measured median. Executing the guest ourselves is the only reliable source.
+async fn measure_cycles(
+    client: &ChainClient,
+    state: &zkminer_tui::state::SharedState,
+    job_id: alloy::primitives::B256,
+    descriptor_hash: alloy::primitives::B256,
+    program_id: alloy::primitives::B256,
+) -> anyhow::Result<u64> {
+    // Cheap availability probe FIRST. The fetches below can hit the chain, and under load
+    // most measurement attempts are skipped for a busy worker — doing the RPC work only to
+    // throw it away wastes a throttled connection the proving path needs.
+    {
+        let pool = zkminer_prover::engine::worker_pool()
+            .ok_or_else(|| anyhow::anyhow!("no worker pool available"))?;
+        if !pool.has_idle_worker("risc0") {
+            anyhow::bail!("no idle risc0 worker; deferring cycle measurement");
+        }
+    }
+
+    // Both of these are locally cached after the first sighting of a program, so a repeat
+    // descriptor costs no chain traffic.
+    let descriptor = fetch_job_descriptor_checked(client, job_id, descriptor_hash).await?;
+    let elf = fetch_or_download_elf(client, state, program_id).await?;
+    let input: Vec<u8> = descriptor.inputData.to_vec();
+
+    let pool = zkminer_prover::engine::worker_pool()
+        .ok_or_else(|| anyhow::anyhow!("no worker pool available"))?;
+
+    // Blocking: the worker protocol is synchronous. Bounded by the watchdog inside
+    // `execute_cycles` so a non-terminating guest cannot wedge a worker forever.
+    tokio::task::spawn_blocking(move || {
+        pool.execute_cycles("risc0", &elf, &input, Some(MEASURE_TIMEOUT))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("cycle measurement task panicked: {e}"))?
+}
+
+
 async fn fetch_or_download_elf(
     client: &ChainClient,
     state: &zkminer_tui::state::SharedState,
@@ -2449,6 +4199,18 @@ async fn release_and_clean(
     journal: &SharedJournal,
     job_id: alloy::primitives::B256,
 ) {
+    release_and_clean_with_nonce(client, state, journal, job_id, None).await
+}
+
+/// As [`release_and_clean`], but with a nonce the caller already reserved (see
+/// `ChainClient::release_job_with_nonce`). Every path that skips the release recycles it.
+async fn release_and_clean_with_nonce(
+    client: &ChainClient,
+    state: &zkminer_tui::state::SharedState,
+    journal: &SharedJournal,
+    job_id: alloy::primitives::B256,
+    pre_nonce: Option<u64>,
+) {
     // The breadcrumb may be ambiguous — a claim whose tx we never confirmed (it may
     // have reverted / never landed, or it may have mined and locked collateral).
     // Check on-chain ownership first so we don't fire a guaranteed-to-revert
@@ -2465,6 +4227,62 @@ async fn release_and_clean(
         let not_ours = view.prover != client.address;
         let not_locked = view.status != JOB_STATUS_LOCKED;
         if not_ours || not_locked {
+            // [D1] `prover == ZERO` (the job still reads OPEN) does NOT prove our claim never
+            // landed: the claimJob(Batch) tx may still be pending, or this node may simply be
+            // behind the claim block — the same lag `DEADLINE_READ_RETRIES` exists for, and
+            // the reason `classify_reconcile` treats ZERO as UNKNOWN rather than NotOurs. A
+            // journal entry still in `Claiming` means exactly "claim sent, never confirmed",
+            // so dropping the breadcrumb here is irreversible: the tx mines seconds later,
+            // collateral locks, and nothing tracks it — not the drain/abandon union, and not
+            // the next startup (with the entry gone `recoverable` is 0, so the EX_TEMPFAIL
+            // restart that would run the on-chain recovery scan never fires). RETAIN it; a
+            // claim that genuinely lost is GC'd by the next recovery pass, which re-reads the
+            // view and drops it via the `Some(_)` arm.
+            //
+            // The same rule holds for an entry PAST `Claiming`: `mark_claimed` only runs
+            // after a post-claim view returned a NONZERO lockDeadline (and recovery's only
+            // after a view proved `prover == us && Locked`), so a Claimed/Proving/Fulfilling
+            // entry has POSITIVELY OBSERVED the collateral locked — a later ZERO read is a
+            // lagging replica far more often than a real reopen. Retain while the recorded
+            // deadline could still be met; a genuinely slashed/reopened job is past its
+            // deadline and is still dropped by this arm exactly as before.
+            let (unconfirmed_claim, deadline_live) = {
+                let j = journal.lock().unwrap_or_else(|p| p.into_inner());
+                match j.entries.get(&job_id) {
+                    Some(e) => (
+                        e.state == crate::journal::JournalState::Claiming,
+                        e.lock_deadline == 0
+                            || e.lock_deadline > chrono::Utc::now().timestamp().max(0) as u64,
+                    ),
+                    None => (false, false),
+                }
+            };
+            if view.prover == alloy::primitives::Address::ZERO
+                && (unconfirmed_claim || deadline_live)
+            {
+                tracing::warn!(
+                    "Job {} shows no on-chain prover but our lock is not provably gone — \
+                     retaining breadcrumb (claim tx may still be pending, or this read is \
+                     from a lagging node; recovery reconciles it)",
+                    short_id(job_id)
+                );
+                // [#45] This arm SKIPS release_job too, and release_job is the only consumer
+                // of the abandoned-fulfill stash. The sibling arms below drain it; this one
+                // was added later and did not. A leaked stash nonce carries NO abort record
+                // and is not in `freed`, so it is exactly the hole shape the shutdown gate
+                // refuses to fill — every broadcast release above it then strands.
+                if let Some(n) = client.take_abandoned_nonce(job_id) {
+                    client.abort_nonce(n);
+                }
+                // Skipping the release — recycle the caller's pre-reserved nonce so it
+                // cannot become a permanent gap in the signer's sequence.
+                if let Some(n) = pre_nonce {
+                    client.abort_nonce(n);
+                }
+                let mut s = state.write().await;
+                s.active_jobs.retain(|j| j.info.job_id != job_id);
+                return;
+            }
             let why = if not_ours {
                 if view.prover == alloy::primitives::Address::ZERO {
                     "never locked on-chain"
@@ -2478,8 +4296,13 @@ async fn release_and_clean(
             // [#45] This path SKIPS release_job (the only stash consumer). If a fulfill
             // stashed its nonce for this job, drain it here or it becomes a permanent gap
             // that wedges the whole signer. The fulfill either mined (abort self-heals via
-            // "nonce too low") or never landed (abort correctly recycles the gap).
+            // "nonce too low", or — once `commit`/`resync` has raised the `consumed_below`
+            // watermark — the abort simply no-ops) or never landed (abort correctly recycles
+            // the gap).
             if let Some(n) = client.take_abandoned_nonce(job_id) {
+                client.abort_nonce(n);
+            }
+            if let Some(n) = pre_nonce {
                 client.abort_nonce(n);
             }
             let mut s = state.write().await;
@@ -2497,6 +4320,19 @@ async fn release_and_clean(
         // stranded case; only a slash frees the collateral now.)
         let now = chrono::Utc::now().timestamp() as u64;
         let lock_deadline = view.lockDeadline.to::<u64>();
+        // Persist the authoritative deadline into the breadcrumb. A fresh claim records intent
+        // with the PRE-claim snapshot (0 for an open job) and `mark_claimed` never runs if the
+        // lifecycle died before its post-claim view read, so an entry can sit at 0 forever —
+        // and once the lifecycle is gone nothing else ever writes it. Every shutdown decision
+        // keys off this field (the drain's stranded filter, the nearest-deadline cut, the
+        // abandon ordering, the EX_TEMPFAIL gate), and all of them mis-handle 0.
+        if lock_deadline != 0 {
+            journal_update(journal, |j| {
+                if let Some(e) = j.entries.get_mut(&job_id) {
+                    e.lock_deadline = lock_deadline;
+                }
+            });
+        }
         if lock_deadline != 0 && now >= lock_deadline {
             tracing::warn!(
                 "Job {} is past its deadline ({} >= {}) — releaseJob would revert; retaining \
@@ -2510,6 +4346,9 @@ async fn release_and_clean(
             if let Some(n) = client.take_abandoned_nonce(job_id) {
                 client.abort_nonce(n);
             }
+            if let Some(n) = pre_nonce {
+                client.abort_nonce(n);
+            }
             let mut s = state.write().await;
             s.active_jobs.retain(|j| j.info.job_id != job_id);
             s.add_log(
@@ -2520,7 +4359,7 @@ async fn release_and_clean(
         }
     }
 
-    let release_ok = match client.release_job(job_id).await {
+    let release_ok = match client.release_job_with_nonce(job_id, pre_nonce).await {
         Ok(()) => {
             journal_update(journal, |j| j.remove(job_id));
             true
@@ -2642,13 +4481,98 @@ async fn recover_claimed_jobs(
             .collect();
 
     const JOB_STATUS_LOCKED: u8 = 1;
+    // [D1] Breadcrumbs whose claim tx could still be LIVE. `prover == ZERO` (the job reads
+    // OPEN) is UNKNOWN, never "not ours": a claim still pending and a lagging post-mine read
+    // are indistinguishable from it — the rule `classify_reconcile` and `release_and_clean`
+    // already apply. Dropping such an entry is irreversible: the tx mines seconds later,
+    // collateral locks, and NOTHING tracks it (the drain/abandon union and the EX_TEMPFAIL
+    // gate read only `active_jobs ∪ journal`, so the miner exits 0 and is never restarted
+    // into the recovery scan that is the only remedy). Bound it by the same age the drain
+    // uses, so a claim that genuinely lost is still GC'd once it ages out.
+    let live_claim_intent: std::collections::HashSet<B256> = {
+        let now_s = chrono::Utc::now().timestamp().max(0) as u64;
+        let j = journal.lock().unwrap_or_else(|p| p.into_inner());
+        j.iter()
+            .filter(|e| {
+                // The age bound covers an UNCONFIRMED claim (deadline still unknown). But an
+                // entry that got past `Claiming` has POSITIVELY OBSERVED the lock —
+                // `mark_claimed` only runs after a view returned a nonzero lockDeadline — and
+                // such a job is routinely older than this bound (a proof plus fulfil retries
+                // alone exceed 900s). On the same ZERO read `release_and_clean` RETAINS those
+                // (`deadline_live`); without the second clause here recovery instead DELETES
+                // the breadcrumb of a job we may well still hold, and the shutdown ladder then
+                // cannot see the lock at all (drain, abandon and the EX_TEMPFAIL gate read only
+                // `active_jobs ∪ journal`, so the miner exits 0 and is never restarted into the
+                // scan that is the only remedy). A genuinely slashed/reopened job is still GC'd
+                // by the settled arm once its recorded deadline passes.
+                now_s.saturating_sub(e.claimed_at.max(0) as u64) <= CLAIM_INTENT_MAX_AGE_SECS
+                    || e.lock_deadline > now_s
+            })
+            .map(|e| e.job_id)
+            .collect()
+    };
     let before = job_ids.len();
     job_ids.retain(|jid| match views_map.get(jid) {
-        // Ours AND still Locked → re-drive.
-        Some(v) if v.prover == client.address && v.status == JOB_STATUS_LOCKED => true,
+        // Ours AND still Locked → re-drive. Persist a breadcrumb NOW for anything
+        // `find_locked_jobs` discovered that the journal lacks (cleared journal, crash before
+        // the journal write, a claim from a previous machine). The only other writer is
+        // `process_job_lifecycle` step 1, which never runs for the ids left behind when the
+        // loop below breaks on shutdown / defers under a storm — and the drain union, the
+        // abandon list and the EX_TEMPFAIL gate ALL read only `active_jobs ∪ journal`, so an
+        // unjournaled lock is never released and does not even raise the restart exit code.
+        // This view has just PROVEN the collateral is ours and locked.
+        Some(v) if v.prover == client.address && v.status == JOB_STATUS_LOCKED => {
+            let d = v.lockDeadline.to::<u64>();
+            if !journal_has(journal, *jid) {
+                tracing::warn!(
+                    "recover: {} is locked to us with no journal entry — recording breadcrumb \
+                     so the shutdown drain/abandon can see it",
+                    jid
+                );
+                journal_update(journal, |j| j.mark_claimed(*jid, None, d));
+            } else if d != 0 {
+                // Backfill the authoritative deadline onto an EXISTING breadcrumb too. An
+                // entry whose `mark_claimed` never ran (crash between the claim tx and the
+                // post-claim view read; every claimJobBatch job until its lifecycle reaches
+                // step 3) sits at 0 forever — and 0 is INVISIBLE to the drain's
+                // nearest-deadline cut (it filters `d > now`), so the drain can burn its whole
+                // budget straight through this job's real deadline. The view in hand has just
+                // proven the lock, and the loop below may `break` on shutdown before anything
+                // else would have fixed it. Field-level write, not `mark_claimed`: that would
+                // also regress a Proving/Fulfilling entry's state back to Claimed.
+                journal_update(journal, |j| {
+                    if let Some(e) = j.entries.get_mut(jid) {
+                        e.lock_deadline = d;
+                    }
+                });
+            }
+            true
+        }
+        // [D1] Reads OPEN (prover == ZERO) while our claim could still be in flight →
+        // UNKNOWN, not "not ours". KEEP the breadcrumb (see above) but do not re-drive it
+        // this pass; a later pass GCs it once it ages out.
+        Some(v)
+            if v.prover == alloy::primitives::Address::ZERO
+                && live_claim_intent.contains(jid) =>
+        {
+            tracing::warn!(
+                "recover: {} reads OPEN but our claim may still be pending — retaining \
+                 breadcrumb",
+                jid
+            );
+            false
+        }
         // Present but settled / held by another prover → drop the stale breadcrumb.
         Some(_) => {
             journal_update(journal, |j| j.remove(*jid));
+            // [#45] Same rule as the serial not-ours / non-Locked arms below (and the one this
+            // [M9] batch pre-filter largely bypasses): dropping the breadcrumb means no
+            // `release_job` will ever run for this job again, and that is the ONLY consumer of
+            // the abandoned-nonce stash. Leaking one leaves a hole with no local trace
+            // (`is_freed`/`recently_aborted` both false) that wedges the whole signer.
+            if let Some(n) = client.take_abandoned_nonce(*jid) {
+                client.abort_nonce(n);
+            }
             false
         }
         // View unreadable (RPC miss / lagging node) → keep and re-read per-job (lag-tolerant).
@@ -2679,6 +4603,23 @@ async fn recover_claimed_jobs(
     let mut deferred = false;
     let mut storm_probed = false;
     for jid in job_ids {
+        // [B5] Shutdown can begin MID-PASS: the gate at the call site only stops a pass from
+        // STARTING. `process_job_lifecycle` is awaited INLINE below, so without this re-check
+        // a pass already in flight keeps launching fresh multi-minute proves after `paused`,
+        // and the drain blocks on them until jobs the abandon path could have released right
+        // now are past their lock deadline (releaseJob then reverts = permanent loss).
+        // Break, don't continue: the remaining ids keep their journal breadcrumbs and are
+        // released nearest-deadline-first by the abandon path.
+        // SHUTTING_DOWN, not `paused` — the TUI's `p` key sets `paused` too, and aborting a
+        // recovery pass on it would skip the past-deadline `release_and_clean` below for jobs
+        // whose collateral is actively ticking down.
+        if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::info!(
+                "recover: shutdown began mid-pass — leaving remaining locked job(s) to the \
+                 abandon path"
+            );
+            break;
+        }
         // Reuse the batched view; only re-read the rare unreadable ones.
         let view = match views_map.get(&jid) {
             Some(v) => v.clone(),
@@ -2725,8 +4666,26 @@ async fn recover_claimed_jobs(
             }
         };
         if view.prover != client.address {
+            // [D1] ZERO = the job reads OPEN = UNKNOWN, not "not ours" — keep the breadcrumb
+            // while our claim could still be live (see `live_claim_intent` above); a later
+            // pass GCs it once it ages out.
+            if view.prover == alloy::primitives::Address::ZERO && live_claim_intent.contains(&jid)
+            {
+                tracing::warn!(
+                    "recover: {} reads OPEN but our claim may still be pending — retaining \
+                     breadcrumb",
+                    jid
+                );
+                continue;
+            }
             tracing::info!("recover: {} no longer ours (prover={})", jid, view.prover);
             journal_update(journal, |j| j.remove(jid));
+            // [#45] Dropping the breadcrumb means no `release_job` will ever run for this job
+            // again — and that is the only consumer of the abandoned-nonce stash. Drain it or
+            // a fulfill that gave up leaves a permanent gap that wedges the whole signer.
+            if let Some(n) = client.take_abandoned_nonce(jid) {
+                client.abort_nonce(n);
+            }
             continue;
         }
         // Terminal status check. Contract JobStatus: Open=0, Locked=1,
@@ -2741,9 +4700,31 @@ async fn recover_claimed_jobs(
                 jid, view.status,
             );
             journal_update(journal, |j| j.remove(jid));
+            // [#45] Same as the not-ours arm above: no release_job will run for this job
+            // again, so a stashed fulfill nonce would leak as a permanent gap.
+            if let Some(n) = client.take_abandoned_nonce(jid) {
+                client.abort_nonce(n);
+            }
             continue;
         }
         let lock_deadline = view.lockDeadline.to::<u64>();
+        // [B5] Ownership is now PROVEN by the re-read above (prover == us, status == Locked) —
+        // but this id can have reached the loop via the `None => true` arm (the whole batch
+        // view was unreadable, e.g. a 429 storm) and, if `find_locked_jobs` discovered it, have
+        // NO journal entry at all. The pre-loop retain arm writes a breadcrumb for exactly this
+        // case; the per-job re-read path did not. The shutdown gates below `break` on the
+        // promise that "the remaining ids keep their journal breadcrumbs" — without this write
+        // that promise is false and the lock is invisible to the drain union, the abandon list
+        // and the EX_TEMPFAIL gate (all read `active_jobs ∪ journal`), so it is never released
+        // and does not even raise the restart exit code.
+        if !journal_has(journal, jid) {
+            tracing::warn!(
+                "recover: {} is locked to us with no journal entry — recording breadcrumb so \
+                 the shutdown drain/abandon can see it",
+                jid
+            );
+            journal_update(journal, |j| j.mark_claimed(jid, None, lock_deadline));
+        }
         let now = chrono::Utc::now().timestamp() as u64;
         // Recovery needs much more headroom than a fresh-claim fulfill because
         // we must re-download ELF and re-prove from scratch. Use the proving
@@ -2808,12 +4789,28 @@ async fn recover_claimed_jobs(
             info: job_info,
             status: zkminer_tui::state::MinerJobStatus::Proving { progress: 0.0, elapsed_secs: 0 },
             current_price: view.currentAuctionPrice.to::<u128>(),
-            gpu_index: None,
+            gpu_bus_id: None,
             prover_backend: String::new(),
             estimated_cycles: view.expectedCycles,
         };
         tracked.info.program_id = descriptor.programId;
 
+        // [B5] The gate at the top of this iteration is many awaits old by now: the per-job
+        // view re-read above and `fetch_job_descriptor_checked` (a cold-cache getLogs
+        // reconstruction, throttled and retried under a 429 storm) can span tens of seconds.
+        // `process_job_lifecycle` deliberately does NOT re-check for `is_recovery` jobs, so
+        // without this a shutdown landing in that window drives a whole fresh lifecycle — and
+        // if ABANDON has already released this job, step 2's `claim_job_idempotent` sees
+        // prover == ZERO and RE-CLAIMS it, locking brand-new collateral on an exiting process.
+        // Break, not continue: remaining ids keep their breadcrumbs for the abandon path.
+        if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::info!(
+                "recover: shutdown began during descriptor fetch — leaving {} and any remaining \
+                 locked job(s) to the abandon path",
+                jid
+            );
+            break;
+        }
         tracing::info!("recover: re-driving fulfill path for {}", jid);
         if let Err(e) = process_job_lifecycle(client, state, journal, tracked, snapshot, proving_timeout, true, Some(descriptor)).await {
             tracing::error!("recover: {} lifecycle failed: {e:#}", jid);
@@ -2858,6 +4855,7 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
                         &event.slot_key,
                         event.gpu_name.as_deref(),
                         event.device_index,
+                        event.pci_bus_id.as_deref(),
                         &event.gpu_tag,
                         &event.entry,
                         event.program_index,
@@ -2996,4 +4994,49 @@ mod tests {
         assert!(all_ff.starts_with("0xff"));
     }
 
+}
+
+#[cfg(test)]
+mod collateral_warning_tests {
+    use super::{collateral_warning, ONE_HEMI_WEI};
+    use zkminer_chain::staking::fmt_hemi_ceil;
+
+    /// Pins the arguments in place. The positional version of this sentence rotated its last
+    /// two args and told the operator to stake 1 HEMI when they were 4.25 short.
+    #[test]
+    fn names_the_shortfall_as_the_stake_amount_not_the_gpu_count() {
+        // The 2026-08-08 incident: 145.75 available, 150.00 per claim, 1 of 2 slots fundable.
+        let msg = collateral_warning(1, 2, 145_750_000_000_000_000_000, 150 * ONE_HEMI_WEI,
+                                     4_250_000_000_000_000_000);
+        assert!(msg.contains("Fix: run `zkminer stake 4.25`"), "got: {msg}");
+        assert!(msg.contains("1 GPU(s) will sit idle"), "GPU count must be a count: {msg}");
+        assert!(msg.contains("Only 1 of 2 GPU slot(s) fundable"), "got: {msg}");
+        assert!(msg.contains("145.75 HEMI available"), "got: {msg}");
+        assert!(msg.contains("locks up to 150.00 HEMI"), "got: {msg}");
+        // The bug verbatim, so it can never come back.
+        assert!(!msg.contains("stake 1`"), "remediation is the GPU count again: {msg}");
+        assert!(!msg.contains("4.25 GPU"), "shortfall leaked into the GPU count: {msg}");
+    }
+
+    /// At the soak's ~50 HEMI per_claim the rotated version undershot by ~35x.
+    #[test]
+    fn remediation_scales_with_per_claim_not_with_gpu_count() {
+        let msg = collateral_warning(0, 2, 0, 50 * ONE_HEMI_WEI, 50 * ONE_HEMI_WEI);
+        assert!(msg.contains("zkminer stake 50.00"), "got: {msg}");
+        assert!(msg.contains("2 GPU(s) will sit idle"), "got: {msg}");
+    }
+
+    /// Whatever the warning prints must be enough when typed back in.
+    #[test]
+    fn the_printed_remediation_always_covers_the_shortfall() {
+        for shortfall in [1u128, ONE_HEMI_WEI - 1, 4_250_000_000_000_000_001,
+                          149_999_999_999_999_999_999, 333_333_333_333_333_333] {
+            let printed = fmt_hemi_ceil(shortfall);
+            assert!(collateral_warning(1, 2, 0, 150 * ONE_HEMI_WEI, shortfall)
+                        .contains(&format!("zkminer stake {printed}")));
+            let cents: u128 = printed.replace('.', "").parse().unwrap();
+            assert!(cents * (ONE_HEMI_WEI / 100) >= shortfall,
+                "printed {printed} is short of {shortfall} wei");
+        }
+    }
 }

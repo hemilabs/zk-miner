@@ -19,6 +19,9 @@ pub struct SlotBenchmarkResult {
     pub slot_key: String,
     pub gpu_name: Option<String>,
     pub device_index: Option<u32>,
+    /// Canonical PCI bus id of the card this slot ran on, when known. The
+    /// identity the TUI joins on -- `device_index` is per-vendor and collides.
+    pub pci_bus_id: Option<String>,
     pub gpu_tag: String,
     pub entries: Vec<zkminer_prover_protocol::BenchmarkEntry>,
     /// Total VRAM of this worker's GPU in bytes, or `None` when unknown
@@ -38,8 +41,11 @@ pub struct BenchmarkProgressEvent {
     pub slot_key: String,
     /// GPU name, e.g. "AMD Radeon RX 7900 XTX"
     pub gpu_name: Option<String>,
-    /// Device index within vendor
+    /// Device index within vendor -- per-vendor, so NOT a unique card identity.
     pub device_index: Option<u32>,
+    /// Canonical PCI bus id of the card, when known. The identity a consumer
+    /// should join on to find this card in its own hardware enumeration.
+    pub pci_bus_id: Option<String>,
     /// GPU tag: "cuda", "rocm", "generic"
     pub gpu_tag: String,
     /// The benchmark entry that just completed
@@ -113,10 +119,11 @@ struct WorkerSlot {
     gpu_tag: String,
     /// Device index within vendor (None for generic/explicit).
     device_index: Option<u32>,
-    /// PCI bus ID for GPU pinning (None for generic/explicit).
-    /// Stored for diagnostic logging; the actual device pinning is
-    /// baked into `spawn_env` at discovery time.
-    #[allow(dead_code)]
+    /// Canonical PCI bus id of this worker's card (None for generic/explicit).
+    ///
+    /// Load-bearing: this is the join key the TUI uses to line a benchmark row
+    /// and its live telemetry up with the right physical card. Device pinning
+    /// itself is still baked into `spawn_env` at discovery time.
     pci_bus_id: Option<String>,
     /// Human-readable GPU name (None for generic/explicit).
     gpu_name: Option<String>,
@@ -791,7 +798,7 @@ impl WorkerPool {
 
         for key in keys {
             // Extract device metadata from the slot before benchmarking
-            let (gpu_name, device_index, gpu_tag, backend, vram_bytes) =
+            let (gpu_name, device_index, slot_pci_bus_id, gpu_tag, backend, vram_bytes) =
                 if let Some(entry) = self.workers.get(&key) {
                     // vram_bytes lives on the WorkerEntry, outside the slot Mutex.
                     let vram = entry.vram_bytes;
@@ -799,6 +806,7 @@ impl WorkerPool {
                         (
                             slot.gpu_name.clone(),
                             slot.device_index,
+                            slot.pci_bus_id.clone(),
                             slot.gpu_tag.clone(),
                             slot.backend.clone(),
                             vram,
@@ -826,6 +834,7 @@ impl WorkerPool {
                         slot_key: key.clone(),
                         gpu_name,
                         device_index,
+                        pci_bus_id: slot_pci_bus_id.clone(),
                         gpu_tag: gpu_tag.clone(),
                         entries,
                         vram_bytes,
@@ -892,6 +901,7 @@ impl WorkerPool {
         // Extract metadata before borrowing handle
         let gpu_name = slot.gpu_name.clone();
         let device_index = slot.device_index;
+        let slot_pci_bus_id = slot.pci_bus_id.clone();
         let gpu_tag = slot.gpu_tag.clone();
 
         self.ensure_alive(&mut slot, &entry.pid)?;
@@ -923,6 +933,7 @@ impl WorkerPool {
                 slot_key: key_owned.clone(),
                 gpu_name: gpu_name.clone(),
                 device_index,
+                pci_bus_id: slot_pci_bus_id.clone(),
                 gpu_tag: gpu_tag.clone(),
                 entry: entry.clone(),
                 program_index: idx,
@@ -988,7 +999,7 @@ impl WorkerPool {
         let mut recycled_keys: Vec<String> = Vec::new();
 
         for key in keys {
-            let (gpu_name, device_index, gpu_tag, backend, vram_bytes) =
+            let (gpu_name, device_index, slot_pci_bus_id, gpu_tag, backend, vram_bytes) =
                 if let Some(entry) = self.workers.get(&key) {
                     // vram_bytes lives on the WorkerEntry, outside the slot Mutex.
                     let vram = entry.vram_bytes;
@@ -996,6 +1007,7 @@ impl WorkerPool {
                         (
                             slot.gpu_name.clone(),
                             slot.device_index,
+                            slot.pci_bus_id.clone(),
                             slot.gpu_tag.clone(),
                             slot.backend.clone(),
                             vram,
@@ -1020,6 +1032,7 @@ impl WorkerPool {
                         slot_key: key.clone(),
                         gpu_name,
                         device_index,
+                        pci_bus_id: slot_pci_bus_id.clone(),
                         gpu_tag: gpu_tag.clone(),
                         entries,
                         vram_bytes,
@@ -1075,7 +1088,7 @@ impl WorkerPool {
         input_data: &[u8],
         po2: Option<u8>,
         timeout: Option<Duration>,
-        on_progress: Option<Box<dyn Fn(f64) + Send>>,
+        on_progress: Option<Box<dyn Fn(f64, &str) + Send>>,
     ) -> Result<ProofOutput> {
         // Never leave a prove unbounded: if the caller didn't set a deadline, arm a
         // generous backstop watchdog so a wedged worker can't hang forever. (The
@@ -1107,6 +1120,108 @@ impl WorkerPool {
     ///   already passed by the time a worker is ready, the proof isn't started and an
     ///   error is returned so the caller can release the job in time.
     #[allow(clippy::too_many_arguments)]
+    /// Is any worker for `backend` idle right now?
+    ///
+    /// Lets a caller skip expensive preparation (descriptor + ELF fetches, which can hit the
+    /// chain) when a measurement would be refused anyway. Best-effort by nature: the worker
+    /// can become busy between this probe and the attempt, which `execute_cycles` handles.
+    pub fn has_idle_worker(&self, backend: &str) -> bool {
+        self.keys_for_prefix(backend).iter().any(|k| {
+            self.workers
+                .get(k)
+                .is_some_and(|e| e.slot.try_lock().is_ok())
+        })
+    }
+
+    /// Measure a job's TRUE cycle count by executing the guest, without proving it.
+    ///
+    /// Every scheduling decision is sized from `expectedCycles` on the job descriptor, which
+    /// is submitter-declared and — on the observed market — always zero, leaving a hardcoded
+    /// 34e6 fallback that is ~8x below the measured median. This is the only way to learn the
+    /// real number before committing collateral.
+    ///
+    /// Runs on any live worker for `backend` WITHOUT taking that worker's GPU lock: execution
+    /// is CPU work in the default executor, so it must not block or contend with the proofs it
+    /// exists to schedule. `timeout` bounds it — an unexpectedly enormous guest must not stall
+    /// the brain loop.
+    pub fn execute_cycles(
+        &self,
+        backend: &str,
+        elf: &[u8],
+        input_data: &[u8],
+        timeout: Option<Duration>,
+    ) -> anyhow::Result<u64> {
+        let keys = self.keys_for_prefix(backend);
+        if keys.is_empty() {
+            anyhow::bail!("no worker registered for backend '{backend}'");
+        }
+
+        // Try EVERY worker, not just the first. `try_lock` never blocks — a busy worker is
+        // proving and a sizing measurement must never queue behind one — but taking only
+        // `keys.first()` meant a rig whose first GPU was busy never measured at all, even with
+        // the second one idle. Measured live: 8 of 12 attempts skipped, every one naming
+        // `risc0:cuda:0`, while `cuda:1` sat free.
+        let (key, entry, mut slot) = {
+            let mut found = None;
+            for k in &keys {
+                let Some(e) = self.workers.get(k) else { continue };
+                if let Ok(sl) = e.slot.try_lock() {
+                    found = Some((k.clone(), e, sl));
+                    break;
+                }
+            }
+            match found {
+                Some(f) => f,
+                None => anyhow::bail!(
+                    "all {} '{backend}' worker(s) busy; skipping cycle measurement",
+                    keys.len()
+                ),
+            }
+        };
+        let key = key.as_str();
+        let handle = slot
+            .handle
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("worker '{key}' has no live handle"))?;
+
+        static EXEC_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let request_id = EXEC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            | 0x8000_0000_0000_0000; // keep execute ids disjoint from prove ids
+
+        handle.send(&WorkerCommand::Execute {
+            request_id,
+            elf: elf.to_vec(),
+            input_data: input_data.to_vec(),
+        })?;
+
+        // Bound it the same way a proof is bounded: the watchdog SIGKILLs the worker if the
+        // guest never terminates. Destructive, but the alternative is a wedged worker holding
+        // its slot forever, and the dispatcher already respawns on death. A guest that cannot
+        // be executed inside the budget is also one we must not claim.
+        let _watchdog = timeout.map(|t| {
+            ProvingWatchdog::new(
+                entry.pid.clone(),
+                t,
+                key.to_string(),
+                entry.intentional_kill.clone(),
+            )
+        });
+
+        match handle.recv_proof(request_id, &None)? {
+            WorkerResponse::ExecuteResult { cycles, duration_secs, .. } => {
+                tracing::debug!(
+                    "cycle measurement on {key}: {cycles} cycles in {duration_secs:.2}s"
+                );
+                Ok(cycles)
+            }
+            WorkerResponse::Error { message, .. } => {
+                anyhow::bail!("cycle measurement failed: {message}")
+            }
+            other => anyhow::bail!("unexpected response to Execute: {other:?}"),
+        }
+    }
+
     pub fn prove_min_vram(
         &self,
         backend: &str,
@@ -1114,7 +1229,7 @@ impl WorkerPool {
         input_data: &[u8],
         po2: Option<u8>,
         timeout: Option<Duration>,
-        on_progress: Option<Box<dyn Fn(f64) + Send>>,
+        on_progress: Option<Box<dyn Fn(f64, &str) + Send>>,
         min_vram_bytes: Option<u64>,
         exclude: &[String],
         used_slot: &mut Option<String>,
@@ -1210,19 +1325,73 @@ impl WorkerPool {
             }
         }
 
-        // All busy — block on first non-permanently-failed slot
-        let fallback = keys
-            .iter()
-            .find(|k| {
-                self.workers
-                    .get(*k)
-                    .and_then(|e| e.slot.lock().ok())
-                    .map(|s| Self::slot_eligible(&s))
-                    .unwrap_or(false)
-            })
-            .unwrap_or(&keys[0]);
-        *used_slot = Some(fallback.clone());
-        self.prove_on_slot(fallback, elf, input_data, po2, timeout, on_progress, abort_at, po2_resolver)
+        // All busy — wait for whichever eligible slot frees FIRST, staying deadline-aware.
+        //
+        // This used to be a BLOCKING `slot.lock()` on the first key that looked eligible,
+        // falling back to `keys[0]`. Two defects, both only reachable once more jobs are in
+        // flight than there are cards:
+        //
+        //  * `keys` comes from a `HashMap` iteration and is unsorted, so every over-committed
+        //    job parked on the SAME arbitrary card and none of them migrated when a different
+        //    card freed. On a 2-GPU rig that serialises everything onto one card while the
+        //    other idles — the exact inversion look-ahead queueing exists to remove.
+        //  * `abort_at` is not consulted until `prove_on_slot` (after it takes the same locks),
+        //    so a job waiting on that mutex had NO clock. It could sit past its own lock
+        //    deadline and only discover it once granted, by which point `releaseJob` reverts
+        //    and the collateral is lost outright rather than released for a penalty.
+        //
+        // Polling re-runs the same eligibility scan over ALL keys, so the job goes to whichever
+        // card frees first, and re-checks the deadline every pass so it can bail while there is
+        // still time to release.
+        // A job with no `abort_at` (recovery re-drives, benchmarks) has no deadline to bail
+        // on, so bound the wait by the caller's own proving `timeout` — otherwise a rig whose
+        // every slot is permanently failed would spin here forever, where the old blocking
+        // version at least returned an error from `prove_on_slot`.
+        const QUEUE_POLL: Duration = Duration::from_millis(250);
+        // `timeout` is optional; with neither it nor `abort_at` there is no deadline to
+        // honour, so fall back to a generous absolute cap rather than spinning forever.
+        const QUEUE_WAIT_CAP: Duration = Duration::from_secs(3600);
+        let queue_deadline = Instant::now() + timeout.unwrap_or(QUEUE_WAIT_CAP);
+        loop {
+            for key in &keys {
+                let Some(entry) = self.workers.get(key) else { continue };
+                let gpu_free = self.gpu_lock_for(key).map_or(true, |l| {
+                    !matches!(l.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+                });
+                if !gpu_free {
+                    continue;
+                }
+                if let Ok(mut slot) = entry.slot.try_lock() {
+                    let is_alive = slot.handle.as_mut().map(|h| h.is_alive()).unwrap_or(false);
+                    if is_alive || Self::slot_eligible(&slot) {
+                        drop(slot);
+                        *used_slot = Some(key.clone());
+                        return self.prove_on_slot(
+                            key, elf, input_data, po2, timeout, on_progress, abort_at,
+                            po2_resolver,
+                        );
+                    }
+                }
+            }
+            // Bail while a release can still succeed, rather than after the deadline passes.
+            if let Some(abort) = abort_at {
+                if abort.saturating_duration_since(Instant::now()) < MIN_ABORT_START_BUDGET {
+                    anyhow::bail!(
+                        "aborting proof: deadline cutoff reached while queued for a worker \
+                         (releasing to recover collateral)"
+                    );
+                }
+            }
+            if Instant::now() >= queue_deadline {
+                anyhow::bail!(
+                    "no worker slot became available within {:?} (all {} slot(s) busy or \
+                     failed)",
+                    timeout.unwrap_or(QUEUE_WAIT_CAP),
+                    keys.len()
+                );
+            }
+            std::thread::sleep(QUEUE_POLL);
+        }
     }
 
     /// Benchmark-facing device id for a slot key: `"risc0:cuda:1"` -> `"gpu1"`,
@@ -1237,8 +1406,51 @@ impl WorkerPool {
         let _backend = parts.next();
         match (parts.next(), parts.next()) {
             (Some("generic"), _) | (None, _) => "cpu".to_string(),
-            (Some(_gpu_tag), Some(idx)) => format!("gpu{idx}"),
-            (Some(_gpu_tag), None) => "gpu0".to_string(),
+            // The vendor tag is PART of a card's identity. Dropping it made
+            // `risc0:cuda:0` and `risc0:rocm:0` -- two different physical cards --
+            // both mint "gpu0", so on a mixed proving box one row silently
+            // overwrites the other's throughput and po2 calibration, with which
+            // one survives depending on HashMap iteration order. `physical_gpu_id`
+            // in this same file already keeps the tag; this now agrees with it.
+            (Some(gpu_tag), Some(idx)) => Self::gpu_device_id(gpu_tag, idx),
+            (Some(gpu_tag), None) => Self::gpu_device_id(gpu_tag, "0"),
+        }
+    }
+
+    /// Canonical PCI bus id of the card behind a slot key, if it is a GPU slot.
+    pub fn bus_id_for_slot(&self, key: &str) -> Option<String> {
+        let entry = self.workers.get(key)?;
+        let slot = entry.slot.lock().ok()?;
+        slot.pci_bus_id.clone().filter(|b| !b.is_empty())
+    }
+
+    /// Canonical PCI bus ids of every GPU slot in this pool.
+    ///
+    /// Used to scope power measurement to cards that are actually proving, so an
+    /// idle GPU on the same box cannot contribute its draw (or, worse, its idle
+    /// draw in place of a working card's).
+    pub fn gpu_bus_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .workers
+            .values()
+            .filter_map(|e| e.slot.lock().ok().and_then(|s| s.pci_bus_id.clone()))
+            .filter(|b| !b.is_empty())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// Canonical benchmark device id for a GPU slot.
+    ///
+    /// `cuda` keeps the bare `gpuN` form so every existing `benchmarks.json`
+    /// and every `starts_with("gpu")` GPU-row predicate keeps working unchanged;
+    /// other vendors are tag-qualified (`gpu-rocm0`) so they cannot collide.
+    pub fn gpu_device_id(gpu_tag: &str, idx: &str) -> String {
+        if gpu_tag == "cuda" {
+            format!("gpu{idx}")
+        } else {
+            format!("gpu-{gpu_tag}{idx}")
         }
     }
 
@@ -1258,7 +1470,7 @@ impl WorkerPool {
         input_data: &[u8],
         po2: Option<u8>,
         timeout: Option<Duration>,
-        on_progress: Option<Box<dyn Fn(f64) + Send>>,
+        on_progress: Option<Box<dyn Fn(f64, &str) + Send>>,
         abort_at: Option<Instant>,
         po2_resolver: Option<&dyn Fn(&str) -> Option<u8>>,
     ) -> Result<ProofOutput> {
@@ -1382,6 +1594,14 @@ impl WorkerPool {
             ProvingWatchdog::new(entry.pid.clone(), t, key.to_string(), entry.intentional_kill.clone())
         });
 
+        // The worker protocol's progress callback carries only a fraction. Bake the
+        // slot key in here so callers learn WHICH card is running the proof --
+        // without it the TUI could not attribute a running job to a GPU row at all,
+        // and every proof rendered as "CPU" on an idle-looking card.
+        let key_for_cb = key.to_string();
+        let on_progress: Option<Box<dyn Fn(f64) + Send>> = on_progress.map(|cb| {
+            Box::new(move |f: f64| cb(f, &key_for_cb)) as Box<dyn Fn(f64) + Send>
+        });
         let proof_response = handle.recv_proof(request_id, &on_progress);
 
         // If recv_proof failed (EOF, stream corruption, protocol desync),
@@ -1614,8 +1834,13 @@ impl WorkerPool {
         let needs_respawn = if is_alive {
             false
         } else if slot.handle.is_some() {
+            let reason = slot
+                .handle
+                .as_mut()
+                .map(|h| h.exit_reason())
+                .unwrap_or_else(|| "no handle".to_string());
             tracing::warn!(
-                "Worker {}:{} died, will attempt respawn",
+                "Worker {}:{} died ({reason}), will attempt respawn",
                 slot.backend,
                 slot.gpu_tag
             );
@@ -2228,17 +2453,43 @@ mod tests {
 
     #[test]
     fn benchmark_device_id_matches_benchmark_module_ids() {
-        // These strings are a CONTRACT with benchmark.rs: GPU rows are built as
+        // These strings are a CONTRACT with benchmark.rs: CUDA rows are built as
         // format!("gpu{idx}") from the slot key's device index, CPU rows are "cpu".
         // If this drifts, `resolve_po2` looks up a device that does not exist in the
         // suite, silently returns None, and po2 selection quietly stops working —
         // with no error anywhere.
         assert_eq!(WorkerPool::benchmark_device_id("risc0:cuda:0"), "gpu0");
         assert_eq!(WorkerPool::benchmark_device_id("risc0:cuda:1"), "gpu1");
-        assert_eq!(WorkerPool::benchmark_device_id("risc0:rocm:2"), "gpu2");
         assert_eq!(WorkerPool::benchmark_device_id("sp1:generic"), "cpu");
         // Degenerate/explicit keys must not panic.
         assert_eq!(WorkerPool::benchmark_device_id("mock"), "cpu");
         assert_eq!(WorkerPool::benchmark_device_id("risc0:cuda"), "gpu0");
+    }
+
+    #[test]
+    fn different_vendors_never_share_a_device_id() {
+        // `device_index` is sequential WITHIN a vendor (discovery.rs), so a rocm
+        // card and a cuda card both legitimately carry index 0. The old key
+        // discarded the tag and mapped both to "gpu0": one physical card's
+        // throughput and po2 samples then overwrote the other's, and which one
+        // survived depended on HashMap iteration order.
+        //
+        // The previous version of this test asserted rocm:2 -> "gpu2", encoding the
+        // assumption that rocm indices continue cuda numbering. Discovery never
+        // produces that.
+        assert_ne!(
+            WorkerPool::benchmark_device_id("risc0:cuda:0"),
+            WorkerPool::benchmark_device_id("risc0:rocm:0"),
+        );
+        assert_eq!(WorkerPool::benchmark_device_id("risc0:rocm:0"), "gpu-rocm0");
+        // CUDA keeps the legacy bare form so existing benchmarks.json still loads.
+        assert_eq!(WorkerPool::benchmark_device_id("risc0:cuda:0"), "gpu0");
+        // Every GPU id, whatever the vendor, must still satisfy the
+        // `starts_with("gpu")` predicate that run.rs and app.rs use to mean
+        // "this is a GPU row" -- planner_active and stale-row pruning depend on it.
+        for key in ["risc0:cuda:0", "risc0:rocm:0", "risc0:intel:1"] {
+            assert!(WorkerPool::benchmark_device_id(key).starts_with("gpu"));
+        }
+        assert!(!WorkerPool::benchmark_device_id("sp1:generic").starts_with("gpu"));
     }
 }

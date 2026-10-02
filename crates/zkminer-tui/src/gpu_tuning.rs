@@ -196,13 +196,40 @@ pub enum TuningChange {
 // Capability probing
 // ---------------------------------------------------------------------------
 
+/// Stable per-card key for tuning state.
+///
+/// The PCI bus id, which is globally unique and vendor-neutral, falling back to
+/// the display ordinal only when the bus id is unavailable. Previously this was
+/// `format!("gpu{}", gpu.index)`, which collides with the benchmark `gpuN`
+/// namespace while meaning something different -- so the tuning before/after
+/// panel summed a *neighbouring* card's throughput as its own baseline.
+///
+/// `find_gpu_by_tuning_id` is the exact inverse and the two MUST change together:
+/// probing mints these ids and `apply_tuning` resolves them back to a card
+/// before writing to sysfs.
+pub fn tuning_device_id(gpu: &crate::hardware::GpuInfo) -> String {
+    if gpu.pci_bus_id.is_empty() {
+        format!("gpu{}", gpu.index)
+    } else {
+        gpu.pci_bus_id.clone()
+    }
+}
+
+/// Inverse of [`tuning_device_id`].
+pub fn find_gpu_by_tuning_id<'a>(
+    gpus: &'a [crate::hardware::GpuInfo],
+    device_id: &str,
+) -> Option<&'a crate::hardware::GpuInfo> {
+    gpus.iter().find(|g| tuning_device_id(g) == device_id)
+}
+
 /// Probe tuning capabilities for all GPUs. Called once at startup.
 pub fn probe_tuning_caps(hardware: &HardwareInfo) -> Vec<GpuTuningCaps> {
     hardware
         .gpus
         .iter()
         .map(|gpu| {
-            let device_id = format!("gpu{}", gpu.index);
+            let device_id = tuning_device_id(gpu);
             match gpu.vendor {
                 GpuVendor::Amd => probe_amd_caps(&device_id, gpu.index),
                 GpuVendor::Nvidia => probe_nvidia_caps(&device_id, nvidia_smi_index(&gpu.pci_id)),
@@ -405,10 +432,7 @@ pub fn apply_tuning(
     change: &TuningChange,
     hardware: &HardwareInfo,
 ) -> Result<String> {
-    let gpu = hardware
-        .gpus
-        .iter()
-        .find(|g| format!("gpu{}", g.index) == device_id)
+    let gpu = find_gpu_by_tuning_id(&hardware.gpus, device_id)
         .ok_or_else(|| anyhow!("GPU not found: {device_id}"))?;
 
     match gpu.vendor {
