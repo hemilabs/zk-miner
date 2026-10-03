@@ -62,6 +62,9 @@ fn main() {
         .init();
 
     // Direct benchmark mode: run benchmarks and print results to stderr (stdout is redirected)
+    // Before constructing any CudaProver: never adopt a server whose owner is gone.
+    reap_orphaned_gpu_servers();
+
     if std::env::args().any(|a| a == "--benchmark") {
         let prover = sp1_sdk::blocking::ProverClient::builder().cuda().build();
         let results = run_benchmarks(&prover);
@@ -77,6 +80,92 @@ fn main() {
     if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Parse the parent pid out of a `/proc/<pid>/stat` line.
+///
+/// Field 4 is ppid, but field 2 (`comm`) is wrapped in parentheses and may itself contain
+/// spaces AND parentheses, so counting from the left is wrong. Split after the LAST ')'
+/// and take the second field from there (field 3 is the state char).
+fn ppid_from_proc_stat(stat: &str) -> Option<i32> {
+    let rest = stat.rsplit_once(')').map(|(_, r)| r)?;
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Kill any ORPHANED `sp1-gpu-server` before this worker starts its own, and remove the
+/// socket it was holding.
+///
+/// WHY THIS EXISTS. The SDK forks `sp1-gpu-server` as a child of this worker and relies on
+/// `kill_on_drop(true)` to reap it. That only works on a graceful teardown. If the worker
+/// is killed abruptly -- SIGKILL, an OOM kill, a `timeout`-killed test run, the host losing
+/// power -- the server is NOT reaped: `PR_SET_PDEATHSIG` is cleared across fork so it does
+/// not apply to the grandchild, and the dispatcher's process-group kill cannot run if the
+/// whole miner is gone.
+///
+/// The result is not a clean failure, which is what made it hard to spot. Measured
+/// 2026-10-03: SIGKILLing the worker left the server alive at 7.6GB RSS, still listening on
+/// `/tmp/sp1-cuda-0.sock`. The NEXT worker's `CudaClient::connect` unconditionally calls
+/// `start_server`, whose new server cannot bind the in-use socket and dies -- so the client
+/// silently CONNECTS TO THE ORPHAN and proves against it. The proof succeeds, and the
+/// orphan's RSS grew 8.5GB -> 19.5GB across one adoption. Nothing ever reaps it, so on a
+/// 28GB host an adopted server drifts upward run after run until the box is out of memory.
+///
+/// `ppid == 1` is the discriminator: a server owned by a LIVE worker (this one, or a
+/// sibling miner on the same box) has that worker as its parent, so it is never touched.
+/// Only a server whose owner is already gone gets killed.
+fn reap_orphaned_gpu_servers() {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return;
+        };
+        let mut killed = 0usize;
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+                continue;
+            };
+            // comm is the truncated executable name.
+            let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
+                continue;
+            };
+            if comm.trim() != "sp1-gpu-server" {
+                continue;
+            }
+            // Field 4 of /proc/<pid>/stat is ppid, but comm (field 2) can contain spaces
+            // and parentheses -- always split after the LAST ')'.
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            let ppid: i32 = match ppid_from_proc_stat(&stat) {
+                Some(v) => v,
+                None => continue,
+            };
+            if ppid != 1 {
+                continue; // still owned by a live worker -- not ours to kill
+            }
+            tracing::warn!(
+                "reaping orphaned sp1-gpu-server pid {pid} (ppid 1) left by an abruptly \
+                 killed worker; adopting it instead would reuse a server nothing can reap"
+            );
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            killed += 1;
+        }
+        if killed > 0 {
+            // The orphan held the socket; remove it so our fresh server binds cleanly
+            // rather than racing a dying one. The SDK never unlinks it (CudaClientInner's
+            // Drop only shuts the stream down), and the path is machine-global.
+            for id in 0..8u32 {
+                let p = format!("/tmp/sp1-cuda-{id}.sock");
+                if std::path::Path::new(&p).exists() {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+            tracing::warn!("reaped {killed} orphaned sp1-gpu-server process(es)");
+        }
     }
 }
 
@@ -415,3 +504,40 @@ fn benchmark_program(
     })
 }
 
+#[cfg(test)]
+mod orphan_reap_tests {
+    use super::ppid_from_proc_stat;
+
+    /// `comm` may contain spaces and parentheses, so the ppid must be located relative to
+    /// the LAST ')' and never by counting whitespace fields from the start.
+    #[test]
+    fn ppid_is_parsed_past_a_hostile_comm() {
+        // Ordinary case.
+        assert_eq!(ppid_from_proc_stat("123 (sp1-gpu-server) S 1 123 123 0 -1 4194560"), Some(1));
+        // Live owner.
+        assert_eq!(ppid_from_proc_stat("200 (sp1-gpu-server) S 199 200 200 0 -1 0"), Some(199));
+        // comm containing spaces AND parens — counting fields from the left gives the
+        // wrong answer here, which would make us kill a server that has a live owner.
+        assert_eq!(ppid_from_proc_stat("77 (we (are) evil) S 42 77 77 0 -1 0"), Some(42));
+        // comm containing a digit that could be mistaken for the ppid.
+        assert_eq!(ppid_from_proc_stat("88 (proc 1 2 3) R 55 88 88 0 -1 0"), Some(55));
+    }
+
+    #[test]
+    fn malformed_stat_yields_none_rather_than_a_wrong_kill() {
+        assert_eq!(ppid_from_proc_stat(""), None);
+        assert_eq!(ppid_from_proc_stat("no parens here"), None);
+        assert_eq!(ppid_from_proc_stat("1 (x)"), None);
+        assert_eq!(ppid_from_proc_stat("1 (x) S"), None);
+        assert_eq!(ppid_from_proc_stat("1 (x) S notanumber"), None);
+    }
+
+    /// The real shape, read from this process: our own ppid must parse correctly.
+    #[test]
+    fn it_agrees_with_the_kernel_for_this_process() {
+        let stat = std::fs::read_to_string("/proc/self/stat").expect("read /proc/self/stat");
+        let parsed = ppid_from_proc_stat(&stat).expect("parse");
+        let expected = unsafe { libc::getppid() };
+        assert_eq!(parsed, expected, "parsed ppid must match getppid()");
+    }
+}
