@@ -16,6 +16,30 @@ on:
     tags:
       - 'v*'
 
+  # Callable from release.yml so a tagged release reuses these exact jobs.
+  workflow_call:
+    inputs:
+      retention-days:
+        description: 'How long to keep the uploaded artifacts'
+        type: number
+        default: 14
+        required: false
+      # Declared so the job `if:` below evaluates true when CALLED. Without these
+      # the guards read an undefined `inputs.build_cli` under a manually
+      # dispatched release and BOTH Windows jobs silently skip, producing a
+      # release with no Windows binaries at all.
+      build_cli:
+        type: boolean
+        default: true
+        required: false
+      build_cuda:
+        type: boolean
+        default: true
+        required: false
+
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -29,7 +53,7 @@ jobs:
   # CLI — cross-compiled from Linux (fast, ~5 min)
   # -----------------------------------------------------------------------
   cli-windows:
-    if: ${{ github.event_name == 'push' || inputs.build_cli }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_cli }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -72,12 +96,14 @@ jobs:
         with:
           name: zkminer-windows-cli
           path: dist/zkminer.exe*
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days || 14 }}
 
   # -----------------------------------------------------------------------
   # CUDA prover — native Windows build (requires MSVC + CUDA toolkit)
   # -----------------------------------------------------------------------
   cuda-windows:
-    if: ${{ github.event_name == 'push' || inputs.build_cuda }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_cuda }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -133,3 +159,5 @@ jobs:
         with:
           name: zkminer-windows-cuda
           path: dist/zkminer-prove-risc0-cuda.exe*
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days || 14 }}

@@ -64,6 +64,13 @@ RUN rustup target add x86_64-pc-windows-msvc \
 
 COPY . .
 
+# Statically link the MSVC runtime so the .exe runs on a clean Windows box without
+# the Visual C++ redistributable. This stage inherited only `+adx` from rust-base,
+# which dynamically links vcruntime -- fine as a compile check, but it made the
+# shipped binary depend on something the user has to install first. The native
+# Windows CI job already used `+crt-static`; the two now agree.
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
+
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=target-cli-windows,target=/build/target \

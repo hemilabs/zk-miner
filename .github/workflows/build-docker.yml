@@ -11,6 +11,18 @@ on:
   # trigger matches the BASE, not the head, so pushing a topic branch does
   # nothing.
   workflow_dispatch:
+  # Callable from release.yml so a tagged release builds the SAME binaries this
+  # workflow already validates, instead of a second copy of the build that can drift.
+  workflow_call:
+    inputs:
+      retention-days:
+        description: 'How long to keep the uploaded artifacts'
+        type: number
+        default: 14
+        required: false
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -32,13 +44,19 @@ jobs:
       # hides the state of the other five.
       fail-fast: false
       matrix:
-        target:
-          - dist-cli
-          - dist-cli-windows
-          - dist-openvm
-          - dist-cuda
-          - dist-sp1
-          - dist-rocm
+        include:
+          - target: dist-cli
+            binary: zkminer
+          - target: dist-cli-windows
+            binary: zkminer.exe
+          - target: dist-openvm
+            binary: zkminer-prove-openvm
+          - target: dist-cuda
+            binary: zkminer-prove-risc0-cuda
+          - target: dist-sp1
+            binary: zkminer-prove-sp1
+          - target: dist-rocm
+            binary: zkminer-prove-risc0-rocm
 
     steps:
       - name: "Checkout repository"
@@ -47,5 +65,46 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: "Build ${{ matrix.target }}"
-        run: docker build -f Dockerfile.build --target ${{ matrix.target }} .
+      # `--output` is a BuildKit feature; the classic builder ignores it.
+      - name: "Set up Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      # EXTRACT the binary instead of discarding it.
+      #
+      # Every `dist-*` stage is a `FROM scratch` container holding exactly one
+      # binary, and exists only to be exported — the Dockerfile's own usage line
+      # says so. Building without `--output` proved the code compiled and then
+      # threw all six binaries away, so no build produced anything anyone could
+      # download or test.
+      - name: "Build and extract ${{ matrix.binary }}"
+        run: |
+          docker buildx build \
+            -f Dockerfile.build \
+            --target ${{ matrix.target }} \
+            --output type=local,dest=dist \
+            .
+
+      - name: "Verify and checksum"
+        run: |
+          set -euo pipefail
+          cd dist
+          test -s "${{ matrix.binary }}" || {
+            echo "::error::${{ matrix.binary }} is missing or empty after extraction"
+            ls -la
+            exit 1
+          }
+          chmod +x "${{ matrix.binary }}" || true
+          sha256sum "${{ matrix.binary }}" | tee "${{ matrix.binary }}.sha256"
+          ls -la
+
+      # Downloadable from the run's Artifacts section by anyone who can see the
+      # repo, on EVERY build — push, PR and manual dispatch alike.
+      - name: "Upload ${{ matrix.binary }}"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/${{ matrix.binary }}
+            dist/${{ matrix.binary }}.sha256
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days || 14 }}
