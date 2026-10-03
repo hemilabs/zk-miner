@@ -523,24 +523,87 @@ impl WorkerHandle {
 
 impl Drop for WorkerHandle {
     fn drop(&mut self) {
+        // Captured BEFORE any wait: the pid doubles as the process-group id.
+        let pid = self.child.id();
         // Best-effort shutdown
         let _ = self.send(&WorkerCommand::Shutdown);
 
-        // Wait briefly then kill
-        let start = Instant::now();
-        let timeout = Duration::from_secs(2);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if start.elapsed() < timeout => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                _ => {
-                    self.force_kill_group();
+        // Poll for exit WITHOUT reaping.
+        //
+        // `kill(pid, 0)` CANNOT be used here: it succeeds for a ZOMBIE (verified), so it
+        // never observes death and the loop degenerates into an unconditional 2s sleep.
+        // With four workers that pushed `shutdown_all` to ~10.2s against the hard 10s cap
+        // its callers impose, so the cap fired on every clean stop and printed the
+        // "check for an orphaned sp1-gpu-server holding VRAM" warning when nothing had
+        // leaked -- training the operator to ignore the one alarm that means "go look".
+        //
+        // `waitid(WNOHANG|WNOWAIT)` reports the exit and LEAVES the zombie, which is what
+        // keeps the pid -- and therefore the process-group NUMBER -- pinned until we are
+        // done signalling it. `try_wait` would reap and free the number.
+        #[cfg(unix)]
+        {
+            let start = Instant::now();
+            let timeout = Duration::from_secs(2);
+            loop {
+                let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let r = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut si,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                if r != 0 {
+                    // ECHILD: already reaped by someone else (ensure_alive / kill /
+                    // shutdown all reap upstream). Nothing left to wait for.
                     break;
                 }
+                // si_pid == 0 means still running under WNOHANG.
+                if unsafe { si.si_pid() } != 0 {
+                    break;
+                }
+                if start.elapsed() >= timeout {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
+
+        // Kill the process group, but ONLY while it still has members.
+        //
+        // This is the whole point of the fix: the old code `break`ed out of its wait loop
+        // precisely when the worker had already exited -- the death-and-respawn path drops
+        // the handle BECAUSE the worker died -- and so never group-killed. A forked GPU
+        // helper (SP1's `sp1-gpu-server`, a 236MB CUDA process) then outlived it as an
+        // orphan holding VRAM, unreachable afterwards because `handle_worker_death` zeroes
+        // the stored PID before dropping the handle. Measured in production: 10.3GB still
+        // held after the miner exited, which starved the next run into CUDA OOM panics.
+        //
+        // The `kill(-pid, 0)` guard matters. When the worker left no children the group is
+        // EMPTY and its number is free for reuse, so an unconditional `kill(-pid, SIGKILL)`
+        // could signal an unrelated group -- and since every worker is a group leader, a
+        // collision would take out somebody's whole worker group mid-proof. A non-empty
+        // group pins the number, so probing first is both safe and sufficient: if members
+        // exist we kill them, and if none exist there is nothing to leak.
+        #[cfg(unix)]
+        unsafe {
+            if pid != 0 && libc::kill(-(pid as i32), 0) == 0 {
+                tracing::warn!(
+                    "worker {} (PID {pid}) left process-group members behind — killing the \
+                     group so a forked GPU helper cannot orphan and hold VRAM",
+                    self.backend
+                );
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+        }
+
+        // Now reap.
+        let _ = self.child.wait();
 
         // Join stderr thread
         if let Some(handle) = self.stderr_task.take() {

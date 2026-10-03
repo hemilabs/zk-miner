@@ -88,6 +88,20 @@ enum ReconcileClass {
 /// Classify a reconcile read from the on-chain `prover` field. `prover == None` means
 /// the view was absent/unreadable. Mirrors the single-claim poll, which treats
 /// `prover == ZERO` as "keep polling, not lost".
+/// True if a proving error means the JOB's deadline is spent, which is terminal: the
+/// same deadline binds every GPU, so retrying is pointless and the job must be released
+/// while it still can be.
+///
+/// Matches the dispatcher's three actual emitters, NOT any message containing the word
+/// "deadline". A bare substring test made this arm terminal for whatever text a worker
+/// or a third-party library happened to write, and it swallows the common transient
+/// failures -- a respawn backoff message, an EOF, a CUDA allocation error -- none of
+/// which should end a job. See `dispatcher.rs` "deadline cutoff reached while queued",
+/// "left before deadline cutoff after", and "job deadline reached mid-proof".
+fn is_deadline_terminal(msg: &str) -> bool {
+    msg.contains("deadline cutoff") || msg.contains("job deadline reached")
+}
+
 fn classify_reconcile(prover: Option<alloy::primitives::Address>, us: alloy::primitives::Address) -> ReconcileClass {
     match prover {
         Some(p) if p == us => ReconcileClass::Locked,
@@ -3837,7 +3851,12 @@ async fn process_job_lifecycle(
                     // A deadline abort is terminal: the same deadline binds every GPU,
                     // so retrying is pointless — return so the job is released while it
                     // still can be. (The dispatcher reports these distinctly.)
-                    if msg.contains("deadline") {
+                    // Match the dispatcher's ACTUAL deadline strings, not any message
+                    // containing the word. A bare `contains("deadline")` makes this arm
+                    // terminal for any text a worker or a third-party library happens to
+                    // write, and commit 1 makes the poll-loop bail a common path on a
+                    // single-key box, so the blast radius was about to grow.
+                    if is_deadline_terminal(&msg) {
                         return Err(anyhow::anyhow!(
                             "proving stopped for {} (deadline): {msg}",
                             short_id(job_id)
@@ -3854,16 +3873,30 @@ async fn process_job_lifecycle(
                     let real_oom = zkminer_prover_protocol::types::is_gpu_oom(&msg);
                     let health_fail = !invalid && !real_oom;
                     if attempt < MAX_PROVE_ATTEMPTS {
-                        if real_oom {
-                            min_vram = Some(LARGE_JOB_MIN_VRAM_BYTES);
-                        } else if health_fail {
-                            // Steer the retry off this worker's GPU (never strands:
-                            // if excluding empties the set, the full set is used).
-                            if let Some(k) = used_slot {
+                        // BOTH non-invalid classes steer OFF the card that just failed.
+                        //
+                        // The OOM arm used to set a VRAM floor INSTEAD of excluding, and
+                        // `LARGE_JOB_MIN_VRAM_BYTES` exceeds every card on this hardware
+                        // (30 GiB vs 16303 and 24564 MiB). So the floor emptied the
+                        // candidate set, `prove_min_vram` restored the FULL key set, and
+                        // the retry landed straight back on the card that had just OOMed
+                        // -- which, with the other card already excluded, left one key
+                        // and took the single-key shortcut into an instant respawn-backoff
+                        // bail. Observed in soak20 at 10:38:43.897 -> 10:38:44.580.
+                        //
+                        // Excluding cannot strand a job: `prove_min_vram` restores the
+                        // full set when pruning empties it.
+                        if !invalid {
+                            if let Some(k) = used_slot.clone() {
                                 if !excluded.contains(&k) {
                                     excluded.push(k);
                                 }
                             }
+                        }
+                        // Kept as a PREFERENCE for a bigger card, never as a substitute
+                        // for steering off the one that failed.
+                        if real_oom {
+                            min_vram = Some(LARGE_JOB_MIN_VRAM_BYTES);
                         }
                         // invalid ⇒ just re-prove (round-robin may pick another worker).
                         tracing::warn!(
@@ -4910,6 +4943,51 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
 mod tests {
     use super::*;
     use alloy::primitives::{Address, B256};
+
+    /// Commit 3. The dispatcher's three REAL deadline strings are terminal...
+    #[test]
+    fn the_dispatchers_real_deadline_strings_are_terminal() {
+        for m in [
+            "aborting proof: deadline cutoff reached while queued for a worker",
+            "aborting proof on risc0:cuda:0: only 4s left before deadline cutoff after queuing",
+            "proof on risc0:cuda:1 stopped: job deadline reached mid-proof (releasing to recover collateral)",
+        ] {
+            assert!(is_deadline_terminal(m), "should be terminal: {m}");
+        }
+    }
+
+    /// ...and the transient failures that a bare `contains("deadline")` would have
+    /// swallowed are NOT. The backoff string is the one that terminated all four jobs
+    /// soak20 lost, so it must stay retryable.
+    #[test]
+    fn transient_failures_are_not_treated_as_deadline_terminal() {
+        for m in [
+            "Backoff: waiting 4.52991749s before respawning /home/user/.zkminer/provers/zkminer-prove-risc0-cuda",
+            "Worker risc0:cuda:0 process died (EOF)",
+            "allocation failed on evaluated: 1728053248 bytes",
+            "failed to run groth16 prove operation: cudaGetLastError() failed: \"out of memory\"",
+        ] {
+            assert!(!is_deadline_terminal(m), "should be retryable: {m}");
+        }
+    }
+
+    /// Commit 2's premise, pinned: the VRAM floor the OOM arm sets exceeds EVERY card on
+    /// this hardware (16303 MiB / 24564 MiB), so using it INSTEAD of excluding the failed
+    /// slot emptied the candidate set, `prove_min_vram` restored the full set, and the
+    /// retry landed back on the card that had just OOMed. The floor is now a preference
+    /// applied ALONGSIDE exclusion, never a substitute for it.
+    #[test]
+    fn the_large_job_vram_floor_is_inert_on_this_hardware() {
+        const MIB: u64 = 1024 * 1024;
+        for card_mib in [16_303u64, 24_564] {
+            assert!(
+                LARGE_JOB_MIN_VRAM_BYTES > card_mib * MIB,
+                "a {card_mib} MiB card cannot satisfy a {} MiB floor — so the floor alone \
+                 steers nowhere and exclusion is what must do the steering",
+                LARGE_JOB_MIN_VRAM_BYTES / MIB
+            );
+        }
+    }
 
     #[test]
     fn classify_reconcile_treats_zero_and_none_as_unknown() {

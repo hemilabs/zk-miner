@@ -1283,8 +1283,30 @@ impl WorkerPool {
             if pruned.is_empty() { vram_keys } else { pruned }
         };
 
-        // Single key — use it directly
-        if keys.len() == 1 {
+        // Single key — use it directly, UNLESS it is a dead slot still inside its own
+        // respawn backoff window.
+        //
+        // This shortcut is how soak20 lost its jobs. Pruning a two-key set by one
+        // exclusion leaves exactly one key, so the retry took this path straight into
+        // `prove_on_slot` -> `ensure_alive` -> `respawn`, which bailed instantly with
+        // "Backoff: waiting 4.53s" and consumed the caller's last attempt 155us after
+        // the previous one. Falling through to the poll loop instead WAITS the window
+        // out, and that loop gives up only with `MIN_ABORT_START_BUDGET` left, so the
+        // job gets a real attempt rather than a timer rejection.
+        //
+        // A RETIRED slot (`slot_eligible == false`) deliberately still takes the fast
+        // path: its honest "permanently failed" error is more useful than a long wait.
+        // Uses `try_lock` so a slot that is merely BUSY proving is never mistaken for
+        // one in backoff -- a held lock means alive, which is not a backoff state.
+        let backoff_blocked = keys.len() == 1
+            && self
+                .workers
+                .get(&keys[0])
+                .and_then(|e| e.slot.try_lock().ok())
+                .map_or(false, |slot| {
+                    Self::slot_eligible(&slot) && Self::in_respawn_backoff(&slot)
+                });
+        if keys.len() == 1 && !backoff_blocked {
             *used_slot = Some(keys[0].clone());
             return self.prove_on_slot(&keys[0], elf, input_data, po2, timeout, on_progress, abort_at, po2_resolver);
         }
@@ -1316,7 +1338,7 @@ impl WorkerPool {
                         .as_mut()
                         .map(|h| h.is_alive())
                         .unwrap_or(false);
-                    if is_alive || Self::slot_eligible(&slot) {
+                    if is_alive || Self::slot_dispatchable(&slot) {
                         drop(slot);
                         *used_slot = Some(key.clone());
                         return self.prove_on_slot(key, elf, input_data, po2, timeout, on_progress, abort_at, po2_resolver);
@@ -1363,7 +1385,7 @@ impl WorkerPool {
                 }
                 if let Ok(mut slot) = entry.slot.try_lock() {
                     let is_alive = slot.handle.as_mut().map(|h| h.is_alive()).unwrap_or(false);
-                    if is_alive || Self::slot_eligible(&slot) {
+                    if is_alive || Self::slot_dispatchable(&slot) {
                         drop(slot);
                         *used_slot = Some(key.clone());
                         return self.prove_on_slot(
@@ -1422,6 +1444,12 @@ impl WorkerPool {
         let entry = self.workers.get(key)?;
         let slot = entry.slot.lock().ok()?;
         slot.pci_bus_id.clone().filter(|b| !b.is_empty())
+    }
+
+    /// PID of the worker behind `key`, or 0 if it has none. For tests that need to
+    /// induce a real worker death.
+    pub fn worker_pid(&self, key: &str) -> Option<u32> {
+        self.workers.get(key).map(|e| e.pid.load(Ordering::Acquire))
     }
 
     /// Canonical PCI bus ids of every GPU slot in this pool.
@@ -1755,6 +1783,47 @@ impl WorkerPool {
             || slot.last_failure.map_or(false, |t| t.elapsed() >= RETIRE_COOLDOWN)
     }
 
+    /// True if this DEAD slot is still inside the respawn backoff window that its own
+    /// last failure armed.
+    ///
+    /// Dispatching to such a slot is guaranteed to bail in `respawn` without ever
+    /// touching the GPU, so it burns one of the caller's `MAX_PROVE_ATTEMPTS` in
+    /// microseconds. That is what terminated every job soak20 lost: all four died on
+    /// `proving failed after 3 attempt(s): Backoff: waiting ~4.5s before respawning`,
+    /// and for 0x92e7686c attempt 3 fired **155 microseconds** after attempt 2
+    /// (10:38:44.580790 -> .580945). The whole retry budget was consumed by a 5s timer
+    /// the failure handler had armed 0.7s earlier.
+    ///
+    /// `respawn` already documents this bug class for a different path ("the 'first
+    /// respawn always fails' bug where the self-imposed `last_failure` timestamp caused
+    /// an immediate backoff rejection"); the OOM arm reintroduced it because no dispatch
+    /// predicate knew about the window. `slot_eligible` checks only
+    /// `consecutive_failures`.
+    ///
+    /// Mirrors `respawn`'s own arithmetic so the two cannot disagree.
+    fn in_respawn_backoff(slot: &WorkerSlot) -> bool {
+        if slot.handle.is_some() {
+            return false; // alive: nothing to respawn, no window
+        }
+        match slot.last_failure {
+            Some(last) => {
+                let idx = (slot.consecutive_failures as usize).min(RESPAWN_BACKOFF.len() - 1);
+                last.elapsed() < RESPAWN_BACKOFF[idx]
+            }
+            None => false,
+        }
+    }
+
+    /// `slot_eligible` AND not inside its respawn backoff window.
+    ///
+    /// Deliberately a separate predicate rather than folding the window into
+    /// `slot_eligible`: that one is also consulted by `is_backend_healthy`, which asks
+    /// "could this backend ever serve again", not "can it serve right now". Merging them
+    /// would make a backend look permanently unhealthy for the length of a backoff.
+    fn slot_dispatchable(slot: &WorkerSlot) -> bool {
+        Self::slot_eligible(slot) && !Self::in_respawn_backoff(slot)
+    }
+
     /// Attempt to respawn a dead worker with exponential backoff.
     fn respawn(slot: &mut WorkerSlot) -> Result<()> {
         // Self-heal: clear a retirement once the card has been quiet for the cooldown,
@@ -1893,6 +1962,11 @@ impl WorkerPool {
                 tracing::info!("Sending SIGTERM to worker {key} (PID {pid})");
                 #[cfg(unix)]
                 unsafe {
+                    // Signal the GROUP, not just the leader: a forked GPU helper
+                    // (SP1's sp1-gpu-server) should get a chance to release its VRAM
+                    // and exit cleanly rather than being SIGKILLed in phase 3. pid is
+                    // non-zero here, so kill(-pid) cannot degenerate to kill(0)/kill(-1).
+                    libc::kill(-(pid as i32), libc::SIGTERM);
                     libc::kill(pid as i32, libc::SIGTERM);
                 }
             }
@@ -2327,6 +2401,117 @@ mod tests {
         drop(watchdog);
         // intentional_kill SHOULD be set (kill was attempted, PID unchanged)
         assert!(ik.load(Ordering::Acquire));
+    }
+
+    // ---- backoff-aware dispatch (soak20 job-loss regression) ----
+
+    fn slot_with(failures: u32, last_failure_ago: Option<Duration>, alive: bool) -> WorkerSlot {
+        let _ = alive; // handle is always None here: a live slot has no backoff window
+        WorkerSlot {
+            handle: None,
+            path: PathBuf::from("/nonexistent/binary"),
+            backend: "risc0".to_string(),
+            gpu_tag: "cuda".to_string(),
+            device_index: Some(0),
+            pci_bus_id: Some("0000:06:1b.0".to_string()),
+            gpu_name: Some("test".to_string()),
+            spawn_env: HashMap::new(),
+            consecutive_failures: failures,
+            last_failure: last_failure_ago.map(|d| Instant::now() - d),
+            proofs_since_spawn: 0,
+        }
+    }
+
+    /// THE REGRESSION. soak20 lost all four of its failed jobs to
+    /// `proving failed after 3 attempt(s): Backoff: waiting ~4.5s before respawning`,
+    /// with attempt 3 firing 155us after attempt 2. A dead slot inside its own backoff
+    /// window must not be considered dispatchable, or the caller's whole
+    /// MAX_PROVE_ATTEMPTS budget is spent on a timer.
+    #[test]
+    fn a_slot_inside_its_respawn_backoff_is_not_dispatchable() {
+        // consecutive_failures = 1 -> RESPAWN_BACKOFF[1] = 5s. Failed 0.7s ago, exactly
+        // the soak20 shape (OOM at 10:38:43.897, retry at 10:38:44.580).
+        let slot = slot_with(1, Some(Duration::from_millis(700)), false);
+        assert!(
+            WorkerPool::in_respawn_backoff(&slot),
+            "0.7s into a 5s window must read as in-backoff"
+        );
+        assert!(
+            WorkerPool::slot_eligible(&slot),
+            "it is still ELIGIBLE -- only 1 failure -- which is why slot_eligible alone \
+             let the dispatch through"
+        );
+        assert!(
+            !WorkerPool::slot_dispatchable(&slot),
+            "but it must NOT be dispatchable: respawn would bail instantly"
+        );
+    }
+
+    /// Once the window has elapsed the slot is dispatchable again.
+    #[test]
+    fn a_cooled_backoff_window_is_dispatchable_again() {
+        let slot = slot_with(1, Some(Duration::from_secs(6)), false);
+        assert!(!WorkerPool::in_respawn_backoff(&slot));
+        assert!(WorkerPool::slot_dispatchable(&slot));
+    }
+
+    /// A healthy slot that has never failed is unaffected.
+    #[test]
+    fn a_never_failed_slot_is_dispatchable() {
+        let slot = slot_with(0, None, false);
+        assert!(!WorkerPool::in_respawn_backoff(&slot));
+        assert!(WorkerPool::slot_dispatchable(&slot));
+    }
+
+    /// A RETIRED-but-cooled slot must stay dispatchable, so the new predicate cannot
+    /// re-retire a card that `RETIRE_COOLDOWN` has already forgiven.
+    #[test]
+    fn a_retired_but_cooled_slot_is_still_dispatchable() {
+        let slot = slot_with(MAX_RESPAWN_FAILURES, Some(RETIRE_COOLDOWN + Duration::from_secs(1)), false);
+        assert!(
+            WorkerPool::slot_eligible(&slot),
+            "RETIRE_COOLDOWN has elapsed, so it is eligible"
+        );
+        assert!(
+            !WorkerPool::in_respawn_backoff(&slot),
+            "and well past any RESPAWN_BACKOFF entry"
+        );
+        assert!(WorkerPool::slot_dispatchable(&slot));
+    }
+
+    /// `slot_eligible` must keep its old meaning: `is_backend_healthy` asks "could this
+    /// backend ever serve again", not "can it serve right now". Folding the backoff
+    /// window into it would make a backend look unhealthy for the length of a backoff.
+    #[test]
+    fn slot_eligible_truth_table_is_unchanged() {
+        assert!(WorkerPool::slot_eligible(&slot_with(0, None, false)));
+        assert!(WorkerPool::slot_eligible(&slot_with(1, Some(Duration::from_millis(1)), false)));
+        assert!(!WorkerPool::slot_eligible(&slot_with(
+            MAX_RESPAWN_FAILURES,
+            Some(Duration::from_secs(1)),
+            false
+        )));
+        assert!(WorkerPool::slot_eligible(&slot_with(
+            MAX_RESPAWN_FAILURES,
+            Some(RETIRE_COOLDOWN + Duration::from_secs(1)),
+            false
+        )));
+    }
+
+    /// The `backoff_blocked` discriminator used to gate the single-key shortcut: it must
+    /// fire ONLY for an eligible slot inside its window. A retired slot keeps the fast
+    /// path so its honest "permanently failed" error is not replaced by a long wait.
+    #[test]
+    fn only_an_eligible_in_backoff_slot_blocks_the_single_key_shortcut() {
+        let blocked = |s: &WorkerSlot| {
+            WorkerPool::slot_eligible(s) && WorkerPool::in_respawn_backoff(s)
+        };
+        assert!(blocked(&slot_with(1, Some(Duration::from_millis(700)), false)), "in-backoff");
+        assert!(!blocked(&slot_with(0, None, false)), "healthy");
+        assert!(
+            !blocked(&slot_with(MAX_RESPAWN_FAILURES, Some(Duration::from_millis(1)), false)),
+            "retired: must take the fast path and report permanently-failed"
+        );
     }
 
     // ---- respawn backoff tests ----

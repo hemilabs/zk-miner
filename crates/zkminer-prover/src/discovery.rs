@@ -725,6 +725,29 @@ pub fn discover_workers(
     found
 }
 
+// NOTE — why SP1 is left classified as "generic" even though it IS a CUDA prover.
+//
+// `zkminer-prove-sp1` forks `sp1-gpu-server` (a 236MB CUDA process, measured holding
+// 10.3GB of VRAM) yet carries no `-cuda` suffix, so `infer_gpu_tag` returns "generic".
+// A generic slot gets a 2-part key, which means `physical_gpu_id` returns None (no
+// per-card lock, so SP1 and risc0 can double-book one card), `gpu_env` injects no
+// `CUDA_VISIBLE_DEVICES` (no pin), and `proving_gpu_count` does not count it.
+//
+// Re-tagging it "cuda" to earn those three things was TRIED and REVERTED: it breaks SP1
+// proving outright. Measured on 2026-10-03 -- `sp1:generic` proves bigint-mul in 64s,
+// while `sp1:cuda:0` (16GB card) and `sp1:cuda:1` (24GB card) BOTH die with
+// "Worker sp1 process died (EOF)" in ~7s. Identical on both cards, so it is not a VRAM
+// shortfall: restricting `CUDA_VISIBLE_DEVICES` breaks the SDK's negotiation with its
+// gpu-server child. Re-tagging also made SP1 share risc0's per-card lock, and because a
+// single-key backend takes the `keys.len() == 1` shortcut in `prove_min_vram` it would
+// then block on an unbounded `l.lock()` with no deadline check -- able to park a job past
+// its own abort_at with collateral bonded, a loss path that does not exist today.
+//
+// A correct fix must therefore decouple "which card does this worker occupy" (for the
+// lock and the capacity count) from "inject a visibility pin" (which SP1 cannot take).
+// Until then the accounting gap is accepted, and the VRAM leak it caused is addressed
+// instead in `WorkerHandle::drop`, which now reaps a forked helper unconditionally.
+
 /// Infer GPU tag from binary filename.
 fn infer_gpu_tag(path: &Path) -> String {
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
