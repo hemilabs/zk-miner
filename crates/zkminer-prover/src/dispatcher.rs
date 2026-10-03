@@ -131,6 +131,16 @@ struct WorkerSlot {
     spawn_env: HashMap<String, String>,
     consecutive_failures: u32,
     last_failure: Option<Instant>,
+    /// Set when the worker SPOKE the protocol and declined: it cannot prove on this
+    /// host, and no retry will change that. Holds the reason for the operator.
+    ///
+    /// Distinct from `consecutive_failures` on purpose. A dead-but-eligible slot is
+    /// deliberately still "healthy" (see `is_backend_healthy`) so a crashed worker
+    /// respawns and claiming does not stall on a transient fault. A capability decline
+    /// is not transient, so treating it the same way made the miner keep claiming jobs
+    /// the worker had just said it could not prove -- and every ~RETIRE_COOLDOWN the
+    /// counter reset re-opened the window for the life of the process.
+    declined: Option<String>,
     /// Number of proofs this worker instance has completed since it was (re)spawned.
     /// When it reaches `recycle_after_proofs()`, the worker is killed + respawned so
     /// the accumulated GPU context / buffer pool / persistent stream is reset to a
@@ -431,7 +441,8 @@ impl WorkerPool {
                                 spawn_env: env,
                                 consecutive_failures: 0,
                                 last_failure: None,
-                    proofs_since_spawn: 0,
+                                declined: None,
+                                proofs_since_spawn: 0,
                             }),
                             vram_bytes: gpu_vram_bytes(&gpu_tag, device_index),
                             pid: Arc::new(AtomicU32::new(worker_pid)),
@@ -441,7 +452,21 @@ impl WorkerPool {
                     connected.push(key);
                 }
                 Err(e) => {
-                    tracing::error!("Failed to start worker {key}{device_desc}: {e:#}");
+                    let msg = format!("{e:#}");
+                    // A DECLINE is permanent; a spawn failure is transient. Conflating
+                    // them is what kept `is_backend_healthy` true for a worker that had
+                    // just said it cannot prove.
+                    let declined = msg
+                        .contains(zkminer_prover_protocol::types::WORKER_DECLINED)
+                        .then(|| msg.clone());
+                    if declined.is_some() {
+                        tracing::error!(
+                            "Worker {key}{device_desc} DECLINED and will not be \
+                             advertised or respawned: {msg}"
+                        );
+                    } else {
+                        tracing::error!("Failed to start worker {key}{device_desc}: {msg}");
+                    }
                     let vram_bytes = gpu_vram_bytes(&gpu_tag, device_index);
                     self.workers.insert(
                         key,
@@ -457,6 +482,7 @@ impl WorkerPool {
                                 spawn_env: env,
                                 consecutive_failures: 1,
                                 last_failure: Some(Instant::now()),
+                                declined,
                                 proofs_since_spawn: 0,
                             }),
                             vram_bytes,
@@ -1446,6 +1472,31 @@ impl WorkerPool {
         slot.pci_bus_id.clone().filter(|b| !b.is_empty())
     }
 
+    /// The reason a backend DECLINED, if every slot serving it declined.
+    ///
+    /// A declined backend must not be reported as `Simulated` either: that is the
+    /// demo-mode signal, and the pre-claim gate deliberately no-ops in demo mode. A host
+    /// whose only worker declined would otherwise look like a demo and resume claiming.
+    pub fn backend_declined(&self, backend: &str) -> Option<String> {
+        let mut reason = None;
+        let mut saw_any = false;
+        for (key, entry) in &self.workers {
+            if !key.starts_with(backend) {
+                continue;
+            }
+            saw_any = true;
+            match entry.slot.lock() {
+                Ok(slot) => match &slot.declined {
+                    Some(r) => reason = reason.or_else(|| Some(r.clone())),
+                    // One non-declined slot means the backend is not categorically out.
+                    None => return None,
+                },
+                Err(_) => return None,
+            }
+        }
+        if saw_any { reason } else { None }
+    }
+
     /// Total VRAM of the card behind `key`, if known.
     ///
     /// Lets a retry demand a STRICTLY BIGGER card after a VRAM OOM, instead of a fixed
@@ -1787,6 +1838,14 @@ impl WorkerPool {
     /// True if a slot may be dispatched to: healthy, or retired-but-cooled-down so a
     /// transient failure burst doesn't sideline a GPU until process restart.
     fn slot_eligible(slot: &WorkerSlot) -> bool {
+        // A DECLINED worker can run but cannot prove here, and no retry changes that.
+        // It must never look eligible: the cooldown clause below is a pure clock check,
+        // so without this the slot became eligible again every RETIRE_COOLDOWN and the
+        // miner resumed claiming jobs it could not prove, for the process lifetime.
+        // This also stops the pointless respawn churn against a known-impossible worker.
+        if slot.declined.is_some() {
+            return false;
+        }
         slot.consecutive_failures < MAX_RESPAWN_FAILURES
             || slot.last_failure.map_or(false, |t| t.elapsed() >= RETIRE_COOLDOWN)
     }
@@ -2058,6 +2117,7 @@ impl WorkerPool {
                     spawn_env: env,
                     consecutive_failures: 0,
                     last_failure: None,
+                    declined: None,
                     proofs_since_spawn: 0,
                 }),
                 vram_bytes: None,
@@ -2186,6 +2246,7 @@ mod tests {
                         spawn_env: HashMap::new(),
                         consecutive_failures: 0,
                         last_failure: None,
+                    declined: None,
                     proofs_since_spawn: 0,
                     }),
                     vram_bytes: None,
@@ -2426,6 +2487,7 @@ mod tests {
             spawn_env: HashMap::new(),
             consecutive_failures: failures,
             last_failure: last_failure_ago.map(|d| Instant::now() - d),
+            declined: None,
             proofs_since_spawn: 0,
         }
     }
@@ -2537,6 +2599,7 @@ mod tests {
             spawn_env: HashMap::new(),
             consecutive_failures: MAX_RESPAWN_FAILURES,
             last_failure: Some(Instant::now()),
+            declined: None,
             proofs_since_spawn: 0,
         };
         let result = WorkerPool::respawn(&mut slot);
@@ -2558,6 +2621,7 @@ mod tests {
             spawn_env: HashMap::new(),
             consecutive_failures: 1,
             last_failure: Some(Instant::now()), // just failed
+            declined: None,
             proofs_since_spawn: 0,
         };
         // With consecutive_failures=1, backoff is RESPAWN_BACKOFF[1] = 5s.
@@ -2581,6 +2645,7 @@ mod tests {
             spawn_env: HashMap::new(),
             consecutive_failures: 0,
             last_failure: None,
+            declined: None,
             proofs_since_spawn: 0,
         };
         let result = WorkerPool::respawn(&mut slot);
@@ -2608,6 +2673,7 @@ mod tests {
             spawn_env: HashMap::new(),
             consecutive_failures: 0,
             last_failure: None,
+            declined: None,
             proofs_since_spawn: 0,
         };
         let result = pool.ensure_alive(&mut slot, &pid);
@@ -2636,6 +2702,7 @@ mod tests {
             spawn_env: HashMap::new(),
             consecutive_failures: 0,
             last_failure: None,
+            declined: None,
             proofs_since_spawn: 0,
         };
         let result = pool.ensure_alive(&mut slot, &pid);
@@ -2684,5 +2751,150 @@ mod tests {
             assert!(WorkerPool::benchmark_device_id(key).starts_with("gpu"));
         }
         assert!(!WorkerPool::benchmark_device_id("sp1:generic").starts_with("gpu"));
+    }
+}
+
+#[cfg(test)]
+mod declined_backend_tests {
+    use super::*;
+
+    fn pool_with(slots: Vec<(&str, WorkerSlot)>) -> WorkerPool {
+        let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+        for (key, sl) in slots {
+            pool.workers.insert(
+                key.to_string(),
+                WorkerEntry {
+                    slot: Mutex::new(sl),
+                    vram_bytes: None,
+                    pid: Arc::new(AtomicU32::new(0)),
+                    intentional_kill: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        pool
+    }
+
+    fn slot(declined: Option<&str>, cf: u32) -> WorkerSlot {
+        WorkerSlot {
+            handle: None,
+            path: PathBuf::from("/nonexistent"),
+            backend: "sp1".to_string(),
+            gpu_tag: "generic".to_string(),
+            device_index: None,
+            pci_bus_id: None,
+            gpu_name: None,
+            spawn_env: HashMap::new(),
+            consecutive_failures: cf,
+            last_failure: Some(Instant::now()),
+            declined: declined.map(str::to_string),
+            proofs_since_spawn: 0,
+        }
+    }
+
+    /// THE DEFECT. A spawn failure registers the slot with consecutive_failures = 1, so
+    /// `slot_eligible` was true, `is_backend_healthy` returned true for a "dead but
+    /// eligible" slot by design, `backend_sources` reported the backend as a real
+    /// Subprocess, and run.rs's pre-claim gate let the miner CLAIM jobs the worker had
+    /// just said it could not prove. Refusing the handshake alone did NOT close that.
+    #[test]
+    fn a_declined_slot_is_not_eligible_even_though_it_looks_transient() {
+        // Exactly the state discover_and_spawn records on a failed spawn.
+        let transient = slot(None, 1);
+        assert!(
+            WorkerPool::slot_eligible(&transient),
+            "a transient failure must stay eligible so a crashed worker respawns"
+        );
+
+        let declined = slot(Some("sp1 unavailable: libcudart.so.12 not found"), 1);
+        assert!(
+            !WorkerPool::slot_eligible(&declined),
+            "a DECLINED slot must never be eligible -- no retry can change its verdict"
+        );
+    }
+
+    /// The cooldown clause is a pure clock check, so without the declined guard the slot
+    /// became eligible again every RETIRE_COOLDOWN, re-opening the claim window for the
+    /// life of the process.
+    #[test]
+    fn a_declined_slot_stays_ineligible_past_the_retire_cooldown() {
+        let mut s = slot(Some("cannot prove here"), MAX_RESPAWN_FAILURES);
+        s.last_failure = Some(Instant::now() - (RETIRE_COOLDOWN + Duration::from_secs(1)));
+        // A non-declined slot in this state IS eligible again -- that is the behaviour
+        // the guard must not break.
+        let mut cooled = s.clone_for_test();
+        cooled.declined = None;
+        assert!(
+            WorkerPool::slot_eligible(&cooled),
+            "a cooled-down transient failure must become eligible again"
+        );
+        assert!(
+            !WorkerPool::slot_eligible(&s),
+            "but a declined slot must stay ineligible regardless of elapsed time"
+        );
+    }
+
+    /// What the MONEY path actually reads. run.rs's pre-claim gate consults
+    /// `engine::backend_sources()`, which asks `is_backend_healthy`. Asserting on the
+    /// `Workers:` log line (as the first verification of this fix wrongly did) proves
+    /// nothing: that is `discover_and_spawn`'s returned vec, a DIFFERENT predicate.
+    #[test]
+    fn a_declined_backend_is_neither_healthy_nor_silently_simulated() {
+        let pool = pool_with(vec![(
+            "sp1:generic",
+            slot(Some("libcudart.so.12: cannot open shared object"), 1),
+        )]);
+
+        assert!(
+            !pool.is_backend_healthy("sp1"),
+            "a declined backend must NOT read as healthy -- this is the check the \
+             pre-claim gate depends on, and it was true before the fix"
+        );
+        let reason = pool
+            .backend_declined("sp1")
+            .expect("the decline reason must be reportable so it is not mistaken for demo mode");
+        assert!(reason.contains("libcudart"), "reason should carry the cause: {reason}");
+    }
+
+    /// One healthy slot means the backend is NOT categorically declined, even if a
+    /// sibling slot declined -- otherwise a single bad card would disable a working one.
+    #[test]
+    fn one_healthy_slot_keeps_the_backend_available() {
+        let pool = pool_with(vec![
+            ("sp1:cuda:0", slot(Some("declined"), 1)),
+            ("sp1:cuda:1", slot(None, 0)),
+        ]);
+        assert!(
+            pool.backend_declined("sp1").is_none(),
+            "a backend with one usable slot must not be reported as declined"
+        );
+    }
+
+    /// A declined worker must not be respawned either -- it is pointless churn against a
+    /// worker that has told us it cannot work.
+    #[test]
+    fn a_declined_slot_is_not_dispatchable() {
+        let declined = slot(Some("cannot prove here"), 1);
+        assert!(!WorkerPool::slot_dispatchable(&declined));
+    }
+}
+
+impl WorkerSlot {
+    /// Test-only shallow copy (WorkerHandle is not Clone, and these fixtures hold None).
+    #[cfg(test)]
+    fn clone_for_test(&self) -> Self {
+        WorkerSlot {
+            handle: None,
+            path: self.path.clone(),
+            backend: self.backend.clone(),
+            gpu_tag: self.gpu_tag.clone(),
+            device_index: self.device_index,
+            pci_bus_id: self.pci_bus_id.clone(),
+            gpu_name: self.gpu_name.clone(),
+            spawn_env: self.spawn_env.clone(),
+            consecutive_failures: self.consecutive_failures,
+            last_failure: self.last_failure,
+            declined: self.declined.clone(),
+            proofs_since_spawn: self.proofs_since_spawn,
+        }
     }
 }

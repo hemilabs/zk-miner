@@ -164,6 +164,12 @@ pub fn backend_sources() -> Vec<(&'static str, BackendSource)> {
         } else if let Some(pool) = worker_pool() {
             if pool.is_backend_healthy(backend) {
                 sources.push((backend, BackendSource::Subprocess));
+            } else if let Some(reason) = pool.backend_declined(backend) {
+                // Report NOTHING for a backend whose worker spoke the protocol and said
+                // it cannot prove here. Reporting `Simulated` would be worse than
+                // reporting nothing: that is the demo-mode marker, and the pre-claim gate
+                // in run.rs treats an all-Simulated list as "demo, claim freely".
+                tracing::debug!("backend {backend} declined, not advertising it: {reason}");
             } else if !any_feature {
                 sources.push((backend, BackendSource::Simulated));
             }

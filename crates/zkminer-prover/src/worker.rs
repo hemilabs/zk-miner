@@ -322,8 +322,13 @@ impl WorkerHandle {
             // "expected HelloAck". This is how an SP1 worker on a host with no usable
             // CUDA runtime declines, instead of claiming jobs it would lose.
             WorkerResponse::Error { kind, message, .. } => {
+                // Tagged with WORKER_DECLINED so the dispatcher can tell this from a
+                // transient spawn failure. Without the tag the slot is registered as
+                // dead-but-eligible, `is_backend_healthy` returns true, and the miner
+                // goes on claiming jobs this worker has just said it cannot prove.
                 bail!(
-                    "Worker {} declined the handshake ({kind:?}): {message}",
+                    "{} Worker {} declined the handshake ({kind:?}): {message}",
+                    zkminer_prover_protocol::types::WORKER_DECLINED,
                     self.backend
                 );
             }

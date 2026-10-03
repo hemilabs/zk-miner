@@ -2449,9 +2449,14 @@ async fn miner_brain(
                     // `available` is false only when some real backend IS compiled
                     // in (so we're not in pure-sim mode) yet THIS backend is neither
                     // in-process nor served by a healthy worker.
-                    let sim_mode = sources
-                        .iter()
-                        .all(|(_, source)| matches!(source, BackendSource::Simulated));
+                    // `all()` on an EMPTY list is true, which would read a host with no
+                    // advertisable backend at all as demo mode and claim freely. A
+                    // declined backend is now reported as nothing rather than Simulated,
+                    // so the empty case is reachable: require a non-empty list.
+                    let sim_mode = !sources.is_empty()
+                        && sources
+                            .iter()
+                            .all(|(_, source)| matches!(source, BackendSource::Simulated));
                     if !available && !sim_mode {
                         tracing::debug!(
                             "Skipping {}: no {} backend available to prove it",

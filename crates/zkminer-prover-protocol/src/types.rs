@@ -156,6 +156,17 @@ pub enum ErrorKind {
     Internal,
 }
 
+/// Marker in a spawn error meaning the worker SPOKE the protocol and deliberately
+/// DECLINED: it can run, but it cannot prove on this host (e.g. an SP1 worker whose
+/// `sp1-gpu-server` needs a CUDA runtime the host lacks).
+///
+/// This is categorically different from a transient spawn failure. A dead-but-eligible
+/// slot is intentionally still "healthy" so a crashed worker respawns and claiming does
+/// not stall -- but a decline will never succeed on retry, so advertising the backend
+/// makes the miner claim jobs it must then release at a penalty. Callers match on this
+/// to tell the two apart.
+pub const WORKER_DECLINED: &str = "worker declined: cannot prove on this host";
+
 /// True if a worker error message indicates a GPU out-of-memory / device
 /// allocation failure (CUDA or HIP/ROCm). Workers use this to tag such errors as
 /// [`ErrorKind::ResourceExhausted`] so the dispatcher kills + respawns the worker
