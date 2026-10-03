@@ -1446,6 +1446,14 @@ impl WorkerPool {
         slot.pci_bus_id.clone().filter(|b| !b.is_empty())
     }
 
+    /// Total VRAM of the card behind `key`, if known.
+    ///
+    /// Lets a retry demand a STRICTLY BIGGER card after a VRAM OOM, instead of a fixed
+    /// floor that may exceed every card on the box and therefore steer nowhere.
+    pub fn vram_bytes_for_slot(&self, key: &str) -> Option<u64> {
+        self.workers.get(key).and_then(|e| e.vram_bytes)
+    }
+
     /// PID of the worker behind `key`, or 0 if it has none. For tests that need to
     /// induce a real worker death.
     pub fn worker_pid(&self, key: &str) -> Option<u32> {

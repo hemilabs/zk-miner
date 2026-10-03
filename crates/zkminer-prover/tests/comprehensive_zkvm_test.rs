@@ -640,6 +640,13 @@ fn run_on_all_risc0(guest: &str, input: &[u8], timeout: Duration) -> Vec<(String
     }
     let mut fails = Vec::new();
     let mut results = Vec::new();
+    let mut vram_skips: Vec<String> = Vec::new();
+    // Largest card among the risc0 workers: a VRAM failure there has nowhere to retry.
+    let max_vram = workers
+        .iter()
+        .filter_map(|k| pool.vram_bytes_for_slot(k))
+        .max()
+        .unwrap_or(0);
     for key in &workers {
         eprintln!("\n--- {guest} on {key} ---");
         let start = Instant::now();
@@ -650,11 +657,55 @@ fn run_on_all_risc0(guest: &str, input: &[u8], timeout: Duration) -> Vec<(String
                 assert!(!proof.journal.is_empty(), "journal must be non-empty");
                 results.push((key.clone(), proof));
             }
-            Err(e) => { eprintln!("  FAIL: {e:#}"); fails.push(format!("{key}: {e:#}")); }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                // A VRAM exhaustion on a card that is NOT the largest is a HARDWARE
+                // LIMIT, not a prover defect, and must not fail the suite.
+                //
+                // Measured on this box: bigint-mul's groth16 wrap OOMs on the 16,303 MiB
+                // RTX 5080 (`cudaMallocAsync ... "out of memory"`) and proves on the
+                // 24,564 MiB RTX 4090 in 16s. Demanding that EVERY card prove EVERY
+                // guest makes a heterogeneous box permanently red and hides real
+                // regressions in the noise. The miner's own answer to this is to retry on
+                // a strictly bigger card (see `oom_routing.rs`), so a smaller card
+                // declining a heavy guest is expected behaviour.
+                //
+                // Still fatal: any NON-VRAM failure, a VRAM failure on the largest card
+                // (nothing bigger to retry on), and every card failing.
+                let is_vram = zkminer_prover_protocol::types::is_gpu_oom(&msg);
+                let this_vram = pool.vram_bytes_for_slot(key).unwrap_or(0);
+                let is_largest = this_vram >= max_vram;
+                if is_vram && !is_largest {
+                    eprintln!(
+                        "  SKIP (hardware limit): {} MiB card cannot fit this guest; \
+                         largest here is {} MiB. {msg}",
+                        this_vram / 1024 / 1024,
+                        max_vram / 1024 / 1024
+                    );
+                    vram_skips.push(format!("{key} ({} MiB)", this_vram / 1024 / 1024));
+                } else {
+                    eprintln!("  FAIL: {msg}");
+                    fails.push(format!("{key}: {msg}"));
+                }
+            }
         }
     }
     pool.shutdown_all();
     if !fails.is_empty() { panic!("{guest}: {}/{} workers failed:\n  {}", fails.len(), workers.len(), fails.join("\n  ")); }
+    if results.is_empty() {
+        panic!(
+            "{guest}: NO worker produced a proof ({} skipped for VRAM: {}). A guest that \
+             fits on no card at all is a real failure, not a hardware limit.",
+            vram_skips.len(),
+            vram_skips.join(", ")
+        );
+    }
+    if !vram_skips.is_empty() {
+        eprintln!(
+            "  ({} of {} risc0 workers skipped as too small: {})",
+            vram_skips.len(), workers.len(), vram_skips.join(", ")
+        );
+    }
     results
 }
 

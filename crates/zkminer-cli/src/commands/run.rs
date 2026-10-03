@@ -3893,10 +3893,25 @@ async fn process_job_lifecycle(
                                 }
                             }
                         }
-                        // Kept as a PREFERENCE for a bigger card, never as a substitute
-                        // for steering off the one that failed.
+                        // A VRAM OOM means the job did not fit THAT card, so ask for a
+                        // strictly bigger one. A fixed floor cannot do that job:
+                        // LARGE_JOB_MIN_VRAM_BYTES is 30 GiB and exceeds every card on
+                        // this box (16303 and 24564 MiB), so it matches nothing and
+                        // `prove_min_vram` just restores the full set. Measured here:
+                        // bigint-mul groth16 OOMs on the 16 GiB 5080 and proves on the
+                        // 24 GiB 4090 in 16s, so "> the card that just failed" routes it
+                        // correctly on the first retry while a 30 GiB floor routes it
+                        // nowhere. Falls back to the constant when the card's VRAM is
+                        // unknown (non-CUDA, or nvidia-smi unavailable).
                         if real_oom {
-                            min_vram = Some(LARGE_JOB_MIN_VRAM_BYTES);
+                            // `used_slot`, NOT `proved_on`: the latter is assigned only on
+                            // the success path, so reading it here always yields None and
+                            // silently falls back to the inert constant.
+                            min_vram = used_slot
+                                .as_deref()
+                                .and_then(|k| pool.vram_bytes_for_slot(k))
+                                .map(|v| v.saturating_add(1))
+                                .or(Some(LARGE_JOB_MIN_VRAM_BYTES));
                         }
                         // invalid ⇒ just re-prove (round-robin may pick another worker).
                         tracing::warn!(
