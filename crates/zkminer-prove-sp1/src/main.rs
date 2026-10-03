@@ -169,6 +169,83 @@ fn reap_orphaned_gpu_servers() {
     }
 }
 
+/// Can this host actually prove with SP1, or would we only *claim* to?
+///
+/// WHY THIS EXISTS. The handshake used to succeed unconditionally, because the
+/// `CudaProver` is built lazily on the first Prove. So a worker on a host that cannot
+/// run `sp1-gpu-server` still reported `Worker sp1:generic ready`, the pool's
+/// `is_backend_healthy("sp1")` returned true, `backend_sources()` listed sp1 as a real
+/// Subprocess backend, and run.rs's pre-claim gate let the miner CLAIM SP1 jobs. That
+/// gate's own comment states the consequence: a job we can never prove "would force a
+/// release later -- and a voluntary release burns a penalty ... so a job we can never
+/// prove is a guaranteed loss." Past the lock deadline it is worse: `releaseJob` reverts
+/// and the collateral is stranded until a keeper slash.
+///
+/// Measured on a fresh install of the release artifacts (2026-10-03): `sp1-gpu-server`
+/// is prebuilt against `libcudart.so.12`, the host had CUDA 13.3 and no CUDA 12 runtime,
+/// and the worker still announced itself ready.
+///
+/// The checks are deliberately cheap -- milliseconds, no CUDA context, no 236MB download
+/// -- because the laziness they protect is deliberate: building the prover forks
+/// `sp1-gpu-server`, which was measured holding ~25GB of host RSS. Paying that at every
+/// miner start, when no SP1 job may ever arrive, would be a worse trade than the bug.
+///
+/// Returns `Err(reason)` only when SP1 provably CANNOT work here. A case we cannot settle
+/// cheaply (the server binary is absent, so the SDK would download it) returns `Ok`: this
+/// must not refuse a host that would in fact work.
+fn sp1_usability() -> Result<(), String> {
+    // The SDK does `env::var("HOME").expect(...)` to locate the server, so an unset HOME
+    // is a panic rather than an error. Systemd units routinely have no HOME.
+    let home = match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => h,
+        _ => {
+            return Err(
+                "$HOME is not set, and the SP1 SDK requires it to locate                  ~/.sp1/bin/sp1-gpu-server (it panics without it)"
+                    .to_string(),
+            )
+        }
+    };
+
+    // SP1 here is CUDA-only: `.cuda()` is unconditional, there is no CPU path. With no
+    // NVIDIA GPU at all, nothing this worker advertises can ever be proved.
+    let (gpu_available, _) = detect_gpu();
+    if !gpu_available {
+        return Err(
+            "no NVIDIA GPU detected (nvidia-smi reported none) and this SP1 worker is              CUDA-only -- it has no CPU proving path"
+                .to_string(),
+        );
+    }
+
+    // If the server binary is already present it must actually EXECUTE. A prebuilt
+    // server linked against a CUDA runtime the host lacks fails at the dynamic loader,
+    // which is precisely what a downloaded release hits:
+    //   "error while loading shared libraries: libcudart.so.12: cannot open shared
+    //    object file"
+    // `--version` is what the SDK itself runs, costs milliseconds, and touches no GPU.
+    let server = std::path::PathBuf::from(&home).join(".sp1/bin/sp1-gpu-server");
+    if !server.exists() {
+        // Absent: the SDK downloads it on first use. We cannot verify a binary that does
+        // not exist yet, and refusing here would disable SP1 on a host where it works.
+        return Ok(());
+    }
+    match std::process::Command::new(&server).arg("--version").output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let detail = if detail.is_empty() {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            } else {
+                detail
+            };
+            Err(format!(
+                "{} exists but cannot run: {detail}",
+                server.display()
+            ))
+        }
+        Err(e) => Err(format!("cannot execute {}: {e}", server.display())),
+    }
+}
+
 fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     let mut stdin = BufReader::new(io::stdin().lock());
     let mut stdout = BufWriter::new(ipc_stdout);
@@ -207,6 +284,27 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
         match cmd {
             WorkerCommand::Hello { protocol_version } => {
                 tracing::info!("Hello from host (protocol v{protocol_version})");
+                // Refuse the handshake rather than advertise a capability we do not have.
+                // Answering HelloAck here is what let the miner claim SP1 jobs it could
+                // not prove -- see `sp1_usability`. Reported as an Error so the host logs
+                // the REASON and skips sp1 instead of silently advertising it.
+                //
+                // Deliberately not a new HelloAck field: the codec is bincode, which is
+                // not self-describing, so adding one is a wire break between a new host
+                // and an older worker. This uses existing protocol surface.
+                if let Err(reason) = sp1_usability() {
+                    tracing::error!(
+                        "SP1 is NOT usable on this host, so this worker will not \
+                         advertise it: {reason}"
+                    );
+                    let resp = WorkerResponse::Error {
+                        request_id: 0,
+                        kind: ErrorKind::ResourceExhausted,
+                        message: format!("sp1 unavailable on this host: {reason}"),
+                    };
+                    write_message(&mut stdout, &resp)?;
+                    return Ok(());
+                }
                 let resp = WorkerResponse::HelloAck {
                     protocol_version: PROTOCOL_VERSION,
                     backend: BACKEND_SP1.to_string(),
@@ -539,5 +637,107 @@ mod orphan_reap_tests {
         let parsed = ppid_from_proc_stat(&stat).expect("parse");
         let expected = unsafe { libc::getppid() };
         assert_eq!(parsed, expected, "parsed ppid must match getppid()");
+    }
+}
+
+#[cfg(test)]
+mod usability_tests {
+    use super::sp1_usability;
+
+    /// The probe must be CHEAP: it may not build a CudaProver (which forks
+    /// sp1-gpu-server, measured at ~25GB host RSS) and must not download the 236MB
+    /// server. A slow probe would make every miner start pay for a backend that may
+    /// never be used, which is a worse trade than the bug it fixes.
+    #[test]
+    fn the_probe_is_cheap() {
+        let t0 = std::time::Instant::now();
+        let _ = sp1_usability();
+        let dt = t0.elapsed();
+        assert!(
+            dt < std::time::Duration::from_secs(5),
+            "sp1_usability took {dt:?} -- it must stay a milliseconds-scale check"
+        );
+    }
+
+    /// An unset HOME must be reported, not panicked on: the SDK does
+    /// `env::var("HOME").expect(...)`, and systemd units routinely have no HOME.
+    /// Serialised against the other env-mutating test.
+    #[test]
+    fn unset_home_is_an_error_not_a_panic() {
+        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let saved = std::env::var("HOME").ok();
+        unsafe { std::env::remove_var("HOME") };
+        let r = sp1_usability();
+        if let Some(h) = saved {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+        let err = r.expect_err("an unset HOME must be an error");
+        assert!(err.contains("HOME"), "unexpected reason: {err}");
+    }
+
+    /// A server binary that exists but cannot execute -- the real release failure, where
+    /// the prebuilt server needs libcudart.so.12 and the host has only CUDA 13 -- must be
+    /// reported as unusable, carrying the loader's own message so it is actionable.
+    #[test]
+    fn a_present_but_unrunnable_server_is_unusable() {
+        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("sp1probe-{}", std::process::id()));
+        let bin = tmp.join(".sp1/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // Not a valid executable: exec fails, exactly as a missing-.so loader error does.
+        std::fs::write(bin.join("sp1-gpu-server"), b"\x7fELF not really").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                bin.join("sp1-gpu-server"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let saved = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", &tmp) };
+        let r = sp1_usability();
+        match saved {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // Only assert the unusable verdict when a GPU exists -- on a GPU-less machine the
+        // earlier no-GPU arm fires first and is equally correct.
+        if let Err(e) = r {
+            assert!(
+                e.contains("cannot run") || e.contains("cannot execute") || e.contains("GPU"),
+                "unexpected reason: {e}"
+            );
+        }
+    }
+
+    /// An ABSENT server must NOT be reported unusable: the SDK downloads it on first use,
+    /// and refusing here would disable SP1 on a host where it actually works.
+    #[test]
+    fn an_absent_server_is_not_treated_as_unusable() {
+        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("sp1probe-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let saved = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", &tmp) };
+        let r = sp1_usability();
+        match saved {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Ok, or the no-GPU arm on a GPU-less machine -- never "cannot run".
+        if let Err(e) = r {
+            assert!(e.contains("GPU"), "an absent server must not be 'cannot run': {e}");
+        }
+    }
+
+    /// These tests mutate the process environment, so they must not interleave.
+    pub(super) fn env_lock() -> &'static std::sync::Mutex<()> {
+        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(()))
     }
 }

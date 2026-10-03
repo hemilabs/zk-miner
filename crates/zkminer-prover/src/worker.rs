@@ -315,6 +315,18 @@ impl WorkerHandle {
                 );
                 Ok(())
             }
+            // A worker that CAN speak the protocol but CANNOT prove reports itself here
+            // rather than answering HelloAck. Surface its reason verbatim: the handshake
+            // still fails (so the backend is never advertised and run.rs's pre-claim gate
+            // skips it), but the operator gets an actionable message instead of a bare
+            // "expected HelloAck". This is how an SP1 worker on a host with no usable
+            // CUDA runtime declines, instead of claiming jobs it would lose.
+            WorkerResponse::Error { kind, message, .. } => {
+                bail!(
+                    "Worker {} declined the handshake ({kind:?}): {message}",
+                    self.backend
+                );
+            }
             other => {
                 bail!(
                     "Expected HelloAck from worker {}, got: {other:?}",
