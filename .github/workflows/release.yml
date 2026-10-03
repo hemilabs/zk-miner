@@ -29,7 +29,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           persist-credentials: false
 
@@ -64,28 +64,22 @@ jobs:
   # Native Windows. The CUDA prover cannot be cross-compiled (it needs MSVC +
   # the CUDA toolkit), which is the whole reason this job exists.
   # ---------------------------------------------------------------------------
-  windows:
-    needs: check-version
-    uses: ./.github/workflows/build-windows.yml
-    with:
-      retention_days: 30
-
   # ---------------------------------------------------------------------------
   # Collect every artifact, checksum the set, publish.
   # ---------------------------------------------------------------------------
   publish:
-    needs: [check-version, linux, windows]
+    needs: [check-version, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write   # required to create a release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           persist-credentials: false
 
       # Reusable workflows share the caller's run, so their uploads are visible here.
       - name: "Download every build artifact"
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: staging
 
@@ -97,12 +91,14 @@ jobs:
           # the per-artifact .sha256 files -- a single SHA256SUMS replaces them so
           # a user has one file to verify against.
           #
-          # zkminer.exe is produced TWICE: by the Dockerfile's cross-compile
-          # (dist-cli-windows) and by the native Windows job (zkminer-windows-cli).
-          # Both are cargo-xwin + crt-static and equivalent, but shipping one file
-          # from two sources invites a silent overwrite, so the native job is
-          # canonical and the cross-compiled copy stays a compile check only.
-          rm -rf staging/dist-cli-windows
+          # NOTE on Windows coverage. `build-windows.yml` builds a native Windows
+          # CUDA prover, but it needs `dtolnay/rust-toolchain` and
+          # `Jimver/cuda-toolkit`, NEITHER of which is on this repo's
+          # allowed-actions list -- so a release cannot call it without a policy
+          # change, and doing so would fail the whole run at startup. The
+          # Windows CLI here is the Dockerfile's cargo-xwin cross-build, which is
+          # policy-clean and statically linked. Add those two actions to the
+          # allowlist (or install CUDA manually) to ship the Windows prover too.
           # Any OTHER duplicate basename is unintended -- fail rather than let one
           # artifact silently overwrite another in the release.
           dupes=$(find staging -type f ! -name '*.sha256' -printf '%f\n' | sort | uniq -d)
@@ -127,7 +123,7 @@ jobs:
           cd release
           missing=0
           for f in zkminer zkminer.exe \
-                   zkminer-prove-risc0-cuda zkminer-prove-risc0-cuda.exe \
+                   zkminer-prove-risc0-cuda \
                    zkminer-prove-risc0-rocm zkminer-prove-sp1 zkminer-prove-openvm; do
             if [ ! -s "$f" ]; then echo "::error::missing release asset: $f"; missing=1; fi
           done
@@ -135,7 +131,7 @@ jobs:
           echo "all expected assets present"
 
       - name: "Upload the assembled set as a run artifact"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ needs.check-version.outputs.version }}
           path: release/
@@ -144,33 +140,44 @@ jobs:
 
       - name: "Publish GitHub Release"
         if: ${{ github.ref_type == 'tag' && !inputs.dry_run }}
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release/*
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          body: |
-            ## zkminer ${{ github.ref_name }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # `softprops/action-gh-release` is NOT on this repo's allowed-actions list
+        # (the policy is `allowed_actions: selected` with `sha_pinning_required`),
+        # so the release is cut with the gh CLI, which is preinstalled on the
+        # runner and needs no action entry.
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'NOTES'
+          ## zkminer ${{ github.ref_name }}
 
-            ### Linux (glibc 2.35+, x86-64-v3)
-            | file | what it is |
-            |---|---|
-            | `zkminer` | the miner CLI — start here |
-            | `zkminer-prove-risc0-cuda` | RISC Zero prover, NVIDIA |
-            | `zkminer-prove-risc0-rocm` | RISC Zero prover, AMD |
-            | `zkminer-prove-sp1` | SP1 prover (NVIDIA; needs `sp1-gpu-server`) |
-            | `zkminer-prove-openvm` | OpenVM prover |
+          ### Linux (glibc 2.35+, x86-64-v3)
+          | file | what it is |
+          |---|---|
+          | `zkminer` | the miner CLI - start here |
+          | `zkminer-prove-risc0-cuda` | RISC Zero prover, NVIDIA |
+          | `zkminer-prove-risc0-rocm` | RISC Zero prover, AMD |
+          | `zkminer-prove-sp1` | SP1 prover (NVIDIA; also needs `sp1-gpu-server`) |
+          | `zkminer-prove-openvm` | OpenVM prover |
 
-            ### Windows (x86-64)
-            | file | what it is |
-            |---|---|
-            | `zkminer.exe` | the miner CLI |
-            | `zkminer-prove-risc0-cuda.exe` | RISC Zero prover, NVIDIA |
+          ### Windows (x86-64)
+          | file | what it is |
+          |---|---|
+          | `zkminer.exe` | the miner CLI (statically linked; no VC++ redistributable needed) |
 
-            Verify with `sha256sum -c SHA256SUMS`.
+          Verify with `sha256sum -c SHA256SUMS`.
 
-            Put the prover binaries in `~/.zkminer/providers/` (Linux) and
-            `chmod +x` them; the CLI discovers them there.
+          On Linux, put the prover binaries in `~/.zkminer/provers/` and `chmod +x`
+          them; the CLI discovers them there.
+
+          The native Windows CUDA prover is not included - see the release workflow
+          for why.
+          NOTES
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "zkminer ${GITHUB_REF_NAME}" \
+            --notes-file notes.md \
+            --verify-tag \
+            release/*
 
       - name: "Dry run — nothing published"
         if: ${{ !(github.ref_type == 'tag' && !inputs.dry_run) }}
