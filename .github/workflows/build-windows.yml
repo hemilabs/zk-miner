@@ -19,7 +19,7 @@ on:
   # Callable from release.yml so a tagged release reuses these exact jobs.
   workflow_call:
     inputs:
-      retention-days:
+      retention_days:
         description: 'How long to keep the uploaded artifacts'
         type: number
         default: 14
@@ -97,7 +97,7 @@ jobs:
           name: zkminer-windows-cli
           path: dist/zkminer.exe*
           if-no-files-found: error
-          retention-days: ${{ inputs.retention-days || 14 }}
+          retention-days: ${{ inputs.retention_days || 14 }}
 
   # -----------------------------------------------------------------------
   # CUDA prover — native Windows build (requires MSVC + CUDA toolkit)
@@ -160,4 +160,4 @@ jobs:
           name: zkminer-windows-cuda
           path: dist/zkminer-prove-risc0-cuda.exe*
           if-no-files-found: error
-          retention-days: ${{ inputs.retention-days || 14 }}
+          retention-days: ${{ inputs.retention_days || 14 }}

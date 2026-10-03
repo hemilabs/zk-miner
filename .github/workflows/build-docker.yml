@@ -15,7 +15,7 @@ on:
   # workflow already validates, instead of a second copy of the build that can drift.
   workflow_call:
     inputs:
-      retention-days:
+      retention_days:
         description: 'How long to keep the uploaded artifacts'
         type: number
         default: 14
@@ -107,4 +107,4 @@ jobs:
             dist/${{ matrix.binary }}
             dist/${{ matrix.binary }}.sha256
           if-no-files-found: error
-          retention-days: ${{ inputs.retention-days || 14 }}
+          retention-days: ${{ inputs.retention_days || 14 }}

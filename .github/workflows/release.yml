@@ -58,7 +58,7 @@ jobs:
     needs: check-version
     uses: ./.github/workflows/build-docker.yml
     with:
-      retention-days: 30
+      retention_days: 30
 
   # ---------------------------------------------------------------------------
   # Native Windows. The CUDA prover cannot be cross-compiled (it needs MSVC +
@@ -68,7 +68,7 @@ jobs:
     needs: check-version
     uses: ./.github/workflows/build-windows.yml
     with:
-      retention-days: 30
+      retention_days: 30
 
   # ---------------------------------------------------------------------------
   # Collect every artifact, checksum the set, publish.
