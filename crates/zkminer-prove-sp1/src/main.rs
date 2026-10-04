@@ -65,6 +65,11 @@ fn main() {
     // Before constructing any CudaProver: never adopt a server whose owner is gone.
     reap_orphaned_gpu_servers();
 
+    // Then make a CUDA 12 runtime reachable if the host has one anywhere, so the
+    // installed toolkit version stops mattering. Must run BEFORE sp1_usability, which
+    // execs sp1-gpu-server and is the authority on whether this actually worked.
+    ensure_cuda12_on_library_path();
+
     if std::env::args().any(|a| a == "--benchmark") {
         let prover = sp1_sdk::blocking::ProverClient::builder().cuda().build();
         let results = run_benchmarks(&prover);
@@ -169,6 +174,156 @@ fn reap_orphaned_gpu_servers() {
     }
 }
 
+/// The soname `sp1-gpu-server` demands. Fixed at ITS link time, not ours.
+const CUDART_SONAME: &str = "libcudart.so.12";
+
+/// Env var an operator can set to point at a CUDA 12 runtime directory directly.
+const CUDA_DIR_OVERRIDE: &str = "ZKMINER_SP1_CUDA_RUNTIME_DIR";
+
+/// Make a CUDA 12 runtime reachable for `sp1-gpu-server`, so the host's INSTALLED
+/// TOOLKIT VERSION stops mattering.
+///
+/// The problem is narrower than "support CUDA 11 through 13". `sp1-gpu-server` is a
+/// prebuilt binary we do not compile, and its `DT_NEEDED` names `libcudart.so.12`
+/// specifically. A soname is matched exactly, so it will never load `.so.11` or `.so.13`
+/// no matter what is installed -- there is no version negotiation to do. Note our OWN
+/// CUDA prover has no libcudart dependency at all (it links only `libcuda.so.1`, whose
+/// soname never changes), which is why risc0 already runs on a CUDA 11, 12 or 13 host and
+/// only SP1 is affected.
+///
+/// So the achievable goal is: supply the one runtime library that binary needs, from
+/// wherever this host happens to keep it, and let the DRIVER provide compatibility. A
+/// driver is backward compatible with older runtimes, so a CUDA 12 runtime works on a
+/// CUDA 13-era driver -- measured here: driver 610.43.02, toolkit 13.3, and the server
+/// runs fine once a 12.x `libcudart` is reachable.
+///
+/// Appends rather than prepends: a deployment that already provides a working runtime
+/// (the hand-written wrapper does) must keep winning, and shadowing it with a different
+/// copy would be a regression for a setup that works.
+///
+/// This only ATTEMPTS the fix. `sp1_usability` then runs `sp1-gpu-server --version` and
+/// has the final say, so a failed or wrong resolution degrades to "SP1 cleanly
+/// unavailable, here is why" instead of claiming jobs it cannot prove.
+fn ensure_cuda12_on_library_path() {
+    // Already reachable? Then do nothing -- including the case where the operator's own
+    // LD_LIBRARY_PATH already provides it.
+    if existing_path_has_cudart() {
+        return;
+    }
+    let Some(dir) = find_cuda12_runtime_dir() else {
+        tracing::warn!(
+            "no {CUDART_SONAME} found on this host. sp1-gpu-server is prebuilt against \
+             CUDA 12 and cannot load a 11.x or 13.x runtime (the soname is matched \
+             exactly), so SP1 will decline unless a CUDA 12 runtime is provided. Set \
+             {CUDA_DIR_OVERRIDE} to a directory containing it, or install the \
+             nvidia-cuda-runtime-cu12 package. Your CUDA TOOLKIT version does not \
+             otherwise matter -- only the driver, which is backward compatible."
+        );
+        return;
+    };
+    let mut joined = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    if !joined.is_empty() {
+        joined.push(':');
+    }
+    joined.push_str(&dir.to_string_lossy());
+    tracing::info!("found {CUDART_SONAME} in {}; adding it to LD_LIBRARY_PATH for sp1-gpu-server", dir.display());
+    // Affects CHILDREN, which is what matters: the probe's exec and the gpu-server the
+    // SDK forks both inherit it. Our own already-loaded libraries are unaffected.
+    unsafe { std::env::set_var("LD_LIBRARY_PATH", joined) };
+}
+
+/// True if some directory already on LD_LIBRARY_PATH holds the required soname.
+fn existing_path_has_cudart() -> bool {
+    std::env::var("LD_LIBRARY_PATH")
+        .map(|v| {
+            v.split(':')
+                .filter(|p| !p.is_empty())
+                .any(|p| std::path::Path::new(p).join(CUDART_SONAME).exists())
+        })
+        .unwrap_or(false)
+}
+
+/// Candidate directories that may hold `libcudart.so.12`, in priority order.
+///
+/// Covers the layouts a CUDA 12 runtime actually ships in: an explicit override, a copy
+/// bundled beside this binary, versioned toolkit installs, the distro package, pip's
+/// `nvidia-cuda-runtime-cu12` wheel (which is how THIS host has one, nested ~13 levels
+/// deep inside a venv -- a shallow search misses it), and conda.
+fn cuda12_candidate_dirs() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut v: Vec<PathBuf> = Vec::new();
+
+    // 1. Operator override wins outright.
+    if let Ok(d) = std::env::var(CUDA_DIR_OVERRIDE) {
+        if !d.is_empty() {
+            v.push(PathBuf::from(d));
+        }
+    }
+    // 2. Shipped beside the worker binary, so a release can be self-contained.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            v.push(dir.join("cuda12"));
+            v.push(dir.to_path_buf());
+        }
+    }
+    // 3. Versioned toolkit installs. Both the modern `targets/` layout and plain lib64.
+    if let Ok(rd) = std::fs::read_dir("/usr/local") {
+        let mut hits: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("cuda-12"))
+            })
+            .collect();
+        hits.sort(); // deterministic, and newest 12.x last
+        hits.reverse();
+        for base in hits {
+            v.push(base.join("targets/x86_64-linux/lib"));
+            v.push(base.join("lib64"));
+        }
+    }
+    // 4. Distro package.
+    v.push(PathBuf::from("/usr/lib/x86_64-linux-gnu"));
+    // 5. conda.
+    if let Ok(p) = std::env::var("CONDA_PREFIX") {
+        if !p.is_empty() {
+            v.push(PathBuf::from(p).join("lib"));
+        }
+    }
+    // 6. pip wheels. VIRTUAL_ENV first, then the user site dir, then any venv under
+    //    ~/.local/opt — the wheel always lands at
+    //    <root>/lib/pythonX.Y/site-packages/nvidia/cuda_runtime/lib.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(ve) = std::env::var("VIRTUAL_ENV") {
+        if !ve.is_empty() {
+            roots.push(PathBuf::from(ve));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        roots.push(PathBuf::from(&home).join(".local"));
+        if let Ok(rd) = std::fs::read_dir(PathBuf::from(&home).join(".local/opt")) {
+            roots.extend(rd.flatten().map(|e| e.path()));
+        }
+    }
+    for root in roots {
+        if let Ok(rd) = std::fs::read_dir(root.join("lib")) {
+            for py in rd.flatten().map(|e| e.path()) {
+                v.push(py.join("site-packages/nvidia/cuda_runtime/lib"));
+            }
+        }
+    }
+    v
+}
+
+/// First candidate directory that actually contains the required soname.
+fn find_cuda12_runtime_dir() -> Option<std::path::PathBuf> {
+    cuda12_candidate_dirs()
+        .into_iter()
+        .find(|d| d.join(CUDART_SONAME).exists())
+}
+
 /// Can this host actually prove with SP1, or would we only *claim* to?
 ///
 /// WHY THIS EXISTS. The handshake used to succeed unconditionally, because the
@@ -200,7 +355,7 @@ fn sp1_usability() -> Result<(), String> {
         Ok(h) if !h.is_empty() => h,
         _ => {
             return Err(
-                "$HOME is not set, and the SP1 SDK requires it to locate                  ~/.sp1/bin/sp1-gpu-server (it panics without it)"
+                "$HOME is not set, and the SP1 SDK requires it to locate ~/.sp1/bin/sp1-gpu-server (it panics without it)"
                     .to_string(),
             )
         }
@@ -208,10 +363,23 @@ fn sp1_usability() -> Result<(), String> {
 
     // SP1 here is CUDA-only: `.cuda()` is unconditional, there is no CPU path. With no
     // NVIDIA GPU at all, nothing this worker advertises can ever be proved.
+    // `detect_gpu()` alone is NOT evidence of absence: it shells out to nvidia-smi and
+    // returns false identically for "no GPU", "nvidia-smi not installed", "not on PATH"
+    // and "spawn failed". Those are very different things. A CUDA container started with
+    // NVIDIA_DRIVER_CAPABILITIES=compute gets libcuda and the device nodes but NOT
+    // nvidia-smi; a host can carry libnvidia-compute without nvidia-utils; and a fork can
+    // fail transiently under memory pressure. Declining on any of those would disable SP1
+    // on a host where it proves fine, and the message would mislead by blaming the GPU.
+    //
+    // The host-side `discovery::detect_nvidia_gpus` has exactly this fallback and states
+    // the reason: do not report "0 GPUs" from an unparseable probe, because "that would
+    // silently skip the CUDA worker". Only treat the GPU as absent when nvidia-smi AND
+    // the kernel driver's own /proc entries agree.
     let (gpu_available, _) = detect_gpu();
-    if !gpu_available {
+    if !gpu_available && !nvidia_gpu_in_proc() {
         return Err(
-            "no NVIDIA GPU detected (nvidia-smi reported none) and this SP1 worker is              CUDA-only -- it has no CPU proving path"
+            "no NVIDIA GPU detected (neither nvidia-smi nor /proc/driver/nvidia/gpus \
+             reports one) and this SP1 worker is CUDA-only -- it has no CPU proving path"
                 .to_string(),
         );
     }
@@ -228,22 +396,56 @@ fn sp1_usability() -> Result<(), String> {
         // not exist yet, and refusing here would disable SP1 on a host where it works.
         return Ok(());
     }
+    // Decline ONLY on an UNREPAIRABLE failure. Being stricter than this disables hosts
+    // the SDK can fix by itself.
+    //
+    // `maybe_download_server` ignores `--version`'s exit STATUS entirely: it reads
+    // stdout, compares it to SP1_CRATE_VERSION, and re-downloads on a mismatch. A stale,
+    // truncated, zero-byte or wrong-version server is therefore exactly the state the SDK
+    // exists to repair, and declining it here would permanently kill SP1 over something
+    // that self-heals on the next run.
+    //
+    // What does NOT self-heal is a loader failure: the asset is pinned to the SDK's own
+    // version, so a re-download reproduces the same libcudart.so.12 ABI gap. That, and a
+    // binary that cannot be exec'd at all, is the only case worth declining.
     match std::process::Command::new(&server).arg("--version").output() {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => {
-            let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let detail = if detail.is_empty() {
-                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let low = stderr.to_ascii_lowercase();
+            let unrepairable = low.contains("error while loading shared libraries")
+                || low.contains("cannot open shared object file")
+                || low.contains("symbol lookup error")
+                || low.contains("glibc_");
+            if unrepairable {
+                Err(format!(
+                    "{} exists but cannot run: {}",
+                    server.display(),
+                    stderr.trim()
+                ))
             } else {
-                detail
-            };
-            Err(format!(
-                "{} exists but cannot run: {detail}",
-                server.display()
-            ))
+                tracing::warn!(
+                    "{} --version exited non-zero without a loader error; leaving the \
+                     verdict to the SDK's own version check and re-download: {}",
+                    server.display(),
+                    stderr.trim()
+                );
+                Ok(())
+            }
         }
+        // Could not exec at all: not executable, wrong architecture, ENOEXEC.
         Err(e) => Err(format!("cannot execute {}: {e}", server.display())),
     }
+}
+
+/// True if the kernel driver reports at least one NVIDIA GPU, independent of nvidia-smi.
+///
+/// The same fallback the host-side detector uses. Present even in a container granted
+/// compute capability but no CUDA user-space utilities.
+fn nvidia_gpu_in_proc() -> bool {
+    std::fs::read_dir("/proc/driver/nvidia/gpus")
+        .map(|mut d| d.any(|e| e.is_ok()))
+        .unwrap_or(false)
 }
 
 fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
@@ -712,6 +914,213 @@ mod usability_tests {
                 "unexpected reason: {e}"
             );
         }
+    }
+
+    /// The override must come FIRST, so an operator can always win.
+    #[test]
+    fn the_override_has_top_priority() {
+        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let saved = std::env::var(super::CUDA_DIR_OVERRIDE).ok();
+        unsafe { std::env::set_var(super::CUDA_DIR_OVERRIDE, "/zz-override") };
+        let got = super::cuda12_candidate_dirs();
+        match saved {
+            Some(v) => unsafe { std::env::set_var(super::CUDA_DIR_OVERRIDE, v) },
+            None => unsafe { std::env::remove_var(super::CUDA_DIR_OVERRIDE) },
+        }
+        assert_eq!(
+            got.first().map(|p| p.to_string_lossy().to_string()),
+            Some("/zz-override".to_string()),
+            "{} must be searched before anything else",
+            super::CUDA_DIR_OVERRIDE
+        );
+    }
+
+    /// The candidate list must cover the layouts a CUDA 12 runtime actually ships in.
+    /// The pip/venv layout matters most: on this host that is the ONLY copy, nested ~13
+    /// levels deep, where a shallow directory search misses it entirely.
+    #[test]
+    fn the_candidate_list_covers_the_real_layouts() {
+        // Takes the env lock: this reads HOME/VIRTUAL_ENV/CONDA_PREFIX, and a sibling test
+        // that removes HOME would otherwise delete the pip branch mid-read and fail this
+        // intermittently. Passing in isolation and failing in a full run is the signature.
+        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let dirs = super::cuda12_candidate_dirs();
+        let joined: Vec<String> = dirs.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        let has = |frag: &str| joined.iter().any(|d| d.contains(frag));
+        assert!(has("/usr/lib/x86_64-linux-gnu"), "distro package dir missing: {joined:?}");
+        assert!(
+            has("site-packages/nvidia/cuda_runtime/lib"),
+            "pip wheel layout missing -- it is the only copy on some hosts: {joined:?}"
+        );
+        // A bundled copy beside the binary, so a release can be made self-contained.
+        assert!(has("cuda12"), "bundled-beside-binary dir missing: {joined:?}");
+    }
+
+    /// An LD_LIBRARY_PATH that already provides the soname must be left ALONE. A
+    /// deployment that works (the hand-written wrapper) must not be disturbed, and
+    /// shadowing it with a different copy would regress a working setup.
+    #[test]
+    fn an_existing_working_library_path_is_not_disturbed() {
+        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("cudart-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join(super::CUDART_SONAME), b"x").unwrap();
+
+        let saved = std::env::var("LD_LIBRARY_PATH").ok();
+        unsafe { std::env::set_var("LD_LIBRARY_PATH", &tmp) };
+        assert!(super::existing_path_has_cudart(), "the planted dir should be detected");
+        super::ensure_cuda12_on_library_path();
+        let after = std::env::var("LD_LIBRARY_PATH").unwrap();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("LD_LIBRARY_PATH", v) },
+            None => unsafe { std::env::remove_var("LD_LIBRARY_PATH") },
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            after,
+            tmp.to_string_lossy(),
+            "an already-working LD_LIBRARY_PATH must be left exactly as it was"
+        );
+    }
+
+    /// And when it is NOT already reachable, resolution APPENDS (never prepends), so an
+    /// operator's own entries keep precedence.
+    #[test]
+    fn resolution_appends_rather_than_prepends() {
+        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("cudart-ap-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join(super::CUDART_SONAME), b"x").unwrap();
+
+        let saved_ld = std::env::var("LD_LIBRARY_PATH").ok();
+        let saved_ov = std::env::var(super::CUDA_DIR_OVERRIDE).ok();
+        unsafe {
+            std::env::set_var("LD_LIBRARY_PATH", "/zz-operator-first");
+            std::env::set_var(super::CUDA_DIR_OVERRIDE, &tmp);
+        }
+        super::ensure_cuda12_on_library_path();
+        let after = std::env::var("LD_LIBRARY_PATH").unwrap();
+        unsafe {
+            match saved_ld {
+                Some(v) => std::env::set_var("LD_LIBRARY_PATH", v),
+                None => std::env::remove_var("LD_LIBRARY_PATH"),
+            }
+            match saved_ov {
+                Some(v) => std::env::set_var(super::CUDA_DIR_OVERRIDE, v),
+                None => std::env::remove_var(super::CUDA_DIR_OVERRIDE),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            after.starts_with("/zz-operator-first:"),
+            "the operator's entries must stay first; got {after}"
+        );
+        assert!(after.ends_with(&*tmp.to_string_lossy()), "resolved dir must be appended: {after}");
+    }
+
+    /// FN1. nvidia-smi absent must NOT read as "no GPU" when the kernel driver says
+    /// otherwise. A CUDA container with NVIDIA_DRIVER_CAPABILITIES=compute has libcuda
+    /// and the device nodes but no nvidia-smi, and declining there would disable SP1 on a
+    /// host where it proves fine. The host-side detector has the same fallback.
+    #[test]
+    fn the_proc_fallback_agrees_with_the_driver_on_this_host() {
+        let proc_says = super::nvidia_gpu_in_proc();
+        let smi_says = super::detect_gpu().0;
+        // On this box both should see the GPUs; the point is that the fallback is a real,
+        // independent source of truth rather than a stub that always says false.
+        if smi_says {
+            assert!(
+                proc_says,
+                "/proc/driver/nvidia/gpus must see the GPUs nvidia-smi sees, or the \
+                 fallback cannot rescue a container without nvidia-smi"
+            );
+        }
+    }
+
+    /// FN1, the decisive case: with nvidia-smi made unreachable, the probe must NOT
+    /// decide the GPU is absent, because /proc still knows better.
+    #[test]
+    fn an_unreachable_nvidia_smi_does_not_mean_no_gpu() {
+        let _g = super::usability_tests::env_lock().lock().unwrap();
+        if !super::nvidia_gpu_in_proc() {
+            return; // no GPU on this machine at all: nothing to assert
+        }
+        let saved = std::env::var("PATH").ok();
+        unsafe { std::env::set_var("PATH", "/nonexistent-for-test") };
+        let smi = super::detect_gpu().0;
+        let r = super::sp1_usability();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        assert!(!smi, "with PATH emptied nvidia-smi must be unreachable for this test to mean anything");
+        if let Err(e) = r {
+            assert!(
+                !e.contains("no NVIDIA GPU"),
+                "the /proc fallback must prevent a 'no GPU' verdict here; got: {e}"
+            );
+        }
+    }
+
+    /// FN2. A non-zero `--version` that is NOT a loader failure must NOT be declined:
+    /// that is the stale/wrong-version state `maybe_download_server` exists to repair,
+    /// and the SDK ignores the exit status entirely.
+    #[test]
+    fn a_non_loader_failure_is_left_to_the_sdk() {
+        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("sp1probe-nz-{}", std::process::id()));
+        let bin = tmp.join(".sp1/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // Executable, runs, exits non-zero, says nothing about shared libraries.
+        std::fs::write(bin.join("sp1-gpu-server"), b"#!/bin/sh\necho 'bad args' >&2\nexit 2\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join("sp1-gpu-server"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let saved = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", &tmp) };
+        let r = super::sp1_usability();
+        match saved {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        if let Err(e) = r {
+            assert!(
+                e.contains("GPU"),
+                "a plain non-zero exit must be left to the SDK, not declined: {e}"
+            );
+        }
+    }
+
+    /// FN2 converse: a LOADER failure is unrepairable (the asset is version-pinned, so a
+    /// re-download reproduces it) and must still be declined.
+    #[test]
+    fn a_loader_failure_is_still_declined() {
+        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("sp1probe-ld-{}", std::process::id()));
+        let bin = tmp.join(".sp1/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join("sp1-gpu-server"),
+            b"#!/bin/sh\necho 'error while loading shared libraries: libcudart.so.12: cannot open shared object file' >&2\nexit 127\n",
+        ).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join("sp1-gpu-server"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let saved = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", &tmp) };
+        let r = super::sp1_usability();
+        match saved {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        let e = r.expect_err("a loader failure must be declined");
+        assert!(e.contains("cannot run") || e.contains("GPU"), "unexpected: {e}");
     }
 
     /// An ABSENT server must NOT be reported unusable: the SDK downloads it on first use,
