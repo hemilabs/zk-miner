@@ -10,10 +10,12 @@ fn benchmark_json_without_devices(v: &serde_json::Value) -> Result<(), String> {
     if !v["cpu_info"].is_string() {
         return Err(format!("cpu_info should be a string, got {}", v["cpu_info"]));
     }
+    // CPU entries (one per backend profile) are always generated; with no
+    // workers installed there must be no GPU entries.
     match v["device_benchmarks"].as_array() {
-        Some(devices) if devices.is_empty() => Ok(()),
+        Some(devices) if devices.iter().all(|d| d["device_id"] == "cpu") => Ok(()),
         _ => Err(format!(
-            "device_benchmarks should be an empty array, got {}",
+            "device_benchmarks should only contain cpu entries, got {}",
             v["device_benchmarks"]
         )),
     }
