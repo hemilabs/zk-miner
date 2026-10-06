@@ -12,6 +12,7 @@ members = [
     "crates/zkminer-prove-risc0",
     "crates/zkminer-prove-sp1",
     "crates/zkminer-prove-openvm",
+    "crates/zkminer-e2e",
 ]
 default-members = [
     "crates/zkminer-contracts",
