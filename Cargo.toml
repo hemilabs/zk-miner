@@ -114,24 +114,31 @@ risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "df270d
 sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "32f2101" }
 
 # Patch SP1 crates to use hemilabs fork (AMD GPU + PLONK optimizations)
-sp1-sdk = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-build = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-cuda = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-prover = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-prover-types = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-core-executor = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-core-machine = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-curves = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-derive = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-hypercube = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-jit = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-primitives = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-verifier = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+#
+# Branch `zkminer/sp1-gpu-fixes`: `max/optimizations_and_amd` @ 676290bb8 plus four out-of-bounds GPU
+# fixes that crash Blackwell (sm_120) and the changes that let a 16 GB card finish a Groth16 proof.
+# Those commits touch only the `sp1-gpu` crates, which zkminer does not compile: they take effect in
+# `sp1-gpu-server`, which must be BUILT FROM THIS BRANCH (the server the SDK downloads is upstream's and
+# has neither the fixes nor the 16 GB tier). Pinning zkminer here keeps the SDK and the server on one
+# source. Keep `crates/zkminer-cli/Cargo.toml`, which names the branch directly, in step with this.
+sp1-sdk = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-build = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-cuda = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-prover = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-prover-types = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-core-executor = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-core-machine = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-curves = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-derive = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-hypercube = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-jit = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-primitives = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
+sp1-verifier = { git = "https://github.com/hemilabs/sp1", branch = "zkminer/sp1-gpu-fixes" }
 
 [profile.release]
 opt-level = 3
