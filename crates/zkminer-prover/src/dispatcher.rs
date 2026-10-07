@@ -346,7 +346,8 @@ impl ProvingWatchdog {
     /// handler knows not to count it as a consecutive failure.
     fn new(
         pid_ref: Arc<AtomicU32>,
-        starttime_ref: Arc<AtomicU64>,
+        // Only the identity-checked group kill reads it, and that is Unix-only.
+        #[cfg_attr(not(unix), allow(unused_variables))] starttime_ref: Arc<AtomicU64>,
         timeout: Duration,
         slot_key: String,
         intentional_kill: Arc<AtomicBool>,
@@ -396,21 +397,27 @@ impl ProvingWatchdog {
                         // respect to the reap, so the number could already belong to a stranger —
                         // and the next statement signals an entire process GROUP. See
                         // `memory::pid_is_our_worker`.
+                        //
+                        // Unix-only as a WHOLE, as the unchecked kill it replaced was: there are no
+                        // process groups to signal elsewhere. The `cfg` once sat on the first
+                        // statement alone, which compiled `libc::kill` into the Windows build.
                         #[cfg(unix)]
-                        let expected_start = starttime_ref.load(Ordering::Acquire);
-                        if crate::memory::pid_is_our_worker(
-                            current_pid,
-                            (expected_start != 0).then_some(expected_start),
-                        ) {
-                            unsafe {
-                                libc::kill(-(current_pid as i32), libc::SIGKILL);
-                                libc::kill(current_pid as i32, libc::SIGKILL);
+                        {
+                            let expected_start = starttime_ref.load(Ordering::Acquire);
+                            if crate::memory::pid_is_our_worker(
+                                current_pid,
+                                (expected_start != 0).then_some(expected_start),
+                            ) {
+                                unsafe {
+                                    libc::kill(-(current_pid as i32), libc::SIGKILL);
+                                    libc::kill(current_pid as i32, libc::SIGKILL);
+                                }
+                            } else {
+                                tracing::warn!(
+                                    "not killing PID {current_pid} for {slot_key}: it is no longer \
+                                     our worker (reaped, and the number may have been reused)"
+                                );
                             }
-                        } else {
-                            tracing::warn!(
-                                "not killing PID {current_pid} for {slot_key}: it is no longer our \
-                                 worker (reaped, and the number may have been reused)"
-                            );
                         }
                     }
                 })

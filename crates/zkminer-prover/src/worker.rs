@@ -1266,7 +1266,6 @@ impl Drop for WorkerHandle {
 
 /// Bound on becoming reapable in `Drop`. A zombie is reaped instantly; this budget only matters
 /// when the kernel has not finished tearing the process down.
-#[cfg(unix)]
 const DROP_REAP_BUDGET: Duration = Duration::from_millis(300);
 
 /// Bound on waiting for the stderr forwarder. Normally instant: the pipe is at EOF the moment the
@@ -1274,7 +1273,9 @@ const DROP_REAP_BUDGET: Duration = Duration::from_millis(300);
 const STDERR_JOIN_BUDGET: Duration = Duration::from_millis(300);
 
 /// `wait()` with a deadline. Returns false if the child is still not reapable.
-#[cfg(unix)]
+///
+/// Portable: `try_wait` works on every platform. Only the ECHILD arm below is Unix-specific, and it is
+/// the only thing that ever kept this function — and its callers in `Drop` and `kill` — Unix-only.
 fn reap_within(child: &mut Child, budget: Duration) -> bool {
     let deadline = Instant::now() + budget;
     loop {
@@ -1284,6 +1285,7 @@ fn reap_within(child: &mut Child, budget: Duration) -> bool {
             // error is not evidence of a reap, and claiming one is load-bearing: `shutdown()` early
             // -returns on `self.reaped`, so a spurious error here used to skip the group sweep and
             // leak the `sp1-gpu-server` that sweep exists to kill.
+            #[cfg(unix)]
             Err(e) if e.raw_os_error() == Some(libc::ECHILD) => return true,
             Err(_) => return false,
             Ok(None) => {

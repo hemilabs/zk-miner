@@ -489,6 +489,13 @@ pub fn pid_is_our_worker(_pid: u32, _expected_starttime: Option<u64>) -> bool {
     false
 }
 
+/// Non-unix: no `/proc` to read a start time from. `None` is "unknown", which `publish_pid` already
+/// stores as 0 and every reader treats as absent — the same thing an unreadable `/proc` means on Linux.
+#[cfg(not(unix))]
+pub fn pid_starttime(_pid: u32) -> Option<u64> {
+    None
+}
+
 pub(crate) fn group_of_stat(stat: &str) -> Option<i32> {
     let rest = stat.get(stat.rfind(')')? + 1..)?;
     rest.split_whitespace().nth(2)?.parse().ok()
