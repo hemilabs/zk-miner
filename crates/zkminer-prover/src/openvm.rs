@@ -44,13 +44,11 @@ pub fn benchmark_fibonacci(n: u32) -> BenchmarkResult {
     let sdk = openvm_sdk::Sdk::new();
 
     // Build the guest program from source
-    let guest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("guests/openvm/fibonacci");
+    let guest_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("guests/openvm/fibonacci");
 
     let elf = sdk
-        .build(
-            openvm_sdk::fs::BuildArgs::new(guest_dir),
-        )
+        .build(openvm_sdk::fs::BuildArgs::new(guest_dir))
         .expect("OpenVM guest build failed");
 
     let stdin = openvm_sdk::StdIn::from_bytes(&n.to_le_bytes());

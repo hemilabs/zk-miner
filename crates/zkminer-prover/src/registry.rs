@@ -33,7 +33,13 @@ impl ElfRegistry {
     }
 
     /// Register a program with its ELF binary.
-    pub fn register(&mut self, image_id: B256, name: String, elf: Vec<u8>, estimated_cycles: Option<u64>) {
+    pub fn register(
+        &mut self,
+        image_id: B256,
+        name: String,
+        elf: Vec<u8>,
+        estimated_cycles: Option<u64>,
+    ) {
         self.programs.insert(
             image_id,
             RegisteredProgram {

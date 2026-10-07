@@ -123,19 +123,22 @@ pub fn enabled_backends() -> Vec<&'static str> {
         if let Some(pool) = worker_pool() {
             let connected = pool.connected_backends();
             if !connected.is_empty() {
-                return connected.iter().map(|s| {
-                    // Leak strings so we can return &'static str
-                    // This is fine since backends are a fixed small set
-                    match s.as_str() {
-                        "risc0" => "risc0",
-                        "sp1" => "sp1",
-                        "openvm" => "openvm",
-                        _ => {
-                            tracing::warn!("Unknown backend from worker: {s}");
-                            "unknown"
+                return connected
+                    .iter()
+                    .map(|s| {
+                        // Leak strings so we can return &'static str
+                        // This is fine since backends are a fixed small set
+                        match s.as_str() {
+                            "risc0" => "risc0",
+                            "sp1" => "sp1",
+                            "openvm" => "openvm",
+                            _ => {
+                                tracing::warn!("Unknown backend from worker: {s}");
+                                "unknown"
+                            }
                         }
-                    }
-                }).collect();
+                    })
+                    .collect();
             }
         }
         // Mock / simulated mode — show all engines as available
@@ -145,6 +148,22 @@ pub fn enabled_backends() -> Vec<&'static str> {
 }
 
 /// Returns all available backends with their source (in-process, subprocess, or simulated).
+/// True if any backend's worker spoke the protocol and said it cannot prove here.
+///
+/// `backend_sources` reports NOTHING for such a backend, which is right — but it means the
+/// remaining entries can be all-`Simulated`, and the pre-claim gate reads an all-`Simulated` list
+/// as "demo mode, claim freely". On a host whose only discovered worker is a declining SP1 (the
+/// fresh-install-of-the-release-artifacts case), the gate would then claim every job, including
+/// the SP1 jobs that worker has just proved it cannot serve — a guaranteed loss, and a stranded
+/// collateral if the deadline passes before the release.
+pub fn any_backend_declined() -> bool {
+    worker_pool().is_some_and(|pool| {
+        ["risc0", "sp1", "openvm"]
+            .iter()
+            .any(|b| pool.backend_declined(b).is_some())
+    })
+}
+
 pub fn backend_sources() -> Vec<(&'static str, BackendSource)> {
     let mut sources = Vec::new();
 
@@ -323,9 +342,9 @@ pub async fn prove_async(
                 if pool.is_backend_healthy(backend_name) {
                     // engine's public callback is Fn(f64); the pool now also reports
                     // the slot key. Drop it here rather than widening this API.
-                    let cb: Option<Box<dyn Fn(f64, &str) + Send>> = on_progress
-                        .map(|f| Box::new(move |p: f64, _slot: &str| f(p))
-                            as Box<dyn Fn(f64, &str) + Send>);
+                    let cb: Option<Box<dyn Fn(f64, &str) + Send>> = on_progress.map(|f| {
+                        Box::new(move |p: f64, _slot: &str| f(p)) as Box<dyn Fn(f64, &str) + Send>
+                    });
                     return pool.prove(backend_name, &elf, &input_data, po2, timeout, cb);
                 }
             }

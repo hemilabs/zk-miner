@@ -9,12 +9,12 @@ use zkminer_chain::auction::{self, CurveType};
 use zkminer_chain::jobs::JobInfo;
 use zkminer_chain::staking::{ProverStatistics, StakeInfo};
 use zkminer_prover::benchmark::{
-    BenchmarkSuite, DeviceBenchmark, PROVER_BACKENDS,
-    load_cached_benchmark, run_benchmark_gpu_only_streaming, save_benchmark,
+    load_cached_benchmark, run_benchmark_gpu_only_streaming, save_benchmark, BenchmarkSuite,
+    DeviceBenchmark, PROVER_BACKENDS,
 };
 use zkminer_strategy::cost_model::CostParams;
 use zkminer_strategy::evaluator::{self, JobParams, Recommendation};
-use zkminer_tui::state::{LogLevel, MinerJobStatus, SharedState, TrackedJob, new_shared_state};
+use zkminer_tui::state::{new_shared_state, LogLevel, MinerJobStatus, SharedState, TrackedJob};
 
 const ETHER: u128 = 1_000_000_000_000_000_000;
 
@@ -93,8 +93,8 @@ pub async fn run(headless: bool) -> Result<()> {
     // This discovers binaries in ~/.zkminer/provers/, $PATH, etc.
     {
         let mut pool = zkminer_prover::dispatcher::WorkerPool::new(
-            HashMap::new(), // no explicit binaries in mock mode
-            Vec::new(),     // default search paths
+            HashMap::new(),                            // no explicit binaries in mock mode
+            Vec::new(),                                // default search paths
             Some(std::time::Duration::from_secs(600)), // 10 min benchmark timeout
         );
         let connected = pool.discover_and_spawn();
@@ -204,7 +204,15 @@ pub async fn run(headless: bool) -> Result<()> {
                 // The deque is bounded at 1000, but log_total_added always increases.
                 let new_count = (s.log_total_added - last_total_seen) as usize;
                 let new_count = new_count.min(s.activity_log.len());
-                for entry in s.activity_log.iter().rev().take(new_count).collect::<Vec<_>>().into_iter().rev() {
+                for entry in s
+                    .activity_log
+                    .iter()
+                    .rev()
+                    .take(new_count)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
                     println!(
                         "[{}] {:?}: {}",
                         entry.timestamp.format("%H:%M:%S"),
@@ -315,7 +323,11 @@ async fn job_generator(state: SharedState) {
             estimated_cycles: 0,
         };
 
-        let curve_label = if curve_type == 0 { "Linear" } else { "Quadratic" };
+        let curve_label = if curve_type == 0 {
+            "Linear"
+        } else {
+            "Quadratic"
+        };
 
         let mut s = state.write().await;
         let backend_label = job.prover_backend.clone();
@@ -375,11 +387,8 @@ async fn miner_brain(state: SharedState) {
 
         // Phase 2: Evaluate & claim (allow one job per device)
         // Collect device IDs already busy with an active job
-        let busy_devices: Vec<Option<String>> = s
-            .active_jobs
-            .iter()
-            .map(|j| j.gpu_bus_id.clone())
-            .collect();
+        let busy_devices: Vec<Option<String>> =
+            s.active_jobs.iter().map(|j| j.gpu_bus_id.clone()).collect();
 
         let max_concurrent = s.runtime_settings.max_concurrent_proofs;
         if !s.open_jobs.is_empty() && !s.paused && s.active_jobs.len() < max_concurrent {
@@ -421,7 +430,10 @@ async fn miner_brain(state: SharedState) {
                 let devices = devices_for_backend(&benchmarks, &job.prover_backend);
 
                 // Skip if backend is disabled
-                if s.runtime_settings.disabled_backends.contains(&job.prover_backend) {
+                if s.runtime_settings
+                    .disabled_backends
+                    .contains(&job.prover_backend)
+                {
                     continue;
                 }
 
@@ -430,15 +442,20 @@ async fn miner_brain(state: SharedState) {
                         continue;
                     }
                     // Skip disabled devices and device-backend combos
-                    if s.runtime_settings.disabled_devices.contains(&device.device_id) {
+                    if s.runtime_settings
+                        .disabled_devices
+                        .contains(&device.device_id)
+                    {
                         continue;
                     }
-                    if s.runtime_settings.disabled_device_backends.contains(
-                        &(device.device_id.clone(), job.prover_backend.clone())
-                    ) {
+                    if s.runtime_settings
+                        .disabled_device_backends
+                        .contains(&(device.device_id.clone(), job.prover_backend.clone()))
+                    {
                         continue;
                     }
-                    let cost_params = build_cost_params_for_device(&benchmarks, device, elec_cost, gas_cost, system_overhead);
+                    let cost_params =
+                        build_cost_params_for_device(elec_cost, gas_cost, system_overhead);
                     let params = JobParams {
                         current_price: job.current_price,
                         bonus_amount: job.info.bonus_amount,
@@ -452,6 +469,9 @@ async fn miner_brain(state: SharedState) {
                         fee_rate_bps: PROTOCOL_FEE_BPS,
                         throughput: device.throughput,
                         max_price: job.info.max_price,
+                        // Name the card, so the duration above and the electricity charged
+                        // describe the same device.
+                        device_watts: device_watts_for(device),
                     };
 
                     let eval = evaluator::evaluate_job(
@@ -487,8 +507,7 @@ async fn miner_brain(state: SharedState) {
                 job.info.locked_collateral = collateral;
                 job.info.lock_deadline = current_time + job.info.fulfillment_timeout;
                 job.info.prover = mock_address();
-                job.info.elapsed_at_lock =
-                    current_time.saturating_sub(job.info.ramp_up_start);
+                job.info.elapsed_at_lock = current_time.saturating_sub(job.info.ramp_up_start);
                 job.info.status = 1; // Locked
                 job.status = MinerJobStatus::Proving {
                     progress: 0.0,
@@ -533,9 +552,7 @@ async fn miner_brain(state: SharedState) {
                     .iter()
                     .max_by_key(|j| j.current_price)
                     .map(|top_job| {
-                        let devices = devices_for_backend(
-                            &benchmarks, &top_job.prover_backend,
-                        );
+                        let devices = devices_for_backend(&benchmarks, &top_job.prover_backend);
                         let required_collateral = auction::compute_collateral(
                             top_job.current_price,
                             top_job.info.lock_collateral_bps as u64,
@@ -543,10 +560,16 @@ async fn miner_brain(state: SharedState) {
                         );
 
                         // Use the fastest available device for this backend
-                        let (throughput, cost_params) = if let Some(d) = devices.first() {
-                            (d.throughput, build_cost_params_for_device(&benchmarks, d, elec_cost, gas_cost, system_overhead))
+                        let (throughput, device_watts, cost_params) = if let Some(d) =
+                            devices.first()
+                        {
+                            (
+                                d.throughput,
+                                device_watts_for(d),
+                                build_cost_params_for_device(elec_cost, gas_cost, system_overhead),
+                            )
                         } else {
-                            (benchmarks.average_throughput(), CostParams::default())
+                            (benchmarks.average_throughput(), None, CostParams::default())
                         };
 
                         let params = JobParams {
@@ -562,6 +585,7 @@ async fn miner_brain(state: SharedState) {
                             fee_rate_bps: PROTOCOL_FEE_BPS,
                             throughput,
                             max_price: top_job.info.max_price,
+                            device_watts,
                         };
                         let eval = evaluator::evaluate_job(
                             &benchmarks,
@@ -575,11 +599,16 @@ async fn miner_brain(state: SharedState) {
                             Recommendation::WatchAndWait => "price may rise, watching".to_string(),
                             _ => "no profitable jobs".to_string(),
                         };
-                        let job_id_short =
-                            format!("{}", top_job.info.job_id)[..10].to_string();
+                        let job_id_short = format!("{}", top_job.info.job_id)[..10].to_string();
                         let backend = top_job.prover_backend.clone();
                         let cycles = top_job.estimated_cycles;
-                        (job_id_short, backend, reason, cycles, eval.estimated_proving_time_secs)
+                        (
+                            job_id_short,
+                            backend,
+                            reason,
+                            cycles,
+                            eval.estimated_proving_time_secs,
+                        )
                     });
 
                 if let Some((job_id_short, backend, reason, cycles, eta)) = skip_info {
@@ -635,20 +664,16 @@ async fn miner_brain(state: SharedState) {
         // Process in reverse to maintain valid indices during removal
         for &i in to_fulfill.iter().rev() {
             let mut job = s.active_jobs.remove(i);
-            let time_remaining = job
-                .info
-                .lock_deadline
-                .saturating_sub(current_time);
+            let time_remaining = job.info.lock_deadline.saturating_sub(current_time);
 
-            let (net_payout, _protocol_fee, _speed_bonus) =
-                auction::estimate_prover_reward(
-                    job.info.settled_price,
-                    job.info.bonus_amount,
-                    job.info.speed_premium,
-                    time_remaining,
-                    job.info.fulfillment_timeout,
-                    PROTOCOL_FEE_BPS,
-                );
+            let (net_payout, _protocol_fee, _speed_bonus) = auction::estimate_prover_reward(
+                job.info.settled_price,
+                job.info.bonus_amount,
+                job.info.speed_premium,
+                time_remaining,
+                job.info.fulfillment_timeout,
+                PROTOCOL_FEE_BPS,
+            );
 
             // Release collateral
             if let Some(ref mut stake) = s.stake_info {
@@ -785,33 +810,45 @@ fn devices_for_backend(benchmarks: &BenchmarkSuite, backend: &str) -> Vec<Device
         .into_iter()
         .map(DeviceChoice::from_benchmark)
         .collect();
-    devices.sort_by(|a, b| b.throughput.partial_cmp(&a.throughput).unwrap_or(std::cmp::Ordering::Equal));
+    devices.sort_by(|a, b| {
+        b.throughput
+            .partial_cmp(&a.throughput)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     devices
 }
 
 /// Build cost params for a specific device.
 ///
-/// System power = CPU baseline + device-specific power (GPU power if using a
-/// GPU, zero extra if using CPU-only).
+/// Carries only the fixed OVERHEAD in `base_overhead_watts`; `evaluate_job` adds the measured
+/// CPU and the named card. This used to compose the total here instead — correctly, while the
+/// production path did not — and that divergence is why the production bug survived. Composing
+/// in one place means a caller can no longer forget.
 fn build_cost_params_for_device(
-    benchmarks: &BenchmarkSuite,
-    device: &DeviceChoice,
     electricity_cost_kwh: f64,
     gas_cost_usd: f64,
     system_overhead_watts: f64,
 ) -> CostParams {
-    let cpu_watts = benchmarks.cpu_power_watts.unwrap_or(65.0);
-    let device_watts = if device.gpu_bus_id.is_some() {
-        device.power_watts // GPU draws additional power
-    } else {
-        0.0 // CPU power is already in cpu_watts
-    };
-
     CostParams {
         electricity_cost_kwh,
-        system_power_watts: cpu_watts + device_watts + system_overhead_watts,
+        base_overhead_watts: system_overhead_watts,
         hardware_cost_per_hour: 0.0,
         gas_cost_usd,
+    }
+}
+
+/// The draw to charge for this device choice.
+///
+/// `Some(0.0)` for a CPU-only choice — its draw is already the suite's `cpu_power_watts`, and
+/// saying `None` there would mean "no device named" and charge the mean card for a job that
+/// touches no GPU. A GPU choice reports its own watts whether or not its `pci_bus_id` is known:
+/// keying on the bus id discarded a measured figure for a card whose identity was simply not
+/// recorded, while still using that card's throughput.
+fn device_watts_for(device: &DeviceChoice) -> Option<f64> {
+    if device.device_id == zkminer_prover::benchmark::CPU_DEVICE_ID {
+        Some(0.0)
+    } else {
+        Some(device.power_watts)
     }
 }
 

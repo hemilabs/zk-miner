@@ -136,7 +136,11 @@ impl SetupStatus {
 
     /// Update from current MinerState balances and stake info.
     pub fn refresh(&mut self, state: &MinerState) {
-        self.refresh_from_balances(state.eth_balance, state.hemi_balance, state.stake_info.as_ref());
+        self.refresh_from_balances(
+            state.eth_balance,
+            state.hemi_balance,
+            state.stake_info.as_ref(),
+        );
     }
 
     /// Update from individual balance/stake values (avoids borrow issues when
@@ -277,7 +281,6 @@ pub struct SettingsUiState {
     /// Which button is focused on the button row (0 = Apply, 1 = Reset).
     pub tuning_button_idx: usize,
 }
-
 
 /// Activity log entry.
 #[derive(Debug, Clone)]
@@ -481,7 +484,11 @@ pub struct ProgramProgress {
     pub name: String,
     pub phase: ProgramPhase,
     pub throughput: Option<f64>,
+    /// STARK proving time (protocol v4+): excludes the Groth16 wrap, which is `wrap_secs`.
     pub duration_secs: Option<f64>,
+    /// Groth16 wrap time, when the worker measured it for this program. SP1 measures it on one
+    /// program per card; see `BenchmarkEntry::wrap_secs`.
+    pub wrap_secs: Option<f64>,
     pub cycles: Option<u64>,
     /// Prover backend that ran this program (e.g. "risc0", "sp1").
     pub prover_backend: Option<String>,
@@ -561,10 +568,8 @@ impl BenchmarkTracker {
         let idx = device_index.unwrap_or(0);
         // Must match `WorkerPool::benchmark_device_id` / the benchmark writer:
         // tag-qualified so a cuda and a rocm card at index 0 do not collide.
-        let device_id = zkminer_prover::dispatcher::WorkerPool::gpu_device_id(
-            gpu_tag,
-            &idx.to_string(),
-        );
+        let device_id =
+            zkminer_prover::dispatcher::WorkerPool::gpu_device_id(gpu_tag, &idx.to_string());
         let device_label = match gpu_name {
             Some(name) => format!("GPU{idx} {name}"),
             None => format!("GPU{idx}"),
@@ -579,6 +584,7 @@ impl BenchmarkTracker {
                 phase: ProgramPhase::Pending,
                 throughput: None,
                 duration_secs: None,
+                wrap_secs: None,
                 cycles: None,
                 prover_backend: None,
                 weight: None,
@@ -607,10 +613,15 @@ impl BenchmarkTracker {
         };
 
         // Mark the completed program
-        if let Some(prog) = dev.programs.iter_mut().find(|p| p.name == entry.program_name) {
+        if let Some(prog) = dev
+            .programs
+            .iter_mut()
+            .find(|p| p.name == entry.program_name)
+        {
             prog.phase = ProgramPhase::Done;
             prog.throughput = Some(entry.throughput);
             prog.duration_secs = Some(entry.duration_secs);
+            prog.wrap_secs = entry.wrap_secs;
             prog.cycles = Some(entry.cycles);
             prog.prover_backend = Some(entry.prover_backend.clone());
             prog.weight = Some(entry.weight);
@@ -627,9 +638,7 @@ impl BenchmarkTracker {
                     program_name: p.name.clone(),
                     prover_backend: p.prover_backend.clone().unwrap_or_default(),
                     cycles: p.cycles.unwrap_or(0),
-                    duration: std::time::Duration::from_secs_f64(
-                        p.duration_secs.unwrap_or(0.0),
-                    ),
+                    duration: std::time::Duration::from_secs_f64(p.duration_secs.unwrap_or(0.0)),
                     throughput: p.throughput.unwrap_or(0.0),
                     weight: p.weight.unwrap_or(0.0),
                     precompile: p.precompile.unwrap_or(false),
@@ -637,8 +646,7 @@ impl BenchmarkTracker {
             })
             .collect();
         if !partial_results.is_empty() {
-            dev.partial_zkops =
-                Some(zkminer_prover::benchmark::compute_zkops(&partial_results));
+            dev.partial_zkops = Some(zkminer_prover::benchmark::compute_zkops(&partial_results));
         }
 
         // Mark the next pending program as Running
@@ -659,7 +667,8 @@ impl BenchmarkTracker {
 
     /// Total completed programs across all devices.
     pub fn completed_count(&self) -> usize {
-        self.devices.iter()
+        self.devices
+            .iter()
             .flat_map(|d| &d.programs)
             .filter(|p| p.phase == ProgramPhase::Done)
             .count()

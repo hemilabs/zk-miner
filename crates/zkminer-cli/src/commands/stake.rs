@@ -67,7 +67,6 @@ fn parse_hemi(s: &str) -> Result<u128> {
     Ok(wei)
 }
 
-
 /// Does this process share our signing key?
 ///
 /// Pure so it can actually be tested: the previous test asserted only that the scan does not
@@ -204,7 +203,11 @@ pub async fn run(
     // but it catches sharers that are not local processes.
     let running = other_running_miners();
     if !running.is_empty() {
-        let pids = running.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
+        let pids = running
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         if force {
             // Never bypass the PRIMARY fund-loss guard in silence. The weaker mempool check
             // below already warns on its force path; this one held the pid and said nothing.
@@ -224,11 +227,18 @@ pub async fn run(
              \n\
              Stop the miner (Ctrl-C drains queued jobs cleanly), stake, then restart it.\n\
              Use --force only if you are certain no other process shares this key.",
-            running.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "),
+            running
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
         );
     }
 
-    let latest = client.provider.get_transaction_count(client.address).await?;
+    let latest = client
+        .provider
+        .get_transaction_count(client.address)
+        .await?;
     let pending = client
         .provider
         .get_transaction_count(client.address)
@@ -271,8 +281,10 @@ pub async fn run(
         // "staked" and "did nothing" indistinguishable to any wrapper or `&&` chain — for the
         // very command the miner's warning tells operators to run.
         if read == 0 {
-            anyhow::bail!("no input on stdin (not a terminal?) — nothing sent; pass --yes to \
-                           skip the confirmation in scripts");
+            anyhow::bail!(
+                "no input on stdin (not a terminal?) — nothing sent; pass --yes to \
+                           skip the confirmation in scripts"
+            );
         }
         if !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes") {
             anyhow::bail!("declined; nothing sent");
@@ -290,7 +302,11 @@ pub async fn run(
             anyhow::bail!(
                 "The miner started while the confirmation was pending (pid {}) — nothing sent. \
                  Stop it and re-run.",
-                now_running.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "),
+                now_running
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
             );
         }
     }
@@ -315,7 +331,10 @@ pub async fn run(
         Ok(after) => {
             println!();
             println!("Staked:         {} HEMI", fmt_hemi(after.total_staked));
-            println!("Available:      {} HEMI", fmt_hemi(after.available_collateral));
+            println!(
+                "Available:      {} HEMI",
+                fmt_hemi(after.available_collateral)
+            );
             if let Some(b) = &before {
                 let delta = after.total_staked.saturating_sub(b.total_staked);
                 println!("Change:         +{} HEMI staked", fmt_hemi(delta));
@@ -371,11 +390,11 @@ mod tests {
         // (per_claim is a ceil over a wei-granular price, so it is essentially never a
         // clean multiple of 0.01 HEMI — the general case, which is where floor fails).
         let cases = [
-            4_250_000_000_000_000_000u128,     // the 2026-08-08 incident: exactly 4.25
-            1,                                  // 1 wei short
-            WEI_PER_HEMI - 1,                   // just under 1 HEMI
-            4_250_000_000_000_000_001,          // 4.25 + 1 wei -> floor says 4.25, short
-            149_999_999_999_999_999_999,        // ~150, one wei under
+            4_250_000_000_000_000_000u128, // the 2026-08-08 incident: exactly 4.25
+            1,                             // 1 wei short
+            WEI_PER_HEMI - 1,              // just under 1 HEMI
+            4_250_000_000_000_000_001,     // 4.25 + 1 wei -> floor says 4.25, short
+            149_999_999_999_999_999_999,   // ~150, one wei under
             10_000_000_000_000_000_001,
             333_333_333_333_333_333,
         ];
@@ -417,19 +436,37 @@ mod tests {
     fn identifies_processes_that_share_the_signer() {
         // MUST refuse: these hold the key and allocate nonces.
         assert!(shares_our_signer("zkminer", &cmdline(&["zkminer", "run"])));
-        assert!(shares_our_signer("zkminer", &cmdline(&["./target/release/zkminer", "-v", "run", "--headless"])));
+        assert!(shares_our_signer(
+            "zkminer",
+            &cmdline(&["./target/release/zkminer", "-v", "run", "--headless"])
+        ));
 
         // MUST NOT refuse: no signer, or not our binary.
-        assert!(!shares_our_signer("zkminer", &cmdline(&["zkminer", "run", "--mock"])),
-            "mock mode loads no signer; refusing here breeds a --force habit");
-        assert!(!shares_our_signer("zkminer", &cmdline(&["zkminer", "status"])));
-        assert!(!shares_our_signer("zkminer", &cmdline(&["zkminer", "benchmark"])));
-        assert!(!shares_our_signer("zkminer", &cmdline(&["zkminer", "stake", "10"])));
-        assert!(!shares_our_signer("zkminer-8852d4a1b", &cmdline(&["...", "run"])),
-            "the cargo test binary is named zkminer-<hash> and must not match");
-        assert!(!shares_our_signer("bash", &cmdline(&["bash", "-c", "zkminer run"])),
+        assert!(
+            !shares_our_signer("zkminer", &cmdline(&["zkminer", "run", "--mock"])),
+            "mock mode loads no signer; refusing here breeds a --force habit"
+        );
+        assert!(!shares_our_signer(
+            "zkminer",
+            &cmdline(&["zkminer", "status"])
+        ));
+        assert!(!shares_our_signer(
+            "zkminer",
+            &cmdline(&["zkminer", "benchmark"])
+        ));
+        assert!(!shares_our_signer(
+            "zkminer",
+            &cmdline(&["zkminer", "stake", "10"])
+        ));
+        assert!(
+            !shares_our_signer("zkminer-8852d4a1b", &cmdline(&["...", "run"])),
+            "the cargo test binary is named zkminer-<hash> and must not match"
+        );
+        assert!(
+            !shares_our_signer("bash", &cmdline(&["bash", "-c", "zkminer run"])),
             "a shell whose ARGS mention the miner is not the miner — this is the pgrep -f \
-             self-match that killed the operator's shell twice");
+             self-match that killed the operator's shell twice"
+        );
         assert!(!shares_our_signer("zkminer", &[]));
     }
 

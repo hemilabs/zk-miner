@@ -18,8 +18,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -86,7 +85,7 @@ fn run_worker_loop() -> Result<()> {
             WorkerCommand::Prove {
                 request_id,
                 elf,
-                input_data,
+                input_data: _,
                 po2: _, // OpenVM does not use segment sizing
             } => {
                 tracing::info!("Proving request {request_id} ({} bytes ELF)", elf.len());
@@ -155,12 +154,7 @@ fn run_benchmarks() -> Vec<BenchmarkEntry> {
     ]
 }
 
-fn simulated_benchmark(
-    name: &str,
-    cycles: u64,
-    weight: f64,
-    precompile: bool,
-) -> BenchmarkEntry {
+fn simulated_benchmark(name: &str, cycles: u64, weight: f64, precompile: bool) -> BenchmarkEntry {
     let start = Instant::now();
     let iterations = (cycles / 1000) as usize;
     let mut acc: u64 = 0;
@@ -173,7 +167,9 @@ fn simulated_benchmark(
     let duration_secs = start.elapsed().as_secs_f64();
     let throughput = cycles as f64 / duration_secs;
 
-    tracing::info!("{name} (simulated): {cycles} cycles in {duration_secs:.2}s ({throughput:.0} c/s)");
+    tracing::info!(
+        "{name} (simulated): {cycles} cycles in {duration_secs:.2}s ({throughput:.0} c/s)"
+    );
 
     BenchmarkEntry {
         program_name: name.to_string(),
@@ -183,5 +179,7 @@ fn simulated_benchmark(
         throughput,
         weight,
         precompile,
+        // Simulated: there is no proof, so there is nothing to wrap.
+        wrap_secs: None,
     }
 }

@@ -15,7 +15,11 @@ use crate::theme;
 
 pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
     let gpu_count = state.hardware.gpus.len();
-    let gpu_ideal = if gpu_count > 0 { gpu_count as u16 + 3 } else { 3 };
+    let gpu_ideal = if gpu_count > 0 {
+        gpu_count as u16 + 3
+    } else {
+        3
+    };
 
     // Show a readiness banner if setup is incomplete (but only after checks are done
     // and the user has dismissed the setup wizard or it wasn't shown).
@@ -28,11 +32,11 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(banner_height), // Readiness banner (0 if ready)
-            Constraint::Length(3),           // CPU + ZK Engines (compact, never shrink)
-            Constraint::Min(gpu_ideal),      // GPUs (protected — shrinks last)
-            Constraint::Max(8),              // Wallet & Staking + Performance (shrinks first)
-            Constraint::Length(0),           // Active jobs (hidden when tight)
-            Constraint::Max(6),              // Recent activity (shrinks early)
+            Constraint::Length(3),             // CPU + ZK Engines (compact, never shrink)
+            Constraint::Min(gpu_ideal),        // GPUs (protected — shrinks last)
+            Constraint::Max(8),                // Wallet & Staking + Performance (shrinks first)
+            Constraint::Length(0),             // Active jobs (hidden when tight)
+            Constraint::Max(6),                // Recent activity (shrinks early)
         ])
         .split(area);
 
@@ -78,7 +82,7 @@ fn render_readiness_banner(f: &mut Frame, area: Rect, state: &MinerState) {
                 .bg(theme::yellow())
                 .add_modifier(ratatui::style::Modifier::BOLD),
         ),
-        Span::styled(format!(" {reason} ", ), theme::warning()),
+        Span::styled(format!(" {reason} ",), theme::warning()),
         Span::styled("  Press ", theme::dim()),
         Span::styled("4", theme::accent()),
         Span::styled(":wallet for actions", theme::dim()),
@@ -121,19 +125,37 @@ fn render_hardware(f: &mut Frame, area: Rect, state: &MinerState) {
         0
     };
 
-    let is_amd = cpu.model.starts_with("R5 ") || cpu.model.starts_with("R7 ")
-        || cpu.model.starts_with("R9 ") || cpu.model.starts_with("TR ")
-        || cpu.model.starts_with("EPYC ") || cpu.model.contains("AMD");
-    let is_intel = cpu.model.starts_with("Xeon ") || cpu.model.starts_with("i3-")
-        || cpu.model.starts_with("i5-") || cpu.model.starts_with("i7-")
-        || cpu.model.starts_with("i9-") || cpu.model.contains("Intel");
+    let is_amd = cpu.model.starts_with("R5 ")
+        || cpu.model.starts_with("R7 ")
+        || cpu.model.starts_with("R9 ")
+        || cpu.model.starts_with("TR ")
+        || cpu.model.starts_with("EPYC ")
+        || cpu.model.contains("AMD");
+    let is_intel = cpu.model.starts_with("Xeon ")
+        || cpu.model.starts_with("i3-")
+        || cpu.model.starts_with("i5-")
+        || cpu.model.starts_with("i7-")
+        || cpu.model.starts_with("i9-")
+        || cpu.model.contains("Intel");
 
     let mut cpu_spans: Vec<Span> = Vec::new();
     if is_amd {
-        cpu_spans.push(Span::styled("  AMD ", Style::default().fg(theme::base()).bg(theme::amd_red()).add_modifier(ratatui::style::Modifier::BOLD)));
+        cpu_spans.push(Span::styled(
+            "  AMD ",
+            Style::default()
+                .fg(theme::base())
+                .bg(theme::amd_red())
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ));
         cpu_spans.push(Span::raw(" "));
     } else if is_intel {
-        cpu_spans.push(Span::styled(" INTC ", Style::default().fg(theme::base()).bg(theme::intel_blue()).add_modifier(ratatui::style::Modifier::BOLD)));
+        cpu_spans.push(Span::styled(
+            " INTC ",
+            Style::default()
+                .fg(theme::base())
+                .bg(theme::intel_blue())
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ));
         cpu_spans.push(Span::raw(" "));
     }
     cpu_spans.extend(vec![
@@ -150,7 +172,11 @@ fn render_hardware(f: &mut Frame, area: Rect, state: &MinerState) {
         ),
         Span::styled(" | ", theme::separator()),
         Span::styled(
-            format!("{}/{}", fmt_bytes(mem.used_bytes), fmt_bytes(mem.total_bytes)),
+            format!(
+                "{}/{}",
+                fmt_bytes(mem.used_bytes),
+                fmt_bytes(mem.total_bytes)
+            ),
             Style::default().fg(theme::usage_color(mem_pct)),
         ),
     ]);
@@ -195,14 +221,8 @@ fn render_zk_engines(f: &mut Frame, area: Rect, state: &MinerState) {
             }
             Some((_, BackendSource::Simulated)) => {
                 // Simulated only — dim badge with (sim) suffix
-                spans.push(Span::styled(
-                    *label,
-                    Style::default().fg(theme::overlay()),
-                ));
-                spans.push(Span::styled(
-                    "(sim)",
-                    Style::default().fg(theme::overlay()),
-                ));
+                spans.push(Span::styled(*label, Style::default().fg(theme::overlay())));
+                spans.push(Span::styled("(sim)", Style::default().fg(theme::overlay())));
             }
             Some((_, _source)) if runtime_disabled => {
                 // Available but user-disabled — brand color text, strikethrough
@@ -235,14 +255,9 @@ fn render_zk_engines(f: &mut Frame, area: Rect, state: &MinerState) {
                     // Available but degraded — brand color badge + warning
                     spans.push(Span::styled(
                         *label,
-                        Style::default()
-                            .fg(*color)
-                            .bg(theme::base()),
+                        Style::default().fg(*color).bg(theme::base()),
                     ));
-                    spans.push(Span::styled(
-                        "!",
-                        Style::default().fg(theme::yellow()),
-                    ));
+                    spans.push(Span::styled("!", Style::default().fg(theme::yellow())));
                 }
             }
         }
@@ -281,8 +296,8 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &MinerState) {
         .border_type(theme::border_type());
 
     if hw.gpus.is_empty() {
-        let paragraph = Paragraph::new(Span::styled("No GPUs detected", theme::placeholder()))
-            .block(block);
+        let paragraph =
+            Paragraph::new(Span::styled("No GPUs detected", theme::placeholder())).block(block);
         f.render_widget(paragraph, area);
         return;
     }
@@ -391,12 +406,9 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
     };
 
     // Find active job assigned to this GPU
-    let gpu_job = state
-        .active_jobs
-        .iter()
-        .find(|j| {
-            !gpu.pci_bus_id.is_empty() && j.gpu_bus_id.as_deref() == Some(gpu.pci_bus_id.as_str())
-        });
+    let gpu_job = state.active_jobs.iter().find(|j| {
+        !gpu.pci_bus_id.is_empty() && j.gpu_bus_id.as_deref() == Some(gpu.pci_bus_id.as_str())
+    });
 
     let (job_str, progress_str, progress_style) = if let Some(job) = gpu_job {
         let id = format!("{}", job.info.job_id);
@@ -422,42 +434,40 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
                 "Queued — waiting for a GPU".to_string(),
                 theme::dim(),
             ),
-            MinerJobStatus::Submitting => (
-                id_short,
-                "Submitting…".to_string(),
-                theme::warning(),
-            ),
-            MinerJobStatus::Fulfilled { .. } => (
-                id_short,
-                "Done".to_string(),
-                theme::positive(),
-            ),
-            _ => (
-                id_short,
-                "Pending".to_string(),
-                theme::dim(),
-            ),
+            MinerJobStatus::Submitting => (id_short, "Submitting…".to_string(), theme::warning()),
+            MinerJobStatus::Fulfilled { .. } => (id_short, "Done".to_string(), theme::positive()),
+            _ => (id_short, "Pending".to_string(), theme::dim()),
         }
     } else {
-        (
-            "—".to_string(),
-            "Idle".to_string(),
-            theme::dim(),
-        )
+        ("—".to_string(), "Idle".to_string(), theme::dim())
     };
 
     Row::new(vec![
         Cell::from(Line::from(vec![
-            Span::styled(vendor_tag, Style::default().fg(theme::base()).bg(vendor_bg).add_modifier(ratatui::style::Modifier::BOLD)),
+            Span::styled(
+                vendor_tag,
+                Style::default()
+                    .fg(theme::base())
+                    .bg(vendor_bg)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
             Span::styled(format!(" {}", gpu.name), theme::bold()),
         ])),
         Cell::from(zkops_str).style(theme::metric()),
         Cell::from(format!("{:3}%", gpu.gpu_usage_percent)).style(Style::default().fg(gpu_color)),
         Cell::from(format!("{}MHz", gpu.gpu_clock_mhz)),
         Cell::from(format!("{}MHz", gpu.mem_clock_mhz)),
-        Cell::from(format!("{}/{}", fmt_bytes(gpu.vram_used_bytes), fmt_bytes(gpu.vram_total_bytes))),
+        Cell::from(format!(
+            "{}/{}",
+            fmt_bytes(gpu.vram_used_bytes),
+            fmt_bytes(gpu.vram_total_bytes)
+        )),
         Cell::from(temp_str).style(Style::default().fg(temp_color)),
-        Cell::from(format!("{:.0}/{:.0}W", gpu.power_watts, gpu.power_cap_watts)).style(Style::default().fg(pwr_color)),
+        Cell::from(format!(
+            "{:.0}/{:.0}W",
+            gpu.power_watts, gpu.power_cap_watts
+        ))
+        .style(Style::default().fg(pwr_color)),
         Cell::from(job_str).style(theme::identifier()),
         Cell::from(progress_str).style(progress_style),
     ])
@@ -501,7 +511,10 @@ fn render_wallet_staking(f: &mut Frame, area: Rect, state: &MinerState) {
                     .add_modifier(ratatui::style::Modifier::BOLD),
             ),
             Span::styled("  Block ", theme::dim()),
-            Span::styled(format!("{}", state.block_number), Style::default().fg(theme::text())),
+            Span::styled(
+                format!("{}", state.block_number),
+                Style::default().fg(theme::text()),
+            ),
             Span::styled("  RPC ", theme::dim()),
             Span::styled(
                 format!("{} ({}/min)", state.rpc_total, state.rpc_last_minute),
@@ -511,9 +524,15 @@ fn render_wallet_staking(f: &mut Frame, area: Rect, state: &MinerState) {
         // Line 2: balances
         Line::from(vec![
             Span::styled("ETH ", theme::dim()),
-            Span::styled(format_token_amount(state.eth_balance), Style::default().fg(theme::text())),
+            Span::styled(
+                format_token_amount(state.eth_balance),
+                Style::default().fg(theme::text()),
+            ),
             Span::styled("     HEMI ", theme::dim()),
-            Span::styled(format_token_amount(state.hemi_balance), Style::default().fg(theme::text())),
+            Span::styled(
+                format_token_amount(state.hemi_balance),
+                Style::default().fg(theme::text()),
+            ),
         ]),
     ];
 
@@ -529,11 +548,20 @@ fn render_wallet_staking(f: &mut Frame, area: Rect, state: &MinerState) {
 
         let mut staking_spans = vec![
             Span::styled("Staked ", theme::dim()),
-            Span::styled(format_token_amount(stake.total_staked), Style::default().fg(theme::text())),
+            Span::styled(
+                format_token_amount(stake.total_staked),
+                Style::default().fg(theme::text()),
+            ),
             Span::styled("  Locked ", theme::dim()),
-            Span::styled(format_token_amount(stake.locked_collateral), Style::default().fg(theme::text())),
+            Span::styled(
+                format_token_amount(stake.locked_collateral),
+                Style::default().fg(theme::text()),
+            ),
             Span::styled("  Liquid ", theme::dim()),
-            Span::styled(format_token_amount(stake.available_collateral), theme::positive()),
+            Span::styled(
+                format_token_amount(stake.available_collateral),
+                theme::positive(),
+            ),
         ];
 
         if stake.unstake_amount > 0 {
@@ -565,11 +593,18 @@ fn render_wallet_staking(f: &mut Frame, area: Rect, state: &MinerState) {
                 Span::styled("Slots fundable ", theme::dim()),
                 Span::styled(
                     format!("{}/{}", h.fundable, h.wanted),
-                    if starved { theme::warning() } else { theme::positive() },
+                    if starved {
+                        theme::warning()
+                    } else {
+                        theme::positive()
+                    },
                 ),
                 if starved {
                     Span::styled(
-                        format!("  ⚠ short {}", zkminer_chain::staking::fmt_hemi_ceil(h.shortfall)),
+                        format!(
+                            "  ⚠ short {}",
+                            zkminer_chain::staking::fmt_hemi_ceil(h.shortfall)
+                        ),
                         theme::warning(),
                     )
                 } else {
@@ -581,7 +616,10 @@ fn render_wallet_staking(f: &mut Frame, area: Rect, state: &MinerState) {
             ]));
             if starved {
                 lines.push(Line::from(Span::styled(
-                    format!("→ zkminer stake {}", zkminer_chain::staking::fmt_hemi_ceil(h.shortfall)),
+                    format!(
+                        "→ zkminer stake {}",
+                        zkminer_chain::staking::fmt_hemi_ceil(h.shortfall)
+                    ),
                     theme::warning(),
                 )));
             }
@@ -635,7 +673,10 @@ fn render_performance(f: &mut Frame, area: Rect, state: &MinerState) {
         lines.push(Line::from(vec![
             Span::styled("Success  ", theme::dim()),
             Span::styled(format!("{:.1}%", rate_pct), rate_style),
-            Span::styled(format!("  ({}/{})", stats.jobs_fulfilled, total), theme::dim()),
+            Span::styled(
+                format!("  ({}/{})", stats.jobs_fulfilled, total),
+                theme::dim(),
+            ),
         ]));
 
         // Line 2: total earned
@@ -669,7 +710,10 @@ fn render_performance(f: &mut Frame, area: Rect, state: &MinerState) {
             Span::styled("  Slashed ", theme::dim()),
             Span::styled(format!("{}", stats.jobs_slashed), slashed_style),
             Span::styled("  Released ", theme::dim()),
-            Span::styled(format!("{}", stats.jobs_released), Style::default().fg(theme::text())),
+            Span::styled(
+                format!("{}", stats.jobs_released),
+                Style::default().fg(theme::text()),
+            ),
         ]));
     } else {
         lines.push(Line::from(Span::styled(
@@ -702,8 +746,8 @@ fn render_active_jobs(f: &mut Frame, area: Rect, state: &MinerState) {
         .border_type(theme::border_type());
 
     if state.active_jobs.is_empty() {
-        let paragraph = Paragraph::new(Span::styled("No active jobs", theme::placeholder()))
-            .block(block);
+        let paragraph =
+            Paragraph::new(Span::styled("No active jobs", theme::placeholder())).block(block);
         f.render_widget(paragraph, area);
         return;
     }
@@ -903,8 +947,15 @@ mod headroom_verdict_tests {
     /// called `render_wallet_staking(f, f.area(), ..)` and handed the widget 120 columns it
     /// never gets in production (it gets 60). The single-line verdict passed that test and
     /// still rendered "run `zkminer stake 4" on a real 120-column terminal.
-    const WIDTHS: [(u16, u16); 7] =
-        [(200, 40), (160, 40), (128, 40), (120, 40), (100, 30), (80, 40), (80, 20)];
+    const WIDTHS: [(u16, u16); 7] = [
+        (200, 40),
+        (160, 40),
+        (128, 40),
+        (120, 40),
+        (100, 30),
+        (80, 40),
+        (80, 20),
+    ];
 
     fn state_with(headroom: Option<HeadroomView>) -> MinerState {
         let mut state = MinerState::default();
@@ -927,7 +978,11 @@ mod headroom_verdict_tests {
         term.draw(|f| render(f, f.area(), &state)).unwrap();
         let buf = term.backend().buffer().clone();
         (0..buf.area.height)
-            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect()
     }
 
@@ -945,8 +1000,14 @@ mod headroom_verdict_tests {
         let shortfall = 4_250_000_000_000_000_000; // the 2026-08-08 incident
         for (w, h) in WIDTHS {
             let rows = screen(
-                Some(HeadroomView { fundable: 1, wanted: 2, per_claim: 150 * HEMI, shortfall }),
-                w, h,
+                Some(HeadroomView {
+                    fundable: 1,
+                    wanted: 2,
+                    per_claim: 150 * HEMI,
+                    shortfall,
+                }),
+                w,
+                h,
             );
             let cmd = line_with(&rows, "zkminer stake")
                 .unwrap_or_else(|| panic!("{w}x{h}: no remedy on screen:\n{}", rows.join("\n")));
@@ -964,15 +1025,22 @@ mod headroom_verdict_tests {
         for (w, h) in WIDTHS {
             let rows = screen(
                 Some(HeadroomView {
-                    fundable: 1, wanted: 2, per_claim: 150 * HEMI,
+                    fundable: 1,
+                    wanted: 2,
+                    per_claim: 150 * HEMI,
                     shortfall: 4_250_000_000_000_000_000,
                 }),
-                w, h,
+                w,
+                h,
             );
             let v = line_with(&rows, "Slots fundable")
                 .unwrap_or_else(|| panic!("{w}x{h}: verdict absent:\n{}", rows.join("\n")));
             assert!(v.contains("1/2"), "{w}x{h}: counts lost: [{}]", v.trim());
-            assert!(v.contains("short 4.25"), "{w}x{h}: shortfall lost: [{}]", v.trim());
+            assert!(
+                v.contains("short 4.25"),
+                "{w}x{h}: shortfall lost: [{}]",
+                v.trim()
+            );
         }
     }
 
@@ -982,26 +1050,44 @@ mod headroom_verdict_tests {
     fn displayed_shortfall_rounds_up() {
         let rows = screen(
             Some(HeadroomView {
-                fundable: 1, wanted: 2, per_claim: 150 * HEMI,
+                fundable: 1,
+                wanted: 2,
+                per_claim: 150 * HEMI,
                 shortfall: 4_250_000_000_000_000_001,
             }),
-            160, 40,
+            160,
+            40,
         );
-        assert!(line_with(&rows, "zkminer stake 4.26").is_some(),
-            "must round up:\n{}", rows.join("\n"));
+        assert!(
+            line_with(&rows, "zkminer stake 4.26").is_some(),
+            "must round up:\n{}",
+            rows.join("\n")
+        );
     }
 
     /// Healthy: a verdict, but no alarm and no command.
     #[test]
     fn healthy_verdict_is_quiet() {
         let rows = screen(
-            Some(HeadroomView { fundable: 2, wanted: 2, per_claim: 50 * HEMI, shortfall: 0 }),
-            160, 40,
+            Some(HeadroomView {
+                fundable: 2,
+                wanted: 2,
+                per_claim: 50 * HEMI,
+                shortfall: 0,
+            }),
+            160,
+            40,
         );
         let v = line_with(&rows, "Slots fundable").expect("verdict missing");
         assert!(v.contains("2/2"), "got: [{}]", v.trim());
-        assert!(line_with(&rows, "zkminer stake").is_none(), "must not nag when healthy");
-        assert!(line_with(&rows, "⚠").is_none(), "must not warn when healthy");
+        assert!(
+            line_with(&rows, "zkminer stake").is_none(),
+            "must not nag when healthy"
+        );
+        assert!(
+            line_with(&rows, "⚠").is_none(),
+            "must not warn when healthy"
+        );
     }
 
     /// No observed per-claim price => no verdict. Better silent than a guessed green tick:
@@ -1009,8 +1095,14 @@ mod headroom_verdict_tests {
     #[test]
     fn absent_headroom_renders_nothing_rather_than_guessing() {
         let rows = screen(None, 160, 40);
-        assert!(line_with(&rows, "Slots fundable").is_none(), "invented a verdict");
-        assert!(line_with(&rows, "Staked").is_some(), "rest of the panel must still render");
+        assert!(
+            line_with(&rows, "Slots fundable").is_none(),
+            "invented a verdict"
+        );
+        assert!(
+            line_with(&rows, "Staked").is_some(),
+            "rest of the panel must still render"
+        );
     }
 
     /// The verdict must outlive the decorative utilization bar when the panel is squeezed —
@@ -1019,12 +1111,18 @@ mod headroom_verdict_tests {
     fn the_verdict_outlives_the_utilization_bar_when_squeezed() {
         let rows = screen(
             Some(HeadroomView {
-                fundable: 1, wanted: 2, per_claim: 150 * HEMI,
+                fundable: 1,
+                wanted: 2,
+                per_claim: 150 * HEMI,
                 shortfall: 4_250_000_000_000_000_000,
             }),
-            80, 20,
+            80,
+            20,
         );
-        assert!(line_with(&rows, "Slots fundable").is_some(),
-            "verdict died before the bar:\n{}", rows.join("\n"));
+        assert!(
+            line_with(&rows, "Slots fundable").is_some(),
+            "verdict died before the bar:\n{}",
+            rows.join("\n")
+        );
     }
 }

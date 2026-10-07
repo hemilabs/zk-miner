@@ -16,16 +16,27 @@ use std::time::Duration;
 use zkminer_prover::dispatcher::WorkerPool;
 
 fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 fn find_risc0_elf(guest: &str) -> Option<Vec<u8>> {
     let p = workspace_root().join(format!(
         "target/riscv-guest/zkminer-prover/{guest}/riscv32im-risc0-zkvm-elf/release/{guest}.bin"
     ));
-    if p.exists() { return std::fs::read(&p).ok(); }
+    if p.exists() {
+        return std::fs::read(&p).ok();
+    }
     let alt = p.with_extension("");
-    if alt.exists() { std::fs::read(&alt).ok() } else { None }
+    if alt.exists() {
+        std::fs::read(&alt).ok()
+    } else {
+        None
+    }
 }
 
 fn input(vals: &[u32]) -> Vec<u8> {
@@ -63,7 +74,9 @@ fn per_slot_vram_is_known_and_cards_differ() {
 #[test]
 #[ignore = "needs real CUDA workers; run explicitly"]
 fn a_relative_vram_floor_routes_off_the_smallest_card() {
-    let elf = find_risc0_elf("fibonacci").filter(|e| !e.is_empty()).expect("fibonacci ELF");
+    let elf = find_risc0_elf("fibonacci")
+        .filter(|e| !e.is_empty())
+        .expect("fibonacci ELF");
 
     let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(600)));
     let connected = pool.discover_and_spawn();
@@ -75,16 +88,33 @@ fn a_relative_vram_floor_routes_off_the_smallest_card() {
     sizes.sort_by_key(|(_, v)| *v);
     assert!(sizes.len() >= 2, "need >= 2 cuda slots");
     let (small_key, small_vram) = sizes[0].clone();
-    eprintln!("smallest card: {small_key} @ {} MiB", small_vram / 1024 / 1024);
+    eprintln!(
+        "smallest card: {small_key} @ {} MiB",
+        small_vram / 1024 / 1024
+    );
 
     // Exactly what the OOM arm now computes: one byte more than the failed card.
     let floor = small_vram.saturating_add(1);
     let mut used = None;
     let r = pool.prove_min_vram(
-        "risc0", &elf, &input(&[1000]), None, Some(Duration::from_secs(300)),
-        None, Some(floor), &[], &mut used, None, None,
+        "risc0",
+        &elf,
+        &input(&[1000]),
+        None,
+        Some(Duration::from_secs(300)),
+        None,
+        Some(floor),
+        &[],
+        &[],
+        &mut used,
+        None,
+        None,
     );
-    assert!(r.is_ok(), "proof should succeed on a bigger card: {:?}", r.err().map(|e| format!("{e:#}")));
+    assert!(
+        r.is_ok(),
+        "proof should succeed on a bigger card: {:?}",
+        r.err().map(|e| format!("{e:#}"))
+    );
     let landed = used.expect("used_slot must be recorded");
     eprintln!("floor {} MiB -> landed on {landed}", floor / 1024 / 1024);
     assert_ne!(

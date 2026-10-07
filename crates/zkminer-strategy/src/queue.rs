@@ -98,7 +98,11 @@ pub fn plan_admission(
     let mut best: Option<Admission> = None;
 
     for slot in slots {
-        let tput = if slot.throughput > 0.0 { slot.throughput } else { fallback_throughput };
+        let tput = if slot.throughput > 0.0 {
+            slot.throughput
+        } else {
+            fallback_throughput
+        };
         if tput <= 0.0 || estimated_cycles == 0 {
             continue; // cannot estimate on this device; do not gamble the collateral
         }
@@ -127,7 +131,10 @@ pub fn plan_admission(
             // and the caller uses this to update the device backlog.
             finishes_in: slot.backlog.saturating_add(est),
         };
-        if best.as_ref().is_none_or(|b| cand.finishes_in < b.finishes_in) {
+        if best
+            .as_ref()
+            .is_none_or(|b| cand.finishes_in < b.finishes_in)
+        {
             best = Some(cand);
         }
     }
@@ -148,7 +155,11 @@ mod tests {
 
     /// 1e9 cycles/s: a 100e9-cycle job takes 100s. Keeps the arithmetic readable.
     fn slot(id: &str, backlog_secs: u64, tput: f64) -> DeviceSlot {
-        DeviceSlot { device_id: id.into(), backlog: SEC(backlog_secs), throughput: tput }
+        DeviceSlot {
+            device_id: id.into(),
+            backlog: SEC(backlog_secs),
+            throughput: tput,
+        }
     }
     const T: f64 = 1e9;
     const CYCLES_100S: u64 = 100_000_000_000;
@@ -164,7 +175,9 @@ mod tests {
         );
         let idle = [slot("a", 0, T)];
         assert_eq!(
-            plan_admission(&idle, Duration::ZERO, CYCLES_100S, SEC(9999), 1.0, T).unwrap().device_id,
+            plan_admission(&idle, Duration::ZERO, CYCLES_100S, SEC(9999), 1.0, T)
+                .unwrap()
+                .device_id,
             "a"
         );
     }
@@ -211,7 +224,10 @@ mod tests {
             slot("fast-busy", 40, T),      // busy 40s, then 100s => done at 140s
         ];
         let a = plan_admission(&slots, SEC(300), CYCLES_100S, SEC(9999), 1.0, T).unwrap();
-        assert_eq!(a.device_id, "fast-busy", "earliest start would have picked the slow device");
+        assert_eq!(
+            a.device_id, "fast-busy",
+            "earliest start would have picked the slow device"
+        );
         assert_eq!(a.finishes_in, SEC(140));
     }
 
@@ -234,7 +250,9 @@ mod tests {
     fn an_unbenchmarked_device_uses_the_fallback_and_refuses_without_one() {
         let slots = [slot("a", 0, 0.0)];
         assert_eq!(
-            plan_admission(&slots, SEC(300), CYCLES_100S, SEC(9999), 1.0, T).unwrap().finishes_in,
+            plan_admission(&slots, SEC(300), CYCLES_100S, SEC(9999), 1.0, T)
+                .unwrap()
+                .finishes_in,
             SEC(100)
         );
         assert_eq!(
@@ -283,7 +301,10 @@ mod tests {
         for _ in 0..10 {
             match plan_admission(&slots, SEC(300), CYCLES_100S, SEC(9999), 1.0, T) {
                 Ok(a) => {
-                    let s = slots.iter_mut().find(|s| s.device_id == a.device_id).unwrap();
+                    let s = slots
+                        .iter_mut()
+                        .find(|s| s.device_id == a.device_id)
+                        .unwrap();
                     s.backlog = a.finishes_in; // commit it, as the caller would
                     placed.push(a.device_id);
                 }
@@ -292,7 +313,11 @@ mod tests {
             }
         }
         assert_eq!(placed.len(), 8, "4 x 100s per device up to a 300s horizon");
-        assert_eq!(placed.iter().filter(|d| *d == "a").count(), 4, "must balance: {placed:?}");
+        assert_eq!(
+            placed.iter().filter(|d| *d == "a").count(),
+            4,
+            "must balance: {placed:?}"
+        );
         assert_eq!(slots[0].backlog, SEC(400));
     }
 }
@@ -343,7 +368,8 @@ impl QueueModel {
     /// `finish_offset` is `Admission::finishes_in` — how long until this job COMPLETES,
     /// measured from now. Not its work duration; see the field docs.
     pub fn commit(&mut self, job: [u8; 32], device_id: &str, finish_offset: Duration) {
-        self.assigned.insert(job, (device_id.to_string(), finish_offset));
+        self.assigned
+            .insert(job, (device_id.to_string(), finish_offset));
     }
 
     /// Drop a finished (or abandoned) job. Idempotent — the brain settles jobs from several
@@ -370,7 +396,11 @@ impl QueueModel {
                     .filter(|(d, _)| d == id)
                     .map(|(_, rem)| *rem)
                     .fold(Duration::ZERO, Duration::max);
-                DeviceSlot { device_id: id.clone(), backlog, throughput: *tput }
+                DeviceSlot {
+                    device_id: id.clone(),
+                    backlog,
+                    throughput: *tput,
+                }
             })
             .collect()
     }
@@ -403,7 +433,11 @@ mod model_tests {
         m.commit(job(3), "b", Duration::from_secs(30));
 
         let s = m.slots(&devs);
-        assert_eq!(s[0].backlog, Duration::from_secs(150), "a is free when its LAST job ends");
+        assert_eq!(
+            s[0].backlog,
+            Duration::from_secs(150),
+            "a is free when its LAST job ends"
+        );
         assert_eq!(s[1].backlog, Duration::from_secs(30));
 
         m.settle(&job(2));
@@ -420,7 +454,11 @@ mod model_tests {
         let devs = vec![("a".to_string(), T)];
         m.commit(job(1), "a", Duration::from_secs(100));
         m.tick(Duration::from_secs(500)); // it ran 5x its estimate
-        assert_eq!(m.slots(&devs)[0].backlog, Duration::ZERO, "decayed, not negative or stuck");
+        assert_eq!(
+            m.slots(&devs)[0].backlog,
+            Duration::ZERO,
+            "decayed, not negative or stuck"
+        );
         // ...and the device is admissible again even though the job has not finished.
         assert!(plan_admission(
             &m.slots(&devs),
@@ -527,12 +565,26 @@ mod fallback_tests {
         let cycles = 200_000_000u64;
         let deadline = Duration::from_secs(100); // between the two
         assert!(
-            plan_admission(&unbenchmarked, Duration::from_secs(300), cycles, deadline, 1.0, 3_030_000.0)
-                .is_ok(),
+            plan_admission(
+                &unbenchmarked,
+                Duration::from_secs(300),
+                cycles,
+                deadline,
+                1.0,
+                3_030_000.0
+            )
+            .is_ok(),
             "the optimistic (cpu-skewed) fallback WOULD have admitted this"
         );
         assert_eq!(
-            plan_admission(&unbenchmarked, Duration::from_secs(300), cycles, deadline, 1.0, 1_440_000.0),
+            plan_admission(
+                &unbenchmarked,
+                Duration::from_secs(300),
+                cycles,
+                deadline,
+                1.0,
+                1_440_000.0
+            ),
             Err(Rejection::DeadlineInfeasible),
             "the slowest-GPU fallback correctly refuses it"
         );
@@ -566,7 +618,11 @@ mod depth_tests {
         m.commit(job(1), "a", Duration::from_secs(100)); // finishes at t=100
         m.commit(job(2), "a", Duration::from_secs(200)); // queued behind it, ends t=200
 
-        assert_eq!(m.slots(&devs)[0].backlog, Duration::from_secs(200), "free at t=200");
+        assert_eq!(
+            m.slots(&devs)[0].backlog,
+            Duration::from_secs(200),
+            "free at t=200"
+        );
         m.tick(Duration::from_secs(100));
         assert_eq!(
             m.slots(&devs)[0].backlog,
@@ -635,7 +691,14 @@ mod earned_headroom_tests {
             throughput: 1e9,
         }];
         assert_eq!(
-            plan_admission(&idle, Duration::from_secs(300), 0, Duration::from_secs(9999), 1.0, 1e9),
+            plan_admission(
+                &idle,
+                Duration::from_secs(300),
+                0,
+                Duration::from_secs(9999),
+                1.0,
+                1e9
+            ),
             Err(Rejection::NoUsableDevice),
             "a job with no cycle count must produce no Admission — so the caller has nothing \
              to justify the tripled ceiling with, and must fall back to max_concurrent"

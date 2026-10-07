@@ -166,7 +166,11 @@ mod tests {
 
     fn tmp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("zkminer_journal_test_{}_{}.json", name, std::process::id()));
+        p.push(format!(
+            "zkminer_journal_test_{}_{}.json",
+            name,
+            std::process::id()
+        ));
         p
     }
 

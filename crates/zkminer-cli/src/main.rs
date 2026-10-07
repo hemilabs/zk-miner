@@ -6,7 +6,10 @@ mod commands;
 mod journal;
 
 #[derive(Parser)]
-#[command(name = "zkminer", about = "ZK Miner — HemiProve proving marketplace client")]
+#[command(
+    name = "zkminer",
+    about = "ZK Miner — HemiProve proving marketplace client"
+)]
 struct Cli {
     /// Path to config file (default: ~/.zkminer/config.toml)
     #[arg(long, short)]
@@ -136,9 +139,12 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Status => commands::status::run(config_path).await,
-        Commands::Stake { amount, dry_run, force, yes } => {
-            commands::stake::run(config_path, amount, dry_run, force, yes).await
-        }
+        Commands::Stake {
+            amount,
+            dry_run,
+            force,
+            yes,
+        } => commands::stake::run(config_path, amount, dry_run, force, yes).await,
         Commands::Benchmark { json, calibrate } => {
             commands::benchmark::run(config_path, json, calibrate).await
         }
@@ -146,8 +152,10 @@ async fn main() -> Result<()> {
         Commands::Run { headless, .. } => commands::run::run(config_path, headless).await,
         #[cfg(feature = "sp1-demo")]
         Commands::Sp1Demo { input } => commands::sp1_demo::run(config_path, input).await,
-        Commands::Init { force, network, generate_key } => {
-            commands::init::run(config_path, force, &network, generate_key)
-        }
+        Commands::Init {
+            force,
+            network,
+            generate_key,
+        } => commands::init::run(config_path, force, &network, generate_key),
     }
 }

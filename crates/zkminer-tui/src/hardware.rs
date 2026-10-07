@@ -167,12 +167,7 @@ pub fn refresh_state(state: &mut crate::state::MinerState) {
     refresh_memory(&mut state.hardware.memory);
     for gpu in &mut state.hardware.gpus {
         let energy_snap = if gpu.vendor == GpuVendor::Intel {
-            Some(
-                state
-                    .intel_gpu_energy
-                    .entry(gpu.index)
-                    .or_default(),
-            )
+            Some(state.intel_gpu_energy.entry(gpu.index).or_default())
         } else {
             None
         };
@@ -205,12 +200,7 @@ pub fn collect_hw_snapshot(mut input: HwRefreshInput) -> HwRefreshOutput {
     refresh_memory(&mut input.hardware.memory);
     for gpu in &mut input.hardware.gpus {
         let energy_snap = if gpu.vendor == GpuVendor::Intel {
-            Some(
-                input
-                    .intel_gpu_energy
-                    .entry(gpu.index)
-                    .or_default(),
-            )
+            Some(input.intel_gpu_energy.entry(gpu.index).or_default())
         } else {
             None
         };
@@ -281,7 +271,11 @@ impl HwMonitor {
     ) {
         // Cache NVML device handles — avoids a device_by_index() ioctl per refresh.
         let nvml_devices = cache_nvml_devices(&state.hardware);
-        let has_nvidia = state.hardware.gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia);
+        let has_nvidia = state
+            .hardware
+            .gpus
+            .iter()
+            .any(|g| g.vendor == GpuVendor::Nvidia);
 
         let mut cycle: u32 = 0;
         let mut nvml_consecutive_slow: u32 = 0;
@@ -299,7 +293,7 @@ impl HwMonitor {
             // Decide whether to poll NVIDIA this cycle.
             // When throttled, only poll every Nth cycle to reduce kernel driver contention.
             let poll_nvidia = has_nvidia
-                && (!nvml_throttled || cycle % Self::NVML_THROTTLE_DIVISOR == 0);
+                && (!nvml_throttled || cycle.is_multiple_of(Self::NVML_THROTTLE_DIVISOR));
 
             // All blocking I/O happens here on this dedicated thread.
             refresh_cpu(&mut state.hardware.cpu, &mut state.cpu_stat_snapshot);
@@ -315,7 +309,8 @@ impl HwMonitor {
                 };
                 if gpu.vendor == GpuVendor::Nvidia {
                     if poll_nvidia {
-                        if let Some(device) = nvml_devices.as_ref().and_then(|d| d.get(&gpu.index)) {
+                        if let Some(device) = nvml_devices.as_ref().and_then(|d| d.get(&gpu.index))
+                        {
                             refresh_nvidia_gpu_cached(gpu, device);
                         }
                     }
@@ -346,16 +341,14 @@ impl HwMonitor {
                             Self::NVML_THROTTLE_DIVISOR,
                         );
                     }
-                } else {
-                    if nvml_throttled && nvml_consecutive_slow > 0 {
-                        nvml_consecutive_slow -= 1;
-                        if nvml_consecutive_slow == 0 {
-                            nvml_throttled = false;
-                            tracing::info!("NVML monitoring resumed — calls fast again");
-                        }
-                    } else {
-                        nvml_consecutive_slow = 0;
+                } else if nvml_throttled && nvml_consecutive_slow > 0 {
+                    nvml_consecutive_slow -= 1;
+                    if nvml_consecutive_slow == 0 {
+                        nvml_throttled = false;
+                        tracing::info!("NVML monitoring resumed — calls fast again");
                     }
+                } else {
+                    nvml_consecutive_slow = 0;
                 }
             }
 
@@ -457,8 +450,7 @@ fn refresh_cpu(cpu: &mut CpuInfo, prev: &mut CpuStatSnapshot) {
                     let d_total = total.saturating_sub(prev.total);
                     let d_idle = idle.saturating_sub(prev.idle);
                     if d_total > 0 {
-                        cpu.usage_percent =
-                            (1.0 - d_idle as f64 / d_total as f64) * 100.0;
+                        cpu.usage_percent = (1.0 - d_idle as f64 / d_total as f64) * 100.0;
                     }
                 }
                 prev.idle = idle;
@@ -471,10 +463,7 @@ fn refresh_cpu(cpu: &mut CpuInfo, prev: &mut CpuStatSnapshot) {
     let mut total_freq: u64 = 0;
     let mut count: u32 = 0;
     for i in 0..cpu.threads {
-        let path = format!(
-            "/sys/devices/system/cpu/cpu{}/cpufreq/scaling_cur_freq",
-            i
-        );
+        let path = format!("/sys/devices/system/cpu/cpu{}/cpufreq/scaling_cur_freq", i);
         if let Some(khz) = read_u64(&path) {
             total_freq += khz;
             count += 1;
@@ -622,16 +611,14 @@ fn detect_gpus() -> Vec<GpuInfo> {
             let device_id = read_trimmed(&format!("{}/device", base)).unwrap_or_default();
             let name = amd_gpu_name(&device_id);
             let vbios = read_trimmed(&format!("{}/vbios_version", base)).unwrap_or_default();
-            let pcie_speed = read_trimmed(&format!("{}/current_link_speed", base))
-                .unwrap_or_default();
-            let pcie_width =
-                read_u32(&format!("{}/current_link_width", base)).unwrap_or(0);
+            let pcie_speed =
+                read_trimmed(&format!("{}/current_link_speed", base)).unwrap_or_default();
+            let pcie_width = read_u32(&format!("{}/current_link_width", base)).unwrap_or(0);
 
             // Find hwmon path
             let hwmon = find_hwmon(&base);
 
-            let vram_total =
-                read_u64(&format!("{}/mem_info_vram_total", base)).unwrap_or(0);
+            let vram_total = read_u64(&format!("{}/mem_info_vram_total", base)).unwrap_or(0);
 
             let mut gpu = GpuInfo {
                 index: idx,
@@ -678,10 +665,9 @@ fn detect_gpus() -> Vec<GpuInfo> {
             let hwmon = find_hwmon(&base);
 
             let vram_total = detect_intel_vram(&base);
-            let pcie_speed = read_trimmed(&format!("{}/current_link_speed", base))
-                .unwrap_or_default();
-            let pcie_width =
-                read_u32(&format!("{}/current_link_width", base)).unwrap_or(0);
+            let pcie_speed =
+                read_trimmed(&format!("{}/current_link_speed", base)).unwrap_or_default();
+            let pcie_width = read_u32(&format!("{}/current_link_width", base)).unwrap_or(0);
 
             let mut gpu = GpuInfo {
                 index: idx,
@@ -773,7 +759,10 @@ fn detect_gpus() -> Vec<GpuInfo> {
             .filter(|g| g.vendor == GpuVendor::Nvidia)
             .filter_map(|g| {
                 let nv_idx = g.pci_id.strip_prefix("nv:")?;
-                nvml_data.values().find(|nv| nv.nv_index == nv_idx).map(|nv| nv.pci_bus_id.clone())
+                nvml_data
+                    .values()
+                    .find(|nv| nv.nv_index == nv_idx)
+                    .map(|nv| nv.pci_bus_id.clone())
             })
             .collect();
 
@@ -873,17 +862,10 @@ fn query_nvml_gpus() -> std::collections::HashMap<String, NvmlGpuData> {
             .map(|p| normalize_pci_bus_id(&p.bus_id))
             .unwrap_or_default();
 
-        let vram_bytes = device
-            .memory_info()
-            .map(|m| m.total)
-            .unwrap_or(0);
+        let vram_bytes = device.memory_info().map(|m| m.total).unwrap_or(0);
 
-        let pcie_gen = device
-            .max_pcie_link_gen()
-            .unwrap_or(0);
-        let pcie_width = device
-            .max_pcie_link_width()
-            .unwrap_or(0);
+        let pcie_gen = device.max_pcie_link_gen().unwrap_or(0);
+        let pcie_width = device.max_pcie_link_width().unwrap_or(0);
         let pcie_speed = if pcie_gen > 0 {
             format!("Gen{}", pcie_gen)
         } else {
@@ -897,16 +879,19 @@ fn query_nvml_gpus() -> std::collections::HashMap<String, NvmlGpuData> {
 
         let vbios = device.vbios_version().unwrap_or_default();
 
-        map.insert(pci_bus_id.clone(), NvmlGpuData {
-            nv_index: i.to_string(),
-            name,
-            vram_bytes,
-            pcie_speed,
-            pcie_width,
-            power_cap,
-            vbios,
-            pci_bus_id,
-        });
+        map.insert(
+            pci_bus_id.clone(),
+            NvmlGpuData {
+                nv_index: i.to_string(),
+                name,
+                vram_bytes,
+                pcie_speed,
+                pcie_width,
+                power_cap,
+                vbios,
+                pci_bus_id,
+            },
+        );
     }
 
     map
@@ -958,8 +943,8 @@ fn refresh_gpu(gpu: &mut GpuInfo, intel_energy: Option<&mut IntelGpuEnergySnapsh
                 if let Some(speed) = read_trimmed(&format!("{}/current_link_speed", base)) {
                     gpu.pcie_speed = speed;
                 }
-                gpu.pcie_width = read_u32(&format!("{}/current_link_width", base))
-                    .unwrap_or(gpu.pcie_width);
+                gpu.pcie_width =
+                    read_u32(&format!("{}/current_link_width", base)).unwrap_or(gpu.pcie_width);
             }
         }
         GpuVendor::Intel => {
@@ -1063,12 +1048,9 @@ fn find_drm_card_by_global_idx(target_idx: u32) -> Option<(String, String)> {
 }
 
 fn refresh_amd_gpu(gpu: &mut GpuInfo, base: &str, hwmon: &Option<PathBuf>) {
-    gpu.gpu_usage_percent =
-        read_u32(&format!("{}/gpu_busy_percent", base)).unwrap_or(0);
-    gpu.mem_usage_percent =
-        read_u32(&format!("{}/mem_busy_percent", base)).unwrap_or(0);
-    gpu.vram_used_bytes =
-        read_u64(&format!("{}/mem_info_vram_used", base)).unwrap_or(0);
+    gpu.gpu_usage_percent = read_u32(&format!("{}/gpu_busy_percent", base)).unwrap_or(0);
+    gpu.mem_usage_percent = read_u32(&format!("{}/mem_busy_percent", base)).unwrap_or(0);
+    gpu.vram_used_bytes = read_u64(&format!("{}/mem_info_vram_used", base)).unwrap_or(0);
     gpu.vram_total_bytes =
         read_u64(&format!("{}/mem_info_vram_total", base)).unwrap_or(gpu.vram_total_bytes);
 
@@ -1082,17 +1064,17 @@ fn refresh_amd_gpu(gpu: &mut GpuInfo, base: &str, hwmon: &Option<PathBuf>) {
             .unwrap_or(0);
 
         // Temperatures (millidegrees → degrees)
-        gpu.temp_edge_c = read_u64_from_hwmon_path(hwmon_path, "temp1_input")
-            .map(|v| v as f64 / 1000.0);
-        gpu.temp_junction_c = read_u64_from_hwmon_path(hwmon_path, "temp2_input")
-            .map(|v| v as f64 / 1000.0);
-        gpu.temp_mem_c = read_u64_from_hwmon_path(hwmon_path, "temp3_input")
-            .map(|v| v as f64 / 1000.0);
+        gpu.temp_edge_c =
+            read_u64_from_hwmon_path(hwmon_path, "temp1_input").map(|v| v as f64 / 1000.0);
+        gpu.temp_junction_c =
+            read_u64_from_hwmon_path(hwmon_path, "temp2_input").map(|v| v as f64 / 1000.0);
+        gpu.temp_mem_c =
+            read_u64_from_hwmon_path(hwmon_path, "temp3_input").map(|v| v as f64 / 1000.0);
 
         // Fan
         gpu.fan_rpm = read_u32_from_hwmon_path(hwmon_path, "fan1_input").unwrap_or(0);
-        gpu.fan_max_rpm = read_u32_from_hwmon_path(hwmon_path, "fan1_max")
-            .unwrap_or(gpu.fan_max_rpm);
+        gpu.fan_max_rpm =
+            read_u32_from_hwmon_path(hwmon_path, "fan1_max").unwrap_or(gpu.fan_max_rpm);
 
         // Power (microwatts → watts)
         gpu.power_watts = read_u64_from_hwmon_path(hwmon_path, "power1_average")
@@ -1110,8 +1092,7 @@ fn refresh_amd_gpu(gpu: &mut GpuInfo, base: &str, hwmon: &Option<PathBuf>) {
     if let Some(speed) = read_trimmed(&format!("{}/current_link_speed", base)) {
         gpu.pcie_speed = speed;
     }
-    gpu.pcie_width =
-        read_u32(&format!("{}/current_link_width", base)).unwrap_or(gpu.pcie_width);
+    gpu.pcie_width = read_u32(&format!("{}/current_link_width", base)).unwrap_or(gpu.pcie_width);
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,16 +1117,10 @@ fn is_intel_discrete_gpu(base: &str) -> bool {
             if i == 2 {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
-                    let start = u64::from_str_radix(
-                        parts[0].trim_start_matches("0x"),
-                        16,
-                    )
-                    .unwrap_or(0);
-                    let end = u64::from_str_radix(
-                        parts[1].trim_start_matches("0x"),
-                        16,
-                    )
-                    .unwrap_or(0);
+                    let start =
+                        u64::from_str_radix(parts[0].trim_start_matches("0x"), 16).unwrap_or(0);
+                    let end =
+                        u64::from_str_radix(parts[1].trim_start_matches("0x"), 16).unwrap_or(0);
                     if end > start {
                         return true;
                     }
@@ -1175,16 +1150,10 @@ fn detect_intel_vram(base: &str) -> u64 {
             if i == 2 {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
-                    let start = u64::from_str_radix(
-                        parts[0].trim_start_matches("0x"),
-                        16,
-                    )
-                    .unwrap_or(0);
-                    let end = u64::from_str_radix(
-                        parts[1].trim_start_matches("0x"),
-                        16,
-                    )
-                    .unwrap_or(0);
+                    let start =
+                        u64::from_str_radix(parts[0].trim_start_matches("0x"), 16).unwrap_or(0);
+                    let end =
+                        u64::from_str_radix(parts[1].trim_start_matches("0x"), 16).unwrap_or(0);
                     if end > start {
                         return end - start + 1;
                     }
@@ -1257,8 +1226,8 @@ fn refresh_intel_gpu(
 
         // Fan
         gpu.fan_rpm = read_u32_from_hwmon_path(hwmon_path, "fan1_input").unwrap_or(0);
-        gpu.fan_max_rpm = read_u32_from_hwmon_path(hwmon_path, "fan1_max")
-            .unwrap_or(gpu.fan_max_rpm);
+        gpu.fan_max_rpm =
+            read_u32_from_hwmon_path(hwmon_path, "fan1_max").unwrap_or(gpu.fan_max_rpm);
 
         // Power — xe driver exposes energy counters (microjoules), not instantaneous
         // power. Compute average watts from the delta since last refresh.
@@ -1296,8 +1265,7 @@ fn refresh_intel_gpu(
     if let Some(speed) = read_trimmed(&format!("{}/current_link_speed", base)) {
         gpu.pcie_speed = speed;
     }
-    gpu.pcie_width =
-        read_u32(&format!("{}/current_link_width", base)).unwrap_or(gpu.pcie_width);
+    gpu.pcie_width = read_u32(&format!("{}/current_link_width", base)).unwrap_or(gpu.pcie_width);
 }
 
 /// Find an energy counter by label (e.g. "card", "pkg").
@@ -1434,7 +1402,10 @@ mod tests {
         // Should always detect CPU
         assert!(info.cpu.threads > 0, "should detect CPU threads");
         assert!(!info.cpu.model.is_empty(), "should detect CPU model");
-        eprintln!("CPU: {} {}C/{}T", info.cpu.model, info.cpu.cores, info.cpu.threads);
+        eprintln!(
+            "CPU: {} {}C/{}T",
+            info.cpu.model, info.cpu.cores, info.cpu.threads
+        );
         for gpu in &info.gpus {
             eprintln!(
                 "GPU{}: {} | VRAM {}  | PCIe {} x{} | VBIOS {}",
@@ -1586,6 +1557,7 @@ mod gpu_identity_tests {
 
     fn row(device_id: &str, label: &str, bus: &str, tp: f64) -> DeviceBenchmark {
         DeviceBenchmark {
+            program_stages: Vec::new(),
             device_id: device_id.to_string(),
             device_label: label.to_string(),
             prover_backend: "risc0".to_string(),
@@ -1597,6 +1569,7 @@ mod gpu_identity_tests {
             program_throughputs: Default::default(),
             po2_samples: Vec::new(),
             pci_bus_id: bus.to_string(),
+            host_peak_bytes: None,
         }
     }
 
@@ -1617,8 +1590,18 @@ mod gpu_identity_tests {
         // Benchmark rows exist ONLY for the two NVIDIA cards, keyed in the
         // prover's own index space -- exactly what this box has on disk.
         let s = suite(vec![
-            row("gpu0", "GPU0 NVIDIA GeForce RTX 5090", "0000:06:1b.0", 2_287_871.9),
-            row("gpu1", "GPU1 NVIDIA GeForce RTX 4090", "0000:08:0d.0", 1_504_981.0),
+            row(
+                "gpu0",
+                "GPU0 NVIDIA GeForce RTX 5090",
+                "0000:06:1b.0",
+                2_287_871.9,
+            ),
+            row(
+                "gpu1",
+                "GPU1 NVIDIA GeForce RTX 4090",
+                "0000:08:0d.0",
+                1_504_981.0,
+            ),
         ]);
 
         // The AMD card has no row and must resolve to nothing -- NOT to "gpu0",
@@ -1662,7 +1645,10 @@ mod gpu_identity_tests {
         r1.prover_backend = "risc0".to_string();
         let mut r2 = row("gpu0", "GPU0 NVIDIA GeForce RTX 4090", "", 2.0);
         r2.prover_backend = "sp1".to_string();
-        assert_eq!(a.benchmark_device_id(&suite(vec![r1, r2])).as_deref(), Some("gpu0"));
+        assert_eq!(
+            a.benchmark_device_id(&suite(vec![r1, r2])).as_deref(),
+            Some("gpu0")
+        );
     }
 
     /// Bus id wins over a name that would match a different row.

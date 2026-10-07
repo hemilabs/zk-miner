@@ -1,10 +1,13 @@
 use alloy::{
     network::EthereumWallet,
     primitives::Address,
-    providers::{Provider, ProviderBuilder, RootProvider, fillers::{
-        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
-        WalletFiller,
-    }, Identity},
+    providers::{
+        fillers::{
+            BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
+            WalletFiller,
+        },
+        Identity, Provider, ProviderBuilder, RootProvider,
+    },
     signers::local::PrivateKeySigner,
 };
 use anyhow::{Context, Result};
@@ -253,7 +256,8 @@ impl ChainClient {
             anyhow::bail!(
                 "Chain ID mismatch: config says {}, RPC reports {}. \
                  Update config.chain.chain_id or point rpc_url at the correct network.",
-                config.chain.chain_id, rpc_chain_id,
+                config.chain.chain_id,
+                rpc_chain_id,
             );
         }
 
@@ -262,7 +266,10 @@ impl ChainClient {
             .gas_price_gwei
             .map(|g| (g * 1e9).round() as u128);
 
-        let fulfill_gas_limit = config.chain.fulfill_gas_limit.unwrap_or(DEFAULT_FULFILL_GAS_LIMIT);
+        let fulfill_gas_limit = config
+            .chain
+            .fulfill_gas_limit
+            .unwrap_or(DEFAULT_FULFILL_GAS_LIMIT);
 
         Ok(Self {
             provider: Arc::new(provider),
@@ -343,7 +350,8 @@ impl ChainClient {
     /// nonce is forced above it. See `NonceManager::note_broadcast` for the wedge this
     /// prevents. Call ONLY after the node accepted the tx.
     pub fn note_broadcast_fee(&self, nonce: u64, tip: u128, max_fee: u128, seed_max_fee: u128) {
-        self.nonce_mgr.note_broadcast(nonce, tip, max_fee, seed_max_fee);
+        self.nonce_mgr
+            .note_broadcast(nonce, tip, max_fee, seed_max_fee);
     }
 
     /// Mark `nonce` as legitimately in use by an accepted send that records no fee (the
@@ -576,9 +584,7 @@ impl ChainClient {
         //     That is exactly how the 2026-08-01 wedge stayed invisible for 10 minutes with a
         //     1-nonce hole. `recently_aborted` is the same evidence class (we abandoned a tx
         //     there) but sticky, and it is pruned the moment the nonce mines.
-        if self.nonce_mgr.is_freed(mined)
-            || self.nonce_mgr.recently_aborted(mined, ABORT_MEMORY)
-        {
+        if self.nonce_mgr.is_freed(mined) || self.nonce_mgr.recently_aborted(mined, ABORT_MEMORY) {
             return Ok((Some(mined), mined));
         }
         // (A) [A4] A hole ANYWHERE at or above the mined frontier — not just AT it.
@@ -798,17 +804,20 @@ impl ChainClient {
             return Ok(OwnedHealOutcome::RefusedNotOurs);
         }
         // `claim_gap` returned true above, so we definitively own this one.
-        Ok(match self.heal_claimed_gap_at(hole, true, receipt_budget).await? {
-            true => OwnedHealOutcome::Filled,
-            false => OwnedHealOutcome::Unconfirmed,
-        })
+        Ok(
+            match self.heal_claimed_gap_at(hole, true, receipt_budget).await? {
+                true => OwnedHealOutcome::Filled,
+                false => OwnedHealOutcome::Unconfirmed,
+            },
+        )
     }
 
     pub async fn heal_nonce_gap_at(&self, hole: u64) -> Result<bool> {
         let owned = self.nonce_mgr.claim_gap(hole);
         // The watchdog runs in a live process with no deadline pressure, so it keeps the
         // original budget and this path is byte-for-byte unchanged.
-        self.heal_claimed_gap_at(hole, owned, HEAL_RECEIPT_BUDGET).await
+        self.heal_claimed_gap_at(hole, owned, HEAL_RECEIPT_BUDGET)
+            .await
     }
 
     /// The fill itself. The caller has already claimed `hole` out of the allocator.
@@ -973,7 +982,8 @@ impl ChainClient {
             }
         };
         // Successive heals must out-bid the previous heal at this nonce, not repeat it.
-        self.nonce_mgr.note_broadcast(hole, tip, max_fee, seed_max_fee);
+        self.nonce_mgr
+            .note_broadcast(hole, tip, max_fee, seed_max_fee);
         let tx_hash = *pending_tx.tx_hash();
         // [D4] A fill ABOVE the mined frontier CANNOT mine until every nonce below it does,
         // so waiting for its receipt is a guaranteed 30s burn for an answer we already know.
@@ -1011,7 +1021,9 @@ impl ChainClient {
                 return Ok(true);
             }
             self.nonce_mgr.note_unresolved(hole);
-            tracing::warn!("nonce gap-fill at {hole} (tx {tx_hash:?}) did not enter the mempool; will retry");
+            tracing::warn!(
+                "nonce gap-fill at {hole} (tx {tx_hash:?}) did not enter the mempool; will retry"
+            );
             return Ok(false);
         }
         // [RPC #1] Poll for the receipt (no heartbeat watcher). Some+status = unwedged;
@@ -1023,7 +1035,10 @@ impl ChainClient {
         // gone; if not, the retry re-sends at the same claimed nonce with a higher fee.
         match crate::tx::await_receipt(&*self.provider, tx_hash, receipt_budget).await {
             Some(r) if r.status() => {
-                tracing::info!("nonce gap at {hole} filled (tx {:?}) — signer unwedged", r.transaction_hash);
+                tracing::info!(
+                    "nonce gap at {hole} filled (tx {:?}) — signer unwedged",
+                    r.transaction_hash
+                );
                 self.resync_nonce().await.ok(); // advance the allocator past the filled nonce
                 Ok(true)
             }
@@ -1105,7 +1120,9 @@ impl ChainClient {
                 // "replacement underpriced" forever and strands. Seed a nonzero floor from
                 // the live eth_gasPrice (or a hard 1 gwei minimum) so escalation always works.
                 if let Err(e) = &other {
-                    tracing::debug!("EIP-1559 fee estimate failed: {e:#}; falling back to eth_gasPrice");
+                    tracing::debug!(
+                        "EIP-1559 fee estimate failed: {e:#}; falling back to eth_gasPrice"
+                    );
                 }
                 let gp = self.provider.get_gas_price().await.unwrap_or(0);
                 let floor = (gp).max(1_000_000_000u128); // >= 1 gwei
@@ -1193,7 +1210,7 @@ impl ChainClient {
     /// shared head-block cache.
     pub async fn get_refresh_batch(&self) -> Result<RefreshData> {
         use alloy::providers::MulticallItem;
-        use zkminer_contracts::bindings::{IERC20, IHemiProveStaking};
+        use zkminer_contracts::bindings::{IHemiProveStaking, IERC20};
         let token = IERC20::new(self.hemi_token, &*self.provider);
         let staking = IHemiProveStaking::new(self.hemi_prove_staking, &*self.provider);
         // [review must-fix] Each contract view is added with allowFailure=TRUE. alloy's

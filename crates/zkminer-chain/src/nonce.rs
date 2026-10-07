@@ -347,7 +347,6 @@ impl NonceManager {
         e.origin_max_fee = e.origin_max_fee.max(seed_max_fee.max(1));
     }
 
-
     /// Record that `nonce` carries a transaction we cannot outbid within the cap.
     pub fn note_undisplaceable(&self, nonce: u64) {
         let mut g = self.lock();
@@ -555,7 +554,11 @@ impl NonceManager {
     /// upper frontier of everything the allocator has handed out.
     pub fn peek_next(&self) -> Option<u64> {
         let g = self.lock();
-        if g.synced { Some(g.next) } else { None }
+        if g.synced {
+            Some(g.next)
+        } else {
+            None
+        }
     }
 
     /// Force a full re-anchor to chain on the next reservation (last resort for an
@@ -604,8 +607,15 @@ mod tests {
         assert_eq!(m.try_reserve(), Some(101));
         m.commit(100);
         m.abort(100); // late abort, after the receipt landed
-        assert!(!m.is_freed(100), "a mined nonce was recycled into the reissue set");
-        assert_eq!(m.try_reserve(), Some(102), "the next reserve must not be handed 100");
+        assert!(
+            !m.is_freed(100),
+            "a mined nonce was recycled into the reissue set"
+        );
+        assert_eq!(
+            m.try_reserve(),
+            Some(102),
+            "the next reserve must not be handed 100"
+        );
     }
 
     /// The same via `resync`, which learns the frontier from the chain rather than a commit.
@@ -617,7 +627,10 @@ mod tests {
         m.resync(102); // the chain moved on; 100 and 101 are consumed
         m.abort(100);
         m.abort(101);
-        assert!(!m.is_freed(100) && !m.is_freed(101), "consumed nonces were resurrected");
+        assert!(
+            !m.is_freed(100) && !m.is_freed(101),
+            "consumed nonces were resurrected"
+        );
     }
 
     /// THE BOUNDARY. `consumed_below` is exclusive, so the watermark's own value must still
@@ -651,7 +664,11 @@ mod tests {
         m.commit(100);
         m.abort(102); // 102 never landed and is genuinely a gap
         assert!(m.is_freed(102));
-        assert_eq!(m.try_reserve(), Some(102), "the open gap must be reissued first");
+        assert_eq!(
+            m.try_reserve(),
+            Some(102),
+            "the open gap must be reissued first"
+        );
     }
     use super::*;
     use std::time::Duration;
@@ -736,9 +753,15 @@ mod tests {
         m.abort(7708);
 
         // Invocation 2 recycles the SAME nonce (freed is reissued first) ...
-        assert_eq!(m.try_reserve(), Some(7708), "the poisoned nonce is handed back");
+        assert_eq!(
+            m.try_reserve(),
+            Some(7708),
+            "the poisoned nonce is handed back"
+        );
         // ... and would otherwise open at the unbumped base.
-        let floor = m.fee_floor(7708).expect("floor recorded for a broadcast nonce");
+        let floor = m
+            .fee_floor(7708)
+            .expect("floor recorded for a broadcast nonce");
         assert!(
             floor.1 >= top,
             "floor must remember the resident fee ({top}), got {}",
@@ -763,7 +786,11 @@ mod tests {
         // cap exists to stop. Seed stays 1_000 because the escalated base did not move.
         m.note_broadcast(100, 0, 1_000_000_000, 1_000);
         let (_, capped) = m.fee_floor(100).unwrap();
-        assert_eq!(capped, 1_000 * FEE_FLOOR_MAX_RATCHET, "ratchet must be capped");
+        assert_eq!(
+            capped,
+            1_000 * FEE_FLOOR_MAX_RATCHET,
+            "ratchet must be capped"
+        );
         // Once mined, the entry is dead weight and must not accumulate.
         m.commit(100);
         assert!(m.fee_floor(100).is_none(), "committed nonce must be pruned");
@@ -781,7 +808,7 @@ mod tests {
         let m = NonceManager::new();
         assert_eq!(m.anchor_if_unsynced(100), Some(100));
         m.note_broadcast(100, 0, 50_000_000, 50_000_000); // fulfill: 0.05 gwei
-        // The healer's own price, not derived from the floor.
+                                                          // The healer's own price, not derived from the floor.
         m.note_broadcast(100, 2_000_000_000, 2_000_000_000, 2_000_000_000);
         let (_, capped) = m.fee_floor(100).unwrap();
         assert!(
@@ -828,7 +855,10 @@ mod tests {
         m.abort(7708);
         assert!(m.recently_aborted(7708, Duration::from_secs(600)));
         m.commit(7708);
-        assert!(!m.recently_aborted(7708, Duration::from_secs(600)), "mined => not a hole");
+        assert!(
+            !m.recently_aborted(7708, Duration::from_secs(600)),
+            "mined => not a hole"
+        );
         // and via the resync path (external tx advanced the account)
         let m2 = NonceManager::new();
         assert_eq!(m2.anchor_if_unsynced(100), Some(100));
@@ -844,7 +874,10 @@ mod tests {
         let m = NonceManager::new();
         assert_eq!(m.anchor_if_unsynced(10), Some(10));
         m.abort(10);
-        assert!(!m.recently_aborted(10, Duration::ZERO), "zero window => already expired");
+        assert!(
+            !m.recently_aborted(10, Duration::ZERO),
+            "zero window => already expired"
+        );
         m.abort(10); // second abort must NOT reset the clock
         assert!(!m.recently_aborted(10, Duration::ZERO));
     }
@@ -863,7 +896,10 @@ mod tests {
         assert!(live <= 5_001, "map grew to {live}");
         // and once the frontier advances, everything at/below it is dropped
         m.commit(4_999);
-        assert!(m.lock().aborted_at.len() <= 1, "commit must prune below the frontier");
+        assert!(
+            m.lock().aborted_at.len() <= 1,
+            "commit must prune below the frontier"
+        );
     }
 
     /// R3/R5: the healer's unconfirmed path must stay DETECTABLE next tick. `claim_gap`
@@ -875,8 +911,15 @@ mod tests {
         assert_eq!(m.anchor_if_unsynced(7708), Some(7708));
         m.claim_gap(7708); // healer takes exclusive custody
         assert!(!m.is_freed(7708), "claim_gap removes it from freed");
-        assert_eq!(m.peek_next(), Some(7709), "next is only mined+1 -> branch (A) blind");
-        assert!(!m.recently_aborted(7708, Duration::from_secs(600)), "no evidence yet");
+        assert_eq!(
+            m.peek_next(),
+            Some(7709),
+            "next is only mined+1 -> branch (A) blind"
+        );
+        assert!(
+            !m.recently_aborted(7708, Duration::from_secs(600)),
+            "no evidence yet"
+        );
         // heal sends, gets no receipt within budget:
         m.note_unresolved(7708);
         assert!(
@@ -884,7 +927,10 @@ mod tests {
             "next tick must still see the gap"
         );
         // ...and it must NOT have been recycled for a sibling task to grab
-        assert!(!m.is_freed(7708), "note_unresolved must not hand the nonce to others");
+        assert!(
+            !m.is_freed(7708),
+            "note_unresolved must not hand the nonce to others"
+        );
     }
 
     /// [A2] The ratchet cap must never invert the EIP-1559 pair. A node REJECTS a tx with
@@ -913,7 +959,7 @@ mod tests {
         let _ = m.try_reserve(); // 31
         m.invalidate();
         assert_eq!(m.try_reserve(), None); // unsynced again
-        // Re-anchor never goes below where we were.
+                                           // Re-anchor never goes below where we were.
         assert_eq!(m.anchor_if_unsynced(20), Some(32));
     }
 }
@@ -1058,7 +1104,10 @@ mod eviction_wedge_tests {
         // and `reserve_locked` hands the lowest freed nonce out first, so the next
         // reserver -- preferentially a deadline-critical release -- would draw this same
         // poisoned nonce and bail again, in a loop.
-        assert!(!m.is_freed(500), "a poisoned nonce must not head the free list");
+        assert!(
+            !m.is_freed(500),
+            "a poisoned nonce must not head the free list"
+        );
         for _ in 0..5 {
             assert_ne!(
                 m.try_reserve(),
@@ -1070,7 +1119,10 @@ mod eviction_wedge_tests {
 
         // When it finally mines, the jam retires.
         m.commit(500);
-        assert!(!m.is_jammed(), "the jam is over once the frontier passes it");
+        assert!(
+            !m.is_jammed(),
+            "the jam is over once the frontier passes it"
+        );
     }
 }
 
@@ -1202,7 +1254,11 @@ mod healer_bid_tests {
         // the shape that actually wedged 11589 -- not the shorter claim ladder.
         let mut v = base;
         for _ in 0..9 {
-            v = v.saturating_add((v.saturating_mul(15) / 100).max(v.saturating_add(7) / 8).max(1));
+            v = v.saturating_add(
+                (v.saturating_mul(15) / 100)
+                    .max(v.saturating_add(7) / 8)
+                    .max(1),
+            );
         }
         m.note_broadcast(11_589, 0, v, v);
 
@@ -1211,7 +1267,10 @@ mod healer_bid_tests {
         for i in 0..80 {
             let st = m.fee_floor_state(11_589).expect("floor");
             let ceiling = over(over(st.cap));
-            let bid = (4 * base).max(over(st.broadcast.1)).min(ceiling).max(4 * base);
+            let bid = (4 * base)
+                .max(over(st.broadcast.1))
+                .min(ceiling)
+                .max(4 * base);
             assert!(
                 bid <= ceiling,
                 "heal #{i} bid {bid} escaped the ceiling {ceiling} — this is the \
@@ -1282,7 +1341,10 @@ mod jam_gate_tests {
         m.note_undisplaceable(11_589);
 
         for _ in 0..50 {
-            assert!(m.is_jammed(), "the gate must stay closed while the jam is live");
+            assert!(
+                m.is_jammed(),
+                "the gate must stay closed while the jam is live"
+            );
         }
         assert_eq!(
             m.jammed_nonce(),

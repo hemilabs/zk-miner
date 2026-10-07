@@ -169,9 +169,11 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
     }
 
     println!();
+    // "STARK", not "Time": from protocol v4 a worker's duration is the STARK proving time and
+    // EXCLUDES the Groth16 wrap, which is reported per card under "Proving stages" below.
     println!(
         "{:<18} {:<10} {:<10} {:>8} {:>12} {:>10} {:>15}",
-        "Program", "Backend", "Precompile", "Weight", "Cycles", "Time", "Throughput"
+        "Program", "Backend", "Precompile", "Weight", "Cycles", "STARK", "STARK rate"
     );
     println!("{}", "─".repeat(86));
 
@@ -196,10 +198,7 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
 
     println!("{}", "─".repeat(86));
     println!();
-    println!(
-        "  zkOP/s: {:.0}  (3970X baseline = 100,000)",
-        results.zkops
-    );
+    println!("  zkOP/s: {:.0}  (3970X baseline = 100,000)", results.zkops);
     println!();
 
     // Device benchmarks summary
@@ -207,10 +206,10 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
         println!("Device Benchmarks");
         println!("──────────────────────────────────────────────────────────────────────────");
         println!(
-            "{:<26} {:<10} {:>5} {:>10} {:>10} {:>15}",
-            "Device", "Backend", "po2", "Segment", "Memory", "Throughput"
+            "{:<26} {:<10} {:>5} {:>10} {:>10} {:>15} {:>9}",
+            "Device", "Backend", "po2", "Segment", "Memory", "STARK rate", "Groth16"
         );
-        println!("{}", "─".repeat(80));
+        println!("{}", "─".repeat(90));
 
         for d in &results.device_benchmarks {
             let rows_count = 1u64 << d.optimal_po2;
@@ -225,13 +224,11 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
             } else {
                 format!("{:.0} MB", mem_gb * 1024.0)
             };
-            let tp_str = if d.throughput >= 1_000_000.0 {
-                format!("{:.1}M c/s", d.throughput / 1_000_000.0)
-            } else if d.throughput >= 1_000.0 {
-                format!("{:.1}K c/s", d.throughput / 1_000.0)
-            } else {
-                format!("{:.0} c/s", d.throughput)
-            };
+            let tp_str = fmt_rate(d.throughput);
+            let wrap_str = d
+                .wrap_secs()
+                .map(|w| format!("{w:.1}s"))
+                .unwrap_or_else(|| "\u{2014}".to_string());
 
             // Truncate device label to fit column
             let label = if d.device_label.len() > 25 {
@@ -241,13 +238,98 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
             };
 
             println!(
-                "{:<26} {:<10} {:>5} {:>10} {:>10} {:>15}",
-                label, d.prover_backend, d.optimal_po2, segment_str, mem_str, tp_str
+                "{:<26} {:<10} {:>5} {:>10} {:>10} {:>15} {:>9}",
+                label, d.prover_backend, d.optimal_po2, segment_str, mem_str, tp_str, wrap_str
             );
         }
-        println!("{}", "─".repeat(80));
+        println!("{}", "─".repeat(90));
         println!();
     }
 
+    print_proving_stages(&results.device_benchmarks);
+
     Ok(())
+}
+
+/// `1.6M c/s`, `72.8K c/s`, `950 c/s`.
+fn fmt_rate(rate: f64) -> String {
+    if rate >= 1_000_000.0 {
+        format!("{:.1}M c/s", rate / 1_000_000.0)
+    } else if rate >= 1_000.0 {
+        format!("{:.1}K c/s", rate / 1_000.0)
+    } else {
+        format!("{rate:.0} c/s")
+    }
+}
+
+/// Per card and backend: each program's STARK time, and the Groth16 wrap that turns it into the proof
+/// submitted on chain.
+///
+/// Grouped by device because the flattened program table above carries no device column, so on a
+/// two-card box its rows were distinguishable only by order. The footer states the model the split
+/// exists for — a fixed wrap plus a cycle-proportional STARK — rather than a per-program "total",
+/// which for these deliberately small programs would mostly be the wrap and say little.
+fn print_proving_stages(devices: &[benchmark::DeviceBenchmark]) {
+    let staged: Vec<_> = devices
+        .iter()
+        .filter(|d| !d.program_stages.is_empty())
+        .collect();
+    if staged.is_empty() {
+        return;
+    }
+    println!(
+        "Proving stages (STARK = execution + core proofs + recursion; Groth16 = the on-chain wrap)"
+    );
+    println!("{}", "─".repeat(90));
+    for d in staged {
+        println!("{} / {}", d.device_label, d.prover_backend);
+        println!(
+            "  {:<16} {:>12} {:>10} {:>14} {:>10}",
+            "Program", "Cycles", "STARK", "STARK rate", "Groth16"
+        );
+        for p in &d.program_stages {
+            let rate = if p.stark_secs > 0.0 {
+                p.cycles as f64 / p.stark_secs
+            } else {
+                0.0
+            };
+            let wrap = p
+                .wrap_secs
+                .map(|w| format!("{w:.2}s"))
+                .unwrap_or_else(|| "\u{2014}".to_string());
+            println!(
+                "  {:<16} {:>12} {:>9.2}s {:>14} {:>10}",
+                p.program_name,
+                p.cycles,
+                p.stark_secs,
+                fmt_rate(rate),
+                wrap,
+            );
+        }
+        let measured: Vec<&str> = d
+            .program_stages
+            .iter()
+            .filter(|p| p.wrap_secs.is_some())
+            .map(|p| p.program_name.as_str())
+            .collect();
+        match d.wrap_secs() {
+            Some(w) => {
+                let basis = if measured.len() == 1 {
+                    format!("measured on {} by difference", measured[0])
+                } else {
+                    // Median: the first wrap in a worker process is ~0.9 s slower; see `wrap_secs`.
+                    format!("median of {} programs", measured.len())
+                };
+                // The cycle-weighted rate, not `throughput`: see `DeviceBenchmark::stark_rate`.
+                let rate = d.stark_rate().unwrap_or(d.throughput);
+                println!(
+                    "  Groth16 wrap {w:.2}s (fixed; {basis}). A job of N cycles ≈ {w:.1}s + N / {} \
+                     (cycle-weighted STARK rate).",
+                    fmt_rate(rate)
+                );
+            }
+            None => println!("  Groth16 wrap not measured on this card."),
+        }
+        println!();
+    }
 }

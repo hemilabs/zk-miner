@@ -18,7 +18,12 @@ use std::time::{Duration, Instant};
 use zkminer_prover::dispatcher::WorkerPool;
 
 fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 fn find_risc0_elf(guest: &str) -> Option<Vec<u8>> {
@@ -29,7 +34,11 @@ fn find_risc0_elf(guest: &str) -> Option<Vec<u8>> {
         return std::fs::read(&p).ok();
     }
     let alt = p.with_extension("");
-    if alt.exists() { std::fs::read(&alt).ok() } else { None }
+    if alt.exists() {
+        std::fs::read(&alt).ok()
+    } else {
+        None
+    }
 }
 
 fn input(vals: &[u32]) -> Vec<u8> {
@@ -58,7 +67,11 @@ fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
 
     let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(900)));
     let connected = pool.discover_and_spawn();
-    let keys: Vec<_> = connected.iter().filter(|k| k.starts_with("risc0:cuda")).cloned().collect();
+    let keys: Vec<_> = connected
+        .iter()
+        .filter(|k| k.starts_with("risc0:cuda"))
+        .cloned()
+        .collect();
     assert_eq!(
         keys.len(),
         1,
@@ -79,8 +92,18 @@ fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
     let prove1 = std::thread::spawn(move || {
         let mut used = None;
         let r = pool_c.prove_min_vram(
-            "risc0", &elf_c, &big, None, Some(Duration::from_secs(600)),
-            None, None, &[], &mut used, None, None,
+            "risc0",
+            &elf_c,
+            &big,
+            None,
+            Some(Duration::from_secs(600)),
+            None,
+            None,
+            &[],
+            &[],
+            &mut used,
+            None,
+            None,
         );
         r.map(|_| ()).map_err(|e| format!("{e:#}"))
     });
@@ -102,8 +125,18 @@ fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
     let t0 = Instant::now();
     let mut used2 = None;
     let second = pool.prove_min_vram(
-        "risc0", &elf, &input(&[1000]), None, Some(Duration::from_secs(300)),
-        None, None, &[], &mut used2, None, None,
+        "risc0",
+        &elf,
+        &input(&[1000]),
+        None,
+        Some(Duration::from_secs(300)),
+        None,
+        None,
+        &[],
+        &[],
+        &mut used2,
+        None,
+        None,
     );
     let elapsed = t0.elapsed();
     eprintln!("prove #2 returned after {elapsed:?}: ok={}", second.is_ok());

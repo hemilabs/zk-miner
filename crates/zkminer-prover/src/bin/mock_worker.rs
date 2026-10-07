@@ -32,7 +32,9 @@ fn main() {
         };
 
         match cmd {
-            WorkerCommand::Hello { protocol_version: _ } => {
+            WorkerCommand::Hello {
+                protocol_version: _,
+            } => {
                 let resp = WorkerResponse::HelloAck {
                     protocol_version: PROTOCOL_VERSION,
                     backend: backend.clone(),

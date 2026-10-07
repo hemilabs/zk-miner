@@ -83,7 +83,10 @@ fn spawn_parent_that_orphans_a_child() -> (i32, i32) {
                 break p;
             }
         }
-        assert!(start.elapsed() < Duration::from_secs(10), "grandchild never started");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "grandchild never started"
+        );
         std::thread::sleep(Duration::from_millis(50));
     };
     // Reap the parent so it is a true orphan situation.
@@ -108,7 +111,8 @@ fn a_forked_helper_inherits_the_workers_process_group() {
     }
 }
 
-/// THE REGRESSION. The parent is already dead; a group kill must still reap the orphan.
+/// Kernel semantics the sweep relies on. NOT a test of `WorkerHandle::drop` — see the note in the
+/// body, and `worker::tests` for the predicate itself.. The parent is already dead; a group kill must still reap the orphan.
 /// This is the case the old `Ok(Some(_)) => break` skipped.
 #[cfg(unix)]
 #[test]
@@ -118,7 +122,10 @@ fn group_kill_reaps_an_orphan_whose_leader_already_exited() {
     assert!(!alive(parent_pid), "parent should already have exited");
     assert!(alive(gc), "the orphaned helper should still be running");
 
-    // What the fixed Drop does: group-kill even though the leader is gone.
+    // What `WorkerHandle::drop` does on this state, performed here directly: this file tests the
+    // KERNEL semantics the sweep relies on, not `Drop` itself (which needs a real worker binary
+    // and a handshake). `worker::tests` covers the predicate; nothing covers `Drop`'s dispatch,
+    // which is recorded as a known gap rather than implied by this test's name.
     unsafe {
         libc::kill(-(parent_pid), libc::SIGKILL);
     }
@@ -133,10 +140,16 @@ fn group_kill_reaps_an_orphan_whose_leader_already_exited() {
     );
 }
 
-/// The guard the fix relies on: an EMPTY process group must be distinguishable from one
-/// that still has members, because `kill(-pid, SIGKILL)` on an empty group whose number
-/// has been recycled would signal an unrelated group — and every worker is a group
-/// leader, so a collision takes out a whole worker group mid-proof.
+/// Kernel behaviour the OLD guard rested on — kept as documentation, no longer the guard.
+///
+/// `kill(-pgid, 0)` can tell an empty process group from one with members, and that is what
+/// `WorkerHandle::drop` used. What it CANNOT do is tell a group whose only member is the
+/// worker's own ZOMBIE from one holding a live forked helper, so it reported "members left
+/// behind" on every clean exit (measured: 6 false alarms in one SP1-decline run). The live
+/// predicate is now `worker::live_group_members`, which reads `/proc` and excludes both the
+/// leader and zombies; it is private, so its discriminating tests live in that module
+/// (`a_zombie_leader_satisfies_the_old_guard_but_is_not_a_leftover` asserts BOTH halves of
+/// this contrast against the real kernel).
 #[cfg(unix)]
 #[test]
 fn an_empty_group_is_distinguishable_from_one_with_survivors() {
@@ -164,8 +177,9 @@ fn an_empty_group_is_distinguishable_from_one_with_survivors() {
     assert_ne!(
         unsafe { libc::kill(-parent_pid, 0) },
         0,
-        "an empty group must NOT probe as present — that guard is what stops a recycled \
-         pgid being SIGKILLed"
+        "an empty group must NOT probe as present — this is the property the old guard \
+         rested on, and the reason the current code additionally refuses to signal a pid \
+         it has already reaped"
     );
 }
 

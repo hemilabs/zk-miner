@@ -155,7 +155,10 @@ async fn client_with(mined: u64, pending: u64, next: u64) -> ChainClient {
 /// are what it reports afterwards. Separating them lets a test advance the chain underneath
 /// a synced allocator, which is the only way to reach `next == mined` with `synced == true`.
 async fn client_from(anchor_at: u64, mined: u64, pending: u64, next: u64) -> ChainClient {
-    let counts = Arc::new(Mutex::new(Counts { mined: anchor_at, pending: anchor_at }));
+    let counts = Arc::new(Mutex::new(Counts {
+        mined: anchor_at,
+        pending: anchor_at,
+    }));
     let url = start_stub(counts.clone()).await;
     let signer: alloy::signers::local::PrivateKeySigner = KEY.parse().unwrap();
     let client = ChainClient::new(&config(&url), signer).await.unwrap();
@@ -202,9 +205,23 @@ async fn still_detects_a_hole_at_the_mined_frontier() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lone_unsent_reservation_is_not_a_hole() {
     // At the frontier: reserved 100, nothing sent yet.
-    assert_eq!(client_with(100, 100, 101).await.nonce_gap_frontier().await.unwrap(), None);
+    assert_eq!(
+        client_with(100, 100, 101)
+            .await
+            .nonce_gap_frontier()
+            .await
+            .unwrap(),
+        None
+    );
     // Above the frontier: 100-101 executable, 102 reserved but unsent, nothing above it.
-    assert_eq!(client_with(100, 102, 103).await.nonce_gap_frontier().await.unwrap(), None);
+    assert_eq!(
+        client_with(100, 102, 103)
+            .await
+            .nonce_gap_frontier()
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 /// Nothing handed out past the mined frontier => nothing of ours can be stuck. Reached by
@@ -213,7 +230,11 @@ async fn a_lone_unsent_reservation_is_not_a_hole() {
 #[tokio::test(flavor = "multi_thread")]
 async fn no_gap_when_the_allocator_is_level_with_chain() {
     let c = client_from(100, 101, 101, 101).await;
-    assert_eq!(c.peek_nonce(), Some(101), "must be SYNCED and level, not unsynced");
+    assert_eq!(
+        c.peek_nonce(),
+        Some(101),
+        "must be SYNCED and level, not unsynced"
+    );
     assert_eq!(c.nonce_gap_frontier().await.unwrap(), None);
 }
 
@@ -221,7 +242,10 @@ async fn no_gap_when_the_allocator_is_level_with_chain() {
 /// nominate a hole — there is no first-person evidence that anything is ours.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unsynced_allocator_never_reports_a_gap() {
-    let counts = Arc::new(Mutex::new(Counts { mined: 100, pending: 100 }));
+    let counts = Arc::new(Mutex::new(Counts {
+        mined: 100,
+        pending: 100,
+    }));
     let url = start_stub(counts).await;
     let signer: alloy::signers::local::PrivateKeySigner = KEY.parse().unwrap();
     let c = ChainClient::new(&config(&url), signer).await.unwrap();
@@ -233,7 +257,14 @@ async fn an_unsynced_allocator_never_reports_a_gap() {
 /// everything we handed out, so every tx will mine in order.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_healthy_backlog_is_not_a_hole() {
-    assert_eq!(client_with(100, 105, 105).await.nonce_gap_frontier().await.unwrap(), None);
+    assert_eq!(
+        client_with(100, 105, 105)
+            .await
+            .nonce_gap_frontier()
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 /// A load-balanced RPC can serve a STALE pending read that trails `mined`. That must never
@@ -370,7 +401,11 @@ async fn shutdown_gate_fills_an_empty_frontier_we_provably_abandoned() {
 async fn an_accepted_broadcast_clears_the_abort_record() {
     let c = client_with(100, 103, 103).await;
     c.abort_nonce(100);
-    assert_eq!(c.reserve_nonce().await.unwrap(), 100, "freed is reissued first");
+    assert_eq!(
+        c.reserve_nonce().await.unwrap(),
+        100,
+        "freed is reissued first"
+    );
     assert_eq!(
         c.nonce_gap_frontier().await.unwrap(),
         Some(100),
@@ -394,7 +429,11 @@ async fn an_accepted_broadcast_clears_the_abort_record() {
 async fn shutdown_gate_refuses_a_nonce_re_reserved_after_its_abort() {
     let c = client_with(100, 101, 103).await;
     c.abort_nonce(101);
-    assert_eq!(c.reserve_nonce().await.unwrap(), 101, "freed is reissued FIRST");
+    assert_eq!(
+        c.reserve_nonce().await.unwrap(),
+        101,
+        "freed is reissued FIRST"
+    );
     assert_eq!(
         c.nonce_gap_safe_to_fill().await.unwrap(),
         None,
@@ -433,9 +472,15 @@ async fn a_vetted_heal_refuses_a_nonce_re_reserved_after_the_gate() {
     // The gate approves it: it is a gap we own.
     assert_eq!(c.nonce_gap_safe_to_fill().await.unwrap(), Some(100));
     // ...then a sibling task takes it out of `freed` before the fill goes out.
-    assert_eq!(c.reserve_nonce().await.unwrap(), 100, "freed is reissued FIRST");
     assert_eq!(
-        c.heal_owned_nonce_gap_at(100, std::time::Duration::from_secs(1)).await.unwrap(),
+        c.reserve_nonce().await.unwrap(),
+        100,
+        "freed is reissued FIRST"
+    );
+    assert_eq!(
+        c.heal_owned_nonce_gap_at(100, std::time::Duration::from_secs(1))
+            .await
+            .unwrap(),
         zkminer_chain::client::OwnedHealOutcome::RefusedNotOurs,
         "must not displace a nonce that was re-reserved after the gate approved it — that \
          task's releaseJob is live, and we exit with nothing alive to re-send it. It must \
@@ -452,7 +497,11 @@ async fn a_vetted_heal_refuses_a_nonce_re_reserved_after_the_gate() {
 async fn an_accepted_send_with_no_fee_record_still_retires_the_abort() {
     let c = client_with(100, 103, 103).await;
     c.abort_nonce(100);
-    assert_eq!(c.reserve_nonce().await.unwrap(), 100, "freed is reissued first");
+    assert_eq!(
+        c.reserve_nonce().await.unwrap(),
+        100,
+        "freed is reissued first"
+    );
     assert_eq!(
         c.nonce_gap_frontier().await.unwrap(),
         Some(100),
@@ -496,7 +545,7 @@ async fn the_gate_never_nominates_below_the_mined_frontier() {
 async fn a_stale_fee_record_does_not_veto_healing_a_hole_we_abandoned() {
     let c = client_with(100, 100, 103).await;
     c.note_broadcast_fee(100, 1_000, 1_000, 1_000); // we broadcast there...
-    c.abort_nonce(100);                              // ...then gave up; the tx was evicted
+    c.abort_nonce(100); // ...then gave up; the tx was evicted
     assert_eq!(
         c.nonce_gap_safe_to_fill().await.unwrap(),
         Some(100),
@@ -510,7 +559,11 @@ async fn a_stale_fee_record_does_not_veto_healing_a_hole_we_abandoned() {
 async fn a_live_broadcast_at_the_frontier_is_still_refused() {
     let c = client_with(100, 100, 103).await;
     c.abort_nonce(100);
-    assert_eq!(c.reserve_nonce().await.unwrap(), 100, "a sibling takes it back");
+    assert_eq!(
+        c.reserve_nonce().await.unwrap(),
+        100,
+        "a sibling takes it back"
+    );
     c.note_broadcast_fee(100, 1_000, 1_000, 1_000); // ...and broadcasts
     assert_eq!(
         c.nonce_gap_safe_to_fill().await.unwrap(),
@@ -527,7 +580,7 @@ async fn a_live_broadcast_at_the_frontier_is_still_refused() {
 async fn an_accepted_send_with_an_unobserved_receipt_is_not_a_hole() {
     let c = client_with(100, 101, 101).await;
     c.note_nonce_in_use(100); // the send was ACCEPTED
-    // ...the receipt never arrives. The path must leave no abandonment evidence behind.
+                              // ...the receipt never arrives. The path must leave no abandonment evidence behind.
     assert_eq!(
         c.nonce_gap_frontier().await.unwrap(),
         None,

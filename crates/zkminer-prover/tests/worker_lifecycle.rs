@@ -34,11 +34,7 @@ fn mock_env(hang_on: &str, crash_on: &str) -> HashMap<String, String> {
 
 #[test]
 fn benchmark_timeout_kills_and_cleans_up() {
-    let mut pool = WorkerPool::new(
-        HashMap::new(),
-        Vec::new(),
-        Some(Duration::from_secs(2)),
-    );
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(2)));
 
     pool.insert_test_worker(
         "mock:generic",
@@ -69,11 +65,7 @@ fn benchmark_timeout_kills_and_cleans_up() {
 
 #[test]
 fn benchmark_timeout_then_ensure_alive_respawns() {
-    let mut pool = WorkerPool::new(
-        HashMap::new(),
-        Vec::new(),
-        Some(Duration::from_secs(2)),
-    );
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(2)));
 
     pool.insert_test_worker(
         "mock:generic",
@@ -101,7 +93,10 @@ fn benchmark_timeout_then_ensure_alive_respawns() {
     assert_eq!(pool.test_has_handle("mock:generic"), Some(true));
     let new_pid = pool.test_pid("mock:generic").unwrap();
     assert!(new_pid > 0, "respawned worker should have a nonzero PID");
-    assert_ne!(new_pid, initial_pid, "respawn should produce a different PID");
+    assert_ne!(
+        new_pid, initial_pid,
+        "respawn should produce a different PID"
+    );
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
 }
 
@@ -122,14 +117,7 @@ fn prove_timeout_kills_and_cleans_up() {
     let initial_pid = pool.test_pid("mock:generic").unwrap();
     assert!(initial_pid > 0);
 
-    let result = pool.prove(
-        "mock",
-        &[],
-        &[],
-        None,
-        Some(Duration::from_secs(2)),
-        None,
-    );
+    let result = pool.prove("mock", &[], &[], None, Some(Duration::from_secs(2)), None);
     assert!(result.is_err(), "prove should fail after timeout kill");
 
     assert_eq!(pool.test_has_handle("mock:generic"), Some(false));
@@ -170,7 +158,10 @@ fn prove_timeout_then_ensure_alive_respawns() {
 
     let new_pid = pool.test_pid("mock:generic").unwrap();
     assert!(new_pid > 0);
-    assert_ne!(new_pid, initial_pid, "respawn should produce a different PID");
+    assert_ne!(
+        new_pid, initial_pid,
+        "respawn should produce a different PID"
+    );
 }
 
 // ---- Worker crash tests (spontaneous death, not timeout) ----
@@ -268,19 +259,10 @@ fn crash_then_ensure_alive_respawns_successfully() {
 
 #[test]
 fn normal_benchmark_completes_without_timeout() {
-    let mut pool = WorkerPool::new(
-        HashMap::new(),
-        Vec::new(),
-        Some(Duration::from_secs(10)),
-    );
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(10)));
 
-    pool.insert_test_worker(
-        "mock:generic",
-        "mock",
-        mock_worker_path(),
-        mock_env("", ""),
-    )
-    .expect("failed to spawn mock worker");
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
 
     let result = pool.benchmark("mock");
     assert!(result.is_ok());
@@ -294,13 +276,8 @@ fn normal_benchmark_completes_without_timeout() {
 fn normal_prove_completes_without_timeout() {
     let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
 
-    pool.insert_test_worker(
-        "mock:generic",
-        "mock",
-        mock_worker_path(),
-        mock_env("", ""),
-    )
-    .expect("failed to spawn mock worker");
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
 
     let result = pool.prove("mock", &[], &[], None, Some(Duration::from_secs(10)), None);
     assert!(result.is_ok());

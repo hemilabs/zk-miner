@@ -7,6 +7,7 @@ use std::io::{self, BufReader, BufWriter};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV;
 use zkminer_prover_protocol::{
     is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
     WorkerResponse, BACKEND_RISC0, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
@@ -21,8 +22,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -105,7 +105,10 @@ fn run_worker_loop() -> Result<()> {
                 input_data,
                 po2,
             } => {
-                tracing::info!("Proving request {request_id} ({} bytes ELF, po2={po2:?})", elf.len());
+                tracing::info!(
+                    "Proving request {request_id} ({} bytes ELF, po2={po2:?})",
+                    elf.len()
+                );
                 // Announce that proving has STARTED. `WorkerResponse::Progress` had exactly one
                 // reference in the whole workspace — the arm that consumes it — so no worker
                 // ever emitted one and the dispatcher's `on_progress` callback was dead code.
@@ -296,7 +299,62 @@ fn run_execute(elf: &[u8], input_data: &[u8]) -> anyhow::Result<(u64, f64)> {
     Ok((cycles, started.elapsed().as_secs_f64()))
 }
 
-fn run_proof(elf: &[u8], input_data: &[u8], po2: Option<u8>) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
+/// Cards with less VRAM than this release the Groth16 SRS cache after every proof.
+///
+/// Set between the two cards measured on 2026-10-07. On the 16.3 GB RTX 5080 the cache stays resident
+/// at ~7.25 GB between proofs, and the next 46M-cycle STARK at po2 20 then peaked at 15,834 MiB — 469
+/// MiB from the card's capacity — and in the benchmark's program order failed outright. Releasing it
+/// dropped the idle worker to 2,452 MiB and that peak to 12,436 MiB. On the 24.6 GB RTX 4090 the same
+/// proof leaves ~8 GB spare, so it keeps the cache.
+///
+/// The saving from keeping it turned out small: wraps after a release ran 2.08-2.12 s on the 5080
+/// against 2.01-2.05 s on the cache-keeping 4090, so at most ~0.1 s. The threshold is therefore cheap to
+/// get wrong in the conservative direction, which is why an unknown size releases.
+const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// Free the Groth16 prover and SRS cached on the GPU if this card cannot also hold the next STARK.
+///
+/// The cache is the Groth16 prover's: `shrink_wrap` uploads the SRS once and keeps it for the life of
+/// the process, in a C++ static nothing frees. Whether to drop it is a property of the CARD, which the
+/// library cannot see from where it sits, so the decision lives here. The card's size arrives from the
+/// dispatcher in `CUDA_VRAM_BYTES_ENV`: `nvidia-smi` ignores `CUDA_VISIBLE_DEVICES`, so this pinned
+/// worker cannot ask about its own card. When the size is UNKNOWN the cache is released — that costs
+/// at most ~0.1 s per proof, while keeping it on a card that cannot afford it costs the proof.
+///
+/// Called whether the proof succeeded or not: a wrap that failed part-way can still have built the
+/// cache, and the retry that follows needs the room most.
+fn release_groth16_cache_if_tight() {
+    static DECISION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let release = *DECISION.get_or_init(|| {
+        let total = std::env::var(CUDA_VRAM_BYTES_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let release = total.is_none_or(|t| t < RELEASE_GROTH16_CACHE_BELOW_BYTES);
+        match total {
+            Some(t) => tracing::info!(
+                "card has {:.1} GiB of VRAM: {} the Groth16 SRS cache between proofs",
+                t as f64 / (1u64 << 30) as f64,
+                if release { "releasing" } else { "keeping" },
+            ),
+            None => tracing::info!(
+                "card VRAM unknown ({CUDA_VRAM_BYTES_ENV} unset): releasing the Groth16 SRS cache \
+                 between proofs"
+            ),
+        }
+        release
+    });
+    if release {
+        if let Err(e) = risc0_groth16::prove::release_srs() {
+            tracing::warn!("could not release the Groth16 SRS cache: {e:#}");
+        }
+    }
+}
+
+fn run_proof(
+    elf: &[u8],
+    input_data: &[u8],
+    po2: Option<u8>,
+) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
     // Retry-on-invalid mitigation for the rare (~1.5%) nondeterministic GPU
     // timing race on RTX 5090 / Blackwell (sm_120) — an intra-kernel race
     // produces an internally-invalid segment STARK, surfaced as
@@ -353,7 +411,9 @@ fn run_proof_once(
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let c = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if c < n.parse::<usize>().unwrap_or(0) {
-            anyhow::bail!("verify segment: verification indicates proof is invalid (TEST INJECTED)");
+            anyhow::bail!(
+                "verify segment: verification indicates proof is invalid (TEST INJECTED)"
+            );
         }
     }
 
@@ -375,16 +435,19 @@ fn run_proof_once(
     let prover = risc0_zkvm::default_prover();
     let opts = ProverOpts::groth16();
     let start = Instant::now();
-    let prove_info = prover.prove_with_opts(env, elf, &opts)?;
+    let proved = prover.prove_with_opts(env, elf, &opts);
+    release_groth16_cache_if_tight();
+    let prove_info = proved?;
     let duration_secs = start.elapsed().as_secs_f64();
 
     let receipt = prove_info.receipt;
 
     // Verify proof locally before returning — catches GPU corruption (e.g., ROCm SHA-256 bug)
-    let image_id = risc0_zkvm::compute_image_id(elf)
-        .context("Failed to compute image ID for verification")?;
-    receipt.verify(image_id)
-        .context("Proof verification FAILED — receipt is invalid, GPU may have produced corrupt output")?;
+    let image_id =
+        risc0_zkvm::compute_image_id(elf).context("Failed to compute image ID for verification")?;
+    receipt.verify(image_id).context(
+        "Proof verification FAILED — receipt is invalid, GPU may have produced corrupt output",
+    )?;
 
     let journal = receipt.journal.bytes.clone();
 
@@ -420,17 +483,57 @@ fn run_benchmarks_streaming<W: std::io::Write>(
     // Input sizes tuned so each completes in 5-30s on a mid-range GPU,
     // keeping total benchmark time under 2 minutes on a 4090.
     let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
-        (BENCH_FIBONACCI, FIBONACCI_ELF, &1000u32.to_le_bytes(), 0.10, false),
-        (BENCH_SHA256_CHAIN, SHA256_CHAIN_ELF, &10_000u32.to_le_bytes(), 0.20, true),
-        (BENCH_ECDSA_VERIFY, ECDSA_VERIFY_ELF, &10u32.to_le_bytes(), 0.25, true),
-        (BENCH_BIGINT_MUL, BIGINT_MUL_ELF, &100u32.to_le_bytes(), 0.10, false),
-        (BENCH_MEMORY_MERKLE, MEMORY_MERKLE_ELF, &512u32.to_le_bytes(), 0.15, true),
-        (BENCH_CHACHA_MIX, CHACHA_MIX_ELF, &5_000u32.to_le_bytes(), 0.20, false),
+        (
+            BENCH_FIBONACCI,
+            FIBONACCI_ELF,
+            &1000u32.to_le_bytes(),
+            0.10,
+            false,
+        ),
+        (
+            BENCH_SHA256_CHAIN,
+            SHA256_CHAIN_ELF,
+            &10_000u32.to_le_bytes(),
+            0.20,
+            true,
+        ),
+        (
+            BENCH_ECDSA_VERIFY,
+            ECDSA_VERIFY_ELF,
+            &10u32.to_le_bytes(),
+            0.25,
+            true,
+        ),
+        (
+            BENCH_BIGINT_MUL,
+            BIGINT_MUL_ELF,
+            &100u32.to_le_bytes(),
+            0.10,
+            false,
+        ),
+        (
+            BENCH_MEMORY_MERKLE,
+            MEMORY_MERKLE_ELF,
+            &512u32.to_le_bytes(),
+            0.15,
+            true,
+        ),
+        (
+            BENCH_CHACHA_MIX,
+            CHACHA_MIX_ELF,
+            &5_000u32.to_le_bytes(),
+            0.20,
+            false,
+        ),
     ];
 
-    let active: Vec<_> = benchmarks.iter()
+    let active: Vec<_> = benchmarks
+        .iter()
         .filter(|&&(name, elf, _, _, _)| {
-            !elf.is_empty() && bench_only.as_ref().map_or(true, |only| name.eq_ignore_ascii_case(only))
+            !elf.is_empty()
+                && bench_only
+                    .as_ref()
+                    .map_or(true, |only| name.eq_ignore_ascii_case(only))
         })
         .collect();
     let total = active.len() as u32;
@@ -460,12 +563,48 @@ fn run_benchmarks() -> Vec<BenchmarkEntry> {
     // Input sizes tuned so each completes in 5-30s on a mid-range GPU,
     // keeping total benchmark time under 2 minutes on a 4090.
     let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
-        (BENCH_FIBONACCI, FIBONACCI_ELF, &1000u32.to_le_bytes(), 0.10, false),
-        (BENCH_SHA256_CHAIN, SHA256_CHAIN_ELF, &10_000u32.to_le_bytes(), 0.20, true),
-        (BENCH_ECDSA_VERIFY, ECDSA_VERIFY_ELF, &10u32.to_le_bytes(), 0.25, true),
-        (BENCH_BIGINT_MUL, BIGINT_MUL_ELF, &100u32.to_le_bytes(), 0.10, false),
-        (BENCH_MEMORY_MERKLE, MEMORY_MERKLE_ELF, &512u32.to_le_bytes(), 0.15, true),
-        (BENCH_CHACHA_MIX, CHACHA_MIX_ELF, &5_000u32.to_le_bytes(), 0.20, false),
+        (
+            BENCH_FIBONACCI,
+            FIBONACCI_ELF,
+            &1000u32.to_le_bytes(),
+            0.10,
+            false,
+        ),
+        (
+            BENCH_SHA256_CHAIN,
+            SHA256_CHAIN_ELF,
+            &10_000u32.to_le_bytes(),
+            0.20,
+            true,
+        ),
+        (
+            BENCH_ECDSA_VERIFY,
+            ECDSA_VERIFY_ELF,
+            &10u32.to_le_bytes(),
+            0.25,
+            true,
+        ),
+        (
+            BENCH_BIGINT_MUL,
+            BIGINT_MUL_ELF,
+            &100u32.to_le_bytes(),
+            0.10,
+            false,
+        ),
+        (
+            BENCH_MEMORY_MERKLE,
+            MEMORY_MERKLE_ELF,
+            &512u32.to_le_bytes(),
+            0.15,
+            true,
+        ),
+        (
+            BENCH_CHACHA_MIX,
+            CHACHA_MIX_ELF,
+            &5_000u32.to_le_bytes(),
+            0.20,
+            false,
+        ),
     ];
 
     for &(name, elf, input, weight, precompile) in benchmarks {
@@ -531,21 +670,61 @@ fn benchmark_program(
         }
     }
 
-    let start = Instant::now();
+    // ONE proof, staged, so each stage is timed exactly rather than inferred from two runs.
+    //
+    // This previously called bare `prove(env, elf)`, i.e. `ProverOpts::default()`, which is
+    // `ReceiptKind::Composite`: segment proofs only. That is not what the miner submits. Production
+    // (`run_proof_once`) and calibration (`calibrate_segment_limit`) both go to Groth16, so the
+    // benchmark measured neither the recursion that folds segments together — whose cost scales with
+    // segment count, i.e. with po2 — nor the wrap. `compress` consumes the previous receipt, so the
+    // three stages below add up to the same work `prove_with_opts(groth16)` does in one call.
     let prover = risc0_zkvm::default_prover();
-    let prove_info = match prover.prove(env, elf) {
+
+    // Stage 1: execution and the segment proofs.
+    let started = Instant::now();
+    let prove_info = match prover.prove_with_opts(env, elf, &risc0_zkvm::ProverOpts::composite()) {
         Ok(info) => info,
         Err(e) => {
             tracing::error!("{name}: prove failed: {e:#}");
             return None;
         }
     };
-    let duration_secs = start.elapsed().as_secs_f64();
+    let composite_secs = started.elapsed().as_secs_f64();
 
-    // Verify the receipt locally — catches GPU output corruption (notably the
-    // known ROCm SHA-256 bug at scale). An unverified benchmark would pollute
-    // the throughput cache with numbers from a broken proof and the miner
-    // would later lose stake attempting to fulfill with an invalid proof.
+    // Stage 2: lift every segment receipt and join them into one constant-size STARK. Scales with
+    // segment count, so it is STARK proving and belongs on the variable side of the split.
+    let started = Instant::now();
+    let succinct = match prover.compress(&risc0_zkvm::ProverOpts::succinct(), &prove_info.receipt) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("{name}: succinct recursion failed: {e:#}");
+            return None;
+        }
+    };
+    let recursion_secs = started.elapsed().as_secs_f64();
+
+    // Stage 3: STARK-to-SNARK. Proves the fixed `stark_verify` circuit with a fixed proving key
+    // (`~/.risc0/extensions/*-risc0-groth16/stark_verify_final.zkey`), so it does not depend on the
+    // program at all — which is the reason to report it apart from the stages above.
+    let started = Instant::now();
+    let wrapped = prover.compress(&risc0_zkvm::ProverOpts::groth16(), &succinct);
+    let wrap_secs = started.elapsed().as_secs_f64();
+    // Outside the stopwatch: the release is not part of the wrap, and on a card that releases, the NEXT
+    // wrap pays the reload — which is that card's honest per-proof cost.
+    release_groth16_cache_if_tight();
+    let groth16 = match wrapped {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("{name}: Groth16 wrap failed: {e:#}");
+            return None;
+        }
+    };
+
+    // Verify the GROTH16 receipt — the artifact production submits — rather than the composite one.
+    // It also covers the earlier stages: the recursion circuit verifies every segment proof, so GPU
+    // output corruption there (notably the known ROCm SHA-256 bug at scale) cannot reach a valid
+    // Groth16 receipt. An unverified benchmark would pollute the throughput cache with numbers from a
+    // broken proof and the miner would later lose stake attempting to fulfill with an invalid one.
     let image_id = match risc0_zkvm::compute_image_id(elf) {
         Ok(id) => id,
         Err(e) => {
@@ -553,17 +732,26 @@ fn benchmark_program(
             return None;
         }
     };
-    if let Err(e) = prove_info.receipt.verify(image_id) {
+    if let Err(e) = groth16.verify(image_id) {
         tracing::error!(
-            "{name}: receipt.verify() FAILED — benchmark proof is invalid, skipping entry: {e:#}"
+            "{name}: Groth16 receipt.verify() FAILED — benchmark proof is invalid, skipping entry: \
+             {e:#}"
         );
         return None;
     }
 
     let cycles = prove_info.stats.total_cycles;
+    // STARK = segments + recursion: everything up to one constant-size proof. `throughput` is over
+    // this, not over the total, because the wrap is a fixed cost and folding it into a rate would
+    // make a 33k-cycle program look orders of magnitude slower than a 65M-cycle one.
+    let duration_secs = composite_secs + recursion_secs;
     let throughput = cycles as f64 / duration_secs;
 
-    tracing::info!("{name}: {cycles} cycles in {duration_secs:.2}s ({throughput:.0} c/s, verified)");
+    tracing::info!(
+        "{name}: {cycles} cycles — STARK {duration_secs:.2}s (segments {composite_secs:.2}s + \
+         recursion {recursion_secs:.2}s, {throughput:.0} c/s), Groth16 wrap {wrap_secs:.2}s, \
+         verified"
+    );
 
     Some(BenchmarkEntry {
         program_name: name.to_string(),
@@ -573,6 +761,7 @@ fn benchmark_program(
         throughput,
         weight,
         precompile,
+        wrap_secs: Some(wrap_secs),
     })
 }
 
@@ -627,7 +816,9 @@ fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
     // under-reports MEMORY pressure: po2=21 completes composite-only but OOMs on the
     // real groth16 path, so a composite-derived max_feasible_po2 is too optimistic.
     let opts = risc0_zkvm::ProverOpts::groth16();
-    let prove_info = prover.prove_with_opts(env, FIBONACCI_ELF, &opts)?;
+    let proved = prover.prove_with_opts(env, FIBONACCI_ELF, &opts);
+    release_groth16_cache_if_tight();
+    let prove_info = proved?;
     let duration = start.elapsed();
 
     let total_cycles = prove_info.stats.total_cycles;

@@ -64,7 +64,10 @@ fn handle(req: &Value, cap: &Arc<Mutex<Captured>>) -> Value {
                 .or_else(|| params[0]["data"].as_str())
                 .unwrap_or("0x");
             let bytes = alloy::hex::decode(data.trim_start_matches("0x")).unwrap_or_default();
-            let sel: [u8; 4] = bytes.get(..4).and_then(|s| s.try_into().ok()).unwrap_or([0; 4]);
+            let sel: [u8; 4] = bytes
+                .get(..4)
+                .and_then(|s| s.try_into().ok())
+                .unwrap_or([0; 4]);
             let c = cap.lock().unwrap();
             if sel == IERC20::balanceOfCall::SELECTOR {
                 json!(word(c.balance))
@@ -171,16 +174,30 @@ fn config(rpc_url: &str) -> zkminer_config::ZkMinerConfig {
     let mut c = zkminer_config::ZkMinerConfig::default();
     c.chain.rpc_url = rpc_url.to_string();
     c.chain.chain_id = CHAIN_ID;
-    c.contracts.hemi_prove = format!("{:#x}", address!("00000000000000000000000000000000000000CC"));
+    c.contracts.hemi_prove = format!(
+        "{:#x}",
+        address!("00000000000000000000000000000000000000CC")
+    );
     c.contracts.hemi_prove_staking = format!("{STAKING:#x}");
-    c.contracts.hemi_prove_registry =
-        format!("{:#x}", address!("00000000000000000000000000000000000000DD"));
+    c.contracts.hemi_prove_registry = format!(
+        "{:#x}",
+        address!("00000000000000000000000000000000000000DD")
+    );
     c.contracts.hemi_token = format!("{TOKEN:#x}");
     c
 }
 
-async fn run_stake(amount_wei: u128, allowance: U256, balance: U256) -> (Vec<Bytes>, anyhow::Result<()>) {
-    let cap = Arc::new(Mutex::new(Captured { raw_txs: Vec::new(), allowance, balance, no_receipt: false }));
+async fn run_stake(
+    amount_wei: u128,
+    allowance: U256,
+    balance: U256,
+) -> (Vec<Bytes>, anyhow::Result<()>) {
+    let cap = Arc::new(Mutex::new(Captured {
+        raw_txs: Vec::new(),
+        allowance,
+        balance,
+        no_receipt: false,
+    }));
     let url = start_stub(cap.clone()).await;
     let signer: alloy::signers::local::PrivateKeySigner = KEY.parse().unwrap();
     let client = ChainClient::new(&config(&url), signer).await.unwrap();
@@ -195,7 +212,12 @@ async fn run_stake(amount_wei: u128, allowance: U256, balance: U256) -> (Vec<Byt
 async fn approve_then_stake_uses_the_uint128_abi_and_consecutive_nonces() {
     // 4.25 HEMI — the exact shortfall from the incident.
     let amount: u128 = 4_250_000_000_000_000_000;
-    let (txs, res) = run_stake(amount, U256::ZERO, U256::from(444_804u64) * U256::from(10u64).pow(U256::from(18))).await;
+    let (txs, res) = run_stake(
+        amount,
+        U256::ZERO,
+        U256::from(444_804u64) * U256::from(10u64).pow(U256::from(18)),
+    )
+    .await;
     res.expect("approve_and_stake should succeed against the stub");
     assert_eq!(txs.len(), 2, "expected exactly approve + stake");
 
@@ -203,7 +225,11 @@ async fn approve_then_stake_uses_the_uint128_abi_and_consecutive_nonces() {
     let stake = alloy::consensus::TxEnvelope::decode_2718(&mut txs[1].as_ref()).unwrap();
 
     // Order + destination.
-    assert_eq!(approve.to(), Some(TOKEN), "first tx must be the ERC-20 approve");
+    assert_eq!(
+        approve.to(),
+        Some(TOKEN),
+        "first tx must be the ERC-20 approve"
+    );
     assert_eq!(stake.to(), Some(STAKING), "second tx must be the stake");
 
     // TRAP: nonces must come from the shared allocator, anchored at the node's
@@ -220,14 +246,23 @@ async fn approve_then_stake_uses_the_uint128_abi_and_consecutive_nonces() {
     const STAKE_ADDRESS_UINT128: [u8; 4] = [0x19, 0xf8, 0xd5, 0xb4]; // keccak("stake(address,uint128)")[..4]
     const STAKE_ADDRESS_UINT256: [u8; 4] = [0xad, 0xc9, 0x77, 0x2e]; // the silent no-op
     let sel: [u8; 4] = stake.input()[..4].try_into().unwrap();
-    assert_ne!(sel, STAKE_ADDRESS_UINT256, "uint256 stake() silently does nothing");
+    assert_ne!(
+        sel, STAKE_ADDRESS_UINT256,
+        "uint256 stake() silently does nothing"
+    );
     assert_eq!(sel, STAKE_ADDRESS_UINT128, "wrong stake() selector");
-    assert_eq!(stake.input().len(), 4 + 32 + 32, "stake calldata must be 2 words");
+    assert_eq!(
+        stake.input().len(),
+        4 + 32 + 32,
+        "stake calldata must be 2 words"
+    );
     let decoded = IHemiProveStaking::stakeCall::abi_decode(stake.input()).unwrap();
     assert_eq!(decoded.amount, amount, "amount must be the full wei value");
     assert_eq!(
         decoded.prover,
-        "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".parse::<Address>().unwrap(),
+        "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+            .parse::<Address>()
+            .unwrap(),
         "stake() must credit this signer as prover"
     );
 
@@ -282,7 +317,9 @@ async fn two_processes_over_one_signer_collide_on_the_same_nonce() {
     let signer: alloy::signers::local::PrivateKeySigner = KEY.parse().unwrap();
 
     // "the miner"
-    let miner = ChainClient::new(&config(&url), signer.clone()).await.unwrap();
+    let miner = ChainClient::new(&config(&url), signer.clone())
+        .await
+        .unwrap();
     // "zkminer stake", a separate process, same key, same node
     let cli = ChainClient::new(&config(&url), signer).await.unwrap();
 
@@ -321,9 +358,16 @@ async fn an_unobserved_receipt_does_not_recycle_the_nonce() {
     let client = ChainClient::new(&config(&url), signer).await.unwrap();
 
     let res = client.approve_and_stake(10 * 10u128.pow(18)).await;
-    assert!(res.is_err(), "an unobserved receipt must not be reported as success");
+    assert!(
+        res.is_err(),
+        "an unobserved receipt must not be reported as success"
+    );
 
-    assert_eq!(cap.lock().unwrap().raw_txs.len(), 1, "exactly one stake tx was accepted");
+    assert_eq!(
+        cap.lock().unwrap().raw_txs.len(),
+        1,
+        "exactly one stake tx was accepted"
+    );
     assert!(
         !client.nonce_is_freed(PENDING_NONCE),
         "nonce {PENDING_NONCE} was recycled after an ACCEPTED send — that arms the gap \

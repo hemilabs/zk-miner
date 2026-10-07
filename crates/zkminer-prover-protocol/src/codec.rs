@@ -78,6 +78,75 @@ mod tests {
         }
     }
 
+    /// `wrap_secs` must survive the wire both measured and unmeasured.
+    ///
+    /// The codec is bincode, which is positional and cannot skip a field: a
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` — the natural way to keep JSON tidy —
+    /// would make an unmeasured entry encode one field short and garble everything after it.
+    #[test]
+    fn a_benchmark_entry_round_trips_with_and_without_a_wrap() {
+        for wrap in [Some(55.25), None] {
+            let entry = crate::types::BenchmarkEntry {
+                program_name: "chacha-mix".to_string(),
+                prover_backend: "sp1".to_string(),
+                cycles: 32_484_958,
+                duration_secs: 8.5,
+                throughput: 32_484_958.0 / 8.5,
+                weight: 0.20,
+                precompile: false,
+                wrap_secs: wrap,
+            };
+            let resp = WorkerResponse::BenchmarkResult {
+                results: vec![entry.clone(), entry],
+            };
+            let mut buf = Vec::new();
+            write_message(&mut buf, &resp).unwrap();
+            let decoded: WorkerResponse = read_message(&mut Cursor::new(buf)).unwrap();
+            match decoded {
+                WorkerResponse::BenchmarkResult { results } => {
+                    assert_eq!(results.len(), 2);
+                    for r in results {
+                        assert_eq!(r.wrap_secs, wrap);
+                        assert_eq!(r.duration_secs, 8.5, "a field after it must not shift");
+                    }
+                }
+                _ => panic!("wrong variant"),
+            }
+        }
+    }
+
+    /// Why `PROTOCOL_VERSION` had to move when `wrap_secs` was added: a v3 worker's entry is one field
+    /// short under bincode, so without the bump it would reach the decoder and fail mid-benchmark
+    /// instead of being refused cleanly at the handshake.
+    #[test]
+    fn a_v3_benchmark_entry_does_not_decode_as_v4() {
+        #[derive(serde::Serialize)]
+        struct V3Entry {
+            program_name: String,
+            prover_backend: String,
+            cycles: u64,
+            duration_secs: f64,
+            throughput: f64,
+            weight: f64,
+            precompile: bool,
+        }
+        let bytes = bincode::serialize(&V3Entry {
+            program_name: "fibonacci".to_string(),
+            prover_backend: "risc0".to_string(),
+            cycles: 32_768,
+            duration_secs: 0.42,
+            throughput: 78_000.0,
+            weight: 0.10,
+            precompile: false,
+        })
+        .unwrap();
+        assert!(
+            bincode::deserialize::<crate::types::BenchmarkEntry>(&bytes).is_err(),
+            "a v3 entry must NOT silently decode as v4; if it ever does, the version bump is moot"
+        );
+        assert!(PROTOCOL_VERSION >= 4);
+    }
+
     #[test]
     fn round_trip_response() {
         let resp = WorkerResponse::HelloAck {

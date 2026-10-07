@@ -1,8 +1,8 @@
 use anyhow::Result;
 use std::path::Path;
 use zkminer_chain::client::ChainClient;
-use zkminer_config::ZkMinerConfig;
 use zkminer_config::wallet::load_signer;
+use zkminer_config::ZkMinerConfig;
 
 pub async fn run(config_path: Option<&Path>) -> Result<()> {
     let config = ZkMinerConfig::load(config_path)?;
@@ -43,9 +43,18 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
             println!();
             println!("Staking");
             println!("──────────────────────────────────────────────────");
-            println!("Total Staked:       {} HEMI", format_token(stake.total_staked));
-            println!("Locked Collateral:  {} HEMI", format_token(stake.locked_collateral));
-            println!("Available:          {} HEMI", format_token(stake.available_collateral));
+            println!(
+                "Total Staked:       {} HEMI",
+                format_token(stake.total_staked)
+            );
+            println!(
+                "Locked Collateral:  {} HEMI",
+                format_token(stake.locked_collateral)
+            );
+            println!(
+                "Available:          {} HEMI",
+                format_token(stake.available_collateral)
+            );
             // Derived verdict: `status` printed the three numbers and left the division to
             // the reader, which is how a 4.25 HEMI shortfall idled a GPU unnoticed.
             // Reported as ADDITIONAL slots: from chain alone a live lock is indistinguishable
@@ -66,7 +75,9 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
                     format_token(per_claim)
                 );
                 if extra == 0 {
-                    println!("                    [!] cannot fund even a minimum claim — stake more");
+                    println!(
+                        "                    [!] cannot fund even a minimum claim — stake more"
+                    );
                 } else {
                     println!(
                         "                    (a real claim locks the auction max_price, so the \
@@ -92,7 +103,10 @@ true figure is lower)"
             println!("Jobs Fulfilled:     {}", stats.jobs_fulfilled);
             println!("Jobs Slashed:       {}", stats.jobs_slashed);
             println!("Jobs Released:      {}", stats.jobs_released);
-            println!("Total Earned:       {} HEMI", format_token(stats.total_earned));
+            println!(
+                "Total Earned:       {} HEMI",
+                format_token(stats.total_earned)
+            );
         }
         Err(e) => println!("\nProver stats:   Error: {}", e),
     }

@@ -4,15 +4,23 @@ use ratatui::{
     Frame,
 };
 
+use super::dashboard::format_token_amount;
 use crate::state::{MinerJobStatus, MinerState};
 use crate::theme;
-use super::dashboard::format_token_amount;
 use ratatui::text::Span;
 
 pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
-    let header_cells = ["ID", "Program", "Price", "Max Price", "Timeout", "Bonus", "Status"]
-        .iter()
-        .map(|h| Cell::from(*h).style(theme::table_header()));
+    let header_cells = [
+        "ID",
+        "Program",
+        "Price",
+        "Max Price",
+        "Timeout",
+        "Bonus",
+        "Status",
+    ]
+    .iter()
+    .map(|h| Cell::from(*h).style(theme::table_header()));
     let header = Row::new(header_cells).height(1);
 
     let rows: Vec<Row> = state
@@ -25,7 +33,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
 
             let status = match &job.status {
                 MinerJobStatus::Open => "Open",
-                MinerJobStatus::Queued { .. } => "Queued",
+                MinerJobStatus::Queued => "Queued",
                 MinerJobStatus::Proving { .. } => "Proving",
                 MinerJobStatus::Submitting => "Submitting",
                 MinerJobStatus::Fulfilled { .. } => "Fulfilled",
@@ -67,7 +75,10 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
     .block(
         Block::default()
             .title(Span::styled(
-                format!(" Open Jobs ({}) — [c]laim [f]ast-path [r]elease [Enter]detail ", state.open_jobs.len()),
+                format!(
+                    " Open Jobs ({}) — [c]laim [f]ast-path [r]elease [Enter]detail ",
+                    state.open_jobs.len()
+                ),
                 theme::title(),
             ))
             .borders(Borders::ALL)

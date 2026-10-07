@@ -175,8 +175,15 @@ pub struct ProverConfig {
     /// Electricity cost in USD/kWh for cost modeling.
     #[serde(default = "default_electricity_cost")]
     pub electricity_cost_kwh: f64,
-    /// Base system power overhead in watts (motherboard, fans, drives, PSU losses).
-    /// Added to measured CPU and GPU power for cost estimation.
+    /// Base system power overhead in watts (motherboard, fans, drives, PSU losses) —
+    /// everything EXCEPT the CPU package and the GPUs, which are measured.
+    ///
+    /// Added to measured CPU and GPU power by
+    /// `zkminer_strategy::cost_model::system_watts_for_suite`. It was not added by anything
+    /// until then: the production path passed this value into `CostParams` as the whole
+    /// machine's draw, so a two-GPU box costed its electricity at 75 W against ~872 W
+    /// measured at the wall. Raise it if your board/drives/PSU losses exceed ~75 W; do NOT
+    /// raise it to cover the GPUs.
     #[serde(default = "default_system_watts")]
     pub system_power_watts: f64,
     /// Token price in USD for profitability calculation.
@@ -237,6 +244,11 @@ fn default_electricity_cost() -> f64 {
     0.12
 }
 fn default_system_watts() -> f64 {
+    // Board, fans, drives and PSU conversion loss on a desktop/workstation, with CPU and
+    // GPU excluded because those are measured and added separately. The remaining
+    // inaccuracy is that PSU loss scales with load rather than being fixed, which this
+    // understates at full tilt — within tens of watts, not the order of magnitude that the
+    // missing CPU+GPU terms cost.
     75.0
 }
 fn default_proving_timeout() -> u64 {
@@ -294,12 +306,13 @@ impl ZkMinerConfig {
 
     /// Load config from the given path, or default path if None.
     pub fn load(path: Option<&Path>) -> Result<Self> {
-        let path = path
-            .map(PathBuf::from)
-            .unwrap_or_else(Self::default_path);
+        let path = path.map(PathBuf::from).unwrap_or_else(Self::default_path);
 
         if !path.exists() {
-            tracing::info!("Config file not found at {}, using defaults", path.display());
+            tracing::info!(
+                "Config file not found at {}, using defaults",
+                path.display()
+            );
             return Ok(Self::default());
         }
 
@@ -312,17 +325,15 @@ impl ZkMinerConfig {
 
     /// Save config to the given path, creating directories as needed.
     pub fn save(&self, path: Option<&Path>) -> Result<()> {
-        let path = path
-            .map(PathBuf::from)
-            .unwrap_or_else(Self::default_path);
+        let path = path.map(PathBuf::from).unwrap_or_else(Self::default_path);
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create config directory {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create config directory {}", parent.display())
+            })?;
         }
 
-        let content = toml::to_string_pretty(self)
-            .context("Failed to serialize config")?;
+        let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
 
         std::fs::write(&path, content)
             .with_context(|| format!("Failed to write config to {}", path.display()))?;
@@ -372,7 +383,9 @@ impl ZkMinerConfig {
             );
         }
         if self.prover.token_price_usd <= 0.0 {
-            anyhow::bail!("token_price_usd must be positive (used as divisor in profitability calculation)");
+            anyhow::bail!(
+                "token_price_usd must be positive (used as divisor in profitability calculation)"
+            );
         }
         // max_concurrent_proofs == 0 is valid and means "auto" (resolved at startup
         // to the detected proving-GPU count); any positive value pins it explicitly.
@@ -398,9 +411,14 @@ mod validation_tests {
             c.chain.gas_price_gwei = Some(g);
             let err = c
                 .validate_for_chain()
-                .expect_err(&format!("gas_price_gwei={g} rounds to 0 wei and must be rejected"))
+                .expect_err(&format!(
+                    "gas_price_gwei={g} rounds to 0 wei and must be rejected"
+                ))
                 .to_string();
-            assert!(err.contains("at least 1 wei"), "wrong rejection reason for {g}: {err}");
+            assert!(
+                err.contains("at least 1 wei"),
+                "wrong rejection reason for {g}: {err}"
+            );
         }
     }
 

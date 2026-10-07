@@ -12,7 +12,12 @@ use zkminer_chain::staking::TESTNET_CHAIN_ID;
 const MAINNET_CHAIN_ID: u64 = 43111;
 const MAINNET_RPC: &str = "https://rpc.hemi.network";
 
-pub fn run(config_path: Option<&Path>, force: bool, network: &str, generate_key: bool) -> Result<()> {
+pub fn run(
+    config_path: Option<&Path>,
+    force: bool,
+    network: &str,
+    generate_key: bool,
+) -> Result<()> {
     let path = config_path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(ZkMinerConfig::default_path);

@@ -27,20 +27,20 @@ pub enum SettingsAction {
         tuning: GpuTuningState,
     },
     /// Reset a GPU's tuning to hardware defaults.
-    GpuTuningReset { device_id: String },
+    GpuTuningReset {
+        device_id: String,
+    },
     /// Re-run zkVM benchmarks on a GPU to measure tuning impact.
-    GpuTuningBenchmark { device_id: String },
+    GpuTuningBenchmark {
+        device_id: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const BACKENDS: &[(&str, &str)] = &[
-    ("risc0", "RISC Zero"),
-    ("sp1", "SP1"),
-    ("openvm", "OpenVM"),
-];
+const BACKENDS: &[(&str, &str)] = &[("risc0", "RISC Zero"), ("sp1", "SP1"), ("openvm", "OpenVM")];
 
 const STRATEGIES: &[&str] = &["conservative", "auto", "aggressive"];
 
@@ -83,16 +83,46 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
             Constraint::Length(adv_h),
             Constraint::Length(tuning_h),
             Constraint::Length(1), // hint bar
-            Constraint::Min(0),   // spacer
+            Constraint::Min(0),    // spacer
         ])
         .split(area);
 
-    render_devices(f, chunks[0], state, ui.active_section == SettingsSection::Devices);
-    render_backends(f, chunks[1], state, ui.active_section == SettingsSection::Backends);
-    render_device_grid(f, chunks[2], state, ui.active_section == SettingsSection::DeviceGrid);
-    render_parameters(f, chunks[3], state, ui.active_section == SettingsSection::Parameters);
-    render_advanced(f, chunks[4], state, ui.active_section == SettingsSection::Advanced);
-    render_gpu_tuning(f, chunks[5], state, ui.active_section == SettingsSection::GpuTuning);
+    render_devices(
+        f,
+        chunks[0],
+        state,
+        ui.active_section == SettingsSection::Devices,
+    );
+    render_backends(
+        f,
+        chunks[1],
+        state,
+        ui.active_section == SettingsSection::Backends,
+    );
+    render_device_grid(
+        f,
+        chunks[2],
+        state,
+        ui.active_section == SettingsSection::DeviceGrid,
+    );
+    render_parameters(
+        f,
+        chunks[3],
+        state,
+        ui.active_section == SettingsSection::Parameters,
+    );
+    render_advanced(
+        f,
+        chunks[4],
+        state,
+        ui.active_section == SettingsSection::Advanced,
+    );
+    render_gpu_tuning(
+        f,
+        chunks[5],
+        state,
+        ui.active_section == SettingsSection::GpuTuning,
+    );
 
     // Hint bar
     let hints = Line::from(vec![
@@ -138,9 +168,7 @@ fn render_devices(f: &mut Frame, area: Rect, state: &MinerState, focused: bool) 
             && !device_id
                 .as_ref()
                 .is_some_and(|id| rs.disabled_devices.contains(id));
-        let sel = focused
-            && ui.active_section == SettingsSection::Devices
-            && ui.row_index == i + 1;
+        let sel = focused && ui.active_section == SettingsSection::Devices && ui.row_index == i + 1;
         let vram = fmt_bytes(gpu.vram_total_bytes);
         let label = format!("GPU{}   {:<24} {}", gpu.index, gpu.name, vram);
         let color = match gpu.vendor {
@@ -152,7 +180,11 @@ fn render_devices(f: &mut Frame, area: Rect, state: &MinerState, focused: bool) 
         lines.push(toggle_line(sel, enabled, &label, color));
     }
 
-    let border = if focused { theme::border_focused() } else { theme::border() };
+    let border = if focused {
+        theme::border_focused()
+    } else {
+        theme::border()
+    };
     let block = Block::default()
         .title(Span::styled(" Devices ", theme::title()))
         .borders(Borders::ALL)
@@ -177,7 +209,11 @@ fn render_backends(f: &mut Frame, area: Rect, state: &MinerState, focused: bool)
         lines.push(toggle_line(sel, enabled, display, backend_color(key)));
     }
 
-    let border = if focused { theme::border_focused() } else { theme::border() };
+    let border = if focused {
+        theme::border_focused()
+    } else {
+        theme::border()
+    };
     let block = Block::default()
         .title(Span::styled(" Proof Systems ", theme::title()))
         .borders(Borders::ALL)
@@ -198,7 +234,11 @@ fn render_device_grid(f: &mut Frame, area: Rect, state: &MinerState, focused: bo
     let enabled_devs = enabled_devices(state);
     let enabled_bks = enabled_backends(state);
 
-    let border = if focused { theme::border_focused() } else { theme::border() };
+    let border = if focused {
+        theme::border_focused()
+    } else {
+        theme::border()
+    };
     let block = Block::default()
         .title(Span::styled(" Per-Device Proof Systems ", theme::title()))
         .borders(Borders::ALL)
@@ -220,12 +260,10 @@ fn render_device_grid(f: &mut Frame, area: Rect, state: &MinerState, focused: bo
 
     // Header row
     let device_col_w = 30;
-    let mut header_spans: Vec<Span> = vec![
-        Span::styled(
-            format!("{:<width$}", "", width = device_col_w + 2),
-            Style::default(),
-        ),
-    ];
+    let mut header_spans: Vec<Span> = vec![Span::styled(
+        format!("{:<width$}", "", width = device_col_w + 2),
+        Style::default(),
+    )];
     for bk in &enabled_bks {
         let color = backend_color(bk.0);
         header_spans.push(Span::styled(
@@ -239,9 +277,8 @@ fn render_device_grid(f: &mut Frame, area: Rect, state: &MinerState, focused: bo
 
     // Device rows
     for (row, dev) in enabled_devs.iter().enumerate() {
-        let sel_row = focused
-            && ui.active_section == SettingsSection::DeviceGrid
-            && ui.row_index == row;
+        let sel_row =
+            focused && ui.active_section == SettingsSection::DeviceGrid && ui.row_index == row;
 
         let cursor = if sel_row { "> " } else { "  " };
         let mut spans: Vec<Span> = vec![
@@ -334,20 +371,13 @@ fn render_parameters(f: &mut Frame, area: Rect, state: &MinerState, focused: boo
             "Deadline Safety",
             format!("{:.1}\u{00d7}", rs.deadline_safety_margin),
         ),
-        (
-            "Token Price",
-            format!("${:.2}", rs.token_price_usd),
-        ),
-        (
-            "Gas Cost",
-            format!("${:.3}", rs.gas_cost_usd),
-        ),
+        ("Token Price", format!("${:.2}", rs.token_price_usd)),
+        ("Gas Cost", format!("${:.3}", rs.gas_cost_usd)),
     ];
 
     let mut lines: Vec<Line> = Vec::new();
     for (i, (label, value)) in params.iter().enumerate() {
-        let sel =
-            focused && ui.active_section == SettingsSection::Parameters && ui.row_index == i;
+        let sel = focused && ui.active_section == SettingsSection::Parameters && ui.row_index == i;
         lines.push(spinner_line(sel, label, value));
     }
 
@@ -376,8 +406,7 @@ fn render_advanced(f: &mut Frame, area: Rect, state: &MinerState, focused: bool)
 
     // Row 0: Advanced Mode toggle
     {
-        let sel =
-            focused && ui.active_section == SettingsSection::Advanced && ui.row_index == 0;
+        let sel = focused && ui.active_section == SettingsSection::Advanced && ui.row_index == 0;
         let check = if rs.advanced_mode { "[✓] " } else { "[ ] " };
         let cursor = if sel { "> " } else { "  " };
 
@@ -447,15 +476,9 @@ fn render_advanced(f: &mut Frame, area: Rect, state: &MinerState, focused: bool)
                 Span::styled("/ ".to_string(), theme::dim()),
                 Span::styled(bk_label, theme::accent()),
                 Span::styled("po2: ".to_string(), theme::dim()),
-                Span::styled(
-                    "\u{25c2} ".to_string(),
-                    Style::default().fg(theme::peach()),
-                ),
+                Span::styled("\u{25c2} ".to_string(), Style::default().fg(theme::peach())),
                 Span::styled(format!("{}", current_po2), theme::metric()),
-                Span::styled(
-                    " \u{25b8}".to_string(),
-                    Style::default().fg(theme::peach()),
-                ),
+                Span::styled(" \u{25b8}".to_string(), Style::default().fg(theme::peach())),
                 Span::styled(format!("   (optimal: {})", optimal), theme::dim()),
             ];
 
@@ -493,7 +516,9 @@ fn gpu_tuning_height(state: &MinerState) -> u16 {
         return 3; // border + "No GPUs" message
     }
     let ui = &state.settings_ui;
-    let idx = ui.tuning_gpu_index.min(state.gpu_tuning.len().saturating_sub(1));
+    let idx = ui
+        .tuning_gpu_index
+        .min(state.gpu_tuning.len().saturating_sub(1));
     let controls = state
         .gpu_tuning
         .get(idx)
@@ -587,11 +612,12 @@ fn render_gpu_tuning(f: &mut Frame, area: Rect, state: &MinerState, focused: boo
             .gpus
             .iter()
             .find(|g| crate::gpu_tuning::tuning_device_id(g) == ts.caps.device_id);
-        let name = gpu
-            .map(|g| g.name.as_str())
-            .unwrap_or(&ts.caps.device_id);
+        let name = gpu.map(|g| g.name.as_str()).unwrap_or(&ts.caps.device_id);
         let dirty_mark = if ts.dirty { " *" } else { "" };
-        format!(" GPU Tuning \u{2014} GPU{}: {}{} ", gpu_idx, name, dirty_mark)
+        format!(
+            " GPU Tuning \u{2014} GPU{}: {}{} ",
+            gpu_idx, name, dirty_mark
+        )
     } else {
         " GPU Tuning ".to_string()
     };
@@ -643,20 +669,14 @@ fn render_gpu_tuning(f: &mut Frame, area: Rect, state: &MinerState, focused: boo
 
             if is_selected {
                 // Selected GPU: [ GPU0: Name ]  with color+bold
-                spans.push(Span::styled(
-                    "[".to_string(),
-                    Style::default().fg(color),
-                ));
+                spans.push(Span::styled("[".to_string(), Style::default().fg(color)));
                 spans.push(Span::styled(
                     format!("GPU{}: {}{}", i, name, dirty_mark),
                     Style::default()
                         .fg(color)
                         .add_modifier(ratatui::style::Modifier::BOLD),
                 ));
-                spans.push(Span::styled(
-                    "]".to_string(),
-                    Style::default().fg(color),
-                ));
+                spans.push(Span::styled("]".to_string(), Style::default().fg(color)));
             } else {
                 // Non-selected GPU: dim
                 spans.push(Span::styled(
@@ -882,7 +902,12 @@ fn render_gpu_tuning(f: &mut Frame, area: Rect, state: &MinerState, focused: boo
                     Span::styled("  (was ", theme::dim()),
                     Span::styled(format_tp(before), theme::dim()),
                     Span::styled(", ", theme::dim()),
-                    Span::styled(delta_str, Style::default().fg(delta_color).add_modifier(ratatui::style::Modifier::BOLD)),
+                    Span::styled(
+                        delta_str,
+                        Style::default()
+                            .fg(delta_color)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
                     Span::styled(")", theme::dim()),
                 ]));
             }
@@ -982,12 +1007,7 @@ fn format_clock_value(
     }
 }
 
-fn tuning_spinner_line<'a>(
-    selected: bool,
-    label: &str,
-    value: &str,
-    hint: &str,
-) -> Line<'a> {
+fn tuning_spinner_line<'a>(selected: bool, label: &str, value: &str, hint: &str) -> Line<'a> {
     let cursor = if selected { "> " } else { "  " };
 
     let mut spans = vec![
@@ -1000,15 +1020,9 @@ fn tuning_spinner_line<'a>(
             },
         ),
         Span::styled(format!("{:<24}", label), theme::dim()),
-        Span::styled(
-            "\u{25c2} ".to_string(),
-            Style::default().fg(theme::peach()),
-        ),
+        Span::styled("\u{25c2} ".to_string(), Style::default().fg(theme::peach())),
         Span::styled(value.to_string(), theme::metric()),
-        Span::styled(
-            " \u{25b8}".to_string(),
-            Style::default().fg(theme::peach()),
-        ),
+        Span::styled(" \u{25b8}".to_string(), Style::default().fg(theme::peach())),
         Span::styled(hint.to_string(), theme::dim()),
     ];
 
@@ -1081,15 +1095,9 @@ fn spinner_line<'a>(selected: bool, label: &str, value: &str) -> Line<'a> {
             },
         ),
         Span::styled(format!("{:<28}", label), theme::dim()),
-        Span::styled(
-            "\u{25c2} ".to_string(),
-            Style::default().fg(theme::peach()),
-        ),
+        Span::styled("\u{25c2} ".to_string(), Style::default().fg(theme::peach())),
         Span::styled(value.to_string(), theme::metric()),
-        Span::styled(
-            " \u{25b8}".to_string(),
-            Style::default().fg(theme::peach()),
-        ),
+        Span::styled(" \u{25b8}".to_string(), Style::default().fg(theme::peach())),
     ];
 
     if selected {
@@ -1394,10 +1402,19 @@ pub fn settings_prev_section(state: &mut MinerState) {
 /// Handle Enter/Space — toggle checkboxes, toggle grid cells, cycle spinners.
 pub fn settings_activate(state: &mut MinerState) -> SettingsAction {
     match state.settings_ui.active_section {
-        SettingsSection::Devices => { toggle_device(state); SettingsAction::None }
-        SettingsSection::Backends => { toggle_backend(state); SettingsAction::None }
-        SettingsSection::DeviceGrid => { toggle_grid_cell(state); SettingsAction::None }
-        SettingsSection::Parameters => { settings_adjust_right(state) }
+        SettingsSection::Devices => {
+            toggle_device(state);
+            SettingsAction::None
+        }
+        SettingsSection::Backends => {
+            toggle_backend(state);
+            SettingsAction::None
+        }
+        SettingsSection::DeviceGrid => {
+            toggle_grid_cell(state);
+            SettingsAction::None
+        }
+        SettingsSection::Parameters => settings_adjust_right(state),
         SettingsSection::Advanced => {
             if state.settings_ui.row_index == 0 {
                 state.runtime_settings.advanced_mode = !state.runtime_settings.advanced_mode;
@@ -1412,16 +1429,17 @@ pub fn settings_activate(state: &mut MinerState) -> SettingsAction {
 
 pub fn settings_adjust_left(state: &mut MinerState) -> SettingsAction {
     match state.settings_ui.active_section {
-        SettingsSection::Devices | SettingsSection::Backends => {
-            settings_activate(state)
-        }
+        SettingsSection::Devices | SettingsSection::Backends => settings_activate(state),
         SettingsSection::DeviceGrid => {
             if state.settings_ui.col_index > 0 {
                 state.settings_ui.col_index -= 1;
             }
             SettingsAction::None
         }
-        SettingsSection::Parameters => { adjust_param(state, -1); SettingsAction::None }
+        SettingsSection::Parameters => {
+            adjust_param(state, -1);
+            SettingsAction::None
+        }
         SettingsSection::Advanced => {
             if state.settings_ui.row_index == 0 {
                 state.runtime_settings.advanced_mode = !state.runtime_settings.advanced_mode;
@@ -1431,15 +1449,16 @@ pub fn settings_adjust_left(state: &mut MinerState) -> SettingsAction {
                 SettingsAction::None
             }
         }
-        SettingsSection::GpuTuning => { adjust_tuning(state, -1); SettingsAction::None }
+        SettingsSection::GpuTuning => {
+            adjust_tuning(state, -1);
+            SettingsAction::None
+        }
     }
 }
 
 pub fn settings_adjust_right(state: &mut MinerState) -> SettingsAction {
     match state.settings_ui.active_section {
-        SettingsSection::Devices | SettingsSection::Backends => {
-            settings_activate(state)
-        }
+        SettingsSection::Devices | SettingsSection::Backends => settings_activate(state),
         SettingsSection::DeviceGrid => {
             let max_col = enabled_backend_count(state).saturating_sub(1);
             if state.settings_ui.col_index < max_col {
@@ -1447,7 +1466,10 @@ pub fn settings_adjust_right(state: &mut MinerState) -> SettingsAction {
             }
             SettingsAction::None
         }
-        SettingsSection::Parameters => { adjust_param(state, 1); SettingsAction::None }
+        SettingsSection::Parameters => {
+            adjust_param(state, 1);
+            SettingsAction::None
+        }
         SettingsSection::Advanced => {
             if state.settings_ui.row_index == 0 {
                 state.runtime_settings.advanced_mode = !state.runtime_settings.advanced_mode;
@@ -1457,7 +1479,10 @@ pub fn settings_adjust_right(state: &mut MinerState) -> SettingsAction {
                 SettingsAction::None
             }
         }
-        SettingsSection::GpuTuning => { adjust_tuning(state, 1); SettingsAction::None }
+        SettingsSection::GpuTuning => {
+            adjust_tuning(state, 1);
+            SettingsAction::None
+        }
     }
 }
 
@@ -1557,7 +1582,8 @@ fn adjust_tuning(state: &mut MinerState, dir: i32) {
                     FanSetting::Fixed(pct) => *pct as i32,
                 };
                 let step = 5i32;
-                let new_pct = (current + dir * step).clamp(fan.min_percent as i32, fan.max_percent as i32);
+                let new_pct =
+                    (current + dir * step).clamp(fan.min_percent as i32, fan.max_percent as i32);
                 if dir < 0 && new_pct <= fan.min_percent as i32 {
                     ts.fan_speed = FanSetting::Auto;
                 } else {
@@ -1598,10 +1624,7 @@ fn activate_tuning_button(state: &mut MinerState) -> SettingsAction {
             }
             let tuning = ts.clone();
             ts.dirty = false;
-            SettingsAction::GpuTuningApply {
-                device_id,
-                tuning,
-            }
+            SettingsAction::GpuTuningApply { device_id, tuning }
         }
         1 => {
             // Reset
@@ -1642,11 +1665,7 @@ fn tuning_row_to_control(caps: &crate::gpu_tuning::GpuTuningCaps, row: usize) ->
 }
 
 /// Adjust a clock setting in-place. Returns true if a change was made.
-fn adjust_clock(
-    ts: &mut GpuTuningState,
-    dir: i32,
-    is_core: bool,
-) -> bool {
+fn adjust_clock(ts: &mut GpuTuningState, dir: i32, is_core: bool) -> bool {
     let caps = if is_core {
         match ts.caps.core_clock.clone() {
             Some(c) => c,
@@ -1672,7 +1691,11 @@ fn adjust_clock(
             let max_idx = levels.last().map(|l| l.index).unwrap_or(0);
             let current_idx = match setting {
                 ClockSetting::DpmLevel(idx) => *idx,
-                _ => levels.iter().find(|l| l.active).map(|l| l.index).unwrap_or(0),
+                _ => levels
+                    .iter()
+                    .find(|l| l.active)
+                    .map(|l| l.index)
+                    .unwrap_or(0),
             };
             let new_idx = if dir > 0 {
                 (current_idx + 1).min(max_idx)
@@ -1775,8 +1798,15 @@ fn toggle_grid_cell(state: &mut MinerState) {
     let backend_key = bks[col].0.to_string();
     let pair = (device_id, backend_key);
 
-    if state.runtime_settings.disabled_device_backends.contains(&pair) {
-        state.runtime_settings.disabled_device_backends.remove(&pair);
+    if state
+        .runtime_settings
+        .disabled_device_backends
+        .contains(&pair)
+    {
+        state
+            .runtime_settings
+            .disabled_device_backends
+            .remove(&pair);
     } else {
         state.runtime_settings.disabled_device_backends.insert(pair);
     }
@@ -1830,13 +1860,11 @@ fn adjust_param(state: &mut MinerState, dir: i32) {
             rs.deadline_safety_margin = rs.deadline_safety_margin.clamp(1.0, 5.0);
         }
         7 => {
-            rs.token_price_usd =
-                ((rs.token_price_usd + dir as f64 * 0.05) * 100.0).round() / 100.0;
+            rs.token_price_usd = ((rs.token_price_usd + dir as f64 * 0.05) * 100.0).round() / 100.0;
             rs.token_price_usd = rs.token_price_usd.clamp(0.01, 100.0);
         }
         8 => {
-            rs.gas_cost_usd =
-                ((rs.gas_cost_usd + dir as f64 * 0.005) * 1000.0).round() / 1000.0;
+            rs.gas_cost_usd = ((rs.gas_cost_usd + dir as f64 * 0.005) * 1000.0).round() / 1000.0;
             rs.gas_cost_usd = rs.gas_cost_usd.clamp(0.0, 10.0);
         }
         _ => {}
@@ -1898,7 +1926,10 @@ mod param_row_tests {
         let mut st = MinerState::default();
         st.settings_ui.row_index = 1;
         adjust_param(&mut st, 1);
-        assert_eq!(st.runtime_settings.queue_horizon_secs, 30, "0 -> 30s in one step");
+        assert_eq!(
+            st.runtime_settings.queue_horizon_secs, 30,
+            "0 -> 30s in one step"
+        );
         assert_eq!(
             st.runtime_settings.max_concurrent_proofs, before.max_concurrent_proofs,
             "row 1 must NOT touch max_concurrent_proofs"
@@ -1906,7 +1937,10 @@ mod param_row_tests {
         adjust_param(&mut st, -1);
         assert_eq!(st.runtime_settings.queue_horizon_secs, 0, "and back to off");
         adjust_param(&mut st, -1);
-        assert_eq!(st.runtime_settings.queue_horizon_secs, 0, "clamped at off, never negative");
+        assert_eq!(
+            st.runtime_settings.queue_horizon_secs, 0,
+            "clamped at off, never negative"
+        );
 
         // Row 2 must still be min profit, i.e. the insert shifted it correctly.
         let mut st = MinerState::default();
@@ -1927,6 +1961,9 @@ mod param_row_tests {
         for _ in 0..100 {
             adjust_param(&mut st, 1);
         }
-        assert_eq!(st.runtime_settings.queue_horizon_secs, 1800, "clamps at 30 minutes");
+        assert_eq!(
+            st.runtime_settings.queue_horizon_secs, 1800,
+            "clamps at 30 minutes"
+        );
     }
 }

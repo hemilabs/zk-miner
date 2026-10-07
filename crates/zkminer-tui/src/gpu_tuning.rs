@@ -12,9 +12,9 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 
-use crate::hardware::{GpuVendor, HardwareInfo, find_amd_card, find_intel_card};
+use crate::hardware::{find_amd_card, find_intel_card, GpuVendor, HardwareInfo};
 use crate::nvml::nvml;
 
 // ---------------------------------------------------------------------------
@@ -289,7 +289,7 @@ fn probe_amd_caps(device_id: &str, gpu_index: u32) -> GpuTuningCaps {
     // Performance profile
     let perf_path = format!("{}/power_dpm_force_performance_level", base);
     if Path::new(&perf_path).exists() {
-        let levels: Vec<PerfLevel> = PerfLevel::ALL.iter().copied().collect();
+        let levels: Vec<PerfLevel> = PerfLevel::ALL.to_vec();
         caps.perf_profile = Some(PerfProfileCaps { levels });
     }
 
@@ -449,13 +449,9 @@ fn apply_amd_tuning(device_id: &str, gpu_index: u32, change: &TuningChange) -> R
 
     match change {
         TuningChange::PowerLimit(watts) => {
-            let hwmon_path =
-                hwmon.ok_or_else(|| anyhow!("No hwmon path for {device_id}"))?;
+            let hwmon_path = hwmon.ok_or_else(|| anyhow!("No hwmon path for {device_id}"))?;
             let microwatts = (*watts * 1_000_000.0) as u64;
-            write_sysfs(
-                &hwmon_path.join("power1_cap"),
-                &microwatts.to_string(),
-            )?;
+            write_sysfs(&hwmon_path.join("power1_cap"), &microwatts.to_string())?;
             Ok(format!("{device_id}: Power limit set to {watts:.0}W"))
         }
         TuningChange::PerfLevel(level) => {
@@ -475,9 +471,9 @@ fn apply_amd_tuning(device_id: &str, gpu_index: u32, change: &TuningChange) -> R
                 write_sysfs(Path::new(&path), "auto")?;
                 Ok(format!("{device_id}: Core clock reset to auto"))
             }
-            ClockSetting::Fixed(_) | ClockSetting::Offset(_) => {
-                Err(anyhow!("AMD GPUs use DPM levels, not fixed clocks or offsets"))
-            }
+            ClockSetting::Fixed(_) | ClockSetting::Offset(_) => Err(anyhow!(
+                "AMD GPUs use DPM levels, not fixed clocks or offsets"
+            )),
         },
         TuningChange::MemClock(setting) => match setting {
             ClockSetting::DpmLevel(idx) => {
@@ -490,9 +486,9 @@ fn apply_amd_tuning(device_id: &str, gpu_index: u32, change: &TuningChange) -> R
                 write_sysfs(Path::new(&path), "auto")?;
                 Ok(format!("{device_id}: Memory clock reset to auto"))
             }
-            ClockSetting::Fixed(_) | ClockSetting::Offset(_) => {
-                Err(anyhow!("AMD GPUs use DPM levels, not fixed clocks or offsets"))
-            }
+            ClockSetting::Fixed(_) | ClockSetting::Offset(_) => Err(anyhow!(
+                "AMD GPUs use DPM levels, not fixed clocks or offsets"
+            )),
         },
         TuningChange::FanSpeed(_) => {
             // TODO: AMD fan control via hwmon
@@ -508,10 +504,7 @@ fn apply_amd_tuning(device_id: &str, gpu_index: u32, change: &TuningChange) -> R
                     .ok()
                     .and_then(|s| s.trim().parse::<u64>().ok())
                 {
-                    let _ = write_sysfs(
-                        &hwmon_path.join("power1_cap"),
-                        &default_uw.to_string(),
-                    );
+                    let _ = write_sysfs(&hwmon_path.join("power1_cap"), &default_uw.to_string());
                 }
             }
             Ok(format!("{device_id}: All tuning reset to defaults"))
@@ -519,11 +512,7 @@ fn apply_amd_tuning(device_id: &str, gpu_index: u32, change: &TuningChange) -> R
     }
 }
 
-fn apply_nvidia_tuning(
-    device_id: &str,
-    nv_index: u32,
-    change: &TuningChange,
-) -> Result<String> {
+fn apply_nvidia_tuning(device_id: &str, nv_index: u32, change: &TuningChange) -> Result<String> {
     let nvml = nvml().ok_or_else(|| anyhow!("NVML not available"))?;
     let mut device = nvml
         .device_by_index(nv_index)
@@ -537,15 +526,17 @@ fn apply_nvidia_tuning(
                 .map_err(|e| anyhow!("set power limit: {e}"))?;
             Ok(format!("{device_id}: Power limit set to {watts:.0}W"))
         }
-        TuningChange::PerfLevel(_) => {
-            Err(anyhow!("NVIDIA GPUs don't support performance level profiles"))
-        }
+        TuningChange::PerfLevel(_) => Err(anyhow!(
+            "NVIDIA GPUs don't support performance level profiles"
+        )),
         TuningChange::CoreClock(setting) => match setting {
             ClockSetting::Offset(offset) => {
                 device
                     .set_gpc_clock_vf_offset(*offset)
                     .map_err(|e| anyhow!("set core clock offset: {e}"))?;
-                Ok(format!("{device_id}: Core clock offset set to {offset:+} MHz"))
+                Ok(format!(
+                    "{device_id}: Core clock offset set to {offset:+} MHz"
+                ))
             }
             ClockSetting::Fixed(mhz) => {
                 use nvml_wrapper::enums::device::GpuLockedClocksSetting;
@@ -562,9 +553,7 @@ fn apply_nvidia_tuning(
                 let _ = device.reset_gpu_locked_clocks();
                 Ok(format!("{device_id}: Core clock reset to default"))
             }
-            ClockSetting::DpmLevel(_) => {
-                Err(anyhow!("NVIDIA GPUs don't use DPM levels"))
-            }
+            ClockSetting::DpmLevel(_) => Err(anyhow!("NVIDIA GPUs don't use DPM levels")),
         },
         TuningChange::MemClock(setting) => match setting {
             ClockSetting::Offset(offset) => {
@@ -698,12 +687,7 @@ fn read_intel_freq(path: &str) -> Option<u32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
-
-fn apply_intel_tuning(
-    device_id: &str,
-    gpu_index: u32,
-    change: &TuningChange,
-) -> Result<String> {
+fn apply_intel_tuning(device_id: &str, gpu_index: u32, change: &TuningChange) -> Result<String> {
     let (base, hwmon) = find_intel_card(gpu_index)
         .ok_or_else(|| anyhow!("Intel GPU {device_id} sysfs path not found"))?;
 
@@ -711,13 +695,9 @@ fn apply_intel_tuning(
 
     match change {
         TuningChange::PowerLimit(watts) => {
-            let hwmon_path =
-                hwmon.ok_or_else(|| anyhow!("No hwmon path for {device_id}"))?;
+            let hwmon_path = hwmon.ok_or_else(|| anyhow!("No hwmon path for {device_id}"))?;
             let microwatts = (*watts * 1_000_000.0) as u64;
-            write_sysfs(
-                &hwmon_path.join("power1_cap"),
-                &microwatts.to_string(),
-            )?;
+            write_sysfs(&hwmon_path.join("power1_cap"), &microwatts.to_string())?;
             Ok(format!("{device_id}: Power limit set to {watts:.0}W"))
         }
         TuningChange::PerfLevel(level) => {
@@ -748,11 +728,15 @@ fn apply_intel_tuning(
                 }
                 PerfLevel::Low => {
                     write_sysfs(Path::new(&profile_path), "power_saving")?;
-                    Ok(format!("{device_id}: Performance profile set to power_saving"))
+                    Ok(format!(
+                        "{device_id}: Performance profile set to power_saving"
+                    ))
                 }
                 PerfLevel::High => {
                     write_sysfs(Path::new(&profile_path), "base")?;
-                    Ok(format!("{device_id}: Performance profile set to base (max performance)"))
+                    Ok(format!(
+                        "{device_id}: Performance profile set to base (max performance)"
+                    ))
                 }
                 _ => Err(anyhow!(
                     "Intel GPUs support Auto, Low (power_saving), and High (base) profiles"
@@ -763,14 +747,8 @@ fn apply_intel_tuning(
             ClockSetting::Fixed(mhz) => {
                 // Lock clock by setting min = max = target
                 let mhz_str = mhz.to_string();
-                write_sysfs(
-                    Path::new(&format!("{}/min_freq", freq_base)),
-                    &mhz_str,
-                )?;
-                write_sysfs(
-                    Path::new(&format!("{}/max_freq", freq_base)),
-                    &mhz_str,
-                )?;
+                write_sysfs(Path::new(&format!("{}/min_freq", freq_base)), &mhz_str)?;
+                write_sysfs(Path::new(&format!("{}/max_freq", freq_base)), &mhz_str)?;
                 Ok(format!("{device_id}: Core clock locked to {mhz} MHz"))
             }
             ClockSetting::Default => {
@@ -787,21 +765,21 @@ fn apply_intel_tuning(
                     Path::new(&format!("{}/max_freq", freq_base)),
                     &rp0.to_string(),
                 )?;
-                Ok(format!("{device_id}: Core clock reset to default ({rpn}–{rp0} MHz)"))
+                Ok(format!(
+                    "{device_id}: Core clock reset to default ({rpn}–{rp0} MHz)"
+                ))
             }
-            ClockSetting::DpmLevel(_) => {
-                Err(anyhow!("Intel GPUs don't use DPM levels — use Fixed clock instead"))
-            }
-            ClockSetting::Offset(_) => {
-                Err(anyhow!("Intel GPUs don't support clock offsets — use Fixed clock instead"))
-            }
+            ClockSetting::DpmLevel(_) => Err(anyhow!(
+                "Intel GPUs don't use DPM levels — use Fixed clock instead"
+            )),
+            ClockSetting::Offset(_) => Err(anyhow!(
+                "Intel GPUs don't support clock offsets — use Fixed clock instead"
+            )),
         },
-        TuningChange::MemClock(_) => {
-            Err(anyhow!("Intel GPU memory clock is not user-adjustable"))
-        }
-        TuningChange::FanSpeed(_) => {
-            Err(anyhow!("Intel GPU fan speed is not user-adjustable (read-only sensor)"))
-        }
+        TuningChange::MemClock(_) => Err(anyhow!("Intel GPU memory clock is not user-adjustable")),
+        TuningChange::FanSpeed(_) => Err(anyhow!(
+            "Intel GPU fan speed is not user-adjustable (read-only sensor)"
+        )),
         TuningChange::ResetAll => {
             // Reset power to default
             if let Some(hwmon_path) = hwmon {
@@ -809,10 +787,7 @@ fn apply_intel_tuning(
                     .ok()
                     .and_then(|s| s.trim().parse::<u64>().ok())
                 {
-                    let _ = write_sysfs(
-                        &hwmon_path.join("power1_cap"),
-                        &default_uw.to_string(),
-                    );
+                    let _ = write_sysfs(&hwmon_path.join("power1_cap"), &default_uw.to_string());
                 }
             }
             // Reset clock range to hardware defaults
@@ -831,10 +806,7 @@ fn apply_intel_tuning(
                 );
             }
             // Reset power profile
-            let _ = write_sysfs(
-                Path::new(&format!("{}/power_profile", freq_base)),
-                "base",
-            );
+            let _ = write_sysfs(Path::new(&format!("{}/power_profile", freq_base)), "base");
             Ok(format!("{device_id}: All tuning reset to defaults"))
         }
     }
@@ -850,10 +822,18 @@ pub fn apply_full_state(
     let mut results = Vec::new();
 
     if let Some(watts) = ts.power_limit_watts {
-        results.push(apply_tuning(device_id, &TuningChange::PowerLimit(watts), hardware));
+        results.push(apply_tuning(
+            device_id,
+            &TuningChange::PowerLimit(watts),
+            hardware,
+        ));
     }
     if let Some(level) = ts.perf_level {
-        results.push(apply_tuning(device_id, &TuningChange::PerfLevel(level), hardware));
+        results.push(apply_tuning(
+            device_id,
+            &TuningChange::PerfLevel(level),
+            hardware,
+        ));
     }
     if ts.core_clock != ClockSetting::Default {
         results.push(apply_tuning(
@@ -892,4 +872,3 @@ fn write_sysfs(path: &Path, value: &str) -> Result<()> {
     fs::write(path, value)
         .with_context(|| format!("Failed to write '{}' to {}", value, path.display()))
 }
-
