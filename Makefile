@@ -9,6 +9,7 @@
 #   make all          Build everything
 #   make clean        Remove dist/ outputs
 #   make distclean    Remove dist/ and prune Docker build cache
+#   make e2e          Run end-to-end tests in Docker
 #   make help         Show this help
 #
 # Override versions:
@@ -21,6 +22,7 @@ RUST_VERSION  ?= 1.93.0
 CUDA_VERSION  ?= 12.8.0
 ROCM_IMAGE    ?= rocm/dev-ubuntu-22.04:6.4
 UBUNTU_VERSION ?= 22.04
+FOUNDRY_VERSION ?= v1.3.5
 
 PROGRESS ?= auto
 
@@ -29,9 +31,10 @@ DOCKER_BUILD = docker build -f Dockerfile.build \
 	--build-arg RUST_VERSION=$(RUST_VERSION) \
 	--build-arg CUDA_VERSION=$(CUDA_VERSION) \
 	--build-arg ROCM_IMAGE=$(ROCM_IMAGE) \
-	--build-arg UBUNTU_VERSION=$(UBUNTU_VERSION)
+	--build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
+	--build-arg FOUNDRY_VERSION=$(FOUNDRY_VERSION)
 
-.PHONY: all cli cli-windows cuda rocm intel sp1 openvm clean distclean help test test-integration
+.PHONY: all cli cli-windows cuda rocm intel sp1 openvm clean distclean help test test-integration e2e
 
 all: cli cuda rocm sp1 openvm
 
@@ -74,6 +77,12 @@ test:
 test-integration:
 	cargo test -p zkminer-prover --features testing --test worker_lifecycle
 
+# End-to-end tests, run inside the `e2e` Docker stage.
+# Extra cargo test args: make e2e E2E_ARGS="smoke"
+e2e:
+	$(DOCKER_BUILD) --target e2e -t zkminer-e2e .
+	docker run --rm -e ZKMINER_E2E_KEEP zkminer-e2e $(if $(E2E_ARGS),cargo test -p zkminer-e2e $(E2E_ARGS))
+
 clean:
 	rm -rf dist/
 
@@ -93,6 +102,7 @@ help:
 	@echo "  all      - Build all binaries"
 	@echo "  test     - Run all tests (unit + integration)"
 	@echo "  test-integration - Run worker lifecycle integration tests only"
+	@echo "  e2e      - Run end-to-end tests in Docker (E2E_ARGS=... to filter)"
 	@echo "  clean    - Remove dist/ directory"
 	@echo "  distclean - Remove dist/ and prune Docker build cache"
 	@echo ""

@@ -1,6 +1,7 @@
 //! Mock worker binary for integration tests.
 //!
-//! Speaks the worker IPC protocol (Hello/HelloAck handshake, Benchmark, Prove)
+//! Speaks the worker IPC protocol (Hello/HelloAck handshake, Benchmark, Prove,
+//! CalibrateSegmentLimit)
 //! and can be configured via environment variables:
 //!
 //! - `MOCK_HANG_ON`: `"benchmark"`, `"prove"`, or `"both"` — hangs (sleeps forever)
@@ -93,6 +94,17 @@ fn main() {
 
             WorkerCommand::Cancel { request_id } => {
                 let resp = WorkerResponse::Cancelled { request_id };
+                write_message(&mut stdout, &resp).unwrap();
+            }
+
+            WorkerCommand::CalibrateSegmentLimit { request_id, po2 } => {
+                let resp = WorkerResponse::CalibrationResult {
+                    request_id,
+                    po2,
+                    segment_count: 1,
+                    total_cycles: 1000,
+                    prove_duration_secs: 0.01,
+                };
                 write_message(&mut stdout, &resp).unwrap();
             }
 

@@ -12,6 +12,7 @@ ARG RUST_VERSION=1.93.0
 ARG CUDA_VERSION=12.8.0
 ARG ROCM_IMAGE=rocm/dev-ubuntu-22.04:6.4
 ARG UBUNTU_VERSION=22.04
+ARG FOUNDRY_VERSION=v1.3.5
 
 # ===========================================================================
 # Stage: rust-base — Ubuntu 22.04 + Rust toolchain
@@ -49,6 +50,35 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     --mount=type=cache,id=target-cli,target=/build/target \
     cargo build --release -p zkminer-cli --bin zkminer \
     && cp target/release/zkminer /zkminer
+
+# ===========================================================================
+# Stage: e2e — end-to-end tests that drive the built zkminer binary
+#
+#   make e2e
+#
+# Builds zkminer + mock-worker and the test binaries into the image; the tests
+# run at `docker run` time. No cache mounts: `cargo test` at run time needs the
+# registry sources and target/ that the build steps produced.
+# ===========================================================================
+FROM rust-base AS e2e
+ARG FOUNDRY_VERSION
+
+# anvil, for the local-chain fixture
+ENV FOUNDRY_DIR=/usr/local/foundry \
+    PATH="/usr/local/foundry/bin:${PATH}"
+RUN curl -L https://foundry.paradigm.xyz | bash \
+    && foundryup --install ${FOUNDRY_VERSION} \
+    && anvil --version
+
+COPY . .
+
+# Separate builds so the `testing` feature isn't unified into `zkminer`.
+RUN cargo build -p zkminer-cli --bin zkminer \
+    && cargo build -p zkminer-prover --features testing --bin mock-worker \
+    && cargo test -p zkminer-e2e --no-run
+
+ENV ZKMINER_E2E_BIN_DIR=/build/target/debug
+CMD ["cargo", "test", "-p", "zkminer-e2e"]
 
 # ===========================================================================
 # Stage: build-cli-windows — Windows CLI via cargo-xwin cross-compilation
