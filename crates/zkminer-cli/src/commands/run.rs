@@ -379,6 +379,9 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         tracing::info!("Connected subprocess workers: {}", connected.join(", "));
     }
     init_worker_pool(pool);
+    // SP1's one-time setup, in the background: SP1 jobs are not claimed until it is done (see the
+    // pre-claim gate), and everything else proceeds meanwhile.
+    spawn_sp1_warmup();
 
     // Hardware probe — runs on a blocking thread to avoid freezing the system.
     // NVML init + device queries + sysfs reads can take seconds on idle GPUs.
@@ -1905,6 +1908,56 @@ impl FiniteOr for f64 {
 /// Subsequently loops, invoking the full profitability evaluator to decide
 /// whether to claim any newly-seen open jobs.
 #[allow(clippy::too_many_arguments)]
+/// Seconds of a proof's watchdog budget that do not scale with its cycles. SP1's proof ends in a
+/// Groth16 wrap that costs the same for any job, ~25-50 s on its own, and with hemilabs `sp1` from
+/// v6.8.1 it can also wait for the host-wide final-wrap slot while another card's wrap holds it. A
+/// small job sat at the 90 s floor, which those alone could use up.
+fn fixed_proving_allowance_secs(backend: &str) -> u64 {
+    if backend == zkminer_prover_protocol::BACKEND_SP1 {
+        120
+    } else {
+        0
+    }
+}
+
+/// Warms SP1 up in the background until it succeeds (see `WorkerPool::warm_up`): installs its
+/// Groth16 circuit artifacts and, where its server supports it, builds the stripped circuit, before
+/// its first proof rather than inside it. A failure (a network error, the host short of memory just
+/// then) is retried, more patiently each time.
+fn spawn_sp1_warmup() {
+    use zkminer_prover_protocol::BACKEND_SP1;
+    let Some(pool) = zkminer_prover::engine::worker_pool() else {
+        return;
+    };
+    if !pool.has_slots(BACKEND_SP1) || pool.backend_warmed(BACKEND_SP1) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("sp1-warmup".into())
+        .spawn(move || {
+            let mut delay = Duration::from_secs(60);
+            loop {
+                match pool.warm_up(BACKEND_SP1, zkminer_prover::dispatcher::WARMUP_TIMEOUT) {
+                    Ok(summary) => {
+                        tracing::info!("SP1 is ready: {summary}");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                        "SP1's one-time setup failed, so SP1 jobs are not claimed yet; retrying in \
+                         {delay:?}: {e:#}"
+                    );
+                        std::thread::sleep(delay);
+                        delay = (delay * 2).min(Duration::from_secs(15 * 60));
+                    }
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::error!("could not start SP1's warm-up ({e}); SP1 jobs will not be claimed");
+    }
+}
+
 async fn miner_brain(
     client: ChainClient,
     state: zkminer_tui::state::SharedState,
@@ -2856,6 +2909,23 @@ async fn miner_brain(
                     // 21 GiB free, and report "the box cannot fit it right now" about a proof that
                     // never runs. The `available` gate below states the same no-op-in-demo rule for
                     // itself; this one sat above it and silently did not honour it.
+                    // Not before the backend's one-time setup is done. SP1's first proof would
+                    // otherwise download ~8 GB of circuit artifacts inside its 90 s watchdog, be
+                    // killed mid-way, and leave an install that fails every later proof. See
+                    // `spawn_sp1_warmup`.
+                    if !sim_mode {
+                        if let Some(pool) = zkminer_prover::engine::worker_pool() {
+                            if !pool.backend_warmed(backend) {
+                                if memory_skips_this_tick.insert(format!("{backend}:warmup")) {
+                                    tracing::debug!(
+                                        "Not claiming {backend} jobs until its one-time setup is \
+                                         done"
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     if !sim_mode {
                         if let Some(pool) = zkminer_prover::engine::worker_pool() {
                             let want = pool.expected_host_peak(backend);
@@ -4244,8 +4314,10 @@ async fn process_job_lifecycle(
         const MIN_PROVING_TIMEOUT_SECS: u64 = 90;
         let cap = proving_timeout.as_secs();
         if snapshot.expected_cycles > 0 {
-            let est = snapshot.expected_cycles / CONSERVATIVE_CPS * TIMEOUT_MARGIN;
-            Duration::from_secs(est.clamp(MIN_PROVING_TIMEOUT_SECS.min(cap), cap))
+            let fixed = fixed_proving_allowance_secs(backend);
+            let est = (snapshot.expected_cycles / CONSERVATIVE_CPS * TIMEOUT_MARGIN)
+                .saturating_add(fixed);
+            Duration::from_secs(est.clamp((MIN_PROVING_TIMEOUT_SECS + fixed).min(cap), cap))
         } else {
             proving_timeout
         }

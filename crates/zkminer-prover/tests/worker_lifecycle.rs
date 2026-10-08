@@ -426,3 +426,59 @@ fn a_closed_pool_never_respawns() {
     assert_eq!(pool.test_has_handle("mock:a"), Some(false));
     assert_eq!(pool.test_pid("mock:a"), Some(0));
 }
+
+// ---- Warm-up ----
+
+/// A backend's one-time setup answers, and is reported back.
+#[test]
+fn warmup_reports_what_was_done() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    let summary = pool.warm_up("mock", Duration::from_secs(10)).unwrap();
+    assert_eq!(summary, "nothing to warm up");
+    assert!(pool.backend_warmed("mock"));
+    assert!(pool
+        .warm_up("nonexistent", Duration::from_secs(10))
+        .is_err());
+}
+
+/// A warm-up that hangs (a download that stalls) is killed at its deadline, like a benchmark: the
+/// slot is cleared for a respawn and the kill is not counted as a crash.
+#[test]
+fn a_hung_warmup_is_killed_at_its_deadline() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker(
+        "mock:generic",
+        "mock",
+        mock_worker_path(),
+        mock_env("warmup", ""),
+    )
+    .expect("failed to spawn mock worker");
+    let started = std::time::Instant::now();
+    assert!(pool.warm_up("mock", Duration::from_secs(2)).is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(pool.test_has_handle("mock:generic"), Some(false));
+    assert_eq!(pool.test_pid("mock:generic"), Some(0));
+    assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
+}
+
+/// A worker that dies during its warm-up is an error, counted as a failure.
+#[test]
+fn a_warmup_crash_is_an_error() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker(
+        "mock:generic",
+        "mock",
+        mock_worker_path(),
+        mock_env("", "warmup"),
+    )
+    .expect("failed to spawn mock worker");
+    assert!(pool.warm_up("mock", Duration::from_secs(10)).is_err());
+    assert_eq!(pool.test_has_handle("mock:generic"), Some(false));
+    assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(1));
+}

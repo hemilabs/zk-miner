@@ -124,7 +124,8 @@ jobs:
           missing=0
           for f in zkminer zkminer.exe \
                    zkminer-prove-risc0-cuda \
-                   zkminer-prove-risc0-rocm zkminer-prove-sp1 zkminer-prove-openvm; do
+                   zkminer-prove-risc0-rocm zkminer-prove-sp1 sp1-gpu-server \
+                   zkminer-prove-openvm; do
             if [ ! -s "$f" ]; then echo "::error::missing release asset: $f"; missing=1; fi
           done
           [ "$missing" -eq 0 ] || exit 1
@@ -157,7 +158,8 @@ jobs:
           | `zkminer` | the miner CLI - start here |
           | `zkminer-prove-risc0-cuda` | RISC Zero prover, NVIDIA |
           | `zkminer-prove-risc0-rocm` | RISC Zero prover, AMD |
-          | `zkminer-prove-sp1` | SP1 prover (NVIDIA; also needs `sp1-gpu-server`) |
+          | `zkminer-prove-sp1` | SP1 prover (NVIDIA) |
+          | `sp1-gpu-server` | the GPU server `zkminer-prove-sp1` drives, built from the pinned hemilabs/sp1; keep it beside `zkminer-prove-sp1`, which installs it into `~/.sp1/bin` |
           | `zkminer-prove-openvm` | OpenVM prover |
 
           ### Windows (x86-64)
@@ -167,8 +169,8 @@ jobs:
 
           Verify with `sha256sum -c SHA256SUMS`.
 
-          On Linux, put the prover binaries in `~/.zkminer/provers/` and `chmod +x`
-          them; the CLI discovers them there.
+          On Linux, put the prover binaries (and `sp1-gpu-server`) in
+          `~/.zkminer/provers/` and `chmod +x` them; the CLI discovers them there.
 
           The native Windows CUDA prover is not included - see the release workflow
           for why.

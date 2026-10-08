@@ -130,6 +130,16 @@ fn run_worker_loop() -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
+            WorkerCommand::Warmup { request_id } => {
+                // Nothing to set up before a first proof.
+                let resp = WorkerResponse::WarmupDone {
+                    request_id,
+                    summary: "nothing to warm up".to_string(),
+                    groth16_helper: false,
+                };
+                write_message(&mut stdout, &resp)?;
+            }
+
             WorkerCommand::Shutdown => {
                 tracing::info!("Shutdown requested, exiting");
                 break;

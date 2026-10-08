@@ -51,6 +51,10 @@ dist/zkminer-prove-sp1: FORCE
 	$(DOCKER_BUILD) --target dist-sp1 --output type=local,dest=dist/ .
 	cd dist && sha256sum zkminer-prove-sp1 > zkminer-prove-sp1.sha256
 
+dist/sp1-gpu-server: FORCE
+	$(DOCKER_BUILD) --target dist-sp1-server --output type=local,dest=dist/ .
+	cd dist && sha256sum sp1-gpu-server > sp1-gpu-server.sha256
+
 dist/zkminer-prove-openvm: FORCE
 	$(DOCKER_BUILD) --target dist-openvm --output type=local,dest=dist/ .
 	cd dist && sha256sum zkminer-prove-openvm > zkminer-prove-openvm.sha256
@@ -64,7 +68,7 @@ cli-windows: dist/zkminer.exe
 cuda: dist/zkminer-prove-risc0-cuda
 rocm: dist/zkminer-prove-risc0-rocm
 # intel: dist/zkminer-prove-risc0-intel  # uncomment when sppark SYCL port is ready
-sp1: dist/zkminer-prove-sp1
+sp1: dist/zkminer-prove-sp1 dist/sp1-gpu-server
 openvm: dist/zkminer-prove-openvm
 
 test:
@@ -88,7 +92,7 @@ help:
 	@echo "  cuda     - RISC Zero CUDA prover (~2h build)"
 	@echo "  rocm     - RISC Zero ROCm prover (~7h build)"
 	@echo "  intel    - Intel GPU prover (placeholder, pending sppark SYCL port)"
-	@echo "  sp1      - SP1 prover"
+	@echo "  sp1      - SP1 prover, and the sp1-gpu-server it ships with"
 	@echo "  openvm   - OpenVM prover"
 	@echo "  all      - Build all binaries"
 	@echo "  test     - Run all tests (unit + integration)"

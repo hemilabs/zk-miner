@@ -7,7 +7,7 @@
 //! When dispatching by logical backend (e.g. `"risc0"`), all matching slots are considered
 //! and available workers are selected via round-robin.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1307,6 +1307,17 @@ struct OwnSlot {
     live: Option<Option<u64>>,
 }
 
+/// Where SP1's server keeps its host-wide final-wrap queue; see `gpu_env`.
+const SP1_QUEUE_DIR_ENV: &str = "SP1_GROTH16_QUEUE_DIR";
+
+/// How long SP1's warm-up may take: the circuit artifacts are ~8 GB to download.
+pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// `~/.zkminer/locks`: on disk, owned by the miner, and the same for every worker it starts.
+fn sp1_queue_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".zkminer").join("locks"))
+}
+
 /// Pool of worker processes, keyed by compound slot key.
 pub struct WorkerPool {
     /// What a proof on each backend is expected to peak at in host memory, in bytes.
@@ -1318,6 +1329,11 @@ pub struct WorkerPool {
     expected_peaks: Mutex<HashMap<String, u64>>,
     /// Host memory in-flight proofs have laid claim to. See `memory::MemoryLedger`.
     memory_ledger: crate::memory::MemoryLedger,
+    /// Backends whose one-time setup has completed on this host; see `warm_up`.
+    warmed: Mutex<HashSet<String>>,
+    /// Whether SP1's server proves Groth16 in a helper process, as its warm-up reported. A peak read
+    /// from live processes must then add the helper's; see `host_peak_for_slot`.
+    sp1_groth16_helper: AtomicBool,
     workers: HashMap<String, WorkerEntry>,
     explicit_binaries: HashMap<String, PathBuf>,
     search_dirs: Vec<PathBuf>,
@@ -1355,6 +1371,8 @@ impl WorkerPool {
         Self {
             expected_peaks: Mutex::new(HashMap::new()),
             memory_ledger: crate::memory::MemoryLedger::default(),
+            warmed: Mutex::new(HashSet::new()),
+            sp1_groth16_helper: AtomicBool::new(false),
             workers: HashMap::new(),
             explicit_binaries,
             search_dirs,
@@ -1439,6 +1457,16 @@ impl WorkerPool {
                                 zkminer_prover_protocol::types::HOST_MEM_BUDGET_ENV.into(),
                                 budget.to_string(),
                             );
+                        }
+                        // One host-wide queue for every SP1 server's final wrap (hemilabs `sp1`
+                        // from v6.8.1), in a directory that is the same for all of them. Its own
+                        // default is chosen per process, and lives in `/dev/shm` where `/run/lock`
+                        // is not writable, which logind empties at logout. Ignored by older servers;
+                        // an operator's own setting, inherited from this process, wins.
+                        if std::env::var_os(SP1_QUEUE_DIR_ENV).is_none() {
+                            if let Some(dir) = sp1_queue_dir() {
+                                env.insert(SP1_QUEUE_DIR_ENV.into(), dir.display().to_string());
+                            }
                         }
                     } else {
                         env.insert("CUDA_VISIBLE_DEVICES".into(), i.to_string());
@@ -1970,7 +1998,148 @@ impl WorkerPool {
         }
     }
 
+    /// Whether this pool has any worker slot for `backend`.
+    pub fn has_slots(&self, backend: &str) -> bool {
+        !self.keys_for_prefix(backend).is_empty()
+    }
+
+    /// Whether `backend` is ready for its first proof. SP1 must have warmed up (see `warm_up`): its
+    /// first proof would otherwise download ~8 GB of circuit artifacts inside its watchdog, and the
+    /// SDK's installer leaves a torn install that fails every later proof if that is cut short.
+    /// Other backends need nothing.
+    pub fn backend_warmed(&self, backend: &str) -> bool {
+        backend != zkminer_prover_protocol::BACKEND_SP1
+            || self
+                .warmed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(backend)
+    }
+
+    /// Runs `backend`'s one-time setup on one of its workers and records the backend as warmed:
+    /// for SP1, installing the Groth16 circuit artifacts and, where its server supports it,
+    /// building the stripped circuit. Takes a host-memory reservation for it, and kills the worker
+    /// if it runs past `timeout`. Returns what was done.
+    pub fn warm_up(&self, backend: &str, timeout: Duration) -> Result<String> {
+        let mut keys = self.keys_for_prefix(backend);
+        keys.sort();
+        let key = keys
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no {backend} worker to warm up"))?;
+        let summary = self.warm_up_slot(key, timeout)?;
+        self.warmed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(backend.to_string());
+        Ok(summary)
+    }
+
+    /// Warms `key`'s backend up first if it has not been, for a path that would otherwise do the
+    /// setup itself inside its own watchdog (a benchmark proves Groth16 too).
+    fn ensure_warmed(&self, key: &str) -> Result<()> {
+        let backend = key.split(':').next().unwrap_or(key);
+        if self.backend_warmed(backend) {
+            return Ok(());
+        }
+        let summary = self.warm_up_slot(key, WARMUP_TIMEOUT)?;
+        self.warmed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(backend.to_string());
+        tracing::info!("{key} warmed up: {summary}");
+        Ok(())
+    }
+
+    fn warm_up_slot(&self, key: &str, timeout: Duration) -> Result<String> {
+        let backend = key.split(':').next().unwrap_or(key);
+        let entry = self
+            .workers
+            .get(key)
+            .ok_or_else(|| anyhow::anyhow!("No worker registered for '{key}'"))?;
+        let mut slot = entry.slot.lock().unwrap_or_else(|e| {
+            tracing::warn!(
+                "worker slot {key} was poisoned by an earlier panic; recovering it rather                      than retiring the slot"
+            );
+            e.into_inner()
+        });
+
+        // Building SP1's stripped circuit reads the full one, as much host memory as a proof's
+        // wrap, so it is charged like one. No GPU work: no per-card guard or VRAM budget.
+        let _memory_reservation = if backend == zkminer_prover_protocol::BACKEND_SP1 {
+            let total = crate::memory::mem_total_bytes().unwrap_or(u64::MAX);
+            let want = crate::memory::SP1_WARMUP_PEAK_BYTES
+                .min(crate::memory::max_admissible_budget(total));
+            match self.reserve_host_memory(want, key) {
+                Some(r) => Some(r),
+                None => {
+                    return Err(anyhow::Error::new(
+                        zkminer_prover_protocol::types::HostMemoryShortage {
+                            attempted: false,
+                            slot_key: key.to_string(),
+                            needed: want,
+                            reserved: self.reserved_host_memory(),
+                            available: crate::memory::mem_available_bytes().unwrap_or(0),
+                        },
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        self.ensure_alive(&mut slot, entry)?;
+        if let Some(h) = slot.handle.as_ref() {
+            entry.publish_pid(h.pid());
+        }
+        self.bail_if_closing(&mut slot, entry, key)?;
+        entry.intentional_kill.store(false, Ordering::Release);
+        let handle = slot
+            .handle
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Worker not available for {key}"))?;
+
+        static WARMUP_REQUEST: AtomicU64 = AtomicU64::new(1);
+        let request_id = WARMUP_REQUEST.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = handle.send(&WorkerCommand::Warmup { request_id }) {
+            Self::mark_slot_failed(&mut slot, entry);
+            return Err(e);
+        }
+        let _watchdog = ProvingWatchdog::new(
+            entry.pid.clone(),
+            entry.pid_starttime.clone(),
+            timeout,
+            key.to_string(),
+            entry.intentional_kill.clone(),
+        );
+        let response = handle.recv();
+        if response.is_err() {
+            if entry.intentional_kill.load(Ordering::Acquire) {
+                Self::mark_slot_dead(&mut slot, entry);
+            } else {
+                Self::mark_slot_failed(&mut slot, entry);
+            }
+        }
+        match response? {
+            WorkerResponse::WarmupDone {
+                summary,
+                groth16_helper,
+                ..
+            } => {
+                if backend == zkminer_prover_protocol::BACKEND_SP1 {
+                    self.sp1_groth16_helper
+                        .store(groth16_helper, Ordering::Release);
+                }
+                Ok(summary)
+            }
+            WorkerResponse::Error { message, .. } => bail!("warm-up of {key} failed: {message}"),
+            other => bail!("Unexpected response from {key} to Warmup: {other:?}"),
+        }
+    }
+
     fn benchmark_slot(&self, key: &str) -> Result<Vec<BenchmarkEntry>> {
+        // A benchmark proves Groth16 on SP1: set it up first, outside this benchmark's watchdog.
+        self.ensure_warmed(key)?;
+
         // The per-card guard, like every other path that puts work on a GPU. Without it, a benchmark
         // started from the TUI's `[b]` or from `zkminer benchmark` ran concurrently with a proof on
         // the SAME physical card, each side's VRAM invisible to the other — the double-booking the
@@ -2351,6 +2520,8 @@ impl WorkerPool {
         key: &str,
         on_progress: &dyn Fn(BenchmarkProgressEvent),
     ) -> Result<Vec<BenchmarkEntry>> {
+        // A benchmark proves Groth16 on SP1: set it up first, outside this benchmark's watchdog.
+        self.ensure_warmed(key)?;
         // The per-card guard, like every other path that puts work on a GPU. Without it, a benchmark
         // started from the TUI's `[b]` or from `zkminer benchmark` ran concurrently with a proof on
         // the SAME physical card, each side's VRAM invisible to the other — the double-booking the
@@ -3554,7 +3725,16 @@ impl WorkerPool {
         // the SP1 SDK forks `sp1-gpu-server` into our group, and it is the grandchild that holds the
         // memory. Less accurate than the cgroup counter — high-water marks do not necessarily
         // coincide, so the sum can overstate — and overstating is the safe direction.
-        crate::memory::process_group_peak_bytes(std::path::Path::new("/proc"), pid as i32)
+        let live =
+            crate::memory::process_group_peak_bytes(std::path::Path::new("/proc"), pid as i32)?;
+        // Except for a process that has already exited, whose high-water mark went with it: SP1's
+        // Groth16 helper, where its server runs one (see `warm_up`). Its typical peak stands in.
+        if backend == zkminer_prover_protocol::BACKEND_SP1
+            && self.sp1_groth16_helper.load(Ordering::Acquire)
+        {
+            return Some(live.saturating_add(crate::memory::SP1_GROTH16_HELPER_PEAK_BYTES));
+        }
+        Some(live)
     }
 
     /// Canonical PCI bus id of the card behind a slot key, if it is a GPU slot.
@@ -5472,6 +5652,17 @@ mod tests {
         let env = WorkerPool::gpu_env("risc0", "intel", None, Some(1));
         assert_eq!(env.get("ZE_AFFINITY_MASK").unwrap(), "1");
         assert!(env.get("ONEAPI_DEVICE_SELECTOR").is_none());
+    }
+
+    /// SP1 waits for its one-time setup before its first proof; nothing else has one.
+    #[test]
+    fn only_sp1_waits_for_its_warm_up() {
+        let pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+        assert!(!pool.backend_warmed("sp1"));
+        assert!(pool.backend_warmed("risc0") && pool.backend_warmed("openvm"));
+        pool.warmed.lock().unwrap().insert("sp1".to_string());
+        assert!(pool.backend_warmed("sp1"));
+        assert!(!pool.has_slots("sp1"));
     }
 
     /// EVERY path that puts work on a card must take the per-card guard, and the guard must be taken

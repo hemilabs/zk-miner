@@ -29,6 +29,9 @@ use zkminer_prover_protocol::{
     BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, PROTOCOL_VERSION,
 };
 
+mod bundled_server;
+mod warmup;
+
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // SP1 ELFs are embedded via include_bytes! using env vars set by sp1_build::build_program.
@@ -96,6 +99,10 @@ fn main() {
     // Direct benchmark mode: run benchmarks and print results to stderr (stdout is redirected)
     // Before constructing any CudaProver: never adopt a server whose owner is gone.
     reap_orphaned_gpu_servers(our_cuda_device);
+
+    // Then put the server this release ships in the place the SDK runs it from, before anything
+    // runs it: `sp1_usability` probes it, and the SDK would otherwise download upstream's.
+    bundled_server::install_bundled_server();
 
     // Then make a CUDA 12 runtime reachable if the host has one anywhere, so the
     // installed toolkit version stops mattering. Must run BEFORE sp1_usability, which
@@ -1167,6 +1174,30 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
+            WorkerCommand::Warmup { request_id } => {
+                // Outside any proof's watchdog: the artifact download alone can take minutes.
+                tracing::info!("warming up: Groth16 circuit artifacts and helper setup");
+                let resp = match warmup::warm_up() {
+                    Ok(report) => {
+                        tracing::info!("warm-up done: {}", report.summary);
+                        WorkerResponse::WarmupDone {
+                            request_id,
+                            summary: report.summary,
+                            groth16_helper: report.groth16_helper,
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("warm-up failed: {e:#}");
+                        WorkerResponse::Error {
+                            request_id,
+                            kind: ErrorKind::Internal,
+                            message: format!("sp1 warm-up failed: {e:#}"),
+                        }
+                    }
+                };
+                write_message(&mut stdout, &resp)?;
+            }
+
             WorkerCommand::Shutdown => {
                 tracing::info!("Shutdown requested, exiting");
                 break;
@@ -2011,6 +2042,24 @@ mod threshold_tests {
             "the element threshold is settled AFTER the `scale >= 1.0` early return, so a host with \
              plenty of RAM skips the free-VRAM cap entirely and an occupied card sizes itself for a \
              tier that does not fit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    /// The SP1 sizing mirror in `zkminer_prover_protocol::types` (the fork's shard tiers and its
+    /// 402,653,184-element default) was measured against the pinned hemilabs `sp1`, whose circuit is
+    /// v6.0.0. Moving the pin must revisit it: v6.8.1's circuit is v6.1.0, and its tiers differ (a
+    /// 24 GB card defaults to 285,212,672 elements, and its Groth16 runs in a helper process with a
+    /// host-wide queue, which `warmup` and the dispatcher already handle).
+    #[test]
+    fn the_sizing_mirror_was_measured_for_the_pinned_sp1() {
+        assert_eq!(
+            sp1_sdk::SP1_CIRCUIT_VERSION,
+            "v6.0.0",
+            "the SP1 pin moved: re-measure and update the sizing mirror in \
+             zkminer_prover_protocol::types, then update this test"
         );
     }
 }

@@ -38,7 +38,8 @@ jobs:
     # zkminer-prove-risc0 depends only on zkminer-prover-protocol, a compile
     # error in zkminer-cli, -chain, -tui, -strategy or -prover passed CI green.
     name: ${{ matrix.target }}
-    timeout-minutes: 120
+    # sp1-gpu-server compiles SP1's CUDA kernels on top of the whole prover.
+    timeout-minutes: ${{ matrix.timeout || 120 }}
     strategy:
       # Build every target even after one fails — otherwise the first failure
       # hides the state of the other five.
@@ -55,6 +56,9 @@ jobs:
             binary: zkminer-prove-risc0-cuda
           - target: dist-sp1
             binary: zkminer-prove-sp1
+          - target: dist-sp1-server
+            binary: sp1-gpu-server
+            timeout: 300
           - target: dist-rocm
             binary: zkminer-prove-risc0-rocm
 

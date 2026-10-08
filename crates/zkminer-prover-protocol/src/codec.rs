@@ -147,6 +147,38 @@ mod tests {
         assert!(PROTOCOL_VERSION >= 4);
     }
 
+    /// v5 added `Warmup` / `WarmupDone`, appended so no older variant's index moved.
+    #[test]
+    fn warmup_round_trips() {
+        let mut buf = Vec::new();
+        write_message(&mut buf, &WorkerCommand::Warmup { request_id: 7 }).unwrap();
+        match read_message::<_, WorkerCommand>(&mut Cursor::new(buf)).unwrap() {
+            WorkerCommand::Warmup { request_id } => assert_eq!(request_id, 7),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let resp = WorkerResponse::WarmupDone {
+            request_id: 7,
+            summary: "groth16 artifacts present".to_string(),
+            groth16_helper: true,
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &resp).unwrap();
+        match read_message::<_, WorkerResponse>(&mut Cursor::new(buf)).unwrap() {
+            WorkerResponse::WarmupDone {
+                request_id,
+                summary,
+                groth16_helper,
+            } => {
+                assert_eq!(
+                    (request_id, summary.as_str(), groth16_helper),
+                    (7, "groth16 artifacts present", true)
+                );
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        const _: () = assert!(PROTOCOL_VERSION >= 5);
+    }
+
     #[test]
     fn round_trip_response() {
         let resp = WorkerResponse::HelloAck {

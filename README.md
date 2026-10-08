@@ -74,8 +74,21 @@ no error.**
 ├── zkminer-prove-risc0-cuda
 ├── zkminer-prove-risc0-rocm
 ├── zkminer-prove-sp1
+├── sp1-gpu-server
 └── zkminer-prove-openvm
 ```
+
+**SP1** needs two more things, both handled for you:
+
+- `sp1-gpu-server` ships beside `zkminer-prove-sp1`, built from the same hemilabs/sp1 commit as
+  the worker. The worker installs it as `~/.sp1/bin/sp1-gpu-server`, where the SP1 SDK runs it
+  from; without it the SDK downloads upstream's server, which lacks the fork's GPU fixes. Keep it
+  beside the real binary, not a wrapper script. `ZKMINER_SP1_SERVER_INSTALL=0` leaves
+  `~/.sp1/bin` alone, for a server you manage yourself.
+- The Groth16 circuit artifacts (~8 GB, in `~/.sp1/circuits/groth16/`) are downloaded once, when
+  the miner starts, before it claims any SP1 job; until then SP1 jobs are skipped. A download cut
+  short is detected and redone. Final Groth16 proofs on one host take turns through lock files in
+  `~/.zkminer/locks/` (hemilabs/sp1 v6.8.1 and later).
 
 If a worker needs environment the miner's own process won't have (a systemd unit or cron
 job does *not* source `~/.bashrc`), install a small wrapper script under the expected

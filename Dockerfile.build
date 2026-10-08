@@ -165,6 +165,41 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     && cp target/release/zkminer-prove-sp1 /zkminer-prove-sp1
 
 # ===========================================================================
+# Stage: build-sp1-server — sp1-gpu-server from the hemilabs/sp1 commit Cargo.lock pins
+# ===========================================================================
+# The SP1 SDK runs ~/.sp1/bin/sp1-gpu-server and, without one, downloads upstream's build, which has
+# none of the fork's GPU fixes (Blackwell faults, the 16 GB tier) and whose `--version` matches the
+# fork's, so the SDK cannot tell. The release therefore ships this one beside zkminer-prove-sp1,
+# which installs it. It is built from the exact commit Cargo.lock records for the SDK, so the two can
+# never disagree, using that commit's own Cargo.lock.
+FROM cuda-base AS build-sp1-server
+
+# gnark's Groth16/PLONK provers are linked into the server through cgo.
+ARG GO_VERSION=1.24.13
+ARG GO_SHA256=1fc94b57134d51669c72173ad5d49fd62afb0f1db9bf3f798fd98ee423f8d730
+RUN curl -fsSL -o /tmp/go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+    && echo "${GO_SHA256}  /tmp/go.tgz" | sha256sum -c - \
+    && tar -C /usr/local -xzf /tmp/go.tgz \
+    && rm /tmp/go.tgz
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+# GPU targets, as for the risc0 CUDA build above: the 4090 (sm_89) and Blackwell (sm_120). Others
+# (sm_80 A100, sm_86 3090, sm_90 H100) can be added here, at the cost of build time.
+ARG SP1_CUDA_ARCHS=89,120
+
+COPY Cargo.lock /build/Cargo.lock
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-sp1-server,target=/build/target-sp1-server \
+    REV=$(grep -o 'git+https://github.com/hemilabs/sp1?[^#"]*#[0-9a-f]\{40\}' /build/Cargo.lock | head -1 | cut -d'#' -f2) \
+    && test -n "$REV" \
+    && echo "building sp1-gpu-server at hemilabs/sp1 $REV" \
+    && CUDA_ARCHS="${SP1_CUDA_ARCHS}" CARGO_TARGET_DIR=/build/target-sp1-server \
+       cargo install --locked --root /sp1-server --git https://github.com/hemilabs/sp1 --rev "$REV" sp1-gpu-server \
+    && cp /sp1-server/bin/sp1-gpu-server /sp1-gpu-server
+
+# ===========================================================================
 # Stage: rocm-base — AMD ROCm + Rust toolchain
 # ===========================================================================
 # rocm/dev-ubuntu-22.04:6.4 — pinned 2026-03-05
@@ -293,6 +328,9 @@ COPY --from=build-cuda /zkminer-prove-risc0-cuda /zkminer-prove-risc0-cuda
 
 FROM scratch AS dist-sp1
 COPY --from=build-sp1 /zkminer-prove-sp1 /zkminer-prove-sp1
+
+FROM scratch AS dist-sp1-server
+COPY --from=build-sp1-server /sp1-gpu-server /sp1-gpu-server
 
 FROM scratch AS dist-rocm
 COPY --from=build-rocm /zkminer-prove-risc0-rocm /zkminer-prove-risc0-rocm

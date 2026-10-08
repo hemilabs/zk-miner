@@ -8684,7 +8684,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slop-air"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "p3-air 0.3.2-succinct",
 ]
@@ -8692,7 +8692,7 @@ dependencies = [
 [[package]]
 name = "slop-algebra"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "itertools 0.14.0",
  "p3-field 0.3.2-succinct",
@@ -8702,7 +8702,7 @@ dependencies = [
 [[package]]
 name = "slop-alloc"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "serde",
  "slop-algebra",
@@ -8712,7 +8712,7 @@ dependencies = [
 [[package]]
 name = "slop-baby-bear"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "lazy_static",
  "p3-baby-bear 0.3.2-succinct",
@@ -8726,7 +8726,7 @@ dependencies = [
 [[package]]
 name = "slop-basefold"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "derive-where",
  "itertools 0.14.0",
@@ -8748,7 +8748,7 @@ dependencies = [
 [[package]]
 name = "slop-basefold-prover"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "derive-where",
  "itertools 0.14.0",
@@ -8774,7 +8774,7 @@ dependencies = [
 [[package]]
 name = "slop-bn254"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "ff 0.13.1",
  "p3-bn254-fr",
@@ -8789,7 +8789,7 @@ dependencies = [
 [[package]]
 name = "slop-challenger"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "futures",
  "p3-challenger 0.3.2-succinct",
@@ -8801,7 +8801,7 @@ dependencies = [
 [[package]]
 name = "slop-commit"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "p3-commit 0.3.2-succinct",
  "serde",
@@ -8811,7 +8811,7 @@ dependencies = [
 [[package]]
 name = "slop-dft"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "p3-dft 0.3.2-succinct",
  "serde",
@@ -8824,7 +8824,7 @@ dependencies = [
 [[package]]
 name = "slop-fri"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "p3-fri 0.3.2-succinct",
 ]
@@ -8832,7 +8832,7 @@ dependencies = [
 [[package]]
 name = "slop-futures"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "crossbeam",
  "futures",
@@ -8846,7 +8846,7 @@ dependencies = [
 [[package]]
 name = "slop-jagged"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "derive-where",
  "futures",
@@ -8879,7 +8879,7 @@ dependencies = [
 [[package]]
 name = "slop-keccak-air"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "p3-keccak-air 0.3.2-succinct",
 ]
@@ -8887,7 +8887,7 @@ dependencies = [
 [[package]]
 name = "slop-koala-bear"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "lazy_static",
  "p3-koala-bear 0.3.2-succinct",
@@ -8901,7 +8901,7 @@ dependencies = [
 [[package]]
 name = "slop-matrix"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "p3-matrix 0.3.2-succinct",
 ]
@@ -8909,7 +8909,7 @@ dependencies = [
 [[package]]
 name = "slop-maybe-rayon"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "p3-maybe-rayon 0.3.2-succinct",
 ]
@@ -8917,7 +8917,7 @@ dependencies = [
 [[package]]
 name = "slop-merkle-tree"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "derive-where",
  "ff 0.13.1",
@@ -8943,7 +8943,7 @@ dependencies = [
 [[package]]
 name = "slop-multilinear"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "derive-where",
  "futures",
@@ -8963,7 +8963,7 @@ dependencies = [
 [[package]]
 name = "slop-poseidon2"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "p3-poseidon2 0.3.2-succinct",
 ]
@@ -8971,7 +8971,7 @@ dependencies = [
 [[package]]
 name = "slop-primitives"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "slop-algebra",
 ]
@@ -8979,7 +8979,7 @@ dependencies = [
 [[package]]
 name = "slop-stacked"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "derive-where",
  "futures",
@@ -9001,7 +9001,7 @@ dependencies = [
 [[package]]
 name = "slop-sumcheck"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "futures",
  "itertools 0.14.0",
@@ -9018,7 +9018,7 @@ dependencies = [
 [[package]]
 name = "slop-symmetric"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "p3-symmetric 0.3.2-succinct",
 ]
@@ -9026,7 +9026,7 @@ dependencies = [
 [[package]]
 name = "slop-tensor"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "arrayvec",
  "derive-where",
@@ -9045,7 +9045,7 @@ dependencies = [
 [[package]]
 name = "slop-uni-stark"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "p3-uni-stark",
 ]
@@ -9053,7 +9053,7 @@ dependencies = [
 [[package]]
 name = "slop-utils"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "p3-util 0.3.2-succinct",
  "tracing-forest",
@@ -9063,7 +9063,7 @@ dependencies = [
 [[package]]
 name = "slop-whir"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "derive-where",
  "futures",
@@ -9131,7 +9131,7 @@ dependencies = [
 [[package]]
 name = "sp1-build"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "anyhow",
  "cargo_metadata 0.18.1",
@@ -9144,7 +9144,7 @@ dependencies = [
 [[package]]
 name = "sp1-core-executor"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "bincode",
  "bytemuck",
@@ -9183,7 +9183,7 @@ dependencies = [
 [[package]]
 name = "sp1-core-executor-runner"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "base64",
  "bincode",
@@ -9204,7 +9204,7 @@ dependencies = [
 [[package]]
 name = "sp1-core-executor-runner-binary"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "bincode",
  "crash-handler",
@@ -9218,7 +9218,7 @@ dependencies = [
 [[package]]
 name = "sp1-core-machine"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "bincode",
  "cfg-if",
@@ -9265,7 +9265,7 @@ dependencies = [
 [[package]]
 name = "sp1-cuda"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "bincode",
  "bytes",
@@ -9285,7 +9285,7 @@ dependencies = [
 [[package]]
 name = "sp1-curves"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "cfg-if",
  "dashu",
@@ -9305,7 +9305,7 @@ dependencies = [
 [[package]]
 name = "sp1-derive"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9315,7 +9315,7 @@ dependencies = [
 [[package]]
 name = "sp1-hypercube"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "arrayref",
  "deepsize2",
@@ -9362,7 +9362,7 @@ dependencies = [
 [[package]]
 name = "sp1-jit"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "dynasmrt",
  "hashbrown 0.14.5",
@@ -9377,7 +9377,7 @@ dependencies = [
 [[package]]
 name = "sp1-primitives"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "bincode",
  "blake3",
@@ -9400,7 +9400,7 @@ dependencies = [
 [[package]]
 name = "sp1-prover"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "anyhow",
  "bincode",
@@ -9464,7 +9464,7 @@ dependencies = [
 [[package]]
 name = "sp1-prover-types"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "anyhow",
  "async-scoped",
@@ -9484,7 +9484,7 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-circuit"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "bincode",
  "itertools 0.14.0",
@@ -9523,7 +9523,7 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-compiler"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "backtrace",
  "cfg-if",
@@ -9543,7 +9543,7 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-executor"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "backtrace",
  "cfg-if",
@@ -9566,7 +9566,7 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-gnark-ffi"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "anyhow",
  "bincode",
@@ -9590,7 +9590,7 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-machine"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "itertools 0.14.0",
  "rand 0.8.5",
@@ -9612,7 +9612,7 @@ dependencies = [
 [[package]]
 name = "sp1-sdk"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9660,7 +9660,7 @@ dependencies = [
 [[package]]
 name = "sp1-verifier"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?branch=zkminer%2Fsp1-gpu-fixes#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
 dependencies = [
  "bincode",
  "blake3",

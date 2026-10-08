@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// 4: `BenchmarkEntry` gained `wrap_secs`. The codec is bincode, which is POSITIONAL — an extra field
 /// cannot be defaulted, so a v3 worker's entries do not decode as v4 and would fail mid-benchmark.
 /// Bumping the version makes `handshake` reject a stale worker at spawn with a clear message instead.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Maximum frame size: 256 MB (accommodates large risc0 composite receipts).
 pub const MAX_FRAME_SIZE: u32 = 256 * 1024 * 1024;
@@ -62,6 +62,11 @@ pub enum WorkerCommand {
     /// program (chacha-mix with small input) at the specified segment limit
     /// and reports segment count + timing.
     CalibrateSegmentLimit { request_id: u64, po2: u8 },
+    /// Do the one-time setup a backend needs before its first proof, outside any proof's
+    /// watchdog: for SP1, installing the Groth16 circuit artifacts (~8 GB downloaded) and, where
+    /// its `sp1-gpu-server` supports it, building the stripped circuit its Groth16 helper reads.
+    /// Answered with `WarmupDone`, or `Error`. A backend with nothing to set up answers at once.
+    Warmup { request_id: u64 },
 }
 
 /// Responses sent from worker to host via stdout.
@@ -137,6 +142,16 @@ pub enum WorkerResponse {
         segment_count: u32,
         total_cycles: u64,
         prove_duration_secs: f64,
+    },
+    /// Response to Warmup.
+    WarmupDone {
+        request_id: u64,
+        /// What was done, for the log.
+        summary: String,
+        /// Whether this worker's Groth16 runs in a helper process outside the worker's own
+        /// (`sp1-gpu-server --sp1-groth16-cpu-helper`), whose memory a peak read from the live
+        /// processes alone would miss once it has exited.
+        groth16_helper: bool,
     },
 }
 

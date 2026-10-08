@@ -42,6 +42,15 @@ use std::time::Duration;
 /// Too small and the cap does not prevent a freeze; too large and a legitimate proof is refused.
 pub const DEFAULT_HOST_RESERVE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 
+/// Host memory SP1's one-time warm-up (`WorkerPool::warm_up`) may use at peak: where the server
+/// runs Groth16 in a helper, building the stripped circuit reads the full one (13.9 GB measured on
+/// the v6.1.0 circuit). The artifact download alone needs little.
+pub const SP1_WARMUP_PEAK_BYTES: u64 = 15 * 1024 * 1024 * 1024;
+
+/// What SP1's Groth16 helper process peaks at (16.0 GiB measured on the v6.1.0 circuit with Go's
+/// default GC), for a peak read from live processes only, by which time the helper has exited.
+pub const SP1_GROTH16_HELPER_PEAK_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// `/proc/pressure/memory`'s `full avg10`, in percent, above which the host is genuinely stalling.
 ///
 /// This is the SYSTEM-wide PSI file, not a cgroup's `memory.pressure`. `full` means all non-idle

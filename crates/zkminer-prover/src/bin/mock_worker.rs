@@ -4,9 +4,9 @@
 //! Execute and CalibrateSegmentLimit)
 //! and can be configured via environment variables:
 //!
-//! - `MOCK_HANG_ON`: `"benchmark"`, `"prove"`, or `"both"` — hangs (sleeps forever)
+//! - `MOCK_HANG_ON`: `"benchmark"`, `"prove"`, `"both"` or `"warmup"` — hangs (sleeps forever)
 //!   on the specified command type. Unset or empty = respond normally.
-//! - `MOCK_CRASH_ON`: `"benchmark"`, `"prove"`, or `"both"` — exits immediately
+//! - `MOCK_CRASH_ON`: `"benchmark"`, `"prove"`, `"both"` or `"warmup"` — exits immediately
 //!   with code 1 on the specified command type, simulating a worker crash.
 //! - `MOCK_BACKEND`: backend name for the HelloAck response. Default: `"mock"`.
 
@@ -118,6 +118,24 @@ fn main() {
 
             WorkerCommand::Cancel { request_id } => {
                 let resp = WorkerResponse::Cancelled { request_id };
+                write_message(&mut stdout, &resp).unwrap();
+            }
+
+            WorkerCommand::Warmup { request_id } => {
+                if crash_on == "warmup" {
+                    std::process::exit(1);
+                }
+                if hang_on == "warmup" {
+                    // Hang forever — the watchdog will SIGKILL us
+                    loop {
+                        std::thread::sleep(Duration::from_secs(3600));
+                    }
+                }
+                let resp = WorkerResponse::WarmupDone {
+                    request_id,
+                    summary: "nothing to warm up".to_string(),
+                    groth16_helper: false,
+                };
                 write_message(&mut stdout, &resp).unwrap();
             }
 
