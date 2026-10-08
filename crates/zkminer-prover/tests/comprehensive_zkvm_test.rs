@@ -1133,9 +1133,10 @@ fn run_on_sp1(guest: &str, input: &[u8], timeout: Duration) -> Option<ProofOutpu
         // RELEASE the previous slot's worker before starting the next.
         //
         // SP1 now has one slot per CUDA card, so this loop proves on every card in turn — and each
-        // proof leaves an `sp1-gpu-server` resident, by design, at ~17.6 GiB of host RSS and ~10 GiB
-        // of VRAM. Walking two cards without a teardown leaves both alive, which is ~35 GiB on a
-        // 28 GiB box: this machine has already been hard-frozen that way and needed a power cycle.
+        // proof leaves an `sp1-gpu-server` resident, by design — measured on 2026-10-07 at 23.3 GB of
+        // host RSS and 15,124 MiB of VRAM. Walking two cards without a teardown leaves both alive, far
+        // more than this 28 GiB box holds: it has already been hard-frozen that way and needed a power
+        // cycle.
         // When `sp1_keys` had one element the loop could not do this; now it can.
         if i > 0 {
             pool.recycle_slot(&sp1_keys[i - 1]);

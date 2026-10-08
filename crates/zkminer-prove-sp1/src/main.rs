@@ -663,46 +663,17 @@ fn nvidia_gpu_in_proc() -> bool {
 
 /// Cap SP1's core element threshold to a value this host's memory budget can actually carry.
 ///
-/// THE lever for SP1 host memory, and the only one that was measured to work. The threshold sizes
-/// the per-worker pinned HOST buffer (`num_workers x threshold x 4 bytes`), so lowering it from
-/// the default 402,653,184 to 268,435,456 removes ~1.1 GB of non-swappable host memory per worker.
+/// Lives in `zkminer-prover-protocol` (`sp1_element_threshold_for_host_scale`, where the measurements
+/// behind it are recorded) so the dispatcher computes exactly the threshold this worker will settle on
+/// — it needs that figure to decide how much room to make for this worker on a shared card.
 ///
-/// Measured on this 28 GiB box with the 24,564 MiB RTX 4090, one Groth16 proof each:
-///
-/// | threshold | trace ring | result |
-/// |---|---|---|
-/// | 402,653,184 (default) | default | OOM-killed in the wrap at 25.0 GiB |
-/// | 402,653,184 (default) | halved | **still** OOM-killed |
-/// | 268,435,456 (`1<<28`) | default | **PASS, 55.0s** |
-/// | 134,217,728 (`1<<27`) | default | PASS, 58.0s |
-///
-/// So the ring is not the lever and the threshold is, and the larger of the two working values is
-/// also the faster one — fewer shards, less fixed per-shard overhead.
-///
-/// Only ever set to a value that has been MEASURED to complete a proof. Interpolating would be
-/// guessing about recursion shapes and per-shard overheads, so the computed figure is snapped down
-/// to the nearest known-good step rather than used directly. Raising it is impossible by
-/// construction: the server clamps anything above `ELEMENT_THRESHOLD`, because a larger value
-/// produces a recursion shape the circuit cannot accept.
-///
-/// Caveat on the timings: the test program is fibonacci(100), 5,466 cycles, so those 55-58s are
-/// almost entirely the fixed Groth16 wrap (~23s reading the R1CS, ~5s solving 15.9M constraints).
-/// The shard-count cost of a lower threshold barely registers there and WILL be larger on a real
-/// job of millions of cycles. Treat the ordering as established and the magnitude as unpriced.
+/// Caveat on the measured timings there: the test program is fibonacci(100), 5,466 cycles, so those
+/// 55-58s are almost entirely the fixed Groth16 wrap (~23s reading the R1CS, ~5s solving 15.9M
+/// constraints). The shard-count cost of a lower threshold barely registers there and WILL be larger
+/// on a real job of millions of cycles. Treat the ordering as established and the magnitude as
+/// unpriced.
 fn sp1_element_threshold_for(scale: f64) -> Option<u64> {
-    // Known-good, measured, descending.
-    const MEASURED_GOOD: &[u64] = &[268_435_456, 134_217_728];
-    const DEFAULT_THRESHOLD: f64 = 402_653_184.0;
-    if scale >= 1.0 {
-        return None;
-    }
-    let want = DEFAULT_THRESHOLD * scale;
-    MEASURED_GOOD
-        .iter()
-        .copied()
-        .find(|t| (*t as f64) <= want)
-        // Below the smallest measured step, still use the smallest rather than inventing one.
-        .or_else(|| MEASURED_GOOD.last().copied())
+    zkminer_prover_protocol::types::sp1_element_threshold_for_host_scale(scale)
 }
 
 /// Settle `SP1_GPU_ELEMENT_THRESHOLD`, the one knob measured to decide whether a proof completes
@@ -725,23 +696,30 @@ fn sp1_element_threshold_for(scale: f64) -> Option<u64> {
 /// the constant yields shapes the circuit already accepts while one above it does not.
 fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>) {
     // Never override what the operator set by hand.
-    if std::env::var("SP1_GPU_ELEMENT_THRESHOLD").is_ok() {
+    if std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_ENV).is_ok() {
         return;
     }
+    // For the log line only. The threshold itself comes from `sp1_element_threshold_cap`, the shared
+    // function whose inputs the dispatcher reads too when it predicts this worker's tier.
     let from_host = sp1_element_threshold_for(scale);
-    let from_vram = available_vram
-        .and_then(zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram);
-    let threshold = match (from_host, from_vram) {
-        (Some(h), Some(v)) => Some(h.min(v)),
-        (Some(h), None) => Some(h),
-        (None, Some(v)) => Some(v),
-        (None, None) => None,
-    };
-    let Some(threshold) = threshold else {
+    let from_vram = available_vram.map(|a| {
+        match zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(a) {
+            Some(t) => t.to_string(),
+            None => format!(
+                "{} ({} MiB free is below every measured tier; using the smallest)",
+                zkminer_prover_protocol::types::sp1_smallest_measured_threshold(),
+                a / (1024 * 1024)
+            ),
+        }
+    });
+    let Some(threshold) =
+        zkminer_prover_protocol::types::sp1_element_threshold_cap(scale, available_vram)
+    else {
         return;
     };
-    // Only say so when it actually changes something. `from_vram` returns the FULL tier for a
-    // roomy card, which is the fork's own default and worth no line in the log.
+    // Only say so when it lowers the fork's own default. With today's tables every computed value
+    // does (the largest measured tier is 268M), so this is a guard for a future table that measures
+    // the default itself, not a branch that fires now.
     const DEFAULT_THRESHOLD: u64 = 402_653_184;
     if threshold >= DEFAULT_THRESHOLD {
         return;
@@ -752,12 +730,15 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>) {
         from_host
             .map(|t| t.to_string())
             .unwrap_or_else(|| "no limit".into()),
-        from_vram
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "unknown".into()),
+        from_vram.unwrap_or_else(|| "unknown".into()),
     );
     // SAFETY: single-threaded startup, before any prover, server or thread exists.
-    unsafe { std::env::set_var("SP1_GPU_ELEMENT_THRESHOLD", threshold.to_string()) };
+    unsafe {
+        std::env::set_var(
+            zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_ENV,
+            threshold.to_string(),
+        )
+    };
 }
 
 fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
@@ -821,7 +802,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     }
     // Scale SP1's memory appetite to the machine it is actually on.
     //
-    // WHAT THIS DOES AND DOES NOT FIX. It does NOT lower `sp1-gpu-server`'s hard 24 GB VRAM floor:
+    // WHAT THIS DOES AND DOES NOT FIX. It does NOT lower `sp1-gpu-server`'s hard VRAM floor (16 GB in
+    // the fork this repo pins, 24 GB upstream — see `min_vram_bytes_for_backend` in the dispatcher):
     // that is a tier check on the device, made before any proving option exists, and
     // `SP1CoreOpts` never even crosses into the server crate. A card below the floor is refused
     // whatever we set, which is why the dispatcher declines to create a slot there at all.
@@ -862,31 +844,14 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     //
     // `ZKMINER_SP1_NO_AUTOTUNE=1` disables it, for bisecting a proving failure against stock SDK
     // behaviour.
-    // Host budget the STOCK defaults are assumed to need.
-    //
-    // A lower bound turned into a working figure. The defaults were measured dying at 25.0 GiB
-    // against a 25.1 GiB ceiling on this box — so they need MORE than 25.1 GiB, but the kill tells us
-    // only where it stopped, not where it would have peaked. Setting the reference AT the observed
-    // kill point would make this box scale by 1.00 and change nothing, i.e. fail again. 32 GiB is the
-    // next plausible tier for a prover whose own device tiers are 24/40/78 GB, and it makes a 28 GiB
-    // host scale to ~0.78 — a real reduction that can then be measured. Refine it when a run on a
-    // larger host records the true peak.
-    const SP1_REFERENCE_BUDGET_BYTES: u64 = 32 * 1024 * 1024 * 1024;
-    const SP1_MIN_SCALE: f64 = 0.25;
-
+    // Host budget the STOCK defaults are assumed to need, and how far below it the defaults are
+    // scaled: `SP1_REFERENCE_BUDGET_BYTES` and `SP1_MIN_SCALE` in `zkminer-prover-protocol`, shared so
+    // the dispatcher can predict the tier this worker settles on.
     fn sp1_memory_scale(host_budget: Option<u64>) -> f64 {
-        if std::env::var("ZKMINER_SP1_NO_AUTOTUNE").is_ok() {
-            return 1.0;
-        }
-        match host_budget {
-            // Unknown budget: change nothing. An absent reading is not evidence of a small machine,
-            // and the stock defaults are the only configuration with any track record.
-            None => 1.0,
-            Some(b) => {
-                let scale = b as f64 / SP1_REFERENCE_BUDGET_BYTES as f64;
-                scale.clamp(SP1_MIN_SCALE, 1.0)
-            }
-        }
+        zkminer_prover_protocol::types::sp1_memory_scale(
+            host_budget,
+            std::env::var(zkminer_prover_protocol::types::SP1_NO_AUTOTUNE_ENV).is_ok(),
+        )
     }
 
     /// Apply the scaled stage concurrency to our own environment, which the forked
@@ -971,8 +936,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     // stops `sp1-gpu-server` coming up kills this process outright. The dispatcher then sees only EOF
     // and reads it as worker ill-health: it excludes a slot, burns a retry, respawns, and does it all
     // again on the next job. But the commonest cause is categorical, not transient — the server
-    // refuses a card below its hard 24 GB floor with
-    // "Unsupported GPU memory: 20, must be at least 24GB", which will be just as true next time.
+    // refuses a card below its hard VRAM floor — upstream's reads "Unsupported GPU memory: 20, must be
+    // at least 24GB"; the fork this repo pins lowers it to 16 — which will be just as true next time.
     //
     // Catching it lets us answer the protocol properly. `WORKER_DECLINED` is the dispatcher's existing
     // signal for "I spoke to you, and I cannot prove here": it stops the backend being advertised on
@@ -1001,8 +966,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 .unwrap_or_else(|| "panic with no message".to_string());
             format!(
                 "{}: could not initialise the SP1 CUDA prover on device {}: {detail}. The most \
-                 likely cause is a card below sp1-gpu-server's hard 24 GB VRAM floor, which no \
-                 proving option can change.",
+                 likely cause is a card below sp1-gpu-server's hard VRAM floor (16 GB in the pinned \
+                 fork, 24 GB upstream), which no proving option can change.",
                 zkminer_prover_protocol::types::WORKER_DECLINED,
                 cuda_device_id
                     .map(|d| d.to_string())
@@ -1947,7 +1912,9 @@ mod ipc_fd_tests {
 /// `zkminer_prover_protocol::proc`, which owns it; these are the SP1-specific obligations.
 #[cfg(test)]
 mod threshold_tests {
-    use zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram as from_vram;
+    use zkminer_prover_protocol::types::{
+        sp1_element_threshold_cap as cap, sp1_element_threshold_for_available_vram as from_vram,
+    };
 
     const GIB: u64 = 1024 * 1024 * 1024;
     const SMALL: u64 = 134_217_728;
@@ -1968,10 +1935,8 @@ mod threshold_tests {
         // A roomy HOST gives no host-derived limit, so a constrained CARD must still bind.
         assert_eq!(super::sp1_element_threshold_for(1.0), None);
         assert_eq!(from_vram(16 * GIB), Some(SMALL));
-        let combined = [super::sp1_element_threshold_for(1.0), from_vram(16 * GIB)]
-            .into_iter()
-            .flatten()
-            .min();
+        // Through the function the worker actually calls, not a re-implementation of it.
+        let combined = cap(1.0, Some(16 * GIB));
         assert_eq!(
             combined,
             Some(SMALL),
@@ -1986,11 +1951,7 @@ mod threshold_tests {
             host_bound.is_some_and(|t| t < LARGEST_MEASURED),
             "a tight host budget must still produce a limit: {host_bound:?}"
         );
-        let combined = [host_bound, from_vram(24 * GIB)]
-            .into_iter()
-            .flatten()
-            .min();
-        assert_eq!(combined, host_bound);
+        assert_eq!(cap(0.3, Some(24 * GIB)), host_bound);
     }
 
     /// Only ever a CAP. The fork treats `SP1_GPU_ELEMENT_THRESHOLD` as a bound on its own tier, and the

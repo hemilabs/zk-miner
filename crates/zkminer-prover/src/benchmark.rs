@@ -1867,9 +1867,14 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
         //
         // `calibrate_slot_po2` clamps each individual run as well, so a sample taken here can still
         // come back at a lower po2 than requested; stopping the range early just avoids asking.
-        let free_po2 = match pool.foreign_vram_for_slot(&key) {
-            Some((foreign, _used, total)) if total > 0 => {
-                let (fits, _) = find_optimal_po2(total.saturating_sub(foreign), "risc0", true);
+        //
+        // Read only once the card has settled: `shutdown_all` above returns as the workers die, not
+        // as their memory comes back, and memory on its way back still counts as held (`draining`),
+        // so the sweep would be capped too low.
+        pool.settle_vram(&key);
+        let free_po2 = match pool.vram_budget_for_slot(&key) {
+            Some(budget) if budget.total > 0 => {
+                let (fits, _) = find_optimal_po2(budget.available, "risc0", true);
                 Some(fits)
             }
             _ => None,
@@ -1877,7 +1882,8 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
         let max_po2 = match free_po2 {
             Some(fits) if fits < db.max_feasible_po2.min(PO2_MAX) => {
                 tracing::info!(
-                    "{key}: capping the po2 sweep at {fits} rather than {} — part of this card's                      VRAM is in use by another process",
+                    "{key}: capping the po2 sweep at {fits} rather than {} — part of this card's \
+                     VRAM is held by another process or another of our workers",
                     db.max_feasible_po2.min(PO2_MAX),
                 );
                 fits

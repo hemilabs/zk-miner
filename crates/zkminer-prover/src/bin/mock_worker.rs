@@ -1,6 +1,7 @@
 //! Mock worker binary for integration tests.
 //!
-//! Speaks the worker IPC protocol (Hello/HelloAck handshake, Benchmark, Prove)
+//! Speaks the worker IPC protocol (Hello/HelloAck handshake, Benchmark, Prove, and a canned answer to
+//! Execute and CalibrateSegmentLimit)
 //! and can be configured via environment variables:
 //!
 //! - `MOCK_HANG_ON`: `"benchmark"`, `"prove"`, or `"both"` — hangs (sleeps forever)
@@ -89,6 +90,28 @@ fn main() {
                     seal: vec![],
                     duration_secs: 0.01,
                     cycles: 1000,
+                };
+                write_message(&mut stdout, &resp).unwrap();
+            }
+
+            // Measures nothing: answers like a guest of 1,000 cycles, so a caller sees a well-formed
+            // reply rather than a hang.
+            WorkerCommand::Execute { request_id, .. } => {
+                let resp = WorkerResponse::ExecuteResult {
+                    request_id,
+                    cycles: 1000,
+                    duration_secs: 0.01,
+                };
+                write_message(&mut stdout, &resp).unwrap();
+            }
+
+            // Only risc0 implements calibration; every other worker answers with an error rather than
+            // ignoring the command, so the caller cannot hang on it.
+            WorkerCommand::CalibrateSegmentLimit { request_id, .. } => {
+                let resp = WorkerResponse::Error {
+                    request_id,
+                    kind: zkminer_prover_protocol::ErrorKind::Internal,
+                    message: "mock worker does not calibrate".to_string(),
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }

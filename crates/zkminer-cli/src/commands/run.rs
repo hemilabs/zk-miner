@@ -79,15 +79,18 @@ const HOST_MEMORY_BACKOFF_SECS: u64 = 15;
 /// flight, bounded so a permanently short host cannot hold a claim until its deadline.
 const MAX_HOST_MEMORY_WAITS: u32 = 20;
 
-/// How long to wait before retrying a job refused because another process holds the card's VRAM.
+/// How long to wait before retrying a job refused because the card's VRAM is held — by another
+/// process, or by one of our own workers of the other backend that could not be recycled to make room
+/// (its slot was busy, or its memory had not come back yet).
 ///
 /// Shorter than the host-RAM backoff because the remedy is different in kind. A host-RAM shortage
 /// clears when OUR proof in flight finishes, which takes minutes; foreign VRAM clears when a human
-/// closes something, which can happen at any moment. Retrying sooner also re-reads the OTHER card,
-/// which may have been busy with our own work on the previous attempt and free now.
+/// closes something, which can happen at any moment, and a busy sibling within seconds to a couple of
+/// minutes (a cycle measurement holds one for up to `MEASURE_TIMEOUT`). Retrying sooner also re-reads
+/// the OTHER card, which may have been busy with our own work on the previous attempt and free now.
 const GPU_MEMORY_BACKOFF_SECS: u64 = 5;
 
-/// How many free waits one job may take for foreign VRAM before it starts costing attempts.
+/// How many free waits one job may take for held VRAM before it starts costing attempts.
 ///
 /// Bounded for the same reason as `MAX_HOST_MEMORY_WAITS`: a refusal that refunds its attempt means
 /// `MAX_PROVE_ATTEMPTS` no longer bounds the loop on its own, so a permanently occupied card must not
@@ -994,7 +997,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
                         std::thread::spawn(move || {
                             if let Some(pool) = zkminer_prover::engine::worker_pool() {
-                                pool.shutdown_all();
+                                pool.close();
                             }
                             let _ = done_tx.send(());
                         });
@@ -1744,7 +1747,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         std::thread::spawn(move || {
             if let Some(pool) = zkminer_prover::engine::worker_pool() {
                 tracing::info!("shutting down worker pool");
-                pool.shutdown_all();
+                pool.close();
             }
             let _ = done_tx.send(());
         });
@@ -4442,18 +4445,26 @@ async fn process_job_lifecycle(
                             short_id(job_id)
                         ));
                     }
-                    // Another process holds this CARD's VRAM — a desktop session, a browser with
-                    // hardware acceleration, somebody else's CUDA job. Neither the worker nor the job
-                    // is at fault, and nothing ran, so this must not cost an attempt or mark the slot
+                    // Something holds this CARD's VRAM — a desktop session, a browser with hardware
+                    // acceleration, somebody else's CUDA job, or our own worker of the other backend
+                    // that could not be recycled for this proof yet. Neither the worker nor the job is
+                    // at fault, and nothing ran, so this must not cost an attempt or mark the slot
                     // unhealthy.
                     //
                     // Unlike the host-RAM arm below, this one DOES exclude the slot, and that is the
                     // substantive difference between them: the host ledger is process-wide, so every
-                    // other slot fails identically and excluding is pointless, whereas foreign VRAM is
-                    // a property of one physical card. Excluding sends the retry to the other GPU,
+                    // other slot fails identically and excluding is pointless, whereas held VRAM is a
+                    // property of one physical card. Excluding sends the retry to the other GPU,
                     // which is usually free. On a single-GPU box `prove_min_vram` restores the set it
                     // just emptied, so the retry lands on the same card — that is what the backoff and
                     // the wait cap are for, and why this cannot spin.
+                    //
+                    // EXCEPT when the obstacle was our own worker, which clears in seconds to a couple
+                    // of minutes
+                    // (`ours_in_the_way`: a sibling busy with a cycle measurement, memory of one just
+                    // torn down). Excluding the card then — `excluded` lives for the whole job —
+                    // reduced a two-card backend to its other card, whose single-key path waits on
+                    // that card's guard behind whatever long proof it is running, up to the deadline.
                     //
                     // Matched on the TYPE for the same reason as every other arm here: `msg` embeds
                     // worker text that can carry a submitter's guest-ELF output, and an arm that
@@ -4462,7 +4473,7 @@ async fn process_job_lifecycle(
                         e.downcast_ref::<zkminer_prover_protocol::types::GpuMemoryShortage>()
                     {
                         if let Some(k) = used_slot.clone() {
-                            if !excluded.contains(&k) {
+                            if !shortage.ours_in_the_way && !excluded.contains(&k) {
                                 excluded.push(k);
                             }
                         }
@@ -4471,12 +4482,16 @@ async fn process_job_lifecycle(
                             attempt = attempt.saturating_sub(1);
                             tracing::warn!(
                                 "{} is waiting for GPU memory, not failing: {shortage} Retrying in \
-                                 {}s (wait {}/{}), preferring another card; the deadline budget \
-                                 decides when to give up.",
+                                 {}s (wait {}/{}), {}; the deadline budget decides when to give up.",
                                 short_id(job_id),
                                 GPU_MEMORY_BACKOFF_SECS,
                                 gpu_memory_waits,
                                 MAX_GPU_MEMORY_WAITS,
+                                if shortage.ours_in_the_way {
+                                    "this card included"
+                                } else {
+                                    "preferring another card"
+                                },
                             );
                             tokio::time::sleep(Duration::from_secs(GPU_MEMORY_BACKOFF_SECS)).await;
                             continue;
@@ -5879,8 +5894,10 @@ mod tests {
         let real: anyhow::Error = anyhow::Error::new(GpuMemoryShortage {
             slot_key: "sp1:cuda:0".to_string(),
             foreign_bytes: 2 << 30,
+            sibling_bytes: 0,
             available_bytes: 14 << 30,
-            needed_bytes: 16_000_000_000,
+            needed_bytes: Some(16_000_000_000),
+            ours_in_the_way: false,
             total_bytes: 16 << 30,
         });
         assert!(real.downcast_ref::<GpuMemoryShortage>().is_some());

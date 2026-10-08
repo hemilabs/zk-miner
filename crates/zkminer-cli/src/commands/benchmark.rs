@@ -129,7 +129,7 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
     // PID), so the normal path calling it once is safe.
     if let Err(e) = tokio::task::spawn_blocking(|| {
         if let Some(pool) = worker_pool() {
-            pool.shutdown_all();
+            pool.close();
         }
     })
     .await
