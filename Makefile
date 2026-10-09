@@ -56,7 +56,8 @@ dist/zkminer-prove-sp1: FORCE
 
 dist/sp1-gpu-server: FORCE
 	$(DOCKER_BUILD) --target dist-sp1-server --output type=local,dest=dist/ .
-	cd dist && sha256sum sp1-gpu-server > sp1-gpu-server.sha256
+	cd dist && sha256sum sp1-gpu-server > sp1-gpu-server.sha256 \
+		&& sha256sum libcudart.so.12 > libcudart.so.12.sha256
 
 dist/zkminer-prove-openvm: FORCE
 	$(DOCKER_BUILD) --target dist-openvm --output type=local,dest=dist/ .

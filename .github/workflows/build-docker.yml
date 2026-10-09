@@ -59,6 +59,8 @@ jobs:
           - target: dist-sp1-server
             binary: sp1-gpu-server
             timeout: 300
+            # Shipped with it: the CUDA runtime it links, and that file's license.
+            extras: libcudart.so.12 libcudart.so.12.LICENSE.txt
           - target: dist-rocm
             binary: zkminer-prove-risc0-rocm
 
@@ -104,6 +106,13 @@ jobs:
             ls -la
             exit 1
           }
+          for f in ${{ matrix.extras }}; do
+            test -s "$f" || {
+              echo "::error::$f is missing or empty after extraction"
+              ls -la
+              exit 1
+            }
+          done
           chmod +x "${{ matrix.binary }}" || true
           sha256sum "${{ matrix.binary }}" | tee "${{ matrix.binary }}.sha256"
           ls -la
@@ -114,8 +123,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.target }}
-          path: |
-            dist/${{ matrix.binary }}
-            dist/${{ matrix.binary }}.sha256
+          # Everything the dist stage exports: the binary, plus any extras.
+          path: dist/
           if-no-files-found: error
           retention-days: ${{ inputs.retention_days || 14 }}

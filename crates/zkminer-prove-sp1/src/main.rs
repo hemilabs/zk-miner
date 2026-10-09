@@ -300,9 +300,9 @@ const CUDA_DIR_OVERRIDE: &str = "ZKMINER_SP1_CUDA_RUNTIME_DIR";
 /// Make a CUDA 12 runtime reachable for `sp1-gpu-server`, so the host's INSTALLED
 /// TOOLKIT VERSION stops mattering.
 ///
-/// The problem is narrower than "support CUDA 11 through 13". `sp1-gpu-server` is a
-/// prebuilt binary we do not compile, and its `DT_NEEDED` names `libcudart.so.12`
-/// specifically. A soname is matched exactly, so it will never load `.so.11` or `.so.13`
+/// The problem is narrower than "support CUDA 11 through 13". `sp1-gpu-server`, upstream's
+/// or the one a release ships (built against CUDA 12.8), names `libcudart.so.12` in its
+/// `DT_NEEDED` specifically. A soname is matched exactly, so it will never load `.so.11` or `.so.13`
 /// no matter what is installed -- there is no version negotiation to do. Note our OWN
 /// CUDA prover has no libcudart dependency at all (it links only `libcuda.so.1`, whose
 /// soname never changes), which is why risc0 already runs on a CUDA 11, 12 or 13 host and
@@ -329,12 +329,13 @@ fn ensure_cuda12_on_library_path() {
     }
     let Some(dir) = find_cuda12_runtime_dir() else {
         tracing::warn!(
-            "no {CUDART_SONAME} found on this host. sp1-gpu-server is prebuilt against \
+            "no {CUDART_SONAME} found on this host. sp1-gpu-server is built against \
              CUDA 12 and cannot load a 11.x or 13.x runtime (the soname is matched \
-             exactly), so SP1 will decline unless a CUDA 12 runtime is provided. Set \
-             {CUDA_DIR_OVERRIDE} to a directory containing it, or install the \
-             nvidia-cuda-runtime-cu12 package. Your CUDA TOOLKIT version does not \
-             otherwise matter -- only the driver, which is backward compatible."
+             exactly), so SP1 will decline unless a CUDA 12 runtime is provided. Put the \
+             {CUDART_SONAME} a release ships beside this binary, set {CUDA_DIR_OVERRIDE} to \
+             a directory containing it, or install the nvidia-cuda-runtime-cu12 package. \
+             Your CUDA TOOLKIT version does not otherwise matter -- only the driver, which \
+             is backward compatible."
         );
         return;
     };
@@ -379,7 +380,8 @@ fn cuda12_candidate_dirs() -> Vec<std::path::PathBuf> {
             v.push(PathBuf::from(d));
         }
     }
-    // 2. Shipped beside the worker binary, so a release can be self-contained.
+    // 2. Shipped beside the worker binary: releases ship the runtime the server was built
+    //    against (see Dockerfile.build), so a host needs only the driver.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             v.push(dir.join("cuda12"));

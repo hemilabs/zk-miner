@@ -265,6 +265,47 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
        cargo install --locked --root /sp1-server --git https://github.com/hemilabs/sp1 --rev "$REV" sp1-gpu-server \
     && cp /sp1-server/bin/sp1-gpu-server /sp1-gpu-server
 
+# The CUDA runtime the server is linked against, shipped beside zkminer-prove-sp1 so a host needs
+# only the NVIDIA driver: the worker puts its own directory on the server's library path. NVIDIA's
+# CUDA EULA lists libcudart.so among the files an application may distribute (Attachment A), as
+# unmodified object code (2.3), under terms consistent with its own. So it is copied byte for byte
+# from this image, and ships with a notice and the EULA that came with this copy (Ubuntu images
+# keep /usr/share/doc/*/copyright). The build fails if the server stops needing exactly
+# libcudart.so.12, rather than ship a runtime it does not load.
+RUN <<'EOF'
+set -eu
+readelf -d /sp1-gpu-server | grep -q 'NEEDED.*\[libcudart\.so\.12\]' || {
+    echo "sp1-gpu-server no longer needs libcudart.so.12; update what ships beside it" >&2
+    exit 1
+}
+lib=$(readlink -f /usr/local/cuda/lib64/libcudart.so.12)
+pkg=$(dpkg -S "$lib" | cut -d: -f1)
+version=$(dpkg-query -W -f='${Version}' "$pkg")
+eula="/usr/share/doc/$pkg/copyright"
+grep -q 'libcudart.so, libcudart_static.a' "$eula"
+mkdir /cudart
+cp "$lib" /cudart/libcudart.so.12
+cmp "$lib" /cudart/libcudart.so.12
+{
+    cat <<NOTICE
+libcudart.so.12 is the NVIDIA CUDA Runtime, version $version (NVIDIA package $pkg),
+copied unmodified from NVIDIA's CUDA container image.
+
+It is NOT covered by zkminer's MIT license. It is NVIDIA's software, distributed with
+zkminer under the NVIDIA CUDA Toolkit End User License Agreement that came with this copy,
+which follows in full. That agreement lists libcudart.so among the files that may be
+distributed with an application (Attachment A).
+
+It ships so that sp1-gpu-server, which zkminer-prove-sp1 runs, can start on a host without
+a CUDA 12 toolkit. It is for use by zkminer, and is not offered on its own.
+
+================================================================================
+
+NOTICE
+    cat "$eula"
+} > /cudart/libcudart.so.12.LICENSE.txt
+EOF
+
 # ===========================================================================
 # Stage: rocm-base — AMD ROCm + Rust toolchain
 # ===========================================================================
@@ -399,6 +440,7 @@ COPY --from=build-sp1 /zkminer-prove-sp1 /zkminer-prove-sp1
 
 FROM scratch AS dist-sp1-server
 COPY --from=build-sp1-server /sp1-gpu-server /sp1-gpu-server
+COPY --from=build-sp1-server /cudart/ /
 
 FROM scratch AS dist-rocm
 COPY --from=build-rocm /zkminer-prove-risc0-rocm /zkminer-prove-risc0-rocm
