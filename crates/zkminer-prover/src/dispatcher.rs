@@ -878,7 +878,7 @@ fn owner_of(
 /// The compute apps whose memory is known, or `None` if one of OURS hides its figure — see
 /// `read_card_occupancy`. Somebody else's hidden figure is fine: its memory is in `memory.used` and
 /// counts as foreign, correctly.
-fn apps_we_can_account_for(
+fn apps_we_can_attribute(
     apps: Vec<(u32, Option<u64>)>,
     owner: &dyn Fn(u32) -> PidOwner,
 ) -> Option<Vec<(u32, u64)>> {
@@ -930,7 +930,7 @@ fn read_card_occupancy(
     let miner = std::process::id();
     let retired = retired_groups();
     let owner = |pid: u32| owner_of(pid, miner, slot_pids, &retired);
-    let known = apps_we_can_account_for(apps, &owner)?;
+    let known = apps_we_can_attribute(apps, &owner)?;
     Some(CardOccupancy::from_readings(
         used_mib,
         total_mib,
@@ -6324,15 +6324,15 @@ mod tests {
             _ => PidOwner::Outside,
         };
         assert_eq!(
-            apps_we_can_account_for(vec![(200, Some(1806)), (999, None)], &owner),
+            apps_we_can_attribute(vec![(200, Some(1806)), (999, None)], &owner),
             Some(vec![(200, 1806)])
         );
         assert_eq!(
-            apps_we_can_account_for(vec![(200, None), (999, Some(10))], &owner),
+            apps_we_can_attribute(vec![(200, None), (999, Some(10))], &owner),
             None
         );
-        assert_eq!(apps_we_can_account_for(vec![(300, None)], &owner), None);
-        assert_eq!(apps_we_can_account_for(vec![], &owner), Some(vec![]));
+        assert_eq!(apps_we_can_attribute(vec![(300, None)], &owner), None);
+        assert_eq!(apps_we_can_attribute(vec![], &owner), Some(vec![]));
     }
 
     #[test]
