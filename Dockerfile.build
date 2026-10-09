@@ -122,10 +122,10 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     && cp target/release/zkminer-prove-openvm /zkminer-prove-openvm
 
 # ===========================================================================
-# Stage: cuda-base — NVIDIA CUDA + Rust toolchain
+# Stage: cuda-rust-base — NVIDIA CUDA + Rust toolchain
 # ===========================================================================
 # nvidia/cuda:12.8.0-devel-ubuntu22.04 — pinned 2026-03-05
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04@sha256:54f18e2a8e1b3d03f77b9a6dc905533da46ac93a5513f10e8ba8e560db9fa5ab AS cuda-base
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04@sha256:54f18e2a8e1b3d03f77b9a6dc905533da46ac93a5513f10e8ba8e560db9fa5ab AS cuda-rust-base
 ARG RUST_VERSION
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -142,6 +142,16 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && rustup show
 
 ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
+
+WORKDIR /build
+
+# ===========================================================================
+# Stage: cuda-base — cuda-rust-base + the RISC Zero toolchain
+# ===========================================================================
+# Only the risc0 CUDA build needs this. `rzup install` downloads through GitHub's unauthenticated
+# API, which rate-limits by runner IP (it failed a dist-sp1-server build that way), so the SP1
+# stages start from cuda-rust-base instead.
+FROM cuda-rust-base AS cuda-base
 
 RUN apt update
 RUN apt install -y curl 
@@ -175,7 +185,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 # ===========================================================================
 # Stage: build-sp1 — SP1 prover (requires CUDA base, sp1-sdk hardcodes cuda)
 # ===========================================================================
-FROM cuda-base AS build-sp1
+FROM cuda-rust-base AS build-sp1
 
 RUN apt update
 RUN apt install -y protobuf-compiler libprotobuf-dev
@@ -202,7 +212,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 # fork's, so the SDK cannot tell. The release therefore ships this one beside zkminer-prove-sp1,
 # which installs it. It is built from the exact commit Cargo.lock records for the SDK, so the two can
 # never disagree, using that commit's own Cargo.lock.
-FROM cuda-base AS build-sp1-server
+FROM cuda-rust-base AS build-sp1-server
 
 # gnark's Groth16/PLONK provers are linked into the server through cgo.
 ARG GO_VERSION=1.24.13
