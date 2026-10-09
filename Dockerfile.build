@@ -222,6 +222,13 @@ RUN curl -fsSL -o /tmp/go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar
     && tar -C /usr/local -xzf /tmp/go.tgz \
     && rm /tmp/go.tgz
 ENV PATH="/usr/local/go/bin:${PATH}"
+# SP1's gnark FFI (upstream's as much as the fork's) imports
+# github.com/consensys/gnark-ignition-verifier at a version proxy.golang.org does not serve, from a
+# GitHub repository that no longer exists, so a fresh module cache can fetch it from neither.
+# goproxy.cn still serves it. Go only asks it for what proxy.golang.org answers 404 to, and checks
+# every download against the hash go.sum pins (h1:z42ewLaL... for this one), so a copy that differs
+# fails the build rather than going into it.
+ENV GOPROXY="https://proxy.golang.org,https://goproxy.cn,direct"
 
 # GPU targets, as for the risc0 CUDA build above: the 4090 (sm_89) and Blackwell (sm_120). Others
 # (sm_80 A100, sm_86 3090, sm_90 H100) can be added here, at the cost of build time.
