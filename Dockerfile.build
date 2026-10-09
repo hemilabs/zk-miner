@@ -217,6 +217,22 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 # never disagree, using that commit's own Cargo.lock.
 FROM cuda-rust-base AS build-sp1-server
 
+# sp1-prover-types' protos import google/protobuf/empty.proto, which Ubuntu ships in libprotobuf-dev:
+# protobuf-compiler only recommends it, and cuda-rust-base installs without recommends.
+RUN apt-get update && apt-get install -y --no-install-recommends libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# sp1-gpu-sys needs CMake 3.30 or later, and Ubuntu 22.04's is 3.22. This is Kitware's build, of the
+# version the server has been built with outside Docker. /usr/local/bin comes first on PATH.
+ARG CMAKE_VERSION=3.31.6
+ARG CMAKE_SHA256=5a1133ff103c71eb5120e2cc3de922733e7d8a26a98ae716397e8676adb367bf
+RUN curl -fsSL -o /tmp/cmake.tgz \
+        "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" \
+    && echo "${CMAKE_SHA256}  /tmp/cmake.tgz" | sha256sum -c - \
+    && tar -C /usr/local --strip-components=1 -xzf /tmp/cmake.tgz \
+    && rm /tmp/cmake.tgz \
+    && cmake --version
+
 # gnark's Groth16/PLONK provers are linked into the server through cgo.
 ARG GO_VERSION=1.24.13
 ARG GO_SHA256=1fc94b57134d51669c72173ad5d49fd62afb0f1db9bf3f798fd98ee423f8d730
