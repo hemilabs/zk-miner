@@ -80,11 +80,18 @@ jobs:
       # says so. Building without `--output` proved the code compiled and then
       # threw all six binaries away, so no build produced anything anyone could
       # download or test.
+      #
+      # The token is for rzup, in the risc0 stages: GitHub's unauthenticated API
+      # limits requests per IP, which runners share, and failed builds there.
+      # Passed as a secret, it never goes into a layer or the build cache.
       - name: "Build and extract ${{ matrix.binary }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           docker buildx build \
             -f Dockerfile.build \
             --target ${{ matrix.target }} \
+            --secret id=github_token,env=GITHUB_TOKEN \
             --output type=local,dest=dist \
             .
 

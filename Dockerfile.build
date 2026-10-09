@@ -148,9 +148,8 @@ WORKDIR /build
 # ===========================================================================
 # Stage: cuda-base — cuda-rust-base + the RISC Zero toolchain
 # ===========================================================================
-# Only the risc0 CUDA build needs this. `rzup install` downloads through GitHub's unauthenticated
-# API, which rate-limits by runner IP (it failed a dist-sp1-server build that way), so the SP1
-# stages start from cuda-rust-base instead.
+# Only the risc0 CUDA build needs this, so the SP1 stages start from cuda-rust-base and never wait
+# on GitHub's API, which `rzup install` calls.
 FROM cuda-rust-base AS cuda-base
 
 RUN apt update
@@ -161,7 +160,11 @@ ENV PATH="$PATH:/root/.risc0/bin"
 RUN echo blah
 RUN rzup --help
 RUN rzup install --help
-RUN rzup install -f
+# rzup asks GitHub's API for the latest release. Unauthenticated, that is limited per IP, which CI
+# runners share, and it failed builds. CI passes its token as the `github_token` secret, which rzup
+# reads as GITHUB_TOKEN, and which never goes into a layer or the cache. Without the secret (a local
+# build) it runs unauthenticated, as before.
+RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN rzup install -f
 
 WORKDIR /build
 
@@ -277,7 +280,8 @@ ENV PATH="$PATH:/root/.risc0/bin"
 RUN echo blah
 RUN rzup --help
 RUN rzup install --help
-RUN rzup install -f
+# GITHUB_TOKEN: see cuda-base.
+RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN rzup install -f
 
 WORKDIR /build
 
@@ -341,7 +345,8 @@ ENV PATH="$PATH:/root/.risc0/bin"
 RUN echo blah
 RUN rzup --help
 RUN rzup install --help
-RUN rzup install -f
+# GITHUB_TOKEN: see cuda-base.
+RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN rzup install -f
 
 WORKDIR /build
 
