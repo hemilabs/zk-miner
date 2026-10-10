@@ -19,7 +19,7 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 
 /// Set to `0` to leave `~/.sp1/bin/sp1-gpu-server` alone.
-pub(crate) const INSTALL_ENV: &str = "ZKMINER_SP1_SERVER_INSTALL";
+pub(crate) const INSTALL_ENV: &str = zkminer_prover_protocol::types::SP1_SERVER_INSTALL_ENV;
 /// The shipped server's name, beside this worker's executable.
 const BUNDLED_NAME: &str = "sp1-gpu-server";
 

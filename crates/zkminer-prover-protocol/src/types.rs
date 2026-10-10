@@ -253,6 +253,11 @@ pub const SP1_ELEMENT_THRESHOLD_ENV: &str = "SP1_GPU_ELEMENT_THRESHOLD";
 /// SDK behaviour.
 pub const SP1_NO_AUTOTUNE_ENV: &str = "ZKMINER_SP1_NO_AUTOTUNE";
 
+/// Set to `0` to stop the SP1 worker installing the `sp1-gpu-server` shipped beside it over
+/// `~/.sp1/bin/sp1-gpu-server`. Shared because the dispatcher has to know which of the two servers
+/// a worker will run, to check that the card can run its GPU code.
+pub const SP1_SERVER_INSTALL_ENV: &str = "ZKMINER_SP1_SERVER_INSTALL";
+
 /// Host budget the STOCK SP1 defaults are assumed to need.
 ///
 /// A lower bound turned into a working figure. The defaults were measured dying at 25.0 GiB against

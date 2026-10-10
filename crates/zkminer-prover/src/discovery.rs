@@ -57,7 +57,8 @@ pub struct DiscoveredWorker {
     /// Human-readable GPU name (None for "generic" or explicit binaries).
     pub gpu_name: Option<String>,
     /// CUDA compute capability of the card, when known. Carried so the dispatcher can refuse a
-    /// backend that is known to fault on this architecture — see `backend_broken_on_compute_cap`.
+    /// backend that is known to fault on this architecture — see `backend_broken_on_compute_cap` —
+    /// or whose binary carries no GPU code this card can run — see `gpu_code_binary`.
     pub compute_cap: Option<(u32, u32)>,
     pub path: PathBuf,
 }
@@ -952,6 +953,45 @@ pub fn backend_broken_on_compute_cap(backend: &str, cap: Option<(u32, u32)>) -> 
     false
 }
 
+/// The binary holding a backend's CUDA device code, for `gpu_code::EmbeddedGpuCode` to read.
+///
+/// For most backends that is the worker itself. SP1's worker carries none: its proving runs in
+/// `sp1-gpu-server`, so the server is the binary whose GPU code decides which cards SP1 can use.
+/// `None` when that cannot be determined, which the caller must treat as "unknown", never as
+/// "cannot run".
+pub fn gpu_code_binary(backend: &str, worker: &Path) -> Option<PathBuf> {
+    if backend != "sp1" {
+        return Some(worker.to_path_buf());
+    }
+    let install = std::env::var(zkminer_prover_protocol::types::SP1_SERVER_INSTALL_ENV)
+        .map_or(true, |v| v.trim() != "0");
+    sp1_server_for(worker, install, dirs::home_dir().as_deref())
+}
+
+/// The `sp1-gpu-server` an SP1 worker at `worker` will run. Mirrors `zkminer-prove-sp1`'s
+/// `bundled_server`, which at startup installs the server shipped beside the worker over
+/// `~/.sp1/bin/sp1-gpu-server` unless `install` is off — so that shipped server, not the one
+/// installed now, is the one the worker will use. Without either, the SDK downloads upstream's
+/// build later, whose GPU code nothing here can see in advance.
+fn sp1_server_for(worker: &Path, install: bool, home: Option<&Path>) -> Option<PathBuf> {
+    const SERVER: &str = "sp1-gpu-server";
+    if install {
+        // The worker looks beside its own executable, which for a symlinked worker is the target's
+        // directory; a wrapper script sits beside the binary it runs, so its own directory works too.
+        let real = std::fs::canonicalize(worker).ok();
+        let shipped = [real.as_deref().and_then(Path::parent), worker.parent()]
+            .into_iter()
+            .flatten()
+            .map(|dir| dir.join(SERVER))
+            .find(|path| path.is_file());
+        if shipped.is_some() {
+            return shipped;
+        }
+    }
+    let installed = home?.join(".sp1").join("bin").join(SERVER);
+    installed.is_file().then_some(installed)
+}
+
 /// Minimum VRAM a card must have for a backend to run on it at all, or `None` for no floor.
 ///
 /// SP1 has a HARD one, enforced inside `sp1-gpu-server` before any proving starts, and it is a
@@ -1168,6 +1208,57 @@ mod tests {
         // And the 5080 passes the VRAM floor, so nothing stops it being used.
         let floor = min_vram_bytes_for_backend("sp1").expect("sp1 has a floor");
         assert!(16_303u64 * 1024 * 1024 >= floor);
+    }
+
+    /// Which server's GPU code decides SP1's cards: the one the worker is about to install, not
+    /// whatever is installed now.
+    #[test]
+    fn the_sp1_server_checked_is_the_one_the_worker_will_run() {
+        let root = std::env::temp_dir().join(format!(
+            "zk-sp1-server-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (release, home) = (root.join("provers"), root.join("home"));
+        let installed = home.join(".sp1").join("bin").join("sp1-gpu-server");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&release).unwrap();
+        let worker = release.join("zkminer-prove-sp1");
+        let shipped = release.join("sp1-gpu-server");
+        for file in [&worker, &shipped, &installed] {
+            std::fs::write(file, b"x").unwrap();
+        }
+
+        // The release layout: the shipped server will replace the installed one.
+        assert_eq!(
+            sp1_server_for(&worker, true, Some(&home)),
+            Some(shipped.clone())
+        );
+        // `ZKMINER_SP1_SERVER_INSTALL=0`: the worker leaves the installed one in place.
+        assert_eq!(
+            sp1_server_for(&worker, false, Some(&home)),
+            Some(installed.clone())
+        );
+        // A development build, with nothing shipped beside it.
+        std::fs::remove_file(&shipped).unwrap();
+        assert_eq!(
+            sp1_server_for(&worker, true, Some(&home)),
+            Some(installed.clone())
+        );
+        // Neither: the SDK will download upstream's, which cannot be read in advance.
+        std::fs::remove_file(&installed).unwrap();
+        assert_eq!(sp1_server_for(&worker, true, Some(&home)), None);
+        assert_eq!(sp1_server_for(&worker, true, None), None);
+
+        // Every other backend's GPU code is in the worker itself.
+        assert_eq!(
+            gpu_code_binary("risc0", Path::new("/opt/zk/zkminer-prove-risc0-cuda")),
+            Some(PathBuf::from("/opt/zk/zkminer-prove-risc0-cuda"))
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

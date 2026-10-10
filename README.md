@@ -58,6 +58,11 @@ env HIPCC=/opt/rocm/bin/hipcc NVCC=off RISC0_HIP_ARCH="gfx1100" \
                 --bin zkminer-prove-risc0-rocm --target-dir target/release-rocm
 ```
 
+Each `-gencode` adds a GPU family the worker can run on, so name your card's. The miner
+reads which families a worker binary carries (for SP1, its `sp1-gpu-server`) and will not
+start it on a card that has none of them, logging why. `Dockerfile.build` lists the
+families the release builds.
+
 Never set `RISC0_SKIP_BUILD=1` — it produces empty guest ELF stubs, and every
 benchmark then silently reports zero work.
 

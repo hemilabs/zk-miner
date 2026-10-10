@@ -1571,6 +1571,49 @@ impl WorkerPool {
                 continue;
             }
 
+            // A card this backend's binary carries no GPU code for.
+            //
+            // A different fact again: not a fault in the code but its absence. A release is built for
+            // a list of architectures, and a card outside it fails every kernel launch with "no kernel
+            // image is available for execution on the device". Checked at spawn for the same reason as
+            // the two gates around it — CUDA init is lazy, so nothing before the first real proof
+            // would notice, and the slot would claim work it can never prove. Read from the binary
+            // rather than from a list kept here, because the binary is the authority: an operator's
+            // own build, upstream's, or the next release's wider one all answer for themselves.
+            //
+            // Unknown is not "cannot": a binary this cannot read, or a card whose compute capability
+            // `nvidia-smi` did not report, is allowed through. `ZKMINER_ALLOW_BROKEN_GPU` overrides
+            // it, as it does the gate above.
+            if let Some(cap) =
+                compute_cap.filter(|_| std::env::var("ZKMINER_ALLOW_BROKEN_GPU").is_err())
+            {
+                if let Some(binary) = crate::discovery::gpu_code_binary(&backend, &path) {
+                    match crate::gpu_code::EmbeddedGpuCode::read(&binary) {
+                        Ok(Some(code)) if !code.runs_on(cap) => {
+                            tracing::warn!(
+                                "not starting worker {key}{device_desc}: {} carries GPU code for \
+                                 {} only, and this card is compute capability {}.{}, which can run \
+                                 none of it — every proof would fail with \"no kernel image is \
+                                 available\". The slot is not advertised; {backend} jobs will be \
+                                 routed to a card it can run on. A build that includes this card's \
+                                 architecture lifts this.",
+                                binary.display(),
+                                code.describe(),
+                                cap.0,
+                                cap.1,
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::debug!(
+                            "could not read the GPU code in {} ({e}); not checking it against \
+                             {key}",
+                            binary.display()
+                        ),
+                    }
+                }
+            }
+
             if let (Some(floor), Some(have)) = (
                 crate::discovery::min_vram_bytes_for_backend(&backend),
                 gpu_vram_bytes(&gpu_tag, device_index),
