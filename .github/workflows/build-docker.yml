@@ -37,7 +37,7 @@ jobs:
     # binary were all skipped while the check still reported success. Because
     # zkminer-prove-risc0 depends only on zkminer-prover-protocol, a compile
     # error in zkminer-cli, -chain, -tui, -strategy or -prover passed CI green.
-    name: ${{ matrix.target }}
+    name: ${{ matrix.artifact || matrix.target }}
     # sp1-gpu-server compiles SP1's CUDA kernels on top of the whole prover.
     timeout-minutes: ${{ matrix.timeout || 120 }}
     strategy:
@@ -46,25 +46,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: dist-cli
-            binary: zkminer
-          - target: dist-cli-windows
-            binary: zkminer.exe
-          - target: dist-openvm
-            binary: zkminer-prove-openvm
-          - target: dist-cuda
-            binary: zkminer-prove-risc0-cuda
-            # Native code for seven GPU families, not two: see NVCC_APPEND_FLAGS in Dockerfile.build.
-            timeout: 240
-          - target: dist-sp1
-            binary: zkminer-prove-sp1
+          # TEST BRANCH ONLY: sp1-gpu-server built by the release recipe with other CUDA versions,
+          # to benchmark against the 12.8 release build. Not for merging.
           - target: dist-sp1-server
+            dockerfile: Dockerfile.cuda129
+            artifact: sp1-gpu-server-cuda12.9.2
             binary: sp1-gpu-server
             timeout: 300
-            # Shipped with it: the CUDA runtime it links, and that file's license.
             extras: libcudart.so.12 libcudart.so.12.LICENSE.txt
-          - target: dist-rocm
-            binary: zkminer-prove-risc0-rocm
+          - target: dist-sp1-server
+            dockerfile: Dockerfile.cuda133
+            artifact: sp1-gpu-server-cuda13.3.1
+            binary: sp1-gpu-server
+            timeout: 300
+            extras: libcudart.so.13 libcudart.so.13.LICENSE.txt
 
     steps:
       - name: "Checkout repository"
@@ -93,7 +88,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           docker buildx build \
-            -f Dockerfile.build \
+            -f ${{ matrix.dockerfile || 'Dockerfile.build' }} \
             --target ${{ matrix.target }} \
             --secret id=github_token,env=GITHUB_TOKEN \
             --output type=local,dest=dist \
@@ -124,7 +119,7 @@ jobs:
       - name: "Upload ${{ matrix.binary }}"
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ matrix.target }}
+          name: ${{ matrix.artifact || matrix.target }}
           # Everything the dist stage exports: the binary, plus any extras.
           path: dist/
           if-no-files-found: error

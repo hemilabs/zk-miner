@@ -1,0 +1,464 @@
+# syntax=docker/dockerfile:1
+#
+# Multi-stage portable Linux build for zkminer binaries.
+# Usage: docker build -f Dockerfile.build --target dist-cli --output type=local,dest=dist/ .
+#
+# All binaries link against glibc 2.35 (Ubuntu 22.04) for broad compatibility.
+
+# ---------------------------------------------------------------------------
+# Build args (all overridable)
+# ---------------------------------------------------------------------------
+ARG RUST_VERSION=1.93.0
+ARG CUDA_VERSION=13.3.1
+ARG ROCM_IMAGE=rocm/dev-ubuntu-22.04:6.4
+ARG UBUNTU_VERSION=22.04
+ARG FOUNDRY_VERSION=v1.3.5
+
+# ===========================================================================
+# Stage: rust-base — Ubuntu 22.04 + Rust toolchain
+# ===========================================================================
+# ubuntu:22.04 — pinned 2026-03-05
+FROM ubuntu:${UBUNTU_VERSION}@sha256:3ba65aa20f86a0fad9df2b2c259c613df006b2e6d0bfcc8a146afb8c525a9751 AS rust-base
+ARG RUST_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git curl ca-certificates cmake pkg-config libssl-dev \
+        protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
+    && rustup show
+
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
+
+WORKDIR /build
+
+# ===========================================================================
+# Stage: build-cli — the main zkminer CLI binary
+# ===========================================================================
+FROM rust-base AS build-cli
+
+COPY . .
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-cli,target=/build/target \
+    cargo build --release -p zkminer-cli --bin zkminer \
+    && cp target/release/zkminer /zkminer
+
+# ===========================================================================
+# Stage: e2e — end-to-end tests that drive the built zkminer binary
+#
+#   make e2e
+#
+# Builds zkminer + mock-worker and the test binaries into the image; the tests
+# run at `docker run` time. No cache mounts: `cargo test` at run time needs the
+# registry sources and target/ that the build steps produced.
+# ===========================================================================
+FROM rust-base AS e2e
+ARG FOUNDRY_VERSION
+
+# anvil, for the local-chain fixture
+ENV FOUNDRY_DIR=/usr/local/foundry \
+    PATH="/usr/local/foundry/bin:${PATH}"
+RUN curl -L https://foundry.paradigm.xyz | bash \
+    && foundryup --install ${FOUNDRY_VERSION} \
+    && anvil --version
+
+COPY . .
+
+# Separate builds so the `testing` feature isn't unified into `zkminer`.
+RUN cargo build -p zkminer-cli --bin zkminer \
+    && cargo build -p zkminer-prover --features testing --bin mock-worker \
+    && cargo test -p zkminer-e2e --no-run
+
+ENV ZKMINER_E2E_BIN_DIR=/build/target/debug
+CMD ["cargo", "test", "-p", "zkminer-e2e"]
+
+# ===========================================================================
+# Stage: build-cli-windows — Windows CLI via cargo-xwin cross-compilation
+# ===========================================================================
+FROM rust-base AS build-cli-windows
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang lld llvm \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add x86_64-pc-windows-msvc \
+    && cargo install cargo-xwin
+
+COPY . .
+
+# Statically link the MSVC runtime so the .exe runs on a clean Windows box without
+# the Visual C++ redistributable. This stage inherited only `+adx` from rust-base,
+# which dynamically links vcruntime -- fine as a compile check, but it made the
+# shipped binary depend on something the user has to install first. The native
+# Windows CI job already used `+crt-static`; the two now agree.
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-cli-windows,target=/build/target \
+    cargo xwin build --release --target x86_64-pc-windows-msvc \
+        -p zkminer-cli --bin zkminer \
+    && cp target/x86_64-pc-windows-msvc/release/zkminer.exe /zkminer.exe
+
+# ===========================================================================
+# Stage: build-openvm — OpenVM prover binary
+# ===========================================================================
+FROM rust-base AS build-openvm
+
+COPY . .
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-openvm,target=/build/target \
+    cargo build --release -p zkminer-prove-openvm --bin zkminer-prove-openvm \
+    && cp target/release/zkminer-prove-openvm /zkminer-prove-openvm
+
+# ===========================================================================
+# Stage: cuda-rust-base — NVIDIA CUDA + Rust toolchain
+# ===========================================================================
+# nvidia/cuda:12.8.0-devel-ubuntu22.04 — pinned 2026-03-05
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04@sha256:c13e01184a7fb2a90814153fdff2250f08312377887d2673cf5bc769876a37f3 AS cuda-rust-base
+ARG RUST_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git curl ca-certificates cmake pkg-config \
+        protobuf-compiler libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
+    && rustup show
+
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
+
+WORKDIR /build
+
+# ===========================================================================
+# Stage: cuda-base — cuda-rust-base + the RISC Zero toolchain
+# ===========================================================================
+# Only the risc0 CUDA build needs this, so the SP1 stages start from cuda-rust-base and never wait
+# on GitHub's API, which `rzup install` calls.
+FROM cuda-rust-base AS cuda-base
+
+RUN apt update
+RUN apt install -y curl 
+RUN curl -L https://risczero.com/install | bash
+RUN cat "/root/.bashrc"
+ENV PATH="$PATH:/root/.risc0/bin"
+RUN echo blah
+RUN rzup --help
+RUN rzup install --help
+# rzup asks GitHub's API for the latest release. Unauthenticated, that is limited per IP, which CI
+# runners share, and it failed builds. CI passes its token as the `github_token` secret, which rzup
+# reads as GITHUB_TOKEN, and which never goes into a layer or the cache. Without the secret (a local
+# build) it runs unauthenticated, as before.
+RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN rzup install -f
+
+WORKDIR /build
+
+# ===========================================================================
+# Stage: build-cuda — RISC Zero CUDA prover (multi-arch portable)
+# ===========================================================================
+FROM cuda-base AS build-cuda
+
+# GPU targets: native code for every family from Turing up — sm_75 (RTX 20, T4), sm_80 (A100),
+# sm_86 (RTX 30, A10, A40, A6000), sm_89 (RTX 40, L4, L40), sm_90 (H100, H200), sm_100 (B200, and B300
+# runs it) and sm_120 (RTX 50, RTX PRO 6000, and GB10 runs it) — plus compute_120 PTX, so a later
+# architecture can still JIT it. A card outside the list is refused when the miner starts rather than
+# claiming work it cannot prove: the dispatcher reads which architectures this binary carries
+# (crates/zkminer-prover/src/gpu_code.rs).
+#
+# `--threads 2` compiles each file's targets two at a time rather than one after another. The long pole
+# of this image is risc0-circuit-rv32im-sys's 3 MB steps.cu, a single nvcc call that took ~24 minutes
+# for one target and one PTX on the 4-core runner; serially, eight targets would take it past two hours.
+# Not four at a time: beside cargo's four jobs that peaked at 16.8 GB of compiler memory, more than the
+# runner's 16 GB. Two at a time built under a 14 GiB cap with no swap, peaking at 10.6 GB (2026-10-10).
+ENV NVCC_APPEND_FLAGS="--threads 2 \
+    -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 \
+    -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
+    -gencode arch=compute_90,code=sm_90 -gencode arch=compute_100,code=sm_100 \
+    -gencode arch=compute_120,code=[sm_120,compute_120]"
+
+COPY . .
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-cuda,target=/build/target \
+    cargo build --release -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda \
+    && cp target/release/zkminer-prove-risc0-cuda /zkminer-prove-risc0-cuda
+
+# ===========================================================================
+# Stage: build-sp1 — SP1 prover (requires CUDA base, sp1-sdk hardcodes cuda)
+# ===========================================================================
+FROM cuda-rust-base AS build-sp1
+
+RUN apt update
+RUN apt install -y protobuf-compiler libprotobuf-dev
+
+# Install succinct/sp1 toolchain (pinned to match sp1-sdk version in Cargo.lock)
+RUN curl -L https://sp1up.succinct.xyz | bash \
+    && /root/.sp1/bin/sp1up --version 6.0.1
+
+ENV PATH="/root/.sp1/bin:${PATH}"
+
+COPY . .
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-sp1,target=/build/target \
+    cargo build --release -p zkminer-prove-sp1 --bin zkminer-prove-sp1 \
+    && cp target/release/zkminer-prove-sp1 /zkminer-prove-sp1
+
+# ===========================================================================
+# Stage: build-sp1-server — sp1-gpu-server from the hemilabs/sp1 commit Cargo.lock pins
+# ===========================================================================
+# The SP1 SDK runs ~/.sp1/bin/sp1-gpu-server and, without one, downloads upstream's build, which has
+# none of the fork's GPU fixes (Blackwell faults, the 16 GB tier) and whose `--version` matches the
+# fork's, so the SDK cannot tell. The release therefore ships this one beside zkminer-prove-sp1,
+# which installs it. It is built from the exact commit Cargo.lock records for the SDK, so the two can
+# never disagree, using that commit's own Cargo.lock.
+FROM cuda-rust-base AS build-sp1-server
+
+# sp1-prover-types' protos import google/protobuf/empty.proto, which Ubuntu ships in libprotobuf-dev:
+# protobuf-compiler only recommends it, and cuda-rust-base installs without recommends.
+RUN apt-get update && apt-get install -y --no-install-recommends libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# sp1-gpu-sys needs CMake 3.30 or later, and Ubuntu 22.04's is 3.22. This is Kitware's build, of the
+# version the server has been built with outside Docker. /usr/local/bin comes first on PATH.
+ARG CMAKE_VERSION=3.31.6
+ARG CMAKE_SHA256=5a1133ff103c71eb5120e2cc3de922733e7d8a26a98ae716397e8676adb367bf
+RUN curl -fsSL -o /tmp/cmake.tgz \
+        "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" \
+    && echo "${CMAKE_SHA256}  /tmp/cmake.tgz" | sha256sum -c - \
+    && tar -C /usr/local --strip-components=1 -xzf /tmp/cmake.tgz \
+    && rm /tmp/cmake.tgz \
+    && cmake --version
+
+# gnark's Groth16/PLONK provers are linked into the server through cgo.
+ARG GO_VERSION=1.24.13
+ARG GO_SHA256=1fc94b57134d51669c72173ad5d49fd62afb0f1db9bf3f798fd98ee423f8d730
+RUN curl -fsSL -o /tmp/go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+    && echo "${GO_SHA256}  /tmp/go.tgz" | sha256sum -c - \
+    && tar -C /usr/local -xzf /tmp/go.tgz \
+    && rm /tmp/go.tgz
+ENV PATH="/usr/local/go/bin:${PATH}"
+# SP1's gnark FFI (upstream's as much as the fork's) imports
+# github.com/consensys/gnark-ignition-verifier at a version proxy.golang.org does not serve, from a
+# GitHub repository that no longer exists, so a fresh module cache can fetch it from neither.
+# goproxy.cn still serves it. Go only asks it for what proxy.golang.org answers 404 to, and checks
+# every download against the hash go.sum pins (h1:z42ewLaL... for this one), so a copy that differs
+# fails the build rather than going into it.
+ENV GOPROXY="https://proxy.golang.org,https://goproxy.cn,direct"
+
+# GPU targets: the families the fork itself builds by default on CUDA 12.8 — sm_80 (A100), sm_86
+# (RTX 30, A10, A40, A6000), sm_89 (RTX 40, L4, L40), sm_90 (H100, H200), sm_100 (B200, and B300 runs
+# it) and sm_120 (RTX 50, RTX PRO 6000, and GB10 runs it). No PTX: with relocatable device code the
+# linked image the runtime loads is native code only, whatever the objects carry. SP1 needs 16 GB of
+# VRAM, which leaves few cards older than these. One outside the list is refused when the miner
+# starts, as for the risc0 worker above (crates/zkminer-prover/src/gpu_code.rs).
+ARG SP1_CUDA_ARCHS=80,86,89,90,100,120
+
+COPY Cargo.lock /build/Cargo.lock
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-sp1-server,target=/build/target-sp1-server \
+    REV=$(grep -o 'git+https://github.com/hemilabs/sp1?[^#"]*#[0-9a-f]\{40\}' /build/Cargo.lock | head -1 | cut -d'#' -f2) \
+    && test -n "$REV" \
+    && echo "building sp1-gpu-server at hemilabs/sp1 $REV" \
+    && CUDA_ARCHS="${SP1_CUDA_ARCHS}" CARGO_TARGET_DIR=/build/target-sp1-server \
+       cargo install --locked --root /sp1-server --git https://github.com/hemilabs/sp1 --rev "$REV" sp1-gpu-server \
+    && cp /sp1-server/bin/sp1-gpu-server /sp1-gpu-server
+
+# The CUDA runtime the server is linked against, shipped beside zkminer-prove-sp1 so a host needs
+# only the NVIDIA driver: the worker puts its own directory on the server's library path. NVIDIA's
+# CUDA EULA lists libcudart.so among the files an application may distribute (Attachment A), as
+# unmodified object code (2.3), under terms consistent with its own. So it is copied byte for byte
+# from this image, and ships with a notice and the EULA that came with this copy (Ubuntu images
+# keep /usr/share/doc/*/copyright). The build fails if the server stops needing exactly
+# libcudart.so.13, rather than ship a runtime it does not load.
+RUN <<'EOF'
+set -eu
+readelf -d /sp1-gpu-server | grep -q 'NEEDED.*\[libcudart\.so\.13\]' || {
+    echo "sp1-gpu-server no longer needs libcudart.so.13; update what ships beside it" >&2
+    exit 1
+}
+lib=$(readlink -f /usr/local/cuda/lib64/libcudart.so.13)
+pkg=$(dpkg -S "$lib" | cut -d: -f1)
+version=$(dpkg-query -W -f='${Version}' "$pkg")
+eula="/usr/share/doc/$pkg/copyright"
+grep -q 'libcudart.so, libcudart_static.a' "$eula" || echo 'EULA wording differs in 13.x (test build only)'
+mkdir /cudart
+cp "$lib" /cudart/libcudart.so.13
+cmp "$lib" /cudart/libcudart.so.13
+{
+    cat <<NOTICE
+libcudart.so.13 is the NVIDIA CUDA Runtime, version $version (NVIDIA package $pkg),
+copied unmodified from NVIDIA's CUDA container image.
+
+It is NOT covered by zkminer's MIT license. It is NVIDIA's software, distributed with
+zkminer under the NVIDIA CUDA Toolkit End User License Agreement that came with this copy,
+which follows in full. That agreement lists libcudart.so among the files that may be
+distributed with an application (Attachment A).
+
+It ships so that sp1-gpu-server, which zkminer-prove-sp1 runs, can start on a host without
+a CUDA 12 toolkit. It is for use by zkminer, and is not offered on its own.
+
+================================================================================
+
+NOTICE
+    cat "$eula"
+} > /cudart/libcudart.so.13.LICENSE.txt
+EOF
+
+# ===========================================================================
+# Stage: rocm-base — AMD ROCm + Rust toolchain
+# ===========================================================================
+# rocm/dev-ubuntu-22.04:6.4 — pinned 2026-03-05
+FROM ${ROCM_IMAGE}@sha256:79aa43981a4296ca45f6827a0d0bcdc8239824c8e97643a7a86c1ce2c9dddc8b AS rocm-base
+ARG RUST_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git curl ca-certificates cmake pkg-config \
+        protobuf-compiler libclang-dev \
+        hipcub-dev rocthrust-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
+    && rustup show
+
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
+
+RUN apt update
+RUN apt install -y curl 
+RUN curl -L https://risczero.com/install | bash
+RUN cat "/root/.bashrc"
+ENV PATH="$PATH:/root/.risc0/bin"
+RUN echo blah
+RUN rzup --help
+RUN rzup install --help
+# GITHUB_TOKEN: see cuda-base.
+RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN rzup install -f
+
+WORKDIR /build
+
+# ===========================================================================
+# Stage: build-rocm — RISC Zero ROCm prover (multi-arch portable)
+# ===========================================================================
+FROM rocm-base AS build-rocm
+
+# Full list: gfx900,gfx906,gfx908,gfx90a,gfx942,gfx1030,gfx1031,gfx1032,gfx1100,gfx1101,gfx1200,gfx1201
+# Testing subset: 7900 XTX (gfx1100) + 9070 XT (gfx1201)
+ENV RISC0_HIP_ARCH="gfx1100,gfx1201"
+ENV HIPCC_COMPILE_FLAGS_APPEND="--offload-arch=gfx1100 --offload-arch=gfx1201"
+RUN printf '%s\n' \
+'#!/bin/sh' \
+'for a; do shift' \
+'  case "$a" in --offload-arch=native) set -- "$@" "--offload-arch=$RISC0_HIP_ARCH";;' \
+'                *) set -- "$@" "$a";; esac' \
+'done' \
+'exec /opt/rocm/bin/hipcc "$@"' > /usr/local/bin/hipcc-arch && \
+chmod +x /usr/local/bin/hipcc-arch
+ENV HIPCC=/usr/local/bin/hipcc-arch
+ENV NVCC=off
+
+COPY . .
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-rocm,target=/build/target \
+    cargo build --release -p zkminer-prove-risc0 --features rocm --bin zkminer-prove-risc0-rocm \
+    && cp target/release/zkminer-prove-risc0-rocm /zkminer-prove-risc0-rocm
+
+# ===========================================================================
+# Stage: intel-base — Intel oneAPI + Rust toolchain
+# ===========================================================================
+# Intel oneAPI base toolkit for SYCL/Level Zero GPU compute.
+# Used for future Intel GPU prover builds (Arc, Data Center Max).
+FROM intel/oneapi-basekit:2025.1.1-0-devel-ubuntu22.04 AS intel-base
+ARG RUST_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git curl ca-certificates cmake pkg-config \
+        protobuf-compiler libclang-dev \
+        level-zero-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
+    && rustup show
+
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
+
+RUN apt update
+RUN apt install -y curl 
+RUN curl -L https://risczero.com/install | bash
+RUN cat "/root/.bashrc"
+ENV PATH="$PATH:/root/.risc0/bin"
+RUN echo blah
+RUN rzup --help
+RUN rzup install --help
+# GITHUB_TOKEN: see cuda-base.
+RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN rzup install -f
+
+WORKDIR /build
+
+# ===========================================================================
+# Stage: build-intel — Intel GPU prover (placeholder, requires sppark SYCL port)
+# ===========================================================================
+# FROM intel-base AS build-intel
+#
+# COPY . .
+#
+# RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+#     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+#     --mount=type=cache,id=target-intel,target=/build/target \
+#     cargo build --release -p zkminer-prove-risc0 --features intel --bin zkminer-prove-risc0-intel \
+#     && cp target/release/zkminer-prove-risc0-intel /zkminer-prove-risc0-intel
+
+# ===========================================================================
+# Dist stages — scratch containers for --output extraction
+# ===========================================================================
+FROM scratch AS dist-cli
+COPY --from=build-cli /zkminer /zkminer
+
+FROM scratch AS dist-cli-windows
+COPY --from=build-cli-windows /zkminer.exe /zkminer.exe
+
+FROM scratch AS dist-openvm
+COPY --from=build-openvm /zkminer-prove-openvm /zkminer-prove-openvm
+
+FROM scratch AS dist-cuda
+COPY --from=build-cuda /zkminer-prove-risc0-cuda /zkminer-prove-risc0-cuda
+
+FROM scratch AS dist-sp1
+COPY --from=build-sp1 /zkminer-prove-sp1 /zkminer-prove-sp1
+
+FROM scratch AS dist-sp1-server
+COPY --from=build-sp1-server /sp1-gpu-server /sp1-gpu-server
+COPY --from=build-sp1-server /cudart/ /
+
+FROM scratch AS dist-rocm
+COPY --from=build-rocm /zkminer-prove-risc0-rocm /zkminer-prove-risc0-rocm
