@@ -10,7 +10,6 @@ use ratatui::text::Span;
 use ratatui::widgets::BorderType;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-
 // ---------------------------------------------------------------------------
 // Theme identification
 // ---------------------------------------------------------------------------
@@ -127,157 +126,160 @@ struct Palette {
 /// Catppuccin Mocha — warm pastels on deep purple-blue base.
 /// The cozy default. Rounded lavender borders, warm peach metrics.
 const MOCHA: Palette = Palette {
-    base:         (30, 30, 46),
-    surface:      (49, 50, 68),
-    overlay:      (69, 71, 90),
-    subtext:      (127, 132, 156),
-    text:         (205, 214, 244),
-    status_bar:   (24, 24, 37),
-    border_dim:   (88, 91, 112),    // visible muted lavender-gray
-    badge_fg:     (30, 30, 46),
-    primary:      (180, 190, 254),  // lavender
-    secondary:    (137, 180, 250),  // blue
-    tertiary:     (203, 166, 247),  // mauve
-    title_color:  (137, 220, 235),  // sky
-    highlight:    (148, 226, 213),  // teal
-    green:        (166, 227, 161),
-    yellow:       (249, 226, 175),
-    red:          (243, 139, 168),
-    metric_color: (250, 179, 135),  // peach
-    stripe:       (35, 35, 52),
-    border:       BorderType::Rounded,
-    progress:     ProgressStyle::Block,
+    base: (30, 30, 46),
+    surface: (49, 50, 68),
+    overlay: (69, 71, 90),
+    subtext: (127, 132, 156),
+    text: (205, 214, 244),
+    status_bar: (24, 24, 37),
+    border_dim: (88, 91, 112), // visible muted lavender-gray
+    badge_fg: (30, 30, 46),
+    primary: (180, 190, 254),     // lavender
+    secondary: (137, 180, 250),   // blue
+    tertiary: (203, 166, 247),    // mauve
+    title_color: (137, 220, 235), // sky
+    highlight: (148, 226, 213),   // teal
+    green: (166, 227, 161),
+    yellow: (249, 226, 175),
+    red: (243, 139, 168),
+    metric_color: (250, 179, 135), // peach
+    stripe: (35, 35, 52),
+    border: BorderType::Rounded,
+    progress: ProgressStyle::Block,
 };
 
 /// Phosphor — green-on-black CRT terminal. Maximum retro.
 /// Monochrome green with amber warnings. ASCII progress bars.
 const PHOSPHOR: Palette = Palette {
-    base:         (0, 0, 0),
-    surface:      (0, 24, 0),
-    overlay:      (0, 45, 0),
-    subtext:      (0, 120, 0),
-    text:         (0, 255, 0),
-    status_bar:   (0, 15, 0),
-    border_dim:   (0, 160, 0),      // bright green borders
-    badge_fg:     (0, 0, 0),
-    primary:      (50, 255, 50),    // bright green
-    secondary:    (0, 200, 100),    // green-teal
-    tertiary:     (0, 220, 0),      // green
-    title_color:  (100, 255, 100),  // bright green
-    highlight:    (150, 255, 150),
-    green:        (0, 255, 0),
-    yellow:       (255, 180, 0),    // amber
-    red:          (255, 0, 0),
-    metric_color: (255, 200, 0),    // amber/gold
-    stripe:       (0, 10, 0),
-    border:       BorderType::Plain,
-    progress:     ProgressStyle::Ascii,
+    base: (0, 0, 0),
+    surface: (0, 24, 0),
+    overlay: (0, 45, 0),
+    subtext: (0, 120, 0),
+    text: (0, 255, 0),
+    status_bar: (0, 15, 0),
+    border_dim: (0, 160, 0), // bright green borders
+    badge_fg: (0, 0, 0),
+    primary: (50, 255, 50),       // bright green
+    secondary: (0, 200, 100),     // green-teal
+    tertiary: (0, 220, 0),        // green
+    title_color: (100, 255, 100), // bright green
+    highlight: (150, 255, 150),
+    green: (0, 255, 0),
+    yellow: (255, 180, 0), // amber
+    red: (255, 0, 0),
+    metric_color: (255, 200, 0), // amber/gold
+    stripe: (0, 10, 0),
+    border: BorderType::Plain,
+    progress: ProgressStyle::Ascii,
 };
 
 /// Cyberpunk — neon hot pink and electric cyan on jet black.
 /// Maximum saturation. Bladerunner vibes.
 const CYBERPUNK: Palette = Palette {
-    base:         (8, 8, 16),       // near-black with blue tint
-    surface:      (18, 18, 32),
-    overlay:      (35, 35, 55),
-    subtext:      (120, 110, 140),  // muted purple-gray
-    text:         (230, 225, 240),  // cool white
-    status_bar:   (12, 0, 20),      // deep purple-black
-    border_dim:   (255, 0, 128),    // HOT PINK borders
-    badge_fg:     (8, 8, 16),
-    primary:      (0, 255, 255),    // electric cyan
-    secondary:    (255, 0, 128),    // hot pink
-    tertiary:     (180, 0, 255),    // electric purple
-    title_color:  (0, 255, 255),    // cyan
-    highlight:    (0, 255, 180),    // neon mint
-    green:        (0, 255, 65),     // neon green
-    yellow:       (255, 255, 0),    // neon yellow
-    red:          (255, 0, 60),     // neon red
-    metric_color: (255, 0, 200),    // neon magenta
-    stripe:       (14, 14, 28),
-    border:       BorderType::Rounded,
-    progress:     ProgressStyle::Dot,
+    base: (8, 8, 16), // near-black with blue tint
+    surface: (18, 18, 32),
+    overlay: (35, 35, 55),
+    subtext: (120, 110, 140),  // muted purple-gray
+    text: (230, 225, 240),     // cool white
+    status_bar: (12, 0, 20),   // deep purple-black
+    border_dim: (255, 0, 128), // HOT PINK borders
+    badge_fg: (8, 8, 16),
+    primary: (0, 255, 255),      // electric cyan
+    secondary: (255, 0, 128),    // hot pink
+    tertiary: (180, 0, 255),     // electric purple
+    title_color: (0, 255, 255),  // cyan
+    highlight: (0, 255, 180),    // neon mint
+    green: (0, 255, 65),         // neon green
+    yellow: (255, 255, 0),       // neon yellow
+    red: (255, 0, 60),           // neon red
+    metric_color: (255, 0, 200), // neon magenta
+    stripe: (14, 14, 28),
+    border: BorderType::Rounded,
+    progress: ProgressStyle::Dot,
 };
 
 /// Tokyo Night — deep blue-black with neon blue and purple accents.
 /// Modern IDE aesthetic. Blue-tinted everything.
 const TOKYO_NIGHT: Palette = Palette {
-    base:         (26, 27, 38),     // bg
-    surface:      (36, 40, 59),     // bg_highlight
-    overlay:      (55, 59, 78),
-    subtext:      (86, 95, 137),    // muted blue
-    text:         (192, 202, 245),  // light blue-white
-    status_bar:   (22, 22, 30),     // bg_dark
-    border_dim:   (61, 89, 161),    // visible blue borders
-    badge_fg:     (26, 27, 38),
-    primary:      (122, 162, 247),  // bright blue
-    secondary:    (187, 154, 247),  // purple
-    tertiary:     (255, 117, 127),  // pink-red
-    title_color:  (125, 207, 255),  // sky blue
-    highlight:    (115, 218, 202),  // teal
-    green:        (158, 206, 106),
-    yellow:       (224, 175, 104),
-    red:          (247, 118, 142),
-    metric_color: (255, 158, 100),  // orange
-    stripe:       (33, 35, 50),
-    border:       BorderType::Rounded,
-    progress:     ProgressStyle::Block,
+    base: (26, 27, 38),    // bg
+    surface: (36, 40, 59), // bg_highlight
+    overlay: (55, 59, 78),
+    subtext: (86, 95, 137),    // muted blue
+    text: (192, 202, 245),     // light blue-white
+    status_bar: (22, 22, 30),  // bg_dark
+    border_dim: (61, 89, 161), // visible blue borders
+    badge_fg: (26, 27, 38),
+    primary: (122, 162, 247),     // bright blue
+    secondary: (187, 154, 247),   // purple
+    tertiary: (255, 117, 127),    // pink-red
+    title_color: (125, 207, 255), // sky blue
+    highlight: (115, 218, 202),   // teal
+    green: (158, 206, 106),
+    yellow: (224, 175, 104),
+    red: (247, 118, 142),
+    metric_color: (255, 158, 100), // orange
+    stripe: (33, 35, 50),
+    border: BorderType::Rounded,
+    progress: ProgressStyle::Block,
 };
 
 /// Kanagawa — inspired by Japanese ink painting and the Great Wave.
 /// Deep indigo base, old gold titles, sakura pink accents, warm whites.
 const KANAGAWA: Palette = Palette {
-    base:         (22, 22, 29),     // sumiInk0
-    surface:      (30, 30, 41),     // sumiInk1
-    overlay:      (54, 54, 70),     // sumiInk3
-    subtext:      (114, 113, 105),  // fujiGray
-    text:         (220, 215, 186),  // fujiWhite — warm ivory
-    status_bar:   (18, 18, 23),     // sumiInk0 darker
-    border_dim:   (84, 84, 109),    // slate-purple borders
-    badge_fg:     (22, 22, 29),
-    primary:      (126, 156, 216),  // crystalBlue
-    secondary:    (149, 127, 184),  // oniViolet
-    tertiary:     (210, 126, 153),  // sakuraPink
-    title_color:  (192, 163, 110),  // carpYellow — old gold titles
-    highlight:    (106, 149, 137),  // waveAqua
-    green:        (152, 187, 108),  // springGreen
-    yellow:       (192, 163, 110),  // carpYellow
-    red:          (195, 64, 67),    // autumnRed
-    metric_color: (255, 160, 102),  // surimiOrange
-    stripe:       (27, 27, 36),
-    border:       BorderType::Plain,
-    progress:     ProgressStyle::Dot,
+    base: (22, 22, 29),        // sumiInk0
+    surface: (30, 30, 41),     // sumiInk1
+    overlay: (54, 54, 70),     // sumiInk3
+    subtext: (114, 113, 105),  // fujiGray
+    text: (220, 215, 186),     // fujiWhite — warm ivory
+    status_bar: (18, 18, 23),  // sumiInk0 darker
+    border_dim: (84, 84, 109), // slate-purple borders
+    badge_fg: (22, 22, 29),
+    primary: (126, 156, 216),      // crystalBlue
+    secondary: (149, 127, 184),    // oniViolet
+    tertiary: (210, 126, 153),     // sakuraPink
+    title_color: (192, 163, 110),  // carpYellow — old gold titles
+    highlight: (106, 149, 137),    // waveAqua
+    green: (152, 187, 108),        // springGreen
+    yellow: (192, 163, 110),       // carpYellow
+    red: (195, 64, 67),            // autumnRed
+    metric_color: (255, 160, 102), // surimiOrange
+    stripe: (27, 27, 36),
+    border: BorderType::Plain,
+    progress: ProgressStyle::Dot,
 };
 
 /// High Contrast — maximum readability. Pure black, bright white, vivid primaries.
 /// Accessibility-first. Cyan borders for structural visibility.
 const HIGH_CONTRAST: Palette = Palette {
-    base:         (0, 0, 0),        // pure black
-    surface:      (25, 25, 25),
-    overlay:      (60, 60, 60),
-    subtext:      (180, 180, 180),  // bright gray
-    text:         (255, 255, 255),  // pure white
-    status_bar:   (0, 40, 50),      // dark teal bar
-    border_dim:   (0, 190, 210),    // bright cyan borders
-    badge_fg:     (0, 0, 0),
-    primary:      (100, 160, 255),  // bright blue
-    secondary:    (200, 120, 255),  // bright purple
-    tertiary:     (255, 120, 200),  // bright pink
-    title_color:  (0, 220, 240),    // bright cyan
-    highlight:    (100, 255, 220),  // bright mint
-    green:        (0, 230, 0),      // vivid green
-    yellow:       (255, 230, 0),    // vivid yellow
-    red:          (255, 60, 60),    // vivid red
-    metric_color: (255, 190, 0),    // vivid orange
-    stripe:       (18, 18, 18),
-    border:       BorderType::Double,
-    progress:     ProgressStyle::Block,
+    base: (0, 0, 0), // pure black
+    surface: (25, 25, 25),
+    overlay: (60, 60, 60),
+    subtext: (180, 180, 180),  // bright gray
+    text: (255, 255, 255),     // pure white
+    status_bar: (0, 40, 50),   // dark teal bar
+    border_dim: (0, 190, 210), // bright cyan borders
+    badge_fg: (0, 0, 0),
+    primary: (100, 160, 255),    // bright blue
+    secondary: (200, 120, 255),  // bright purple
+    tertiary: (255, 120, 200),   // bright pink
+    title_color: (0, 220, 240),  // bright cyan
+    highlight: (100, 255, 220),  // bright mint
+    green: (0, 230, 0),          // vivid green
+    yellow: (255, 230, 0),       // vivid yellow
+    red: (255, 60, 60),          // vivid red
+    metric_color: (255, 190, 0), // vivid orange
+    stripe: (18, 18, 18),
+    border: BorderType::Double,
+    progress: ProgressStyle::Block,
 };
 
 const PALETTES: &[Palette] = &[
-    TOKYO_NIGHT, MOCHA,
-    PHOSPHOR, CYBERPUNK,
-    KANAGAWA, HIGH_CONTRAST,
+    TOKYO_NIGHT,
+    MOCHA,
+    PHOSPHOR,
+    CYBERPUNK,
+    KANAGAWA,
+    HIGH_CONTRAST,
 ];
 
 fn pal() -> &'static Palette {
@@ -545,7 +547,9 @@ pub fn accent() -> Style {
 
 /// Loading / placeholder text.
 pub fn placeholder() -> Style {
-    Style::default().fg(subtext()).add_modifier(Modifier::ITALIC)
+    Style::default()
+        .fg(subtext())
+        .add_modifier(Modifier::ITALIC)
 }
 
 /// Separator string (" | ").
@@ -690,7 +694,7 @@ fn progress_bar_dot(ratio: f64, width: usize) -> (String, String) {
     let filled_count = (ratio.clamp(0.0, 1.0) * width as f64).round() as usize;
     let empty_count = width.saturating_sub(filled_count);
     let filled = "\u{25cf}".repeat(filled_count); // ●
-    let blank = "\u{25cb}".repeat(empty_count);    // ○
+    let blank = "\u{25cb}".repeat(empty_count); // ○
     (filled, blank)
 }
 

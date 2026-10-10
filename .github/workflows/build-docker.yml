@@ -6,11 +6,65 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # Lets any branch be built on demand. Without this, the only way to exercise
+  # this workflow is to open a PR against main — `branches:` on a pull_request
+  # trigger matches the BASE, not the head, so pushing a topic branch does
+  # nothing.
+  workflow_dispatch:
+  # Callable from release.yml so a tagged release builds the SAME binaries this
+  # workflow already validates, instead of a second copy of the build that can drift.
+  workflow_call:
+    inputs:
+      retention_days:
+        description: 'How long to keep the uploaded artifacts'
+        type: number
+        default: 14
+        required: false
+
+permissions:
+  contents: read
 
 jobs:
   build:
     # Docker actions require a Linux environment
     runs-on: ubuntu-latest
+    # One job per shippable artifact.
+    #
+    # `docker build -f Dockerfile.build .` with no --target builds only the LAST
+    # stage in the file and its dependencies. The last stage is dist-rocm, so a
+    # bare build compiled `zkminer-prove-risc0 --features rocm` and nothing else:
+    # the main zkminer CLI, the CUDA and SP1 provers, OpenVM and the Windows
+    # binary were all skipped while the check still reported success. Because
+    # zkminer-prove-risc0 depends only on zkminer-prover-protocol, a compile
+    # error in zkminer-cli, -chain, -tui, -strategy or -prover passed CI green.
+    name: ${{ matrix.target }}
+    # sp1-gpu-server compiles SP1's CUDA kernels on top of the whole prover.
+    timeout-minutes: ${{ matrix.timeout || 120 }}
+    strategy:
+      # Build every target even after one fails — otherwise the first failure
+      # hides the state of the other five.
+      fail-fast: false
+      matrix:
+        include:
+          - target: dist-cli
+            binary: zkminer
+          - target: dist-cli-windows
+            binary: zkminer.exe
+          - target: dist-openvm
+            binary: zkminer-prove-openvm
+          - target: dist-cuda
+            binary: zkminer-prove-risc0-cuda
+            # Native code for seven GPU families, not two: see NVCC_APPEND_FLAGS in Dockerfile.build.
+            timeout: 240
+          - target: dist-sp1
+            binary: zkminer-prove-sp1
+          - target: dist-sp1-server
+            binary: sp1-gpu-server
+            timeout: 300
+            # Shipped with it: the CUDA runtime it links, and that file's license.
+            extras: libcudart.so.12 libcudart.so.12.LICENSE.txt
+          - target: dist-rocm
+            binary: zkminer-prove-risc0-rocm
 
     steps:
       - name: "Checkout repository"
@@ -19,5 +73,59 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: "Build Docker Image"
-        run: docker build -f Dockerfile.build .
+      # `--output` is a BuildKit feature; the classic builder ignores it.
+      - name: "Set up Buildx"
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # EXTRACT the binary instead of discarding it.
+      #
+      # Every `dist-*` stage is a `FROM scratch` container holding exactly one
+      # binary, and exists only to be exported — the Dockerfile's own usage line
+      # says so. Building without `--output` proved the code compiled and then
+      # threw all six binaries away, so no build produced anything anyone could
+      # download or test.
+      #
+      # The token is for rzup, in the risc0 stages: GitHub's unauthenticated API
+      # limits requests per IP, which runners share, and failed builds there.
+      # Passed as a secret, it never goes into a layer or the build cache.
+      - name: "Build and extract ${{ matrix.binary }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker buildx build \
+            -f Dockerfile.build \
+            --target ${{ matrix.target }} \
+            --secret id=github_token,env=GITHUB_TOKEN \
+            --output type=local,dest=dist \
+            .
+
+      - name: "Verify and checksum"
+        run: |
+          set -euo pipefail
+          cd dist
+          test -s "${{ matrix.binary }}" || {
+            echo "::error::${{ matrix.binary }} is missing or empty after extraction"
+            ls -la
+            exit 1
+          }
+          for f in ${{ matrix.extras }}; do
+            test -s "$f" || {
+              echo "::error::$f is missing or empty after extraction"
+              ls -la
+              exit 1
+            }
+          done
+          chmod +x "${{ matrix.binary }}" || true
+          sha256sum "${{ matrix.binary }}" | tee "${{ matrix.binary }}.sha256"
+          ls -la
+
+      # Downloadable from the run's Artifacts section by anyone who can see the
+      # repo, on EVERY build — push, PR and manual dispatch alike.
+      - name: "Upload ${{ matrix.binary }}"
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}
+          # Everything the dist stage exports: the binary, plus any extras.
+          path: dist/
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention_days || 14 }}

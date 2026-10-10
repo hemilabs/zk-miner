@@ -1,12 +1,12 @@
 //! Mock worker binary for integration tests.
 //!
-//! Speaks the worker IPC protocol (Hello/HelloAck handshake, Benchmark, Prove,
-//! CalibrateSegmentLimit)
+//! Speaks the worker IPC protocol (Hello/HelloAck handshake, Benchmark, Prove, Warmup, and canned
+//! answers to Execute and CalibrateSegmentLimit)
 //! and can be configured via environment variables:
 //!
-//! - `MOCK_HANG_ON`: `"benchmark"`, `"prove"`, or `"both"` — hangs (sleeps forever)
+//! - `MOCK_HANG_ON`: `"benchmark"`, `"prove"`, `"both"` or `"warmup"` — hangs (sleeps forever)
 //!   on the specified command type. Unset or empty = respond normally.
-//! - `MOCK_CRASH_ON`: `"benchmark"`, `"prove"`, or `"both"` — exits immediately
+//! - `MOCK_CRASH_ON`: `"benchmark"`, `"prove"`, `"both"` or `"warmup"` — exits immediately
 //!   with code 1 on the specified command type, simulating a worker crash.
 //! - `MOCK_BACKEND`: backend name for the HelloAck response. Default: `"mock"`.
 
@@ -33,7 +33,9 @@ fn main() {
         };
 
         match cmd {
-            WorkerCommand::Hello { protocol_version: _ } => {
+            WorkerCommand::Hello {
+                protocol_version: _,
+            } => {
                 let resp = WorkerResponse::HelloAck {
                     protocol_version: PROTOCOL_VERSION,
                     backend: backend.clone(),
@@ -92,11 +94,18 @@ fn main() {
                 write_message(&mut stdout, &resp).unwrap();
             }
 
-            WorkerCommand::Cancel { request_id } => {
-                let resp = WorkerResponse::Cancelled { request_id };
+            // Measures nothing: answers like a guest of 1,000 cycles, so a caller sees a well-formed
+            // reply rather than a hang.
+            WorkerCommand::Execute { request_id, .. } => {
+                let resp = WorkerResponse::ExecuteResult {
+                    request_id,
+                    cycles: 1000,
+                    duration_secs: 0.01,
+                };
                 write_message(&mut stdout, &resp).unwrap();
             }
 
+            // Measures nothing either: one segment of 1,000 cycles at whatever po2 was asked for.
             WorkerCommand::CalibrateSegmentLimit { request_id, po2 } => {
                 let resp = WorkerResponse::CalibrationResult {
                     request_id,
@@ -104,6 +113,29 @@ fn main() {
                     segment_count: 1,
                     total_cycles: 1000,
                     prove_duration_secs: 0.01,
+                };
+                write_message(&mut stdout, &resp).unwrap();
+            }
+
+            WorkerCommand::Cancel { request_id } => {
+                let resp = WorkerResponse::Cancelled { request_id };
+                write_message(&mut stdout, &resp).unwrap();
+            }
+
+            WorkerCommand::Warmup { request_id } => {
+                if crash_on == "warmup" {
+                    std::process::exit(1);
+                }
+                if hang_on == "warmup" {
+                    // Hang forever — the watchdog will SIGKILL us
+                    loop {
+                        std::thread::sleep(Duration::from_secs(3600));
+                    }
+                }
+                let resp = WorkerResponse::WarmupDone {
+                    request_id,
+                    summary: "nothing to warm up".to_string(),
+                    groth16_helper: false,
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }

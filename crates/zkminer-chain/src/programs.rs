@@ -5,10 +5,10 @@
 //! Provers use this to discover where to obtain the ELF for a given programId.
 
 use alloy::primitives::B256;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 use crate::client::ChainClient;
-use zkminer_contracts::bindings::{IProgramRegistry, ProgramVersion, StorageURI};
+use zkminer_contracts::bindings::IProgramRegistry;
 
 /// Hard cap on a downloaded ELF. Real guest ELFs are single-digit MB; this bounds a
 /// submitter-controlled storage URI so an accidentally- or maliciously-huge response
@@ -150,6 +150,12 @@ pub struct ElfCache {
     cache_dir: std::path::PathBuf,
 }
 
+impl Default for ElfCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ElfCache {
     pub fn new() -> Self {
         let cache_dir = dirs::home_dir()
@@ -186,8 +192,7 @@ impl ElfCache {
 
     /// Store an ELF in the cache.
     pub fn put(&self, program_id: &B256, elf: &[u8]) -> Result<()> {
-        std::fs::create_dir_all(&self.cache_dir)
-            .context("Failed to create ELF cache directory")?;
+        std::fs::create_dir_all(&self.cache_dir).context("Failed to create ELF cache directory")?;
         let path = self.cache_dir.join(format!("{}.elf", program_id));
         std::fs::write(&path, elf).context("Failed to write ELF to cache")?;
         tracing::info!("Cached ELF for {} ({} bytes)", program_id, elf.len());
@@ -196,18 +201,13 @@ impl ElfCache {
 
     /// Check if an ELF is cached.
     pub fn has(&self, program_id: &B256) -> bool {
-        self.cache_dir
-            .join(format!("{}.elf", program_id))
-            .exists()
+        self.cache_dir.join(format!("{}.elf", program_id)).exists()
     }
 }
 
 /// Download an ELF binary from a list of storage URIs.
 /// Tries each URI in order until one succeeds.
-pub async fn download_elf(
-    uris: &[ResolvedURI],
-    expected_hash: Option<B256>,
-) -> Result<Vec<u8>> {
+pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> Result<Vec<u8>> {
     if uris.is_empty() {
         bail!("No storage URIs available for this program");
     }
@@ -242,7 +242,9 @@ pub async fn download_elf(
                     if len > MAX_ELF_BYTES {
                         tracing::warn!(
                             "ELF at {} declares {} bytes (> {} cap) — skipping",
-                            url, len, MAX_ELF_BYTES
+                            url,
+                            len,
+                            MAX_ELF_BYTES
                         );
                         continue;
                     }
@@ -273,7 +275,8 @@ pub async fn download_elf(
                 if over_cap {
                     tracing::warn!(
                         "ELF from {} exceeds {} cap mid-stream — skipping",
-                        url, MAX_ELF_BYTES
+                        url,
+                        MAX_ELF_BYTES
                     );
                     continue;
                 }
@@ -288,7 +291,9 @@ pub async fn download_elf(
                     if actual != expected {
                         tracing::warn!(
                             "ELF hash mismatch from {}: expected {}, got {}",
-                            url, expected, actual
+                            url,
+                            expected,
+                            actual
                         );
                         continue;
                     }
@@ -300,7 +305,9 @@ pub async fn download_elf(
                     if actual != uri_info.content_hash {
                         tracing::warn!(
                             "Content hash mismatch from {}: expected {}, got {}",
-                            url, uri_info.content_hash, actual
+                            url,
+                            uri_info.content_hash,
+                            actual
                         );
                         continue;
                     }

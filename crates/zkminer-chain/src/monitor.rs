@@ -3,7 +3,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use anyhow::Result;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, interval};
+use tokio::time::{interval, Duration};
 
 use crate::client::ChainClient;
 
@@ -202,7 +202,10 @@ impl JobMonitor {
                 Ok(b) => b,
                 Err(e) => {
                     let _ = tx
-                        .send(MonitorEvent::Error(format!("Failed to get block number: {}", e)))
+                        .send(MonitorEvent::Error(format!(
+                            "Failed to get block number: {}",
+                            e
+                        )))
                         .await;
                     continue;
                 }
@@ -258,7 +261,10 @@ impl JobMonitor {
 
                 match self.client.provider.get_logs(&filter).await {
                     Ok(logs) => {
-                        tracing::debug!("monitor: get_logs {start}..={end} returned {} logs", logs.len());
+                        tracing::debug!(
+                            "monitor: get_logs {start}..={end} returned {} logs",
+                            logs.len()
+                        );
                         for log in logs {
                             let topic0 = log.topics().first().copied();
                             // [RPC #2] Cache jobId → submitting tx hash for the descriptor
@@ -289,7 +295,7 @@ impl JobMonitor {
                                 // claims prune as designed. JobCancelled stays unconditional:
                                 // Cancelled is terminal — no contract path resets it.
                                 if matches!(event, MonitorEvent::JobClaimed { .. })
-                                    && log.block_number.map_or(true, |b| b <= startup_head)
+                                    && log.block_number.is_none_or(|b| b <= startup_head)
                                 {
                                     continue;
                                 }
@@ -304,7 +310,10 @@ impl JobMonitor {
                     }
                     Err(e) => {
                         let _ = tx
-                            .send(MonitorEvent::Error(format!("Failed to get logs {start}..={end}: {}", e)))
+                            .send(MonitorEvent::Error(format!(
+                                "Failed to get logs {start}..={end}: {}",
+                                e
+                            )))
                             .await;
                         // Stop this poll; retry the FAILED chunk next poll. last_block has
                         // already advanced past the successful chunks, so the range never grows.
@@ -356,7 +365,12 @@ fn parse_job_claimed_log(log: &Log) -> Option<MonitorEvent> {
         buf[3..8].copy_from_slice(&data[91..96]);
         buf
     });
-    Some(MonitorEvent::JobClaimed { job_id, prover, settled_price, lock_deadline })
+    Some(MonitorEvent::JobClaimed {
+        job_id,
+        prover,
+        settled_price,
+        lock_deadline,
+    })
 }
 
 /// Parse a JobCancelled log.
@@ -487,7 +501,12 @@ mod tests {
         data.extend_from_slice(&word(&7200u64.to_be_bytes()[3..])); // fulfillmentTimeout uint40
         data.extend_from_slice(&word(&[0])); // trust uint8
         let log = mk_log(
-            vec![job_submitted_topic0(), jid, ps, B256::from(word(caller.as_slice()))],
+            vec![
+                job_submitted_topic0(),
+                jid,
+                ps,
+                B256::from(word(caller.as_slice())),
+            ],
             data,
         );
         match parse_monitor_log(&log) {
@@ -552,7 +571,12 @@ mod tests {
             data,
         );
         match parse_monitor_log(&log) {
-            Some(MonitorEvent::JobClaimed { job_id, prover: p, settled_price, lock_deadline }) => {
+            Some(MonitorEvent::JobClaimed {
+                job_id,
+                prover: p,
+                settled_price,
+                lock_deadline,
+            }) => {
                 assert_eq!(job_id, jid);
                 assert_eq!(p, prover);
                 assert_eq!(settled_price, 50_000_000_000_000_000_000u128);
@@ -580,7 +604,11 @@ mod tests {
         data.extend_from_slice(&[0u8; 32]); // refundAmount
         data.extend_from_slice(&word(&[1])); // bonusIncluded = true
         let log = mk_log(
-            vec![job_cancelled_topic0(), jid, B256::from(word(caller.as_slice()))],
+            vec![
+                job_cancelled_topic0(),
+                jid,
+                B256::from(word(caller.as_slice())),
+            ],
             data,
         );
         match parse_monitor_log(&log) {
@@ -610,13 +638,20 @@ mod tests {
             ],
             vec![0u8; 256],
         );
-        assert!(parse_monitor_log(&log).is_none(), "JobReopened must be ignored");
+        assert!(
+            parse_monitor_log(&log).is_none(),
+            "JobReopened must be ignored"
+        );
     }
 
     #[test]
     fn short_or_malformed_logs_return_none() {
         // Claimed log with too few topics.
-        assert!(parse_monitor_log(&mk_log(vec![job_claimed_topic0(), B256::ZERO], vec![0u8; 96])).is_none());
+        assert!(parse_monitor_log(&mk_log(
+            vec![job_claimed_topic0(), B256::ZERO],
+            vec![0u8; 96]
+        ))
+        .is_none());
         // Claimed log with short data.
         assert!(parse_monitor_log(&mk_log(
             vec![job_claimed_topic0(), B256::ZERO, B256::ZERO],
@@ -624,7 +659,9 @@ mod tests {
         ))
         .is_none());
         // Cancelled log with too few topics.
-        assert!(parse_monitor_log(&mk_log(vec![job_cancelled_topic0(), B256::ZERO], vec![])).is_none());
+        assert!(
+            parse_monitor_log(&mk_log(vec![job_cancelled_topic0(), B256::ZERO], vec![])).is_none()
+        );
         // Empty-topic log.
         assert!(parse_monitor_log(&mk_log(vec![], vec![])).is_none());
     }

@@ -104,9 +104,15 @@ fn test_gpu_groth16_proof_format() {
                 let seal_size = proof.seal.len();
 
                 if seal_size <= 512 {
-                    eprintln!("  FORMAT: Groth16 seal ({} bytes) - CORRECT for on-chain verification", seal_size);
+                    eprintln!(
+                        "  FORMAT: Groth16 seal ({} bytes) - CORRECT for on-chain verification",
+                        seal_size
+                    );
                 } else if seal_size <= 10_000 {
-                    eprintln!("  FORMAT: Succinct/Compact receipt ({} bytes) - MAY work on-chain", seal_size);
+                    eprintln!(
+                        "  FORMAT: Succinct/Compact receipt ({} bytes) - MAY work on-chain",
+                        seal_size
+                    );
                 } else {
                     eprintln!("  FORMAT: Large receipt ({} bytes) - likely bincode InnerReceipt, WILL NOT work on-chain!", seal_size);
                     panic!(
@@ -118,7 +124,11 @@ fn test_gpu_groth16_proof_format() {
 
                 // Print seal header for inspection
                 let preview_len = seal_size.min(64);
-                eprintln!("  Seal[0..{}]: {:02x?}", preview_len, &proof.seal[..preview_len]);
+                eprintln!(
+                    "  Seal[0..{}]: {:02x?}",
+                    preview_len,
+                    &proof.seal[..preview_len]
+                );
 
                 eprintln!("  RESULT: PASS");
             }

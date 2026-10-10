@@ -1,7 +1,7 @@
 //! Job profitability evaluation and strategy.
 
-use crate::cost_model::{CostParams, estimate_proving_cost};
-use crate::timing::{BenchmarkSuite, can_finish_at_throughput, can_finish_before_deadline};
+use crate::cost_model::{estimate_proving_cost, CostParams};
+use crate::timing::{can_finish_at_throughput, can_finish_before_deadline, BenchmarkSuite};
 
 /// Recommendation for how to handle a job.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +68,12 @@ pub struct JobParams {
     pub throughput: f64,
     /// Maximum auction price for this job (for WatchAndWait decisions).
     pub max_price: u128,
+    /// Measured draw of the card this evaluation assumes, in watts.
+    ///
+    /// Pairs with `throughput`: a caller that names a device must name its power too, so the
+    /// duration and the electricity charged describe the same card. `None` means "the suite
+    /// average card", matching `throughput: 0.0`.
+    pub device_watts: Option<f64>,
 }
 
 /// Default job params for testing.
@@ -79,13 +85,14 @@ impl Default for JobParams {
             bonus_amount: 0,
             speed_premium: 0,
             fulfillment_timeout: 3600,
-            time_remaining: 3600, // 1 hour
-            estimated_cycles: 10_000_000, // 10M cycles
-            required_collateral: 1_000_000_000_000_000_000, // 1 HEMI
+            time_remaining: 3600,                              // 1 hour
+            estimated_cycles: 10_000_000,                      // 10M cycles
+            required_collateral: 1_000_000_000_000_000_000,    // 1 HEMI
             available_collateral: 100_000_000_000_000_000_000, // 100 HEMI
             token_price_usd: 0.80,
             fee_rate_bps: 500, // 5%
             throughput: 0.0,
+            device_watts: None,
             max_price: 20_000_000_000_000_000_000, // 20 HEMI
         }
     }
@@ -123,16 +130,74 @@ pub fn evaluate_job(
         )
     };
 
-    // Estimate proving cost
-    let cost_usd = estimate_proving_cost(cost_params, estimated_duration);
+    // Estimate proving cost.
+    //
+    // The composition happens HERE, not at the call site, because a caller that forgets it
+    // gets a silently wrong answer rather than a compile error. That is exactly what happened:
+    // `cost_params.system_power_watts` carries config's `prover.system_power_watts`, which its
+    // own documentation defines as a COMPONENT ("base system power overhead … added to
+    // measured CPU and GPU power"), and the production path passed it through as the TOTAL.
+    // Every claim decision on a two-GPU box was therefore costed at 75 W of electricity
+    // against ~872 W measured at the wall. Mock mode composed it correctly all along, which is
+    // why the bug survived: two paths disagreed and only the unused one was right.
+    let composed = CostParams {
+        base_overhead_watts: crate::cost_model::system_watts_for_suite(
+            benchmarks,
+            cost_params.base_overhead_watts,
+            job.device_watts,
+        ),
+        ..cost_params.clone()
+    };
+
+    // Energy is P·t, so `t` has to describe the same machine as `P`.
+    //
+    // When the caller names a device, `estimated_duration` already came from that device's
+    // throughput and the pairing is exact. When it does not, the duration comes from
+    // `average_throughput()` — a flat mean over per-(slot, program) rows — while the power comes
+    // from the mean of distinct CARDS. On a two-card rig those differ by ~1.6x, so the charge was
+    // "the mean card's watts for the time a faster mix would take", understating energy by that
+    // factor. Recompute the duration for the COST on the same basis as the power, and leave
+    // `estimated_duration` (and therefore the deadline verdict) exactly as it was: feasibility is
+    // a different question, decided by other evidence, and changing it here would silently alter
+    // which jobs are considered claimable.
+    // `estimate_proving_time_at_throughput` rather than a hand-rolled division: it carries the
+    // `throughput <= 0` / `cycles == 0` guards and the INFEASIBLE sentinel, and
+    // `Duration::from_secs_f64` PANICS on overflow — reachable from a hand-edited or corrupt
+    // `benchmarks.json` with a near-zero throughput, and `evaluate_job` runs inline in the brain
+    // task, so a panic there stops claiming AND fulfil-driving.
+    let card_duration = crate::cost_model::mean_proving_card_throughput(benchmarks)
+        .map(|cps| crate::timing::estimate_proving_time_at_throughput(cps, job.estimated_cycles))
+        .filter(|d| d.as_secs_f64().is_finite() && *d != crate::timing::INFEASIBLE);
+
+    // Naming WATTS without a throughput is the harmful asymmetry: `cost_duration` then falls
+    // through to `estimated_duration`, which came from the suite average, so the named card's
+    // watts are charged for the time a different (faster) machine would take — the bug this
+    // pairing exists to remove, reached through the path the comment above calls exact. Mock
+    // supplies both from one `DeviceChoice`; production supplies neither.
+    //
+    // The converse (throughput without watts) is tolerated and used: the duration is then that
+    // device's own and the power is the suite's mean card, which errs high on a slow card rather
+    // than low.
+    debug_assert!(
+        job.device_watts.is_none() || job.throughput > 0.0,
+        "naming device_watts ({:?}) without a throughput charges that card for the suite \
+         average's duration",
+        job.device_watts
+    );
+
+    let cost_duration = match (job.device_watts, card_duration) {
+        (None, Some(d)) => d,
+        _ => estimated_duration,
+    };
+    let cost_usd = estimate_proving_cost(&composed, cost_duration);
 
     // Estimate reward
     let gross_reward = job.current_price + job.bonus_amount;
     let speed_bonus = if job.speed_premium > 0 && job.fulfillment_timeout > 0 {
         // Estimate speed bonus based on estimated proving time
-        let time_left_after_proving = job.time_remaining.saturating_sub(
-            estimated_duration.as_secs()
-        );
+        let time_left_after_proving = job
+            .time_remaining
+            .saturating_sub(estimated_duration.as_secs());
         // Use checked_mul to prevent u128 overflow
         job.speed_premium
             .checked_mul(time_left_after_proving as u128)
@@ -161,7 +226,19 @@ pub fn evaluate_job(
         0.0
     };
     let profit_hemi = net_reward_hemi - cost_hemi;
-    let proving_days = estimated_duration.as_secs_f64() / 86400.0;
+    // Divide by the SAME duration the cost was computed over, not by `estimated_duration`.
+    //
+    // This is the number `min_profit_threshold` gates on, so an optimistic denominator claims
+    // jobs. Production passes no device, so `estimated_duration` comes from
+    // `average_throughput()` — which this crate's own comment measures at 1.6x the card mean on
+    // this rig (3.03M c/s against 1.90M). Correcting the cost numerator while leaving the
+    // denominator optimistic inflated the reported rate by that factor: a job honestly worth
+    // ~60 HEMI/day reported ~95 and passed a threshold of 75.
+    //
+    // `deadline_feasible` and the returned `estimated_duration` deliberately keep using
+    // `estimated_duration`: feasibility is a different question, decided on other evidence, and
+    // changing it here would silently alter which jobs are considered claimable at all.
+    let proving_days = cost_duration.as_secs_f64() / 86400.0;
     let profit_hemi_per_day = if proving_days > 0.0 {
         profit_hemi / proving_days
     } else {
@@ -283,7 +360,8 @@ mod tests {
         let eval = evaluate_job(&suite, &cost, &job, 10.0, 1.5);
         assert!(
             matches!(&eval.recommendation, Recommendation::Skip { reason } if reason.contains("simulated")),
-            "expected Skip(simulated), got {:?}", eval.recommendation
+            "expected Skip(simulated), got {:?}",
+            eval.recommendation
         );
     }
 
@@ -340,7 +418,8 @@ mod tests {
         let eval = evaluate_job(&suite, &cost, &job, 10.0, 1.5);
         assert!(
             matches!(&eval.recommendation, Recommendation::Skip { reason } if reason.contains("collateral")),
-            "expected Skip(collateral), got {:?}", eval.recommendation
+            "expected Skip(collateral), got {:?}",
+            eval.recommendation
         );
         assert!(!eval.collateral_sufficient);
     }
@@ -367,18 +446,22 @@ mod tests {
         let suite = real_suite(100_000.0);
         let cost = CostParams::default();
         let job = JobParams {
-            throughput: 100_000.0,                          // 100K c/s = 100s proving
+            throughput: 100_000.0, // 100K c/s = 100s proving
             estimated_cycles: 10_000_000,
-            current_price: 10_000_000_000_000_000,          // 0.01 HEMI (very cheap)
-            max_price: 50_000_000_000_000_000_000,          // 50 HEMI (room to grow)
+            current_price: 10_000_000_000_000_000, // 0.01 HEMI (very cheap)
+            max_price: 50_000_000_000_000_000_000, // 50 HEMI (room to grow)
             time_remaining: 3600,
             ..Default::default()
         };
 
         let eval = evaluate_job(&suite, &cost, &job, 100.0, 1.5);
-        assert_eq!(eval.recommendation, Recommendation::WatchAndWait,
+        assert_eq!(
+            eval.recommendation,
+            Recommendation::WatchAndWait,
             "expected WatchAndWait, got {:?} (profit_hemi_per_day={:.2})",
-            eval.recommendation, eval.estimated_profit_hemi_per_day);
+            eval.recommendation,
+            eval.estimated_profit_hemi_per_day
+        );
     }
 
     #[test]
@@ -388,8 +471,8 @@ mod tests {
         let job = JobParams {
             throughput: 100_000.0,
             estimated_cycles: 10_000_000,
-            current_price: 10_000_000_000_000_000,          // 0.01 HEMI
-            max_price: 10_000_000_000_000_000,              // already at max
+            current_price: 10_000_000_000_000_000, // 0.01 HEMI
+            max_price: 10_000_000_000_000_000,     // already at max
             time_remaining: 3600,
             ..Default::default()
         };
@@ -397,7 +480,8 @@ mod tests {
         let eval = evaluate_job(&suite, &cost, &job, 100.0, 1.5);
         assert!(
             matches!(&eval.recommendation, Recommendation::Skip { reason } if reason.contains("Profit rate")),
-            "expected Skip(profit), got {:?}", eval.recommendation
+            "expected Skip(profit), got {:?}",
+            eval.recommendation
         );
     }
 

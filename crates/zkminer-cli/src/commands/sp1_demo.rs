@@ -11,18 +11,18 @@
 //!   5. Approve HemiProve for the deposit, submit a job via submitJobDefault
 //!   6. Print the jobId — the miner will pick it up from the monitor
 
-use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
+use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use zkminer_chain::client::ChainClient;
-use zkminer_config::ZkMinerConfig;
 use zkminer_config::wallet::load_signer;
+use zkminer_config::ZkMinerConfig;
 use zkminer_contracts::bindings::{
-    AuctionConfig, CompetitiveBidConfig, CycleConfig, IERC20, IHemiProveCore,
-    IProgramRegistry, JobDescriptor, ResourceEstimate, StorageURI,
+    AuctionConfig, CompetitiveBidConfig, CycleConfig, IHemiProveCore, IProgramRegistry,
+    JobDescriptor, ResourceEstimate, StorageURI, IERC20,
 };
 
 const FIBONACCI_ELF: &[u8] = include_bytes!(concat!(
@@ -37,13 +37,16 @@ pub async fn run(config_path: Option<&Path>, n: u32) -> Result<()> {
             "fibonacci-sp1-guest ELF is empty — rebuild the guest first. Expected at target/elf-compilation/..."
         );
     }
-    println!("Loaded fibonacci-sp1-guest ELF: {} bytes", FIBONACCI_ELF.len());
+    println!(
+        "Loaded fibonacci-sp1-guest ELF: {} bytes",
+        FIBONACCI_ELF.len()
+    );
 
     // 1. Derive SP1 vkey — that's the on-chain programId.
     //    Setup is expensive but we only do it once.
     println!("Deriving SP1 vkey (this may take a few seconds)...");
-    let (vkey_bytes, content_hash) = tokio::task::spawn_blocking(|| compute_sp1_vkey(FIBONACCI_ELF))
-        .await??;
+    let (vkey_bytes, content_hash) =
+        tokio::task::spawn_blocking(|| compute_sp1_vkey(FIBONACCI_ELF)).await??;
     let program_id = B256::from(vkey_bytes);
     let content_hash = B256::from(content_hash);
     println!("  programId (vkey):  {program_id}");
@@ -97,7 +100,10 @@ pub async fn run(config_path: Option<&Path>, n: u32) -> Result<()> {
             vec![uri],
         );
         let pending = tx.send().await.context("registerProgram send failed")?;
-        let receipt = pending.get_receipt().await.context("registerProgram receipt failed")?;
+        let receipt = pending
+            .get_receipt()
+            .await
+            .context("registerProgram receipt failed")?;
         if !receipt.status() {
             anyhow::bail!("registerProgram reverted");
         }
@@ -114,7 +120,10 @@ pub async fn run(config_path: Option<&Path>, n: u32) -> Result<()> {
         .call()
         .await?;
     if allowance < deposit_approval {
-        println!("Approving HemiProve for {} wei of tHEMI...", deposit_approval);
+        println!(
+            "Approving HemiProve for {} wei of tHEMI...",
+            deposit_approval
+        );
         let tx = token.approve(client.hemi_prove, deposit_approval);
         let pending = tx.send().await?;
         let r = pending.get_receipt().await?;
@@ -149,9 +158,9 @@ pub async fn run(config_path: Option<&Path>, n: u32) -> Result<()> {
         minPrice: U96::from(1_000_000_000_000_000_000u128), // 1 HEMI
         maxPrice: U96::from(5_000_000_000_000_000_000u128), // 5 HEMI
         rampUpPeriod: U40::from(60u64),
-        curveType: 0, // Linear
+        curveType: 0,                             // Linear
         fulfillmentTimeout: U40::from(14_400u64), // 4h
-        lockCollateralBps: U96::from(15_000u64), // 150%
+        lockCollateralBps: U96::from(15_000u64),  // 150%
         speedPremium: U96::from(0u64),
         exclusivityDuration: U40::from(0u64),
         callbackGasLimit: 0,
@@ -176,7 +185,10 @@ pub async fn run(config_path: Option<&Path>, n: u32) -> Result<()> {
         bidExtensionCurveType: 0,
     };
     let submit_tx = core.submitJob(descriptor, auction, cycle, bid);
-    let pending = submit_tx.send().await.context("submitJobDefault send failed")?;
+    let pending = submit_tx
+        .send()
+        .await
+        .context("submitJobDefault send failed")?;
     let receipt = pending.get_receipt().await?;
     if !receipt.status() {
         anyhow::bail!("submitJobDefault reverted");
@@ -194,7 +206,10 @@ pub async fn run(config_path: Option<&Path>, n: u32) -> Result<()> {
     println!("Job submitted");
     println!("  tx:      {}", receipt.transaction_hash);
     println!("  jobId:   {job_id}");
-    println!("  fibonacci({n})  →  input 0x{}", alloy::hex::encode(n.to_le_bytes()));
+    println!(
+        "  fibonacci({n})  →  input 0x{}",
+        alloy::hex::encode(n.to_le_bytes())
+    );
     println!();
     println!(
         "The zkminer should now pick this up via the monitor and produce a proof. \
@@ -212,7 +227,9 @@ fn compute_sp1_vkey(elf: &[u8]) -> Result<([u8; 32], [u8; 32])> {
     use sp1_sdk::blocking::{Elf, Prover, ProverClient};
     use sp1_sdk::{HashableKey, ProvingKey};
     let client = ProverClient::builder().cpu().build();
-    let pk = client.setup(Elf::from(elf.to_vec())).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pk = client
+        .setup(Elf::from(elf.to_vec()))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let vk = pk.verifying_key();
     let vk_hash = vk.bytes32();
     // bytes32() returns a 0x-prefixed hex string of 32 bytes

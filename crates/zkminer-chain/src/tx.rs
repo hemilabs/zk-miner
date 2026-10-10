@@ -43,8 +43,7 @@ pub async fn await_receipt<P: Provider>(
     let deadline = Instant::now() + budget;
     // 0..~2s deterministic per-tx jitter (two hash bytes XORed so cadence collisions
     // need a 2-byte coincidence, not just a shared first byte).
-    let jitter =
-        Duration::from_millis((tx_hash.0[0] ^ tx_hash.0[31]) as u64 * 2000 / 255);
+    let jitter = Duration::from_millis((tx_hash.0[0] ^ tx_hash.0[31]) as u64 * 2000 / 255);
     loop {
         let now = Instant::now();
         if now >= deadline {

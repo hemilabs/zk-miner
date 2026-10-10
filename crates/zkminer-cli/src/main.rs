@@ -6,7 +6,10 @@ mod commands;
 mod journal;
 
 #[derive(Parser)]
-#[command(name = "zkminer", about = "ZK Miner — HemiProve proving marketplace client")]
+#[command(
+    name = "zkminer",
+    about = "ZK Miner — HemiProve proving marketplace client"
+)]
 struct Cli {
     /// Path to config file (default: ~/.zkminer/config.toml)
     #[arg(long, short)]
@@ -24,6 +27,21 @@ struct Cli {
 enum Commands {
     /// Show prover status (balance, stake, stats)
     Status,
+    /// Add collateral so more GPU slots can be funded (approve + stake, in HEMI)
+    Stake {
+        /// Amount in HEMI (e.g. `500`, or `4.25`). NOT wei.
+        amount: String,
+        /// Print what would happen and send nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Stake even though this account has transactions in flight (the miner is
+        /// running). Risks displacing a pending fulfillJob and getting it slashed.
+        #[arg(long)]
+        force: bool,
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Run benchmarks to measure proving performance
     Benchmark {
         /// Output results as JSON instead of a formatted table
@@ -121,6 +139,12 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Status => commands::status::run(config_path).await,
+        Commands::Stake {
+            amount,
+            dry_run,
+            force,
+            yes,
+        } => commands::stake::run(config_path, amount, dry_run, force, yes).await,
         Commands::Benchmark { json, calibrate } => {
             commands::benchmark::run(config_path, json, calibrate).await
         }
@@ -128,8 +152,10 @@ async fn main() -> Result<()> {
         Commands::Run { headless, .. } => commands::run::run(config_path, headless).await,
         #[cfg(feature = "sp1-demo")]
         Commands::Sp1Demo { input } => commands::sp1_demo::run(config_path, input).await,
-        Commands::Init { force, network, generate_key } => {
-            commands::init::run(config_path, force, &network, generate_key)
-        }
+        Commands::Init {
+            force,
+            network,
+            generate_key,
+        } => commands::init::run(config_path, force, &network, generate_key),
     }
 }

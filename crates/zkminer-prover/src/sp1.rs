@@ -90,7 +90,9 @@ pub fn benchmark_sha256_chain(n: u32) -> BenchmarkResult {
 
     let throughput = cycles as f64 / duration.as_secs_f64();
 
-    tracing::info!("  sp1 sha256-chain({n}): {cycles} cycles in {duration:?} ({throughput:.0} c/s)");
+    tracing::info!(
+        "  sp1 sha256-chain({n}): {cycles} cycles in {duration:?} ({throughput:.0} c/s)"
+    );
 
     BenchmarkResult {
         program_name: format!("sha256-chain({n})"),
