@@ -173,9 +173,23 @@ WORKDIR /build
 # ===========================================================================
 FROM cuda-base AS build-cuda
 
-# Full list: sm_75 (Turing) sm_80 (A100) sm_86 (3090) sm_89 (4090) sm_90 (H100) sm_100 (B200) compute_120 (5090+)
-# Testing subset: 4090 (sm_89) + 5090 (sm_120)
-ENV NVCC_APPEND_FLAGS="-gencode arch=compute_89,code=sm_89 -gencode arch=compute_120,code=compute_120"
+# GPU targets: native code for every family from Turing up — sm_75 (RTX 20, T4), sm_80 (A100),
+# sm_86 (RTX 30, A10, A40, A6000), sm_89 (RTX 40, L4, L40), sm_90 (H100, H200), sm_100 (B200, and B300
+# runs it) and sm_120 (RTX 50, RTX PRO 6000, and GB10 runs it) — plus compute_120 PTX, so a later
+# architecture can still JIT it. A card outside the list is refused when the miner starts rather than
+# claiming work it cannot prove: the dispatcher reads which architectures this binary carries
+# (crates/zkminer-prover/src/gpu_code.rs).
+#
+# `--threads 2` compiles each file's targets two at a time rather than one after another. The long pole
+# of this image is risc0-circuit-rv32im-sys's 3 MB steps.cu, a single nvcc call that took ~24 minutes
+# for one target and one PTX on the 4-core runner; serially, eight targets would take it past two hours.
+# Not four at a time: beside cargo's four jobs that peaked at 16.8 GB of compiler memory, more than the
+# runner's 16 GB. Two at a time built under a 14 GiB cap with no swap, peaking at 10.6 GB (2026-10-10).
+ENV NVCC_APPEND_FLAGS="--threads 2 \
+    -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 \
+    -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
+    -gencode arch=compute_90,code=sm_90 -gencode arch=compute_100,code=sm_100 \
+    -gencode arch=compute_120,code=[sm_120,compute_120]"
 
 COPY . .
 
@@ -249,9 +263,13 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 # fails the build rather than going into it.
 ENV GOPROXY="https://proxy.golang.org,https://goproxy.cn,direct"
 
-# GPU targets, as for the risc0 CUDA build above: the 4090 (sm_89) and Blackwell (sm_120). Others
-# (sm_80 A100, sm_86 3090, sm_90 H100) can be added here, at the cost of build time.
-ARG SP1_CUDA_ARCHS=89,120
+# GPU targets: the families the fork itself builds by default on CUDA 12.8 — sm_80 (A100), sm_86
+# (RTX 30, A10, A40, A6000), sm_89 (RTX 40, L4, L40), sm_90 (H100, H200), sm_100 (B200, and B300 runs
+# it) and sm_120 (RTX 50, RTX PRO 6000, and GB10 runs it). No PTX: with relocatable device code the
+# linked image the runtime loads is native code only, whatever the objects carry. SP1 needs 16 GB of
+# VRAM, which leaves few cards older than these. One outside the list is refused when the miner
+# starts, as for the risc0 worker above (crates/zkminer-prover/src/gpu_code.rs).
+ARG SP1_CUDA_ARCHS=80,86,89,90,100,120
 
 COPY Cargo.lock /build/Cargo.lock
 

@@ -54,6 +54,8 @@ jobs:
             binary: zkminer-prove-openvm
           - target: dist-cuda
             binary: zkminer-prove-risc0-cuda
+            # Native code for seven GPU families, not two: see NVCC_APPEND_FLAGS in Dockerfile.build.
+            timeout: 240
           - target: dist-sp1
             binary: zkminer-prove-sp1
           - target: dist-sp1-server
