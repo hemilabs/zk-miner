@@ -53,6 +53,10 @@ fn sigkill_worker(pool: &WorkerPool, key: &str) -> Option<u32> {
         unsafe {
             libc::kill(pid as i32, libc::SIGKILL);
         }
+        #[cfg(windows)]
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status();
     }
     Some(pid)
 }

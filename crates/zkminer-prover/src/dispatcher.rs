@@ -690,12 +690,21 @@ enum PidOwner {
 }
 
 /// Parent pid of `pid` from `/proc`, or `None` when the process is gone or there is no `/proc`.
+#[cfg(not(windows))]
 fn proc_parent(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     match crate::memory::parent_of_stat(&stat)? {
         ppid if ppid > 0 => Some(ppid as u32),
         _ => None,
     }
+}
+
+/// Parent pid of `pid`, or `None` when the process is gone or its parent cannot be confirmed (see
+/// `memory::parent_pid`). Without it nothing on a card attributes to a slot, so our own warm
+/// `sp1-gpu-server` read as foreign and its slot refused its own next proof.
+#[cfg(windows)]
+fn proc_parent(pid: u32) -> Option<u32> {
+    crate::memory::parent_pid(pid)
 }
 
 /// Walk `pid`'s parent chain to find whose it is.
@@ -926,11 +935,12 @@ fn apps_we_can_attribute(
 /// `slot_pids` maps each live worker's PUBLISHED pid to its slot key. With an empty map, everything of
 /// ours reads as `unattributed` (or `draining`) — still ours, never foreign.
 ///
-/// Also `None` when a context of OURS is on the card but the driver will not say how much it holds —
-/// every process under Windows' WDDM reports "[N/A]". Its memory is then inside `memory.used` with no
-/// way to credit it, so our own warm worker would read as somebody else's and its slot would refuse
-/// its own next proof, indefinitely, telling the operator to close a process that is ours. No opinion
-/// is the honest answer, as for any other unreadable card.
+/// Also `None` when a context of OURS is on the card but the driver will not say how much it holds.
+/// Its memory is then inside `memory.used` with no way to credit it, so our own warm worker would read
+/// as somebody else's and its slot would refuse its own next proof, indefinitely, telling the operator
+/// to close a process that is ours. No opinion is the honest answer, as for any other unreadable card.
+/// Windows' WDDM reports "[N/A]" for every process, so there the figures come from Windows' own
+/// per-process accounting instead (`windows_gpu_memory`).
 fn read_card_occupancy(
     device_index: u32,
     slot_pids: &HashMap<u32, String>,
@@ -954,6 +964,8 @@ fn read_card_occupancy(
     let apps = nvidia_smi_query("--query-compute-apps=pid,used_gpu_memory", device_index)
         .map(|out| parse_compute_apps(&out))
         .unwrap_or_default();
+    #[cfg(windows)]
+    let apps = crate::windows_gpu_memory::fill_unreported(apps);
     let miner = std::process::id();
     let retired = retired_groups();
     let owner = |pid: u32| owner_of(pid, miner, slot_pids, &retired);

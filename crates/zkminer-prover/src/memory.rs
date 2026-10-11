@@ -442,6 +442,7 @@ pub fn process_group_peak_bytes(proc_root: &std::path::Path, pgid: i32) -> Optio
 ///
 /// Field 4, read past the last `)` so a `comm` containing spaces and parentheses cannot shift the
 /// offsets. Same technique as `group_of_stat`, which reads field 5 two positions further on.
+#[cfg_attr(windows, allow(dead_code))] // Windows reads parents from a snapshot: `parent_pid`
 pub(crate) fn parent_of_stat(stat: &str) -> Option<i32> {
     let rest = stat.get(stat.rfind(')')? + 1..)?;
     rest.split_whitespace().nth(1)?.parse().ok()
@@ -554,6 +555,19 @@ pub fn terminate_if_our_worker(pid: u32, expected_starttime: Option<u64>) -> boo
     process.creation_time() == Some(expected) && process.terminate()
 }
 
+/// Windows: the process that started `pid`, which Linux reads from `/proc/<pid>/stat`.
+///
+/// Windows records the parent's pid at creation and keeps it after the parent exits, by which time
+/// the number may belong to another process. One that started after `pid` cannot be its parent, so
+/// it is not returned; nor is one whose start time cannot be read, so a walk up the tree stops there
+/// rather than guessing.
+#[cfg(windows)]
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    let parent = win32::recorded_parent(pid)?;
+    let started = pid_starttime(pid)?;
+    (parent != 0 && pid_starttime(parent)? <= started).then_some(parent)
+}
+
 #[cfg(windows)]
 mod win32 {
     use std::ffi::c_void;
@@ -598,8 +612,56 @@ mod win32 {
         (ok != 0).then_some((status.total_phys, status.avail_phys))
     }
 
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        size: u32,
+        usage: u32,
+        process_id: u32,
+        default_heap_id: usize,
+        module_id: u32,
+        threads: u32,
+        parent_process_id: u32,
+        pri_class_base: i32,
+        flags: u32,
+        exe_file: [u16; 260],
+    }
+
+    /// The parent pid Windows recorded when `pid` was created, from a process snapshot.
+    pub fn recorded_parent(pid: u32) -> Option<u32> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot.is_null() || snapshot as isize == -1 {
+            return None;
+        }
+        let snapshot = Process(snapshot); // closed on drop, like a process handle
+        let mut entry = ProcessEntry32W {
+            size: std::mem::size_of::<ProcessEntry32W>() as u32,
+            usage: 0,
+            process_id: 0,
+            default_heap_id: 0,
+            module_id: 0,
+            threads: 0,
+            parent_process_id: 0,
+            pri_class_base: 0,
+            flags: 0,
+            exe_file: [0; 260],
+        };
+        let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
+        while more {
+            if entry.process_id == pid {
+                return Some(entry.parent_process_id);
+            }
+            more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
+        }
+        None
+    }
+
     #[link(name = "kernel32")]
     extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut c_void;
+        fn Process32FirstW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
         fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
         fn CloseHandle(handle: *mut c_void) -> i32;
@@ -1712,6 +1774,20 @@ mod windows_pid_tests {
 
         assert!(terminate_if_our_worker(pid, Some(start)));
         child.wait().expect("terminated child is reaped");
+    }
+
+    /// A child's parent is us, and a pid that does not exist has none.
+    #[test]
+    fn a_child_names_its_parent() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        assert_eq!(parent_pid(child.id()), Some(std::process::id()));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(parent_pid(u32::MAX - 3), None);
     }
 }
 

@@ -6,6 +6,8 @@ pub mod engine;
 pub mod gpu_code;
 pub mod memory;
 pub mod registry;
+#[cfg(windows)]
+mod windows_gpu_memory;
 pub mod worker;
 
 #[cfg(feature = "openvm")]
