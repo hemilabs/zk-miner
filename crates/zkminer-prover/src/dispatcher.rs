@@ -98,6 +98,18 @@ const RESPAWN_BACKOFF: [Duration; 3] = [
 /// reclaim costs ~50ms.
 const RECLAIM_WAIT: Duration = Duration::from_millis(1500);
 
+/// Least host RAM an idle worker of another backend must hold for `make_host_room` to recycle it. A
+/// respawn and a cold cache are not worth less.
+const MIN_RECLAIMABLE_HOST: u64 = 1024 * 1024 * 1024;
+
+/// How long `make_host_room` waits for a recycled worker's pages to come back to `MemAvailable`.
+///
+/// Longer than `RECLAIM_WAIT`, which is a last resort hoping for any improvement at all. This follows
+/// a recycle chosen because its pages make the proof fit — ~23 GB of them for an idle SP1 worker — and
+/// `wait_for_reclaim` returns as soon as they have settled, so the bound only matters when they do
+/// not. Bounded further by the proof's deadline.
+const HOST_ROOM_RECLAIM_WAIT: Duration = Duration::from_secs(10);
+
 /// How long the BENCHMARK loop waits for a reaped worker's pages to come back before testing the
 /// next slot's reservation against them.
 ///
@@ -3677,6 +3689,88 @@ impl WorkerPool {
         0
     }
 
+    /// Host RAM held by each IDLE worker of a backend other than `backend`: a live worker whose slot
+    /// is free right now, so nothing is running on it. What `make_host_room` may recycle, and so what
+    /// the claim gate may count on getting back.
+    #[cfg(unix)]
+    fn idle_host_holdings_except(&self, backend: &str) -> Vec<(String, u64)> {
+        self.workers
+            .iter()
+            .filter(|(key, _)| key.split(':').next() != Some(backend))
+            .filter(|(_, entry)| {
+                entry
+                    .slot
+                    .try_lock()
+                    .is_ok_and(|slot| slot.handle.is_some())
+            })
+            .filter_map(|(key, _)| Some((key.clone(), self.current_host_bytes_for_slot(key)?)))
+            .collect()
+    }
+
+    #[cfg(not(unix))]
+    fn idle_host_holdings_except(&self, _backend: &str) -> Vec<(String, u64)> {
+        Vec::new()
+    }
+
+    /// Make room in host RAM for a proof on `key` that `reserve_host_memory` just refused, by
+    /// recycling idle workers of OTHER backends, and reserve it.
+    ///
+    /// The host-RAM counterpart of the room `check_vram_budget` makes on a card, and wider: a worker
+    /// on ANY card holds host RAM. On this 28 GB box an idle `sp1-gpu-server` keeps ~23 GB, so until
+    /// its worker was recycled for some other reason, no risc0 proof fitted on either card. A worker
+    /// of the proof's own backend is never chosen: another SP1 slot's resident server is what
+    /// `prove_min_vram`'s warm-slot preference routes to, not something to destroy.
+    ///
+    /// `None` when it cannot be done — recycling would not make the proof fit (`plan_host_room`), a
+    /// planned worker's slot is busy, too little time is left before `abort_at` to be worth
+    /// destroying a warm worker, or the pages did not come back in time. The caller then refuses as
+    /// before, with a typed `HostMemoryShortage` that costs the job no attempt.
+    fn make_host_room(
+        &self,
+        key: &str,
+        want: u64,
+        abort_at: Option<Instant>,
+    ) -> Option<crate::memory::MemoryReservation<'_>> {
+        let backend = key.split(':').next().unwrap_or(key);
+        let (Some(available), Some(total)) = (
+            crate::memory::mem_available_bytes(),
+            crate::memory::mem_total_bytes(),
+        ) else {
+            return None;
+        };
+        let resident = self.current_host_bytes_for_slot(key).unwrap_or(0);
+        let plan = crate::memory::plan_host_room(
+            want,
+            resident,
+            self.reserved_host_memory(),
+            available,
+            total,
+            crate::memory::DEFAULT_HOST_RESERVE_BYTES,
+            &self.idle_host_holdings_except(backend),
+            MIN_RECLAIMABLE_HOST,
+        )?;
+        if plan.is_empty() {
+            // It fits now: memory came back between the refusal and this reading.
+            return self.reserve_host_memory(want, key);
+        }
+        if abort_at
+            .is_some_and(|a| too_late_to_make_room(a.saturating_duration_since(Instant::now())))
+        {
+            return None;
+        }
+        if self.evict_idle_siblings(key, &plan, "host RAM").is_empty() {
+            return None;
+        }
+        // Not back when the process is: see `wait_for_reclaim`.
+        let give_up_at = abort_at.map(|a| a.checked_sub(MIN_ABORT_START_BUDGET).unwrap_or(a));
+        let budget = give_up_at.map_or(HOST_ROOM_RECLAIM_WAIT, |g| {
+            g.saturating_duration_since(Instant::now())
+                .min(HOST_ROOM_RECLAIM_WAIT)
+        });
+        wait_for_reclaim(key, budget);
+        self.reserve_host_memory(want, key)
+    }
+
     /// Could this host run the concurrent set that claiming one more `backend` job implies?
     ///
     /// For the CLAIM decision, and the question is deliberately NOT "does one more peak fit on top
@@ -3728,14 +3822,26 @@ impl WorkerPool {
         } else {
             0
         };
-        crate::memory::can_admit(
+        let reserved = self.reserved_host_memory();
+        if crate::memory::can_admit(expected_peak, resident, reserved, available, total, reserve) {
+            return true;
+        }
+        // Memory that only an IDLE worker of another backend is holding counts as free: the proof's
+        // dispatch recycles that worker to get it back (`make_host_room`). Refusing the claim instead
+        // was permanent on this box — an idle SP1 worker keeps ~23 GB, so risc0 jobs were not claimed
+        // on either card for as long as SP1 sat warm. Only looked at after a refusal: this runs per
+        // candidate job, and reading each worker's slot and cgroup is not free.
+        crate::memory::plan_host_room(
             expected_peak,
             resident,
-            self.reserved_host_memory(),
+            reserved,
             available,
             total,
             reserve,
+            &self.idle_host_holdings_except(backend),
+            MIN_RECLAIMABLE_HOST,
         )
+        .is_some()
     }
 
     /// Peak host memory this slot's worker has reached, in bytes.
@@ -4180,8 +4286,8 @@ impl WorkerPool {
         }
     }
 
-    /// Recycle the idle workers of `keys` — siblings on the card `for_key` is about to use — so their
-    /// VRAM comes back. Returns the keys whose worker is now gone: recycled here, or found already
+    /// Recycle the idle workers of `keys` so the `what` they hold (VRAM, or host RAM) comes back for
+    /// `for_key`'s proof. Returns the keys whose worker is now gone: recycled here, or found already
     /// gone (its memory, read a moment ago under its pid, is then on its way back too, and worth
     /// waiting for).
     ///
@@ -4192,12 +4298,15 @@ impl WorkerPool {
     /// Recycling some of them would destroy warm workers for room that still could not be made, and
     /// the caller refuses in that case anyway (`check_vram_budget`'s post-check).
     ///
-    /// Safe to do without asking: the caller holds the per-card guard, so none of these workers is
-    /// proving, and a recycled slot respawns on its next dispatch exactly as one that `recycle_slot`
+    /// Safe to do without asking. For VRAM the keys are siblings on the caller's card, whose guard it
+    /// holds, so none of them is proving. For host RAM (`make_host_room`) they can be on other cards,
+    /// and what keeps a proving worker out is the slot itself: every dispatch path holds its slot for
+    /// the whole run, so a busy slot fails the `try_lock` below and nothing is recycled. Either way a
+    /// recycled slot respawns on its next dispatch exactly as one that `recycle_slot`
     /// or the proof-count recycle dropped — no failure is counted, no backoff applies, and
     /// `is_backend_healthy` keeps reporting the backend. Each slot is only ever `try_lock`ed, with a
     /// bound, so holding several at once cannot deadlock.
-    fn evict_idle_siblings(&self, for_key: &str, keys: &[String]) -> Vec<String> {
+    fn evict_idle_siblings(&self, for_key: &str, keys: &[String], what: &str) -> Vec<String> {
         let mut held = Vec::with_capacity(keys.len());
         for key in keys {
             let Some(entry) = self.workers.get(key) else {
@@ -4217,7 +4326,7 @@ impl WorkerPool {
             };
             let Some(slot) = slot else {
                 tracing::warn!(
-                    "{for_key}: {key}'s worker is holding VRAM this proof needs, but its slot is \
+                    "{for_key}: {key}'s worker is holding {what} this proof needs, but its slot is \
                      busy, so no worker is being recycled for it yet"
                 );
                 return Vec::new();
@@ -4228,7 +4337,7 @@ impl WorkerPool {
         for (key, entry, mut slot) in held {
             if slot.handle.is_some() {
                 tracing::info!(
-                    "{for_key}: recycling {key}'s idle worker to give this proof the VRAM it is \
+                    "{for_key}: recycling {key}'s idle worker to give this proof the {what} it is \
                      holding; it respawns on its next job"
                 );
                 // Pid retracted before the reap, so no signaller can use the number afterwards.
@@ -4451,7 +4560,7 @@ impl WorkerPool {
                 let gone = if recyclable.is_empty() {
                     Vec::new()
                 } else {
-                    self.evict_idle_siblings(key, &recyclable)
+                    self.evict_idle_siblings(key, &recyclable, "VRAM")
                 };
                 let freed = movable
                     .iter()
@@ -4668,7 +4777,10 @@ impl WorkerPool {
         let backend_of_slot = key.split(':').next().unwrap_or(key);
         // Scaled to THIS proof's segment size — see `expected_host_peak_at_po2`.
         let want = self.expected_host_peak_at_po2(backend_of_slot, po2);
-        let _memory_reservation = match self.reserve_host_memory(want, key) {
+        let _memory_reservation = match self
+            .reserve_host_memory(want, key)
+            .or_else(|| self.make_host_room(key, want, abort_at))
+        {
             Some(r) => r,
             None => {
                 // Last resort before refusing, and ONLY when we could not read what this slot's
@@ -5477,7 +5589,7 @@ impl WorkerPool {
 
     /// `evict_idle_siblings`, for tests that drive it against real worker processes.
     pub fn test_evict_idle_siblings(&self, for_key: &str, keys: &[String]) -> Vec<String> {
-        self.evict_idle_siblings(for_key, keys)
+        self.evict_idle_siblings(for_key, keys, "VRAM")
     }
 
     /// Get consecutive_failures for a worker slot (test inspection).
@@ -6739,7 +6851,7 @@ mod tests {
         let pool = pool_with_keys(&["risc0:cuda:0", "sp1:cuda:0"]);
         let held = pool.workers["risc0:cuda:0"].slot.lock().unwrap();
         let started = Instant::now();
-        let evicted = pool.evict_idle_siblings("sp1:cuda:0", &["risc0:cuda:0".to_string()]);
+        let evicted = pool.evict_idle_siblings("sp1:cuda:0", &["risc0:cuda:0".to_string()], "VRAM");
         assert!(evicted.is_empty());
         assert!(
             started.elapsed() < SIBLING_LOCK_WAIT + Duration::from_secs(1),
@@ -6750,7 +6862,7 @@ mod tests {
         // Free but with no live worker: nothing to recycle, but whatever the reading charged to it is
         // on its way back, so it is reported as gone and waited for.
         assert_eq!(
-            pool.evict_idle_siblings("sp1:cuda:0", &["risc0:cuda:0".to_string()]),
+            pool.evict_idle_siblings("sp1:cuda:0", &["risc0:cuda:0".to_string()], "VRAM"),
             vec!["risc0:cuda:0".to_string()]
         );
     }

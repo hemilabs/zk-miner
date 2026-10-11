@@ -601,6 +601,56 @@ pub fn can_admit(
     fits_now && fits_committed
 }
 
+/// Which IDLE workers of other backends to recycle so a proof `can_admit` refuses would fit; `None`
+/// when recycling all of them would still not be enough, and empty when it fits already.
+///
+/// The case it exists for is this host's: `sp1-gpu-server` stays resident at ~23 GB between proofs,
+/// deliberately, so the next SP1 proof is cheap. On a 28 GB box that leaves no room for a risc0 proof
+/// on the other card, and nothing gives it back until SP1's worker is recycled for some other reason —
+/// so risc0 jobs were neither claimed nor proved while SP1 sat warm. Recycling the idle SP1 worker
+/// costs it a respawn and a cold proving-key cache on its next job; the alternative was a card idle.
+///
+/// What a recycle gives back is what the worker holds as anonymous memory (`anon_memory_of_pid`).
+/// Those pages are all resident — the worker's scope sets `MemorySwapMax=0` — so `MemAvailable` gains
+/// them when it exits. Largest first, so as few warm workers as possible are destroyed, and none
+/// holding less than `min_holding`: a respawn is not worth that little.
+///
+/// `None` also when the refusal is not about live headroom at all: `fits_committed` does not depend
+/// on `available`, so when every outstanding claim plus this one exceeds the machine, no recycle helps
+/// and none is planned. Destroying a warm worker for a proof that is refused anyway is the outcome to
+/// avoid.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_host_room(
+    expected_peak: u64,
+    resident: u64,
+    reserved: u64,
+    available: u64,
+    total: u64,
+    reserve: u64,
+    idle_others: &[(String, u64)],
+    min_holding: u64,
+) -> Option<Vec<String>> {
+    let fits = |available| can_admit(expected_peak, resident, reserved, available, total, reserve);
+    if fits(available) {
+        return Some(Vec::new());
+    }
+    let mut candidates: Vec<&(String, u64)> = idle_others
+        .iter()
+        .filter(|(_, held)| *held >= min_holding)
+        .collect();
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut freed = 0u64;
+    let mut chosen = Vec::new();
+    for (key, held) in candidates {
+        freed = freed.saturating_add(*held);
+        chosen.push(key.clone());
+        if fits(available.saturating_add(freed)) {
+            return Some(chosen);
+        }
+    }
+    None
+}
+
 /// What to assume a proof costs in host RAM when nothing has measured it, PER BACKEND.
 ///
 /// An unmeasured backend must look expensive, because assuming it is free is what permits the
@@ -1659,6 +1709,80 @@ mod budget_tests {
         assert!(
             !can_admit(sp1, resident, sp1, available, total, reserve),
             "netting out `resident` must not wave through two concurrent SP1 proofs"
+        );
+    }
+
+    /// The refusal above is right as far as `can_admit` goes, and it was permanent: nothing gave the
+    /// idle SP1 worker's pages back. `plan_host_room` names the worker whose recycle makes it fit.
+    #[test]
+    fn an_idle_worker_of_another_backend_is_recycled_to_make_room() {
+        let total = 28 * GIB;
+        let reserve = DEFAULT_HOST_RESERVE_BYTES;
+        let risc0 = unmeasured_peak_for("risc0");
+        // Measured 2026-10-07: an idle sp1-gpu-server held 23.3 GB.
+        let sp1_idle = 23_300_000_000;
+        let available = total - sp1_idle - GIB;
+        assert!(!can_admit(risc0, 0, 0, available, total, reserve));
+        let idle = vec![("sp1:cuda:0".to_string(), sp1_idle)];
+        assert_eq!(
+            plan_host_room(risc0, 0, 0, available, total, reserve, &idle, GIB),
+            Some(vec!["sp1:cuda:0".to_string()])
+        );
+        // Room already there: nothing is recycled.
+        assert_eq!(
+            plan_host_room(risc0, 0, 0, 20 * GIB, total, reserve, &idle, GIB),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn as_few_warm_workers_as_possible_are_recycled() {
+        let total = 28 * GIB;
+        let reserve = DEFAULT_HOST_RESERVE_BYTES;
+        let idle = vec![
+            ("risc0:cuda:1".to_string(), 2 * GIB),
+            ("sp1:cuda:0".to_string(), 20 * GIB),
+            ("openvm:generic".to_string(), 3 * GIB),
+        ];
+        // 5 GiB short: the 20 GiB worker alone covers it, so it alone goes.
+        assert_eq!(
+            plan_host_room(6 * GIB, 0, 0, 4 * GIB, total, reserve, &idle, GIB),
+            Some(vec!["sp1:cuda:0".to_string()])
+        );
+        // A holding below the floor is never chosen, even when it would be enough.
+        let small = vec![("risc0:cuda:1".to_string(), 512 * 1024 * 1024)];
+        assert_eq!(
+            plan_host_room(
+                6 * GIB,
+                0,
+                0,
+                8 * GIB + 700 * 1024 * 1024,
+                total,
+                reserve,
+                &small,
+                GIB
+            ),
+            None
+        );
+    }
+
+    /// No warm worker is destroyed for a proof that would be refused anyway.
+    #[test]
+    fn nothing_is_recycled_when_it_cannot_make_room() {
+        let total = 28 * GIB;
+        let reserve = DEFAULT_HOST_RESERVE_BYTES;
+        let idle = vec![("sp1:cuda:0".to_string(), 4 * GIB)];
+        // Live headroom: even with the 4 GiB back, 1 + 4 < 6 + 3.
+        assert_eq!(
+            plan_host_room(6 * GIB, 0, 0, GIB, total, reserve, &idle, GIB),
+            None
+        );
+        // Commitments: 20 GiB already reserved by proofs in flight, plus 6, plus the 3 GiB reserve,
+        // exceeds 28 GiB however much is free, so recycling cannot help.
+        let big = vec![("sp1:cuda:0".to_string(), 23 * GIB)];
+        assert_eq!(
+            plan_host_room(6 * GIB, 0, 20 * GIB, 2 * GIB, total, reserve, &big, GIB),
+            None
         );
     }
 }
