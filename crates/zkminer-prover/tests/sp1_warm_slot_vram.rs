@@ -18,8 +18,9 @@
 //! host-memory ledger credited resident workers with MIN instead of MAX and made SP1 unclaimable
 //! after one proof.
 //!
-//! Assumes nothing else is on the card — no display, no other backend's worker — since it bounds
-//! what may be charged against the slot to driver bookkeeping.
+//! What may be charged against the slot is bounded relative to what the card already held for others
+//! before the proof — a display, a desktop session, the other backend's worker — so the card need not
+//! be headless: only what the proof adds must be credited to the slot.
 //!
 //! `#[ignore]`d — it is a real GPU proof. Run with:
 //!   cargo test -p zkminer-prover --test sp1_warm_slot_vram -- --ignored --test-threads=1 --nocapture
@@ -73,6 +74,13 @@ fn our_own_device_memory_is_never_counted_as_foreign() {
     // own server's VRAM does not count against that floor. See `min_available_vram_bytes_for_backend`.
     let needed = zkminer_prover::discovery::min_available_vram_bytes_for_backend("sp1")
         .expect("sp1 must require free VRAM for this test to mean anything");
+
+    // What the card holds for others before the proof: a display (1.3 GB of a desktop's RTX 5090
+    // under Windows), the other backend's idle worker. That is rightly charged against the slot, so the
+    // bound below is on what is charged beyond it. Unreadable: 0, which bounds the absolute figure.
+    let baseline_elsewhere = pool
+        .vram_budget_for_slot(&key)
+        .map_or(0, |b| b.held_elsewhere);
 
     // Sample the gate's own evidence while the proof runs.
     let pool = Arc::new(pool);
@@ -131,10 +139,12 @@ fn our_own_device_memory_is_never_counted_as_foreign() {
         .unwrap_or(0);
     const MIB: f64 = 1024.0 * 1024.0;
     eprintln!(
-        "{key}: peak VRAM in use {:.0} MiB, of which {:.0} MiB was counted against this slot, \
-         leaving at least {:.0} MiB available; the card is {:.0} MiB and sp1 needs {:.0} MiB free",
+        "{key}: peak VRAM in use {:.0} MiB, of which {:.0} MiB was counted against this slot \
+         ({:.0} MiB of it held for others before the proof), leaving at least {:.0} MiB available; \
+         the card is {:.0} MiB and sp1 needs {:.0} MiB free",
         used as f64 / MIB,
         elsewhere as f64 / MIB,
+        baseline_elsewhere as f64 / MIB,
         available as f64 / MIB,
         total as f64 / MIB,
         needed as f64 / MIB,
@@ -167,13 +177,18 @@ fn our_own_device_memory_is_never_counted_as_foreign() {
         available != u64::MAX,
         "no sample caught our server holding the card, so nothing below is evidence of crediting"
     );
-    // Essentially none of the card may be charged against the slot while its own server holds it:
-    // driver bookkeeping, nothing more. Bounded on its own because the floor check below is loose on a
-    // big card — on the 4090 it would let 8 GiB of misattribution through.
+    // Essentially nothing beyond what others held before the proof may be charged against the slot
+    // while its own server holds the card: driver bookkeeping, nothing more. Bounded on its own because
+    // the floor check below is loose on a big card — on the 4090 it would let 8 GiB of
+    // misattribution through.
+    let added_elsewhere = elsewhere.saturating_sub(baseline_elsewhere);
     assert!(
-        elsewhere < 512 * 1024 * 1024,
-        "{:.0} MiB of the card was charged against {key} while only our own server held it",
+        added_elsewhere < 512 * 1024 * 1024,
+        "{:.0} MiB more than before the proof was charged against {key} while our own server held \
+         the card ({:.0} MiB in all, {:.0} MiB of it held for others beforehand)",
+        added_elsewhere as f64 / MIB,
         elsewhere as f64 / MIB,
+        baseline_elsewhere as f64 / MIB,
     );
     // The substantive assertion: with ~15 GiB of this card held by our OWN server, the amount the
     // gate considers available — at the fullest moment sampled — must still clear the floor. If the
