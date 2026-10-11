@@ -110,9 +110,12 @@ risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "df270d
 risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
 # Pinned by immutable REV, not a branch: a branch head can silently move the build
 # off a validated commit (which is why the risc0/sp1 patches below carry a
-# do-not-cargo-update warning). 32f2101 = c5d2d7a (AMD HIP LDS-race fix) plus the
-# cuda/std/array HIP shim and the 0.1.14 version bump Cargo.lock pins.
-sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "32f2101" }
+# do-not-cargo-update warning). 8860917 = hemilabs/risc0-sppark main after #5, the
+# merge of upstream sppark up to 9e5c795 (0.1.15). It includes the gpu_ptr_t
+# destructor leak fix (upstream #81), and keeps the 16-byte alignment of 254-bit
+# fields that risc0's GPU Groth16 prover relies on (upstream's a8bf573/eff682c
+# change it and every Groth16 proof then fails; see that PR).
+sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "8860917" }
 
 # Patch SP1 crates to use hemilabs fork (AMD GPU + PLONK optimizations)
 #
