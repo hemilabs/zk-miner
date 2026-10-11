@@ -1240,6 +1240,10 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        // In its canonical spelling, as `sp1_server_for` returns paths: a temp dir can be spelled
+        // otherwise (a Windows runner's TEMP is `C:\Users\RUNNER~1\...`, 8.3 for `runneradmin`).
+        std::fs::create_dir_all(&root).unwrap();
+        let root = strip_verbatim(std::fs::canonicalize(&root).unwrap());
         let (release, home) = (root.join("provers"), root.join("home"));
         let server = worker_file_name("sp1-gpu-server");
         let installed = home.join(".sp1").join("bin").join(&server);
