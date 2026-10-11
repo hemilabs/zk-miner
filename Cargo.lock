@@ -9767,8 +9767,8 @@ dependencies = [
 
 [[package]]
 name = "sppark"
-version = "0.1.14"
-source = "git+https://github.com/hemilabs/risc0-sppark?rev=32f2101#32f21018d50604a16cb10bc611c0965b44f795bd"
+version = "0.1.15"
+source = "git+https://github.com/hemilabs/risc0-sppark?rev=024d22f#024d22f2d8b986608496946540bf1b42b59ea288"
 dependencies = [
  "cc",
  "which",
