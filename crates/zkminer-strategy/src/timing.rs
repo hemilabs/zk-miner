@@ -6,7 +6,7 @@ pub use zkminer_prover::benchmark::BenchmarkSuite;
 /// Sentinel duration representing "infeasible" — 100 years.
 /// Small enough to never overflow when multiplied by safety_margin,
 /// large enough to always exceed any real proving deadline.
-const INFEASIBLE: Duration = Duration::from_secs(100 * 365 * 24 * 3600); // ~3.15 billion seconds
+pub(crate) const INFEASIBLE: Duration = Duration::from_secs(100 * 365 * 24 * 3600); // ~3.15 billion seconds
 
 /// Predict proving duration for a given cycle count based on benchmark results.
 pub fn estimate_proving_time(benchmarks: &BenchmarkSuite, estimated_cycles: u64) -> Duration {
@@ -30,9 +30,7 @@ pub fn can_finish_before_deadline(
     if estimated_duration >= INFEASIBLE {
         return (false, estimated_duration);
     }
-    let safe_duration = Duration::from_secs_f64(
-        estimated_duration.as_secs_f64() * safety_margin,
-    );
+    let safe_duration = Duration::from_secs_f64(estimated_duration.as_secs_f64() * safety_margin);
     let deadline = Duration::from_secs(deadline_secs_remaining);
 
     (safe_duration < deadline, estimated_duration)

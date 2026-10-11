@@ -42,9 +42,7 @@ impl ProvingEngine for Risc0Prover {
         let seal = match receipt.inner.groth16() {
             Ok(groth16) => groth16.seal.clone(),
             Err(_) => {
-                tracing::warn!(
-                    "No Groth16 seal — proof not on-chain verifiable (dev/CPU mode)"
-                );
+                tracing::warn!("No Groth16 seal — proof not on-chain verifiable (dev/CPU mode)");
                 bincode::serialize(&receipt.inner)
                     .map_err(|e| anyhow::anyhow!("Failed to serialize seal: {e}"))?
             }
@@ -114,9 +112,7 @@ pub fn benchmark_fibonacci(n: u32) -> BenchmarkResult {
     let cycles = prove_info.stats.total_cycles as u64;
     let throughput = cycles as f64 / duration.as_secs_f64();
 
-    tracing::info!(
-        "  risc0 fibonacci({n}): {cycles} cycles in {duration:?} ({throughput:.0} c/s)"
-    );
+    tracing::info!("  risc0 fibonacci({n}): {cycles} cycles in {duration:?} ({throughput:.0} c/s)");
 
     BenchmarkResult {
         program_name: format!("fibonacci({n})"),

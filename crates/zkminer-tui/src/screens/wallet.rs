@@ -6,15 +6,17 @@ use ratatui::{
     Frame,
 };
 
+use super::dashboard::{
+    compute_daily_earning_rate, compute_success_rate, format_duration, format_token_amount,
+};
 use crate::state::MinerState;
 use crate::theme;
-use super::dashboard::{compute_daily_earning_rate, compute_success_rate, format_duration, format_token_amount};
 
 pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),  // Balances
+            Constraint::Length(8), // Balances
             Constraint::Min(12),   // $HEMI Staking (merged)
         ])
         .split(area);
@@ -36,14 +38,13 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
         ]),
     ];
 
-    let balances = Paragraph::new(balance_text)
-        .block(
-            Block::default()
-                .title(Span::styled(" Wallet ", theme::title()))
-                .borders(Borders::ALL)
-                .border_style(theme::border())
-                .border_type(theme::border_type()),
-        );
+    let balances = Paragraph::new(balance_text).block(
+        Block::default()
+            .title(Span::styled(" Wallet ", theme::title()))
+            .borders(Borders::ALL)
+            .border_style(theme::border())
+            .border_type(theme::border_type()),
+    );
     f.render_widget(balances, chunks[0]);
 
     // $HEMI Staking (merged staking + prover stats)
@@ -80,7 +81,11 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
             } else {
                 String::new()
             };
-            format!("{} $HEMI{}", format_token_amount(stake.unstake_amount), cooldown_left)
+            format!(
+                "{} $HEMI{}",
+                format_token_amount(stake.unstake_amount),
+                cooldown_left
+            )
         } else {
             "None".to_string()
         };
@@ -112,20 +117,9 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
                 Line::from(vec![
                     Span::styled("Success Rate:     ", theme::dim()),
                     Span::styled(format!("{:.1}%", rate_pct), rate_style),
-                    Span::styled(
-                        format!(
-                            "  F:{}", stats.jobs_fulfilled
-                        ),
-                        theme::positive(),
-                    ),
-                    Span::styled(
-                        format!("  S:{}", stats.jobs_slashed),
-                        theme::error(),
-                    ),
-                    Span::styled(
-                        format!("  R:{}", stats.jobs_released),
-                        theme::warning(),
-                    ),
+                    Span::styled(format!("  F:{}", stats.jobs_fulfilled), theme::positive()),
+                    Span::styled(format!("  S:{}", stats.jobs_slashed), theme::error()),
+                    Span::styled(format!("  R:{}", stats.jobs_released), theme::warning()),
                 ]),
                 Line::from(vec![
                     Span::styled("Total Earned:     ", theme::dim()),
@@ -140,10 +134,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
                         format!("~{} $HEMI/day", format_token_amount(daily_wei)),
                         theme::identifier(),
                     ),
-                    Span::styled(
-                        format!("         {}", since_str),
-                        theme::dim(),
-                    ),
+                    Span::styled(format!("         {}", since_str), theme::dim()),
                 ]),
             )
         } else {
@@ -161,16 +152,16 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
                     format!("{} $HEMI", format_token_amount(stake.total_staked)),
                     theme::metric(),
                 ),
-                Span::styled(
-                    format!("     Deposit: {}", age_str),
-                    theme::dim(),
-                ),
+                Span::styled(format!("     Deposit: {}", age_str), theme::dim()),
             ]),
             Line::from(vec![
                 Span::styled("Collateral:       ", theme::dim()),
                 Span::styled(bar_filled, Style::default().fg(bar_color)),
                 Span::styled(bar_empty, theme::dim()),
-                Span::styled(format!(" {}% utilized", stake_pct), Style::default().fg(bar_color)),
+                Span::styled(
+                    format!(" {}% utilized", stake_pct),
+                    Style::default().fg(bar_color),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("  Locked:         ", theme::dim()),
@@ -204,16 +195,18 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
             rate_line,
         ]
     } else {
-        vec![Line::from(Span::styled("Loading staking info...", theme::placeholder()))]
+        vec![Line::from(Span::styled(
+            "Loading staking info...",
+            theme::placeholder(),
+        ))]
     };
 
-    let staking = Paragraph::new(staking_text)
-        .block(
-            Block::default()
-                .title(Span::styled(" $HEMI Staking ", theme::title()))
-                .borders(Borders::ALL)
-                .border_style(theme::border())
-                .border_type(theme::border_type()),
-        );
+    let staking = Paragraph::new(staking_text).block(
+        Block::default()
+            .title(Span::styled(" $HEMI Staking ", theme::title()))
+            .borders(Borders::ALL)
+            .border_style(theme::border())
+            .border_type(theme::border_type()),
+    );
     f.render_widget(staking, chunks[1]);
 }

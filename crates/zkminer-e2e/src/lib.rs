@@ -128,6 +128,7 @@ impl Sandbox {
     /// Write an executable script into `shims/`, which is first on `PATH`.
     pub fn install_shim(&self, name: &str, script: &str) -> PathBuf {
         let dst = self.shims_dir().join(name);
+        let _writing = EXEC_LOCK.write().unwrap_or_else(|e| e.into_inner());
         std::fs::write(&dst, script).expect("write shim");
         std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))
             .expect("chmod shim");
@@ -169,7 +170,14 @@ impl Default for Sandbox {
     }
 }
 
+/// Writing an executable and starting a process must not overlap. A process forked while this test
+/// binary has an executable open for writing inherits that descriptor until it execs, and exec'ing
+/// the file meanwhile fails with ETXTBSY ("Text file busy"). Tests run on parallel threads, so one
+/// test's copy raced another's spawn. Writers take this exclusively; spawns share it.
+static EXEC_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 fn copy_executable(src: &Path, dst: &Path) {
+    let _writing = EXEC_LOCK.write().unwrap_or_else(|e| e.into_inner());
     std::fs::copy(src, dst)
         .unwrap_or_else(|e| panic!("copy {} -> {}: {e}", src.display(), dst.display()));
     std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755))
@@ -293,7 +301,10 @@ pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Outcome {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn zkminer");
+    let mut child = {
+        let _spawning = EXEC_LOCK.read().unwrap_or_else(|e| e.into_inner());
+        cmd.spawn().expect("spawn zkminer")
+    };
     let stdout = drain(&mut child, true);
     let stderr = drain(&mut child, false);
 

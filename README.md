@@ -58,6 +58,11 @@ env HIPCC=/opt/rocm/bin/hipcc NVCC=off RISC0_HIP_ARCH="gfx1100" \
                 --bin zkminer-prove-risc0-rocm --target-dir target/release-rocm
 ```
 
+Each `-gencode` adds a GPU family the worker can run on, so name your card's. The miner
+reads which families a worker binary carries (for SP1, its `sp1-gpu-server`) and will not
+start it on a card that has none of them, logging why. `Dockerfile.build` lists the
+families the release builds.
+
 Never set `RISC0_SKIP_BUILD=1` — it produces empty guest ELF stubs, and every
 benchmark then silently reports zero work.
 
@@ -74,8 +79,29 @@ no error.**
 ├── zkminer-prove-risc0-cuda
 ├── zkminer-prove-risc0-rocm
 ├── zkminer-prove-sp1
+├── sp1-gpu-server
+├── libcudart.so.12
+├── libcudart.so.12.LICENSE.txt
 └── zkminer-prove-openvm
 ```
+
+**SP1** needs three more things, all handled for you:
+
+- `sp1-gpu-server` ships beside `zkminer-prove-sp1`, built from the same hemilabs/sp1 commit as
+  the worker. The worker installs it as `~/.sp1/bin/sp1-gpu-server`, where the SP1 SDK runs it
+  from; without it the SDK downloads upstream's server, which lacks the fork's GPU fixes. Keep it
+  beside the real binary, not a wrapper script. `ZKMINER_SP1_SERVER_INSTALL=0` leaves
+  `~/.sp1/bin` alone, for a server you manage yourself.
+- `libcudart.so.12`, the CUDA 12 runtime `sp1-gpu-server` links, ships beside it too. The worker
+  puts its own directory on the server's library path, so a host needs only the NVIDIA driver,
+  whatever CUDA toolkit it has, or none. Without that file the worker looks for a CUDA 12 runtime
+  elsewhere (`ZKMINER_SP1_CUDA_RUNTIME_DIR`, a CUDA 12 toolkit, pip's `nvidia-cuda-runtime-cu12`)
+  and SP1 declines if there is none. It is NVIDIA's software, under NVIDIA's CUDA EULA rather
+  than zkminer's license: see `libcudart.so.12.LICENSE.txt`.
+- The Groth16 circuit artifacts (~8 GB, in `~/.sp1/circuits/groth16/`) are downloaded once, when
+  the miner starts, before it claims any SP1 job; until then SP1 jobs are skipped. A download cut
+  short is detected and redone. Final Groth16 proofs on one host take turns through lock files in
+  `~/.zkminer/locks/` (hemilabs/sp1 v6.8.1 and later).
 
 If a worker needs environment the miner's own process won't have (a systemd unit or cron
 job does *not* source `~/.bashrc`), install a small wrapper script under the expected
@@ -183,3 +209,8 @@ needs only `cast`.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+Releases also ship `libcudart.so.12`, NVIDIA's CUDA runtime, unmodified. It is NVIDIA's software,
+distributed under the NVIDIA CUDA Toolkit End User License Agreement, which lists it as
+distributable with an application, and not under this license. Its notice and that agreement ship
+beside it as `libcudart.so.12.LICENSE.txt`.

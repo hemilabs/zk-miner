@@ -6,11 +6,11 @@
 //! JobSubmitted event and decoding its calldata.
 
 use alloy::consensus::Transaction;
-use alloy::primitives::{Address, B256, Bytes, keccak256};
+use alloy::primitives::{keccak256, Address, Bytes, B256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolCall;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 use zkminer_contracts::bindings::{IHemiProveCore, JobDescriptor};
 
@@ -140,9 +140,9 @@ async fn scan_for_descriptor(
             )
         })?;
 
-    let log = logs.first().ok_or_else(|| {
-        anyhow::anyhow!("No JobSubmitted log found for job_id {}", job_id)
-    })?;
+    let log = logs
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No JobSubmitted log found for job_id {}", job_id))?;
 
     let tx_hash = log
         .transaction_hash
@@ -171,7 +171,10 @@ async fn decode_descriptor_from_tx(
 
     let calldata = tx.input();
     if calldata.len() < 4 {
-        bail!("Submitting tx calldata is too short: {} bytes", calldata.len());
+        bail!(
+            "Submitting tx calldata is too short: {} bytes",
+            calldata.len()
+        );
     }
     let selector: [u8; 4] = calldata[..4].try_into().unwrap();
 
@@ -199,11 +202,15 @@ async fn decode_descriptor_from_tx(
         // select the descriptor without the extra getJobStatusView read.
         let want = match known_hash {
             Some(h) => h,
-            None => client
-                .get_job_status_view(job_id)
-                .await
-                .context("submitJobBatch: need on-chain descriptorHash to select the descriptor")?
-                .descriptorHash,
+            None => {
+                client
+                    .get_job_status_view(job_id)
+                    .await
+                    .context(
+                        "submitJobBatch: need on-chain descriptorHash to select the descriptor",
+                    )?
+                    .descriptorHash
+            }
         };
         decoded
             .descriptors
@@ -436,7 +443,11 @@ mod tests {
         );
 
         // The encoding length must be exactly 9*32 = 288 bytes (no dynamic tails).
-        assert_eq!(reference_encoded.len(), 288, "abi.encode of 9 fixed-size values must be 288 bytes");
+        assert_eq!(
+            reference_encoded.len(),
+            288,
+            "abi.encode of 9 fixed-size values must be 288 bytes"
+        );
     }
 
     /// Solidity-derived hardcoded reference vector.
@@ -488,15 +499,15 @@ mod tests {
         // share the same encoding definition.
         let empty_hash = keccak256(b"");
         let mut buf = [0u8; 288];
-        buf[31] = 1;                          // programId
+        buf[31] = 1; // programId
         buf[32..64].copy_from_slice(proof_system_id.as_slice()); // proofSystemId
-        // callback: 32 zeros
-        // assignedProver: 32 zeros
-        // tag: 32 zeros
+                                                                 // callback: 32 zeros
+                                                                 // assignedProver: 32 zeros
+                                                                 // tag: 32 zeros
         buf[160..192].copy_from_slice(empty_hash.as_slice()); // keccak256(inputData)
         buf[192..224].copy_from_slice(empty_hash.as_slice()); // keccak256(callbackExtra)
         buf[224..256].copy_from_slice(empty_hash.as_slice()); // keccak256(extraVerifier)
-        // buf[256..288]: expectedJournalHash = 32 zeros
+                                                              // buf[256..288]: expectedJournalHash = 32 zeros
         let manual_hash = keccak256(&buf);
 
         assert_eq!(
@@ -517,6 +528,9 @@ mod tests {
             B256::ZERO,
         );
         let reference_hash = keccak256(reference_tuple.abi_encode());
-        assert_eq!(our_hash, reference_hash, "descriptor hash must match alloy tuple encoding");
+        assert_eq!(
+            our_hash, reference_hash,
+            "descriptor hash must match alloy tuple encoding"
+        );
     }
 }

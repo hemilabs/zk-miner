@@ -39,8 +39,8 @@ pub const MINIMAL_PROOF_ID: [u32; 8] = [0u32; 8];
         return;
     }
 
-    let guest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../zkminer-prover/guests/risc0");
+    let guest_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../zkminer-prover/guests/risc0");
 
     let mut guests = std::collections::HashMap::new();
     let opts = risc0_build::GuestOptions::default();
@@ -59,17 +59,58 @@ pub const MINIMAL_PROOF_ID: [u32; 8] = [0u32; 8];
     guests.insert("minimal-proof", opts);
     risc0_build::embed_methods_with_options(guests);
     // Tell cargo to watch the guest source directories.
-    println!("cargo:rerun-if-changed={}", guest_dir.join("fibonacci/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("sha256-chain/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("ecdsa-verify/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("bigint-mul/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("memory-merkle/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("chacha-mix/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("rv32im-torture/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("edge-case-arith/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("memory-stress/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("precompile-interleave/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("segment-boundary/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("babybear-stress/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("minimal-proof/src/main.rs").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("fibonacci/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("sha256-chain/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("ecdsa-verify/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("bigint-mul/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("memory-merkle/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("chacha-mix/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("rv32im-torture/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("edge-case-arith/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("memory-stress/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir
+            .join("precompile-interleave/src/main.rs")
+            .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("segment-boundary/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("babybear-stress/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("minimal-proof/src/main.rs").display()
+    );
 }

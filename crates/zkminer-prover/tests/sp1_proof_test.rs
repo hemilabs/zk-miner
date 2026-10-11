@@ -22,6 +22,16 @@ fn find_sp1_fibonacci_elf() -> Option<Vec<u8>> {
 
 #[test]
 fn test_sp1_groth16_proof() {
+    // Forward the WORKER's stderr. The dispatcher re-emits it with
+    // `tracing::warn!(target: "worker", ..)`, and a test binary installs no subscriber — so when the
+    // worker died this test could only report "process died (EOF)" and threw away the reason the
+    // worker had already written down. Diagnosing a GPU failure is most of what this test is for.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .try_init();
     let elf = match find_sp1_fibonacci_elf() {
         Some(elf) if !elf.is_empty() => {
             eprintln!("SP1 fibonacci ELF: {} bytes", elf.len());
@@ -37,7 +47,21 @@ fn test_sp1_groth16_proof() {
     let connected = pool.discover_and_spawn();
     eprintln!("Connected workers: {:?}", connected);
 
-    let sp1_key = connected.iter().find(|k| k.starts_with("sp1:"));
+    // `ZKMINER_TEST_SP1_SLOT` targets one slot, e.g. `sp1:cuda:1`. Needed to attribute a failure to a
+    // CARD: with per-device SP1 slots the default `find` always takes `sp1:cuda:0`, so without an
+    // override there is no way to ask "does this fail on the other GPU too?" — which is the question
+    // that separates a bad tier from a bad code change.
+    let want = std::env::var("ZKMINER_TEST_SP1_SLOT").ok();
+    let sp1_key = match &want {
+        Some(w) => {
+            let found = connected.iter().find(|k| *k == w);
+            if found.is_none() {
+                eprintln!("SKIP: requested slot {w} not among {connected:?}");
+            }
+            found
+        }
+        None => connected.iter().find(|k| k.starts_with("sp1:")),
+    };
     let Some(sp1_key) = sp1_key else {
         eprintln!("SKIP: No SP1 worker found");
         pool.shutdown_all();
@@ -72,12 +96,21 @@ fn test_sp1_groth16_proof() {
             // 4 bytes vkey_hash prefix + encoded Groth16 proof
             // Total is typically ~260-300 bytes
             let seal_size = proof.seal.len();
-            eprintln!("  Seal[0..4]: {:02x?}", &proof.seal[..proof.seal.len().min(4)]);
+            eprintln!(
+                "  Seal[0..4]: {:02x?}",
+                &proof.seal[..proof.seal.len().min(4)]
+            );
 
             if seal_size < 500 {
-                eprintln!("  FORMAT: Compact Groth16 ({} bytes) - CORRECT for on-chain", seal_size);
+                eprintln!(
+                    "  FORMAT: Compact Groth16 ({} bytes) - CORRECT for on-chain",
+                    seal_size
+                );
             } else {
-                eprintln!("  FORMAT: Large ({} bytes) - may be bincode, NOT on-chain compatible!", seal_size);
+                eprintln!(
+                    "  FORMAT: Large ({} bytes) - may be bincode, NOT on-chain compatible!",
+                    seal_size
+                );
                 panic!("SP1 seal too large: {} bytes", seal_size);
             }
 

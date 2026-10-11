@@ -59,6 +59,9 @@ sp1-sdk = { version = "6.0", features = ["blocking"], optional = true }
 openvm-sdk = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.5.0-rc.1", optional = true }
 
 [dev-dependencies]
+# So an integration test can forward the WORKER's own stderr. Without a subscriber the dispatcher's
+# `tracing::warn!(target: "worker", ..)` is dropped and a GPU failure reads only as "process died".
+tracing-subscriber = { workspace = true }
 sha2 = "0.10"
 tiny-keccak = { version = "2", features = ["keccak"] }
 # Correct, well-tested bignum for the host-side 256-bit modmul reference used to

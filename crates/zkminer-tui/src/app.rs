@@ -4,7 +4,7 @@ use anyhow::Result;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, KeyCode, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -17,11 +17,11 @@ use ratatui::{
 use std::io;
 use std::time::Duration;
 
-use crate::event::{AppEvent, spawn_event_reader};
+use crate::event::{spawn_event_reader, AppEvent};
 use crate::gpu_tuning::GpuTuningState;
 use crate::screens;
 use crate::screens::settings::SettingsAction;
-use crate::state::{LogLevel, MinerState, Screen, SharedState, TESTNET_MINT_AMOUNT, MIN_STAKE_WEI};
+use crate::state::{LogLevel, MinerState, Screen, SharedState, MIN_STAKE_WEI, TESTNET_MINT_AMOUNT};
 use crate::theme;
 use zkminer_chain::client::ChainClient;
 
@@ -65,6 +65,27 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
         EnableMouseCapture,
     )?;
     enable_raw_mode()?;
+    // Restore on EVERY exit path, not just the `q` break below. `run()` in zkminer-cli
+    // deliberately falls THROUGH a `run_tui` error into its shutdown ladder (drain → abandon →
+    // reap) and installs the SIGINT/SIGTERM handler at that point. If an in-loop
+    // `terminal.draw()?` returns with raw mode still on, ISIG stays cleared, the tty never
+    // raises SIGINT, and the operator's Ctrl+C cannot escalate that drain (up to 3000s) to
+    // ABANDON — with collateral riding toward its lock deadline. The explicit cleanup below
+    // stays: `disable_raw_mode` restores crossterm's saved termios and the escape sequences
+    // are idempotent, so the guard's second pass on the normal path is a no-op.
+    struct TermRestore;
+    impl Drop for TermRestore {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                io::stdout(),
+                LeaveAlternateScreen,
+                DisableMouseCapture,
+                crossterm::cursor::Show
+            );
+        }
+    }
+    let _restore = TermRestore;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -92,6 +113,13 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
                 }
                 AppEvent::Resize(_, _) => PostKeyAction::None,
             };
+
+            // A signal asked us to shut down: leave the TUI so `run()` continues into its
+            // drain/abandon ladder. Without this the TUI owns the terminal forever and the
+            // ladder never runs.
+            if state.read().await.shutdown_requested {
+                break;
+            }
 
             // Process actions that need the lock released
             match action {
@@ -337,6 +365,23 @@ async fn run_device_benchmark(state: SharedState, device_id: &str) {
 
         let mut s = state.write().await;
 
+        // A run that produced NO GPU rows must not overwrite one that had them, and must never be
+        // saved. The suite arrives from `spawn_blocking(..).await.unwrap_or_default()`, so a
+        // panicked task yields `BenchmarkSuite::default()` — and a wedged driver or VRAM
+        // starvation yields a real suite with zero device rows. Persisting either one prices every
+        // card at 0 W (the cost model's own doc: "which on a GPU box would price every job as if
+        // the cards were switched off"), reverts the cost/throughput pairing to the optimistic
+        // suite average, and on a cold start leaves `average_throughput() == 0` so every job is
+        // skipped as infeasible — reproduced from the cache on every restart until the file is
+        // deleted by hand.
+        if suite.device_benchmarks.is_empty() {
+            tracing::warn!(
+                "the CPU re-benchmark produced no device rows at all — keeping the previous \
+                 results and NOT saving, rather than persisting a suite that prices every card \
+                 at 0W"
+            );
+            return;
+        }
         if let Some(existing) = s.benchmark_results.as_mut() {
             // Update CPU-specific data; leave the real (worker-measured) GPU
             // benchmarks intact — GPU throughput is measured, not derived from CPU.
@@ -347,9 +392,7 @@ async fn run_device_benchmark(state: SharedState, device_id: &str) {
             existing.cpu_power_watts = suite.cpu_power_watts;
 
             // Replace CPU device benchmarks
-            existing
-                .device_benchmarks
-                .retain(|d| d.device_id != "cpu");
+            existing.device_benchmarks.retain(|d| d.device_id != "cpu");
             existing.device_benchmarks.extend(
                 suite
                     .device_benchmarks
@@ -412,6 +455,7 @@ async fn run_streaming_gpu_benchmark(state: SharedState) {
                         &event.slot_key,
                         event.gpu_name.as_deref(),
                         event.device_index,
+                        event.pci_bus_id.as_deref(),
                         &event.gpu_tag,
                         &event.entry,
                         event.program_index,
@@ -442,6 +486,28 @@ async fn run_streaming_gpu_benchmark(state: SharedState) {
 
     let mut s = state.write().await;
     let gpu_count = suite.device_benchmarks.len();
+
+    // A run that produced no GPU rows must not overwrite ones that had them, and must never be
+    // saved. The suite arrives from `spawn_blocking(..).await.unwrap_or_default()`, so a panicked
+    // task yields `BenchmarkSuite::default()` — and a wedged driver or VRAM starvation yields a
+    // real suite with zero device rows. Persisting either prices every card at 0 W (the cost
+    // model's own words: "which on a GPU box would price every job as if the cards were switched
+    // off"), reverts the cost/throughput pairing to the optimistic suite average, and on a cold
+    // start leaves `average_throughput() == 0` so every job is skipped as infeasible — reproduced
+    // from the cache on every restart until the file is deleted by hand. `None` has a safety net
+    // (`synthetic_conservative_benchmark` supplies conservative rows); `Some(no-gpu-rows)` has
+    // none, so it must not be created.
+    if !suite
+        .device_benchmarks
+        .iter()
+        .any(|d| d.device_id.starts_with("gpu"))
+    {
+        tracing::warn!(
+            "GPU benchmark produced no device rows — keeping the previous results and NOT saving, \
+             rather than persisting a suite that prices every card at 0W"
+        );
+        return;
+    }
 
     // Merge freshly-measured GPU benchmarks into the existing suite (keep CPU data).
     if let Some(existing) = s.benchmark_results.as_mut() {
@@ -527,27 +593,29 @@ fn settings_action_to_post_key(action: SettingsAction, state: &mut MinerState) -
         SettingsAction::GpuTuningApply { device_id, tuning } => {
             PostKeyAction::ApplyGpuTuningAll { device_id, tuning }
         }
-        SettingsAction::GpuTuningReset { device_id } => {
-            PostKeyAction::ResetGpuTuning { device_id }
-        }
+        SettingsAction::GpuTuningReset { device_id } => PostKeyAction::ResetGpuTuning { device_id },
         SettingsAction::GpuTuningBenchmark { device_id } => {
-            // Capture current throughput as the "before" baseline
-            let before = state
-                .benchmark_results
-                .as_ref()
-                .map(|suite| {
-                    suite
-                        .device_benchmarks
-                        .iter()
-                        .filter(|d| d.device_id == device_id)
-                        .map(|d| d.throughput)
-                        .sum::<f64>()
-                })
-                .unwrap_or(0.0);
+            // `device_id` here is a TUNING id (PCI bus). Benchmark rows are keyed
+            // in the prover's namespace, so map across before summing -- comparing
+            // them directly made the baseline read a neighbouring card, and made
+            // the one card whose id matched no row always report "+0.0%".
+            let bench_id = state.benchmark_id_for_tuning_id(&device_id);
+            let before = match (&state.benchmark_results, &bench_id) {
+                (Some(suite), Some(bid)) => suite
+                    .device_benchmarks
+                    .iter()
+                    .filter(|d| d.device_id == *bid)
+                    .map(|d| d.throughput)
+                    .sum::<f64>(),
+                _ => 0.0,
+            };
 
-            state.gpu_tuning_bench_before = Some((device_id.clone(), before));
+            // Store the BENCHMARK id: the before/after comparison and the
+            // "is this device benchmarking" checks all live in that namespace.
+            let progress_id = bench_id.clone().unwrap_or_else(|| device_id.clone());
+            state.gpu_tuning_bench_before = Some((progress_id.clone(), before));
             state.gpu_tuning_bench_result = None;
-            state.benchmark_device_in_progress = Some(device_id.clone());
+            state.benchmark_device_in_progress = Some(progress_id);
             state.add_log(
                 LogLevel::Info,
                 format!("Re-benchmarking {device_id} after tuning changes..."),
@@ -558,11 +626,7 @@ fn settings_action_to_post_key(action: SettingsAction, state: &mut MinerState) -
 }
 
 /// Apply all pending GPU tuning changes asynchronously.
-async fn apply_gpu_tuning_all_async(
-    state: SharedState,
-    device_id: String,
-    tuning: GpuTuningState,
-) {
+async fn apply_gpu_tuning_all_async(state: SharedState, device_id: String, tuning: GpuTuningState) {
     let hardware = { state.read().await.hardware.clone() };
     let dev_id = device_id.clone();
 
@@ -586,7 +650,11 @@ async fn apply_gpu_tuning_all_async(
 
     // Re-mark dirty if any write failed so user can retry
     if any_error {
-        if let Some(ts) = s.gpu_tuning.iter_mut().find(|t| t.caps.device_id == device_id) {
+        if let Some(ts) = s
+            .gpu_tuning
+            .iter_mut()
+            .find(|t| t.caps.device_id == device_id)
+        {
             ts.dirty = true;
         }
     }
@@ -637,7 +705,8 @@ async fn setup_mint_async(state: SharedState, chain_client: std::sync::Arc<Optio
             let (eth, hemi, stake) = (s.eth_balance, s.hemi_balance, s.stake_info.clone());
             s.setup_status.pending_action = None;
             s.setup_status.last_error = None;
-            s.setup_status.refresh_from_balances(eth, hemi, stake.as_ref());
+            s.setup_status
+                .refresh_from_balances(eth, hemi, stake.as_ref());
             s.add_log(LogLevel::Success, "Minted 1000 tHEMI tokens");
         }
         Err(e) => {
@@ -678,7 +747,8 @@ async fn setup_stake_async(state: SharedState, chain_client: std::sync::Arc<Opti
             let (eth, hemi, stake) = (s.eth_balance, s.hemi_balance, s.stake_info.clone());
             s.setup_status.pending_action = None;
             s.setup_status.last_error = None;
-            s.setup_status.refresh_from_balances(eth, hemi, stake.as_ref());
+            s.setup_status
+                .refresh_from_balances(eth, hemi, stake.as_ref());
             s.add_log(LogLevel::Success, "Staked 100 HEMI");
         }
         Err(e) => {
@@ -700,7 +770,7 @@ fn draw(f: &mut Frame, state: &MinerState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // Tab bar (compact)
-            Constraint::Min(0),   // Content
+            Constraint::Min(0),    // Content
             Constraint::Length(1), // Status bar
         ])
         .split(f.area());
@@ -785,7 +855,11 @@ fn draw(f: &mut Frame, state: &MinerState) {
 
     // Job counts
     left_spans.push(Span::styled(
-        format!("Locked: {}  Available: {}  ", state.active_jobs.len(), state.open_jobs.len()),
+        format!(
+            "Locked: {}  Available: {}  ",
+            state.active_jobs.len(),
+            state.open_jobs.len()
+        ),
         Style::default().fg(theme::text()),
     ));
 

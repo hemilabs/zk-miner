@@ -1,8 +1,8 @@
 fn main() {
     // Note: sp1_build::build_program handles SP1_SKIP_PROGRAM_BUILD internally
     // (creates dummy ELFs and sets env vars for include_elf! macro).
-    let guest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../zkminer-prover/guests/sp1");
+    let guest_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../zkminer-prover/guests/sp1");
 
     // Build SP1 guest programs
     let fibonacci_dir = guest_dir.join("fibonacci");
@@ -55,15 +55,42 @@ fn main() {
         sp1_build::build_program(&precompile_dir.to_string_lossy());
     }
 
-    println!("cargo:rerun-if-changed={}", guest_dir.join("fibonacci/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("sha256-chain/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("ecdsa-verify/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("bigint-mul/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("memory-merkle/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("chacha-mix/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("rv32im-torture/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("edge-case-arith/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("memory-stress/src/main.rs").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("fibonacci/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("sha256-chain/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("ecdsa-verify/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("bigint-mul/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("memory-merkle/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("chacha-mix/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("rv32im-torture/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("edge-case-arith/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("memory-stress/src/main.rs").display()
+    );
     let seg_boundary_dir = guest_dir.join("segment-boundary");
     if seg_boundary_dir.exists() {
         sp1_build::build_program(&seg_boundary_dir.to_string_lossy());
@@ -74,7 +101,18 @@ fn main() {
         sp1_build::build_program(&minimal_dir.to_string_lossy());
     }
 
-    println!("cargo:rerun-if-changed={}", guest_dir.join("precompile-interleave/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("segment-boundary/src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", guest_dir.join("minimal-proof/src/main.rs").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir
+            .join("precompile-interleave/src/main.rs")
+            .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("segment-boundary/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("minimal-proof/src/main.rs").display()
+    );
 }

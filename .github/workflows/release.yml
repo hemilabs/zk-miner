@@ -1,0 +1,192 @@
+name: Release
+
+# A tag is the only thing that cuts a public release. Everything it ships is
+# built by the SAME reusable workflows that run on every push and PR, so a
+# release cannot contain a binary nobody has built before.
+on:
+  push:
+    tags:
+      - 'v*'
+  # Dry run: build and assemble everything, but publish nothing.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Assemble assets but do not publish a release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Fail fast, BEFORE an hour of GPU builds, if the tag and the crate version
+  # disagree. A release whose assets report a different version than its tag is
+  # worse than no release.
+  # ---------------------------------------------------------------------------
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+
+      - id: v
+        name: "Tag must match [workspace.package].version"
+        run: |
+          set -euo pipefail
+          CRATE=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$CRATE" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $CRATE"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            echo "tag version:        $TAG"
+            if [ "$TAG" != "$CRATE" ]; then
+              echo "::error::tag v$TAG does not match [workspace.package].version $CRATE - bump Cargo.toml or retag"
+              exit 1
+            fi
+          else
+            echo "manual run — skipping tag comparison"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Linux + cross-compiled Windows CLI, via the Dockerfile. Six binaries.
+  # ---------------------------------------------------------------------------
+  linux:
+    needs: check-version
+    uses: ./.github/workflows/build-docker.yml
+    with:
+      retention_days: 30
+
+  # ---------------------------------------------------------------------------
+  # Native Windows. The CUDA prover cannot be cross-compiled (it needs MSVC +
+  # the CUDA toolkit), which is the whole reason this job exists.
+  # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Collect every artifact, checksum the set, publish.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [check-version, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to create a release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+
+      # Reusable workflows share the caller's run, so their uploads are visible here.
+      - name: "Download every build artifact"
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: staging
+
+      - name: "Assemble release assets"
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # Artifacts arrive as staging/<artifact-name>/<files>. Flatten, dropping
+          # the per-artifact .sha256 files -- a single SHA256SUMS replaces them so
+          # a user has one file to verify against.
+          #
+          # NOTE on Windows coverage. `build-windows.yml` builds a native Windows
+          # CUDA prover, but it needs `dtolnay/rust-toolchain` and
+          # `Jimver/cuda-toolkit`, NEITHER of which is on this repo's
+          # allowed-actions list -- so a release cannot call it without a policy
+          # change, and doing so would fail the whole run at startup. The
+          # Windows CLI here is the Dockerfile's cargo-xwin cross-build, which is
+          # policy-clean and statically linked. Add those two actions to the
+          # allowlist (or install CUDA manually) to ship the Windows prover too.
+          # Any OTHER duplicate basename is unintended -- fail rather than let one
+          # artifact silently overwrite another in the release.
+          dupes=$(find staging -type f ! -name '*.sha256' -printf '%f\n' | sort | uniq -d)
+          if [ -n "$dupes" ]; then
+            echo "::error::two artifacts provide the same filename: $dupes"
+            exit 1
+          fi
+          find staging -type f ! -name '*.sha256' -exec cp -v {} release/ \;
+          cd release
+          test -n "$(ls -A)" || { echo "::error::no assets were assembled"; exit 1; }
+          sha256sum * > SHA256SUMS
+          echo "--- release contents ---"
+          ls -la
+          cat SHA256SUMS
+
+      # Every expected user-facing binary must be present. Without this a job
+      # that silently produced nothing would yield a release that is quietly
+      # missing a platform, which is how a half-published release happens.
+      - name: "Verify the asset set is complete"
+        run: |
+          set -euo pipefail
+          cd release
+          missing=0
+          for f in zkminer zkminer.exe \
+                   zkminer-prove-risc0-cuda \
+                   zkminer-prove-risc0-rocm zkminer-prove-sp1 sp1-gpu-server \
+                   libcudart.so.12 libcudart.so.12.LICENSE.txt \
+                   zkminer-prove-openvm; do
+            if [ ! -s "$f" ]; then echo "::error::missing release asset: $f"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "all expected assets present"
+
+      - name: "Upload the assembled set as a run artifact"
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ needs.check-version.outputs.version }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: "Publish GitHub Release"
+        if: ${{ github.ref_type == 'tag' && !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # `softprops/action-gh-release` is NOT on this repo's allowed-actions list
+        # (the policy is `allowed_actions: selected` with `sha_pinning_required`),
+        # so the release is cut with the gh CLI, which is preinstalled on the
+        # runner and needs no action entry.
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'NOTES'
+          ## zkminer ${{ github.ref_name }}
+
+          ### Linux (glibc 2.35+, x86-64-v3)
+          | file | what it is |
+          |---|---|
+          | `zkminer` | the miner CLI - start here |
+          | `zkminer-prove-risc0-cuda` | RISC Zero prover, NVIDIA |
+          | `zkminer-prove-risc0-rocm` | RISC Zero prover, AMD |
+          | `zkminer-prove-sp1` | SP1 prover (NVIDIA) |
+          | `sp1-gpu-server` | the GPU server `zkminer-prove-sp1` drives, built from the pinned hemilabs/sp1; keep it beside `zkminer-prove-sp1`, which installs it into `~/.sp1/bin` |
+          | `libcudart.so.12` | NVIDIA's CUDA 12 runtime, which `sp1-gpu-server` links; keep it beside `zkminer-prove-sp1`, so a host needs only the NVIDIA driver. NVIDIA's software under NVIDIA's CUDA EULA, not zkminer's MIT license: see `libcudart.so.12.LICENSE.txt` |
+          | `libcudart.so.12.LICENSE.txt` | the notice and NVIDIA's license for `libcudart.so.12` |
+          | `zkminer-prove-openvm` | OpenVM prover |
+
+          ### Windows (x86-64)
+          | file | what it is |
+          |---|---|
+          | `zkminer.exe` | the miner CLI (statically linked; no VC++ redistributable needed) |
+
+          Verify with `sha256sum -c SHA256SUMS`.
+
+          On Linux, put the prover binaries (and `sp1-gpu-server`, `libcudart.so.12` and its
+          license) in `~/.zkminer/provers/` and `chmod +x` the binaries; the CLI discovers
+          them there.
+
+          The native Windows CUDA prover is not included - see the release workflow
+          for why.
+          NOTES
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "zkminer ${GITHUB_REF_NAME}" \
+            --notes-file notes.md \
+            --verify-tag \
+            release/*
+
+      - name: "Dry run — nothing published"
+        if: ${{ !(github.ref_type == 'tag' && !inputs.dry_run) }}
+        run: |
+          echo "Assets assembled and uploaded as a run artifact; no release published."
+          echo "ref_type=${{ github.ref_type }} dry_run=${{ inputs.dry_run }}"

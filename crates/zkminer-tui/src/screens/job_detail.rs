@@ -6,12 +6,14 @@ use ratatui::{
     Frame,
 };
 
+use super::dashboard::{format_duration, format_token_amount};
 use crate::state::{MinerJobStatus, MinerState};
 use crate::theme;
-use super::dashboard::{format_duration, format_token_amount};
 
 pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
-    let selected = state.open_jobs.get(state.selected_job_index)
+    let selected = state
+        .open_jobs
+        .get(state.selected_job_index)
         .or_else(|| state.active_jobs.first());
 
     let block = Block::default()
@@ -36,7 +38,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
             Constraint::Length(12), // Job info
             Constraint::Length(8),  // Economics
             Constraint::Length(5),  // Risk
-            Constraint::Min(3),    // Progress
+            Constraint::Min(3),     // Progress
         ])
         .margin(1)
         .split(area);
@@ -56,7 +58,12 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
         ]),
         Line::from(vec![
             Span::styled("Status:        ", theme::dim()),
-            Span::raw(format!("{:?}", job.status).chars().take(30).collect::<String>()),
+            Span::raw(
+                format!("{:?}", job.status)
+                    .chars()
+                    .take(30)
+                    .collect::<String>(),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Descriptor:    ", theme::dim()),
@@ -80,18 +87,21 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
         ]),
         Line::from(vec![
             Span::styled("Curve:         ", theme::dim()),
-            Span::raw(if job.info.curve_type == 0 { "Linear" } else { "Quadratic" }),
+            Span::raw(if job.info.curve_type == 0 {
+                "Linear"
+            } else {
+                "Quadratic"
+            }),
         ]),
     ];
 
-    let info = Paragraph::new(info_text)
-        .block(
-            Block::default()
-                .title(Span::styled(" Info ", theme::title()))
-                .borders(Borders::ALL)
-                .border_style(theme::border())
-                .border_type(theme::border_type()),
-        );
+    let info = Paragraph::new(info_text).block(
+        Block::default()
+            .title(Span::styled(" Info ", theme::title()))
+            .borders(Borders::ALL)
+            .border_style(theme::border())
+            .border_type(theme::border_type()),
+    );
     f.render_widget(info, chunks[0]);
 
     // Economics
@@ -114,29 +124,36 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
         ]),
     ];
 
-    let econ = Paragraph::new(econ_text)
-        .block(
-            Block::default()
-                .title(Span::styled(" Economics ", theme::title()))
-                .borders(Borders::ALL)
-                .border_style(theme::border())
-                .border_type(theme::border_type()),
-        );
+    let econ = Paragraph::new(econ_text).block(
+        Block::default()
+            .title(Span::styled(" Economics ", theme::title()))
+            .borders(Borders::ALL)
+            .border_style(theme::border())
+            .border_type(theme::border_type()),
+    );
     f.render_widget(econ, chunks[1]);
 
     // Progress (if proving)
-    if let MinerJobStatus::Proving { progress, elapsed_secs } = &job.status {
+    if let MinerJobStatus::Proving {
+        progress,
+        elapsed_secs,
+    } = &job.status
+    {
         let gauge = Gauge::default()
             .block(
                 Block::default()
                     .title(Span::styled(" Proving Progress ", theme::title()))
                     .borders(Borders::ALL)
                     .border_style(theme::border())
-                .border_type(theme::border_type()),
+                    .border_type(theme::border_type()),
             )
             .gauge_style(Style::default().fg(theme::green()))
             .percent((*progress * 100.0).clamp(0.0, 100.0) as u16)
-            .label(format!("{:.1}% ({})", progress * 100.0, format_duration(*elapsed_secs)));
+            .label(format!(
+                "{:.1}% ({})",
+                progress * 100.0,
+                format_duration(*elapsed_secs)
+            ));
         f.render_widget(gauge, chunks[3]);
     }
 }

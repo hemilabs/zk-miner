@@ -5,18 +5,15 @@
 //! Can be dismissed with Esc (experienced users) or skipped entirely if already set up.
 
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::Style,
+    layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
-use crate::state::{
-    MinerState, SetupStatus, MIN_STAKE_WEI, TESTNET_MINT_AMOUNT,
-};
-use crate::theme;
 use super::dashboard::format_token_amount;
+use crate::state::{MinerState, SetupStatus, MIN_STAKE_WEI};
+use crate::theme;
 
 /// Step indices in the setup wizard.
 const STEP_WALLET: usize = 0;
@@ -28,7 +25,7 @@ const TOTAL_STEPS: usize = 5;
 
 /// Render the setup wizard screen.
 pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
-    let setup = &state.setup_status;
+    let _setup = &state.setup_status;
 
     let outer_block = Block::default()
         .title(Span::styled(" Setup Wizard ", theme::title()))
@@ -42,11 +39,11 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Header
-            Constraint::Length(1),  // Spacer
+            Constraint::Length(3), // Header
+            Constraint::Length(1), // Spacer
             Constraint::Min(16),   // Steps
-            Constraint::Length(1),  // Spacer
-            Constraint::Length(3),  // Action bar / status
+            Constraint::Length(1), // Spacer
+            Constraint::Length(3), // Action bar / status
         ])
         .split(inner);
 
@@ -185,10 +182,7 @@ fn render_step(
             theme::border()
         });
 
-    let mut lines = vec![Line::from(vec![
-        icon,
-        Span::styled(title, title_style),
-    ])];
+    let mut lines = vec![Line::from(vec![icon, Span::styled(title, title_style)])];
     lines.extend(description.iter().cloned());
 
     let paragraph = Paragraph::new(lines).block(block);
@@ -205,7 +199,11 @@ fn wallet_description(state: &MinerState) -> Vec<Line<'static>> {
     }
 
     let addr_display = if state.address.len() > 10 {
-        format!("{}...{}", &state.address[..6], &state.address[state.address.len() - 4..])
+        format!(
+            "{}...{}",
+            &state.address[..6],
+            &state.address[state.address.len() - 4..]
+        )
     } else if state.address.is_empty() {
         "N/A".to_string()
     } else {
@@ -213,7 +211,11 @@ fn wallet_description(state: &MinerState) -> Vec<Line<'static>> {
     };
 
     let eth_str = format_token_amount(state.eth_balance);
-    let eth_style = if setup.has_gas { theme::positive() } else { theme::error() };
+    let eth_style = if setup.has_gas {
+        theme::positive()
+    } else {
+        theme::error()
+    };
     let gas_note = if setup.has_gas {
         String::new()
     } else {
@@ -239,7 +241,11 @@ fn tokens_description(state: &MinerState) -> Vec<Line<'static>> {
     }
 
     let balance_str = format_token_amount(state.hemi_balance);
-    let balance_style = if setup.has_hemi { theme::positive() } else { theme::warning() };
+    let balance_style = if setup.has_hemi {
+        theme::positive()
+    } else {
+        theme::warning()
+    };
 
     let mut spans = vec![
         Span::styled("      Balance: ", theme::dim()),
@@ -251,7 +257,10 @@ fn tokens_description(state: &MinerState) -> Vec<Line<'static>> {
         spans.push(Span::styled("[m]", theme::accent()));
         spans.push(Span::styled(" to mint 1000 tHEMI", theme::dim()));
     } else if !setup.has_hemi {
-        spans.push(Span::styled("  |  Transfer HEMI tokens to your wallet", theme::dim()));
+        spans.push(Span::styled(
+            "  |  Transfer HEMI tokens to your wallet",
+            theme::dim(),
+        ));
     }
 
     vec![Line::from(spans)]
@@ -272,7 +281,11 @@ fn stake_description(state: &MinerState) -> Vec<Line<'static>> {
         .map(|s| s.total_staked)
         .unwrap_or(0);
     let staked_str = format_token_amount(staked);
-    let staked_style = if setup.has_stake { theme::positive() } else { theme::warning() };
+    let staked_style = if setup.has_stake {
+        theme::positive()
+    } else {
+        theme::warning()
+    };
     let min_str = format_token_amount(MIN_STAKE_WEI);
 
     let mut spans = vec![
@@ -379,10 +392,7 @@ pub enum SetupAction {
 }
 
 /// Handle a key press on the setup screen.
-pub fn handle_setup_key(
-    state: &mut MinerState,
-    key: crossterm::event::KeyCode,
-) -> SetupAction {
+pub fn handle_setup_key(state: &mut MinerState, key: crossterm::event::KeyCode) -> SetupAction {
     match key {
         crossterm::event::KeyCode::Esc => {
             state.setup_status.dismissed = true;
@@ -401,8 +411,7 @@ pub fn handle_setup_key(
                 && !state.setup_status.has_hemi
                 && state.setup_status.pending_action.is_none()
             {
-                state.setup_status.pending_action =
-                    Some("Minting tHEMI tokens...".to_string());
+                state.setup_status.pending_action = Some("Minting tHEMI tokens...".to_string());
                 state.setup_status.last_error = None;
                 SetupAction::MintTokens
             } else {
@@ -414,8 +423,7 @@ pub fn handle_setup_key(
                 && !state.setup_status.has_stake
                 && state.setup_status.pending_action.is_none()
             {
-                state.setup_status.pending_action =
-                    Some("Approving + staking HEMI...".to_string());
+                state.setup_status.pending_action = Some("Approving + staking HEMI...".to_string());
                 state.setup_status.last_error = None;
                 SetupAction::ApproveAndStake
             } else {
@@ -423,8 +431,7 @@ pub fn handle_setup_key(
             }
         }
         crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-            state.setup_status.selected_step =
-                state.setup_status.selected_step.saturating_sub(1);
+            state.setup_status.selected_step = state.setup_status.selected_step.saturating_sub(1);
             SetupAction::NavigateUp
         }
         crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {

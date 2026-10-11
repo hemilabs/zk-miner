@@ -9,11 +9,15 @@ use crate::state::{LogLevel, MinerState};
 use crate::theme;
 
 pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
-    let filtered: Vec<&crate::state::ActivityEntry> = state.activity_log
+    let filtered: Vec<&crate::state::ActivityEntry> = state
+        .activity_log
         .iter()
         .filter(|entry| {
             if let Some(filter) = &state.log_filter {
-                entry.message.to_lowercase().contains(&filter.to_lowercase())
+                entry
+                    .message
+                    .to_lowercase()
+                    .contains(&filter.to_lowercase())
             } else {
                 true
             }
@@ -47,21 +51,20 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
 
             let time = entry.timestamp.format("%H:%M:%S%.3f").to_string();
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{} ", time),
-                    theme::dim(),
-                ),
-                Span::styled(
-                    format!("[{}] ", level_str),
-                    Style::default().fg(color),
-                ),
+                Span::styled(format!("{} ", time), theme::dim()),
+                Span::styled(format!("[{}] ", level_str), Style::default().fg(color)),
                 Span::raw(&entry.message),
             ]))
         })
         .collect();
 
     let title = if let Some(filter) = &state.log_filter {
-        format!(" Logs (filter: '{}') — {}/{} ", filter, items.len(), state.activity_log.len())
+        format!(
+            " Logs (filter: '{}') — {}/{} ",
+            filter,
+            items.len(),
+            state.activity_log.len()
+        )
     } else {
         format!(" Logs — {} entries ", state.activity_log.len())
     };

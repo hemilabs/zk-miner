@@ -12,9 +12,35 @@ on:
         type: boolean
         default: true
 
-  push:
-    tags:
-      - 'v*'
+  # NO tag trigger. The cuda-windows job below references a non-allowlisted
+  # action, which fails the entire run at STARTUP -- so a tag would reliably put
+  # a red check on an otherwise-good release. release.yml owns the tag path and
+  # gets its Windows CLI from the Dockerfile's cross-compile instead. Restore
+  # this trigger once `Jimver/cuda-toolkit@*` is allowlisted.
+
+  # Callable from release.yml so a tagged release reuses these exact jobs.
+  workflow_call:
+    inputs:
+      retention_days:
+        description: 'How long to keep the uploaded artifacts'
+        type: number
+        default: 14
+        required: false
+      # Declared so the job `if:` below evaluates true when CALLED. Without these
+      # the guards read an undefined `inputs.build_cli` under a manually
+      # dispatched release and BOTH Windows jobs silently skip, producing a
+      # release with no Windows binaries at all.
+      build_cli:
+        type: boolean
+        default: true
+        required: false
+      build_cuda:
+        type: boolean
+        default: true
+        required: false
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,21 +55,24 @@ jobs:
   # CLI — cross-compiled from Linux (fast, ~5 min)
   # -----------------------------------------------------------------------
   cli-windows:
-    if: ${{ github.event_name == 'push' || inputs.build_cli }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_cli }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y lld llvm
 
+      # rustup is preinstalled on GitHub runners. `dtolnay/rust-toolchain` is NOT
+      # on this repo's allowed-actions list, and an action outside that list fails
+      # the whole run at startup before any job executes.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          targets: x86_64-pc-windows-msvc
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+          rustup default ${{ env.RUST_VERSION }}
+          rustup target add x86_64-pc-windows-msvc
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -68,19 +97,29 @@ jobs:
           cp target/x86_64-pc-windows-msvc/release/zkminer.exe dist/
           cd dist && sha256sum zkminer.exe > zkminer.exe.sha256
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: zkminer-windows-cli
           path: dist/zkminer.exe*
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention_days || 14 }}
 
   # -----------------------------------------------------------------------
   # CUDA prover — native Windows build (requires MSVC + CUDA toolkit)
+  #
+  # BLOCKED BY POLICY: `Jimver/cuda-toolkit` is not on this repo's
+  # allowed-actions list (`allowed_actions: selected`), and referencing an action
+  # outside that list fails the entire run at startup. So this job cannot run as
+  # written, and release.yml deliberately does NOT call this workflow -- it would
+  # take the release down with it. To ship a native Windows prover, either add
+  # `Jimver/cuda-toolkit@*` to the allowlist or replace this step with a manual
+  # silent install of the CUDA network installer.
   # -----------------------------------------------------------------------
   cuda-windows:
-    if: ${{ github.event_name == 'push' || inputs.build_cuda }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_cuda }}
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           submodules: recursive
 
@@ -93,11 +132,11 @@ jobs:
           sub-packages: '["nvcc", "cudart", "thrust", "visual_studio_integration"]'
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+          rustup default ${{ env.RUST_VERSION }}
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -129,7 +168,9 @@ jobs:
           cp target/release/zkminer-prove-risc0-cuda.exe dist/
           cd dist && sha256sum zkminer-prove-risc0-cuda.exe > zkminer-prove-risc0-cuda.exe.sha256
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: zkminer-windows-cuda
           path: dist/zkminer-prove-risc0-cuda.exe*
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention_days || 14 }}

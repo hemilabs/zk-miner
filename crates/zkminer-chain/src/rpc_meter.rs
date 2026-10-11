@@ -79,7 +79,10 @@ impl RpcMeter {
     /// Note that a response came back rate-limited.
     fn record_rate_limit(&self, now: Instant) {
         self.rate_limit_total.fetch_add(1, Ordering::Relaxed);
-        let mut last = self.last_rate_limit.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last = self
+            .last_rate_limit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *last = Some(now);
     }
 
@@ -95,7 +98,10 @@ impl RpcMeter {
     /// backlog (each job's descriptor reconstruction is a heavy `getLogs` burst),
     /// so claiming pauses until the window clears while in-flight jobs keep draining.
     pub fn rate_limited_within(&self, window: Duration) -> bool {
-        let last = *self.last_rate_limit.lock().unwrap_or_else(|e| e.into_inner());
+        let last = *self
+            .last_rate_limit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match last {
             Some(t) => Instant::now().saturating_duration_since(t) < window,
             None => false,
@@ -134,7 +140,7 @@ fn is_rate_limited(result: &Result<ResponsePacket, TransportError>) -> bool {
 
 /// True if a single JSON-RPC response carries a rate-limit/overload error payload.
 fn resp_is_rate_limit(resp: &Response) -> bool {
-    resp.payload.as_error().map_or(false, payload_is_overloaded)
+    resp.payload.as_error().is_some_and(payload_is_overloaded)
 }
 
 /// alloy's canonical rate-limit/retry classification for a JSON-RPC error, minus
@@ -161,10 +167,12 @@ mod tests {
     use alloy_json_rpc::{ErrorPayload, Id, ResponsePayload};
 
     fn http_err(status: u16) -> Result<ResponsePacket, TransportError> {
-        Err(RpcError::Transport(TransportErrorKind::HttpError(HttpError {
-            status,
-            body: String::new(),
-        })))
+        Err(RpcError::Transport(TransportErrorKind::HttpError(
+            HttpError {
+                status,
+                body: String::new(),
+            },
+        )))
     }
 
     fn failure_resp(code: i64, message: &'static str) -> Response {
@@ -183,18 +191,36 @@ mod tests {
         // Alchemy surfaces 429 as a JSON-RPC error code in a 200 body.
         assert!(resp_is_rate_limit(&failure_resp(429, "Too Many Requests")));
         // Infura: "exceeded project rate limit".
-        assert!(resp_is_rate_limit(&failure_resp(-32005, "exceeded project rate limit")));
+        assert!(resp_is_rate_limit(&failure_resp(
+            -32005,
+            "exceeded project rate limit"
+        )));
         // Message-based match on a generic code.
-        assert!(resp_is_rate_limit(&failure_resp(-32000, "rate limit exceeded")));
+        assert!(resp_is_rate_limit(&failure_resp(
+            -32000,
+            "rate limit exceeded"
+        )));
         // A plain contract revert must NOT trip backoff.
         assert!(!resp_is_rate_limit(&failure_resp(3, "execution reverted")));
-        assert!(!resp_is_rate_limit(&failure_resp(-32000, "insufficient funds for gas")));
+        assert!(!resp_is_rate_limit(&failure_resp(
+            -32000,
+            "insufficient funds for gas"
+        )));
         // "header not found" is a per-request consistency race, NOT overload — the
         // narrowed classifier must exclude it so getLogs bursts don't stall claims.
-        assert!(!resp_is_rate_limit(&failure_resp(-32000, "header not found")));
+        assert!(!resp_is_rate_limit(&failure_resp(
+            -32000,
+            "header not found"
+        )));
         // is_rate_limited must route an Ok(Failure) packet the same way.
-        assert!(is_rate_limited(&Ok(ResponsePacket::Single(failure_resp(429, "Too Many Requests")))));
-        assert!(!is_rate_limited(&Ok(ResponsePacket::Single(failure_resp(3, "execution reverted")))));
+        assert!(is_rate_limited(&Ok(ResponsePacket::Single(failure_resp(
+            429,
+            "Too Many Requests"
+        )))));
+        assert!(!is_rate_limited(&Ok(ResponsePacket::Single(failure_resp(
+            3,
+            "execution reverted"
+        )))));
     }
 
     #[test]
@@ -260,7 +286,12 @@ pub struct MeterService<S> {
 
 impl<S> Service<RequestPacket> for MeterService<S>
 where
-    S: Service<RequestPacket, Response = ResponsePacket, Error = TransportError, Future = TransportFut<'static>>,
+    S: Service<
+        RequestPacket,
+        Response = ResponsePacket,
+        Error = TransportError,
+        Future = TransportFut<'static>,
+    >,
 {
     type Response = ResponsePacket;
     type Error = TransportError;
@@ -340,7 +371,12 @@ pub struct ThrottleService<S> {
 
 impl<S> Service<RequestPacket> for ThrottleService<S>
 where
-    S: Service<RequestPacket, Response = ResponsePacket, Error = TransportError, Future = TransportFut<'static>>,
+    S: Service<
+        RequestPacket,
+        Response = ResponsePacket,
+        Error = TransportError,
+        Future = TransportFut<'static>,
+    >,
 {
     type Response = ResponsePacket;
     type Error = TransportError;

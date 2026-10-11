@@ -4,4 +4,5 @@ pub mod mock;
 pub mod run;
 #[cfg(feature = "sp1-demo")]
 pub mod sp1_demo;
+pub mod stake;
 pub mod status;

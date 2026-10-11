@@ -1,6 +1,6 @@
 //! EIP-712 signing for atomic fast-path operations.
 
-use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
+use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use anyhow::{Context, Result};

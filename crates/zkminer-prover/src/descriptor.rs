@@ -14,7 +14,7 @@
 //! ))
 //! ```
 
-use alloy_primitives::{Address, B256, keccak256};
+use alloy_primitives::{keccak256, Address, B256};
 
 /// Compute the descriptor hash matching the on-chain `_computeDescriptorHash`.
 ///
@@ -156,7 +156,10 @@ mod tests {
             extra_verifier,
             B256::ZERO,
         );
-        assert_ne!(hash1, hash3, "expectedJournalHash must affect the descriptor hash");
+        assert_ne!(
+            hash1, hash3,
+            "expectedJournalHash must affect the descriptor hash"
+        );
     }
 
     #[test]

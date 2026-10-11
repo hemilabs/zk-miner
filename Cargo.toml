@@ -84,24 +84,30 @@ zkminer-tui = { path = "crates/zkminer-tui" }
 zkminer-config = { path = "crates/zkminer-config" }
 
 # Patch risc0 crates to use hemilabs fork (AMD + NVIDIA GPU support)
+#
+# Pinned by REV to branch `zkminer/clear-gpu-cache` @ df270d34, which is `max/cdna` @ c2b1e94 plus the
+# release of cached GPU memory around the Groth16 wrap. Without it a real risc0 Groth16 proof cannot
+# finish on a 16 GB card (see crates/zkminer-prover/tests/risc0_groth16_vram.rs). A rev and not a branch
+# for the reason given on `sppark` below: `max/cdna` has since moved on (53c761a0), and a branch pin
+# follows a moved head on the next `cargo update` without anyone choosing to.
 [patch.crates-io]
-risc0-zkvm = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-build = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-zkp = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-sys = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-core = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-binfmt = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-groth16 = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
-risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", branch = "max/cdna" }
+risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
+risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "df270d34" }
 # Pinned by immutable REV, not a branch: a branch head can silently move the build
 # off a validated commit (which is why the risc0/sp1 patches below carry a
 # do-not-cargo-update warning). 32f2101 = c5d2d7a (AMD HIP LDS-race fix) plus the
@@ -109,24 +115,34 @@ risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", branch = "max
 sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "32f2101" }
 
 # Patch SP1 crates to use hemilabs fork (AMD GPU + PLONK optimizations)
-sp1-sdk = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-build = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-cuda = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-prover = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-prover-types = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-core-executor = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-core-machine = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-curves = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-derive = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-hypercube = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-jit = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-primitives = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
-sp1-verifier = { git = "https://github.com/hemilabs/sp1", branch = "max/optimizations_and_amd" }
+#
+# Pinned by commit: the head of branch `zkminer/sp1-gpu-fixes`, which is `max/optimizations_and_amd` @
+# 676290bb8 plus four out-of-bounds GPU fixes that crash Blackwell (sm_120) and the changes that let a
+# 16 GB card finish a Groth16 proof. Those commits touch only the `sp1-gpu` crates, which zkminer does
+# not compile: they take effect in `sp1-gpu-server`, which must be BUILT FROM THIS COMMIT (the server
+# the SDK downloads is upstream's and has neither the fixes nor the 16 GB tier). Dockerfile.build
+# builds it from the commit Cargo.lock records here, and the release ships it beside
+# `zkminer-prove-sp1`, which installs it. A commit rather than a branch, so that a moved branch can
+# never pair an SDK with a different server. Keep `crates/zkminer-cli/Cargo.toml`, which names the
+# commit directly, in step with this.
+sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-build = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-cuda = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-prover = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-prover-types = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-core-executor = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-core-machine = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-curves = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-derive = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-hypercube = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-jit = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-primitives = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+sp1-verifier = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
 
 [profile.release]
 opt-level = 3

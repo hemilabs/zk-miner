@@ -136,7 +136,11 @@ impl SetupStatus {
 
     /// Update from current MinerState balances and stake info.
     pub fn refresh(&mut self, state: &MinerState) {
-        self.refresh_from_balances(state.eth_balance, state.hemi_balance, state.stake_info.as_ref());
+        self.refresh_from_balances(
+            state.eth_balance,
+            state.hemi_balance,
+            state.stake_info.as_ref(),
+        );
     }
 
     /// Update from individual balance/stake values (avoids borrow issues when
@@ -224,6 +228,8 @@ pub struct RuntimeSettings {
     pub po2_overrides: HashMap<(String, String), u8>,
     // Tunables
     pub max_concurrent_proofs: usize,
+    /// Seconds of work to keep queued ahead per GPU. 0 = look-ahead off (one job per GPU).
+    pub queue_horizon_secs: u64,
     pub min_profit_threshold: f64,
     pub strategy: String,
     pub electricity_cost_kwh: f64,
@@ -248,6 +254,7 @@ impl Default for RuntimeSettings {
             advanced_mode: false,
             po2_overrides: HashMap::new(),
             max_concurrent_proofs: 1,
+            queue_horizon_secs: 0, // look-ahead off by default: one job per GPU
             min_profit_threshold: 10.0,
             strategy: "auto".to_string(),
             electricity_cost_kwh: 0.12,
@@ -275,7 +282,6 @@ pub struct SettingsUiState {
     pub tuning_button_idx: usize,
 }
 
-
 /// Activity log entry.
 #[derive(Debug, Clone)]
 pub struct ActivityEntry {
@@ -297,6 +303,17 @@ pub enum LogLevel {
 pub enum MinerJobStatus {
     /// Job is open and being evaluated.
     Open,
+    /// Claimed and holding collateral, but not yet started — waiting for a GPU.
+    ///
+    /// Distinct from `Proving` on purpose. Look-ahead queueing claims work BEFORE a device is
+    /// free, so without this a queued job displayed as "Proving 0%" and the operator could not
+    /// tell which jobs were actually on a card. `queued_behind` is how much work the planner
+    /// expects to finish ahead of it.
+    /// No payload: the admission that planned this job lives in the brain loop, while the
+    /// status is set inside the per-job lifecycle task, and threading the placement through
+    /// would couple the two for a cosmetic detail. The distinction that matters to an operator
+    /// — is this job on a card, or waiting for one — needs no payload.
+    Queued,
     /// We are actively proving this job.
     Proving { progress: f64, elapsed_secs: u64 },
     /// Proof is complete, submitting on-chain.
@@ -316,7 +333,15 @@ pub struct TrackedJob {
     pub status: MinerJobStatus,
     pub current_price: u128,
     /// Which GPU index is proving this job (None if CPU-only or not yet assigned).
-    pub gpu_index: Option<u32>,
+    /// PCI bus id of the card proving this job, set when proving starts.
+    ///
+    /// Was `gpu_index: Option<u32>`, which was never assigned outside mock and
+    /// so matched no GPU row in production: every card rendered "Idle" while it
+    /// proved, and every CUDA proof was labelled "CPU". Keying on the bus id also
+    /// avoids the trap in the obvious fix -- mock derived the old index by parsing
+    /// "gpuN" (the prover's namespace) and compared it against `GpuInfo.index`
+    /// (a display ordinal), which would have put the 5090's job on the AMD row.
+    pub gpu_bus_id: Option<String>,
     /// Proving backend: "risc0", "sp1", "openvm", or "simulated".
     pub prover_backend: String,
     /// Estimated cycle count for the proof.
@@ -331,6 +356,24 @@ pub struct WorkerStatus {
     pub healthy: bool,
     pub pid: Option<u32>,
     pub version: Option<String>,
+}
+
+/// A collateral verdict as computed by the brain. Mirrors `zkminer_chain::staking::Headroom`
+/// plus the price it was computed against, which the dashboard needs to explain the number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadroomView {
+    pub fundable: usize,
+    pub wanted: usize,
+    /// Collateral a single claim locks, at the price that actually blocked a job.
+    pub per_claim: u128,
+    /// Extra wei needed to fund one more slot. Meaningful only when `fundable < wanted`.
+    pub shortfall: u128,
+}
+
+impl HeadroomView {
+    pub fn is_starved(&self) -> bool {
+        self.fundable < self.wanted
+    }
 }
 
 /// The complete miner state, shared between TUI and background tasks.
@@ -372,8 +415,24 @@ pub struct MinerState {
     pub cpu_stat_snapshot: CpuStatSnapshot,
     pub intel_gpu_energy: std::collections::HashMap<u32, crate::hardware::IntelGpuEnergySnapshot>,
 
+    /// The collateral verdict, published by the brain each tick from the SAME
+    /// `collateral_headroom()` call that drives the log warning.
+    ///
+    /// Published rather than recomputed on purpose. The dashboard has the raw numbers
+    /// (Staked/Locked/Liquid) but deriving a verdict from them here would reproduce the
+    /// three-different-meanings-of-"available" trap: the brain nets out the current tick's
+    /// own reservations and subtracts in-flight locks a second time as a documented
+    /// fail-safe, and a TUI that skipped either would show a green verdict while the miner
+    /// logged starvation. `None` means the brain has not observed a collateral-blocked job,
+    /// so no honest per-claim price is known — show nothing rather than guess.
+    pub collateral_headroom: Option<HeadroomView>,
+
     // Status
     pub paused: bool,
+    /// Set by the CLI's signal handler. The TUI event loop breaks on it so a SIGTERM
+    /// exits the TUI *into* the shutdown ladder (drain -> abandon -> reap) instead of
+    /// killing the process outright with collateral still held.
+    pub shutdown_requested: bool,
     pub connected: bool,
     pub block_number: u64,
     pub errors: Vec<String>,
@@ -425,7 +484,11 @@ pub struct ProgramProgress {
     pub name: String,
     pub phase: ProgramPhase,
     pub throughput: Option<f64>,
+    /// STARK proving time (protocol v4+): excludes the Groth16 wrap, which is `wrap_secs`.
     pub duration_secs: Option<f64>,
+    /// Groth16 wrap time, when the worker measured it for this program. SP1 measures it on one
+    /// program per card; see `BenchmarkEntry::wrap_secs`.
+    pub wrap_secs: Option<f64>,
     pub cycles: Option<u64>,
     /// Prover backend that ran this program (e.g. "risc0", "sp1").
     pub prover_backend: Option<String>,
@@ -441,6 +504,9 @@ pub struct DeviceProgress {
     pub slot_key: String,
     pub device_id: String,
     pub device_label: String,
+    /// Canonical PCI bus id of the card this row is measuring, when known.
+    /// Join on this to find the physical card -- see `GpuInfo::benchmark_device_id`.
+    pub pci_bus_id: Option<String>,
     /// GPU variant: "cuda", "rocm", "intel", "generic".
     pub gpu_tag: String,
     pub programs: Vec<ProgramProgress>,
@@ -450,11 +516,29 @@ pub struct DeviceProgress {
 }
 
 impl DeviceProgress {
-    /// Extract the GPU index from the device_id (e.g. "gpu0" -> 0).
+    /// Extract the prover-side device index from the device_id (`"gpu0"` -> 0).
+    ///
+    /// This is the PROVER's per-vendor index. It is NOT `GpuInfo.index`, which is
+    /// a display ordinal over all DRM cards; matching the two is what showed the
+    /// idle AMD card's telemetry while an NVIDIA card was benchmarking. Use
+    /// `resolve_gpu` to find the physical card.
     pub fn device_index(&self) -> Option<u32> {
         self.device_id
             .strip_prefix("gpu")
             .and_then(|s| s.parse().ok())
+    }
+
+    /// Find the physical card this row is measuring, by PCI bus id.
+    ///
+    /// Returns `None` rather than guessing when the bus id is unknown (a worker
+    /// from an older build) or matches no detected card -- callers must render
+    /// that as "no telemetry", never as a neighbouring card's values.
+    pub fn resolve_gpu<'a>(
+        &self,
+        gpus: &'a [crate::hardware::GpuInfo],
+    ) -> Option<&'a crate::hardware::GpuInfo> {
+        let bus = self.pci_bus_id.as_deref().filter(|b| !b.is_empty())?;
+        gpus.iter().find(|g| g.pci_bus_id == bus)
     }
 }
 
@@ -475,13 +559,17 @@ impl BenchmarkTracker {
         slot_key: &str,
         gpu_name: Option<&str>,
         device_index: Option<u32>,
+        pci_bus_id: Option<&str>,
         gpu_tag: &str,
         entry: &zkminer_prover_protocol::BenchmarkEntry,
         program_index: u32,
         total_programs: u32,
     ) {
         let idx = device_index.unwrap_or(0);
-        let device_id = format!("gpu{idx}");
+        // Must match `WorkerPool::benchmark_device_id` / the benchmark writer:
+        // tag-qualified so a cuda and a rocm card at index 0 do not collide.
+        let device_id =
+            zkminer_prover::dispatcher::WorkerPool::gpu_device_id(gpu_tag, &idx.to_string());
         let device_label = match gpu_name {
             Some(name) => format!("GPU{idx} {name}"),
             None => format!("GPU{idx}"),
@@ -496,6 +584,7 @@ impl BenchmarkTracker {
                 phase: ProgramPhase::Pending,
                 throughput: None,
                 duration_secs: None,
+                wrap_secs: None,
                 cycles: None,
                 prover_backend: None,
                 weight: None,
@@ -514,6 +603,7 @@ impl BenchmarkTracker {
                 slot_key: slot_key.to_string(),
                 device_id,
                 device_label,
+                pci_bus_id: pci_bus_id.map(str::to_string),
                 gpu_tag: gpu_tag.to_string(),
                 programs,
                 complete: false,
@@ -523,10 +613,15 @@ impl BenchmarkTracker {
         };
 
         // Mark the completed program
-        if let Some(prog) = dev.programs.iter_mut().find(|p| p.name == entry.program_name) {
+        if let Some(prog) = dev
+            .programs
+            .iter_mut()
+            .find(|p| p.name == entry.program_name)
+        {
             prog.phase = ProgramPhase::Done;
             prog.throughput = Some(entry.throughput);
             prog.duration_secs = Some(entry.duration_secs);
+            prog.wrap_secs = entry.wrap_secs;
             prog.cycles = Some(entry.cycles);
             prog.prover_backend = Some(entry.prover_backend.clone());
             prog.weight = Some(entry.weight);
@@ -543,9 +638,7 @@ impl BenchmarkTracker {
                     program_name: p.name.clone(),
                     prover_backend: p.prover_backend.clone().unwrap_or_default(),
                     cycles: p.cycles.unwrap_or(0),
-                    duration: std::time::Duration::from_secs_f64(
-                        p.duration_secs.unwrap_or(0.0),
-                    ),
+                    duration: std::time::Duration::from_secs_f64(p.duration_secs.unwrap_or(0.0)),
                     throughput: p.throughput.unwrap_or(0.0),
                     weight: p.weight.unwrap_or(0.0),
                     precompile: p.precompile.unwrap_or(false),
@@ -553,8 +646,7 @@ impl BenchmarkTracker {
             })
             .collect();
         if !partial_results.is_empty() {
-            dev.partial_zkops =
-                Some(zkminer_prover::benchmark::compute_zkops(&partial_results));
+            dev.partial_zkops = Some(zkminer_prover::benchmark::compute_zkops(&partial_results));
         }
 
         // Mark the next pending program as Running
@@ -575,7 +667,8 @@ impl BenchmarkTracker {
 
     /// Total completed programs across all devices.
     pub fn completed_count(&self) -> usize {
-        self.devices.iter()
+        self.devices
+            .iter()
             .flat_map(|d| &d.programs)
             .filter(|p| p.phase == ProgramPhase::Done)
             .count()
@@ -611,9 +704,11 @@ impl Default for MinerState {
             activity_log: VecDeque::new(),
             log_total_added: 0,
             log_scroll: 0,
+            collateral_headroom: None,
             log_filter: None,
             last_refresh: None,
             paused: false,
+            shutdown_requested: false,
             connected: false,
             block_number: 0,
             errors: Vec::new(),
@@ -657,6 +752,19 @@ impl TuiContext {
 }
 
 impl MinerState {
+    /// Map a GPU-tuning device id (see `gpu_tuning::tuning_device_id`) to the
+    /// benchmark `device_id` for the same physical card.
+    ///
+    /// The two namespaces are deliberately different -- tuning keys on the PCI
+    /// bus id because it needs no benchmark data, benchmarks key on the prover's
+    /// own device id -- so anything comparing one to the other must go through
+    /// here. Returns `None` when the card has no benchmark row.
+    pub fn benchmark_id_for_tuning_id(&self, tuning_id: &str) -> Option<String> {
+        let suite = self.benchmark_results.as_ref()?;
+        let gpu = crate::gpu_tuning::find_gpu_by_tuning_id(&self.hardware.gpus, tuning_id)?;
+        gpu.benchmark_device_id(suite)
+    }
+
     pub fn add_log(&mut self, level: LogLevel, message: impl Into<String>) {
         self.activity_log.push_back(ActivityEntry {
             timestamp: chrono::Utc::now(),

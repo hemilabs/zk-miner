@@ -168,7 +168,9 @@ pub fn compute_slash_split(locked_collateral: u128) -> (u128, u128, u128) {
     let total = locked_collateral;
 
     // Keeper floor: max(MIN_KEEPER_REWARD, collateral * 2%)
-    let mut keeper_reward = (U256::from(total) * U256::from(SLASH_KEEPER_BPS as u128) / U256::from(10000u128)).to::<u128>();
+    let mut keeper_reward = (U256::from(total) * U256::from(SLASH_KEEPER_BPS as u128)
+        / U256::from(10000u128))
+    .to::<u128>();
     if keeper_reward < MIN_KEEPER_REWARD {
         keeper_reward = MIN_KEEPER_REWARD;
     }
@@ -179,7 +181,8 @@ pub fn compute_slash_split(locked_collateral: u128) -> (u128, u128, u128) {
 
     // Remaining split proportionally between burn and bonus
     let remaining = total - keeper_reward;
-    let burn_amount = remaining * SLASH_BURN_BPS as u128 / (SLASH_BURN_BPS + SLASH_BONUS_BPS) as u128;
+    let burn_amount =
+        remaining * SLASH_BURN_BPS as u128 / (SLASH_BURN_BPS + SLASH_BONUS_BPS) as u128;
     let bonus_portion = remaining - burn_amount;
 
     (keeper_reward, burn_amount, bonus_portion)
@@ -197,7 +200,9 @@ pub fn compute_release_penalty(
 
     if fulfillment_timeout == 0 {
         // Avoid division by zero; return floor penalty
-        let min_penalty = (U256::from(total) * U256::from(RELEASE_PENALTY_FLOOR_BPS as u128) / U256::from(10000u128)).to::<u128>();
+        let min_penalty = (U256::from(total) * U256::from(RELEASE_PENALTY_FLOOR_BPS as u128)
+            / U256::from(10000u128))
+        .to::<u128>();
         return std::cmp::min(min_penalty, total);
     }
 
@@ -210,11 +215,15 @@ pub fn compute_release_penalty(
     };
 
     // Scale penalty by time remaining (use U256 to avoid overflow)
-    let scaled_penalty = (U256::from(total) * U256::from(RELEASE_PENALTY_BPS as u128) * U256::from(time_remaining)
-        / (U256::from(fulfillment_timeout as u128) * U256::from(10000u128))).to::<u128>();
+    let scaled_penalty =
+        (U256::from(total) * U256::from(RELEASE_PENALTY_BPS as u128) * U256::from(time_remaining)
+            / (U256::from(fulfillment_timeout as u128) * U256::from(10000u128)))
+        .to::<u128>();
 
     // 5% floor
-    let min_penalty = (U256::from(total) * U256::from(RELEASE_PENALTY_FLOOR_BPS as u128) / U256::from(10000u128)).to::<u128>();
+    let min_penalty = (U256::from(total) * U256::from(RELEASE_PENALTY_FLOOR_BPS as u128)
+        / U256::from(10000u128))
+    .to::<u128>();
 
     let penalty = std::cmp::max(scaled_penalty, min_penalty);
     std::cmp::min(penalty, total)
@@ -233,7 +242,9 @@ pub fn estimate_prover_reward(
 
     let gross = settled_price + bonus_amount + speed_bonus;
     // Protocol fee is on settled_price only (matching Solidity contract)
-    let protocol_fee = (U256::from(settled_price) * U256::from(fee_rate_bps as u128) / U256::from(10000u128)).to::<u128>();
+    let protocol_fee = (U256::from(settled_price) * U256::from(fee_rate_bps as u128)
+        / U256::from(10000u128))
+    .to::<u128>();
     let net_payout = gross.saturating_sub(protocol_fee);
 
     (net_payout, protocol_fee, speed_bonus)
@@ -253,7 +264,10 @@ mod tests {
         // At 0s: min
         assert_eq!(compute_price(min, max, period, CurveType::Linear, 0), min);
         // At 3600s: max
-        assert_eq!(compute_price(min, max, period, CurveType::Linear, 3600), max);
+        assert_eq!(
+            compute_price(min, max, period, CurveType::Linear, 3600),
+            max
+        );
         // At 1800s: midpoint
         let mid = compute_price(min, max, period, CurveType::Linear, 1800);
         assert_eq!(mid, 5_500_000_000_000_000_000u128);
