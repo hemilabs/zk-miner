@@ -10,6 +10,8 @@
 # ---------------------------------------------------------------------------
 ARG RUST_VERSION=1.93.0
 ARG CUDA_VERSION=12.8.0
+# sp1-gpu-server alone: see the sp1-server-cuda-rust-base stage.
+ARG SP1_SERVER_CUDA_VERSION=12.9.2
 ARG ROCM_IMAGE=rocm/dev-ubuntu-22.04:6.4
 ARG UBUNTU_VERSION=22.04
 ARG FOUNDRY_VERSION=v1.3.5
@@ -146,6 +148,35 @@ ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
 WORKDIR /build
 
 # ===========================================================================
+# Stage: sp1-server-cuda-rust-base — cuda-rust-base, on CUDA 12.9 for sp1-gpu-server
+# ===========================================================================
+# The same stage as cuda-rust-base on a newer CUDA 12, for the one binary measured to gain from it.
+# sp1-gpu-server built by this recipe with 12.9.2 instead of 12.8.0, nothing else different, proved
+# 4.3% faster on an RTX 5080 (Blackwell) over four alternating rounds and the same on an RTX 4090
+# (2026-10-11). 13.3 was 5.2% faster, but CUDA 13 needs driver 580 where any CUDA 12 runs on 525.
+# The risc0 worker stays on 12.8 until it has been measured the same way.
+# nvidia/cuda:12.9.2-devel-ubuntu22.04 — pinned 2026-10-11
+FROM nvidia/cuda:${SP1_SERVER_CUDA_VERSION}-devel-ubuntu22.04@sha256:e0203e3a0d3d02b05f4210867b973b7f48997c71bc99b994f2bd350ee60f77a1 AS sp1-server-cuda-rust-base
+ARG RUST_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git curl ca-certificates cmake pkg-config \
+        protobuf-compiler libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
+    && rustup show
+
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
+
+WORKDIR /build
+
+# ===========================================================================
 # Stage: cuda-base — cuda-rust-base + the RISC Zero toolchain
 # ===========================================================================
 # Only the risc0 CUDA build needs this, so the SP1 stages start from cuda-rust-base and never wait
@@ -229,7 +260,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 # fork's, so the SDK cannot tell. The release therefore ships this one beside zkminer-prove-sp1,
 # which installs it. It is built from the exact commit Cargo.lock records for the SDK, so the two can
 # never disagree, using that commit's own Cargo.lock.
-FROM cuda-rust-base AS build-sp1-server
+FROM sp1-server-cuda-rust-base AS build-sp1-server
 
 # sp1-prover-types' protos import google/protobuf/empty.proto, which Ubuntu ships in libprotobuf-dev:
 # protobuf-compiler only recommends it, and cuda-rust-base installs without recommends.
@@ -263,7 +294,7 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 # fails the build rather than going into it.
 ENV GOPROXY="https://proxy.golang.org,https://goproxy.cn,direct"
 
-# GPU targets: the families the fork itself builds by default on CUDA 12.8 — sm_80 (A100), sm_86
+# GPU targets: the families the fork itself builds by default on CUDA 12.8 and later — sm_80 (A100), sm_86
 # (RTX 30, A10, A40, A6000), sm_89 (RTX 40, L4, L40), sm_90 (H100, H200), sm_100 (B200, and B300 runs
 # it) and sm_120 (RTX 50, RTX PRO 6000, and GB10 runs it). No PTX: with relocatable device code the
 # linked image the runtime loads is native code only, whatever the objects carry. SP1 needs 16 GB of

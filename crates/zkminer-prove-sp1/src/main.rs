@@ -301,7 +301,7 @@ const CUDA_DIR_OVERRIDE: &str = "ZKMINER_SP1_CUDA_RUNTIME_DIR";
 /// TOOLKIT VERSION stops mattering.
 ///
 /// The problem is narrower than "support CUDA 11 through 13". `sp1-gpu-server`, upstream's
-/// or the one a release ships (built against CUDA 12.8), names `libcudart.so.12` in its
+/// or the one a release ships (built against CUDA 12.9), names `libcudart.so.12` in its
 /// `DT_NEEDED` specifically. A soname is matched exactly, so it will never load `.so.11` or `.so.13`
 /// no matter what is installed -- there is no version negotiation to do. Note our OWN
 /// CUDA prover has no libcudart dependency at all (it links only `libcuda.so.1`, whose
