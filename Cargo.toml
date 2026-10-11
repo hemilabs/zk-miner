@@ -85,30 +85,31 @@ zkminer-config = { path = "crates/zkminer-config" }
 
 # Patch risc0 crates to use hemilabs fork (AMD + NVIDIA GPU support)
 #
-# Pinned by REV to branch `zkminer/windows-msvc` @ ac35452c: `zkminer/clear-gpu-cache` @ df270d34 plus
-# the CUDA build and runtime fixes for Windows (MSVC). df270d34 is `max/cdna` @ c2b1e94 plus the
+# Pinned by REV to branch `zkminer/windows-msvc` @ 7d8d730f: `zkminer/clear-gpu-cache` @ df270d34 plus
+# the CUDA build and runtime fixes for Windows (MSVC), and a fix for the worker's re-prove after an
+# invalid proof, which crashed on the segment the failed session left pending. df270d34 is `max/cdna` @ c2b1e94 plus the
 # release of cached GPU memory around the Groth16 wrap. Without it a real risc0 Groth16 proof cannot
 # finish on a 16 GB card (see crates/zkminer-prover/tests/risc0_groth16_vram.rs). A rev and not a branch
 # for the reason given on `sppark` below: `max/cdna` has since moved on (53c761a0), and a branch pin
 # follows a moved head on the next `cargo update` without anyone choosing to.
 [patch.crates-io]
-risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
-risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "ac35452c" }
+risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
+risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "7d8d730f" }
 # Pinned by immutable REV, not a branch: a branch head can silently move the build
 # off a validated commit (which is why the risc0/sp1 patches below carry a
 # do-not-cargo-update warning). fbeb7d9 (branch `zkminer/windows-msvc`) = 32f2101 plus the
