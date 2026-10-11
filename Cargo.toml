@@ -112,7 +112,7 @@ risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "df270d
 # off a validated commit (which is why the risc0/sp1 patches below carry a
 # do-not-cargo-update warning). 32f2101 = c5d2d7a (AMD HIP LDS-race fix) plus the
 # cuda/std/array HIP shim and the 0.1.14 version bump Cargo.lock pins.
-sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "024d22f" }
+sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "0f71ea6" }
 
 # Patch SP1 crates to use hemilabs fork (AMD GPU + PLONK optimizations)
 #
