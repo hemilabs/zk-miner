@@ -593,6 +593,10 @@ impl WorkerHandle {
                          ({unit})",
                         ceiling as f64 / (1024.0 * 1024.0 * 1024.0)
                     ),
+                    // Windows has neither layer; the dispatcher's memory admission still applies.
+                    Err(why) if cfg!(windows) => tracing::info!(
+                        "worker {backend} (PID {pid_for_cap}) runs without a memory ceiling ({why})"
+                    ),
                     // No cap is survivable: `oom_score_adj` still points the kernel at the prover.
                     Err(why) => tracing::warn!(
                         "worker {backend} (PID {pid_for_cap}) could NOT be memory-capped ({why}); \
@@ -1298,7 +1302,8 @@ fn reap_within(child: &mut Child, budget: Duration) -> bool {
     }
 }
 
-#[cfg(test)]
+// Unix-only, as the `/proc` helpers it tests are.
+#[cfg(all(test, unix))]
 mod tests {
     use super::{comm_from_stat, live_group_members, parse_stat_state_pgrp};
     use std::path::{Path, PathBuf};

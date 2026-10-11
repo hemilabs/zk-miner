@@ -108,6 +108,68 @@ job does *not* source `~/.bashrc`), install a small wrapper script under the exp
 name that sets it up and then `exec`s the real binary — `exec` preserves the PID and
 process group the dispatcher relies on.
 
+## Windows
+
+The CLI, the RISC Zero CUDA worker (`zkminer-prove-risc0-cuda.exe`) and the SP1 worker
+(`zkminer-prove-sp1.exe`) build and prove natively. Workers are found under the same names plus
+`.exe`, in `%USERPROFILE%\.zkminer\provers\` or beside `zkminer.exe`. ROCm and OpenVM workers are
+Linux-only for now.
+
+**Groth16 component.** rzup does not run on Windows, so install `risc0-groth16` with
+`scripts\install-risc0-groth16.ps1` (a ~2.3 GB download, checked against rzup's manifest). It
+unpacks to `%USERPROFILE%\.risc0\extensions\v0.1.0-risc0-groth16`, where the worker looks, as on
+Linux; `RISC0_GROTH16_DIR` names a different directory. Without it every proof fails at the wrap.
+
+**Building the CUDA worker** needs Visual Studio 2022 Build Tools (C++ workload), Rust 1.93.0,
+`protoc`, LLVM (for libclang) and **CUDA 12.8**. Not 12.9: its CCCL headers do not compile for
+Blackwell (`sm_100`/`sm_120`) under MSVC. A Developer shell is not needed.
+
+```powershell
+$env:NVCC = "$env:CUDA_PATH\bin\nvcc.exe"; $env:HIPCC = 'off'
+$env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
+$env:NVCC_APPEND_FLAGS = '-gencode arch=compute_120,code=[sm_120,compute_120]'  # your card's
+$env:ZKMINER_RISC0_GUESTS_DIR = 'C:\path\to\risc0-guests'
+cargo build --release -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda
+```
+
+`ZKMINER_RISC0_GUESTS_DIR` supplies the benchmark guests, which rzup's toolchain compiles: a
+directory holding a Linux build's `methods.rs` and the guest binaries it names, as the
+`risc0-guests` job in `.github/workflows/build-windows.yml` produces. Without it, use
+`RISC0_SKIP_BUILD=1` and accept the empty stubs (see Build).
+
+**SP1** ships three files, kept together beside the miner: `zkminer-prove-sp1.exe`,
+`sp1-gpu-server.exe` and `sp1gnark.dll` (gnark's Groth16 prover, which on Windows is a DLL the
+server loads from beside itself). The worker installs the server and the DLL into
+`%USERPROFILE%\.sp1\bin\`, as on Linux. The server links the CUDA runtime statically, so a host
+needs only the NVIDIA driver and the Visual C++ 2015-2022 redistributable. The server and worker
+talk over a named pipe (`\\.\pipe\sp1-cuda-<device>`). A server that is running cannot be
+replaced, so stop the miner before upgrading.
+
+**Building SP1** needs, beyond the CUDA worker's tools, CMake 3.30 or later (Visual Studio's
+bundled one is) and its bundled Ninja, CUDA's `nvtx` component, Go 1.24 and a GCC-compatible
+compiler for cgo: [llvm-mingw](https://github.com/mstorsjo/llvm-mingw)'s UCRT build. Pass that
+compiler by full path and keep it off `PATH`, where bindgen would take its headers over MSVC's.
+
+```powershell
+$env:ZKMINER_SP1_GUESTS_DIR = 'C:\path\to\sp1-guests'
+cargo build --release -p zkminer-prove-sp1 --bin zkminer-prove-sp1
+
+# sp1-gpu-server, from the hemilabs/sp1 commit Cargo.lock pins (see Dockerfile.build)
+$env:CUDA_ARCHS = '120'  # your card's
+$env:SP1_GNARK_FFI_GO_ENVS = 'CC=C:\llvm-mingw\bin\x86_64-w64-mingw32-gcc.exe'
+$env:GOPROXY = 'https://proxy.golang.org,https://goproxy.cn,direct'
+$env:CARGO_TARGET_DIR = 'target-sp1-server'
+cargo install --locked --root sp1-server --git https://github.com/hemilabs/sp1 --rev <rev> sp1-gpu-server
+# sp1gnark.dll is left in target-sp1-server\release\
+```
+
+Succinct's toolchain, which compiles the guests, has no Windows build: `ZKMINER_SP1_GUESTS_DIR`
+names a directory of guest ELFs built on Linux (`<name>-sp1-guest`), as the `sp1-guests` job in
+`.github/workflows/build-windows.yml` produces.
+
+**Not yet on Windows**: the per-worker memory ceiling (the dispatcher's host-memory admission
+still applies) and CPU power readings.
+
 ## Configure
 
 Copy or write `~/.zkminer/config.toml`:

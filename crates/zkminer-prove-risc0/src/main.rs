@@ -46,6 +46,11 @@ fn main() {
 
 fn run_worker_loop() -> Result<()> {
     let mut stdin = BufReader::new(io::stdin().lock());
+    // circom-witnesscalc prints during the Groth16 witness; risc0-groth16 silences it with
+    // `suppress_stdout`, which is Unix-only, so on Windows stray output goes to the log instead.
+    #[cfg(windows)]
+    let mut stdout = BufWriter::new(zkminer_prover_protocol::ipc::take_ipc_stdout());
+    #[cfg(not(windows))]
     let mut stdout = BufWriter::new(io::stdout().lock());
 
     loop {

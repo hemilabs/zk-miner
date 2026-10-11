@@ -25,7 +25,10 @@
 //! Every container must be runnable, not merely one. Each is a separately loaded module, and a
 //! kernel in a module the card cannot load fails however many others it can.
 //!
-//! Anything this cannot read — not a 64-bit little-endian ELF (a wrapper script, say), no
+//! A Windows (PE) binary carries the same sections under PE's eight-character names: `.nv_fatb` for
+//! the loaded fatbins and `__nv_rel` for the relocatable ones, which are skipped for the same reason.
+//!
+//! Anything this cannot read — not a 64-bit little-endian ELF or a PE (a wrapper script, say), no
 //! `.nv_fatbin`, or a container laid out in a way it does not recognise — is reported as unknown,
 //! never as unrunnable. The cost of a wrong "no" is a card left idle; the caller must not pay that
 //! for a binary it simply failed to parse.
@@ -36,6 +39,8 @@ use std::path::Path;
 
 /// The section whose fatbins the CUDA runtime registers and loads.
 const LOADED_SECTION: &[u8] = b".nv_fatbin";
+/// The same section in a PE, whose section names are at most eight bytes.
+const LOADED_SECTION_PE: &[u8] = b".nv_fatb";
 /// A fatbin container's first four bytes.
 const FATBIN_MAGIC: u32 = 0xBA55_ED50;
 /// Entry kinds. Others (LTO IR, for one) cannot be run as they stand, so they count for nothing.
@@ -75,7 +80,11 @@ impl EmbeddedGpuCode {
     }
 
     fn from_reader<R: Read + Seek>(r: &mut R) -> io::Result<Option<Self>> {
-        let Some((offset, size)) = find_section(r, LOADED_SECTION)? else {
+        let section = match find_section(r, LOADED_SECTION)? {
+            Some(section) => Some(section),
+            None => find_pe_section(r, LOADED_SECTION_PE)?,
+        };
+        let Some((offset, size)) = section else {
             return Ok(None);
         };
         let Some(containers) = read_containers(r, offset, size)? else {
@@ -181,6 +190,40 @@ fn find_section<R: Read + Seek>(r: &mut R, name: &[u8]) -> io::Result<Option<(u6
         // SHT_NOBITS has no bytes in the file to read.
         if this == name && u32_at(h, 4) != 8 {
             return Ok(Some((u64_at(h, 24), u64_at(h, 32))));
+        }
+    }
+    Ok(None)
+}
+
+/// `(file offset, size)` of the named section of a PE, or `None` if `r` is no PE or has no such
+/// section. The size is the section's virtual size, which excludes the zero padding its raw data is
+/// rounded up with (bounded by that raw size, since a section may be partly uninitialised).
+fn find_pe_section<R: Read + Seek>(r: &mut R, name: &[u8]) -> io::Result<Option<(u64, u64)>> {
+    let mut dos = [0u8; 64];
+    if !read_at(r, 0, &mut dos)? || &dos[..2] != b"MZ" {
+        return Ok(None);
+    }
+    let pe = u64::from(u32_at(&dos, 0x3C));
+    // Signature, then the COFF header: machine, section count, ..., optional header size at 16.
+    let mut coff = [0u8; 24];
+    if !read_at(r, pe, &mut coff)? || &coff[..4] != b"PE\0\0" {
+        return Ok(None);
+    }
+    let sections = u64::from(u16_at(&coff, 6));
+    let optional_len = u64::from(u16_at(&coff, 20));
+    let mut table = vec![0u8; (sections * 40) as usize];
+    if !read_at(r, pe + 24 + optional_len, &mut table)? {
+        return Ok(None);
+    }
+    for header in table.chunks_exact(40) {
+        let this = header[..8].split(|&c| c == 0).next().unwrap_or_default();
+        if this == name {
+            let (virtual_size, raw_size, raw_offset) =
+                (u32_at(header, 8), u32_at(header, 16), u32_at(header, 20));
+            return Ok(Some((
+                u64::from(raw_offset),
+                u64::from(virtual_size.min(raw_size)),
+            )));
         }
     }
     Ok(None)
@@ -324,6 +367,77 @@ mod tests {
         file
     }
 
+    /// A minimal PE: DOS header, `PE\0\0`, a COFF header with no optional header, the section
+    /// table, then each section's raw data, padded to 0x200 as a linker would.
+    fn pe(sections: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let pe_at = 0x40usize;
+        let table_at = pe_at + 24;
+        let mut data_at = table_at + 40 * sections.len();
+        data_at += (0x200 - data_at % 0x200) % 0x200;
+
+        let mut file = vec![0u8; data_at];
+        file[0..2].copy_from_slice(b"MZ");
+        file[0x3C..0x40].copy_from_slice(&(pe_at as u32).to_le_bytes());
+        file[pe_at..pe_at + 4].copy_from_slice(b"PE\0\0");
+        file[pe_at + 4..pe_at + 6].copy_from_slice(&0x8664u16.to_le_bytes());
+        file[pe_at + 6..pe_at + 8].copy_from_slice(&(sections.len() as u16).to_le_bytes());
+        for (i, (name, data)) in sections.iter().enumerate() {
+            let raw_at = file.len();
+            file.extend(data);
+            file.extend(std::iter::repeat_n(
+                0u8,
+                (0x200 - data.len() % 0x200) % 0x200,
+            ));
+            let h = table_at + 40 * i;
+            let raw_len = (file.len() - raw_at) as u32;
+            file[h..h + name.len()].copy_from_slice(name.as_bytes());
+            file[h + 8..h + 12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            file[h + 16..h + 20].copy_from_slice(&raw_len.to_le_bytes());
+            file[h + 20..h + 24].copy_from_slice(&(raw_at as u32).to_le_bytes());
+        }
+        file
+    }
+
+    /// A Windows binary's loaded fatbins are read from `.nv_fatb`, and its relocatable ones in
+    /// `__nv_rel` are skipped, as `__nv_relfatbin` is in an ELF.
+    #[test]
+    fn a_pe_is_read_from_its_truncated_section_name() {
+        let code = parse(pe(&[
+            (".text", vec![0x90; 100]),
+            ("__nv_rel", container(&[(KIND_PTX, 90)])),
+            (".nv_fatb", container(&[(KIND_SASS, 120), (KIND_PTX, 120)])),
+        ]))
+        .unwrap();
+        assert_eq!(code.describe(), "sm_120, PTX compute_120");
+        assert!(code.runs_on((12, 0)));
+        assert!(
+            !code.runs_on((9, 0)),
+            "the relocatable PTX must not clear sm_90"
+        );
+
+        // The raw data's alignment padding is not read as containers.
+        let two = parse(pe(&[(
+            ".nv_fatb",
+            [
+                container(&[(KIND_SASS, 89)]),
+                container(&[(KIND_SASS, 120)]),
+            ]
+            .concat(),
+        )]))
+        .unwrap();
+        assert_eq!(two.describe(), "sm_89, sm_120");
+        assert!(!two.runs_on((8, 9)), "every module must be runnable");
+
+        assert_eq!(
+            parse(pe(&[(".text", vec![0x90; 64])])),
+            None,
+            "no device code"
+        );
+        let mut not_pe = pe(&[(".nv_fatb", container(&[(KIND_SASS, 89)]))]);
+        not_pe[0x40] = b'X';
+        assert_eq!(parse(not_pe), None);
+    }
+
     fn parse(bytes: Vec<u8>) -> Option<EmbeddedGpuCode> {
         EmbeddedGpuCode::from_reader(&mut Cursor::new(bytes)).unwrap()
     }
@@ -465,13 +579,14 @@ mod tests {
         assert_eq!(parse(big_endian), None);
     }
 
-    /// Reads real binaries, which a unit test cannot ship. Run by hand:
+    /// Reads real binaries, which a unit test cannot ship. Run by hand, with the paths separated
+    /// as PATH is (`:`, or `;` on Windows):
     /// `ZKMINER_GPU_CODE_PROBE=/path/a:/path/b cargo test -p zkminer-prover --lib \
     ///   gpu_code::tests::probe -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn probe() {
-        let paths = std::env::var("ZKMINER_GPU_CODE_PROBE").expect("set ZKMINER_GPU_CODE_PROBE");
+        let paths = std::env::var_os("ZKMINER_GPU_CODE_PROBE").expect("set ZKMINER_GPU_CODE_PROBE");
         let cards = [
             (7, 5),
             (8, 0),
@@ -483,8 +598,9 @@ mod tests {
             (12, 0),
             (12, 1),
         ];
-        for path in paths.split(':') {
-            match EmbeddedGpuCode::read(Path::new(path)).unwrap() {
+        for path in std::env::split_paths(&paths) {
+            let path = path.display();
+            match EmbeddedGpuCode::read(Path::new(&path.to_string())).unwrap() {
                 None => println!("{path}: no loaded device code found"),
                 Some(code) => {
                     let ok: Vec<String> = cards

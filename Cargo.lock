@@ -7650,7 +7650,7 @@ checksum = "3df6368f71f205ff9c33c076d170dd56ebf68e8161c733c0caa07a7a5509ed53"
 [[package]]
 name = "risc0-binfmt"
 version = "3.0.3"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "anyhow",
  "borsh",
@@ -7671,7 +7671,7 @@ dependencies = [
 [[package]]
 name = "risc0-build"
 version = "3.0.4"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "anyhow",
  "cargo_metadata 0.19.2",
@@ -7694,7 +7694,7 @@ dependencies = [
 [[package]]
 name = "risc0-build-kernel"
 version = "2.0.1"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "cc",
  "directories",
@@ -7707,7 +7707,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-keccak"
 version = "4.0.3"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -7728,7 +7728,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-keccak-sys"
 version = "4.0.1"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "cc",
  "cust",
@@ -7743,7 +7743,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-recursion"
 version = "4.0.3"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -7768,7 +7768,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-recursion-sys"
 version = "4.0.1"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "cc",
  "glob",
@@ -7781,7 +7781,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-rv32im"
 version = "4.0.3"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "anyhow",
  "bit-vec",
@@ -7814,7 +7814,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-rv32im-sys"
 version = "4.0.1"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "cc",
  "cust",
@@ -7829,7 +7829,7 @@ dependencies = [
 [[package]]
 name = "risc0-core"
 version = "3.0.0"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "bytemuck",
  "nvtx",
@@ -7840,7 +7840,7 @@ dependencies = [
 [[package]]
 name = "risc0-groth16"
 version = "3.0.3"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "anyhow",
  "ark-bn254",
@@ -7870,7 +7870,7 @@ dependencies = [
 [[package]]
 name = "risc0-groth16-sys"
 version = "0.1.0"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "anyhow",
  "blst",
@@ -7881,7 +7881,7 @@ dependencies = [
 [[package]]
 name = "risc0-sys"
 version = "1.5.0"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "anyhow",
  "blst",
@@ -7894,7 +7894,7 @@ dependencies = [
 [[package]]
 name = "risc0-zkos-v1compat"
 version = "2.2.1"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "include_bytes_aligned",
  "no_std_strings",
@@ -7904,7 +7904,7 @@ dependencies = [
 [[package]]
 name = "risc0-zkp"
 version = "3.0.3"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "anyhow",
  "blake2",
@@ -7935,7 +7935,7 @@ dependencies = [
 [[package]]
 name = "risc0-zkvm"
 version = "3.0.4"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "addr2line 0.24.2",
  "anyhow",
@@ -7983,7 +7983,7 @@ dependencies = [
 [[package]]
 name = "risc0-zkvm-platform"
 version = "2.2.1"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -8260,7 +8260,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "rzup"
 version = "0.5.1"
-source = "git+https://github.com/hemilabs/risc0?rev=df270d34#df270d3472467198e22608f31c158cea08fbc20d"
+source = "git+https://github.com/hemilabs/risc0?rev=ac35452c#ac35452c62efb55e620f682d7584e7c38585cc6f"
 dependencies = [
  "hex",
  "rsa",
@@ -8738,7 +8738,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slop-air"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "p3-air 0.3.2-succinct",
 ]
@@ -8746,7 +8746,7 @@ dependencies = [
 [[package]]
 name = "slop-algebra"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "itertools 0.14.0",
  "p3-field 0.3.2-succinct",
@@ -8756,7 +8756,7 @@ dependencies = [
 [[package]]
 name = "slop-alloc"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "serde",
  "slop-algebra",
@@ -8766,7 +8766,7 @@ dependencies = [
 [[package]]
 name = "slop-baby-bear"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "lazy_static",
  "p3-baby-bear 0.3.2-succinct",
@@ -8780,7 +8780,7 @@ dependencies = [
 [[package]]
 name = "slop-basefold"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "derive-where",
  "itertools 0.14.0",
@@ -8802,7 +8802,7 @@ dependencies = [
 [[package]]
 name = "slop-basefold-prover"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "derive-where",
  "itertools 0.14.0",
@@ -8828,7 +8828,7 @@ dependencies = [
 [[package]]
 name = "slop-bn254"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "ff 0.13.1",
  "p3-bn254-fr",
@@ -8843,7 +8843,7 @@ dependencies = [
 [[package]]
 name = "slop-challenger"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "futures",
  "p3-challenger 0.3.2-succinct",
@@ -8855,7 +8855,7 @@ dependencies = [
 [[package]]
 name = "slop-commit"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "p3-commit 0.3.2-succinct",
  "serde",
@@ -8865,7 +8865,7 @@ dependencies = [
 [[package]]
 name = "slop-dft"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "p3-dft 0.3.2-succinct",
  "serde",
@@ -8878,7 +8878,7 @@ dependencies = [
 [[package]]
 name = "slop-fri"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "p3-fri 0.3.2-succinct",
 ]
@@ -8886,7 +8886,7 @@ dependencies = [
 [[package]]
 name = "slop-futures"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "crossbeam",
  "futures",
@@ -8900,7 +8900,7 @@ dependencies = [
 [[package]]
 name = "slop-jagged"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "derive-where",
  "futures",
@@ -8933,7 +8933,7 @@ dependencies = [
 [[package]]
 name = "slop-keccak-air"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "p3-keccak-air 0.3.2-succinct",
 ]
@@ -8941,7 +8941,7 @@ dependencies = [
 [[package]]
 name = "slop-koala-bear"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "lazy_static",
  "p3-koala-bear 0.3.2-succinct",
@@ -8955,7 +8955,7 @@ dependencies = [
 [[package]]
 name = "slop-matrix"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "p3-matrix 0.3.2-succinct",
 ]
@@ -8963,7 +8963,7 @@ dependencies = [
 [[package]]
 name = "slop-maybe-rayon"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "p3-maybe-rayon 0.3.2-succinct",
 ]
@@ -8971,7 +8971,7 @@ dependencies = [
 [[package]]
 name = "slop-merkle-tree"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "derive-where",
  "ff 0.13.1",
@@ -8997,7 +8997,7 @@ dependencies = [
 [[package]]
 name = "slop-multilinear"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "derive-where",
  "futures",
@@ -9017,7 +9017,7 @@ dependencies = [
 [[package]]
 name = "slop-poseidon2"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "p3-poseidon2 0.3.2-succinct",
 ]
@@ -9025,7 +9025,7 @@ dependencies = [
 [[package]]
 name = "slop-primitives"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "slop-algebra",
 ]
@@ -9033,7 +9033,7 @@ dependencies = [
 [[package]]
 name = "slop-stacked"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "derive-where",
  "futures",
@@ -9055,7 +9055,7 @@ dependencies = [
 [[package]]
 name = "slop-sumcheck"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "futures",
  "itertools 0.14.0",
@@ -9072,7 +9072,7 @@ dependencies = [
 [[package]]
 name = "slop-symmetric"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "p3-symmetric 0.3.2-succinct",
 ]
@@ -9080,7 +9080,7 @@ dependencies = [
 [[package]]
 name = "slop-tensor"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "arrayvec",
  "derive-where",
@@ -9099,7 +9099,7 @@ dependencies = [
 [[package]]
 name = "slop-uni-stark"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "p3-uni-stark",
 ]
@@ -9107,7 +9107,7 @@ dependencies = [
 [[package]]
 name = "slop-utils"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "p3-util 0.3.2-succinct",
  "tracing-forest",
@@ -9117,7 +9117,7 @@ dependencies = [
 [[package]]
 name = "slop-whir"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "derive-where",
  "futures",
@@ -9185,7 +9185,7 @@ dependencies = [
 [[package]]
 name = "sp1-build"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "anyhow",
  "cargo_metadata 0.18.1",
@@ -9198,7 +9198,7 @@ dependencies = [
 [[package]]
 name = "sp1-core-executor"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "bincode",
  "bytemuck",
@@ -9237,7 +9237,7 @@ dependencies = [
 [[package]]
 name = "sp1-core-executor-runner"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "base64",
  "bincode",
@@ -9258,7 +9258,7 @@ dependencies = [
 [[package]]
 name = "sp1-core-executor-runner-binary"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "bincode",
  "crash-handler",
@@ -9272,7 +9272,7 @@ dependencies = [
 [[package]]
 name = "sp1-core-machine"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "bincode",
  "cfg-if",
@@ -9319,7 +9319,7 @@ dependencies = [
 [[package]]
 name = "sp1-cuda"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "bincode",
  "bytes",
@@ -9339,7 +9339,7 @@ dependencies = [
 [[package]]
 name = "sp1-curves"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "cfg-if",
  "dashu",
@@ -9359,7 +9359,7 @@ dependencies = [
 [[package]]
 name = "sp1-derive"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9369,7 +9369,7 @@ dependencies = [
 [[package]]
 name = "sp1-hypercube"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "arrayref",
  "deepsize2",
@@ -9416,7 +9416,7 @@ dependencies = [
 [[package]]
 name = "sp1-jit"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "dynasmrt",
  "hashbrown 0.14.5",
@@ -9431,7 +9431,7 @@ dependencies = [
 [[package]]
 name = "sp1-primitives"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "bincode",
  "blake3",
@@ -9454,7 +9454,7 @@ dependencies = [
 [[package]]
 name = "sp1-prover"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "anyhow",
  "bincode",
@@ -9518,7 +9518,7 @@ dependencies = [
 [[package]]
 name = "sp1-prover-types"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "anyhow",
  "async-scoped",
@@ -9538,7 +9538,7 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-circuit"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "bincode",
  "itertools 0.14.0",
@@ -9577,7 +9577,7 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-compiler"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "backtrace",
  "cfg-if",
@@ -9597,7 +9597,7 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-executor"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "backtrace",
  "cfg-if",
@@ -9620,7 +9620,7 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-gnark-ffi"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "anyhow",
  "bincode",
@@ -9644,7 +9644,7 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-machine"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "itertools 0.14.0",
  "rand 0.8.5",
@@ -9666,7 +9666,7 @@ dependencies = [
 [[package]]
 name = "sp1-sdk"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9714,7 +9714,7 @@ dependencies = [
 [[package]]
 name = "sp1-verifier"
 version = "6.0.2"
-source = "git+https://github.com/hemilabs/sp1?rev=64e895cb300679e5731bb0eb59e30be4c9f16c1d#64e895cb300679e5731bb0eb59e30be4c9f16c1d"
+source = "git+https://github.com/hemilabs/sp1?rev=4b35f3d028293bb5d28b436a12fb8b449fe2fcc3#4b35f3d028293bb5d28b436a12fb8b449fe2fcc3"
 dependencies = [
  "bincode",
  "blake3",
@@ -9768,7 +9768,7 @@ dependencies = [
 [[package]]
 name = "sppark"
 version = "0.1.14"
-source = "git+https://github.com/hemilabs/risc0-sppark?rev=32f2101#32f21018d50604a16cb10bc611c0965b44f795bd"
+source = "git+https://github.com/hemilabs/risc0-sppark?rev=fbeb7d9#fbeb7d91884165d566a911c2eb2c8f0252705a8e"
 dependencies = [
  "cc",
  "which",

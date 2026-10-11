@@ -149,6 +149,19 @@ pub fn probe_static() -> HardwareInfo {
             core_ids.len() as u32
         };
     }
+    // Windows has no /proc/cpuinfo.
+    #[cfg(windows)]
+    {
+        let name = zkminer_prover::benchmark::get_cpu_info();
+        if name != "Unknown CPU" {
+            info.cpu.model = shorten_cpu_name(&name);
+        }
+        info.cpu.threads = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1);
+        info.cpu.cores =
+            zkminer_prover::benchmark::physical_core_count().unwrap_or(info.cpu.threads);
+    }
 
     // Detect GPUs
     info.gpus = detect_gpus();

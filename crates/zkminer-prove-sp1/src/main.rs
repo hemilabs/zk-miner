@@ -31,6 +31,8 @@ use zkminer_prover_protocol::{
 
 mod bundled_server;
 mod warmup;
+#[cfg(windows)]
+mod windows_job;
 
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -79,8 +81,8 @@ fn main() {
         unsafe { libc::dup2(io::stderr().as_raw_fd(), stdout_fd) };
         unsafe { std::fs::File::from_raw_fd(ipc_fd) }
     };
-    #[cfg(not(unix))]
-    let ipc_stdout = io::stdout();
+    #[cfg(windows)]
+    let ipc_stdout = zkminer_prover_protocol::ipc::take_ipc_stdout();
 
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
@@ -92,13 +94,18 @@ fn main() {
     // Which card this worker drives, set by the dispatcher. Read here as well as in the worker loop
     // because the orphan reaping below must be scoped to it: there is one SP1 worker per card now,
     // and each must leave its siblings' servers and sockets alone.
+    #[cfg(target_os = "linux")]
     let our_cuda_device: Option<u32> = std::env::var(CUDA_DEVICE_ID_ENV)
         .ok()
         .and_then(|v| v.trim().parse().ok());
 
     // Direct benchmark mode: run benchmarks and print results to stderr (stdout is redirected)
     // Before constructing any CudaProver: never adopt a server whose owner is gone.
+    #[cfg(target_os = "linux")]
     reap_orphaned_gpu_servers(our_cuda_device);
+    // On Windows no server outlives its worker to be adopted.
+    #[cfg(windows)]
+    windows_job::end_children_with_this_process();
 
     // Then put the server this release ships in the place the SDK runs it from, before anything
     // runs it: `sp1_usability` probes it, and the SDK would otherwise download upstream's.
@@ -143,6 +150,7 @@ fn main() {
 /// Field 4 is ppid, but field 2 (`comm`) is wrapped in parentheses and may itself contain
 /// spaces AND parentheses, so counting from the left is wrong. Split after the LAST ')'
 /// and take the second field from there (field 3 is the state char).
+#[cfg(target_os = "linux")]
 fn ppid_from_proc_stat(stat: &str) -> Option<i32> {
     let rest = stat.rsplit_once(')').map(|(_, r)| r)?;
     rest.split_whitespace().nth(1)?.parse().ok()
@@ -169,6 +177,7 @@ fn ppid_from_proc_stat(stat: &str) -> Option<i32> {
 /// `ppid == 1` is the discriminator: a server owned by a LIVE worker (this one, or a
 /// sibling miner on the same box) has that worker as its parent, so it is never touched.
 /// Only a server whose owner is already gone gets killed.
+#[cfg(target_os = "linux")]
 fn reap_orphaned_gpu_servers(our_device: Option<u32>) {
     #[cfg(target_os = "linux")]
     {
@@ -322,6 +331,11 @@ const CUDA_DIR_OVERRIDE: &str = "ZKMINER_SP1_CUDA_RUNTIME_DIR";
 /// has the final say, so a failed or wrong resolution degrades to "SP1 cleanly
 /// unavailable, here is why" instead of claiming jobs it cannot prove.
 fn ensure_cuda12_on_library_path() {
+    // Windows' sp1-gpu-server links the CUDA runtime statically (cudart_static, see hemilabs/sp1's
+    // sp1-gpu-sys), so it needs only the driver.
+    if !cfg!(target_os = "linux") {
+        return;
+    }
     // Already reachable? Then do nothing -- including the case where the operator's own
     // LD_LIBRARY_PATH already provides it.
     if existing_path_has_cudart() {
@@ -471,11 +485,12 @@ fn find_cuda12_runtime_dir() -> Option<std::path::PathBuf> {
 /// cheaply (the server binary is absent, so the SDK would download it) returns `Ok`: this
 /// must not refuse a host that would in fact work.
 fn sp1_usability() -> Result<(), String> {
-    // The SDK does `env::var("HOME").expect(...)` to locate the server, so an unset HOME
-    // is a panic rather than an error. Systemd units routinely have no HOME.
-    let home = match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => h,
-        _ => {
+    // The SDK does `env::var("HOME").expect(...)` to locate the server (hemilabs/sp1 falls back to
+    // USERPROFILE, which is all Windows sets), so an unset HOME is a panic rather than an error.
+    // Systemd units routinely have no HOME.
+    let server = match warmup::server_path() {
+        Ok(server) => server,
+        Err(_) => {
             return Err(
                 "$HOME is not set, and the SP1 SDK requires it to locate ~/.sp1/bin/sp1-gpu-server (it panics without it)"
                     .to_string(),
@@ -512,7 +527,6 @@ fn sp1_usability() -> Result<(), String> {
     //   "error while loading shared libraries: libcudart.so.12: cannot open shared
     //    object file"
     // `--version` is what the SDK itself runs, costs milliseconds, and touches no GPU.
-    let server = std::path::PathBuf::from(&home).join(".sp1/bin/sp1-gpu-server");
     if !server.exists() {
         // Absent: the SDK downloads it on first use. We cannot verify a binary that does
         // not exist yet, and refusing here would disable SP1 on a host where it works.
@@ -1502,7 +1516,7 @@ fn benchmark_program(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod orphan_reap_tests {
     use super::ppid_from_proc_stat;
 
@@ -1552,7 +1566,8 @@ mod orphan_reap_tests {
     }
 }
 
-#[cfg(test)]
+// Linux semantics throughout: shell scripts standing in for the server, sonames, /proc.
+#[cfg(all(test, target_os = "linux"))]
 mod usability_tests {
     use super::sp1_usability;
 

@@ -783,7 +783,110 @@ pub fn get_cpu_info() -> String {
             }
         }
     }
+    #[cfg(windows)]
+    if let Some(name) = windows_cpu::processor_name() {
+        return name;
+    }
     "Unknown CPU".to_string()
+}
+
+/// Physical CPU cores, on Windows. (On Linux the TUI counts them from `/proc/cpuinfo`.)
+#[cfg(windows)]
+pub fn physical_core_count() -> Option<u32> {
+    windows_cpu::physical_cores()
+}
+
+/// The CPU's name and core count from Windows, which has no `/proc/cpuinfo`.
+#[cfg(windows)]
+mod windows_cpu {
+    use std::ffi::c_void;
+
+    const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
+    const RRF_RT_REG_SZ: u32 = 0x2;
+    const RELATION_PROCESSOR_CORE: u32 = 0;
+
+    /// SYSTEM_LOGICAL_PROCESSOR_INFORMATION: mask, relationship, then a 16-byte union.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct LogicalProcessorInfo {
+        mask: usize,
+        relationship: u32,
+        _union: [u64; 2],
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            key: isize,
+            sub_key: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut c_void,
+            len: *mut u32,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLogicalProcessorInformation(buf: *mut LogicalProcessorInfo, len: *mut u32) -> i32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// The marketing name Windows shows (as `/proc/cpuinfo`'s `model name` is on Linux).
+    pub fn processor_name() -> Option<String> {
+        let key = wide(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0");
+        let value = wide("ProcessorNameString");
+        let mut buf = [0u16; 256];
+        let mut len = std::mem::size_of_val(&buf) as u32;
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let chars = (len as usize / 2).min(buf.len());
+        let name = String::from_utf16_lossy(&buf[..chars]);
+        let name = name.trim_end_matches('\0').trim();
+        (!name.is_empty()).then(|| name.to_string())
+    }
+
+    pub fn physical_cores() -> Option<u32> {
+        let mut len = 0u32;
+        unsafe { GetLogicalProcessorInformation(std::ptr::null_mut(), &mut len) };
+        let count = len as usize / std::mem::size_of::<LogicalProcessorInfo>();
+        if count == 0 {
+            return None;
+        }
+        let mut infos = vec![
+            LogicalProcessorInfo {
+                mask: 0,
+                relationship: 0,
+                _union: [0; 2]
+            };
+            count
+        ];
+        if unsafe { GetLogicalProcessorInformation(infos.as_mut_ptr(), &mut len) } == 0 {
+            return None;
+        }
+        let cores = infos
+            .iter()
+            .take(len as usize / std::mem::size_of::<LogicalProcessorInfo>())
+            .filter(|info| info.relationship == RELATION_PROCESSOR_CORE)
+            .count() as u32;
+        (cores > 0).then_some(cores)
+    }
 }
 
 /// Get number of available CPU cores.
@@ -972,16 +1075,11 @@ where
 /// than reporting a confidently wrong number for it.
 fn read_gpu_power_by_card(proving_bus_ids: &[String]) -> PowerSample {
     let mut out: BTreeMap<String, f64> = BTreeMap::new();
+    // AMD's reader is sysfs hwmon, so Linux only; nvidia-smi answers the same query on
+    // Windows, where leaving it out made every card take FALLBACK_GPU_WATTS.
     #[cfg(target_os = "linux")]
-    let probe_failed = {
-        read_amd_power_by_card(proving_bus_ids, &mut out);
-        !read_nvidia_power_by_card(proving_bus_ids, &mut out)
-    };
-    #[cfg(not(target_os = "linux"))]
-    let probe_failed = {
-        let _ = proving_bus_ids;
-        true
-    };
+    read_amd_power_by_card(proving_bus_ids, &mut out);
+    let probe_failed = !read_nvidia_power_by_card(proving_bus_ids, &mut out);
     PowerSample {
         per_card: out,
         probe_failed,
@@ -992,7 +1090,6 @@ fn read_gpu_power_by_card(proving_bus_ids: &[String]) -> PowerSample {
 /// Returns false when the QUERY itself did not answer — which is the leak signal the sampler's
 /// give-up cap counts. A successful query that reports no usable row for some card returns true:
 /// that is a fact about the card, not a failure of the probe.
-#[cfg(target_os = "linux")]
 fn read_nvidia_power_by_card(proving_bus_ids: &[String], out: &mut BTreeMap<String, f64>) -> bool {
     // Bounded. `nvidia-smi` blocks in the driver after an Xid, a bus fall-off or an ECC remap,
     // and the sampler calls this every couple of seconds for the whole benchmark window. The

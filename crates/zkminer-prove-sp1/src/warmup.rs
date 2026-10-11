@@ -82,12 +82,17 @@ pub(crate) fn warm_up() -> Result<WarmupReport> {
     })
 }
 
-/// `~/.sp1/bin/sp1-gpu-server`, where the SDK runs it from.
+/// `~/.sp1/bin/sp1-gpu-server` (`.exe` on Windows), where the SDK runs it from. The home directory
+/// is found as the SDK finds it: `HOME`, or on Windows, which does not set it, `USERPROFILE`.
 pub(crate) fn server_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|home| !home.is_empty()))
         .ok_or_else(|| anyhow!("$HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".sp1/bin/sp1-gpu-server"))
+    Ok(PathBuf::from(home).join(format!(
+        ".sp1/bin/sp1-gpu-server{}",
+        std::env::consts::EXE_SUFFIX
+    )))
 }
 
 /// How the artifacts came to be in place.
@@ -202,9 +207,9 @@ fn download(staging: &Path) -> Result<()> {
     ))
 }
 
-/// An exclusive `flock` on `path`, held until the file is dropped.
+/// An exclusive lock on `path`, held until the file is dropped: `flock` on Unix, `LockFileEx` on
+/// Windows (std's `File::lock`).
 fn lock(path: &Path) -> Result<File> {
-    use std::os::unix::io::AsRawFd;
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -212,13 +217,10 @@ fn lock(path: &Path) -> Result<File> {
         .open(path)
         .with_context(|| format!("cannot open {}", path.display()))?;
     loop {
-        // SAFETY: flock on a descriptor we own.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Ok(file);
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::Interrupted {
-            return Err(err).with_context(|| format!("cannot lock {}", path.display()));
+        match file.lock() {
+            Ok(()) => return Ok(file),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err).with_context(|| format!("cannot lock {}", path.display())),
         }
     }
 }
@@ -392,6 +394,7 @@ mod tests {
 
     /// The probe tells a helper-hosting server from one that rejects the argument, as the pinned
     /// v6.0.2 server does, without starting either as a server.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_helper_probe_reads_the_servers_answer() {
         // Other tests in this binary briefly point PATH elsewhere, and the scripts are written with

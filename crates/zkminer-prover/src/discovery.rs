@@ -974,22 +974,31 @@ pub fn gpu_code_binary(backend: &str, worker: &Path) -> Option<PathBuf> {
 /// installed now, is the one the worker will use. Without either, the SDK downloads upstream's
 /// build later, whose GPU code nothing here can see in advance.
 fn sp1_server_for(worker: &Path, install: bool, home: Option<&Path>) -> Option<PathBuf> {
-    const SERVER: &str = "sp1-gpu-server";
+    let server = worker_file_name("sp1-gpu-server");
     if install {
         // The worker looks beside its own executable, which for a symlinked worker is the target's
         // directory; a wrapper script sits beside the binary it runs, so its own directory works too.
-        let real = std::fs::canonicalize(worker).ok();
+        let real = std::fs::canonicalize(worker).ok().map(strip_verbatim);
         let shipped = [real.as_deref().and_then(Path::parent), worker.parent()]
             .into_iter()
             .flatten()
-            .map(|dir| dir.join(SERVER))
+            .map(|dir| dir.join(&server))
             .find(|path| path.is_file());
         if shipped.is_some() {
             return shipped;
         }
     }
-    let installed = home?.join(".sp1").join("bin").join(SERVER);
+    let installed = home?.join(".sp1").join("bin").join(&server);
     installed.is_file().then_some(installed)
+}
+
+/// `path` without the `\\?\` that `canonicalize` puts before a Windows drive path, so a canonical
+/// path compares and prints as the ordinary spelling of the same file. Anything else is unchanged.
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
 }
 
 /// Minimum VRAM a card must have for a backend to run on it at all, or `None` for no floor.
@@ -1123,6 +1132,9 @@ pub fn vram_required_for_tier(backend: &str, tier: u64) -> Option<u64> {
 /// Infer GPU tag from binary filename.
 fn infer_gpu_tag(path: &Path) -> String {
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        let name = name
+            .strip_suffix(std::env::consts::EXE_SUFFIX)
+            .unwrap_or(name);
         if name.ends_with("-cuda") {
             return "cuda".to_string();
         }
@@ -1136,9 +1148,15 @@ fn infer_gpu_tag(path: &Path) -> String {
     "generic".to_string()
 }
 
+/// The file a worker binary is installed as: `bin_name` plus the platform's
+/// executable suffix (`.exe` on Windows, nothing elsewhere).
+fn worker_file_name(bin_name: &str) -> String {
+    format!("{bin_name}{}", std::env::consts::EXE_SUFFIX)
+}
+
 fn search_in_dirs(bin_name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     for dir in dirs {
-        let candidate = dir.join(bin_name);
+        let candidate = dir.join(worker_file_name(bin_name));
         if candidate.is_file() && is_executable(&candidate) {
             return Some(candidate);
         }
@@ -1149,7 +1167,7 @@ fn search_in_dirs(bin_name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 fn search_in_path(bin_name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(bin_name);
+        let candidate = dir.join(worker_file_name(bin_name));
         if candidate.is_file() && is_executable(&candidate) {
             return Some(candidate);
         }
@@ -1223,11 +1241,12 @@ mod tests {
                 .as_nanos()
         ));
         let (release, home) = (root.join("provers"), root.join("home"));
-        let installed = home.join(".sp1").join("bin").join("sp1-gpu-server");
+        let server = worker_file_name("sp1-gpu-server");
+        let installed = home.join(".sp1").join("bin").join(&server);
         std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&release).unwrap();
-        let worker = release.join("zkminer-prove-sp1");
-        let shipped = release.join("sp1-gpu-server");
+        let worker = release.join(worker_file_name("zkminer-prove-sp1"));
+        let shipped = release.join(&server);
         for file in [&worker, &shipped, &installed] {
             std::fs::write(file, b"x").unwrap();
         }
@@ -1364,6 +1383,27 @@ mod tests {
             infer_gpu_tag(Path::new("/usr/bin/zkminer-prove-risc0")),
             "generic"
         );
+    }
+
+    /// Windows installs workers as `<name>.exe`: discovery must find them under that
+    /// name, and an explicitly configured `...-cuda.exe` is still a CUDA worker.
+    #[test]
+    #[cfg(windows)]
+    fn windows_worker_names_carry_exe() {
+        assert_eq!(
+            worker_file_name("zkminer-prove-risc0-cuda"),
+            "zkminer-prove-risc0-cuda.exe"
+        );
+        assert_eq!(
+            infer_gpu_tag(Path::new(r"C:\zk\zkminer-prove-risc0-cuda.exe")),
+            "cuda"
+        );
+        let dir = std::env::temp_dir().join(format!("zkminer-disc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("zkminer-prove-risc0-cuda.exe"), b"").unwrap();
+        let found = search_in_dirs("zkminer-prove-risc0-cuda", std::slice::from_ref(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, Some(dir.join("zkminer-prove-risc0-cuda.exe")));
     }
 
     #[test]
