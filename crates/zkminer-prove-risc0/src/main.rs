@@ -281,6 +281,13 @@ fn detect_gpu() -> (bool, Option<String>) {
             return (true, Some("AMD GPU".to_string()));
         }
     }
+    #[cfg(feature = "intel")]
+    {
+        // The dispatcher only starts this worker for an Intel GPU it detected (and pins it with
+        // ZE_AFFINITY_MASK); the prover itself fails loudly if no Level Zero device is visible.
+        return (true, Some("Intel GPU".to_string()));
+    }
+    #[allow(unreachable_code)]
     (false, None)
 }
 
