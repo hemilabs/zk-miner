@@ -293,18 +293,43 @@ fn detect_intel_gpus() -> Vec<DetectedGpu> {
     }
 }
 
-/// PowerShell that lists the PnP display devices as `name|PNPDeviceID|location` lines, the
-/// location being `DEVPKEY_Device_LocationInfo` ("PCI bus 3, device 0, function 0").
+/// PowerShell that lists the PnP display devices as `name|PNPDeviceID|location|memory` lines:
+/// the location is `DEVPKEY_Device_LocationInfo` ("PCI bus 3, device 0, function 0"), the memory
+/// the adapter's `HardwareInformation.qwMemorySize` from its driver key (bytes; empty if absent).
+/// (WMI's `AdapterRAM` is a 32-bit field, capped at 4 GiB.)
 #[cfg(any(windows, test))]
-const WINDOWS_DISPLAY_DEVICES_PS: &str = "Get-CimInstance Win32_PnPEntity -Filter \"PNPClass='Display'\" | \
-     ForEach-Object { $loc = (Get-PnpDeviceProperty -InstanceId $_.PNPDeviceID \
-     -KeyName DEVPKEY_Device_LocationInfo -ErrorAction SilentlyContinue).Data; \
-     '{0}|{1}|{2}' -f $_.Name, $_.PNPDeviceID, $loc }";
+const WINDOWS_DISPLAY_DEVICES_PS: &str = r#"Get-CimInstance Win32_PnPEntity -Filter "PNPClass='Display'" | ForEach-Object { $loc = (Get-PnpDeviceProperty -InstanceId $_.PNPDeviceID -KeyName DEVPKEY_Device_LocationInfo -ErrorAction SilentlyContinue).Data; $drv = (Get-PnpDeviceProperty -InstanceId $_.PNPDeviceID -KeyName DEVPKEY_Device_Driver -ErrorAction SilentlyContinue).Data; $mem = ''; if ($drv) { $mem = (Get-ItemProperty ('HKLM:\SYSTEM\CurrentControlSet\Control\Class\' + $drv) -ErrorAction SilentlyContinue).'HardwareInformation.qwMemorySize' }; '{0}|{1}|{2}|{3}' -f $_.Name, $_.PNPDeviceID, $loc, $mem }"#;
 
 /// Detect Intel discrete GPUs on Windows, which has no sysfs: list the PnP display devices
 /// through PowerShell and keep Intel's discrete parts (see `parse_windows_intel_gpus`).
 #[cfg(windows)]
 fn detect_intel_gpus_windows() -> Vec<DetectedGpu> {
+    query_windows_intel_gpus()
+        .into_iter()
+        .map(|(gpu, _)| gpu)
+        .collect()
+}
+
+/// The VRAM of Intel GPU `device_index` (as numbered by `detect_intel_gpus`), where the platform
+/// reports it: on Windows, from the adapter's driver key. `None` elsewhere or if unknown.
+pub(crate) fn intel_vram_bytes(device_index: u32) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        query_windows_intel_gpus()
+            .into_iter()
+            .find(|(gpu, _)| gpu.device_index == device_index)
+            .and_then(|(_, vram)| vram)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = device_index;
+        None
+    }
+}
+
+/// The Intel discrete GPUs on Windows with their VRAM (see `WINDOWS_DISPLAY_DEVICES_PS`).
+#[cfg(windows)]
+fn query_windows_intel_gpus() -> Vec<(DetectedGpu, Option<u64>)> {
     // PowerShell's own start-up takes a second or so: allow it more than a GPU tool.
     let (outcome, stdout) = zkminer_prover_protocol::proc::output_with_timeout_capturing_stdout(
         std::process::Command::new("powershell").args([
@@ -326,7 +351,7 @@ fn detect_intel_gpus_windows() -> Vec<DetectedGpu> {
         );
         return Vec::new();
     }
-    parse_windows_intel_gpus(&stdout)
+    parse_windows_intel_gpus_with_vram(&stdout)
 }
 
 /// Whether an Intel PCI device ID is a discrete GPU: Arc Alchemist / Flex (DG2, 0x56xx), Arc
@@ -337,18 +362,31 @@ fn is_discrete_intel_device_id(device_id: u16) -> bool {
     matches!(device_id >> 8, 0x56 | 0xe2) || (0x0bd5..=0x0bdb).contains(&device_id)
 }
 
-/// Parse `name|PNPDeviceID|location` lines (`WINDOWS_DISPLAY_DEVICES_PS`) into Intel discrete
-/// GPUs, ordered by PCI bus ID. `device_index` follows that order, which is the order Level Zero
-/// enumerates them in (the index `ZE_AFFINITY_MASK` selects by).
-#[cfg(any(windows, test))]
+/// Parse `name|PNPDeviceID|location[|memory]` lines (`WINDOWS_DISPLAY_DEVICES_PS`) into Intel
+/// discrete GPUs, ordered by PCI bus ID. `device_index` follows that order, which is the order
+/// Level Zero enumerates them in (the index `ZE_AFFINITY_MASK` selects by).
+#[cfg(test)]
 fn parse_windows_intel_gpus(output: &str) -> Vec<DetectedGpu> {
-    let mut gpus: Vec<DetectedGpu> = output
+    parse_windows_intel_gpus_with_vram(output)
+        .into_iter()
+        .map(|(gpu, _)| gpu)
+        .collect()
+}
+
+/// `parse_windows_intel_gpus`, with each GPU's VRAM in bytes where the line reports it.
+#[cfg(any(windows, test))]
+fn parse_windows_intel_gpus_with_vram(output: &str) -> Vec<(DetectedGpu, Option<u64>)> {
+    let mut gpus: Vec<(DetectedGpu, Option<u64>)> = output
         .lines()
         .filter_map(|line| {
-            let mut parts = line.trim().splitn(3, '|');
+            let mut parts = line.trim().splitn(4, '|');
             let name = parts.next()?.trim();
             let pnp_id = parts.next()?.trim().to_uppercase();
             let location = parts.next().unwrap_or("").trim();
+            let vram = parts
+                .next()
+                .and_then(|m| m.trim().parse::<u64>().ok())
+                .filter(|&m| m > 0);
             let ids = pnp_id.strip_prefix("PCI\\VEN_8086&DEV_")?;
             let device_id = u16::from_str_radix(ids.get(..4)?, 16).ok()?;
             if !is_discrete_intel_device_id(device_id) {
@@ -360,18 +398,21 @@ fn parse_windows_intel_gpus(output: &str) -> Vec<DetectedGpu> {
             } else {
                 name.to_string()
             };
-            Some(DetectedGpu {
-                gpu_tag: "intel".to_string(),
-                device_index: 0,
-                pci_bus_id,
-                name,
-                // Not a CUDA device; CUDA compute capability does not apply.
-                compute_cap: None,
-            })
+            Some((
+                DetectedGpu {
+                    gpu_tag: "intel".to_string(),
+                    device_index: 0,
+                    pci_bus_id,
+                    name,
+                    // Not a CUDA device; CUDA compute capability does not apply.
+                    compute_cap: None,
+                },
+                vram,
+            ))
         })
         .collect();
-    gpus.sort_by(|a, b| a.pci_bus_id.cmp(&b.pci_bus_id));
-    for (i, gpu) in gpus.iter_mut().enumerate() {
+    gpus.sort_by(|a, b| a.0.pci_bus_id.cmp(&b.0.pci_bus_id));
+    for (i, (gpu, _)) in gpus.iter_mut().enumerate() {
         gpu.device_index = i as u32;
     }
     gpus
@@ -1596,7 +1637,7 @@ mod tests {
         // (Meteor Lake, 0x7d55) and a second B70 on a lower bus, to check filtering and order.
         let out = [
             r"AMD Radeon(TM) Graphics|PCI\VEN_1002&DEV_13C0&SUBSYS_D0001458&REV_C9\4&16012499&0&0041|PCI bus 19, device 0, function 0",
-            r"Intel(R) Arc(TM) Pro B70 Graphics|PCI\VEN_8086&DEV_E223&SUBSYS_60251849&REV_00\6&81E8C03&0&00080009|PCI bus 3, device 0, function 0",
+            r"Intel(R) Arc(TM) Pro B70 Graphics|PCI\VEN_8086&DEV_E223&SUBSYS_60251849&REV_00\6&81E8C03&0&00080009|PCI bus 3, device 0, function 0|34359738368",
             r"Intel(R) Graphics|PCI\VEN_8086&DEV_7D55&SUBSYS_00000000&REV_08\3&11583659&0&10|PCI bus 0, device 2, function 0",
             r"|PCI\VEN_8086&DEV_E223&SUBSYS_60251849&REV_00\6&1&0&0|PCI bus 2, device 0, function 0",
             // No location: dropped, as it couldn't be matched to a device.
@@ -1613,6 +1654,11 @@ mod tests {
         assert_eq!(gpus[1].name, "Intel(R) Arc(TM) Pro B70 Graphics");
         assert_eq!(gpus[1].device_index, 1);
         assert!(gpus.iter().all(|g| g.gpu_tag == "intel" && g.compute_cap.is_none()));
+        let vram: Vec<Option<u64>> = parse_windows_intel_gpus_with_vram(out)
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(vram, vec![None, Some(34359738368)]);
     }
 
     #[test]

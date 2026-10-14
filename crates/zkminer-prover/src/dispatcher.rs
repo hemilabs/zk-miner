@@ -517,6 +517,9 @@ const VRAM_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn gpu_vram_bytes(gpu_tag: &str, device_index: Option<u32>) -> Option<u64> {
     let idx = device_index?;
+    if gpu_tag == "intel" {
+        return crate::discovery::intel_vram_bytes(idx);
+    }
     if gpu_tag != "cuda" {
         return None;
     }
@@ -1537,6 +1540,15 @@ impl WorkerPool {
                 // The affinity mask alone correctly pins to the intended device.
                 if let Some(i) = device_index {
                     env.insert("ZE_AFFINITY_MASK".into(), i.to_string());
+                }
+                // The card's capacity, as for CUDA above: the risc0 worker keeps its Groth16
+                // proving key cached on the GPU between proofs only on a card it knows has room
+                // (`release_groth16_cache_if_tight`).
+                if let Some(vram) = gpu_vram_bytes(gpu_tag, device_index) {
+                    env.insert(
+                        zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
+                        vram.to_string(),
+                    );
                 }
             }
             _ => {}
