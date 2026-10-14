@@ -8,7 +8,7 @@
 //! because no dispatch predicate knew about the window and the single-key shortcut went
 //! straight into `ensure_alive` -> `respawn` -> instant bail.
 //!
-//! Needs a real CUDA worker. Run with:
+//! Needs a real GPU worker (CUDA, ROCm or Intel). Run with:
 //!   ZKMINER_GPU_NAME_FILTER=4090 cargo test --release -p zkminer-prover \
 //!     --test backoff_dispatch -- --ignored --nocapture --test-threads=1
 
@@ -62,7 +62,7 @@ fn sigkill_worker(pool: &WorkerPool, key: &str) -> Option<u32> {
 }
 
 #[test]
-#[ignore = "needs a real CUDA worker; run explicitly"]
+#[ignore = "needs a real GPU worker; run explicitly"]
 fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
     let elf = match find_risc0_elf("fibonacci") {
         Some(e) if !e.is_empty() => e,
@@ -73,13 +73,13 @@ fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
     let connected = pool.discover_and_spawn();
     let keys: Vec<_> = connected
         .iter()
-        .filter(|k| k.starts_with("risc0:cuda"))
+        .filter(|k| k.starts_with("risc0:"))
         .cloned()
         .collect();
     assert_eq!(
         keys.len(),
         1,
-        "this test needs EXACTLY one cuda slot so the single-key shortcut is exercised; \
+        "this test needs EXACTLY one risc0 GPU slot so the single-key shortcut is exercised; \
          set ZKMINER_GPU_NAME_FILTER. got: {keys:?}"
     );
     let key = keys[0].clone();

@@ -25,6 +25,8 @@
 //! `#[ignore]`d — real GPU proofs. Run with:
 //!   ZKMINER_TEST_RISC0_SLOT=risc0:cuda:0 cargo test -p zkminer-prover --test risc0_groth16_vram \
 //!     -- --ignored --test-threads=1 --nocapture
+//! (`risc0:intel:0` or `risc0:rocm:0` for other cards; VRAM is read from `nvidia-smi`, else from
+//! Windows' per-process GPU memory counters).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -33,6 +35,10 @@ use std::time::{Duration, Instant};
 use zkminer_prover::dispatcher::WorkerPool;
 
 fn worker_vram_mib(pid: u32) -> Option<u64> {
+    nvidia_smi_vram_mib(pid).or_else(|| windows_gpu_process_memory_mib(pid))
+}
+
+fn nvidia_smi_vram_mib(pid: u32) -> Option<u64> {
     let out = std::process::Command::new("nvidia-smi")
         .args([
             "--query-compute-apps=pid,used_gpu_memory",
@@ -46,6 +52,23 @@ fn worker_vram_mib(pid: u32) -> Option<u64> {
         let m: u64 = f.next()?.trim().parse().ok()?;
         (p == pid).then_some(m)
     })
+}
+
+/// Any vendor's card on Windows: the process's dedicated GPU memory, summed over its adapters.
+fn windows_gpu_process_memory_mib(pid: u32) -> Option<u64> {
+    if !cfg!(windows) || pid == 0 {
+        return None;
+    }
+    let script = format!(
+        "(Get-Counter '\\GPU Process Memory(pid_{pid}_*)\\Dedicated Usage' -ErrorAction Stop)\
+         .CounterSamples | Measure-Object CookedValue -Sum | ForEach-Object {{ [uint64]$_.Sum }}"
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .ok()?;
+    let bytes: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    Some(bytes >> 20)
 }
 
 #[test]
