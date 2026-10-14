@@ -332,7 +332,15 @@ fn run_execute(elf: &[u8], input_data: &[u8]) -> anyhow::Result<(u64, f64)> {
 /// The saving from keeping it turned out small: wraps after a release ran 2.08-2.12 s on the 5080
 /// against 2.01-2.05 s on the cache-keeping 4090, so at most ~0.1 s. The threshold is therefore cheap to
 /// get wrong in the conservative direction, which is why an unknown size releases.
+#[cfg(not(feature = "intel"))]
 const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// On Intel the threshold is higher: risc0 proves its segments at po2 21 there, and a 23M-cycle
+/// keccak job's segments alone peaked at 23 GB of a 32 GB Arc Pro B70. With the cache kept from the
+/// previous proof, the same segments ran with the card full and up to 5.8 GB spilled into shared
+/// system memory, at 2-5x the time (2026-10-14).
+#[cfg(feature = "intel")]
+const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 48 * 1024 * 1024 * 1024;
 
 /// Free the Groth16 prover and SRS cached on the GPU if this card cannot also hold the next STARK.
 ///
