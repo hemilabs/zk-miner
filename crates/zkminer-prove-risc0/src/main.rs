@@ -342,6 +342,17 @@ const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 #[cfg(feature = "intel")]
 const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 48 * 1024 * 1024 * 1024;
 
+/// This worker's card's VRAM, from the dispatcher (see `release_groth16_cache_if_tight`).
+fn card_vram_bytes() -> Option<u64> {
+    std::env::var(CUDA_VRAM_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// Intel cards this big prove keccak at po2 18 (see `run_proof_once`).
+#[cfg(feature = "intel")]
+const KECCAK_PO2_18_FROM_BYTES: u64 = 30 * 1024 * 1024 * 1024;
+
 /// Free the Groth16 prover and SRS cached on the GPU if this card cannot also hold the next STARK.
 ///
 /// The cache is the Groth16 prover's: `shrink_wrap` uploads the SRS once and keeps it for the life of
@@ -356,9 +367,7 @@ const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 48 * 1024 * 1024 * 1024;
 fn release_groth16_cache_if_tight() {
     static DECISION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let release = *DECISION.get_or_init(|| {
-        let total = std::env::var(CUDA_VRAM_BYTES_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok());
+        let total = card_vram_bytes();
         let release = total.is_none_or(|t| t < RELEASE_GROTH16_CACHE_BELOW_BYTES);
         match total {
             Some(t) => tracing::info!(
@@ -455,6 +464,14 @@ fn run_proof_once(
         }
         tracing::info!("Setting segment_limit_po2 = {po2}");
         env_builder.segment_limit_po2(po2 as u32);
+    }
+    // On Intel, keccak proofs at po2 18 rather than risc0's default 17: half as many proofs to lift
+    // and union, at the same cost per cycle (2.36 s against 2 x 1.23 s on an Arc Pro B70). A
+    // 23M-cycle keccak job took 83.7 s instead of 95.8 s, peaking at 29.8 of the card's 32 GB, so
+    // only on cards at least that big. RISC0_KECCAK_PO2 still overrides it.
+    #[cfg(feature = "intel")]
+    if card_vram_bytes().is_some_and(|b| b >= KECCAK_PO2_18_FROM_BYTES) {
+        env_builder.keccak_max_po2(18)?;
     }
     let env = env_builder.build()?;
 
