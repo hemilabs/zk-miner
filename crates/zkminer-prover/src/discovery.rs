@@ -74,6 +74,15 @@ fn worker_binary_name(backend: &str, gpu_tag: &str) -> String {
 
 /// Detect all physical GPUs (NVIDIA + AMD + Intel).
 pub fn detect_all_gpus() -> Vec<DetectedGpu> {
+    detect_all_gpus_with(&HashMap::new(), &[])
+}
+
+/// `detect_all_gpus`, also looking for the HIP probe (see `detect_amd_gpus_windows`) where
+/// `discover_workers` looks for worker binaries: `explicit_binaries` and `search_dirs`.
+fn detect_all_gpus_with(
+    explicit_binaries: &HashMap<String, PathBuf>,
+    search_dirs: &[PathBuf],
+) -> Vec<DetectedGpu> {
     let mut gpus = Vec::new();
 
     let nvidia = detect_nvidia_gpus();
@@ -90,7 +99,13 @@ pub fn detect_all_gpus() -> Vec<DetectedGpu> {
         gpus.extend(nvidia);
     }
 
-    let amd = detect_amd_gpus();
+    #[cfg(windows)]
+    let amd = detect_amd_gpus_windows(explicit_binaries, search_dirs);
+    #[cfg(not(windows))]
+    let amd = {
+        let _ = (explicit_binaries, search_dirs);
+        detect_amd_gpus()
+    };
     if !amd.is_empty() {
         let names: Vec<_> = amd
             .iter()
@@ -593,7 +608,101 @@ fn intel_gpu_name_from_id(device_id: &str) -> String {
     }
 }
 
+/// Detect AMD discrete GPUs on Windows, which has neither sysfs nor rocm-smi, from the HIP runtime
+/// itself: run a ROCm worker binary's `--list-hip-devices` (see `parse_hip_device_list`). Only
+/// the runtime knows its own device order, which is what `HIP_VISIBLE_DEVICES` selects by (an
+/// integrated GPU, which it lists too, can sit anywhere in it), and which devices are integrated.
+/// No ROCm worker binary, no AMD GPU: there would be nothing to run on it.
+#[cfg(windows)]
+fn detect_amd_gpus_windows(
+    explicit_binaries: &HashMap<String, PathBuf>,
+    search_dirs: &[PathBuf],
+) -> Vec<DetectedGpu> {
+    let Some(probe) = find_hip_probe(explicit_binaries, search_dirs) else {
+        return Vec::new();
+    };
+    // The probe must see every device, whatever this process was started with.
+    let mut cmd = std::process::Command::new(&probe);
+    cmd.arg("--list-hip-devices")
+        .env_remove("HIP_VISIBLE_DEVICES")
+        .env_remove("ROCR_VISIBLE_DEVICES")
+        .env_remove("CUDA_VISIBLE_DEVICES")
+        .env("RUST_LOG", "error");
+    // A worker's start-up (a large binary, the HIP runtime) takes longer than a GPU tool's.
+    let (outcome, stdout) = zkminer_prover_protocol::proc::output_with_timeout_capturing_stdout(
+        &mut cmd,
+        GPU_TOOL_TIMEOUT * 4,
+        256 * 1024,
+    );
+    if !matches!(
+        outcome,
+        zkminer_prover_protocol::proc::Outcome::Ran { success: true, .. }
+    ) {
+        tracing::warn!(
+            "listing HIP devices with {} failed ({})",
+            probe.display(),
+            outcome.describe()
+        );
+        return Vec::new();
+    }
+    parse_hip_device_list(&stdout)
+}
+
+/// The ROCm worker binary to list HIP devices with: an explicitly configured one, else the first
+/// `zkminer-prove-<backend>-rocm` where `discover_workers` searches.
+#[cfg(windows)]
+fn find_hip_probe(
+    explicit_binaries: &HashMap<String, PathBuf>,
+    search_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    for backend in ALL_BACKENDS {
+        if let Some(path) = explicit_binaries.get(*backend) {
+            if path.is_file() && infer_gpu_tag(path) == "rocm" {
+                return Some(path.clone());
+            }
+        }
+    }
+    let dirs = worker_search_dirs(search_dirs);
+    ALL_BACKENDS.iter().find_map(|backend| {
+        let bin_name = worker_binary_name(backend, "rocm");
+        search_in_dirs(&bin_name, &dirs).or_else(|| search_in_path(&bin_name))
+    })
+}
+
+/// Parse `index|pci_bus_id|integrated|total_mem|name` lines (a ROCm worker's
+/// `--list-hip-devices`) into the discrete AMD GPUs, keeping HIP's own index.
+#[cfg(any(windows, test))]
+fn parse_hip_device_list(output: &str) -> Vec<DetectedGpu> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.trim().splitn(5, '|');
+            let device_index = parts.next()?.trim().parse::<u32>().ok()?;
+            let pci_bus_id = normalize_pci_bus_id(parts.next()?);
+            let integrated = parts.next()?.trim() != "0";
+            let _total_mem = parts.next()?;
+            let name = parts.next()?.trim().to_string();
+            if integrated {
+                tracing::debug!("Skipping integrated AMD GPU [{device_index}] {name}");
+                return None;
+            }
+            if pci_bus_id.is_empty() {
+                return None;
+            }
+            Some(DetectedGpu {
+                gpu_tag: "rocm".to_string(),
+                device_index,
+                pci_bus_id,
+                name,
+                // Not a CUDA device; CUDA compute capability does not apply.
+                compute_cap: None,
+            })
+        })
+        .collect()
+}
+
 /// Detect AMD GPUs via /sys/class/drm/card*/device/.
+#[cfg_attr(windows, allow(dead_code))]
 fn detect_amd_gpus() -> Vec<DetectedGpu> {
     let drm_base = Path::new("/sys/class/drm");
     if !drm_base.is_dir() {
@@ -838,7 +947,7 @@ pub fn discover_workers(
     explicit_binaries: &HashMap<String, PathBuf>,
     search_dirs: &[PathBuf],
 ) -> Vec<DiscoveredWorker> {
-    let gpus = detect_all_gpus();
+    let gpus = detect_all_gpus_with(explicit_binaries, search_dirs);
     let mut found: Vec<DiscoveredWorker> = Vec::new();
 
     for backend in ALL_BACKENDS {
@@ -893,16 +1002,7 @@ pub fn discover_workers(
             }
         }
 
-        // Build search directories list: configured -> ~/.zkminer/provers/ -> sibling of exe
-        let mut all_dirs: Vec<PathBuf> = search_dirs.to_vec();
-        if let Some(home_dir) = dirs::home_dir() {
-            all_dirs.push(home_dir.join(".zkminer").join("provers"));
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                all_dirs.push(parent.to_path_buf());
-            }
-        }
+        let all_dirs = worker_search_dirs(search_dirs);
 
         // Search for each GPU variant
         for gpu_tag in GPU_TAGS {
@@ -1307,6 +1407,21 @@ fn worker_file_name(bin_name: &str) -> String {
     format!("{bin_name}{}", std::env::consts::EXE_SUFFIX)
 }
 
+/// Where worker binaries are searched for: the configured directories, then ~/.zkminer/provers/,
+/// then the directory of this executable.
+fn worker_search_dirs(search_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut all_dirs: Vec<PathBuf> = search_dirs.to_vec();
+    if let Some(home_dir) = dirs::home_dir() {
+        all_dirs.push(home_dir.join(".zkminer").join("provers"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            all_dirs.push(parent.to_path_buf());
+        }
+    }
+    all_dirs
+}
+
 fn search_in_dirs(bin_name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     for dir in dirs {
         let candidate = dir.join(worker_file_name(bin_name));
@@ -1344,6 +1459,25 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_hip_device_list_keeps_discrete_gpus_with_hip_index() {
+        // A Ryzen host with an RX 9070 XT: the iGPU is HIP device 1 here, but could be any index.
+        let out = "0|0000:03:00.0|0|17095983104|AMD Radeon RX 9070 XT
+                   1|0000:16:00.0|1|62477336576|AMD Radeon(TM) Graphics
+                   2|00000000:2d:00.0|0|25753026560|AMD Radeon RX 7900 XTX
+                   garbage line
+";
+        let gpus = parse_hip_device_list(out);
+        assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[0].device_index, 0);
+        assert_eq!(gpus[0].pci_bus_id, "0000:03:00.0");
+        assert_eq!(gpus[0].name, "AMD Radeon RX 9070 XT");
+        assert_eq!(gpus[0].gpu_tag, "rocm");
+        // The index is HIP's, not the position among discrete GPUs.
+        assert_eq!(gpus[1].device_index, 2);
+        assert_eq!(gpus[1].pci_bus_id, "0000:2d:00.0");
+    }
 
     #[test]
     fn worker_binary_names() {

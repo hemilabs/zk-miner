@@ -16,6 +16,9 @@ use zkminer_prover_protocol::{
 
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 
+#[cfg(feature = "rocm")]
+mod hip;
+
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
@@ -25,6 +28,13 @@ fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // The HIP devices, for the host's GPU discovery where there is no rocm-smi (Windows).
+    #[cfg(feature = "rocm")]
+    if std::env::args().any(|a| a == "--list-hip-devices") {
+        hip::print_devices();
+        return;
+    }
 
     // Direct benchmark mode: run benchmarks and print results to stdout
     if std::env::args().any(|a| a == "--benchmark") {
@@ -255,7 +265,22 @@ fn detect_gpu() -> (bool, Option<String>) {
             }
         }
     }
-    #[cfg(feature = "rocm")]
+    // Windows has neither rocm-smi nor /dev/kfd: ask HIP for the device this worker proves on
+    // (the dispatcher pins it with HIP_VISIBLE_DEVICES, so it is the first one visible).
+    #[cfg(all(feature = "rocm", windows))]
+    {
+        return match hip::devices() {
+            Ok(devices) => match devices.into_iter().next() {
+                Some(d) => (true, Some(d.name)),
+                None => (false, None),
+            },
+            Err(e) => {
+                tracing::warn!("{e}");
+                (false, None)
+            }
+        };
+    }
+    #[cfg(all(feature = "rocm", not(windows)))]
     {
         // Try rocm-smi first (more reliable than sysfs product_name)
         if let Ok(output) = std::process::Command::new("rocm-smi")
@@ -342,12 +367,34 @@ const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 #[cfg(feature = "intel")]
 const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 48 * 1024 * 1024 * 1024;
 
-/// This worker's card's VRAM, from the dispatcher (see `release_groth16_cache_if_tight`).
+/// This worker's card's VRAM, from the dispatcher (see `release_groth16_cache_if_tight`). A ROCm
+/// worker, which the dispatcher doesn't size, asks HIP for its one visible device.
 fn card_vram_bytes() -> Option<u64> {
-    std::env::var(CUDA_VRAM_BYTES_ENV)
+    let from_dispatcher = std::env::var(CUDA_VRAM_BYTES_ENV)
         .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    #[cfg(feature = "rocm")]
+    let from_dispatcher = from_dispatcher.or_else(|| {
+        static HIP_VRAM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        *HIP_VRAM.get_or_init(|| hip::devices().ok()?.first().map(|d| d.total_mem))
+    });
+    from_dispatcher
 }
+
+/// AMD cards smaller than this prove segments at po2 19 rather than risc0's default 20, unless the
+/// request sets a po2. On a 16 GB RX 9070 XT (Windows) a 23M-cycle job's segments took 25 s at
+/// po2 19 against 31-39 s at po2 20, and the worker peaked at ~10 GB instead of ~14: with the
+/// desktop on the same card, po2 20 left too little room and some jobs spilled into shared system
+/// memory at several times the time.
+#[cfg(feature = "rocm")]
+const ROCM_SEGMENT_PO2_19_BELOW_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// AMD cards this big prove keccak at po2 18 rather than risc0's default 17, as Intel cards of 30
+/// GiB do: half as many keccak proofs to lift and union. On a 16 GB RX 9070 XT (15.9 GiB as HIP
+/// reports it) a 23M-cycle job took 79-83 s instead of 90-91 s, the worker peaking at 12.6 GB.
+/// RISC0_KECCAK_PO2 still overrides it.
+#[cfg(feature = "rocm")]
+const ROCM_KECCAK_PO2_18_FROM_BYTES: u64 = 15 * 1024 * 1024 * 1024;
 
 /// Intel cards this big prove keccak at po2 18 (see `run_proof_once`).
 #[cfg(feature = "intel")]
@@ -465,12 +512,21 @@ fn run_proof_once(
         tracing::info!("Setting segment_limit_po2 = {po2}");
         env_builder.segment_limit_po2(po2 as u32);
     }
+    #[cfg(feature = "rocm")]
+    if po2.is_none() && card_vram_bytes().is_some_and(|b| b < ROCM_SEGMENT_PO2_19_BELOW_BYTES) {
+        tracing::info!("Setting segment_limit_po2 = 19 for a card under 20 GiB");
+        env_builder.segment_limit_po2(19);
+    }
     // On Intel, keccak proofs at po2 18 rather than risc0's default 17: half as many proofs to lift
     // and union, at the same cost per cycle (2.36 s against 2 x 1.23 s on an Arc Pro B70). A
     // 23M-cycle keccak job took 83.7 s instead of 95.8 s, peaking at 29.8 of the card's 32 GB, so
     // only on cards at least that big. RISC0_KECCAK_PO2 still overrides it.
     #[cfg(feature = "intel")]
     if card_vram_bytes().is_some_and(|b| b >= KECCAK_PO2_18_FROM_BYTES) {
+        env_builder.keccak_max_po2(18)?;
+    }
+    #[cfg(feature = "rocm")]
+    if card_vram_bytes().is_some_and(|b| b >= ROCM_KECCAK_PO2_18_FROM_BYTES) {
         env_builder.keccak_max_po2(18)?;
     }
     let env = env_builder.build()?;
