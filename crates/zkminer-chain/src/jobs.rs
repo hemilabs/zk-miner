@@ -1,9 +1,33 @@
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::Provider;
+use alloy::rpc::types::TransactionReceipt;
 use anyhow::{bail, Context, Result};
 use std::time::Duration;
 
 use crate::tx::TX_RECEIPT_TIMEOUT;
+
+/// topic0 of the `JobFulfilled` event (see `bindings.rs`), computed like monitor.rs's other
+/// canonical topics so signature drift is caught by the same test discipline.
+fn job_fulfilled_topic0() -> B256 {
+    alloy::primitives::keccak256(
+        "JobFulfilled(bytes32,address,address,uint96,uint96,uint256,uint256,uint256,uint256,uint64,bytes)",
+    )
+}
+
+/// Did this receipt's OWN logs record a `JobFulfilled(jobId, …)` for `job_id`? [security H4]
+///
+/// Reading the mined transaction's logs is race-free, unlike a follow-up `getJobStatusView` which a
+/// load-balanced RPC can serve from a block BEFORE the tx mined (showing the stale pre-fulfill
+/// Locked state). A submitter-controlled callback that rejects makes `fulfillJob` mine successfully
+/// (receipt.status() == true) WITHOUT fulfilling the job — so the mined receipt alone is not proof
+/// of fulfillment; the emitted event is.
+fn receipt_fulfilled_this_job(receipt: &TransactionReceipt, job_id: B256) -> bool {
+    let topic0 = job_fulfilled_topic0();
+    receipt.inner.logs().iter().any(|log| {
+        let topics = log.topics();
+        topics.first() == Some(&topic0) && topics.get(1) == Some(&job_id)
+    })
+}
 use zkminer_contracts::bindings::{
     HashedDescriptor, IHemiProveAux, IHemiProveCore, IHemiProveFulfill, JobDescriptor,
     JobStatusView,
@@ -1201,12 +1225,30 @@ impl ChainClient {
                 Some(receipt) => {
                     if receipt.status() {
                         self.commit_nonce(nonce);
-                        tracing::info!(
-                            "Job fulfilled: {} tx: {:?}",
-                            job_id,
-                            receipt.transaction_hash
+                        // [security H4] A mined fulfillJob is NOT proof the job reached Fulfilled: a
+                        // submitter's rejecting callback mines successfully yet leaves the job
+                        // unfulfilled (until a 4th rejection force-accepts), so trusting the receipt
+                        // would mark a job done that a keeper can still slash. Confirm via the tx's
+                        // own logs (race-free) that a JobFulfilled for THIS job was emitted. If the
+                        // tx emitted logs but none is our JobFulfilled, the fulfill did not take →
+                        // return Err so the caller releases while releaseJob can still land (and if
+                        // the job IS somehow fulfilled, release_and_clean no-ops after its ownership
+                        // check, so a false negative costs only a cosmetic stat, never a double-send).
+                        if receipt_fulfilled_this_job(&receipt, job_id)
+                            || receipt.inner.logs().is_empty()
+                        {
+                            tracing::info!(
+                                "Job fulfilled: {} tx: {:?}",
+                                job_id,
+                                receipt.transaction_hash
+                            );
+                            return Ok(());
+                        }
+                        anyhow::bail!(
+                            "fulfillJob tx {tx_hash:?} mined but emitted no JobFulfilled for {job_id} \
+                             (likely a rejecting callback) — treating as NOT fulfilled so collateral \
+                             is released rather than left to a slash"
                         );
-                        return Ok(());
                     }
                     // A genuine revert (e.g. verifier rejected the proof) — retrying
                     // the same proof won't help. The reverted tx consumed the nonce

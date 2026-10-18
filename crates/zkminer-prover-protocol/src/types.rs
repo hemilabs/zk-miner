@@ -40,6 +40,14 @@ pub enum WorkerCommand {
         /// Segment limit as log2 of rows. None = use SDK default.
         /// Only meaningful for risc0; other backends accept but ignore.
         po2: Option<u8>,
+        /// The job's on-chain `programId` (32 bytes), if the host knows it. For risc0 this is the
+        /// guest image id, so the worker refuses to prove an ELF whose computed image id does not
+        /// match (a submitter who serves bytes unrelated to the registered program can otherwise
+        /// burn a full Groth16 proof + fulfill gas on a proof the on-chain verifier will reject).
+        /// SP1/OpenVM ignore it (for SP1 `programId` is a vkey, not the ELF image). `None` keeps
+        /// the pre-existing behaviour (benchmark/calibration paths, mock worker).
+        #[serde(default)]
+        program_id: Option<[u8; 32]>,
     },
     /// EXECUTE the guest without proving, to measure its true cycle count.
     ///
@@ -53,6 +61,12 @@ pub enum WorkerCommand {
         request_id: u64,
         elf: Vec<u8>,
         input_data: Vec<u8>,
+        /// The job's on-chain `programId` (32 bytes), if known. Same meaning as on `Prove`: the
+        /// risc0 worker refuses to EXECUTE (size) an ELF whose image id does not match, so a
+        /// submitter cannot drive the zero-cost pre-claim measurement path with an ELF unrelated
+        /// to the program they registered. `None` preserves the prior behaviour.
+        #[serde(default)]
+        program_id: Option<[u8; 32]>,
     },
     /// Cancel an in-flight proof. Worker should abort and send Cancelled or Error.
     Cancel { request_id: u64 },
@@ -1005,6 +1019,7 @@ mod tests {
             elf: vec![1, 2, 3],
             input_data: vec![4, 5, 6],
             po2: Some(20),
+            program_id: Some([7u8; 32]),
         };
         let bytes = bincode::serialize(&cmd).unwrap();
         let decoded: WorkerCommand = bincode::deserialize(&bytes).unwrap();
@@ -1014,11 +1029,13 @@ mod tests {
                 elf,
                 input_data,
                 po2,
+                program_id,
             } => {
                 assert_eq!(request_id, 42);
                 assert_eq!(elf, vec![1, 2, 3]);
                 assert_eq!(input_data, vec![4, 5, 6]);
                 assert_eq!(po2, Some(20));
+                assert_eq!(program_id, Some([7u8; 32]));
             }
             _ => panic!("wrong variant"),
         }

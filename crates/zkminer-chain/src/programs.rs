@@ -4,11 +4,124 @@
 //! register their compiled ELF binaries with metadata and download locations.
 //! Provers use this to discover where to obtain the ELF for a given programId.
 
+use std::net::{IpAddr, ToSocketAddrs};
+use std::time::Duration;
+
 use alloy::primitives::B256;
 use anyhow::{bail, Context, Result};
 
 use crate::client::ChainClient;
 use zkminer_contracts::bindings::IProgramRegistry;
+
+/// Per-request connect + total timeout for an ELF download. A submitter endpoint that trickles bytes
+/// or never closes must not pin a socket — and, on the pre-claim measurement path, a worker slot —
+/// indefinitely. Overridable with `ZKMINER_ELF_FETCH_TIMEOUT_SECS`.
+fn elf_fetch_timeout() -> Duration {
+    let secs = std::env::var("ZKMINER_ELF_FETCH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(60);
+    Duration::from_secs(secs)
+}
+
+/// Allow fetching an ELF from a private/loopback/link-local host — only for an operator who
+/// deliberately self-hosts the program store on a private network. OFF by default: a
+/// submitter-controlled storage URI that resolves to 169.254.169.254 (cloud metadata), 127.0.0.1,
+/// 10/8, etc. is a server-side request forgery vector (the miner fetches it pre-claim, unauthenticated).
+fn allow_private_elf_hosts() -> bool {
+    matches!(
+        std::env::var("ZKMINER_ELF_ALLOW_PRIVATE_URLS")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// True for an address a submitter must not be able to make the miner reach: loopback, RFC1918
+/// private, link-local (incl. the 169.254.169.254 metadata endpoint), CGNAT, unspecified, broadcast,
+/// documentation, multicast, IPv6 ULA/link-local, and IPv4-mapped forms of all the above.
+fn ip_is_blocked(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return ip_is_blocked(&IpAddr::V4(mapped));
+            }
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+    }
+}
+
+/// Reject a URL whose scheme isn't http(s), or whose host is (or resolves to) a private/reserved
+/// address. Used both before the initial fetch and on EVERY redirect hop, so a 3xx to an internal
+/// address can't slip past. A DNS rebind between this check and the actual connect is still
+/// theoretically possible; the redirect re-check closes the amplification that makes it practical.
+fn validate_fetch_url(url: &reqwest::Url) -> Result<()> {
+    match url.scheme() {
+        "http" | "https" => {}
+        other => bail!("refusing ELF fetch with non-http(s) scheme '{other}': {url}"),
+    }
+    if allow_private_elf_hosts() {
+        return Ok(());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("ELF URL has no host: {url}"))?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<std::net::SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolving ELF host '{host}'"))?
+        .collect();
+    if addrs.is_empty() {
+        bail!("ELF host '{host}' did not resolve");
+    }
+    for a in &addrs {
+        if ip_is_blocked(&a.ip()) {
+            bail!(
+                "refusing ELF fetch to private/reserved address {} (host '{host}') — set \
+                 ZKMINER_ELF_ALLOW_PRIVATE_URLS=1 only if you self-host the program store",
+                a.ip()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Build the download client once: bounded connect/total timeout and a redirect policy that
+/// re-validates each hop against [`validate_fetch_url`] and caps the chain length.
+fn build_elf_client() -> Result<reqwest::Client> {
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error("too many redirects while fetching ELF");
+        }
+        match validate_fetch_url(attempt.url()) {
+            Ok(()) => attempt.follow(),
+            Err(e) => attempt.error(format!("blocked redirect target: {e}")),
+        }
+    });
+    reqwest::Client::builder()
+        .connect_timeout(elf_fetch_timeout())
+        .timeout(elf_fetch_timeout())
+        .redirect(policy)
+        .build()
+        .context("building hardened ELF download client")
+}
 
 /// Hard cap on a downloaded ELF. Real guest ELFs are single-digit MB; this bounds a
 /// submitter-controlled storage URI so an accidentally- or maliciously-huge response
@@ -61,13 +174,7 @@ impl ChainClient {
     /// (registered metadata is immutable), so repeated jobs for the same program
     /// hit the registry only once.
     pub async fn get_program_info(&self, program_id: B256) -> Result<ProgramInfo> {
-        if let Some(hit) = self
-            .program_info_cache
-            .lock()
-            .unwrap()
-            .get(&program_id)
-            .cloned()
-        {
+        if let Some(hit) = self.program_info_cache.lock().unwrap().get(&program_id) {
             return Ok(hit);
         }
 
@@ -196,7 +303,65 @@ impl ElfCache {
         let path = self.cache_dir.join(format!("{}.elf", program_id));
         std::fs::write(&path, elf).context("Failed to write ELF to cache")?;
         tracing::info!("Cached ELF for {} ({} bytes)", program_id, elf.len());
+        // Bound total on-disk cache size. Without this, a submitter who registers many distinct
+        // programs (each served from a URI near the 256 MiB cap) could fill the operator's disk —
+        // and this cache is written even on the PRE-CLAIM measurement path, for jobs never claimed.
+        self.prune_to_budget();
         Ok(())
+    }
+
+    /// Maximum total bytes kept in the on-disk ELF cache. Override with
+    /// `ZKMINER_ELF_CACHE_MAX_BYTES` (0 = unbounded, the old behaviour).
+    fn cache_budget_bytes() -> u64 {
+        std::env::var("ZKMINER_ELF_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(4 * 1024 * 1024 * 1024) // 4 GiB
+    }
+
+    /// Evict the least-recently-modified cached ELFs until the directory is under budget.
+    fn prune_to_budget(&self) {
+        self.prune_with_budget(Self::cache_budget_bytes());
+    }
+
+    fn prune_with_budget(&self, budget: u64) {
+        if budget == 0 {
+            return;
+        }
+        let read = match std::fs::read_dir(&self.cache_dir) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        // (path, size, mtime) for each cached ELF.
+        let mut entries: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
+        for ent in read.flatten() {
+            let path = ent.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("elf") {
+                continue;
+            }
+            if let Ok(md) = ent.metadata() {
+                let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+                entries.push((path, md.len(), mtime));
+            }
+        }
+        let mut total: u64 = entries.iter().map(|(_, sz, _)| *sz).sum();
+        if total <= budget {
+            return;
+        }
+        // Oldest first.
+        entries.sort_by_key(|(_, _, mtime)| *mtime);
+        for (path, sz, _) in entries {
+            if total <= budget {
+                break;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    total = total.saturating_sub(sz);
+                    tracing::info!("Evicted cached ELF {} ({sz} bytes) to stay under cache budget", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to evict cached ELF {}: {e}", path.display()),
+            }
+        }
     }
 
     /// Check if an ELF is cached.
@@ -211,6 +376,9 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
     if uris.is_empty() {
         bail!("No storage URIs available for this program");
     }
+
+    // One hardened client for all URIs: bounded timeouts + SSRF-checked redirects.
+    let client = build_elf_client()?;
 
     for uri_info in uris {
         let url = match uri_info.storage_type {
@@ -230,8 +398,21 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
             }
         };
 
+        // SSRF guard: parse + validate the (submitter-controlled) URL before touching the network.
+        let parsed = match reqwest::Url::parse(&url) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!("Skipping unparseable storage URI {url}: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = validate_fetch_url(&parsed) {
+            tracing::warn!("Skipping storage URI {url}: {e:#}");
+            continue;
+        }
+
         tracing::info!("Downloading ELF from {}...", url);
-        match reqwest::get(&url).await {
+        match client.get(parsed).send().await {
             Ok(mut response) => {
                 if !response.status().is_success() {
                     tracing::warn!("HTTP {} from {}", response.status(), url);
@@ -324,4 +505,92 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
     }
 
     bail!("Failed to download ELF from any of {} URIs", uris.len())
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn blocks_private_reserved_and_metadata_addresses() {
+        for s in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.5.4",
+            "192.168.1.1",
+            "169.254.169.254", // cloud metadata
+            "100.64.0.1",      // CGNAT
+            "0.0.0.0",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1", // IPv4-mapped loopback
+        ] {
+            assert!(ip_is_blocked(&ip(s)), "{s} should be blocked");
+        }
+    }
+
+    #[test]
+    fn allows_public_addresses() {
+        for s in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {
+            assert!(!ip_is_blocked(&ip(s)), "{s} should be allowed");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_scheme_and_private_ip_literals() {
+        // Non-http(s) scheme.
+        assert!(validate_fetch_url(&reqwest::Url::parse("ftp://example.com/x").unwrap()).is_err());
+        assert!(validate_fetch_url(&reqwest::Url::parse("file:///etc/passwd").unwrap()).is_err());
+        // Private / metadata IP literals (no DNS needed).
+        assert!(validate_fetch_url(&reqwest::Url::parse("http://127.0.0.1/x").unwrap()).is_err());
+        assert!(validate_fetch_url(
+            &reqwest::Url::parse("http://169.254.169.254/latest/meta-data/").unwrap()
+        )
+        .is_err());
+        assert!(validate_fetch_url(&reqwest::Url::parse("http://[::1]:8545/").unwrap()).is_err());
+        // Public IP literal is allowed.
+        assert!(validate_fetch_url(&reqwest::Url::parse("https://1.1.1.1/elf").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn cache_prune_enforces_byte_budget() {
+        let dir = std::env::temp_dir().join(format!("zkminer-elfcache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = ElfCache {
+            cache_dir: dir.clone(),
+        };
+
+        // Three 1000-byte ELFs = 3000 bytes total.
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.join(format!("{name}.elf")), vec![0u8; 1000]).unwrap();
+        }
+
+        // A budget of 2500 must leave the directory at or under budget (one file evicted).
+        cache.prune_with_budget(2500);
+        let remaining: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("elf"))
+            .collect();
+        let total: u64 = remaining.iter().map(|e| e.metadata().unwrap().len()).sum();
+        assert!(total <= 2500, "cache not pruned under budget: {total} bytes");
+        assert_eq!(remaining.len(), 2, "exactly one oldest ELF should be evicted");
+
+        // Budget 0 = unbounded: nothing is evicted.
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.join(format!("{name}.elf")), vec![0u8; 1000]).unwrap();
+        }
+        cache.prune_with_budget(0);
+        let count = std::fs::read_dir(&dir).unwrap().flatten().count();
+        assert_eq!(count, 3, "budget 0 must not evict");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

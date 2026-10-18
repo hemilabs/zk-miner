@@ -11890,6 +11890,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "libc",
  "openvm-sdk",
  "serde",
  "tracing",
@@ -11903,6 +11904,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "libc",
  "risc0-build",
  "risc0-groth16",
  "risc0-zkvm",
@@ -11920,6 +11922,7 @@ dependencies = [
  "bincode",
  "libc",
  "serde",
+ "sha2",
  "sp1-build",
  "sp1-sdk",
  "tokio",

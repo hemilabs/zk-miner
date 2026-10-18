@@ -75,6 +75,7 @@ fn main() {
                 elf: _,
                 input_data: _,
                 po2: _,
+                program_id: _,
             } => {
                 if crash_on == "prove" || crash_on == "both" {
                     std::process::exit(1);

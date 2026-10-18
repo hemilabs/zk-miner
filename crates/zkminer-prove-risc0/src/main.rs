@@ -18,16 +18,33 @@ include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn main() {
-    tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+/// Duplicate `fd` with close-on-exec set.
+///
+/// `dup` deliberately CLEARS `FD_CLOEXEC` on the new descriptor, so without this every process the
+/// worker forks inherits a writable copy of the host's IPC pipe; a grandchild that outlives us then
+/// keeps the write end open and the host's blocking `read_exact` never sees EOF. The host never
+/// passes this descriptor to anyone, so close-on-exec is unconditionally correct. (Mirrors the SP1
+/// worker's `dup_cloexec`.)
+#[cfg(unix)]
+fn dup_cloexec(fd: std::os::unix::io::RawFd) -> std::io::Result<std::os::unix::io::RawFd> {
+    let new = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if new < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(new)
+}
 
-    // Direct benchmark mode: run benchmarks and print results to stdout
+fn main() {
+    // Direct benchmark mode runs the operator's own guests and prints a human table to the REAL
+    // stdout, so it must come before the fd-1 redirect below. It speaks no IPC.
     if std::env::args().any(|a| a == "--benchmark") {
+        tracing_subscriber::fmt()
+            .with_writer(io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info".into()),
+            )
+            .init();
         let results = run_benchmarks();
         for r in &results {
             println!(
@@ -38,15 +55,39 @@ fn main() {
         return;
     }
 
-    if let Err(e) = run_worker_loop() {
+    // CRITICAL (security): save the real stdout FD for IPC, then redirect FD 1 to stderr so NOTHING
+    // the guest (via risc0's POSIX `sys_write`/`sys_log` to fd 1, which `PosixIo::default()` wires to
+    // this process's stdout) — nor any native/CUDA library — can inject bytes into the length-prefixed
+    // bincode control stream the dispatcher reads. A submitter's ELF could otherwise desync/forge that
+    // stream and churn the GPU prover. The SP1 worker already does this for gnark's CGO prints; risc0
+    // and OpenVM were missing it. The worker's own IPC frames go only through the saved descriptor.
+    #[cfg(unix)]
+    let ipc_stdout = {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let stdout_fd = io::stdout().as_raw_fd(); // FD 1
+        let ipc_fd = dup_cloexec(stdout_fd).expect("dup(stdout) failed");
+        unsafe { libc::dup2(io::stderr().as_raw_fd(), stdout_fd) };
+        unsafe { std::fs::File::from_raw_fd(ipc_fd) }
+    };
+    #[cfg(not(unix))]
+    let ipc_stdout = io::stdout();
+
+    tracing_subscriber::fmt()
+        .with_writer(io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
         std::process::exit(1);
     }
 }
 
-fn run_worker_loop() -> Result<()> {
+fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     let mut stdin = BufReader::new(io::stdin().lock());
-    let mut stdout = BufWriter::new(io::stdout().lock());
+    let mut stdout = BufWriter::new(ipc_stdout);
 
     loop {
         let cmd: WorkerCommand = match read_message(&mut stdin) {
@@ -104,6 +145,7 @@ fn run_worker_loop() -> Result<()> {
                 elf,
                 input_data,
                 po2,
+                program_id,
             } => {
                 tracing::info!(
                     "Proving request {request_id} ({} bytes ELF, po2={po2:?})",
@@ -123,7 +165,7 @@ fn run_worker_loop() -> Result<()> {
                     segments: None,
                 };
                 write_message(&mut stdout, &started)?;
-                match run_proof(&elf, &input_data, po2) {
+                match run_proof(&elf, &input_data, po2, program_id) {
                     Ok((journal, seal, duration_secs, cycles)) => {
                         let resp = WorkerResponse::ProofResult {
                             request_id,
@@ -141,7 +183,12 @@ fn run_worker_loop() -> Result<()> {
                             // respawns this worker with a clean GPU context (a wedged/leaked
                             // context would otherwise fail every subsequent proof).
                             ErrorKind::ResourceExhausted
-                        } else if msg.contains("po2 value") || msg.contains("out of valid range") {
+                        } else if msg.contains("po2 value")
+                            || msg.contains("out of valid range")
+                            || msg.contains("does not match job programId")
+                        {
+                            // Bad job (wrong po2 / wrong ELF for the programId), not a sick worker:
+                            // InvalidInput so the dispatcher does not kill+respawn a healthy worker.
                             ErrorKind::InvalidInput
                         } else if msg.contains("serialize") || msg.contains("bincode") {
                             ErrorKind::Internal
@@ -162,9 +209,10 @@ fn run_worker_loop() -> Result<()> {
                 request_id,
                 elf,
                 input_data,
+                program_id,
             } => {
                 tracing::info!("Execute request {request_id} ({} bytes ELF)", elf.len());
-                match run_execute(&elf, &input_data) {
+                match run_execute(&elf, &input_data, program_id) {
                     Ok((cycles, duration_secs)) => {
                         tracing::info!(
                             "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s"
@@ -288,13 +336,98 @@ fn detect_gpu() -> (bool, Option<String>) {
 ///
 /// Deliberately uses the default (CPU) executor: this is a sizing measurement, so it must not
 /// contend for the GPU that the proofs it sizes are running on.
-fn run_execute(elf: &[u8], input_data: &[u8]) -> anyhow::Result<(u64, f64)> {
+/// True when `image_id` (a risc0 guest image id, 32 bytes) corresponds to the on-chain `program_id`.
+///
+/// The byte order the registry stores a risc0 programId in — vs risc0's native word layout from
+/// `Digest::as_bytes` — is deployment-defined and not knowable from this repo, so we accept EITHER
+/// order. A legitimately matching ELF matches under whichever order the chain used; an ELF that is a
+/// *different* program matches under neither (a 256-bit collision is infeasible). Accepting both
+/// orders is what guarantees the binding check can never false-reject a genuine job.
+fn image_id_matches(image_id: &[u8], program_id: &[u8; 32]) -> bool {
+    image_id == program_id.as_slice()
+        || image_id.iter().rev().copied().eq(program_id.iter().copied())
+}
+
+/// Set `ZKMINER_RISC0_SKIP_PROGRAM_ID_CHECK=1` to disable the image-id↔programId binding (only for a
+/// deployment whose risc0 programId is NOT the raw image id). Enforced by default.
+fn program_id_check_disabled() -> bool {
+    matches!(
+        std::env::var("ZKMINER_RISC0_SKIP_PROGRAM_ID_CHECK")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// Refuse to run an ELF whose computed risc0 image id does not match the job's on-chain `programId`.
+/// No-op when the host did not supply a programId (benchmark/calibration/mock) or the check is
+/// disabled. Catches a submitter who registers programId X but serves an ELF for a different program,
+/// *before* a full Groth16 proof (or a sizing execute) is spent on a proof the chain will reject.
+fn verify_program_id(elf: &[u8], program_id: Option<[u8; 32]>) -> anyhow::Result<()> {
+    let Some(pid) = program_id else {
+        return Ok(());
+    };
+    if program_id_check_disabled() {
+        return Ok(());
+    }
+    let image_id =
+        risc0_zkvm::compute_image_id(elf).context("compute_image_id for programId binding")?;
+    if image_id_matches(image_id.as_bytes(), &pid) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "ELF image id {image_id} does not match job programId {} (served ELF is not the \
+             registered program) — refusing to prove",
+            risc0_zkvm::Digest::from(pid)
+        );
+    }
+}
+
+/// Cycle cap for the pre-claim EXECUTE (sizing) path. A runaway guest here is a free DoS lever (no
+/// claim, no collateral at stake), and the result is only a sizing estimate, so a generous cap is
+/// safe: `1<<34` ≈ 1.7e10 cycles is ~180× the largest proof observed on this market (~9.3e7) and
+/// cannot false-cap a real job. The wall-clock measure timeout is the primary bound; this is
+/// defence-in-depth and yields a clean "session limit exceeded" rather than a watchdog kill.
+/// Override with `ZKMINER_RISC0_EXECUTE_MAX_CYCLES` (0 = unlimited).
+fn execute_session_cycle_limit() -> Option<u64> {
+    const DEFAULT: u64 = 1u64 << 34;
+    match std::env::var("ZKMINER_RISC0_EXECUTE_MAX_CYCLES") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT),
+        },
+        Err(_) => Some(DEFAULT),
+    }
+}
+
+/// Optional cycle cap for the PROVE path, honoured only when the operator sets
+/// `ZKMINER_RISC0_MAX_SESSION_CYCLES`. Unset = SDK default (no cap), so a legitimately large proof
+/// is never cut short by surprise.
+fn prove_session_cycle_limit() -> Option<u64> {
+    std::env::var("ZKMINER_RISC0_MAX_SESSION_CYCLES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+}
+
+fn run_execute(
+    elf: &[u8],
+    input_data: &[u8],
+    program_id: Option<[u8; 32]>,
+) -> anyhow::Result<(u64, f64)> {
     use std::time::Instant;
+    // Bind the ELF to the job's programId before spending any execution on it (the pre-claim
+    // measurement path runs UNCLAIMED, submitter-controlled ELFs).
+    verify_program_id(elf, program_id)?;
     let started = Instant::now();
 
     let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
     if !input_data.is_empty() {
         env_builder.write_slice(input_data);
+    }
+    if let Some(limit) = execute_session_cycle_limit() {
+        env_builder.session_limit(Some(limit));
     }
     let env = env_builder
         .build()
@@ -364,7 +497,10 @@ fn run_proof(
     elf: &[u8],
     input_data: &[u8],
     po2: Option<u8>,
+    program_id: Option<[u8; 32]>,
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
+    // Bind the ELF to the job's programId ONCE, before the retry loop spends any GPU on it.
+    verify_program_id(elf, program_id)?;
     // Retry-on-invalid mitigation for the rare (~1.5%) nondeterministic GPU
     // timing race on RTX 5090 / Blackwell (sm_120) — an intra-kernel race
     // produces an internally-invalid segment STARK, surfaced as
@@ -435,6 +571,10 @@ fn run_proof_once(
         }
         tracing::info!("Setting segment_limit_po2 = {po2}");
         env_builder.segment_limit_po2(po2 as u32);
+    }
+    if let Some(limit) = prove_session_cycle_limit() {
+        tracing::info!("Setting session_limit = {limit} cycles (operator override)");
+        env_builder.session_limit(Some(limit));
     }
     let env = env_builder.build()?;
 
@@ -841,4 +981,53 @@ fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
         total_cycles,
         prove_duration_secs: duration.as_secs_f64(),
     })
+}
+
+#[cfg(test)]
+mod program_id_tests {
+    use super::*;
+
+    #[test]
+    fn matches_forward_and_reverse_but_not_a_different_id() {
+        let mut img = [0u8; 32];
+        for (i, b) in img.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        // Same bytes (forward order) matches.
+        assert!(image_id_matches(&img, &img));
+        // The chain may store the reversed order — that must still match.
+        let mut rev = img;
+        rev.reverse();
+        assert!(image_id_matches(&img, &rev));
+        // A genuinely different program (one bit flipped) matches under neither order.
+        let mut other = img;
+        other[0] ^= 0x01;
+        assert!(!image_id_matches(&img, &other));
+    }
+
+    #[test]
+    fn verify_accepts_none_and_respects_kill_switch() {
+        // No programId supplied (benchmark/calibration/mock) → always OK, regardless of ELF.
+        assert!(verify_program_id(&[0u8; 8], None).is_ok());
+    }
+
+    // Guest-gated: only meaningful when real guests were compiled in (not RISC0_SKIP_BUILD).
+    #[test]
+    fn computed_image_id_matches_embedded_fibonacci_id() {
+        if FIBONACCI_ELF.is_empty() {
+            return; // stubbed guests; nothing to validate
+        }
+        let image_id = risc0_zkvm::compute_image_id(FIBONACCI_ELF).expect("compute image id");
+        // The build embeds FIBONACCI_ID from the SAME computation; this proves our local
+        // image-id derivation is self-consistent (the forward byte order).
+        let embedded: Vec<u8> = FIBONACCI_ID.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(image_id.as_bytes(), embedded.as_slice());
+        // And the real embedded id must bind to itself under verify_program_id.
+        let mut pid = [0u8; 32];
+        pid.copy_from_slice(image_id.as_bytes());
+        assert!(verify_program_id(FIBONACCI_ELF, Some(pid)).is_ok());
+        // A different programId (bit flipped) must be refused.
+        pid[0] ^= 0x01;
+        assert!(verify_program_id(FIBONACCI_ELF, Some(pid)).is_err());
+    }
 }

@@ -59,9 +59,10 @@ pub struct ChainConfig {
     /// (Phase-2 "journal predicate"). Fulfilling such a job with a proof whose
     /// public values don't satisfy the predicate reverts `JournalMismatch`
     /// AFTER the lock — risking a collateral slash on timeout — because zkminer
-    /// does not yet simulate the predicate before claiming. None = built-in
-    /// default (TRUE: claim them, for testnet testing). Set `false` to skip
-    /// predicate jobs entirely once you've decided the final policy.
+    /// does not yet simulate the predicate before claiming. A submitter can set
+    /// an unsatisfiable predicate deliberately to bait a slash, so None = built-in
+    /// default (FALSE: skip them) [security H2]. Set `true` only on a deployment
+    /// where you accept the risk (e.g. testnet testing of the predicate feature).
     #[serde(default)]
     pub claim_predicate_jobs: Option<bool>,
 }

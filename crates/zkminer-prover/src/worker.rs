@@ -10,6 +10,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Environment-variable names that must NEVER be passed to a prover worker or the sp1-gpu-server it
+/// forks (they carry the operator's signing secret). Workers prove; they never sign a chain tx.
+/// Matches the default `ZKMINER_PRIVATE_KEY` plus common secret-bearing patterns; an operator using
+/// a non-standard `key_env_var` that matches none of these should add it here. [security I2]
+fn is_secret_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.contains("PRIVATE_KEY")
+        || upper.contains("SECRET_KEY")
+        || upper == "MNEMONIC"
+        || upper.ends_with("_MNEMONIC")
+        || upper.contains("SEED_PHRASE")
+        || upper == "ZKMINER_KEYSTORE_PASSWORD"
+}
+
 /// When true, worker stderr forwarding is suppressed (TUI mode).
 static SUPPRESS_WORKER_STDERR: AtomicBool = AtomicBool::new(false);
 
@@ -444,6 +458,24 @@ impl WorkerHandle {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // [security I2] Do NOT let a worker (or the third-party sp1-gpu-server it forks) inherit the
+        // operator's funded signing key. The miner process holds ZKMINER_PRIVATE_KEY in its env;
+        // workers only prove and never sign a chain tx, so the key is pure attack surface there (a
+        // compromise of a prover, the SP1 SDK's CGO code, or a crafted guest should not hand over the
+        // wallet). We rebuild the child env from ours MINUS secret-bearing names, rather than
+        // `env_clear()` alone, so PATH / HOME / LD_LIBRARY_PATH / CUDA_* and everything the worker
+        // genuinely needs are preserved. The dispatcher's explicit overrides are applied last.
+        cmd.env_clear();
+        for (k, v) in std::env::vars_os() {
+            let is_secret = k
+                .to_str()
+                .map(is_secret_env_name)
+                .unwrap_or(false);
+            if !is_secret {
+                cmd.env(k, v);
+            }
+        }
 
         for (k, v) in env_overrides {
             cmd.env(k, v);
@@ -1300,9 +1332,39 @@ fn reap_within(child: &mut Child, budget: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{comm_from_stat, live_group_members, parse_stat_state_pgrp};
+    use super::{comm_from_stat, is_secret_env_name, live_group_members, parse_stat_state_pgrp};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    #[test]
+    fn secret_env_names_are_filtered_but_operational_ones_pass() {
+        // Must be stripped from a worker's environment.
+        for s in [
+            "ZKMINER_PRIVATE_KEY",
+            "zkminer_private_key",
+            "PRIVATE_KEY",
+            "ETH_PRIVATE_KEY",
+            "SOME_SECRET_KEY",
+            "MNEMONIC",
+            "WALLET_MNEMONIC",
+            "ZKMINER_KEYSTORE_PASSWORD",
+        ] {
+            assert!(is_secret_env_name(s), "{s} should be treated as secret");
+        }
+        // Must be preserved — the worker needs these.
+        for s in [
+            "PATH",
+            "HOME",
+            "LD_LIBRARY_PATH",
+            "CUDA_VISIBLE_DEVICES",
+            "CUDA_DEVICE_ORDER",
+            "ZKMINER_CUDA_VRAM_BYTES",
+            "NVCC",
+            "TMPDIR",
+        ] {
+            assert!(!is_secret_env_name(s), "{s} must be preserved");
+        }
+    }
 
     /// A throwaway `/proc`-shaped tree. Removed on drop.
     struct FakeProc(PathBuf);

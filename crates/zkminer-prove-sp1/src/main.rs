@@ -13,12 +13,104 @@ use anyhow::Result;
 type CudaPk = <sp1_sdk::blocking::CudaProver as sp1_sdk::blocking::Prover>::ProvingKey;
 
 /// Hash an ELF into a stable cache key (the proving key depends only on the program).
-fn elf_hash(elf: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    elf.hash(&mut h);
-    h.finish()
+///
+/// Uses SHA-256, not a 64-bit `DefaultHasher`: the key selects a GPU proving key that is reused
+/// WITHOUT re-checking the ELF, so a 64-bit digest let a submitter craft two distinct programs with
+/// the same key and make the worker prove program B under program A's key (a wrong proof). A
+/// collision-resistant 256-bit digest removes that.
+fn elf_hash(elf: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(elf);
+    h.finalize().into()
 }
+
+/// Largest number of distinct proving keys the worker keeps resident. Each entry is a large
+/// GPU-resident key, so without a bound the cache grows O(distinct ELFs a submitter sends) in host
+/// RAM and VRAM. LRU-evicted beyond this. Override with `ZKMINER_SP1_PK_CACHE_MAX`.
+fn pk_cache_capacity() -> usize {
+    std::env::var("ZKMINER_SP1_PK_CACHE_MAX")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(4)
+}
+
+/// Drop a GPU-resident proving key safely. Dropping a `CudaPk` performs async teardown of the
+/// `sp1-gpu-server` that needs a tokio runtime context (see the shutdown path); without one the Drop
+/// impl panics. Evictions are rare, so a short-lived runtime per eviction is acceptable.
+fn drop_pk(pk: CudaPk) {
+    match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt.block_on(async move {
+            drop(pk);
+        }),
+        Err(e) => {
+            tracing::warn!("No tokio runtime to free an evicted SP1 proving key ({e}); leaking it");
+            std::mem::forget(pk);
+        }
+    }
+}
+
+/// LRU map bounded by capacity. Generic over the value so the eviction-order logic is unit-testable
+/// without a real (unconstructible) `CudaPk`. `insert` returns the values it evicted so the caller
+/// can drop them in whatever context they require (for `CudaPk`, inside a tokio runtime).
+struct LruCache<V> {
+    map: HashMap<[u8; 32], V>,
+    order: std::collections::VecDeque<[u8; 32]>, // front = least-recently-used
+    cap: usize,
+}
+
+impl<V> LruCache<V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    fn contains(&self, key: &[u8; 32]) -> bool {
+        self.map.contains_key(key)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Mark `key` most-recently-used (call on a cache hit).
+    fn touch(&mut self, key: &[u8; 32]) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            let k = self.order.remove(pos).expect("position just found");
+            self.order.push_back(k);
+        }
+    }
+
+    fn get(&self, key: &[u8; 32]) -> Option<&V> {
+        self.map.get(key)
+    }
+
+    /// Insert `value`, evicting least-recently-used entries until under capacity. Returns evicted
+    /// values (usually zero or one).
+    #[must_use = "evicted proving keys must be dropped in a runtime context via drop_pk"]
+    fn insert(&mut self, key: [u8; 32], value: V) -> Vec<V> {
+        let mut evicted = Vec::new();
+        while self.map.len() >= self.cap {
+            match self.order.pop_front() {
+                Some(old) => {
+                    if let Some(v) = self.map.remove(&old) {
+                        evicted.push(v);
+                    }
+                }
+                None => break,
+            }
+        }
+        self.map.insert(key, value);
+        self.order.push_back(key);
+        evicted
+    }
+}
+
+type PkCache = LruCache<CudaPk>;
 use zkminer_prover_protocol::proc::{self, Outcome};
 use zkminer_prover_protocol::types::{
     CUDA_DEVICE_ID_ENV, CUDA_VRAM_AVAILABLE_BYTES_ENV, CUDA_VRAM_BYTES_ENV, HOST_MEM_BUDGET_ENV,
@@ -762,7 +854,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     // reusing it across proofs of the same ELF avoids a costly setup() every call AND
     // stops leaking a fresh GPU-resident key per proof (the old code mem::forget'd the
     // key each time). VRAM is now bounded to O(unique ELFs) instead of O(proofs).
-    let mut pk_cache: HashMap<u64, CudaPk> = HashMap::new();
+    let mut pk_cache = PkCache::new(pk_cache_capacity());
     // Which card this worker drives, chosen by the dispatcher.
     //
     // NOT `CUDA_VISIBLE_DEVICES`. The SDK sets that itself on the `sp1-gpu-server` child from the id
@@ -1086,7 +1178,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 request_id,
                 elf,
                 input_data,
-                po2: _, // SP1 does not use segment sizing
+                po2: _,        // SP1 does not use segment sizing
+                program_id: _, // for SP1 programId is a vkey, not the ELF image — no binding here
             } => {
                 tracing::info!("Proving request {request_id} ({} bytes ELF)", elf.len());
                 // Announce proof START so the miner can move the job from Queued to Proving.
@@ -1257,7 +1350,7 @@ fn detect_gpu() -> (bool, Option<String>) {
 
 fn run_proof(
     prover: &sp1_sdk::blocking::CudaProver,
-    pk_cache: &mut HashMap<u64, CudaPk>,
+    pk_cache: &mut PkCache,
     elf: &[u8],
     input_data: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
@@ -1282,13 +1375,19 @@ fn run_proof(
     // program (not the input), so it's cached and reused across proofs — no per-proof
     // setup() and no per-proof GPU-key leak. See `pk_cache` in run_worker_loop.
     let key = elf_hash(elf);
-    if let std::collections::hash_map::Entry::Vacant(e) = pk_cache.entry(key) {
+    if pk_cache.contains(&key) {
+        pk_cache.touch(&key);
+    } else {
         let pk = prover
             .setup(Elf::from(elf))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        e.insert(pk);
+        // LRU-evict to bound host RAM + VRAM; free each evicted key's GPU memory in a runtime.
+        for evicted in pk_cache.insert(key, pk) {
+            tracing::info!("Evicting a cached SP1 proving key (cap {})", pk_cache_capacity());
+            drop_pk(evicted);
+        }
     }
-    let pk = pk_cache.get(&key).expect("pk was just inserted");
+    let pk = pk_cache.get(&key).expect("pk was just inserted or touched");
 
     // Generate Groth16 proof for on-chain verification.
     // The SP1 on-chain verifier expects: vkey_hash[0..4] || encoded_groth16_proof
@@ -2063,5 +2162,60 @@ mod pin_tests {
             "the SP1 pin moved: re-measure and update the sizing mirror in \
              zkminer_prover_protocol::types, then update this test"
         );
+    }
+}
+
+#[cfg(test)]
+mod pk_cache_tests {
+    use super::*;
+
+    fn k(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    #[test]
+    fn elf_hash_is_deterministic_and_collision_resistant() {
+        // Deterministic.
+        assert_eq!(elf_hash(b"program-a"), elf_hash(b"program-a"));
+        // Distinct programs -> distinct 256-bit keys (no 64-bit truncation).
+        assert_ne!(elf_hash(b"program-a"), elf_hash(b"program-b"));
+        // A one-byte change changes the key.
+        assert_ne!(elf_hash(b"program-a"), elf_hash(b"program-A"));
+        assert_eq!(elf_hash(b"").len(), 32);
+    }
+
+    #[test]
+    fn lru_evicts_least_recently_used() {
+        let mut c: LruCache<u32> = LruCache::new(2);
+        assert!(c.insert(k(1), 1).is_empty());
+        assert!(c.insert(k(2), 2).is_empty());
+        // Touch key 1 so key 2 becomes least-recently-used.
+        assert!(c.contains(&k(1)));
+        c.touch(&k(1));
+        // Inserting a third evicts key 2 (the LRU), not key 1.
+        let evicted = c.insert(k(3), 3);
+        assert_eq!(evicted, vec![2]);
+        assert!(c.contains(&k(1)));
+        assert!(!c.contains(&k(2)));
+        assert!(c.contains(&k(3)));
+    }
+
+    #[test]
+    fn lru_capacity_one_holds_a_single_entry() {
+        let mut c: LruCache<u32> = LruCache::new(1);
+        assert!(c.insert(k(1), 10).is_empty());
+        let evicted = c.insert(k(2), 20);
+        assert_eq!(evicted, vec![10]);
+        assert_eq!(c.get(&k(2)), Some(&20));
+        assert!(!c.contains(&k(1)));
+    }
+
+    #[test]
+    fn lru_cap_floored_at_one() {
+        // A zero capacity must not mean "evict forever / never hold"; it is floored to 1.
+        let mut c: LruCache<u32> = LruCache::new(0);
+        let evicted = c.insert(k(1), 1);
+        assert!(evicted.is_empty());
+        assert!(c.contains(&k(1)));
     }
 }

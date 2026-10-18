@@ -238,10 +238,12 @@ pub struct RuntimeSettings {
     pub token_price_usd: f64,
     pub gas_cost_usd: f64,
     /// Whether to claim jobs carrying a non-zero `expectedJournalHash` (Phase-2
-    /// journal predicate). Default true (claim them). Set false to skip — a
-    /// predicate job whose committed journal our proof can't reproduce reverts
-    /// `JournalMismatch` at fulfill and risks a collateral slash on timeout,
-    /// and zkminer does not yet simulate the predicate before claiming.
+    /// journal predicate). Default FALSE (skip them). A submitter can set an
+    /// unsatisfiable `expectedJournalHash`; our proof then reverts `JournalMismatch`
+    /// at fulfill and risks a collateral slash on timeout, and zkminer does not yet
+    /// simulate the predicate before claiming (reproducing the on-chain
+    /// `JOURNAL_PREDICATE_DOMAIN_V1` predicate is required first). Opt in only on a
+    /// deployment where you accept that risk. [security H2]
     pub claim_predicate_jobs: bool,
 }
 
@@ -262,7 +264,7 @@ impl Default for RuntimeSettings {
             deadline_safety_margin: 1.5,
             token_price_usd: 0.80,
             gas_cost_usd: 0.01,
-            claim_predicate_jobs: true,
+            claim_predicate_jobs: false,
         }
     }
 }

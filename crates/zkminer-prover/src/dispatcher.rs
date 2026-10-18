@@ -2968,6 +2968,7 @@ impl WorkerPool {
             &mut used,
             None,
             None,
+            None, // program_id: convenience path (tests/benchmark) has no on-chain binding
         )
     }
 
@@ -3004,6 +3005,10 @@ impl WorkerPool {
         elf: &[u8],
         input_data: &[u8],
         timeout: Option<Duration>,
+        // The job's on-chain programId; the risc0 worker refuses to size (execute) an ELF whose
+        // image id does not match, so the zero-cost pre-claim measurement path cannot be driven with
+        // an ELF unrelated to the registered program.
+        program_id: Option<[u8; 32]>,
     ) -> anyhow::Result<u64> {
         let keys = self.keys_for_prefix(backend);
         if keys.is_empty() {
@@ -3059,6 +3064,7 @@ impl WorkerPool {
             request_id,
             elf: elf.to_vec(),
             input_data: input_data.to_vec(),
+            program_id,
         })?;
 
         // Bound it the same way a proof is bounded: the watchdog SIGKILLs the worker if the
@@ -3162,6 +3168,8 @@ impl WorkerPool {
         // exclusions) — the caller cannot know it in advance, and po2 is a
         // per-device property. Consulted only when `po2` is None.
         po2_resolver: Option<&dyn Fn(&str) -> Option<u8>>,
+        // The job's on-chain programId (risc0 image-id binding; see WorkerCommand::Prove).
+        program_id: Option<[u8; 32]>,
     ) -> Result<ProofOutput> {
         let mut all_keys = self.keys_for_prefix(backend);
         if all_keys.is_empty() {
@@ -3255,6 +3263,7 @@ impl WorkerPool {
                 on_progress,
                 abort_at,
                 po2_resolver,
+                program_id,
             );
         }
 
@@ -3321,6 +3330,7 @@ impl WorkerPool {
                             on_progress,
                             abort_at,
                             po2_resolver,
+                            program_id,
                         );
                     }
                 }
@@ -3379,6 +3389,7 @@ impl WorkerPool {
                             on_progress,
                             abort_at,
                             po2_resolver,
+                            program_id,
                         );
                     }
                 }
@@ -4657,6 +4668,10 @@ impl WorkerPool {
         on_progress: Option<Box<dyn Fn(f64, &str) + Send>>,
         abort_at: Option<Instant>,
         po2_resolver: Option<&dyn Fn(&str) -> Option<u8>>,
+        // The job's on-chain programId, forwarded to the worker so a risc0 worker can refuse an ELF
+        // whose image id does not match (see WorkerCommand::Prove). None on the benchmark/calibration
+        // paths and for backends where programId is not the ELF image.
+        program_id: Option<[u8; 32]>,
     ) -> Result<ProofOutput> {
         // Resolve the segment size now that the device is known. An explicit `po2`
         // always wins; otherwise ask the resolver for THIS device. Derived from the
@@ -4920,6 +4935,7 @@ impl WorkerPool {
             elf: elf.to_vec(),
             input_data: input_data.to_vec(),
             po2,
+            program_id,
         }) {
             // Send failed (broken pipe = worker died before receiving the command).
             Self::mark_slot_failed(&mut slot, entry);
@@ -6875,7 +6891,7 @@ mod tests {
         let pool = pool_with_keys(&["risc0:cuda:0", "risc0:cuda:1"]);
         assert!(!pool.has_idle_worker("risc0"));
         let err = pool
-            .execute_cycles("risc0", &[], &[], Some(Duration::from_secs(1)))
+            .execute_cycles("risc0", &[], &[], Some(Duration::from_secs(1)), None)
             .expect_err("no live worker, so nothing can measure");
         assert!(
             format!("{err:#}").contains("busy or not running"),

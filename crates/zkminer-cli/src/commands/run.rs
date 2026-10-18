@@ -465,7 +465,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         s.runtime_settings.token_price_usd = config.prover.token_price_usd;
         s.runtime_settings.gas_cost_usd = config.prover.gas_cost_usd;
         // Default TRUE: claim predicate jobs (so they can be tested on testnet).
-        s.runtime_settings.claim_predicate_jobs = config.chain.claim_predicate_jobs.unwrap_or(true);
+        s.runtime_settings.claim_predicate_jobs = config.chain.claim_predicate_jobs.unwrap_or(false);
 
         s.address = format!("{}", client.address);
         s.connected = true;
@@ -2844,6 +2844,28 @@ async fn miner_brain(
                     continue;
                 }
                 Some(backend) => {
+                    // [security M4] Refuse a job whose window is too short to claim, prove, AND still
+                    // release collateral before the deadline. A submitter can set a tiny
+                    // fulfillmentTimeout (with small declared cycles so the duration estimate looks
+                    // feasible) to bait a claim that then cannot be fulfilled in time → release
+                    // penalty / slash. The floor is the irreducible overhead independent of proof
+                    // size: release margin + one minimum attempt + the backend's fixed setup
+                    // allowance + a buffer for the claim tx itself to mine. (Fresh-job loop only, so
+                    // skipping is free — nothing is on-chain yet.)
+                    let min_deadline_floor = DEADLINE_RELEASE_MARGIN_SECS
+                        + MIN_ATTEMPT_BUDGET_SECS
+                        + fixed_proving_allowance_secs(backend)
+                        + DEADLINE_FULFILL_MARGIN_SECS;
+                    if time_remaining < min_deadline_floor {
+                        tracing::debug!(
+                            "Skipping {}: deadline too short ({}s < {}s floor for {backend}) — \
+                             claiming would risk a release penalty / slash",
+                            short_id(jid),
+                            time_remaining,
+                            min_deadline_floor
+                        );
+                        continue;
+                    }
                     // Snapshot the backend sources ONCE so `available` and `sim_mode`
                     // are computed from a single consistent view (a health flip between
                     // two separate calls could otherwise disagree).
@@ -3037,16 +3059,24 @@ async fn miner_brain(
             // Preference order: the submitter's declaration, then our own MEASUREMENT, then
             // the constant. A measured value beats the constant by ~8x in accuracy; the
             // declaration is preferred only because it is backed by the submitter's bond.
-            let estimated_cycles = if snapshot.expected_cycles > 0 {
-                snapshot.expected_cycles
-            } else if let Some(c) = measured_cycles
+            // [security H3] The submitter's `expectedCycles` is attacker-controlled: declaring a
+            // tiny count behind an ELF that runs billions of cycles makes a job look cheap and
+            // deadline-feasible, so the miner claims (locking collateral) then cannot finish, and
+            // bleeds the release penalty. Our OWN executor measurement is ground truth. So:
+            //   - with a measurement, never size SMALLER than it — take max(declared, measured), so
+            //     an under-declaration cannot shrink the estimate (over-declaration stays
+            //     conservative and is backed by the submitter's bond);
+            //   - with no measurement yet, trust the declaration (first sighting only; the block
+            //     below measures every unmeasured descriptor so the next sighting is protected).
+            let measured_for_descriptor = measured_cycles
                 .lock()
                 .ok()
-                .and_then(|m| m.get(&snapshot.descriptor_hash).copied())
-            {
-                c
-            } else {
-                FALLBACK_ESTIMATED_CYCLES
+                .and_then(|m| m.get(&snapshot.descriptor_hash).copied());
+            let estimated_cycles = match (snapshot.expected_cycles, measured_for_descriptor) {
+                (0, Some(c)) => c,
+                (0, None) => FALLBACK_ESTIMATED_CYCLES,
+                (declared, Some(c)) => declared.max(c),
+                (declared, None) => declared,
             };
 
             // Required collateral: compute from the auction formula.
@@ -3202,7 +3232,16 @@ async fn miner_brain(
             // measurement improves every future decision about the same work. The market
             // recycles a small set of descriptors, so one execution each buys accurate
             // sizing for everything that follows.
-            if !measurable {
+            // [security H3] Measure EVERY descriptor we have not measured yet — including ones the
+            // submitter declared a cycle count for — so a declaration can be validated against
+            // ground truth on the next sighting (see the max() above). Previously a declared job was
+            // never measured, which left the declaration unchecked. Still gated by an idle worker
+            // (inside `measure_cycles`) and deduped by `measuring`, so it adds no load when busy.
+            let already_measured = measured_cycles
+                .lock()
+                .map(|m| m.contains_key(&snapshot.descriptor_hash))
+                .unwrap_or(false);
+            if !already_measured {
                 let dh = snapshot.descriptor_hash;
                 let fresh = measuring.lock().map(|mut m| m.insert(dh)).unwrap_or(false);
                 if fresh {
@@ -3224,6 +3263,17 @@ async fn miner_brain(
                                     short_id(dh)
                                 );
                                 if let Ok(mut m) = cache.lock() {
+                                    // [security I3] Bound this never-evicted map so a stream of
+                                    // distinct submitter descriptors can't grow the long-lived brain
+                                    // task's heap without limit. Each entry costs a full guest
+                                    // execution to create, so this cap is never reached in practice;
+                                    // it is a backstop. Evicting one entry only forces a re-measure.
+                                    const MEASURED_CYCLES_CAP: usize = 100_000;
+                                    if m.len() >= MEASURED_CYCLES_CAP && !m.contains_key(&dh) {
+                                        if let Some(k) = m.keys().next().copied() {
+                                            m.remove(&k);
+                                        }
+                                    }
                                     m.insert(dh, cycles);
                                 }
                             }
@@ -4363,6 +4413,13 @@ async fn process_job_lifecycle(
             let elf_clone = elf.clone();
             let input_clone = input_bytes.clone();
             let backend_str = backend.to_string();
+            // Bind the ELF to the job's programId for risc0 (its programId IS the guest image id), so
+            // the worker refuses an ELF unrelated to the registered program before spending a Groth16
+            // proof on it. Only risc0 (SP1/OpenVM programIds are vkeys), and never a zero/unknown id
+            // (mock mode) — enforcing against zero would reject every legitimate job.
+            let program_id_bytes: Option<[u8; 32]> = (backend_str == "risc0"
+                && program_id != alloy::primitives::B256::ZERO)
+                .then(|| program_id.0);
             let mv = min_vram;
             let excl = excluded.clone();
             // Per-device segment size (po2). Snapshot the inputs here, then build the
@@ -4480,6 +4537,7 @@ async fn process_job_lifecycle(
                     &mut used,
                     abort_at,
                     Some(&po2_for_device),
+                    program_id_bytes,
                 );
                 (r, used)
             })
@@ -4922,7 +4980,16 @@ fn resolve_backend(proof_system_id: alloy::primitives::B256) -> Option<&'static 
     } else if proof_system_id == zkminer_chain::auction::sp1_v1_id() {
         Some("sp1")
     } else if proof_system_id == zkminer_chain::auction::openvm_v1_id() {
-        Some("openvm")
+        // [security M7] The OpenVM worker cannot actually prove — every Prove returns an error — yet
+        // it answers Hello/Capabilities and reports SIMULATED benchmark throughput, so the evaluator
+        // would otherwise find openvm jobs feasible and attractive, claim them, and fail to fulfill
+        // every one → release penalty / slash. Decline openvm jobs entirely until real proving lands.
+        // Opt back in with ZKMINER_ENABLE_OPENVM=1 once the backend can prove.
+        if std::env::var("ZKMINER_ENABLE_OPENVM").ok().as_deref() == Some("1") {
+            Some("openvm")
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -5032,10 +5099,15 @@ async fn measure_cycles(
     let pool = zkminer_prover::engine::worker_pool()
         .ok_or_else(|| anyhow::anyhow!("no worker pool available"))?;
 
+    // Bind the sizing ELF to the programId (risc0 image id), so the zero-cost pre-claim measurement
+    // path cannot be driven with an ELF unrelated to the registered program. Never against a zero id.
+    let program_id_bytes: Option<[u8; 32]> =
+        (program_id != alloy::primitives::B256::ZERO).then(|| program_id.0);
+
     // Blocking: the worker protocol is synchronous. Bounded by the watchdog inside
     // `execute_cycles` so a non-terminating guest cannot wedge a worker forever.
     tokio::task::spawn_blocking(move || {
-        pool.execute_cycles("risc0", &elf, &input, Some(MEASURE_TIMEOUT))
+        pool.execute_cycles("risc0", &elf, &input, Some(MEASURE_TIMEOUT), program_id_bytes)
     })
     .await
     .map_err(|e| anyhow::anyhow!("cycle measurement task panicked: {e}"))?
@@ -5070,6 +5142,31 @@ async fn fetch_or_download_elf(
             ));
         }
     };
+    // [security I1] The registry marks a program Active / Deprecated / Revoked. A non-Active status
+    // (Active is the zero/default variant) means the program author pulled it; proving it wastes GPU
+    // + gas. We WARN by default rather than hard-refuse because the exact enum ordering is not
+    // encoded in the JSON ABI and a wrong guess would refuse legitimate Active programs. Set
+    // ZKMINER_REFUSE_NONACTIVE_PROGRAMS=1 to refuse non-Active programs outright on a deployment
+    // whose status mapping you have confirmed.
+    if info.status != 0 {
+        if std::env::var("ZKMINER_REFUSE_NONACTIVE_PROGRAMS")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            return Err(anyhow::anyhow!(
+                "program {} has non-Active registry status {} — refusing (ZKMINER_REFUSE_NONACTIVE_PROGRAMS=1)",
+                program_id,
+                info.status
+            ));
+        }
+        tracing::warn!(
+            "program {} has non-Active registry status {} (Deprecated/Revoked) — proving anyway; \
+             set ZKMINER_REFUSE_NONACTIVE_PROGRAMS=1 to decline",
+            program_id,
+            info.status
+        );
+    }
     // First trusted URI's content hash — zero means "unspecified", skip verify.
     let expected_content_hash = info
         .storage_uris
@@ -6155,10 +6252,11 @@ mod tests {
             resolve_backend(zkminer_chain::auction::sp1_v1_id()),
             Some("sp1")
         );
-        assert_eq!(
-            resolve_backend(zkminer_chain::auction::openvm_v1_id()),
-            Some("openvm")
-        );
+        // [security M7] OpenVM is declined by default (its worker cannot prove), so it must NOT map
+        // to a claimable backend unless explicitly opted in via ZKMINER_ENABLE_OPENVM.
+        if std::env::var("ZKMINER_ENABLE_OPENVM").ok().as_deref() != Some("1") {
+            assert_eq!(resolve_backend(zkminer_chain::auction::openvm_v1_id()), None);
+        }
     }
 
     #[test]

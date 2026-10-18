@@ -78,11 +78,7 @@ pub struct ChainClient {
     /// Cache of ProgramRegistry metadata keyed by programId. Registered program
     /// metadata is immutable, so once fetched we never re-query the registry for
     /// the same program. Shared across clones.
-    pub(crate) program_info_cache: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<alloy::primitives::B256, crate::programs::ProgramInfo>,
-        >,
-    >,
+    pub(crate) program_info_cache: Arc<std::sync::Mutex<ProgramInfoCache>>,
     /// Counts every JSON-RPC request sent to the endpoint (total + rolling minute).
     rpc_meter: Arc<crate::rpc_meter::RpcMeter>,
     /// [RPC #2] jobId → submitting tx hash, written by the monitor as it parses
@@ -94,6 +90,41 @@ pub struct ChainClient {
     /// from a monotonic index and reopen does not re-emit), so the cached tx IS the
     /// tx the scan would find. FIFO-bounded; a miss just uses the scan fallback.
     submit_tx_cache: Arc<std::sync::Mutex<SubmitTxCache>>,
+}
+
+/// FIFO-bounded programId → ProgramInfo cache (see `ChainClient::program_info_cache`). Registered
+/// metadata is immutable, so a bounded cache only ever drops a cold entry (re-fetched on demand);
+/// the bound stops a submitter who registers unboundedly many distinct programIds from growing the
+/// long-lived client's heap without limit.
+#[derive(Default)]
+pub(crate) struct ProgramInfoCache {
+    map: std::collections::HashMap<alloy::primitives::B256, crate::programs::ProgramInfo>,
+    order: std::collections::VecDeque<alloy::primitives::B256>,
+}
+
+/// Bound on the program-info cache: comfortably covers the distinct programs a miner works with,
+/// while capping heap growth under a flood of distinct submitter-chosen programIds.
+const PROGRAM_INFO_CACHE_CAP: usize = 4096;
+
+impl ProgramInfoCache {
+    pub(crate) fn get(&self, id: &alloy::primitives::B256) -> Option<crate::programs::ProgramInfo> {
+        self.map.get(id).cloned()
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        id: alloy::primitives::B256,
+        info: crate::programs::ProgramInfo,
+    ) {
+        if self.map.insert(id, info).is_none() {
+            self.order.push_back(id);
+            while self.order.len() > PROGRAM_INFO_CACHE_CAP {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+    }
 }
 
 /// FIFO-bounded jobId → submit-tx-hash map (see `ChainClient::submit_tx_cache`).
@@ -285,7 +316,7 @@ impl ChainClient {
             fulfill_gas_limit,
             tx_lock: Arc::new(tokio::sync::Mutex::new(())),
             head_block: Arc::new(AtomicU64::new(0)),
-            program_info_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            program_info_cache: Arc::new(std::sync::Mutex::new(ProgramInfoCache::default())),
             submit_tx_cache: Arc::new(std::sync::Mutex::new(SubmitTxCache::default())),
             nonce_mgr: Arc::new(crate::nonce::NonceManager::new()),
             abandoned_fulfill_nonces: Arc::new(std::sync::Mutex::new(Default::default())),
