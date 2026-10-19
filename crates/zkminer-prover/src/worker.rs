@@ -24,6 +24,25 @@ fn is_secret_env_name(name: &str) -> bool {
         || upper == "ZKMINER_KEYSTORE_PASSWORD"
 }
 
+/// Sanitize a line of worker stderr before it reaches the operator's terminal or log file.
+///
+/// [security R3] Since the H1 fix routes a guest's stdout onto the worker's stderr (fd 1 → 2), a
+/// malicious guest ELF can emit arbitrary bytes here. Forwarding them verbatim would let it inject
+/// ANSI/terminal escape sequences into the operator's console or forge log lines (via carriage
+/// returns). Strip control characters (keep tab) and cap the length so neither is possible.
+fn sanitize_worker_line(line: &str) -> String {
+    const MAX: usize = 2048;
+    let mut out: String = line
+        .chars()
+        .filter(|&c| c == '\t' || !c.is_control())
+        .take(MAX)
+        .collect();
+    if line.chars().count() > MAX {
+        out.push_str("…[truncated]");
+    }
+    out
+}
+
 /// When true, worker stderr forwarding is suppressed (TUI mode).
 static SUPPRESS_WORKER_STDERR: AtomicBool = AtomicBool::new(false);
 
@@ -595,6 +614,10 @@ impl WorkerHandle {
                     for line in reader.lines() {
                         match line {
                             Ok(line) if !line.is_empty() => {
+                                // [security R3] A guest's stdout is dup2'd onto worker stderr (H1), so
+                                // this line may be fully attacker-controlled. Strip control/escape
+                                // bytes and bound its length before it can reach the operator console.
+                                let line = sanitize_worker_line(&line);
                                 // DIAGNOSTIC: surface WITSUM / EVALCHECK_DIFF lines directly to stderr
                                 // (the test harness installs no tracing subscriber, so warn is dropped).
                                 if line.starts_with("[WITSUM]") || line.starts_with("[EVALCHECK_DIFF]") {
@@ -1332,9 +1355,26 @@ fn reap_within(child: &mut Child, budget: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{comm_from_stat, is_secret_env_name, live_group_members, parse_stat_state_pgrp};
+    use super::{
+        comm_from_stat, is_secret_env_name, live_group_members, parse_stat_state_pgrp,
+        sanitize_worker_line,
+    };
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    #[test]
+    fn worker_line_sanitizer_strips_escapes_and_bounds_length() {
+        // ANSI escape + carriage-return log-forging are removed; printable text + tab survive.
+        let evil = "ok\x1b[2J\x1b[31mred\rFAKE: all good\ttab";
+        let clean = sanitize_worker_line(evil);
+        assert!(!clean.contains('\x1b'), "escape must be stripped");
+        assert!(!clean.contains('\r'), "carriage return must be stripped");
+        assert!(clean.contains("ok") && clean.contains("red") && clean.contains('\t'));
+        // Length is bounded.
+        let huge = "A".repeat(10_000);
+        let out = sanitize_worker_line(&huge);
+        assert!(out.len() < 10_000 && out.ends_with("…[truncated]"));
+    }
 
     #[test]
     fn secret_env_names_are_filtered_but_operational_ones_pass() {

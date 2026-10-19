@@ -1178,8 +1178,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 request_id,
                 elf,
                 input_data,
-                po2: _,        // SP1 does not use segment sizing
-                program_id: _, // for SP1 programId is a vkey, not the ELF image — no binding here
+                po2: _, // SP1 does not use segment sizing
+                program_id,
             } => {
                 tracing::info!("Proving request {request_id} ({} bytes ELF)", elf.len());
                 // Announce proof START so the miner can move the job from Queued to Proving.
@@ -1206,7 +1206,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         continue;
                     }
                 };
-                match run_proof(prover_for_proof, &mut pk_cache, &elf, &input_data) {
+                match run_proof(prover_for_proof, &mut pk_cache, &elf, &input_data, program_id) {
                     Ok((journal, seal, duration_secs, cycles)) => {
                         let resp = WorkerResponse::ProofResult {
                             request_id,
@@ -1225,6 +1225,9 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             ErrorKind::ResourceExhausted
                         } else if msg.contains("serialize") || msg.contains("bincode") {
                             ErrorKind::Internal
+                        } else if msg.contains("does not match job programId") {
+                            // Wrong ELF for the job's vkey — a bad job, not a sick worker.
+                            ErrorKind::InvalidInput
                         } else {
                             ErrorKind::ProofFailed
                         };
@@ -1353,8 +1356,10 @@ fn run_proof(
     pk_cache: &mut PkCache,
     elf: &[u8],
     input_data: &[u8],
+    program_id: Option<[u8; 32]>,
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
-    use sp1_sdk::blocking::{Elf, ProveRequest, Prover, SP1Stdin};
+    use sp1_sdk::blocking::{Elf, Prover, ProveRequest, SP1Stdin};
+    use sp1_sdk::HashableKey;
 
     let mut stdin = SP1Stdin::new();
     // NOTE: this pushes the ENTIRE input as ONE SP1 input element (SP1Stdin.buffer
@@ -1388,6 +1393,31 @@ fn run_proof(
         }
     }
     let pk = pk_cache.get(&key).expect("pk was just inserted or touched");
+
+    // [security #05] Bind the served ELF to the job's on-chain programId. For SP1 the programId IS
+    // the verifying-key hash, so an ELF whose vkey hash != programId can never produce a proof the
+    // on-chain SP1 verifier accepts — proving it just burns a full GPU proof + fulfill gas on a
+    // guaranteed revert. Reject BEFORE proving. The exact byte order of the on-chain programId vs
+    // SP1's vkey hash is deployment-defined, so accept EITHER order (a wrong ELF matches neither; a
+    // legit one never false-rejects). Default-on; ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK=1 disables.
+    if let Some(pid) = program_id {
+        let skip = matches!(
+            std::env::var("ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        );
+        if !skip {
+            let vk_hash = pk.verifying_key().bytes32_raw();
+            let matches = vk_hash == pid || vk_hash.iter().rev().copied().eq(pid.iter().copied());
+            if !matches {
+                anyhow::bail!(
+                    "ELF vkey hash does not match job programId (served ELF is not the registered \
+                     program) — refusing to prove"
+                );
+            }
+        }
+    }
 
     // Generate Groth16 proof for on-chain verification.
     // The SP1 on-chain verifier expects: vkey_hash[0..4] || encoded_groth16_proof

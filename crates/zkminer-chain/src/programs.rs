@@ -13,6 +13,23 @@ use anyhow::{bail, Context, Result};
 use crate::client::ChainClient;
 use zkminer_contracts::bindings::IProgramRegistry;
 
+/// Strip control/escape bytes (keep tab) and cap length before logging a submitter-controlled string
+/// (storage URIs, program names). [security #10/#19] Otherwise a crafted URI/name with ANSI escapes
+/// could inject into the operator's terminal or forge log lines (via carriage returns) when the log
+/// is viewed.
+pub fn sanitize_log(s: &str) -> String {
+    const MAX: usize = 512;
+    let mut out: String = s
+        .chars()
+        .filter(|&c| c == '\t' || !c.is_control())
+        .take(MAX)
+        .collect();
+    if s.chars().count() > MAX {
+        out.push('…');
+    }
+    out
+}
+
 /// Per-request connect + total timeout for an ELF download. A submitter endpoint that trickles bytes
 /// or never closes must not pin a socket — and, on the pre-claim measurement path, a worker slot —
 /// indefinitely. Overridable with `ZKMINER_ELF_FETCH_TIMEOUT_SECS`.
@@ -88,10 +105,50 @@ fn validate_fetch_url(url: &reqwest::Url) -> Result<()> {
         .to_socket_addrs()
         .with_context(|| format!("resolving ELF host '{host}'"))?
         .collect();
+    reject_blocked_addrs(host, &addrs)
+}
+
+/// Async wrapper around [`validate_fetch_url`] that runs the BLOCKING DNS resolution off the tokio
+/// runtime, bounded by a timeout. [security R4] `validate_fetch_url` calls `to_socket_addrs`, which
+/// blocks the calling thread; invoked directly from the async `download_elf` it would stall a
+/// runtime worker (a submitter hostname with slow/hanging DNS could wedge the executor, and the
+/// reqwest download timeout does not cover resolution, which happens before the request). The scheme
+/// check stays inline (cheap); only the resolution is offloaded.
+async fn validate_fetch_url_async(url: &reqwest::Url) -> Result<()> {
+    match url.scheme() {
+        "http" | "https" => {}
+        other => bail!("refusing ELF fetch with non-http(s) scheme '{other}': {url}"),
+    }
+    if allow_private_elf_hosts() {
+        return Ok(());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("ELF URL has no host: {url}"))?
+        .to_string();
+    let port = url.port_or_known_default().unwrap_or(443);
+    let host_for_dns = host.clone();
+    let addrs: Vec<std::net::SocketAddr> = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            (host_for_dns.as_str(), port)
+                .to_socket_addrs()
+                .map(|it| it.collect::<Vec<_>>())
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("DNS resolution for ELF host '{host}' timed out"))?
+    .map_err(|e| anyhow::anyhow!("DNS resolution task failed for '{host}': {e}"))?
+    .with_context(|| format!("resolving ELF host '{host}'"))?;
+    reject_blocked_addrs(&host, &addrs)
+}
+
+/// Shared IP-range check used by both the sync and async URL validators.
+fn reject_blocked_addrs(host: &str, addrs: &[std::net::SocketAddr]) -> Result<()> {
     if addrs.is_empty() {
         bail!("ELF host '{host}' did not resolve");
     }
-    for a in &addrs {
+    for a in addrs {
         if ip_is_blocked(&a.ip()) {
             bail!(
                 "refusing ELF fetch to private/reserved address {} (host '{host}') — set \
@@ -402,12 +459,12 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
         let parsed = match reqwest::Url::parse(&url) {
             Ok(u) => u,
             Err(e) => {
-                tracing::warn!("Skipping unparseable storage URI {url}: {e}");
+                tracing::warn!("Skipping unparseable storage URI {}: {e}", sanitize_log(&url));
                 continue;
             }
         };
-        if let Err(e) = validate_fetch_url(&parsed) {
-            tracing::warn!("Skipping storage URI {url}: {e:#}");
+        if let Err(e) = validate_fetch_url_async(&parsed).await {
+            tracing::warn!("Skipping storage URI {}: {e:#}", sanitize_log(&url));
             continue;
         }
 

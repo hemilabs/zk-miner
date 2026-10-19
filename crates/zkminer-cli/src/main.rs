@@ -102,7 +102,15 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join(".zkminer")
             .join("logs");
-        let file_appender = tracing_appender::rolling::daily(&log_dir, "zkminer.log");
+        // [security #20] Cap log retention so a submitter who floods log-worthy events (bad jobs,
+        // rejected URIs, failed proofs) cannot fill the operator's disk via unbounded daily files.
+        // Keep ~2 weeks of daily logs; fall back to the simple appender if the builder errors.
+        let file_appender = tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("zkminer.log")
+            .max_log_files(14)
+            .build(&log_dir)
+            .unwrap_or_else(|_| tracing_appender::rolling::daily(&log_dir, "zkminer.log"));
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
         _log_guard = Some(guard);
 

@@ -260,6 +260,31 @@ static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 
 const FALLBACK_ESTIMATED_CYCLES: u64 = 34_000_000;
 
+/// Sentinel cycle count for a program the executor could not measure because the guest is too heavy
+/// or non-terminating (timeout / cycle-cap). Large enough that any evaluator sizing on it deems the
+/// job deadline-infeasible (so it is never claimed), while staying well clear of u64 overflow in the
+/// downstream duration math. [security #16]
+const UNMEASURABLE_CYCLES: u64 = 1_000_000_000_000_000; // 1e15
+
+/// Insert a measured cycle count for `program_id`, bounding the map so a flood of distinct programs
+/// cannot grow the long-lived brain task's heap without limit. [security I3] Each real entry costs a
+/// full guest execution, so the cap is a backstop; evicting one entry only forces a re-measure.
+fn insert_measured(
+    cache: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, u64>>>,
+    program_id: alloy::primitives::B256,
+    cycles: u64,
+) {
+    const MEASURED_CYCLES_CAP: usize = 100_000;
+    if let Ok(mut m) = cache.lock() {
+        if m.len() >= MEASURED_CYCLES_CAP && !m.contains_key(&program_id) {
+            if let Some(k) = m.keys().next().copied() {
+                m.remove(&k);
+            }
+        }
+        m.insert(program_id, cycles);
+    }
+}
+
 /// Bound on a single cycle measurement. Execution is far cheaper than proving, but a hostile
 /// or pathological guest must not hold a worker: the watchdog kills it at this point, and a
 /// job we cannot execute inside the budget is one we should not claim either.
@@ -656,6 +681,16 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                         prover_backend: String::new(),
                         estimated_cycles: 0,
                     });
+                    // [security #06] Bound the Open-candidate set. A submitter can post unboundedly
+                    // many jobs and leave them Open; every brain tick reads them all via Multicall3
+                    // over the throttled RPC, so an uncapped list is a slow-RPC-starvation DoS. Drop
+                    // the OLDEST beyond the cap (forward-only arrival order) — a still-relevant job
+                    // reappears via the monitor, and stale ones are status-pruned anyway.
+                    const MAX_OPEN_JOBS: usize = 4096;
+                    if s.open_jobs.len() > MAX_OPEN_JOBS {
+                        let excess = s.open_jobs.len() - MAX_OPEN_JOBS;
+                        s.open_jobs.drain(0..excess);
+                    }
                 }
                 // [RPC #3] Event-driven pruning: a job claimed (by ANYONE — including our
                 // own claim, where this is an idempotent no-op) or cancelled is no longer
@@ -3059,24 +3094,30 @@ async fn miner_brain(
             // Preference order: the submitter's declaration, then our own MEASUREMENT, then
             // the constant. A measured value beats the constant by ~8x in accuracy; the
             // declaration is preferred only because it is backed by the submitter's bond.
-            // [security H3] The submitter's `expectedCycles` is attacker-controlled: declaring a
+            // [security H3 + R2] The submitter's `expectedCycles` is attacker-controlled: declaring a
             // tiny count behind an ELF that runs billions of cycles makes a job look cheap and
             // deadline-feasible, so the miner claims (locking collateral) then cannot finish, and
-            // bleeds the release penalty. Our OWN executor measurement is ground truth. So:
-            //   - with a measurement, never size SMALLER than it — take max(declared, measured), so
-            //     an under-declaration cannot shrink the estimate (over-declaration stays
-            //     conservative and is backed by the submitter's bond);
-            //   - with no measurement yet, trust the declaration (first sighting only; the block
-            //     below measures every unmeasured descriptor so the next sighting is protected).
-            let measured_for_descriptor = measured_cycles
+            // bleeds the release penalty. Defences:
+            //   - key our executor measurement by PROGRAM ID, not descriptor_hash. [R2] The free-form
+            //     `tag` field is in the descriptor hash but not the guest input, so a submitter could
+            //     flood unique-tag jobs — each a never-before-seen descriptor_hash — to make `measured`
+            //     perpetually absent and defeat the clamp. The cycle count is a property of the
+            //     program (and input); keying by programId means one measurement of a program protects
+            //     EVERY tag/job for it.
+            //   - with a measurement, never size SMALLER than it: max(declared, measured).
+            //   - with NO measurement (not yet measured, or a non-risc0 backend we can't measure),
+            //     floor the declaration at FALLBACK_ESTIMATED_CYCLES so a `declared = 1` can't shrink
+            //     the estimate toward zero. (risc0 jobs get a real measurement via the block below;
+            //     the floor is the backstop for the first sighting and for SP1/OpenVM.)
+            let measured_for_program = measured_cycles
                 .lock()
                 .ok()
-                .and_then(|m| m.get(&snapshot.descriptor_hash).copied());
-            let estimated_cycles = match (snapshot.expected_cycles, measured_for_descriptor) {
+                .and_then(|m| m.get(&job.info.program_id).copied());
+            let estimated_cycles = match (snapshot.expected_cycles, measured_for_program) {
                 (0, Some(c)) => c,
                 (0, None) => FALLBACK_ESTIMATED_CYCLES,
                 (declared, Some(c)) => declared.max(c),
-                (declared, None) => declared,
+                (declared, None) => declared.max(FALLBACK_ESTIMATED_CYCLES),
             };
 
             // Required collateral: compute from the auction formula.
@@ -3221,7 +3262,7 @@ async fn miner_brain(
             let measurable = snapshot.expected_cycles > 0
                 || measured_cycles
                     .lock()
-                    .map(|m| m.contains_key(&snapshot.descriptor_hash))
+                    .map(|m| m.contains_key(&job.info.program_id))
                     .unwrap_or(false);
 
             // [cycles] Never measured this descriptor and the submitter did not declare one?
@@ -3232,18 +3273,19 @@ async fn miner_brain(
             // measurement improves every future decision about the same work. The market
             // recycles a small set of descriptors, so one execution each buys accurate
             // sizing for everything that follows.
-            // [security H3] Measure EVERY descriptor we have not measured yet — including ones the
-            // submitter declared a cycle count for — so a declaration can be validated against
-            // ground truth on the next sighting (see the max() above). Previously a declared job was
-            // never measured, which left the declaration unchecked. Still gated by an idle worker
-            // (inside `measure_cycles`) and deduped by `measuring`, so it adds no load when busy.
+            // [security H3/R2] Measure every PROGRAM we have not measured yet, keyed by programId so
+            // a tag-varying flood can't dodge it (see the estimate above). Only risc0 can be measured
+            // here (its executor reports the same cycle count proving does; the SP1/OpenVM workers
+            // decline Execute), so skip the trigger for other backends — they rely on the declared
+            // floor — rather than spawn a measurement that would always fail and churn.
+            let pid = job.info.program_id;
             let already_measured = measured_cycles
                 .lock()
-                .map(|m| m.contains_key(&snapshot.descriptor_hash))
+                .map(|m| m.contains_key(&pid))
                 .unwrap_or(false);
-            if !already_measured {
+            if resolve_backend(snapshot.proof_system_id) == Some("risc0") && !already_measured {
                 let dh = snapshot.descriptor_hash;
-                let fresh = measuring.lock().map(|mut m| m.insert(dh)).unwrap_or(false);
+                let fresh = measuring.lock().map(|mut m| m.insert(pid)).unwrap_or(false);
                 if fresh {
                     let (c2, st2, cache, inflight) = (
                         client.clone(),
@@ -3251,41 +3293,52 @@ async fn miner_brain(
                         measured_cycles.clone(),
                         measuring.clone(),
                     );
-                    let pid = job.info.program_id;
                     tokio::spawn(async move {
                         let outcome = measure_cycles(&c2, &st2, jid, dh, pid).await;
                         match outcome {
                             Ok(cycles) => {
                                 tracing::info!(
-                                    "measured {} cycles for descriptor {} by execution — \
-                                     future jobs with this descriptor will be sized on it",
-                                    cycles,
-                                    short_id(dh)
+                                    "measured {cycles} cycles for program {} by execution — all its \
+                                     jobs will be sized on it",
+                                    short_id(pid)
                                 );
-                                if let Ok(mut m) = cache.lock() {
-                                    // [security I3] Bound this never-evicted map so a stream of
-                                    // distinct submitter descriptors can't grow the long-lived brain
-                                    // task's heap without limit. Each entry costs a full guest
-                                    // execution to create, so this cap is never reached in practice;
-                                    // it is a backstop. Evicting one entry only forces a re-measure.
-                                    const MEASURED_CYCLES_CAP: usize = 100_000;
-                                    if m.len() >= MEASURED_CYCLES_CAP && !m.contains_key(&dh) {
-                                        if let Some(k) = m.keys().next().copied() {
-                                            m.remove(&k);
-                                        }
-                                    }
-                                    m.insert(dh, cycles);
+                                insert_measured(&cache, pid, cycles);
+                            }
+                            Err(e) => {
+                                let msg = format!("{e:#}").to_lowercase();
+                                // [security #16] A guest that EXECUTES but will not terminate within
+                                // the measure budget, or exceeds the execute cycle cap, is a free DoS
+                                // lever if re-measured every brain tick (it wedges a risc0 slot for
+                                // MEASURE_TIMEOUT each time). Negative-cache it as effectively
+                                // unmeasurable → the evaluator sizes it as infeasible (never claimed)
+                                // AND `already_measured` becomes true so it is never re-measured.
+                                // Only for a HARD failure (timeout / cycle cap / execute error); a
+                                // TRANSIENT one (no idle worker, descriptor/ELF fetch error) is left
+                                // uncached so it can retry.
+                                let hard = msg.contains("session limit")
+                                    || msg.contains("cycle")
+                                    || msg.contains("timed out")
+                                    || msg.contains("timeout")
+                                    || msg.contains("deadline")
+                                    || msg.contains("execute:");
+                                if hard {
+                                    tracing::warn!(
+                                        "program {} is unmeasurable (too heavy / non-terminating): {e:#} \
+                                         — marking infeasible so it is not claimed or re-measured",
+                                        short_id(pid)
+                                    );
+                                    insert_measured(&cache, pid, UNMEASURABLE_CYCLES);
+                                } else {
+                                    tracing::debug!(
+                                        "cycle measurement for program {} failed (transient): {e:#}",
+                                        short_id(pid)
+                                    );
                                 }
                             }
-                            Err(e) => tracing::debug!(
-                                "cycle measurement for {} failed: {e:#}",
-                                short_id(dh)
-                            ),
                         }
-                        // Always clear the in-flight marker, so a transient failure does not
-                        // permanently prevent a retry.
+                        // Clear the in-flight marker so a transient failure can retry.
                         if let Ok(mut m) = inflight.lock() {
-                            m.remove(&dh);
+                            m.remove(&pid);
                         }
                     });
                 }
@@ -4413,12 +4466,13 @@ async fn process_job_lifecycle(
             let elf_clone = elf.clone();
             let input_clone = input_bytes.clone();
             let backend_str = backend.to_string();
-            // Bind the ELF to the job's programId for risc0 (its programId IS the guest image id), so
-            // the worker refuses an ELF unrelated to the registered program before spending a Groth16
-            // proof on it. Only risc0 (SP1/OpenVM programIds are vkeys), and never a zero/unknown id
-            // (mock mode) — enforcing against zero would reject every legitimate job.
-            let program_id_bytes: Option<[u8; 32]> = (backend_str == "risc0"
-                && program_id != alloy::primitives::B256::ZERO)
+            // Bind the ELF to the job's programId so a worker refuses an ELF unrelated to the
+            // registered program before spending a Groth16 proof on it. risc0 compares the guest
+            // image id [M1]; SP1 compares the vkey hash [#05]; both ARE the on-chain programId for
+            // their system. OpenVM ignores it (and is declined anyway). Never enforce against a
+            // zero/unknown id (mock mode) — that would reject every legitimate job.
+            let program_id_bytes: Option<[u8; 32]> = (program_id
+                != alloy::primitives::B256::ZERO)
                 .then(|| program_id.0);
             let mv = min_vram;
             let excl = excluded.clone();
@@ -4850,6 +4904,27 @@ async fn process_job_lifecycle(
         }
     };
 
+    // [security #11] A fulfillJob tx carries the full descriptor (incl. submitter-controlled
+    // inputData) and the guest journal as publicValues, under a FIXED gas limit. A submitter who
+    // sizes inputData and/or the journal large enough makes fulfill OOG-revert — wasting the proof
+    // and the fulfill gas, and risking a slash if it recurs near the deadline. If the payload can't
+    // plausibly fit the gas budget, skip the guaranteed-revert fulfill and release now to recover
+    // collateral cheaply. ~16 gas/calldata-byte means the fulfill gas limit bounds total calldata;
+    // the floor below leaves generous room for the fixed descriptor fields and on-chain execution.
+    {
+        let payload_bytes = proof.journal.len() + descriptor.inputData.len() + proof.seal.len();
+        const MAX_FULFILL_PAYLOAD_BYTES: usize = 128 * 1024; // conservative vs the ~5M gas fulfill cap
+        if payload_bytes > MAX_FULFILL_PAYLOAD_BYTES {
+            return Err(anyhow::anyhow!(
+                "fulfill payload for {} is {} bytes (> {} cap) — would OOG-revert under the fulfill \
+                 gas limit; releasing to recover collateral instead of burning gas",
+                short_id(job_id),
+                payload_bytes,
+                MAX_FULFILL_PAYLOAD_BYTES,
+            ));
+        }
+    }
+
     // 11. Fulfill on-chain.
     journal_update(journal, |j| j.mark_fulfilling(job_id));
     {
@@ -5183,7 +5258,7 @@ async fn fetch_or_download_elf(
             LogLevel::Info,
             format!(
                 "Downloading ELF '{}' ({} URIs)",
-                info.name,
+                zkminer_chain::programs::sanitize_log(&info.name),
                 info.storage_uris.len()
             ),
         );

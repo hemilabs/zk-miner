@@ -128,10 +128,20 @@ pub fn compute_collateral(
     // Compute entirely in U256 to avoid overflow, then convert final result
     let product = U256::from(settled_price) * U256::from(effective_collateral_bps as u128);
     // Ceiling division in U256: (n == 0) ? 0 : (n - 1) / d + 1
-    let raw = if product.is_zero() {
-        0u128
+    let raw_u256 = if product.is_zero() {
+        U256::ZERO
     } else {
-        ((product - U256::from(1u128)) / U256::from(10000u128) + U256::from(1u128)).to::<u128>()
+        (product - U256::from(1u128)) / U256::from(10000u128) + U256::from(1u128)
+    };
+    // [security #26] `.to::<u128>()` PANICS on overflow. settled_price and effective_collateral_bps
+    // are both derived from submitter-controlled AuctionConfig fields (uint96 price, lockCollateralBps
+    // cast from uint96), so their product / 10000 can exceed u128 and panic the brain tick. Saturate
+    // to u128::MAX instead: the result then trips the "unaffordable" path below and the job is skipped
+    // (it would revert CollateralOverflow on-chain anyway), rather than crashing the miner.
+    let raw: u128 = if raw_u256 > U256::from(u128::MAX) {
+        u128::MAX
+    } else {
+        raw_u256.to::<u128>()
     };
     // Apply the min-collateral floor FIRST, then the overflow check — mirroring the
     // contract's computeCollateral order (it maxes the floor in, then require()s the
@@ -253,6 +263,19 @@ pub fn estimate_prover_reward(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_collateral_saturates_instead_of_panicking() {
+        // [security #26] Submitter-controlled extremes: a huge settled_price and a large bps whose
+        // product/10000 exceeds u128. Must return the unaffordable sentinel, not panic.
+        let got = compute_collateral(u128::MAX, u64::MAX, 0);
+        assert_eq!(got, u128::MAX, "overflowing collateral must saturate to unaffordable");
+        // A huge min-collateral floor is likewise reported unaffordable, not panicked.
+        assert_eq!(compute_collateral(0, 0, u128::MAX), u128::MAX);
+        // Sanity: a normal case still computes a finite, affordable value.
+        let normal = compute_collateral(1_000_000_000_000_000_000u128, 15000, 0);
+        assert!(normal > 0 && normal < u128::MAX);
+    }
 
     #[test]
     fn test_compute_price_linear() {

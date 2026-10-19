@@ -14,19 +14,43 @@ fn job_fulfilled_topic0() -> B256 {
     )
 }
 
-/// Did this receipt's OWN logs record a `JobFulfilled(jobId, …)` for `job_id`? [security H4]
+/// Did this receipt's OWN logs record a `JobFulfilled(jobId, …)` emitted BY THE ROUTER for `job_id`?
+/// [security H4 + R1]
 ///
 /// Reading the mined transaction's logs is race-free, unlike a follow-up `getJobStatusView` which a
 /// load-balanced RPC can serve from a block BEFORE the tx mined (showing the stale pre-fulfill
 /// Locked state). A submitter-controlled callback that rejects makes `fulfillJob` mine successfully
 /// (receipt.status() == true) WITHOUT fulfilling the job — so the mined receipt alone is not proof
 /// of fulfillment; the emitted event is.
-fn receipt_fulfilled_this_job(receipt: &TransactionReceipt, job_id: B256) -> bool {
-    let topic0 = job_fulfilled_topic0();
-    receipt.inner.logs().iter().any(|log| {
-        let topics = log.topics();
-        topics.first() == Some(&topic0) && topics.get(1) == Some(&job_id)
-    })
+///
+/// [R1] The emitter address MUST be checked: the submitter's callback contract runs INSIDE the
+/// fulfillJob tx and can emit a counterfeit `JobFulfilled(jobId, …)` log from its own address. Only
+/// a log emitted by the HemiProve router (`expected_emitter`) is authentic, so matching on topics
+/// alone would let a rejecting callback forge "fulfilled" and walk the job into a slash.
+fn receipt_fulfilled_this_job(
+    receipt: &TransactionReceipt,
+    job_id: B256,
+    expected_emitter: Address,
+) -> bool {
+    receipt
+        .inner
+        .logs()
+        .iter()
+        .any(|log| log_is_authentic_fulfilled(log.inner.address, log.topics(), job_id, expected_emitter))
+}
+
+/// Pure predicate (testable without a TransactionReceipt): a log is an authentic `JobFulfilled` for
+/// `job_id` iff it was emitted BY the router (`expected_emitter`) with topic0 == JobFulfilled and
+/// topic1 == job_id. The emitter check is what defeats a submitter callback forging the event. [R1]
+fn log_is_authentic_fulfilled(
+    emitter: Address,
+    topics: &[B256],
+    job_id: B256,
+    expected_emitter: Address,
+) -> bool {
+    emitter == expected_emitter
+        && topics.first() == Some(&job_fulfilled_topic0())
+        && topics.get(1) == Some(&job_id)
 }
 use zkminer_contracts::bindings::{
     HashedDescriptor, IHemiProveAux, IHemiProveCore, IHemiProveFulfill, JobDescriptor,
@@ -1225,18 +1249,18 @@ impl ChainClient {
                 Some(receipt) => {
                     if receipt.status() {
                         self.commit_nonce(nonce);
-                        // [security H4] A mined fulfillJob is NOT proof the job reached Fulfilled: a
-                        // submitter's rejecting callback mines successfully yet leaves the job
+                        // [security H4+R1] A mined fulfillJob is NOT proof the job reached Fulfilled:
+                        // a submitter's rejecting callback mines successfully yet leaves the job
                         // unfulfilled (until a 4th rejection force-accepts), so trusting the receipt
                         // would mark a job done that a keeper can still slash. Confirm via the tx's
-                        // own logs (race-free) that a JobFulfilled for THIS job was emitted. If the
-                        // tx emitted logs but none is our JobFulfilled, the fulfill did not take →
-                        // return Err so the caller releases while releaseJob can still land (and if
-                        // the job IS somehow fulfilled, release_and_clean no-ops after its ownership
-                        // check, so a false negative costs only a cosmetic stat, never a double-send).
-                        if receipt_fulfilled_this_job(&receipt, job_id)
-                            || receipt.inner.logs().is_empty()
-                        {
+                        // own logs (race-free) that a JobFulfilled for THIS job was emitted BY THE
+                        // ROUTER (not a forged log from the submitter's callback). A real fulfill
+                        // always emits that event, so treat a tx with no authentic JobFulfilled —
+                        // including the zero-log case [R1/#25] — as NOT fulfilled and return Err so
+                        // the caller releases while releaseJob can still land. If the job IS in fact
+                        // fulfilled, release_and_clean no-ops after its ownership check, so a false
+                        // negative costs only a cosmetic stat, never a double-send.
+                        if receipt_fulfilled_this_job(&receipt, job_id, self.hemi_prove) {
                             tracing::info!(
                                 "Job fulfilled: {} tx: {:?}",
                                 job_id,
@@ -1768,6 +1792,42 @@ impl ChainClient {
             receipt.transaction_hash
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod h4_tests {
+    use super::{job_fulfilled_topic0, log_is_authentic_fulfilled};
+    use alloy::primitives::{Address, B256};
+
+    #[test]
+    fn authentic_only_when_router_emitted() {
+        let router = Address::repeat_byte(0xAA);
+        let attacker = Address::repeat_byte(0xBB);
+        let job = B256::repeat_byte(0x11);
+        let good_topics = vec![job_fulfilled_topic0(), job];
+
+        // Router + correct topics → authentic.
+        assert!(log_is_authentic_fulfilled(router, &good_topics, job, router));
+        // [R1] The forgery: a submitter callback emits an identical log from ITS OWN address.
+        // Must NOT be accepted.
+        assert!(!log_is_authentic_fulfilled(attacker, &good_topics, job, router));
+        // Router but a different jobId → not for us.
+        assert!(!log_is_authentic_fulfilled(
+            router,
+            &[job_fulfilled_topic0(), B256::repeat_byte(0x22)],
+            job,
+            router
+        ));
+        // Router but wrong event (topic0) → not JobFulfilled.
+        assert!(!log_is_authentic_fulfilled(
+            router,
+            &[B256::repeat_byte(0x99), job],
+            job,
+            router
+        ));
+        // No topics at all → not authentic.
+        assert!(!log_is_authentic_fulfilled(router, &[], job, router));
     }
 }
 
