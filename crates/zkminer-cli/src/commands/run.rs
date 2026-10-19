@@ -335,6 +335,54 @@ fn insert_measured(
     }
 }
 
+/// [security C] (backend, program, input) -> consecutive wall-clock measure-timeout count. A wall-clock
+/// watchdog SIGKILL during measurement is AMBIGUOUS (a genuinely-too-heavy guest vs. one merely starved
+/// under transient host load), unlike the executor's clean cycle-cap trip. So it must NOT permanently
+/// blacklist a triple on the first one; we only give up after `MEASURE_TIMEOUT_STRIKES` consecutive
+/// timeouts. A success or a clean cap trip clears the tally. Bounded like the measured cache.
+type MeasureStrikes = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<(u8, alloy::primitives::B256, alloy::primitives::B256), u8>,
+    >,
+>;
+
+/// Consecutive wall-clock measure-timeouts for one (backend, program, input) before it is treated as
+/// unmeasurable. A genuinely-too-heavy guest times out every attempt and converges in this many ticks;
+/// a transiently-starved feasible guest succeeds on a retry well before it. [security C]
+const MEASURE_TIMEOUT_STRIKES: u8 = 3;
+
+/// [security C] Increment and return a triple's consecutive wall-clock measure-timeout count. Bounded
+/// like the measured cache so a flood of distinct timing-out triples cannot grow the brain's heap.
+fn bump_measure_strikes(
+    strikes: &MeasureStrikes,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+) -> u8 {
+    let key = (backend_tag(backend), program_id, input_hash);
+    if let Ok(mut m) = strikes.lock() {
+        let next = m.get(&key).copied().unwrap_or(0).saturating_add(1);
+        bounded_insert(&mut m, key, next, MEASURED_CYCLES_CAP);
+        next
+    } else {
+        // Poisoned: report a single strike so a lock mishap can never wrongly escalate to permanent.
+        1
+    }
+}
+
+/// [security C] Clear a triple's wall-clock timeout tally — on a successful measurement (self-heal) or
+/// once it has been permanently negative-cached (the tally is then moot).
+fn clear_measure_strikes(
+    strikes: &MeasureStrikes,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+) {
+    if let Ok(mut m) = strikes.lock() {
+        m.remove(&(backend_tag(backend), program_id, input_hash));
+    }
+}
+
 /// Record that `descriptor_hash` carries `input_hash`, so a later sighting can resolve its
 /// measurement without re-fetching the descriptor. Bounded by [security I3].
 fn insert_desc_input(
@@ -2261,6 +2309,10 @@ async fn miner_brain(
             std::collections::HashSet<(u8, alloy::primitives::B256, alloy::primitives::B256)>,
         >,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    // [security C] consecutive wall-clock measure-timeout strikes per (backend, program, input), so a
+    // single transient timeout does not permanently blacklist a feasible job (see `measure_cycles`).
+    let measure_strikes: MeasureStrikes =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut queue_model = zkminer_strategy::queue::QueueModel::new();
     let mut queue_last_tick = std::time::Instant::now();
     if !initial_queue_horizon.is_zero() {
@@ -3441,13 +3493,14 @@ async fn miner_brain(
                     })
                     .unwrap_or(false);
                 if fresh {
-                    let (c2, st2, cache, resolver, inflight, inflight_inputs) = (
+                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2) = (
                         client.clone(),
                         state.clone(),
                         measured_cycles.clone(),
                         desc_input_hash.clone(),
                         measuring.clone(),
                         measuring_inputs.clone(),
+                        measure_strikes.clone(),
                     );
                     tokio::spawn(async move {
                         // measure_cycles does all caching: it records desc->input, negative-caches a
@@ -3467,6 +3520,7 @@ async fn miner_brain(
                             &cache,
                             &resolver,
                             &inflight_inputs,
+                            &strikes2,
                         )
                         .await;
                         // Clear the per-descriptor in-flight marker so a transient failure can retry.
@@ -5338,6 +5392,7 @@ async fn measure_cycles(
             std::collections::HashSet<(u8, alloy::primitives::B256, alloy::primitives::B256)>,
         >,
     >,
+    measure_strikes: &MeasureStrikes,
 ) {
     // Cheap availability probe FIRST, for THIS backend. The fetches below can hit the chain, and
     // under load most measurement attempts are skipped for a busy worker — doing the RPC work only to
@@ -5386,29 +5441,33 @@ async fn measure_cycles(
         return;
     }
 
-    // [security E] SP1 has no cheap programId→bytes binding (its vkey needs the minutes-long `setup`),
-    // so the ONLY guarantee that the bytes we MEASURE are the bytes we later PROVE is the registry's
-    // byte binding — an `elf_hash` or a URI `content_hash`. Without one, a flood could evict the
-    // measured ELF from the byte-budget-bounded cache and a prove-time re-download could serve
-    // DIFFERENT (heavier) bytes: the job was sized on the cheap measurement, proves heavy, and blows
-    // its deadline → SLASH. Refuse to size (→ never claim) an unbound SP1 program; negative-cache it
-    // so it is not re-measured. risc0 is EXEMPT: its image-id check binds the bytes to programId at
-    // BOTH measure and prove, so measure-ELF == prove-ELF regardless of content_hash. The residual
-    // (a byte-bound but vkey≠programId decoy) can at worst force a bounded collateral release at prove
-    // time, never a slash. [security E]
+    // [security E] SP1 has no cheap programId->bytes binding (its vkey needs the minutes-long `setup`),
+    // so the ONLY guarantee that the bytes we MEASURE are the bytes we later PROVE is a registry byte
+    // binding that `download_elf` enforces against EVERY served URI. That is `elf_hash` ALONE: it is
+    // passed as `download_elf`'s `expected_hash` on both the measure and the prove path, so whichever
+    // URI wins the first-reachable race is rejected unless it hashes to `elf_hash` — measure-ELF ==
+    // prove-ELF, always. A per-URI `content_hash` does NOT give this: `download_elf` tries URIs in
+    // submitter order and verifies only the ONE it serves against ITS OWN hash (and skips the check
+    // when that hash is zero), so a decoy URI carrying a hash satisfies an `any(content_hash)` test
+    // while a zero-hash sibling URL — attacker-controlled, unverified — is the one downloaded; and two
+    // URIs pinned to DIFFERENT hashes let the attacker serve cheap at measure and heavy at prove by
+    // toggling availability. Both re-open the measure-cheap/prove-heavy SLASH, so require `elf_hash`
+    // specifically; refuse to size (-> never claim) an SP1 program without it and negative-cache it so
+    // it is not re-measured. risc0 is EXEMPT: its image-id binds the whole-ELF bytes to programId at
+    // BOTH measure and prove regardless of the registry hashes. [security E]
     if backend == "sp1" {
         match client.get_program_info(program_id).await {
             Ok(info) => {
-                let bound = info.elf_hash.is_some()
-                    || info
-                        .storage_uris
-                        .iter()
-                        .any(|u| u.content_hash != alloy::primitives::B256::ZERO);
+                // `elf_hash` ONLY — NOT `any(content_hash)`: a per-URI content hash does not guarantee
+                // measure-ELF == prove-ELF (download_elf serves the first reachable URI and checks only
+                // that one). See the comment above. [security E]
+                let bound = info.elf_hash.is_some();
                 if !bound {
                     tracing::warn!(
-                        "measure {} (sp1): registry carries no ELF byte-binding (no elf_hash, no URI \
-                         content hash) — measure-ELF cannot be guaranteed == prove-ELF, so refusing to \
-                         size; marking infeasible so it is never claimed",
+                        "measure {} (sp1): registry carries no program-wide elf_hash — measure-ELF \
+                         cannot be guaranteed == prove-ELF (a per-URI content_hash does not suffice: \
+                         download_elf serves the first reachable URI), refusing to size; marking \
+                         infeasible so it is never claimed",
                         short_id(program_id)
                     );
                     insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
@@ -5475,9 +5534,11 @@ async fn measure_cycles(
     };
 
     // Bind the sizing ELF to the programId so the pre-claim measurement path cannot be driven with an
-    // ELF unrelated to the registered program. Never against a zero id. risc0 checks the image id; the
-    // sp1 worker now checks the vkey hash on its CpuProver (cheap, no gpu-server) — see
-    // `run_execute_sp1`. [security E]
+    // ELF unrelated to the registered program. Never against a zero id. risc0's worker checks the image
+    // id at execute, which binds the bytes to the programId. SP1's Execute arm does NOT check the vkey
+    // (deriving it needs the minutes-long `setup`, which would blow the measure watchdog), so for SP1
+    // this `program_id_bytes` is advisory and the load-bearing guarantee is the host-side `elf_hash`
+    // gate above. [security E]
     let program_id_bytes: Option<[u8; 32]> =
         (program_id != alloy::primitives::B256::ZERO).then(|| program_id.0);
 
@@ -5495,30 +5556,62 @@ async fn measure_cycles(
                 short_id(program_id)
             );
             insert_measured(measured, backend, program_id, input_hash, cycles);
+            clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
         }
         Ok(Err(e)) => {
             let msg = format!("{e:#}");
-            // A guest that trips the execute cycle cap — OR that the measure watchdog SIGKILLs for
-            // exceeding the time budget (see `execute_cycles`, which now surfaces that as the canonical
-            // "exceeded cycle limit" wording) — is "too heavy": negative-cacheable, sized infeasible so
-            // it is never claimed nor re-measured. risc0 emits "Session limit exceeded"; sp1's cap trip
-            // is canonicalized to "exceeded cycle limit …"; the watchdog timeout says "exceeded the
-            // time budget … exceeded cycle limit". A programId mismatch, an input-specific error, or a
-            // non-timeout worker death are all TRANSIENT here (left uncached so a later tick retries) —
-            // matching only precise phrases, never a loose substring like "cycle", avoids the #16 class
-            // of false-blacklisting.
+            // Two kinds of "heavy", with DIFFERENT confidence:
+            //
+            //  - A CLEAN CAP TRIP is the executor itself reporting it passed the cycle cap: reliable
+            //    and deterministic for the (program, input), so negative-cache it PERMANENTLY (sized
+            //    infeasible -> never claimed nor re-measured). risc0 emits "Session limit exceeded";
+            //    sp1's cap trip is canonicalized to "exceeded cycle limit ...".
+            //
+            //  - A WALL-CLOCK WATCHDOG TIMEOUT (`execute_cycles` surfaces a distinct "wall-clock
+            //    watchdog" phrase) is AMBIGUOUS: a feasible guest can miss the 120s budget purely under
+            //    transient host load (SP1's CPU executor runs alongside live proofs; fix A re-enabled
+            //    gas simulation). Permanently blacklisting on the first one strands legitimate work and
+            //    is attacker-inducible via a load flood — the regression [security C] had. So RETRY it:
+            //    count consecutive timeouts per (backend, program, input) and only treat it as
+            //    unmeasurable after `MEASURE_TIMEOUT_STRIKES`. A genuinely-too-heavy guest times out
+            //    every attempt and converges fast; a transiently-starved one succeeds on a retry.
+            //
+            // Everything else (programId mismatch, input-specific error, a non-timeout worker death) is
+            // TRANSIENT: left uncached so a later tick retries. Matching only precise phrases, never a
+            // loose substring like "cycle", avoids the #16 class of false-blacklisting. [security C]
             let lower = msg.to_lowercase();
-            let too_heavy = lower.contains("session limit")
+            let clean_cap_trip = lower.contains("session limit")
                 || lower.contains("exceeded cycle limit")
-                || lower.contains("exceededcyclelimit")
-                || lower.contains("exceeded the time budget");
-            if too_heavy {
+                || lower.contains("exceededcyclelimit");
+            let wall_clock_timeout = lower.contains("wall-clock watchdog");
+            if clean_cap_trip {
                 tracing::warn!(
-                    "measure {} ({backend}): program is unmeasurable (exceeds the execute cycle cap or \
-                     the measure time budget) — marking infeasible so it is not claimed or re-measured",
+                    "measure {} ({backend}): program exceeds the execute cycle cap — marking infeasible \
+                     so it is not claimed or re-measured",
                     short_id(program_id)
                 );
                 insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
+                clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+            } else if wall_clock_timeout {
+                let strikes = bump_measure_strikes(measure_strikes, backend, program_id, input_hash);
+                if strikes >= MEASURE_TIMEOUT_STRIKES {
+                    tracing::warn!(
+                        "measure {} ({backend}): wall-clock measure timeout #{strikes} (>= {}) — the \
+                         guest cannot be sized inside the budget across repeated attempts; marking \
+                         infeasible so it is not claimed or re-measured",
+                        short_id(program_id),
+                        MEASURE_TIMEOUT_STRIKES
+                    );
+                    insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
+                    clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+                } else {
+                    tracing::debug!(
+                        "measure {} ({backend}): wall-clock measure timeout #{strikes} (< {}) — leaving \
+                         uncached so a later tick retries (may be transient host load)",
+                        short_id(program_id),
+                        MEASURE_TIMEOUT_STRIKES
+                    );
+                }
             } else {
                 tracing::debug!("measure {}: execute failed (transient): {msg}", short_id(program_id));
             }
@@ -6919,5 +7012,38 @@ mod r2_sizing_tests {
         // Unsized: floored, never zero.
         assert_eq!(est(1, None), FALLBACK_ESTIMATED_CYCLES);
         assert_eq!(est(0, None), FALLBACK_ESTIMATED_CYCLES);
+    }
+
+    #[test]
+    fn wall_clock_timeout_strikes_bound_before_permanent_blacklist() {
+        // [security C] A wall-clock measure-timeout must NOT permanently blacklist on the first one:
+        // it takes MEASURE_TIMEOUT_STRIKES consecutive strikes, and a success (or a clean cap trip)
+        // clears the tally so a feasible job that timed out under transient load self-heals.
+        let strikes: MeasureStrikes =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let prog = B256::repeat_byte(0xCC);
+        let ih = keccak256(b"heavy-input");
+
+        // Each strike returns the running count; the threshold is reached only on the Kth.
+        for n in 1..MEASURE_TIMEOUT_STRIKES {
+            assert_eq!(bump_measure_strikes(&strikes, "sp1", prog, ih), n);
+            assert!(n < MEASURE_TIMEOUT_STRIKES, "below threshold -> still retryable, not blacklisted");
+        }
+        assert_eq!(
+            bump_measure_strikes(&strikes, "sp1", prog, ih),
+            MEASURE_TIMEOUT_STRIKES,
+            "the Kth consecutive wall-clock timeout reaches the blacklist threshold"
+        );
+
+        // A success / clean cap trip clears the tally: the count restarts from 1.
+        clear_measure_strikes(&strikes, "sp1", prog, ih);
+        assert_eq!(
+            bump_measure_strikes(&strikes, "sp1", prog, ih),
+            1,
+            "clearing resets the tally so a later transient timeout starts over, never pre-escalated"
+        );
+
+        // Strikes are isolated per (backend, program, input): a different backend is independent.
+        assert_eq!(bump_measure_strikes(&strikes, "risc0", prog, ih), 1);
     }
 }

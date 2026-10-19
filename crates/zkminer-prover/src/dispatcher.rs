@@ -2996,9 +2996,18 @@ impl WorkerPool {
     /// still excluded, so this keeps the "don't do RPC work for a worker that can't take it now"
     /// optimization in `measure_cycles`. [security D]
     pub fn has_idle_or_revivable_worker(&self, backend: &str) -> bool {
-        self.keys_for_prefix(backend)
-            .iter()
-            .any(|k| self.workers.get(k).is_some_and(|e| e.slot.try_lock().is_ok()))
+        self.keys_for_prefix(backend).iter().any(|k| {
+            self.workers.get(k).is_some_and(|e| {
+                e.slot
+                    .try_lock()
+                    // Live-and-idle, OR down but genuinely dispatchable. A DECLINED / retired /
+                    // backoff-windowed DOWN slot is NOT revivable: `respawn` would spawn it only to
+                    // have it re-decline (or bail on backoff), the exact churn `slot_eligible` exists to
+                    // prevent — so it must not keep `measure_cycles` doing per-tick RPC + ELF work for a
+                    // worker that can never take the job. [security D]
+                    .is_ok_and(|sl| sl.handle.is_some() || Self::slot_dispatchable(&sl))
+            })
+        })
     }
 
     /// Measure a job's TRUE cycle count by executing the guest, without proving it.
@@ -3068,7 +3077,10 @@ impl WorkerPool {
                             continue;
                         };
                         if let Ok(mut sl) = e.slot.try_lock() {
-                            if sl.handle.is_none() {
+                            // Only revive a DOWN slot that is actually dispatchable: a declined /
+                            // retired / in-backoff slot would just re-decline or bail in `respawn`,
+                            // reintroducing the handshake churn `slot_eligible` guards against. [security D]
+                            if sl.handle.is_none() && Self::slot_dispatchable(&sl) {
                                 match self.ensure_alive(&mut sl, e) {
                                     Ok(_) => {
                                         if let Some(h) = sl.handle.as_ref() {
@@ -3145,18 +3157,19 @@ impl WorkerPool {
             Err(e) => {
                 if entry.intentional_kill.load(Ordering::Acquire) {
                     // [security C] The watchdog SIGKILLed the worker because the guest did not finish
-                    // within the measure budget. In the raw EOF error that is indistinguishable from a
-                    // transient crash, so the host would classify it transient and RE-MEASURE it
-                    // forever — each attempt costing a full timeout plus a respawn. A guest we cannot
-                    // execute inside the budget is one we must not claim, so surface it as the
-                    // canonical "too heavy" error (same wording the clean cycle-cap trip uses) and the
-                    // host negative-caches it: never re-measured, never claimed. This matters most for
-                    // SP1, whose slower CPU emulation may not reach the cycle cap before the
-                    // wall-clock watchdog fires.
+                    // within the measure budget. This is a WALL-CLOCK timeout, NOT the executor's own
+                    // cycle-cap trip: a genuinely feasible guest can miss the budget purely because the
+                    // host was transiently overloaded (fix A re-enabled gas simulation, and SP1's CPU
+                    // executor runs alongside live proofs). So it must NOT be conflated with the clean
+                    // cap trip — surfacing it as "exceeded cycle limit" would let the caller PERMANENTLY
+                    // negative-cache a feasible job on a single unlucky timeout. Mark it with a DISTINCT
+                    // "wall-clock watchdog" phrase; `measure_cycles` treats it as retryable and only
+                    // gives up after K consecutive timeouts for the same (backend, program, input). A
+                    // raw EOF here, by contrast, is a non-intentional crash — handled below as transient.
                     Self::mark_slot_dead(&mut slot, entry);
                     anyhow::bail!(
-                        "cycle measurement exceeded the time budget on {key} (guest too heavy to \
-                         size within the window) — exceeded cycle limit"
+                        "cycle measurement timed out on {key}: the guest did not finish within the \
+                         measure budget (wall-clock watchdog) — may be transient host load"
                     );
                 } else {
                     Self::mark_slot_failed(&mut slot, entry);
@@ -4775,22 +4788,57 @@ impl WorkerPool {
             .get(key)
             .ok_or_else(|| anyhow::anyhow!("No worker registered for '{key}'"))?;
 
-        let mut slot = entry.slot.lock().unwrap_or_else(|e| {
-            // RECOVER, do not hard-fail. The guard is held across code that can panic — the
-            // progress callback runs synchronously on the proving thread while this very guard
-            // is held, and in production that closure touches the shared TUI state — so one
-            // panic there used to poison this slot permanently: every dispatch returned "lock
-            // poisoned" while `is_backend_healthy` reported the slot alive (it reads any lock
-            // error as "busy, therefore proving"), so the miner claimed jobs it could never
-            // dispatch for the life of the process. What this mutex guards is a handle plus two
-            // counters, not an invariant a panic can corrupt into unsafety, and `gpu_locks` and
-            // `shutdown_all` already recover the same way.
-            tracing::warn!(
-                "worker slot {key} was poisoned by an earlier panic; recovering it rather \
+        // Bound the wait for the slot mutex by `abort_at`, exactly as `acquire_gpu_guard` bounds the
+        // GPU lock just above. The hazard this closes: a pre-claim cycle MEASUREMENT (`execute_cycles`)
+        // holds this slot via `try_lock` for up to MEASURE_TIMEOUT (120s) and does NOT take the GPU
+        // lock, so it is invisible to the guard acquired above. A plain `slot.lock()` here would then
+        // park a claimed proof behind the measurement with the GPU guard held and collateral bonded,
+        // past its own release margin -> an unreleasable late revert (SLASH) rather than a clean
+        // release. Polling try_lock until `abort_at` downgrades that worst case to a
+        // `ProofDeadlineReached` release the caller already recovers from. Poison is recovered inline:
+        // this mutex guards a handle plus two counters, not a safety invariant — the same rationale the
+        // old `unwrap_or_else` used (a progress-callback panic once poisoned it and wedged the slot for
+        // the process lifetime). [security F]
+        let give_up_at = match (abort_at, timeout) {
+            (Some(abort), _) => Some(abort.checked_sub(MIN_ABORT_START_BUDGET).unwrap_or(abort)),
+            (None, Some(t)) => Some(Instant::now() + t),
+            (None, None) => None,
+        };
+        let mut slot = match give_up_at {
+            None => entry.slot.lock().unwrap_or_else(|e| {
+                tracing::warn!(
+                    "worker slot {key} was poisoned by an earlier panic; recovering it rather \
                      than retiring the slot"
-            );
-            e.into_inner()
-        });
+                );
+                e.into_inner()
+            }),
+            Some(give_up_at) => loop {
+                match entry.slot.try_lock() {
+                    Ok(g) => break g,
+                    Err(std::sync::TryLockError::Poisoned(e)) => {
+                        tracing::warn!(
+                            "worker slot {key} was poisoned by an earlier panic; recovering it rather \
+                             than retiring the slot"
+                        );
+                        break e.into_inner();
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        if Instant::now() >= give_up_at {
+                            return Err(anyhow::Error::new(
+                                zkminer_prover_protocol::types::ProofDeadlineReached {
+                                    detail: format!(
+                                        "giving up waiting for the {key} worker slot: a cycle \
+                                         measurement is holding it and too little time is left to \
+                                         start (releasing to recover collateral)"
+                                    ),
+                                },
+                            ));
+                        }
+                        std::thread::sleep(GPU_LOCK_POLL);
+                    }
+                }
+            },
+        };
 
         // Fix #3: proactively recycle a worker that has completed many proofs, so the
         // accumulated GPU context / buffer pool / persistent stream (which can wedge a
