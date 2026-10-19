@@ -2988,6 +2988,19 @@ impl WorkerPool {
         })
     }
 
+    /// Like [`has_idle_worker`], but ALSO true when a slot is DOWN (handle=None) yet lockable — i.e.
+    /// REVIVABLE. The measurement path ([`execute_cycles`]) can respawn such a slot (VRAM-cheap for a
+    /// CPU-only execute), so the brain must not gate the measurement out before it gets the chance;
+    /// otherwise a backend whose only worker was recycled could never be measured and — since a claim
+    /// now requires a measurement — never claimed or proved (a deadlock). A BUSY (locked) slot is
+    /// still excluded, so this keeps the "don't do RPC work for a worker that can't take it now"
+    /// optimization in `measure_cycles`. [security D]
+    pub fn has_idle_or_revivable_worker(&self, backend: &str) -> bool {
+        self.keys_for_prefix(backend)
+            .iter()
+            .any(|k| self.workers.get(k).is_some_and(|e| e.slot.try_lock().is_ok()))
+    }
+
     /// Measure a job's TRUE cycle count by executing the guest, without proving it.
     ///
     /// Every scheduling decision is sized from `expectedCycles` on the job descriptor, which
@@ -3038,10 +3051,50 @@ impl WorkerPool {
             }
             match found {
                 Some(f) => f,
-                None => anyhow::bail!(
-                    "all {} '{backend}' worker(s) busy or not running; skipping cycle measurement",
-                    keys.len()
-                ),
+                None => {
+                    // [security D] No LIVE worker for this backend — but a claim now requires a
+                    // measurement and a measurement requires a live worker, so a backend whose only
+                    // slot was recycled (dual-backend VRAM eviction, or a watchdog/crash death) would
+                    // DEADLOCK: never measured → never claimable → never proved → never respawned.
+                    // Revive a DOWN-but-lockable slot here. Reviving for a MEASUREMENT is VRAM-cheap
+                    // (execute is CPU-only: SP1 sizes on its `CpuProver`, no sp1-gpu-server, no CUDA
+                    // proving context), so unlike a proof it needs no sibling VRAM eviction — just a
+                    // respawn, which `ensure_alive` does with its own backoff/failure accounting that
+                    // prevents thrash. This mirrors how the pre-measurement flow self-healed (a claim
+                    // drove `prove_on_slot` → `ensure_alive`), only earlier and without proving.
+                    let mut revived = None;
+                    for k in &keys {
+                        let Some(e) = self.workers.get(k) else {
+                            continue;
+                        };
+                        if let Ok(mut sl) = e.slot.try_lock() {
+                            if sl.handle.is_none() {
+                                match self.ensure_alive(&mut sl, e) {
+                                    Ok(_) => {
+                                        if let Some(h) = sl.handle.as_ref() {
+                                            e.publish_pid(h.pid());
+                                        }
+                                        revived = Some((k.clone(), e, sl));
+                                        break;
+                                    }
+                                    Err(err) => {
+                                        tracing::debug!(
+                                            "measure: could not revive {k} for sizing: {err:#}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    match revived {
+                        Some(f) => f,
+                        None => anyhow::bail!(
+                            "all {} '{backend}' worker(s) busy, or down and not revivable; skipping \
+                             cycle measurement",
+                            keys.len()
+                        ),
+                    }
+                }
             }
         };
         let key = key.as_str();
@@ -3091,11 +3144,24 @@ impl WorkerPool {
             Ok(r) => r,
             Err(e) => {
                 if entry.intentional_kill.load(Ordering::Acquire) {
+                    // [security C] The watchdog SIGKILLed the worker because the guest did not finish
+                    // within the measure budget. In the raw EOF error that is indistinguishable from a
+                    // transient crash, so the host would classify it transient and RE-MEASURE it
+                    // forever — each attempt costing a full timeout plus a respawn. A guest we cannot
+                    // execute inside the budget is one we must not claim, so surface it as the
+                    // canonical "too heavy" error (same wording the clean cycle-cap trip uses) and the
+                    // host negative-caches it: never re-measured, never claimed. This matters most for
+                    // SP1, whose slower CPU emulation may not reach the cycle cap before the
+                    // wall-clock watchdog fires.
                     Self::mark_slot_dead(&mut slot, entry);
+                    anyhow::bail!(
+                        "cycle measurement exceeded the time budget on {key} (guest too heavy to \
+                         size within the window) — exceeded cycle limit"
+                    );
                 } else {
                     Self::mark_slot_failed(&mut slot, entry);
+                    return Err(e);
                 }
-                return Err(e);
             }
         };
         match response {
@@ -6887,15 +6953,28 @@ mod tests {
     /// not an idle worker for cycle measurement. Counting it made `execute_cycles` stop on it and fail
     /// instead of moving on to a live one.
     #[test]
-    fn a_slot_without_a_worker_is_not_idle_for_measurement() {
+    fn a_down_worker_is_revivable_for_measurement_and_errors_if_respawn_fails() {
+        // [security D] A down (handle=None) slot is NOT "idle", but it IS revivable: the measurement
+        // path may respawn it (VRAM-cheap for a CPU-only execute), so `has_idle_or_revivable_worker`
+        // is true even though `has_idle_worker` is false. This is what breaks the claim↔measure↔revive
+        // deadlock. Here the mock slots point at /dev/null, so the respawn fails fast (no real worker,
+        // no GPU) and `execute_cycles` reports that the backend was down and could not be revived —
+        // never a silent success that would let an unmeasured job be sized.
         let pool = pool_with_keys(&["risc0:cuda:0", "risc0:cuda:1"]);
-        assert!(!pool.has_idle_worker("risc0"));
+        assert!(!pool.has_idle_worker("risc0"), "a handle=None slot is not idle");
+        assert!(
+            pool.has_idle_or_revivable_worker("risc0"),
+            "a lockable handle=None slot IS revivable for measurement"
+        );
+        // An empty/unknown backend is neither idle nor revivable.
+        assert!(!pool.has_idle_or_revivable_worker("sp1"));
+
         let err = pool
             .execute_cycles("risc0", &[], &[], Some(Duration::from_secs(1)), None)
-            .expect_err("no live worker, so nothing can measure");
+            .expect_err("respawn of /dev/null fails, so nothing can measure");
         assert!(
-            format!("{err:#}").contains("busy or not running"),
-            "must report that no worker could run it, not fail on the first slot: {err:#}"
+            format!("{err:#}").contains("down and not revivable"),
+            "must report that the down worker could not be revived: {err:#}"
         );
     }
 

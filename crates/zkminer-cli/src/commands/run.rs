@@ -269,12 +269,26 @@ const FALLBACK_ESTIMATED_CYCLES: u64 = 34_000_000;
 const UNMEASURABLE_CYCLES: u64 = 1_000_000_000_000_000_000; // 1e18
 
 
-/// Measured cycle counts keyed by (programId, keccak256(inputData)). See the declaration in `run`.
+/// Measured cycle counts keyed by (backend tag, programId, keccak256(inputData)). The backend tag is
+/// load-bearing: `programId`, `inputData` AND `proofSystemId` are all submitter-chosen, so without it
+/// a cheap risc0 measurement of (P, I) would size an SP1 job carrying the same (P, I) — which the SP1
+/// worker then cannot prove (release penalty). See [`backend_tag`] and the declaration in `run`.
+/// [security G]
 type MeasuredCache = std::sync::Arc<
     std::sync::Mutex<
-        std::collections::HashMap<(alloy::primitives::B256, alloy::primitives::B256), u64>,
+        std::collections::HashMap<(u8, alloy::primitives::B256, alloy::primitives::B256), u64>,
     >,
 >;
+
+/// Stable per-backend discriminant for the measured-cycles key. An unknown backend collapses to 255;
+/// nothing is ever inserted under it (only risc0/sp1 measure), so a lookup simply misses. [security G]
+fn backend_tag(backend: &str) -> u8 {
+    match backend {
+        "risc0" => 0,
+        "sp1" => 1,
+        _ => 255,
+    }
+}
 /// descriptor hash -> keccak256(inputData) resolver. See the declaration in `run`.
 type DescInputCache = std::sync::Arc<
     std::sync::Mutex<
@@ -302,15 +316,22 @@ where
 /// reason. [security I3]
 const MEASURED_CYCLES_CAP: usize = 100_000;
 
-/// Insert a measured cycle count for the exact (program, input) pair, bounded by [security I3].
+/// Insert a measured cycle count for the exact (backend, program, input) triple, bounded by
+/// [security I3]. [security G]
 fn insert_measured(
     cache: &MeasuredCache,
+    backend: &str,
     program_id: alloy::primitives::B256,
     input_hash: alloy::primitives::B256,
     cycles: u64,
 ) {
     if let Ok(mut m) = cache.lock() {
-        bounded_insert(&mut m, (program_id, input_hash), cycles, MEASURED_CYCLES_CAP);
+        bounded_insert(
+            &mut m,
+            (backend_tag(backend), program_id, input_hash),
+            cycles,
+            MEASURED_CYCLES_CAP,
+        );
     }
 }
 
@@ -333,11 +354,16 @@ fn insert_desc_input(
 fn resolve_measured(
     measured: &MeasuredCache,
     desc_input: &DescInputCache,
+    backend: &str,
     program_id: alloy::primitives::B256,
     descriptor_hash: alloy::primitives::B256,
 ) -> Option<u64> {
     let input_hash = desc_input.lock().ok()?.get(&descriptor_hash).copied()?;
-    measured.lock().ok()?.get(&(program_id, input_hash)).copied()
+    measured
+        .lock()
+        .ok()?
+        .get(&(backend_tag(backend), program_id, input_hash))
+        .copied()
 }
 
 /// Bound on a single cycle measurement. Execution is far cheaper than proving, but a hostile
@@ -2204,7 +2230,10 @@ async fn miner_brain(
     // Shared so the background measurement task below can populate it while the brain runs.
     let measured_cycles: std::sync::Arc<
         std::sync::Mutex<
-            std::collections::HashMap<(alloy::primitives::B256, alloy::primitives::B256), u64>,
+            std::collections::HashMap<
+                (u8, alloy::primitives::B256, alloy::primitives::B256),
+                u64,
+            >,
         >,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // [security R2] descriptor hash -> keccak256(inputData). Lets a brain tick resolve a sighting's
@@ -2221,6 +2250,16 @@ async fn miner_brain(
     // Descriptor hashes already being measured, so N sightings of the same job spawn ONE execution.
     let measuring: std::sync::Arc<
         std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    // [security I] (backend, program, input) triples with an execution IN FLIGHT. The `measuring` set
+    // above dedups by DESCRIPTOR hash, but the measured cache keys by (backend, program, input): a
+    // concurrent burst of the SAME input under many distinct tags is many distinct descriptor hashes,
+    // which would all pass `measuring`, all see an empty cache, and all execute the identical heavy
+    // input at once. This set collapses that to one execution per (backend, program, input).
+    let measuring_inputs: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashSet<(u8, alloy::primitives::B256, alloy::primitives::B256)>,
+        >,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let mut queue_model = zkminer_strategy::queue::QueueModel::new();
     let mut queue_last_tick = std::time::Instant::now();
@@ -3183,9 +3222,13 @@ async fn miner_brain(
             //     FALLBACK_ESTIMATED_CYCLES so a `declared = 1` can't shrink the estimate toward zero.
             //     This estimate is only for RANKING an unsized job; it cannot be CLAIMED until measured
             //     (see `measurable` and the claim gate), so the floor never gates real collateral.
+            // [security G] The measured count is keyed by backend too, so resolve against THIS job's
+            // backend — a measurement only sizes a job of the same proof system.
+            let backend_opt = resolve_backend(snapshot.proof_system_id);
             let measured_for_job = resolve_measured(
                 &measured_cycles,
                 &desc_input_hash,
+                backend_opt.unwrap_or(""),
                 job.info.program_id,
                 snapshot.descriptor_hash,
             );
@@ -3340,7 +3383,7 @@ async fn miner_brain(
             // cannot execute-measure, fall back to the declaration so the gate does not permanently
             // strand it — but both real backends (risc0 and sp1) measure, so in practice a claim
             // always waits for a real number. The planner shares this: it needs a real number too.
-            let backend_opt = resolve_backend(snapshot.proof_system_id);
+            // (`backend_opt` was resolved above, before the estimate, for the backend-keyed lookup.)
             let backend_measurable = matches!(backend_opt, Some("risc0") | Some("sp1"));
             let measurable = if backend_measurable {
                 measured_for_job.is_some()
@@ -3357,26 +3400,39 @@ async fn miner_brain(
             // (the sp1 worker measures on a CPU executor). Deduped by DESCRIPTOR HASH: that is what we
             // hold before the descriptor is fetched, and the task resolves it to the input hash.
             // `measure_cycles` fetches the descriptor, records desc->input, short-circuits if this
-            // input was already measured under another tag, else executes and caches by (program,
-            // input). A non-measurable backend is skipped — it relies on the declared floor and cannot
-            // be claimed here anyway (its `measurable` is declared-only).
+            // input was already measured under another tag, else executes and caches by (backend,
+            // program, input). A non-measurable backend is skipped — it relies on the declared floor
+            // and cannot be claimed here anyway (its `measurable` is declared-only).
+            //
+            // [security F] Measure ONLY a job we would actually claim (`Recommendation::Claim` on the
+            // current estimate). The measurement holds a GPU worker slot for up to MEASURE_TIMEOUT, so
+            // without this gate a flood of distinct-input junk jobs — none of which we'd ever claim —
+            // would consume every slot measuring and starve the proofs the measurement exists to
+            // schedule. (Trade-off: a job that looks unprofitable/infeasible at the FALLBACK estimate
+            // but is actually tiny won't be measured; that is a missed opportunity, not a safety loss,
+            // and the fallback is ~the market median so it is rare.)
             let pid = job.info.program_id;
             let dh = snapshot.descriptor_hash;
-            if backend_measurable && measured_for_job.is_none() {
+            if backend_measurable
+                && measured_for_job.is_none()
+                && matches!(eval.recommendation, Recommendation::Claim)
+            {
                 let backend = backend_opt.unwrap_or("");
-                // Dedup by descriptor hash so N sightings spawn ONE execution; cleared below. Also
-                // bound the number of CONCURRENT in-flight measurements. [security R2/DoS] Keying by
-                // (program, input) means an input-varying flood now triggers a distinct measurement
-                // per input (correct — each input must be sized), but the spawns must not grow without
-                // limit or starve proving (execute_cycles try_locks a worker slot). When the set is
-                // full, a new descriptor simply waits for a later tick, by when earlier measurements
-                // have finished and freed room. Each measurement is also idle-worker gated and
-                // cap/watchdog bounded, so this only caps the SPAWN rate.
+                // Dedup by descriptor hash so N sightings spawn ONE execution; cleared below.
+                // [security F] Budget this tick's measurement spawns against the proving concurrency
+                // left after in-flight claims, so measurements can never consume the whole GPU pool —
+                // but always allow at least one, so a single-GPU rig (and the down-worker revival path
+                // in `execute_cycles`) still makes progress. Capped absolutely at
+                // MAX_INFLIGHT_MEASUREMENTS. A descriptor over budget simply waits for a later tick.
                 const MAX_INFLIGHT_MEASUREMENTS: usize = 16;
+                let measure_budget = max_concurrent
+                    .saturating_sub(in_flight.len())
+                    .max(1)
+                    .min(MAX_INFLIGHT_MEASUREMENTS);
                 let fresh = measuring
                     .lock()
                     .map(|mut m| {
-                        if m.contains(&dh) || m.len() >= MAX_INFLIGHT_MEASUREMENTS {
+                        if m.contains(&dh) || m.len() >= measure_budget {
                             false
                         } else {
                             m.insert(dh);
@@ -3385,20 +3441,34 @@ async fn miner_brain(
                     })
                     .unwrap_or(false);
                 if fresh {
-                    let (c2, st2, cache, resolver, inflight) = (
+                    let (c2, st2, cache, resolver, inflight, inflight_inputs) = (
                         client.clone(),
                         state.clone(),
                         measured_cycles.clone(),
                         desc_input_hash.clone(),
                         measuring.clone(),
+                        measuring_inputs.clone(),
                     );
                     tokio::spawn(async move {
                         // measure_cycles does all caching: it records desc->input, negative-caches a
                         // too-heavy guest (sized infeasible so it is never claimed nor re-measured),
-                        // caches a real measurement by (program, input), and leaves a transient failure
-                        // uncached so it retries. [security #16] Classification is by the backend's
-                        // precise cap error, never a loose substring like "cycle".
-                        measure_cycles(&c2, &st2, backend, jid, dh, pid, &cache, &resolver).await;
+                        // caches a real measurement by (backend, program, input), and leaves a
+                        // transient failure uncached so it retries. [security #16] Classification is by
+                        // the backend's precise cap error, never a loose substring like "cycle".
+                        // [security I] `inflight_inputs` collapses a concurrent same-input/different-tag
+                        // burst to ONE execution per (backend, program, input).
+                        measure_cycles(
+                            &c2,
+                            &st2,
+                            backend,
+                            jid,
+                            dh,
+                            pid,
+                            &cache,
+                            &resolver,
+                            &inflight_inputs,
+                        )
+                        .await;
                         // Clear the per-descriptor in-flight marker so a transient failure can retry.
                         if let Ok(mut m) = inflight.lock() {
                             m.remove(&dh);
@@ -5253,6 +5323,7 @@ fn ensure_deadline_room(lock_deadline: u64, margin_secs: u64) -> Result<()> {
 /// submitter and will stay that way, leaving a hardcoded 34e6 constant that is ~8x below the
 /// measured median. Executing the guest ourselves is the only reliable source.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn measure_cycles(
     client: &ChainClient,
     state: &zkminer_tui::state::SharedState,
@@ -5262,14 +5333,22 @@ async fn measure_cycles(
     program_id: alloy::primitives::B256,
     measured: &MeasuredCache,
     desc_input: &DescInputCache,
+    measuring_inputs: &std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashSet<(u8, alloy::primitives::B256, alloy::primitives::B256)>,
+        >,
+    >,
 ) {
     // Cheap availability probe FIRST, for THIS backend. The fetches below can hit the chain, and
     // under load most measurement attempts are skipped for a busy worker — doing the RPC work only to
     // throw it away wastes a throttled connection the proving path needs. A busy worker is a TRANSIENT
     // condition: cache nothing and return so a later tick retries. [security R2] risc0 and sp1 both
     // measure (sp1 on a CPU executor); a non-measurable backend is never triggered.
+    // [security D] Accept a DOWN-but-revivable worker here too: `execute_cycles` can respawn one for a
+    // (VRAM-cheap) measurement, and gating that out would reintroduce the claim↔measure deadlock for a
+    // backend whose only worker was recycled. A BUSY worker is still skipped (the probe excludes it).
     match zkminer_prover::engine::worker_pool() {
-        Some(pool) if pool.has_idle_worker(backend) => {}
+        Some(pool) if pool.has_idle_or_revivable_worker(backend) => {}
         _ => return,
     }
 
@@ -5283,27 +5362,104 @@ async fn measure_cycles(
         }
     };
     let input: Vec<u8> = descriptor.inputData.to_vec();
-    // The cycle count is a function of (program, keccak256(input)); the descriptor hash resolves to
-    // that input hash. Record the resolver FIRST so a later sighting of this descriptor (e.g. under a
-    // different tag, which this task may already have short-circuited) can find the measurement.
+    // The cycle count is a function of (backend, program, keccak256(input)); the descriptor hash
+    // resolves to that input hash. Record the resolver FIRST so a later sighting of this descriptor
+    // (e.g. under a different tag, which this task may already have short-circuited) can find the
+    // measurement.
     let input_hash = alloy::primitives::keccak256(&input);
     insert_desc_input(desc_input, descriptor_hash, input_hash);
+    let key = (backend_tag(backend), program_id, input_hash);
 
-    // [security R2] Short-circuit: if this exact (program, input) was already measured — e.g. the same
-    // input flooded under many distinct tags — reuse it with NO execution. Only the resolver above
-    // needed updating so this descriptor hash now points at the known measurement.
+    // [security R2/G] Short-circuit: if this exact (backend, program, input) was already measured —
+    // e.g. the same input flooded under many distinct tags — reuse it with NO execution. Only the
+    // resolver above needed updating so this descriptor hash now points at the known measurement.
     if measured
         .lock()
         .ok()
-        .map(|m| m.contains_key(&(program_id, input_hash)))
+        .map(|m| m.contains_key(&key))
         .unwrap_or(false)
     {
         tracing::debug!(
-            "measure {}: (program, input) already measured — resolver updated, no execution",
+            "measure {}: (backend, program, input) already measured — resolver updated, no execution",
             short_id(program_id)
         );
         return;
     }
+
+    // [security E] SP1 has no cheap programId→bytes binding (its vkey needs the minutes-long `setup`),
+    // so the ONLY guarantee that the bytes we MEASURE are the bytes we later PROVE is the registry's
+    // byte binding — an `elf_hash` or a URI `content_hash`. Without one, a flood could evict the
+    // measured ELF from the byte-budget-bounded cache and a prove-time re-download could serve
+    // DIFFERENT (heavier) bytes: the job was sized on the cheap measurement, proves heavy, and blows
+    // its deadline → SLASH. Refuse to size (→ never claim) an unbound SP1 program; negative-cache it
+    // so it is not re-measured. risc0 is EXEMPT: its image-id check binds the bytes to programId at
+    // BOTH measure and prove, so measure-ELF == prove-ELF regardless of content_hash. The residual
+    // (a byte-bound but vkey≠programId decoy) can at worst force a bounded collateral release at prove
+    // time, never a slash. [security E]
+    if backend == "sp1" {
+        match client.get_program_info(program_id).await {
+            Ok(info) => {
+                let bound = info.elf_hash.is_some()
+                    || info
+                        .storage_uris
+                        .iter()
+                        .any(|u| u.content_hash != alloy::primitives::B256::ZERO);
+                if !bound {
+                    tracing::warn!(
+                        "measure {} (sp1): registry carries no ELF byte-binding (no elf_hash, no URI \
+                         content hash) — measure-ELF cannot be guaranteed == prove-ELF, so refusing to \
+                         size; marking infeasible so it is never claimed",
+                        short_id(program_id)
+                    );
+                    insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "measure {} (sp1): program-info fetch failed (transient): {e:#}",
+                    short_id(program_id)
+                );
+                return;
+            }
+        }
+    }
+
+    // [security I] Claim the (backend, program, input) as in-flight BEFORE the expensive fetch +
+    // execute. A concurrent burst of the same input under different tags passes the descriptor-hash
+    // dedup as distinct descriptors; without this they would all execute the identical heavy input at
+    // once. The first task here wins and executes; the rest return (the resolver is already recorded,
+    // so they will resolve to the winner's measurement). Released via the guard below on every path.
+    let claimed_input = measuring_inputs
+        .lock()
+        .map(|mut s| s.insert(key))
+        .unwrap_or(false);
+    if !claimed_input {
+        tracing::debug!(
+            "measure {}: an execution of this exact (backend, program, input) is already in flight",
+            short_id(program_id)
+        );
+        return;
+    }
+    // RAII release so an early return / panic cannot leak the in-flight marker (which would wedge all
+    // future measurements of this input).
+    struct InputGuard<'a> {
+        set: &'a std::sync::Mutex<
+            std::collections::HashSet<(u8, alloy::primitives::B256, alloy::primitives::B256)>,
+        >,
+        key: (u8, alloy::primitives::B256, alloy::primitives::B256),
+    }
+    impl Drop for InputGuard<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut s) = self.set.lock() {
+                s.remove(&self.key);
+            }
+        }
+    }
+    let _input_guard = InputGuard {
+        set: measuring_inputs,
+        key,
+    };
 
     let elf = match fetch_or_download_elf(client, state, program_id).await {
         Ok(e) => e,
@@ -5318,10 +5474,10 @@ async fn measure_cycles(
         None => return,
     };
 
-    // Bind the sizing ELF to the programId (risc0 image id) so the pre-claim measurement path cannot
-    // be driven with an ELF unrelated to the registered program. Never against a zero id. The sp1
-    // worker ignores this (its vkey derivation is the GPU-heavy setup; the ELF is registry-bound by
-    // the content-hash check in fetch_or_download_elf) — see `run_execute_sp1`.
+    // Bind the sizing ELF to the programId so the pre-claim measurement path cannot be driven with an
+    // ELF unrelated to the registered program. Never against a zero id. risc0 checks the image id; the
+    // sp1 worker now checks the vkey hash on its CpuProver (cheap, no gpu-server) — see
+    // `run_execute_sp1`. [security E]
     let program_id_bytes: Option<[u8; 32]> =
         (program_id != alloy::primitives::B256::ZERO).then(|| program_id.0);
 
@@ -5334,31 +5490,35 @@ async fn measure_cycles(
     match res {
         Ok(Ok(cycles)) => {
             tracing::info!(
-                "measured {cycles} cycles for program {} by execution — all its jobs with this \
-                 input will be sized on it",
+                "measured {cycles} cycles for program {} ({backend}) by execution — all its jobs with \
+                 this input will be sized on it",
                 short_id(program_id)
             );
-            insert_measured(measured, program_id, input_hash, cycles);
+            insert_measured(measured, backend, program_id, input_hash, cycles);
         }
         Ok(Err(e)) => {
             let msg = format!("{e:#}");
-            // A guest that trips the execute cycle cap is "too heavy" (negative-cacheable, sized
-            // infeasible so it is never claimed nor re-measured). The cap is set below what the
-            // measure watchdog can reach, so a runaway trips the backend's clean cap error rather than
-            // the SIGKILL (indistinguishable from a transient crash — must NOT negative-cache). risc0
-            // emits "Session limit exceeded"; sp1 emits "exceeded cycle limit of N". A programId
-            // mismatch, an input-specific panic, or a worker death are all transient here.
+            // A guest that trips the execute cycle cap — OR that the measure watchdog SIGKILLs for
+            // exceeding the time budget (see `execute_cycles`, which now surfaces that as the canonical
+            // "exceeded cycle limit" wording) — is "too heavy": negative-cacheable, sized infeasible so
+            // it is never claimed nor re-measured. risc0 emits "Session limit exceeded"; sp1's cap trip
+            // is canonicalized to "exceeded cycle limit …"; the watchdog timeout says "exceeded the
+            // time budget … exceeded cycle limit". A programId mismatch, an input-specific error, or a
+            // non-timeout worker death are all TRANSIENT here (left uncached so a later tick retries) —
+            // matching only precise phrases, never a loose substring like "cycle", avoids the #16 class
+            // of false-blacklisting.
             let lower = msg.to_lowercase();
             let too_heavy = lower.contains("session limit")
                 || lower.contains("exceeded cycle limit")
-                || lower.contains("exceededcyclelimit");
+                || lower.contains("exceededcyclelimit")
+                || lower.contains("exceeded the time budget");
             if too_heavy {
                 tracing::warn!(
-                    "measure {}: program is unmeasurable (exceeds the execute cycle cap) — marking \
-                     infeasible so it is not claimed or re-measured",
+                    "measure {} ({backend}): program is unmeasurable (exceeds the execute cycle cap or \
+                     the measure time budget) — marking infeasible so it is not claimed or re-measured",
                     short_id(program_id)
                 );
-                insert_measured(measured, program_id, input_hash, UNMEASURABLE_CYCLES);
+                insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
             } else {
                 tracing::debug!("measure {}: execute failed (transient): {msg}", short_id(program_id));
             }
@@ -6629,20 +6789,20 @@ mod r2_sizing_tests {
         let ih = keccak256(&input);
 
         // Nothing known yet -> not sized -> NOT claimable.
-        assert_eq!(resolve_measured(&measured, &desc_input, prog, desc), None);
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc), None);
 
         // Resolver alone (descriptor fetched, not yet executed) is still not sized: the claim must
         // wait for the real cycle count, never fall back to the declared value.
         insert_desc_input(&desc_input, desc, ih);
-        assert_eq!(resolve_measured(&measured, &desc_input, prog, desc), None);
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc), None);
 
         // Measurement present for a DIFFERENT input does not size this descriptor.
-        insert_measured(&measured, prog, keccak256(b"other-input"), 999);
-        assert_eq!(resolve_measured(&measured, &desc_input, prog, desc), None);
+        insert_measured(&measured, "risc0", prog, keccak256(b"other-input"), 999);
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc), None);
 
         // Both present for THIS input -> sized.
-        insert_measured(&measured, prog, ih, 42_000);
-        assert_eq!(resolve_measured(&measured, &desc_input, prog, desc), Some(42_000));
+        insert_measured(&measured, "risc0", prog, ih, 42_000);
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc), Some(42_000));
     }
 
     #[test]
@@ -6656,14 +6816,14 @@ mod r2_sizing_tests {
         let desc_b = B256::repeat_byte(0x02);
 
         insert_desc_input(&desc_input, desc_a, ih);
-        insert_measured(&measured, prog, ih, 7_777);
-        assert_eq!(resolve_measured(&measured, &desc_input, prog, desc_a), Some(7_777));
+        insert_measured(&measured, "risc0", prog, ih, 7_777);
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc_a), Some(7_777));
 
         // A new tag is a miss until its descriptor fetch records the resolver entry — then it resolves
         // to the SAME measurement with no new execution. This is the tag-flood defence.
-        assert_eq!(resolve_measured(&measured, &desc_input, prog, desc_b), None);
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc_b), None);
         insert_desc_input(&desc_input, desc_b, ih);
-        assert_eq!(resolve_measured(&measured, &desc_input, prog, desc_b), Some(7_777));
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc_b), Some(7_777));
     }
 
     #[test]
@@ -6675,17 +6835,17 @@ mod r2_sizing_tests {
 
         insert_desc_input(&desc_input, desc_cheap, keccak256(&in_cheap));
         insert_desc_input(&desc_input, desc_heavy, keccak256(&in_heavy));
-        insert_measured(&measured, prog, keccak256(&in_cheap), 10_000);
+        insert_measured(&measured, "risc0", prog, keccak256(&in_cheap), 10_000);
 
         // The cheap input is sized; the heavy input — the input-flood vector — is still UNSIZED and so
         // cannot be claimed on the cheap measurement. This is the exact under-sizing R2 closes.
-        assert_eq!(resolve_measured(&measured, &desc_input, prog, desc_cheap), Some(10_000));
-        assert_eq!(resolve_measured(&measured, &desc_input, prog, desc_heavy), None);
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc_cheap), Some(10_000));
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc_heavy), None);
 
         // Measure the heavy input as too-heavy (negative cache) -> now sized infeasible.
-        insert_measured(&measured, prog, keccak256(&in_heavy), UNMEASURABLE_CYCLES);
+        insert_measured(&measured, "risc0", prog, keccak256(&in_heavy), UNMEASURABLE_CYCLES);
         assert_eq!(
-            resolve_measured(&measured, &desc_input, prog, desc_heavy),
+            resolve_measured(&measured, &desc_input, "risc0", prog, desc_heavy),
             Some(UNMEASURABLE_CYCLES)
         );
     }
@@ -6705,6 +6865,41 @@ mod r2_sizing_tests {
             assert_eq!(m.len(), before);
             assert_eq!(m.get(&k), Some(&123));
         }
+    }
+
+    #[test]
+    fn measurement_is_isolated_per_backend() {
+        // [security G] programId, inputData AND proofSystemId are all submitter-chosen, so a cheap
+        // risc0 measurement of (P, I) must NOT size an SP1 job carrying the same (P, I) — the SP1
+        // worker cannot prove a risc0 ELF (→ release penalty). The backend-qualified key isolates them.
+        let (measured, desc_input) = fresh();
+        let prog = B256::repeat_byte(0xDD);
+        let input = b"shared-input".to_vec();
+        let ih = keccak256(&input);
+        let desc = B256::repeat_byte(0x05);
+        insert_desc_input(&desc_input, desc, ih);
+
+        // Measure it for risc0 only.
+        insert_measured(&measured, "risc0", prog, ih, 12_345);
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "risc0", prog, desc),
+            Some(12_345)
+        );
+        // An SP1 job with the SAME programId+input is still UNSIZED (not claimable on risc0's number).
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", prog, desc),
+            None
+        );
+        // Measuring it for SP1 is independent and does not disturb the risc0 entry.
+        insert_measured(&measured, "sp1", prog, ih, 67_890);
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", prog, desc),
+            Some(67_890)
+        );
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "risc0", prog, desc),
+            Some(12_345)
+        );
     }
 
     #[test]

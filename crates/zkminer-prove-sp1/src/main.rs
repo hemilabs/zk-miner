@@ -1284,9 +1284,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 request_id,
                 elf,
                 input_data,
-                // program_id is NOT enforced on the sizing path for SP1 — the vkey derivation is the
-                // GPU-heavy `setup`, and the fetched ELF is already registry-bound by the host's
-                // content-hash check. See `run_execute_sp1`.
+                // [security E] NOT used on the SP1 sizing path: deriving SP1's vkey needs `setup`,
+                // which is ~minutes on CPU and would blow the host's measure watchdog. The binding is
+                // enforced host-side (registry byte-binding → measure-ELF == prove-ELF) and on the
+                // prove path's vkey gate instead. See `run_execute_sp1`.
                 program_id: _,
             } => {
                 // [security R2/SP1 sizing] Real cycle measurement for SP1, matching risc0's Execute
@@ -1316,8 +1317,17 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         }
                     }
                 };
-                match run_execute_sp1(cpu, &elf, &input_data) {
-                    Ok((cycles, duration_secs)) => {
+                // [security H] The ELF bytes are fully attacker-controlled, and SP1's parser/executor
+                // (`Elf::from` / `setup` / `execute().run()`) CAN panic on a malformed registered ELF
+                // rather than returning Err. A panic unwinding out of the loop would have the
+                // dispatcher score a HEALTHY proving slot as failed — the very outcome the executor
+                // builder above is wrapped to avoid. Contain the attacker-data path too: a caught
+                // panic is a property of the job (InvalidInput), not of this worker.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_execute_sp1(cpu, &elf, &input_data)
+                }));
+                match outcome {
+                    Ok(Ok((cycles, duration_secs))) => {
                         tracing::info!(
                             "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s"
                         );
@@ -1328,16 +1338,29 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         let msg = format!("{e:#}");
                         // Execution failure is NOT proof failure: the guest may trip the cycle cap
-                        // ("exceeded cycle limit of N" — which the host classifies as too-heavy) or
-                        // simply panic on this input. Both are properties of the job, not of this
-                        // worker, so report InvalidInput and keep the healthy worker alive.
+                        // (canonicalized to "exceeded cycle limit …", which the host classifies as
+                        // too-heavy), fail the vkey bind, or simply error on this input. All are
+                        // properties of the job, not of this worker, so report InvalidInput and keep
+                        // the healthy worker alive.
                         let resp = WorkerResponse::Error {
                             request_id,
                             kind: ErrorKind::InvalidInput,
                             message: msg,
+                        };
+                        write_message(&mut stdout, &resp)?;
+                    }
+                    Err(_) => {
+                        // A panic in the attacker-data path: same InvalidInput classification, worker
+                        // stays alive (the loop continues; the slot is not scored failed).
+                        let resp = WorkerResponse::Error {
+                            request_id,
+                            kind: ErrorKind::InvalidInput,
+                            message: "SP1 executor panicked while sizing this ELF (malformed or \
+                                      hostile program)"
+                                .to_string(),
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -1425,13 +1448,16 @@ fn detect_gpu() -> (bool, Option<String>) {
 
 /// Cycle cap for the pre-claim EXECUTE (sizing) path, mirroring the risc0 worker's
 /// `execute_session_cycle_limit`. The guest here runs UNCLAIMED and submitter-controlled, so a
-/// runaway is a free DoS lever and the result is only a sizing estimate. SP1's executor fails with
-/// `ExecutionError::ExceededCycleLimit` ("exceeded cycle limit of N") when the cap is hit, which the
-/// host classifies as "too heavy" and negative-caches — rather than running until the host's ~120 s
-/// measure watchdog SIGKILLs the worker (indistinguishable from a transient crash, so NOT
-/// negative-cached). The default (2e9) matches risc0's and is ~21× the largest proof observed on this
-/// market (~9.3e7 cycles), so it cannot false-cap a real job. Override with
-/// `ZKMINER_SP1_EXECUTE_MAX_CYCLES` (0 = unlimited).
+/// runaway is a free DoS lever and the result is only a sizing estimate. In the pinned build the cap
+/// surfaces from the executor as the string `"cycle limit reached"` (NOT the `ExceededCycleLimit`
+/// variant), which `canonicalize_sp1_execute_error` rewrites to the canonical "exceeded cycle limit …"
+/// so the host classifies it as "too heavy" and negative-caches it — rather than the guest running
+/// until the host's ~120 s measure watchdog SIGKILLs the worker. (A watchdog SIGKILL is now ALSO
+/// negative-cached host-side — see the dispatcher's `execute_cycles` timeout branch — so a guest too
+/// slow to trip the cap inside the window is still never re-measured forever.) The default (2e9)
+/// matches risc0's and is ~21× the largest proof observed on this market (~9.3e7 cycles), so it cannot
+/// false-cap a real job. Override with `ZKMINER_SP1_EXECUTE_MAX_CYCLES` (0 = unlimited, which removes
+/// this protection — rely on the watchdog-timeout negative-cache instead).
 fn sp1_execute_cycle_limit() -> Option<u64> {
     parse_sp1_execute_cycle_limit(std::env::var("ZKMINER_SP1_EXECUTE_MAX_CYCLES").ok().as_deref())
 }
@@ -1462,13 +1488,17 @@ fn parse_sp1_execute_cycle_limit(raw: Option<&str>) -> Option<u64> {
 /// the cycle count is deterministic in (program, input) whichever prover runs it, so routing it to the
 /// CPU keeps the measurement as cheap as risc0's and never spins up `sp1-gpu-server`.
 ///
-/// Program-id (vkey) binding is deliberately NOT enforced here. For SP1 `programId` is the vkey, whose
-/// only derivation is the full GPU-heavy `setup`; doing that per measurement would turn the SP1 sizing
-/// path into an asymmetric GPU-DoS lever the cheap risc0 path does not have. The ELF is already bound
-/// to the registry on the host side by `download_elf`'s keccak content-hash check, so the bytes
-/// measured are the registered program's; the authoritative `vkey == programId` gate stays on the
-/// PROVE path (`run_proof`). A mismatched ELF therefore still sizes correctly and simply fails to
-/// prove (→ release), never a forged or under-sized claim.
+/// [security E] Program-id (vkey) binding is NOT done here, deliberately. For SP1 `programId` is the
+/// verifying-key hash, whose ONLY derivation is `setup` — and `setup` is empirically ~minutes on the
+/// CPU even for a tiny program, so doing it per measurement would blow the host's ~120 s measure
+/// watchdog (every first sighting would time out → the job would be wrongly marked unmeasurable and
+/// never claimed) AND hand a permissionless submitter a trivial CPU-DoS lever. Instead the binding is
+/// split: the HOST refuses to size/claim an SP1 job whose registry entry carries no byte binding
+/// (`elf_hash` + URI `content_hash` both unset), which guarantees measure-ELF == prove-ELF (so the
+/// measured count is the proved cost — no deadline under-size/slash); and the authoritative
+/// `vkey == programId` gate stays on the PROVE path (`run_proof`), where `setup` runs anyway and is
+/// pk-cached. A served-consistent decoy whose vkey != programId therefore still sizes correctly and
+/// at worst fails to prove → collateral release (bounded), never a forged or under-sized claim.
 fn run_execute_sp1(
     cpu: &sp1_sdk::blocking::CpuProver,
     elf: &[u8],
@@ -1477,6 +1507,7 @@ fn run_execute_sp1(
     use sp1_sdk::blocking::{Elf, Prover, SP1Stdin};
 
     let started = Instant::now();
+
     let mut stdin = SP1Stdin::new();
     // One input element, consumed by a single `io::read_vec` in the guest — matching `run_proof`.
     stdin.write_slice(input_data);
@@ -1485,12 +1516,39 @@ fn run_execute_sp1(
     if let Some(limit) = sp1_execute_cycle_limit() {
         req = req.cycle_limit(limit);
     }
-    // We need only the instruction count; skip gas simulation (extra work) to keep sizing cheap.
+    // [security A] Gas calculation MUST stay enabled (the builder default). With `.calculate_gas(false)`
+    // the pinned SP1 build NEVER sets the executor's final VM state — `GasExecutingWorker::call`
+    // short-circuits (crates/prover/src/worker/prover/execute.rs:92) so `final_vm_state` stays unset
+    // and `execute_with_options`'s `.ok_or(anyhow!("Failed to extract public value digest"))?`
+    // (execute.rs:321) returns Err for EVERY guest. Gas accumulation is also what populates
+    // `opcode_counts`, i.e. `total_instruction_count()`. So we do NOT disable it.
     let (_, report) = req
-        .calculate_gas(false)
         .run()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(|e| canonicalize_sp1_execute_error(&e.to_string()))?;
     Ok((report.total_instruction_count(), started.elapsed().as_secs_f64()))
+}
+
+/// [security B] True iff an SP1 `execute().run()` error string denotes the cycle cap being tripped
+/// (the guest is too heavy to size). The pinned build signals the cap from the gas accumulator as the
+/// bare string `"cycle limit reached"` (execute.rs:206) — NOT the `ExceededCycleLimit` variant, which
+/// is only produced on the distributed-controller path — so the host's "exceeded cycle limit" match
+/// would miss it. Match every wording the build and SDK can emit.
+fn is_sp1_cycle_cap_trip(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("cycle limit reached")
+        || m.contains("exceeded cycle limit")
+        || m.contains("exceededcyclelimit")
+}
+
+/// [security B] Canonicalize an SP1 execute error so the host's `measure_cycles` classifier recognizes
+/// a cycle-cap trip as "too heavy" (and negative-caches it) regardless of SP1's internal wording. A
+/// non-cap error is passed through unchanged (the host leaves it transient).
+fn canonicalize_sp1_execute_error(raw: &str) -> anyhow::Error {
+    if is_sp1_cycle_cap_trip(raw) {
+        anyhow::anyhow!("exceeded cycle limit (SP1 executor: {raw})")
+    } else {
+        anyhow::anyhow!("{raw}")
+    }
 }
 
 fn run_proof(
@@ -2429,5 +2487,53 @@ mod pk_cache_tests {
         assert_eq!(super::parse_sp1_execute_cycle_limit(Some("0")), None);
         // A concrete override wins, whitespace tolerated.
         assert_eq!(super::parse_sp1_execute_cycle_limit(Some(" 5000000 ")), Some(5_000_000));
+    }
+
+    #[test]
+    fn sp1_cycle_cap_trip_recognized_across_wordings() {
+        // [security B] The pinned build emits this bare string from the gas accumulator.
+        assert!(super::is_sp1_cycle_cap_trip("cycle limit reached"));
+        assert!(super::is_sp1_cycle_cap_trip("Error: cycle limit reached, stopping execution"));
+        // The SDK variant wording and the type name, for robustness across builds/paths.
+        assert!(super::is_sp1_cycle_cap_trip("exceeded cycle limit of 2000000000"));
+        assert!(super::is_sp1_cycle_cap_trip("ExceededCycleLimit(2000000000)"));
+        // A genuinely transient error must NOT be mistaken for a cap trip (else a legit program
+        // would be permanently negative-cached — the #16 class of bug).
+        assert!(!super::is_sp1_cycle_cap_trip("no idle worker available"));
+        assert!(!super::is_sp1_cycle_cap_trip("Failed to extract public value digest"));
+        assert!(!super::is_sp1_cycle_cap_trip("broken pipe"));
+    }
+
+    #[test]
+    fn sp1_execute_error_canonicalized_only_for_cap_trip() {
+        // A cap trip is rewritten to the canonical phrase the HOST matches as too-heavy...
+        let cap = super::canonicalize_sp1_execute_error("cycle limit reached").to_string();
+        assert!(cap.to_lowercase().contains("exceeded cycle limit"));
+        // ...while a transient error passes through verbatim (stays transient host-side).
+        let transient = super::canonicalize_sp1_execute_error("broken pipe").to_string();
+        assert_eq!(transient, "broken pipe");
+        assert!(!transient.to_lowercase().contains("exceeded cycle limit"));
+    }
+
+    // [security A] End-to-end guard against the critical regression the fix-review found: with
+    // `.calculate_gas(false)` the pinned SP1 build returns Err("Failed to extract public value
+    // digest") for EVERY guest, so NO SP1 job was ever claimable. Runs a REAL CPU execution of the
+    // embedded fibonacci guest (CPU-only, no sp1-gpu-server, no GPU, no network — and NO `setup`, so
+    // it stays fast, a few seconds). Skips cleanly when guests are stubbed (SP1_SKIP_PROGRAM_BUILD).
+    #[test]
+    fn sp1_execute_measures_real_cycles() {
+        if super::FIBONACCI_SP1_GUEST_ELF.is_empty() {
+            eprintln!("skipping: fibonacci guest ELF is stubbed (SP1_SKIP_PROGRAM_BUILD)");
+            return;
+        }
+        let elf = super::FIBONACCI_SP1_GUEST_ELF;
+        let input = 1000u32.to_le_bytes(); // the known-good benchmark input
+        let cpu = sp1_sdk::blocking::ProverClient::builder().cpu().build();
+
+        // Gas calculation left at its default (enabled) → a real guest returns a POSITIVE instruction
+        // count. `.calculate_gas(false)` would make this return Err for every guest.
+        let (cycles, _dur) = super::run_execute_sp1(&cpu, elf, &input)
+            .expect("executing a valid guest must succeed and yield a cycle count");
+        assert!(cycles > 0, "measured cycle count must be positive, got {cycles}");
     }
 }
