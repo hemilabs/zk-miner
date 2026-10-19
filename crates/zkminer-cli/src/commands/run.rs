@@ -261,10 +261,12 @@ static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 const FALLBACK_ESTIMATED_CYCLES: u64 = 34_000_000;
 
 /// Sentinel cycle count for a program the executor could not measure because the guest is too heavy
-/// or non-terminating (it tripped the execute cycle cap). Large enough that any evaluator sizing on
-/// it deems the job deadline-infeasible (so it is never claimed), while staying well clear of u64
-/// overflow in the downstream duration math. [security #16]
-const UNMEASURABLE_CYCLES: u64 = 1_000_000_000_000_000; // 1e15
+/// or non-terminating (it tripped the execute cycle cap). Sized so that at ANY realistic GPU
+/// throughput (≤ ~3e8 cycles/s) the implied duration exceeds the evaluator's hard `INFEASIBLE`
+/// sentinel (~100 years / 3.15e9 s) — 1e18 / 3e8 ≈ 3.3e9 s — so the job is unconditionally rejected,
+/// not merely deadline-infeasible for typical deadlines. Still far below u64::MAX (1.8e19) and the
+/// f64 duration range, so no overflow downstream. [security #16]
+const UNMEASURABLE_CYCLES: u64 = 1_000_000_000_000_000_000; // 1e18
 
 /// Outcome of a background cycle measurement. [security #16] A typed result instead of classifying
 /// free-form error strings: the previous substring match flagged the TRANSIENT "no idle risc0
