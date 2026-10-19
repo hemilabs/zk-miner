@@ -868,6 +868,11 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     // CudaProver initialization is expensive (spawns sp1-gpu-server, CUDA context)
     // and would block the handshake response if done before the message loop.
     let mut prover: Option<sp1_sdk::blocking::CudaProver> = None;
+    // Lazy CPU prover used ONLY for the pre-claim EXECUTE (cycle-measurement) path. SP1 execution is
+    // pure CPU emulation, so measuring on a `CpuProver` yields the identical cycle count the CUDA
+    // prover would while never spinning up `sp1-gpu-server` — keeping the sizing path as cheap as
+    // risc0's. See `run_execute_sp1`. [security R2/SP1 sizing]
+    let mut cpu_executor: Option<sp1_sdk::blocking::CpuProver> = None;
     // Cache one proving key per unique ELF. The key depends only on the program, so
     // reusing it across proofs of the same ELF avoids a costly setup() every call AND
     // stops leaking a fresh GPU-resident key per proof (the old code mem::forget'd the
@@ -1275,19 +1280,68 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Execute { request_id, .. } => {
-                // Cycle measurement is implemented for risc0 only: it is the backend whose
-                // executor reports the same `total_cycles` the prover does, so the number is
-                // directly comparable to what proving will report. Decline explicitly rather
-                // than returning a fabricated count — a wrong cycle count would size the
-                // deadline check and the look-ahead queue, and silently claiming work we
-                // cannot finish loses collateral outright.
-                let resp = WorkerResponse::Error {
-                    request_id,
-                    kind: ErrorKind::InvalidInput,
-                    message: "cycle measurement not supported by the sp1 backend".to_string(),
+            WorkerCommand::Execute {
+                request_id,
+                elf,
+                input_data,
+                // program_id is NOT enforced on the sizing path for SP1 — the vkey derivation is the
+                // GPU-heavy `setup`, and the fetched ELF is already registry-bound by the host's
+                // content-hash check. See `run_execute_sp1`.
+                program_id: _,
+            } => {
+                // [security R2/SP1 sizing] Real cycle measurement for SP1, matching risc0's Execute
+                // arm, so the miner sizes SP1 jobs on a measured count rather than the
+                // submitter-declared `expectedCycles`. Runs on a lazily-built CPU executor (no
+                // gpu-server), so it is as cheap as risc0's sizing path.
+                tracing::info!("Execute (sizing) request {request_id} ({} bytes ELF)", elf.len());
+                let cpu = match cpu_executor {
+                    Some(ref c) => c,
+                    None => {
+                        // Build the CPU executor defensively: a panic here must answer the protocol
+                        // (Internal), not vanish and have the dispatcher kill a healthy proving slot.
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            sp1_sdk::blocking::ProverClient::builder().cpu().build()
+                        })) {
+                            Ok(built) => cpu_executor.insert(built),
+                            Err(_) => {
+                                let resp = WorkerResponse::Error {
+                                    request_id,
+                                    kind: ErrorKind::Internal,
+                                    message: "failed to initialise the SP1 CPU executor for sizing"
+                                        .to_string(),
+                                };
+                                write_message(&mut stdout, &resp)?;
+                                continue;
+                            }
+                        }
+                    }
                 };
-                write_message(&mut stdout, &resp)?;
+                match run_execute_sp1(cpu, &elf, &input_data) {
+                    Ok((cycles, duration_secs)) => {
+                        tracing::info!(
+                            "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s"
+                        );
+                        let resp = WorkerResponse::ExecuteResult {
+                            request_id,
+                            cycles,
+                            duration_secs,
+                        };
+                        write_message(&mut stdout, &resp)?;
+                    }
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        // Execution failure is NOT proof failure: the guest may trip the cycle cap
+                        // ("exceeded cycle limit of N" — which the host classifies as too-heavy) or
+                        // simply panic on this input. Both are properties of the job, not of this
+                        // worker, so report InvalidInput and keep the healthy worker alive.
+                        let resp = WorkerResponse::Error {
+                            request_id,
+                            kind: ErrorKind::InvalidInput,
+                            message: msg,
+                        };
+                        write_message(&mut stdout, &resp)?;
+                    }
+                }
             }
 
             WorkerCommand::Warmup { request_id } => {
@@ -1367,6 +1421,76 @@ fn detect_gpu() -> (bool, Option<String>) {
         tracing::warn!("nvidia-smi did not answer ({}) ", outcome.describe());
     }
     (false, None)
+}
+
+/// Cycle cap for the pre-claim EXECUTE (sizing) path, mirroring the risc0 worker's
+/// `execute_session_cycle_limit`. The guest here runs UNCLAIMED and submitter-controlled, so a
+/// runaway is a free DoS lever and the result is only a sizing estimate. SP1's executor fails with
+/// `ExecutionError::ExceededCycleLimit` ("exceeded cycle limit of N") when the cap is hit, which the
+/// host classifies as "too heavy" and negative-caches — rather than running until the host's ~120 s
+/// measure watchdog SIGKILLs the worker (indistinguishable from a transient crash, so NOT
+/// negative-cached). The default (2e9) matches risc0's and is ~21× the largest proof observed on this
+/// market (~9.3e7 cycles), so it cannot false-cap a real job. Override with
+/// `ZKMINER_SP1_EXECUTE_MAX_CYCLES` (0 = unlimited).
+fn sp1_execute_cycle_limit() -> Option<u64> {
+    parse_sp1_execute_cycle_limit(std::env::var("ZKMINER_SP1_EXECUTE_MAX_CYCLES").ok().as_deref())
+}
+
+/// Pure parser behind [`sp1_execute_cycle_limit`], split out so the cap logic is testable without
+/// mutating process-global env. `None` env → default; `Some("0")` → unlimited; a non-numeric value →
+/// default (fail safe: keep the cap rather than silently removing it).
+fn parse_sp1_execute_cycle_limit(raw: Option<&str>) -> Option<u64> {
+    const DEFAULT: u64 = 2_000_000_000;
+    match raw {
+        Some(s) => match s.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT),
+        },
+        None => Some(DEFAULT),
+    }
+}
+
+/// Execute the guest WITHOUT proving, returning its true cycle count — the pre-claim sizing path for
+/// SP1, the analogue of the risc0 worker's `run_execute`. The count is SP1's `total_instruction_count`,
+/// the SAME quantity `run_proof` reports and the SP1 benchmark suite measures throughput in, so it
+/// feeds the deadline/look-ahead math in matching units. This lets the miner size an SP1 job on a
+/// MEASURED cycle count instead of the submitter-declared `expectedCycles`, closing the input-flood
+/// under-sizing vector for SP1. [security R2/SP1 sizing]
+///
+/// Runs on a lightweight `CpuProver`, never the CUDA prover: SP1 execution is pure CPU emulation and
+/// the cycle count is deterministic in (program, input) whichever prover runs it, so routing it to the
+/// CPU keeps the measurement as cheap as risc0's and never spins up `sp1-gpu-server`.
+///
+/// Program-id (vkey) binding is deliberately NOT enforced here. For SP1 `programId` is the vkey, whose
+/// only derivation is the full GPU-heavy `setup`; doing that per measurement would turn the SP1 sizing
+/// path into an asymmetric GPU-DoS lever the cheap risc0 path does not have. The ELF is already bound
+/// to the registry on the host side by `download_elf`'s keccak content-hash check, so the bytes
+/// measured are the registered program's; the authoritative `vkey == programId` gate stays on the
+/// PROVE path (`run_proof`). A mismatched ELF therefore still sizes correctly and simply fails to
+/// prove (→ release), never a forged or under-sized claim.
+fn run_execute_sp1(
+    cpu: &sp1_sdk::blocking::CpuProver,
+    elf: &[u8],
+    input_data: &[u8],
+) -> anyhow::Result<(u64, f64)> {
+    use sp1_sdk::blocking::{Elf, Prover, SP1Stdin};
+
+    let started = Instant::now();
+    let mut stdin = SP1Stdin::new();
+    // One input element, consumed by a single `io::read_vec` in the guest — matching `run_proof`.
+    stdin.write_slice(input_data);
+
+    let mut req = cpu.execute(Elf::from(elf), stdin);
+    if let Some(limit) = sp1_execute_cycle_limit() {
+        req = req.cycle_limit(limit);
+    }
+    // We need only the instruction count; skip gas simulation (extra work) to keep sizing cheap.
+    let (_, report) = req
+        .calculate_gas(false)
+        .run()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok((report.total_instruction_count(), started.elapsed().as_secs_f64()))
 }
 
 fn run_proof(
@@ -2294,5 +2418,16 @@ mod pk_cache_tests {
         let evicted = c.insert(k(1), 1);
         assert!(evicted.is_empty());
         assert!(c.contains(&k(1)));
+    }
+
+    #[test]
+    fn sp1_execute_cap_parses_env_forms() {
+        // Default when unset or garbage (fail safe: keep the cap).
+        assert_eq!(super::parse_sp1_execute_cycle_limit(None), Some(2_000_000_000));
+        assert_eq!(super::parse_sp1_execute_cycle_limit(Some("not-a-number")), Some(2_000_000_000));
+        // Explicit 0 disables the cap.
+        assert_eq!(super::parse_sp1_execute_cycle_limit(Some("0")), None);
+        // A concrete override wins, whitespace tolerated.
+        assert_eq!(super::parse_sp1_execute_cycle_limit(Some(" 5000000 ")), Some(5_000_000));
     }
 }
