@@ -1801,6 +1801,19 @@ mod h4_tests {
     use alloy::primitives::{Address, B256};
 
     #[test]
+    fn job_fulfilled_topic0_matches_binding_signature() {
+        // [R1 test-gap] Pin the hand-computed topic0 to the generated ABI binding's signature hash,
+        // mirroring the monitor's discipline. If the JobFulfilled event signature ever drifts, this
+        // fails in CI instead of silently making the H4 check see every real fulfill as "not
+        // fulfilled" (which would release genuinely-fulfilled jobs).
+        use alloy::sol_types::SolEvent;
+        assert_eq!(
+            job_fulfilled_topic0(),
+            zkminer_contracts::bindings::IHemiProveFulfill::JobFulfilled::SIGNATURE_HASH
+        );
+    }
+
+    #[test]
     fn authentic_only_when_router_emitted() {
         let router = Address::repeat_byte(0xAA);
         let attacker = Address::repeat_byte(0xBB);

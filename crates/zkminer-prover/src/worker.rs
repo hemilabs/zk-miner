@@ -609,26 +609,59 @@ impl WorkerHandle {
             std::thread::Builder::new()
                 .name(format!("worker-stderr-{backend_name}"))
                 .spawn(move || {
-                    use std::io::BufRead;
-                    let reader = BufReader::new(stderr);
-                    for line in reader.lines() {
-                        match line {
-                            Ok(line) if !line.is_empty() => {
-                                // [security R3] A guest's stdout is dup2'd onto worker stderr (H1), so
-                                // this line may be fully attacker-controlled. Strip control/escape
-                                // bytes and bound its length before it can reach the operator console.
-                                let line = sanitize_worker_line(&line);
-                                // DIAGNOSTIC: surface WITSUM / EVALCHECK_DIFF lines directly to stderr
-                                // (the test harness installs no tracing subscriber, so warn is dropped).
-                                if line.starts_with("[WITSUM]") || line.starts_with("[EVALCHECK_DIFF]") {
-                                    eprintln!("[worker:{backend_name}] {line}");
-                                }
-                                if !SUPPRESS_WORKER_STDERR.load(Ordering::Relaxed) {
-                                    tracing::warn!(target: "worker", "[worker:{backend_name}] {line}");
+                    use std::io::Read;
+                    // [security R3/H1] Read with a per-line BYTE CAP, not BufRead::lines(): since H1
+                    // dup2's a guest's stdout onto worker stderr, a malicious guest can emit gigabytes
+                    // with no newline, and lines() would allocate the whole run into one String first
+                    // — a free heap-OOM of the miner. Accumulate at most MAX_LINE_BYTES per line, emit
+                    // the (sanitized) prefix, then discard the rest of an over-long line until '\n'.
+                    const MAX_LINE_BYTES: usize = 8192;
+                    let mut reader = BufReader::new(stderr);
+                    let mut buf: Vec<u8> = Vec::with_capacity(256);
+                    let mut discarding = false;
+                    let mut byte = [0u8; 1];
+                    let emit = |raw: &[u8]| {
+                        if raw.is_empty() {
+                            return;
+                        }
+                        // Sanitize (strip control/escape bytes, cap length) before it can reach the
+                        // operator's console or log file.
+                        let line = sanitize_worker_line(&String::from_utf8_lossy(raw));
+                        if line.is_empty() {
+                            return;
+                        }
+                        if line.starts_with("[WITSUM]") || line.starts_with("[EVALCHECK_DIFF]") {
+                            eprintln!("[worker:{backend_name}] {line}");
+                        }
+                        if !SUPPRESS_WORKER_STDERR.load(Ordering::Relaxed) {
+                            tracing::warn!(target: "worker", "[worker:{backend_name}] {line}");
+                        }
+                    };
+                    loop {
+                        match reader.read(&mut byte) {
+                            Ok(0) => {
+                                emit(&buf);
+                                break;
+                            }
+                            Ok(_) => {
+                                if byte[0] == b'\n' {
+                                    emit(&buf);
+                                    buf.clear();
+                                    discarding = false;
+                                } else if !discarding {
+                                    buf.push(byte[0]);
+                                    if buf.len() >= MAX_LINE_BYTES {
+                                        // Line too long: emit what we have, then skip to the newline.
+                                        emit(&buf);
+                                        buf.clear();
+                                        discarding = true;
+                                    }
                                 }
                             }
-                            Err(_) => break,
-                            _ => {}
+                            Err(_) => {
+                                emit(&buf);
+                                break;
+                            }
                         }
                     }
                 })

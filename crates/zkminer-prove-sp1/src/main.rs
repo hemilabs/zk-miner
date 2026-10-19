@@ -25,6 +25,24 @@ fn elf_hash(elf: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Decode a `0x`-prefixed 64-hex-char string (SP1's vkey `bytes32()`) into `[u8; 32]`; `None` on any
+/// malformed input. Used instead of `bytes32_raw()`, which panics for digests that aren't exactly 31
+/// bytes big-endian. No hex-crate dependency.
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    if s.len() != 64 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        let hi = (bytes[2 * i] as char).to_digit(16)?;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
+        *b = ((hi << 4) | lo) as u8;
+    }
+    Some(out)
+}
+
 /// Largest number of distinct proving keys the worker keeps resident. Each entry is a large
 /// GPU-resident key, so without a bound the cache grows O(distinct ELFs a submitter sends) in host
 /// RAM and VRAM. LRU-evicted beyond this. Override with `ZKMINER_SP1_PK_CACHE_MAX`.
@@ -1408,13 +1426,27 @@ fn run_proof(
             Some("1") | Some("true") | Some("TRUE")
         );
         if !skip {
-            let vk_hash = pk.verifying_key().bytes32_raw();
-            let matches = vk_hash == pid || vk_hash.iter().rev().copied().eq(pid.iter().copied());
-            if !matches {
-                anyhow::bail!(
-                    "ELF vkey hash does not match job programId (served ELF is not the registered \
-                     program) — refusing to prove"
-                );
+            // Use bytes32() (a 0x-prefixed 64-hex string, zero-padded) and decode it, NOT
+            // bytes32_raw(): the latter does `result[1..].copy_from_slice(&digest.to_bytes_be())`,
+            // which PANICS unless the big-endian digest is exactly 31 bytes — a condition a
+            // submitter-crafted ELF (hence vkey) can violate, crashing the worker. bytes32() formats
+            // via `format!("0x{:0>64}", …)` and never panics.
+            match decode_hex32(&pk.verifying_key().bytes32()) {
+                Some(vk_hash) => {
+                    let matches =
+                        vk_hash == pid || vk_hash.iter().rev().copied().eq(pid.iter().copied());
+                    if !matches {
+                        anyhow::bail!(
+                            "ELF vkey hash does not match job programId (served ELF is not the \
+                             registered program) — refusing to prove"
+                        );
+                    }
+                }
+                None => {
+                    // The SDK returned a vkey string we can't parse to 32 bytes; refuse rather than
+                    // prove an unverifiable binding (a legit program's vkey always parses).
+                    anyhow::bail!("could not parse SP1 vkey hash for programId binding — refusing to prove");
+                }
             }
         }
     }
@@ -2201,6 +2233,21 @@ mod pk_cache_tests {
 
     fn k(n: u8) -> [u8; 32] {
         [n; 32]
+    }
+
+    #[test]
+    fn decode_hex32_parses_sp1_bytes32_form() {
+        // The on-chain-form vkey string: 0x + 64 hex, zero-padded.
+        let s = "0x00000000000000000000000000000000000000000000000000000000000000ff";
+        let got = super::decode_hex32(s).expect("parse");
+        assert_eq!(got[31], 0xff);
+        assert!(got[..31].iter().all(|&b| b == 0));
+        // Full-width value with a non-zero top byte (the case bytes32_raw would PANIC on) parses fine.
+        let full = format!("0x{}", "ab".repeat(32));
+        assert_eq!(super::decode_hex32(&full).unwrap(), [0xabu8; 32]);
+        // Malformed inputs → None (never panic).
+        assert!(super::decode_hex32("0x1234").is_none()); // too short
+        assert!(super::decode_hex32(&("0x".to_owned() + &"zz".repeat(32))).is_none()); // non-hex
     }
 
     #[test]

@@ -261,10 +261,25 @@ static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 const FALLBACK_ESTIMATED_CYCLES: u64 = 34_000_000;
 
 /// Sentinel cycle count for a program the executor could not measure because the guest is too heavy
-/// or non-terminating (timeout / cycle-cap). Large enough that any evaluator sizing on it deems the
-/// job deadline-infeasible (so it is never claimed), while staying well clear of u64 overflow in the
-/// downstream duration math. [security #16]
+/// or non-terminating (it tripped the execute cycle cap). Large enough that any evaluator sizing on
+/// it deems the job deadline-infeasible (so it is never claimed), while staying well clear of u64
+/// overflow in the downstream duration math. [security #16]
 const UNMEASURABLE_CYCLES: u64 = 1_000_000_000_000_000; // 1e15
+
+/// Outcome of a background cycle measurement. [security #16] A typed result instead of classifying
+/// free-form error strings: the previous substring match flagged the TRANSIENT "no idle risc0
+/// worker; deferring cycle measurement" bail as "hard" (it contains "cycle") and permanently
+/// negative-cached — i.e. declined — legitimate programs whenever a worker was briefly busy.
+enum MeasureOutcome {
+    /// The guest executed and reported a real cycle count.
+    Measured(u64),
+    /// The guest executed but tripped the execute cycle cap (too heavy / non-terminating). Safe to
+    /// negative-cache: the program is sized infeasible and not re-measured.
+    TooHeavy,
+    /// A transient failure (no idle worker, descriptor/ELF fetch error, worker died for an unrelated
+    /// reason, programId mismatch, or an input-specific guest panic). Do NOT cache; retry later.
+    Transient,
+}
 
 /// Insert a measured cycle count for `program_id`, bounding the map so a flood of distinct programs
 /// cannot grow the long-lived brain task's heap without limit. [security I3] Each real entry costs a
@@ -3294,9 +3309,12 @@ async fn miner_brain(
                         measuring.clone(),
                     );
                     tokio::spawn(async move {
-                        let outcome = measure_cycles(&c2, &st2, jid, dh, pid).await;
-                        match outcome {
-                            Ok(cycles) => {
+                        // [security #16] Negative-cache a too-heavy guest (sized infeasible so it is
+                        // never claimed AND not re-measured every tick), cache a real measurement,
+                        // and leave a transient failure uncached so it retries. Classification is by
+                        // typed MeasureOutcome, NOT a substring of free-form error text.
+                        match measure_cycles(&c2, &st2, jid, dh, pid).await {
+                            MeasureOutcome::Measured(cycles) => {
                                 tracing::info!(
                                     "measured {cycles} cycles for program {} by execution — all its \
                                      jobs will be sized on it",
@@ -3304,37 +3322,15 @@ async fn miner_brain(
                                 );
                                 insert_measured(&cache, pid, cycles);
                             }
-                            Err(e) => {
-                                let msg = format!("{e:#}").to_lowercase();
-                                // [security #16] A guest that EXECUTES but will not terminate within
-                                // the measure budget, or exceeds the execute cycle cap, is a free DoS
-                                // lever if re-measured every brain tick (it wedges a risc0 slot for
-                                // MEASURE_TIMEOUT each time). Negative-cache it as effectively
-                                // unmeasurable → the evaluator sizes it as infeasible (never claimed)
-                                // AND `already_measured` becomes true so it is never re-measured.
-                                // Only for a HARD failure (timeout / cycle cap / execute error); a
-                                // TRANSIENT one (no idle worker, descriptor/ELF fetch error) is left
-                                // uncached so it can retry.
-                                let hard = msg.contains("session limit")
-                                    || msg.contains("cycle")
-                                    || msg.contains("timed out")
-                                    || msg.contains("timeout")
-                                    || msg.contains("deadline")
-                                    || msg.contains("execute:");
-                                if hard {
-                                    tracing::warn!(
-                                        "program {} is unmeasurable (too heavy / non-terminating): {e:#} \
-                                         — marking infeasible so it is not claimed or re-measured",
-                                        short_id(pid)
-                                    );
-                                    insert_measured(&cache, pid, UNMEASURABLE_CYCLES);
-                                } else {
-                                    tracing::debug!(
-                                        "cycle measurement for program {} failed (transient): {e:#}",
-                                        short_id(pid)
-                                    );
-                                }
+                            MeasureOutcome::TooHeavy => {
+                                tracing::warn!(
+                                    "program {} is unmeasurable (exceeds the execute cycle cap) — \
+                                     marking infeasible so it is not claimed or re-measured",
+                                    short_id(pid)
+                                );
+                                insert_measured(&cache, pid, UNMEASURABLE_CYCLES);
                             }
+                            MeasureOutcome::Transient => {}
                         }
                         // Clear the in-flight marker so a transient failure can retry.
                         if let Ok(mut m) = inflight.lock() {
@@ -4011,12 +4007,16 @@ fn spawn_lifecycle_task(
         )
         .await;
         if let Err(e) = outcome {
-            tracing::error!("Job {} lifecycle error: {e:#}", short_id(jid));
+            // [security R3/#09] The lifecycle error can carry a guest-controlled proof-failure
+            // message (a worker Error.message surfaced as anyhow). Sanitize before it reaches the
+            // operator's console/log or the TUI, so it cannot inject terminal escapes / forge lines.
+            let emsg = zkminer_chain::programs::sanitize_log(&format!("{e:#}"));
+            tracing::error!("Job {} lifecycle error: {emsg}", short_id(jid));
             {
                 let mut s = state.write().await;
                 s.add_log(
                     zkminer_tui::state::LogLevel::Error,
-                    format!("Job {} failed: {:#}", short_id(jid), e),
+                    format!("Job {} failed: {emsg}", short_id(jid)),
                 );
             }
             // Release the on-chain claim to unlock collateral and avoid slashing. If we
@@ -4327,6 +4327,28 @@ async fn process_job_lifecycle(
             descriptor.programId,
             program_id,
         ));
+    }
+
+    // [security #11, early] The submitter-controlled descriptor bytes (inputData + the two extra-data
+    // fields) are re-encoded into the fulfillJob calldata under a fixed gas limit. Their size is known
+    // NOW, before the expensive proof — so reject an over-budget descriptor here and release, rather
+    // than burning a full Groth16 proof first. (The guest journal is only known post-prove and is
+    // re-checked at the fulfill step.)
+    {
+        let descriptor_bytes = descriptor.inputData.len()
+            + descriptor.callbackExtraData.len()
+            + descriptor.extraVerifierData.len();
+        // Leave generous headroom under the 128 KiB fulfill-payload cap for the journal + seal.
+        const MAX_DESCRIPTOR_PAYLOAD_BYTES: usize = 96 * 1024;
+        if descriptor_bytes > MAX_DESCRIPTOR_PAYLOAD_BYTES {
+            return Err(anyhow::anyhow!(
+                "descriptor payload for {} is {} bytes (> {} cap) — fulfill would OOG-revert; \
+                 releasing before wasting a proof",
+                short_id(job_id),
+                descriptor_bytes,
+                MAX_DESCRIPTOR_PAYLOAD_BYTES,
+            ));
+        }
     }
 
     // Surface predicate jobs (the default policy claims them). Fulfilling with a
@@ -4912,7 +4934,15 @@ async fn process_job_lifecycle(
     // collateral cheaply. ~16 gas/calldata-byte means the fulfill gas limit bounds total calldata;
     // the floor below leaves generous room for the fixed descriptor fields and on-chain execution.
     {
-        let payload_bytes = proof.journal.len() + descriptor.inputData.len() + proof.seal.len();
+        // Sum ALL submitter-controlled calldata the fulfillJob tx carries: the guest journal
+        // (publicValues), the seal, and every bytes field of the descriptor that is re-encoded
+        // on-chain — inputData AND callbackExtraData AND extraVerifierData. [R3-fix for #11] Omitting
+        // the latter two left the OOG DoS open: a submitter could move the bulk into them.
+        let payload_bytes = proof.journal.len()
+            + proof.seal.len()
+            + descriptor.inputData.len()
+            + descriptor.callbackExtraData.len()
+            + descriptor.extraVerifierData.len();
         const MAX_FULFILL_PAYLOAD_BYTES: usize = 128 * 1024; // conservative vs the ~5M gas fulfill cap
         if payload_bytes > MAX_FULFILL_PAYLOAD_BYTES {
             return Err(anyhow::anyhow!(
@@ -5153,39 +5183,71 @@ async fn measure_cycles(
     job_id: alloy::primitives::B256,
     descriptor_hash: alloy::primitives::B256,
     program_id: alloy::primitives::B256,
-) -> anyhow::Result<u64> {
+) -> MeasureOutcome {
     // Cheap availability probe FIRST. The fetches below can hit the chain, and under load
     // most measurement attempts are skipped for a busy worker — doing the RPC work only to
-    // throw it away wastes a throttled connection the proving path needs.
-    {
-        let pool = zkminer_prover::engine::worker_pool()
-            .ok_or_else(|| anyhow::anyhow!("no worker pool available"))?;
-        if !pool.has_idle_worker("risc0") {
-            anyhow::bail!("no idle risc0 worker; deferring cycle measurement");
-        }
+    // throw it away wastes a throttled connection the proving path needs. A busy worker is a
+    // TRANSIENT condition — never negative-cache on it.
+    match zkminer_prover::engine::worker_pool() {
+        Some(pool) if pool.has_idle_worker("risc0") => {}
+        _ => return MeasureOutcome::Transient,
     }
 
     // Both of these are locally cached after the first sighting of a program, so a repeat
-    // descriptor costs no chain traffic.
-    let descriptor = fetch_job_descriptor_checked(client, job_id, descriptor_hash).await?;
-    let elf = fetch_or_download_elf(client, state, program_id).await?;
+    // descriptor costs no chain traffic. A fetch failure is transient (RPC / storage).
+    let descriptor = match fetch_job_descriptor_checked(client, job_id, descriptor_hash).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!("measure {}: descriptor fetch failed (transient): {e:#}", short_id(program_id));
+            return MeasureOutcome::Transient;
+        }
+    };
+    let elf = match fetch_or_download_elf(client, state, program_id).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!("measure {}: ELF fetch failed (transient): {e:#}", short_id(program_id));
+            return MeasureOutcome::Transient;
+        }
+    };
     let input: Vec<u8> = descriptor.inputData.to_vec();
 
-    let pool = zkminer_prover::engine::worker_pool()
-        .ok_or_else(|| anyhow::anyhow!("no worker pool available"))?;
+    let pool = match zkminer_prover::engine::worker_pool() {
+        Some(p) => p,
+        None => return MeasureOutcome::Transient,
+    };
 
     // Bind the sizing ELF to the programId (risc0 image id), so the zero-cost pre-claim measurement
     // path cannot be driven with an ELF unrelated to the registered program. Never against a zero id.
     let program_id_bytes: Option<[u8; 32]> =
         (program_id != alloy::primitives::B256::ZERO).then(|| program_id.0);
 
-    // Blocking: the worker protocol is synchronous. Bounded by the watchdog inside
-    // `execute_cycles` so a non-terminating guest cannot wedge a worker forever.
-    tokio::task::spawn_blocking(move || {
+    // Blocking: the worker protocol is synchronous. Bounded by the watchdog inside `execute_cycles`.
+    let res = tokio::task::spawn_blocking(move || {
         pool.execute_cycles("risc0", &elf, &input, Some(MEASURE_TIMEOUT), program_id_bytes)
     })
-    .await
-    .map_err(|e| anyhow::anyhow!("cycle measurement task panicked: {e}"))?
+    .await;
+    match res {
+        Ok(Ok(cycles)) => MeasureOutcome::Measured(cycles),
+        Ok(Err(e)) => {
+            let msg = format!("{e:#}");
+            // ONLY risc0's precise cap error marks a guest "too heavy" (negative-cacheable). The
+            // execute cap is set below what the measure watchdog can reach, so a runaway trips this
+            // rather than the SIGKILL (which is indistinguishable from a transient crash and must NOT
+            // negative-cache). A programId mismatch, an input-specific panic, or a worker death are
+            // all transient here.
+            if msg.contains("Session limit exceeded") || msg.to_lowercase().contains("session limit") {
+                tracing::warn!("measure {}: guest exceeds the execute cycle cap — too heavy", short_id(program_id));
+                MeasureOutcome::TooHeavy
+            } else {
+                tracing::debug!("measure {}: execute failed (transient): {msg}", short_id(program_id));
+                MeasureOutcome::Transient
+            }
+        }
+        Err(join) => {
+            tracing::debug!("measure {}: measurement task panicked (transient): {join}", short_id(program_id));
+            MeasureOutcome::Transient
+        }
+    }
 }
 
 async fn fetch_or_download_elf(

@@ -85,28 +85,6 @@ fn ip_is_blocked(ip: &IpAddr) -> bool {
     }
 }
 
-/// Reject a URL whose scheme isn't http(s), or whose host is (or resolves to) a private/reserved
-/// address. Used both before the initial fetch and on EVERY redirect hop, so a 3xx to an internal
-/// address can't slip past. A DNS rebind between this check and the actual connect is still
-/// theoretically possible; the redirect re-check closes the amplification that makes it practical.
-fn validate_fetch_url(url: &reqwest::Url) -> Result<()> {
-    match url.scheme() {
-        "http" | "https" => {}
-        other => bail!("refusing ELF fetch with non-http(s) scheme '{other}': {url}"),
-    }
-    if allow_private_elf_hosts() {
-        return Ok(());
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("ELF URL has no host: {url}"))?;
-    let port = url.port_or_known_default().unwrap_or(443);
-    let addrs: Vec<std::net::SocketAddr> = (host, port)
-        .to_socket_addrs()
-        .with_context(|| format!("resolving ELF host '{host}'"))?
-        .collect();
-    reject_blocked_addrs(host, &addrs)
-}
 
 /// Async wrapper around [`validate_fetch_url`] that runs the BLOCKING DNS resolution off the tokio
 /// runtime, bounded by a timeout. [security R4] `validate_fetch_url` calls `to_socket_addrs`, which
@@ -122,9 +100,14 @@ async fn validate_fetch_url_async(url: &reqwest::Url) -> Result<()> {
     if allow_private_elf_hosts() {
         return Ok(());
     }
-    let host = url
+    let host_raw = url
         .host_str()
-        .ok_or_else(|| anyhow::anyhow!("ELF URL has no host: {url}"))?
+        .ok_or_else(|| anyhow::anyhow!("ELF URL has no host: {url}"))?;
+    // host_str() brackets an IPv6 literal ("[::1]"); strip so to_socket_addrs treats it as an IP.
+    let host = host_raw
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host_raw)
         .to_string();
     let port = url.port_or_known_default().unwrap_or(443);
     let host_for_dns = host.clone();
@@ -160,14 +143,47 @@ fn reject_blocked_addrs(host: &str, addrs: &[std::net::SocketAddr]) -> Result<()
     Ok(())
 }
 
+/// Non-blocking redirect-hop validation (no DNS): reject a non-http(s) scheme, and reject a host
+/// that is an IP LITERAL in a blocked range. A hostname host is allowed here (resolving it would
+/// block reqwest's runtime task — the thing R4 fixes); the initial URL was already resolved and
+/// checked off-runtime. [R4]
+fn validate_redirect_target(url: &reqwest::Url) -> Result<()> {
+    match url.scheme() {
+        "http" | "https" => {}
+        other => bail!("non-http(s) redirect scheme '{other}'"),
+    }
+    if allow_private_elf_hosts() {
+        return Ok(());
+    }
+    if let Some(host) = url.host_str() {
+        // host_str() returns an IPv6 literal bracketed ("[::1]"); strip for IpAddr parsing.
+        let h = host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = h.parse::<IpAddr>() {
+            if ip_is_blocked(&ip) {
+                bail!("redirect to private/reserved address {ip}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Build the download client once: bounded connect/total timeout and a redirect policy that
-/// re-validates each hop against [`validate_fetch_url`] and caps the chain length.
+/// re-validates each hop (non-blocking) and caps the chain length.
 fn build_elf_client() -> Result<reqwest::Client> {
     let policy = reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= 5 {
             return attempt.error("too many redirects while fetching ELF");
         }
-        match validate_fetch_url(attempt.url()) {
+        // [R4] NON-BLOCKING check only. reqwest runs this closure synchronously on its connection
+        // task, so it must NOT resolve DNS (that was the exact runtime stall R4 set out to remove).
+        // Reject a redirect whose scheme is wrong or whose host is an IP LITERAL in a blocked range
+        // (the common redirect-to-metadata/loopback SSRF). A redirect to a hostname is followed:
+        // the initial URL was already validated with DNS off-runtime, and re-resolving here would
+        // reintroduce the block. The MAX_ELF_BYTES cap and timeouts still bound the response.
+        match validate_redirect_target(attempt.url()) {
             Ok(()) => attempt.follow(),
             Err(e) => attempt.error(format!("blocked redirect target: {e}")),
         }
@@ -602,17 +618,17 @@ mod security_tests {
     #[test]
     fn validate_rejects_bad_scheme_and_private_ip_literals() {
         // Non-http(s) scheme.
-        assert!(validate_fetch_url(&reqwest::Url::parse("ftp://example.com/x").unwrap()).is_err());
-        assert!(validate_fetch_url(&reqwest::Url::parse("file:///etc/passwd").unwrap()).is_err());
-        // Private / metadata IP literals (no DNS needed).
-        assert!(validate_fetch_url(&reqwest::Url::parse("http://127.0.0.1/x").unwrap()).is_err());
-        assert!(validate_fetch_url(
+        // The redirect-hop validator (non-blocking) rejects bad schemes and private IP LITERALS.
+        assert!(validate_redirect_target(&reqwest::Url::parse("ftp://example.com/x").unwrap()).is_err());
+        assert!(validate_redirect_target(&reqwest::Url::parse("file:///etc/passwd").unwrap()).is_err());
+        assert!(validate_redirect_target(&reqwest::Url::parse("http://127.0.0.1/x").unwrap()).is_err());
+        assert!(validate_redirect_target(
             &reqwest::Url::parse("http://169.254.169.254/latest/meta-data/").unwrap()
         )
         .is_err());
-        assert!(validate_fetch_url(&reqwest::Url::parse("http://[::1]:8545/").unwrap()).is_err());
+        assert!(validate_redirect_target(&reqwest::Url::parse("http://[::1]:8545/").unwrap()).is_err());
         // Public IP literal is allowed.
-        assert!(validate_fetch_url(&reqwest::Url::parse("https://1.1.1.1/elf").unwrap()).is_ok());
+        assert!(validate_redirect_target(&reqwest::Url::parse("https://1.1.1.1/elf").unwrap()).is_ok());
     }
 
     #[test]

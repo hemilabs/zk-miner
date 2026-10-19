@@ -384,13 +384,14 @@ fn verify_program_id(elf: &[u8], program_id: Option<[u8; 32]>) -> anyhow::Result
 }
 
 /// Cycle cap for the pre-claim EXECUTE (sizing) path. A runaway guest here is a free DoS lever (no
-/// claim, no collateral at stake), and the result is only a sizing estimate, so a generous cap is
-/// safe: `1<<34` ≈ 1.7e10 cycles is ~180× the largest proof observed on this market (~9.3e7) and
-/// cannot false-cap a real job. The wall-clock measure timeout is the primary bound; this is
-/// defence-in-depth and yields a clean "session limit exceeded" rather than a watchdog kill.
-/// Override with `ZKMINER_RISC0_EXECUTE_MAX_CYCLES` (0 = unlimited).
+/// claim, no collateral at stake), and the result is only a sizing estimate. The cap is set BELOW the
+/// cycles a non-terminating guest could reach inside the host's ~120 s measure watchdog, so a runaway
+/// trips risc0's clean "Session limit exceeded" error — which the host classifies as "too heavy" and
+/// negative-caches — rather than the watchdog SIGKILL (indistinguishable from a transient crash). 2e9
+/// is still ~21× the largest proof observed on this market (~9.3e7), so it cannot false-cap a real
+/// job. Override with `ZKMINER_RISC0_EXECUTE_MAX_CYCLES` (0 = unlimited).
 fn execute_session_cycle_limit() -> Option<u64> {
-    const DEFAULT: u64 = 1u64 << 34;
+    const DEFAULT: u64 = 2_000_000_000;
     match std::env::var("ZKMINER_RISC0_EXECUTE_MAX_CYCLES") {
         Ok(s) => match s.trim().parse::<u64>() {
             Ok(0) => None,
