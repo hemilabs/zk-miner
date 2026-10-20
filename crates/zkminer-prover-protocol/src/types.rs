@@ -187,8 +187,9 @@ pub enum ErrorKind {
     /// The served ELF's verifying key / image id cannot match the job's on-chain `programId`, so NO
     /// job for this program can ever produce an accepted proof. Distinct from `InvalidInput` (which is
     /// per-job) because it is PERMANENT per program: the host negative-caches the program on it so it
-    /// stops claiming every job the program submits, capping the loss to one baited claim instead of
-    /// one release penalty per job. SP1 cannot check this before claiming (deriving the vkey needs the
+    /// stops claiming every future job the program submits, capping the loss to the one claim wave
+    /// already in flight when its first prove faults instead of one release penalty per job. SP1 cannot
+    /// check this before claiming (deriving the vkey needs the
     /// minutes-long `setup`), so it is only proven on the prove path and reported with this kind.
     ProgramMismatch,
     /// Ran out of memory or other system resources.

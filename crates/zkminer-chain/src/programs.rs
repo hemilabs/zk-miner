@@ -599,7 +599,7 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                 format!("https://arweave.net/{tx_id}")
             }
             StorageKind::Custom => {
-                tracing::debug!("Skipping Custom storage URI: {}", uri_info.uri);
+                tracing::debug!("Skipping Custom storage URI: {}", sanitize_log(&uri_info.uri));
                 continue;
             }
         };
@@ -631,11 +631,14 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
             }
         };
 
-        tracing::info!("Downloading ELF from {}...", url);
+        // The URL string is submitter-controlled (built from a registered URI); sanitize it in
+        // every log line so embedded ANSI/OSC/CRLF cannot forge or corrupt operator console output.
+        let url_log = sanitize_log(&url);
+        tracing::info!("Downloading ELF from {}...", url_log);
         match client.get(parsed).send().await {
             Ok(mut response) => {
                 if !response.status().is_success() {
-                    tracing::warn!("HTTP {} from {}", response.status(), url);
+                    tracing::warn!("HTTP {} from {}", response.status(), url_log);
                     continue;
                 }
                 // Reject an over-cap body up front when the server declares its size.
@@ -643,7 +646,7 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                     if len > MAX_ELF_BYTES {
                         tracing::warn!(
                             "ELF at {} declares {} bytes (> {} cap) — skipping",
-                            url,
+                            url_log,
                             len,
                             MAX_ELF_BYTES
                         );
@@ -676,13 +679,13 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                 if over_cap {
                     tracing::warn!(
                         "ELF from {} exceeds {} cap mid-stream — skipping",
-                        url,
+                        url_log,
                         MAX_ELF_BYTES
                     );
                     continue;
                 }
                 if let Some(e) = read_err {
-                    tracing::warn!("Failed to read response from {}: {}", url, e);
+                    tracing::warn!("Failed to read response from {}: {}", url_log, sanitize_log(&e));
                     continue;
                 }
 
@@ -692,7 +695,7 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                     if actual != expected {
                         tracing::warn!(
                             "ELF hash mismatch from {}: expected {}, got {}",
-                            url,
+                            url_log,
                             expected,
                             actual
                         );
@@ -706,7 +709,7 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                     if actual != uri_info.content_hash {
                         tracing::warn!(
                             "Content hash mismatch from {}: expected {}, got {}",
-                            url,
+                            url_log,
                             uri_info.content_hash,
                             actual
                         );
@@ -718,7 +721,7 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                 return Ok(elf);
             }
             Err(e) => {
-                tracing::warn!("Failed to download from {}: {}", url, e);
+                tracing::warn!("Failed to download from {}: {}", url_log, sanitize_log(&e.to_string()));
                 continue;
             }
         }
