@@ -27,11 +27,11 @@ fn load_from_env(env_var: &str) -> Result<PrivateKeySigner> {
             .with_context(|| format!("Environment variable '{}' not set", env_var))?,
     );
 
-    // [security I2] Remove the key from THIS process's environment the moment it is read, so no
-    // child we later spawn (prover workers, the SP1 gpu-server) can inherit it — whatever the
-    // variable is named. This is the complete fix for a non-standard `key_env_var`; the worker-side
-    // secret-name filter (`is_secret_env_name`) remains as defense-in-depth. Called once at startup,
-    // before any worker or env-reading thread exists, so the process-global mutation is safe here.
+    // Remove the key from THIS process's environment the moment it is read, so no child we
+    // later spawn (prover workers, the SP1 gpu-server) can inherit it — whatever the variable
+    // is named. This covers a non-standard `key_env_var`; the worker-side secret-name filter
+    // (`is_secret_env_name`) remains as a second layer. Called once at startup, before any
+    // worker or env-reading thread exists, so the process-global mutation is safe here.
     std::env::remove_var(env_var);
 
     parse_private_key(&key_hex)

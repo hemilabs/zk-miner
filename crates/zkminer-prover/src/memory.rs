@@ -1,16 +1,15 @@
 //! Host memory: how much is left, how hard the box is stalling, and who the kernel should kill.
 //!
-//! WHY THIS EXISTS. On 2026-10-04 this host was hard-frozen by its own prover processes and had to
-//! be power-cycled, then OOM-killed a prover again nine hours later. The two events looked nothing
-//! alike, and between them they rule out most of the obvious defences:
+//! WHY THIS EXISTS. Prover processes can take the whole host down, and they do it in two very
+//! different shapes that rule out most of the obvious single defences:
 //!
-//! | | the freeze (06:23) | the cgroup kill (08:57) |
+//! | | the freeze | the cgroup kill |
 //! |---|---|---|
 //! | victim | 4x `zkminer-prove-risc0` | `sp1-gpu-server` |
 //! | `total_vm` | 54-72 GB each | **139 GB** |
 //! | anon RSS | **2-11 MB each** | 17.6 GB |
 //! | constraint | `global_oom` | `CONSTRAINT_MEMCG` |
-//! | outcome | hard reboot | one failed test |
+//! | outcome | hard reboot | one failed proof |
 //!
 //! What that table forces:
 //!
@@ -32,7 +31,7 @@
 //! 2. `cap_process_memory` — a kernel-enforced ceiling per worker, so ONE runaway cannot take the
 //!    host down. Summing across concurrent workers is deliberately NOT this layer's job.
 //! 3. `oom_kill_count` — so a kill is reported as a host OOM rather than as a prover bug. Mistaking
-//!    one for the other has already cost real debugging time here.
+//!    one for the other is an easy and costly error.
 
 use std::time::Duration;
 
@@ -56,8 +55,8 @@ pub const SP1_GROTH16_HELPER_PEAK_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// This is the SYSTEM-wide PSI file, not a cgroup's `memory.pressure`. `full` means all non-idle
 /// tasks were stalled on memory at once — time the machine lost outright, which is the thing to
 /// react to. It is a better signal than free-memory thresholds
-/// because it measures the symptom (stalling) rather than a proxy for it. An earlier session on
-/// this box recorded `full avg10 = 67.95%` while it was unusable.
+/// because it measures the symptom (stalling) rather than a proxy for it. A `full avg10` of
+/// 67.95% has been seen on a host that was effectively unusable.
 pub const STALL_BRAKE_PERCENT: f64 = 10.0;
 
 /// Above this, the host is losing real time; stop admitting and raise an alarm.
@@ -202,8 +201,9 @@ pub fn worker_memory_ceiling_bytes(reserve: u64) -> Option<u64> {
 ///
 /// `MemorySwapMax=0` is deliberate. Swap turns a kill into a stall, and for a prover that is the
 /// worse outcome: a killed proof can be released and retried, whereas a thrashing one takes the
-/// host's responsiveness with it — which is the failure this module exists to prevent. The earlier
-/// cgroup kill burned 4 GB of swap on its way down for no benefit.
+/// host's responsiveness with it — which is the failure this module exists to prevent. A cgroup
+/// kill otherwise burns gigabytes of swap (4 GB, in one observed case) on its way down for no
+/// benefit.
 ///
 /// Best effort by design: no systemd user bus, no `busctl`, a different init, or a container
 /// without delegation all mean no cap, and that must not stop a worker from starting. The
@@ -219,8 +219,8 @@ pub fn worker_memory_ceiling_bytes(reserve: u64) -> Option<u64> {
 ///
 /// Deterministic on purpose, so the readers that need to prove provenance — `peak_memory_of_pid`,
 /// `current_memory_of_pid` — can reconstruct the expected name instead of the dispatcher having to
-/// carry it in shared state. Those readers take no lock (that is what fixed the `bus_id_for_slot`
-/// deadlock), so there is nowhere lock-free for a per-worker string to live.
+/// carry it in shared state. Those readers take no lock (avoiding the `bus_id_for_slot` deadlock),
+/// so there is nowhere lock-free for a per-worker string to live.
 pub fn cap_unit_name(unit_hint: &str, pid: u32) -> String {
     format!(
         "{CAP_UNIT_PREFIX}{}-{}.scope",
@@ -245,11 +245,11 @@ pub fn cap_process_memory(pid: u32, unit_hint: &str, max_bytes: u64) -> Result<S
         // FOUR properties. `CollectMode` is the fourth and it is not optional: systemd's default
         // (`inactive`) unloads a transient unit when it goes inactive but NOT when it FAILS, and a
         // worker that is SIGKILLed — by its own ceiling, by the 20-proof recycle, by a timeout, by
-        // shutdown phase 3 — leaves a failed unit behind every single time. Verified on this box:
-        // `zkminer-gputest.scope` was still `loaded failed` long after its process was gone. Nothing
-        // here ever calls StopUnit or ResetFailed, so a soak accumulates one per spawn. Worse, the
-        // unit name embeds the pid and the mode is `fail`, so a lingering unit whose pid gets reused
-        // makes StartTransientUnit fail and that worker runs UNCAPPED, reported only as a warning.
+        // shutdown phase 3 — leaves a failed unit behind every single time (a scope can sit
+        // `loaded failed` long after its process is gone). Nothing here ever calls StopUnit or
+        // ResetFailed, so a long run accumulates one per spawn. Worse, the unit name embeds the pid
+        // and the mode is `fail`, so a lingering unit whose pid gets reused makes StartTransientUnit
+        // fail and that worker runs UNCAPPED, reported only as a warning.
         "4",
         "CollectMode",
         "s",
@@ -302,17 +302,17 @@ pub fn peak_memory_of_pid(pid: u32, expected_unit: Option<&str>) -> Option<u64> 
     // ONLY the cgroup we created for THIS worker, matched by its exact unit name. Without a
     // provenance check the function silently measures whatever cgroup the pid happens to sit in, and
     // when the cap did not apply — a supported state, since it is best effort — that is the MINER'S
-    // OWN cgroup. Measured on this host: our session scope's `memory.peak` reads 16.7 GB and the
-    // enclosing `app.slice` 25.8 GB, both lifetime subtree high-water marks having nothing to do
-    // with one proof. That figure would be persisted as the backend's expected peak and refuse every
-    // job from then on.
+    // OWN cgroup. On this host the session scope's `memory.peak` reads 16.7 GB and the enclosing
+    // `app.slice` 25.8 GB, both lifetime subtree high-water marks having nothing to do with one
+    // proof. Such a figure would be persisted as the backend's expected peak and refuse every job
+    // from then on.
     //
-    // The check used to be `leaf.starts_with("zkminer-")`, which is a NAME, not provenance. This box
-    // has a `zkminer-gputest.scope` sitting in it right now from a capped test run, and the natural
+    // A prefix check like `leaf.starts_with("zkminer-")` is a NAME, not provenance, and is not
+    // enough: a leftover `zkminer-gputest.scope` can be sitting in the hierarchy, and the natural
     // way to run a miner under a limit is `systemd-run --user --unit=zkminer-soak --scope`. In
-    // either case a worker whose cap failed sits in a cgroup whose leaf matches the prefix, and the
-    // guard waves through exactly the lifetime figure it was written to reject. An exact match
-    // against the unit `cap_process_memory` reported cannot be satisfied by an ancestor.
+    // either case a worker whose cap failed sits in a cgroup whose leaf matches the prefix, and a
+    // prefix guard would wave through exactly the lifetime figure it is meant to reject. An exact
+    // match against the unit `cap_process_memory` reported cannot be satisfied by an ancestor.
     let Some(unit) = expected_unit else {
         return None;
     };
@@ -331,14 +331,14 @@ pub fn peak_memory_of_pid(pid: u32, expected_unit: Option<&str>) -> Option<u64> 
 /// Anonymous, not `memory.current`, and the distinction is the whole correctness of the credit this
 /// feeds. `memory.current` charges the page cache too, and `MemAvailable` ALREADY counts reclaimable
 /// page cache as available — so crediting `memory.current` against a proof's expected peak counts
-/// those pages twice: once as headroom and once as a discount. Measured on this box, a single user
-/// slice reads `anon 465 MiB` against `file 18.3 GiB`, so the over-credit is not marginal, it is
-/// most of the number.
+/// those pages twice: once as headroom and once as a discount. On this box a single user slice
+/// reads `anon 465 MiB` against `file 18.3 GiB`, so the over-credit is not marginal, it is most of
+/// the number.
 ///
 /// Left uncorrected, that compounds with an unfloored subtraction into the original freeze: once the
 /// credit exceeds the expected peak the increment is zero, `fits_now` reduces to "is the host reserve
-/// free", and four concurrent provers are admitted onto a box with 4 GiB left — which is the 06:23
-/// incident exactly — and `can_admit` documents on `fits_now` why anon, unlike `memory.current`,
+/// free", and four concurrent provers are admitted onto a box with 4 GiB left — the exact freeze
+/// this guards against — and `can_admit` documents on `fits_now` why anon, unlike `memory.current`,
 /// is safe to credit in full.
 ///
 /// Anonymous pages are the right quantity on two counts: they are what a prover actually holds, and
@@ -394,8 +394,8 @@ pub fn process_group_peak_bytes(proc_root: &std::path::Path, pgid: i32) -> Optio
             continue;
         }
         // Group membership FIRST: `stat` is one short line, `status` is ~60, and on a busy host
-        // most of `/proc` is not ours. Reading `status` for every pid and then discarding it was
-        // the wrong order.
+        // most of `/proc` is not ours. Reading `status` for every pid and then discarding it would
+        // be the wrong order.
         let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else {
             continue;
         };
@@ -546,31 +546,31 @@ pub fn can_admit(
     total: u64,
     reserve: u64,
 ) -> bool {
-    // TWO independent conditions, both of which must hold. The previous single test added
-    // `reserved` to a figure already net of it — once an in-flight proof has actually allocated
-    // its pages, that memory is both absent from `available` AND still counted in `reserved`, so
-    // every proof in flight shrank the apparent headroom twice. On this box that admitted 2 proofs
-    // where 4 genuinely fitted, quietly defeating the concurrency the rest of the design assumes.
+    // TWO independent conditions, both of which must hold. Adding `reserved` to a figure already
+    // net of it would be wrong — once an in-flight proof has actually allocated its pages, that
+    // memory is both absent from `available` AND still counted in `reserved`, so every proof in
+    // flight would shrink the apparent headroom twice. On this box that admits 2 proofs where 4
+    // genuinely fit, quietly defeating the concurrency the rest of the design assumes.
     //
     // 1. LIVE headroom must cover the INCREMENT this proof adds: what is free right now, minus
     //    the OS slice. The increment, not the peak, because `resident` — what this slot's worker
     //    is already holding — has ALREADY been subtracted from `available`. Charging the full peak
     //    on top of it counts those pages twice.
     //
-    //    That double-count wedged the miner permanently, and silently. The SP1 worker caches
+    //    Charging the full peak here wedges the miner permanently, and silently. The SP1 worker caches
     //    `CudaProver` and its proving keys deliberately, so after proof #1 `sp1-gpu-server` sits
     //    resident at ~17.6 GiB. Proof #2 on that same slot then asked for `18 + 3 <= 8.2` and was
     //    refused — and so was every risc0 proof, because the headroom really was gone. The result
     //    was a miner that earned nothing while `reserved_bytes()` read 0, PSI read 0.00%, and every
-    //    slot and backend reported healthy. `resident` is 0 whenever we cannot read it, which is
-    //    exactly the old behaviour, so an unreadable cgroup is no worse than before.
+    //    slot and backend reported healthy. `resident` is 0 whenever we cannot read it, so an
+    //    unreadable cgroup simply disables the credit, which is the conservative direction.
     //    The credit is NOT artificially capped, and that is a deliberate answer to a real
     //    objection: once the credit reaches the peak, `fits_now` reduces to "is the host reserve
     //    free", which sounds like no test at all. Two things make it sound anyway.
     //
     //    First, `resident` is ANONYMOUS memory only (`anon_memory_of_pid`), not `memory.current`.
-    //    The version of this that was dangerous credited the page cache, which `MemAvailable`
-    //    already counts as available — double-counting pages that are reclaimable anyway, and on
+    //    Crediting the page cache instead would be dangerous: `MemAvailable` already counts it as
+    //    available — double-counting pages that are reclaimable anyway, and on
     //    this box that is most of the number (`anon 465 MiB` against `file 18.3 GiB` in one slice).
     //    With anon, every credited byte is a page the worker really holds, really cannot have
     //    reclaimed (its scope sets `MemorySwapMax=0`), and will really reuse. Crediting it in full
@@ -580,8 +580,8 @@ pub fn can_admit(
     //    Second, concurrency is bounded by `fits_committed` below, which uses the ABSOLUTE peak and
     //    ignores the credit entirely. So the credit can only ever help the sequential case — the
     //    next proof on an already-warm slot — and can never wave through a second concurrent proof.
-    //    Capping it at half instead refused exactly the case it was added for: a warm SP1 slot
-    //    holding 17.6 GiB, where proof #2 genuinely needs 0.4 GiB more and the cap demanded 7.5.
+    //    Capping it at half would refuse exactly the case it exists for: a warm SP1 slot
+    //    holding 17.6 GiB, where proof #2 genuinely needs 0.4 GiB more and a half-cap would demand 7.5.
     let fits_now = expected_peak
         .saturating_sub(resident)
         .saturating_add(reserve)
@@ -675,9 +675,9 @@ pub fn unmeasured_peak_for(backend: &str) -> u64 {
         "risc0" | "openvm" => 6 * GIB,
         // `mock_worker` speaks the protocol and allocates nothing; `crates/zkminer-prover/src/bin/`
         // builds it and the integration tests register it as a backend. Charging it the
-        // unknown-backend figure made every such test demand more RAM than a standard CI runner has
-        // (18 GiB committed on a 7-16 GB box), so the benchmark and prove paths returned
-        // `HostMemoryShortage` and the tests failed for a reason that had nothing to do with them.
+        // unknown-backend figure would make every such test demand more RAM than a standard CI runner
+        // has (18 GiB committed on a 7-16 GB box), so the benchmark and prove paths would return
+        // `HostMemoryShortage` and the tests would fail for a reason that had nothing to do with them.
         "mock" => 64 * 1024 * 1024,
         // SP1 and anything we do not recognise.
         _ => 18 * GIB,
@@ -687,7 +687,7 @@ pub fn unmeasured_peak_for(backend: &str) -> u64 {
 /// Multiplier applied to a MEASURED peak before trusting it as a budget.
 ///
 /// The measurement is taken on a strictly cheaper workload than the one it predicts, in two
-/// independent ways, and the repo documents both:
+/// independent ways:
 ///
 /// * **Receipt kind.** The benchmark calls `prover.prove(..)` — the default COMPOSITE receipt. A
 ///   real proof calls `prove_with_opts(.., ProverOpts::groth16())`, adding lift/join and a Groth16
@@ -729,11 +729,11 @@ pub const MIN_TRUSTED_PEAK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// reporting "cannot fit it right now" in perpetuity is worse than saying the box is too small.
 pub fn max_admissible_budget(total: u64) -> u64 {
     // Both terms must leave room for the reserve ON TOP of the budget, because that is what
-    // `can_admit` tests. The first version returned `min(¾·total, total − reserve)` and added the
-    // reserve afterwards, which made the bound satisfiable only where `0.75·T + reserve <= 0.92·T`,
-    // i.e. `T >= 18 GiB` — so it reintroduced the permanent silent refusal it was written to remove,
-    // for every host smaller than this one. Subtracting the reserve from both terms fixes it:
-    // a 16 GiB box now bounds a budget at 9 GiB, which an idle 14.7 GiB of `MemAvailable` can admit.
+    // `can_admit` tests. Returning `min(¾·total, total − reserve)` and adding the reserve afterwards
+    // would make the bound satisfiable only where `0.75·T + reserve <= 0.92·T`, i.e. `T >= 18 GiB` —
+    // reintroducing the permanent silent refusal for every host smaller than this one. Subtracting
+    // the reserve from both terms avoids that: a 16 GiB box bounds a budget at 9 GiB, which an idle
+    // 14.7 GiB of `MemAvailable` can admit.
     let headroom = total.saturating_sub(DEFAULT_HOST_RESERVE_BYTES);
     let bound = (total / 4 * 3)
         .saturating_sub(DEFAULT_HOST_RESERVE_BYTES)
@@ -773,8 +773,8 @@ pub fn peak_for_po2(baseline_peak: u64, po2: u8) -> u64 {
 /// clamps; `unmeasured_peak_for` does not, and `expected_host_peak_bytes` returns it raw on both of
 /// its early returns. So on any host where `unmeasured_peak_for(backend) + reserve > total` — a 20 GiB
 /// box with SP1's 18 GiB default, or any unrecognised backend name anywhere under ~24 GiB — the
-/// committed condition was unsatisfiable at every level of free memory, for the life of the install.
-/// That is bit-for-bit the permanent silent refusal the measured path was fixed for.
+/// committed condition would be unsatisfiable at every level of free memory, for the life of the
+/// install: the same permanent silent refusal the measured path clamps to avoid.
 ///
 /// It is worse than a proving outage, because the benchmark is charged the same figure: the one thing
 /// that could lower it was refused using the number only it could lower. A deadlock, with no log line
@@ -785,22 +785,22 @@ pub fn admissible_unmeasured_peak_for(backend: &str, host_total: u64) -> u64 {
 
 /// Turn a raw measurement into a budget.
 ///
-/// Three rules, each of which was a bug before it was a rule:
+/// Three rules, each guarding a specific way of getting the budget wrong:
 ///
 /// 1. **Refuse an implausibly small figure.** Below `MIN_TRUSTED_PEAK_BYTES` the benchmark did not
 ///    measure the production workload, and a believable-looking small number is how unlimited
 ///    concurrency gets authorised.
-/// 2. **Never undercut the blind default.** The old code returned `measured * FACTOR` outright, so a
-///    3 GiB SP1 reading — entirely plausible given the composite-receipt caveat above — produced a
-///    6 GiB budget where knowing nothing would have charged 18 GiB, and licensed three concurrent
-///    proofs of a workload observed at 17.6 GB each. It also made the function non-monotonic across
-///    the trust floor: 1.9 GiB gave 18 GiB and 2.0 GiB gave 4 GiB, so a SMALLER measurement produced
-///    a LARGER charge. Taking the max fixes both.
+/// 2. **Never undercut the blind default.** Returning `measured * FACTOR` outright would let a
+///    3 GiB SP1 reading — entirely plausible given the composite-receipt caveat above — produce a
+///    6 GiB budget where knowing nothing would charge 18 GiB, licensing three concurrent
+///    proofs of a workload observed at 17.6 GB each. It would also make the function non-monotonic
+///    across the trust floor: 1.9 GiB gives 18 GiB and 2.0 GiB gives 4 GiB, so a SMALLER measurement
+///    produces a LARGER charge. Taking the max prevents both.
 /// 3. **Never exceed what the host can admit.** Unclamped, `measured * 2` above
 ///    `max_admissible_budget` permanently disables the backend — and on a 28 GiB box that threshold
-///    is an 11.4 GiB measurement, below the 16.4 GiB SP1 figure this project has actually observed.
-///    So the single act of running an ACCURATE benchmark turned a working miner into one that never
-///    claims again, silently, with no way back but deleting the cache. Clamping instead yields
+///    is an 11.4 GiB measurement, below the 16.4 GiB SP1 figure observed on this hardware.
+///    So the single act of running an ACCURATE benchmark would turn a working miner into one that
+///    never claims again, silently, with no way back but deleting the cache. Clamping instead yields
 ///    one-proof-at-a-time, which is the truth about such a host, and leaves the per-worker ceiling
 ///    and `oom_score_adj` standing behind it. The caller logs when the clamp bites, because a
 ///    backend whose honest requirement exceeds the machine is something the operator must be told.
@@ -839,7 +839,7 @@ impl Drop for MemoryReservation<'_> {
         // ~u64::MAX, and `can_admit`'s committed term then refuses every proof for the life of the
         // process — a miner that never mines again, silently, from a single arithmetic mismatch.
         // Unreachable today (`try_reserve` refuses a reservation that would clamp the add), but the
-        // failure mode is terminal and the fix costs nothing.
+        // failure mode is terminal and guarding against it costs nothing.
         let _ = self.ledger.reserved.fetch_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
@@ -911,7 +911,7 @@ pub enum PressureState {
     /// `Brake` in severity and in what it tells the operator, not yet in action. Releasing an
     /// in-flight job needs the deadline and collateral context that lives in the brain, and
     /// choosing the wrong victim strands collateral — so the selection is left to be designed
-    /// rather than guessed at. Calling this `Sacrifice` implied an action the system does not take.
+    /// rather than guessed at. Calling this `Sacrifice` would imply an action the system does not take.
     Critical,
 }
 
@@ -930,10 +930,10 @@ pub fn classify_pressure(stall_pct: Option<f64>, available: u64, total: u64) -> 
     //
     // That minimum is `1.5 x` the admission reserve, not `0.5 x`. The brake is supposed to fire
     // BEFORE the gate starts refusing, so the operator sees the host struggling rather than a stream
-    // of per-job refusals; with the old half-reserve minimum the free-memory backstop could only
-    // trigger once `available` was already well below the 3 GiB that admission insists on, i.e. after
+    // of per-job refusals; a half-reserve minimum would let the free-memory backstop trigger only
+    // once `available` was already well below the 3 GiB that admission insists on, i.e. after
     // everything had been silently refused. On a kernel without PSI — the only case this backstop
-    // exists for — that made layer 4 effectively dead.
+    // exists for — that would make this backstop effectively dead.
     let floor = (total / 10).max(DEFAULT_HOST_RESERVE_BYTES * 3 / 2);
     if let Some(p) = stall_pct {
         if p >= STALL_CRITICAL_PERCENT {
@@ -1031,10 +1031,10 @@ mod tests {
         // A second must be refused — this is the sum that froze the host.
         assert!(!can_admit(17 * gib, 0, 17 * gib, 9 * gib, total, reserve));
 
-        // THE double-count regression. Two 6 GiB proofs in flight on a 28 GiB box: 12 GiB
+        // The double-count case. Two 6 GiB proofs in flight on a 28 GiB box: 12 GiB
         // reserved, ~13 GiB still free. A third genuinely fits and must be admitted. Adding
-        // `reserved` to a figure already net of it made this refuse, halving real concurrency and
-        // quietly defeating the look-ahead the rest of the design assumes.
+        // `reserved` to a figure already net of it would make this refuse, halving real concurrency
+        // and quietly defeating the look-ahead the rest of the design assumes.
         assert!(can_admit(6 * gib, 0, 12 * gib, 13 * gib, total, reserve));
 
         // Four in flight: live headroom is gone, so refuse even though the committed total still
@@ -1111,8 +1111,8 @@ mod tests {
                 hs.push(std::thread::spawn(move || {
                     b.wait();
                     // BIND the reservation: testing `.is_some()` in an `if` condition drops the
-                    // temporary before the body, which released every claim instantly and let all
-                    // eight "win" regardless of the ledger's behaviour.
+                    // temporary before the body, which would release every claim instantly and let
+                    // all eight "win" regardless of the ledger's behaviour.
                     // Room for exactly ONE: 10 GiB each, 1 GiB OS reserve, 20 GiB total. The first
                     // leaves 10+10+1 = 21 > 20 committed for any second, so the committed-total test
                     // is what binds. `available` is a fixed fixture figure here — the live-headroom
@@ -1326,8 +1326,8 @@ mod live_tests {
             .arg("cat /proc/self/oom_score_adj; sh -c 'cat /proc/self/oom_score_adj'")
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        // The PRODUCTION call, not a copy of it. An earlier version of this test re-implemented
-        // the `pre_exec` body, so deleting the real one would have left the test green.
+        // The PRODUCTION call, not a copy of it. Re-implementing the `pre_exec` body here would let
+        // deleting the real one leave the test green.
         unsafe {
             cmd.pre_exec(|| {
                 volunteer_as_oom_victim();
@@ -1353,7 +1353,7 @@ mod live_tests {
         );
     }
 
-    /// The pid guard every group kill now passes through. Verified against real processes, because
+    /// The pid guard every group kill passes through. Verified against real processes, because
     /// the whole point is that `/proc` agrees with us about who owns a number.
     #[test]
     fn only_our_own_group_leading_children_may_be_signalled() {
@@ -1487,9 +1487,9 @@ mod live_tests {
         match applied {
             Ok(unit) => {
                 // WAIT for it. `StartTransientUnit` returns a job, so the move is asynchronous —
-                // reading the cgroup immediately is a race, and losing it is what made the first
-                // version of this test fail intermittently. The production doc now records the same
-                // window, which is why `oom_score_adj` is the layer that has no window.
+                // reading the cgroup immediately is a race, and losing that race makes the read
+                // fail intermittently. This is the same window the production code documents, and
+                // is why `oom_score_adj` is the layer that has no window.
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let mut max = String::new();
                 let mut swap = String::new();
@@ -1552,7 +1552,7 @@ mod budget_tests {
         let big = 512 * GIB; // a host large enough that the clamp is not what we are testing
         assert_eq!(budget_from_measurement(4 * GIB, "risc0", big), 8 * GIB);
         assert_eq!(budget_from_measurement(9 * GIB, "sp1", big), 18 * GIB);
-        // THE scenario this prevents: a 2 GiB reading on a 28 GiB box. Unscaled it licenses ~11
+        // The scenario this prevents: a 2 GiB reading on a 28 GiB box. Unscaled it licenses ~11
         // concurrent proofs; four was enough to require a power cycle.
         let unscaled_concurrency = (28 * GIB - 3 * GIB) / (2 * GIB);
         let scaled_concurrency =
@@ -1565,9 +1565,10 @@ mod budget_tests {
     }
 
     /// An ACCURATE benchmark must not disable the backend. Unclamped, `measured * 2` above
-    /// `total - reserve` made `can_admit`'s committed condition unsatisfiable at any level of free
-    /// memory — so measuring this box's real 16.4 GiB SP1 peak retired SP1 permanently, silently,
-    /// with no recovery but deleting the cache. One proof at a time is the truth about such a host.
+    /// `total - reserve` would make `can_admit`'s committed condition unsatisfiable at any level of
+    /// free memory — so measuring this box's real 16.4 GiB SP1 peak would retire SP1 permanently,
+    /// silently, with no recovery but deleting the cache. One proof at a time is the truth about such
+    /// a host.
     #[test]
     fn an_honest_measurement_cannot_brick_a_backend() {
         let total = 28 * GIB;
@@ -1598,11 +1599,11 @@ mod budget_tests {
 
     /// Measuring must never buy MORE concurrency than knowing nothing would.
     ///
-    /// The old code returned `measured * FACTOR` outright, so a 3 GiB SP1 reading — plausible, given
-    /// that the benchmark proves a composite receipt at the default segment size — yielded a 6 GiB
-    /// budget against an 18 GiB blind default, and licensed three concurrent proofs of a workload
-    /// observed at 17.6 GB each. It was also non-monotonic across the trust floor: 1.9 GiB charged
-    /// 18 GiB while 2.0 GiB charged 4 GiB.
+    /// Returning `measured * FACTOR` outright would let a 3 GiB SP1 reading — plausible, given
+    /// that the benchmark proves a composite receipt at the default segment size — yield a 6 GiB
+    /// budget against an 18 GiB blind default, and license three concurrent proofs of a workload
+    /// observed at 17.6 GB each. It would also be non-monotonic across the trust floor: 1.9 GiB
+    /// charging 18 GiB while 2.0 GiB charges 4 GiB.
     #[test]
     fn a_cheap_measurement_cannot_undercut_the_blind_default() {
         let big = 512 * GIB;
@@ -1672,13 +1673,13 @@ mod budget_tests {
         ));
     }
 
-    /// The wedge that earned `resident` its argument: a worker that keeps its allocations between
+    /// Why `resident` is an argument at all: a worker that keeps its allocations between
     /// proofs must not be charged for them twice.
     ///
     /// The SP1 worker caches `CudaProver` and its proving keys on purpose, so after proof #1
     /// `sp1-gpu-server` sits resident at its full working set. `MemAvailable` is down by that much
-    /// ALREADY. Charging proof #2 the whole 18 GiB again refused it — and every risc0 proof too —
-    /// on a host that genuinely had room, with the ledger reading 0 and every layer reporting
+    /// ALREADY. Charging proof #2 the whole 18 GiB again would refuse it — and every risc0 proof too
+    /// — on a host that genuinely had room, with the ledger reading 0 and every layer reporting
     /// healthy. A permanent earnings outage dressed as safety.
     #[test]
     fn a_resident_worker_is_not_charged_for_its_memory_twice() {
@@ -1719,7 +1720,7 @@ mod budget_tests {
         let total = 28 * GIB;
         let reserve = DEFAULT_HOST_RESERVE_BYTES;
         let risc0 = unmeasured_peak_for("risc0");
-        // Measured 2026-10-07: an idle sp1-gpu-server held 23.3 GB.
+        // An idle sp1-gpu-server has been observed holding 23.3 GB.
         let sp1_idle = 23_300_000_000;
         let available = total - sp1_idle - GIB;
         assert!(!can_admit(risc0, 0, 0, available, total, reserve));

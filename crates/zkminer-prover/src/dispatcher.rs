@@ -88,7 +88,7 @@ const RESPAWN_BACKOFF: [Duration; 3] = [
 ];
 
 /// Default number of proofs after which a worker is recycled (killed + respawned)
-/// to reset accumulated GPU state (fix #3). Balances the reset benefit against the
+/// to reset accumulated GPU state. Balances the reset benefit against the
 /// ~1-2s CUDA re-init cost (~0.5% overhead at 20 proofs of tens of seconds each).
 /// How long to wait for a killed worker's pages to return to `MemAvailable` before re-testing
 /// admission.
@@ -118,10 +118,10 @@ const HOST_ROOM_RECLAIM_WAIT: Duration = Duration::from_secs(10);
 /// destroyed. This one sits between two benchmark slots, where nothing is on a clock and the cost of
 /// not waiting is a card that never gets a throughput row at all.
 ///
-/// Measured on this box on 2026-10-06: the SP1 benchmark on card 0 was recycled and card 1's
+/// The failure this length prevents: an SP1 benchmark on card 0 is recycled and card 1's
 /// reservation tested 367 ms later, with `MemAvailable` still reading 20.8 GiB of 27.4. Against an
 /// 18.0 GiB increment and a 3.0 GiB host reserve that leaves 17.8 GiB of headroom — short by 0.2 —
-/// so card 1 was refused and the whole SP1 row for the 4090 went missing from the suite.
+/// so card 1 is refused and the whole SP1 row for the 4090 goes missing from the suite.
 const BENCHMARK_RECLAIM_WAIT: Duration = Duration::from_secs(20);
 
 /// Block until the kernel has actually given back the pages of a process we just reaped, or until
@@ -244,7 +244,7 @@ struct WorkerSlot {
     /// Number of proofs this worker instance has completed since it was (re)spawned.
     /// When it reaches `recycle_after_proofs()`, the worker is killed + respawned so
     /// the accumulated GPU context / buffer pool / persistent stream is reset to a
-    /// clean slate (fix #3). Reset to 0 on every (re)spawn.
+    /// clean slate. Reset to 0 on every (re)spawn.
     proofs_since_spawn: u32,
 }
 
@@ -296,8 +296,8 @@ struct WorkerEntry {
 /// Whatever publishes a worker's pid for signallers to read.
 ///
 /// Exists so `mark_slot_failed`, `mark_slot_dead` and `ensure_alive` cannot clear the pid while
-/// leaving the start time that identifies it behind — they used to take a bare `&AtomicU32`, which
-/// made that mistake possible and silent. A bare atomic still satisfies the trait so the unit tests
+/// leaving the start time that identifies it behind: taking a bare `&AtomicU32` would make that
+/// mistake possible and silent. A bare atomic still satisfies the trait so the unit tests
 /// need no worker.
 trait PidSlot {
     fn clear(&self);
@@ -590,7 +590,7 @@ fn nvidia_smi_query_outcome(query: &str, device_index: u32) -> Result<String, bo
 
 /// How long a retired worker's process group stays recognised as ours. Generous against the ~2 s a
 /// context was measured taking to come back after its process exits (SP1's 15 GB arena: 1.7-2.1 s
-/// after its worker was recycled, 2026-10-07), and bounded so that something
+/// after its worker was recycled), and bounded so that something
 /// that genuinely never lets go is eventually treated like any other occupant rather than waited on.
 const RETIRED_GROUP_WINDOW: Duration = Duration::from_secs(30);
 
@@ -751,12 +751,12 @@ fn parse_memory_row(row: &str) -> Option<(u64, u64, u64)> {
 /// Attributed PER SLOT, not merely "ours vs. not ours", because the two backends on one card are
 /// both ours and only one of them is about to run. The other one's idle worker keeps its CUDA context
 /// and whatever its runtime caches, and none of that comes back by itself when a proof starts beside
-/// it. Measured on 2026-10-07 after a `fibonacci` proof: an idle risc0 worker holds 1,806 MiB of the
+/// it. After a `fibonacci` proof, an idle risc0 worker holds 1,806 MiB of the
 /// RTX 5080 and 7,134 MiB of the RTX 4090 (which keeps its Groth16 SRS cache resident, see
 /// `release_groth16_cache_if_tight`); an idle SP1 worker holds 15,124 MiB of the 5080 and 15,302 MiB
-/// of the 4090 still 30 s after its proof. The gate used to credit every process of ours as free,
-/// so the 5080 beside an idle risc0 worker read as 16,301 MiB available, cleared SP1's 15,604 MiB
-/// floor, and the SP1 proof ran out of device memory and died after the 600 s watchdog.
+/// of the 4090 still 30 s after its proof. Crediting every process of ours as free would let
+/// the 5080 beside an idle risc0 worker read as 16,301 MiB available, clear SP1's 15,604 MiB
+/// floor, and then run the SP1 proof out of device memory, killing it after the 600 s watchdog.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CardOccupancy {
     total: u64,
@@ -1363,9 +1363,9 @@ pub struct WorkerPool {
     gpu_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Set by `close` when the process is exiting: from then on no worker is spawned and no room is
     /// made. Without it, a dispatch in flight could respawn a worker after `shutdown_all` had swept
-    /// the slots — and a window that used to be milliseconds is now up to tens of seconds, because
+    /// the slots — and that window is up to tens of seconds, because
     /// making room and recycling both wait for VRAM to come back with the slot's pid already cleared.
-    /// That respawned worker's `sp1-gpu-server` then outlived the miner, holding its VRAM.
+    /// That respawned worker's `sp1-gpu-server` then outlives the miner, holding its VRAM.
     closing: AtomicBool,
 }
 
@@ -1943,11 +1943,11 @@ impl WorkerPool {
             // RECOVER, do not hard-fail. The guard is held across code that can panic — the
             // progress callback runs synchronously on the proving thread while this very guard
             // is held, and in production that closure touches the shared TUI state — so one
-            // panic there used to poison this slot permanently: every dispatch returned "lock
-            // poisoned" while `is_backend_healthy` reported the slot alive (it reads any lock
-            // error as "busy, therefore proving"), so the miner claimed jobs it could never
-            // dispatch for the life of the process. What this mutex guards is a handle plus two
-            // counters, not an invariant a panic can corrupt into unsafety, and `gpu_locks` and
+            // panic there would otherwise poison this slot permanently: every dispatch would
+            // return "lock poisoned" while `is_backend_healthy` reported the slot alive (it reads
+            // any lock error as "busy, therefore proving"), so the miner would claim jobs it could
+            // never dispatch for the life of the process. What this mutex guards is a handle plus
+            // two counters, not an invariant a panic can corrupt into unsafety, and `gpu_locks` and
             // `shutdown_all` already recover the same way.
             tracing::warn!(
                 "worker slot {key} was poisoned by an earlier panic; recovering it rather \
@@ -2220,11 +2220,11 @@ impl WorkerPool {
             // RECOVER, do not hard-fail. The guard is held across code that can panic — the
             // progress callback runs synchronously on the proving thread while this very guard
             // is held, and in production that closure touches the shared TUI state — so one
-            // panic there used to poison this slot permanently: every dispatch returned "lock
-            // poisoned" while `is_backend_healthy` reported the slot alive (it reads any lock
-            // error as "busy, therefore proving"), so the miner claimed jobs it could never
-            // dispatch for the life of the process. What this mutex guards is a handle plus two
-            // counters, not an invariant a panic can corrupt into unsafety, and `gpu_locks` and
+            // panic there would otherwise poison this slot permanently: every dispatch would
+            // return "lock poisoned" while `is_backend_healthy` reported the slot alive (it reads
+            // any lock error as "busy, therefore proving"), so the miner would claim jobs it could
+            // never dispatch for the life of the process. What this mutex guards is a handle plus
+            // two counters, not an invariant a panic can corrupt into unsafety, and `gpu_locks` and
             // `shutdown_all` already recover the same way.
             tracing::warn!(
                 "worker slot {key} was poisoned by an earlier panic; recovering it rather \
@@ -2602,11 +2602,11 @@ impl WorkerPool {
             // RECOVER, do not hard-fail. The guard is held across code that can panic — the
             // progress callback runs synchronously on the proving thread while this very guard
             // is held, and in production that closure touches the shared TUI state — so one
-            // panic there used to poison this slot permanently: every dispatch returned "lock
-            // poisoned" while `is_backend_healthy` reported the slot alive (it reads any lock
-            // error as "busy, therefore proving"), so the miner claimed jobs it could never
-            // dispatch for the life of the process. What this mutex guards is a handle plus two
-            // counters, not an invariant a panic can corrupt into unsafety, and `gpu_locks` and
+            // panic there would otherwise poison this slot permanently: every dispatch would
+            // return "lock poisoned" while `is_backend_healthy` reported the slot alive (it reads
+            // any lock error as "busy, therefore proving"), so the miner would claim jobs it could
+            // never dispatch for the life of the process. What this mutex guards is a handle plus
+            // two counters, not an invariant a panic can corrupt into unsafety, and `gpu_locks` and
             // `shutdown_all` already recover the same way.
             tracing::warn!(
                 "worker slot {key} was poisoned by an earlier panic; recovering it rather \
@@ -2994,7 +2994,7 @@ impl WorkerPool {
     /// otherwise a backend whose only worker was recycled could never be measured and — since a claim
     /// now requires a measurement — never claimed or proved (a deadlock). A BUSY (locked) slot is
     /// still excluded, so this keeps the "don't do RPC work for a worker that can't take it now"
-    /// optimization in `measure_cycles`. [security D]
+    /// optimization in `measure_cycles`.
     pub fn has_idle_or_revivable_worker(&self, backend: &str) -> bool {
         self.keys_for_prefix(backend).iter().any(|k| {
             self.workers.get(k).is_some_and(|e| {
@@ -3004,7 +3004,7 @@ impl WorkerPool {
                     // backoff-windowed DOWN slot is NOT revivable: `respawn` would spawn it only to
                     // have it re-decline (or bail on backoff), the exact churn `slot_eligible` exists to
                     // prevent — so it must not keep `measure_cycles` doing per-tick RPC + ELF work for a
-                    // worker that can never take the job. [security D]
+                    // worker that can never take the job.
                     .is_ok_and(|sl| sl.handle.is_some() || Self::slot_dispatchable(&sl))
             })
         })
@@ -3061,7 +3061,7 @@ impl WorkerPool {
             match found {
                 Some(f) => f,
                 None => {
-                    // [security D] No LIVE worker for this backend — but a claim now requires a
+                    // No LIVE worker for this backend — but a claim now requires a
                     // measurement and a measurement requires a live worker, so a backend whose only
                     // slot was recycled (dual-backend VRAM eviction, or a watchdog/crash death) would
                     // DEADLOCK: never measured → never claimable → never proved → never respawned.
@@ -3079,7 +3079,7 @@ impl WorkerPool {
                         if let Ok(mut sl) = e.slot.try_lock() {
                             // Only revive a DOWN slot that is actually dispatchable: a declined /
                             // retired / in-backoff slot would just re-decline or bail in `respawn`,
-                            // reintroducing the handshake churn `slot_eligible` guards against. [security D]
+                            // reintroducing the handshake churn `slot_eligible` guards against.
                             if sl.handle.is_none() && Self::slot_dispatchable(&sl) {
                                 match self.ensure_alive(&mut sl, e) {
                                     Ok(_) => {
@@ -3156,10 +3156,10 @@ impl WorkerPool {
             Ok(r) => r,
             Err(e) => {
                 if entry.intentional_kill.load(Ordering::Acquire) {
-                    // [security C] The watchdog SIGKILLed the worker because the guest did not finish
+                    // The watchdog SIGKILLed the worker because the guest did not finish
                     // within the measure budget. This is a WALL-CLOCK timeout, NOT the executor's own
                     // cycle-cap trip: a genuinely feasible guest can miss the budget purely because the
-                    // host was transiently overloaded (fix A re-enabled gas simulation, and SP1's CPU
+                    // host was transiently overloaded (gas simulation is enabled, and SP1's CPU
                     // executor runs alongside live proofs). So it must NOT be conflated with the clean
                     // cap trip — surfacing it as "exceeded cycle limit" would let the caller PERMANENTLY
                     // negative-cache a feasible job on a single unlucky timeout. Mark it with a DISTINCT
@@ -3188,8 +3188,9 @@ impl WorkerPool {
                     "cycle measurement on {key}: {cycles} cycles in {duration_secs:.2}s, \
                      {journal_len} journal bytes"
                 );
-                // [security H7] journal_len (0 from a pre-H7 worker, treated as "unknown") lets the
-                // caller pre-screen a program whose journal alone would OOG-revert fulfillJob.
+                // journal_len (0 from an older worker that does not report it, treated as
+                // "unknown") lets the caller pre-screen a program whose journal alone would
+                // OOG-revert fulfillJob.
                 Ok((cycles, journal_len))
             }
             WorkerResponse::Error { message, .. } => {
@@ -3317,10 +3318,10 @@ impl WorkerPool {
         // Single key — use it directly, UNLESS it is a dead slot still inside its own
         // respawn backoff window.
         //
-        // This shortcut is how soak20 lost its jobs. Pruning a two-key set by one
-        // exclusion leaves exactly one key, so the retry took this path straight into
-        // `prove_on_slot` -> `ensure_alive` -> `respawn`, which bailed instantly with
-        // "Backoff: waiting 4.53s" and consumed the caller's last attempt 155us after
+        // This shortcut can lose jobs. Pruning a two-key set by one
+        // exclusion leaves exactly one key, so the retry takes this path straight into
+        // `prove_on_slot` -> `ensure_alive` -> `respawn`, which bails instantly with
+        // "Backoff: waiting 4.53s" and consumes the caller's last attempt ~155us after
         // the previous one. Falling through to the poll loop instead WAITS the window
         // out, and that loop gives up only with `MIN_ABORT_START_BUDGET` left, so the
         // job gets a real attempt rather than a timer rejection.
@@ -3422,16 +3423,16 @@ impl WorkerPool {
 
         // All busy — wait for whichever eligible slot frees FIRST, staying deadline-aware.
         //
-        // This used to be a BLOCKING `slot.lock()` on the first key that looked eligible,
-        // falling back to `keys[0]`. Two defects, both only reachable once more jobs are in
-        // flight than there are cards:
+        // A BLOCKING `slot.lock()` on the first key that looked eligible (falling back to
+        // `keys[0]`) has two defects, both only reachable once more jobs are in flight than
+        // there are cards:
         //
         //  * `keys` comes from a `HashMap` iteration and is unsorted, so every over-committed
-        //    job parked on the SAME arbitrary card and none of them migrated when a different
+        //    job would park on the SAME arbitrary card and none would migrate when a different
         //    card freed. On a 2-GPU rig that serialises everything onto one card while the
         //    other idles — the exact inversion look-ahead queueing exists to remove.
         //  * `abort_at` is not consulted until `prove_on_slot` (after it takes the same locks),
-        //    so a job waiting on that mutex had NO clock. It could sit past its own lock
+        //    so a job waiting on that mutex would have NO clock. It could sit past its own lock
         //    deadline and only discover it once granted, by which point `releaseJob` reverts
         //    and the collateral is lost outright rather than released for a penalty.
         //
@@ -3440,8 +3441,8 @@ impl WorkerPool {
         // still time to release.
         // A job with no `abort_at` (recovery re-drives, benchmarks) has no deadline to bail
         // on, so bound the wait by the caller's own proving `timeout` — otherwise a rig whose
-        // every slot is permanently failed would spin here forever, where the old blocking
-        // version at least returned an error from `prove_on_slot`.
+        // every slot is permanently failed would spin here forever, whereas a blocking
+        // `slot.lock()` would at least return an error from `prove_on_slot`.
         const QUEUE_POLL: Duration = Duration::from_millis(250);
         // `timeout` is optional; with neither it nor `abort_at` there is no deadline to
         // honour, so fall back to a generous absolute cap rather than spinning forever.
@@ -3732,14 +3733,13 @@ impl WorkerPool {
     /// bytes, a proof dispatched there costs only `peak - R` more, because those pages are already out
     /// of `MemAvailable`.
     ///
-    /// The MAXIMUM, and the reasoning has been round the houses, so it is worth recording why.
+    /// The MAXIMUM, and the reasoning is subtle, so it is worth recording why.
     ///
     /// MAX is optimistic: the warm slot might be busy, so a claim can pass the gate and then land on a
     /// cold slot where the dispatch gate refuses it. MIN avoids that — and MIN is catastrophic the
     /// moment a backend has more than one slot. Walk it with SP1's two cards: proof #1 runs on card 0
     /// and leaves `sp1-gpu-server` resident at ~17.6 GiB, deliberately, so the next proof is cheap.
-    /// (Those are the figures of the day this was reasoned through; on 2026-10-07 the idle server held
-    /// 23.3 GB, which only strengthens the case.)
+    /// (An idle server has also been seen holding 23.3 GB, which only strengthens the case.)
     /// `MemAvailable` is now down by that much. MIN credits the COLD slot's 0, so `fits_now` asks for
     /// `18 + 3` against the 6.8 GiB that remains and refuses — and keeps refusing, because nothing
     /// frees a warm worker and the 20-proof recycle will never be reached. One SP1 proof per process
@@ -3942,8 +3942,7 @@ impl WorkerPool {
     ///
     /// Must be called while the worker is ALIVE: the counter lives in the worker's transient cgroup,
     /// which the kernel destroys with its last process. Takes NO lock at all — it reads an atomic
-    /// pid and then `/proc` — so it cannot block on a proving slot. (An earlier version of this
-    /// comment claimed a `try_lock` the body never performed.)
+    /// pid and then `/proc` — so it cannot block on a proving slot.
     pub fn host_peak_for_slot(&self, key: &str) -> Option<u64> {
         let entry = self.workers.get(key)?;
         let pid = entry.pid.load(Ordering::Acquire);
@@ -4037,7 +4036,7 @@ impl WorkerPool {
     /// that cannot be read.
     ///
     /// Public so the gate's own evidence is observable from outside — a status display can show why a
-    /// card is being skipped, and the warm-slot regression test can assert that OUR resident
+    /// card is being skipped, and a test can assert that OUR resident
     /// `sp1-gpu-server` is credited to its own slot rather than counted. Uncached by design: occupancy
     /// changes while the miner runs, which is the entire point.
     pub fn vram_budget_for_slot(&self, key: &str) -> Option<VramBudget> {
@@ -4083,8 +4082,8 @@ impl WorkerPool {
     /// Shut this slot's worker down so whatever it was holding is released.
     ///
     /// Exists because a worker holds its resources ON PURPOSE between proofs — SP1 caches `CudaProver`
-    /// and its proving keys, keeping `sp1-gpu-server` resident; measured on 2026-10-07 after a
-    /// `fibonacci` proof at 23.3 GB of host RSS and 15,124 MiB (~14.8 GiB) of VRAM — and with one slot
+    /// and its proving keys, keeping `sp1-gpu-server` resident; after a `fibonacci` proof that was
+    /// 23.3 GB of host RSS and 15,124 MiB (~14.8 GiB) of VRAM — and with one slot
     /// per card a caller that walks every card leaves one of those per card.
     /// Two is more than this 28 GiB box can hold. `ensure_alive` respawns on the next dispatch, so the
     /// only cost is a CUDA re-init.
@@ -4117,11 +4116,11 @@ impl WorkerPool {
     /// rows, the Settings toggles and `slots_disabled_by` use — so anything built from this list
     /// addresses cards by the ids the rest of the system already agrees on.
     ///
-    /// That is the point. The synthetic fallback suite used to mint `gpu{i}` from a card's POSITION in
-    /// a sorted bus-id list, which coincides with the real id only when the cards are enumerated from
+    /// That is the point. Minting `gpu{i}` from a card's POSITION in a sorted bus-id list (as a
+    /// synthetic fallback might) coincides with the real id only when the cards are enumerated from
     /// zero with none missing. Filter to the second card with `ZKMINER_GPU_NAME_FILTER` and the
     /// synthetic row says `gpu0` while `slots_disabled_by` says `gpu1`: the operator's toggle and the
-    /// dispatcher's filter then name different things, and the toggle goes back to being decorative.
+    /// dispatcher's filter then name different things, and the toggle becomes decorative.
     ///
     /// Takes no lock: both fields live on `WorkerEntry`.
     pub fn gpu_cards(&self) -> Vec<(String, String)> {
@@ -4287,7 +4286,7 @@ impl WorkerPool {
         let Some(entry) = self.workers.get(key) else {
             return Ok(());
         };
-        // [security H4] Bounded like `own_slot`: this runs inside `check_vram_budget` with the GPU
+        // Bounded like `own_slot`: this runs inside `check_vram_budget` with the GPU
         // guard held, so an unbounded wait behind a 120s cycle measurement would wedge a claimed proof
         // past its release margin. A deadline-free caller (benchmark/calibration) still blocks.
         let mut slot = Self::lock_slot_bounded(entry, key, give_up_at, "vram-budget resize")?;
@@ -4360,13 +4359,13 @@ impl WorkerPool {
     /// Take `entry.slot`, bounded by `give_up_at` when set. With no cutoff (benchmark/calibration, or
     /// a dispatch without a deadline) it blocks, recovering a poisoned lock inline — the slot guards a
     /// handle plus counters, not a safety invariant. With a cutoff it polls `try_lock` to it and
-    /// otherwise returns a typed `ProofDeadlineReached`. [security H4] `prove_on_slot` takes the GPU
+    /// otherwise returns a typed `ProofDeadlineReached`. `prove_on_slot` takes the GPU
     /// guard, then calls `check_vram_budget` (which takes this slot via `own_slot`/the resize), and
     /// ONLY THEN its own deadline-bounded slot loop. `execute_cycles` holds a slot for up to
     /// MEASURE_TIMEOUT (120s) WITHOUT the GPU guard, so it is invisible to `acquire_gpu_guard`: an
     /// unbounded `lock()` inside the budget check would therefore park a CLAIMED proof behind a
     /// measurement with the GPU guard held, past its release margin → the unreleasable late
-    /// revert/slash the bounded `prove_on_slot` loop was added to close, re-entered one step earlier.
+    /// revert/slash the bounded `prove_on_slot` loop closes, re-entered one step earlier.
     /// Bounding the budget-check locks too closes that hole; a deadline-free caller is unchanged.
     fn lock_slot_bounded<'a>(
         entry: &'a WorkerEntry,
@@ -4514,7 +4513,7 @@ impl WorkerPool {
     /// being readable.
     ///
     /// Not optional after a recycle. A worker's process is gone when `shutdown` returns, but its
-    /// memory is not yet back: measured 2026-10-07, a risc0 worker respawned 0.7 s after an SP1 worker
+    /// memory is not yet back: a risc0 worker respawned 0.7 s after an SP1 worker
     /// was recycled on the 5080 found the card still full and died on its first 8 MiB allocation. And
     /// the SP1 worker's `sp1-gpu-server`, which holds that memory, is SIGKILLed by the group sweep
     /// without being waited for, so for a moment it can even read as somebody else's.
@@ -4642,7 +4641,7 @@ impl WorkerPool {
             return Ok(None);
         };
         let total = Some(card.total);
-        // [security H4] Compute the deadline cutoff BEFORE the first slot-taking call (own_slot), and
+        // Compute the deadline cutoff BEFORE the first slot-taking call (own_slot), and
         // thread it through own_slot AND the resize, so neither can block unboundedly behind a cycle
         // measurement with the GPU guard held. A `None` abort (benchmark/calibration) means no cutoff.
         let give_up_at = abort_at.map(|a| a.checked_sub(MIN_ABORT_START_BUDGET).unwrap_or(a));
@@ -4866,9 +4865,9 @@ impl WorkerPool {
         // past its own release margin -> an unreleasable late revert (SLASH) rather than a clean
         // release. Polling try_lock until `abort_at` downgrades that worst case to a
         // `ProofDeadlineReached` release the caller already recovers from. Poison is recovered inline:
-        // this mutex guards a handle plus two counters, not a safety invariant — the same rationale the
-        // old `unwrap_or_else` used (a progress-callback panic once poisoned it and wedged the slot for
-        // the process lifetime). [security F]
+        // this mutex guards a handle plus two counters, not a safety invariant — the same rationale as
+        // the poison recovery on the other slot locks (a progress-callback panic can otherwise poison
+        // it and wedge the slot for the process lifetime).
         let give_up_at = match (abort_at, timeout) {
             (Some(abort), _) => Some(abort.checked_sub(MIN_ABORT_START_BUDGET).unwrap_or(abort)),
             (None, Some(t)) => Some(Instant::now() + t),
@@ -4910,7 +4909,7 @@ impl WorkerPool {
             },
         };
 
-        // Fix #3: proactively recycle a worker that has completed many proofs, so the
+        // Proactively recycle a worker that has completed many proofs, so the
         // accumulated GPU context / buffer pool / persistent stream (which can wedge a
         // flaky card mid-proof) is reset to a clean slate. Killing the live handle here
         // makes ensure_alive() respawn a fresh worker (which zeroes proofs_since_spawn).
@@ -4989,7 +4988,7 @@ impl WorkerPool {
                 // exactly. Before the kill the live test is `peak - R + reserve <= A`. After it the
                 // credit is gone (pid 0) but the pages come back, so it is `peak + reserve <= A + R`
                 // — the same inequality. And `fits_committed` is untouched, because neither
-                // `reserved` nor `want` changes. So in the case the comment used to be about, the
+                // `reserved` nor `want` changes. So when the credit is readable, the
                 // recycle is neutral at best, and in practice worse: it destroys a warm worker, pays
                 // a GPU re-init and a cold `pk_cache`, and the refusal still happens.
                 //
@@ -5102,7 +5101,7 @@ impl WorkerPool {
         entry.intentional_kill.store(false, Ordering::Release);
 
         // Captured now (shared borrow, before the &mut handle borrow below) for the
-        // completion log (#16) so operators can see which physical GPU ran each proof.
+        // completion log so operators can see which physical GPU ran each proof.
         let gpu_name = slot.gpu_name.clone();
 
         // Re-borrow handle after PID update
@@ -5158,17 +5157,17 @@ impl WorkerPool {
 
             // Ask about a host OOM FIRST — before any kill, and before the slot is cleared.
             //
-            // Ordering is the whole fix here, twice over. `died_of_host_oom` used to be consulted
-            // only in `ensure_alive`'s "handle present but dead" branch, which this path makes
-            // unreachable because `mark_slot_*` sets `slot.handle = None`. Moving the query here was
-            // not enough: `h.kill()` below runs `force_kill_group`, which REAPS, and
+            // Ordering matters here, twice over. If `died_of_host_oom` is consulted only in
+            // `ensure_alive`'s "handle present but dead" branch, this path makes that branch
+            // unreachable because `mark_slot_*` sets `slot.handle = None`. Querying it here is also
+            // not enough on its own: `h.kill()` below runs `force_kill_group`, which REAPS, and
             // `died_of_host_oom` returns `None` once `reaped` — correctly, since a reaped pid may
-            // name a stranger. So on the stream-corruption branch the answer was always `None`, and
-            // a stream corruption CAUSED by a host OOM was still charged to the prover.
+            // name a stranger. So unless the query runs first, the stream-corruption branch always
+            // answers `None`, and a stream corruption CAUSED by a host OOM is charged to the prover.
             //
             // It must also not count against the slot's health. A host OOM is an environmental fact:
-            // the card is fine, and three of them retired a healthy GPU for the cooldown while the
-            // caller burnt its attempts and released the job at a penalty.
+            // the card is fine, and three consecutive such kills would retire a healthy GPU for the
+            // cooldown while the caller burnt its attempts and released the job at a penalty.
             #[cfg(unix)]
             let host_oom = !entry.intentional_kill.load(Ordering::Acquire)
                 && slot
@@ -5244,7 +5243,7 @@ impl WorkerPool {
             }
         }
 
-        // Count a completed proof toward the recycle threshold (fix #3). Only on
+        // Count a completed proof toward the recycle threshold. Only on
         // success — a failed/killed worker is respawned, which resets the counter.
         if proof_response.is_ok() {
             slot.proofs_since_spawn = slot.proofs_since_spawn.saturating_add(1);
@@ -5273,7 +5272,7 @@ impl WorkerPool {
                 })
             }
             WorkerResponse::Error { kind, message, .. } => {
-                // TYPED, carrying the worker's own `kind`. The caller used to classify this by
+                // TYPED, carrying the worker's own `kind`, so the caller does not classify this by
                 // searching the formatted string, which embeds `message` — text that can originate in
                 // the guest ELF of an on-chain job. See `WorkerProofError`.
                 let typed = zkminer_prover_protocol::types::WorkerProofError {
@@ -5395,11 +5394,11 @@ impl WorkerPool {
     ///
     /// Dispatching to such a slot is guaranteed to bail in `respawn` without ever
     /// touching the GPU, so it burns one of the caller's `MAX_PROVE_ATTEMPTS` in
-    /// microseconds. That is what terminated every job soak20 lost: all four died on
-    /// `proving failed after 3 attempt(s): Backoff: waiting ~4.5s before respawning`,
-    /// and for 0x92e7686c attempt 3 fired **155 microseconds** after attempt 2
-    /// (10:38:44.580790 -> .580945). The whole retry budget was consumed by a 5s timer
-    /// the failure handler had armed 0.7s earlier.
+    /// microseconds. This is how a job can lose its entire retry budget: all attempts fail on
+    /// `proving failed after 3 attempt(s): Backoff: waiting ~4.5s before respawning`, with the
+    /// later attempts firing microseconds apart (as little as 155 microseconds between two) — the
+    /// whole budget consumed by a multi-second backoff timer the failure handler armed moments
+    /// earlier.
     ///
     /// `respawn` already documents this bug class for a different path ("the 'first
     /// respawn always fails' bug where the self-imposed `last_failure` timestamp caused
@@ -5535,8 +5534,8 @@ impl WorkerPool {
                 .unwrap_or_else(|| "no handle".to_string());
             // Say whether the HOST ran out of memory, rather than leaving a signal-9 death looking
             // like a prover bug. An OOM-killed prover surfaces as EOF, a broken pipe or "killed by
-            // signal 9" — indistinguishable from a regression unless we check, and this project's
-            // notes record that misdiagnosis being made.
+            // signal 9" — indistinguishable from a prover bug unless we check, which makes it an
+            // easy misdiagnosis.
             #[cfg(unix)]
             let host_oom = slot
                 .handle
@@ -6707,7 +6706,7 @@ mod tests {
         assert_eq!(parse_memory_row(""), None);
     }
 
-    /// The bug this fixes, in figures measured on this box on 2026-10-07: an idle risc0 worker held
+    /// The failure this guards against, in concrete figures: an idle risc0 worker held
     /// 1,806 MiB of the 16,303 MiB 5080 (423 MiB of it reserved by the driver) and the SP1 proof
     /// admitted beside it died of it. Read per slot, SP1 must see the risc0 worker's share as held, and
     /// risc0 must see its own share as its own.
@@ -6866,7 +6865,7 @@ mod tests {
         );
     }
 
-    /// Both directions of the bug, in the figures measured on this box on 2026-10-07.
+    /// Both directions of the failure, in concrete figures.
     #[test]
     fn room_is_made_in_both_directions() {
         const MIB: u64 = 1024 * 1024;
@@ -7068,11 +7067,11 @@ mod tests {
     }
 
     /// A slot with no live worker — the normal state of one recycled to make room on its card — is
-    /// not an idle worker for cycle measurement. Counting it made `execute_cycles` stop on it and fail
-    /// instead of moving on to a live one.
+    /// not an idle worker for cycle measurement. Counting it would make `execute_cycles` stop on it
+    /// and fail instead of moving on to a live one.
     #[test]
     fn a_down_worker_is_revivable_for_measurement_and_errors_if_respawn_fails() {
-        // [security D] A down (handle=None) slot is NOT "idle", but it IS revivable: the measurement
+        // A down (handle=None) slot is NOT "idle", but it IS revivable: the measurement
         // path may respawn it (VRAM-cheap for a CPU-only execute), so `has_idle_or_revivable_worker`
         // is true even though `has_idle_worker` is false. This is what breaks the claim↔measure↔revive
         // deadlock. Here the mock slots point at /dev/null, so the respawn fails fast (no real worker,
@@ -7096,12 +7095,12 @@ mod tests {
         );
     }
 
-    /// The order inside `check_vram_budget` is the fix. Room is made BEFORE the live worker is
+    /// The order inside `check_vram_budget` matters. Room is made BEFORE the live worker is
     /// resized — otherwise SP1 would be shrunk to fit beside a sibling about to be recycled — and
     /// before the floor is tested, or the card is refused for memory we could have had back; the
     /// figures used after that come from the reading taken once the memory is back; and an obstacle
     /// that is ours and could not be moved is refused before any resize. Admission must also never use
-    /// the spawn-time figure, which credits our other workers as free — the bug.
+    /// the spawn-time figure, which credits our other workers as free.
     #[test]
     fn the_budget_makes_room_before_it_resizes_or_refuses() {
         let src = include_str!("dispatcher.rs");
@@ -7359,7 +7358,7 @@ mod tests {
             "SP1 must share the per-card lock with risc0 on the same card"
         );
         assert_eq!(physical_gpu_id("risc0:cuda:0").as_deref(), Some("cuda:0"));
-        // The old generic key was unguarded, which is the bug this replaces.
+        // A generic key has no device, so it gets no per-card lock (returns None).
         assert_eq!(physical_gpu_id("sp1:generic"), None);
 
         // Addressable, and by the SAME device id the benchmark suite and the Settings toggles use —
@@ -7542,7 +7541,7 @@ mod tests {
         assert!(ik.load(Ordering::Acquire));
     }
 
-    // ---- backoff-aware dispatch (soak20 job-loss regression) ----
+    // ---- backoff-aware dispatch (job-loss on a dead slot inside its backoff window) ----
 
     fn slot_with(failures: u32, last_failure_ago: Option<Duration>, alive: bool) -> WorkerSlot {
         let _ = alive; // handle is always None here: a live slot has no backoff window
@@ -7562,15 +7561,14 @@ mod tests {
         }
     }
 
-    /// THE REGRESSION. soak20 lost all four of its failed jobs to
-    /// `proving failed after 3 attempt(s): Backoff: waiting ~4.5s before respawning`,
-    /// with attempt 3 firing 155us after attempt 2. A dead slot inside its own backoff
-    /// window must not be considered dispatchable, or the caller's whole
-    /// MAX_PROVE_ATTEMPTS budget is spent on a timer.
+    /// A dead slot inside its own respawn backoff window must not be considered dispatchable:
+    /// otherwise the caller's whole MAX_PROVE_ATTEMPTS budget is spent on a timer. Each attempt
+    /// fails with `proving failed after 3 attempt(s): Backoff: waiting ~4.5s before respawning`,
+    /// with the later attempts firing microseconds apart (as little as 155us between two).
     #[test]
     fn a_slot_inside_its_respawn_backoff_is_not_dispatchable() {
-        // consecutive_failures = 1 -> RESPAWN_BACKOFF[1] = 5s. Failed 0.7s ago, exactly
-        // the soak20 shape (OOM at 10:38:43.897, retry at 10:38:44.580).
+        // consecutive_failures = 1 -> RESPAWN_BACKOFF[1] = 5s. Failed 0.7s ago, so the slot is
+        // 0.7s into a 5s backoff window: an OOM followed quickly by a retry.
         let slot = slot_with(1, Some(Duration::from_millis(700)), false);
         assert!(
             WorkerPool::in_respawn_backoff(&slot),
@@ -7646,7 +7644,7 @@ mod tests {
         )));
     }
 
-    /// The `backoff_blocked` discriminator used to gate the single-key shortcut: it must
+    /// The `backoff_blocked` discriminator gates the single-key shortcut: it must
     /// fire ONLY for an eligible slot inside its window. A retired slot keeps the fast
     /// path so its honest "permanently failed" error is not replaced by a long wait.
     #[test]
@@ -7800,7 +7798,7 @@ mod tests {
 
     #[test]
     fn lock_slot_bounded_gives_up_on_a_held_slot_past_the_deadline() {
-        // [security H4] `check_vram_budget` (own_slot / resize) runs inside `prove_on_slot` with the
+        // `check_vram_budget` (own_slot / resize) runs inside `prove_on_slot` with the
         // GPU guard held. A cycle measurement holds a slot for up to MEASURE_TIMEOUT WITHOUT that
         // guard, so an UNBOUNDED `lock()` there would park a claimed proof past its deadline → late
         // revert/slash. The bounded take must surface `ProofDeadlineReached` instead of blocking.
@@ -7854,14 +7852,13 @@ mod tests {
     #[test]
     fn different_vendors_never_share_a_device_id() {
         // `device_index` is sequential WITHIN a vendor (discovery.rs), so a rocm
-        // card and a cuda card both legitimately carry index 0. The old key
-        // discarded the tag and mapped both to "gpu0": one physical card's
-        // throughput and po2 samples then overwrote the other's, and which one
-        // survived depended on HashMap iteration order.
+        // card and a cuda card both legitimately carry index 0. A key that
+        // discarded the tag and mapped both to "gpu0" would let one physical card's
+        // throughput and po2 samples overwrite the other's, with which one
+        // survived depending on HashMap iteration order.
         //
-        // The previous version of this test asserted rocm:2 -> "gpu2", encoding the
-        // assumption that rocm indices continue cuda numbering. Discovery never
-        // produces that.
+        // This deliberately does not assume rocm indices continue cuda numbering
+        // (e.g. rocm:2 -> "gpu2"): discovery never produces that.
         assert_ne!(
             WorkerPool::benchmark_device_id("risc0:cuda:0"),
             WorkerPool::benchmark_device_id("risc0:rocm:0"),
@@ -7962,8 +7959,8 @@ mod declined_backend_tests {
 
     /// What the MONEY path actually reads. run.rs's pre-claim gate consults
     /// `engine::backend_sources()`, which asks `is_backend_healthy`. Asserting on the
-    /// `Workers:` log line (as the first verification of this fix wrongly did) proves
-    /// nothing: that is `discover_and_spawn`'s returned vec, a DIFFERENT predicate.
+    /// `Workers:` log line proves nothing: that is `discover_and_spawn`'s returned vec, a
+    /// DIFFERENT predicate.
     #[test]
     fn a_declined_backend_is_neither_healthy_nor_silently_simulated() {
         let pool = pool_with(vec![(
@@ -8071,9 +8068,9 @@ mod bus_id_locking_tests {
         pool
     }
 
-    /// THE regression test. With the guard held — exactly the state `prove_on_slot` is in when the
+    /// With the guard held — exactly the state `prove_on_slot` is in when the
     /// progress callback fires — both readers must still answer. If either goes through the mutex
-    /// this test does not fail, it HANGS, which is what production did.
+    /// this test does not fail, it HANGS.
     #[test]
     fn the_readers_answer_while_the_slot_guard_is_held() {
         let pool = pool_with_entry("risc0:cuda:0", Some("0000:06:10.0"));

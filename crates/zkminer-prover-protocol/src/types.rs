@@ -131,11 +131,11 @@ pub enum WorkerResponse {
         cycles: u64,
         /// How long the execution itself took, so the caller can bound future ones.
         duration_secs: f64,
-        /// [security H7] Length in bytes of the guest journal (risc0) / public values (SP1) this
+        /// Length in bytes of the guest journal (risc0) / public values (SP1) this
         /// execution produced. The guest commits it deterministically from (ELF, input) — the same
         /// bytes the later proof would carry as `ProofResult.journal` — so the host can pre-screen a
         /// program whose journal alone would OOG-revert fulfillJob and refuse to CLAIM it, instead of
-        /// discovering it only after wasting a full proof. `#[serde(default)]` keeps a pre-H7 worker
+        /// discovering it only after wasting a full proof. `#[serde(default)]` keeps an older worker
         /// (which omits the field) interoperable: it decodes as 0, i.e. "unknown, do not screen".
         #[serde(default)]
         journal_len: u64,
@@ -223,7 +223,7 @@ const MIB: u64 = 1024 * 1024;
 
 /// Measured `(element threshold, peak VRAM)` for SP1, largest first.
 ///
-/// Both figures measured on this box on 2026-10-05 with a 1,912,954,963-cycle `sha256-chain` proof
+/// Both figures measured on this box with a 1,912,954,963-cycle `sha256-chain` proof
 /// through to a compact Groth16 seal: 17,766 MiB of a 24,564 MiB RTX 4090 at the 268M threshold, and
 /// 15,092 MiB of a 16,303 MiB RTX 5080 at 134M.
 ///
@@ -416,9 +416,9 @@ pub fn sp1_vram_required_for_threshold(threshold: u64) -> Option<u64> {
 ///
 /// Derived from [`SP1_MEASURED_TIERS`] rather than written down separately, so this and
 /// [`sp1_element_threshold_for_available_vram`] cannot disagree about whether a card is usable. Two
-/// independent constants did disagree in the first draft — the floor admitted a card by ~350 MiB that
-/// the tier function then had no configuration for, which would have refused the work one layer later
-/// after the worker was already spawned.
+/// independent constants could disagree — a floor that admitted a card by ~350 MiB the tier function
+/// then had no configuration for would refuse the work one layer later, after the worker was already
+/// spawned.
 pub fn sp1_min_available_vram_bytes() -> u64 {
     SP1_MEASURED_TIERS
         .last()
@@ -878,8 +878,8 @@ mod tests {
 
     /// These messages are operator-facing and go to a one-line log sink, so a wrapped literal must be
     /// continued with `\` rather than left to carry its own indentation. `cargo fmt` collapses the
-    /// literal onto one physical line and the leading spaces survive into the output, which is how
-    /// this shipped the first time: "more than              the 512 MiB".
+    /// literal onto one physical line and the leading spaces survive into the output, e.g.
+    /// "more than              the 512 MiB".
     #[test]
     fn shortage_messages_render_as_one_clean_line() {
         const MIB: u64 = 1024 * 1024;

@@ -268,8 +268,8 @@ fn ppid_from_proc_stat(stat: &str) -> Option<i32> {
 /// not apply to the grandchild, and the dispatcher's process-group kill cannot run if the
 /// whole miner is gone.
 ///
-/// The result is not a clean failure, which is what made it hard to spot. Measured
-/// 2026-10-03: SIGKILLing the worker left the server alive at 7.6GB RSS, still listening on
+/// The result is not a clean failure, which is what makes it hard to spot. Measured
+/// behaviour: SIGKILLing the worker left the server alive at 7.6GB RSS, still listening on
 /// `/tmp/sp1-cuda-0.sock`. The NEXT worker's `CudaClient::connect` unconditionally calls
 /// `start_server`, whose new server cannot bind the in-use socket and dies -- so the client
 /// silently CONNECTS TO THE ORPHAN and proves against it. The proof succeeds, and the
@@ -568,7 +568,7 @@ fn find_cuda12_runtime_dir() -> Option<std::path::PathBuf> {
 /// prove is a guaranteed loss." Past the lock deadline it is worse: `releaseJob` reverts
 /// and the collateral is stranded until a keeper slash.
 ///
-/// Measured on a fresh install of the release artifacts (2026-10-03): `sp1-gpu-server`
+/// Measured on a fresh install of the release artifacts: `sp1-gpu-server`
 /// is prebuilt against `libcudart.so.12`, the host had CUDA 13.3 and no CUDA 12 runtime,
 /// and the worker still announced itself ready.
 ///
@@ -871,7 +871,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     // Lazy CPU prover used ONLY for the pre-claim EXECUTE (cycle-measurement) path. SP1 execution is
     // pure CPU emulation, so measuring on a `CpuProver` yields the identical cycle count the CUDA
     // prover would while never spinning up `sp1-gpu-server` — keeping the sizing path as cheap as
-    // risc0's. See `run_execute_sp1`. [security R2/SP1 sizing]
+    // risc0's. See `run_execute_sp1`.
     let mut cpu_executor: Option<sp1_sdk::blocking::CpuProver> = None;
     // Cache one proving key per unique ELF. The key depends only on the program, so
     // reusing it across proofs of the same ELF avoids a costly setup() every call AND
@@ -932,7 +932,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     // `SP1CoreOpts` never even crosses into the server crate. A card below the floor is refused
     // whatever we set, which is why the dispatcher declines to create a slot there at all.
     //
-    // What it does address is the limit that actually bound on this box, measured on 2026-10-05 with
+    // What it does address is the limit that actually bound on this box, measured with
     // SP1 pinned to the 24,564 MiB RTX 4090. The core proof and the Groth16 witness completed; the
     // worker then died in the wrap at 18.0 GiB of heap plus 7.0 GiB of shared memory — 25.0 GiB
     // against a 25.1 GiB per-worker ceiling, killed by its own cgroup (CONSTRAINT_MEMCG) rather than
@@ -1229,7 +1229,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         continue;
                     }
                 };
-                // [security H3] `run_proof`'s prove-only SDK calls — `setup` (vkey/pk derivation) and
+                // `run_proof`'s prove-only SDK calls — `setup` (vkey/pk derivation) and
                 // the GPU `prove` — run on the fully attacker-controlled ELF and are NOT exercised by
                 // the Execute measurement gate, so a crafted ELF that executes cleanly (hence measures
                 // feasible and gets CLAIMED) can still panic here. The Execute arm already wraps its
@@ -1303,13 +1303,13 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 request_id,
                 elf,
                 input_data,
-                // [security E] NOT used on the SP1 sizing path: deriving SP1's vkey needs `setup`,
+                // NOT used on the SP1 sizing path: deriving SP1's vkey needs `setup`,
                 // which is ~minutes on CPU and would blow the host's measure watchdog. The binding is
                 // enforced host-side (registry byte-binding → measure-ELF == prove-ELF) and on the
                 // prove path's vkey gate instead. See `run_execute_sp1`.
                 program_id: _,
             } => {
-                // [security R2/SP1 sizing] Real cycle measurement for SP1, matching risc0's Execute
+                // Real cycle measurement for SP1, matching risc0's Execute
                 // arm, so the miner sizes SP1 jobs on a measured count rather than the
                 // submitter-declared `expectedCycles`. Runs on a lazily-built CPU executor (no
                 // gpu-server), so it is as cheap as risc0's sizing path.
@@ -1336,7 +1336,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         }
                     }
                 };
-                // [security H] The ELF bytes are fully attacker-controlled, and SP1's parser/executor
+                // The ELF bytes are fully attacker-controlled, and SP1's parser/executor
                 // (`Elf::from` / `setup` / `execute().run()`) CAN panic on a malformed registered ELF
                 // rather than returning Err. A panic unwinding out of the loop would have the
                 // dispatcher score a HEALTHY proving slot as failed — the very outcome the executor
@@ -1502,13 +1502,13 @@ fn parse_sp1_execute_cycle_limit(raw: Option<&str>) -> Option<u64> {
 /// the SAME quantity `run_proof` reports and the SP1 benchmark suite measures throughput in, so it
 /// feeds the deadline/look-ahead math in matching units. This lets the miner size an SP1 job on a
 /// MEASURED cycle count instead of the submitter-declared `expectedCycles`, closing the input-flood
-/// under-sizing vector for SP1. [security R2/SP1 sizing]
+/// under-sizing vector for SP1.
 ///
 /// Runs on a lightweight `CpuProver`, never the CUDA prover: SP1 execution is pure CPU emulation and
 /// the cycle count is deterministic in (program, input) whichever prover runs it, so routing it to the
 /// CPU keeps the measurement as cheap as risc0's and never spins up `sp1-gpu-server`.
 ///
-/// [security E] Program-id (vkey) binding is NOT done here, deliberately. For SP1 `programId` is the
+/// Program-id (vkey) binding is NOT done here, deliberately. For SP1 `programId` is the
 /// verifying-key hash, whose ONLY derivation is `setup` — and `setup` is empirically ~minutes on the
 /// CPU even for a tiny program, so doing it per measurement would blow the host's ~120 s measure
 /// watchdog (every first sighting would time out → the job would be wrongly marked unmeasurable and
@@ -1536,7 +1536,7 @@ fn run_execute_sp1(
     if let Some(limit) = sp1_execute_cycle_limit() {
         req = req.cycle_limit(limit);
     }
-    // [security A] Gas calculation MUST stay enabled (the builder default). With `.calculate_gas(false)`
+    // Gas calculation MUST stay enabled (the builder default). With `.calculate_gas(false)`
     // the pinned SP1 build NEVER sets the executor's final VM state — `GasExecutingWorker::call`
     // short-circuits (crates/prover/src/worker/prover/execute.rs:92) so `final_vm_state` stays unset
     // and `execute_with_options`'s `.ok_or(anyhow!("Failed to extract public value digest"))?`
@@ -1545,7 +1545,7 @@ fn run_execute_sp1(
     let (public_values, report) = req
         .run()
         .map_err(|e| canonicalize_sp1_execute_error(&e.to_string()))?;
-    // [security H7] The public values the guest commits here are byte-identical to the journal the
+    // The public values the guest commits here are byte-identical to the journal the
     // later Groth16 proof carries (both are a deterministic function of (ELF, input), and the host's
     // elf_hash gate makes measure-ELF == prove-ELF). Report their length so the host can refuse to
     // CLAIM a program whose journal alone would OOG-revert fulfillJob, instead of learning it only
@@ -1558,7 +1558,7 @@ fn run_execute_sp1(
     ))
 }
 
-/// [security B] True iff an SP1 `execute().run()` error string denotes the cycle cap being tripped
+/// True iff an SP1 `execute().run()` error string denotes the cycle cap being tripped
 /// (the guest is too heavy to size). The pinned build signals the cap from the gas accumulator as the
 /// bare string `"cycle limit reached"` (execute.rs:206) — NOT the `ExceededCycleLimit` variant, which
 /// is only produced on the distributed-controller path — so the host's "exceeded cycle limit" match
@@ -1570,7 +1570,7 @@ fn is_sp1_cycle_cap_trip(msg: &str) -> bool {
         || m.contains("exceededcyclelimit")
 }
 
-/// [security B] Canonicalize an SP1 execute error so the host's `measure_cycles` classifier recognizes
+/// Canonicalize an SP1 execute error so the host's `measure_cycles` classifier recognizes
 /// a cycle-cap trip as "too heavy" (and negative-caches it) regardless of SP1's internal wording. A
 /// non-cap error is passed through unchanged (the host leaves it transient).
 fn canonicalize_sp1_execute_error(raw: &str) -> anyhow::Error {
@@ -1624,7 +1624,7 @@ fn run_proof(
     }
     let pk = pk_cache.get(&key).expect("pk was just inserted or touched");
 
-    // [security #05] Bind the served ELF to the job's on-chain programId. For SP1 the programId IS
+    // Bind the served ELF to the job's on-chain programId. For SP1 the programId IS
     // the verifying-key hash, so an ELF whose vkey hash != programId can never produce a proof the
     // on-chain SP1 verifier accepts — proving it just burns a full GPU proof + fulfill gas on a
     // guaranteed revert. Reject BEFORE proving. The exact byte order of the on-chain programId vs
@@ -1778,7 +1778,7 @@ fn benchmark_program(
     let cycles = report.total_instruction_count();
 
     // Key setup OUTSIDE the timed region. It is not proving, and production caches the key per ELF
-    // (`pk_cache` in `run_worker_loop`) so never pays it per proof. Measured on 2026-10-06 the cost is
+    // (`pk_cache` in `run_worker_loop`) so never pays it per proof. In practice the cost is
     // almost entirely a FIRST-CALL warm-up, not per-program key generation: 5.37 s and 5.46 s for the
     // first program on each card, then 0.02-0.03 s for every one after. Inside the stopwatch it was
     // most of why a 9,966-cycle fibonacci "took" 6 s, and it landed on whichever program ran first.
@@ -2104,7 +2104,7 @@ mod usability_tests {
         );
     }
 
-    /// FN1. nvidia-smi absent must NOT read as "no GPU" when the kernel driver says
+    /// nvidia-smi absent must NOT read as "no GPU" when the kernel driver says
     /// otherwise. A CUDA container with NVIDIA_DRIVER_CAPABILITIES=compute has libcuda
     /// and the device nodes but no nvidia-smi, and declining there would disable SP1 on a
     /// host where it proves fine. The host-side detector has the same fallback.
@@ -2123,7 +2123,7 @@ mod usability_tests {
         }
     }
 
-    /// FN1, the decisive case: with nvidia-smi made unreachable, the probe must NOT
+    /// The decisive case: with nvidia-smi made unreachable, the probe must NOT
     /// decide the GPU is absent, because /proc still knows better.
     #[test]
     fn an_unreachable_nvidia_smi_does_not_mean_no_gpu() {
@@ -2151,7 +2151,7 @@ mod usability_tests {
         }
     }
 
-    /// FN2. A non-zero `--version` that is NOT a loader failure must NOT be declined:
+    /// A non-zero `--version` that is NOT a loader failure must NOT be declined:
     /// that is the stale/wrong-version state `maybe_download_server` exists to repair,
     /// and the SDK ignores the exit status entirely.
     #[test]
@@ -2191,7 +2191,7 @@ mod usability_tests {
         }
     }
 
-    /// FN2 converse: a LOADER failure is unrepairable (the asset is version-pinned, so a
+    /// The converse: a LOADER failure is unrepairable (the asset is version-pinned, so a
     /// re-download reproduces it) and must still be declined.
     #[test]
     fn a_loader_failure_is_still_declined() {
@@ -2313,7 +2313,7 @@ mod ipc_fd_tests {
     }
 }
 
-/// [D4] What the SP1 worker must guarantee about the handshake. The bounded-runner
+/// What the SP1 worker must guarantee about the handshake. The bounded-runner
 /// behaviour itself (timeout, kill, capture, cap, spawn-retry classification) is tested in
 /// `zkminer_prover_protocol::proc`, which owns it; these are the SP1-specific obligations.
 #[cfg(test)]
@@ -2333,8 +2333,8 @@ mod threshold_tests {
     /// The two bounds are independent and the SMALLER must win.
     ///
     /// `apply_sp1_element_threshold` writes to the process environment, so the arithmetic is asserted
-    /// here rather than the side effect. The combination is what regressed in the first draft: the
-    /// function returned early on `scale >= 1.0`, skipping the VRAM cap in exactly the case it exists
+    /// here rather than the side effect. The combination is the easy case to get wrong: returning
+    /// early on `scale >= 1.0` skips the VRAM cap in exactly the case it exists
     /// for — a roomy host attached to an occupied card.
     #[test]
     fn the_smaller_of_the_host_and_vram_bounds_wins() {
@@ -2390,7 +2390,7 @@ mod threshold_tests {
     /// The threshold must be settled BEFORE the `scale >= 1.0` early return.
     ///
     /// The two bounds are independent, so a host roomy enough to produce no host-derived limit must
-    /// still let an occupied CARD bind. Returning on `scale` first — what the first draft did — skipped
+    /// still let an occupied CARD bind. Returning on `scale` first would skip
     /// the VRAM cap in precisely the configuration it exists for. The arithmetic tests above cannot see
     /// this, because the ordering is control flow and not a value.
     #[test]
@@ -2521,14 +2521,14 @@ mod pk_cache_tests {
 
     #[test]
     fn sp1_cycle_cap_trip_recognized_across_wordings() {
-        // [security B] The pinned build emits this bare string from the gas accumulator.
+        // The pinned build emits this bare string from the gas accumulator.
         assert!(super::is_sp1_cycle_cap_trip("cycle limit reached"));
         assert!(super::is_sp1_cycle_cap_trip("Error: cycle limit reached, stopping execution"));
         // The SDK variant wording and the type name, for robustness across builds/paths.
         assert!(super::is_sp1_cycle_cap_trip("exceeded cycle limit of 2000000000"));
         assert!(super::is_sp1_cycle_cap_trip("ExceededCycleLimit(2000000000)"));
         // A genuinely transient error must NOT be mistaken for a cap trip (else a legit program
-        // would be permanently negative-cached — the #16 class of bug).
+        // would be permanently negative-cached).
         assert!(!super::is_sp1_cycle_cap_trip("no idle worker available"));
         assert!(!super::is_sp1_cycle_cap_trip("Failed to extract public value digest"));
         assert!(!super::is_sp1_cycle_cap_trip("broken pipe"));
@@ -2545,7 +2545,7 @@ mod pk_cache_tests {
         assert!(!transient.to_lowercase().contains("exceeded cycle limit"));
     }
 
-    // [security A] End-to-end guard against the critical regression the fix-review found: with
+    // End-to-end guard against a critical failure mode: with
     // `.calculate_gas(false)` the pinned SP1 build returns Err("Failed to extract public value
     // digest") for EVERY guest, so NO SP1 job was ever claimable. Runs a REAL CPU execution of the
     // embedded fibonacci guest (CPU-only, no sp1-gpu-server, no GPU, no network — and NO `setup`, so

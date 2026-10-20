@@ -81,7 +81,7 @@ pub struct ChainClient {
     pub(crate) program_info_cache: Arc<std::sync::Mutex<ProgramInfoCache>>,
     /// Counts every JSON-RPC request sent to the endpoint (total + rolling minute).
     rpc_meter: Arc<crate::rpc_meter::RpcMeter>,
-    /// [RPC #2] jobId → submitting tx hash, written by the monitor as it parses
+    /// jobId → submitting tx hash, written by the monitor as it parses
     /// JobSubmitted logs (the log already carries `transaction_hash`, so populating
     /// this costs ZERO extra requests). Read by the descriptor fast path
     /// ([`crate::descriptor::fetch_job_descriptor_checked`]) to replace the
@@ -205,7 +205,7 @@ impl ChainClient {
         // Install an RPC meter layer so we can report request volume (it counts
         // every JSON-RPC call, including alloy-internal receipt/gas/nonce calls).
         let rpc_meter = crate::rpc_meter::RpcMeter::new();
-        // [D4] Transport-level timeouts so NO RPC await can hang forever. A
+        // Transport-level timeouts so NO RPC await can hang forever. A
         // black-holing endpoint (TCP accepted, no HTTP response — the documented
         // flaky-testnet failure) would otherwise wedge any await indefinitely: the
         // post-claim lockDeadline read, the serial startup-recovery loop, the batch
@@ -220,7 +220,7 @@ impl ChainClient {
             .build()
             .context("Failed to build HTTP client with timeouts")?;
         let http = alloy::transports::http::Http::with_client(http_client, rpc_url);
-        // [RPC-1/2] Two burst-shaping measures against the public endpoint's ~5 req/s
+        // Two burst-shaping measures against the public endpoint's ~5 req/s
         // per-second cap (which tripped at only ~70 req/min sustained because concurrent
         // lifecycles + the monitor/refresh loops fired in the same second):
         //  - ThrottleLayer (OUTERMOST, MeterLayer innermost so genuine 429s still reach
@@ -448,20 +448,17 @@ impl ChainClient {
     /// below exist rather than being mere style.
     ///
     /// The exceptions are documented at their call sites: the staking receipt-timeout arms
-    /// ([R4-A]) must NOT abort — leaving the nonce reserved-but-unresolved is safe there,
-    /// because [A4]'s detector finds such a hole off the node's pending count — and a stuck
-    /// fulfill's nonce is HANDED to `release_job` via the stash rather than recycled, so the
-    /// release can displace it at that exact nonce.
-    ///
-    /// (This contract text previously sat, orphaned, on `note_broadcast_fee`'s doc block,
-    /// where it also contradicted `NonceManager::abort`.)
+    /// must NOT abort — leaving the nonce reserved-but-unresolved is safe there, because the
+    /// gap detector finds such a hole off the node's pending count — and a stuck fulfill's
+    /// nonce is HANDED to `release_job` via the stash rather than recycled, so the release
+    /// can displace it at that exact nonce.
     pub fn abort_nonce(&self, nonce: u64) {
         self.nonce_mgr.abort(nonce);
     }
 
     /// True if one of our txs is EXECUTABLE at the mined frontier, i.e. `pending > mined`.
     ///
-    /// [nonce-review round 5] `nonce_gap_frontier`'s branch (B) (`is_freed` /
+    /// `nonce_gap_frontier`'s branch (B) (`is_freed` /
     /// `recently_aborted`) deliberately does NO pending check — it exists to DISPLACE a stuck
     /// low-fee tx of ours, which is right for the brain's watchdog but wrong for a caller
     /// that is about to exit: the tx-layer give-up paths abort a nonce whose tx they actually
@@ -511,7 +508,7 @@ impl ChainClient {
     /// advance the allocator past it. Only ever raises `next`; never reissues an in-flight
     /// nonce. Returns the (possibly-updated) chain nonce.
     pub async fn resync_nonce(&self) -> Result<u64> {
-        // [nonce-review] Use the MINED frontier (`.latest()`), NOT `.pending()`. resync
+        // Use the MINED frontier (`.latest()`), NOT `.pending()`. resync
         // prunes recycled gaps below the frontier, and only a MINED nonce proves the gap
         // below it is truly consumed. `.pending()` counts still-in-mempool txs, so a
         // genuine recycled gap (abort() deliberately recycles a possibly-pending nonce)
@@ -554,9 +551,9 @@ impl ChainClient {
         Ok((next > pending + 1).then_some(pending))
     }
 
-    /// Detect and heal a nonce GAP that has wedged the signer. [nonce-review round 4] A
-    /// hole at the mined frontier — an evicted external tx (e.g. a stake/mint from another
-    /// process or the alloy NonceFiller bypass, #48), or a below-`next` abort-gap that no
+    /// Detect and heal a nonce GAP that has wedged the signer. A hole at the mined frontier
+    /// — an evicted external tx (e.g. a stake/mint from another process or the alloy
+    /// NonceFiller bypass), or a below-`next` abort-gap that no
     /// organic reserve has refilled — leaves our higher-nonce txs queued forever (the
     /// sequential-nonce rule) with NO error surfaced, and neither `resync` (only raises
     /// next) nor `reserve` (only hands out freed/next) can fill it. This sends a 0-value
@@ -598,7 +595,7 @@ impl ChainClient {
             Some(n) => n,
             None => return Ok((None, mined)),
         };
-        // [RPC quick-win] Reordered to avoid the second getTransactionCount(.pending())
+        // Reordered to avoid the second getTransactionCount(.pending())
         // whenever it can't change the answer — provably equivalent to the original
         // `(next > mined) && (external_hole || owned_stuck)` where
         // `external_hole = next > mined+1 && pending <= mined`, `owned_stuck = is_freed(mined)`.
@@ -612,13 +609,13 @@ impl ChainClient {
         //     `is_freed` alone FLICKERS: `reserve_locked` pops the nonce out of `freed` the
         //     moment it is re-handed-out, and a failing retry loop aborts/re-reserves the same
         //     nonce many times a second, so a once-a-minute sample nearly always misses it.
-        //     That is exactly how the 2026-08-01 wedge stayed invisible for 10 minutes with a
-        //     1-nonce hole. `recently_aborted` is the same evidence class (we abandoned a tx
+        //     A real one-nonce wedge can therefore stay invisible for many minutes.
+        //     `recently_aborted` is the same evidence class (we abandoned a tx
         //     there) but sticky, and it is pruned the moment the nonce mines.
         if self.nonce_mgr.is_freed(mined) || self.nonce_mgr.recently_aborted(mined, ABORT_MEMORY) {
             return Ok((Some(mined), mined));
         }
-        // (A) [A4] A hole ANYWHERE at or above the mined frontier — not just AT it.
+        // (A) A hole ANYWHERE at or above the mined frontier — not just AT it.
         //
         // The node's pending count IS the lowest hole: `eth_getTransactionCount(pending)` is
         // the first nonce with no EXECUTABLE tx, and txs above a hole sit in the queued pool
@@ -649,7 +646,7 @@ impl ChainClient {
     /// alive to re-send — stranding exactly the nearest-deadline job it was trying to save.
     ///
     /// That path previously gated on `frontier_has_executable_tx()` alone, i.e. "if anything
-    /// is executable at the mined frontier, do not heal". [A4] That is too coarse now that a
+    /// is executable at the mined frontier, do not heal". That is too coarse now that a
     /// hole ABOVE the frontier is detectable, and it excluded the very case the abandon path
     /// exists for: a skipped release leaves a hole BELOW the releaseJob txs it did broadcast,
     /// so the frontier IS busy (its own release is executable there) while the hole sits
@@ -695,10 +692,10 @@ impl ChainClient {
         if !self.frontier_has_executable_tx_at(mined).await? {
             return Ok(self.hole_we_own(hole));
         }
-        // [D2] Do NOT stop here. Branch (B) runs FIRST in the detector and its evidence
+        // Do NOT stop here. Branch (B) runs FIRST in the detector and its evidence
         // (`recently_aborted`) is sticky for 600s and survives re-reservation, so a stale
-        // abort record at `mined` makes it nominate `mined` and mask a genuine A4 hole above
-        // — on precisely the shutdown path this function was added for. Fall through and ask
+        // abort record at `mined` makes it nominate `mined` and mask a genuine hole above
+        // — on precisely the shutdown path this function exists for. Fall through and ask
         // for the pending-based hole directly.
         match self.pending_hole(mined).await? {
             Some(h) if h > mined => Ok(self.hole_we_own(h)),
@@ -708,7 +705,7 @@ impl ChainClient {
 
     /// Ownership gate for filling ANY hole on the shutdown path.
     ///
-    /// [D1] "Nothing executable at `pending`" does NOT mean "nobody owns it". The abandon
+    /// "Nothing executable at `pending`" does NOT mean "nobody owns it". The abandon
     /// path pre-reserves a nonce for EVERY doomed job in one burst (`run.rs`, before any task
     /// sends), and each task then makes several throttled RPCs at a 4 req/s global cap before
     /// its first broadcast; the join budget can expire with those tasks still live, since the
@@ -726,7 +723,7 @@ impl ChainClient {
     ///
     /// So require first-person evidence that the nonce is ours and ABANDONED: an abort record
     /// at the hole itself. Every skip arm in the abandon path recycles its nonce via
-    /// `abort_nonce`, so this is true in the documented A4 scenario and false for a live
+    /// `abort_nonce`, so this is true in that abandon scenario and false for a live
     /// unsent reservation.
     ///
     /// This is NOT the rejected "no recorded broadcast" heuristic: that inferred absence of a
@@ -749,13 +746,14 @@ impl ChainClient {
         // `is_freed` is the same evidence class but is invalidated by precisely the event
         // that makes filling destructive: a new owner taking the nonce.
         //
-        // Branch (B) keeps `recently_aborted`: it needs the flicker-proofing (the 2026-08-01
-        // wedge) and it runs on the live watchdog, where a wrong answer is re-sendable now
-        // that every send path reads and writes the per-nonce fee floor.
+        // Branch (B) keeps `recently_aborted`: it needs the flicker-proofing (a periodic
+        // sample can otherwise miss a one-nonce wedge) and it runs on the live watchdog,
+        // where a wrong answer is re-sendable now that every send path reads and writes the
+        // per-nonce fee floor.
         //
-        // NOT, as an earlier version of this comment claimed, "separately gated by
-        // `frontier_has_executable_tx`" — that gate exists only in THIS function, which the
-        // watchdog never calls. Branch (B) is consumed ungated. What actually bounds it is
+        // Branch (B) is NOT separately gated by `frontier_has_executable_tx`: that gate
+        // exists only in THIS function, which the watchdog never calls. Branch (B) is
+        // consumed ungated. What actually bounds it is
         // `note_broadcast` clearing `aborted_at` on an accepted send, so a re-reserved nonce
         // stops looking abandoned the moment it is legitimately in use.
         if self.nonce_mgr.is_freed(hole) {
@@ -792,7 +790,7 @@ impl ChainClient {
     /// This split is not cosmetic. `heal_nonce_gap` re-derives its target from the UNGATED
     /// `nonce_gap_frontier`, whose branch (B) is checked FIRST and nominates `mined` on a
     /// sticky `recently_aborted` record. `nonce_gap_safe_to_fill` deliberately DISAGREES
-    /// with that — the [D2] fall-through is the whole point, and
+    /// with that — the fall-through is the whole point, and
     /// `a_stale_abort_record_at_the_frontier_does_not_mask_a_hole_above_it` pins a state
     /// where the two return different nonces. So a caller that gated and then called the
     /// argument-less form filled precisely the nonce its gate had refused: on the shutdown
@@ -869,7 +867,7 @@ impl ChainClient {
         owned: bool,
         receipt_budget: std::time::Duration,
     ) -> Result<bool> {
-        // [A4] `hole` is the lowest nonce with no executable tx. It is USUALLY the MINED
+        // `hole` is the lowest nonce with no executable tx. It is USUALLY the MINED
         // frontier, but need not be: a hole above the frontier blocks everything above it
         // just as effectively, and is the case the detector was previously blind to.
         let next = self.nonce_mgr.peek_next().unwrap_or(hole);
@@ -892,21 +890,21 @@ impl ChainClient {
         // Lift over the UNCAPPED high-water. Reading the CAPPED floor here is what made
         // this heal a guaranteed loser: the job paths' exhausted steady state settles at
         // ~1.0415x cap, so a bid of over(cap) = 1.125x cap is only +8.0% over the
-        // resident -- under geth's +10% replacement threshold. Measured on soak20:
-        // 259 heal attempts between 22:19 and 02:38, every one rejected "replacement
-        // transaction underpriced", while the nonce stayed wedged for 4h24m.
+        // resident -- under geth's +10% replacement threshold, so every attempt is
+        // rejected "replacement transaction underpriced" and the nonce stays wedged
+        // indefinitely.
         //
         // BOUNDED. This heal writes its OWN lifted bid back as the new high-water
         // (`note_broadcast` below) while `seed_max_fee` stays frozen at 4x base, so the
         // cap stops moving and each heal would otherwise lift over the previous heal:
-        // a self-referential ratchet compounding x9/8 every 60s. On soak20 this path ran
-        // 259 consecutive times, which would reach ~1 ETH of priority fee on a single
+        // a self-referential ratchet compounding x9/8 every 60s. Firing every 60s over
+        // hours, it would reach ~1 ETH of priority fee on a single
         // 21k self-transfer and then freeze the high-water above what the signer can
         // afford -- leaving the nonce unreservable, undetectable and unhealable, i.e. the
         // permanent signer wedge the cap exists to prevent.
         //
         // So: lift over the UNCAPPED high-water (reading the CAPPED floor is what made
-        // this heal a guaranteed loser -- 259 rejections), but clamp to a hard ceiling.
+        // this heal a guaranteed loser), but clamp to a hard ceiling.
         // Clamp BOTH members so `tip <= max_fee` is preserved.
         let over = |v: u128| v.saturating_add((v / 8).max(1));
         let mut ceiling_reached = false;
@@ -920,8 +918,8 @@ impl ChainClient {
                 // resident (geth 10%, some 12.5%). Once the clamp binds, the bid keeps
                 // creeping toward the ceiling while the resident creeps with it, and the
                 // ratio decays below the threshold -- at which point every send is
-                // rejected "replacement underpriced" again. That is the round-1 defect in
-                // a bounded disguise, and `want_max <= bm` does not catch it: with a
+                // rejected "replacement underpriced" again. That is the same under-margin
+                // failure in a bounded disguise, and `want_max <= bm` does not catch it: with a
                 // 64 gwei cap the third heal bids 81.000 against a 74.193 resident, which
                 // is larger but only +9.18%.
                 //
@@ -1016,7 +1014,7 @@ impl ChainClient {
         self.nonce_mgr
             .note_broadcast(hole, tip, max_fee, seed_max_fee);
         let tx_hash = *pending_tx.tx_hash();
-        // [D4] A fill ABOVE the mined frontier CANNOT mine until every nonce below it does,
+        // A fill ABOVE the mined frontier CANNOT mine until every nonce below it does,
         // so waiting for its receipt is a guaranteed 30s burn for an answer we already know.
         // That matters on the shutdown path, where this now runs (it did not before) and the
         // budget is already 45s join + reap against a 90s supervisor kill — burning 30s here
@@ -1057,9 +1055,9 @@ impl ChainClient {
             );
             return Ok(false);
         }
-        // [RPC #1] Poll for the receipt (no heartbeat watcher). Some+status = unwedged;
+        // Poll for the receipt (no heartbeat watcher). Some+status = unwedged;
         // anything else (no receipt within budget, or a mined revert) → retry next tick.
-        // [review] Budget capped at 30s, NOT TX_RECEIPT_TIMEOUT: heal is awaited directly
+        // Budget capped at 30s, NOT TX_RECEIPT_TIMEOUT: heal is awaited directly
         // in the brain's 5s scheduler loop (unlike every other site, which runs in a
         // spawned lifecycle task), so a long wait here stalls claim dispatch. On None the
         // watchdog simply re-probes next tick — if the fill tx mined meanwhile the gap is
@@ -1131,7 +1129,7 @@ impl ChainClient {
     /// (and thus displaces) a stuck predecessor. A configured fixed `gas_price` takes
     /// precedence (legacy behavior).
     ///
-    /// NEVER returns `(0, 0)` from estimation failure — see [H2(c)] below: a zero base
+    /// NEVER returns `(0, 0)` from estimation failure: a zero base
     /// disables every `base_max_fee > 0` escalation gate, so a stuck tx could never clear a
     /// node's replacement threshold. The fallback floors at `max(eth_gasPrice, 1 gwei)`.
     /// (A configured `gas_price` of 0 would still short-circuit to `(0, 0)`; config
@@ -1145,7 +1143,7 @@ impl ChainClient {
                 (est.max_priority_fee_per_gas, est.max_fee_per_gas)
             }
             other => {
-                // [H2(c)] NEVER return (0,0). Fee escalation is gated on `base_max_fee > 0`,
+                // NEVER return (0,0). Fee escalation is gated on `base_max_fee > 0`,
                 // so a zero base disables ALL escalation → a re-broadcast can never clear a
                 // node's +12.5% replacement floor → a stuck tx (fulfill/release/claim) loops
                 // "replacement underpriced" forever and strands. Seed a nonzero floor from
@@ -1175,7 +1173,7 @@ impl ChainClient {
         self.head_block.store(block, Ordering::Relaxed);
     }
 
-    /// [RPC #2] Record the submitting tx hash for a job (from the monitor's
+    /// Record the submitting tx hash for a job (from the monitor's
     /// JobSubmitted log — free, the log carries it). FIFO-bounded internally.
     pub fn note_submit_tx(
         &self,
@@ -1188,7 +1186,7 @@ impl ChainClient {
             .insert(job_id, tx_hash);
     }
 
-    /// [RPC #2] The cached submitting tx hash for a job, if the monitor saw its
+    /// The cached submitting tx hash for a job, if the monitor saw its
     /// JobSubmitted log (live poll or startup backfill). `None` → use the scan path.
     pub fn submit_tx_for(
         &self,
@@ -1244,7 +1242,7 @@ impl ChainClient {
         use zkminer_contracts::bindings::{IHemiProveStaking, IERC20};
         let token = IERC20::new(self.hemi_token, &*self.provider);
         let staking = IHemiProveStaking::new(self.hemi_prove_staking, &*self.provider);
-        // [review must-fix] Each contract view is added with allowFailure=TRUE. alloy's
+        // Each contract view is added with allowFailure=TRUE. alloy's
         // `.add()` builds a CallItem with `allow_failure: false` by DEFAULT, and aggregate3
         // reverts WHOLESALE if any allowFailure=false sub-call reverts — so without this the
         // per-field degrade below is a lie: one reverting view would sink block+balances+

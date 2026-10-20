@@ -97,22 +97,21 @@ async fn main() -> Result<()> {
     let mut _log_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
 
     if is_tui {
-        // [security H5] TUI mode: suppress forwarding of worker-process stderr. H1 dup2's each guest's
+        // TUI mode: suppress forwarding of worker-process stderr. The worker dup2's each guest's
         // stdout onto the worker stderr pipe, so a malicious guest can emit unbounded output; forwarded
         // to the daily-rotated, size-uncapped log it fills the operator's disk, and its ungated
         // "[WITSUM]" eprintln path would corrupt the alternate screen. The drainer still READS the pipe
-        // (so the worker never blocks on a full pipe) — it just does not forward while suppressed. This
-        // finally wires up the suppress flag that shipped dead. (Headless keeps forwarding, rate-capped
-        // in the drainer, to operator-controlled stderr.)
+        // (so the worker never blocks on a full pipe) — it just does not forward while suppressed.
+        // (Headless keeps forwarding, rate-capped in the drainer, to operator-controlled stderr.)
         zkminer_prover::worker::suppress_worker_stderr(true);
         // TUI mode: log to file instead of stderr (stderr output corrupts the alternate screen).
         let log_dir = dirs::home_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join(".zkminer")
             .join("logs");
-        // [security #20] Cap log retention so a submitter who floods log-worthy events (bad jobs,
-        // rejected URIs, failed proofs) cannot fill the operator's disk via unbounded daily files.
-        // Keep ~2 weeks of daily logs; fall back to the simple appender if the builder errors.
+        // Cap log retention so a submitter who floods log-worthy events (bad jobs, rejected URIs,
+        // failed proofs) cannot fill the operator's disk via unbounded daily files. Keep ~2 weeks
+        // of daily logs; fall back to the simple appender if the builder errors.
         let file_appender = tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix("zkminer.log")

@@ -133,10 +133,11 @@ pub fn compute_collateral(
     } else {
         (product - U256::from(1u128)) / U256::from(10000u128) + U256::from(1u128)
     };
-    // [security #26] `.to::<u128>()` PANICS on overflow. settled_price and effective_collateral_bps
+    // `.to::<u128>()` PANICS on overflow. settled_price and effective_collateral_bps
     // are both derived from submitter-controlled AuctionConfig fields (uint96 price, lockCollateralBps
-    // cast from uint96), so their product / 10000 can exceed u128 and panic the brain tick. Saturate
-    // to u128::MAX instead: the result then trips the "unaffordable" path below and the job is skipped
+    // cast from uint96), so their product / 10000 can exceed u128 and panic the brain tick. Those
+    // fields are attacker-controlled, so this must not be able to crash the miner. Saturate to
+    // u128::MAX instead: the result then trips the "unaffordable" path below and the job is skipped
     // (it would revert CollateralOverflow on-chain anyway), rather than crashing the miner.
     let raw: u128 = if raw_u256 > U256::from(u128::MAX) {
         u128::MAX
@@ -266,7 +267,7 @@ mod tests {
 
     #[test]
     fn compute_collateral_saturates_instead_of_panicking() {
-        // [security #26] Submitter-controlled extremes: a huge settled_price and a large bps whose
+        // Submitter-controlled extremes: a huge settled_price and a large bps whose
         // product/10000 exceeds u128. Must return the unaffordable sentinel, not panic.
         let got = compute_collateral(u128::MAX, u64::MAX, 0);
         assert_eq!(got, u128::MAX, "overflowing collateral must saturate to unaffordable");
@@ -351,8 +352,8 @@ mod tests {
         const U96_MAX: u128 = (1u128 << 96) - 1;
         // A min-collateral floor that itself exceeds the u96 ceiling: the contract maxes
         // the floor in THEN require()s <= u96max, so it reverts. We must mirror that and
-        // return u128::MAX (unaffordable), not the finite floor value — this is the
-        // floor-before-overflow ordering fix.
+        // return u128::MAX (unaffordable), not the finite floor value — the floor must be
+        // applied before the overflow check.
         assert_eq!(compute_collateral(1, 1, U96_MAX + 1), u128::MAX);
     }
 

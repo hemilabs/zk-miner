@@ -154,12 +154,11 @@ impl SetupStatus {
         self.has_gas = eth_balance > 0;
         self.has_hemi = hemi_balance > 0;
 
-        // [FIX-V1A3, 2026-07-08] The 1h MIN_STAKING_AGE claim gate was removed
-        // on-chain; a stake is claimable from the next block after it lands
-        // (block.number > depositBlock), which is always satisfied by the time
-        // we evaluate jobs. So maturity simply tracks "has an active stake".
-        // `deposit_block` is a block number (not a wall-clock timestamp), so no
-        // age countdown is computed.
+        // The 1h MIN_STAKING_AGE claim gate was removed on-chain; a stake is
+        // claimable from the next block after it lands (block.number > depositBlock),
+        // which is always satisfied by the time we evaluate jobs. So maturity simply
+        // tracks "has an active stake". `deposit_block` is a block number (not a
+        // wall-clock timestamp), so no age countdown is computed.
         if let Some(stake) = stake_info {
             self.has_stake = stake.total_staked >= MIN_STAKE_WEI;
             self.stake_mature = self.has_stake;
@@ -243,7 +242,7 @@ pub struct RuntimeSettings {
     /// at fulfill and risks a collateral slash on timeout, and zkminer does not yet
     /// simulate the predicate before claiming (reproducing the on-chain
     /// `JOURNAL_PREDICATE_DOMAIN_V1` predicate is required first). Opt in only on a
-    /// deployment where you accept that risk. [security H2]
+    /// deployment where you accept that risk.
     pub claim_predicate_jobs: bool,
 }
 

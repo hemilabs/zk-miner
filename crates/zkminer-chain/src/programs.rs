@@ -14,7 +14,7 @@ use crate::client::ChainClient;
 use zkminer_contracts::bindings::IProgramRegistry;
 
 /// Strip control/escape bytes (keep tab) and cap length before logging a submitter-controlled string
-/// (storage URIs, program names). [security #10/#19] Otherwise a crafted URI/name with ANSI escapes
+/// (storage URIs, program names). Otherwise a crafted URI/name with ANSI escapes
 /// could inject into the operator's terminal or forge log lines (via carriage returns) when the log
 /// is viewed.
 pub fn sanitize_log(s: &str) -> String {
@@ -87,13 +87,13 @@ fn ip_is_blocked(ip: &IpAddr) -> bool {
 
 
 /// Async wrapper around [`validate_fetch_url`] that runs the BLOCKING DNS resolution off the tokio
-/// runtime, bounded by a timeout. [security R4] `validate_fetch_url` calls `to_socket_addrs`, which
+/// runtime, bounded by a timeout. `validate_fetch_url` calls `to_socket_addrs`, which
 /// blocks the calling thread; invoked directly from the async `download_elf` it would stall a
 /// runtime worker (a submitter hostname with slow/hanging DNS could wedge the executor, and the
 /// reqwest download timeout does not cover resolution, which happens before the request). The scheme
 /// check stays inline (cheap); only the resolution is offloaded.
 /// Validate a (submitter-controlled) ELF URL and return the VETTED socket addresses its host
-/// resolves to. [security H6] The caller PINS the connection to exactly these addresses (reqwest
+/// resolves to. The caller PINS the connection to exactly these addresses (reqwest
 /// `resolve_to_addrs`), so the host is resolved ONCE here (off-runtime, IP-checked) and never
 /// re-resolved at connect time — closing the DNS-rebinding window where a TTL-0 host answers public
 /// to this validation lookup and internal to reqwest's own connect lookup. An empty Vec means "do not
@@ -150,8 +150,8 @@ fn reject_blocked_addrs(host: &str, addrs: &[std::net::SocketAddr]) -> Result<()
     Ok(())
 }
 
-/// Non-blocking redirect-hop validation (no DNS). [security H6] reqwest runs the redirect policy
-/// synchronously on its connection task, so it must NOT resolve DNS (the runtime stall R4 removed) —
+/// Non-blocking redirect-hop validation (no DNS). reqwest runs the redirect policy
+/// synchronously on its connection task, so it must NOT resolve DNS (that would stall a runtime worker) —
 /// but that is exactly why a redirect to an unvalidated HOSTNAME must now be REFUSED rather than
 /// followed: we cannot IP-check it here, and only the ORIGINAL host was resolved+vetted+pinned
 /// off-runtime. The previous policy followed hostname redirects, so a `302 Location:
@@ -197,7 +197,7 @@ fn validate_redirect_target(url: &reqwest::Url, pinned_host: &str) -> Result<()>
 
 /// Build a download client pinned to `host` → `addrs` (the addresses `validate_fetch_url_async`
 /// already IP-checked), with bounded connect/total timeouts and an SSRF-checked redirect policy.
-/// [security H6] Pinning resolves the host ONCE (here) and connects to those exact addresses,
+/// Pinning resolves the host ONCE (here) and connects to those exact addresses,
 /// closing DNS rebinding; the policy refuses redirects to any other hostname (see
 /// `validate_redirect_target`). An empty `addrs` (private hosts allowed by config) builds an
 /// unpinned client — there is nothing to guard in that mode.
@@ -217,7 +217,7 @@ fn build_elf_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result<reqwes
         .timeout(elf_fetch_timeout())
         .redirect(policy);
     if !addrs.is_empty() {
-        // [security H6] Pin only the vetted IP, NOT the port. The connector (hyper-util `set_port`)
+        // Pin only the vetted IP, NOT the port. The connector (hyper-util `set_port`)
         // fills a resolved addr's port iff it is 0 OR the URI carries an explicit port, so a pinned
         // port-0 addr gets the correct scheme-default PER HOP — 80 on http, 443 on an https upgrade —
         // while the IP still blocks DNS rebinding. Baking the original scheme's default port in (80
@@ -231,7 +231,7 @@ fn build_elf_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result<reqwes
         .context("building hardened ELF download client")
 }
 
-/// [security H6] Strip the port from each vetted address so the pin binds the IP only. The connector
+/// Strip the port from each vetted address so the pin binds the IP only. The connector
 /// supplies the correct per-hop scheme-default port (see `build_elf_client`); pinning a concrete port
 /// would break a same-host cross-scheme (http<->https) redirect, whose default port differs from the
 /// original URL's. The SSRF guarantee rests on the IP (already `reject_blocked_addrs`-checked), which
@@ -501,7 +501,7 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
         bail!("No storage URIs available for this program");
     }
 
-    // [security M1] Cap the number of submitter-listed URIs actually tried. download_elf is on the
+    // Cap the number of submitter-listed URIs actually tried. download_elf is on the
     // pre-claim MEASURE path (bounded by a measure-fetch timeout at the caller) and the prove path;
     // without a cap a program advertising dozens of stalling URIs burns timeout × count, pinning a
     // scarce measure-budget slot (or a prove deadline). Real programs list one or a few mirrors.
@@ -547,7 +547,7 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                 continue;
             }
         };
-        // [security H6] Build the client pinned to the host we just resolved+IP-checked, so the
+        // Build the client pinned to the host we just resolved+IP-checked, so the
         // connection uses those exact addresses (no rebindable re-resolution) and redirects to any
         // other hostname are refused. Per-URI because each may target a different host.
         let host = parsed.host_str().unwrap_or("").to_string();
@@ -703,12 +703,12 @@ mod security_tests {
         assert!(v("http://[::1]:8545/").is_err());
         // Public IP literal is allowed.
         assert!(v("https://1.1.1.1/elf").is_ok());
-        // [security H6] A redirect back to the SAME (pinned) host is allowed — the client pins it to
+        // A redirect back to the SAME (pinned) host is allowed — the client pins it to
         // the already-vetted address, so http→https and path redirects still work.
         assert!(v("https://elf.example.com/elf").is_ok());
         assert!(v("https://ELF.EXAMPLE.COM/elf").is_ok()); // case-insensitive
-        // [security H6] A redirect to a DIFFERENT hostname is refused: it cannot be resolved+checked
-        // on reqwest's runtime task, and only the original host was vetted+pinned. This is the fix for
+        // A redirect to a DIFFERENT hostname is refused: it cannot be resolved+checked
+        // on reqwest's runtime task, and only the original host was vetted+pinned. This closes
         // the redirect-to-internal-hostname / DNS-rebind SSRF bypass.
         assert!(v("http://name.attacker.com/").is_err());
         assert!(v("https://metadata.google.internal/").is_err());
@@ -716,7 +716,7 @@ mod security_tests {
 
     #[test]
     fn pinning_binds_the_ip_but_not_the_port() {
-        // [security H6, fix-review regression] The pin must carry port 0 so the connector fills the
+        // The pin must carry port 0 so the connector fills the
         // correct scheme-default per hop; baking a concrete port (80 for http) in breaks a legitimate
         // same-host http->https redirect (connector keeps 80, attempts TLS on it). The IP — the thing
         // the SSRF guard actually rests on — is preserved exactly.

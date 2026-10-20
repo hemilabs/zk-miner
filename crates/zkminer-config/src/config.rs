@@ -61,7 +61,7 @@ pub struct ChainConfig {
     /// AFTER the lock — risking a collateral slash on timeout — because zkminer
     /// does not yet simulate the predicate before claiming. A submitter can set
     /// an unsatisfiable predicate deliberately to bait a slash, so None = built-in
-    /// default (FALSE: skip them) [security H2]. Set `true` only on a deployment
+    /// default (FALSE: skip them). Set `true` only on a deployment
     /// where you accept the risk (e.g. testnet testing of the predicate feature).
     #[serde(default)]
     pub claim_predicate_jobs: Option<bool>,
@@ -354,7 +354,7 @@ impl ZkMinerConfig {
     pub fn validate_for_chain(&self) -> Result<()> {
         // `gas_price_gwei` reaches the client as `(g * 1e9).round() as u128`, which saturates
         // a negative or NaN to 0 — and `base_fees` short-circuits `Some(0)` to `(0, 0)` BEFORE
-        // the [H2(c)] floor. Every escalation path is gated on `base_max_fee > 0`, so a zero
+        // the floor. Every escalation path is gated on `base_max_fee > 0`, so a zero
         // here silently disables the whole fee ladder AND the per-nonce ratchet: a stuck tx can
         // then never clear a node's +12.5% replacement threshold and strands. Reject it here
         // rather than let it degrade a live money path in silence.
@@ -398,12 +398,12 @@ impl ZkMinerConfig {
 mod validation_tests {
     use super::*;
 
-    /// [cheap-5 / round-1 LOW-1] A positive, finite gwei value can still round to ZERO wei.
+    /// A positive, finite gwei value can still round to ZERO wei.
     ///
     /// The client converts with `(g * 1e9).round() as u128`, so any `0 < g < 5e-10` becomes
     /// `Some(0)` — and `base_fees` short-circuits that to `(0, 0)` BEFORE its own floor,
     /// disabling every `base_max_fee > 0` escalation gate and the whole per-nonce ratchet.
-    /// A bare `g > 0.0` check passed it straight through to the failure this validation
+    /// A bare `g > 0.0` check passes it straight through to the failure this validation
     /// exists to prevent, so the validation must mirror the client's expression.
     #[test]
     fn a_sub_wei_gas_price_is_rejected() {

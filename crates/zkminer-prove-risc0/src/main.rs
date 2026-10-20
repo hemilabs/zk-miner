@@ -55,12 +55,12 @@ fn main() {
         return;
     }
 
-    // CRITICAL (security): save the real stdout FD for IPC, then redirect FD 1 to stderr so NOTHING
+    // CRITICAL: save the real stdout FD for IPC, then redirect FD 1 to stderr so NOTHING
     // the guest (via risc0's POSIX `sys_write`/`sys_log` to fd 1, which `PosixIo::default()` wires to
     // this process's stdout) — nor any native/CUDA library — can inject bytes into the length-prefixed
-    // bincode control stream the dispatcher reads. A submitter's ELF could otherwise desync/forge that
-    // stream and churn the GPU prover. The SP1 worker already does this for gnark's CGO prints; risc0
-    // and OpenVM were missing it. The worker's own IPC frames go only through the saved descriptor.
+    // bincode control stream the dispatcher reads. A submitter's ELF could otherwise desync or forge
+    // that stream and churn the GPU prover. The SP1 worker does the same for gnark's CGO prints. The
+    // worker's own IPC frames go only through the saved descriptor.
     #[cfg(unix)]
     let ipc_stdout = {
         use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -165,7 +165,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     segments: None,
                 };
                 write_message(&mut stdout, &started)?;
-                // [security H3] A crafted ELF that EXECUTES cleanly (so it measures feasible and gets
+                // A crafted ELF that EXECUTES cleanly (so it measures feasible and gets
                 // CLAIMED) can still panic in risc0's prove-only path (image-id/proving on an
                 // adversarial-but-executable program). Without containment the worker dies on a CLAIMED
                 // job, the dispatcher charges a healthy slot, the retry loop re-dispatches the same job
@@ -230,7 +230,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 program_id,
             } => {
                 tracing::info!("Execute request {request_id} ({} bytes ELF)", elf.len());
-                // [security H3] The ELF bytes are fully attacker-controlled and reach risc0's ELF
+                // The ELF bytes are fully attacker-controlled and reach risc0's ELF
                 // parser / image-id computation / executor UNCLAIMED on this pre-claim measurement
                 // path. Those SDK calls CAN PANIC on a malformed registered ELF rather than returning
                 // Err (the SP1 worker's Execute arm documents and guards the identical hazard). An
@@ -269,7 +269,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         write_message(&mut stdout, &resp)?;
                     }
                     Err(_panic) => {
-                        // [security H3] risc0 panicked parsing/executing this attacker ELF. Same
+                        // risc0 panicked parsing/executing this attacker ELF. Same
                         // disposition as an execution Err — a bad program, not a sick worker — so the
                         // slot stays healthy and the host can negative-cache the program.
                         let resp = WorkerResponse::Error {
@@ -483,7 +483,7 @@ fn run_execute(
 
     // `SessionInfo::cycles()` is the total cycle count, matching what proving reports.
     let cycles = session.cycles();
-    // [security H7] The journal the guest committed here is byte-identical to the one the later proof
+    // The journal the guest committed here is byte-identical to the one the later proof
     // would carry (both are a deterministic function of (ELF, input), and the elf_hash gate makes
     // measure-ELF == prove-ELF), so its length lets the host pre-screen a program whose journal alone
     // would blow the fulfillJob payload cap — before committing collateral and a full proof to it.
@@ -493,7 +493,7 @@ fn run_execute(
 
 /// Cards with less VRAM than this release the Groth16 SRS cache after every proof.
 ///
-/// Set between the two cards measured on 2026-10-07. On the 16.3 GB RTX 5080 the cache stays resident
+/// Set between the two cards that were measured. On the 16.3 GB RTX 5080 the cache stays resident
 /// at ~7.25 GB between proofs, and the next 46M-cycle STARK at po2 20 then peaked at 15,834 MiB — 469
 /// MiB from the card's capacity — and in the benchmark's program order failed outright. Releasing it
 /// dropped the idle worker to 2,452 MiB and that peak to 12,436 MiB. On the 24.6 GB RTX 4090 the same
