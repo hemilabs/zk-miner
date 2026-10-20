@@ -1261,15 +1261,26 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     }
                     Ok(Err(e)) => {
                         let msg = format!("{e:#}");
-                        let kind = if is_gpu_oom(&msg) {
+                        // The vkey-binding bails below are THIS binary's own host-authored strings, not
+                        // guest text (the executor's errors are a typed enum with no free-form guest
+                        // field), so matching them is safe — unlike matching the guest-controlled
+                        // `message` body, which nothing here does. Check them BEFORE is_gpu_oom so a
+                        // permanent program-level mismatch is reported as such and never misread as a
+                        // transient GPU OOM.
+                        let kind = if msg.contains("does not match job programId")
+                            || msg.contains("could not parse SP1 vkey hash")
+                        {
+                            // The served ELF's verifying key cannot match this job's programId. No job
+                            // for this program can ever be proved, so report it as ProgramMismatch: the
+                            // host negative-caches the program and stops claiming its jobs, instead of
+                            // eating a release penalty per submitted job.
+                            ErrorKind::ProgramMismatch
+                        } else if is_gpu_oom(&msg) {
                             // GPU OOM: tag as ResourceExhausted so the dispatcher kills +
                             // respawns this worker (and its gpu-server) with clean VRAM.
                             ErrorKind::ResourceExhausted
                         } else if msg.contains("serialize") || msg.contains("bincode") {
                             ErrorKind::Internal
-                        } else if msg.contains("does not match job programId") {
-                            // Wrong ELF for the job's vkey — a bad job, not a sick worker.
-                            ErrorKind::InvalidInput
                         } else {
                             ErrorKind::ProofFailed
                         };

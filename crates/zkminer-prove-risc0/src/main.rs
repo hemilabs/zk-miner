@@ -196,17 +196,32 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     }
                     Ok(Err(e)) => {
                         let msg = format!("{e:#}");
-                        let kind = if is_gpu_oom(&msg) {
-                            // GPU OOM: tag as ResourceExhausted so the dispatcher kills +
-                            // respawns this worker with a clean GPU context (a wedged/leaked
-                            // context would otherwise fail every subsequent proof).
-                            ErrorKind::ResourceExhausted
-                        } else if msg.contains("po2 value")
-                            || msg.contains("out of valid range")
-                            || msg.contains("does not match job programId")
+                        let lower = msg.to_ascii_lowercase();
+                        // A guest-execution fault must be classified BEFORE is_gpu_oom. risc0 wraps a
+                        // guest panic as "Guest panicked: <msg>" — a host-generated prefix followed by
+                        // the guest's OWN text. Feeding that whole string to is_gpu_oom let a guest
+                        // panic with "out of memory" and steer ITSELF onto a worker kill+respawn and a
+                        // bigger-card retry — the self-classification the typed `kind` was meant to
+                        // prevent. A guest that faults in the prove-only path is a BAD JOB, not a sick
+                        // worker: classify InvalidInput and never let its text reach is_gpu_oom.
+                        // (Session-/cycle-limit are too-heavy bad jobs; their text is host-generated.)
+                        let kind = if lower.contains("guest panicked")
+                            || lower.contains("session limit")
+                            || lower.contains("exceeded cycle")
                         {
-                            // Bad job (wrong po2 / wrong ELF for the programId), not a sick worker:
-                            // InvalidInput so the dispatcher does not kill+respawn a healthy worker.
+                            ErrorKind::InvalidInput
+                        } else if msg.contains("does not match job programId") {
+                            // The served ELF's image id is not this job's programId — permanent for the
+                            // program. Report ProgramMismatch so the host stops claiming its jobs.
+                            ErrorKind::ProgramMismatch
+                        } else if is_gpu_oom(&msg) {
+                            // GPU OOM — host/driver text (guest faults are handled above): tag
+                            // ResourceExhausted so the dispatcher kills + respawns this worker with a
+                            // clean GPU context (a wedged/leaked context would fail every later proof).
+                            ErrorKind::ResourceExhausted
+                        } else if msg.contains("po2 value") || msg.contains("out of valid range") {
+                            // Bad job (wrong po2), not a sick worker: InvalidInput so the dispatcher
+                            // does not kill+respawn a healthy worker.
                             ErrorKind::InvalidInput
                         } else if msg.contains("serialize") || msg.contains("bincode") {
                             ErrorKind::Internal
@@ -574,10 +589,17 @@ fn run_proof(
             }
             Err(e) => {
                 let msg = format!("{e:#}").to_lowercase();
-                let recoverable = msg.contains("verification indicates")
-                    || msg.contains("verify segment")
-                    || msg.contains("receipt is invalid")
-                    || msg.contains("proof verification failed");
+                // A guest-execution fault carries guest-controlled text ("Guest panicked: <msg>"), so
+                // it must never match the recoverable-retry predicate below — otherwise a guest could
+                // panic with "receipt is invalid" and buy itself MAX_ATTEMPTS full re-proves of wasted
+                // GPU. The genuine GPU-corruption signals this retry targets are host-generated (segment
+                // verification / receipt.verify), never wrapped as a guest panic.
+                let guest_fault = msg.contains("guest panicked") || msg.contains("session limit");
+                let recoverable = !guest_fault
+                    && (msg.contains("verification indicates")
+                        || msg.contains("verify segment")
+                        || msg.contains("receipt is invalid")
+                        || msg.contains("proof verification failed"));
                 if recoverable && attempt < MAX_ATTEMPTS {
                     tracing::warn!(
                         "Proof attempt {attempt}/{MAX_ATTEMPTS} produced an invalid proof (likely GPU race), re-proving: {e:#}"

@@ -184,6 +184,13 @@ pub enum ErrorKind {
     ProofFailed,
     /// Invalid input data or ELF.
     InvalidInput,
+    /// The served ELF's verifying key / image id cannot match the job's on-chain `programId`, so NO
+    /// job for this program can ever produce an accepted proof. Distinct from `InvalidInput` (which is
+    /// per-job) because it is PERMANENT per program: the host negative-caches the program on it so it
+    /// stops claiming every job the program submits, capping the loss to one baited claim instead of
+    /// one release penalty per job. SP1 cannot check this before claiming (deriving the vkey needs the
+    /// minutes-long `setup`), so it is only proven on the prove path and reported with this kind.
+    ProgramMismatch,
     /// Ran out of memory or other system resources.
     ResourceExhausted,
     /// Protocol violation (unexpected message, version mismatch).
@@ -680,6 +687,12 @@ impl WorkerProofError {
     /// Was the input or the proof itself rejected, so another card would fail the same way?
     pub fn is_invalid(&self) -> bool {
         matches!(self.kind, ErrorKind::InvalidInput)
+    }
+
+    /// Did the served ELF's verifying key / image id fail to match the job's `programId`? Then no job
+    /// for this program can ever be proved: the caller should stop claiming the program, not retry.
+    pub fn is_program_mismatch(&self) -> bool {
+        matches!(self.kind, ErrorKind::ProgramMismatch)
     }
 }
 

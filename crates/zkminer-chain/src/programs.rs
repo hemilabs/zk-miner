@@ -42,6 +42,20 @@ fn elf_fetch_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Cap on concurrent blocking DNS resolutions of submitter-controlled ELF hosts, node-wide.
+///
+/// `to_socket_addrs` (getaddrinfo) is a blocking, UNCANCELLABLE call run on tokio's shared blocking
+/// pool. When the 5s timeout in `validate_fetch_url_async` fires we abandon the `JoinHandle`, but the
+/// pool thread keeps running getaddrinfo until the OS resolver gives up (tens of seconds for a
+/// black-holed nameserver). A submitter who points many ELF hostnames at a non-responding nameserver
+/// could otherwise start resolutions faster than they drain and exhaust the whole blocking pool —
+/// stalling ELF cache reads/writes and `/proc` reads node-wide (a liveness DoS). This semaphore bounds
+/// how many resolutions are IN FLIGHT at once; since each holds its permit for at most the 5s timeout,
+/// the start rate is capped and the number of abandoned-but-still-running threads stays a small
+/// multiple of this bound, well under the pool size.
+const MAX_CONCURRENT_ELF_DNS: usize = 16;
+static ELF_DNS_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+
 /// Allow fetching an ELF from a private/loopback/link-local host — only for an operator who
 /// deliberately self-hosts the program store on a private network. OFF by default: a
 /// submitter-controlled storage URI that resolves to 169.254.169.254 (cloud metadata), 127.0.0.1,
@@ -55,9 +69,48 @@ fn allow_private_elf_hosts() -> bool {
     )
 }
 
+/// Extract the IPv4 address embedded in an IPv6 address for every form that carries one, so the IPv4
+/// blocklist can be applied to it. Covers IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`,
+/// excluding `::` and `::1`, which are IPv6 unspecified/loopback), the NAT64 well-known prefix
+/// (`64:ff9b::a.b.c.d`), 6to4 (`2002:AABB:CCDD::`, v4 = `AABB.CCDD`) and Teredo (`2001:0::/32`, where the
+/// client v4 is the bitwise complement of the last two groups). These are the translation/relay
+/// encodings a submitter's authoritative DNS can return to smuggle a private/metadata v4 target past a
+/// guard that only normalises the mapped form. Returns `None` for an ordinary global IPv6 address.
+fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    use std::net::Ipv4Addr;
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    let seg = v6.segments();
+    let v4_from = |hi: u16, lo: u16| {
+        let a = hi.to_be_bytes();
+        let b = lo.to_be_bytes();
+        Ipv4Addr::new(a[0], a[1], b[0], b[1])
+    };
+    // IPv4-compatible `::a.b.c.d` — the high 96 bits are zero. Exclude `::` (unspecified) and `::1`
+    // (loopback): those are native IPv6, not an embedded v4.
+    if seg[0..6].iter().all(|&s| s == 0) && !(seg[6] == 0 && (seg[7] == 0 || seg[7] == 1)) {
+        return Some(v4_from(seg[6], seg[7]));
+    }
+    // NAT64 well-known prefix `64:ff9b::/96` — `64:ff9b::a.b.c.d`.
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6].iter().all(|&s| s == 0) {
+        return Some(v4_from(seg[6], seg[7]));
+    }
+    // 6to4 `2002:AABB:CCDD::/16` — the v4 is groups 1 and 2.
+    if seg[0] == 0x2002 {
+        return Some(v4_from(seg[1], seg[2]));
+    }
+    // Teredo `2001:0000::/32` — the client v4 is the bitwise complement of the last two groups.
+    if seg[0] == 0x2001 && seg[1] == 0x0000 {
+        return Some(v4_from(!seg[6], !seg[7]));
+    }
+    None
+}
+
 /// True for an address a submitter must not be able to make the miner reach: loopback, RFC1918
 /// private, link-local (incl. the 169.254.169.254 metadata endpoint), CGNAT, unspecified, broadcast,
-/// documentation, multicast, IPv6 ULA/link-local, and IPv4-mapped forms of all the above.
+/// documentation, multicast, IPv6 ULA/link-local, and every IPv6 form that embeds an IPv4 address
+/// (IPv4-mapped, IPv4-compatible, NAT64, 6to4, Teredo — see [`embedded_ipv4`]).
 fn ip_is_blocked(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -72,8 +125,11 @@ fn ip_is_blocked(ip: &IpAddr) -> bool {
                 || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
         }
         IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return ip_is_blocked(&IpAddr::V4(mapped));
+            // Normalise every IPv6 form that EMBEDS an IPv4 address back to that IPv4 and re-test it,
+            // so a blocked v4 target cannot be smuggled through as a v6 literal the submitter's DNS
+            // returns. `to_ipv4_mapped()` alone (the previous guard) covered only `::ffff:a.b.c.d`.
+            if let Some(v4) = embedded_ipv4(*v6) {
+                return ip_is_blocked(&IpAddr::V4(v4));
             }
             let seg = v6.segments();
             v6.is_loopback()
@@ -81,6 +137,12 @@ fn ip_is_blocked(ip: &IpAddr) -> bool {
                 || v6.is_multicast()
                 || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
                 || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                // Block the translation/relay prefixes themselves too, so a form of them that carries
+                // no routable embedded v4 (or one `embedded_ipv4` declines) still cannot be reached —
+                // no legitimate program store serves from a NAT64/6to4/Teredo address.
+                || (seg[0] == 0x0064 && seg[1] == 0xff9b) // NAT64 well-known 64:ff9b::/96
+                || seg[0] == 0x2002 // 6to4 2002::/16
+                || (seg[0] == 0x2001 && seg[1] == 0x0000) // Teredo 2001:0::/32
         }
     }
 }
@@ -116,6 +178,15 @@ async fn validate_fetch_url_async(url: &reqwest::Url) -> Result<Vec<std::net::So
         .unwrap_or(host_raw)
         .to_string();
     let port = url.port_or_known_default().unwrap_or(443);
+    // Bound concurrent blocking resolutions node-wide so a flood of black-holed submitter hostnames
+    // cannot exhaust the shared blocking pool (see MAX_CONCURRENT_ELF_DNS). Held across the timeout;
+    // released when this function returns. acquire() only errors if the semaphore is closed, which
+    // never happens here, so on the impossible error we proceed without a permit rather than block.
+    let _dns_permit = ELF_DNS_SEMAPHORE
+        .get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_ELF_DNS))
+        .acquire()
+        .await
+        .ok();
     let host_for_dns = host.clone();
     let addrs: Vec<std::net::SocketAddr> = tokio::time::timeout(
         Duration::from_secs(5),
@@ -689,6 +760,36 @@ mod security_tests {
         for s in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {
             assert!(!ip_is_blocked(&ip(s)), "{s} should be allowed");
         }
+    }
+
+    #[test]
+    fn blocks_ipv4_embedding_ipv6_forms() {
+        use std::net::Ipv4Addr;
+        // Every IPv6 encoding that embeds the cloud-metadata v4 169.254.169.254 (a9fe:a9fe) must be
+        // blocked — the forms the old guard (to_ipv4_mapped only) let through.
+        for s in [
+            "64:ff9b::a9fe:a9fe",  // NAT64 well-known prefix of 169.254.169.254
+            "64:ff9b::a00:1",      // NAT64 of 10.0.0.1
+            "::a9fe:a9fe",         // IPv4-compatible 169.254.169.254
+            "2002:a9fe:a9fe::",    // 6to4 of 169.254.169.254
+            "2001::f5ff:fffe",     // Teredo whose client v4 (~f5ff:fffe) is 10.0.0.1
+        ] {
+            assert!(ip_is_blocked(&ip(s)), "{s} embeds a blocked v4 and must be blocked");
+        }
+        // The extractor decodes each form to the right v4.
+        let md = Ipv4Addr::new(169, 254, 169, 254);
+        assert_eq!(embedded_ipv4("64:ff9b::a9fe:a9fe".parse().unwrap()), Some(md));
+        assert_eq!(embedded_ipv4("::a9fe:a9fe".parse().unwrap()), Some(md));
+        assert_eq!(embedded_ipv4("2002:a9fe:a9fe::".parse().unwrap()), Some(md));
+        assert_eq!(
+            embedded_ipv4("2001::f5ff:fffe".parse().unwrap()),
+            Some(Ipv4Addr::new(10, 0, 0, 1))
+        );
+        // :: and ::1 are IPv6 unspecified/loopback, NOT an embedded v4 (and are blocked as v6).
+        assert_eq!(embedded_ipv4("::".parse().unwrap()), None);
+        assert_eq!(embedded_ipv4("::1".parse().unwrap()), None);
+        // An ordinary global v6 embeds nothing and stays allowed.
+        assert_eq!(embedded_ipv4("2606:4700:4700::1111".parse().unwrap()), None);
     }
 
     #[test]

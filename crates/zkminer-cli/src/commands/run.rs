@@ -425,6 +425,106 @@ fn fulfill_payload_over_cap(
         > MAX_FULFILL_PAYLOAD_BYTES
 }
 
+/// Programs whose on-chain `programId` cannot be satisfied by the ELF the submitter serves: the prover
+/// derived the verifying key / image id and it did not equal `programId`, so EVERY job for this program
+/// fails at PROVE — after the collateral-locking claim — and releases at a penalty. SP1 cannot detect
+/// this before claiming (deriving the vkey needs the minutes-long `setup`, far over the measure
+/// watchdog), so the binding is only proven on the prove path. Recording a mismatch here caps the loss
+/// to ONE baited claim per registered program instead of a release penalty per submitted job: the claim
+/// and measure gates skip every future job for a program listed here. Write-once per bad program, read
+/// once per candidate per tick — a process-wide static like the other brain-wide flags in this module,
+/// bounded like the measured cache so a flood of distinct decoy programs cannot grow it. A legitimate
+/// program's vkey always equals its `programId`, so it is never listed and never skipped.
+static VKEY_MISMATCH_PROGRAMS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>>,
+> = std::sync::OnceLock::new();
+
+fn vkey_mismatch_programs(
+) -> &'static std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>> {
+    VKEY_MISMATCH_PROGRAMS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Record a program whose served ELF can never match its `programId` (a prove-path vkey/image-id
+/// mismatch), so the claim and measure gates skip every future job for it.
+fn mark_program_vkey_mismatch(program_id: alloy::primitives::B256) {
+    if let Ok(mut s) = vkey_mismatch_programs().lock() {
+        // Bounded like the brain maps so a flood of distinct decoy programs cannot grow the heap.
+        if s.len() >= MEASURED_CYCLES_CAP && !s.contains(&program_id) {
+            if let Some(k) = s.iter().next().copied() {
+                s.remove(&k);
+            }
+        }
+        s.insert(program_id);
+    }
+}
+
+/// True if a prior prove proved this `programId`'s served ELF cannot satisfy it (see
+/// [`mark_program_vkey_mismatch`]). Such a program is permanently unclaimable.
+fn program_vkey_mismatched(program_id: alloy::primitives::B256) -> bool {
+    vkey_mismatch_programs()
+        .lock()
+        .map(|s| s.contains(&program_id))
+        .unwrap_or(false)
+}
+
+/// descriptor hash -> the submitter descriptor's payload length (inputData + callbackExtraData +
+/// extraVerifierData), cached during measurement. The fulfill payload is journal + THIS sum + the proof
+/// seal; the journal length is cached per (program, input) in [`JournalLenCache`], but the descriptor
+/// portion is per-DESCRIPTOR and is only known while the descriptor is in hand. Caching it lets the
+/// claim gate re-check a descriptor's full payload against the cap even when THIS descriptor was never
+/// the one that executed — e.g. a sibling that lost the `measuring_inputs` dedup race and returned
+/// before any journal existed, which otherwise reaches neither the short-circuit nor the post-execute
+/// payload screen. Bounded like the measured cache.
+type DescPayloadCache =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, u64>>>;
+
+/// Cache THIS descriptor's payload length (see [`DescPayloadCache`]), bounded to `MEASURED_CYCLES_CAP`.
+fn insert_desc_payload(
+    cache: &DescPayloadCache,
+    descriptor_hash: alloy::primitives::B256,
+    payload_len: u64,
+) {
+    if let Ok(mut m) = cache.lock() {
+        bounded_insert(&mut m, descriptor_hash, payload_len, MEASURED_CYCLES_CAP);
+    }
+}
+
+/// True if THIS descriptor's full fulfill payload (the cached journal for its (program, input) + its
+/// cached descriptor payload + a minimal seal) is CERTAIN to exceed the on-chain cap — so claiming and
+/// proving it would waste a proof on a fulfill guaranteed to OOG-revert, then release at a penalty.
+/// Returns false (does not block) whenever any input is not yet known, so it never false-skips a job
+/// that could still fulfill. This is the claim-gate backstop for a descriptor whose own measure task
+/// returned before checking its payload (notably the `measuring_inputs` race loser).
+fn claim_payload_over_cap(
+    desc_input: &DescInputCache,
+    measured_journal: &JournalLenCache,
+    desc_payload: &DescPayloadCache,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    descriptor_hash: alloy::primitives::B256,
+) -> bool {
+    let Some(input_hash) = desc_input
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&descriptor_hash).copied())
+    else {
+        return false;
+    };
+    let Some(journal_len) = get_journal_len(measured_journal, backend, program_id, input_hash) else {
+        return false;
+    };
+    let Some(payload) = desc_payload
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&descriptor_hash).copied())
+    else {
+        return false;
+    };
+    // `payload` already sums inputData + callbackExtraData + extraVerifierData, so pass it as one term;
+    // fulfill_payload_over_cap adds the minimal seal and compares to the cap.
+    fulfill_payload_over_cap(journal_len, payload as usize, 0, 0)
+}
+
 /// (backend, program, input) -> consecutive wall-clock measure-timeout count. A wall-clock
 /// watchdog SIGKILL during measurement is AMBIGUOUS (a genuinely-too-heavy guest vs. one merely starved
 /// under transient host load), unlike the executor's clean cycle-cap trip. So it must NOT permanently
@@ -2436,6 +2536,12 @@ async fn miner_brain(
     // still have its full fulfill payload checked and, if over the cap, marked in desc_skip.
     let measured_journal: JournalLenCache =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // descriptor hash -> its payload length (inputData + the two extra-data fields), cached during
+    // measurement so the claim gate can re-check a descriptor's full fulfill payload against the cap
+    // even when that descriptor's own measure task returned before any journal existed (the
+    // measuring_inputs race loser), which otherwise escaped both payload screens (see `DescPayloadCache`).
+    let desc_payload: DescPayloadCache =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut queue_model = zkminer_strategy::queue::QueueModel::new();
     let mut queue_last_tick = std::time::Instant::now();
     if !initial_queue_horizon.is_zero() {
@@ -3150,6 +3256,23 @@ async fn miner_brain(
                 );
                 continue;
             }
+            // Skip a program whose served ELF can never satisfy its on-chain programId: a prior prove
+            // derived the verifying key / image id and it did not match, so EVERY job for this program
+            // fails at prove AFTER the collateral-locking claim and releases at a penalty. SP1 cannot
+            // check this before claiming (deriving the vkey needs the minutes-long setup), so it is only
+            // learned on the prove path — recording it there caps the loss to one baited claim per
+            // program instead of a release penalty per job. (The job stays in the open set; the check
+            // is a cheap per-tick lookup. A legitimate program's vkey always matches, so this never
+            // false-skips real work.)
+            if program_vkey_mismatched(job.info.program_id) {
+                tracing::debug!(
+                    "Skipping {}: its programId cannot be satisfied by the served ELF (vkey/image-id \
+                     mismatch seen on a prior prove) — any claim would waste a proof and release at a \
+                     penalty",
+                    short_id(jid)
+                );
+                continue;
+            }
             // Proving-time budget if we claim now. getJobStatusView.timeRemaining is
             // only populated for LOCKED jobs (it's lockDeadline - now); for an OPEN
             // job it is 0. So for an unclaimed job, fall back to the fulfillmentTimeout
@@ -3180,6 +3303,33 @@ async fn miner_brain(
                     continue;
                 }
                 Some(backend) => {
+                    // Backstop the per-descriptor fulfill-payload screen at the claim gate. A sibling
+                    // descriptor that LOST the measuring_inputs dedup race recorded its resolver (so it
+                    // became claimable) but returned before any journal existed, so neither payload
+                    // screen inside its measure task ran for it. Once the winner's measurement lands, the
+                    // journal length is known; combined with THIS descriptor's payload (cached during its
+                    // own measure task) the full payload can be re-checked here and the claim refused when
+                    // it is over the cap — closing the window where such a descriptor is claimed+proved
+                    // into a guaranteed OOG-revert fulfill. Mark it so later ticks short-circuit at the
+                    // cheap desc_skip check above. (Returns false, i.e. does not block, until all three
+                    // inputs are cached, so it never false-skips a job that could actually fulfill.)
+                    if claim_payload_over_cap(
+                        &desc_input_hash,
+                        &measured_journal,
+                        &desc_payload,
+                        backend,
+                        job.info.program_id,
+                        snapshot.descriptor_hash,
+                    ) {
+                        mark_desc_unfulfillable(&desc_skip, snapshot.descriptor_hash);
+                        tracing::debug!(
+                            "Skipping {}: its full fulfill payload (measured journal + descriptor + \
+                             seal) exceeds the on-chain cap — proving it would waste a proof on a \
+                             guaranteed-revert fulfill",
+                            short_id(jid)
+                        );
+                        continue;
+                    }
                     // Refuse a job whose window is too short to claim, prove, AND still
                     // release collateral before the deadline. A submitter can set a tiny
                     // fulfillmentTimeout (with small declared cycles so the duration estimate looks
@@ -3609,6 +3759,10 @@ async fn miner_brain(
             if backend_measurable
                 && measured_for_job.is_none()
                 && matches!(eval.recommendation, Recommendation::Claim)
+                // Don't spend a measure slot on a program a prior prove already proved unclaimable
+                // (its served ELF's vkey/image-id can never match its programId); the claim gate skips
+                // it anyway.
+                && !program_vkey_mismatched(pid)
             {
                 let backend = backend_opt.unwrap_or("");
                 // Dedup by descriptor hash so N sightings spawn ONE execution; cleared below.
@@ -3634,7 +3788,7 @@ async fn miner_brain(
                     })
                     .unwrap_or(false);
                 if fresh {
-                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2, skip2, jcache2) = (
+                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2, skip2, jcache2, pcache2) = (
                         client.clone(),
                         state.clone(),
                         measured_cycles.clone(),
@@ -3644,6 +3798,7 @@ async fn miner_brain(
                         measure_strikes.clone(),
                         desc_skip.clone(),
                         measured_journal.clone(),
+                        desc_payload.clone(),
                     );
                     tokio::spawn(async move {
                         // measure_cycles does all caching: it records desc->input, negative-caches a
@@ -3666,6 +3821,7 @@ async fn miner_brain(
                             &strikes2,
                             &skip2,
                             &jcache2,
+                            &pcache2,
                         )
                         .await;
                         // Clear the per-descriptor in-flight marker so a transient failure can retry.
@@ -5246,6 +5402,20 @@ async fn process_job_lifecycle(
                     // that had just failed. `ErrorKind` is set by the worker about itself.
                     let worker_err =
                         e.downcast_ref::<zkminer_prover_protocol::types::WorkerProofError>();
+                    // A programId/vkey mismatch is PERMANENT for this program: the served ELF's
+                    // verifying key / image id can never equal its on-chain programId, so no job for it
+                    // can ever be proved. Record the program so the claim+measure gates skip every future
+                    // job for it (capping the loss to this one baited claim, not a penalty per job), and
+                    // return terminally — more attempts on the same binding fail identically. Typed, so
+                    // guest-controlled error text can never forge it.
+                    if worker_err.map(|w| w.is_program_mismatch()).unwrap_or(false) {
+                        mark_program_vkey_mismatch(program_id);
+                        return Err(anyhow::anyhow!(
+                            "proving stopped for {} (served ELF's vkey/image-id does not match its \
+                             programId — program is unprovable; skipping its future jobs): {msg}",
+                            short_id(job_id)
+                        ));
+                    }
                     let invalid = match worker_err {
                         Some(w) => w.is_invalid(),
                         None => is_invalid_proof(&msg),
@@ -5647,6 +5817,7 @@ async fn measure_cycles(
     measure_strikes: &MeasureStrikes,
     desc_skip: &DescSkip,
     measured_journal: &JournalLenCache,
+    desc_payload: &DescPayloadCache,
 ) {
     // Cheap availability probe FIRST, for THIS backend. The fetches below can hit the chain, and
     // under load most measurement attempts are skipped for a busy worker — doing the RPC work only to
@@ -5736,6 +5907,12 @@ async fn measure_cycles(
     // measurement.
     let input_hash = alloy::primitives::keccak256(&input);
     insert_desc_input(desc_input, descriptor_hash, input_hash);
+    // Cache THIS descriptor's payload length alongside the resolver, BEFORE the short-circuit and the
+    // measuring_inputs dedup CAS below. A descriptor that loses that race returns without running either
+    // payload screen, yet it is now claimable (its resolver is recorded); the claim gate re-runs the
+    // full-payload check from this cached length plus the winner's journal length (see
+    // `claim_payload_over_cap`), so the race loser can no longer slip an over-cap descriptor through.
+    insert_desc_payload(desc_payload, descriptor_hash, descriptor_payload as u64);
     let key = (backend_tag(backend), program_id, input_hash);
 
     // Short-circuit: if this exact (backend, program, input) was already measured —
@@ -7578,5 +7755,60 @@ mod r2_sizing_tests {
         // Keyed by backend too: a different backend for the same program+input is independent, so a
         // sibling check on one backend never reads the other's journal length.
         assert_eq!(get_journal_len(&jc, "risc0", prog, ih), None);
+    }
+
+    #[test]
+    fn program_vkey_mismatch_skips_every_future_job_for_the_program() {
+        // A program recorded as vkey/image-id-mismatched is permanently unclaimable; an unrelated
+        // program is unaffected. Distinct ids keep it independent of any other test touching the
+        // process-wide set.
+        let bad = B256::repeat_byte(0xab);
+        let good = B256::repeat_byte(0xcd);
+        assert!(!program_vkey_mismatched(bad));
+        mark_program_vkey_mismatch(bad);
+        assert!(program_vkey_mismatched(bad), "the mismatched program is skipped");
+        assert!(!program_vkey_mismatched(good), "an unrelated program is not skipped");
+        // Idempotent: re-marking does not change membership.
+        mark_program_vkey_mismatch(bad);
+        assert!(program_vkey_mismatched(bad));
+    }
+
+    #[test]
+    fn claim_payload_over_cap_catches_the_race_loser_and_needs_all_three_inputs() {
+        // Reproduces the measuring_inputs race loser: its own (early-returning) measure task cached its
+        // resolver and payload, and the winner cached the journal length for the shared (program,
+        // input). The claim gate must then catch an over-cap full payload — and must NOT fire until all
+        // three inputs are present, so it never false-skips a job that could still fulfill.
+        let desc_input: DescInputCache =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let jc: JournalLenCache =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let pc: DescPayloadCache =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let prog = B256::repeat_byte(0x44);
+        let desc = B256::repeat_byte(0x55);
+        let ih = keccak256(b"shared-input");
+
+        // Nothing cached yet -> never blocks.
+        assert!(!claim_payload_over_cap(&desc_input, &jc, &pc, "sp1", prog, desc));
+        // Resolver only -> cannot decide, does not block.
+        insert_desc_input(&desc_input, desc, ih);
+        assert!(!claim_payload_over_cap(&desc_input, &jc, &pc, "sp1", prog, desc));
+        // + a journal length that alone fits under the cap, but THIS descriptor's payload is not yet
+        // cached -> still does not block.
+        insert_journal_len(&jc, "sp1", prog, ih, 100 * 1024);
+        assert!(!claim_payload_over_cap(&desc_input, &jc, &pc, "sp1", prog, desc));
+        // + a FAT descriptor payload that tips the full payload (journal + payload + seal) over the cap
+        // -> now the claim is refused (the race-loser case).
+        insert_desc_payload(&pc, desc, 40 * 1024);
+        assert!(claim_payload_over_cap(&desc_input, &jc, &pc, "sp1", prog, desc));
+        // A slim descriptor for the SAME (program, input) is independent and NOT blocked.
+        let slim = B256::repeat_byte(0x66);
+        insert_desc_input(&desc_input, slim, ih);
+        insert_desc_payload(&pc, slim, 1024);
+        assert!(!claim_payload_over_cap(&desc_input, &jc, &pc, "sp1", prog, slim));
+        // Journal is backend-keyed: the same descriptor under a DIFFERENT backend (no journal there)
+        // does not block.
+        assert!(!claim_payload_over_cap(&desc_input, &jc, &pc, "risc0", prog, desc));
     }
 }
