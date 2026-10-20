@@ -3031,7 +3031,7 @@ impl WorkerPool {
         // image id does not match, so the zero-cost pre-claim measurement path cannot be driven with
         // an ELF unrelated to the registered program.
         program_id: Option<[u8; 32]>,
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<(u64, u64)> {
         let keys = self.keys_for_prefix(backend);
         if keys.is_empty() {
             anyhow::bail!("no worker registered for backend '{backend}'");
@@ -3181,12 +3181,16 @@ impl WorkerPool {
             WorkerResponse::ExecuteResult {
                 cycles,
                 duration_secs,
+                journal_len,
                 ..
             } => {
                 tracing::debug!(
-                    "cycle measurement on {key}: {cycles} cycles in {duration_secs:.2}s"
+                    "cycle measurement on {key}: {cycles} cycles in {duration_secs:.2}s, \
+                     {journal_len} journal bytes"
                 );
-                Ok(cycles)
+                // [security H7] journal_len (0 from a pre-H7 worker, treated as "unknown") lets the
+                // caller pre-screen a program whose journal alone would OOG-revert fulfillJob.
+                Ok((cycles, journal_len))
             }
             WorkerResponse::Error { message, .. } => {
                 anyhow::bail!("cycle measurement failed: {message}")
@@ -4276,25 +4280,28 @@ impl WorkerPool {
         available: u64,
         total: Option<u64>,
         give_up_at: Option<Instant>,
-    ) {
+    ) -> Result<()> {
         if crate::discovery::vram_sizing_tier(backend, u64::MAX).is_none() {
-            return; // no VRAM-derived knob for this backend
+            return Ok(()); // no VRAM-derived knob for this backend
         }
         let Some(entry) = self.workers.get(key) else {
-            return;
+            return Ok(());
         };
-        let mut slot = entry.slot.lock().unwrap_or_else(|e| e.into_inner());
+        // [security H4] Bounded like `own_slot`: this runs inside `check_vram_budget` with the GPU
+        // guard held, so an unbounded wait behind a 120s cycle measurement would wedge a claimed proof
+        // past its release margin. A deadline-free caller (benchmark/calibration) still blocks.
+        let mut slot = Self::lock_slot_bounded(entry, key, give_up_at, "vram-budget resize")?;
         if slot.handle.is_none() {
             // Nothing live to resize; the next spawn reads a fresh figure anyway. Still refresh the
             // env, so that spawn uses today's number rather than discovery's.
             Self::set_spawn_vram(&mut slot, available);
-            return;
+            return Ok(());
         }
         let cap = SizingCap::for_slot(backend, &slot.spawn_env);
         let assumed = spawned_vram(&slot.spawn_env);
         let floor = crate::discovery::min_available_vram_bytes_for_backend(backend);
         if !vram_tier_shrank(cap, backend, assumed, available, total, floor) {
-            return;
+            return Ok(());
         }
         let was = cap
             .tier_at(backend, assumed, total)
@@ -4318,6 +4325,7 @@ impl WorkerPool {
         // `available` was read with that worker alive and credited to this slot, so it is exactly
         // what has to come back before the replacement is spawned into it.
         self.await_own_vram_release(key, Some(available), give_up_at);
+        Ok(())
     }
 
     /// Record the free-VRAM figure the next spawn of this slot should size itself against.
@@ -4349,31 +4357,90 @@ impl WorkerPool {
         read_card_occupancy(idx, &slot_pids)
     }
 
+    /// Take `entry.slot`, bounded by `give_up_at` when set. With no cutoff (benchmark/calibration, or
+    /// a dispatch without a deadline) it blocks, recovering a poisoned lock inline — the slot guards a
+    /// handle plus counters, not a safety invariant. With a cutoff it polls `try_lock` to it and
+    /// otherwise returns a typed `ProofDeadlineReached`. [security H4] `prove_on_slot` takes the GPU
+    /// guard, then calls `check_vram_budget` (which takes this slot via `own_slot`/the resize), and
+    /// ONLY THEN its own deadline-bounded slot loop. `execute_cycles` holds a slot for up to
+    /// MEASURE_TIMEOUT (120s) WITHOUT the GPU guard, so it is invisible to `acquire_gpu_guard`: an
+    /// unbounded `lock()` inside the budget check would therefore park a CLAIMED proof behind a
+    /// measurement with the GPU guard held, past its release margin → the unreleasable late
+    /// revert/slash the bounded `prove_on_slot` loop was added to close, re-entered one step earlier.
+    /// Bounding the budget-check locks too closes that hole; a deadline-free caller is unchanged.
+    fn lock_slot_bounded<'a>(
+        entry: &'a WorkerEntry,
+        key: &str,
+        give_up_at: Option<Instant>,
+        what: &str,
+    ) -> Result<std::sync::MutexGuard<'a, WorkerSlot>> {
+        match give_up_at {
+            None => Ok(entry.slot.lock().unwrap_or_else(|e| {
+                tracing::warn!(
+                    "worker slot {key} was poisoned by an earlier panic; recovering it rather than \
+                     retiring the slot"
+                );
+                e.into_inner()
+            })),
+            Some(give_up_at) => loop {
+                match entry.slot.try_lock() {
+                    Ok(g) => return Ok(g),
+                    Err(std::sync::TryLockError::Poisoned(e)) => {
+                        tracing::warn!(
+                            "worker slot {key} was poisoned by an earlier panic; recovering it rather \
+                             than retiring the slot"
+                        );
+                        return Ok(e.into_inner());
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        if Instant::now() >= give_up_at {
+                            return Err(anyhow::Error::new(
+                                zkminer_prover_protocol::types::ProofDeadlineReached {
+                                    detail: format!(
+                                        "giving up waiting for the {key} worker slot ({what}): a cycle \
+                                         measurement is holding it and too little time is left to \
+                                         start (releasing to recover collateral)"
+                                    ),
+                                },
+                            ));
+                        }
+                        std::thread::sleep(GPU_LOCK_POLL);
+                    }
+                }
+            },
+        }
+    }
+
     /// What `check_vram_budget` needs from `key`'s own slot. See `OwnSlot`.
     ///
-    /// Takes the slot mutex briefly, as `resize_worker_if_vram_shrank` does. The caller holds the
-    /// card's guard and not yet the slot; every path that holds this slot for long either takes the
-    /// same guard first, or is the post-benchmark respawn or `execute_cycles`, which never wait on a
-    /// card guard while holding it — so this can wait, but cannot deadlock.
-    fn own_slot(&self, key: &str, backend: &str, total: Option<u64>) -> OwnSlot {
+    /// Takes the slot mutex, as `resize_worker_if_vram_shrank` does, bounded by `give_up_at` so a
+    /// cycle measurement holding it cannot park a deadline-bearing caller (see `lock_slot_bounded`).
+    /// The caller holds the card's guard and not yet the slot.
+    fn own_slot(
+        &self,
+        key: &str,
+        backend: &str,
+        total: Option<u64>,
+        give_up_at: Option<Instant>,
+    ) -> Result<OwnSlot> {
         let Some(entry) = self.workers.get(key) else {
-            return OwnSlot {
+            return Ok(OwnSlot {
                 dispatchable: false,
                 cap: SizingCap::NotSized,
                 live: None,
-            };
+            });
         };
-        let slot = entry.slot.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = Self::lock_slot_bounded(entry, key, give_up_at, "vram-budget slot check")?;
         let cap = SizingCap::for_slot(backend, &slot.spawn_env);
         let live = slot
             .handle
             .as_ref()
             .map(|_| cap.tier_at(backend, spawned_vram(&slot.spawn_env), total));
-        OwnSlot {
+        Ok(OwnSlot {
             dispatchable: slot.handle.is_some() || Self::slot_dispatchable(&slot),
             cap,
             live,
-        }
+        })
     }
 
     /// Recycle the idle workers of `keys` so the `what` they hold (VRAM, or host RAM) comes back for
@@ -4575,7 +4642,11 @@ impl WorkerPool {
             return Ok(None);
         };
         let total = Some(card.total);
-        let own = self.own_slot(key, backend, total);
+        // [security H4] Compute the deadline cutoff BEFORE the first slot-taking call (own_slot), and
+        // thread it through own_slot AND the resize, so neither can block unboundedly behind a cycle
+        // measurement with the GPU guard held. A `None` abort (benchmark/calibration) means no cutoff.
+        let give_up_at = abort_at.map(|a| a.checked_sub(MIN_ABORT_START_BUDGET).unwrap_or(a));
+        let own = self.own_slot(key, backend, total, give_up_at)?;
         // A slot that cannot run gets no opinion: not room — that destroys a warm sibling for a
         // dispatch `ensure_alive` is about to fail — and not a refusal either, whose free retries would
         // hide the slot's honest "permanently failed" behind "memory is short". Likewise while the
@@ -4584,7 +4655,6 @@ impl WorkerPool {
             return Ok(None);
         }
         let floor = crate::discovery::min_available_vram_bytes_for_backend(backend);
-        let give_up_at = abort_at.map(|a| a.checked_sub(MIN_ABORT_START_BUDGET).unwrap_or(a));
         let this_card = physical_gpu_id(key);
         // What of OURS stands on this card and could move: same-card siblings' workers — only they are
         // behind the guard we hold; a slot pinned to another card holding a context here is not — and
@@ -4710,7 +4780,7 @@ impl WorkerPool {
         // card needs ~17.8 GiB. Re-sizing is the repair, not refusing — that is the whole point of
         // measuring instead of gating. After the room-making above, so a worker is never shrunk to
         // fit beside a sibling that was, or could have been, recycled.
-        self.resize_worker_if_vram_shrank(key, backend, budget.available, total, give_up_at);
+        self.resize_worker_if_vram_shrank(key, backend, budget.available, total, give_up_at)?;
 
         let Some(needed) = floor else {
             return Ok(Some(budget));
@@ -7726,6 +7796,44 @@ mod tests {
         assert!(result.is_err());
         // PID is defensively zeroed even in the handle=None path
         assert_eq!(pid.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn lock_slot_bounded_gives_up_on_a_held_slot_past_the_deadline() {
+        // [security H4] `check_vram_budget` (own_slot / resize) runs inside `prove_on_slot` with the
+        // GPU guard held. A cycle measurement holds a slot for up to MEASURE_TIMEOUT WITHOUT that
+        // guard, so an UNBOUNDED `lock()` there would park a claimed proof past its deadline → late
+        // revert/slash. The bounded take must surface `ProofDeadlineReached` instead of blocking.
+        let pool = pool_with_keys(&["risc0:cuda:0"]);
+        let entry = pool.workers.get("risc0:cuda:0").expect("entry present");
+        // Hold the slot, as a measurement would.
+        let _held = entry.slot.lock().unwrap();
+        let past = Instant::now() - Duration::from_secs(1);
+        // Not `expect_err`: the Ok type (MutexGuard<WorkerSlot>) is not Debug.
+        let err = match WorkerPool::lock_slot_bounded(entry, "risc0:cuda:0", Some(past), "test") {
+            Ok(_g) => panic!("a held slot past the deadline must not be acquired"),
+            Err(e) => e,
+        };
+        assert!(
+            err.downcast_ref::<zkminer_prover_protocol::types::ProofDeadlineReached>()
+                .is_some(),
+            "the bounded wait must surface ProofDeadlineReached, not block or a different error"
+        );
+    }
+
+    #[test]
+    fn lock_slot_bounded_acquires_a_free_slot() {
+        // A deadline-free caller (benchmark/calibration) and one with time left both acquire a free
+        // slot; the bound only ever triggers when a slot is genuinely held past the cutoff.
+        let pool = pool_with_keys(&["risc0:cuda:0"]);
+        let entry = pool.workers.get("risc0:cuda:0").expect("entry present");
+        let g = WorkerPool::lock_slot_bounded(entry, "risc0:cuda:0", None, "test")
+            .expect("a free slot is acquired with no deadline");
+        drop(g);
+        let fut = Instant::now() + Duration::from_secs(60);
+        let g2 = WorkerPool::lock_slot_bounded(entry, "risc0:cuda:0", Some(fut), "test")
+            .expect("a free slot with time left is acquired");
+        drop(g2);
     }
 
     #[test]

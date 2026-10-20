@@ -1229,8 +1229,18 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         continue;
                     }
                 };
-                match run_proof(prover_for_proof, &mut pk_cache, &elf, &input_data, program_id) {
-                    Ok((journal, seal, duration_secs, cycles)) => {
+                // [security H3] `run_proof`'s prove-only SDK calls — `setup` (vkey/pk derivation) and
+                // the GPU `prove` — run on the fully attacker-controlled ELF and are NOT exercised by
+                // the Execute measurement gate, so a crafted ELF that executes cleanly (hence measures
+                // feasible and gets CLAIMED) can still panic here. The Execute arm already wraps its
+                // SDK calls in catch_unwind for exactly this reason; the Prove arm must too, or the
+                // worker dies on a CLAIMED job, the dispatcher charges a healthy slot, the retry loop
+                // crashes every GPU, and the program is never classed bad. A caught panic is a bad job.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_proof(prover_for_proof, &mut pk_cache, &elf, &input_data, program_id)
+                }));
+                match outcome {
+                    Ok(Ok((journal, seal, duration_secs, cycles))) => {
                         let resp = WorkerResponse::ProofResult {
                             request_id,
                             journal,
@@ -1240,7 +1250,16 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(e) => {
+                    Err(_panic) => {
+                        let resp = WorkerResponse::Error {
+                            request_id,
+                            kind: ErrorKind::InvalidInput,
+                            message: "SP1 prover panicked on this ELF (malformed or hostile program)"
+                                .to_string(),
+                        };
+                        write_message(&mut stdout, &resp)?;
+                    }
+                    Ok(Err(e)) => {
                         let msg = format!("{e:#}");
                         let kind = if is_gpu_oom(&msg) {
                             // GPU OOM: tag as ResourceExhausted so the dispatcher kills +
@@ -1327,7 +1346,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     run_execute_sp1(cpu, &elf, &input_data)
                 }));
                 match outcome {
-                    Ok(Ok((cycles, duration_secs))) => {
+                    Ok(Ok((cycles, journal_len, duration_secs))) => {
                         tracing::info!(
                             "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s"
                         );
@@ -1335,6 +1354,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             request_id,
                             cycles,
                             duration_secs,
+                            journal_len,
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -1503,7 +1523,7 @@ fn run_execute_sp1(
     cpu: &sp1_sdk::blocking::CpuProver,
     elf: &[u8],
     input_data: &[u8],
-) -> anyhow::Result<(u64, f64)> {
+) -> anyhow::Result<(u64, u64, f64)> {
     use sp1_sdk::blocking::{Elf, Prover, SP1Stdin};
 
     let started = Instant::now();
@@ -1522,10 +1542,20 @@ fn run_execute_sp1(
     // and `execute_with_options`'s `.ok_or(anyhow!("Failed to extract public value digest"))?`
     // (execute.rs:321) returns Err for EVERY guest. Gas accumulation is also what populates
     // `opcode_counts`, i.e. `total_instruction_count()`. So we do NOT disable it.
-    let (_, report) = req
+    let (public_values, report) = req
         .run()
         .map_err(|e| canonicalize_sp1_execute_error(&e.to_string()))?;
-    Ok((report.total_instruction_count(), started.elapsed().as_secs_f64()))
+    // [security H7] The public values the guest commits here are byte-identical to the journal the
+    // later Groth16 proof carries (both are a deterministic function of (ELF, input), and the host's
+    // elf_hash gate makes measure-ELF == prove-ELF). Report their length so the host can refuse to
+    // CLAIM a program whose journal alone would OOG-revert fulfillJob, instead of learning it only
+    // after a full proof is wasted. `.to_vec()` matches how `run_proof` extracts the journal.
+    let journal_len = public_values.to_vec().len() as u64;
+    Ok((
+        report.total_instruction_count(),
+        journal_len,
+        started.elapsed().as_secs_f64(),
+    ))
 }
 
 /// [security B] True iff an SP1 `execute().run()` error string denotes the cycle cap being tripped

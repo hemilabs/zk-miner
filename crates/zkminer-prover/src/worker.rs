@@ -620,8 +620,32 @@ impl WorkerHandle {
                     let mut buf: Vec<u8> = Vec::with_capacity(256);
                     let mut discarding = false;
                     let mut byte = [0u8; 1];
-                    let emit = |raw: &[u8]| {
+                    // [security H5] Aggregate flood cap on forwarding. H1 dup2's a guest's stdout onto
+                    // this worker-stderr pipe, so a malicious guest can emit unbounded lines; the
+                    // per-line BYTE cap above bounds each line but not their NUMBER. Unbounded, a guest
+                    // in a tight print loop (free, on the pre-claim EXECUTE measurement path — no claim,
+                    // no collateral) floods the daily-rotated, size-uncapped log and fills the
+                    // operator's disk. Token-bucket it: a burst, then a steady trickle, with the excess
+                    // folded into one periodic "(N dropped)" summary so a genuine late diagnostic still
+                    // gets through while a flood cannot. Per drainer thread = per worker lifetime; a
+                    // respawn resets it. In TUI mode forwarding is gated off ENTIRELY below
+                    // (SUPPRESS_WORKER_STDERR), which closes the rolling-file disk-fill outright; the
+                    // bucket is the headless (operator-redirected stderr) defence-in-depth.
+                    const BUCKET_CAP: u32 = 2048; // lines forwardable back-to-back
+                    const REFILL_PER_SEC: u32 = 32; // steady trickle once the burst is spent
+                    let mut tokens: u32 = BUCKET_CAP;
+                    let mut last_refill = std::time::Instant::now();
+                    let mut dropped: u64 = 0;
+                    let mut emit = |raw: &[u8]| {
                         if raw.is_empty() {
+                            return;
+                        }
+                        // [security H5] TUI mode suppresses forwarding to BOTH sinks: the eprintln
+                        // would corrupt the alternate screen (a guest could force it by prefixing
+                        // "[WITSUM]"), and the tracing::warn would flood the rolling log file. The pipe
+                        // is still drained (we read every byte), so the worker never blocks on a full
+                        // pipe regardless. This also finally wires up the long-dead suppress flag.
+                        if SUPPRESS_WORKER_STDERR.load(Ordering::Relaxed) {
                             return;
                         }
                         // Sanitize (strip control/escape bytes, cap length) before it can reach the
@@ -630,12 +654,30 @@ impl WorkerHandle {
                         if line.is_empty() {
                             return;
                         }
+                        // Refill the bucket for the time since the last forward, then spend one token.
+                        let now = std::time::Instant::now();
+                        let add = (now.duration_since(last_refill).as_secs_f64()
+                            * REFILL_PER_SEC as f64) as u32;
+                        if add > 0 {
+                            tokens = tokens.saturating_add(add).min(BUCKET_CAP);
+                            last_refill = now;
+                        }
+                        if tokens == 0 {
+                            dropped = dropped.saturating_add(1);
+                            return;
+                        }
+                        tokens -= 1;
+                        if dropped > 0 {
+                            let n = std::mem::take(&mut dropped);
+                            tracing::warn!(
+                                target: "worker",
+                                "[worker:{backend_name}] …{n} line(s) of worker output dropped (flood protection)"
+                            );
+                        }
                         if line.starts_with("[WITSUM]") || line.starts_with("[EVALCHECK_DIFF]") {
                             eprintln!("[worker:{backend_name}] {line}");
                         }
-                        if !SUPPRESS_WORKER_STDERR.load(Ordering::Relaxed) {
-                            tracing::warn!(target: "worker", "[worker:{backend_name}] {line}");
-                        }
+                        tracing::warn!(target: "worker", "[worker:{backend_name}] {line}");
                     };
                     loop {
                         match reader.read(&mut byte) {

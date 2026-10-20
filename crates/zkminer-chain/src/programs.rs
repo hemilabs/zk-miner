@@ -92,13 +92,19 @@ fn ip_is_blocked(ip: &IpAddr) -> bool {
 /// runtime worker (a submitter hostname with slow/hanging DNS could wedge the executor, and the
 /// reqwest download timeout does not cover resolution, which happens before the request). The scheme
 /// check stays inline (cheap); only the resolution is offloaded.
-async fn validate_fetch_url_async(url: &reqwest::Url) -> Result<()> {
+/// Validate a (submitter-controlled) ELF URL and return the VETTED socket addresses its host
+/// resolves to. [security H6] The caller PINS the connection to exactly these addresses (reqwest
+/// `resolve_to_addrs`), so the host is resolved ONCE here (off-runtime, IP-checked) and never
+/// re-resolved at connect time — closing the DNS-rebinding window where a TTL-0 host answers public
+/// to this validation lookup and internal to reqwest's own connect lookup. An empty Vec means "do not
+/// pin" (private hosts are allowed by config, so there is nothing to guard).
+async fn validate_fetch_url_async(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>> {
     match url.scheme() {
         "http" | "https" => {}
         other => bail!("refusing ELF fetch with non-http(s) scheme '{other}': {url}"),
     }
     if allow_private_elf_hosts() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let host_raw = url
         .host_str()
@@ -123,7 +129,8 @@ async fn validate_fetch_url_async(url: &reqwest::Url) -> Result<()> {
     .map_err(|_| anyhow::anyhow!("DNS resolution for ELF host '{host}' timed out"))?
     .map_err(|e| anyhow::anyhow!("DNS resolution task failed for '{host}': {e}"))?
     .with_context(|| format!("resolving ELF host '{host}'"))?;
-    reject_blocked_addrs(&host, &addrs)
+    reject_blocked_addrs(&host, &addrs)?;
+    Ok(addrs)
 }
 
 /// Shared IP-range check used by both the sync and async URL validators.
@@ -143,11 +150,16 @@ fn reject_blocked_addrs(host: &str, addrs: &[std::net::SocketAddr]) -> Result<()
     Ok(())
 }
 
-/// Non-blocking redirect-hop validation (no DNS): reject a non-http(s) scheme, and reject a host
-/// that is an IP LITERAL in a blocked range. A hostname host is allowed here (resolving it would
-/// block reqwest's runtime task — the thing R4 fixes); the initial URL was already resolved and
-/// checked off-runtime. [R4]
-fn validate_redirect_target(url: &reqwest::Url) -> Result<()> {
+/// Non-blocking redirect-hop validation (no DNS). [security H6] reqwest runs the redirect policy
+/// synchronously on its connection task, so it must NOT resolve DNS (the runtime stall R4 removed) —
+/// but that is exactly why a redirect to an unvalidated HOSTNAME must now be REFUSED rather than
+/// followed: we cannot IP-check it here, and only the ORIGINAL host was resolved+vetted+pinned
+/// off-runtime. The previous policy followed hostname redirects, so a `302 Location:
+/// http://name.attacker.com/` whose A record is 169.254.169.254 / 127.0.0.1 / RFC1918 defeated the
+/// whole SSRF guard. Now: reject a non-http(s) scheme; allow a redirect back to the SAME (pinned)
+/// host — reqwest connects it to the pinned address, so http→https and path redirects still work;
+/// IP-check an IP-literal target; and refuse any OTHER hostname.
+fn validate_redirect_target(url: &reqwest::Url, pinned_host: &str) -> Result<()> {
     match url.scheme() {
         "http" | "https" => {}
         other => bail!("non-http(s) redirect scheme '{other}'"),
@@ -155,43 +167,59 @@ fn validate_redirect_target(url: &reqwest::Url) -> Result<()> {
     if allow_private_elf_hosts() {
         return Ok(());
     }
-    if let Some(host) = url.host_str() {
-        // host_str() returns an IPv6 literal bracketed ("[::1]"); strip for IpAddr parsing.
-        let h = host
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(host);
-        if let Ok(ip) = h.parse::<IpAddr>() {
+    let Some(host) = url.host_str() else {
+        bail!("redirect target has no host");
+    };
+    // Same host as the vetted+pinned original: safe to follow — the client's resolve override pins
+    // this host to the addresses we already IP-checked, so no fresh (rebindable) lookup happens.
+    if host.eq_ignore_ascii_case(pinned_host) {
+        return Ok(());
+    }
+    // host_str() returns an IPv6 literal bracketed ("[::1]"); strip for IpAddr parsing.
+    let h = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    match h.parse::<IpAddr>() {
+        Ok(ip) => {
             if ip_is_blocked(&ip) {
                 bail!("redirect to private/reserved address {ip}");
             }
+            Ok(())
         }
+        // A different hostname we cannot resolve+check on the runtime task: refuse.
+        Err(_) => bail!(
+            "redirect to unvalidated host '{host}' (differs from the vetted ELF host); refusing \
+             to follow a redirect whose address cannot be re-checked"
+        ),
     }
-    Ok(())
 }
 
-/// Build the download client once: bounded connect/total timeout and a redirect policy that
-/// re-validates each hop (non-blocking) and caps the chain length.
-fn build_elf_client() -> Result<reqwest::Client> {
-    let policy = reqwest::redirect::Policy::custom(|attempt| {
+/// Build a download client pinned to `host` → `addrs` (the addresses `validate_fetch_url_async`
+/// already IP-checked), with bounded connect/total timeouts and an SSRF-checked redirect policy.
+/// [security H6] Pinning resolves the host ONCE (here) and connects to those exact addresses,
+/// closing DNS rebinding; the policy refuses redirects to any other hostname (see
+/// `validate_redirect_target`). An empty `addrs` (private hosts allowed by config) builds an
+/// unpinned client — there is nothing to guard in that mode.
+fn build_elf_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result<reqwest::Client> {
+    let pinned_host = host.to_string();
+    let policy = reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= 5 {
             return attempt.error("too many redirects while fetching ELF");
         }
-        // [R4] NON-BLOCKING check only. reqwest runs this closure synchronously on its connection
-        // task, so it must NOT resolve DNS (that was the exact runtime stall R4 set out to remove).
-        // Reject a redirect whose scheme is wrong or whose host is an IP LITERAL in a blocked range
-        // (the common redirect-to-metadata/loopback SSRF). A redirect to a hostname is followed:
-        // the initial URL was already validated with DNS off-runtime, and re-resolving here would
-        // reintroduce the block. The MAX_ELF_BYTES cap and timeouts still bound the response.
-        match validate_redirect_target(attempt.url()) {
+        match validate_redirect_target(attempt.url(), &pinned_host) {
             Ok(()) => attempt.follow(),
             Err(e) => attempt.error(format!("blocked redirect target: {e}")),
         }
     });
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(elf_fetch_timeout())
         .timeout(elf_fetch_timeout())
-        .redirect(policy)
+        .redirect(policy);
+    if !addrs.is_empty() {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+    builder
         .build()
         .context("building hardened ELF download client")
 }
@@ -450,10 +478,20 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
         bail!("No storage URIs available for this program");
     }
 
-    // One hardened client for all URIs: bounded timeouts + SSRF-checked redirects.
-    let client = build_elf_client()?;
+    // [security M1] Cap the number of submitter-listed URIs actually tried. download_elf is on the
+    // pre-claim MEASURE path (bounded by a measure-fetch timeout at the caller) and the prove path;
+    // without a cap a program advertising dozens of stalling URIs burns timeout × count, pinning a
+    // scarce measure-budget slot (or a prove deadline). Real programs list one or a few mirrors.
+    const MAX_ELF_URIS: usize = 8;
+    if uris.len() > MAX_ELF_URIS {
+        tracing::warn!(
+            "program lists {} storage URIs; trying only the first {} (flood protection)",
+            uris.len(),
+            MAX_ELF_URIS
+        );
+    }
 
-    for uri_info in uris {
+    for uri_info in uris.iter().take(MAX_ELF_URIS) {
         let url = match uri_info.storage_type {
             StorageKind::IPFS => {
                 // Convert IPFS CID to a gateway URL
@@ -479,10 +517,24 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                 continue;
             }
         };
-        if let Err(e) = validate_fetch_url_async(&parsed).await {
-            tracing::warn!("Skipping storage URI {}: {e:#}", sanitize_log(&url));
-            continue;
-        }
+        let vetted_addrs = match validate_fetch_url_async(&parsed).await {
+            Ok(addrs) => addrs,
+            Err(e) => {
+                tracing::warn!("Skipping storage URI {}: {e:#}", sanitize_log(&url));
+                continue;
+            }
+        };
+        // [security H6] Build the client pinned to the host we just resolved+IP-checked, so the
+        // connection uses those exact addresses (no rebindable re-resolution) and redirects to any
+        // other hostname are refused. Per-URI because each may target a different host.
+        let host = parsed.host_str().unwrap_or("").to_string();
+        let client = match build_elf_client(&host, &vetted_addrs) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Skipping storage URI {}: client build failed: {e:#}", sanitize_log(&url));
+                continue;
+            }
+        };
 
         tracing::info!("Downloading ELF from {}...", url);
         match client.get(parsed).send().await {
@@ -617,18 +669,26 @@ mod security_tests {
 
     #[test]
     fn validate_rejects_bad_scheme_and_private_ip_literals() {
-        // Non-http(s) scheme.
-        // The redirect-hop validator (non-blocking) rejects bad schemes and private IP LITERALS.
-        assert!(validate_redirect_target(&reqwest::Url::parse("ftp://example.com/x").unwrap()).is_err());
-        assert!(validate_redirect_target(&reqwest::Url::parse("file:///etc/passwd").unwrap()).is_err());
-        assert!(validate_redirect_target(&reqwest::Url::parse("http://127.0.0.1/x").unwrap()).is_err());
-        assert!(validate_redirect_target(
-            &reqwest::Url::parse("http://169.254.169.254/latest/meta-data/").unwrap()
-        )
-        .is_err());
-        assert!(validate_redirect_target(&reqwest::Url::parse("http://[::1]:8545/").unwrap()).is_err());
+        // The redirect-hop validator (non-blocking) rejects bad schemes and private IP LITERALS. The
+        // pinned host here is "elf.example.com" — the vetted ELF host the download started from.
+        let pin = "elf.example.com";
+        let v = |u: &str| validate_redirect_target(&reqwest::Url::parse(u).unwrap(), pin);
+        assert!(v("ftp://example.com/x").is_err());
+        assert!(v("file:///etc/passwd").is_err());
+        assert!(v("http://127.0.0.1/x").is_err());
+        assert!(v("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(v("http://[::1]:8545/").is_err());
         // Public IP literal is allowed.
-        assert!(validate_redirect_target(&reqwest::Url::parse("https://1.1.1.1/elf").unwrap()).is_ok());
+        assert!(v("https://1.1.1.1/elf").is_ok());
+        // [security H6] A redirect back to the SAME (pinned) host is allowed — the client pins it to
+        // the already-vetted address, so http→https and path redirects still work.
+        assert!(v("https://elf.example.com/elf").is_ok());
+        assert!(v("https://ELF.EXAMPLE.COM/elf").is_ok()); // case-insensitive
+        // [security H6] A redirect to a DIFFERENT hostname is refused: it cannot be resolved+checked
+        // on reqwest's runtime task, and only the original host was vetted+pinned. This is the fix for
+        // the redirect-to-internal-hostname / DNS-rebind SSRF bypass.
+        assert!(v("http://name.attacker.com/").is_err());
+        assert!(v("https://metadata.google.internal/").is_err());
     }
 
     #[test]

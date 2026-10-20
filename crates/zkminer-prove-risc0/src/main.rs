@@ -165,8 +165,17 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     segments: None,
                 };
                 write_message(&mut stdout, &started)?;
-                match run_proof(&elf, &input_data, po2, program_id) {
-                    Ok((journal, seal, duration_secs, cycles)) => {
+                // [security H3] A crafted ELF that EXECUTES cleanly (so it measures feasible and gets
+                // CLAIMED) can still panic in risc0's prove-only path (image-id/proving on an
+                // adversarial-but-executable program). Without containment the worker dies on a CLAIMED
+                // job, the dispatcher charges a healthy slot, the retry loop re-dispatches the same job
+                // to every GPU crashing each, and the program is never classed bad — so it is cheaply
+                // repeatable and drives a release-penalty/slash. Treat a prove-time panic as InvalidInput.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_proof(&elf, &input_data, po2, program_id)
+                }));
+                match outcome {
+                    Ok(Ok((journal, seal, duration_secs, cycles))) => {
                         let resp = WorkerResponse::ProofResult {
                             request_id,
                             journal,
@@ -176,7 +185,16 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(e) => {
+                    Err(_panic) => {
+                        let resp = WorkerResponse::Error {
+                            request_id,
+                            kind: ErrorKind::InvalidInput,
+                            message: "risc0 prover panicked on this ELF (malformed or hostile program)"
+                                .to_string(),
+                        };
+                        write_message(&mut stdout, &resp)?;
+                    }
+                    Ok(Err(e)) => {
                         let msg = format!("{e:#}");
                         let kind = if is_gpu_oom(&msg) {
                             // GPU OOM: tag as ResourceExhausted so the dispatcher kills +
@@ -212,8 +230,20 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 program_id,
             } => {
                 tracing::info!("Execute request {request_id} ({} bytes ELF)", elf.len());
-                match run_execute(&elf, &input_data, program_id) {
-                    Ok((cycles, duration_secs)) => {
+                // [security H3] The ELF bytes are fully attacker-controlled and reach risc0's ELF
+                // parser / image-id computation / executor UNCLAIMED on this pre-claim measurement
+                // path. Those SDK calls CAN PANIC on a malformed registered ELF rather than returning
+                // Err (the SP1 worker's Execute arm documents and guards the identical hazard). An
+                // unguarded panic unwinds out of this loop and kills the worker PROCESS; the dispatcher
+                // then sees a bare EOF (non-intentional), scores a HEALTHY slot as failed, and the host
+                // never classes the program as bad — so the crash repeats on every respawn, a free
+                // sustained liveness DoS. Contain it here: a caught panic is a property of the job
+                // (InvalidInput), exactly like an execution Err.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_execute(&elf, &input_data, program_id)
+                }));
+                match outcome {
+                    Ok(Ok((cycles, journal_len, duration_secs))) => {
                         tracing::info!(
                             "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s"
                         );
@@ -221,10 +251,11 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             request_id,
                             cycles,
                             duration_secs,
+                            journal_len,
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         let msg = format!("{e:#}");
                         // Execution failure is NOT proof failure: the guest may simply panic
                         // on this input, which is a property of the job, not of this worker.
@@ -234,6 +265,18 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             request_id,
                             kind: ErrorKind::InvalidInput,
                             message: msg,
+                        };
+                        write_message(&mut stdout, &resp)?;
+                    }
+                    Err(_panic) => {
+                        // [security H3] risc0 panicked parsing/executing this attacker ELF. Same
+                        // disposition as an execution Err — a bad program, not a sick worker — so the
+                        // slot stays healthy and the host can negative-cache the program.
+                        let resp = WorkerResponse::Error {
+                            request_id,
+                            kind: ErrorKind::InvalidInput,
+                            message: "risc0 executor panicked while sizing this ELF (malformed or hostile program)"
+                                .to_string(),
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -416,7 +459,7 @@ fn run_execute(
     elf: &[u8],
     input_data: &[u8],
     program_id: Option<[u8; 32]>,
-) -> anyhow::Result<(u64, f64)> {
+) -> anyhow::Result<(u64, u64, f64)> {
     use std::time::Instant;
     // Bind the ELF to the job's programId before spending any execution on it (the pre-claim
     // measurement path runs UNCLAIMED, submitter-controlled ELFs).
@@ -440,7 +483,12 @@ fn run_execute(
 
     // `SessionInfo::cycles()` is the total cycle count, matching what proving reports.
     let cycles = session.cycles();
-    Ok((cycles, started.elapsed().as_secs_f64()))
+    // [security H7] The journal the guest committed here is byte-identical to the one the later proof
+    // would carry (both are a deterministic function of (ELF, input), and the elf_hash gate makes
+    // measure-ELF == prove-ELF), so its length lets the host pre-screen a program whose journal alone
+    // would blow the fulfillJob payload cap — before committing collateral and a full proof to it.
+    let journal_len = session.journal.bytes.len() as u64;
+    Ok((cycles, journal_len, started.elapsed().as_secs_f64()))
 }
 
 /// Cards with less VRAM than this release the Groth16 SRS cache after every proof.

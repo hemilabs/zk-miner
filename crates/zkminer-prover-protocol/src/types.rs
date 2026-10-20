@@ -131,6 +131,14 @@ pub enum WorkerResponse {
         cycles: u64,
         /// How long the execution itself took, so the caller can bound future ones.
         duration_secs: f64,
+        /// [security H7] Length in bytes of the guest journal (risc0) / public values (SP1) this
+        /// execution produced. The guest commits it deterministically from (ELF, input) — the same
+        /// bytes the later proof would carry as `ProofResult.journal` — so the host can pre-screen a
+        /// program whose journal alone would OOG-revert fulfillJob and refuse to CLAIM it, instead of
+        /// discovering it only after wasting a full proof. `#[serde(default)]` keeps a pre-H7 worker
+        /// (which omits the field) interoperable: it decodes as 0, i.e. "unknown, do not screen".
+        #[serde(default)]
+        journal_len: u64,
     },
     /// Progress update during proving.
     Progress {

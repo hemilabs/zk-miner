@@ -419,6 +419,32 @@ fn resolve_measured(
 /// job we cannot execute inside the budget is one we should not claim either.
 const MEASURE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// [security H1] Cycle count the PROVE path (watchdog timeout / min-VRAM routing / po2) sizes on. It
+/// is the MEASURED count, never the submitter-declared `expected_cycles` alone: admission claims a job
+/// only if feasible at `max(declared, measured)`, and the prove path must size on the SAME quantity or
+/// a tiny declared value collapses the watchdog to its floor and SIGKILLs a job that was admitted
+/// feasible on the larger measured count — a submitter-driven premature kill → release-penalty/slash.
+/// `max(declared, measured)` can only hold the sizing at or ABOVE the real work (a larger value merely
+/// detects a wedged GPU later, bounded by the configured cap — the safe direction). With no
+/// measurement in hand (recovery, or a non-measurable backend) the declared value is still adversarial:
+/// a nonzero one is floored at `FALLBACK_ESTIMATED_CYCLES` rather than trusted small, while a zero
+/// declaration returns 0 so the caller keeps the old full-timeout fallback.
+fn prove_sizing_cycles(declared: u64, measured: Option<u64>) -> u64 {
+    match measured {
+        Some(m) => declared.max(m),
+        None if declared > 0 => declared.max(FALLBACK_ESTIMATED_CYCLES),
+        None => 0,
+    }
+}
+
+/// [security M1] Wall-clock bound on each pre-claim fetch (descriptor, ELF) on the measurement path.
+/// The prove path bounds the SAME fetches with `with_deadline_budget`; the measure path had no bound,
+/// so a submitter storage/descriptor source that stalls could pin a scarce measure-budget slot for
+/// `num_uris × per-URI-timeout` (minutes), and because a claim now REQUIRES a measurement, a frozen
+/// budget halts all claiming. A real descriptor read / few-MB ELF download completes in seconds; this
+/// is generous for that while cutting a staller off. `download_elf` also caps the URI count.
+const MEASURE_FETCH_BUDGET: Duration = Duration::from_secs(90);
+
 /// Fallback fee rate (5%) used only if the adapter query fails.
 const FALLBACK_FEE_RATE_BPS: u16 = 500;
 
@@ -3012,7 +3038,10 @@ async fn miner_brain(
                 s.open_jobs.retain(|j| j.info.job_id != jid);
                 continue;
             }
-            let snapshot = JobStatusSnapshot::from_view(&view);
+            // `mut`: the candidate loop records this job's MEASURED cycle count on the snapshot below
+            // (once resolved), so the prove path sizes its watchdog/VRAM/po2 on it, not on the
+            // adversarial declared `expected_cycles`. [security H1]
+            let mut snapshot = JobStatusSnapshot::from_view(&view);
             // Proving-time budget if we claim now. getJobStatusView.timeRemaining is
             // only populated for LOCKED jobs (it's lockDeadline - now); for an OPEN
             // job it is 0. So for an unclaimed job, fall back to the fulfillmentTimeout
@@ -3284,6 +3313,10 @@ async fn miner_brain(
                 job.info.program_id,
                 snapshot.descriptor_hash,
             );
+            // [security H1] Carry the measured count on the snapshot so the prove path (watchdog
+            // timeout, min-VRAM, po2) sizes on it instead of the adversarial declared field. Rides
+            // through the batch tuple → spawn_lifecycle_task → process_job_lifecycle unchanged.
+            snapshot.measured_cycles = measured_for_job;
             let estimated_cycles = match (snapshot.expected_cycles, measured_for_job) {
                 (0, Some(c)) => c,
                 (0, None) => FALLBACK_ESTIMATED_CYCLES,
@@ -4140,6 +4173,15 @@ struct JobStatusSnapshot {
     expected_cycles: u64,
     descriptor_hash: alloy::primitives::B256,
     proof_system_id: alloy::primitives::B256,
+    /// [security H1] The cycle count this job was actually MEASURED at for its (backend, program,
+    /// input), when known. `expected_cycles` above is the SUBMITTER-DECLARED on-chain field and is
+    /// adversarial; admission already sizes feasibility on `max(declared, measured)`, but the prove
+    /// path (watchdog timeout, min-VRAM routing, po2) must use the same quantity or a tiny declared
+    /// value collapses the watchdog to its floor and SIGKILLs a job that was admitted feasible on the
+    /// larger measured count — a submitter-driven premature kill → release-penalty/slash. Populated by
+    /// the candidate loop from `resolve_measured`; `None` on paths without a measurement (recovery,
+    /// non-measurable backends), where the sizing falls back to the FALLBACK floor, never below it.
+    measured_cycles: Option<u64>,
 }
 
 impl JobStatusSnapshot {
@@ -4161,6 +4203,9 @@ impl JobStatusSnapshot {
             expected_cycles: v.expectedCycles,
             descriptor_hash: v.descriptorHash,
             proof_system_id: v.proofSystemId,
+            // Set by the candidate loop once the measurement for this (backend, program, input) is
+            // resolved; the view itself carries no measured count. [security H1]
+            measured_cycles: None,
         }
     }
 }
@@ -4352,6 +4397,35 @@ async fn process_job_lifecycle(
         let mut s = state.write().await;
         s.open_jobs.retain(|j| j.info.job_id != job_id);
         return Ok(());
+    }
+
+    // [security M2] Confirm the ELF is actually obtainable BEFORE committing collateral. A claim can
+    // ride on a cached cycle MEASUREMENT (process-lifetime cache) whose ELF has since been evicted from
+    // the much smaller on-disk LRU; the ELF is otherwise first (re)fetched only at prove time (step 7),
+    // so a submitter who takes the storage URI offline after measurement turns the claim into a
+    // post-claim release-penalty (or a slash if release cannot land). Fetching now makes a withheld ELF
+    // a free PRE-claim skip instead. Common case: a disk-cache hit (cheap, no network — fetch_or_...
+    // checks the cache first). Fresh jobs only: a recovery job is already locked and MUST be driven. We
+    // do not thread the bytes to step 7 (it re-reads the now-warm cache); correctness over micro-opt.
+    if !is_recovery {
+        if let Err(e) = tokio::time::timeout(
+            MEASURE_FETCH_BUDGET,
+            fetch_or_download_elf(client, state, program_id),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("ELF fetch exceeded the pre-claim budget"))
+        .and_then(|r| r)
+        {
+            tracing::warn!(
+                "not claiming {}: its ELF is not obtainable now ({}) — skipping before locking \
+                 collateral (the submitter may have withdrawn the stored program)",
+                short_id(job_id),
+                zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+            );
+            let mut s = state.write().await;
+            s.open_jobs.retain(|j| j.info.job_id != job_id);
+            return Ok(());
+        }
     }
 
     // 1. Record claim intent BEFORE sending the claim tx, so a crash mid-claim
@@ -4590,11 +4664,15 @@ async fn process_job_lifecycle(
         .ok_or_else(|| anyhow::anyhow!("no worker pool available"))?;
     let input_bytes: Vec<u8> = descriptor.inputData.to_vec();
 
+    // [security H1] Size the watchdog / VRAM routing / po2 on the quantity admission used — the
+    // MEASURED count — not the adversarial declared `expected_cycles`. See `prove_sizing_cycles`.
+    let sizing_cycles: u64 = prove_sizing_cycles(snapshot.expected_cycles, snapshot.measured_cycles);
+
     // Proactive routing: a job that commits a large cycle count starts pinned to
     // a high-VRAM GPU (0 = uncommitted → no floor; the reactive path below still
     // catches an OOM on the first attempt).
     let mut min_vram: Option<u64> =
-        (snapshot.expected_cycles >= LARGE_JOB_CYCLES).then_some(LARGE_JOB_MIN_VRAM_BYTES);
+        (sizing_cycles >= LARGE_JOB_CYCLES).then_some(LARGE_JOB_MIN_VRAM_BYTES);
     // Fix #1: slot keys of workers that wedged/timed out on this job, so a retry
     // is steered to a *different* GPU instead of being re-pinned to a flaky one.
     // The slots the operator switched off in Settings. Those toggles were honoured by mock mode and
@@ -4637,10 +4715,11 @@ async fn process_job_lifecycle(
         const TIMEOUT_MARGIN: u64 = 4;
         const MIN_PROVING_TIMEOUT_SECS: u64 = 90;
         let cap = proving_timeout.as_secs();
-        if snapshot.expected_cycles > 0 {
+        // [security H1] `sizing_cycles` = max(declared, measured) (or the FALLBACK floor), never the
+        // raw declared field, so a small declaration cannot shrink this below the measured work.
+        if sizing_cycles > 0 {
             let fixed = fixed_proving_allowance_secs(backend);
-            let est = (snapshot.expected_cycles / CONSERVATIVE_CPS * TIMEOUT_MARGIN)
-                .saturating_add(fixed);
+            let est = (sizing_cycles / CONSERVATIVE_CPS * TIMEOUT_MARGIN).saturating_add(fixed);
             Duration::from_secs(est.clamp((MIN_PROVING_TIMEOUT_SECS + fixed).min(cap), cap))
         } else {
             proving_timeout
@@ -4718,8 +4797,9 @@ async fn process_job_lifecycle(
             // silently never engage. Note `optimal_po2_for_job` is argmax(throughput)
             // and therefore independent of the magnitude; the value only has to be
             // non-zero to enable selection.
-            let est_cycles = if snapshot.expected_cycles > 0 {
-                snapshot.expected_cycles
+            // [security H1] Size po2 on the measured count too, not the declared field.
+            let est_cycles = if sizing_cycles > 0 {
+                sizing_cycles
             } else {
                 FALLBACK_ESTIMATED_CYCLES
             };
@@ -5409,13 +5489,72 @@ async fn measure_cycles(
 
     // Locally cached after the first sighting of a descriptor, so a repeat costs no chain traffic.
     // A fetch failure is transient (RPC / storage): cache nothing, retry later.
-    let descriptor = match fetch_job_descriptor_checked(client, job_id, descriptor_hash).await {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::debug!("measure {}: descriptor fetch failed (transient): {e:#}", short_id(program_id));
+    // [security M1] Bound the pre-claim descriptor fetch by wall-clock time. Unlike the prove path
+    // (wrapped in `with_deadline_budget`), this fetch had NO overall bound, so a submitter whose
+    // storage/descriptor source stalls could pin this measure-budget slot indefinitely — and because a
+    // claim now REQUIRES a measurement, a frozen measure budget halts all claiming. [security W1] The
+    // error embeds submitter-controlled text (URI), so sanitize before logging.
+    let descriptor = match tokio::time::timeout(
+        MEASURE_FETCH_BUDGET,
+        fetch_job_descriptor_checked(client, job_id, descriptor_hash),
+    )
+    .await
+    {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => {
+            tracing::debug!(
+                "measure {}: descriptor fetch failed (transient): {}",
+                short_id(program_id),
+                zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+            );
+            return;
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                "measure {}: descriptor fetch exceeded the {}s measure-fetch budget — skipping \
+                 (transient); a later tick retries",
+                short_id(program_id),
+                MEASURE_FETCH_BUDGET.as_secs()
+            );
             return;
         }
     };
+    // [security M3] The submitter-controlled descriptor payload (inputData + the two extra-data
+    // fields) is re-encoded into the fulfillJob calldata under a fixed gas limit. Its size is known
+    // here, PRE-CLAIM — so a descriptor that would OOG-revert fulfill is skipped now (never measured →
+    // never claimable for a measurable backend) instead of after the collateral-locking claim, which
+    // would force a penalized release. Not negative-cached: the cap mixes fields outside the
+    // (program, input) cache key, and the per-tick re-check is cheap (no execution).
+    const MAX_DESCRIPTOR_PAYLOAD_BYTES: usize = 96 * 1024;
+    let descriptor_payload =
+        descriptor.inputData.len() + descriptor.callbackExtraData.len() + descriptor.extraVerifierData.len();
+    if descriptor_payload > MAX_DESCRIPTOR_PAYLOAD_BYTES {
+        tracing::warn!(
+            "measure {}: descriptor payload is {} bytes (> {} cap) — would OOG-revert fulfill; \
+             skipping before claim (not sizing, so never claimed)",
+            short_id(program_id),
+            descriptor_payload,
+            MAX_DESCRIPTOR_PAYLOAD_BYTES
+        );
+        return;
+    }
+    // [security W2] Skip a job the submitter assigned exclusively to a DIFFERENT prover: the candidate
+    // filter gates only on status/prover and JobStatusView does not expose `assignedProver`, so
+    // without this we would measure it (burning a measure-budget slot) and broadcast a claimJob the
+    // contract is guaranteed to revert. The descriptor carries the assignment. Conservative: skip
+    // whenever it is set to someone other than us (we may re-see it, free, once it opens up); never
+    // negative-cached, since the assignment/exclusivity can change.
+    {
+        let assigned = descriptor.assignedProver;
+        if assigned != alloy::primitives::Address::ZERO && assigned != client.address {
+            tracing::debug!(
+                "measure {}: job assigned to another prover ({}) — skipping (we cannot claim it)",
+                short_id(program_id),
+                assigned
+            );
+            return;
+        }
+    }
     let input: Vec<u8> = descriptor.inputData.to_vec();
     // The cycle count is a function of (backend, program, keccak256(input)); the descriptor hash
     // resolves to that input hash. Record the resolver FIRST so a later sighting of this descriptor
@@ -5520,10 +5659,32 @@ async fn measure_cycles(
         key,
     };
 
-    let elf = match fetch_or_download_elf(client, state, program_id).await {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::debug!("measure {}: ELF fetch failed (transient): {e:#}", short_id(program_id));
+    // [security M1] Bound the pre-claim ELF fetch by wall-clock time, like the descriptor fetch above
+    // and unlike the historical unbounded call. `download_elf` now also caps the number of URIs tried;
+    // together they stop a submitter URI list from pinning this measure-budget slot for minutes.
+    // [security W1] Sanitize the (URI-bearing) error before logging.
+    let elf = match tokio::time::timeout(
+        MEASURE_FETCH_BUDGET,
+        fetch_or_download_elf(client, state, program_id),
+    )
+    .await
+    {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => {
+            tracing::debug!(
+                "measure {}: ELF fetch failed (transient): {}",
+                short_id(program_id),
+                zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+            );
+            return;
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                "measure {}: ELF fetch exceeded the {}s measure-fetch budget — skipping (transient); \
+                 a later tick retries",
+                short_id(program_id),
+                MEASURE_FETCH_BUDGET.as_secs()
+            );
             return;
         }
     };
@@ -5542,6 +5703,9 @@ async fn measure_cycles(
     let program_id_bytes: Option<[u8; 32]> =
         (program_id != alloy::primitives::B256::ZERO).then(|| program_id.0);
 
+    // Captured before `input` is moved into the blocking closure; the journal-size screen below needs
+    // it. [security H7]
+    let input_len = input.len();
     // Blocking: the worker protocol is synchronous. Bounded by the watchdog inside `execute_cycles`.
     let backend_owned = backend.to_string();
     let res = tokio::task::spawn_blocking(move || {
@@ -5549,36 +5713,65 @@ async fn measure_cycles(
     })
     .await;
     match res {
-        Ok(Ok(cycles)) => {
-            tracing::info!(
-                "measured {cycles} cycles for program {} ({backend}) by execution — all its jobs with \
-                 this input will be sized on it",
-                short_id(program_id)
-            );
-            insert_measured(measured, backend, program_id, input_hash, cycles);
-            clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+        Ok(Ok((cycles, journal_len))) => {
+            // [security H7] The guest committed `journal_len` bytes. fulfillJob re-encodes the journal
+            // AND the input (plus the rest of the descriptor) into its calldata under a fixed gas
+            // limit. Both the journal and the input are a deterministic function of (program, input) —
+            // exactly this cache key — so if journal + input ALONE already exceed the fulfill payload
+            // cap, fulfill is guaranteed to OOG-revert regardless of the rest of the descriptor, and no
+            // proof of this job can EVER be fulfilled. Negative-cache it so the job is never CLAIMED
+            // and never re-measured, instead of committing collateral and a full Groth16 proof only to
+            // discover the over-cap journal post-prove and release at a penalty. Keyed purely by
+            // (program, input), so it never mis-blacklists a sibling descriptor. A pre-H7 worker
+            // reports journal_len == 0, which never trips this (screen simply disabled for it).
+            const MAX_FULFILL_PAYLOAD_BYTES: usize = 128 * 1024;
+            let projected = journal_len as usize + input_len;
+            if projected > MAX_FULFILL_PAYLOAD_BYTES {
+                tracing::warn!(
+                    "measure {} ({backend}): journal {} bytes + input {} bytes exceed the {}-byte \
+                     fulfill payload cap — fulfill would OOG-revert; marking infeasible so it is never \
+                     claimed or re-measured",
+                    short_id(program_id),
+                    journal_len,
+                    input_len,
+                    MAX_FULFILL_PAYLOAD_BYTES
+                );
+                insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
+                clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+            } else {
+                tracing::info!(
+                    "measured {cycles} cycles for program {} ({backend}) by execution — all its jobs \
+                     with this input will be sized on it",
+                    short_id(program_id)
+                );
+                insert_measured(measured, backend, program_id, input_hash, cycles);
+                clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+            }
         }
         Ok(Err(e)) => {
             let msg = format!("{e:#}");
-            // Two kinds of "heavy", with DIFFERENT confidence:
+            // [security W1] The message embeds guest/worker-controlled text; sanitize before logging
+            // (classification still matches the RAW text — the precise cap phrase, not the sanitized
+            // one). Two dispositions:
             //
             //  - A CLEAN CAP TRIP is the executor itself reporting it passed the cycle cap: reliable
-            //    and deterministic for the (program, input), so negative-cache it PERMANENTLY (sized
-            //    infeasible -> never claimed nor re-measured). risc0 emits "Session limit exceeded";
-            //    sp1's cap trip is canonicalized to "exceeded cycle limit ...".
+            //    and deterministic for the (program, input), so negative-cache it PERMANENTLY on the
+            //    FIRST sighting (sized infeasible -> never claimed nor re-measured). risc0 emits
+            //    "Session limit exceeded"; sp1's cap trip is canonicalized to "exceeded cycle limit".
             //
-            //  - A WALL-CLOCK WATCHDOG TIMEOUT (`execute_cycles` surfaces a distinct "wall-clock
-            //    watchdog" phrase) is AMBIGUOUS: a feasible guest can miss the 120s budget purely under
-            //    transient host load (SP1's CPU executor runs alongside live proofs; fix A re-enabled
-            //    gas simulation). Permanently blacklisting on the first one strands legitimate work and
-            //    is attacker-inducible via a load flood — the regression [security C] had. So RETRY it:
-            //    count consecutive timeouts per (backend, program, input) and only treat it as
-            //    unmeasurable after `MEASURE_TIMEOUT_STRIKES`. A genuinely-too-heavy guest times out
-            //    every attempt and converges fast; a transiently-starved one succeeds on a retry.
-            //
-            // Everything else (programId mismatch, input-specific error, a non-timeout worker death) is
-            // TRANSIENT: left uncached so a later tick retries. Matching only precise phrases, never a
-            // loose substring like "cycle", avoids the #16 class of false-blacklisting. [security C]
+            //  - [security H2] EVERY OTHER failure — a wall-clock watchdog timeout, a guest panic, a
+            //    risc0 image-id / SP1 vkey mismatch, any deterministic bad-program error — is
+            //    strike-counted per (backend, program, input) and negative-cached UNMEASURABLE after
+            //    MEASURE_TIMEOUT_STRIKES CONSECUTIVE failures. Previously only the wall-clock case was
+            //    bounded and "everything else" was left uncached and re-measured every tick FOREVER: a
+            //    submitter controls (ELF, input), so a DETERMINISTIC non-cap failure (e.g. an image-id
+            //    mismatch, which needs no clever guest) re-fired the measurement endlessly — a free,
+            //    perpetual CPU/sizing DoS that also starved the measure budget. A genuinely transient
+            //    failure (a one-off RPC/worker hiccup, or a guest that misses the 120s budget only under
+            //    transient host load) clears on the next success (`clear_measure_strikes` on the Ok
+            //    path), so the bound only ever retires a REPEATABLE failure. Matching only the precise
+            //    cap phrase, never a loose substring like "cycle", still avoids #16 false-blacklisting.
+            let msg_log = zkminer_chain::programs::sanitize_log(&msg);
             let lower = msg.to_lowercase();
             let clean_cap_trip = lower.contains("session limit")
                 || lower.contains("exceeded cycle limit")
@@ -5592,28 +5785,32 @@ async fn measure_cycles(
                 );
                 insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
                 clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
-            } else if wall_clock_timeout {
+            } else {
+                let kind = if wall_clock_timeout {
+                    "wall-clock measure timeout"
+                } else {
+                    "execute failure"
+                };
                 let strikes = bump_measure_strikes(measure_strikes, backend, program_id, input_hash);
                 if strikes >= MEASURE_TIMEOUT_STRIKES {
                     tracing::warn!(
-                        "measure {} ({backend}): wall-clock measure timeout #{strikes} (>= {}) — the \
-                         guest cannot be sized inside the budget across repeated attempts; marking \
-                         infeasible so it is not claimed or re-measured",
+                        "measure {} ({backend}): {kind} #{strikes} (>= {}) — cannot be sized across \
+                         repeated attempts; marking infeasible so it is not claimed or re-measured: {}",
                         short_id(program_id),
-                        MEASURE_TIMEOUT_STRIKES
+                        MEASURE_TIMEOUT_STRIKES,
+                        msg_log
                     );
                     insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
                     clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
                 } else {
                     tracing::debug!(
-                        "measure {} ({backend}): wall-clock measure timeout #{strikes} (< {}) — leaving \
-                         uncached so a later tick retries (may be transient host load)",
+                        "measure {} ({backend}): {kind} #{strikes} (< {}) — leaving uncached so a later \
+                         tick retries (may be transient): {}",
                         short_id(program_id),
-                        MEASURE_TIMEOUT_STRIKES
+                        MEASURE_TIMEOUT_STRIKES,
+                        msg_log
                     );
                 }
-            } else {
-                tracing::debug!("measure {}: execute failed (transient): {msg}", short_id(program_id));
             }
         }
         Err(join) => {
@@ -7045,5 +7242,36 @@ mod r2_sizing_tests {
 
         // Strikes are isolated per (backend, program, input): a different backend is independent.
         assert_eq!(bump_measure_strikes(&strikes, "risc0", prog, ih), 1);
+    }
+
+    #[test]
+    fn prove_sizing_never_sizes_below_the_measured_count() {
+        // [security H1] The prove-path watchdog/VRAM/po2 must size on max(declared, measured), so a
+        // submitter who declares a tiny `expectedCycles` cannot shrink the budget below the MEASURED
+        // work (which is what admission claimed the job on) and get a feasible proof SIGKILLed.
+        const FB: u64 = FALLBACK_ESTIMATED_CYCLES;
+
+        // A tiny declared value can never pull the sizing below the measurement.
+        assert_eq!(prove_sizing_cycles(1, Some(200_000_000)), 200_000_000);
+        assert_eq!(prove_sizing_cycles(0, Some(200_000_000)), 200_000_000);
+        // A declared value LARGER than the measurement raises the sizing (harmless: a larger watchdog
+        // only detects a wedge later, bounded by the cap).
+        assert_eq!(prove_sizing_cycles(500_000_000, Some(200_000_000)), 500_000_000);
+
+        // With no measurement (recovery / non-measurable backend) the declared value is still
+        // adversarial: a nonzero one is floored at FALLBACK, never trusted small...
+        assert_eq!(prove_sizing_cycles(1, None), FB);
+        assert_eq!(prove_sizing_cycles(FB + 7, None), FB + 7);
+        // ...and a zero declaration returns 0 so the caller keeps the old full-timeout fallback.
+        assert_eq!(prove_sizing_cycles(0, None), 0);
+
+        // The exploit shape: declared = 1 (floors the raw formula to the 90s watchdog), measured huge.
+        // The old code sized on `declared` (→ 90s kill); the fix sizes on the measured count.
+        let measured = 1_900_000_000; // ~just under the execute cap, a real multi-minute proof
+        assert_eq!(prove_sizing_cycles(1, Some(measured)), measured);
+        assert!(
+            prove_sizing_cycles(1, Some(measured)) > 1,
+            "the declared=1 must NOT be the sizing value when a real measurement exists"
+        );
     }
 }
