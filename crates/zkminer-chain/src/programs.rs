@@ -217,11 +217,34 @@ fn build_elf_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result<reqwes
         .timeout(elf_fetch_timeout())
         .redirect(policy);
     if !addrs.is_empty() {
-        builder = builder.resolve_to_addrs(host, addrs);
+        // [security H6] Pin only the vetted IP, NOT the port. The connector (hyper-util `set_port`)
+        // fills a resolved addr's port iff it is 0 OR the URI carries an explicit port, so a pinned
+        // port-0 addr gets the correct scheme-default PER HOP — 80 on http, 443 on an https upgrade —
+        // while the IP still blocks DNS rebinding. Baking the original scheme's default port in (80
+        // for an http:// URL) instead breaks a legitimate same-host http->https redirect: the
+        // connector keeps 80 and attempts TLS against the plaintext port. See `pin_addrs`.
+        let pinned = pin_addrs(addrs);
+        builder = builder.resolve_to_addrs(host, &pinned);
     }
     builder
         .build()
         .context("building hardened ELF download client")
+}
+
+/// [security H6] Strip the port from each vetted address so the pin binds the IP only. The connector
+/// supplies the correct per-hop scheme-default port (see `build_elf_client`); pinning a concrete port
+/// would break a same-host cross-scheme (http<->https) redirect, whose default port differs from the
+/// original URL's. The SSRF guarantee rests on the IP (already `reject_blocked_addrs`-checked), which
+/// is preserved.
+fn pin_addrs(addrs: &[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> {
+    addrs
+        .iter()
+        .map(|a| {
+            let mut a = *a;
+            a.set_port(0);
+            a
+        })
+        .collect()
 }
 
 /// Hard cap on a downloaded ELF. Real guest ELFs are single-digit MB; this bounds a
@@ -689,6 +712,23 @@ mod security_tests {
         // the redirect-to-internal-hostname / DNS-rebind SSRF bypass.
         assert!(v("http://name.attacker.com/").is_err());
         assert!(v("https://metadata.google.internal/").is_err());
+    }
+
+    #[test]
+    fn pinning_binds_the_ip_but_not_the_port() {
+        // [security H6, fix-review regression] The pin must carry port 0 so the connector fills the
+        // correct scheme-default per hop; baking a concrete port (80 for http) in breaks a legitimate
+        // same-host http->https redirect (connector keeps 80, attempts TLS on it). The IP — the thing
+        // the SSRF guard actually rests on — is preserved exactly.
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 80);
+        let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443);
+        let pinned = pin_addrs(&[v4, v6]);
+        assert_eq!(pinned.len(), 2);
+        assert_eq!(pinned[0].ip(), v4.ip(), "IP preserved");
+        assert_eq!(pinned[0].port(), 0, "port zeroed so the connector picks the per-hop default");
+        assert_eq!(pinned[1].ip(), v6.ip(), "IPv6 preserved");
+        assert_eq!(pinned[1].port(), 0);
     }
 
     #[test]
