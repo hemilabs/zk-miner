@@ -363,6 +363,68 @@ fn desc_is_unfulfillable(skip: &DescSkip, descriptor_hash: alloy::primitives::B2
         .unwrap_or(false)
 }
 
+/// (backend, program, input) -> length in bytes of the guest journal that (program, input) produces.
+/// The journal is a deterministic function of (program, input), so it is shared by EVERY descriptor
+/// for that pair. It is cached here when a measurement executes so that a later descriptor for the
+/// same pair — which short-circuits on the cached cycle count without re-executing — can still have
+/// its full fulfill payload (journal + its own descriptor bytes + seal) checked against the cap.
+/// Bounded like the measured-cycles cache.
+type JournalLenCache = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<(u8, alloy::primitives::B256, alloy::primitives::B256), u64>,
+    >,
+>;
+
+fn insert_journal_len(
+    cache: &JournalLenCache,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+    journal_len: u64,
+) {
+    if let Ok(mut m) = cache.lock() {
+        bounded_insert(
+            &mut m,
+            (backend_tag(backend), program_id, input_hash),
+            journal_len,
+            MEASURED_CYCLES_CAP,
+        );
+    }
+}
+
+fn get_journal_len(
+    cache: &JournalLenCache,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+) -> Option<u64> {
+    cache
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&(backend_tag(backend), program_id, input_hash)).copied())
+}
+
+/// The fulfillJob calldata carries the guest journal, the proof seal, and the submitter descriptor
+/// (inputData + callbackExtraData + extraVerifierData) under a fixed gas limit. This is true only when
+/// that payload is CERTAIN to exceed the cap: a minimal seal estimate (<= any real Groth16 seal) is
+/// used, so it never false-positives a job that could actually fulfill. When it holds, proving the job
+/// would waste a full proof on a fulfill guaranteed to OOG-revert, then force a penalized release.
+const MAX_FULFILL_PAYLOAD_BYTES: usize = 128 * 1024;
+const MIN_SEAL_BYTES: usize = 256;
+fn fulfill_payload_over_cap(
+    journal_len: u64,
+    input_len: usize,
+    callback_len: usize,
+    extra_verifier_len: usize,
+) -> bool {
+    (journal_len as usize)
+        .saturating_add(input_len)
+        .saturating_add(callback_len)
+        .saturating_add(extra_verifier_len)
+        .saturating_add(MIN_SEAL_BYTES)
+        > MAX_FULFILL_PAYLOAD_BYTES
+}
+
 /// (backend, program, input) -> consecutive wall-clock measure-timeout count. A wall-clock
 /// watchdog SIGKILL during measurement is AMBIGUOUS (a genuinely-too-heavy guest vs. one merely starved
 /// under transient host load), unlike the executor's clean cycle-cap trip. So it must NOT permanently
@@ -2369,6 +2431,11 @@ async fn miner_brain(
     // proof on a guaranteed-revert fulfill (see `DescSkip` / `measure_cycles`).
     let desc_skip: DescSkip =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    // Journal length per (backend, program, input), cached when a measurement executes so a later
+    // descriptor for the same pair (which reuses the cached cycle count without re-executing) can
+    // still have its full fulfill payload checked and, if over the cap, marked in desc_skip.
+    let measured_journal: JournalLenCache =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut queue_model = zkminer_strategy::queue::QueueModel::new();
     let mut queue_last_tick = std::time::Instant::now();
     if !initial_queue_horizon.is_zero() {
@@ -3567,7 +3634,7 @@ async fn miner_brain(
                     })
                     .unwrap_or(false);
                 if fresh {
-                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2, skip2) = (
+                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2, skip2, jcache2) = (
                         client.clone(),
                         state.clone(),
                         measured_cycles.clone(),
@@ -3576,6 +3643,7 @@ async fn miner_brain(
                         measuring_inputs.clone(),
                         measure_strikes.clone(),
                         desc_skip.clone(),
+                        measured_journal.clone(),
                     );
                     tokio::spawn(async move {
                         // measure_cycles does all caching: it records desc->input, negative-caches a
@@ -3597,6 +3665,7 @@ async fn miner_brain(
                             &inflight_inputs,
                             &strikes2,
                             &skip2,
+                            &jcache2,
                         )
                         .await;
                         // Clear the per-descriptor in-flight marker so a transient failure can retry.
@@ -3934,28 +4003,23 @@ async fn miner_brain(
                         if !unobtainable.is_empty() {
                             tracing::warn!(
                                 "not batch-claiming {} of {} job(s) whose ELF is not obtainable now — \
-                                 returning them to the open set before locking collateral",
+                                 dropping them before locking collateral",
                                 unobtainable.len(),
                                 jids.len()
                             );
-                            let mut returned = Vec::new();
-                            batch_jobs.retain(|(job, _, _)| {
-                                if unobtainable.contains(&job.info.job_id) {
-                                    returned.push(job.clone());
-                                    false
-                                } else {
-                                    true
-                                }
-                            });
+                            // DROP the unobtainable jobs — do NOT re-queue them to open_jobs. A job
+                            // pushed into the batch was already removed from open_jobs at collection,
+                            // so re-adding it would make the next tick re-collect and re-check it,
+                            // and since a withheld ELF stays unobtainable (the cycle measurement is
+                            // cached, so the job is still a claim candidate), that forms a tight
+                            // collect→reserve-slot→ELF-check-fails→re-queue loop a submitter can use to
+                            // pin every concurrency slot and halt all claiming. Dropping matches the
+                            // single-claim path, which also removes such a job and does not retry it;
+                            // the job stays OPEN on-chain and is re-evaluated only if re-surfaced.
+                            batch_jobs.retain(|(job, _, _)| !unobtainable.contains(&job.info.job_id));
                             jids.retain(|id| !unobtainable.contains(id));
                             for jid in &unobtainable {
                                 journal_update(&journal_c, |jj| jj.remove(*jid));
-                            }
-                            let mut s = state_c.write().await;
-                            for j in returned {
-                                if !s.open_jobs.iter().any(|o| o.info.job_id == j.info.job_id) {
-                                    s.open_jobs.push(j);
-                                }
                             }
                         }
                         if jids.is_empty() {
@@ -5582,6 +5646,7 @@ async fn measure_cycles(
     >,
     measure_strikes: &MeasureStrikes,
     desc_skip: &DescSkip,
+    measured_journal: &JournalLenCache,
 ) {
     // Cheap availability probe FIRST, for THIS backend. The fetches below can hit the chain, and
     // under load most measurement attempts are skipped for a busy worker — doing the RPC work only to
@@ -5682,6 +5747,30 @@ async fn measure_cycles(
         .map(|m| m.contains_key(&key))
         .unwrap_or(false)
     {
+        // The journal is a function of (program, input), shared by every descriptor for this pair, so
+        // THIS descriptor's full fulfill payload must still be checked even though we skip execution:
+        // its callbackExtraData/extraVerifierData differ from the descriptor that was executed. Using
+        // the journal length cached when that measurement ran, mark this descriptor unclaimable if its
+        // payload is over the cap — otherwise a sibling descriptor with padded extra-data escapes the
+        // check entirely and is claimed+proved into a guaranteed-revert fulfill. (If no journal length
+        // was cached — an older measurement, or one that failed before producing a journal — skip the
+        // check; it is re-done when the pair is next executed.)
+        if let Some(journal_len) = get_journal_len(measured_journal, backend, program_id, input_hash) {
+            if fulfill_payload_over_cap(
+                journal_len,
+                descriptor.inputData.len(),
+                descriptor.callbackExtraData.len(),
+                descriptor.extraVerifierData.len(),
+            ) {
+                tracing::warn!(
+                    "measure {}: a sibling descriptor's fulfill payload (cached journal {} + its \
+                     descriptor + seal) exceeds the cap — marking it unclaimable",
+                    short_id(program_id),
+                    journal_len
+                );
+                mark_desc_unfulfillable(desc_skip, descriptor_hash);
+            }
+        }
         tracing::debug!(
             "measure {}: (backend, program, input) already measured — resolver updated, no execution",
             short_id(program_id)
@@ -5834,9 +5923,11 @@ async fn measure_cycles(
             // (program, input), so it never mis-blacklists a sibling descriptor. A worker that does
             // not report the journal length reports journal_len == 0, which never trips this (screen
             // simply disabled for it).
-            const MAX_FULFILL_PAYLOAD_BYTES: usize = 128 * 1024;
-            let projected = journal_len as usize + input_len;
-            if projected > MAX_FULFILL_PAYLOAD_BYTES {
+            if journal_len as usize + input_len > MAX_FULFILL_PAYLOAD_BYTES {
+                // journal + input ALONE exceed the cap: fulfill can never succeed regardless of the
+                // rest of the descriptor, and both terms are a function of (program, input) — exactly
+                // this cache key — so negative-cache the pair as infeasible (never claimed, never
+                // re-measured). A worker that does not report a journal length sends 0, disabling this.
                 tracing::warn!(
                     "measure {} ({backend}): journal {} bytes + input {} bytes exceed the {}-byte \
                      fulfill payload cap — fulfill would OOG-revert; marking infeasible so it is never \
@@ -5855,33 +5946,30 @@ async fn measure_cycles(
                     short_id(program_id)
                 );
                 insert_measured(measured, backend, program_id, input_hash, cycles);
+                // Cache the journal length so a LATER descriptor for this same (program, input) — which
+                // reuses this cycle count and short-circuits without re-executing — can still have its
+                // own full fulfill payload checked against the cap (see the short-circuit above).
+                insert_journal_len(measured_journal, backend, program_id, input_hash, journal_len);
                 clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
-                // journal + input fit, but the FULL fulfill payload also carries this descriptor's
-                // callbackExtraData + extraVerifierData + the proof seal. Those two extra-data fields
-                // are outside the (program, input) cache key, so their contribution cannot be folded
-                // into the input-keyed negative-cache above without risking a cross-descriptor skip.
-                // Check the whole payload here (we hold the descriptor and the just-measured journal
-                // length) with a minimal seal estimate — a value guaranteed <= any real Groth16 seal,
-                // so this only ever fires when fulfill is CERTAIN to OOG-revert (never a false skip) —
-                // and record THIS descriptor as unfulfillable so the candidate loop skips claiming it.
-                // The measurement stays cached, so a slimmer descriptor for the same input is unaffected.
-                const MIN_SEAL_BYTES: usize = 256;
-                let full_payload = journal_len as usize
-                    + descriptor.inputData.len()
-                    + descriptor.callbackExtraData.len()
-                    + descriptor.extraVerifierData.len()
-                    + MIN_SEAL_BYTES;
-                if full_payload > MAX_FULFILL_PAYLOAD_BYTES {
+                // journal + input fit, but the full fulfill payload also carries THIS descriptor's
+                // callbackExtraData + extraVerifierData + the proof seal — fields outside the (program,
+                // input) key, so their contribution cannot be folded into the input-keyed negative-cache
+                // above without risking a cross-descriptor skip. Mark THIS descriptor (only) unclaimable
+                // when its full payload is over the cap; the minimal seal estimate makes this fire only
+                // when fulfill is certain to OOG-revert, never a false skip. The measurement stays
+                // cached, so a slimmer descriptor for the same input is unaffected.
+                if fulfill_payload_over_cap(
+                    journal_len,
+                    descriptor.inputData.len(),
+                    descriptor.callbackExtraData.len(),
+                    descriptor.extraVerifierData.len(),
+                ) {
                     tracing::warn!(
-                        "measure {} ({backend}): fulfill payload ~{} bytes (journal {} + descriptor {} \
-                         + seal) exceeds the {}-byte cap — this descriptor would OOG-revert fulfill; \
-                         marking it unclaimable (other descriptors for this input are unaffected)",
+                        "measure {} ({backend}): fulfill payload (journal {} + this descriptor + seal) \
+                         exceeds the {}-byte cap — marking this descriptor unclaimable (other \
+                         descriptors for this input are unaffected)",
                         short_id(program_id),
-                        full_payload,
                         journal_len,
-                        descriptor.inputData.len()
-                            + descriptor.callbackExtraData.len()
-                            + descriptor.extraVerifierData.len(),
                         MAX_FULFILL_PAYLOAD_BYTES
                     );
                     mark_desc_unfulfillable(desc_skip, descriptor_hash);
@@ -6020,19 +6108,18 @@ async fn fetch_or_download_elf(
             info.status
         );
     }
-    // Verify a cached ELF against the SAME hash the download enforces when it writes the cache — the
-    // program-wide elf_hash (download_elf below is passed info.elf_hash). elf_hash and the per-URI
-    // content_hash are independent, both submitter-controlled; verifying the read against a per-URI
-    // content_hash that differs from elf_hash would make every cache read mismatch and force a
-    // re-download on every measure/claim/prove — a submitter could register a decoy content_hash to
-    // defeat the cache for free. Fall back to the first non-zero per-URI content_hash only when no
-    // program-wide elf_hash is registered (nothing else to check against). Zero means "unspecified".
-    let expected_cache_hash = info.elf_hash.or_else(|| {
-        info.storage_uris
-            .iter()
-            .map(|u| u.content_hash)
-            .find(|h| *h != alloy::primitives::B256::ZERO)
-    });
+    // Verify a cached ELF against the SAME quantity the download enforces when it writes the cache:
+    // the program-wide elf_hash (download_elf below is passed info.elf_hash). elf_hash and the per-URI
+    // content_hash are independent, both submitter-controlled, so verifying the read against a per-URI
+    // content_hash that differs from elf_hash would make every cache read mismatch and re-download on
+    // every measure/claim/prove — a decoy content_hash would defeat the cache for free. Use elf_hash
+    // and nothing else: do NOT fall back to a per-URI content_hash when elf_hash is absent, since
+    // download_elf did not enforce that hash on the whole cached file either (only on the one URI it
+    // served, when that URI's hash was non-zero), so a decoy on a different URI would again force a
+    // re-download. elf_hash is absent only for a risc0 program (SP1 is refused without it); there the
+    // cached bytes are returned unverified, which is safe because risc0's image-id binds the bytes to
+    // the programId at execute and prove — a wrong cached ELF simply fails there, it cannot forge.
+    let expected_cache_hash = info.elf_hash;
     let cache_read = cache.clone();
     let cached = tokio::task::spawn_blocking(move || cache_read.get(&program_id, expected_cache_hash))
         .await
@@ -7460,5 +7547,36 @@ mod r2_sizing_tests {
         // Idempotent and bounded: re-marking does not grow unboundedly, and the cap evicts.
         mark_desc_unfulfillable(&skip, fat);
         assert_eq!(skip.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fulfill_payload_over_cap_is_conservative_and_descriptor_sensitive() {
+        let cap = MAX_FULFILL_PAYLOAD_BYTES;
+        // Clearly under the cap: a big journal with a tiny descriptor still fits, so it must NOT be
+        // flagged (no false skip of a job that could fulfill).
+        assert!(!fulfill_payload_over_cap(100 * 1024, 1024, 0, 0));
+        // The gap the fix closes: the SAME 100 KiB journal (same program+input) with ~30 KiB of
+        // descriptor extra-data tips the full payload over the cap, so THIS descriptor is flagged
+        // even though the journal+input alone fit.
+        assert!(fulfill_payload_over_cap(100 * 1024, 1024, 30 * 1024, 0));
+        // A journal that alone exceeds the whole cap is always over, with or without a descriptor.
+        assert!(fulfill_payload_over_cap(cap as u64 + 1, 0, 0, 0));
+        // Exactly at the cap with the minimal seal is NOT over (strictly-greater comparison, so the
+        // minimal-seal estimate can never false-fire on a payload that just fits).
+        assert!(!fulfill_payload_over_cap((cap - MIN_SEAL_BYTES) as u64, 0, 0, 0));
+    }
+
+    #[test]
+    fn journal_len_cache_round_trips_per_backend_program_input() {
+        let jc: JournalLenCache =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let prog = B256::repeat_byte(0x33);
+        let ih = keccak256(b"some-input");
+        assert_eq!(get_journal_len(&jc, "sp1", prog, ih), None);
+        insert_journal_len(&jc, "sp1", prog, ih, 70_000);
+        assert_eq!(get_journal_len(&jc, "sp1", prog, ih), Some(70_000));
+        // Keyed by backend too: a different backend for the same program+input is independent, so a
+        // sibling check on one backend never reads the other's journal length.
+        assert_eq!(get_journal_len(&jc, "risc0", prog, ih), None);
     }
 }
