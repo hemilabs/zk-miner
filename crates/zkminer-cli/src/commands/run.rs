@@ -334,6 +334,35 @@ fn insert_measured(
     }
 }
 
+/// Descriptor hashes whose job, if claimed, is GUARANTEED to fail the on-chain fulfill payload-size
+/// check: the guest journal plus the full submitter descriptor (inputData + callbackExtraData +
+/// extraVerifierData) plus the proof seal exceed the fulfillJob calldata cap, so fulfill would
+/// OOG-revert and the proof would be wasted on a release penalty. Keyed by DESCRIPTOR hash, not by
+/// (program, input): the overflow depends on callbackExtraData/extraVerifierData, which are outside
+/// the measurement cache key, so keying it by input would let one submitter's padded descriptor
+/// wrongly skip a different slim job for the same program+input. Bounded like the other brain maps.
+type DescSkip =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>>>;
+
+/// Record a descriptor whose fulfill payload is over the cap so the candidate loop never claims it.
+fn mark_desc_unfulfillable(skip: &DescSkip, descriptor_hash: alloy::primitives::B256) {
+    if let Ok(mut s) = skip.lock() {
+        if s.len() >= MEASURED_CYCLES_CAP && !s.contains(&descriptor_hash) {
+            if let Some(k) = s.iter().next().copied() {
+                s.remove(&k);
+            }
+        }
+        s.insert(descriptor_hash);
+    }
+}
+
+/// True if this descriptor was found to have an over-cap fulfill payload (see `DescSkip`).
+fn desc_is_unfulfillable(skip: &DescSkip, descriptor_hash: alloy::primitives::B256) -> bool {
+    skip.lock()
+        .map(|s| s.contains(&descriptor_hash))
+        .unwrap_or(false)
+}
+
 /// (backend, program, input) -> consecutive wall-clock measure-timeout count. A wall-clock
 /// watchdog SIGKILL during measurement is AMBIGUOUS (a genuinely-too-heavy guest vs. one merely starved
 /// under transient host load), unlike the executor's clean cycle-cap trip. So it must NOT permanently
@@ -2335,6 +2364,11 @@ async fn miner_brain(
     // single transient timeout does not permanently blacklist a feasible job (see `measure_cycles`).
     let measure_strikes: MeasureStrikes =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // Descriptors whose fulfill payload (journal + full descriptor + seal) is over the on-chain cap,
+    // discovered during measurement, so the candidate loop skips claiming them rather than wasting a
+    // proof on a guaranteed-revert fulfill (see `DescSkip` / `measure_cycles`).
+    let desc_skip: DescSkip =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let mut queue_model = zkminer_strategy::queue::QueueModel::new();
     let mut queue_last_tick = std::time::Instant::now();
     if !initial_queue_horizon.is_zero() {
@@ -3037,6 +3071,18 @@ async fn miner_brain(
             // (once resolved), so the prove path sizes its watchdog/VRAM/po2 on it, not on the
             // adversarial declared `expected_cycles`.
             let mut snapshot = JobStatusSnapshot::from_view(&view);
+            // Skip a descriptor whose fulfill payload a prior measurement found to be over the
+            // on-chain cap: claiming+proving it would waste a full proof on a fulfill that is
+            // guaranteed to OOG-revert, then release at a penalty. Cheap per-tick re-check; the job
+            // stays in the open set in case the submitter re-submits it under a slimmer descriptor.
+            if desc_is_unfulfillable(&desc_skip, snapshot.descriptor_hash) {
+                tracing::debug!(
+                    "Skipping {}: its fulfill payload exceeds the on-chain cap (journal + descriptor \
+                     + seal) — proving it would waste a proof on a guaranteed-revert fulfill",
+                    short_id(jid)
+                );
+                continue;
+            }
             // Proving-time budget if we claim now. getJobStatusView.timeRemaining is
             // only populated for LOCKED jobs (it's lockDeadline - now); for an OPEN
             // job it is 0. So for an unclaimed job, fall back to the fulfillmentTimeout
@@ -3521,7 +3567,7 @@ async fn miner_brain(
                     })
                     .unwrap_or(false);
                 if fresh {
-                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2) = (
+                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2, skip2) = (
                         client.clone(),
                         state.clone(),
                         measured_cycles.clone(),
@@ -3529,6 +3575,7 @@ async fn miner_brain(
                         measuring.clone(),
                         measuring_inputs.clone(),
                         measure_strikes.clone(),
+                        desc_skip.clone(),
                     );
                     tokio::spawn(async move {
                         // measure_cycles does all caching: it records desc->input, negative-caches a
@@ -3549,6 +3596,7 @@ async fn miner_brain(
                             &resolver,
                             &inflight_inputs,
                             &strikes2,
+                            &skip2,
                         )
                         .await;
                         // Clear the per-descriptor in-flight marker so a transient failure can retry.
@@ -3847,6 +3895,73 @@ async fn miner_brain(
                             journal_update(&journal_c, |jj| jj.remove(*jid));
                         }
                         return; // `reclaim` still holds every jid → its Drop frees the slots
+                    }
+
+                    // Confirm each job's ELF is obtainable BEFORE claimJobBatch locks collateral,
+                    // matching the single-claim pre-claim check. A claim can ride on a cached cycle
+                    // measurement whose ELF has since been evicted from the disk cache or withdrawn by
+                    // the submitter; without this, every such job in the batch becomes a post-claim
+                    // release-penalty (or a slash if release cannot land). Check concurrently (bounded
+                    // by one fetch budget total), then drop the unobtainable jobs: remove their claim
+                    // breadcrumbs and return them to the open set. They are never dispatched, so the
+                    // reclaim guard (which still holds every original jid) frees their reserved slots.
+                    let mut jids = jids;
+                    let mut batch_jobs = batch_jobs;
+                    {
+                        let mut set = tokio::task::JoinSet::new();
+                        for (job, _, _) in &batch_jobs {
+                            let c = client_c.clone();
+                            let st = state_c.clone();
+                            let pid = job.info.program_id;
+                            let jid = job.info.job_id;
+                            set.spawn(async move {
+                                let ok = tokio::time::timeout(
+                                    MEASURE_FETCH_BUDGET,
+                                    fetch_or_download_elf(&c, &st, pid),
+                                )
+                                .await
+                                .map(|r| r.is_ok())
+                                .unwrap_or(false);
+                                (jid, ok)
+                            });
+                        }
+                        let mut unobtainable: std::collections::HashSet<B256> = Default::default();
+                        while let Some(res) = set.join_next().await {
+                            if let Ok((jid, false)) = res {
+                                unobtainable.insert(jid);
+                            }
+                        }
+                        if !unobtainable.is_empty() {
+                            tracing::warn!(
+                                "not batch-claiming {} of {} job(s) whose ELF is not obtainable now — \
+                                 returning them to the open set before locking collateral",
+                                unobtainable.len(),
+                                jids.len()
+                            );
+                            let mut returned = Vec::new();
+                            batch_jobs.retain(|(job, _, _)| {
+                                if unobtainable.contains(&job.info.job_id) {
+                                    returned.push(job.clone());
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
+                            jids.retain(|id| !unobtainable.contains(id));
+                            for jid in &unobtainable {
+                                journal_update(&journal_c, |jj| jj.remove(*jid));
+                            }
+                            let mut s = state_c.write().await;
+                            for j in returned {
+                                if !s.open_jobs.iter().any(|o| o.info.job_id == j.info.job_id) {
+                                    s.open_jobs.push(j);
+                                }
+                            }
+                        }
+                        if jids.is_empty() {
+                            // Nothing obtainable to claim; the reclaim guard frees every reserved slot.
+                            return;
+                        }
                     }
 
                     let batch_result = client_c.claim_job_batch(&jids).await;
@@ -5466,6 +5581,7 @@ async fn measure_cycles(
         >,
     >,
     measure_strikes: &MeasureStrikes,
+    desc_skip: &DescSkip,
 ) {
     // Cheap availability probe FIRST, for THIS backend. The fetches below can hit the chain, and
     // under load most measurement attempts are skipped for a busy worker — doing the RPC work only to
@@ -5740,6 +5856,36 @@ async fn measure_cycles(
                 );
                 insert_measured(measured, backend, program_id, input_hash, cycles);
                 clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+                // journal + input fit, but the FULL fulfill payload also carries this descriptor's
+                // callbackExtraData + extraVerifierData + the proof seal. Those two extra-data fields
+                // are outside the (program, input) cache key, so their contribution cannot be folded
+                // into the input-keyed negative-cache above without risking a cross-descriptor skip.
+                // Check the whole payload here (we hold the descriptor and the just-measured journal
+                // length) with a minimal seal estimate — a value guaranteed <= any real Groth16 seal,
+                // so this only ever fires when fulfill is CERTAIN to OOG-revert (never a false skip) —
+                // and record THIS descriptor as unfulfillable so the candidate loop skips claiming it.
+                // The measurement stays cached, so a slimmer descriptor for the same input is unaffected.
+                const MIN_SEAL_BYTES: usize = 256;
+                let full_payload = journal_len as usize
+                    + descriptor.inputData.len()
+                    + descriptor.callbackExtraData.len()
+                    + descriptor.extraVerifierData.len()
+                    + MIN_SEAL_BYTES;
+                if full_payload > MAX_FULFILL_PAYLOAD_BYTES {
+                    tracing::warn!(
+                        "measure {} ({backend}): fulfill payload ~{} bytes (journal {} + descriptor {} \
+                         + seal) exceeds the {}-byte cap — this descriptor would OOG-revert fulfill; \
+                         marking it unclaimable (other descriptors for this input are unaffected)",
+                        short_id(program_id),
+                        full_payload,
+                        journal_len,
+                        descriptor.inputData.len()
+                            + descriptor.callbackExtraData.len()
+                            + descriptor.extraVerifierData.len(),
+                        MAX_FULFILL_PAYLOAD_BYTES
+                    );
+                    mark_desc_unfulfillable(desc_skip, descriptor_hash);
+                }
             }
         }
         Ok(Err(e)) => {
@@ -5828,7 +5974,14 @@ async fn fetch_or_download_elf(
     let info = match client.get_program_info(program_id).await {
         Ok(info) => info,
         Err(e) => {
-            if let Some(elf) = cache.get(&program_id, None) {
+            // Cache I/O (a read of up to MAX_ELF_BYTES plus a keccak over it) runs on a blocking
+            // thread so a large-ELF flood cannot stall the async runtime's worker threads.
+            let cache_read = cache.clone();
+            let cached = tokio::task::spawn_blocking(move || cache_read.get(&program_id, None))
+                .await
+                .ok()
+                .flatten();
+            if let Some(elf) = cached {
                 tracing::warn!(
                     "ProgramRegistry unavailable ({e:#}); using cached ELF for {} ({} bytes)",
                     program_id,
@@ -5867,13 +6020,25 @@ async fn fetch_or_download_elf(
             info.status
         );
     }
-    // First trusted URI's content hash — zero means "unspecified", skip verify.
-    let expected_content_hash = info
-        .storage_uris
-        .iter()
-        .map(|u| u.content_hash)
-        .find(|h| *h != alloy::primitives::B256::ZERO);
-    if let Some(elf) = cache.get(&program_id, expected_content_hash) {
+    // Verify a cached ELF against the SAME hash the download enforces when it writes the cache — the
+    // program-wide elf_hash (download_elf below is passed info.elf_hash). elf_hash and the per-URI
+    // content_hash are independent, both submitter-controlled; verifying the read against a per-URI
+    // content_hash that differs from elf_hash would make every cache read mismatch and force a
+    // re-download on every measure/claim/prove — a submitter could register a decoy content_hash to
+    // defeat the cache for free. Fall back to the first non-zero per-URI content_hash only when no
+    // program-wide elf_hash is registered (nothing else to check against). Zero means "unspecified".
+    let expected_cache_hash = info.elf_hash.or_else(|| {
+        info.storage_uris
+            .iter()
+            .map(|u| u.content_hash)
+            .find(|h| *h != alloy::primitives::B256::ZERO)
+    });
+    let cache_read = cache.clone();
+    let cached = tokio::task::spawn_blocking(move || cache_read.get(&program_id, expected_cache_hash))
+        .await
+        .ok()
+        .flatten();
+    if let Some(elf) = cached {
         tracing::info!("Using cached ELF for {} ({} bytes)", program_id, elf.len());
         return Ok(elf);
     }
@@ -5891,9 +6056,16 @@ async fn fetch_or_download_elf(
     let elf = zkminer_chain::programs::download_elf(&info.storage_uris, info.elf_hash)
         .await
         .map_err(|e| anyhow::anyhow!("ELF download failed: {e:#}"))?;
-    if let Err(e) = cache.put(&program_id, &elf) {
-        tracing::warn!("Failed to cache ELF: {e:#}");
-    }
+    // Write the cache on a blocking thread (a disk write of up to MAX_ELF_BYTES plus a prune that
+    // stats every cache file); the ELF is moved in and handed back out so it is not copied.
+    let elf = tokio::task::spawn_blocking(move || {
+        if let Err(e) = cache.put(&program_id, &elf) {
+            tracing::warn!("Failed to cache ELF: {e:#}");
+        }
+        elf
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("ELF cache-write task failed: {e}"))?;
     Ok(elf)
 }
 
@@ -7267,5 +7439,26 @@ mod r2_sizing_tests {
             prove_sizing_cycles(1, Some(measured)) > 1,
             "the declared=1 must NOT be the sizing value when a real measurement exists"
         );
+    }
+
+    #[test]
+    fn unfulfillable_descriptor_skip_is_per_descriptor_and_bounded() {
+        // A descriptor whose fulfill payload is over the cap must be skippable WITHOUT blacklisting a
+        // sibling descriptor that happens to share the same program+input (the overflow comes from the
+        // descriptor's extra-data, which is outside the measurement cache key).
+        let skip: DescSkip =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let fat = B256::repeat_byte(0x11);
+        let slim = B256::repeat_byte(0x22);
+        assert!(!desc_is_unfulfillable(&skip, fat));
+        mark_desc_unfulfillable(&skip, fat);
+        assert!(desc_is_unfulfillable(&skip, fat), "the over-cap descriptor is flagged");
+        assert!(
+            !desc_is_unfulfillable(&skip, slim),
+            "a different descriptor (e.g. a slim one for the same input) is NOT flagged"
+        );
+        // Idempotent and bounded: re-marking does not grow unboundedly, and the cap evicts.
+        mark_desc_unfulfillable(&skip, fat);
+        assert_eq!(skip.lock().unwrap().len(), 1);
     }
 }

@@ -377,6 +377,7 @@ impl ChainClient {
 }
 
 /// Local ELF cache manager — stores downloaded ELF binaries at ~/.zkminer/elfs/.
+#[derive(Clone)]
 pub struct ElfCache {
     cache_dir: std::path::PathBuf,
 }
