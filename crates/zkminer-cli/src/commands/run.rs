@@ -2639,9 +2639,12 @@ async fn miner_brain(
     let desc_input_hash: DescInputCache =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // Descriptor hashes already being measured, so N sightings of the same job spawn ONE execution.
+    // Maps dh -> backend_tag so the measure budget below can be counted PER-BACKEND (one backend's
+    // in-flight measurement must not consume the slot the other backend needs); dedup is still global
+    // by descriptor hash (a dh is unique to one job).
     let measuring: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>>,
-    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, u8>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // (backend, program, input) triples with an execution IN FLIGHT. The `measuring` set
     // above dedups by DESCRIPTOR hash, but the measured cache keys by (backend, program, input): a
     // concurrent burst of the SAME input under many distinct tags is many distinct descriptor hashes,
@@ -3989,10 +3992,16 @@ async fn miner_brain(
                 let fresh = measuring
                     .lock()
                     .map(|mut m| {
-                        if m.contains(&dh) || m.len() >= measure_budget {
+                        // Budget PER-BACKEND: count only THIS backend's in-flight measurements, so one
+                        // backend's long measurement (e.g. a ~115s SP1 decoy on the dedicated measure
+                        // worker) cannot monopolize the slot the OTHER backend (risc0, on its GPU prove
+                        // pool) needs. Dedup stays global by descriptor hash.
+                        let tag = backend_tag(backend_opt.unwrap_or(""));
+                        let in_flight_this_backend = m.values().filter(|&&b| b == tag).count();
+                        if m.contains_key(&dh) || in_flight_this_backend >= measure_budget {
                             false
                         } else {
-                            m.insert(dh);
+                            m.insert(dh, tag);
                             true
                         }
                     })
@@ -5392,6 +5401,11 @@ async fn process_job_lifecycle(
         // desktop consume the waits a genuine host-RAM dip needs.
         let mut gpu_memory_waits = 0u32;
         let mut attempt = 0u32;
+        // Set once the claim-time preferred card hits an ADMISSION (un-attempted host-RAM) refusal:
+        // unlike a GPU shortage it does not exclude the card, so without dropping the preference the
+        // dispatcher would re-pin the un-admittable cold preferred card every retry while the warm
+        // sibling idles → abandon → penalized release. Dropping it reverts to warm-first fallback.
+        let mut drop_preference = false;
         loop {
             attempt += 1;
             // Pre-deadline release margin: compute the absolute instant past
@@ -5463,7 +5477,11 @@ async fn process_job_lifecycle(
             // needs the list again next time round.
             let disabled_for_prove = disabled_slots.clone();
             // The card this job was planned for (benchmark id, e.g. "gpu1"), preferred at dispatch.
-            let preferred_for_prove = snapshot.preferred_device.clone();
+            let preferred_for_prove = if drop_preference {
+                None
+            } else {
+                snapshot.preferred_device.clone()
+            };
             let (proof_result, used_slot) = match tokio::task::spawn_blocking(move || {
                 let resolve_backend = backend_str.clone();
                 let po2_for_device = move |device_id: &str| -> Option<u8> {
@@ -5674,6 +5692,15 @@ async fn process_job_lifecycle(
                     if let Some(shortage) =
                         e.downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
                     {
+                        // An admission refusal (nothing ran) means the slot just tried — most likely
+                        // the cold claim-time preferred card — could not be admitted now. Unlike a GPU
+                        // shortage this does NOT exclude the slot, so drop the device preference for the
+                        // rest of this job and let the dispatcher's warm-first ordering pick the warm
+                        // sibling instead of re-pinning the un-admittable card every retry. Only on an
+                        // un-attempted (admission) refusal; an OOM mid-proof is a different event.
+                        if !shortage.attempted {
+                            drop_preference = true;
+                        }
                         // Only an ADMISSION refusal is free. That costs a `/proc/meminfo` read, so
                         // nothing was attempted and waiting is the honest response. A worker
                         // OOM-killed MID-PROOF is a different event: minutes of real work ran and
