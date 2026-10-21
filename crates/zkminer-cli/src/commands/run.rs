@@ -260,6 +260,15 @@ static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 
 const FALLBACK_ESTIMATED_CYCLES: u64 = 34_000_000;
 
+/// Conservative throughput (cycles/sec) the live claim gate sizes feasibility on when it has NO
+/// genuine per-device benchmark row for the job's backend on a REAL (non-simulated) rig — e.g. a
+/// cached suite predating device rows. Without this, a 0.0 throughput falls through to the evaluator's
+/// OPTIMISTIC suite average, re-opening deadline claim-bait (a deadline-tight flood that fits the mean
+/// but not the slow card is admitted, then missed -> penalized release). A low floor sizes
+/// pessimistically so such jobs are refused rather than admitted-then-doomed. Matches the prove
+/// watchdog's CONSERVATIVE_CPS.
+const CONSERVATIVE_SIZING_CPS: f64 = 400_000.0;
+
 /// Sentinel cycle count for a program the executor could not measure because the guest is too heavy
 /// or non-terminating (it tripped the execute cycle cap). Sized so that at ANY realistic GPU
 /// throughput (≤ ~3e8 cycles/s) the implied duration exceeds the evaluator's hard `INFEASIBLE`
@@ -3739,7 +3748,21 @@ async fn miner_brain(
                 .filter(|(_, b, t)| b.as_str() == backend_name && t.is_finite() && *t > 0.0)
                 .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(id, _, _)| id.clone());
-            let live_gate_throughput = if planner_active { 0.0 } else { slowest_eligible };
+            let live_gate_throughput = if planner_active {
+                0.0
+            } else if slowest_eligible > 0.0 {
+                slowest_eligible
+            } else if benchmarks.is_simulated() {
+                // Simulated suite: keep 0.0 so the evaluator's is_simulated()+throughput<=0 guard waves
+                // the (instant, allocation-free) simulated proof through — don't break demo/test flows.
+                0.0
+            } else {
+                // Real rig but no genuine per-device row for this backend (e.g. a cached suite
+                // predating device_benchmarks): size on a conservative floor rather than letting the
+                // evaluator fall back to its OPTIMISTIC suite average, which would re-open deadline
+                // claim-bait. See `CONSERVATIVE_SIZING_CPS`.
+                CONSERVATIVE_SIZING_CPS
+            };
 
             // Backstop the per-descriptor fulfill-payload screen at the claim gate, evaluated HERE —
             // right after resolve_measured — so the measured-cycle and journal-length caches are read
