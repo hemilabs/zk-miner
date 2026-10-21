@@ -644,64 +644,65 @@ fn clear_measure_strikes(
     }
 }
 
-/// (backend, programId) -> (count of measure wall-clock-watchdog SIGKILLs, time of the last one).
-/// The per-(program,input) strike cache cannot bound an input-ROTATING flood (a fresh key per
-/// input), so this counts SIGKILLs across ALL of a program's inputs. Past
-/// `MEASURE_PROGRAM_SIGKILL_BREAK` the measure-spawn gate stops measuring the program entirely,
-/// bounding the flood. Keyed by programId only; bounded like the measured cache. The count DECAYS
-/// after `MEASURE_PROGRAM_BREAK_COOLDOWN` with no new SIGKILL, so a transient host-overload storm
-/// cannot permanently retire a legitimately heavy program (the over-block the generous threshold +
-/// self-heal exist to avoid).
-type MeasureProgramBreaker = std::sync::Arc<
-    std::sync::Mutex<
-        std::collections::HashMap<(u8, alloy::primitives::B256), (u8, std::time::Instant)>,
-    >,
+/// backend_tag -> (count of EXPENSIVE (near-watchdog) measurements in the current window, time of the
+/// last one). A GLOBAL, per-backend throttle on measurement COST. The per-(program,input) strike
+/// cache (above) precisely negative-caches a deterministically-unmeasurable input, but it cannot
+/// bound a flood that ROTATES programId/inputData (a fresh key each time) with each guest tuned to run
+/// just UNDER the watchdog — paying no SIGKILL, tripping no strike, yet pinning the scarce measure
+/// workers and starving all claiming. This counts EXPENSIVE measurements (ANY outcome: clean,
+/// cap-trip, or SIGKILL) across all programs/inputs for a backend; past `MEASURE_COST_BREAK` the
+/// measure-spawn gate DEFERS new measurements for that backend until the count decays
+/// (`MEASURE_COST_WINDOW`) — a self-healing THROTTLE, never a permanent stop. Keyed ONLY by backend
+/// (never by program or submitter), so unlike the per-program breaker it replaced it can never retire
+/// a specific (possibly shared) program for everyone, and program/input rotation cannot evade it.
+type MeasureCostBreaker = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<u8, (u32, std::time::Instant)>>,
 >;
 
-/// SIGKILLs across a program's inputs before the measure-spawn gate stops measuring it. Deliberately
-/// MUCH higher than `MEASURE_TIMEOUT_STRIKES` (3, per-input): a legit heavy program whose guests
-/// honestly measure near the 120s watchdog must be able to accrue several timeouts under transient
-/// load without being retired, while an input-rotating flood still trips it quickly.
-const MEASURE_PROGRAM_SIGKILL_BREAK: u8 = 12;
+/// A measurement is "expensive" (counts toward the cost breaker) if it ran at least this long — about
+/// half the 120s measure watchdog. A legitimate size is far cheaper; a guest tuned to pin a measure
+/// worker near the watchdog (the penalty-free sub-watchdog flood) is not.
+const LONG_MEASURE_SECS: f64 = 60.0;
 
-/// Idle time after the last SIGKILL before the per-program breaker count decays to zero (self-heal).
-const MEASURE_PROGRAM_BREAK_COOLDOWN: Duration = Duration::from_secs(600);
+/// Expensive measurements for one backend within the window before the measure-spawn gate throttles
+/// new measurements for it. Generous: a real backlog of a few genuinely-heavy sizes is fine; a
+/// sustained flood of near-watchdog measurements is not.
+const MEASURE_COST_BREAK: u32 = 8;
 
-/// Record a measure wall-clock-watchdog SIGKILL for a program (across all inputs). Decays first if
-/// the previous SIGKILL was longer ago than the cooldown, so only a SUSTAINED storm accumulates.
-fn bump_measure_program_breaker(
-    breaker: &MeasureProgramBreaker,
-    backend: &str,
-    program_id: alloy::primitives::B256,
-) {
+/// Idle time after the last expensive measurement before the per-backend cost count decays to zero
+/// (self-heal), so a transient burst of heavy-but-legit sizing cannot throttle the backend for long.
+const MEASURE_COST_WINDOW: Duration = Duration::from_secs(120);
+
+/// Record a measurement's wall-clock cost for a backend. Only an EXPENSIVE (>= LONG_MEASURE_SECS) run
+/// counts; a cheap size, or a ~0s transient defer, does not. Decays first if the last expensive
+/// measurement was longer ago than the window, so only a SUSTAINED flood accumulates.
+fn bump_measure_cost(breaker: &MeasureCostBreaker, backend: &str, duration_secs: f64) {
+    if duration_secs < LONG_MEASURE_SECS {
+        return;
+    }
     if let Ok(mut m) = breaker.lock() {
         let now = std::time::Instant::now();
-        let key = (backend_tag(backend), program_id);
+        let key = backend_tag(backend);
         let count = match m.get(&key).copied() {
-            Some((c, last)) if now.duration_since(last) <= MEASURE_PROGRAM_BREAK_COOLDOWN => {
-                c.saturating_add(1)
-            }
-            _ => 1, // fresh, or decayed since the last SIGKILL
+            Some((c, last)) if now.duration_since(last) <= MEASURE_COST_WINDOW => c.saturating_add(1),
+            _ => 1, // fresh, or decayed since the last expensive measurement
         };
         bounded_insert(&mut m, key, (count, now), MEASURED_CYCLES_CAP);
     }
 }
 
-/// True if a program has taken `MEASURE_PROGRAM_SIGKILL_BREAK` measure SIGKILLs within the cooldown,
-/// so it must not be measured again until it self-heals. A decayed entry is dropped and returns false.
-fn program_measure_broken(
-    breaker: &MeasureProgramBreaker,
-    backend: &str,
-    program_id: alloy::primitives::B256,
-) -> bool {
+/// True if a backend has accumulated `MEASURE_COST_BREAK` expensive measurements within the window,
+/// so the measure-spawn gate should DEFER new measurements for it this tick (a self-healing throttle,
+/// not a stop). A decayed entry is dropped and returns false.
+fn measure_backend_throttled(breaker: &MeasureCostBreaker, backend: &str) -> bool {
     if let Ok(mut m) = breaker.lock() {
-        let key = (backend_tag(backend), program_id);
+        let key = backend_tag(backend);
         if let Some((c, last)) = m.get(&key).copied() {
-            if std::time::Instant::now().duration_since(last) > MEASURE_PROGRAM_BREAK_COOLDOWN {
-                m.remove(&key); // self-heal: the storm has passed
+            if std::time::Instant::now().duration_since(last) > MEASURE_COST_WINDOW {
+                m.remove(&key); // self-heal: the flood has passed
                 return false;
             }
-            return c >= MEASURE_PROGRAM_SIGKILL_BREAK;
+            return c >= MEASURE_COST_BREAK;
         }
     }
     false
@@ -2668,9 +2669,10 @@ async fn miner_brain(
     // single transient timeout does not permanently blacklist a feasible job (see `measure_cycles`).
     let measure_strikes: MeasureStrikes =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    // Per-program measure SIGKILL breaker (bounds an input-rotating measure-DoS; see
-    // `MeasureProgramBreaker`).
-    let measure_program_breaker: MeasureProgramBreaker =
+    // Global per-backend measure-COST breaker: a self-healing throttle that bounds a rotating
+    // sub-watchdog measurement flood without ever over-blocking a specific program (see
+    // `MeasureCostBreaker`).
+    let measure_cost_breaker: MeasureCostBreaker =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // (Over-cap fulfill-payload verdicts now live as the `over_cap` bit on each descriptor's DescInfo
     // resolver entry in `desc_input_hash`, so the verdict and the resolver evict together — see
@@ -3998,7 +4000,7 @@ async fn miner_brain(
                 // across rotated inputs (the input-rotation measure-DoS the per-(program,input) strike
                 // cache cannot bound). Generous threshold + self-heal, so a legitimately heavy program
                 // is not permanently retired by a transient host-overload storm.
-                && !program_measure_broken(&measure_program_breaker, backend_opt.unwrap_or(""), pid)
+                && !measure_backend_throttled(&measure_cost_breaker, backend_opt.unwrap_or(""))
             {
                 let backend = backend_opt.unwrap_or("");
                 // Dedup by descriptor hash so N sightings spawn ONE execution; cleared below.
@@ -4038,7 +4040,7 @@ async fn miner_brain(
                         measuring.clone(),
                         measuring_inputs.clone(),
                         measure_strikes.clone(),
-                        measure_program_breaker.clone(),
+                        measure_cost_breaker.clone(),
                         measured_journal.clone(),
                         desc_payload.clone(),
                         assigned_elsewhere.clone(),
@@ -6196,7 +6198,7 @@ async fn measure_cycles(
         >,
     >,
     measure_strikes: &MeasureStrikes,
-    measure_program_breaker: &MeasureProgramBreaker,
+    measure_cost_breaker: &MeasureCostBreaker,
     measured_journal: &JournalLenCache,
     desc_payload: &DescPayloadCache,
     assigned_elsewhere: &AssignedElsewhere,
@@ -6516,10 +6518,16 @@ async fn measure_cycles(
     let input_len = input.len();
     // Blocking: the worker protocol is synchronous. Bounded by the watchdog inside `execute_cycles`.
     let backend_owned = backend.to_string();
+    let measure_started = std::time::Instant::now();
     let res = tokio::task::spawn_blocking(move || {
         pool.execute_cycles(&backend_owned, &elf, &input, Some(MEASURE_TIMEOUT), program_id_bytes)
     })
     .await;
+    // Record this measurement's wall-clock cost against the GLOBAL per-backend throttle, for ANY
+    // outcome that actually ran (clean, cap-trip, or SIGKILL). A ~0s transient host-RAM defer falls
+    // below LONG_MEASURE_SECS and does not count; an expensive near-watchdog run does — so the
+    // penalty-free sub-watchdog flood that trips no strike/SIGKILL still hits backpressure.
+    bump_measure_cost(measure_cost_breaker, backend, measure_started.elapsed().as_secs_f64());
     match res {
         Ok(Ok((cycles, journal_len))) => {
             // The guest committed `journal_len` bytes. fulfillJob re-encodes the journal
@@ -6650,13 +6658,6 @@ async fn measure_cycles(
                 } else {
                     "execute failure"
                 };
-                if wall_clock_timeout {
-                    // A measure watchdog SIGKILL for THIS program — count it across ALL inputs so the
-                    // measure-spawn gate can break an input-rotating flood the per-(program,input)
-                    // strike cache below cannot. Only the SIGKILL case bumps it (a clean cap trip or a
-                    // success does not); it self-heals after a cooldown.
-                    bump_measure_program_breaker(measure_program_breaker, backend, program_id);
-                }
                 let strikes = bump_measure_strikes(measure_strikes, backend, program_id, input_hash);
                 if strikes >= MEASURE_TIMEOUT_STRIKES {
                     tracing::warn!(
@@ -8159,40 +8160,37 @@ mod r2_sizing_tests {
     }
 
     #[test]
-    fn per_program_breaker_bounds_input_rotation_that_per_input_strikes_cannot() {
-        // An input-ROTATING measure-SIGKILL flood never trips the per-(program,input) strike (each
-        // fresh input sits at 1, below the K-strike threshold), but DOES trip the per-PROGRAM breaker,
-        // which counts SIGKILLs across all inputs.
-        let strikes: MeasureStrikes =
+    fn global_measure_cost_breaker_throttles_a_rotating_sub_watchdog_flood() {
+        // A rotating sub-watchdog flood pays no SIGKILL and trips no per-(program,input) strike, but
+        // each run is EXPENSIVE (near-watchdog), so the global per-backend cost breaker throttles it.
+        let breaker: MeasureCostBreaker =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        let breaker: MeasureProgramBreaker =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        let prog = B256::repeat_byte(0x55);
 
-        assert!(!program_measure_broken(&breaker, "sp1", prog));
-        // Rotate a distinct input each SIGKILL, as the attacker would.
-        for i in 0..MEASURE_PROGRAM_SIGKILL_BREAK {
-            let ih = keccak256(format!("rotated-input-{i}").as_bytes());
-            // Per-input strike never reaches its threshold (fresh key each time).
-            assert_eq!(bump_measure_strikes(&strikes, "sp1", prog, ih), 1);
-            // Below the program threshold until the last bump.
-            assert_eq!(
-                program_measure_broken(&breaker, "sp1", prog),
-                i >= MEASURE_PROGRAM_SIGKILL_BREAK,
-                "not broken before the threshold"
+        assert!(!measure_backend_throttled(&breaker, "sp1"));
+        // A CHEAP measurement never counts, however many there are.
+        for _ in 0..100 {
+            bump_measure_cost(&breaker, "sp1", LONG_MEASURE_SECS - 1.0);
+        }
+        assert!(!measure_backend_throttled(&breaker, "sp1"), "cheap sizes never throttle");
+
+        // Expensive (near-watchdog) runs accumulate across ALL programs/inputs (the breaker is keyed
+        // only by backend), and throttle once the window count reaches the threshold.
+        for i in 0..MEASURE_COST_BREAK {
+            assert!(
+                !measure_backend_throttled(&breaker, "sp1"),
+                "not throttled before the threshold"
             );
-            bump_measure_program_breaker(&breaker, "sp1", prog);
+            let _ = i;
+            bump_measure_cost(&breaker, "sp1", LONG_MEASURE_SECS + 1.0);
         }
         assert!(
-            program_measure_broken(&breaker, "sp1", prog),
-            "the per-program breaker trips once SIGKILLs across inputs reach the threshold"
+            measure_backend_throttled(&breaker, "sp1"),
+            "the global cost breaker throttles once expensive measurements reach the threshold"
         );
 
-        // A DIFFERENT program is independent (the breaker never over-blocks a bystander).
-        let other = B256::repeat_byte(0x66);
-        assert!(!program_measure_broken(&breaker, "sp1", other));
-        // And a different backend for the same program id is independent too.
-        assert!(!program_measure_broken(&breaker, "risc0", prog));
+        // A DIFFERENT backend is independent — the throttle never spills across backends, and (being
+        // keyed only by backend) it can never retire a specific program for everyone.
+        assert!(!measure_backend_throttled(&breaker, "risc0"));
     }
 
     #[test]
