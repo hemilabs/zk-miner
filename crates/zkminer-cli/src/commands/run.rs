@@ -288,10 +288,22 @@ fn backend_tag(backend: &str) -> u8 {
         _ => 255,
     }
 }
-/// descriptor hash -> keccak256(inputData) resolver. See the declaration in `run`.
+/// Per-descriptor resolver entry: the input hash this descriptor carries, PLUS whether its full
+/// fulfill payload (journal + this descriptor + seal) was found to exceed the on-chain cap. Both live
+/// in ONE map keyed by descriptor hash so they EVICT TOGETHER — the over-cap verdict can neither
+/// outlive nor be outlived by the resolver that makes the descriptor claimable. That closes the
+/// fail-open where a separately-bounded, independently-evicting over-cap set let an over-cap descriptor
+/// be claimed because its verdict was evicted while its resolver survived.
+#[derive(Clone, Copy)]
+struct DescInfo {
+    input_hash: alloy::primitives::B256,
+    over_cap: bool,
+}
+
+/// descriptor hash -> [`DescInfo`] (input-hash resolver + over-cap verdict). See the declaration in `run`.
 type DescInputCache = std::sync::Arc<
     std::sync::Mutex<
-        std::collections::HashMap<alloy::primitives::B256, alloy::primitives::B256>,
+        std::collections::HashMap<alloy::primitives::B256, DescInfo>,
     >,
 >;
 
@@ -341,25 +353,32 @@ fn insert_measured(
 /// (program, input): the overflow depends on callbackExtraData/extraVerifierData, which are outside
 /// the measurement cache key, so keying it by input would let one submitter's padded descriptor
 /// wrongly skip a different slim job for the same program+input. Bounded like the other brain maps.
-type DescSkip =
-    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>>>;
-
-/// Record a descriptor whose fulfill payload is over the cap so the candidate loop never claims it.
-fn mark_desc_unfulfillable(skip: &DescSkip, descriptor_hash: alloy::primitives::B256) {
-    if let Ok(mut s) = skip.lock() {
-        if s.len() >= MEASURED_CYCLES_CAP && !s.contains(&descriptor_hash) {
-            if let Some(k) = s.iter().next().copied() {
-                s.remove(&k);
-            }
+/// Record that a descriptor's fulfill payload is over the cap, as the `over_cap` bit on its
+/// [`DescInfo`] resolver entry — creating the entry with a zero input hash if it has none yet (a
+/// descriptor skipped before measurement is not claimable until a measurement exists anyway, and the
+/// bit then co-evicts with the resolver). The candidate loop never claims a flagged descriptor.
+fn mark_desc_unfulfillable(desc_input: &DescInputCache, descriptor_hash: alloy::primitives::B256) {
+    if let Ok(mut m) = desc_input.lock() {
+        match m.get_mut(&descriptor_hash) {
+            Some(info) => info.over_cap = true,
+            None => bounded_insert(
+                &mut m,
+                descriptor_hash,
+                DescInfo {
+                    input_hash: alloy::primitives::B256::ZERO,
+                    over_cap: true,
+                },
+                MEASURED_CYCLES_CAP,
+            ),
         }
-        s.insert(descriptor_hash);
     }
 }
 
-/// True if this descriptor was found to have an over-cap fulfill payload (see `DescSkip`).
-fn desc_is_unfulfillable(skip: &DescSkip, descriptor_hash: alloy::primitives::B256) -> bool {
-    skip.lock()
-        .map(|s| s.contains(&descriptor_hash))
+/// True if this descriptor was found to have an over-cap fulfill payload (see [`DescInfo`]).
+fn desc_is_unfulfillable(desc_input: &DescInputCache, descriptor_hash: alloy::primitives::B256) -> bool {
+    desc_input
+        .lock()
+        .map(|m| m.get(&descriptor_hash).map(|i| i.over_cap).unwrap_or(false))
         .unwrap_or(false)
 }
 
@@ -549,7 +568,7 @@ fn claim_payload_over_cap(
     let Some(input_hash) = desc_input
         .lock()
         .ok()
-        .and_then(|m| m.get(&descriptor_hash).copied())
+        .and_then(|m| m.get(&descriptor_hash).map(|i| i.input_hash))
     else {
         return false;
     };
@@ -624,7 +643,15 @@ fn insert_desc_input(
     input_hash: alloy::primitives::B256,
 ) {
     if let Ok(mut m) = cache.lock() {
-        bounded_insert(&mut m, descriptor_hash, input_hash, MEASURED_CYCLES_CAP);
+        // Preserve any over-cap verdict already recorded for this descriptor when (re)recording its
+        // resolver, so learning the input hash never clears the fact that its payload is over the cap.
+        let over_cap = m.get(&descriptor_hash).map(|i| i.over_cap).unwrap_or(false);
+        bounded_insert(
+            &mut m,
+            descriptor_hash,
+            DescInfo { input_hash, over_cap },
+            MEASURED_CYCLES_CAP,
+        );
     }
 }
 
@@ -638,7 +665,7 @@ fn resolve_measured(
     program_id: alloy::primitives::B256,
     descriptor_hash: alloy::primitives::B256,
 ) -> Option<u64> {
-    let input_hash = desc_input.lock().ok()?.get(&descriptor_hash).copied()?;
+    let input_hash = desc_input.lock().ok()?.get(&descriptor_hash)?.input_hash;
     measured
         .lock()
         .ok()?
@@ -2546,11 +2573,8 @@ async fn miner_brain(
     // later sighting of the same descriptor. A new tag is a new descriptor hash, so a miss here until
     // its (cheap, cached) descriptor fetch records it — never an under-size, because a miss blocks the
     // claim rather than falling back to the declared count.
-    let desc_input_hash: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<alloy::primitives::B256, alloy::primitives::B256>,
-        >,
-    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let desc_input_hash: DescInputCache =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // Descriptor hashes already being measured, so N sightings of the same job spawn ONE execution.
     let measuring: std::sync::Arc<
         std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>>,
@@ -2569,14 +2593,12 @@ async fn miner_brain(
     // single transient timeout does not permanently blacklist a feasible job (see `measure_cycles`).
     let measure_strikes: MeasureStrikes =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    // Descriptors whose fulfill payload (journal + full descriptor + seal) is over the on-chain cap,
-    // discovered during measurement, so the candidate loop skips claiming them rather than wasting a
-    // proof on a guaranteed-revert fulfill (see `DescSkip` / `measure_cycles`).
-    let desc_skip: DescSkip =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    // (Over-cap fulfill-payload verdicts now live as the `over_cap` bit on each descriptor's DescInfo
+    // resolver entry in `desc_input_hash`, so the verdict and the resolver evict together — see
+    // `DescInfo` / `measure_cycles`.)
     // Journal length per (backend, program, input), cached when a measurement executes so a later
     // descriptor for the same pair (which reuses the cached cycle count without re-executing) can
-    // still have its full fulfill payload checked and, if over the cap, marked in desc_skip.
+    // still have its full fulfill payload checked and, if over the cap, flagged on its resolver entry.
     let measured_journal: JournalLenCache =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // descriptor hash -> its payload length (inputData + the two extra-data fields), cached during
@@ -3295,7 +3317,7 @@ async fn miner_brain(
             // on-chain cap: claiming+proving it would waste a full proof on a fulfill that is
             // guaranteed to OOG-revert, then release at a penalty. Cheap per-tick re-check; the job
             // stays in the open set in case the submitter re-submits it under a slimmer descriptor.
-            if desc_is_unfulfillable(&desc_skip, snapshot.descriptor_hash) {
+            if desc_is_unfulfillable(&desc_input_hash, snapshot.descriptor_hash) {
                 tracing::debug!(
                     "Skipping {}: its fulfill payload exceeds the on-chain cap (journal + descriptor \
                      + seal) — proving it would waste a proof on a guaranteed-revert fulfill",
@@ -3622,7 +3644,7 @@ async fn miner_brain(
             // journal length is known; combined with THIS descriptor's cached payload the full payload
             // is re-checked here and the claim refused when it is over the cap — closing the window where
             // such a descriptor is claimed+proved into a guaranteed OOG-revert fulfill. Mark it so later
-            // ticks short-circuit at the cheap desc_skip check. (Returns false — does not block — until
+            // ticks short-circuit at the cheap desc_is_unfulfillable check. (Returns false — does not block — until
             // all three inputs are cached, so it never false-skips a job that could actually fulfill.)
             if let Some(backend) = backend_opt {
                 if claim_payload_over_cap(
@@ -3633,7 +3655,7 @@ async fn miner_brain(
                     job.info.program_id,
                     snapshot.descriptor_hash,
                 ) {
-                    mark_desc_unfulfillable(&desc_skip, snapshot.descriptor_hash);
+                    mark_desc_unfulfillable(&desc_input_hash, snapshot.descriptor_hash);
                     tracing::debug!(
                         "Skipping {}: its full fulfill payload (measured journal + descriptor + \
                          seal) exceeds the on-chain cap — proving it would waste a proof on a \
@@ -3864,7 +3886,7 @@ async fn miner_brain(
                     })
                     .unwrap_or(false);
                 if fresh {
-                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2, skip2, jcache2, pcache2, acache) = (
+                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2, jcache2, pcache2, acache) = (
                         client.clone(),
                         state.clone(),
                         measured_cycles.clone(),
@@ -3872,7 +3894,6 @@ async fn miner_brain(
                         measuring.clone(),
                         measuring_inputs.clone(),
                         measure_strikes.clone(),
-                        desc_skip.clone(),
                         measured_journal.clone(),
                         desc_payload.clone(),
                         assigned_elsewhere.clone(),
@@ -3896,7 +3917,6 @@ async fn miner_brain(
                             &resolver,
                             &inflight_inputs,
                             &strikes2,
-                            &skip2,
                             &jcache2,
                             &pcache2,
                             &acache,
@@ -5998,7 +6018,6 @@ async fn measure_cycles(
         >,
     >,
     measure_strikes: &MeasureStrikes,
-    desc_skip: &DescSkip,
     measured_journal: &JournalLenCache,
     desc_payload: &DescPayloadCache,
     assigned_elsewhere: &AssignedElsewhere,
@@ -6058,8 +6077,9 @@ async fn measure_cycles(
     let descriptor_payload =
         descriptor.inputData.len() + descriptor.callbackExtraData.len() + descriptor.extraVerifierData.len();
     if descriptor_payload > MAX_DESCRIPTOR_PAYLOAD_BYTES {
-        // This descriptor's payload alone would OOG-revert fulfill. Mark it in `desc_skip` (keyed by
-        // descriptor hash, so it never mis-skips a sibling) so the claim gate short-circuits it on
+        // This descriptor's payload alone would OOG-revert fulfill. Flag it unclaimable (the over-cap
+        // bit on its resolver entry, keyed by descriptor hash so it never mis-skips a sibling) so the
+        // claim gate short-circuits it on
         // every later tick instead of re-fetching its descriptor and re-occupying a measure-budget
         // slot here forever. Deterministic for this descriptor; the over-cap payload cannot shrink.
         tracing::warn!(
@@ -6069,7 +6089,7 @@ async fn measure_cycles(
             descriptor_payload,
             MAX_DESCRIPTOR_PAYLOAD_BYTES
         );
-        mark_desc_unfulfillable(desc_skip, descriptor_hash);
+        mark_desc_unfulfillable(desc_input, descriptor_hash);
         return;
     }
     // Skip a job the submitter assigned exclusively to a DIFFERENT prover: the candidate
@@ -6139,7 +6159,7 @@ async fn measure_cycles(
                     short_id(program_id),
                     journal_len
                 );
-                mark_desc_unfulfillable(desc_skip, descriptor_hash);
+                mark_desc_unfulfillable(desc_input, descriptor_hash);
             }
         }
         tracing::debug!(
@@ -6390,7 +6410,7 @@ async fn measure_cycles(
                         journal_len,
                         MAX_FULFILL_PAYLOAD_BYTES
                     );
-                    mark_desc_unfulfillable(desc_skip, descriptor_hash);
+                    mark_desc_unfulfillable(desc_input, descriptor_hash);
                 }
             }
         }
@@ -7974,20 +7994,28 @@ mod r2_sizing_tests {
         // A descriptor whose fulfill payload is over the cap must be skippable WITHOUT blacklisting a
         // sibling descriptor that happens to share the same program+input (the overflow comes from the
         // descriptor's extra-data, which is outside the measurement cache key).
-        let skip: DescSkip =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let desc_input: DescInputCache =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let fat = B256::repeat_byte(0x11);
         let slim = B256::repeat_byte(0x22);
-        assert!(!desc_is_unfulfillable(&skip, fat));
-        mark_desc_unfulfillable(&skip, fat);
-        assert!(desc_is_unfulfillable(&skip, fat), "the over-cap descriptor is flagged");
+        assert!(!desc_is_unfulfillable(&desc_input, fat));
+        mark_desc_unfulfillable(&desc_input, fat);
+        assert!(desc_is_unfulfillable(&desc_input, fat), "the over-cap descriptor is flagged");
         assert!(
-            !desc_is_unfulfillable(&skip, slim),
+            !desc_is_unfulfillable(&desc_input, slim),
             "a different descriptor (e.g. a slim one for the same input) is NOT flagged"
         );
-        // Idempotent and bounded: re-marking does not grow unboundedly, and the cap evicts.
-        mark_desc_unfulfillable(&skip, fat);
-        assert_eq!(skip.lock().unwrap().len(), 1);
+        // The verdict rides the SAME entry as the resolver, so it co-evicts with claimability:
+        // learning the input hash afterwards preserves the over-cap bit, and the over-cap bit can
+        // never outlive the resolver that makes the descriptor claimable.
+        insert_desc_input(&desc_input, fat, keccak256(b"some-input"));
+        assert!(
+            desc_is_unfulfillable(&desc_input, fat),
+            "recording the resolver must not clear the over-cap verdict"
+        );
+        // Idempotent and bounded: re-marking the same descriptor keeps exactly one entry.
+        mark_desc_unfulfillable(&desc_input, fat);
+        assert_eq!(desc_input.lock().unwrap().len(), 1);
     }
 
     #[test]
