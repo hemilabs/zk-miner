@@ -19,15 +19,32 @@ use zkminer_contracts::bindings::IProgramRegistry;
 /// is viewed.
 pub fn sanitize_log(s: &str) -> String {
     const MAX: usize = 512;
+    // `char::is_control()` is Unicode category Cc only — it strips ESC/CR/LF/C1 (the ANSI/OSC/CRLF
+    // injection vectors), but NOT the bidirectional-override/isolate format chars (Cf) or the
+    // line/paragraph separators U+2028/U+2029 (Zl/Zp). Those enable Trojan-Source visual reordering
+    // (CVE-2021-42574) and apparent-newline forging in log viewers — the same "forge log lines"
+    // outcome, from a submitter-controlled URI / CID / program name. Strip them too. Keep TAB.
     let mut out: String = s
         .chars()
-        .filter(|&c| c == '\t' || !c.is_control())
+        .filter(|&c| c == '\t' || (!c.is_control() && !is_log_unsafe_format(c)))
         .take(MAX)
         .collect();
     if s.chars().count() > MAX {
         out.push('…');
     }
     out
+}
+
+/// Bidi controls / explicit directional format chars and the line/paragraph separators that
+/// `char::is_control()` (Cc-only) does not catch but that can still reorder or forge log lines.
+fn is_log_unsafe_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2028}' | '\u{2029}'               // line / paragraph separator (Zl, Zp)
+        | '\u{200E}' | '\u{200F}' | '\u{061C}' // LRM / RLM / ALM
+        | '\u{202A}'..='\u{202E}'             // LRE / RLE / PDF / LRO / RLO
+        | '\u{2066}'..='\u{2069}'             // LRI / RLI / FSI / PDI (isolates)
+    )
 }
 
 /// Per-request connect + total timeout for an ELF download. A submitter endpoint that trickles bytes
@@ -123,6 +140,10 @@ fn ip_is_blocked(ip: &IpAddr) -> bool {
                 || v4.is_unspecified()
                 || o[0] == 0
                 || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
+                || o[0] >= 240 // 240.0.0.0/4 reserved (Class E), incl. 255.255.255.255
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18.0.0/15 benchmarking
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF protocol assignments
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99) // 192.88.99.0/24 6to4 relay anycast
         }
         IpAddr::V6(v6) => {
             // Normalise every IPv6 form that EMBEDS an IPv4 address back to that IPv4 and re-test it,
@@ -143,6 +164,8 @@ fn ip_is_blocked(ip: &IpAddr) -> bool {
                 || (seg[0] == 0x0064 && seg[1] == 0xff9b) // NAT64 well-known 64:ff9b::/96
                 || seg[0] == 0x2002 // 6to4 2002::/16
                 || (seg[0] == 0x2001 && seg[1] == 0x0000) // Teredo 2001:0::/32
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
+                || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0020) // 2001:20::/28 ORCHIDv2
         }
     }
 }
@@ -321,7 +344,13 @@ fn pin_addrs(addrs: &[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> {
 /// Hard cap on a downloaded ELF. Real guest ELFs are single-digit MB; this bounds a
 /// submitter-controlled storage URI so an accidentally- or maliciously-huge response
 /// can't OOM the miner (the outer timeout bounds TIME, not bytes).
-const MAX_ELF_BYTES: u64 = 256 * 1024 * 1024;
+///
+/// Kept strictly BELOW the worker-IPC frame cap (MAX_FRAME_SIZE = 256 MiB in zkminer-prover-protocol):
+/// the Execute/Prove command serializes the ELF plus its input and a small envelope, so an ELF AT a
+/// 256 MiB cap would be un-sendable over the pipe (FrameTooLarge) after a full download + disk write +
+/// triple allocation — a pointless bounded griefing lever and an over-block of any ~256 MiB program.
+/// 248 MiB leaves ample headroom for the command envelope and bounded input. No real guest is near it.
+const MAX_ELF_BYTES: u64 = 248 * 1024 * 1024;
 
 /// Resolved program info with download URIs.
 #[derive(Debug, Clone)]
@@ -689,24 +718,39 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                     continue;
                 }
 
-                // Verify content hash if provided
-                if let Some(expected) = expected_hash {
-                    let actual = alloy::primitives::keccak256(&elf);
-                    if actual != expected {
-                        tracing::warn!(
-                            "ELF hash mismatch from {}: expected {}, got {}",
-                            url_log,
-                            expected,
-                            actual
-                        );
-                        continue;
+                // Verify the whole-ELF keccak digest against the registry `elf_hash` and the
+                // per-URI content_hash. keccak256 over up to MAX_ELF_BYTES is ~1-2s of non-yielding
+                // CPU, so offload it to a blocking thread (the on-disk cache read/write paths already
+                // do): a large-ELF or hash-mismatch flood on this download path must not pin the async
+                // runtime's worker threads. Both checks hash the SAME bytes, so compute the digest once.
+                if expected_hash.is_some() || uri_info.content_hash != B256::ZERO {
+                    let elf_arc = std::sync::Arc::new(std::mem::take(&mut elf));
+                    let for_hash = elf_arc.clone();
+                    let actual = match tokio::task::spawn_blocking(move || {
+                        alloy::primitives::keccak256(for_hash.as_slice())
+                    })
+                    .await
+                    {
+                        Ok(h) => h,
+                        Err(e) => {
+                            tracing::warn!("ELF hashing task failed for {}: {e}", url_log);
+                            continue;
+                        }
+                    };
+                    // The closure dropped its clone, so this Arc is now sole-owner: no 256 MiB copy.
+                    elf = std::sync::Arc::try_unwrap(elf_arc).unwrap_or_else(|a| (*a).clone());
+                    if let Some(expected) = expected_hash {
+                        if actual != expected {
+                            tracing::warn!(
+                                "ELF hash mismatch from {}: expected {}, got {}",
+                                url_log,
+                                expected,
+                                actual
+                            );
+                            continue;
+                        }
                     }
-                }
-
-                // Also verify against URI-level content hash
-                if uri_info.content_hash != B256::ZERO {
-                    let actual = alloy::primitives::keccak256(&elf);
-                    if actual != uri_info.content_hash {
+                    if uri_info.content_hash != B256::ZERO && actual != uri_info.content_hash {
                         tracing::warn!(
                             "Content hash mismatch from {}: expected {}, got {}",
                             url_log,
@@ -763,6 +807,41 @@ mod security_tests {
         for s in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {
             assert!(!ip_is_blocked(&ip(s)), "{s} should be allowed");
         }
+    }
+
+    #[test]
+    fn blocks_additional_special_use_ranges() {
+        for s in [
+            "240.0.0.1",      // 240/4 reserved (Class E)
+            "255.255.255.255",// broadcast / 240/4
+            "198.18.0.1",     // benchmarking 198.18/15
+            "198.19.255.1",   // benchmarking 198.18/15
+            "192.0.0.1",      // 192.0.0/24 IETF protocol assignments
+            "192.88.99.1",    // 6to4 relay anycast
+            "2001:db8::1",    // documentation 2001:db8::/32
+            "2001:20::1",     // ORCHIDv2 2001:20::/28
+            "2001:2f:ffff::1",// still within 2001:20::/28
+        ] {
+            assert!(ip_is_blocked(&ip(s)), "{s} should be blocked");
+        }
+        // Neighbours just outside the new ranges stay allowed.
+        for s in ["198.17.0.1", "198.20.0.1", "191.255.255.255", "2001:30::1"] {
+            assert!(!ip_is_blocked(&ip(s)), "{s} should be allowed");
+        }
+    }
+
+    #[test]
+    fn sanitize_log_strips_terminal_and_bidi_and_separators() {
+        // CRLF / ESC (Cc) stripped, TAB and the printable ANSI payload kept.
+        assert_eq!(super::sanitize_log("a\r\nb\x1b[31mc\td"), "ab[31mc\td");
+        // Bidi overrides/isolates (Cf) and line/paragraph separators (Zl/Zp) stripped.
+        for bad in ['\u{202E}', '\u{2066}', '\u{200F}', '\u{061C}', '\u{2028}', '\u{2029}'] {
+            let input = format!("safe{bad}text");
+            let out = super::sanitize_log(&input);
+            assert_eq!(out, "safetext", "{:?} must be stripped", bad);
+        }
+        // Ordinary unicode (non-format) is preserved.
+        assert_eq!(super::sanitize_log("café-π"), "café-π");
     }
 
     #[test]
