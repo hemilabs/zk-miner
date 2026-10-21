@@ -283,6 +283,13 @@ pub const SP1_ELEMENT_THRESHOLD_ENV: &str = "SP1_GPU_ELEMENT_THRESHOLD";
 /// SDK behaviour.
 pub const SP1_NO_AUTOTUNE_ENV: &str = "ZKMINER_SP1_NO_AUTOTUNE";
 
+/// Set to `1` to run an SP1 worker in MEASURE-ONLY mode: it answers Hello without the GPU usability
+/// probe (cycle sizing is pure CPU emulation, so GPU usability is irrelevant) and HARD-REFUSES every
+/// `Prove`/`Benchmark` so it can never build the `CudaProver` / fork `sp1-gpu-server`. The dispatcher
+/// runs one such server-less worker as the dedicated cycle-measurement slot, so a measure wall-clock
+/// watchdog SIGKILL (which group-kills the worker) can never tear down a proving worker's warm server.
+pub const SP1_MEASURE_ONLY_ENV: &str = "ZKMINER_SP1_MEASURE_ONLY";
+
 /// Set to `0` to stop the SP1 worker installing the `sp1-gpu-server` shipped beside it over
 /// `~/.sp1/bin/sp1-gpu-server`. Shared because the dispatcher has to know which of the two servers
 /// a worker will run, to check that the card can run its GPU code.

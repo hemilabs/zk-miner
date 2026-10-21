@@ -580,6 +580,16 @@ fn find_cuda12_runtime_dir() -> Option<std::path::PathBuf> {
 /// Returns `Err(reason)` only when SP1 provably CANNOT work here. A case we cannot settle
 /// cheaply (the server binary is absent, so the SDK would download it) returns `Ok`: this
 /// must not refuse a host that would in fact work.
+/// True when this worker was launched as the dedicated MEASURE-ONLY slot (see
+/// `SP1_MEASURE_ONLY_ENV`): it only ever sizes cycles on the CPU executor and must never build the
+/// CudaProver / fork `sp1-gpu-server`.
+fn sp1_measure_only() -> bool {
+    std::env::var(zkminer_prover_protocol::types::SP1_MEASURE_ONLY_ENV)
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
 fn sp1_usability() -> Result<(), String> {
     // The SDK does `env::var("HOME").expect(...)` to locate the server, so an unset HOME
     // is a panic rather than an error. Systemd units routinely have no HOME.
@@ -1136,18 +1146,23 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // Deliberately not a new HelloAck field: the codec is bincode, which is
                 // not self-describing, so adding one is a wire break between a new host
                 // and an older worker. This uses existing protocol surface.
-                if let Err(reason) = sp1_usability() {
-                    tracing::error!(
-                        "SP1 is NOT usable on this host, so this worker will not \
-                         advertise it: {reason}"
-                    );
-                    let resp = WorkerResponse::Error {
-                        request_id: 0,
-                        kind: ErrorKind::ResourceExhausted,
-                        message: format!("sp1 unavailable on this host: {reason}"),
-                    };
-                    write_message(&mut stdout, &resp)?;
-                    return Ok(());
+                // A measure-only worker never proves (it sizes on the CPU executor), so the GPU
+                // usability probe is irrelevant and must not gate — or forkserver-probe from — its
+                // handshake. A normal (proving) worker is still gated by the probe.
+                if !sp1_measure_only() {
+                    if let Err(reason) = sp1_usability() {
+                        tracing::error!(
+                            "SP1 is NOT usable on this host, so this worker will not \
+                             advertise it: {reason}"
+                        );
+                        let resp = WorkerResponse::Error {
+                            request_id: 0,
+                            kind: ErrorKind::ResourceExhausted,
+                            message: format!("sp1 unavailable on this host: {reason}"),
+                        };
+                        write_message(&mut stdout, &resp)?;
+                        return Ok(());
+                    }
                 }
                 let resp = WorkerResponse::HelloAck {
                     protocol_version: PROTOCOL_VERSION,
@@ -1179,6 +1194,18 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
 
             WorkerCommand::Benchmark => {
                 tracing::info!("Running benchmarks...");
+                if sp1_measure_only() {
+                    // Benchmarking builds the CudaProver (forks sp1-gpu-server) — exactly what a
+                    // measure-only worker must never do. Refuse on the protocol; the dispatcher never
+                    // sends this to the measure slot, so this is defense in depth against a misroute.
+                    let resp = WorkerResponse::Error {
+                        request_id: 0,
+                        kind: ErrorKind::Internal,
+                        message: "measure-only SP1 worker does not benchmark".to_string(),
+                    };
+                    write_message(&mut stdout, &resp)?;
+                    continue;
+                }
                 match get_prover!(prover) {
                     Ok(p) => {
                         let results = run_benchmarks(p);
@@ -1205,6 +1232,18 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 program_id,
             } => {
                 tracing::info!("Proving request {request_id} ({} bytes ELF)", elf.len());
+                if sp1_measure_only() {
+                    // Proving builds the CudaProver (forks sp1-gpu-server) — exactly what a
+                    // measure-only worker must never do. Refuse on the protocol; the dispatcher never
+                    // routes a Prove to the measure slot, so this is defense in depth against a misroute.
+                    let resp = WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::Internal,
+                        message: "measure-only SP1 worker does not prove".to_string(),
+                    };
+                    write_message(&mut stdout, &resp)?;
+                    continue;
+                }
                 // Announce proof START so the miner can move the job from Queued to Proving.
                 // Without this the job displays "Queued (waiting for GPU)" for the whole proof.
                 let started = WorkerResponse::Progress {

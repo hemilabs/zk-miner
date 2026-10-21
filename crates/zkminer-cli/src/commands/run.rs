@@ -635,6 +635,69 @@ fn clear_measure_strikes(
     }
 }
 
+/// (backend, programId) -> (count of measure wall-clock-watchdog SIGKILLs, time of the last one).
+/// The per-(program,input) strike cache cannot bound an input-ROTATING flood (a fresh key per
+/// input), so this counts SIGKILLs across ALL of a program's inputs. Past
+/// `MEASURE_PROGRAM_SIGKILL_BREAK` the measure-spawn gate stops measuring the program entirely,
+/// bounding the flood. Keyed by programId only; bounded like the measured cache. The count DECAYS
+/// after `MEASURE_PROGRAM_BREAK_COOLDOWN` with no new SIGKILL, so a transient host-overload storm
+/// cannot permanently retire a legitimately heavy program (the over-block the generous threshold +
+/// self-heal exist to avoid).
+type MeasureProgramBreaker = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<(u8, alloy::primitives::B256), (u8, std::time::Instant)>,
+    >,
+>;
+
+/// SIGKILLs across a program's inputs before the measure-spawn gate stops measuring it. Deliberately
+/// MUCH higher than `MEASURE_TIMEOUT_STRIKES` (3, per-input): a legit heavy program whose guests
+/// honestly measure near the 120s watchdog must be able to accrue several timeouts under transient
+/// load without being retired, while an input-rotating flood still trips it quickly.
+const MEASURE_PROGRAM_SIGKILL_BREAK: u8 = 12;
+
+/// Idle time after the last SIGKILL before the per-program breaker count decays to zero (self-heal).
+const MEASURE_PROGRAM_BREAK_COOLDOWN: Duration = Duration::from_secs(600);
+
+/// Record a measure wall-clock-watchdog SIGKILL for a program (across all inputs). Decays first if
+/// the previous SIGKILL was longer ago than the cooldown, so only a SUSTAINED storm accumulates.
+fn bump_measure_program_breaker(
+    breaker: &MeasureProgramBreaker,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+) {
+    if let Ok(mut m) = breaker.lock() {
+        let now = std::time::Instant::now();
+        let key = (backend_tag(backend), program_id);
+        let count = match m.get(&key).copied() {
+            Some((c, last)) if now.duration_since(last) <= MEASURE_PROGRAM_BREAK_COOLDOWN => {
+                c.saturating_add(1)
+            }
+            _ => 1, // fresh, or decayed since the last SIGKILL
+        };
+        bounded_insert(&mut m, key, (count, now), MEASURED_CYCLES_CAP);
+    }
+}
+
+/// True if a program has taken `MEASURE_PROGRAM_SIGKILL_BREAK` measure SIGKILLs within the cooldown,
+/// so it must not be measured again until it self-heals. A decayed entry is dropped and returns false.
+fn program_measure_broken(
+    breaker: &MeasureProgramBreaker,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+) -> bool {
+    if let Ok(mut m) = breaker.lock() {
+        let key = (backend_tag(backend), program_id);
+        if let Some((c, last)) = m.get(&key).copied() {
+            if std::time::Instant::now().duration_since(last) > MEASURE_PROGRAM_BREAK_COOLDOWN {
+                m.remove(&key); // self-heal: the storm has passed
+                return false;
+            }
+            return c >= MEASURE_PROGRAM_SIGKILL_BREAK;
+        }
+    }
+    false
+}
+
 /// Record that `descriptor_hash` carries `input_hash`, so a later sighting can resolve its
 /// measurement without re-fetching the descriptor. Bounded to `MEASURED_CYCLES_CAP` entries.
 fn insert_desc_input(
@@ -2593,6 +2656,10 @@ async fn miner_brain(
     // single transient timeout does not permanently blacklist a feasible job (see `measure_cycles`).
     let measure_strikes: MeasureStrikes =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // Per-program measure SIGKILL breaker (bounds an input-rotating measure-DoS; see
+    // `MeasureProgramBreaker`).
+    let measure_program_breaker: MeasureProgramBreaker =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // (Over-cap fulfill-payload verdicts now live as the `over_cap` bit on each descriptor's DescInfo
     // resolver entry in `desc_input_hash`, so the verdict and the resolver evict together — see
     // `DescInfo` / `measure_cycles`.)
@@ -3886,6 +3953,11 @@ async fn miner_brain(
                 // submitter exclusively assigned to ANOTHER prover; skip it for a cooldown so it cannot
                 // monopolize the per-tick measure budget. Time-bounded, since exclusivity expires.
                 && !assigned_elsewhere_recently(&assigned_elsewhere, dh)
+                // Stop measuring a program that keeps taking the measure wall-clock-watchdog SIGKILL
+                // across rotated inputs (the input-rotation measure-DoS the per-(program,input) strike
+                // cache cannot bound). Generous threshold + self-heal, so a legitimately heavy program
+                // is not permanently retired by a transient host-overload storm.
+                && !program_measure_broken(&measure_program_breaker, backend_opt.unwrap_or(""), pid)
             {
                 let backend = backend_opt.unwrap_or("");
                 // Dedup by descriptor hash so N sightings spawn ONE execution; cleared below.
@@ -3911,7 +3983,7 @@ async fn miner_brain(
                     })
                     .unwrap_or(false);
                 if fresh {
-                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2, jcache2, pcache2, acache) = (
+                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2, breaker2, jcache2, pcache2, acache) = (
                         client.clone(),
                         state.clone(),
                         measured_cycles.clone(),
@@ -3919,6 +3991,7 @@ async fn miner_brain(
                         measuring.clone(),
                         measuring_inputs.clone(),
                         measure_strikes.clone(),
+                        measure_program_breaker.clone(),
                         measured_journal.clone(),
                         desc_payload.clone(),
                         assigned_elsewhere.clone(),
@@ -3942,6 +4015,7 @@ async fn miner_brain(
                             &resolver,
                             &inflight_inputs,
                             &strikes2,
+                            &breaker2,
                             &jcache2,
                             &pcache2,
                             &acache,
@@ -6054,6 +6128,7 @@ async fn measure_cycles(
         >,
     >,
     measure_strikes: &MeasureStrikes,
+    measure_program_breaker: &MeasureProgramBreaker,
     measured_journal: &JournalLenCache,
     desc_payload: &DescPayloadCache,
     assigned_elsewhere: &AssignedElsewhere,
@@ -6493,6 +6568,13 @@ async fn measure_cycles(
                 } else {
                     "execute failure"
                 };
+                if wall_clock_timeout {
+                    // A measure watchdog SIGKILL for THIS program — count it across ALL inputs so the
+                    // measure-spawn gate can break an input-rotating flood the per-(program,input)
+                    // strike cache below cannot. Only the SIGKILL case bumps it (a clean cap trip or a
+                    // success does not); it self-heals after a cooldown.
+                    bump_measure_program_breaker(measure_program_breaker, backend, program_id);
+                }
                 let strikes = bump_measure_strikes(measure_strikes, backend, program_id, input_hash);
                 if strikes >= MEASURE_TIMEOUT_STRIKES {
                     tracing::warn!(
@@ -7992,6 +8074,43 @@ mod r2_sizing_tests {
 
         // Strikes are isolated per (backend, program, input): a different backend is independent.
         assert_eq!(bump_measure_strikes(&strikes, "risc0", prog, ih), 1);
+    }
+
+    #[test]
+    fn per_program_breaker_bounds_input_rotation_that_per_input_strikes_cannot() {
+        // An input-ROTATING measure-SIGKILL flood never trips the per-(program,input) strike (each
+        // fresh input sits at 1, below the K-strike threshold), but DOES trip the per-PROGRAM breaker,
+        // which counts SIGKILLs across all inputs.
+        let strikes: MeasureStrikes =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let breaker: MeasureProgramBreaker =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let prog = B256::repeat_byte(0x55);
+
+        assert!(!program_measure_broken(&breaker, "sp1", prog));
+        // Rotate a distinct input each SIGKILL, as the attacker would.
+        for i in 0..MEASURE_PROGRAM_SIGKILL_BREAK {
+            let ih = keccak256(format!("rotated-input-{i}").as_bytes());
+            // Per-input strike never reaches its threshold (fresh key each time).
+            assert_eq!(bump_measure_strikes(&strikes, "sp1", prog, ih), 1);
+            // Below the program threshold until the last bump.
+            assert_eq!(
+                program_measure_broken(&breaker, "sp1", prog),
+                i >= MEASURE_PROGRAM_SIGKILL_BREAK,
+                "not broken before the threshold"
+            );
+            bump_measure_program_breaker(&breaker, "sp1", prog);
+        }
+        assert!(
+            program_measure_broken(&breaker, "sp1", prog),
+            "the per-program breaker trips once SIGKILLs across inputs reach the threshold"
+        );
+
+        // A DIFFERENT program is independent (the breaker never over-blocks a bystander).
+        let other = B256::repeat_byte(0x66);
+        assert!(!program_measure_broken(&breaker, "sp1", other));
+        // And a different backend for the same program id is independent too.
+        assert!(!program_measure_broken(&breaker, "risc0", prog));
     }
 
     #[test]
