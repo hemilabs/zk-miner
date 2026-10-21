@@ -476,6 +476,53 @@ impl ChainClient {
     }
 }
 
+/// Program ids whose on-disk ELF must NOT be LRU-evicted right now, as a refcount (several in-flight
+/// jobs can share a program). A lifecycle task pins its program from claim through prove: the on-disk
+/// LRU is small (default 4 GiB) relative to the 256 MiB-ish ELF size, so a submitter flooding distinct
+/// decoy programs during the claim->prove window could otherwise evict a just-claimed program's cached
+/// ELF (mtime unchanged since measurement), turning the claim into a prove-time fetch miss -> penalized
+/// release. Pinned bytes stay bounded by max_concurrent in-flight lifecycles.
+static ELF_PIN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<B256, usize>>> =
+    std::sync::OnceLock::new();
+
+fn elf_pin_map() -> &'static std::sync::Mutex<std::collections::HashMap<B256, usize>> {
+    ELF_PIN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn elf_is_pinned(program_id: &B256) -> bool {
+    elf_pin_map()
+        .lock()
+        .map(|m| m.contains_key(program_id))
+        .unwrap_or(false)
+}
+
+/// RAII pin: increments the refcount for `program_id` and decrements it on drop. Hold one for the
+/// lifetime of a lifecycle task so the program's ELF survives in the on-disk cache until prove.
+#[must_use]
+pub struct ElfPin(B256);
+
+impl ElfPin {
+    pub fn new(program_id: B256) -> Self {
+        if let Ok(mut m) = elf_pin_map().lock() {
+            *m.entry(program_id).or_insert(0) += 1;
+        }
+        ElfPin(program_id)
+    }
+}
+
+impl Drop for ElfPin {
+    fn drop(&mut self) {
+        if let Ok(mut m) = elf_pin_map().lock() {
+            if let Some(n) = m.get_mut(&self.0) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(&self.0);
+                }
+            }
+        }
+    }
+}
+
 /// Local ELF cache manager — stores downloaded ELF binaries at ~/.zkminer/elfs/.
 #[derive(Clone)]
 pub struct ElfCache {
@@ -578,6 +625,19 @@ impl ElfCache {
         for (path, sz, _) in entries {
             if total <= budget {
                 break;
+            }
+            // Never evict an ELF whose program is pinned (a lifecycle task holds locked collateral on
+            // it and will read the ELF at prove time). The filename is "<programId>.elf"; parse the
+            // stem back to a B256 and skip if pinned. Pinned bytes are bounded by in-flight count, so
+            // the cache may briefly exceed budget rather than evict a program we are about to prove.
+            let pinned = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<B256>().ok())
+                .map(|pid| elf_is_pinned(&pid))
+                .unwrap_or(false);
+            if pinned {
+                continue;
             }
             match std::fs::remove_file(&path) {
                 Ok(()) => {
@@ -807,6 +867,47 @@ mod security_tests {
         for s in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {
             assert!(!ip_is_blocked(&ip(s)), "{s} should be allowed");
         }
+    }
+
+    #[test]
+    fn pinned_elfs_are_not_evicted_by_prune() {
+        use std::io::Write;
+        // Unique temp cache dir for this test.
+        let dir = std::env::temp_dir().join(format!("zkminer-elf-pin-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = ElfCache { cache_dir: dir.clone() };
+
+        // Three 2 MiB ELFs (6 MiB total); pin two of them.
+        let ids = [B256::repeat_byte(0x11), B256::repeat_byte(0x22), B256::repeat_byte(0x33)];
+        for id in &ids {
+            let mut f = std::fs::File::create(dir.join(format!("{id}.elf"))).unwrap();
+            f.write_all(&vec![0u8; 2 * 1024 * 1024]).unwrap();
+        }
+        let _p1 = ElfPin::new(ids[0]);
+        let _p2 = ElfPin::new(ids[1]);
+        assert!(elf_is_pinned(&ids[0]) && elf_is_pinned(&ids[1]) && !elf_is_pinned(&ids[2]));
+
+        // Budget 3 MiB: prune must shed down toward it, but can only evict the single UNPINNED entry.
+        cache.prune_with_budget(3 * 1024 * 1024);
+
+        assert!(dir.join(format!("{}.elf", ids[0])).exists(), "pinned ELF #1 must survive");
+        assert!(dir.join(format!("{}.elf", ids[1])).exists(), "pinned ELF #2 must survive");
+        assert!(!dir.join(format!("{}.elf", ids[2])).exists(), "unpinned ELF must be evicted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn elf_pin_refcount_releases_on_drop() {
+        let id = B256::repeat_byte(0xab);
+        assert!(!elf_is_pinned(&id));
+        {
+            let _a = ElfPin::new(id);
+            let _b = ElfPin::new(id);
+            assert!(elf_is_pinned(&id), "pinned while a guard is held");
+        }
+        assert!(!elf_is_pinned(&id), "unpinned once all guards drop");
     }
 
     #[test]

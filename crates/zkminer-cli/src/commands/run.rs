@@ -5003,6 +5003,12 @@ async fn process_job_lifecycle(
         }
     }
 
+    // Pin this program's cached ELF so the on-disk LRU cannot evict it between here and the prove step
+    // (step 7 re-reads the cache). Without the pin, a submitter flooding distinct decoy programs during
+    // the claim->prove window could evict the just-claimed ELF, turning the claim into a prove-time
+    // fetch miss and a penalized release. Dropped automatically when this task ends (every path).
+    let _elf_pin = zkminer_chain::programs::ElfPin::new(program_id);
+
     // 3. Read fresh view post-claim to learn the authoritative lock_deadline.
     // A confirmed-claimed job always has a nonzero lockDeadline; a 0 here means a
     // node behind the claim block. Retry briefly so we don't silently disable every
