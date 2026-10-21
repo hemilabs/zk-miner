@@ -363,6 +363,48 @@ fn desc_is_unfulfillable(skip: &DescSkip, descriptor_hash: alloy::primitives::B2
         .unwrap_or(false)
 }
 
+/// descriptor hash -> `Instant` until which a job observed assigned to ANOTHER prover is skipped
+/// WITHOUT re-fetching its descriptor. `assignedProver` is submitter-controlled, is NOT exposed by
+/// `JobStatusView` (so the candidate filter cannot see it), and is only learned from a descriptor
+/// fetch — so without this a flood of high-price jobs the submitter exclusively assigns elsewhere
+/// re-spawns a measure task (descriptor fetch + immediate return) every tick, monopolizing the
+/// per-tick measure budget and the RPC it rides, and starving measurement of legitimately-claimable
+/// jobs. The skip is TIME-BOUNDED, not permanent: on-chain exclusivity expires, so after the cooldown
+/// the job is re-evaluated and a now-open assignment is not missed. Bounded like the other brain maps.
+type AssignedElsewhere = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, std::time::Instant>>,
+>;
+
+/// Cooldown before a job seen assigned to another prover is re-checked. A cooldown, not a blacklist:
+/// exclusivity can lapse on-chain, so the job must become eligible again without a restart.
+const ASSIGNED_ELSEWHERE_TTL: Duration = Duration::from_secs(90);
+
+/// Mark a descriptor as assigned-elsewhere for `ASSIGNED_ELSEWHERE_TTL` so it is not re-measured each
+/// tick. Bounded like the measured cache so a flood of distinct decoys cannot grow the heap.
+fn mark_assigned_elsewhere(cache: &AssignedElsewhere, descriptor_hash: alloy::primitives::B256) {
+    if let Ok(mut m) = cache.lock() {
+        let until = std::time::Instant::now() + ASSIGNED_ELSEWHERE_TTL;
+        bounded_insert(&mut m, descriptor_hash, until, MEASURED_CYCLES_CAP);
+    }
+}
+
+/// True if this descriptor is still within its assigned-elsewhere cooldown. An expired entry returns
+/// false (and is dropped) so the job is re-evaluated once exclusivity may have lapsed.
+fn assigned_elsewhere_recently(
+    cache: &AssignedElsewhere,
+    descriptor_hash: alloy::primitives::B256,
+) -> bool {
+    if let Ok(mut m) = cache.lock() {
+        if let Some(&until) = m.get(&descriptor_hash) {
+            if std::time::Instant::now() < until {
+                return true;
+            }
+            m.remove(&descriptor_hash);
+        }
+    }
+    false
+}
+
 /// (backend, program, input) -> length in bytes of the guest journal that (program, input) produces.
 /// The journal is a deterministic function of (program, input), so it is shared by EVERY descriptor
 /// for that pair. It is cached here when a measurement executes so that a later descriptor for the
@@ -2543,6 +2585,10 @@ async fn miner_brain(
     // measuring_inputs race loser), which otherwise escaped both payload screens (see `DescPayloadCache`).
     let desc_payload: DescPayloadCache =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // descriptor hash -> cooldown Instant for a job the submitter assigned to another prover, so a
+    // flood of such jobs cannot re-consume the per-tick measure budget (see `AssignedElsewhere`).
+    let assigned_elsewhere: AssignedElsewhere =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut queue_model = zkminer_strategy::queue::QueueModel::new();
     let mut queue_last_tick = std::time::Instant::now();
     if !initial_queue_horizon.is_zero() {
@@ -3539,6 +3585,21 @@ async fn miner_brain(
             // The measured count is keyed by backend too, so resolve against THIS job's
             // backend — a measurement only sizes a job of the same proof system.
             let backend_opt = resolve_backend(snapshot.proof_system_id);
+            // The feasibility estimate must be measured against the window the PROVE PATH actually
+            // gets, not the full fulfillment window. Once claimed: the prove watchdog is budgeted at
+            // (window − release margin), the fulfill tx needs its own margin AFTER the proof, and the
+            // backend adds a fixed proving allowance (notably the ~120s SP1 Groth16 wrap) that the
+            // pure cycles/throughput estimate omits. Subtract all three and feed this provable window
+            // to the evaluator and the planner, so a job is admitted only if its estimate fits the time
+            // it will truly have — closing the optimistic-full-window gap that led to admitted-then-
+            // doomed claims (claim → watchdog kill → penalized release). The size-independent
+            // `min_deadline_floor` gate above already guarantees time_remaining ≥ release + min_attempt
+            // + fixed_allowance + fulfill, so this stays ≥ MIN_ATTEMPT_BUDGET_SECS (never 0) here.
+            let prove_window = time_remaining.saturating_sub(
+                DEADLINE_RELEASE_MARGIN_SECS
+                    + DEADLINE_FULFILL_MARGIN_SECS
+                    + backend_opt.map(fixed_proving_allowance_secs).unwrap_or(0),
+            );
             let measured_for_job = resolve_measured(
                 &measured_cycles,
                 &desc_input_hash,
@@ -3648,7 +3709,10 @@ async fn miner_brain(
                 } else {
                     snapshot.fulfillment_timeout
                 },
-                time_remaining,
+                // The provable window (full window − release/fulfill margins − fixed proving
+                // allowance), NOT the full fulfillment window: the evaluator must size feasibility and
+                // risk against the time the prove path actually gets. See `prove_window` above.
+                time_remaining: prove_window,
                 estimated_cycles,
                 required_collateral,
                 available_collateral,
@@ -3771,6 +3835,10 @@ async fn miner_brain(
                 // (its served ELF's vkey/image-id can never match its programId); the claim gate skips
                 // it anyway.
                 && !program_vkey_mismatched(pid)
+                // Don't re-spawn a measure task (descriptor fetch + return) every tick for a job the
+                // submitter exclusively assigned to ANOTHER prover; skip it for a cooldown so it cannot
+                // monopolize the per-tick measure budget. Time-bounded, since exclusivity expires.
+                && !assigned_elsewhere_recently(&assigned_elsewhere, dh)
             {
                 let backend = backend_opt.unwrap_or("");
                 // Dedup by descriptor hash so N sightings spawn ONE execution; cleared below.
@@ -3796,7 +3864,7 @@ async fn miner_brain(
                     })
                     .unwrap_or(false);
                 if fresh {
-                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2, skip2, jcache2, pcache2) = (
+                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2, skip2, jcache2, pcache2, acache) = (
                         client.clone(),
                         state.clone(),
                         measured_cycles.clone(),
@@ -3807,6 +3875,7 @@ async fn miner_brain(
                         desc_skip.clone(),
                         measured_journal.clone(),
                         desc_payload.clone(),
+                        assigned_elsewhere.clone(),
                     );
                     tokio::spawn(async move {
                         // measure_cycles does all caching: it records desc->input, negative-caches a
@@ -3830,6 +3899,7 @@ async fn miner_brain(
                             &skip2,
                             &jcache2,
                             &pcache2,
+                            &acache,
                         )
                         .await;
                         // Clear the per-descriptor in-flight marker so a transient failure can retry.
@@ -3858,7 +3928,10 @@ async fn miner_brain(
                     &slots,
                     queue_horizon,
                     params.estimated_cycles,
-                    std::time::Duration::from_secs(time_remaining),
+                    // Same provable window as the live evaluator (release/fulfill margins + fixed
+                    // proving allowance already subtracted); the planner had the identical
+                    // full-window-optimism defect.
+                    std::time::Duration::from_secs(prove_window),
                     deadline_safety_margin,
                     // Fallback for a GPU with no benchmark row. Deliberately NOT
                     // `average_throughput()`: that averages the 18 canonical results
@@ -5882,6 +5955,7 @@ async fn measure_cycles(
     desc_skip: &DescSkip,
     measured_journal: &JournalLenCache,
     desc_payload: &DescPayloadCache,
+    assigned_elsewhere: &AssignedElsewhere,
 ) {
     // Cheap availability probe FIRST, for THIS backend. The fetches below can hit the chain, and
     // under load most measurement attempts are skipped for a busy worker — doing the RPC work only to
@@ -5938,13 +6012,18 @@ async fn measure_cycles(
     let descriptor_payload =
         descriptor.inputData.len() + descriptor.callbackExtraData.len() + descriptor.extraVerifierData.len();
     if descriptor_payload > MAX_DESCRIPTOR_PAYLOAD_BYTES {
+        // This descriptor's payload alone would OOG-revert fulfill. Mark it in `desc_skip` (keyed by
+        // descriptor hash, so it never mis-skips a sibling) so the claim gate short-circuits it on
+        // every later tick instead of re-fetching its descriptor and re-occupying a measure-budget
+        // slot here forever. Deterministic for this descriptor; the over-cap payload cannot shrink.
         tracing::warn!(
             "measure {}: descriptor payload is {} bytes (> {} cap) — would OOG-revert fulfill; \
-             skipping before claim (not sizing, so never claimed)",
+             marking unclaimable so it is not re-fetched or re-measured every tick",
             short_id(program_id),
             descriptor_payload,
             MAX_DESCRIPTOR_PAYLOAD_BYTES
         );
+        mark_desc_unfulfillable(desc_skip, descriptor_hash);
         return;
     }
     // Skip a job the submitter assigned exclusively to a DIFFERENT prover: the candidate
@@ -5956,11 +6035,16 @@ async fn measure_cycles(
     {
         let assigned = descriptor.assignedProver;
         if assigned != alloy::primitives::Address::ZERO && assigned != client.address {
+            // Cooldown this descriptor so the measure-spawn gate stops re-selecting it (fetch + return)
+            // every tick and it cannot monopolize the measure budget. TIME-BOUNDED, not permanent:
+            // on-chain exclusivity expires, so after the cooldown the job is re-evaluated.
             tracing::debug!(
-                "measure {}: job assigned to another prover ({}) — skipping (we cannot claim it)",
+                "measure {}: job assigned to another prover ({}) — skipping for a cooldown (we cannot \
+                 claim it until exclusivity lapses)",
                 short_id(program_id),
                 assigned
             );
+            mark_assigned_elsewhere(assigned_elsewhere, descriptor_hash);
             return;
         }
     }
@@ -6110,20 +6194,60 @@ async fn measure_cycles(
     {
         Ok(Ok(e)) => e,
         Ok(Err(e)) => {
-            tracing::debug!(
-                "measure {}: ELF fetch failed (transient): {}",
-                short_id(program_id),
-                zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
-            );
+            // An ELF fetch failure is usually transient (RPC/storage), but a submitter can make it
+            // PERMANENT and free by serving a stalling or withheld ELF: without a bound this re-fetches
+            // every tick forever, starving the measure budget and all claiming. Strike-count it per
+            // (program, input) exactly like the execute-failure path below — a genuinely transient
+            // failure clears on the next success, while a repeatable one is negative-cached
+            // UNMEASURABLE after MEASURE_TIMEOUT_STRIKES so it stops being re-selected. (Trade-off,
+            // identical to the execute path: a sustained >3-tick outage of a LEGITIMATE program also
+            // retires it until restart; the on-disk ELF cache means a once-fetched program never hits
+            // this, so it bites only a never-yet-cached program whose host is down during measurement.)
+            let strikes = bump_measure_strikes(measure_strikes, backend, program_id, input_hash);
+            if strikes >= MEASURE_TIMEOUT_STRIKES {
+                tracing::warn!(
+                    "measure {} ({backend}): ELF fetch failed #{strikes} (>= {}) — marking infeasible \
+                     so it is not re-fetched or re-measured every tick: {}",
+                    short_id(program_id),
+                    MEASURE_TIMEOUT_STRIKES,
+                    zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+                );
+                insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
+                clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+            } else {
+                tracing::debug!(
+                    "measure {}: ELF fetch failed #{strikes} (< {}, may be transient): {}",
+                    short_id(program_id),
+                    MEASURE_TIMEOUT_STRIKES,
+                    zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+                );
+            }
             return;
         }
         Err(_elapsed) => {
-            tracing::debug!(
-                "measure {}: ELF fetch exceeded the {}s measure-fetch budget — skipping (transient); \
-                 a later tick retries",
-                short_id(program_id),
-                MEASURE_FETCH_BUDGET.as_secs()
-            );
+            // A wall-clock timeout on the fetch (a slow or stalling ELF host) gets the same bounded
+            // treatment, so a submitter cannot pin a measure-budget slot for MEASURE_FETCH_BUDGET every
+            // tick indefinitely.
+            let strikes = bump_measure_strikes(measure_strikes, backend, program_id, input_hash);
+            if strikes >= MEASURE_TIMEOUT_STRIKES {
+                tracing::warn!(
+                    "measure {} ({backend}): ELF fetch exceeded the {}s budget #{strikes} (>= {}) — \
+                     marking infeasible so it is not re-fetched every tick",
+                    short_id(program_id),
+                    MEASURE_FETCH_BUDGET.as_secs(),
+                    MEASURE_TIMEOUT_STRIKES
+                );
+                insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
+                clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+            } else {
+                tracing::debug!(
+                    "measure {}: ELF fetch exceeded the {}s budget #{strikes} (< {}) — a later tick \
+                     retries (may be transient)",
+                    short_id(program_id),
+                    MEASURE_FETCH_BUDGET.as_secs(),
+                    MEASURE_TIMEOUT_STRIKES
+                );
+            }
             return;
         }
     };

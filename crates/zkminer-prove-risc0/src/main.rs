@@ -208,6 +208,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         let kind = if lower.contains("guest panicked")
                             || lower.contains("session limit")
                             || lower.contains("exceeded cycle")
+                            || lower.contains("non-zero exit code")
                         {
                             ErrorKind::InvalidInput
                         } else if msg.contains("does not match job programId") {
@@ -496,6 +497,22 @@ fn run_execute(
         .execute(env, elf)
         .map_err(|e| anyhow::anyhow!("execute: {e}"))?;
 
+    // A guest that does not halt with exit code 0 can NEVER produce a receipt that
+    // `receipt.verify(image_id)` accepts (verify builds the expected claim as Halted(0)), so this
+    // (program, input) is permanently unprovable and unfulfillable. Reject it HERE, on the pre-claim
+    // measure path, so the host strike-negative-caches it per (program, input) and never claims it —
+    // instead of sizing it feasible, locking collateral on a claim, then force-releasing at a penalty
+    // when the proof is rejected post-prove. Deterministic for (ELF, input); a legitimate job halts 0.
+    match session.exit_code {
+        risc0_zkvm::ExitCode::Halted(0) => {}
+        other => {
+            anyhow::bail!(
+                "execute: guest did not halt successfully (exit {other:?}) — a non-zero exit code can \
+                 never produce an accepted proof for this program+input"
+            );
+        }
+    }
+
     // `SessionInfo::cycles()` is the total cycle count, matching what proving reports.
     let cycles = session.cycles();
     // The journal the guest committed here is byte-identical to the one the later proof
@@ -594,7 +611,9 @@ fn run_proof(
                 // panic with "receipt is invalid" and buy itself MAX_ATTEMPTS full re-proves of wasted
                 // GPU. The genuine GPU-corruption signals this retry targets are host-generated (segment
                 // verification / receipt.verify), never wrapped as a guest panic.
-                let guest_fault = msg.contains("guest panicked") || msg.contains("session limit");
+                let guest_fault = msg.contains("guest panicked")
+                    || msg.contains("session limit")
+                    || msg.contains("non-zero exit code");
                 let recoverable = !guest_fault
                     && (msg.contains("verification indicates")
                         || msg.contains("verify segment")
@@ -666,6 +685,28 @@ fn run_proof_once(
     // Verify proof locally before returning — catches GPU corruption (e.g., ROCm SHA-256 bug)
     let image_id =
         risc0_zkvm::compute_image_id(elf).context("Failed to compute image ID for verification")?;
+
+    // Defense in depth against a guest that halts with a non-zero exit code: `receipt.verify` below
+    // builds the expected claim as Halted(0), so a non-zero exit deterministically fails verification
+    // with a ClaimDigestMismatch that surfaces as "receipt is invalid" — which the retry wrapper in
+    // `run_proof` would otherwise mistake for a (nondeterministic) GPU race and re-prove MAX_ATTEMPTS
+    // times. Detect the non-zero exit explicitly and fail with a distinct, NON-recoverable error (it
+    // does not match the invalid-proof retry phrases) so it is never retried. The pre-claim measure
+    // gate already rejects such a program+input, so reaching here means a stale cached measurement or
+    // a race — but we must still never burn repeated Groth16 proofs on a deterministic fault. If the
+    // claim is pruned/unreadable this is a no-op and `receipt.verify` runs exactly as before.
+    if let Ok(claim) = receipt.claim() {
+        if let Ok(rc) = claim.as_value() {
+            if !matches!(rc.exit_code, risc0_zkvm::ExitCode::Halted(0)) {
+                anyhow::bail!(
+                    "guest halted with a non-zero exit code ({:?}) — unprovable program+input, not a \
+                     GPU race",
+                    rc.exit_code
+                );
+            }
+        }
+    }
+
     receipt.verify(image_id).context(
         "Proof verification FAILED — receipt is invalid, GPU may have produced corrupt output",
     )?;
