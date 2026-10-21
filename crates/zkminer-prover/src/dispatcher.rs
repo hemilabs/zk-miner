@@ -1354,7 +1354,7 @@ pub struct WorkerPool {
     /// measurement path (`execute_cycles` / `has_idle_or_revivable_worker`) consults this map. One
     /// per backend (SP1 only today); its watchdog SIGKILL can never reach a proving worker's warm
     /// `sp1-gpu-server`, which is the whole point. See `SP1_MEASURE_ONLY_ENV`.
-    measure_workers: HashMap<String, WorkerEntry>,
+    measure_workers: HashMap<String, Vec<WorkerEntry>>,
     explicit_binaries: HashMap<String, PathBuf>,
     search_dirs: Vec<PathBuf>,
     /// Per-suite benchmark timeout. None = no timeout. The watchdog SIGKILLs
@@ -1759,49 +1759,57 @@ impl WorkerPool {
             }
         }
 
-        // Provision ONE dedicated, CPU-only SP1 MEASURE worker (see `measure_workers` /
-        // `SP1_MEASURE_ONLY_ENV`). It handles every SP1 `Execute` (cycle sizing), so a measure
-        // wall-clock-watchdog SIGKILL — which group-kills the worker — can only ever hit this
-        // server-less process, never a proving worker's warm `sp1-gpu-server`. One per backend
-        // (execute is CPU work with no card affinity). SP1 only: risc0 measures on its own prove
-        // worker, which keeps no warm child, so a measure SIGKILL there costs nothing.
+        // Provision a small POOL of dedicated, CPU-only SP1 MEASURE workers (see `measure_workers` /
+        // `SP1_MEASURE_ONLY_ENV`). They handle every SP1 `Execute` (cycle sizing), so a measure
+        // wall-clock-watchdog SIGKILL — which group-kills a worker — can only ever hit a server-less
+        // measure process, never a proving worker's warm `sp1-gpu-server`. A POOL (not one) restores
+        // the concurrency the per-GPU prove-pool scan used to give, so one slow/stuck measurement
+        // cannot serialize ALL SP1 sizing (and spreads the single-point-of-failure risk). SP1 only:
+        // risc0 measures on its own prove worker, which keeps no warm child.
+        //
+        // POLICY DEFAULT: pool size = ZKMINER_SP1_MEASURE_WORKERS or 2, clamped to [1,8]. This is a
+        // host-RAM/CPU-vs-measurement-concurrency trade-off — each worker is a CpuProver (a
+        // multi-threaded tokio runtime), and they run concurrent CPU executions alongside GPU proofs;
+        // host-RAM admission on the measure path (added separately) bounds the aggregate.
         if let Some(path) = sp1_measure_path {
-            let mut menv = HashMap::new();
-            menv.insert(
-                zkminer_prover_protocol::types::SP1_MEASURE_ONLY_ENV.to_string(),
-                "1".to_string(),
-            );
             let backend = zkminer_prover_protocol::BACKEND_SP1.to_string();
-            let mkey = format!("{backend}:measure");
-            let (handle, pid, starttime, failures, last_failure) =
-                match WorkerHandle::spawn(&backend, &path, &menv) {
-                    Ok(h) => {
-                        let worker_pid = h.pid();
-                        tracing::info!(
-                            "Measure worker {mkey} ready (pid {worker_pid}, binary {})",
-                            path.display()
-                        );
-                        let st = crate::memory::pid_starttime(worker_pid).unwrap_or(0);
-                        (Some(h), worker_pid, st, 0, None)
-                    }
-                    Err(e) => {
-                        // Non-fatal, but we do NOT fall back to measuring on a prove worker (that would
-                        // re-open the server-teardown DoS). Register a DOWN entry so `ensure_alive` can
-                        // revive it later, mirroring the prove-slot spawn-failure path; SP1 measurement
-                        // is simply unavailable until it comes up. The measure worker shares the SP1
-                        // binary that just spawned proving workers and skips the GPU probe, so a
-                        // measure-only spawn failure is near-impossible in practice.
-                        tracing::error!("Failed to start SP1 measure worker {mkey}: {e:#}");
-                        (None, 0u32, 0u64, 1u32, Some(Instant::now()))
-                    }
-                };
-            self.measure_workers.insert(
-                backend.clone(),
-                WorkerEntry {
+            let pool_size = std::env::var("ZKMINER_SP1_MEASURE_WORKERS")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(2)
+                .clamp(1, 8);
+            let mut pool: Vec<WorkerEntry> = Vec::with_capacity(pool_size);
+            for i in 0..pool_size {
+                let mut menv = HashMap::new();
+                menv.insert(
+                    zkminer_prover_protocol::types::SP1_MEASURE_ONLY_ENV.to_string(),
+                    "1".to_string(),
+                );
+                let mkey = format!("{backend}:measure:{i}");
+                let (handle, pid, starttime, failures, last_failure) =
+                    match WorkerHandle::spawn(&backend, &path, &menv) {
+                        Ok(h) => {
+                            let worker_pid = h.pid();
+                            tracing::info!(
+                                "Measure worker {mkey} ready (pid {worker_pid}, binary {})",
+                                path.display()
+                            );
+                            let st = crate::memory::pid_starttime(worker_pid).unwrap_or(0);
+                            (Some(h), worker_pid, st, 0, None)
+                        }
+                        Err(e) => {
+                            // Non-fatal; we never fall back to measuring on a prove worker (that would
+                            // re-open the server-teardown DoS). Register a DOWN entry so `ensure_alive`
+                            // can revive it later, mirroring the prove-slot spawn-failure path.
+                            tracing::error!("Failed to start SP1 measure worker {mkey}: {e:#}");
+                            (None, 0u32, 0u64, 1u32, Some(Instant::now()))
+                        }
+                    };
+                pool.push(WorkerEntry {
                     slot: Mutex::new(WorkerSlot {
                         handle,
-                        path,
-                        backend,
+                        path: path.clone(),
+                        backend: backend.clone(),
                         gpu_tag: "measure".to_string(),
                         device_index: None,
                         pci_bus_id: None,
@@ -1817,8 +1825,9 @@ impl WorkerPool {
                     pid: Arc::new(AtomicU32::new(pid)),
                     pid_starttime: Arc::new(AtomicU64::new(starttime)),
                     intentional_kill: Arc::new(AtomicBool::new(false)),
-                },
-            );
+                });
+            }
+            self.measure_workers.insert(backend, pool);
         }
 
         connected
@@ -3076,11 +3085,13 @@ impl WorkerPool {
         // A dedicated measure worker handles this backend's measurements EXCLUSIVELY (see
         // `execute_cycles`), so when one exists its liveness — not the prove pool's — is what gates
         // the measure path. Report live-and-idle OR down-but-revivable, matching the prove-pool arm.
-        if let Some(e) = self.measure_workers.get(backend) {
-            return e
-                .slot
-                .try_lock()
-                .is_ok_and(|sl| sl.handle.is_some() || Self::slot_dispatchable(&sl));
+        if let Some(pool) = self.measure_workers.get(backend) {
+            // ANY measure worker live-and-idle OR down-but-revivable gates the measure path.
+            return pool.iter().any(|e| {
+                e.slot
+                    .try_lock()
+                    .is_ok_and(|sl| sl.handle.is_some() || Self::slot_dispatchable(&sl))
+            });
         }
         self.keys_for_prefix(backend).iter().any(|k| {
             self.workers.get(k).is_some_and(|e| {
@@ -3126,7 +3137,11 @@ impl WorkerPool {
         // teardown DoS. A backend with no measure worker (risc0, or SP1 before provisioning) measures
         // on its prove pool exactly as before.
         let candidates: Vec<(String, &WorkerEntry)> = match self.measure_workers.get(backend) {
-            Some(entry) => vec![(format!("{backend}:measure"), entry)],
+            Some(pool) => pool
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (format!("{backend}:measure:{i}"), e))
+                .collect(),
             None => self
                 .keys_for_prefix(backend)
                 .into_iter()
@@ -5751,7 +5766,11 @@ impl WorkerPool {
     pub fn shutdown_all(&self) {
         // Phase 1: Gracefully shut down idle workers (those whose Mutex is free). Include the
         // dedicated measure worker(s) in every phase so they are not leaked as orphans on exit.
-        for (key, entry) in self.workers.iter().chain(self.measure_workers.iter()) {
+        for (key, entry) in self
+            .workers
+            .iter()
+            .chain(self.measure_workers.iter().flat_map(|(k, v)| v.iter().map(move |e| (k, e))))
+        {
             if let Ok(mut slot) = entry.slot.try_lock() {
                 if let Some(handle) = &mut slot.handle {
                     tracing::info!("Sending Shutdown to idle worker {key}");
@@ -5762,7 +5781,11 @@ impl WorkerPool {
 
         // Phase 2: SIGTERM all PIDs (idle workers already got Shutdown; busy ones
         // can't read IPC, but SIGTERM's default handler terminates them cleanly)
-        for (key, entry) in self.workers.iter().chain(self.measure_workers.iter()) {
+        for (key, entry) in self
+            .workers
+            .iter()
+            .chain(self.measure_workers.iter().flat_map(|(k, v)| v.iter().map(move |e| (k, e))))
+        {
             // Identity-checked, as everywhere a pid from this atomic is signalled.
             let Some((pid, expected_start)) = entry.signal_target() else {
                 continue;
@@ -5788,7 +5811,7 @@ impl WorkerPool {
         // worker calls setpgid(0,0) at spawn) so forked GPU/helper children die
         // too instead of leaking as orphans between suites. pid is non-zero here,
         // so kill(-pid) can never degenerate into kill(0)/kill(-1).
-        for entry in self.workers.values().chain(self.measure_workers.values()) {
+        for entry in self.workers.values().chain(self.measure_workers.values().flatten()) {
             // Identity-checked, as everywhere a pid from this atomic is signalled.
             let Some((pid, expected_start)) = entry.signal_target() else {
                 continue;
@@ -5813,7 +5836,7 @@ impl WorkerPool {
         // and 3 read it — a respawn finishing mid-shutdown — and would then hold the slot for a whole
         // proof while that worker's `sp1-gpu-server` outlives us. So each held slot is polled, and any
         // pid published in the meantime is killed, whose EOF ends the dispatch and frees the slot.
-        for entry in self.workers.values().chain(self.measure_workers.values()) {
+        for entry in self.workers.values().chain(self.measure_workers.values().flatten()) {
             let mut slot = loop {
                 match entry.slot.try_lock() {
                     Ok(slot) => break slot,
