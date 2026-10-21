@@ -104,6 +104,7 @@ fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
             None,
             None,
             None,
+            None,
         );
         r.map(|_| ()).map_err(|e| format!("{e:#}"))
     });
@@ -135,6 +136,7 @@ fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
         &[],
         &[],
         &mut used2,
+        None,
         None,
         None,
         None,

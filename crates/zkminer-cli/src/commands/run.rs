@@ -3634,6 +3634,28 @@ async fn miner_brain(
             // through the batch tuple → spawn_lifecycle_task → process_job_lifecycle unchanged.
             snapshot.measured_cycles = measured_for_job;
 
+            // Per-device throughputs for THIS job's backend (the same rows the planner uses). Size the
+            // live claim gate on the SLOWEST eligible card so admission is safe wherever dispatch lands
+            // the job, and record the FASTEST eligible card as the preferred dispatch target so the job
+            // runs on the card it was planned for when that card is free (graceful fallback otherwise).
+            // When the look-ahead planner is active it is the finer, per-device admission gate and
+            // overrides this preference with its own backlog-aware choice below — so the live gate stays
+            // on the suite average there to avoid double-counting its conservatism into an over-refusal.
+            let backend_throughputs =
+                throughputs_for_backend(&device_backend_throughputs, backend_opt.unwrap_or(""));
+            let slowest_eligible = backend_throughputs
+                .iter()
+                .map(|(_, t)| *t)
+                .filter(|t| t.is_finite() && *t > 0.0)
+                .fold(f64::INFINITY, f64::min)
+                .pipe_finite_or(0.0);
+            snapshot.preferred_device = backend_throughputs
+                .iter()
+                .filter(|(_, t)| t.is_finite() && *t > 0.0)
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(id, _)| id.clone());
+            let live_gate_throughput = if planner_active { 0.0 } else { slowest_eligible };
+
             // Backstop the per-descriptor fulfill-payload screen at the claim gate, evaluated HERE —
             // right after resolve_measured — so the measured-cycle and journal-length caches are read
             // at one consistent point (past the adapter-query await above, and after the measure task's
@@ -3740,7 +3762,10 @@ async fn miner_brain(
                 available_collateral,
                 token_price_usd,
                 fee_rate_bps: adapter_info.fee_rate_bps,
-                throughput: 0.0, // use suite average
+                // Slowest eligible card for this backend when the planner is off (safe for any
+                // dispatch landing); suite average when the planner is on (it is the finer gate). 0.0
+                // falls back to the suite average inside the evaluator. See `live_gate_throughput`.
+                throughput: live_gate_throughput,
                 max_price: job.info.max_price.max(snapshot.current_price),
                 // No specific card chosen yet (the dispatcher picks one at prove time), so
                 // the cost model charges the suite's mean card — paired with the suite-average
@@ -4038,6 +4063,9 @@ async fn miner_brain(
                     // planner's one invariant — feasible from the start it would actually get
                     // — was void at any depth >= 2, i.e. the feature's own steady state.
                     queue_model.commit(jid.0, &a.device_id, a.finishes_in);
+                    // Prefer the planner's per-device, backlog-aware device over the fastest-eligible
+                    // hint set above; dispatch tries it first, with the same graceful fallback.
+                    snapshot.preferred_device = Some(a.device_id.clone());
                 }
                 reserved_this_tick = reserved_this_tick.saturating_add(required_collateral);
                 available_collateral = available_collateral.saturating_sub(required_collateral);
@@ -4645,6 +4673,10 @@ struct JobStatusSnapshot {
     /// the candidate loop from `resolve_measured`; `None` on paths without a measurement (recovery,
     /// non-measurable backends), where the sizing falls back to the FALLBACK floor, never below it.
     measured_cycles: Option<u64>,
+    /// Benchmark device id (e.g. "gpu1") of the card this job was sized/planned for at claim time,
+    /// passed to the dispatcher as a PREFERENCE (tried first, graceful fallback). `None` on paths
+    /// without a plan (recovery, non-measurable backends). See `prove_min_vram`'s `preferred_device`.
+    preferred_device: Option<String>,
 }
 
 impl JobStatusSnapshot {
@@ -4669,6 +4701,7 @@ impl JobStatusSnapshot {
             // Set by the candidate loop once the measurement for this (backend, program, input) is
             // resolved; the view itself carries no measured count.
             measured_cycles: None,
+            preferred_device: None,
         }
     }
 }
@@ -5337,6 +5370,8 @@ async fn process_job_lifecycle(
             // Cloned per attempt: the closure below moves into `spawn_blocking`, and the retry loop
             // needs the list again next time round.
             let disabled_for_prove = disabled_slots.clone();
+            // The card this job was planned for (benchmark id, e.g. "gpu1"), preferred at dispatch.
+            let preferred_for_prove = snapshot.preferred_device.clone();
             let (proof_result, used_slot) = match tokio::task::spawn_blocking(move || {
                 let resolve_backend = backend_str.clone();
                 let po2_for_device = move |device_id: &str| -> Option<u8> {
@@ -5422,6 +5457,7 @@ async fn process_job_lifecycle(
                     abort_at,
                     Some(&po2_for_device),
                     program_id_bytes,
+                    preferred_for_prove.as_deref(),
                 );
                 (r, used)
             })

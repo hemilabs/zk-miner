@@ -2969,6 +2969,7 @@ impl WorkerPool {
             None,
             None,
             None, // program_id: convenience path (tests/benchmark) has no on-chain binding
+            None, // preferred_device: convenience path does not reserve a card
         )
     }
 
@@ -3254,6 +3255,12 @@ impl WorkerPool {
         po2_resolver: Option<&dyn Fn(&str) -> Option<u8>>,
         // The job's on-chain programId (risc0 image-id binding; see WorkerCommand::Prove).
         program_id: Option<[u8; 32]>,
+        // Benchmark device id (e.g. "gpu1") of the card this job was sized/planned for at claim time.
+        // Tried FIRST when dispatchable, as a PREFERENCE only: if it is not in the candidate set or is
+        // busy/down, dispatch falls through to the usual warm-first / first-free ordering, so a job is
+        // never stranded waiting for a reserved card. Feasibility is sized for the SLOWEST eligible
+        // card, so any fallback landing still meets the deadline.
+        preferred_device: Option<&str>,
     ) -> Result<ProofOutput> {
         let mut all_keys = self.keys_for_prefix(backend);
         if all_keys.is_empty() {
@@ -3382,6 +3389,12 @@ impl WorkerPool {
             rotated
         };
 
+        // Honor a claim-time device preference (see `preferred_device`): move its slot key, if present
+        // in the candidate set, to the FRONT so the dispatch loop (and the poll-wait loop, which
+        // reuses this ordering) tries it first. Pure preference — everything else keeps its warm-first
+        // order, and a preferred card that is busy/down simply yields to the next candidate.
+        let keys = Self::prefer_device_first(keys, preferred_device);
+
         for key in &keys {
             if let Some(entry) = self.workers.get(key) {
                 // Prefer a worker whose PHYSICAL GPU is idle: skip one whose gpu_lock
@@ -3501,6 +3514,29 @@ impl WorkerPool {
                 );
             }
             std::thread::sleep(QUEUE_POLL);
+        }
+    }
+
+    /// Reorder slot keys so the key whose benchmark device id equals `preferred` (e.g. "gpu1") comes
+    /// FIRST, preserving the relative order of the rest. A PREFERENCE only: a `preferred` that is
+    /// `None` or matches no key leaves the order unchanged, and a matched-but-busy/down card simply
+    /// yields to the next candidate in the dispatch/poll loops — a job is never stranded on it.
+    ///
+    /// Note: this takes precedence over the warm-slot-first ordering applied by the caller, so a COLD
+    /// preferred card is tried ahead of a warm one. Under host-memory pressure that cold card may take
+    /// a host-RAM backoff (resident pages make a warm slot cheaper to admit) before its proof starts;
+    /// the caller'"'"'s retry loop handles that. The admission estimate is sized for the slowest eligible
+    /// card regardless, so preferring any particular card never risks the deadline.
+    fn prefer_device_first(keys: Vec<String>, preferred: Option<&str>) -> Vec<String> {
+        match preferred {
+            Some(pref) => {
+                let (mut preferred, rest): (Vec<String>, Vec<String>) = keys
+                    .into_iter()
+                    .partition(|k| Self::benchmark_device_id(k) == pref);
+                preferred.extend(rest);
+                preferred
+            }
+            None => keys,
         }
     }
 
@@ -5852,6 +5888,23 @@ impl WorkerPool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefer_device_first_moves_matching_key_to_front() {
+        use super::WorkerPool;
+        let keys = vec![
+            "risc0:cuda:0".to_string(),
+            "risc0:cuda:1".to_string(),
+            "risc0:cuda:2".to_string(),
+        ];
+        // "gpu1" -> risc0:cuda:1 is moved first; the rest keep their relative order.
+        assert_eq!(
+            WorkerPool::prefer_device_first(keys.clone(), Some("gpu1")),
+            vec!["risc0:cuda:1", "risc0:cuda:0", "risc0:cuda:2"]
+        );
+        // A preference that matches nothing, or None, leaves the order unchanged (graceful fallback).
+        assert_eq!(WorkerPool::prefer_device_first(keys.clone(), Some("gpu9")), keys);
+        assert_eq!(WorkerPool::prefer_device_first(keys.clone(), None), keys);
+    }
     use super::*;
 
     // ---- slot_key tests ----
