@@ -3233,6 +3233,36 @@ impl WorkerPool {
         // death excused as intentional.
         entry.intentional_kill.store(false, Ordering::Release);
 
+        // Charge this measurement's conservative host-RAM peak to the shared ledger BEFORE running it,
+        // but ONLY on a dedicated measure worker (SP1): the CPU executor materialises the
+        // (submitter-controlled) guest's touched memory with no RSS bound, and the measure worker is
+        // otherwise invisible to the ledger, so without this a crafted guest's balloon plus admitted
+        // proofs can exceed physical RAM and the kernel OOM-kills the largest process — the warm
+        // sp1-gpu-server. On shortage, refuse now (nothing ran); the caller (`measure_cycles`) treats a
+        // HostMemoryShortage as transient — no strike, no breaker. risc0 measures on its prove worker,
+        // whose proofs the ledger already tracks, so it is exempt. Held across the Execute below.
+        let _measure_mem = if self.measure_workers.contains_key(backend) {
+            let total = crate::memory::mem_total_bytes().unwrap_or(u64::MAX);
+            let want = crate::memory::sp1_measure_peak_bytes()
+                .min(crate::memory::max_admissible_budget(total));
+            match self.reserve_host_memory(want, key) {
+                Some(r) => Some(r),
+                None => {
+                    return Err(anyhow::Error::new(
+                        zkminer_prover_protocol::types::HostMemoryShortage {
+                            attempted: false,
+                            slot_key: key.to_string(),
+                            needed: want,
+                            reserved: self.reserved_host_memory(),
+                            available: crate::memory::mem_available_bytes().unwrap_or(0),
+                        },
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         handle.send(&WorkerCommand::Execute {
             request_id,
             elf: elf.to_vec(),

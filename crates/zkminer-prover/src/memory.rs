@@ -50,6 +50,26 @@ pub const SP1_WARMUP_PEAK_BYTES: u64 = 15 * 1024 * 1024 * 1024;
 /// default GC), for a peak read from live processes only, by which time the helper has exited.
 pub const SP1_GROTH16_HELPER_PEAK_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// Conservative host-RAM charge for ONE pre-claim SP1 cycle MEASUREMENT on a dedicated CPU measure
+/// worker. The CpuProver executor materialises the (submitter-controlled) guest's touched memory in
+/// host RAM, bounded only by the cycle cap and the wall-clock watchdog — NOT by RSS — so a crafted
+/// guest can balloon multi-GiB. Reserving this against the shared `MemoryLedger` before dispatching
+/// the Execute keeps admitted proofs + live measurements from summing past physical RAM and OOM-ing
+/// the warm sp1-gpu-server. A conservative estimate (the executor baseline plus headroom), clamped to
+/// the admissible budget at the call site; override with `ZKMINER_SP1_MEASURE_PEAK_BYTES`. Too high
+/// defers measurements under mild pressure (a job cannot be claimed until measured); too low
+/// under-charges the ledger. POLICY DEFAULT: 4 GiB.
+pub const SP1_MEASURE_PEAK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Effective SP1 measurement host-RAM charge, honoring the `ZKMINER_SP1_MEASURE_PEAK_BYTES` override.
+pub fn sp1_measure_peak_bytes() -> u64 {
+    std::env::var("ZKMINER_SP1_MEASURE_PEAK_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(SP1_MEASURE_PEAK_BYTES)
+}
+
 /// `/proc/pressure/memory`'s `full avg10`, in percent, above which the host is genuinely stalling.
 ///
 /// This is the SYSTEM-wide PSI file, not a cgroup's `memory.pressure`. `full` means all non-idle

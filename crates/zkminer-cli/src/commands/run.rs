@@ -6571,6 +6571,20 @@ async fn measure_cycles(
             }
         }
         Ok(Err(e)) => {
+            // A host-RAM admission refusal from the measure path (the shared ledger would be
+            // over-committed) is TRANSIENT — nothing ran, the program is fine — so never strike it or
+            // bump the breaker; skip and let a later tick retry once memory frees. Must precede the
+            // strike logic below, which would otherwise treat it as a repeatable execute failure and
+            // eventually negative-cache a perfectly measurable program.
+            if e.downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+                .is_some()
+            {
+                tracing::debug!(
+                    "measure {}: deferred — host RAM is committed, not sizing now (transient)",
+                    short_id(program_id)
+                );
+                return;
+            }
             let msg = format!("{e:#}");
             // The message embeds guest/worker-controlled text; sanitize before logging
             // (classification still matches the RAW text — the precise cap phrase, not the sanitized
