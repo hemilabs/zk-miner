@@ -30,11 +30,25 @@ fn is_secret_env_name(name: &str) -> bool {
 /// emit arbitrary bytes here. Forwarding them verbatim would let it inject ANSI/terminal escape
 /// sequences into the operator's console or forge log lines (via carriage returns). Strip control
 /// characters (keep tab) and cap the length so neither is possible.
+/// Bidi/directional-format chars and line/paragraph separators that `char::is_control()` (Cc-only)
+/// does not catch but that still reorder or forge log lines (Trojan-Source, CVE-2021-42574). Kept in
+/// sync with `zkminer_chain::programs::sanitize_log`'s `is_log_unsafe_format`; a guest's stdout is
+/// forwarded through here, so it needs the same hardening the structured-error sanitizer already has.
+fn is_worker_log_unsafe_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2028}' | '\u{2029}'               // line / paragraph separator (Zl, Zp)
+        | '\u{200E}' | '\u{200F}' | '\u{061C}' // LRM / RLM / ALM
+        | '\u{202A}'..='\u{202E}'             // LRE / RLE / PDF / LRO / RLO
+        | '\u{2066}'..='\u{2069}'             // LRI / RLI / FSI / PDI (isolates)
+    )
+}
+
 fn sanitize_worker_line(line: &str) -> String {
     const MAX: usize = 2048;
     let mut out: String = line
         .chars()
-        .filter(|&c| c == '\t' || !c.is_control())
+        .filter(|&c| c == '\t' || (!c.is_control() && !is_worker_log_unsafe_format(c)))
         .take(MAX)
         .collect();
     if line.chars().count() > MAX {
@@ -1420,6 +1434,18 @@ fn reap_within(child: &mut Child, budget: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sanitize_worker_line_strips_control_and_bidi_and_separators() {
+        use super::sanitize_worker_line;
+        // Cc control (ESC/CR/LF) stripped, printable + tab kept.
+        assert_eq!(sanitize_worker_line("a\r\nb\x1b[31mc\td"), "ab[31mc\td");
+        // Bidi overrides/isolates (Cf) and line/paragraph separators (Zl/Zp) stripped too.
+        for bad in ['\u{202E}', '\u{2066}', '\u{200F}', '\u{061C}', '\u{2028}', '\u{2029}'] {
+            assert_eq!(sanitize_worker_line(&format!("safe{bad}text")), "safetext", "{:?} must go", bad);
+        }
+        // Ordinary unicode preserved.
+        assert_eq!(sanitize_worker_line("café-π"), "café-π");
+    }
     use super::{
         comm_from_stat, is_secret_env_name, live_group_members, parse_stat_state_pgrp,
         sanitize_worker_line,

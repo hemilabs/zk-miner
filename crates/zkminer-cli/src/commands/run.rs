@@ -3708,19 +3708,34 @@ async fn miner_brain(
             // When the look-ahead planner is active it is the finer, per-device admission gate and
             // overrides this preference with its own backlog-aware choice below — so the live gate stays
             // on the suite average there to avoid double-counting its conservatism into an over-refusal.
-            let backend_throughputs =
-                throughputs_for_backend(&device_backend_throughputs, backend_opt.unwrap_or(""));
-            let slowest_eligible = backend_throughputs
+            // `throughputs_for_backend` also emits cross-backend FALLBACK rows (the global slowest)
+            // for cards with no row for THIS backend — those exist only for the planner's
+            // device-existence logic and CANNOT run this backend. Size and prefer over the GENUINE
+            // per-device rows only: a card that cannot run the backend must neither drag the slowest
+            // estimate down (over-refusing feasible work) nor be chosen as the preferred dispatch
+            // target. Only when there is no genuine row at all do we fall back to the mixed-list value
+            // (behavior there is unchanged; the empty-rows case is handled by the sizing rework).
+            let backend_name = backend_opt.unwrap_or("");
+            let genuine_throughputs: Vec<f64> = device_backend_throughputs
                 .iter()
-                .map(|(_, t)| *t)
-                .filter(|t| t.is_finite() && *t > 0.0)
-                .fold(f64::INFINITY, f64::min)
-                .pipe_finite_or(0.0);
-            snapshot.preferred_device = backend_throughputs
+                .filter(|(_, b, t)| b.as_str() == backend_name && t.is_finite() && *t > 0.0)
+                .map(|(_, _, t)| *t)
+                .collect();
+            let slowest_eligible = if genuine_throughputs.is_empty() {
+                throughputs_for_backend(&device_backend_throughputs, backend_name)
+                    .iter()
+                    .map(|(_, t)| *t)
+                    .filter(|t| t.is_finite() && *t > 0.0)
+                    .fold(f64::INFINITY, f64::min)
+                    .pipe_finite_or(0.0)
+            } else {
+                genuine_throughputs.iter().copied().fold(f64::INFINITY, f64::min)
+            };
+            snapshot.preferred_device = device_backend_throughputs
                 .iter()
-                .filter(|(_, t)| t.is_finite() && *t > 0.0)
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(id, _)| id.clone());
+                .filter(|(_, b, t)| b.as_str() == backend_name && t.is_finite() && *t > 0.0)
+                .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(id, _, _)| id.clone());
             let live_gate_throughput = if planner_active { 0.0 } else { slowest_eligible };
 
             // Backstop the per-descriptor fulfill-payload screen at the claim gate, evaluated HERE —
@@ -4989,6 +5004,15 @@ async fn process_job_lifecycle(
         return Ok(());
     }
 
+    // Pin this program's cached ELF NOW — BEFORE the obtainability fetch warms it and before the
+    // claim — and hold the guard through prove, so the on-disk LRU cannot evict the just-warmed bytes
+    // during the fetch->claim->prove window. ElfCache::get is a bare read that does NOT refresh mtime,
+    // so a cache-hit victim keeps its old measurement-time mtime and, unpinned, a concurrent decoy
+    // measurement's put->prune (oldest-mtime-first) would evict it — turning the claim into a
+    // prove-time fetch miss and a penalized release. Covers fresh (fetch+claim+prove) and recovery
+    // (prove). Dropped automatically when this task ends (every path).
+    let _elf_pin = zkminer_chain::programs::ElfPin::new(program_id);
+
     // Confirm the ELF is actually obtainable BEFORE committing collateral. A claim can
     // ride on a cached cycle MEASUREMENT (process-lifetime cache) whose ELF has since been evicted from
     // the much smaller on-disk LRU; the ELF is otherwise first (re)fetched only at prove time (step 7),
@@ -5129,12 +5153,6 @@ async fn process_job_lifecycle(
             return Err(anyhow::anyhow!("claim failed: {e:#}"));
         }
     }
-
-    // Pin this program's cached ELF so the on-disk LRU cannot evict it between here and the prove step
-    // (step 7 re-reads the cache). Without the pin, a submitter flooding distinct decoy programs during
-    // the claim->prove window could evict the just-claimed ELF, turning the claim into a prove-time
-    // fetch miss and a penalized release. Dropped automatically when this task ends (every path).
-    let _elf_pin = zkminer_chain::programs::ElfPin::new(program_id);
 
     // 3. Read fresh view post-claim to learn the authoritative lock_deadline.
     // A confirmed-claimed job always has a nonzero lockDeadline; a 0 here means a
