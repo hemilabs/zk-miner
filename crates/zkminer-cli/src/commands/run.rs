@@ -4891,6 +4891,23 @@ async fn process_job_lifecycle(
         }
     }
 
+    // Re-check shutdown AFTER the ELF-obtainability fetch above. That fetch is an await of up to
+    // MEASURE_FETCH_BUDGET (a submitter can stall the ELF host), and the earlier
+    // `!is_recovery && SHUTTING_DOWN` gate ran BEFORE it — so without this a signal landing during the
+    // fetch would let the drain union (which sees neither `active_jobs` nor the not-yet-written claim
+    // breadcrumb below) report "drain complete"/exit 0 while this task goes on to write the breadcrumb
+    // and broadcast a fresh claim, locking brand-new collateral on an exiting process. Nothing is
+    // on-chain yet, so dropping is free. `is_recovery` jobs are already locked and must still be driven.
+    if !is_recovery && SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::warn!(
+            "shutdown began during the pre-claim ELF fetch for {} — dropping, nothing locked",
+            short_id(job_id)
+        );
+        let mut s = state.write().await;
+        s.open_jobs.retain(|j| j.info.job_id != job_id);
+        return Ok(());
+    }
+
     // 1. Record claim intent BEFORE sending the claim tx, so a crash mid-claim
     //    still leaves breadcrumbs for recovery.
     journal_update(journal, |j| {
@@ -4927,6 +4944,29 @@ async fn process_job_lifecycle(
             tracing::warn!(
                 "shutdown began before {} was confirmed ours — not (re)claiming; left to the \
                  abandon path",
+                short_id(job_id)
+            );
+            let mut s = state.write().await;
+            s.open_jobs.retain(|j| j.info.job_id != job_id);
+            return Ok(());
+        }
+    }
+
+    // A program proven unclaimable since this task was dispatched (served ELF vkey/image-id can never
+    // match its programId) must not get a FRESH claim broadcast for it. The `!is_recovery` pre-claim
+    // gate above already drops fresh jobs, but the batch-reconcile UNKNOWN class and crash recovery
+    // dispatch with is_recovery=true (ownership unproven), and `claim_job_idempotent` below broadcasts
+    // a fresh claim whenever the job still reads open. Confirm ownership: if we already hold it, fall
+    // through and drive it to prove->release (never stranded); if we do NOT hold it, leave it (the
+    // breadcrumb stays for the abandon path) rather than locking new collateral on a dead-end program.
+    if is_recovery && program_vkey_mismatched(program_id) {
+        let held = matches!(
+            client.get_job_status_view(job_id).await,
+            Ok(v) if v.prover == client.address
+        );
+        if !held {
+            tracing::warn!(
+                "not re-claiming {}: its program was proved unclaimable (vkey/image-id mismatch) and                  we do not hold it — leaving it for the abandon path",
                 short_id(job_id)
             );
             let mut s = state.write().await;
@@ -7177,6 +7217,22 @@ async fn recover_claimed_jobs(
             );
             break;
         }
+        // A prior re-drive in THIS recovery pass may have proved this program unclaimable
+        // (vkey/image-id mismatch), marking VKEY_MISMATCH_PROGRAMS. The remaining recovered jobs for
+        // that same program would each re-drive into the identical guaranteed fault — burning SP1
+        // setup and serializing the recovery pass ahead of the brain loop. Release them directly
+        // (release_and_clean frees collateral we hold and retains the breadcrumb otherwise). The mark
+        // is process-wide and reset on restart, so the FIRST job of a mismatched program still
+        // re-drives once to establish it — nothing legitimate is over-blocked.
+        if program_vkey_mismatched(tracked.info.program_id) {
+            tracing::warn!(
+                "recover: {} belongs to a program already proved unclaimable this session \
+                 (vkey/image-id mismatch) — releasing instead of re-driving a guaranteed-fail prove",
+                jid
+            );
+            release_and_clean(client, state, journal, jid).await;
+            continue;
+        }
         tracing::info!("recover: re-driving fulfill path for {}", jid);
         if let Err(e) = process_job_lifecycle(
             client,
@@ -7190,7 +7246,14 @@ async fn recover_claimed_jobs(
         )
         .await
         {
-            tracing::error!("recover: {} lifecycle failed: {e:#}", jid);
+            // The error can carry a guest-controlled proof-failure message (risc0 surfaces a guest
+            // panic as "Guest panicked: <raw bytes>"), so sanitize it — the twin spawned sink does the
+            // same — before it reaches the operator console / log file.
+            tracing::error!(
+                "recover: {} lifecycle failed: {}",
+                jid,
+                zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+            );
             release_and_clean(client, state, journal, jid).await;
         }
     }
