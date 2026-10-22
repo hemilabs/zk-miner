@@ -29,7 +29,7 @@ use zkminer_chain::adapter::AdapterInfo;
 const DEADLINE_FULFILL_MARGIN_SECS: u64 = 60;
 
 /// Headroom (seconds) kept before a job's lock deadline for the abandon-and-release
-/// path (#20). The proving watchdog is clamped so a proof that won't finish in time
+/// path. The proving watchdog is clamped so a proof that won't finish in time
 /// is killed while there's still this much room for `releaseJob` to land (it reverts
 /// at/after the deadline, stranding collateral until a slash).
 ///
@@ -44,7 +44,7 @@ const DEADLINE_FULFILL_MARGIN_SECS: u64 = 60;
 const DEADLINE_RELEASE_MARGIN_SECS: u64 = zkminer_chain::tx::TX_RECEIPT_TIMEOUT.as_secs() + 60;
 
 /// Below this much remaining proving budget it isn't worth starting another attempt
-/// (#20) — abandon the job now, while `releaseJob` can still land, instead of
+/// — abandon the job now, while `releaseJob` can still land, instead of
 /// starting a proof that would be killed almost immediately.
 const MIN_ATTEMPT_BUDGET_SECS: u64 = 30;
 
@@ -100,7 +100,7 @@ const MAX_GPU_MEMORY_WAITS: u32 = 24;
 /// Max jobs locked in one `claimJobBatch` tx. Matches the contract's MAX_BATCH_SIZE
 /// (10). The actual per-tick batch is further capped to free proving slots so we never
 /// lock more than we can prove before their deadlines (the stranding failure mode).
-/// Set `ZKMINER_NO_BATCH_CLAIM` to force the one-tx-per-job path (soak escape hatch).
+/// Set `ZKMINER_NO_BATCH_CLAIM` to force the one-tx-per-job path (escape hatch).
 const MAX_CLAIM_BATCH: usize = 10;
 
 /// Classification of a single per-job reconcile read after a `claimJobBatch` tx.
@@ -114,7 +114,7 @@ enum ReconcileClass {
     /// from a single read: either the sub-claim reverted (we don't hold it) OR a
     /// lagging/stale post-mine node hasn't indexed our lock yet. Treat as UNKNOWN —
     /// keep the breadcrumb + retry — because classifying a lagging-ZERO read of a job we
-    /// DID lock as NotOurs would drop it → keeper slash (D1).
+    /// DID lock as NotOurs would drop it → keeper slash.
     Unknown,
 }
 
@@ -194,9 +194,9 @@ fn is_invalid_proof(msg: &str) -> bool {
 /// under-estimating proving time and missing deadlines.
 /// How long a DRAIN waits for in-flight proofs before escalating to ABANDON.
 ///
-/// [F3] The earlier 900s was derived from a false premise. The 600s proving watchdog is PER
+/// The 600s proving watchdog is PER
 /// ATTEMPT and `MAX_PROVE_ATTEMPTS = 3`, and fulfil adds up to 5 x (120s receipt + 30s poll)
-/// = 750s, so a HEALTHY worst case is ~2850s. At 900s the drain would abandon jobs that were
+/// = 750s, so a HEALTHY worst case is ~2850s. A shorter budget would abandon jobs that were
 /// still progressing normally. Each lifecycle also self-bounds at
 /// `lock_deadline - DEADLINE_RELEASE_MARGIN_SECS` and self-releases on error, so a job cannot
 /// outlive its own deadline while held — this bound only stops an indefinite wait.
@@ -215,7 +215,7 @@ static SUPERVISED_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// one of them paced by the process-global 4 req/s throttle and contending with the brain /
 /// refresh / lifecycle tasks that keep running through shutdown, on an endpoint that 429s.
 /// A drain cannot buy any of that back: proofs run 60-477s so nothing finishes in seconds,
-/// and `Submitting` jobs are excluded from abandon [F2] anyway — so waiting for their fulfil
+/// and `Submitting` jobs are excluded from abandon anyway — so waiting for their fulfil
 /// cannot change what gets released. Budget = grace - release budget <= 0.
 /// Zero costs nothing when nothing is held: the loop still breaks at "drain complete" on its
 /// first pass; the budget was only ever spent in the case that needs the time for releases.
@@ -224,19 +224,19 @@ const SUPERVISED_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::ZERO;
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3000);
 
 /// Extra drain grace granted ONLY when every outstanding job is `Submitting` — i.e. when the
-/// ABANDON stage has nothing to release ([F2] excludes them) and waiting therefore costs the
+/// ABANDON stage has nothing to release (`Submitting` jobs are excluded) and waiting therefore costs the
 /// release budget nothing. Sized to fit inside `docker stop`'s 10s grace: enough for a fulfil
 /// that is mid pre-broadcast to reach the wire, or to give up and stash its nonce for the
 /// lifecycle's own release. Without it a supervised stop (budget ZERO) exits before either,
 /// leaving the job neither fulfilled nor released.
-/// [O2] Cap on how long the ABANDON step waits for release RECEIPTS. The broadcasts have
+/// Cap on how long the ABANDON step waits for release RECEIPTS. The broadcasts have
 /// already gone out; this only bounds the confirmation wait so the exit verdict, the worker
 /// reap and the nonce heal are not stranded behind ~750s of retries that a supervisor's
 /// SIGKILL would cut short anyway. Sized to sit inside systemd's 90s default with room for
 /// the reap.
 const RELEASE_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// [A3] Interactive stops have NO supervisor deadline, so the 45s supervised cap must not
+/// Interactive stops have NO supervisor deadline, so the 45s supervised cap must not
 /// apply: `release_job_with_nonce` runs 5 attempts x (120s receipt + 30s poll), meaning
 /// attempt 2 cannot even start before ~150s. Capping at 45s abandons the release BEFORE the
 /// first re-broadcast — earlier than the single-receipt-timeout give-up that jobs.rs:962-968
@@ -260,10 +260,458 @@ static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 
 const FALLBACK_ESTIMATED_CYCLES: u64 = 34_000_000;
 
+/// Conservative throughput (cycles/sec) the live claim gate sizes feasibility on when it has NO
+/// genuine per-device benchmark row for the job's backend on a REAL (non-simulated) rig — e.g. a
+/// cached suite predating device rows. Without this, a 0.0 throughput falls through to the evaluator's
+/// OPTIMISTIC suite average, re-opening deadline claim-bait (a deadline-tight flood that fits the mean
+/// but not the slow card is admitted, then missed -> penalized release). A low floor sizes
+/// pessimistically so such jobs are refused rather than admitted-then-doomed. Matches the prove
+/// watchdog's CONSERVATIVE_CPS.
+const CONSERVATIVE_SIZING_CPS: f64 = 400_000.0;
+
+/// Sentinel cycle count for a program the executor could not measure because the guest is too heavy
+/// or non-terminating (it tripped the execute cycle cap). Sized so that at ANY realistic GPU
+/// throughput (≤ ~3e8 cycles/s) the implied duration exceeds the evaluator's hard `INFEASIBLE`
+/// sentinel (~100 years / 3.15e9 s) — 1e18 / 3e8 ≈ 3.3e9 s — so the job is unconditionally rejected,
+/// not merely deadline-infeasible for typical deadlines. Still far below u64::MAX (1.8e19) and the
+/// f64 duration range, so no overflow downstream.
+const UNMEASURABLE_CYCLES: u64 = 1_000_000_000_000_000_000; // 1e18
+
+
+/// Measured cycle counts keyed by (backend tag, programId, keccak256(inputData)). The backend tag is
+/// load-bearing: `programId`, `inputData` AND `proofSystemId` are all submitter-chosen, so without it
+/// a cheap risc0 measurement of (P, I) would size an SP1 job carrying the same (P, I) — which the SP1
+/// worker then cannot prove (release penalty). See [`backend_tag`] and the declaration in `run`.
+type MeasuredCache = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<(u8, alloy::primitives::B256, alloy::primitives::B256), u64>,
+    >,
+>;
+
+/// Stable per-backend discriminant for the measured-cycles key. An unknown backend collapses to 255;
+/// nothing is ever inserted under it (only risc0/sp1 measure), so a lookup simply misses.
+fn backend_tag(backend: &str) -> u8 {
+    match backend {
+        "risc0" => 0,
+        "sp1" => 1,
+        _ => 255,
+    }
+}
+/// Per-descriptor resolver entry: the input hash this descriptor carries, PLUS whether its full
+/// fulfill payload (journal + this descriptor + seal) was found to exceed the on-chain cap. Both live
+/// in ONE map keyed by descriptor hash so they EVICT TOGETHER — the over-cap verdict can neither
+/// outlive nor be outlived by the resolver that makes the descriptor claimable. That closes the
+/// fail-open where a separately-bounded, independently-evicting over-cap set let an over-cap descriptor
+/// be claimed because its verdict was evicted while its resolver survived.
+#[derive(Clone, Copy)]
+struct DescInfo {
+    input_hash: alloy::primitives::B256,
+    over_cap: bool,
+}
+
+/// descriptor hash -> [`DescInfo`] (input-hash resolver + over-cap verdict). See the declaration in `run`.
+type DescInputCache = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<alloy::primitives::B256, DescInfo>,
+    >,
+>;
+
+/// Insert into a `HashMap` bounded to `cap` entries: when full and the key is new, evict one existing
+/// entry first. A flood of distinct keys therefore cannot grow the long-lived brain task's heap
+/// without limit. Eviction only forces a re-measure/re-resolve, never an under-size.
+fn bounded_insert<K, V>(map: &mut std::collections::HashMap<K, V>, key: K, val: V, cap: usize)
+where
+    K: std::cmp::Eq + std::hash::Hash + Copy,
+{
+    if map.len() >= cap && !map.contains_key(&key) {
+        if let Some(k) = map.keys().next().copied() {
+            map.remove(&k);
+        }
+    }
+    map.insert(key, val);
+}
+
+/// Cap on both the measured-cycles and descriptor->input-hash maps. Each measured entry costs a full
+/// guest execution, so the cap is a backstop; the resolver map is cheap but bounded for the same
+/// reason.
+const MEASURED_CYCLES_CAP: usize = 100_000;
+
+/// Insert a measured cycle count for the exact (backend, program, input) triple, bounded to
+/// `MEASURED_CYCLES_CAP` entries.
+fn insert_measured(
+    cache: &MeasuredCache,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+    cycles: u64,
+) {
+    if let Ok(mut m) = cache.lock() {
+        bounded_insert(
+            &mut m,
+            (backend_tag(backend), program_id, input_hash),
+            cycles,
+            MEASURED_CYCLES_CAP,
+        );
+    }
+}
+
+/// Descriptor hashes whose job, if claimed, is GUARANTEED to fail the on-chain fulfill payload-size
+/// check: the guest journal plus the full submitter descriptor (inputData + callbackExtraData +
+/// extraVerifierData) plus the proof seal exceed the fulfillJob calldata cap, so fulfill would
+/// OOG-revert and the proof would be wasted on a release penalty. Keyed by DESCRIPTOR hash, not by
+/// (program, input): the overflow depends on callbackExtraData/extraVerifierData, which are outside
+/// the measurement cache key, so keying it by input would let one submitter's padded descriptor
+/// wrongly skip a different slim job for the same program+input. Bounded like the other brain maps.
+/// Record that a descriptor's fulfill payload is over the cap, as the `over_cap` bit on its
+/// [`DescInfo`] resolver entry — creating the entry with a zero input hash if it has none yet (a
+/// descriptor skipped before measurement is not claimable until a measurement exists anyway, and the
+/// bit then co-evicts with the resolver). The candidate loop never claims a flagged descriptor.
+fn mark_desc_unfulfillable(desc_input: &DescInputCache, descriptor_hash: alloy::primitives::B256) {
+    if let Ok(mut m) = desc_input.lock() {
+        match m.get_mut(&descriptor_hash) {
+            Some(info) => info.over_cap = true,
+            None => bounded_insert(
+                &mut m,
+                descriptor_hash,
+                DescInfo {
+                    input_hash: alloy::primitives::B256::ZERO,
+                    over_cap: true,
+                },
+                MEASURED_CYCLES_CAP,
+            ),
+        }
+    }
+}
+
+/// True if this descriptor was found to have an over-cap fulfill payload (see [`DescInfo`]).
+fn desc_is_unfulfillable(desc_input: &DescInputCache, descriptor_hash: alloy::primitives::B256) -> bool {
+    desc_input
+        .lock()
+        .map(|m| m.get(&descriptor_hash).map(|i| i.over_cap).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+/// descriptor hash -> `Instant` until which a job observed assigned to ANOTHER prover is skipped
+/// WITHOUT re-fetching its descriptor. `assignedProver` is submitter-controlled, is NOT exposed by
+/// `JobStatusView` (so the candidate filter cannot see it), and is only learned from a descriptor
+/// fetch — so without this a flood of high-price jobs the submitter exclusively assigns elsewhere
+/// re-spawns a measure task (descriptor fetch + immediate return) every tick, monopolizing the
+/// per-tick measure budget and the RPC it rides, and starving measurement of legitimately-claimable
+/// jobs. The skip is TIME-BOUNDED, not permanent: on-chain exclusivity expires, so after the cooldown
+/// the job is re-evaluated and a now-open assignment is not missed. Bounded like the other brain maps.
+type AssignedElsewhere = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, std::time::Instant>>,
+>;
+
+/// Cooldown before a job seen assigned to another prover is re-checked. A cooldown, not a blacklist:
+/// exclusivity can lapse on-chain, so the job must become eligible again without a restart.
+const ASSIGNED_ELSEWHERE_TTL: Duration = Duration::from_secs(90);
+
+/// Mark a descriptor as assigned-elsewhere for `ASSIGNED_ELSEWHERE_TTL` so it is not re-measured each
+/// tick. Bounded like the measured cache so a flood of distinct decoys cannot grow the heap.
+fn mark_assigned_elsewhere(cache: &AssignedElsewhere, descriptor_hash: alloy::primitives::B256) {
+    if let Ok(mut m) = cache.lock() {
+        let until = std::time::Instant::now() + ASSIGNED_ELSEWHERE_TTL;
+        bounded_insert(&mut m, descriptor_hash, until, MEASURED_CYCLES_CAP);
+    }
+}
+
+/// True if this descriptor is still within its assigned-elsewhere cooldown. An expired entry returns
+/// false (and is dropped) so the job is re-evaluated once exclusivity may have lapsed.
+fn assigned_elsewhere_recently(
+    cache: &AssignedElsewhere,
+    descriptor_hash: alloy::primitives::B256,
+) -> bool {
+    if let Ok(mut m) = cache.lock() {
+        if let Some(&until) = m.get(&descriptor_hash) {
+            if std::time::Instant::now() < until {
+                return true;
+            }
+            m.remove(&descriptor_hash);
+        }
+    }
+    false
+}
+
+/// (backend, program, input) -> length in bytes of the guest journal that (program, input) produces.
+/// The journal is a deterministic function of (program, input), so it is shared by EVERY descriptor
+/// for that pair. It is cached here when a measurement executes so that a later descriptor for the
+/// same pair — which short-circuits on the cached cycle count without re-executing — can still have
+/// its full fulfill payload (journal + its own descriptor bytes + seal) checked against the cap.
+/// Bounded like the measured-cycles cache.
+type JournalLenCache = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<(u8, alloy::primitives::B256, alloy::primitives::B256), u64>,
+    >,
+>;
+
+fn insert_journal_len(
+    cache: &JournalLenCache,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+    journal_len: u64,
+) {
+    if let Ok(mut m) = cache.lock() {
+        bounded_insert(
+            &mut m,
+            (backend_tag(backend), program_id, input_hash),
+            journal_len,
+            MEASURED_CYCLES_CAP,
+        );
+    }
+}
+
+fn get_journal_len(
+    cache: &JournalLenCache,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+) -> Option<u64> {
+    cache
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&(backend_tag(backend), program_id, input_hash)).copied())
+}
+
+/// The fulfillJob calldata carries the guest journal, the proof seal, and the submitter descriptor
+/// (inputData + callbackExtraData + extraVerifierData) under a fixed gas limit. This is true only when
+/// that payload is CERTAIN to exceed the cap: a minimal seal estimate (<= any real Groth16 seal) is
+/// used, so it never false-positives a job that could actually fulfill. When it holds, proving the job
+/// would waste a full proof on a fulfill guaranteed to OOG-revert, then force a penalized release.
+const MAX_FULFILL_PAYLOAD_BYTES: usize = 128 * 1024;
+const MIN_SEAL_BYTES: usize = 256;
+fn fulfill_payload_over_cap(
+    journal_len: u64,
+    input_len: usize,
+    callback_len: usize,
+    extra_verifier_len: usize,
+) -> bool {
+    (journal_len as usize)
+        .saturating_add(input_len)
+        .saturating_add(callback_len)
+        .saturating_add(extra_verifier_len)
+        .saturating_add(MIN_SEAL_BYTES)
+        > MAX_FULFILL_PAYLOAD_BYTES
+}
+
+/// Programs whose on-chain `programId` cannot be satisfied by the ELF the submitter serves: the prover
+/// derived the verifying key / image id and it did not equal `programId`, so EVERY job for this program
+/// fails at PROVE — after the collateral-locking claim — and releases at a penalty. SP1 cannot detect
+/// this before claiming (deriving the vkey needs the minutes-long `setup`, far over the measure
+/// watchdog), so the binding is only proven on the prove path. Recording a mismatch here caps the loss
+/// to the jobs already claimed in the batch in flight when its first prove faults — ONE claim WAVE, not
+/// a release penalty per submitted job: once marked, the claim gate, the measure gate, the batch-claim
+/// task, and each per-job lifecycle task all skip every future job for it. Write-once per bad program, read
+/// once per candidate per tick — a process-wide static like the other brain-wide flags in this module,
+/// bounded like the measured cache so a flood of distinct decoy programs cannot grow it. A legitimate
+/// program's vkey always equals its `programId`, so it is never listed and never skipped.
+static VKEY_MISMATCH_PROGRAMS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>>,
+> = std::sync::OnceLock::new();
+
+fn vkey_mismatch_programs(
+) -> &'static std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>> {
+    VKEY_MISMATCH_PROGRAMS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Record a program whose served ELF can never match its `programId` (a prove-path vkey/image-id
+/// mismatch), so the claim and measure gates skip every future job for it.
+fn mark_program_vkey_mismatch(program_id: alloy::primitives::B256) {
+    if let Ok(mut s) = vkey_mismatch_programs().lock() {
+        // Bounded like the brain maps so a flood of distinct decoy programs cannot grow the heap.
+        if s.len() >= MEASURED_CYCLES_CAP && !s.contains(&program_id) {
+            if let Some(k) = s.iter().next().copied() {
+                s.remove(&k);
+            }
+        }
+        s.insert(program_id);
+    }
+}
+
+/// True if a prior prove proved this `programId`'s served ELF cannot satisfy it (see
+/// [`mark_program_vkey_mismatch`]). Such a program is permanently unclaimable.
+fn program_vkey_mismatched(program_id: alloy::primitives::B256) -> bool {
+    vkey_mismatch_programs()
+        .lock()
+        .map(|s| s.contains(&program_id))
+        .unwrap_or(false)
+}
+
+/// descriptor hash -> the submitter descriptor's payload length (inputData + callbackExtraData +
+/// extraVerifierData), cached during measurement. The fulfill payload is journal + THIS sum + the proof
+/// seal; the journal length is cached per (program, input) in [`JournalLenCache`], but the descriptor
+/// portion is per-DESCRIPTOR and is only known while the descriptor is in hand. Caching it lets the
+/// claim gate re-check a descriptor's full payload against the cap even when THIS descriptor was never
+/// the one that executed — e.g. a sibling that lost the `measuring_inputs` dedup race and returned
+/// before any journal existed, which otherwise reaches neither the short-circuit nor the post-execute
+/// payload screen. Bounded like the measured cache.
+type DescPayloadCache =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, u64>>>;
+
+/// Cache THIS descriptor's payload length (see [`DescPayloadCache`]), bounded to `MEASURED_CYCLES_CAP`.
+fn insert_desc_payload(
+    cache: &DescPayloadCache,
+    descriptor_hash: alloy::primitives::B256,
+    payload_len: u64,
+) {
+    if let Ok(mut m) = cache.lock() {
+        bounded_insert(&mut m, descriptor_hash, payload_len, MEASURED_CYCLES_CAP);
+    }
+}
+
+/// True if THIS descriptor's full fulfill payload (the cached journal for its (program, input) + its
+/// cached descriptor payload + a minimal seal) is CERTAIN to exceed the on-chain cap — so claiming and
+/// proving it would waste a proof on a fulfill guaranteed to OOG-revert, then release at a penalty.
+/// Returns false (does not block) whenever any input is not yet known, so it never false-skips a job
+/// that could still fulfill. This is the claim-gate backstop for a descriptor whose own measure task
+/// returned before checking its payload (notably the `measuring_inputs` race loser).
+fn claim_payload_over_cap(
+    desc_input: &DescInputCache,
+    measured_journal: &JournalLenCache,
+    desc_payload: &DescPayloadCache,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    descriptor_hash: alloy::primitives::B256,
+) -> bool {
+    let Some(input_hash) = desc_input
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&descriptor_hash).map(|i| i.input_hash))
+    else {
+        return false;
+    };
+    let Some(journal_len) = get_journal_len(measured_journal, backend, program_id, input_hash) else {
+        return false;
+    };
+    let Some(payload) = desc_payload
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&descriptor_hash).copied())
+    else {
+        return false;
+    };
+    // `payload` already sums inputData + callbackExtraData + extraVerifierData, so pass it as one term;
+    // fulfill_payload_over_cap adds the minimal seal and compares to the cap.
+    fulfill_payload_over_cap(journal_len, payload as usize, 0, 0)
+}
+
+/// (backend, program, input) -> consecutive wall-clock measure-timeout count. A wall-clock
+/// watchdog SIGKILL during measurement is AMBIGUOUS (a genuinely-too-heavy guest vs. one merely starved
+/// under transient host load), unlike the executor's clean cycle-cap trip. So it must NOT permanently
+/// blacklist a triple on the first one; we only give up after `MEASURE_TIMEOUT_STRIKES` consecutive
+/// timeouts. A success or a clean cap trip clears the tally. Bounded like the measured cache.
+type MeasureStrikes = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<(u8, alloy::primitives::B256, alloy::primitives::B256), u8>,
+    >,
+>;
+
+/// Consecutive wall-clock measure-timeouts for one (backend, program, input) before it is treated as
+/// unmeasurable. A genuinely-too-heavy guest times out every attempt and converges in this many ticks;
+/// a transiently-starved feasible guest succeeds on a retry well before it.
+const MEASURE_TIMEOUT_STRIKES: u8 = 3;
+
+/// Increment and return a triple's consecutive wall-clock measure-timeout count. Bounded
+/// like the measured cache so a flood of distinct timing-out triples cannot grow the brain's heap.
+fn bump_measure_strikes(
+    strikes: &MeasureStrikes,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+) -> u8 {
+    let key = (backend_tag(backend), program_id, input_hash);
+    if let Ok(mut m) = strikes.lock() {
+        let next = m.get(&key).copied().unwrap_or(0).saturating_add(1);
+        bounded_insert(&mut m, key, next, MEASURED_CYCLES_CAP);
+        next
+    } else {
+        // Poisoned: report a single strike so a lock mishap can never wrongly escalate to permanent.
+        1
+    }
+}
+
+/// Clear a triple's wall-clock timeout tally — on a successful measurement (self-heal) or
+/// once it has been permanently negative-cached (the tally is then moot).
+fn clear_measure_strikes(
+    strikes: &MeasureStrikes,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+) {
+    if let Ok(mut m) = strikes.lock() {
+        m.remove(&(backend_tag(backend), program_id, input_hash));
+    }
+}
+
+/// Record that `descriptor_hash` carries `input_hash`, so a later sighting can resolve its
+/// measurement without re-fetching the descriptor. Bounded to `MEASURED_CYCLES_CAP` entries.
+fn insert_desc_input(
+    cache: &DescInputCache,
+    descriptor_hash: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+) {
+    if let Ok(mut m) = cache.lock() {
+        // Preserve any over-cap verdict already recorded for this descriptor when (re)recording its
+        // resolver, so learning the input hash never clears the fact that its payload is over the cap.
+        let over_cap = m.get(&descriptor_hash).map(|i| i.over_cap).unwrap_or(false);
+        bounded_insert(
+            &mut m,
+            descriptor_hash,
+            DescInfo { input_hash, over_cap },
+            MEASURED_CYCLES_CAP,
+        );
+    }
+}
+
+/// Resolve the measured cycle count for a sighting, given its descriptor hash and program id. Returns
+/// `None` until we have both learned the descriptor's input hash (`desc_input_hash`) and measured the
+/// (program, input) pair (`measured_cycles`). A `None` means "not yet sized" and MUST block the claim.
+fn resolve_measured(
+    measured: &MeasuredCache,
+    desc_input: &DescInputCache,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    descriptor_hash: alloy::primitives::B256,
+) -> Option<u64> {
+    let input_hash = desc_input.lock().ok()?.get(&descriptor_hash)?.input_hash;
+    measured
+        .lock()
+        .ok()?
+        .get(&(backend_tag(backend), program_id, input_hash))
+        .copied()
+}
+
 /// Bound on a single cycle measurement. Execution is far cheaper than proving, but a hostile
 /// or pathological guest must not hold a worker: the watchdog kills it at this point, and a
 /// job we cannot execute inside the budget is one we should not claim either.
 const MEASURE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Cycle count the PROVE path (watchdog timeout / min-VRAM routing / po2) sizes on. It
+/// is the MEASURED count, never the submitter-declared `expected_cycles` alone: admission claims a job
+/// only if feasible at `max(declared, measured)`, and the prove path must size on the SAME quantity or
+/// a tiny declared value collapses the watchdog to its floor and SIGKILLs a job that was admitted
+/// feasible on the larger measured count — a submitter-driven premature kill → release-penalty/slash.
+/// `max(declared, measured)` can only hold the sizing at or ABOVE the real work (a larger value merely
+/// detects a wedged GPU later, bounded by the configured cap — the safe direction). With no
+/// measurement in hand (recovery, or a non-measurable backend) the declared value is still adversarial:
+/// a nonzero one is floored at `FALLBACK_ESTIMATED_CYCLES` rather than trusted small, while a zero
+/// declaration returns 0 so the caller keeps the old full-timeout fallback.
+fn prove_sizing_cycles(declared: u64, measured: Option<u64>) -> u64 {
+    match measured {
+        Some(m) => declared.max(m),
+        None if declared > 0 => declared.max(FALLBACK_ESTIMATED_CYCLES),
+        None => 0,
+    }
+}
+
+/// Wall-clock bound on each pre-claim fetch (descriptor, ELF) on the measurement path.
+/// The prove path bounds the SAME fetches with `with_deadline_budget`; the measure path had no bound,
+/// so a submitter storage/descriptor source that stalls could pin a scarce measure-budget slot for
+/// `num_uris × per-URI-timeout` (minutes), and because a claim now REQUIRES a measurement, a frozen
+/// budget halts all claiming. A real descriptor read / few-MB ELF download completes in seconds; this
+/// is generous for that while cutting a staller off. `download_elf` also caps the URI count.
+const MEASURE_FETCH_BUDGET: Duration = Duration::from_secs(90);
 
 /// Fallback fee rate (5%) used only if the adapter query fails.
 const FALLBACK_FEE_RATE_BPS: u16 = 500;
@@ -275,27 +723,27 @@ const FALLBACK_DEFAULT_COLLATERAL_BPS: u128 = 15_000;
 /// 1 HEMI in wei (18 decimals). Used to render collateral amounts in whole HEMI.
 const ONE_HEMI_WEI: u128 = 1_000_000_000_000_000_000;
 
-/// Minimum spacing between "insufficient collateral" warnings (#14). The brain
+/// Minimum spacing between "insufficient collateral" warnings. The brain
 /// re-evaluates every 5s; without throttling it would warn every tick.
 const COLLATERAL_WARN_EVERY: Duration = Duration::from_secs(120);
 
 /// How recently a 429 must have been seen for the brain to pause claiming new
-/// jobs (#19). A claim kicks off descriptor reconstruction (a heavy `getLogs`
+/// jobs. A claim kicks off descriptor reconstruction (a heavy `getLogs`
 /// burst), so piling on more work while the endpoint is rate-limiting only
 /// deepens the backlog. In-flight jobs (prove/fulfill/recovery) are unaffected —
 /// they run in their own tasks and must finish to release collateral. Sized a
 /// little above the brain's 5s tick so a single 429 gates a few ticks, not one.
 const RPC_BACKOFF_WINDOW: Duration = Duration::from_secs(30);
-// [#10a] Hard ceiling: even while rate-limited, the state-refresh multicall runs at least
+// Hard ceiling: even while rate-limited, the state-refresh multicall runs at least
 // this often so stake_info (→ the idle-recovery collateral gate) never freezes and strands.
 const REFRESH_STALENESS_CEILING: Duration = Duration::from_secs(60);
-// [#10 guard] The brain won't claim on collateral data older than this (~2× the 15s refresh
+// The brain won't claim on collateral data older than this (~2× the 15s refresh
 // period), so a silently-failing refresh can't drive claims on stale stake_info.
 const CLAIM_FRESHNESS_MAX: Duration = Duration::from_secs(35);
-// [#10c] After this much rate-limit quiet, the escalated claim-pause window decays to base.
+// After this much rate-limit quiet, the escalated claim-pause window decays to base.
 const CLAIM_BACKOFF_DECAY: Duration = Duration::from_secs(90);
 
-/// Minimum spacing between "backing off — RPC rate-limited" warnings (#19).
+/// Minimum spacing between "backing off — RPC rate-limited" warnings.
 const RPC_BACKOFF_WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// Render a wei amount (18 decimals) as HEMI with 2 decimals, e.g. "0.50" or
@@ -465,13 +913,13 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         s.runtime_settings.token_price_usd = config.prover.token_price_usd;
         s.runtime_settings.gas_cost_usd = config.prover.gas_cost_usd;
         // Default TRUE: claim predicate jobs (so they can be tested on testnet).
-        s.runtime_settings.claim_predicate_jobs = config.chain.claim_predicate_jobs.unwrap_or(true);
+        s.runtime_settings.claim_predicate_jobs = config.chain.claim_predicate_jobs.unwrap_or(false);
 
         s.address = format!("{}", client.address);
         s.connected = true;
         s.chain_id = config.chain.chain_id;
 
-        // [RPC startup coalescing] Hydrate head + ETH/HEMI balances + stake + prover-stats in
+        // Hydrate head + ETH/HEMI balances + stake + prover-stats in
         // ONE Multicall3 round-trip instead of 6 sequential reads, de-peaking the boot burst
         // (which — with workers connecting and the recovery scan — is where the ~5/s cap bites).
         // Per-field degrade: a single reverting sub-call only drops its own value. Fail-safe:
@@ -492,7 +940,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                     s.hemi_balance = hemi.to::<u128>();
                 }
                 if let Some(stake) = data.stake {
-                    // #15: surface the collateral picture at startup and warn if most of it is
+                    // Surface the collateral picture at startup and warn if most of it is
                     // locked (e.g. tied up in past-deadline jobs) — the usual cause of a miner
                     // that connects fine but then silently claims nothing.
                     let avail = fmt_hemi(stake.available_collateral);
@@ -537,7 +985,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         s.setup_status
             .refresh_from_balances(eth, hemi, stake.as_ref());
 
-        // Show setup wizard if not ready (first-run experience). [review] Only when the
+        // Show setup wizard if not ready (first-run experience). Only when the
         // startup hydration actually SUCCEEDED — otherwise a transient RPC blip in the boot
         // second reads all-zero balances/None stake, which looks identical to "unconfigured"
         // and would drop a correctly-funded operator into the Setup wizard (which nothing
@@ -597,7 +1045,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                     deposited_amount,
                     ..
                 } => {
-                    // [RPC #3] STATIC ingest gate: a job whose proofSystemId doesn't map to
+                    // STATIC ingest gate: a job whose proofSystemId doesn't map to
                     // a backend this build supports can never be claimed by this miner —
                     // don't let it occupy a candidate slot in the per-tick Multicall3
                     // forever. STATIC ONLY (resolve_backend is a pure keccak map): NEVER
@@ -656,13 +1104,23 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                         prover_backend: String::new(),
                         estimated_cycles: 0,
                     });
+                    // Bound the Open-candidate set. A submitter can post unboundedly
+                    // many jobs and leave them Open; every brain tick reads them all via Multicall3
+                    // over the throttled RPC, so an uncapped list is a slow-RPC-starvation DoS. Drop
+                    // the OLDEST beyond the cap (forward-only arrival order) — a still-relevant job
+                    // reappears via the monitor, and stale ones are status-pruned anyway.
+                    const MAX_OPEN_JOBS: usize = 4096;
+                    if s.open_jobs.len() > MAX_OPEN_JOBS {
+                        let excess = s.open_jobs.len() - MAX_OPEN_JOBS;
+                        s.open_jobs.drain(0..excess);
+                    }
                 }
-                // [RPC #3] Event-driven pruning: a job claimed (by ANYONE — including our
+                // Event-driven pruning: a job claimed (by ANYONE — including our
                 // own claim, where this is an idempotent no-op) or cancelled is no longer
                 // an open candidate. Pruning it here — straight from log data, zero extra
                 // requests — removes it from the per-tick Multicall3 candidate set BEFORE
                 // the next tick has to spend a chunk slot discovering the same thing.
-                // GUARD (review): touch ONLY open_jobs. Never in_flight or the journal —
+                // GUARD: touch ONLY open_jobs. Never in_flight or the journal —
                 // those are owned by the lifecycle/batch-reconcile paths, and a foreign
                 // JobClaimed for a job WE hold would otherwise corrupt strand protection.
                 MonitorEvent::JobClaimed { job_id, prover, .. } => {
@@ -699,7 +1157,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
     let refresh_client = client.clone();
     let state_refresh = state.clone();
     let refresh_handle = tokio::spawn(async move {
-        // [RPC quick-win] Phase-offset the 15s state-refresh multicall by 7s so it does not
+        // Phase-offset the 15s state-refresh multicall by 7s so it does not
         // land in the same second as the monitor's 10s get_logs poll (their LCM collision
         // drops from every 30s to the 60s boundary). Fixed +7s startup delay only, zero
         // extra requests. Do NOT apply this offset to the monitor/brain loops.
@@ -709,7 +1167,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         );
         let meter = refresh_client.rpc_meter();
         let mut cycle: u64 = 0;
-        // [#10a] Circuit-breaker state: the wall-clock instant of the last get_refresh_batch
+        // Circuit-breaker state: the wall-clock instant of the last get_refresh_batch
         // ATTEMPT (success OR failure). Seeded to now so the first cycle isn't force-refreshed.
         let mut last_refresh_attempt = tokio::time::Instant::now();
         loop {
@@ -726,16 +1184,16 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                 s.rpc_total = rpc_total;
                 s.rpc_last_minute = rpc_min;
             }
-            // [#10a] 429 CIRCUIT-BREAKER: while the endpoint is rate-limiting, SKIP the
-            // Multicall3 refresh — it would just deepen the backlog, and (the bug this
-            // closes) its OWN 429 re-arms the backoff meter every 15s, keeping the brain's
+            // 429 CIRCUIT-BREAKER: while the endpoint is rate-limiting, SKIP the
+            // Multicall3 refresh — it would just deepen the backlog, and its OWN 429 re-arms
+            // the backoff meter every 15s, which would keep the brain's
             // claim-pause armed forever. The free meter update above still runs.
             // STALENESS CEILING: force a refresh ATTEMPT at least every REFRESH_STALENESS_CEILING
             // even during a storm (measured from the last ATTEMPT, so a sustained storm forces
             // ~1/ceiling, not 1/15s). NOTE: this bounds ATTEMPT cadence, NOT stake_info staleness
             // — a forced attempt that itself 429s updates nothing, so stake_info can stay frozen
             // for the whole storm. The idle-recovery gate is therefore made independently robust
-            // to a stale stake_info (it scans when the read is stale; see [#10 must-fix] there),
+            // to a stale stake_info (it scans when the read is stale),
             // rather than relying on this ceiling to keep the value fresh. On clear the next
             // non-rate-limited tick refreshes naturally (≤15s).
             if meter.rate_limited_within(RPC_BACKOFF_WINDOW)
@@ -763,9 +1221,9 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                     if let Some(hemi) = data.hemi_balance {
                         s.hemi_balance = hemi.to::<u128>();
                     }
-                    // [review must-fix] Stamp last_refresh ONLY when the stake sub-call
+                    // Stamp last_refresh ONLY when the stake sub-call
                     // actually returned — matching the startup path. `last_refresh` is the
-                    // #10 claim-freshness gate's proxy for "how fresh is s.stake_info", and
+                    // claim-freshness gate's proxy for "how fresh is s.stake_info", and
                     // now that sub-calls are allowFailure=true a PARTIAL success (block+
                     // balances Ok, stake reverted) is genuinely reachable. Stamping it
                     // unconditionally would report "fresh" while stake_info is frozen —
@@ -820,7 +1278,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         }
     }
 
-    // [B2] The journal is the AUTHORITATIVE record of what we hold on-chain: a breadcrumb is
+    // The journal is the AUTHORITATIVE record of what we hold on-chain: a breadcrumb is
     // written BEFORE every claim tx and removed only on fulfil or successful release, so it
     // brackets the on-chain lock exactly. `active_jobs` does NOT — a job is pushed there only
     // AFTER the claim mines and the post-claim status view returns, so during that window a
@@ -886,14 +1344,13 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         let sig_tx = sig_tx.clone();
         let sig_state = state.clone();
         tokio::spawn(async move {
-            // [O1] Handlers are installed IMMEDIATELY — NOT after the TUI exits.
+            // Handlers are installed IMMEDIATELY — NOT after the TUI exits.
             //
-            // The previous version awaited `tui_done_rx` here, but that only fires AFTER
+            // Awaiting `tui_done_rx` here would be wrong: it only fires AFTER
             // `run_tui` returns. So for the whole TUI session — and TUI is the DEFAULT mode
-            // — SIGTERM kept its default disposition and killed the process outright: no
-            // pause, no drain, no ABANDON, no release_and_clean, no exit 75, no worker reap.
-            // Every held job then rode to its 7200s lock deadline. That was strictly worse
-            // than both the original code and the first patch.
+            // — SIGTERM would keep its default disposition and kill the process outright: no
+            // pause, no drain, no ABANDON, no release_and_clean, no exit 75, no worker reap,
+            // and every held job would ride to its 7200s lock deadline.
             //
             // Instead we install now and, in TUI mode, set `shutdown_requested` so the TUI
             // event loop breaks and `run()` continues into the ladder. `run_tui` already
@@ -959,7 +1416,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                 if supervised {
                     SUPERVISED_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
-                // [O1] Break the TUI out of its event loop so `run()` reaches the ladder.
+                // Break the TUI out of its event loop so `run()` reaches the ladder.
                 // No-op in headless (nothing reads it there).
                 {
                     let mut st = sig_state.write().await;
@@ -968,7 +1425,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                 }
                 n = n.saturating_add(1);
                 match n {
-                    // [G3] Wording must match what actually happens: with
+                    // Wording must match what actually happens: with
                     // SUPERVISED_DRAIN_TIMEOUT == ZERO a supervised stop abandons on the same
                     // tick, so promising "signal again to ABANDON" there would be a lie — and
                     // this line is the only thing the operator sees.
@@ -983,9 +1440,9 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                     2 => println!("\nABANDONING — releasing jobs, nearest deadline first..."),
                     _ => {
                         eprintln!("\nForce exit — in-flight jobs left locked on-chain.");
-                        // [F4] Reap workers first. SP1's `sp1-gpu-server` is a GRANDCHILD
-                        // that does NOT die with us; measured precedent in this repo is
-                        // 11.5 GB of VRAM still held after the parent exited.
+                        // Reap workers first. SP1's `sp1-gpu-server` is a GRANDCHILD
+                        // that does NOT die with us; it can keep ~11.5 GB of VRAM allocated
+                        // after the parent exited.
                         //
                         // BOUNDED, because `shutdown_all` is not: its phase 4 takes a
                         // BLOCKING slot lock, while phases 2/3 skip any slot whose `pid` is
@@ -993,10 +1450,9 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                         // the pid is zeroed before the handle is dropped and only restored
                         // after `ensure_alive`). Such a worker is never signalled, so the
                         // lock it holds is not released until its whole proof finishes (up
-                        // to the 600s watchdog) — and since the "Force exit" print used to
-                        // sit AFTER this call, the third Ctrl+C produced no output and never
-                        // exited. The third signal must terminate regardless: reap off-thread
-                        // and cap the wait (a normal reap takes ~2.2s).
+                        // to the 600s watchdog). The "Force exit" print therefore comes BEFORE
+                        // this call, and the third signal must terminate regardless: reap
+                        // off-thread and cap the wait (a normal reap takes ~2.2s).
                         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
                         std::thread::spawn(move || {
                             if let Some(pool) = zkminer_prover::engine::worker_pool() {
@@ -1030,7 +1486,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                 break;
             }
         }
-        // [F7] Non-unix has no signal task; fall back to plain Ctrl-C so headless does not
+        // Non-unix has no signal task; fall back to plain Ctrl-C so headless does not
         // park forever waiting on a channel nothing ever sends to.
         #[cfg(not(unix))]
         {
@@ -1071,7 +1527,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
     monitor_handle.abort();
     event_handle.abort();
     hw_handle.abort();
-    // [B5] brain_handle is NOT aborted here. The claim of "per-job lifecycles are
+    // brain_handle is NOT aborted here. The claim of "per-job lifecycles are
     // independent spawned tasks" holds for the normal and batch paths (spawn_lifecycle_task)
     // but NOT for recovery: `recover_claimed_jobs` awaits `process_job_lifecycle` INLINE
     // inside `miner_brain`, so aborting the brain drops a recovered job mid-prove or
@@ -1086,8 +1542,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
     // `refresh_handle` is left running through the drain simply because it is harmless and
     // keeps balances/UI fresh. NOTE: it does NOT advance job status — status transitions
     // happen inside the per-job lifecycle (`active_jobs` mutation sites), so aborting it
-    // would not stall the drain. Stated explicitly because an earlier version of this
-    // comment claimed the opposite and would have misled a future edit.
+    // would not stall the drain.
 
     // 2. DRAIN — let in-flight proofs finish and fulfil.
     //
@@ -1120,7 +1575,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         }
         // Union of what the UI thinks is in flight AND what the journal says we hold
         // on-chain. The journal alone is authoritative for "collateral is locked"; without
-        // it the loop declares "drain complete" while a claim is mid-flight. [B2]
+        // it the loop declares "drain complete" while a claim is mid-flight.
         let (mut outstanding, submitting_now): (Vec<B256>, std::collections::HashSet<B256>) = {
             let s = state.read().await;
             (
@@ -1251,8 +1706,8 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         // but drops the job from `active_jobs`, and recovery is gated off during shutdown, so
         // nothing can advance it. Waiting that out converts a releasable lock into a
         // permanent strand.
-        // Only entries the ABANDON stage would actually act on may cut the drain short. [F2]
-        // excludes `Submitting` jobs from the release list, so tripping on one aborts the drain
+        // Only entries the ABANDON stage would actually act on may cut the drain short. The
+        // ABANDON stage excludes `Submitting` jobs from the release list, so tripping on one aborts the drain
         // for a job abandon then refuses to release — and the exit below kills the in-flight
         // fulfil AND the lifecycle's own self-release, which fires at exactly this instant
         // (fulfill's budget expires at `lock_deadline - DEADLINE_RELEASE_MARGIN_SECS`).
@@ -1276,14 +1731,14 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                 break;
             }
         }
-        // [F2] `Submitting` jobs are excluded from the ABANDON release list, so the DRAIN is
+        // `Submitting` jobs are excluded from the ABANDON release list, so the DRAIN is
         // the ONLY stage that can still free their collateral — by letting the fulfil land
         // (or give up, stashing its nonce so the lifecycle's own release can displace it).
         // `Submitting` is set BEFORE `fulfill_job`, whose pre-broadcast nonce reserve / fee
         // read / status view are all paced by the global RPC throttle, so a ZERO supervised
         // budget `process::exit`s the fulfil before it ever reaches the wire — the job ends
         // up neither fulfilled NOR released, and an operator-initiated stop is not restarted
-        // by the [F5] exit code either. Grant a small grace, but ONLY when every outstanding
+        // by the exit code either. Grant a small grace, but ONLY when every outstanding
         // job is `Submitting`: then `doomed` is empty and this costs the release budget
         // nothing. A mixed set still exits at once — releasable collateral outranks a fulfil.
         let effective_deadline = if !submitting_now.is_empty()
@@ -1347,8 +1802,8 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // Source of truth is the JOURNAL [B2]: it covers the claim window that `active_jobs`
-        // misses. `Submitting` jobs are deliberately EXCLUDED [F2] — they already have a
+        // Source of truth is the JOURNAL: it covers the claim window that `active_jobs`
+        // misses. `Submitting` jobs are deliberately EXCLUDED — they already have a
         // valid proof and a fulfil in flight; releasing one races its own fulfil for the
         // signer's nonce and can strand exactly what it was trying to save.
         let submitting: std::collections::HashSet<B256> = {
@@ -1389,7 +1844,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         let mut stash_frontier_synced = false;
         let mut releasing: Vec<(B256, tokio::task::JoinHandle<()>)> = Vec::new();
         for (deadline, jid) in doomed {
-            // [F2] Re-read the live status per job: `submitting` was snapshotted BEFORE this
+            // Re-read the live status per job: `submitting` was snapshotted BEFORE this
             // loop and the per-job lifecycles are still running, so a job that was Proving at
             // snapshot time can enter its fulfil while we are in here. `release_and_clean`'s
             // on-chain guard only catches a fulfil that already MINED (status != Locked), not
@@ -1416,7 +1871,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                      keeper slash; not attempting release",
                     short_id(jid)
                 );
-                // [#45] No release will EVER be attempted for this job — `releaseJob` would
+                // No release will EVER be attempted for this job — `releaseJob` would
                 // revert past the deadline — and `release_job_with_nonce` is the only consumer
                 // of the abandoned-fulfill stash. So a stashed nonce here has no future owner:
                 // it is in no set at all (not stashed for anyone, not in `freed`, no abort
@@ -1470,7 +1925,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                     deadline.saturating_sub(now)
                 );
             }
-            // [F1] `release_and_clean`, not the raw client call: it re-checks the on-chain
+            // `release_and_clean`, not the raw client call: it re-checks the on-chain
             // status (so a job that fulfilled underneath us is not released), re-reads the
             // authoritative deadline, drains the abandoned-nonce stash, and clears the
             // journal entry — none of which the raw call does.
@@ -1503,7 +1958,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
             ));
         }
         let release_txs_attempted = releasing.len();
-        // [O2] BOUND the join. Each `release_and_clean` is up to 5 attempts x (120s receipt +
+        // BOUND the join. Each `release_and_clean` is up to 5 attempts x (120s receipt +
         // 30s poll) ~= 750s; joining them serially blocked everything downstream — the exit-75
         // verdict, the worker reap (SP1's gpu-server keeps ~11.5 GB) and the nonce heal. Under
         // a supervisor the SIGKILL landed INSIDE this join, so none of them ever ran.
@@ -1574,13 +2029,14 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         // another task re-reserves the nonce, so a still-running lifecycle's live tx trips it
         // too. When something is executable at the frontier there is no wedge to heal: the
         // queued releases cascade as soon as it mines.
-        // [A4] Was `frontier_has_executable_tx()`, i.e. "anything executable at the mined
-        // frontier => don't heal". That excluded the case this whole block exists for: the
-        // skipped release leaves a hole ABOVE the frontier (our own broadcast release is
-        // executable AT it), so the probe said "busy" and we never healed, and the queued
-        // releases rode to their lock deadlines. `nonce_gap_safe_to_fill` keeps the original
-        // protection — it still refuses to displace an executable tx at the frontier — while
-        // allowing a hole above it, where by construction there is nothing to displace.
+        // Use `nonce_gap_safe_to_fill()`, not a plain "anything executable at the mined
+        // frontier => don't heal" test. That coarser test would exclude the case this whole
+        // block exists for: the skipped release leaves a hole ABOVE the frontier (our own
+        // broadcast release is executable AT it), so the probe would say "busy" and we would
+        // never heal, and the queued releases would ride to their lock deadlines.
+        // `nonce_gap_safe_to_fill` keeps that protection — it still refuses to displace an
+        // executable tx at the frontier — while allowing a hole above it, where by
+        // construction there is nothing to displace.
         let heal_target = if release_txs_attempted > 0 {
             match client.nonce_gap_safe_to_fill().await {
                 Ok(t) => t,
@@ -1593,7 +2049,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         } else {
             None
         };
-        // [D3] `pending` reports only the LOWEST hole, and `heal_nonce_gap` fills one. With
+        // `pending` reports only the LOWEST hole, and `heal_nonce_gap` fills one. With
         // two or more skipped releases — routine when several jobs are doomed — plugging the
         // first leaves the next one blocking every release above it, and we exit immediately
         // with nothing alive to notice. The live watchdog walks holes one per ~2 min, which is
@@ -1601,7 +2057,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         // of RPCs plus (for an above-frontier fill) no receipt wait, so this stays well inside
         // the shutdown budget.
         const MAX_SHUTDOWN_HEALS: usize = 3;
-        // [#6b] Bound in TIME as well as passes: a frontier-hole pass can still consume the
+        // Bound in TIME as well as passes: a frontier-hole pass can still consume the
         // full 30s HEAL_RECEIPT_BUDGET, and the shutdown budget is already 45s join + reap
         // against a 90s supervisor kill. Overrunning costs the worker reap (SP1's gpu-server
         // holds ~11.5 GB) and the exit-75 verdict — worse than an unfilled hole, which
@@ -1611,7 +2067,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         let mut heal_target = heal_target;
         let mut healed = 0usize;
         while healed < MAX_SHUTDOWN_HEALS {
-            // [#1] Fill the nonce the GATE approved. `heal_nonce_gap()` re-derives from the
+            // Fill the nonce the GATE approved. `heal_nonce_gap()` re-derives from the
             // ungated detector, which in a documented state nominates a different nonce —
             // the executable releaseJob at the frontier.
             let Some(target) = heal_target else { break };
@@ -1679,7 +2135,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
             );
         }
 
-        // [F5] Leave a machine-readable verdict and a NON-ZERO exit when anything is still
+        // Leave a machine-readable verdict and a NON-ZERO exit when anything is still
         // held: every path previously returned Ok(()) -> exit 0, so `Restart=on-failure`
         // saw success and did NOT restart — disabling the recovery path that is the actual
         // remedy for a held job.
@@ -1738,11 +2194,11 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
 
     // 4. Only now tear down the workers. Releasing needs nothing but the job id, so keeping
     //    them alive until this point costs nothing and lets the drain path finish real work.
-    // BOUNDED, for the same reason as the [F4] hard-kill reap: `shutdown_all` phase 4 takes a
+    // BOUNDED, for the same reason as the hard-kill reap: `shutdown_all` phase 4 takes a
     // BLOCKING slot lock while phases 2/3 skip any slot whose `pid` is momentarily 0 (the
     // dispatcher's respawn/recycle window), so it can block for a whole proof (up to the 600s
     // watchdog). On a SUPERVISED stop there is no third signal to reach the bounded copy, and
-    // the [F5] exit code below is gated behind this call — an unbounded reap means the
+    // the exit code below is gated behind this call — an unbounded reap means the
     // supervisor SIGKILLs us before EX_TEMPFAIL is ever delivered and the sp1-gpu-server
     // grandchild keeps its VRAM anyway. Off-thread so it also can't block a runtime worker.
     {
@@ -1975,7 +2431,7 @@ async fn miner_brain(
     // settings screen can change it — do not use this for decisions.
     initial_queue_horizon: Duration,
 ) {
-    // Journal is owned by `run()` (see [B2]) so the shutdown path can read it. Recovery
+    // Journal is owned by `run()` so the shutdown path can read it. Recovery
     // reconciles the on-disk journal AND scans the chain for locked positions the
     // journal never captured (crash before write, cleared journal, other machine),
     // so it always runs — not only when the journal is non-empty.
@@ -1989,11 +2445,11 @@ async fn miner_brain(
             tracing::info!("Loaded job journal with {n} claimed entries");
         }
     }
-    // [#4 residual — review must-fix] CAPTURE whether startup recovery deferred under a
+    // CAPTURE whether startup recovery deferred under a
     // storm (do NOT discard it): seeding the loop's `recovery_deferred` from it arms the
     // sooner-retry floor for a STARTUP-time deferral too — otherwise a miner that restarts
     // mid-storm holding a deadline-imminent, None-view lock would wait the full ~5-min
-    // periodic cadence and could be slashed, the exact window this mitigation closes.
+    // periodic cadence and could be slashed.
     let mut recovery_deferred = recover_claimed_jobs(
         &client,
         &state,
@@ -2014,14 +2470,14 @@ async fn miner_brain(
     // finished tasks report their job_id back on `done_rx`.
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<B256>();
     let mut in_flight: HashMap<B256, u128> = HashMap::new();
-    // Throttle for the "skipping all jobs — insufficient collateral" warning (#14):
+    // Throttle for the "skipping all jobs — insufficient collateral" warning:
     // the brain re-evaluates every 5s, so warn at most once per COLLATERAL_WARN_EVERY.
     let mut last_collateral_warn: Option<std::time::Instant> = None;
-    // 429-aware claiming (#19): when the RPC is actively rate-limiting, pause
+    // 429-aware claiming: when the RPC is actively rate-limiting, pause
     // claiming NEW jobs (in-flight prove/fulfill keep going). Throttled warn.
     let rpc_meter = client.rpc_meter();
     let mut last_rpc_backoff_warn: Option<std::time::Instant> = None;
-    // [#10c] Escalating claim-pause. Repeated storm EPISODES widen the quiet period required
+    // Escalating claim-pause. Repeated storm EPISODES widen the quiet period required
     // before claims resume (30→60→120s) so the miner doesn't jump back in the instant the
     // base window lapses and immediately re-trigger the storm. Decays after CLAIM_BACKOFF_DECAY
     // of quiet or on any successful claim.
@@ -2031,7 +2487,7 @@ async fn miner_brain(
     // Wait for benchmarks and initial state to settle.
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // [D6] The governance-set per-job collateral floor. The on-chain claim floors
+    // The governance-set per-job collateral floor. The on-chain claim floors
     // computeCollateral() with MIN_COLLATERAL_AMOUNT, so the gate must use the SAME
     // value — not an adapter's minStake (the prover-eligibility total-stake threshold,
     // a different and typically much larger quantity, which made the gate over-provision
@@ -2055,12 +2511,12 @@ async fn miner_brain(
         }
     };
 
-    // [H3] Periodic recovery cadence. Startup recovery runs exactly once, so a job that
+    // Periodic recovery cadence. Startup recovery runs exactly once, so a job that
     // becomes held-but-undriven LATER in the session (a deferred release whose RPC failed,
     // an unknown batch job whose lifecycle exited, a lagging-read drop) would strand to a
     // keeper slash with no restart. We re-run recovery on a timer WHEN IDLE.
     const RECOVERY_EVERY_TICKS: u64 = 60; // ~5 min at a 5s tick
-                                          // [#4 residual] When a recovery pass DEFERS work under a rate-limit storm, retry on this
+                                          // When a recovery pass DEFERS work under a rate-limit storm, retry on this
                                           // much shorter floor instead of waiting the full idle cadence — so a None-view job with
                                           // an imminent deadline gets reconciled/released as soon as the storm eases, not up to
                                           // ~5 min later. Floored so it can't hammer a still-storming endpoint every tick.
@@ -2081,7 +2537,7 @@ async fn miner_brain(
     let mut consecutive_defers: u32 = recovery_deferred as u32;
     let mut last_recovery_tick: u64 = 0;
 
-    // [nonce-review round 4] Nonce-gap watchdog. A hole at the mined frontier (an evicted
+    // Nonce-gap watchdog. A hole at the mined frontier (an evicted
     // external tx, or a below-`next` abort-gap no organic reserve refilled) leaves our
     // higher-nonce txs queued forever with NO error surfaced — a total signer wedge that
     // neither resync nor reserve can heal. Every WEDGE_CHECK_TICKS we probe for the gap;
@@ -2092,28 +2548,81 @@ async fn miner_brain(
     const WEDGE_MIN_PERSIST: std::time::Duration = std::time::Duration::from_secs(45);
     // (nonce, when it was FIRST seen) — see the WEDGE_MIN_PERSIST gate below.
     let mut last_gap: Option<(u64, std::time::Instant)> = None;
-    // [queue] Per-device backlog, so look-ahead admission can ask "when would this job
+    // Per-device backlog, so look-ahead admission can ask "when would this job
     // actually START" instead of assuming now. Self-correcting: entries decay with the wall
     // clock and are dropped on completion, so a wrong estimate cannot accumulate.
-    // [cycles] Descriptor hash -> MEASURED cycle count, from executing the guest.
+    // (programId, keccak256(inputData)) -> MEASURED cycle count, from executing the guest.
     //
-    // Keyed on the descriptor hash, not the program id: cycles depend on the INPUT as well as
-    // the program, and the descriptor hash covers both. Same descriptor => same execution =>
-    // same count, so one measurement is valid forever.
+    // Keyed on the pair (program, input) because the cycle count is a deterministic
+    // function of EXACTLY those two. Keying by programId alone under-sized an
+    // input-varying flood — one cheap measurement of a program was reused for every later job of it,
+    // including inputs that run billions of cycles. Keying by the descriptor hash alone
+    // let a tag-varying flood dodge the cache, since the free-form `tag` is in the descriptor
+    // hash but not the input. The pair defeats both: a new tag with the same input resolves to the
+    // existing measurement (via `desc_input_hash` below), and a genuinely new input is measured on
+    // its own merits. `UNMEASURABLE_CYCLES` is stored for a guest that tripped the execute cap,
+    // negative-caching it as infeasible so it is never claimed and never re-measured.
     //
-    // This exists because `expectedCycles` is submitter-declared and, on the observed market,
-    // always zero (298/298 jobs) — leaving a 34e6 constant that is ~8x below the measured
-    // median. Declaring it honestly costs the submitter a bond that scales with the count
-    // (~1 HEMI per 9M cycles), so an empty field is the rational default and will stay that
-    // way. Measuring it ourselves is the only reliable source.
+    // This exists because `expectedCycles` is submitter-declared, adversarial, and in practice
+    // always zero, leaving a 34e6 constant ~8x below the measured median.
+    // Measuring it ourselves is the only trustworthy source, and a job is NOT claimed until
+    // we hold a measurement for its exact (program, input) — see `measurable` and the claim gate.
     // Shared so the background measurement task below can populate it while the brain runs.
     let measured_cycles: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, u64>>,
+        std::sync::Mutex<
+            std::collections::HashMap<
+                (u8, alloy::primitives::B256, alloy::primitives::B256),
+                u64,
+            >,
+        >,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    // Descriptors already being measured, so N sightings of the same job spawn ONE execution.
+    // descriptor hash -> keccak256(inputData). Lets a brain tick resolve a sighting's
+    // input hash (and hence its measurement) WITHOUT re-fetching the descriptor for every candidate:
+    // it is learned once, when the measurement task fetches the descriptor, and reused for every
+    // later sighting of the same descriptor. A new tag is a new descriptor hash, so a miss here until
+    // its (cheap, cached) descriptor fetch records it — never an under-size, because a miss blocks the
+    // claim rather than falling back to the declared count.
+    let desc_input_hash: DescInputCache =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // Descriptor hashes already being measured, so N sightings of the same job spawn ONE execution.
+    // Maps dh -> backend_tag so the measure budget below can be counted PER-BACKEND (one backend's
+    // in-flight measurement must not consume the slot the other backend needs); dedup is still global
+    // by descriptor hash (a dh is unique to one job).
     let measuring: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>>,
+        std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, u8>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // (backend, program, input) triples with an execution IN FLIGHT. The `measuring` set
+    // above dedups by DESCRIPTOR hash, but the measured cache keys by (backend, program, input): a
+    // concurrent burst of the SAME input under many distinct tags is many distinct descriptor hashes,
+    // which would all pass `measuring`, all see an empty cache, and all execute the identical heavy
+    // input at once. This set collapses that to one execution per (backend, program, input).
+    let measuring_inputs: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashSet<(u8, alloy::primitives::B256, alloy::primitives::B256)>,
+        >,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    // consecutive wall-clock measure-timeout strikes per (backend, program, input), so a
+    // single transient timeout does not permanently blacklist a feasible job (see `measure_cycles`).
+    let measure_strikes: MeasureStrikes =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // (Over-cap fulfill-payload verdicts now live as the `over_cap` bit on each descriptor's DescInfo
+    // resolver entry in `desc_input_hash`, so the verdict and the resolver evict together — see
+    // `DescInfo` / `measure_cycles`.)
+    // Journal length per (backend, program, input), cached when a measurement executes so a later
+    // descriptor for the same pair (which reuses the cached cycle count without re-executing) can
+    // still have its full fulfill payload checked and, if over the cap, flagged on its resolver entry.
+    let measured_journal: JournalLenCache =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // descriptor hash -> its payload length (inputData + the two extra-data fields), cached during
+    // measurement so the claim gate can re-check a descriptor's full fulfill payload against the cap
+    // even when that descriptor's own measure task returned before any journal existed (the
+    // measuring_inputs race loser), which otherwise escaped both payload screens (see `DescPayloadCache`).
+    let desc_payload: DescPayloadCache =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // descriptor hash -> cooldown Instant for a job the submitter assigned to another prover, so a
+    // flood of such jobs cannot re-consume the per-tick measure budget (see `AssignedElsewhere`).
+    let assigned_elsewhere: AssignedElsewhere =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut queue_model = zkminer_strategy::queue::QueueModel::new();
     let mut queue_last_tick = std::time::Instant::now();
     if !initial_queue_horizon.is_zero() {
@@ -2133,9 +2642,42 @@ async fn miner_brain(
         .map(|p| p.gpu_cards())
         .unwrap_or_default();
 
+    // Headless-visible measure-pool health. A backend with a dedicated measure pool (sp1) can no
+    // longer SIZE a not-yet-measured job — and so can no longer CLAIM one — if every pool worker is
+    // dead and not revivable, yet `is_backend_healthy` stays green off the (still-alive) GPU prove
+    // slot. (Already-measured jobs still claim and prove normally — they need no measure capacity;
+    // only new/unmeasured jobs stall.) `worker_status` is a one-shot startup snapshot consumed only by
+    // the TUI, so a runtime retirement is invisible to a HEADLESS operator (the primary deployment).
+    // Emit a log on the live→down transition (and on recovery) so the outage reaches journald.
+    // Per-backend last-known state so each tick only logs a CHANGE, never a per-tick spam. (Liveness,
+    // not idleness: a BUSY or briefly-respawning pool is still live.)
+    let mut measure_pool_down: std::collections::HashMap<&'static str, bool> =
+        std::collections::HashMap::new();
+
     loop {
         interval.tick().await;
         tick_count = tick_count.wrapping_add(1);
+
+        // Surface measure-pool unavailability to headless logs (see `measure_pool_down`).
+        if let Some(pool) = zkminer_prover::engine::worker_pool() {
+            for backend in ["sp1"] {
+                if let Some(live) = pool.measure_pool_live(backend) {
+                    let down = !live;
+                    let was_down = measure_pool_down.get(backend).copied().unwrap_or(false);
+                    if down && !was_down {
+                        tracing::warn!(
+                            "{backend} measure pool is DOWN — every measure worker is dead and not \
+                             revivable; new/unmeasured {backend} jobs cannot be sized or claimed until \
+                             it recovers (already-measured jobs still claim and prove normally). Check \
+                             the measure-worker binary and logs.",
+                        );
+                    } else if !down && was_down {
+                        tracing::info!("{backend} measure pool recovered — sizing/claiming resumes.");
+                    }
+                    measure_pool_down.insert(backend, down);
+                }
+            }
+        }
 
         // Reap finished job tasks before re-evaluating the concurrency budget.
         while let Ok(jid) = done_rx.try_recv() {
@@ -2151,8 +2693,8 @@ async fn miner_brain(
             queue_last_tick = now;
         }
 
-        // [nonce-review round 4] Nonce-gap watchdog (persistence-gated).
-        // [A1] Not during shutdown. The ABANDON stage guards its own heal with
+        // Nonce-gap watchdog (persistence-gated).
+        // Not during shutdown. The ABANDON stage guards its own heal with
         // `frontier_has_executable_tx` precisely because a heal bids >= 4x base and would
         // replace our own still-mineable releaseJob with a 0-value self-transfer — stranding
         // exactly the nearest-deadline job it was trying to save. That guard was applied to
@@ -2162,7 +2704,7 @@ async fn miner_brain(
         if tick_count.is_multiple_of(WEDGE_CHECK_TICKS)
             && !SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
         {
-            // [#6a] Persist on ELAPSED TIME, not on two sightings.
+            // Persist on ELAPSED TIME, not on two sightings.
             //
             // `WEDGE_CHECK_TICKS` counts loop ITERATIONS of a 5s `tokio::time::interval`
             // whose default missed-tick behaviour is Burst, and `recover_claimed_jobs` awaits
@@ -2176,9 +2718,8 @@ async fn miner_brain(
             // `exhausted` is derived from purely local state (the recorded fee floor), and
             // the only thing that can invalidate it is chain truth. But the bail arms give
             // up BEFORE `tx.send()`, so no job path will ever learn that the resident tx
-            // finally mined -- the very send that ended the 2026-08-14 incident at
-            // 02:42:22 ("nonce too low: next nonce 11592" -> resync) no longer happens.
-            // Without this, a jam that used to self-heal in 4h24m self-heals only if some
+            // finally mined -- the "nonce too low" send that would trigger a resync no
+            // longer happens. Without this probe, a jam self-heals only if some
             // concurrent task happens to draw a fresh nonce and observe an error.
             //
             // One `eth_getTransactionCount(latest)` per WEDGE_CHECK_TICKS is enough:
@@ -2221,7 +2762,7 @@ async fn miner_brain(
                     Some((g, first_seen))
                         if g == gap && first_seen.elapsed() >= WEDGE_MIN_PERSIST =>
                     {
-                        // [#1] Same hole, and it has genuinely persisted → fill THIS nonce.
+                        // Same hole, and it has genuinely persisted → fill THIS nonce.
                         match client.heal_nonce_gap_at(gap).await {
                             Ok(true) => last_gap = None,
                             Ok(false) => {} // fill not confirmed; retry next window
@@ -2238,14 +2779,14 @@ async fn miner_brain(
             }
         }
 
-        // [H3] Idle-gated periodic recovery. Only when NOTHING is in flight — the same
+        // Idle-gated periodic recovery. Only when NOTHING is in flight — the same
         // safe precondition as the startup pass, so it never double-drives a job an active
         // lifecycle already owns and never races the collateral/slot accounting. When the
         // miner is idle it has spare GPUs anyway, so recovering a stranded (collateral-
         // locked, deadline-ticking) job is strictly the best use of them. find_locked_jobs
         // re-discovers anything we still hold on-chain, so even a job dropped from the
         // journal by an earlier lagging read is re-driven here.
-        // [#4 residual] Run on the periodic cadence OR, if a previous pass deferred work
+        // Run on the periodic cadence OR, if a previous pass deferred work
         // under a storm, on the shorter deferred-retry floor. The idle gate is KEPT for both
         // (dropping it would let recovery double-drive a job an active lifecycle owns) — but
         // during a storm the miner is typically idle anyway, and this removes the up-to-5-min
@@ -2258,12 +2799,12 @@ async fn miner_brain(
             recovery_deferred && tick_count.saturating_sub(last_recovery_tick) >= retry_floor;
         if in_flight.is_empty() && (due_periodic || due_deferred) {
             // Gate on ON-CHAIN LOCKED COLLATERAL, not the journal — but read its FRESHNESS
-            // too. [#10 must-fix] A 429 storm FREEZES stake_info: the refresh circuit-breaker
+            // too. A 429 storm FREEZES stake_info: the refresh circuit-breaker
             // skips, and a forced ceiling attempt that itself 429s updates nothing — so a
             // `locked==0` from a STALE snapshot is NOT authoritative and must not veto a scan
             // (else a job locked just before the storm, whose stake_info still reads 0,
             // strands to a keeper slash). Scan when: a deferred-retry is pending (find_locked_jobs
-            // is the authoritative chain scan, self-limited by #4's backoff) OR we KNOW we hold
+            // is the authoritative chain scan, self-limited by the deferred-retry backoff) OR we KNOW we hold
             // collateral OR we CAN'T tell (stale read). Only a FRESH read of locked==0 skips.
             let (locked, stake_fresh) = {
                 let s = state.read().await;
@@ -2295,7 +2836,7 @@ async fn miner_brain(
                     }
                 );
                 last_recovery_tick = tick_count;
-                // [B5] Do not START a new recovery pass once shutdown has begun. Recovery
+                // Do not START a new recovery pass once shutdown has begun. Recovery
                 // drives `process_job_lifecycle` INLINE, so a pass begun here would add work
                 // the drain then has to wait for — and the `paused` gate below is checked
                 // AFTER this block, so it does not cover us.
@@ -2545,7 +3086,7 @@ async fn miner_brain(
 
         // Do not take on new collateral while the signer is JAMMED by an undisplaceable
         // nonce: nothing at or above it can mine, so a claim bonds collateral that no
-        // fulfill and no release can free. On 2026-08-14 a 4h24m jam let three jobs age
+        // fulfill and no release can free. A jam can let jobs age
         // past their lock deadline exactly this way, and past the deadline `releaseJob`
         // REVERTS, so the collateral is stranded outright.
         //
@@ -2570,7 +3111,7 @@ async fn miner_brain(
             continue;
         }
 
-        // #19 / [#10c]: don't take on new jobs while the endpoint is rate-limiting. We only
+        // Don't take on new jobs while the endpoint is rate-limiting. We only
         // reach here with open jobs and spare concurrency, so a 429 in the recent window
         // means claiming now would just deepen the backlog. In-flight jobs are unaffected —
         // their prove/fulfill tasks run elsewhere. The window ESCALATES (30→60→120s) across
@@ -2619,7 +3160,7 @@ async fn miner_brain(
             }
         }
 
-        // [#10 guard] Freshness precondition: never claim on stale collateral data. If the
+        // Freshness precondition: never claim on stale collateral data. If the
         // refresh multicall hasn't succeeded recently (silent non-429 failure, or the just-
         // cleared post-storm tick before the forced refresh landed), skip this tick rather
         // than size a claim's collateral against a frozen stake_info. The refresh loop
@@ -2664,8 +3205,8 @@ async fn miner_brain(
                 // living only as a local the shipped default configuration — `skip_benchmark_gate =
                 // true`, no cache, nobody has pressed `[b]` — showed both cards as not-provable and
                 // refused to toggle them. The operator had NO per-device control at all, while mock
-                // mode seeded the field and showed the grid: the mock-only-honoured divergence this
-                // project keeps rediscovering. The figures are conservative placeholders and the
+                // mode seeded the field and showed the grid — a divergence where only the mock path
+                // populated it. The figures are conservative placeholders and the
                 // screen labels them "(unbenchmarked)"; what matters is that the cards are addressable.
                 if !synthetic_published {
                     synthetic_published = true;
@@ -2682,7 +3223,7 @@ async fn miner_brain(
             }
         };
 
-        // [queue] GPU rows of the benchmark suite, as (dispatcher-visible id, cycles/sec).
+        // GPU rows of the benchmark suite, as (dispatcher-visible id, cycles/sec).
         // Keyed on the BENCHMARK device id (`gpu0`), not the dispatcher's (`risc0:cuda:0`):
         // the model only needs stable, distinct keys, and these are what carry a throughput.
         // A GPU with no benchmark row still appears, with 0.0, so the planner falls back to
@@ -2715,9 +3256,9 @@ async fn miner_brain(
         // fresh claim once the 15s stake refresh reflects it, AND collateral stranded in
         // past-deadline jobs that never sit in `in_flight`. Subtracting Σ(in_flight) on
         // top double-counts a fresh claim's collateral during the ~15s window before the
-        // refresh catches up (and, because the D6 gate reserves at max_price, over-counts
+        // refresh catches up (and, because the collateral gate reserves at max_price, over-counts
         // that window by the reservation surplus). That over-conservatism idles GPUs when
-        // collateral is genuinely tight (the D17 finding) — a THROUGHPUT cost, not a
+        // collateral is genuinely tight — a THROUGHPUT cost, not a
         // safety one.
         //
         // An earlier attempt used `total − max(on_chain_locked, Σ in_flight)` to remove
@@ -2760,11 +3301,11 @@ async fn miner_brain(
             })
             .unwrap_or_default();
 
-        // #14: track whether we claimed anything this tick and, if not, the cheapest
+        // Track whether we claimed anything this tick and, if not, the cheapest
         // job we had to skip purely for lack of available collateral — so an idle
         // miner tells the operator WHY (the per-job eval reason is DEBUG-only).
         let mut claimed_this_tick = false;
-        // [headroom] Collateral reserved by claims made THIS tick. `stake_info` is a
+        // Collateral reserved by claims made THIS tick. `stake_info` is a
         // tick-start snapshot and is never re-read, so it does not reflect them; pairing it
         // with a post-claim `in_flight.len()` would count each claim twice.
         let mut reserved_this_tick: u128 = 0;
@@ -2772,7 +3313,7 @@ async fn miner_brain(
         // rather than once per candidate job.
         let mut memory_skips_this_tick: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        // [headroom] Was ANY job affordable on collateral alone? NOT the same as
+        // Was ANY job affordable on collateral alone? NOT the same as
         // `claimed_this_tick`: `Recommendation::Claim` also requires profit, risk and
         // deadline feasibility, so a rich wallet that skips on profit would otherwise report
         // "0 of N slots fundable — stake more".
@@ -2813,7 +3354,40 @@ async fn miner_brain(
                 s.open_jobs.retain(|j| j.info.job_id != jid);
                 continue;
             }
-            let snapshot = JobStatusSnapshot::from_view(&view);
+            // `mut`: the candidate loop records this job's MEASURED cycle count on the snapshot below
+            // (once resolved), so the prove path sizes its watchdog/VRAM/po2 on it, not on the
+            // adversarial declared `expected_cycles`.
+            let mut snapshot = JobStatusSnapshot::from_view(&view);
+            // Skip a descriptor whose fulfill payload a prior measurement found to be over the
+            // on-chain cap: claiming+proving it would waste a full proof on a fulfill that is
+            // guaranteed to OOG-revert, then release at a penalty. Cheap per-tick re-check; the job
+            // stays in the open set in case the submitter re-submits it under a slimmer descriptor.
+            if desc_is_unfulfillable(&desc_input_hash, snapshot.descriptor_hash) {
+                tracing::debug!(
+                    "Skipping {}: its fulfill payload exceeds the on-chain cap (journal + descriptor \
+                     + seal) — proving it would waste a proof on a guaranteed-revert fulfill",
+                    short_id(jid)
+                );
+                continue;
+            }
+            // Skip a program whose served ELF can never satisfy its on-chain programId: a prior prove
+            // derived the verifying key / image id and it did not match, so EVERY job for this program
+            // fails at prove AFTER the collateral-locking claim and releases at a penalty. SP1 cannot
+            // check this before claiming (deriving the vkey needs the minutes-long setup), so it is only
+            // learned on the prove path — recording it there caps the loss to the ONE claim wave already
+            // in flight when its first prove faults (this claim gate, the batch-claim task, and each
+            // per-job lifecycle task all re-check the mark), not a release penalty per job. (The job stays
+            // in the open set; the check is a cheap per-tick lookup. A legitimate program's vkey always
+            // matches, so this never false-skips real work.)
+            if program_vkey_mismatched(job.info.program_id) {
+                tracing::debug!(
+                    "Skipping {}: its programId cannot be satisfied by the served ELF (vkey/image-id \
+                     mismatch seen on a prior prove) — any claim would waste a proof and release at a \
+                     penalty",
+                    short_id(jid)
+                );
+                continue;
+            }
             // Proving-time budget if we claim now. getJobStatusView.timeRemaining is
             // only populated for LOCKED jobs (it's lockDeadline - now); for an OPEN
             // job it is 0. So for an unclaimed job, fall back to the fulfillmentTimeout
@@ -2844,6 +3418,28 @@ async fn miner_brain(
                     continue;
                 }
                 Some(backend) => {
+                    // Refuse a job whose window is too short to claim, prove, AND still
+                    // release collateral before the deadline. A submitter can set a tiny
+                    // fulfillmentTimeout (with small declared cycles so the duration estimate looks
+                    // feasible) to bait a claim that then cannot be fulfilled in time → release
+                    // penalty / slash. The floor is the irreducible overhead independent of proof
+                    // size: release margin + one minimum attempt + the backend's fixed setup
+                    // allowance + a buffer for the claim tx itself to mine. (Fresh-job loop only, so
+                    // skipping is free — nothing is on-chain yet.)
+                    let min_deadline_floor = DEADLINE_RELEASE_MARGIN_SECS
+                        + MIN_ATTEMPT_BUDGET_SECS
+                        + fixed_proving_allowance_secs(backend)
+                        + DEADLINE_FULFILL_MARGIN_SECS;
+                    if time_remaining < min_deadline_floor {
+                        tracing::debug!(
+                            "Skipping {}: deadline too short ({}s < {}s floor for {backend}) — \
+                             claiming would risk a release penalty / slash",
+                            short_id(jid),
+                            time_remaining,
+                            min_deadline_floor
+                        );
+                        continue;
+                    }
                     // Snapshot the backend sources ONCE so `available` and `sim_mode`
                     // are computed from a single consistent view (a health flip between
                     // two separate calls could otherwise disagree).
@@ -3037,16 +3633,140 @@ async fn miner_brain(
             // Preference order: the submitter's declaration, then our own MEASUREMENT, then
             // the constant. A measured value beats the constant by ~8x in accuracy; the
             // declaration is preferred only because it is backed by the submitter's bond.
-            let estimated_cycles = if snapshot.expected_cycles > 0 {
-                snapshot.expected_cycles
-            } else if let Some(c) = measured_cycles
-                .lock()
-                .ok()
-                .and_then(|m| m.get(&snapshot.descriptor_hash).copied())
-            {
-                c
+            // The submitter's `expectedCycles` is attacker-controlled: declaring a
+            // tiny count behind an ELF that runs billions of cycles makes a job look cheap and
+            // deadline-feasible, so the miner claims (locking collateral) then cannot finish, and
+            // bleeds the release penalty. Defences:
+            //   - measure the guest ourselves and key the result by (programId, keccak256(inputData)).
+            //     The cycle count is a deterministic function of exactly (program, input): keying
+            //     by programId alone under-sized an input-varying flood (one cheap input's measurement
+            //     reused for a heavy one), and keying by descriptor_hash alone let a tag-varying flood
+            //     dodge the cache (the free-form `tag` is in the hash but not the input). The pair
+            //     resolves via `desc_input_hash`, so a repeat input — under any tag — is sized on its
+            //     real measurement.
+            //   - with a measurement, never size SMALLER than it: max(declared, measured).
+            //   - with NO measurement (not yet measured for this exact input), floor the declaration at
+            //     FALLBACK_ESTIMATED_CYCLES so a `declared = 1` can't shrink the estimate toward zero.
+            //     This estimate is only for RANKING an unsized job; it cannot be CLAIMED until measured
+            //     (see `measurable` and the claim gate), so the floor never gates real collateral.
+            // The measured count is keyed by backend too, so resolve against THIS job's
+            // backend — a measurement only sizes a job of the same proof system.
+            let backend_opt = resolve_backend(snapshot.proof_system_id);
+            // The feasibility estimate must be measured against the window the PROVE PATH actually
+            // gets, not the full fulfillment window. Once claimed: the prove watchdog is budgeted at
+            // (window − release margin), the fulfill tx needs its own margin AFTER the proof, and the
+            // backend adds a fixed proving allowance (notably the ~120s SP1 Groth16 wrap) that the
+            // pure cycles/throughput estimate omits. Subtract all three and feed this provable window
+            // to the evaluator and the planner, so a job is admitted only if its estimate fits the time
+            // it will truly have — closing the optimistic-full-window gap that led to admitted-then-
+            // doomed claims (claim → watchdog kill → penalized release). The size-independent
+            // `min_deadline_floor` gate above already guarantees time_remaining ≥ release + min_attempt
+            // + fixed_allowance + fulfill, so this stays ≥ MIN_ATTEMPT_BUDGET_SECS (never 0) here.
+            let prove_window = time_remaining.saturating_sub(
+                DEADLINE_RELEASE_MARGIN_SECS
+                    + DEADLINE_FULFILL_MARGIN_SECS
+                    + backend_opt.map(fixed_proving_allowance_secs).unwrap_or(0),
+            );
+            let measured_for_job = resolve_measured(
+                &measured_cycles,
+                &desc_input_hash,
+                backend_opt.unwrap_or(""),
+                job.info.program_id,
+                snapshot.descriptor_hash,
+            );
+            // Carry the measured count on the snapshot so the prove path (watchdog
+            // timeout, min-VRAM, po2) sizes on it instead of the adversarial declared field. Rides
+            // through the batch tuple → spawn_lifecycle_task → process_job_lifecycle unchanged.
+            snapshot.measured_cycles = measured_for_job;
+
+            // Per-device throughputs for THIS job's backend (the same rows the planner uses). Size the
+            // live claim gate on the SLOWEST eligible card so admission is safe wherever dispatch lands
+            // the job, and record the FASTEST eligible card as the preferred dispatch target so the job
+            // runs on the card it was planned for when that card is free (graceful fallback otherwise).
+            // When the look-ahead planner is active it is the finer, per-device admission gate and
+            // overrides this preference with its own backlog-aware choice below — so the live gate stays
+            // on the suite average there to avoid double-counting its conservatism into an over-refusal.
+            // `throughputs_for_backend` also emits cross-backend FALLBACK rows (the global slowest)
+            // for cards with no row for THIS backend — those exist only for the planner's
+            // device-existence logic and CANNOT run this backend. Size and prefer over the GENUINE
+            // per-device rows only: a card that cannot run the backend must neither drag the slowest
+            // estimate down (over-refusing feasible work) nor be chosen as the preferred dispatch
+            // target. Only when there is no genuine row at all do we fall back to the mixed-list value
+            // (behavior there is unchanged; the empty-rows case is handled by the sizing rework).
+            let backend_name = backend_opt.unwrap_or("");
+            let genuine_throughputs: Vec<f64> = device_backend_throughputs
+                .iter()
+                .filter(|(_, b, t)| b.as_str() == backend_name && t.is_finite() && *t > 0.0)
+                .map(|(_, _, t)| *t)
+                .collect();
+            let slowest_eligible = if genuine_throughputs.is_empty() {
+                throughputs_for_backend(&device_backend_throughputs, backend_name)
+                    .iter()
+                    .map(|(_, t)| *t)
+                    .filter(|t| t.is_finite() && *t > 0.0)
+                    .fold(f64::INFINITY, f64::min)
+                    .pipe_finite_or(0.0)
             } else {
-                FALLBACK_ESTIMATED_CYCLES
+                genuine_throughputs.iter().copied().fold(f64::INFINITY, f64::min)
+            };
+            snapshot.preferred_device = device_backend_throughputs
+                .iter()
+                .filter(|(_, b, t)| b.as_str() == backend_name && t.is_finite() && *t > 0.0)
+                .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(id, _, _)| id.clone());
+            let live_gate_throughput = if planner_active {
+                0.0
+            } else if slowest_eligible > 0.0 {
+                slowest_eligible
+            } else if benchmarks.is_simulated() {
+                // Simulated suite: keep 0.0 so the evaluator's is_simulated()+throughput<=0 guard waves
+                // the (instant, allocation-free) simulated proof through — don't break demo/test flows.
+                0.0
+            } else {
+                // Real rig but no genuine per-device row for this backend (e.g. a cached suite
+                // predating device_benchmarks): size on a conservative floor rather than letting the
+                // evaluator fall back to its OPTIMISTIC suite average, which would re-open deadline
+                // claim-bait. See `CONSERVATIVE_SIZING_CPS`.
+                CONSERVATIVE_SIZING_CPS
+            };
+
+            // Backstop the per-descriptor fulfill-payload screen at the claim gate, evaluated HERE —
+            // right after resolve_measured — so the measured-cycle and journal-length caches are read
+            // at one consistent point (past the adapter-query await above, and after the measure task's
+            // journal-before-cycles insert order guarantees a resolved measurement implies a cached
+            // journal). A sibling descriptor that LOST the measuring_inputs dedup race recorded its
+            // resolver (so it became claimable) but returned before any journal existed, so neither
+            // payload screen inside its measure task ran for it. Once the winner's measurement lands the
+            // journal length is known; combined with THIS descriptor's cached payload the full payload
+            // is re-checked here and the claim refused when it is over the cap — closing the window where
+            // such a descriptor is claimed+proved into a guaranteed OOG-revert fulfill. Mark it so later
+            // ticks short-circuit at the cheap desc_is_unfulfillable check. (Returns false — does not block — until
+            // all three inputs are cached, so it never false-skips a job that could actually fulfill.)
+            if let Some(backend) = backend_opt {
+                if claim_payload_over_cap(
+                    &desc_input_hash,
+                    &measured_journal,
+                    &desc_payload,
+                    backend,
+                    job.info.program_id,
+                    snapshot.descriptor_hash,
+                ) {
+                    mark_desc_unfulfillable(&desc_input_hash, snapshot.descriptor_hash);
+                    tracing::debug!(
+                        "Skipping {}: its full fulfill payload (measured journal + descriptor + \
+                         seal) exceeds the on-chain cap — proving it would waste a proof on a \
+                         guaranteed-revert fulfill",
+                        short_id(jid)
+                    );
+                    continue;
+                }
+            }
+
+            let estimated_cycles = match (snapshot.expected_cycles, measured_for_job) {
+                (0, Some(c)) => c,
+                (0, None) => FALLBACK_ESTIMATED_CYCLES,
+                (declared, Some(c)) => declared.max(c),
+                (declared, None) => declared.max(FALLBACK_ESTIMATED_CYCLES),
             };
 
             // Required collateral: compute from the auction formula.
@@ -3054,12 +3774,12 @@ async fn miner_brain(
             //   1. Per-job lockCollateralBps override (if non-zero)
             //   2. Adapter defaultCollateralRatio (if non-zero)
             //   3. Global GLOBAL_DEFAULT_COLLATERAL_BPS (15000)
-            // [D16] Include tier 3: a registered-Active adapter can carry
+            // Include tier 3: a registered-Active adapter can carry
             // defaultCollateralRatio == 0, which the contract resolves to the global
             // default. Without this fallback effective_bps would be 0 → the gate would
             // pass a job needing ~0 collateral → on-chain claim locks 150% → tail revert.
             // (Tier 1 per-job override is currently never populated — the event/view don't
-            // expose lockCollateralBps — but the branch is kept for when they do; see D15.)
+            // expose lockCollateralBps — but the branch is kept for when they do.)
             let effective_bps = if job.info.lock_collateral_bps > 0 {
                 job.info.lock_collateral_bps as u64
             } else if adapter_info.default_collateral_bps > 0 {
@@ -3074,11 +3794,11 @@ async fn miner_brain(
             // assembly + tx mining), by which point the ascending auction has ramped the
             // price HIGHER than snapshot.current_price. Gating on the current price
             // UNDER-provisions: the miner batches N jobs believing they fit, then the tail
-            // claim reverts on-chain for insufficient collateral. The 2026-07-16 soak hit
-            // this in 7 of 14 batches (all 2/3): available fell to ~371 HEMI (~2.7 jobs)
-            // yet every job still evaluated collateral-sufficient (its current-price
-            // estimate fit the stale available), so the brain optimistically batched 3 and
-            // the 3rd sub-claim reverted. max_price is the auction ceiling, so collateral
+            // claim reverts on-chain for insufficient collateral. The failure mode: when
+            // available collateral has fallen to only ~2.7 jobs' worth, every job can still
+            // evaluate collateral-sufficient (its current-price estimate fits the stale
+            // available), so the brain optimistically batches 3 and the 3rd sub-claim
+            // reverts. max_price is the auction ceiling, so collateral
             // at max_price is the most the claim can EVER lock — gating on it means a job
             // joins the batch only if we can cover it even after a full ramp, and the
             // running `available_collateral`/`in_flight` reservations stay conservative
@@ -3090,7 +3810,7 @@ async fn miner_brain(
             let required_collateral = zkminer_chain::auction::compute_collateral(
                 job.info.max_price.max(snapshot.current_price),
                 effective_bps,
-                min_collateral_amount, // [D6] governance floor, not adapter.min_stake
+                min_collateral_amount, // governance floor, not adapter.min_stake
             );
 
             let params = JobParams {
@@ -3107,13 +3827,19 @@ async fn miner_brain(
                 } else {
                     snapshot.fulfillment_timeout
                 },
-                time_remaining,
+                // The provable window (full window − release/fulfill margins − fixed proving
+                // allowance), NOT the full fulfillment window: the evaluator must size feasibility and
+                // risk against the time the prove path actually gets. See `prove_window` above.
+                time_remaining: prove_window,
                 estimated_cycles,
                 required_collateral,
                 available_collateral,
                 token_price_usd,
                 fee_rate_bps: adapter_info.fee_rate_bps,
-                throughput: 0.0, // use suite average
+                // Slowest eligible card for this backend when the planner is off (safe for any
+                // dispatch landing); suite average when the planner is on (it is the finer gate). 0.0
+                // falls back to the suite average inside the evaluator. See `live_gate_throughput`.
+                throughput: live_gate_throughput,
                 max_price: job.info.max_price.max(snapshot.current_price),
                 // No specific card chosen yet (the dispatcher picks one at prove time), so
                 // the cost model charges the suite's mean card — paired with the suite-average
@@ -3138,12 +3864,12 @@ async fn miner_brain(
                 params.estimated_cycles,
                 time_remaining,
             );
-            // #14: count + remember the cheapest job blocked SOLELY by collateral —
+            // Count + remember the cheapest job blocked SOLELY by collateral —
             // i.e. under-collateralized but otherwise on-time. Requiring
             // `deadline_feasible` avoids telling the operator to stake more for jobs
             // that would miss their deadline anyway (the evaluator reports the
             // collateral reason first, before checking the deadline).
-            // [headroom] Collateral alone was enough for this job, whatever else decided it.
+            // Collateral alone was enough for this job, whatever else decided it.
             // Distinguishes "we have no money" from "we declined on profit/risk/deadline".
             if eval.collateral_sufficient {
                 any_affordable = true;
@@ -3155,7 +3881,7 @@ async fn miner_brain(
                         .map_or(required_collateral, |c| c.min(required_collateral)),
                 );
             }
-            // [queue] Look-ahead admission. `evaluate_job` above answered "is this job worth
+            // Look-ahead admission. `evaluate_job` above answered "is this job worth
             // doing and could it finish if it started NOW". That second half is exactly the
             // assumption queueing breaks, so re-ask it against the start time the job would
             // actually get. With `queue_horizon_secs = 0` the planner admits only an idle
@@ -3173,10 +3899,10 @@ async fn miner_brain(
             //     any cached suite predating the field.
             // Without this, `plan_admission` returned NoUsableDevice for every job forever and
             // the miner claimed NOTHING, at the default config, visible only in a debug line.
-            // [round-2] Never queue AHEAD on a job whose cycle count we do not know.
+            // Never queue AHEAD on a job whose cycle count we do not know.
             //
-            // Measured across two soaks: 298 of 298 evaluations had `expected_cycles == 0`, so
-            // `estimated_cycles` was always FALLBACK_ESTIMATED_CYCLES (34e6). That estimates
+            // In practice `expected_cycles` is always 0, so
+            // `estimated_cycles` falls back to FALLBACK_ESTIMATED_CYCLES (34e6). That estimates
             // 14.9s on gpu0 against a real median of 123s — 8x under. The committed backlog
             // then decays to zero within a few brain ticks while the proof runs for another
             // ~100-290s, so `slots()` reports a busy card as idle, `HorizonFull` and
@@ -3186,54 +3912,129 @@ async fn miner_brain(
             //
             // A declared cycle count is the planner's whole input. Without one, fall through
             // to the pre-feature idle-device rule rather than queue on a fiction.
-            // Measured counts as measurable: the planner needs a real number, and it does not
-            // care whether the submitter declared it or we executed the guest ourselves.
-            let measurable = snapshot.expected_cycles > 0
-                || measured_cycles
-                    .lock()
-                    .map(|m| m.contains_key(&snapshot.descriptor_hash))
-                    .unwrap_or(false);
+            // A job is "sized" — and only then claimable — once we hold a MEASURED cycle
+            // count for its exact (program, input). The submitter's declared `expected_cycles` is
+            // adversarial and no longer makes a job claimable on its own; it only raises the estimate
+            // once we ALSO have a measurement (max(declared, measured), above). For a backend we
+            // cannot execute-measure, fall back to the declaration so the gate does not permanently
+            // strand it — but both real backends (risc0 and sp1) measure, so in practice a claim
+            // always waits for a real number. The planner shares this: it needs a real number too.
+            // (`backend_opt` was resolved above, before the estimate, for the backend-keyed lookup.)
+            let backend_measurable = matches!(backend_opt, Some("risc0") | Some("sp1"));
+            let measurable = if backend_measurable {
+                measured_for_job.is_some()
+            } else {
+                snapshot.expected_cycles > 0
+            };
 
-            // [cycles] Never measured this descriptor and the submitter did not declare one?
-            // Run the guest through the RISC-V executor in the background to learn its TRUE
-            // cycle count, so the NEXT sighting of this descriptor can be planned on a real
-            // number instead of the 34e6 constant. Deliberately does not block this tick:
-            // the job in front of us is claimed (or not) on today's information, and the
-            // measurement improves every future decision about the same work. The market
-            // recycles a small set of descriptors, so one execution each buys accurate
-            // sizing for everything that follows.
-            if !measurable {
-                let dh = snapshot.descriptor_hash;
-                let fresh = measuring.lock().map(|mut m| m.insert(dh)).unwrap_or(false);
+            // Not yet measured this exact (program, input)? Execute the guest in the
+            // background to learn its TRUE cycle count, so a later sighting can be sized — and
+            // CLAIMED — on a real number instead of the submitter's declaration. Deliberately does not
+            // block this tick; the measurement improves every future decision about the same work, and
+            // the market recycles a small set of (program, input) pairs.
+            // Trigger for every measurable backend — risc0 AND sp1 now both execute-size
+            // (the sp1 worker measures on a CPU executor). Deduped by DESCRIPTOR HASH: that is what we
+            // hold before the descriptor is fetched, and the task resolves it to the input hash.
+            // `measure_cycles` fetches the descriptor, records desc->input, short-circuits if this
+            // input was already measured under another tag, else executes and caches by (backend,
+            // program, input). A non-measurable backend is skipped — it relies on the declared floor
+            // and cannot be claimed here anyway (its `measurable` is declared-only).
+            //
+            // Measure ONLY a job we would actually claim (`Recommendation::Claim` on the
+            // current estimate). The measurement holds a GPU worker slot for up to MEASURE_TIMEOUT, so
+            // without this gate a flood of distinct-input junk jobs — none of which we'd ever claim —
+            // would consume every slot measuring and starve the proofs the measurement exists to
+            // schedule. (Trade-off: a job that looks unprofitable/infeasible at the FALLBACK estimate
+            // but is actually tiny won't be measured; that is a missed opportunity, not a safety loss,
+            // and the fallback is ~the market median so it is rare.)
+            let pid = job.info.program_id;
+            let dh = snapshot.descriptor_hash;
+            if backend_measurable
+                && measured_for_job.is_none()
+                && matches!(eval.recommendation, Recommendation::Claim)
+                // Don't spend a measure slot on a program a prior prove already proved unclaimable
+                // (its served ELF's vkey/image-id can never match its programId); the claim gate skips
+                // it anyway.
+                && !program_vkey_mismatched(pid)
+                // Don't re-spawn a measure task (descriptor fetch + return) every tick for a job the
+                // submitter exclusively assigned to ANOTHER prover; skip it for a cooldown so it cannot
+                // monopolize the per-tick measure budget. Time-bounded, since exclusivity expires.
+                && !assigned_elsewhere_recently(&assigned_elsewhere, dh)
+            {
+                let backend = backend_opt.unwrap_or("");
+                // Dedup by descriptor hash so N sightings spawn ONE execution; cleared below.
+                const MAX_INFLIGHT_MEASUREMENTS: usize = 16;
+                // Budget per-tick measurement spawns against the MEASURE POOL for a backend that has a
+                // dedicated one (sp1), and against GPU prove-concurrency for a backend that measures on
+                // its prove pool (risc0). sp1 measures on the CPU measure pool, never a GPU, so sizing
+                // its budget on GPU count was a category error: it collapsed to 1 on a single-GPU rig
+                // (serializing the 2-worker pool) and exceeded the pool on >=3-GPU rigs (over-spawning
+                // into the "all slots busy" race). Pool-sized means budget <= pool, so over-spawn is
+                // structurally impossible. A descriptor over budget simply waits for a later tick.
+                let measure_budget = match zkminer_prover::engine::worker_pool()
+                    .and_then(|p| p.measure_worker_count(backend))
+                {
+                    Some(pool) => pool.min(MAX_INFLIGHT_MEASUREMENTS),
+                    None => max_concurrent
+                        .saturating_sub(in_flight.len())
+                        .max(1)
+                        .min(MAX_INFLIGHT_MEASUREMENTS),
+                };
+                let fresh = measuring
+                    .lock()
+                    .map(|mut m| {
+                        // Budget PER-BACKEND: count only THIS backend's in-flight measurements, so one
+                        // backend's long measurement (e.g. a ~115s SP1 decoy on the dedicated measure
+                        // worker) cannot monopolize the slot the OTHER backend (risc0, on its GPU prove
+                        // pool) needs. Dedup stays global by descriptor hash.
+                        let tag = backend_tag(backend_opt.unwrap_or(""));
+                        let in_flight_this_backend = m.values().filter(|&&b| b == tag).count();
+                        if m.contains_key(&dh) || in_flight_this_backend >= measure_budget {
+                            false
+                        } else {
+                            m.insert(dh, tag);
+                            true
+                        }
+                    })
+                    .unwrap_or(false);
                 if fresh {
-                    let (c2, st2, cache, inflight) = (
+                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2, jcache2, pcache2, acache) = (
                         client.clone(),
                         state.clone(),
                         measured_cycles.clone(),
+                        desc_input_hash.clone(),
                         measuring.clone(),
+                        measuring_inputs.clone(),
+                        measure_strikes.clone(),
+                        measured_journal.clone(),
+                        desc_payload.clone(),
+                        assigned_elsewhere.clone(),
                     );
-                    let pid = job.info.program_id;
                     tokio::spawn(async move {
-                        let outcome = measure_cycles(&c2, &st2, jid, dh, pid).await;
-                        match outcome {
-                            Ok(cycles) => {
-                                tracing::info!(
-                                    "measured {} cycles for descriptor {} by execution — \
-                                     future jobs with this descriptor will be sized on it",
-                                    cycles,
-                                    short_id(dh)
-                                );
-                                if let Ok(mut m) = cache.lock() {
-                                    m.insert(dh, cycles);
-                                }
-                            }
-                            Err(e) => tracing::debug!(
-                                "cycle measurement for {} failed: {e:#}",
-                                short_id(dh)
-                            ),
-                        }
-                        // Always clear the in-flight marker, so a transient failure does not
-                        // permanently prevent a retry.
+                        // measure_cycles does all caching: it records desc->input, negative-caches a
+                        // too-heavy guest (sized infeasible so it is never claimed nor re-measured),
+                        // caches a real measurement by (backend, program, input), and leaves a
+                        // transient failure uncached so it retries. Classification is by
+                        // the backend's precise cap error, never a loose substring like "cycle".
+                        // `inflight_inputs` collapses a concurrent same-input/different-tag
+                        // burst to ONE execution per (backend, program, input).
+                        measure_cycles(
+                            &c2,
+                            &st2,
+                            backend,
+                            jid,
+                            dh,
+                            pid,
+                            &cache,
+                            &resolver,
+                            &inflight_inputs,
+                            &strikes2,
+                            &jcache2,
+                            &pcache2,
+                            &acache,
+                        )
+                        .await;
+                        // Clear the per-descriptor in-flight marker so a transient failure can retry.
                         if let Ok(mut m) = inflight.lock() {
                             m.remove(&dh);
                         }
@@ -3259,7 +4060,10 @@ async fn miner_brain(
                     &slots,
                     queue_horizon,
                     params.estimated_cycles,
-                    std::time::Duration::from_secs(time_remaining),
+                    // Same provable window as the live evaluator (release/fulfill margins + fixed
+                    // proving allowance already subtracted); the planner had the identical
+                    // full-window-optimism defect.
+                    std::time::Duration::from_secs(prove_window),
                     deadline_safety_margin,
                     // Fallback for a GPU with no benchmark row. Deliberately NOT
                     // `average_throughput()`: that averages the 18 canonical results
@@ -3305,15 +4109,21 @@ async fn miner_brain(
             // A BYPASSED claim never faced `plan_admission`, so it has not earned the
             // look-ahead headroom and must be held to the pre-feature cap.
             //
-            // The previous version asserted exactly this in prose and did not deliver it:
-            // `claim_ceiling` rides `planner_active`, which is per-TICK, while `measurable` is
-            // per-JOB. On the only market ever observed — 298/298 jobs declaring zero cycles —
-            // turning the horizon on gave `claim_ceiling = max_concurrent * 3` with
+            // This interaction is subtle: `claim_ceiling` rides `planner_active`, which is
+            // per-TICK, while `measurable` is per-JOB. When every job declares zero cycles,
+            // turning the horizon on would give `claim_ceiling = max_concurrent * 3` with
             // `plan_admission` never called and `queue_model` permanently empty: 3x claim depth and ZERO
-            // admission checking, strictly worse than the feature being off. That is the shape
-            // the round-2 fold graded critical and believed it had closed.
-            let queue_bypass = !planner_active || !measurable;
-            if (admission.is_some() || (queue_bypass && in_flight.len() < max_concurrent))
+            // admission checking, strictly worse than the feature being off.
+            // A claim requires `measurable` on EVERY path. `admission.is_some()` already
+            // implies it (the planner block is gated on `measurable`); the bypass path — the whole
+            // gate at the default `queue_horizon_secs = 0` — must require it too. The old bypass was
+            // `!planner_active || !measurable`, which let an UNMEASURED job claim on the submitter's
+            // declared/fallback estimate, exactly the under-sizing an input-varying flood exploited.
+            // Now an unmeasured measurable-backend job is skipped this tick (its measurement was
+            // triggered above) and becomes claimable next tick on the real size. `claim_ceiling`/the
+            // pre-feature `max_concurrent` cap are unchanged.
+            let queue_bypass = !planner_active;
+            if (admission.is_some() || (queue_bypass && measurable && in_flight.len() < max_concurrent))
                 && matches!(eval.recommendation, Recommendation::Claim)
             {
                 claimed_this_tick = true;
@@ -3325,7 +4135,7 @@ async fn miner_brain(
                 // dispatched after the loop; a job that doesn't actually lock has its
                 // slot freed (done_tx) by the dispatch.
                 in_flight.insert(jid, required_collateral);
-                // [queue] Commit the admission to the backlog model, paired with the
+                // Commit the admission to the backlog model, paired with the
                 // `in_flight` insert so the two can never disagree about what is outstanding.
                 // Without this the backlog stays at zero, every device looks idle, and the
                 // horizon check admits without limit — the one bug that would turn look-ahead
@@ -3340,6 +4150,9 @@ async fn miner_brain(
                     // planner's one invariant — feasible from the start it would actually get
                     // — was void at any depth >= 2, i.e. the feature's own steady state.
                     queue_model.commit(jid.0, &a.device_id, a.finishes_in);
+                    // Prefer the planner's per-device, backlog-aware device over the fastest-eligible
+                    // hint set above; dispatch tries it first, with the same graceful fallback.
+                    snapshot.preferred_device = Some(a.device_id.clone());
                 }
                 reserved_this_tick = reserved_this_tick.saturating_add(required_collateral);
                 available_collateral = available_collateral.saturating_sub(required_collateral);
@@ -3359,9 +4172,9 @@ async fn miner_brain(
         }
 
         // ── Dispatch the collected claim batch ───────────────────────────────────
-        // [B5] Re-check `paused` HERE. The snapshot taken at the top of this tick is many
+        // Re-check `paused` HERE. The snapshot taken at the top of this tick is many
         // awaits old (the candidate status multicall + per-system adapter fetches), and since
-        // [B5] the brain is no longer aborted when shutdown begins — so a signal landing
+        // the brain is no longer aborted when shutdown begins — so a signal landing
         // inside that window would let this straddling tick lock BRAND NEW collateral during
         // the drain, which a 6s supervised budget can never fulfil. Nothing on-chain has
         // happened yet (the breadcrumb and the tx both come after this point), so dropping
@@ -3389,8 +4202,8 @@ async fn miner_brain(
         }
         // Do not take on new collateral while the signer is JAMMED by an undisplaceable
         // nonce. Nothing at or above that nonce can mine, so a claim here bonds collateral
-        // that no fulfill and no release can free -- on 2026-08-14 a 4h24m jam at nonce
-        // 11589 let three jobs age past their lock deadline exactly this way, and past the
+        // that no fulfill and no release can free -- a jam can let jobs age past their lock
+        // deadline exactly this way, and past the
         // deadline releaseJob reverts, so the collateral is stranded outright.
         //
         // This gates only NEW work. Jobs already held keep being driven: their fulfill can
@@ -3418,7 +4231,7 @@ async fn miner_brain(
             continue;
         }
         if !batch.is_empty() {
-            // [#10c] We passed the rate-limit pause + freshness gates and are claiming, so
+            // We passed the rate-limit pause + freshness gates and are claiming, so
             // the endpoint is healthy again → decay the escalated claim-pause window to base.
             claim_backoff_mult = 1;
             last_storm_seen = None;
@@ -3482,7 +4295,7 @@ async fn miner_brain(
                 let state_c = state.clone();
                 let done_tx_c = done_tx.clone();
                 tokio::spawn(async move {
-                    // [D4] RAII slot-reclaim guard: every jid holds a reserved in_flight
+                    // RAII slot-reclaim guard: every jid holds a reserved in_flight
                     // slot. If this task panics or early-returns before it has dispatched a
                     // job (to a lifecycle task, which then owns the slot via its own
                     // SlotGuard, or explicitly via done_tx), that slot would leak forever —
@@ -3506,7 +4319,7 @@ async fn miner_brain(
                         tx: done_tx_c.clone(),
                     };
 
-                    // [B5] Shutdown began between the brain's pre-dispatch `paused` gate and
+                    // Shutdown began between the brain's pre-dispatch `paused` gate and
                     // this task's first RPC (spawn scheduling + `claim_job_batch`'s throttled
                     // pre-send round trips are seconds wide). Nothing is on-chain yet, so drop
                     // the intent breadcrumbs and bail BEFORE the broadcast: a claim landing now
@@ -3525,6 +4338,102 @@ async fn miner_brain(
                         return; // `reclaim` still holds every jid → its Drop frees the slots
                     }
 
+                    // Confirm each job's ELF is obtainable BEFORE claimJobBatch locks collateral,
+                    // matching the single-claim pre-claim check. A claim can ride on a cached cycle
+                    // measurement whose ELF has since been evicted from the disk cache or withdrawn by
+                    // the submitter; without this, every such job in the batch becomes a post-claim
+                    // release-penalty (or a slash if release cannot land). Check concurrently (bounded
+                    // by one fetch budget total), then drop the unobtainable jobs: remove their claim
+                    // breadcrumbs and return them to the open set. They are never dispatched, so the
+                    // reclaim guard (which still holds every original jid) frees their reserved slots.
+                    let mut jids = jids;
+                    let mut batch_jobs = batch_jobs;
+
+                    // Re-check the vkey/image-id mismatch negative-cache HERE, before the ELF fetches
+                    // and the claim. A concurrent sibling's prove can mark a program unclaimable AFTER
+                    // the brain's claim gate evaluated these candidates but BEFORE this background task
+                    // locks collateral; dropping such jobs now stops a decoy program from locking a
+                    // SECOND batch once its first batch's prove has already proved it unprovable. Cheap
+                    // in-memory lookup, so it runs before the (networked) ELF-obtainability check below.
+                    // Mirrors the unobtainable-drop that follows: drop — never re-queue to open_jobs —
+                    // so it cannot form a collect->reserve-slot->re-queue loop.
+                    {
+                        let drop_mismatch: std::collections::HashSet<B256> = batch_jobs
+                            .iter()
+                            .filter(|(job, _, _)| program_vkey_mismatched(job.info.program_id))
+                            .map(|(job, _, _)| job.info.job_id)
+                            .collect();
+                        if !drop_mismatch.is_empty() {
+                            tracing::warn!(
+                                "not batch-claiming {} of {} job(s) whose program's served ELF cannot \
+                                 satisfy its programId (vkey/image-id mismatch seen on a prior prove) — \
+                                 dropping before locking collateral",
+                                drop_mismatch.len(),
+                                jids.len()
+                            );
+                            batch_jobs.retain(|(job, _, _)| !drop_mismatch.contains(&job.info.job_id));
+                            jids.retain(|id| !drop_mismatch.contains(id));
+                            for jid in &drop_mismatch {
+                                journal_update(&journal_c, |jj| jj.remove(*jid));
+                            }
+                        }
+                        if jids.is_empty() {
+                            // Nothing left to claim; the reclaim guard frees every reserved slot.
+                            return;
+                        }
+                    }
+                    {
+                        let mut set = tokio::task::JoinSet::new();
+                        for (job, _, _) in &batch_jobs {
+                            let c = client_c.clone();
+                            let st = state_c.clone();
+                            let pid = job.info.program_id;
+                            let jid = job.info.job_id;
+                            set.spawn(async move {
+                                let ok = tokio::time::timeout(
+                                    MEASURE_FETCH_BUDGET,
+                                    fetch_or_download_elf(&c, &st, pid),
+                                )
+                                .await
+                                .map(|r| r.is_ok())
+                                .unwrap_or(false);
+                                (jid, ok)
+                            });
+                        }
+                        let mut unobtainable: std::collections::HashSet<B256> = Default::default();
+                        while let Some(res) = set.join_next().await {
+                            if let Ok((jid, false)) = res {
+                                unobtainable.insert(jid);
+                            }
+                        }
+                        if !unobtainable.is_empty() {
+                            tracing::warn!(
+                                "not batch-claiming {} of {} job(s) whose ELF is not obtainable now — \
+                                 dropping them before locking collateral",
+                                unobtainable.len(),
+                                jids.len()
+                            );
+                            // DROP the unobtainable jobs — do NOT re-queue them to open_jobs. A job
+                            // pushed into the batch was already removed from open_jobs at collection,
+                            // so re-adding it would make the next tick re-collect and re-check it,
+                            // and since a withheld ELF stays unobtainable (the cycle measurement is
+                            // cached, so the job is still a claim candidate), that forms a tight
+                            // collect→reserve-slot→ELF-check-fails→re-queue loop a submitter can use to
+                            // pin every concurrency slot and halt all claiming. Dropping matches the
+                            // single-claim path, which also removes such a job and does not retry it;
+                            // the job stays OPEN on-chain and is re-evaluated only if re-surfaced.
+                            batch_jobs.retain(|(job, _, _)| !unobtainable.contains(&job.info.job_id));
+                            jids.retain(|id| !unobtainable.contains(id));
+                            for jid in &unobtainable {
+                                journal_update(&journal_c, |jj| jj.remove(*jid));
+                            }
+                        }
+                        if jids.is_empty() {
+                            // Nothing obtainable to claim; the reclaim guard frees every reserved slot.
+                            return;
+                        }
+                    }
+
                     let batch_result = client_c.claim_job_batch(&jids).await;
 
                     // Reconcile per-job outcomes (partial-completion / lost races aren't
@@ -3534,7 +4443,7 @@ async fn miner_brain(
                     //   not_ours   = view present AND prover != us AND != ZERO   → safe to drop
                     //   unknown    = None, read failed, OR prover == ZERO        → KEEP breadcrumb
                     //
-                    // [D1] prover == ZERO means the job still reads OPEN: either the sub-claim
+                    // prover == ZERO means the job still reads OPEN: either the sub-claim
                     // reverted (we don't hold it) OR — indistinguishable from a single read — a
                     // lagging/stale post-mine RPC read of a job our claimJobBatch DID lock.
                     // Treating ZERO as "not ours" would drop the breadcrumb + free the slot for
@@ -3544,10 +4453,10 @@ async fn miner_brain(
                     // also succeed overall yet return None for one job, so None is likewise
                     // unknown, never "not ours".
                     //
-                    // [D2] Only `locked` is STICKY across retries: a claim is monotonic once
+                    // Only `locked` is STICKY across retries: a claim is monotonic once
                     // mined (a job seen prover == us stays ours until we fulfill/release it, and
                     // no one else can claim a job we hold), so a later flaky None must never
-                    // demote a confirmed-ours job. [R2:94] `not_ours` is NOT sticky — it is
+                    // demote a confirmed-ours job. `not_ours` is NOT sticky — it is
                     // re-verified every retry. A single stale RPC-replica read of a DEFUNCT prior
                     // prover (on a job that was reopened and RE-claimed by us) would otherwise
                     // stick as not_ours and drop a job we actually hold. So we re-query every
@@ -3604,7 +4513,7 @@ async fn miner_brain(
                         unknown
                     );
 
-                    // [B5] Shutdown began while this speculative batch was in flight. The
+                    // Shutdown began while this speculative batch was in flight. The
                     // brain-side gate only stops a batch that has not been SPAWNED yet;
                     // nothing stopped one already running, and this task lives ~100s (the
                     // 90s claim wall cap plus the 3x3s reconcile). Do NOT dispatch lifecycles
@@ -3658,7 +4567,7 @@ async fn miner_brain(
                             let _ = done_tx_c.send(jid);
                         } else {
                             // UNKNOWN (view None/unreadable or prover==ZERO after all
-                            // retries). [D3] DRIVE it in-session instead of abandoning it to
+                            // retries). DRIVE it in-session instead of abandoning it to
                             // startup-only recovery (which never runs if the process doesn't
                             // restart before the deadline → a held job strands to a slash).
                             // spawn_lifecycle_task(already_locked=true) re-verifies ownership
@@ -3690,20 +4599,20 @@ async fn miner_brain(
             }
         }
 
-        // #14: we evaluated open jobs but claimed none, purely for lack of collateral
+        // We evaluated open jobs but claimed none, purely for lack of collateral
         // → warn (throttled). The per-job eval reason is DEBUG-only, so without this an
         // idle miner gives no clue why. Only fires when at least one job was skipped
         // specifically for collateral (early skips / lost races don't trigger it).
-        // [headroom] Was `if !claimed_this_tick`, which only ever detected TOTAL starvation:
-        // in PARTIAL starvation the miner still funds one claim, so the flag was true on
-        // essentially every tick and the warning was suppressed. Live on 2026-08-08 that hid a
-        // 4.25 HEMI shortfall for hours — 2 GPUs, in_flight never above 1/2, 2,851 DEBUG skips
-        // and ZERO warnings, while 444,804 HEMI sat unstaked in the wallet.
+        // A plain `if !claimed_this_tick` only ever detected TOTAL starvation:
+        // in PARTIAL starvation the miner still funds one claim, so the flag would be true on
+        // essentially every tick and the warning would be suppressed. That can hide a
+        // collateral shortfall for hours — the miner keeps one GPU busy while others sit idle
+        // and HEMI sits unstaked in the wallet, with the skips visible only as DEBUG lines.
         //
         // The capacity test below fires on partial starvation too. It is computed from the
         // ON-CHAIN available figure, NOT the loop residual in scope here: `locked` already
         // includes live in-flight locks (measured: in_flight 2/2 -> locked = baseline + 2x),
-        // and the brain deliberately subtracts them AGAIN as the documented D17 fail-safe, so
+        // and the brain deliberately subtracts them AGAIN as a documented fail-safe, so
         // the residual under-reports by up to a full reservation and would over-warn.
         // Whether the headroom branch produced a verdict this tick; see the legacy warning
         // below for why that suppresses it.
@@ -3788,7 +4697,7 @@ async fn miner_brain(
         // warned, this is throttled out, and the only ticks it can still reach are the ones
         // where headroom was NOT starved. It therefore used to appear exclusively next to a
         // green "Slots fundable 2/2" verdict, quoting a DIFFERENT number for the same word:
-        // its `available_collateral` is the brain's D17 residual, while the dashboard's
+        // its `available_collateral` is the brain's residual, while the dashboard's
         // Liquid figure beside it is the on-chain value. Two answers for "available", in one
         // frame, with the alarming one attached to the healthy verdict.
         //
@@ -3804,7 +4713,7 @@ async fn miner_brain(
                 if due {
                     last_collateral_warn = Some(now);
                     // Labelled "spendable now" rather than "available": this is the residual
-                    // after the D17 fail-safe subtraction, deliberately smaller than both the
+                    // after the in-flight fail-safe subtraction, deliberately smaller than both the
                     // on-chain figure and the dashboard's Liquid line.
                     let avail_hemi = fmt_hemi(available_collateral);
                     let needed_hemi = fmt_hemi(needed);
@@ -3842,6 +4751,19 @@ struct JobStatusSnapshot {
     expected_cycles: u64,
     descriptor_hash: alloy::primitives::B256,
     proof_system_id: alloy::primitives::B256,
+    /// The cycle count this job was actually MEASURED at for its (backend, program,
+    /// input), when known. `expected_cycles` above is the SUBMITTER-DECLARED on-chain field and is
+    /// adversarial; admission already sizes feasibility on `max(declared, measured)`, but the prove
+    /// path (watchdog timeout, min-VRAM routing, po2) must use the same quantity or a tiny declared
+    /// value collapses the watchdog to its floor and SIGKILLs a job that was admitted feasible on the
+    /// larger measured count — a submitter-driven premature kill → release-penalty/slash. Populated by
+    /// the candidate loop from `resolve_measured`; `None` on paths without a measurement (recovery,
+    /// non-measurable backends), where the sizing falls back to the FALLBACK floor, never below it.
+    measured_cycles: Option<u64>,
+    /// Benchmark device id (e.g. "gpu1") of the card this job was sized/planned for at claim time,
+    /// passed to the dispatcher as a PREFERENCE (tried first, graceful fallback). `None` on paths
+    /// without a plan (recovery, non-measurable backends). See `prove_min_vram`'s `preferred_device`.
+    preferred_device: Option<String>,
 }
 
 impl JobStatusSnapshot {
@@ -3863,6 +4785,10 @@ impl JobStatusSnapshot {
             expected_cycles: v.expectedCycles,
             descriptor_hash: v.descriptorHash,
             proof_system_id: v.proofSystemId,
+            // Set by the candidate loop once the measurement for this (backend, program, input) is
+            // resolved; the view itself carries no measured count.
+            measured_cycles: None,
+            preferred_device: None,
         }
     }
 }
@@ -3908,12 +4834,16 @@ fn spawn_lifecycle_task(
         )
         .await;
         if let Err(e) = outcome {
-            tracing::error!("Job {} lifecycle error: {e:#}", short_id(jid));
+            // The lifecycle error can carry a guest-controlled proof-failure
+            // message (a worker Error.message surfaced as anyhow). Sanitize before it reaches the
+            // operator's console/log or the TUI, so it cannot inject terminal escapes / forge lines.
+            let emsg = zkminer_chain::programs::sanitize_log(&format!("{e:#}"));
+            tracing::error!("Job {} lifecycle error: {emsg}", short_id(jid));
             {
                 let mut s = state.write().await;
                 s.add_log(
                     zkminer_tui::state::LogLevel::Error,
-                    format!("Job {} failed: {:#}", short_id(jid), e),
+                    format!("Job {} failed: {emsg}", short_id(jid)),
                 );
             }
             // Release the on-chain claim to unlock collateral and avoid slashing. If we
@@ -3922,7 +4852,7 @@ fn spawn_lifecycle_task(
             if journal_has(&journal, jid) {
                 release_and_clean(&client, &state, &journal, jid).await;
             } else {
-                // No breadcrumb → release is skipped. [#45] If a fulfill nonetheless
+                // No breadcrumb → release is skipped. If a fulfill nonetheless
                 // stashed a nonce for this job, it would leak as a permanent nonce gap;
                 // recycle it so the allocator stays gap-free.
                 if let Some(n) = client.take_abandoned_nonce(jid) {
@@ -3950,7 +4880,7 @@ async fn process_job_lifecycle(
     // slash a lock we already own). `claim_job_idempotent` also no-ops for these
     // (prover == self), so the "claim" step is a single cheap view read.
     is_recovery: bool,
-    // [RPC #2] A descriptor the caller already fetched+verified (recovery does), to
+    // A descriptor the caller already fetched+verified (recovery does), to
     // skip the re-fetch at step 6. Always `None` for fresh jobs.
     prefetched_descriptor: Option<zkminer_contracts::bindings::JobDescriptor>,
 ) -> Result<()> {
@@ -3959,7 +4889,7 @@ async fn process_job_lifecycle(
     let job_id = job.info.job_id;
     let program_id = job.info.program_id;
 
-    // [B5] Shutdown can begin between `spawn_lifecycle_task` and here. The brain's
+    // Shutdown can begin between `spawn_lifecycle_task` and here. The brain's
     // pre-dispatch `paused` gate only closes the window up to the SPAWN; this task is
     // independent (`brain_handle.abort()` never reaches it, and it is not aborted at all) and
     // runs concurrently with the whole shutdown, so without this a signal landing here
@@ -3980,6 +4910,26 @@ async fn process_job_lifecycle(
         return Ok(());
     }
 
+    // A prior prove already proved this program's served ELF can never satisfy its on-chain
+    // programId (SP1 vkey / risc0 image-id mismatch). The brain's claim gate skips such programs,
+    // but a job can be evaluated as claimable at one tick and spawned into this task just as a
+    // CONCURRENT sibling's prove marks the program — so re-check here, the last point before any
+    // collateral is locked, and drop the fresh job (nothing is on-chain yet). This keeps a decoy
+    // program's damage to the one claim wave already in flight when its first prove faulted, instead
+    // of letting spawn-window stragglers lock still more collateral. Fresh jobs only: a recovery job
+    // already holds its lock and MUST be driven to prove→release by the normal path (its prove faults
+    // terminally and `release_and_clean` frees the collateral) — bailing here would strand it to a slash.
+    if !is_recovery && program_vkey_mismatched(program_id) {
+        tracing::debug!(
+            "Dropping {} before claim: its program's served ELF cannot satisfy its programId \
+             (vkey/image-id mismatch seen on a prior prove) — nothing locked",
+            short_id(job_id)
+        );
+        let mut s = state.write().await;
+        s.open_jobs.retain(|j| j.info.job_id != job_id);
+        return Ok(());
+    }
+
     // 0. Predicate-job gate. A job with a non-zero `expectedJournalHash` (Phase-2
     //    predicate) reverts `JournalMismatch` at fulfill unless our proof's public
     //    values reproduce the committed journal — and we'd be slashed on timeout.
@@ -3992,10 +4942,10 @@ async fn process_job_lifecycle(
             // holds an in_flight slot, so a black-holing storage URI here would wedge
             // that concurrency slot forever (the SlotGuard only fires when the task
             // ends). An open job's lock_deadline is 0, so this uses FETCH_FALLBACK_TIMEOUT.
-            // [RPC #2] Checked fetch: fast path via the monitor-cached submit tx, and —
-            // review requirement — the descriptor is now HASH-VERIFIED before the gate
-            // acts on expectedJournalHash (previously unverified here: a wrongly-decoded
-            // descriptor could silently skip a good job or claim an excluded one).
+            // Checked fetch: fast path via the monitor-cached submit tx, and the
+            // descriptor is HASH-VERIFIED before the gate acts on expectedJournalHash — an
+            // unverified, wrongly-decoded descriptor could otherwise silently skip a good job
+            // or claim an excluded one.
             let descriptor = with_deadline_budget(
                 snapshot.lock_deadline,
                 "predicate descriptor fetch",
@@ -4017,7 +4967,7 @@ async fn process_job_lifecycle(
                     return Ok(());
                 }
                 Ok(_) => {} // non-predicate job — proceed to claim
-                // [review] The gate's skip decision now rides on a hash-VERIFIED fetch, so
+                // The gate's skip decision now rides on a hash-VERIFIED fetch, so
                 // if the descriptor can't be verified (unreadable, or a future
                 // descriptor-hash-formula drift) it degrades to "claim". That is safe today
                 // (the formula is consistent; a mis-decoded predicate job is caught by the
@@ -4032,7 +4982,7 @@ async fn process_job_lifecycle(
         }
     }
 
-    // [B5] Re-check HERE, not only at the top of this fn. The guard above runs BEFORE the
+    // Re-check HERE, not only at the top of this fn. The guard above runs BEFORE the
     // predicate gate, whose `fetch_job_descriptor_checked` is bounded only by
     // FETCH_FALLBACK_TIMEOUT (an open job's snapshot deadline is 0, so `deadline_proof_budget`
     // yields no clamp) — and `claim_predicate_jobs=false` FORCES every claim onto that path.
@@ -4045,6 +4995,61 @@ async fn process_job_lifecycle(
     if !is_recovery && SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
         tracing::warn!(
             "shutdown began during the predicate gate for {} — dropping, nothing locked",
+            short_id(job_id)
+        );
+        let mut s = state.write().await;
+        s.open_jobs.retain(|j| j.info.job_id != job_id);
+        return Ok(());
+    }
+
+    // Pin this program's cached ELF NOW — BEFORE the obtainability fetch warms it and before the
+    // claim — and hold the guard through prove, so the on-disk LRU cannot evict the just-warmed bytes
+    // during the fetch->claim->prove window. ElfCache::get is a bare read that does NOT refresh mtime,
+    // so a cache-hit victim keeps its old measurement-time mtime and, unpinned, a concurrent decoy
+    // measurement's put->prune (oldest-mtime-first) would evict it — turning the claim into a
+    // prove-time fetch miss and a penalized release. Covers fresh (fetch+claim+prove) and recovery
+    // (prove). Dropped automatically when this task ends (every path).
+    let _elf_pin = zkminer_chain::programs::ElfPin::new(program_id);
+
+    // Confirm the ELF is actually obtainable BEFORE committing collateral. A claim can
+    // ride on a cached cycle MEASUREMENT (process-lifetime cache) whose ELF has since been evicted from
+    // the much smaller on-disk LRU; the ELF is otherwise first (re)fetched only at prove time (step 7),
+    // so a submitter who takes the storage URI offline after measurement turns the claim into a
+    // post-claim release-penalty (or a slash if release cannot land). Fetching now makes a withheld ELF
+    // a free PRE-claim skip instead. Common case: a disk-cache hit (cheap, no network — fetch_or_...
+    // checks the cache first). Fresh jobs only: a recovery job is already locked and MUST be driven. We
+    // do not thread the bytes to step 7 (it re-reads the now-warm cache); correctness over micro-opt.
+    if !is_recovery {
+        if let Err(e) = tokio::time::timeout(
+            MEASURE_FETCH_BUDGET,
+            fetch_or_download_elf(client, state, program_id),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("ELF fetch exceeded the pre-claim budget"))
+        .and_then(|r| r)
+        {
+            tracing::warn!(
+                "not claiming {}: its ELF is not obtainable now ({}) — skipping before locking \
+                 collateral (the submitter may have withdrawn the stored program)",
+                short_id(job_id),
+                zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+            );
+            let mut s = state.write().await;
+            s.open_jobs.retain(|j| j.info.job_id != job_id);
+            return Ok(());
+        }
+    }
+
+    // Re-check shutdown AFTER the ELF-obtainability fetch above. That fetch is an await of up to
+    // MEASURE_FETCH_BUDGET (a submitter can stall the ELF host), and the earlier
+    // `!is_recovery && SHUTTING_DOWN` gate ran BEFORE it — so without this a signal landing during the
+    // fetch would let the drain union (which sees neither `active_jobs` nor the not-yet-written claim
+    // breadcrumb below) report "drain complete"/exit 0 while this task goes on to write the breadcrumb
+    // and broadcast a fresh claim, locking brand-new collateral on an exiting process. Nothing is
+    // on-chain yet, so dropping is free. `is_recovery` jobs are already locked and must still be driven.
+    if !is_recovery && SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::warn!(
+            "shutdown began during the pre-claim ELF fetch for {} — dropping, nothing locked",
             short_id(job_id)
         );
         let mut s = state.write().await;
@@ -4066,7 +5071,7 @@ async fn process_job_lifecycle(
         );
     }
 
-    // [B5] The two shutdown gates above are both `!is_recovery`, but the batch reconcile
+    // The two shutdown gates above are both `!is_recovery`, but the batch reconcile
     // dispatches its UNKNOWN class with already_locked=true precisely BECAUSE ownership could
     // not be established — and for those `claim_job_idempotent` broadcasts a FRESH claimJob
     // whenever its pre-flight view still reads open. Nothing gates the window between that
@@ -4088,6 +5093,29 @@ async fn process_job_lifecycle(
             tracing::warn!(
                 "shutdown began before {} was confirmed ours — not (re)claiming; left to the \
                  abandon path",
+                short_id(job_id)
+            );
+            let mut s = state.write().await;
+            s.open_jobs.retain(|j| j.info.job_id != job_id);
+            return Ok(());
+        }
+    }
+
+    // A program proven unclaimable since this task was dispatched (served ELF vkey/image-id can never
+    // match its programId) must not get a FRESH claim broadcast for it. The `!is_recovery` pre-claim
+    // gate above already drops fresh jobs, but the batch-reconcile UNKNOWN class and crash recovery
+    // dispatch with is_recovery=true (ownership unproven), and `claim_job_idempotent` below broadcasts
+    // a fresh claim whenever the job still reads open. Confirm ownership: if we already hold it, fall
+    // through and drive it to prove->release (never stranded); if we do NOT hold it, leave it (the
+    // breadcrumb stays for the abandon path) rather than locking new collateral on a dead-end program.
+    if is_recovery && program_vkey_mismatched(program_id) {
+        let held = matches!(
+            client.get_job_status_view(job_id).await,
+            Ok(v) if v.prover == client.address
+        );
+        if !held {
+            tracing::warn!(
+                "not re-claiming {}: its program was proved unclaimable (vkey/image-id mismatch) and                  we do not hold it — leaving it for the abandon path",
                 short_id(job_id)
             );
             let mut s = state.write().await;
@@ -4200,7 +5228,7 @@ async fn process_job_lifecycle(
     // 6. Fetch the JobDescriptor (needed for fulfillJob and for inputData).
     // Deadline-bounded: a stalled RPC/storage endpoint must not hang past the point
     // where releaseJob can still land (see with_deadline_budget).
-    // [RPC #2] Recovery already fetched+verified the descriptor — reuse it instead of
+    // Recovery already fetched+verified the descriptor — reuse it instead of
     // re-fetching (3-4 RPC saved per recovered job). The verify_descriptor_hash below
     // stays UNCONDITIONAL either way, re-checking against THIS view's fresh
     // descriptorHash at zero RPC cost.
@@ -4224,6 +5252,28 @@ async fn process_job_lifecycle(
             descriptor.programId,
             program_id,
         ));
+    }
+
+    // The submitter-controlled descriptor bytes (inputData + the two extra-data
+    // fields) are re-encoded into the fulfillJob calldata under a fixed gas limit. Their size is known
+    // NOW, before the expensive proof — so reject an over-budget descriptor here and release, rather
+    // than burning a full Groth16 proof first. (The guest journal is only known post-prove and is
+    // re-checked at the fulfill step.)
+    {
+        let descriptor_bytes = descriptor.inputData.len()
+            + descriptor.callbackExtraData.len()
+            + descriptor.extraVerifierData.len();
+        // Leave generous headroom under the 128 KiB fulfill-payload cap for the journal + seal.
+        const MAX_DESCRIPTOR_PAYLOAD_BYTES: usize = 96 * 1024;
+        if descriptor_bytes > MAX_DESCRIPTOR_PAYLOAD_BYTES {
+            return Err(anyhow::anyhow!(
+                "descriptor payload for {} is {} bytes (> {} cap) — fulfill would OOG-revert; \
+                 releasing before wasting a proof",
+                short_id(job_id),
+                descriptor_bytes,
+                MAX_DESCRIPTOR_PAYLOAD_BYTES,
+            ));
+        }
     }
 
     // Surface predicate jobs (the default policy claims them). Fulfilling with a
@@ -4266,12 +5316,16 @@ async fn process_job_lifecycle(
         .ok_or_else(|| anyhow::anyhow!("no worker pool available"))?;
     let input_bytes: Vec<u8> = descriptor.inputData.to_vec();
 
+    // Size the watchdog / VRAM routing / po2 on the quantity admission used — the
+    // MEASURED count — not the adversarial declared `expected_cycles`. See `prove_sizing_cycles`.
+    let sizing_cycles: u64 = prove_sizing_cycles(snapshot.expected_cycles, snapshot.measured_cycles);
+
     // Proactive routing: a job that commits a large cycle count starts pinned to
     // a high-VRAM GPU (0 = uncommitted → no floor; the reactive path below still
     // catches an OOM on the first attempt).
     let mut min_vram: Option<u64> =
-        (snapshot.expected_cycles >= LARGE_JOB_CYCLES).then_some(LARGE_JOB_MIN_VRAM_BYTES);
-    // Fix #1: slot keys of workers that wedged/timed out on this job, so a retry
+        (sizing_cycles >= LARGE_JOB_CYCLES).then_some(LARGE_JOB_MIN_VRAM_BYTES);
+    // Slot keys of workers that wedged/timed out on this job, so a retry
     // is steered to a *different* GPU instead of being re-pinned to a flaky one.
     // The slots the operator switched off in Settings. Those toggles were honoured by mock mode and
     // by nothing else — the dashboard struck the row out while production kept proving on it.
@@ -4301,7 +5355,7 @@ async fn process_job_lifecycle(
     }
     let mut excluded: Vec<String> = Vec::new();
 
-    // Fix #2: scale the proving-watchdog deadline to the job so a wedged GPU is
+    // Scale the proving-watchdog deadline to the job so a wedged GPU is
     // caught in minutes, not the full (large) configured timeout. Committed-cycle
     // jobs get a timeout proportional to their size; uncommitted jobs (cycles == 0,
     // can't estimate) fall back to the configured cap. Always <= proving_timeout,
@@ -4313,17 +5367,18 @@ async fn process_job_lifecycle(
         const TIMEOUT_MARGIN: u64 = 4;
         const MIN_PROVING_TIMEOUT_SECS: u64 = 90;
         let cap = proving_timeout.as_secs();
-        if snapshot.expected_cycles > 0 {
+        // `sizing_cycles` = max(declared, measured) (or the FALLBACK floor), never the
+        // raw declared field, so a small declaration cannot shrink this below the measured work.
+        if sizing_cycles > 0 {
             let fixed = fixed_proving_allowance_secs(backend);
-            let est = (snapshot.expected_cycles / CONSERVATIVE_CPS * TIMEOUT_MARGIN)
-                .saturating_add(fixed);
+            let est = (sizing_cycles / CONSERVATIVE_CPS * TIMEOUT_MARGIN).saturating_add(fixed);
             Duration::from_secs(est.clamp((MIN_PROVING_TIMEOUT_SECS + fixed).min(cap), cap))
         } else {
             proving_timeout
         }
     };
 
-    // Which worker slot actually produced the proof (#16) — captured on success so
+    // Which worker slot actually produced the proof — captured on success so
     // the miner log ties a job to the physical GPU that proved it.
     let mut proved_on: Option<String> = None;
     let proof = {
@@ -4335,9 +5390,14 @@ async fn process_job_lifecycle(
         // desktop consume the waits a genuine host-RAM dip needs.
         let mut gpu_memory_waits = 0u32;
         let mut attempt = 0u32;
+        // Set once the claim-time preferred card hits an ADMISSION (un-attempted host-RAM) refusal:
+        // unlike a GPU shortage it does not exclude the card, so without dropping the preference the
+        // dispatcher would re-pin the un-admittable cold preferred card every retry while the warm
+        // sibling idles → abandon → penalized release. Dropping it reverts to warm-first fallback.
+        let mut drop_preference = false;
         loop {
             attempt += 1;
-            // Pre-deadline release margin (#20): compute the absolute instant past
+            // Pre-deadline release margin: compute the absolute instant past
             // which this job must stop proving to still release its collateral, and
             // bail early if too little time remains to even start. `abort_at` is
             // re-checked inside the dispatcher AFTER any GPU-queue / respawn wait, so
@@ -4363,6 +5423,14 @@ async fn process_job_lifecycle(
             let elf_clone = elf.clone();
             let input_clone = input_bytes.clone();
             let backend_str = backend.to_string();
+            // Bind the ELF to the job's programId so a worker refuses an ELF unrelated to the
+            // registered program before spending a Groth16 proof on it. risc0 compares the guest
+            // image id; SP1 compares the vkey hash; both ARE the on-chain programId for
+            // their system. OpenVM ignores it (and is declined anyway). Never enforce against a
+            // zero/unknown id (mock mode) — that would reject every legitimate job.
+            let program_id_bytes: Option<[u8; 32]> = (program_id
+                != alloy::primitives::B256::ZERO)
+                .then(|| program_id.0);
             let mv = min_vram;
             let excl = excluded.clone();
             // Per-device segment size (po2). Snapshot the inputs here, then build the
@@ -4386,8 +5454,9 @@ async fn process_job_lifecycle(
             // silently never engage. Note `optimal_po2_for_job` is argmax(throughput)
             // and therefore independent of the magnitude; the value only has to be
             // non-zero to enable selection.
-            let est_cycles = if snapshot.expected_cycles > 0 {
-                snapshot.expected_cycles
+            // Size po2 on the measured count too, not the declared field.
+            let est_cycles = if sizing_cycles > 0 {
+                sizing_cycles
             } else {
                 FALLBACK_ESTIMATED_CYCLES
             };
@@ -4396,6 +5465,12 @@ async fn process_job_lifecycle(
             // Cloned per attempt: the closure below moves into `spawn_blocking`, and the retry loop
             // needs the list again next time round.
             let disabled_for_prove = disabled_slots.clone();
+            // The card this job was planned for (benchmark id, e.g. "gpu1"), preferred at dispatch.
+            let preferred_for_prove = if drop_preference {
+                None
+            } else {
+                snapshot.preferred_device.clone()
+            };
             let (proof_result, used_slot) = match tokio::task::spawn_blocking(move || {
                 let resolve_backend = backend_str.clone();
                 let po2_for_device = move |device_id: &str| -> Option<u8> {
@@ -4416,7 +5491,7 @@ async fn process_job_lifecycle(
                     )
                 };
                 let mut used = None;
-                // [queue] Flip Queued -> Proving the moment the dispatcher actually starts
+                // Flip Queued -> Proving the moment the dispatcher actually starts
                 // work. Until now `on_progress` was unused and the status was set to
                 // `Proving { progress: 0.0 }` at CLAIM time, so a job waiting for a card was
                 // indistinguishable from one running on it — which is exactly the thing
@@ -4480,6 +5555,8 @@ async fn process_job_lifecycle(
                     &mut used,
                     abort_at,
                     Some(&po2_for_device),
+                    program_id_bytes,
+                    preferred_for_prove.as_deref(),
                 );
                 (r, used)
             })
@@ -4604,6 +5681,15 @@ async fn process_job_lifecycle(
                     if let Some(shortage) =
                         e.downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
                     {
+                        // An admission refusal (nothing ran) means the slot just tried — most likely
+                        // the cold claim-time preferred card — could not be admitted now. Unlike a GPU
+                        // shortage this does NOT exclude the slot, so drop the device preference for the
+                        // rest of this job and let the dispatcher's warm-first ordering pick the warm
+                        // sibling instead of re-pinning the un-admittable card every retry. Only on an
+                        // un-attempted (admission) refusal; an OOM mid-proof is a different event.
+                        if !shortage.attempted {
+                            drop_preference = true;
+                        }
                         // Only an ADMISSION refusal is free. That costs a `/proc/meminfo` read, so
                         // nothing was attempted and waiting is the honest response. A worker
                         // OOM-killed MID-PROOF is a different event: minutes of real work ran and
@@ -4661,6 +5747,22 @@ async fn process_job_lifecycle(
                     // that had just failed. `ErrorKind` is set by the worker about itself.
                     let worker_err =
                         e.downcast_ref::<zkminer_prover_protocol::types::WorkerProofError>();
+                    // A programId/vkey mismatch is PERMANENT for this program: the served ELF's
+                    // verifying key / image id can never equal its on-chain programId, so no job for it
+                    // can ever be proved. Record the program so the claim gate, measure gate, batch-claim
+                    // task, and each per-job lifecycle task all skip every future job for it (capping the
+                    // loss to the one claim wave already in flight when this prove faulted, not a penalty
+                    // per job), and return terminally — more attempts on the same binding fail
+                    // identically. Typed, so
+                    // guest-controlled error text can never forge it.
+                    if worker_err.map(|w| w.is_program_mismatch()).unwrap_or(false) {
+                        mark_program_vkey_mismatch(program_id);
+                        return Err(anyhow::anyhow!(
+                            "proving stopped for {} (served ELF's vkey/image-id does not match its \
+                             programId — program is unprovable; skipping its future jobs): {msg}",
+                            short_id(job_id)
+                        ));
+                    }
                     let invalid = match worker_err {
                         Some(w) => w.is_invalid(),
                         None => is_invalid_proof(&msg),
@@ -4680,14 +5782,14 @@ async fn process_job_lifecycle(
                     if attempt < MAX_PROVE_ATTEMPTS {
                         // BOTH non-invalid classes steer OFF the card that just failed.
                         //
-                        // The OOM arm used to set a VRAM floor INSTEAD of excluding, and
+                        // Exclude the OOMing slot rather than setting a VRAM floor:
                         // `LARGE_JOB_MIN_VRAM_BYTES` exceeds every card on this hardware
-                        // (30 GiB vs 16303 and 24564 MiB). So the floor emptied the
-                        // candidate set, `prove_min_vram` restored the FULL key set, and
-                        // the retry landed straight back on the card that had just OOMed
-                        // -- which, with the other card already excluded, left one key
-                        // and took the single-key shortcut into an instant respawn-backoff
-                        // bail. Observed in soak20 at 10:38:43.897 -> 10:38:44.580.
+                        // (30 GiB vs 16303 and 24564 MiB). A floor would empty the
+                        // candidate set, `prove_min_vram` would restore the FULL key set, and
+                        // the retry would land straight back on the card that had just OOMed
+                        // -- which, with the other card already excluded, leaves one key
+                        // and takes the single-key shortcut into an instant respawn-backoff
+                        // bail.
                         //
                         // Excluding cannot strand a job: `prove_min_vram` restores the
                         // full set when pruning empties it.
@@ -4771,7 +5873,7 @@ async fn process_job_lifecycle(
     }
 
     // 10. Deadline gate 3 — final check before we pay gas to fulfill. Then bound the
-    // fulfill's WALL TIME the same way we bound proving (#20): `fulfill_job` retries
+    // fulfill's WALL TIME the same way we bound proving: `fulfill_job` retries
     // up to ~5× a 120s receipt wait, so under a 429 storm an unbounded fulfill can
     // cross lock_deadline, after which releaseJob ALSO reverts → collateral stranded.
     // If too little time remains to fulfill AND still keep a release margin, skip
@@ -4791,6 +5893,35 @@ async fn process_job_lifecycle(
             Some(budget)
         }
     };
+
+    // A fulfillJob tx carries the full descriptor (incl. submitter-controlled
+    // inputData) and the guest journal as publicValues, under a FIXED gas limit. A submitter who
+    // sizes inputData and/or the journal large enough makes fulfill OOG-revert — wasting the proof
+    // and the fulfill gas, and risking a slash if it recurs near the deadline. If the payload can't
+    // plausibly fit the gas budget, skip the guaranteed-revert fulfill and release now to recover
+    // collateral cheaply. ~16 gas/calldata-byte means the fulfill gas limit bounds total calldata;
+    // the floor below leaves generous room for the fixed descriptor fields and on-chain execution.
+    {
+        // Sum ALL submitter-controlled calldata the fulfillJob tx carries: the guest journal
+        // (publicValues), the seal, and every bytes field of the descriptor that is re-encoded
+        // on-chain — inputData AND callbackExtraData AND extraVerifierData. Omitting
+        // the latter two would leave the OOG-revert open: a submitter could move the bulk into them.
+        let payload_bytes = proof.journal.len()
+            + proof.seal.len()
+            + descriptor.inputData.len()
+            + descriptor.callbackExtraData.len()
+            + descriptor.extraVerifierData.len();
+        const MAX_FULFILL_PAYLOAD_BYTES: usize = 128 * 1024; // conservative vs the ~5M gas fulfill cap
+        if payload_bytes > MAX_FULFILL_PAYLOAD_BYTES {
+            return Err(anyhow::anyhow!(
+                "fulfill payload for {} is {} bytes (> {} cap) — would OOG-revert under the fulfill \
+                 gas limit; releasing to recover collateral instead of burning gas",
+                short_id(job_id),
+                payload_bytes,
+                MAX_FULFILL_PAYLOAD_BYTES,
+            ));
+        }
+    }
 
     // 11. Fulfill on-chain.
     journal_update(journal, |j| j.mark_fulfilling(job_id));
@@ -4815,7 +5946,7 @@ async fn process_job_lifecycle(
     } else {
         proof.seal.clone()
     };
-    // [#45] Pass the deadline budget INTO fulfill_job rather than wrapping the call in a
+    // Pass the deadline budget INTO fulfill_job rather than wrapping the call in a
     // `tokio::time::timeout` that would DROP the future mid-flight — a dropped fulfill
     // never runs its give-up path, orphaning its nonce (a permanent gap) and failing to
     // STASH it for release_job's displacement. fulfill_job enforces the budget in-loop and,
@@ -4831,7 +5962,7 @@ async fn process_job_lifecycle(
         )
         .await;
     if let Err(e) = fulfill_result {
-        // [F2] `Submitting` is the shutdown's proxy for "a fulfil is IN FLIGHT": the drain
+        // `Submitting` is the shutdown's proxy for "a fulfil is IN FLIGHT": the drain
         // excludes such a job from its nearest-deadline cut and ABANDON refuses to release it.
         // The fulfil is OVER here, and the only remaining releaser is this task's own
         // `release_and_clean` below — which the shutdown never joins and `process::exit` kills
@@ -4922,7 +6053,16 @@ fn resolve_backend(proof_system_id: alloy::primitives::B256) -> Option<&'static 
     } else if proof_system_id == zkminer_chain::auction::sp1_v1_id() {
         Some("sp1")
     } else if proof_system_id == zkminer_chain::auction::openvm_v1_id() {
-        Some("openvm")
+        // The OpenVM worker cannot actually prove — every Prove returns an error — yet
+        // it answers Hello/Capabilities and reports SIMULATED benchmark throughput, so the evaluator
+        // would otherwise find openvm jobs feasible and attractive, claim them, and fail to fulfill
+        // every one → release penalty / slash. Decline openvm jobs entirely until real proving lands.
+        // Opt back in with ZKMINER_ENABLE_OPENVM=1 once the backend can prove.
+        if std::env::var("ZKMINER_ENABLE_OPENVM").ok().as_deref() == Some("1") {
+            Some("openvm")
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -5005,40 +6145,516 @@ fn ensure_deadline_room(lock_deadline: u64, margin_secs: u64) -> Result<()> {
 /// at roughly 1 HEMI per 9M cycles). An empty field is therefore the rational default for a
 /// submitter and will stay that way, leaving a hardcoded 34e6 constant that is ~8x below the
 /// measured median. Executing the guest ourselves is the only reliable source.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn measure_cycles(
     client: &ChainClient,
     state: &zkminer_tui::state::SharedState,
+    backend: &str,
     job_id: alloy::primitives::B256,
     descriptor_hash: alloy::primitives::B256,
     program_id: alloy::primitives::B256,
-) -> anyhow::Result<u64> {
-    // Cheap availability probe FIRST. The fetches below can hit the chain, and under load
-    // most measurement attempts are skipped for a busy worker — doing the RPC work only to
-    // throw it away wastes a throttled connection the proving path needs.
+    measured: &MeasuredCache,
+    desc_input: &DescInputCache,
+    measuring_inputs: &std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashSet<(u8, alloy::primitives::B256, alloy::primitives::B256)>,
+        >,
+    >,
+    measure_strikes: &MeasureStrikes,
+    measured_journal: &JournalLenCache,
+    desc_payload: &DescPayloadCache,
+    assigned_elsewhere: &AssignedElsewhere,
+) {
+    // Cheap availability probe FIRST, for THIS backend. The fetches below can hit the chain, and
+    // under load most measurement attempts are skipped for a busy worker — doing the RPC work only to
+    // throw it away wastes a throttled connection the proving path needs. A busy worker is a TRANSIENT
+    // condition: cache nothing and return so a later tick retries. risc0 and sp1 both
+    // measure (sp1 on a CPU executor); a non-measurable backend is never triggered.
+    // Accept a DOWN-but-revivable worker here too: `execute_cycles` can respawn one for a
+    // (VRAM-cheap) measurement, and gating that out would reintroduce the claim↔measure deadlock for a
+    // backend whose only worker was recycled. A BUSY worker is still skipped (the probe excludes it).
+    match zkminer_prover::engine::worker_pool() {
+        Some(pool) if pool.has_idle_or_revivable_worker(backend) => {}
+        _ => return,
+    }
+
+    // Locally cached after the first sighting of a descriptor, so a repeat costs no chain traffic.
+    // A fetch failure is transient (RPC / storage): cache nothing, retry later.
+    // Bound the pre-claim descriptor fetch by wall-clock time. Unlike the prove path
+    // (wrapped in `with_deadline_budget`), this fetch had NO overall bound, so a submitter whose
+    // storage/descriptor source stalls could pin this measure-budget slot indefinitely — and because a
+    // claim now REQUIRES a measurement, a frozen measure budget halts all claiming. The
+    // error embeds submitter-controlled text (URI), so sanitize before logging.
+    let descriptor = match tokio::time::timeout(
+        MEASURE_FETCH_BUDGET,
+        fetch_job_descriptor_checked(client, job_id, descriptor_hash),
+    )
+    .await
     {
-        let pool = zkminer_prover::engine::worker_pool()
-            .ok_or_else(|| anyhow::anyhow!("no worker pool available"))?;
-        if !pool.has_idle_worker("risc0") {
-            anyhow::bail!("no idle risc0 worker; deferring cycle measurement");
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => {
+            tracing::debug!(
+                "measure {}: descriptor fetch failed (transient): {}",
+                short_id(program_id),
+                zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+            );
+            return;
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                "measure {}: descriptor fetch exceeded the {}s measure-fetch budget — skipping \
+                 (transient); a later tick retries",
+                short_id(program_id),
+                MEASURE_FETCH_BUDGET.as_secs()
+            );
+            return;
+        }
+    };
+    // The submitter-controlled descriptor payload (inputData + the two extra-data
+    // fields) is re-encoded into the fulfillJob calldata under a fixed gas limit. Its size is known
+    // here, PRE-CLAIM — so a descriptor that would OOG-revert fulfill is skipped now (never measured →
+    // never claimable for a measurable backend) instead of after the collateral-locking claim, which
+    // would force a penalized release. Not negative-cached: the cap mixes fields outside the
+    // (program, input) cache key, and the per-tick re-check is cheap (no execution).
+    const MAX_DESCRIPTOR_PAYLOAD_BYTES: usize = 96 * 1024;
+    let descriptor_payload =
+        descriptor.inputData.len() + descriptor.callbackExtraData.len() + descriptor.extraVerifierData.len();
+    if descriptor_payload > MAX_DESCRIPTOR_PAYLOAD_BYTES {
+        // This descriptor's payload alone would OOG-revert fulfill. Flag it unclaimable (the over-cap
+        // bit on its resolver entry, keyed by descriptor hash so it never mis-skips a sibling) so the
+        // claim gate short-circuits it on
+        // every later tick instead of re-fetching its descriptor and re-occupying a measure-budget
+        // slot here forever. Deterministic for this descriptor; the over-cap payload cannot shrink.
+        tracing::warn!(
+            "measure {}: descriptor payload is {} bytes (> {} cap) — would OOG-revert fulfill; \
+             marking unclaimable so it is not re-fetched or re-measured every tick",
+            short_id(program_id),
+            descriptor_payload,
+            MAX_DESCRIPTOR_PAYLOAD_BYTES
+        );
+        mark_desc_unfulfillable(desc_input, descriptor_hash);
+        return;
+    }
+    // Skip a job the submitter assigned exclusively to a DIFFERENT prover: the candidate
+    // filter gates only on status/prover and JobStatusView does not expose `assignedProver`, so
+    // without this we would measure it (burning a measure-budget slot) and broadcast a claimJob the
+    // contract is guaranteed to revert. The descriptor carries the assignment. Conservative: skip
+    // whenever it is set to someone other than us (we may re-see it, free, once it opens up); never
+    // negative-cached, since the assignment/exclusivity can change.
+    {
+        let assigned = descriptor.assignedProver;
+        if assigned != alloy::primitives::Address::ZERO && assigned != client.address {
+            // Cooldown this descriptor so the measure-spawn gate stops re-selecting it (fetch + return)
+            // every tick and it cannot monopolize the measure budget. TIME-BOUNDED, not permanent:
+            // on-chain exclusivity expires, so after the cooldown the job is re-evaluated.
+            tracing::debug!(
+                "measure {}: job assigned to another prover ({}) — skipping for a cooldown (we cannot \
+                 claim it until exclusivity lapses)",
+                short_id(program_id),
+                assigned
+            );
+            mark_assigned_elsewhere(assigned_elsewhere, descriptor_hash);
+            return;
+        }
+    }
+    let input: Vec<u8> = descriptor.inputData.to_vec();
+    // The cycle count is a function of (backend, program, keccak256(input)); the descriptor hash
+    // resolves to that input hash. Record the resolver FIRST so a later sighting of this descriptor
+    // (e.g. under a different tag, which this task may already have short-circuited) can find the
+    // measurement.
+    let input_hash = alloy::primitives::keccak256(&input);
+    insert_desc_input(desc_input, descriptor_hash, input_hash);
+    // Cache THIS descriptor's payload length alongside the resolver, BEFORE the short-circuit and the
+    // measuring_inputs dedup CAS below. A descriptor that loses that race returns without running either
+    // payload screen, yet it is now claimable (its resolver is recorded); the claim gate re-runs the
+    // full-payload check from this cached length plus the winner's journal length (see
+    // `claim_payload_over_cap`), so the race loser can no longer slip an over-cap descriptor through.
+    insert_desc_payload(desc_payload, descriptor_hash, descriptor_payload as u64);
+    let key = (backend_tag(backend), program_id, input_hash);
+
+    // Short-circuit: if this exact (backend, program, input) was already measured —
+    // e.g. the same input flooded under many distinct tags — reuse it with NO execution. Only the
+    // resolver above needed updating so this descriptor hash now points at the known measurement.
+    if measured
+        .lock()
+        .ok()
+        .map(|m| m.contains_key(&key))
+        .unwrap_or(false)
+    {
+        // The journal is a function of (program, input), shared by every descriptor for this pair, so
+        // THIS descriptor's full fulfill payload must still be checked even though we skip execution:
+        // its callbackExtraData/extraVerifierData differ from the descriptor that was executed. Using
+        // the journal length cached when that measurement ran, mark this descriptor unclaimable if its
+        // payload is over the cap — otherwise a sibling descriptor with padded extra-data escapes the
+        // check entirely and is claimed+proved into a guaranteed-revert fulfill. (If no journal length
+        // was cached — an older measurement, or one that failed before producing a journal — skip the
+        // check; it is re-done when the pair is next executed.)
+        if let Some(journal_len) = get_journal_len(measured_journal, backend, program_id, input_hash) {
+            if fulfill_payload_over_cap(
+                journal_len,
+                descriptor.inputData.len(),
+                descriptor.callbackExtraData.len(),
+                descriptor.extraVerifierData.len(),
+            ) {
+                tracing::warn!(
+                    "measure {}: a sibling descriptor's fulfill payload (cached journal {} + its \
+                     descriptor + seal) exceeds the cap — marking it unclaimable",
+                    short_id(program_id),
+                    journal_len
+                );
+                mark_desc_unfulfillable(desc_input, descriptor_hash);
+            }
+        }
+        tracing::debug!(
+            "measure {}: (backend, program, input) already measured — resolver updated, no execution",
+            short_id(program_id)
+        );
+        return;
+    }
+
+    // SP1 has no cheap programId->bytes binding (its vkey needs the minutes-long `setup`),
+    // so the ONLY guarantee that the bytes we MEASURE are the bytes we later PROVE is a registry byte
+    // binding that `download_elf` enforces against EVERY served URI. That is `elf_hash` ALONE: it is
+    // passed as `download_elf`'s `expected_hash` on both the measure and the prove path, so whichever
+    // URI wins the first-reachable race is rejected unless it hashes to `elf_hash` — measure-ELF ==
+    // prove-ELF, always. A per-URI `content_hash` does NOT give this: `download_elf` tries URIs in
+    // submitter order and verifies only the ONE it serves against ITS OWN hash (and skips the check
+    // when that hash is zero), so a decoy URI carrying a hash satisfies an `any(content_hash)` test
+    // while a zero-hash sibling URL — attacker-controlled, unverified — is the one downloaded; and two
+    // URIs pinned to DIFFERENT hashes let the attacker serve cheap at measure and heavy at prove by
+    // toggling availability. Both re-open the measure-cheap/prove-heavy SLASH, so require `elf_hash`
+    // specifically; refuse to size (-> never claim) an SP1 program without it and negative-cache it so
+    // it is not re-measured. risc0 is EXEMPT: its image-id binds the whole-ELF bytes to programId at
+    // BOTH measure and prove regardless of the registry hashes.
+    if backend == "sp1" {
+        match client.get_program_info(program_id).await {
+            Ok(info) => {
+                // `elf_hash` ONLY — NOT `any(content_hash)`: a per-URI content hash does not guarantee
+                // measure-ELF == prove-ELF (download_elf serves the first reachable URI and checks only
+                // that one). See the comment above.
+                let bound = info.elf_hash.is_some();
+                if !bound {
+                    tracing::warn!(
+                        "measure {} (sp1): registry carries no program-wide elf_hash — measure-ELF \
+                         cannot be guaranteed == prove-ELF (a per-URI content_hash does not suffice: \
+                         download_elf serves the first reachable URI), refusing to size; marking \
+                         infeasible so it is never claimed",
+                        short_id(program_id)
+                    );
+                    insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "measure {} (sp1): program-info fetch failed (transient): {e:#}",
+                    short_id(program_id)
+                );
+                return;
+            }
         }
     }
 
-    // Both of these are locally cached after the first sighting of a program, so a repeat
-    // descriptor costs no chain traffic.
-    let descriptor = fetch_job_descriptor_checked(client, job_id, descriptor_hash).await?;
-    let elf = fetch_or_download_elf(client, state, program_id).await?;
-    let input: Vec<u8> = descriptor.inputData.to_vec();
+    // Claim the (backend, program, input) as in-flight BEFORE the expensive fetch +
+    // execute. A concurrent burst of the same input under different tags passes the descriptor-hash
+    // dedup as distinct descriptors; without this they would all execute the identical heavy input at
+    // once. The first task here wins and executes; the rest return (the resolver is already recorded,
+    // so they will resolve to the winner's measurement). Released via the guard below on every path.
+    let claimed_input = measuring_inputs
+        .lock()
+        .map(|mut s| s.insert(key))
+        .unwrap_or(false);
+    if !claimed_input {
+        tracing::debug!(
+            "measure {}: an execution of this exact (backend, program, input) is already in flight",
+            short_id(program_id)
+        );
+        return;
+    }
+    // RAII release so an early return / panic cannot leak the in-flight marker (which would wedge all
+    // future measurements of this input).
+    struct InputGuard<'a> {
+        set: &'a std::sync::Mutex<
+            std::collections::HashSet<(u8, alloy::primitives::B256, alloy::primitives::B256)>,
+        >,
+        key: (u8, alloy::primitives::B256, alloy::primitives::B256),
+    }
+    impl Drop for InputGuard<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut s) = self.set.lock() {
+                s.remove(&self.key);
+            }
+        }
+    }
+    let _input_guard = InputGuard {
+        set: measuring_inputs,
+        key,
+    };
 
-    let pool = zkminer_prover::engine::worker_pool()
-        .ok_or_else(|| anyhow::anyhow!("no worker pool available"))?;
-
-    // Blocking: the worker protocol is synchronous. Bounded by the watchdog inside
-    // `execute_cycles` so a non-terminating guest cannot wedge a worker forever.
-    tokio::task::spawn_blocking(move || {
-        pool.execute_cycles("risc0", &elf, &input, Some(MEASURE_TIMEOUT))
-    })
+    // Bound the pre-claim ELF fetch by wall-clock time, like the descriptor fetch above.
+    // `download_elf` also caps the number of URIs tried;
+    // together they stop a submitter URI list from pinning this measure-budget slot for minutes.
+    // Sanitize the (URI-bearing) error before logging.
+    let elf = match tokio::time::timeout(
+        MEASURE_FETCH_BUDGET,
+        fetch_or_download_elf(client, state, program_id),
+    )
     .await
-    .map_err(|e| anyhow::anyhow!("cycle measurement task panicked: {e}"))?
+    {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => {
+            // An ELF fetch failure is usually transient (RPC/storage), but a submitter can make it
+            // PERMANENT and free by serving a stalling or withheld ELF: without a bound this re-fetches
+            // every tick forever, starving the measure budget and all claiming. Strike-count it per
+            // (program, input) exactly like the execute-failure path below — a genuinely transient
+            // failure clears on the next success, while a repeatable one is negative-cached
+            // UNMEASURABLE after MEASURE_TIMEOUT_STRIKES so it stops being re-selected. (Trade-off,
+            // identical to the execute path: a sustained >3-tick outage of a LEGITIMATE program also
+            // retires it until restart; the on-disk ELF cache means a once-fetched program never hits
+            // this, so it bites only a never-yet-cached program whose host is down during measurement.)
+            let strikes = bump_measure_strikes(measure_strikes, backend, program_id, input_hash);
+            if strikes >= MEASURE_TIMEOUT_STRIKES {
+                tracing::warn!(
+                    "measure {} ({backend}): ELF fetch failed #{strikes} (>= {}) — marking infeasible \
+                     so it is not re-fetched or re-measured every tick: {}",
+                    short_id(program_id),
+                    MEASURE_TIMEOUT_STRIKES,
+                    zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+                );
+                insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
+                clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+            } else {
+                tracing::debug!(
+                    "measure {}: ELF fetch failed #{strikes} (< {}, may be transient): {}",
+                    short_id(program_id),
+                    MEASURE_TIMEOUT_STRIKES,
+                    zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+                );
+            }
+            return;
+        }
+        Err(_elapsed) => {
+            // A wall-clock timeout on the fetch (a slow or stalling ELF host) gets the same bounded
+            // treatment, so a submitter cannot pin a measure-budget slot for MEASURE_FETCH_BUDGET every
+            // tick indefinitely.
+            let strikes = bump_measure_strikes(measure_strikes, backend, program_id, input_hash);
+            if strikes >= MEASURE_TIMEOUT_STRIKES {
+                tracing::warn!(
+                    "measure {} ({backend}): ELF fetch exceeded the {}s budget #{strikes} (>= {}) — \
+                     marking infeasible so it is not re-fetched every tick",
+                    short_id(program_id),
+                    MEASURE_FETCH_BUDGET.as_secs(),
+                    MEASURE_TIMEOUT_STRIKES
+                );
+                insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
+                clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+            } else {
+                tracing::debug!(
+                    "measure {}: ELF fetch exceeded the {}s budget #{strikes} (< {}) — a later tick \
+                     retries (may be transient)",
+                    short_id(program_id),
+                    MEASURE_FETCH_BUDGET.as_secs(),
+                    MEASURE_TIMEOUT_STRIKES
+                );
+            }
+            return;
+        }
+    };
+
+    let pool = match zkminer_prover::engine::worker_pool() {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Bind the sizing ELF to the programId so the pre-claim measurement path cannot be driven with an
+    // ELF unrelated to the registered program. Never against a zero id. risc0's worker checks the image
+    // id at execute, which binds the bytes to the programId. SP1's Execute arm does NOT check the vkey
+    // (deriving it needs the minutes-long `setup`, which would blow the measure watchdog), so for SP1
+    // this `program_id_bytes` is advisory and the load-bearing guarantee is the host-side `elf_hash`
+    // gate above.
+    let program_id_bytes: Option<[u8; 32]> =
+        (program_id != alloy::primitives::B256::ZERO).then(|| program_id.0);
+
+    // Captured before `input` is moved into the blocking closure; the journal-size screen below needs
+    // it.
+    let input_len = input.len();
+    // Blocking: the worker protocol is synchronous. Bounded by the watchdog inside `execute_cycles`.
+    let backend_owned = backend.to_string();
+    let res = tokio::task::spawn_blocking(move || {
+        pool.execute_cycles(&backend_owned, &elf, &input, Some(MEASURE_TIMEOUT), program_id_bytes)
+    })
+    .await;
+    match res {
+        Ok(Ok((cycles, journal_len))) => {
+            // The guest committed `journal_len` bytes. fulfillJob re-encodes the journal
+            // AND the input (plus the rest of the descriptor) into its calldata under a fixed gas
+            // limit. Both the journal and the input are a deterministic function of (program, input) —
+            // exactly this cache key — so if journal + input ALONE already exceed the fulfill payload
+            // cap, fulfill is guaranteed to OOG-revert regardless of the rest of the descriptor, and no
+            // proof of this job can EVER be fulfilled. Negative-cache it so the job is never CLAIMED
+            // and never re-measured, instead of committing collateral and a full Groth16 proof only to
+            // discover the over-cap journal post-prove and release at a penalty. Keyed purely by
+            // (program, input), so it never mis-blacklists a sibling descriptor. A worker that does
+            // not report the journal length reports journal_len == 0, which never trips this (screen
+            // simply disabled for it).
+            if journal_len as usize + input_len > MAX_FULFILL_PAYLOAD_BYTES {
+                // journal + input ALONE exceed the cap: fulfill can never succeed regardless of the
+                // rest of the descriptor, and both terms are a function of (program, input) — exactly
+                // this cache key — so negative-cache the pair as infeasible (never claimed, never
+                // re-measured). A worker that does not report a journal length sends 0, disabling this.
+                tracing::warn!(
+                    "measure {} ({backend}): journal {} bytes + input {} bytes exceed the {}-byte \
+                     fulfill payload cap — fulfill would OOG-revert; marking infeasible so it is never \
+                     claimed or re-measured",
+                    short_id(program_id),
+                    journal_len,
+                    input_len,
+                    MAX_FULFILL_PAYLOAD_BYTES
+                );
+                insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
+                clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+            } else {
+                tracing::info!(
+                    "measured {cycles} cycles for program {} ({backend}) by execution — all its jobs \
+                     with this input will be sized on it",
+                    short_id(program_id)
+                );
+                // Cache the journal length FIRST, then the cycle count. Consumers key off the
+                // cycle count (resolve_measured / the measure-task short-circuit) and then read the
+                // journal; inserting the journal before the cycle count makes "cycle count visible"
+                // imply "journal visible" (program order + the per-map mutex release/acquire), so no
+                // reader can observe a measurement whose journal length is not yet cached. This closes
+                // the one-tick window in which the claim-gate payload backstop (claim_payload_over_cap)
+                // saw the cycle count but a None journal and waved an over-cap descriptor through.
+                // A LATER descriptor for this same (program, input) reuses this cycle count and
+                // short-circuits without re-executing, yet still has its own full fulfill payload
+                // checked against the cap from this cached journal length (see the short-circuit above).
+                insert_journal_len(measured_journal, backend, program_id, input_hash, journal_len);
+                insert_measured(measured, backend, program_id, input_hash, cycles);
+                clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+                // journal + input fit, but the full fulfill payload also carries THIS descriptor's
+                // callbackExtraData + extraVerifierData + the proof seal — fields outside the (program,
+                // input) key, so their contribution cannot be folded into the input-keyed negative-cache
+                // above without risking a cross-descriptor skip. Mark THIS descriptor (only) unclaimable
+                // when its full payload is over the cap; the minimal seal estimate makes this fire only
+                // when fulfill is certain to OOG-revert, never a false skip. The measurement stays
+                // cached, so a slimmer descriptor for the same input is unaffected.
+                if fulfill_payload_over_cap(
+                    journal_len,
+                    descriptor.inputData.len(),
+                    descriptor.callbackExtraData.len(),
+                    descriptor.extraVerifierData.len(),
+                ) {
+                    tracing::warn!(
+                        "measure {} ({backend}): fulfill payload (journal {} + this descriptor + seal) \
+                         exceeds the {}-byte cap — marking this descriptor unclaimable (other \
+                         descriptors for this input are unaffected)",
+                        short_id(program_id),
+                        journal_len,
+                        MAX_FULFILL_PAYLOAD_BYTES
+                    );
+                    mark_desc_unfulfillable(desc_input, descriptor_hash);
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            // A host-RAM admission refusal from the measure path (the shared ledger would be
+            // over-committed) is TRANSIENT — nothing ran, the program is fine — so never strike or
+            // negative-cache it; skip and let a later tick retry once memory frees. Must precede the
+            // strike logic below, which would otherwise treat it as a repeatable execute failure and
+            // eventually negative-cache a perfectly measurable program. (A measure-worker death to a
+            // HOST OOM is NOT surfaced as HostMemoryShortage from the measure path — see the dispatcher
+            // note on finding C deferred to D-B — so it flows through the generic strike path below,
+            // exactly as at HEAD.)
+            if e.downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+                .is_some()
+            {
+                tracing::debug!(
+                    "measure {}: deferred — host RAM is committed, not sizing now (transient)",
+                    short_id(program_id)
+                );
+                return;
+            }
+            // Pure scheduling contention (every measure/worker slot busy or down-and-not-revivable):
+            // nothing ran, so it is TRANSIENT — never strike or negative-cache it; retry next tick.
+            if e.downcast_ref::<zkminer_prover_protocol::types::MeasureSlotsBusy>()
+                .is_some()
+            {
+                tracing::debug!(
+                    "measure {}: all measure slots busy, not sizing now (transient)",
+                    short_id(program_id)
+                );
+                return;
+            }
+            let msg = format!("{e:#}");
+            // The message embeds guest/worker-controlled text; sanitize before logging
+            // (classification still matches the RAW text — the precise cap phrase, not the sanitized
+            // one). Two dispositions:
+            //
+            //  - A CLEAN CAP TRIP is the executor itself reporting it passed the cycle cap: reliable
+            //    and deterministic for the (program, input), so negative-cache it PERMANENTLY on the
+            //    FIRST sighting (sized infeasible -> never claimed nor re-measured). risc0 emits
+            //    "Session limit exceeded"; sp1's cap trip is canonicalized to "exceeded cycle limit".
+            //
+            //  - EVERY OTHER failure — a wall-clock watchdog timeout, a guest panic, a
+            //    risc0 image-id / SP1 vkey mismatch, any deterministic bad-program error — is
+            //    strike-counted per (backend, program, input) and negative-cached UNMEASURABLE after
+            //    MEASURE_TIMEOUT_STRIKES CONSECUTIVE failures. Without this bound, every non-wall-clock
+            //    failure would be left uncached and re-measured every tick FOREVER: a
+            //    submitter controls (ELF, input), so a DETERMINISTIC non-cap failure (e.g. an image-id
+            //    mismatch, which needs no clever guest) would re-fire the measurement endlessly — a free,
+            //    perpetual CPU/sizing DoS that also starves the measure budget. A genuinely transient
+            //    failure (a one-off RPC/worker hiccup, or a guest that misses the 120s budget only under
+            //    transient host load) clears on the next success (`clear_measure_strikes` on the Ok
+            //    path), so the bound only ever retires a REPEATABLE failure. Matching only the precise
+            //    cap phrase, never a loose substring like "cycle", still avoids false-blacklisting.
+            let msg_log = zkminer_chain::programs::sanitize_log(&msg);
+            let lower = msg.to_lowercase();
+            let clean_cap_trip = lower.contains("session limit")
+                || lower.contains("exceeded cycle limit")
+                || lower.contains("exceededcyclelimit");
+            let wall_clock_timeout = lower.contains("wall-clock watchdog");
+            if clean_cap_trip {
+                tracing::warn!(
+                    "measure {} ({backend}): program exceeds the execute cycle cap — marking infeasible \
+                     so it is not claimed or re-measured",
+                    short_id(program_id)
+                );
+                insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
+                clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+            } else {
+                let kind = if wall_clock_timeout {
+                    "wall-clock measure timeout"
+                } else {
+                    "execute failure"
+                };
+                let strikes = bump_measure_strikes(measure_strikes, backend, program_id, input_hash);
+                if strikes >= MEASURE_TIMEOUT_STRIKES {
+                    tracing::warn!(
+                        "measure {} ({backend}): {kind} #{strikes} (>= {}) — cannot be sized across \
+                         repeated attempts; marking infeasible so it is not claimed or re-measured: {}",
+                        short_id(program_id),
+                        MEASURE_TIMEOUT_STRIKES,
+                        msg_log
+                    );
+                    insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
+                    clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+                } else {
+                    tracing::debug!(
+                        "measure {} ({backend}): {kind} #{strikes} (< {}) — leaving uncached so a later \
+                         tick retries (may be transient): {}",
+                        short_id(program_id),
+                        MEASURE_TIMEOUT_STRIKES,
+                        msg_log
+                    );
+                }
+            }
+        }
+        Err(join) => {
+            tracing::debug!("measure {}: measurement task panicked (transient): {join}", short_id(program_id));
+        }
+    }
 }
 
 async fn fetch_or_download_elf(
@@ -5056,7 +6672,14 @@ async fn fetch_or_download_elf(
     let info = match client.get_program_info(program_id).await {
         Ok(info) => info,
         Err(e) => {
-            if let Some(elf) = cache.get(&program_id, None) {
+            // Cache I/O (a read of up to MAX_ELF_BYTES plus a keccak over it) runs on a blocking
+            // thread so a large-ELF flood cannot stall the async runtime's worker threads.
+            let cache_read = cache.clone();
+            let cached = tokio::task::spawn_blocking(move || cache_read.get(&program_id, None))
+                .await
+                .ok()
+                .flatten();
+            if let Some(elf) = cached {
                 tracing::warn!(
                     "ProgramRegistry unavailable ({e:#}); using cached ELF for {} ({} bytes)",
                     program_id,
@@ -5070,13 +6693,49 @@ async fn fetch_or_download_elf(
             ));
         }
     };
-    // First trusted URI's content hash — zero means "unspecified", skip verify.
-    let expected_content_hash = info
-        .storage_uris
-        .iter()
-        .map(|u| u.content_hash)
-        .find(|h| *h != alloy::primitives::B256::ZERO);
-    if let Some(elf) = cache.get(&program_id, expected_content_hash) {
+    // The registry marks a program Active / Deprecated / Revoked. A non-Active status
+    // (Active is the zero/default variant) means the program author pulled it; proving it wastes GPU
+    // + gas. We WARN by default rather than hard-refuse because the exact enum ordering is not
+    // encoded in the JSON ABI and a wrong guess would refuse legitimate Active programs. Set
+    // ZKMINER_REFUSE_NONACTIVE_PROGRAMS=1 to refuse non-Active programs outright on a deployment
+    // whose status mapping you have confirmed.
+    if info.status != 0 {
+        if std::env::var("ZKMINER_REFUSE_NONACTIVE_PROGRAMS")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            return Err(anyhow::anyhow!(
+                "program {} has non-Active registry status {} — refusing (ZKMINER_REFUSE_NONACTIVE_PROGRAMS=1)",
+                program_id,
+                info.status
+            ));
+        }
+        tracing::warn!(
+            "program {} has non-Active registry status {} (Deprecated/Revoked) — proving anyway; \
+             set ZKMINER_REFUSE_NONACTIVE_PROGRAMS=1 to decline",
+            program_id,
+            info.status
+        );
+    }
+    // Verify a cached ELF against the SAME quantity the download enforces when it writes the cache:
+    // the program-wide elf_hash (download_elf below is passed info.elf_hash). elf_hash and the per-URI
+    // content_hash are independent, both submitter-controlled, so verifying the read against a per-URI
+    // content_hash that differs from elf_hash would make every cache read mismatch and re-download on
+    // every measure/claim/prove — a decoy content_hash would defeat the cache for free. Use elf_hash
+    // and nothing else: do NOT fall back to a per-URI content_hash when elf_hash is absent, since
+    // download_elf did not enforce that hash on the whole cached file either (only on the one URI it
+    // served, when that URI's hash was non-zero), so a decoy on a different URI would again force a
+    // re-download. elf_hash is absent only for a risc0 program (SP1 is refused without it); there the
+    // cached bytes are returned unverified, which is safe because risc0's image-id binds the bytes to
+    // the programId at execute and prove — a wrong cached ELF simply fails there, it cannot forge.
+    let expected_cache_hash = info.elf_hash;
+    let cache_read = cache.clone();
+    let cached = tokio::task::spawn_blocking(move || cache_read.get(&program_id, expected_cache_hash))
+        .await
+        .ok()
+        .flatten();
+    if let Some(elf) = cached {
         tracing::info!("Using cached ELF for {} ({} bytes)", program_id, elf.len());
         return Ok(elf);
     }
@@ -5086,7 +6745,7 @@ async fn fetch_or_download_elf(
             LogLevel::Info,
             format!(
                 "Downloading ELF '{}' ({} URIs)",
-                info.name,
+                zkminer_chain::programs::sanitize_log(&info.name),
                 info.storage_uris.len()
             ),
         );
@@ -5094,9 +6753,16 @@ async fn fetch_or_download_elf(
     let elf = zkminer_chain::programs::download_elf(&info.storage_uris, info.elf_hash)
         .await
         .map_err(|e| anyhow::anyhow!("ELF download failed: {e:#}"))?;
-    if let Err(e) = cache.put(&program_id, &elf) {
-        tracing::warn!("Failed to cache ELF: {e:#}");
-    }
+    // Write the cache on a blocking thread (a disk write of up to MAX_ELF_BYTES plus a prune that
+    // stats every cache file); the ELF is moved in and handed back out so it is not copied.
+    let elf = tokio::task::spawn_blocking(move || {
+        if let Err(e) = cache.put(&program_id, &elf) {
+            tracing::warn!("Failed to cache ELF: {e:#}");
+        }
+        elf
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("ELF cache-write task failed: {e}"))?;
     Ok(elf)
 }
 
@@ -5134,7 +6800,7 @@ async fn release_and_clean_with_nonce(
         let not_ours = view.prover != client.address;
         let not_locked = view.status != JOB_STATUS_LOCKED;
         if not_ours || not_locked {
-            // [D1] `prover == ZERO` (the job still reads OPEN) does NOT prove our claim never
+            // `prover == ZERO` (the job still reads OPEN) does NOT prove our claim never
             // landed: the claimJob(Batch) tx may still be pending, or this node may simply be
             // behind the claim block — the same lag `DEADLINE_READ_RETRIES` exists for, and
             // the reason `classify_reconcile` treats ZERO as UNKNOWN rather than NotOurs. A
@@ -5173,9 +6839,9 @@ async fn release_and_clean_with_nonce(
                      from a lagging node; recovery reconciles it)",
                     short_id(job_id)
                 );
-                // [#45] This arm SKIPS release_job too, and release_job is the only consumer
-                // of the abandoned-fulfill stash. The sibling arms below drain it; this one
-                // was added later and did not. A leaked stash nonce carries NO abort record
+                // This arm SKIPS release_job too, and release_job is the only consumer
+                // of the abandoned-fulfill stash, so it must drain the stash itself like the
+                // sibling arms below. A leaked stash nonce carries NO abort record
                 // and is not in `freed`, so it is exactly the hole shape the shutdown gate
                 // refuses to fill — every broadcast release above it then strands.
                 if let Some(n) = client.take_abandoned_nonce(job_id) {
@@ -5200,7 +6866,7 @@ async fn release_and_clean_with_nonce(
                 "no longer locked (fulfilled or released)"
             };
             journal_update(journal, |j| j.remove(job_id));
-            // [#45] This path SKIPS release_job (the only stash consumer). If a fulfill
+            // This path SKIPS release_job (the only stash consumer). If a fulfill
             // stashed its nonce for this job, drain it here or it becomes a permanent gap
             // that wedges the whole signer. The fulfill either mined (abort self-heals via
             // "nonce too low", or — once `commit`/`resync` has raised the `consumed_below`
@@ -5252,7 +6918,7 @@ async fn release_and_clean_with_nonce(
                 now,
                 lock_deadline,
             );
-            // [#45] Past-deadline SKIPS release_job — drain the fulfill stash so a stashed
+            // Past-deadline SKIPS release_job — drain the fulfill stash so a stashed
             // nonce can't wedge the signer. (The stuck fulfill may still be pending at N;
             // recycling it lets a reuser evict/replace it, self-healing via "nonce too low"
             // if it later mines — far better than a permanent gap.)
@@ -5386,7 +7052,7 @@ async fn recover_claimed_jobs(
         );
     }
 
-    // [M9] Fetch EVERY candidate's view in ONE (chunked) batch and FILTER to jobs we
+    // Fetch EVERY candidate's view in ONE (chunked) batch and FILTER to jobs we
     // currently hold Locked, up front. The prior code did a per-job getJobStatusView for
     // each of (potentially 100+) historically-claimed jobs every recovery pass — a
     // recurring RPC storm that 429s a rate-limited endpoint and starves live proving.
@@ -5403,7 +7069,7 @@ async fn recover_claimed_jobs(
             .collect();
 
     const JOB_STATUS_LOCKED: u8 = 1;
-    // [D1] Breadcrumbs whose claim tx could still be LIVE. `prover == ZERO` (the job reads
+    // Breadcrumbs whose claim tx could still be LIVE. `prover == ZERO` (the job reads
     // OPEN) is UNKNOWN, never "not ours": a claim still pending and a lagging post-mine read
     // are indistinguishable from it — the rule `classify_reconcile` and `release_and_clean`
     // already apply. Dropping such an entry is irreversible: the tx mines seconds later,
@@ -5470,7 +7136,7 @@ async fn recover_claimed_jobs(
             }
             true
         }
-        // [D1] Reads OPEN (prover == ZERO) while our claim could still be in flight →
+        // Reads OPEN (prover == ZERO) while our claim could still be in flight →
         // UNKNOWN, not "not ours". KEEP the breadcrumb (see above) but do not re-drive it
         // this pass; a later pass GCs it once it ages out.
         Some(v)
@@ -5486,8 +7152,8 @@ async fn recover_claimed_jobs(
         // Present but settled / held by another prover → drop the stale breadcrumb.
         Some(_) => {
             journal_update(journal, |j| j.remove(*jid));
-            // [#45] Same rule as the serial not-ours / non-Locked arms below (and the one this
-            // [M9] batch pre-filter largely bypasses): dropping the breadcrumb means no
+            // Same rule as the serial not-ours / non-Locked arms below (and the one this
+            // batch pre-filter largely bypasses): dropping the breadcrumb means no
             // `release_job` will ever run for this job again, and that is the ONLY consumer of
             // the abandoned-nonce stash. Leaking one leaves a hole with no local trace
             // (`is_freed`/`recently_aborted` both false) that wedges the whole signer.
@@ -5522,13 +7188,13 @@ async fn recover_claimed_jobs(
             .unwrap_or(u64::MAX)
     });
 
-    // [#4 residual mitigation] `deferred` = the pass broke under a storm (caller retries
+    // `deferred` = the pass broke under a storm (caller retries
     // sooner). `storm_probed` = we already spent our ONE single-shot re-read this pass, so
     // subsequent unreadable jobs defer without fanning out.
     let mut deferred = false;
     let mut storm_probed = false;
     for jid in job_ids {
-        // [B5] Shutdown can begin MID-PASS: the gate at the call site only stops a pass from
+        // Shutdown can begin MID-PASS: the gate at the call site only stops a pass from
         // STARTING. `process_job_lifecycle` is awaited INLINE below, so without this re-check
         // a pass already in flight keeps launching fresh multi-minute proves after `paused`,
         // and the drain blocks on them until jobs the abandon path could have released right
@@ -5549,14 +7215,14 @@ async fn recover_claimed_jobs(
         let view = match views_map.get(&jid) {
             Some(v) => v.clone(),
             None => {
-                // [#4] A None view means the batch couldn't read this job. The deadline-sort
+                // A None view means the batch couldn't read this job. The deadline-sort
                 // ranks None-view jobs LAST (u64::MAX), so every readable (Some) job with a
                 // real deadline has ALREADY been driven by the time we reach one.
                 let rate_limited = client
                     .rpc_meter()
                     .rate_limited_within(std::time::Duration::from_secs(5));
                 // Under a storm, per-job re-reads are the amplifier this change exists to
-                // kill. [#4 residual] But spend ONE bounded single-shot probe on the first
+                // kill. But spend ONE bounded single-shot probe on the first
                 // unreadable job so a genuinely time-critical locked job still gets a
                 // release-to-avoid-slash chance — then defer the rest (they keep their
                 // journal breadcrumbs and are retried on the SOONER cadence). Never a fanout.
@@ -5591,7 +7257,7 @@ async fn recover_claimed_jobs(
             }
         };
         if view.prover != client.address {
-            // [D1] ZERO = the job reads OPEN = UNKNOWN, not "not ours" — keep the breadcrumb
+            // ZERO = the job reads OPEN = UNKNOWN, not "not ours" — keep the breadcrumb
             // while our claim could still be live (see `live_claim_intent` above); a later
             // pass GCs it once it ages out.
             if view.prover == alloy::primitives::Address::ZERO && live_claim_intent.contains(&jid) {
@@ -5604,7 +7270,7 @@ async fn recover_claimed_jobs(
             }
             tracing::info!("recover: {} no longer ours (prover={})", jid, view.prover);
             journal_update(journal, |j| j.remove(jid));
-            // [#45] Dropping the breadcrumb means no `release_job` will ever run for this job
+            // Dropping the breadcrumb means no `release_job` will ever run for this job
             // again — and that is the only consumer of the abandoned-nonce stash. Drain it or
             // a fulfill that gave up leaves a permanent gap that wedges the whole signer.
             if let Some(n) = client.take_abandoned_nonce(jid) {
@@ -5625,7 +7291,7 @@ async fn recover_claimed_jobs(
                 view.status,
             );
             journal_update(journal, |j| j.remove(jid));
-            // [#45] Same as the not-ours arm above: no release_job will run for this job
+            // Same as the not-ours arm above: no release_job will run for this job
             // again, so a stashed fulfill nonce would leak as a permanent gap.
             if let Some(n) = client.take_abandoned_nonce(jid) {
                 client.abort_nonce(n);
@@ -5633,7 +7299,7 @@ async fn recover_claimed_jobs(
             continue;
         }
         let lock_deadline = view.lockDeadline.to::<u64>();
-        // [B5] Ownership is now PROVEN by the re-read above (prover == us, status == Locked) —
+        // Ownership is now PROVEN by the re-read above (prover == us, status == Locked) —
         // but this id can have reached the loop via the `None => true` arm (the whole batch
         // view was unreadable, e.g. a 429 storm) and, if `find_locked_jobs` discovered it, have
         // NO journal entry at all. The pre-loop retain arm writes a breadcrumb for exactly this
@@ -5697,7 +7363,7 @@ async fn recover_claimed_jobs(
         let snapshot = JobStatusSnapshot::from_view(&view);
 
         // We need program_id to fetch the ELF — derive from the descriptor.
-        // [RPC #2] Checked fetch (fast path + verified); the descriptor is then handed
+        // Checked fetch (fast path + verified); the descriptor is then handed
         // to process_job_lifecycle below so it is fetched ONCE per recovered job.
         let descriptor = match fetch_job_descriptor_checked(client, jid, view.descriptorHash).await
         {
@@ -5733,7 +7399,7 @@ async fn recover_claimed_jobs(
         };
         tracked.info.program_id = descriptor.programId;
 
-        // [B5] The gate at the top of this iteration is many awaits old by now: the per-job
+        // The gate at the top of this iteration is many awaits old by now: the per-job
         // view re-read above and `fetch_job_descriptor_checked` (a cold-cache getLogs
         // reconstruction, throttled and retried under a 429 storm) can span tens of seconds.
         // `process_job_lifecycle` deliberately does NOT re-check for `is_recovery` jobs, so
@@ -5749,6 +7415,22 @@ async fn recover_claimed_jobs(
             );
             break;
         }
+        // A prior re-drive in THIS recovery pass may have proved this program unclaimable
+        // (vkey/image-id mismatch), marking VKEY_MISMATCH_PROGRAMS. The remaining recovered jobs for
+        // that same program would each re-drive into the identical guaranteed fault — burning SP1
+        // setup and serializing the recovery pass ahead of the brain loop. Release them directly
+        // (release_and_clean frees collateral we hold and retains the breadcrumb otherwise). The mark
+        // is process-wide and reset on restart, so the FIRST job of a mismatched program still
+        // re-drives once to establish it — nothing legitimate is over-blocked.
+        if program_vkey_mismatched(tracked.info.program_id) {
+            tracing::warn!(
+                "recover: {} belongs to a program already proved unclaimable this session \
+                 (vkey/image-id mismatch) — releasing instead of re-driving a guaranteed-fail prove",
+                jid
+            );
+            release_and_clean(client, state, journal, jid).await;
+            continue;
+        }
         tracing::info!("recover: re-driving fulfill path for {}", jid);
         if let Err(e) = process_job_lifecycle(
             client,
@@ -5762,7 +7444,14 @@ async fn recover_claimed_jobs(
         )
         .await
         {
-            tracing::error!("recover: {} lifecycle failed: {e:#}", jid);
+            // The error can carry a guest-controlled proof-failure message (risc0 surfaces a guest
+            // panic as "Guest panicked: <raw bytes>"), so sanitize it — the twin spawned sink does the
+            // same — before it reaches the operator console / log file.
+            tracing::error!(
+                "recover: {} lifecycle failed: {}",
+                jid,
+                zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+            );
             release_and_clean(client, state, journal, jid).await;
         }
     }
@@ -5993,8 +7682,8 @@ mod tests {
     }
 
     /// The transient failures that a bare `contains("deadline")` would have swallowed must stay
-    /// retryable — the backoff string is the one that terminated all four jobs soak20 lost. With the
-    /// classification typed, none of them can reach the terminal arm at all.
+    /// retryable — the backoff string in particular once caused jobs to be dropped that should have
+    /// retried. With the classification typed, none of them can reach the terminal arm at all.
     #[test]
     fn transient_failures_are_not_deadline_terminal() {
         use zkminer_prover_protocol::types::ProofDeadlineReached;
@@ -6012,10 +7701,10 @@ mod tests {
         }
     }
 
-    /// Commit 2's premise, pinned: the VRAM floor the OOM arm sets exceeds EVERY card on
+    /// The VRAM floor the OOM arm sets exceeds EVERY card on
     /// this hardware (16303 MiB / 24564 MiB), so using it INSTEAD of excluding the failed
-    /// slot emptied the candidate set, `prove_min_vram` restored the full set, and the
-    /// retry landed back on the card that had just OOMed. The floor is now a preference
+    /// slot would empty the candidate set, `prove_min_vram` would restore the full set, and the
+    /// retry would land back on the card that had just OOMed. The floor is a preference
     /// applied ALONGSIDE exclusion, never a substitute for it.
     #[test]
     fn the_large_job_vram_floor_is_inert_on_this_hardware() {
@@ -6038,7 +7727,7 @@ mod tests {
         assert_eq!(classify_reconcile(Some(us), us), ReconcileClass::Locked);
         // Held by a different, non-zero prover → definitively not ours.
         assert_eq!(classify_reconcile(Some(other), us), ReconcileClass::NotOurs);
-        // [D1] prover == ZERO (job reads OPEN) → UNKNOWN, NOT NotOurs: a lagging
+        // prover == ZERO (job reads OPEN) → UNKNOWN, NOT NotOurs: a lagging
         // post-mine read of a job we actually locked must not be dropped to a slash.
         assert_eq!(
             classify_reconcile(Some(Address::ZERO), us),
@@ -6155,10 +7844,11 @@ mod tests {
             resolve_backend(zkminer_chain::auction::sp1_v1_id()),
             Some("sp1")
         );
-        assert_eq!(
-            resolve_backend(zkminer_chain::auction::openvm_v1_id()),
-            Some("openvm")
-        );
+        // OpenVM is declined by default (its worker cannot prove), so it must NOT map
+        // to a claimable backend unless explicitly opted in via ZKMINER_ENABLE_OPENVM.
+        if std::env::var("ZKMINER_ENABLE_OPENVM").ok().as_deref() != Some("1") {
+            assert_eq!(resolve_backend(zkminer_chain::auction::openvm_v1_id()), None);
+        }
     }
 
     #[test]
@@ -6185,11 +7875,11 @@ mod collateral_warning_tests {
     use super::{collateral_warning, ONE_HEMI_WEI};
     use zkminer_chain::staking::fmt_hemi_ceil;
 
-    /// Pins the arguments in place. The positional version of this sentence rotated its last
-    /// two args and told the operator to stake 1 HEMI when they were 4.25 short.
+    /// Pins the arguments in place: a positional call can rotate its last two args and tell
+    /// the operator to stake 1 HEMI when they are 4.25 short.
     #[test]
     fn names_the_shortfall_as_the_stake_amount_not_the_gpu_count() {
-        // The 2026-08-08 incident: 145.75 available, 150.00 per claim, 1 of 2 slots fundable.
+        // Scenario: 145.75 available, 150.00 per claim, 1 of 2 slots fundable.
         let msg = collateral_warning(
             1,
             2,
@@ -6208,7 +7898,7 @@ mod collateral_warning_tests {
         );
         assert!(msg.contains("145.75 HEMI available"), "got: {msg}");
         assert!(msg.contains("locks up to 150.00 HEMI"), "got: {msg}");
-        // The bug verbatim, so it can never come back.
+        // The broken strings, asserted absent so they can never come back.
         assert!(
             !msg.contains("stake 1`"),
             "remediation is the GPU count again: {msg}"
@@ -6219,7 +7909,7 @@ mod collateral_warning_tests {
         );
     }
 
-    /// At the soak's ~50 HEMI per_claim the rotated version undershot by ~35x.
+    /// At ~50 HEMI per_claim a remediation scaled to GPU count instead of per_claim undershoots by ~35x.
     #[test]
     fn remediation_scales_with_per_claim_not_with_gpu_count() {
         let msg = collateral_warning(0, 2, 0, 50 * ONE_HEMI_WEI, 50 * ONE_HEMI_WEI);
@@ -6246,5 +7936,343 @@ mod collateral_warning_tests {
                 "printed {printed} is short of {shortfall} wei"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod r2_sizing_tests {
+    //! The measurement cache is keyed by (programId, keccak256(inputData)) and resolved
+    //! through a descriptor-hash -> input-hash map. These tests pin the invariants the claim gate
+    //! relies on: a job is sized only once BOTH the resolver and the measurement exist (so an
+    //! unmeasured job is never claimable), a repeat input under a new tag reuses the measurement, and
+    //! a different input of the same program is sized independently.
+    use super::*;
+    use alloy::primitives::{keccak256, B256};
+
+    fn fresh() -> (MeasuredCache, DescInputCache) {
+        (
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        )
+    }
+
+    #[test]
+    fn unsized_until_both_resolver_and_measurement_present() {
+        let (measured, desc_input) = fresh();
+        let prog = B256::repeat_byte(0xAA);
+        let desc = B256::repeat_byte(0x11);
+        let input = b"the-input".to_vec();
+        let ih = keccak256(&input);
+
+        // Nothing known yet -> not sized -> NOT claimable.
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc), None);
+
+        // Resolver alone (descriptor fetched, not yet executed) is still not sized: the claim must
+        // wait for the real cycle count, never fall back to the declared value.
+        insert_desc_input(&desc_input, desc, ih);
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc), None);
+
+        // Measurement present for a DIFFERENT input does not size this descriptor.
+        insert_measured(&measured, "risc0", prog, keccak256(b"other-input"), 999);
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc), None);
+
+        // Both present for THIS input -> sized.
+        insert_measured(&measured, "risc0", prog, ih, 42_000);
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc), Some(42_000));
+    }
+
+    #[test]
+    fn same_input_under_new_tag_reuses_measurement() {
+        let (measured, desc_input) = fresh();
+        let prog = B256::repeat_byte(0xBB);
+        let input = b"shared-input".to_vec();
+        let ih = keccak256(&input);
+        // Two distinct descriptor hashes (two tags), same input.
+        let desc_a = B256::repeat_byte(0x01);
+        let desc_b = B256::repeat_byte(0x02);
+
+        insert_desc_input(&desc_input, desc_a, ih);
+        insert_measured(&measured, "risc0", prog, ih, 7_777);
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc_a), Some(7_777));
+
+        // A new tag is a miss until its descriptor fetch records the resolver entry — then it resolves
+        // to the SAME measurement with no new execution. This is the tag-flood defence.
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc_b), None);
+        insert_desc_input(&desc_input, desc_b, ih);
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc_b), Some(7_777));
+    }
+
+    #[test]
+    fn different_inputs_of_same_program_are_sized_independently() {
+        let (measured, desc_input) = fresh();
+        let prog = B256::repeat_byte(0xCC);
+        let (in_cheap, in_heavy) = (b"cheap".to_vec(), b"heavy".to_vec());
+        let (desc_cheap, desc_heavy) = (B256::repeat_byte(0x03), B256::repeat_byte(0x04));
+
+        insert_desc_input(&desc_input, desc_cheap, keccak256(&in_cheap));
+        insert_desc_input(&desc_input, desc_heavy, keccak256(&in_heavy));
+        insert_measured(&measured, "risc0", prog, keccak256(&in_cheap), 10_000);
+
+        // The cheap input is sized; the heavy input — the input-flood vector — is still UNSIZED and so
+        // cannot be claimed on the cheap measurement. This is the exact under-sizing the per-input key closes.
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc_cheap), Some(10_000));
+        assert_eq!(resolve_measured(&measured, &desc_input, "risc0", prog, desc_heavy), None);
+
+        // Measure the heavy input as too-heavy (negative cache) -> now sized infeasible.
+        insert_measured(&measured, "risc0", prog, keccak256(&in_heavy), UNMEASURABLE_CYCLES);
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "risc0", prog, desc_heavy),
+            Some(UNMEASURABLE_CYCLES)
+        );
+    }
+
+    #[test]
+    fn bounded_insert_evicts_and_caps() {
+        let mut m: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for i in 0..5u32 {
+            bounded_insert(&mut m, i, i * 10, 3);
+        }
+        // Never exceeds the cap.
+        assert!(m.len() <= 3);
+        // Re-inserting an existing key does not evict (present-key path).
+        let before = m.len();
+        if let Some((&k, _)) = m.iter().next() {
+            bounded_insert(&mut m, k, 123, 3);
+            assert_eq!(m.len(), before);
+            assert_eq!(m.get(&k), Some(&123));
+        }
+    }
+
+    #[test]
+    fn measurement_is_isolated_per_backend() {
+        // programId, inputData AND proofSystemId are all submitter-chosen, so a cheap
+        // risc0 measurement of (P, I) must NOT size an SP1 job carrying the same (P, I) — the SP1
+        // worker cannot prove a risc0 ELF (→ release penalty). The backend-qualified key isolates them.
+        let (measured, desc_input) = fresh();
+        let prog = B256::repeat_byte(0xDD);
+        let input = b"shared-input".to_vec();
+        let ih = keccak256(&input);
+        let desc = B256::repeat_byte(0x05);
+        insert_desc_input(&desc_input, desc, ih);
+
+        // Measure it for risc0 only.
+        insert_measured(&measured, "risc0", prog, ih, 12_345);
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "risc0", prog, desc),
+            Some(12_345)
+        );
+        // An SP1 job with the SAME programId+input is still UNSIZED (not claimable on risc0's number).
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", prog, desc),
+            None
+        );
+        // Measuring it for SP1 is independent and does not disturb the risc0 entry.
+        insert_measured(&measured, "sp1", prog, ih, 67_890);
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", prog, desc),
+            Some(67_890)
+        );
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "risc0", prog, desc),
+            Some(12_345)
+        );
+    }
+
+    #[test]
+    fn estimate_never_shrinks_below_measurement() {
+        // Mirrors the match in the brain loop: a measurement is a hard floor on the estimate, and an
+        // unsized job falls back to the fallback floor (which cannot be claimed, only ranked).
+        let est = |declared: u64, measured: Option<u64>| match (declared, measured) {
+            (0, Some(c)) => c,
+            (0, None) => FALLBACK_ESTIMATED_CYCLES,
+            (d, Some(c)) => d.max(c),
+            (d, None) => d.max(FALLBACK_ESTIMATED_CYCLES),
+        };
+        // A tiny declaration cannot shrink a large measurement.
+        assert_eq!(est(1, Some(500_000_000)), 500_000_000);
+        // A large declaration is honoured over a small measurement (bond-backed, never smaller).
+        assert_eq!(est(900_000_000, Some(10_000)), 900_000_000);
+        // Unsized: floored, never zero.
+        assert_eq!(est(1, None), FALLBACK_ESTIMATED_CYCLES);
+        assert_eq!(est(0, None), FALLBACK_ESTIMATED_CYCLES);
+    }
+
+    #[test]
+    fn wall_clock_timeout_strikes_bound_before_permanent_blacklist() {
+        // A wall-clock measure-timeout must NOT permanently blacklist on the first one:
+        // it takes MEASURE_TIMEOUT_STRIKES consecutive strikes, and a success (or a clean cap trip)
+        // clears the tally so a feasible job that timed out under transient load self-heals.
+        let strikes: MeasureStrikes =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let prog = B256::repeat_byte(0xCC);
+        let ih = keccak256(b"heavy-input");
+
+        // Each strike returns the running count; the threshold is reached only on the Kth.
+        for n in 1..MEASURE_TIMEOUT_STRIKES {
+            assert_eq!(bump_measure_strikes(&strikes, "sp1", prog, ih), n);
+            assert!(n < MEASURE_TIMEOUT_STRIKES, "below threshold -> still retryable, not blacklisted");
+        }
+        assert_eq!(
+            bump_measure_strikes(&strikes, "sp1", prog, ih),
+            MEASURE_TIMEOUT_STRIKES,
+            "the Kth consecutive wall-clock timeout reaches the blacklist threshold"
+        );
+
+        // A success / clean cap trip clears the tally: the count restarts from 1.
+        clear_measure_strikes(&strikes, "sp1", prog, ih);
+        assert_eq!(
+            bump_measure_strikes(&strikes, "sp1", prog, ih),
+            1,
+            "clearing resets the tally so a later transient timeout starts over, never pre-escalated"
+        );
+
+        // Strikes are isolated per (backend, program, input): a different backend is independent.
+        assert_eq!(bump_measure_strikes(&strikes, "risc0", prog, ih), 1);
+    }
+
+    #[test]
+    fn prove_sizing_never_sizes_below_the_measured_count() {
+        // The prove-path watchdog/VRAM/po2 must size on max(declared, measured), so a
+        // submitter who declares a tiny `expectedCycles` cannot shrink the budget below the MEASURED
+        // work (which is what admission claimed the job on) and get a feasible proof SIGKILLed.
+        const FB: u64 = FALLBACK_ESTIMATED_CYCLES;
+
+        // A tiny declared value can never pull the sizing below the measurement.
+        assert_eq!(prove_sizing_cycles(1, Some(200_000_000)), 200_000_000);
+        assert_eq!(prove_sizing_cycles(0, Some(200_000_000)), 200_000_000);
+        // A declared value LARGER than the measurement raises the sizing (harmless: a larger watchdog
+        // only detects a wedge later, bounded by the cap).
+        assert_eq!(prove_sizing_cycles(500_000_000, Some(200_000_000)), 500_000_000);
+
+        // With no measurement (recovery / non-measurable backend) the declared value is still
+        // adversarial: a nonzero one is floored at FALLBACK, never trusted small...
+        assert_eq!(prove_sizing_cycles(1, None), FB);
+        assert_eq!(prove_sizing_cycles(FB + 7, None), FB + 7);
+        // ...and a zero declaration returns 0 so the caller keeps the old full-timeout fallback.
+        assert_eq!(prove_sizing_cycles(0, None), 0);
+
+        // The exploit shape: declared = 1 (floors the raw formula to the 90s watchdog), measured huge.
+        // Sizing on `declared` would give a 90s kill; sizing on the measured count is correct.
+        let measured = 1_900_000_000; // ~just under the execute cap, a real multi-minute proof
+        assert_eq!(prove_sizing_cycles(1, Some(measured)), measured);
+        assert!(
+            prove_sizing_cycles(1, Some(measured)) > 1,
+            "the declared=1 must NOT be the sizing value when a real measurement exists"
+        );
+    }
+
+    #[test]
+    fn unfulfillable_descriptor_skip_is_per_descriptor_and_bounded() {
+        // A descriptor whose fulfill payload is over the cap must be skippable WITHOUT blacklisting a
+        // sibling descriptor that happens to share the same program+input (the overflow comes from the
+        // descriptor's extra-data, which is outside the measurement cache key).
+        let desc_input: DescInputCache =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let fat = B256::repeat_byte(0x11);
+        let slim = B256::repeat_byte(0x22);
+        assert!(!desc_is_unfulfillable(&desc_input, fat));
+        mark_desc_unfulfillable(&desc_input, fat);
+        assert!(desc_is_unfulfillable(&desc_input, fat), "the over-cap descriptor is flagged");
+        assert!(
+            !desc_is_unfulfillable(&desc_input, slim),
+            "a different descriptor (e.g. a slim one for the same input) is NOT flagged"
+        );
+        // The verdict rides the SAME entry as the resolver, so it co-evicts with claimability:
+        // learning the input hash afterwards preserves the over-cap bit, and the over-cap bit can
+        // never outlive the resolver that makes the descriptor claimable.
+        insert_desc_input(&desc_input, fat, keccak256(b"some-input"));
+        assert!(
+            desc_is_unfulfillable(&desc_input, fat),
+            "recording the resolver must not clear the over-cap verdict"
+        );
+        // Idempotent and bounded: re-marking the same descriptor keeps exactly one entry.
+        mark_desc_unfulfillable(&desc_input, fat);
+        assert_eq!(desc_input.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fulfill_payload_over_cap_is_conservative_and_descriptor_sensitive() {
+        let cap = MAX_FULFILL_PAYLOAD_BYTES;
+        // Clearly under the cap: a big journal with a tiny descriptor still fits, so it must NOT be
+        // flagged (no false skip of a job that could fulfill).
+        assert!(!fulfill_payload_over_cap(100 * 1024, 1024, 0, 0));
+        // The gap the fix closes: the SAME 100 KiB journal (same program+input) with ~30 KiB of
+        // descriptor extra-data tips the full payload over the cap, so THIS descriptor is flagged
+        // even though the journal+input alone fit.
+        assert!(fulfill_payload_over_cap(100 * 1024, 1024, 30 * 1024, 0));
+        // A journal that alone exceeds the whole cap is always over, with or without a descriptor.
+        assert!(fulfill_payload_over_cap(cap as u64 + 1, 0, 0, 0));
+        // Exactly at the cap with the minimal seal is NOT over (strictly-greater comparison, so the
+        // minimal-seal estimate can never false-fire on a payload that just fits).
+        assert!(!fulfill_payload_over_cap((cap - MIN_SEAL_BYTES) as u64, 0, 0, 0));
+    }
+
+    #[test]
+    fn journal_len_cache_round_trips_per_backend_program_input() {
+        let jc: JournalLenCache =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let prog = B256::repeat_byte(0x33);
+        let ih = keccak256(b"some-input");
+        assert_eq!(get_journal_len(&jc, "sp1", prog, ih), None);
+        insert_journal_len(&jc, "sp1", prog, ih, 70_000);
+        assert_eq!(get_journal_len(&jc, "sp1", prog, ih), Some(70_000));
+        // Keyed by backend too: a different backend for the same program+input is independent, so a
+        // sibling check on one backend never reads the other's journal length.
+        assert_eq!(get_journal_len(&jc, "risc0", prog, ih), None);
+    }
+
+    #[test]
+    fn program_vkey_mismatch_skips_every_future_job_for_the_program() {
+        // A program recorded as vkey/image-id-mismatched is permanently unclaimable; an unrelated
+        // program is unaffected. Distinct ids keep it independent of any other test touching the
+        // process-wide set.
+        let bad = B256::repeat_byte(0xab);
+        let good = B256::repeat_byte(0xcd);
+        assert!(!program_vkey_mismatched(bad));
+        mark_program_vkey_mismatch(bad);
+        assert!(program_vkey_mismatched(bad), "the mismatched program is skipped");
+        assert!(!program_vkey_mismatched(good), "an unrelated program is not skipped");
+        // Idempotent: re-marking does not change membership.
+        mark_program_vkey_mismatch(bad);
+        assert!(program_vkey_mismatched(bad));
+    }
+
+    #[test]
+    fn claim_payload_over_cap_catches_the_race_loser_and_needs_all_three_inputs() {
+        // Reproduces the measuring_inputs race loser: its own (early-returning) measure task cached its
+        // resolver and payload, and the winner cached the journal length for the shared (program,
+        // input). The claim gate must then catch an over-cap full payload — and must NOT fire until all
+        // three inputs are present, so it never false-skips a job that could still fulfill.
+        let desc_input: DescInputCache =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let jc: JournalLenCache =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let pc: DescPayloadCache =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let prog = B256::repeat_byte(0x44);
+        let desc = B256::repeat_byte(0x55);
+        let ih = keccak256(b"shared-input");
+
+        // Nothing cached yet -> never blocks.
+        assert!(!claim_payload_over_cap(&desc_input, &jc, &pc, "sp1", prog, desc));
+        // Resolver only -> cannot decide, does not block.
+        insert_desc_input(&desc_input, desc, ih);
+        assert!(!claim_payload_over_cap(&desc_input, &jc, &pc, "sp1", prog, desc));
+        // + a journal length that alone fits under the cap, but THIS descriptor's payload is not yet
+        // cached -> still does not block.
+        insert_journal_len(&jc, "sp1", prog, ih, 100 * 1024);
+        assert!(!claim_payload_over_cap(&desc_input, &jc, &pc, "sp1", prog, desc));
+        // + a FAT descriptor payload that tips the full payload (journal + payload + seal) over the cap
+        // -> now the claim is refused (the race-loser case).
+        insert_desc_payload(&pc, desc, 40 * 1024);
+        assert!(claim_payload_over_cap(&desc_input, &jc, &pc, "sp1", prog, desc));
+        // A slim descriptor for the SAME (program, input) is independent and NOT blocked.
+        let slim = B256::repeat_byte(0x66);
+        insert_desc_input(&desc_input, slim, ih);
+        insert_desc_payload(&pc, slim, 1024);
+        assert!(!claim_payload_over_cap(&desc_input, &jc, &pc, "sp1", prog, slim));
+        // Journal is backend-keyed: the same descriptor under a DIFFERENT backend (no journal there)
+        // does not block.
+        assert!(!claim_payload_over_cap(&desc_input, &jc, &pc, "risc0", prog, desc));
     }
 }

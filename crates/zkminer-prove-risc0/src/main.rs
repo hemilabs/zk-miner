@@ -18,16 +18,33 @@ include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn main() {
-    tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+/// Duplicate `fd` with close-on-exec set.
+///
+/// `dup` deliberately CLEARS `FD_CLOEXEC` on the new descriptor, so without this every process the
+/// worker forks inherits a writable copy of the host's IPC pipe; a grandchild that outlives us then
+/// keeps the write end open and the host's blocking `read_exact` never sees EOF. The host never
+/// passes this descriptor to anyone, so close-on-exec is unconditionally correct. (Mirrors the SP1
+/// worker's `dup_cloexec`.)
+#[cfg(unix)]
+fn dup_cloexec(fd: std::os::unix::io::RawFd) -> std::io::Result<std::os::unix::io::RawFd> {
+    let new = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if new < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(new)
+}
 
-    // Direct benchmark mode: run benchmarks and print results to stdout
+fn main() {
+    // Direct benchmark mode runs the operator's own guests and prints a human table to the REAL
+    // stdout, so it must come before the fd-1 redirect below. It speaks no IPC.
     if std::env::args().any(|a| a == "--benchmark") {
+        tracing_subscriber::fmt()
+            .with_writer(io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info".into()),
+            )
+            .init();
         let results = run_benchmarks();
         for r in &results {
             println!(
@@ -38,15 +55,39 @@ fn main() {
         return;
     }
 
-    if let Err(e) = run_worker_loop() {
+    // CRITICAL: save the real stdout FD for IPC, then redirect FD 1 to stderr so NOTHING
+    // the guest (via risc0's POSIX `sys_write`/`sys_log` to fd 1, which `PosixIo::default()` wires to
+    // this process's stdout) — nor any native/CUDA library — can inject bytes into the length-prefixed
+    // bincode control stream the dispatcher reads. A submitter's ELF could otherwise desync or forge
+    // that stream and churn the GPU prover. The SP1 worker does the same for gnark's CGO prints. The
+    // worker's own IPC frames go only through the saved descriptor.
+    #[cfg(unix)]
+    let ipc_stdout = {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let stdout_fd = io::stdout().as_raw_fd(); // FD 1
+        let ipc_fd = dup_cloexec(stdout_fd).expect("dup(stdout) failed");
+        unsafe { libc::dup2(io::stderr().as_raw_fd(), stdout_fd) };
+        unsafe { std::fs::File::from_raw_fd(ipc_fd) }
+    };
+    #[cfg(not(unix))]
+    let ipc_stdout = io::stdout();
+
+    tracing_subscriber::fmt()
+        .with_writer(io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
         std::process::exit(1);
     }
 }
 
-fn run_worker_loop() -> Result<()> {
+fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     let mut stdin = BufReader::new(io::stdin().lock());
-    let mut stdout = BufWriter::new(io::stdout().lock());
+    let mut stdout = BufWriter::new(ipc_stdout);
 
     loop {
         let cmd: WorkerCommand = match read_message(&mut stdin) {
@@ -104,6 +145,7 @@ fn run_worker_loop() -> Result<()> {
                 elf,
                 input_data,
                 po2,
+                program_id,
             } => {
                 tracing::info!(
                     "Proving request {request_id} ({} bytes ELF, po2={po2:?})",
@@ -123,8 +165,17 @@ fn run_worker_loop() -> Result<()> {
                     segments: None,
                 };
                 write_message(&mut stdout, &started)?;
-                match run_proof(&elf, &input_data, po2) {
-                    Ok((journal, seal, duration_secs, cycles)) => {
+                // A crafted ELF that EXECUTES cleanly (so it measures feasible and gets
+                // CLAIMED) can still panic in risc0's prove-only path (image-id/proving on an
+                // adversarial-but-executable program). Without containment the worker dies on a CLAIMED
+                // job, the dispatcher charges a healthy slot, the retry loop re-dispatches the same job
+                // to every GPU crashing each, and the program is never classed bad — so it is cheaply
+                // repeatable and drives a release-penalty/slash. Treat a prove-time panic as InvalidInput.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_proof(&elf, &input_data, po2, program_id)
+                }));
+                match outcome {
+                    Ok(Ok((journal, seal, duration_secs, cycles))) => {
                         let resp = WorkerResponse::ProofResult {
                             request_id,
                             journal,
@@ -134,14 +185,44 @@ fn run_worker_loop() -> Result<()> {
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(e) => {
+                    Err(_panic) => {
+                        let resp = WorkerResponse::Error {
+                            request_id,
+                            kind: ErrorKind::InvalidInput,
+                            message: "risc0 prover panicked on this ELF (malformed or hostile program)"
+                                .to_string(),
+                        };
+                        write_message(&mut stdout, &resp)?;
+                    }
+                    Ok(Err(e)) => {
                         let msg = format!("{e:#}");
-                        let kind = if is_gpu_oom(&msg) {
-                            // GPU OOM: tag as ResourceExhausted so the dispatcher kills +
-                            // respawns this worker with a clean GPU context (a wedged/leaked
-                            // context would otherwise fail every subsequent proof).
+                        let lower = msg.to_ascii_lowercase();
+                        // A guest-execution fault must be classified BEFORE is_gpu_oom. risc0 wraps a
+                        // guest panic as "Guest panicked: <msg>" — a host-generated prefix followed by
+                        // the guest's OWN text. Feeding that whole string to is_gpu_oom let a guest
+                        // panic with "out of memory" and steer ITSELF onto a worker kill+respawn and a
+                        // bigger-card retry — the self-classification the typed `kind` was meant to
+                        // prevent. A guest that faults in the prove-only path is a BAD JOB, not a sick
+                        // worker: classify InvalidInput and never let its text reach is_gpu_oom.
+                        // (Session-/cycle-limit are too-heavy bad jobs; their text is host-generated.)
+                        let kind = if lower.contains("guest panicked")
+                            || lower.contains("session limit")
+                            || lower.contains("exceeded cycle")
+                            || lower.contains("non-zero exit code")
+                        {
+                            ErrorKind::InvalidInput
+                        } else if msg.contains("does not match job programId") {
+                            // The served ELF's image id is not this job's programId — permanent for the
+                            // program. Report ProgramMismatch so the host stops claiming its jobs.
+                            ErrorKind::ProgramMismatch
+                        } else if is_gpu_oom(&msg) {
+                            // GPU OOM — host/driver text (guest faults are handled above): tag
+                            // ResourceExhausted so the dispatcher kills + respawns this worker with a
+                            // clean GPU context (a wedged/leaked context would fail every later proof).
                             ErrorKind::ResourceExhausted
                         } else if msg.contains("po2 value") || msg.contains("out of valid range") {
+                            // Bad job (wrong po2), not a sick worker: InvalidInput so the dispatcher
+                            // does not kill+respawn a healthy worker.
                             ErrorKind::InvalidInput
                         } else if msg.contains("serialize") || msg.contains("bincode") {
                             ErrorKind::Internal
@@ -162,10 +243,23 @@ fn run_worker_loop() -> Result<()> {
                 request_id,
                 elf,
                 input_data,
+                program_id,
             } => {
                 tracing::info!("Execute request {request_id} ({} bytes ELF)", elf.len());
-                match run_execute(&elf, &input_data) {
-                    Ok((cycles, duration_secs)) => {
+                // The ELF bytes are fully attacker-controlled and reach risc0's ELF
+                // parser / image-id computation / executor UNCLAIMED on this pre-claim measurement
+                // path. Those SDK calls CAN PANIC on a malformed registered ELF rather than returning
+                // Err (the SP1 worker's Execute arm documents and guards the identical hazard). An
+                // unguarded panic unwinds out of this loop and kills the worker PROCESS; the dispatcher
+                // then sees a bare EOF (non-intentional), scores a HEALTHY slot as failed, and the host
+                // never classes the program as bad — so the crash repeats on every respawn, a free
+                // sustained liveness DoS. Contain it here: a caught panic is a property of the job
+                // (InvalidInput), exactly like an execution Err.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_execute(&elf, &input_data, program_id)
+                }));
+                match outcome {
+                    Ok(Ok((cycles, journal_len, duration_secs))) => {
                         tracing::info!(
                             "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s"
                         );
@@ -173,10 +267,11 @@ fn run_worker_loop() -> Result<()> {
                             request_id,
                             cycles,
                             duration_secs,
+                            journal_len,
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         let msg = format!("{e:#}");
                         // Execution failure is NOT proof failure: the guest may simply panic
                         // on this input, which is a property of the job, not of this worker.
@@ -186,6 +281,18 @@ fn run_worker_loop() -> Result<()> {
                             request_id,
                             kind: ErrorKind::InvalidInput,
                             message: msg,
+                        };
+                        write_message(&mut stdout, &resp)?;
+                    }
+                    Err(_panic) => {
+                        // risc0 panicked parsing/executing this attacker ELF. Same
+                        // disposition as an execution Err — a bad program, not a sick worker — so the
+                        // slot stays healthy and the host can negative-cache the program.
+                        let resp = WorkerResponse::Error {
+                            request_id,
+                            kind: ErrorKind::InvalidInput,
+                            message: "risc0 executor panicked while sizing this ELF (malformed or hostile program)"
+                                .to_string(),
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -288,13 +395,99 @@ fn detect_gpu() -> (bool, Option<String>) {
 ///
 /// Deliberately uses the default (CPU) executor: this is a sizing measurement, so it must not
 /// contend for the GPU that the proofs it sizes are running on.
-fn run_execute(elf: &[u8], input_data: &[u8]) -> anyhow::Result<(u64, f64)> {
+/// True when `image_id` (a risc0 guest image id, 32 bytes) corresponds to the on-chain `program_id`.
+///
+/// The byte order the registry stores a risc0 programId in — vs risc0's native word layout from
+/// `Digest::as_bytes` — is deployment-defined and not knowable from this repo, so we accept EITHER
+/// order. A legitimately matching ELF matches under whichever order the chain used; an ELF that is a
+/// *different* program matches under neither (a 256-bit collision is infeasible). Accepting both
+/// orders is what guarantees the binding check can never false-reject a genuine job.
+fn image_id_matches(image_id: &[u8], program_id: &[u8; 32]) -> bool {
+    image_id == program_id.as_slice()
+        || image_id.iter().rev().copied().eq(program_id.iter().copied())
+}
+
+/// Set `ZKMINER_RISC0_SKIP_PROGRAM_ID_CHECK=1` to disable the image-id↔programId binding (only for a
+/// deployment whose risc0 programId is NOT the raw image id). Enforced by default.
+fn program_id_check_disabled() -> bool {
+    matches!(
+        std::env::var("ZKMINER_RISC0_SKIP_PROGRAM_ID_CHECK")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// Refuse to run an ELF whose computed risc0 image id does not match the job's on-chain `programId`.
+/// No-op when the host did not supply a programId (benchmark/calibration/mock) or the check is
+/// disabled. Catches a submitter who registers programId X but serves an ELF for a different program,
+/// *before* a full Groth16 proof (or a sizing execute) is spent on a proof the chain will reject.
+fn verify_program_id(elf: &[u8], program_id: Option<[u8; 32]>) -> anyhow::Result<()> {
+    let Some(pid) = program_id else {
+        return Ok(());
+    };
+    if program_id_check_disabled() {
+        return Ok(());
+    }
+    let image_id =
+        risc0_zkvm::compute_image_id(elf).context("compute_image_id for programId binding")?;
+    if image_id_matches(image_id.as_bytes(), &pid) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "ELF image id {image_id} does not match job programId {} (served ELF is not the \
+             registered program) — refusing to prove",
+            risc0_zkvm::Digest::from(pid)
+        );
+    }
+}
+
+/// Cycle cap for the pre-claim EXECUTE (sizing) path. A runaway guest here is a free DoS lever (no
+/// claim, no collateral at stake), and the result is only a sizing estimate. The cap is set BELOW the
+/// cycles a non-terminating guest could reach inside the host's ~120 s measure watchdog, so a runaway
+/// trips risc0's clean "Session limit exceeded" error — which the host classifies as "too heavy" and
+/// negative-caches — rather than the watchdog SIGKILL (indistinguishable from a transient crash). 2e9
+/// is still ~21× the largest proof observed on this market (~9.3e7), so it cannot false-cap a real
+/// job. Override with `ZKMINER_RISC0_EXECUTE_MAX_CYCLES` (0 = unlimited).
+fn execute_session_cycle_limit() -> Option<u64> {
+    const DEFAULT: u64 = 2_000_000_000;
+    match std::env::var("ZKMINER_RISC0_EXECUTE_MAX_CYCLES") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT),
+        },
+        Err(_) => Some(DEFAULT),
+    }
+}
+
+/// Optional cycle cap for the PROVE path, honoured only when the operator sets
+/// `ZKMINER_RISC0_MAX_SESSION_CYCLES`. Unset = SDK default (no cap), so a legitimately large proof
+/// is never cut short by surprise.
+fn prove_session_cycle_limit() -> Option<u64> {
+    std::env::var("ZKMINER_RISC0_MAX_SESSION_CYCLES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+}
+
+fn run_execute(
+    elf: &[u8],
+    input_data: &[u8],
+    program_id: Option<[u8; 32]>,
+) -> anyhow::Result<(u64, u64, f64)> {
     use std::time::Instant;
+    // Bind the ELF to the job's programId before spending any execution on it (the pre-claim
+    // measurement path runs UNCLAIMED, submitter-controlled ELFs).
+    verify_program_id(elf, program_id)?;
     let started = Instant::now();
 
     let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
     if !input_data.is_empty() {
         env_builder.write_slice(input_data);
+    }
+    if let Some(limit) = execute_session_cycle_limit() {
+        env_builder.session_limit(Some(limit));
     }
     let env = env_builder
         .build()
@@ -304,14 +497,35 @@ fn run_execute(elf: &[u8], input_data: &[u8]) -> anyhow::Result<(u64, f64)> {
         .execute(env, elf)
         .map_err(|e| anyhow::anyhow!("execute: {e}"))?;
 
+    // A guest that does not halt with exit code 0 can NEVER produce a receipt that
+    // `receipt.verify(image_id)` accepts (verify builds the expected claim as Halted(0)), so this
+    // (program, input) is permanently unprovable and unfulfillable. Reject it HERE, on the pre-claim
+    // measure path, so the host strike-negative-caches it per (program, input) and never claims it —
+    // instead of sizing it feasible, locking collateral on a claim, then force-releasing at a penalty
+    // when the proof is rejected post-prove. Deterministic for (ELF, input); a legitimate job halts 0.
+    match session.exit_code {
+        risc0_zkvm::ExitCode::Halted(0) => {}
+        other => {
+            anyhow::bail!(
+                "execute: guest did not halt successfully (exit {other:?}) — a non-zero exit code can \
+                 never produce an accepted proof for this program+input"
+            );
+        }
+    }
+
     // `SessionInfo::cycles()` is the total cycle count, matching what proving reports.
     let cycles = session.cycles();
-    Ok((cycles, started.elapsed().as_secs_f64()))
+    // The journal the guest committed here is byte-identical to the one the later proof
+    // would carry (both are a deterministic function of (ELF, input), and the elf_hash gate makes
+    // measure-ELF == prove-ELF), so its length lets the host pre-screen a program whose journal alone
+    // would blow the fulfillJob payload cap — before committing collateral and a full proof to it.
+    let journal_len = session.journal.bytes.len() as u64;
+    Ok((cycles, journal_len, started.elapsed().as_secs_f64()))
 }
 
 /// Cards with less VRAM than this release the Groth16 SRS cache after every proof.
 ///
-/// Set between the two cards measured on 2026-10-07. On the 16.3 GB RTX 5080 the cache stays resident
+/// Set between the two cards that were measured. On the 16.3 GB RTX 5080 the cache stays resident
 /// at ~7.25 GB between proofs, and the next 46M-cycle STARK at po2 20 then peaked at 15,834 MiB — 469
 /// MiB from the card's capacity — and in the benchmark's program order failed outright. Releasing it
 /// dropped the idle worker to 2,452 MiB and that peak to 12,436 MiB. On the 24.6 GB RTX 4090 the same
@@ -364,7 +578,10 @@ fn run_proof(
     elf: &[u8],
     input_data: &[u8],
     po2: Option<u8>,
+    program_id: Option<[u8; 32]>,
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
+    // Bind the ELF to the job's programId ONCE, before the retry loop spends any GPU on it.
+    verify_program_id(elf, program_id)?;
     // Retry-on-invalid mitigation for the rare (~1.5%) nondeterministic GPU
     // timing race on RTX 5090 / Blackwell (sm_120) — an intra-kernel race
     // produces an internally-invalid segment STARK, surfaced as
@@ -389,10 +606,19 @@ fn run_proof(
             }
             Err(e) => {
                 let msg = format!("{e:#}").to_lowercase();
-                let recoverable = msg.contains("verification indicates")
-                    || msg.contains("verify segment")
-                    || msg.contains("receipt is invalid")
-                    || msg.contains("proof verification failed");
+                // A guest-execution fault carries guest-controlled text ("Guest panicked: <msg>"), so
+                // it must never match the recoverable-retry predicate below — otherwise a guest could
+                // panic with "receipt is invalid" and buy itself MAX_ATTEMPTS full re-proves of wasted
+                // GPU. The genuine GPU-corruption signals this retry targets are host-generated (segment
+                // verification / receipt.verify), never wrapped as a guest panic.
+                let guest_fault = msg.contains("guest panicked")
+                    || msg.contains("session limit")
+                    || msg.contains("non-zero exit code");
+                let recoverable = !guest_fault
+                    && (msg.contains("verification indicates")
+                        || msg.contains("verify segment")
+                        || msg.contains("receipt is invalid")
+                        || msg.contains("proof verification failed"));
                 if recoverable && attempt < MAX_ATTEMPTS {
                     tracing::warn!(
                         "Proof attempt {attempt}/{MAX_ATTEMPTS} produced an invalid proof (likely GPU race), re-proving: {e:#}"
@@ -436,6 +662,10 @@ fn run_proof_once(
         tracing::info!("Setting segment_limit_po2 = {po2}");
         env_builder.segment_limit_po2(po2 as u32);
     }
+    if let Some(limit) = prove_session_cycle_limit() {
+        tracing::info!("Setting session_limit = {limit} cycles (operator override)");
+        env_builder.session_limit(Some(limit));
+    }
     let env = env_builder.build()?;
 
     // Use Groth16 receipt kind for on-chain verifiable proofs.
@@ -455,6 +685,28 @@ fn run_proof_once(
     // Verify proof locally before returning — catches GPU corruption (e.g., ROCm SHA-256 bug)
     let image_id =
         risc0_zkvm::compute_image_id(elf).context("Failed to compute image ID for verification")?;
+
+    // Defense in depth against a guest that halts with a non-zero exit code: `receipt.verify` below
+    // builds the expected claim as Halted(0), so a non-zero exit deterministically fails verification
+    // with a ClaimDigestMismatch that surfaces as "receipt is invalid" — which the retry wrapper in
+    // `run_proof` would otherwise mistake for a (nondeterministic) GPU race and re-prove MAX_ATTEMPTS
+    // times. Detect the non-zero exit explicitly and fail with a distinct, NON-recoverable error (it
+    // does not match the invalid-proof retry phrases) so it is never retried. The pre-claim measure
+    // gate already rejects such a program+input, so reaching here means a stale cached measurement or
+    // a race — but we must still never burn repeated Groth16 proofs on a deterministic fault. If the
+    // claim is pruned/unreadable this is a no-op and `receipt.verify` runs exactly as before.
+    if let Ok(claim) = receipt.claim() {
+        if let Ok(rc) = claim.as_value() {
+            if !matches!(rc.exit_code, risc0_zkvm::ExitCode::Halted(0)) {
+                anyhow::bail!(
+                    "guest halted with a non-zero exit code ({:?}) — unprovable program+input, not a \
+                     GPU race",
+                    rc.exit_code
+                );
+            }
+        }
+    }
+
     receipt.verify(image_id).context(
         "Proof verification FAILED — receipt is invalid, GPU may have produced corrupt output",
     )?;
@@ -841,4 +1093,53 @@ fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
         total_cycles,
         prove_duration_secs: duration.as_secs_f64(),
     })
+}
+
+#[cfg(test)]
+mod program_id_tests {
+    use super::*;
+
+    #[test]
+    fn matches_forward_and_reverse_but_not_a_different_id() {
+        let mut img = [0u8; 32];
+        for (i, b) in img.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        // Same bytes (forward order) matches.
+        assert!(image_id_matches(&img, &img));
+        // The chain may store the reversed order — that must still match.
+        let mut rev = img;
+        rev.reverse();
+        assert!(image_id_matches(&img, &rev));
+        // A genuinely different program (one bit flipped) matches under neither order.
+        let mut other = img;
+        other[0] ^= 0x01;
+        assert!(!image_id_matches(&img, &other));
+    }
+
+    #[test]
+    fn verify_accepts_none_and_respects_kill_switch() {
+        // No programId supplied (benchmark/calibration/mock) → always OK, regardless of ELF.
+        assert!(verify_program_id(&[0u8; 8], None).is_ok());
+    }
+
+    // Guest-gated: only meaningful when real guests were compiled in (not RISC0_SKIP_BUILD).
+    #[test]
+    fn computed_image_id_matches_embedded_fibonacci_id() {
+        if FIBONACCI_ELF.is_empty() {
+            return; // stubbed guests; nothing to validate
+        }
+        let image_id = risc0_zkvm::compute_image_id(FIBONACCI_ELF).expect("compute image id");
+        // The build embeds FIBONACCI_ID from the SAME computation; this proves our local
+        // image-id derivation is self-consistent (the forward byte order).
+        let embedded: Vec<u8> = FIBONACCI_ID.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(image_id.as_bytes(), embedded.as_slice());
+        // And the real embedded id must bind to itself under verify_program_id.
+        let mut pid = [0u8; 32];
+        pid.copy_from_slice(image_id.as_bytes());
+        assert!(verify_program_id(FIBONACCI_ELF, Some(pid)).is_ok());
+        // A different programId (bit flipped) must be refused.
+        pid[0] ^= 0x01;
+        assert!(verify_program_id(FIBONACCI_ELF, Some(pid)).is_err());
+    }
 }

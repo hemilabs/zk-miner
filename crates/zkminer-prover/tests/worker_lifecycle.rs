@@ -397,8 +397,8 @@ fn cycle_measurement_skips_a_recycled_slot() {
             pool.has_idle_worker("mock"),
             "the other worker is idle and live"
         );
-        let cycles = pool
-            .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)))
+        let (cycles, _journal_len) = pool
+            .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None)
             .expect("measurement must move on to the live worker");
         assert_eq!(cycles, 1000);
         // Bring it back for the next round.

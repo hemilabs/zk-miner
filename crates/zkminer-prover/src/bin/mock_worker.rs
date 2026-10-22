@@ -75,6 +75,7 @@ fn main() {
                 elf: _,
                 input_data: _,
                 po2: _,
+                program_id: _,
             } => {
                 if crash_on == "prove" || crash_on == "both" {
                     std::process::exit(1);
@@ -101,6 +102,7 @@ fn main() {
                     request_id,
                     cycles: 1000,
                     duration_secs: 0.01,
+                    journal_len: 0,
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }

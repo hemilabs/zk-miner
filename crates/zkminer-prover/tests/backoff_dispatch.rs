@@ -1,12 +1,11 @@
 //! Does a slot inside its own respawn-backoff window burn a caller's attempt, or get
 //! waited out?
 //!
-//! soak20 lost every job it failed to this: all four died on
-//! `proving failed after 3 attempt(s): Backoff: waiting ~4.5s before respawning`, and
-//! for 0x92e7686c attempt 3 fired **155 microseconds** after attempt 2. The 3-attempt
-//! budget was consumed by a 5-second timer the failure handler had armed 0.7s earlier,
-//! because no dispatch predicate knew about the window and the single-key shortcut went
-//! straight into `ensure_alive` -> `respawn` -> instant bail.
+//! The failure mode this guards against: a worker that dies mid-proof arms a respawn-backoff
+//! window in the failure handler, and a caller's whole 3-attempt budget can then be consumed
+//! by that ~5-second timer in microseconds — attempt 3 firing right after attempt 2 — because
+//! no dispatch predicate knew about the window and the single-key shortcut went straight into
+//! `ensure_alive` -> `respawn` -> instant bail. The job is lost without ever reaching a GPU.
 //!
 //! Needs a real CUDA worker. Run with:
 //!   ZKMINER_GPU_NAME_FILTER=4090 cargo test --release -p zkminer-prover \
@@ -83,7 +82,7 @@ fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
 
     // 1. Start a LONG proof, then SIGKILL the worker mid-proof. That path runs the
     //    failure handler (`mark_slot_failed`), which is what arms the backoff window --
-    //    exactly as the OOM did in soak20. Killing the worker BEFORE a prove does not
+    //    the same way an OOM mid-proof does. Killing the worker BEFORE a prove does not
     //    work: `ensure_alive` just respawns it cleanly, since `last_failure` is None.
     let pool = std::sync::Arc::new(pool);
     let big = input(&[40_000_000]);
@@ -104,6 +103,8 @@ fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
             &mut used,
             None,
             None,
+            None,
+            None,
         );
         r.map(|_| ()).map_err(|e| format!("{e:#}"))
     });
@@ -120,8 +121,8 @@ fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
         "killing the worker mid-proof should have failed this attempt (and armed the backoff)"
     );
 
-    // 2. Immediately retry. This is the soak20 moment. The slot is dead and inside its
-    //    5s window, and it is the ONLY key.
+    // 2. Immediately retry. This is the moment that loses jobs: the slot is dead and inside
+    //    its 5s window, and it is the ONLY key.
     let t0 = Instant::now();
     let mut used2 = None;
     let second = pool.prove_min_vram(
@@ -137,11 +138,13 @@ fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
         &mut used2,
         None,
         None,
+        None,
+        None,
     );
     let elapsed = t0.elapsed();
     eprintln!("prove #2 returned after {elapsed:?}: ok={}", second.is_ok());
 
-    // The regression: returning in microseconds with a Backoff error.
+    // The failure shape: returning in microseconds with a Backoff error.
     if let Err(e) = &second {
         let msg = format!("{e:#}");
         assert!(

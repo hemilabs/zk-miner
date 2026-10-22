@@ -332,7 +332,7 @@ async fn two_processes_over_one_signer_collide_on_the_same_nonce() {
     );
 }
 
-/// [round-4 R4-A] An accepted send whose RECEIPT is never observed must not recycle its nonce.
+/// An accepted send whose RECEIPT is never observed must not recycle its nonce.
 ///
 /// `abort` inserts into `freed` AND writes an abandonment record, and the following `resync`
 /// cannot undo either: the stake is unmined, so the mined frontier IS that nonce and
