@@ -644,70 +644,6 @@ fn clear_measure_strikes(
     }
 }
 
-/// backend_tag -> (count of EXPENSIVE (near-watchdog) measurements in the current window, time of the
-/// last one). A GLOBAL, per-backend throttle on measurement COST. The per-(program,input) strike
-/// cache (above) precisely negative-caches a deterministically-unmeasurable input, but it cannot
-/// bound a flood that ROTATES programId/inputData (a fresh key each time) with each guest tuned to run
-/// just UNDER the watchdog — paying no SIGKILL, tripping no strike, yet pinning the scarce measure
-/// workers and starving all claiming. This counts EXPENSIVE measurements (ANY outcome: clean,
-/// cap-trip, or SIGKILL) across all programs/inputs for a backend; past `MEASURE_COST_BREAK` the
-/// measure-spawn gate DEFERS new measurements for that backend until the count decays
-/// (`MEASURE_COST_WINDOW`) — a self-healing THROTTLE, never a permanent stop. Keyed ONLY by backend
-/// (never by program or submitter), so unlike the per-program breaker it replaced it can never retire
-/// a specific (possibly shared) program for everyone, and program/input rotation cannot evade it.
-type MeasureCostBreaker = std::sync::Arc<
-    std::sync::Mutex<std::collections::HashMap<u8, (u32, std::time::Instant)>>,
->;
-
-/// A measurement is "expensive" (counts toward the cost breaker) if it ran at least this long — about
-/// half the 120s measure watchdog. A legitimate size is far cheaper; a guest tuned to pin a measure
-/// worker near the watchdog (the penalty-free sub-watchdog flood) is not.
-const LONG_MEASURE_SECS: f64 = 60.0;
-
-/// Expensive measurements for one backend within the window before the measure-spawn gate throttles
-/// new measurements for it. Generous: a real backlog of a few genuinely-heavy sizes is fine; a
-/// sustained flood of near-watchdog measurements is not.
-const MEASURE_COST_BREAK: u32 = 8;
-
-/// Idle time after the last expensive measurement before the per-backend cost count decays to zero
-/// (self-heal), so a transient burst of heavy-but-legit sizing cannot throttle the backend for long.
-const MEASURE_COST_WINDOW: Duration = Duration::from_secs(120);
-
-/// Record a measurement's wall-clock cost for a backend. Only an EXPENSIVE (>= LONG_MEASURE_SECS) run
-/// counts; a cheap size, or a ~0s transient defer, does not. Decays first if the last expensive
-/// measurement was longer ago than the window, so only a SUSTAINED flood accumulates.
-fn bump_measure_cost(breaker: &MeasureCostBreaker, backend: &str, duration_secs: f64) {
-    if duration_secs < LONG_MEASURE_SECS {
-        return;
-    }
-    if let Ok(mut m) = breaker.lock() {
-        let now = std::time::Instant::now();
-        let key = backend_tag(backend);
-        let count = match m.get(&key).copied() {
-            Some((c, last)) if now.duration_since(last) <= MEASURE_COST_WINDOW => c.saturating_add(1),
-            _ => 1, // fresh, or decayed since the last expensive measurement
-        };
-        bounded_insert(&mut m, key, (count, now), MEASURED_CYCLES_CAP);
-    }
-}
-
-/// True if a backend has accumulated `MEASURE_COST_BREAK` expensive measurements within the window,
-/// so the measure-spawn gate should DEFER new measurements for it this tick (a self-healing throttle,
-/// not a stop). A decayed entry is dropped and returns false.
-fn measure_backend_throttled(breaker: &MeasureCostBreaker, backend: &str) -> bool {
-    if let Ok(mut m) = breaker.lock() {
-        let key = backend_tag(backend);
-        if let Some((c, last)) = m.get(&key).copied() {
-            if std::time::Instant::now().duration_since(last) > MEASURE_COST_WINDOW {
-                m.remove(&key); // self-heal: the flood has passed
-                return false;
-            }
-            return c >= MEASURE_COST_BREAK;
-        }
-    }
-    false
-}
-
 /// Record that `descriptor_hash` carries `input_hash`, so a later sighting can resolve its
 /// measurement without re-fetching the descriptor. Bounded to `MEASURED_CYCLES_CAP` entries.
 fn insert_desc_input(
@@ -2669,11 +2605,6 @@ async fn miner_brain(
     // single transient timeout does not permanently blacklist a feasible job (see `measure_cycles`).
     let measure_strikes: MeasureStrikes =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    // Global per-backend measure-COST breaker: a self-healing throttle that bounds a rotating
-    // sub-watchdog measurement flood without ever over-blocking a specific program (see
-    // `MeasureCostBreaker`).
-    let measure_cost_breaker: MeasureCostBreaker =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // (Over-cap fulfill-payload verdicts now live as the `over_cap` bit on each descriptor's DescInfo
     // resolver entry in `desc_input_hash`, so the verdict and the resolver evict together — see
     // `DescInfo` / `measure_cycles`.)
@@ -2711,9 +2642,42 @@ async fn miner_brain(
         .map(|p| p.gpu_cards())
         .unwrap_or_default();
 
+    // Headless-visible measure-pool health. A backend with a dedicated measure pool (sp1) can no
+    // longer SIZE a not-yet-measured job — and so can no longer CLAIM one — if every pool worker is
+    // dead and not revivable, yet `is_backend_healthy` stays green off the (still-alive) GPU prove
+    // slot. (Already-measured jobs still claim and prove normally — they need no measure capacity;
+    // only new/unmeasured jobs stall.) `worker_status` is a one-shot startup snapshot consumed only by
+    // the TUI, so a runtime retirement is invisible to a HEADLESS operator (the primary deployment).
+    // Emit a log on the live→down transition (and on recovery) so the outage reaches journald.
+    // Per-backend last-known state so each tick only logs a CHANGE, never a per-tick spam. (Liveness,
+    // not idleness: a BUSY or briefly-respawning pool is still live.)
+    let mut measure_pool_down: std::collections::HashMap<&'static str, bool> =
+        std::collections::HashMap::new();
+
     loop {
         interval.tick().await;
         tick_count = tick_count.wrapping_add(1);
+
+        // Surface measure-pool unavailability to headless logs (see `measure_pool_down`).
+        if let Some(pool) = zkminer_prover::engine::worker_pool() {
+            for backend in ["sp1"] {
+                if let Some(live) = pool.measure_pool_live(backend) {
+                    let down = !live;
+                    let was_down = measure_pool_down.get(backend).copied().unwrap_or(false);
+                    if down && !was_down {
+                        tracing::warn!(
+                            "{backend} measure pool is DOWN — every measure worker is dead and not \
+                             revivable; new/unmeasured {backend} jobs cannot be sized or claimed until \
+                             it recovers (already-measured jobs still claim and prove normally). Check \
+                             the measure-worker binary and logs.",
+                        );
+                    } else if !down && was_down {
+                        tracing::info!("{backend} measure pool recovered — sizing/claiming resumes.");
+                    }
+                    measure_pool_down.insert(backend, down);
+                }
+            }
+        }
 
         // Reap finished job tasks before re-evaluating the concurrency budget.
         while let Ok(jid) = done_rx.try_recv() {
@@ -3996,24 +3960,26 @@ async fn miner_brain(
                 // submitter exclusively assigned to ANOTHER prover; skip it for a cooldown so it cannot
                 // monopolize the per-tick measure budget. Time-bounded, since exclusivity expires.
                 && !assigned_elsewhere_recently(&assigned_elsewhere, dh)
-                // Stop measuring a program that keeps taking the measure wall-clock-watchdog SIGKILL
-                // across rotated inputs (the input-rotation measure-DoS the per-(program,input) strike
-                // cache cannot bound). Generous threshold + self-heal, so a legitimately heavy program
-                // is not permanently retired by a transient host-overload storm.
-                && !measure_backend_throttled(&measure_cost_breaker, backend_opt.unwrap_or(""))
             {
                 let backend = backend_opt.unwrap_or("");
                 // Dedup by descriptor hash so N sightings spawn ONE execution; cleared below.
-                // Budget this tick's measurement spawns against the proving concurrency
-                // left after in-flight claims, so measurements can never consume the whole GPU pool —
-                // but always allow at least one, so a single-GPU rig (and the down-worker revival path
-                // in `execute_cycles`) still makes progress. Capped absolutely at
-                // MAX_INFLIGHT_MEASUREMENTS. A descriptor over budget simply waits for a later tick.
                 const MAX_INFLIGHT_MEASUREMENTS: usize = 16;
-                let measure_budget = max_concurrent
-                    .saturating_sub(in_flight.len())
-                    .max(1)
-                    .min(MAX_INFLIGHT_MEASUREMENTS);
+                // Budget per-tick measurement spawns against the MEASURE POOL for a backend that has a
+                // dedicated one (sp1), and against GPU prove-concurrency for a backend that measures on
+                // its prove pool (risc0). sp1 measures on the CPU measure pool, never a GPU, so sizing
+                // its budget on GPU count was a category error: it collapsed to 1 on a single-GPU rig
+                // (serializing the 2-worker pool) and exceeded the pool on >=3-GPU rigs (over-spawning
+                // into the "all slots busy" race). Pool-sized means budget <= pool, so over-spawn is
+                // structurally impossible. A descriptor over budget simply waits for a later tick.
+                let measure_budget = match zkminer_prover::engine::worker_pool()
+                    .and_then(|p| p.measure_worker_count(backend))
+                {
+                    Some(pool) => pool.min(MAX_INFLIGHT_MEASUREMENTS),
+                    None => max_concurrent
+                        .saturating_sub(in_flight.len())
+                        .max(1)
+                        .min(MAX_INFLIGHT_MEASUREMENTS),
+                };
                 let fresh = measuring
                     .lock()
                     .map(|mut m| {
@@ -4032,7 +3998,7 @@ async fn miner_brain(
                     })
                     .unwrap_or(false);
                 if fresh {
-                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2, breaker2, jcache2, pcache2, acache) = (
+                    let (c2, st2, cache, resolver, inflight, inflight_inputs, strikes2, jcache2, pcache2, acache) = (
                         client.clone(),
                         state.clone(),
                         measured_cycles.clone(),
@@ -4040,7 +4006,6 @@ async fn miner_brain(
                         measuring.clone(),
                         measuring_inputs.clone(),
                         measure_strikes.clone(),
-                        measure_cost_breaker.clone(),
                         measured_journal.clone(),
                         desc_payload.clone(),
                         assigned_elsewhere.clone(),
@@ -4064,7 +4029,6 @@ async fn miner_brain(
                             &resolver,
                             &inflight_inputs,
                             &strikes2,
-                            &breaker2,
                             &jcache2,
                             &pcache2,
                             &acache,
@@ -6198,7 +6162,6 @@ async fn measure_cycles(
         >,
     >,
     measure_strikes: &MeasureStrikes,
-    measure_cost_breaker: &MeasureCostBreaker,
     measured_journal: &JournalLenCache,
     desc_payload: &DescPayloadCache,
     assigned_elsewhere: &AssignedElsewhere,
@@ -6518,16 +6481,10 @@ async fn measure_cycles(
     let input_len = input.len();
     // Blocking: the worker protocol is synchronous. Bounded by the watchdog inside `execute_cycles`.
     let backend_owned = backend.to_string();
-    let measure_started = std::time::Instant::now();
     let res = tokio::task::spawn_blocking(move || {
         pool.execute_cycles(&backend_owned, &elf, &input, Some(MEASURE_TIMEOUT), program_id_bytes)
     })
     .await;
-    // Record this measurement's wall-clock cost against the GLOBAL per-backend throttle, for ANY
-    // outcome that actually ran (clean, cap-trip, or SIGKILL). A ~0s transient host-RAM defer falls
-    // below LONG_MEASURE_SECS and does not count; an expensive near-watchdog run does — so the
-    // penalty-free sub-watchdog flood that trips no strike/SIGKILL still hits backpressure.
-    bump_measure_cost(measure_cost_breaker, backend, measure_started.elapsed().as_secs_f64());
     match res {
         Ok(Ok((cycles, journal_len))) => {
             // The guest committed `journal_len` bytes. fulfillJob re-encodes the journal
@@ -6603,15 +6560,29 @@ async fn measure_cycles(
         }
         Ok(Err(e)) => {
             // A host-RAM admission refusal from the measure path (the shared ledger would be
-            // over-committed) is TRANSIENT — nothing ran, the program is fine — so never strike it or
-            // bump the breaker; skip and let a later tick retry once memory frees. Must precede the
+            // over-committed) is TRANSIENT — nothing ran, the program is fine — so never strike or
+            // negative-cache it; skip and let a later tick retry once memory frees. Must precede the
             // strike logic below, which would otherwise treat it as a repeatable execute failure and
-            // eventually negative-cache a perfectly measurable program.
+            // eventually negative-cache a perfectly measurable program. (A measure-worker death to a
+            // HOST OOM is NOT surfaced as HostMemoryShortage from the measure path — see the dispatcher
+            // note on finding C deferred to D-B — so it flows through the generic strike path below,
+            // exactly as at HEAD.)
             if e.downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
                 .is_some()
             {
                 tracing::debug!(
                     "measure {}: deferred — host RAM is committed, not sizing now (transient)",
+                    short_id(program_id)
+                );
+                return;
+            }
+            // Pure scheduling contention (every measure/worker slot busy or down-and-not-revivable):
+            // nothing ran, so it is TRANSIENT — never strike or negative-cache it; retry next tick.
+            if e.downcast_ref::<zkminer_prover_protocol::types::MeasureSlotsBusy>()
+                .is_some()
+            {
+                tracing::debug!(
+                    "measure {}: all measure slots busy, not sizing now (transient)",
                     short_id(program_id)
                 );
                 return;
@@ -8157,40 +8128,6 @@ mod r2_sizing_tests {
 
         // Strikes are isolated per (backend, program, input): a different backend is independent.
         assert_eq!(bump_measure_strikes(&strikes, "risc0", prog, ih), 1);
-    }
-
-    #[test]
-    fn global_measure_cost_breaker_throttles_a_rotating_sub_watchdog_flood() {
-        // A rotating sub-watchdog flood pays no SIGKILL and trips no per-(program,input) strike, but
-        // each run is EXPENSIVE (near-watchdog), so the global per-backend cost breaker throttles it.
-        let breaker: MeasureCostBreaker =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-
-        assert!(!measure_backend_throttled(&breaker, "sp1"));
-        // A CHEAP measurement never counts, however many there are.
-        for _ in 0..100 {
-            bump_measure_cost(&breaker, "sp1", LONG_MEASURE_SECS - 1.0);
-        }
-        assert!(!measure_backend_throttled(&breaker, "sp1"), "cheap sizes never throttle");
-
-        // Expensive (near-watchdog) runs accumulate across ALL programs/inputs (the breaker is keyed
-        // only by backend), and throttle once the window count reaches the threshold.
-        for i in 0..MEASURE_COST_BREAK {
-            assert!(
-                !measure_backend_throttled(&breaker, "sp1"),
-                "not throttled before the threshold"
-            );
-            let _ = i;
-            bump_measure_cost(&breaker, "sp1", LONG_MEASURE_SECS + 1.0);
-        }
-        assert!(
-            measure_backend_throttled(&breaker, "sp1"),
-            "the global cost breaker throttles once expensive measurements reach the threshold"
-        );
-
-        // A DIFFERENT backend is independent — the throttle never spills across backends, and (being
-        // keyed only by backend) it can never retire a specific program for everyone.
-        assert!(!measure_backend_throttled(&breaker, "risc0"));
     }
 
     #[test]

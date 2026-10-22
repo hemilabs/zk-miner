@@ -525,6 +525,33 @@ impl std::fmt::Display for HostMemoryShortage {
 
 impl std::error::Error for HostMemoryShortage {}
 
+/// Every worker/measure slot for a backend was BUSY (or down-and-not-revivable) when a cycle
+/// measurement tried to run, so nothing was attempted.
+///
+/// Typed for the same reason as `HostMemoryShortage`: the caller (the measure path) must not mistake
+/// pure scheduling contention for a bad program. It is TRANSIENT — no guest executed, so the
+/// (program, input) must not be struck or negative-cached; the next tick retries when a slot frees.
+#[derive(Debug, Clone)]
+pub struct MeasureSlotsBusy {
+    /// The backend whose measure/worker slots were all busy, e.g. `sp1`.
+    pub backend: String,
+    /// How many candidate slots were checked and found busy/unrevivable.
+    pub slots: usize,
+}
+
+impl std::fmt::Display for MeasureSlotsBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "all {} '{}' measure/worker slot(s) busy, or down and not revivable; skipping cycle \
+             measurement (transient)",
+            self.slots, self.backend,
+        )
+    }
+}
+
+impl std::error::Error for MeasureSlotsBusy {}
+
 /// Not enough of this card's VRAM is free for this backend to be given work on it.
 ///
 /// Distinct from `HostMemoryShortage` (that is system RAM) and from a GPU OOM (that is the proof

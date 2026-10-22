@@ -1909,6 +1909,42 @@ impl WorkerPool {
         gpus.len().max(1)
     }
 
+    /// Number of dedicated measure workers provisioned for `backend`, or `None` if the backend
+    /// measures on its prove pool (it has no dedicated measure pool).
+    ///
+    /// The measure-spawn budget in the brain must size a dedicated-pool backend (sp1) against THIS,
+    /// not against the GPU prove-concurrency: sp1 measures on the CPU measure pool and never touches a
+    /// GPU, so a GPU-derived budget collapsed to 1 on a single-GPU rig (serializing the pool) and
+    /// exceeded the pool on >=3-GPU rigs (over-spawning into the "all slots busy" race).
+    pub fn measure_worker_count(&self, backend: &str) -> Option<usize> {
+        self.measure_workers.get(backend).map(|p| p.len())
+    }
+
+    /// Measure-pool LIVENESS for `backend` (distinct from idleness): `None` if the backend has no
+    /// dedicated measure pool; else `Some(true)` iff at least one pool slot is alive or revivable,
+    /// treating a BUSY (locked) slot as alive — a locked slot is running a measurement, so it is live.
+    ///
+    /// Used by the brain's health surface to tell "the measure pool is genuinely DOWN" (every slot
+    /// dead and not revivable) from "the pool is merely busy or briefly respawning" (still live). It
+    /// deliberately does NOT gate claiming — an already-measured job needs no measure capacity — it
+    /// only drives a headless-visible degraded signal.
+    ///
+    /// Revivability is `slot_eligible` (the same predicate `is_backend_healthy` uses), NOT
+    /// `slot_dispatchable`: the latter also excludes a slot inside its transient respawn-backoff
+    /// window, so a pool whose workers just crashed and are waiting out a ~5s backoff would be
+    /// falsely reported DOWN and then "recovered" seconds later — a cry-wolf alarm on the sole
+    /// headless signal. `slot_eligible` counts a backing-off-but-eligible slot as revivable (live),
+    /// while a RETIRED (`consecutive_failures >= MAX` within `RETIRE_COOLDOWN`) or DECLINED slot still
+    /// reads down. A BUSY (locked) slot is running a measurement, so it is live.
+    pub fn measure_pool_live(&self, backend: &str) -> Option<bool> {
+        self.measure_workers.get(backend).map(|pool| {
+            pool.iter().any(|e| match e.slot.try_lock() {
+                Ok(sl) => sl.handle.is_some() || Self::slot_eligible(&sl),
+                Err(_) => true, // busy/locked ⇒ a measurement is running ⇒ alive
+            })
+        })
+    }
+
     /// Check if a specific backend has any healthy worker.
     /// Accepts a logical backend name ("risc0"), vendor-level ("risc0:cuda"),
     /// or a full compound key ("risc0:cuda:0").
@@ -3208,11 +3244,18 @@ impl WorkerPool {
                     }
                     match revived {
                         Some(f) => f,
-                        None => anyhow::bail!(
-                            "all {} '{backend}' measure/worker slot(s) busy, or down and not revivable; \
-                             skipping cycle measurement",
-                            candidates.len()
-                        ),
+                        // TYPED transient: pure scheduling contention (every slot busy, or down and not
+                        // revivable), nothing ran. `measure_cycles` must treat this as transient — no
+                        // strike, no negative-cache — and retry next tick, so it cannot be mistaken for a
+                        // repeatable program fault that would blacklist a feasible (program, input).
+                        None => {
+                            return Err(anyhow::Error::new(
+                                zkminer_prover_protocol::types::MeasureSlotsBusy {
+                                    backend: backend.to_string(),
+                                    slots: candidates.len(),
+                                },
+                            ))
+                        }
                     }
                 }
             }
@@ -3310,6 +3353,20 @@ impl WorkerPool {
                          measure budget (wall-clock watchdog) — may be transient host load"
                     );
                 } else {
+                    // A raw EOF here is a non-intentional crash. Treated as a slot failure (counts
+                    // toward respawn backoff / retire), identical to HEAD.
+                    //
+                    // NOTE (D-A / finding C, DEFERRED to D-B): a measure-worker death caused by a HOST
+                    // OOM is environmental, not slot ill-health, and ideally would not count against
+                    // the slot (like `prove_on_slot`'s `died_of_host_oom` path). A v3 attempt to
+                    // reclassify it here via `mark_slot_dead` + `HostMemoryShortage{attempted:true}`
+                    // was REVERTED: `died_of_host_oom` is subtree-wide (it cannot attribute the OOM to
+                    // this worker vs. a co-resident balloon), and removing the `mark_slot_failed`
+                    // retire removes the only bound on a rotating balloon-OOM storm — making it
+                    // unbounded and invisible, strictly worse than this behaviour. Correct handling
+                    // needs D-B's per-process balloon bound first; until then, keeping the retire is
+                    // the safer choice (it throttles an OOM storm, and a retired measure pool now
+                    // surfaces via `measure_pool_live` / the headless health log).
                     Self::mark_slot_failed(&mut slot, entry);
                     return Err(e);
                 }
@@ -8111,6 +8168,58 @@ mod declined_backend_tests {
             last_failure: Some(Instant::now()),
             declined: declined.map(str::to_string),
             proofs_since_spawn: 0,
+        }
+    }
+
+    fn measure_entry(sl: WorkerSlot) -> WorkerEntry {
+        WorkerEntry {
+            slot: Mutex::new(sl),
+            vram_bytes: None,
+            pci_bus_id: None,
+            pid: Arc::new(AtomicU32::new(0)),
+            pid_starttime: Arc::new(AtomicU64::new(0)),
+            intentional_kill: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// `measure_pool_live` reports DOWN only when every measure slot is dead and not revivable, and
+    /// (unlike the idleness probe `has_idle_or_revivable_worker`) treats a BUSY/locked slot as ALIVE —
+    /// so a backend whose pool is merely busy measuring is never reported down. `measure_worker_count`
+    /// returns the pool size, or None for a backend that measures on its prove pool.
+    #[test]
+    fn measure_pool_live_is_down_only_when_every_slot_is_dead_and_not_revivable() {
+        let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+        // No dedicated measure pool for this backend -> None (it measures on the prove pool).
+        assert_eq!(pool.measure_pool_live("sp1"), None);
+        assert_eq!(pool.measure_worker_count("sp1"), None);
+
+        // A pool of DECLINED (dead, not revivable) slots -> DOWN.
+        pool.measure_workers.insert(
+            "sp1".to_string(),
+            vec![
+                measure_entry(slot(Some("unsupported"), 0)),
+                measure_entry(slot(Some("unsupported"), 0)),
+            ],
+        );
+        assert_eq!(pool.measure_worker_count("sp1"), Some(2));
+        assert_eq!(
+            pool.measure_pool_live("sp1"),
+            Some(false),
+            "every slot declined (not revivable) -> down"
+        );
+
+        // Holding one slot's lock makes try_lock fail; a BUSY/locked slot must read as ALIVE even
+        // though the pool is otherwise all-declined -> the backend is not reported down while busy.
+        {
+            let _busy = pool.measure_workers.get("sp1").unwrap()[0]
+                .slot
+                .lock()
+                .unwrap();
+            assert_eq!(
+                pool.measure_pool_live("sp1"),
+                Some(true),
+                "a busy/locked slot counts as alive"
+            );
         }
     }
 
