@@ -111,6 +111,7 @@ fn a_relative_vram_floor_routes_off_the_smallest_card() {
         None,
         None,
         None,
+        0,
     );
     assert!(
         r.is_ok(),

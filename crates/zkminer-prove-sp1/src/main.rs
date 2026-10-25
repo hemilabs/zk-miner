@@ -210,6 +210,12 @@ fn main() {
     // Before constructing any CudaProver: never adopt a server whose owner is gone.
     reap_orphaned_gpu_servers(our_cuda_device);
 
+    // Likewise before any execute: sweep SP1 native-executor /dev/shm trace rings and memory images
+    // orphaned by a worker that died without unlinking (SIGBUS/OOM-kill). Left behind they fill the
+    // tmpfs and make every later execute SIGBUS. Runs at every (re)spawn; a no-op where the native
+    // executor is not in play (non-Linux, or nothing orphaned).
+    reap_orphaned_sp1_shm();
+
     // Then put the server this release ships in the place the SDK runs it from, before anything
     // runs it: `sp1_usability` probes it, and the SDK would otherwise download upstream's.
     bundled_server::install_bundled_server();
@@ -400,6 +406,155 @@ fn server_device_of_pid(pid: i32) -> Option<u32> {
     }
     None
 }
+
+/// How old an UNmapped `/dev/shm/sp1_*` segment must be before the reaper unlinks it. The
+/// `/proc/*/maps` liveness scan is the primary signal; this floor only covers the brief window
+/// between a live worker's `shm_open`+`ftruncate` and the `mmap` that would make the segment appear
+/// in `maps` — when a genuinely-live segment is momentarily in neither place.
+#[cfg(target_os = "linux")]
+const SP1_SHM_ORPHAN_MIN_AGE: Duration = Duration::from_secs(30);
+
+/// True for a `/dev/shm` basename the SP1 native executor creates: the memory image
+/// (`sp1_<uuid>_m`), the trace ring (`sp1_<uuid>_t`) and the ring's POSIX semaphores
+/// (`sem.sp1_<uuid>_t_filled` / `_empty`). Both prefixes are matched on purpose — glibc backs a
+/// named semaphore with a `sem.`-prefixed file in the same tmpfs (see sp1-jit `shm.rs`). The name
+/// carries a random uuid, not a pid, so it cannot be the discriminator; liveness is (see reaper).
+fn is_sp1_shm_basename(name: &str) -> bool {
+    name.starts_with("sp1_") || name.starts_with("sem.sp1_")
+}
+
+/// Record into `out` every SP1 `/dev/shm` basename a `/proc/<pid>/maps` blob currently maps. A
+/// segment that ANY live process maps is in use and must never be unlinked, whichever worker owns
+/// it. Reads `maps` not `fd` deliberately: SP1 `mmap`s a segment then CLOSES the fd, so the fd is
+/// usually gone while the mapping — and the segment's use — persists; keying on fds would unlink a
+/// live prover's ring.
+fn sp1_shm_mapped_in(maps: &str, out: &mut std::collections::HashSet<String>) {
+    for line in maps.lines() {
+        let Some(idx) = line.find("/dev/shm/") else {
+            continue;
+        };
+        // SP1's names are `sp1_` + base64url(uuid) + suffix; the base64url alphabet has no spaces,
+        // so the basename is the first whitespace-delimited token after the prefix. Taking that
+        // token also drops a trailing " (deleted)" annotation on an already-unlinked mapping.
+        let Some(name) = line[idx + "/dev/shm/".len()..].split_whitespace().next() else {
+            continue;
+        };
+        if is_sp1_shm_basename(name) {
+            out.insert(name.to_string());
+        }
+    }
+}
+
+/// Unlink `/dev/shm/sp1_*` segments (memory image, trace ring) and their `sem.sp1_*` semaphores
+/// left behind by a native executor that died WITHOUT running its `Drop` — a SIGBUS when /dev/shm
+/// filled, an OOM `SIGKILL`, an abort. A clean or in-band exit already unlinks them (sp1-jit RAII),
+/// so this only ever removes ORPHANS.
+///
+/// WHY THIS EXISTS. Every `execute()` on the native executor (x86-64 Linux) stages a memory image
+/// and a trace ring in /dev/shm. On the graceful path sp1-jit unlinks them; on an abnormal death
+/// they LEAK, and a tmpfs that accumulates leaked segments makes every LATER execute SIGBUS the
+/// instant it touches an unbacked page — a durable, cross-job denial of service (a stale segment
+/// was found in the wild). Running this at worker startup — which is also every respawn, and so the
+/// step right after the dispatcher's watchdog `SIGKILL`s a wedged measure worker — reclaims leaked
+/// segments over time. The age floor defers the segment THIS respawn's death just leaked to a later
+/// pass (it is younger than the floor now); that is fine, because one stale ring does not fill a
+/// correctly-sized tmpfs, and the next pass reaps it once it has aged out of the create→mmap window.
+///
+/// The discriminator is LIVENESS, not a pid (the names are random uuids): a segment that any live
+/// process still maps (`/proc/*/maps`) is spared. The age floor is a second guard for the create→mmap
+/// window. Cross-user safety is explicit: we only ever unlink a segment whose owner uid is our own
+/// euid, so a foreign segment is never ours to reap — independent of the /dev/shm mount's sticky bit
+/// (which would otherwise be the only thing stopping a root miner, or a miner on a non-sticky mount,
+/// from unlinking another uid's file) and independent of whether we can read that uid's `/proc/*/maps`.
+///
+/// Mirrors `reap_orphaned_gpu_servers`: same /proc-walk, same "only touch what is provably orphaned".
+#[cfg(target_os = "linux")]
+fn reap_orphaned_sp1_shm() {
+    let Ok(dir) = std::fs::read_dir("/dev/shm") else {
+        return;
+    };
+    // SP1 segments old enough to be past the create→mmap window: the only reap candidates.
+    let mut candidates: Vec<(std::path::PathBuf, String)> = Vec::new();
+    for e in dir.flatten() {
+        let fname = e.file_name();
+        let Some(name) = fname.to_str() else {
+            continue;
+        };
+        if !is_sp1_shm_basename(name) {
+            continue;
+        }
+        let Ok(md) = e.metadata() else {
+            continue;
+        };
+        // Only ever unlink a segment WE own. The /proc/*/maps liveness scan already spares live
+        // foreign segments, and on the normal sticky /dev/shm (mode 1777) a non-root miner cannot
+        // unlink another uid's file at all — but an operator who mounted /dev/shm non-sticky would
+        // lose that backstop, and a root miner never had it. An explicit euid check makes the reaper
+        // safe regardless of mount options or uid: a foreign segment is simply not ours to reap.
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid() is always successful and has no side effects.
+            if md.uid() != unsafe { libc::geteuid() } {
+                continue;
+            }
+        }
+        // An unreadable/younger mtime (racing a concurrent create or unlink) → skip; a later pass
+        // reaps it once it has aged, and never while it may still be a live worker's.
+        let old_enough = md
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= SP1_SHM_ORPHAN_MIN_AGE);
+        if old_enough {
+            candidates.push((e.path(), name.to_string()));
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    // Every SP1 /dev/shm name any live process maps right now: spared whoever owns it.
+    let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for pe in entries.flatten() {
+            let pname = pe.file_name();
+            let is_pid = pname
+                .to_str()
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+            if !is_pid {
+                continue;
+            }
+            // Another user's maps is EACCES — skip it. A non-root miner cannot unlink that process's
+            // /dev/shm files anyway (the tmpfs is sticky, mode 1777, and they are another uid's), so
+            // not seeing its mappings here cannot make us remove a live foreign segment. (A root miner
+            // can read every maps, so it spares foreign live segments via the liveness scan instead.)
+            if let Ok(maps) = std::fs::read_to_string(pe.path().join("maps")) {
+                sp1_shm_mapped_in(&maps, &mut live);
+            }
+        }
+    }
+    let mut reaped = 0usize;
+    for (path, name) in candidates {
+        if live.contains(&name) {
+            continue;
+        }
+        // `remove_file` on the backing /dev/shm file is exactly what `shm_unlink`/`sem_unlink` do:
+        // drop the name. EPERM (another user's) or ENOENT (already gone) is a harmless skip.
+        if std::fs::remove_file(&path).is_ok() {
+            reaped += 1;
+        }
+    }
+    if reaped > 0 {
+        tracing::warn!(
+            "reaped {reaped} orphaned SP1 /dev/shm segment(s) left by an abnormally-killed native \
+             executor; left unlinked they fill the tmpfs and SIGBUS every later execute"
+        );
+    }
+}
+
+/// Non-Linux: the native executor (and its /dev/shm staging) does not exist — the portable executor
+/// runs in-process — so there is nothing to reap.
+#[cfg(not(target_os = "linux"))]
+fn reap_orphaned_sp1_shm() {}
 
 /// The soname `sp1-gpu-server` demands. Fixed at ITS link time, not ours.
 const CUDART_SONAME: &str = "libcudart.so.12";
@@ -1396,15 +1551,18 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     run_execute_sp1(cpu, &elf, &input_data)
                 }));
                 match outcome {
-                    Ok(Ok((cycles, journal_len, duration_secs))) => {
+                    Ok(Ok((cycles, journal_len, duration_secs, peak_host_bytes))) => {
                         tracing::info!(
-                            "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s"
+                            "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s, peak \
+                             host {} MiB",
+                            peak_host_bytes / (1024 * 1024)
                         );
                         let resp = WorkerResponse::ExecuteResult {
                             request_id,
                             cycles,
                             duration_secs,
                             journal_len,
+                            peak_host_bytes,
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -1569,11 +1727,124 @@ fn parse_sp1_execute_cycle_limit(raw: Option<&str>) -> Option<u64> {
 /// `vkey == programId` gate stays on the PROVE path (`run_proof`), where `setup` runs anyway and is
 /// pk-cached. A served-consistent decoy whose vkey != programId therefore still sizes correctly and
 /// at worst fails to prove → collateral release (bounded), never a forged or under-sized claim.
+/// Does this `/proc/<pid>/comm` belong to SP1's native-executor runner child? `/proc/<pid>/comm`
+/// truncates to 15 chars. The runner ships two ways: the DEFAULT embedded build extracts it as
+/// `sp1-native-runner-bin-<hash>` (→ comm `sp1-native-runn`, SP1 `runner/src/lib.rs:65`), and an
+/// operator override (`SP1_CORE_RUNNER_OVERRIDE_BINARY`) runs the `sp1-core-executor-runner-binary`
+/// crate (→ `sp1-core-execut`). Match BOTH — matching only `sp1-core` (as an earlier version did)
+/// silently never fired for the shipped embedded runner. The measure worker is server-less, so its
+/// only `sp1-*` child is this runner; no gpu-server to confuse it.
+fn is_sp1_executor_runner_comm(comm: &str) -> bool {
+    let c = comm.trim_end();
+    c.starts_with("sp1-native") || c.starts_with("sp1-core")
+}
+
+/// Current summed RESIDENT set (VmRSS, in KiB) of this worker's SP1 native-executor runner
+/// child/children — where the guest actually runs. VmRSS (not RssAnon) on purpose: it includes the
+/// /dev/shm-mapped guest image, which is real physical RAM and the balloon the host must account for.
+/// Scoped to OUR direct children (ppid == our pid) so a sibling measure worker's child is never
+/// counted. One process normally; summed for robustness.
+#[cfg(target_os = "linux")]
+fn sp1_executor_child_rss_kb(our_pid: u32) -> u64 {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    let mut sum = 0u64;
+    for e in entries.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
+            continue;
+        };
+        if !is_sp1_executor_runner_comm(&comm) {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if ppid_from_proc_stat(&stat) != Some(our_pid as i32) {
+            continue;
+        }
+        if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok())
+                    {
+                        sum = sum.saturating_add(kb);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    sum
+}
+
+/// Run `f` while a background thread samples the peak resident footprint of the SP1 executor child
+/// (see `sp1_executor_child_rss_kb`), and return `(f's result, peak_host_bytes)`. The host reserves
+/// this peak PLUS the warm `sp1-gpu-server`'s resident before claiming, so a guest whose execute is
+/// too heavy to prove beside the server is declined at claim time rather than OOM-ing the box at prove
+/// time (finding H1). Off-Linux / portable executor: no child, returns 0 = "unknown, do not gate".
+#[cfg(target_os = "linux")]
+fn with_peak_rss_sampling<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let our_pid = std::process::id();
+    let peak_kb = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler = {
+        let (peak_kb, stop) = (peak_kb.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                peak_kb.fetch_max(sp1_executor_child_rss_kb(our_pid), Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // One final sample after the stop flag, to catch a peak reached just before the child exits.
+            peak_kb.fetch_max(sp1_executor_child_rss_kb(our_pid), Ordering::Relaxed);
+        })
+    };
+    // Stop + join via Drop, so a PANIC out of `f` (hostile ELFs panic SP1's parser/executor, which the
+    // caller catches with `catch_unwind`) still tears the sampler down. Without this the unwind would
+    // skip the stop/join and leak one /proc-scanning thread per panic-inducing submission — an
+    // unbounded-thread DoS a permissionless submitter could drive.
+    struct SamplerGuard {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for SamplerGuard {
+        fn drop(&mut self) {
+            self.stop
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+    let mut guard = SamplerGuard {
+        stop: stop.clone(),
+        handle: Some(sampler),
+    };
+    let out = f();
+    // Normal path: stop + join NOW (runs the thread's final sample) so we read the settled peak; the
+    // guard's Drop then no-ops (handle already taken).
+    guard.stop.store(true, Ordering::Relaxed);
+    if let Some(h) = guard.handle.take() {
+        let _ = h.join();
+    }
+    (out, peak_kb.load(Ordering::Relaxed).saturating_mul(1024))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn with_peak_rss_sampling<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    (f(), 0)
+}
+
 fn run_execute_sp1(
     cpu: &sp1_sdk::blocking::CpuProver,
     elf: &[u8],
     input_data: &[u8],
-) -> anyhow::Result<(u64, u64, f64)> {
+) -> anyhow::Result<(u64, u64, f64, u64)> {
     use sp1_sdk::blocking::{Elf, Prover, SP1Stdin};
 
     let started = Instant::now();
@@ -1592,9 +1863,9 @@ fn run_execute_sp1(
     // and `execute_with_options`'s `.ok_or(anyhow!("Failed to extract public value digest"))?`
     // (execute.rs:321) returns Err for EVERY guest. Gas accumulation is also what populates
     // `opcode_counts`, i.e. `total_instruction_count()`. So we do NOT disable it.
-    let (public_values, report) = req
-        .run()
-        .map_err(|e| canonicalize_sp1_execute_error(&e.to_string()))?;
+    let (run_result, peak_host_bytes) = with_peak_rss_sampling(|| req.run());
+    let (public_values, report) =
+        run_result.map_err(|e| canonicalize_sp1_execute_error(&e.to_string()))?;
     // The public values the guest commits here are byte-identical to the journal the
     // later Groth16 proof carries (both are a deterministic function of (ELF, input), and the host's
     // elf_hash gate makes measure-ELF == prove-ELF). Report their length so the host can refuse to
@@ -1605,6 +1876,7 @@ fn run_execute_sp1(
         report.total_instruction_count(),
         journal_len,
         started.elapsed().as_secs_f64(),
+        peak_host_bytes,
     ))
 }
 
@@ -1649,11 +1921,16 @@ fn run_proof(
     // no element and halt (empty journal). See guests/sp1/*/src/main.rs.
     stdin.write_slice(input_data);
 
-    // Execute first to get cycle count
-    let (_, report) = prover
-        .execute(Elf::from(elf), stdin.clone())
-        .run()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Execute first to get cycle count. Cap the cycles exactly as the MEASURE path does
+    // (`run_execute_sp1`): without it this prove-time execute was the one SP1 run with no cycle bound,
+    // so a claimed-but-hostile guest could spin the executor far past the measured budget on the
+    // prove worker (where it stacks on the warm sp1-gpu-server). The same ELF+input measured feasible,
+    // so the cap never trips a legitimate claimed job.
+    let mut exec = prover.execute(Elf::from(elf), stdin.clone());
+    if let Some(limit) = sp1_execute_cycle_limit() {
+        exec = exec.cycle_limit(limit);
+    }
+    let (_, report) = exec.run().map_err(|e| anyhow::anyhow!("{e}"))?;
     let cycles = report.total_instruction_count();
 
     // Get-or-create the proving key for this ELF. The key depends only on the
@@ -2612,8 +2889,82 @@ mod pk_cache_tests {
 
         // Gas calculation left at its default (enabled) → a real guest returns a POSITIVE instruction
         // count. `.calculate_gas(false)` would make this return Err for every guest.
-        let (cycles, _dur) = super::run_execute_sp1(&cpu, elf, &input)
+        let (cycles, _journal, _dur, _peak) = super::run_execute_sp1(&cpu, elf, &input)
             .expect("executing a valid guest must succeed and yield a cycle count");
         assert!(cycles > 0, "measured cycle count must be positive, got {cycles}");
+    }
+}
+
+#[cfg(test)]
+mod shm_reaper_tests {
+    use super::{is_sp1_shm_basename, sp1_shm_mapped_in};
+    use std::collections::HashSet;
+
+    #[test]
+    fn basename_matches_every_sp1_segment_and_semaphore() {
+        // The four shapes sp1-jit creates (native.rs id = "sp1_" + base64url(uuid)):
+        assert!(is_sp1_shm_basename("sp1_AAAABBBBCCCCDDDD_m")); // memory image
+        assert!(is_sp1_shm_basename("sp1_AAAABBBBCCCCDDDD_t")); // trace ring
+        assert!(is_sp1_shm_basename("sem.sp1_AAAABBBBCCCCDDDD_t_filled")); // ring sem
+        assert!(is_sp1_shm_basename("sem.sp1_AAAABBBBCCCCDDDD_t_empty")); // ring sem
+    }
+
+    #[test]
+    fn basename_rejects_unrelated_names() {
+        // Never touch another program's tmpfs: the prefix must be anchored at the start.
+        assert!(!is_sp1_shm_basename("foo"));
+        assert!(!is_sp1_shm_basename(""));
+        assert!(!is_sp1_shm_basename("notsp1_x")); // does not START with sp1_
+        assert!(!is_sp1_shm_basename("my.sp1_x")); // nor sem.sp1_
+        assert!(!is_sp1_shm_basename("sem.other")); // a foreign semaphore
+        assert!(!is_sp1_shm_basename("sem.sp1")); // close, but not the sp1_ segment prefix
+    }
+
+    #[test]
+    fn maps_scan_finds_live_sp1_segments_and_nothing_else() {
+        // A realistic /proc/<pid>/maps excerpt: a heap line, a live SP1 image, ring and ring
+        // semaphore, a foreign /dev/shm mapping, and an SP1 image whose fd was unlinked while mapped.
+        let maps = "\
+55a0-55b0 rw-p 00000000 00:00 0                                  [heap]\n\
+7f00-7f10 rw-s 00000000 00:1f 123   /dev/shm/sp1_LIVEuuid_m\n\
+7f20-7f30 rw-s 00000000 00:1f 124   /dev/shm/sp1_LIVEuuid_t\n\
+7f40-7f50 rw-s 00000000 00:1f 125   /dev/shm/sem.sp1_LIVEuuid_t_filled\n\
+7f60-7f70 rw-s 00000000 00:1f 126   /dev/shm/some_other_app_buf\n\
+7f80-7f90 rw-s 00000000 00:1f 127   /dev/shm/sp1_DELETEDuuid_m (deleted)\n";
+        let mut live: HashSet<String> = HashSet::new();
+        sp1_shm_mapped_in(maps, &mut live);
+
+        assert!(live.contains("sp1_LIVEuuid_m"));
+        assert!(live.contains("sp1_LIVEuuid_t"));
+        assert!(live.contains("sem.sp1_LIVEuuid_t_filled"));
+        // The " (deleted)" annotation is dropped, leaving the bare basename.
+        assert!(live.contains("sp1_DELETEDuuid_m"));
+        // A foreign /dev/shm mapping is never recorded.
+        assert!(!live.contains("some_other_app_buf"));
+        assert_eq!(live.len(), 4);
+    }
+
+    #[test]
+    fn maps_scan_tolerates_empty_and_shmless_input() {
+        let mut live: HashSet<String> = HashSet::new();
+        sp1_shm_mapped_in("", &mut live);
+        sp1_shm_mapped_in("55a0-55b0 rw-p 0 00:00 0 [stack]\n", &mut live);
+        assert!(live.is_empty());
+    }
+
+    #[test]
+    fn executor_runner_comm_matches_both_runner_shapes() {
+        use super::is_sp1_executor_runner_comm;
+        // `/proc/<pid>/comm` is 15-char truncated. The SHIPPED embedded runner (the default) and the
+        // override-binary runner must BOTH match, or the H1 peak sampler never finds the child and the
+        // claim gate silently no-ops (the bug this test guards against).
+        assert!(is_sp1_executor_runner_comm("sp1-native-runn")); // embedded, truncated
+        assert!(is_sp1_executor_runner_comm("sp1-native-runner-bin-abc123")); // untruncated form
+        assert!(is_sp1_executor_runner_comm("sp1-core-execut")); // override binary, truncated
+        assert!(is_sp1_executor_runner_comm("sp1-native-runn\n")); // trailing newline from /proc
+        // Not the runner:
+        assert!(!is_sp1_executor_runner_comm("sp1-gpu-server"));
+        assert!(!is_sp1_executor_runner_comm("zkminer-prove-s"));
+        assert!(!is_sp1_executor_runner_comm(""));
     }
 }

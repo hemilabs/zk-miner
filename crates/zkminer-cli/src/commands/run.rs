@@ -278,15 +278,56 @@ const CONSERVATIVE_SIZING_CPS: f64 = 400_000.0;
 const UNMEASURABLE_CYCLES: u64 = 1_000_000_000_000_000_000; // 1e18
 
 
-/// Measured cycle counts keyed by (backend tag, programId, keccak256(inputData)). The backend tag is
+/// One cached measurement for a (backend, program, input): its cycle count, the execute's peak host
+/// RSS, and — for a NON-deterministic unmeasurable verdict — when to retry.
+///
+/// The cycle count and the peak live in ONE value, keyed identically, so they EVICT TOGETHER (finding
+/// C-8). Two independently-bounded maps diverged under a flood of distinct measurements — each
+/// `bounded_insert` picks its own victim — so a victim job's peak could be evicted while its cycle
+/// count survived, and the H1 claim gate then read a MISSING peak as 0 ("unknown, do not gate") and
+/// waved through an SP1 job whose execute would OOM beside the warm server. Merging them (the same
+/// EVICT-TOGETHER pattern [`DescInfo`] uses for its over-cap bit) makes the STORAGE atomic: both
+/// fields are evicted together. For the READ to be equally atomic the claim gate must take both in a
+/// SINGLE lock hold — see [`resolve_measured_full`] — rather than pairing two separate `resolve_*`
+/// calls, between which a concurrent eviction could still drop the entry and desync the peak to 0.
+#[derive(Clone, Copy)]
+struct Measured {
+    /// Measured guest cycles, or [`UNMEASURABLE_CYCLES`] for an infeasible/unmeasurable verdict.
+    cycles: u64,
+    /// The execute's peak host-RAM footprint in bytes (finding H1); 0 = unknown (older worker,
+    /// off-Linux, portable executor) or an unmeasurable verdict. Read at the claim gate and threaded
+    /// into the prove reservation (finding RH2).
+    peak_host_bytes: u64,
+    /// For a WALL-CLOCK-TIMEOUT unmeasurable verdict — the ONLY strike-out that is plausibly caused by
+    /// transient host load rather than the program itself — the instant after which the entry is
+    /// dropped and the pair re-measured. `None` for everything else: a real measurement, AND every
+    /// submitter-REACHABLE / deterministic infeasible verdict (cycle-cap trip, image-id/vkey mismatch,
+    /// over-cap payload, guest panic/trap, ELF-fetch failure/timeout), which stays permanent because a
+    /// retry TTL on a submitter-craftable failure reopens a perpetual re-measurement DoS. This is the
+    /// UNMEASURABLE TTL (finding: UNMEASURABLE had no TTL), scoped down after review to the one
+    /// non-submitter-controllable case.
+    retry_after: Option<std::time::Instant>,
+}
+
+/// Measured results keyed by (backend tag, programId, keccak256(inputData)). The backend tag is
 /// load-bearing: `programId`, `inputData` AND `proofSystemId` are all submitter-chosen, so without it
 /// a cheap risc0 measurement of (P, I) would size an SP1 job carrying the same (P, I) — which the SP1
 /// worker then cannot prove (release penalty). See [`backend_tag`] and the declaration in `run`.
 type MeasuredCache = std::sync::Arc<
     std::sync::Mutex<
-        std::collections::HashMap<(u8, alloy::primitives::B256, alloy::primitives::B256), u64>,
+        std::collections::HashMap<(u8, alloy::primitives::B256, alloy::primitives::B256), Measured>,
     >,
 >;
+
+/// How long a WALL-CLOCK-TIMEOUT UNMEASURABLE verdict is cached before the pair is re-measured. A
+/// guest that legitimately runs ~just-under the 120 s measure budget can time out for
+/// `MEASURE_TIMEOUT_STRIKES` consecutive ticks purely under transient host load and — without a TTL —
+/// be blacklisted for the life of the process, a feasible job lost to a transient. Long enough that a
+/// guest crafted to deterministically time out at ~120 s is not re-measured often (and its
+/// re-measurement is bounded by the 2-slot measure budget regardless), short enough that a transient
+/// clears within an operator's attention span. ONLY the wall-clock-timeout verdict expires; every
+/// deterministic / submitter-reachable verdict is permanent (see [`Measured::retry_after`]).
+const UNMEASURABLE_RETRY_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Stable per-backend discriminant for the measured-cycles key. An unknown backend collapses to 255;
 /// nothing is ever inserted under it (only risc0/sp1 measure), so a lookup simply misses.
@@ -336,8 +377,30 @@ where
 /// reason.
 const MEASURED_CYCLES_CAP: usize = 100_000;
 
-/// Insert a measured cycle count for the exact (backend, program, input) triple, bounded to
-/// `MEASURED_CYCLES_CAP` entries.
+/// Insert a [`Measured`] value for the exact (backend, program, input) triple, bounded to
+/// `MEASURED_CYCLES_CAP` entries. The single store point for the merged cache, so the cycle count and
+/// its peak always evict together (finding C-8).
+fn insert_measured_value(
+    cache: &MeasuredCache,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+    value: Measured,
+) {
+    if let Ok(mut m) = cache.lock() {
+        bounded_insert(
+            &mut m,
+            (backend_tag(backend), program_id, input_hash),
+            value,
+            MEASURED_CYCLES_CAP,
+        );
+    }
+}
+
+/// Insert a CYCLE-ONLY result (no captured peak, never-expiring). Used for a DETERMINISTIC
+/// UNMEASURABLE sentinel (cap trip, image-id/vkey mismatch, over-cap payload) and in tests. A real
+/// measurement that captured a peak uses [`insert_measurement`]; a non-deterministic unmeasurable
+/// verdict uses [`insert_unmeasurable`].
 fn insert_measured(
     cache: &MeasuredCache,
     backend: &str,
@@ -345,14 +408,63 @@ fn insert_measured(
     input_hash: alloy::primitives::B256,
     cycles: u64,
 ) {
-    if let Ok(mut m) = cache.lock() {
-        bounded_insert(
-            &mut m,
-            (backend_tag(backend), program_id, input_hash),
+    insert_measured_value(
+        cache,
+        backend,
+        program_id,
+        input_hash,
+        Measured {
             cycles,
-            MEASURED_CYCLES_CAP,
-        );
-    }
+            peak_host_bytes: 0,
+            retry_after: None,
+        },
+    );
+}
+
+/// Insert a real measurement: its cycle count AND the execute's peak host footprint, stored in ONE
+/// value so they co-evict (finding C-8). Never expires.
+fn insert_measurement(
+    cache: &MeasuredCache,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+    cycles: u64,
+    peak_host_bytes: u64,
+) {
+    insert_measured_value(
+        cache,
+        backend,
+        program_id,
+        input_hash,
+        Measured {
+            cycles,
+            peak_host_bytes,
+            retry_after: None,
+        },
+    );
+}
+
+/// Insert a WALL-CLOCK-TIMEOUT UNMEASURABLE verdict with a retry deadline `UNMEASURABLE_RETRY_TTL`
+/// out, so a job that only timed out under transient host load is re-measured rather than blacklisted
+/// forever (the UNMEASURABLE TTL). Used ONLY for the wall-clock-timeout strike-out — every
+/// deterministic / submitter-reachable verdict uses permanent [`insert_measured`] instead.
+fn insert_unmeasurable(
+    cache: &MeasuredCache,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+) {
+    insert_measured_value(
+        cache,
+        backend,
+        program_id,
+        input_hash,
+        Measured {
+            cycles: UNMEASURABLE_CYCLES,
+            peak_host_bytes: 0,
+            retry_after: Some(std::time::Instant::now() + UNMEASURABLE_RETRY_TTL),
+        },
+    );
 }
 
 /// Descriptor hashes whose job, if claimed, is GUARANTEED to fail the on-chain fulfill payload-size
@@ -675,11 +787,67 @@ fn resolve_measured(
     descriptor_hash: alloy::primitives::B256,
 ) -> Option<u64> {
     let input_hash = desc_input.lock().ok()?.get(&descriptor_hash)?.input_hash;
+    let key = (backend_tag(backend), program_id, input_hash);
+    let mut m = measured.lock().ok()?;
+    let entry = *m.get(&key)?;
+    // An EXPIRED non-deterministic UNMEASURABLE verdict (the UNMEASURABLE TTL): drop it and report
+    // "not yet sized" so a later tick re-measures the pair, rather than treating a possibly-transient
+    // timeout as a permanent blacklist. A real measurement and a deterministic infeasible verdict have
+    // `retry_after == None` and are returned as-is.
+    if let Some(until) = entry.retry_after {
+        if std::time::Instant::now() >= until {
+            m.remove(&key);
+            return None;
+        }
+    }
+    Some(entry.cycles)
+}
+
+/// Resolve the measured PEAK host-RAM footprint (bytes) for a sighting, from the SAME merged entry as
+/// [`resolve_measured`] (finding C-8). `None` = not yet measured; `Some(0)` = an older worker /
+/// off-Linux / portable executor that reported no peak — the gate treats both as "do not block". NOTE:
+/// the claim gate must NOT pair this with a separate [`resolve_measured`] call — a concurrent eviction
+/// between the two lock holds could drop the entry and desync the peak to 0, un-gating a job — so the
+/// gate uses [`resolve_measured_full`] (both fields under ONE lock). This single-field accessor remains
+/// for tests and any caller that needs the peak alone.
+fn resolve_measured_peak(
+    measured: &MeasuredCache,
+    desc_input: &DescInputCache,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    descriptor_hash: alloy::primitives::B256,
+) -> Option<u64> {
+    let input_hash = desc_input.lock().ok()?.get(&descriptor_hash)?.input_hash;
     measured
         .lock()
         .ok()?
         .get(&(backend_tag(backend), program_id, input_hash))
-        .copied()
+        .map(|e| e.peak_host_bytes)
+}
+
+/// Resolve the measured cycle count AND execute peak for a sighting under ONE lock hold (finding C-8),
+/// so a concurrent cache eviction cannot drop the entry between a cycles read and a peak read and
+/// desync the peak to 0 (which would silently un-gate the H1 claim check). Applies the UNMEASURABLE
+/// TTL exactly as [`resolve_measured`]: an expired entry is removed and `None` returned so the pair is
+/// re-measured. Returns `(cycles, peak_host_bytes)`.
+fn resolve_measured_full(
+    measured: &MeasuredCache,
+    desc_input: &DescInputCache,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    descriptor_hash: alloy::primitives::B256,
+) -> Option<(u64, u64)> {
+    let input_hash = desc_input.lock().ok()?.get(&descriptor_hash)?.input_hash;
+    let key = (backend_tag(backend), program_id, input_hash);
+    let mut m = measured.lock().ok()?;
+    let entry = *m.get(&key)?;
+    if let Some(until) = entry.retry_after {
+        if std::time::Instant::now() >= until {
+            m.remove(&key);
+            return None;
+        }
+    }
+    Some((entry.cycles, entry.peak_host_bytes))
 }
 
 /// Bound on a single cycle measurement. Execution is far cheaper than proving, but a hostile
@@ -697,6 +865,31 @@ const MEASURE_TIMEOUT: Duration = Duration::from_secs(120);
 /// measurement in hand (recovery, or a non-measurable backend) the declared value is still adversarial:
 /// a nonzero one is floored at `FALLBACK_ESTIMATED_CYCLES` rather than trusted small, while a zero
 /// declaration returns 0 so the caller keeps the old full-timeout fallback.
+/// Is this measure error the dispatcher's GENUINE wall-clock watchdog timeout (finding RH-round2/4)?
+///
+/// A real timeout is the ONLY strike-out the measure path treats as possibly-transient (and so grants
+/// a retry TTL rather than a permanent blacklist). It must be recognised by the TYPED, dispatcher-only
+/// `MeasureWallClockTimeout` — never by substring-matching the error message, which carries
+/// guest-controlled bytes a hostile guest could set to "wall-clock watchdog" to forge the TTL and
+/// re-open the perpetual re-measurement DoS. Extracted as a free fn so the classification is unit-
+/// testable without driving a worker.
+fn is_measure_wall_clock_timeout(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<zkminer_prover_protocol::types::MeasureWallClockTimeout>()
+        .is_some()
+}
+
+/// Was this measurement PREEMPTED by a committed proof reclaiming its resources (residual A)?
+///
+/// Like the wall-clock-timeout classifier, recognised by the TYPED, dispatcher-only
+/// `MeasurePreempted` — never by substring — so a hostile guest cannot forge it. A preemption is
+/// purely transient scheduling (the measurement was healthy and yielded to a bonded job), so the
+/// caller must treat it exactly like `MeasureSlotsBusy`: no strike, no negative-cache, no retry TTL —
+/// just re-measure next tick. Extracted as a free fn so the classification is unit-testable.
+fn is_measure_preempted(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<zkminer_prover_protocol::types::MeasurePreempted>()
+        .is_some()
+}
+
 fn prove_sizing_cycles(declared: u64, measured: Option<u64>) -> u64 {
     match measured {
         Some(m) => declared.max(m),
@@ -2568,14 +2761,14 @@ async fn miner_brain(
     // Measuring it ourselves is the only trustworthy source, and a job is NOT claimed until
     // we hold a measurement for its exact (program, input) — see `measurable` and the claim gate.
     // Shared so the background measurement task below can populate it while the brain runs.
-    let measured_cycles: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<
-                (u8, alloy::primitives::B256, alloy::primitives::B256),
-                u64,
-            >,
-        >,
-    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // One merged cache of [`Measured`] results: cycle count AND the execute's peak host RSS live in
+    // ONE value per (backend, program, input) so they co-evict (finding C-8) — a surviving cycle count
+    // always carries its own peak, closing the desync where an evicted peak let the H1 claim gate read
+    // 0 ("unknown, do not gate") for a job whose execute would OOM beside the warm server. The peak is
+    // read at the claim gate (finding H1) and threaded into the prove reservation (finding RH2); 0 /
+    // absent = "unknown" (older worker, off-Linux, portable executor) = do not block.
+    let measured_cycles: MeasuredCache =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // descriptor hash -> keccak256(inputData). Lets a brain tick resolve a sighting's
     // input hash (and hence its measurement) WITHOUT re-fetching the descriptor for every candidate:
     // it is learned once, when the measurement task fetches the descriptor, and reused for every
@@ -3667,17 +3860,70 @@ async fn miner_brain(
                     + DEADLINE_FULFILL_MARGIN_SECS
                     + backend_opt.map(fixed_proving_allowance_secs).unwrap_or(0),
             );
-            let measured_for_job = resolve_measured(
-                &measured_cycles,
-                &desc_input_hash,
-                backend_opt.unwrap_or(""),
-                job.info.program_id,
-                snapshot.descriptor_hash,
-            );
+            // Resolve the measured cycle count and — for SP1 — the execute peak from the merged cache.
+            // For SP1 read BOTH under ONE lock (finding C-8): a concurrent eviction between a cycles
+            // read and a separate peak read could drop the entry and desync the peak to 0, un-gating
+            // the H1 check below. Non-SP1 backends have no server-stacking peak to gate on.
+            let (measured_for_job, measured_peak_for_job) = if backend_opt == Some("sp1") {
+                match resolve_measured_full(
+                    &measured_cycles,
+                    &desc_input_hash,
+                    "sp1",
+                    job.info.program_id,
+                    snapshot.descriptor_hash,
+                ) {
+                    Some((cycles, peak)) => (Some(cycles), Some(peak)),
+                    None => (None, None),
+                }
+            } else {
+                (
+                    resolve_measured(
+                        &measured_cycles,
+                        &desc_input_hash,
+                        backend_opt.unwrap_or(""),
+                        job.info.program_id,
+                        snapshot.descriptor_hash,
+                    ),
+                    None,
+                )
+            };
             // Carry the measured count on the snapshot so the prove path (watchdog
             // timeout, min-VRAM, po2) sizes on it instead of the adversarial declared field. Rides
             // through the batch tuple → spawn_lifecycle_task → process_job_lifecycle unchanged.
             snapshot.measured_cycles = measured_for_job;
+            // The execute PEAK (same merged entry) for the RH2 prove reservation; carried on the snapshot.
+            snapshot.measured_peak = measured_peak_for_job;
+
+            // H1 provability gate (SP1 only). A guest measured feasible on the SERVER-LESS measure
+            // worker can still OOM at PROVE time, where `run_proof` replays the same deterministic
+            // execute on the prove worker that holds the warm ~17.6 GiB sp1-gpu-server — the host peak
+            // is their SUM, which the serverless measure cap does not bound. Skip claiming this job
+            // while that sum would not fit. TRANSIENT, not a negative-cache: provability depends on the
+            // CURRENT server residency, so the job becomes claimable once the server goes idle/evicted
+            // (or on a bigger host). `peak == 0` (older worker / off-Linux / portable executor, which
+            // has no server-stacking) leaves it ungated — the prior behaviour.
+            if backend_opt == Some("sp1") && measured_for_job.is_some() {
+                // `worker_pool()` is None in sim mode, so the gate is naturally inert there.
+                if let Some(pool) = zkminer_prover::engine::worker_pool() {
+                    let peak = measured_peak_for_job.unwrap_or(0);
+                    if !pool.sp1_execute_provable_beside_server(peak) {
+                        if memory_skips_this_tick
+                            .insert(format!("sp1:provable:{:x}", job.info.program_id))
+                        {
+                            tracing::warn!(
+                                "Not claiming SP1 job {}: its measured execute peak (~{:.1} GiB) plus \
+                                 a warm sp1-gpu-server would exceed host RAM at prove time, so it is \
+                                 not provable here. The gate assumes the server is warm at prove time \
+                                 (it persists across proofs), so on this host this is effectively a \
+                                 permanent decline for a job this heavy — a bigger host is required.",
+                                short_id(job.info.program_id),
+                                peak as f64 / (1024.0 * 1024.0 * 1024.0),
+                            );
+                        }
+                        continue;
+                    }
+                }
+            }
 
             // Per-device throughputs for THIS job's backend (the same rows the planner uses). Size the
             // live claim gate on the SLOWEST eligible card so admission is safe wherever dispatch lands
@@ -3965,12 +4211,14 @@ async fn miner_brain(
                 // Dedup by descriptor hash so N sightings spawn ONE execution; cleared below.
                 const MAX_INFLIGHT_MEASUREMENTS: usize = 16;
                 // Budget per-tick measurement spawns against the MEASURE POOL for a backend that has a
-                // dedicated one (sp1), and against GPU prove-concurrency for a backend that measures on
-                // its prove pool (risc0). sp1 measures on the CPU measure pool, never a GPU, so sizing
-                // its budget on GPU count was a category error: it collapsed to 1 on a single-GPU rig
-                // (serializing the 2-worker pool) and exceeded the pool on >=3-GPU rigs (over-spawning
-                // into the "all slots busy" race). Pool-sized means budget <= pool, so over-spawn is
-                // structurally impossible. A descriptor over budget simply waits for a later tick.
+                // dedicated one — now BOTH sp1 AND risc0 (finding TR1 gave risc0 its own CPU-only
+                // measure pool) — and against GPU prove-concurrency only for a backend with no dedicated
+                // pool (openvm, in-process on its prove worker). Both pooled backends measure on a CPU
+                // pool, never a GPU, so sizing their budget on GPU count was a category error: it
+                // collapsed to 1 on a single-GPU rig (serializing the pool) and exceeded the pool on
+                // >=3-GPU rigs (over-spawning into the "all slots busy" race). Pool-sized means
+                // budget <= pool, so over-spawn is structurally impossible. A descriptor over budget
+                // simply waits for a later tick.
                 let measure_budget = match zkminer_prover::engine::worker_pool()
                     .and_then(|p| p.measure_worker_count(backend))
                 {
@@ -3984,9 +4232,9 @@ async fn miner_brain(
                     .lock()
                     .map(|mut m| {
                         // Budget PER-BACKEND: count only THIS backend's in-flight measurements, so one
-                        // backend's long measurement (e.g. a ~115s SP1 decoy on the dedicated measure
-                        // worker) cannot monopolize the slot the OTHER backend (risc0, on its GPU prove
-                        // pool) needs. Dedup stays global by descriptor hash.
+                        // backend's long measurement (e.g. a ~115s SP1 decoy on its dedicated measure
+                        // worker) cannot monopolize the slot the OTHER backend (risc0, now on its OWN
+                        // dedicated measure pool) needs. Dedup stays global by descriptor hash.
                         let tag = backend_tag(backend_opt.unwrap_or(""));
                         let in_flight_this_backend = m.values().filter(|&&b| b == tag).count();
                         if m.contains_key(&dh) || in_flight_this_backend >= measure_budget {
@@ -4760,6 +5008,11 @@ struct JobStatusSnapshot {
     /// the candidate loop from `resolve_measured`; `None` on paths without a measurement (recovery,
     /// non-measurable backends), where the sizing falls back to the FALLBACK floor, never below it.
     measured_cycles: Option<u64>,
+    /// This job's pre-claim measured EXECUTE peak host RSS (bytes) for its (backend, program, input),
+    /// when known (SP1 only). Threaded into the prove reservation so the dispatcher charges the SP1
+    /// execute spike — `server + execute` — to the host ledger and refuses a concurrent other-backend
+    /// proof that would OOM during the execute window (finding RH2). `None` = unknown / not SP1.
+    measured_peak: Option<u64>,
     /// Benchmark device id (e.g. "gpu1") of the card this job was sized/planned for at claim time,
     /// passed to the dispatcher as a PREFERENCE (tried first, graceful fallback). `None` on paths
     /// without a plan (recovery, non-measurable backends). See `prove_min_vram`'s `preferred_device`.
@@ -4788,6 +5041,7 @@ impl JobStatusSnapshot {
             // Set by the candidate loop once the measurement for this (backend, program, input) is
             // resolved; the view itself carries no measured count.
             measured_cycles: None,
+            measured_peak: None,
             preferred_device: None,
         }
     }
@@ -5471,6 +5725,11 @@ async fn process_job_lifecycle(
             } else {
                 snapshot.preferred_device.clone()
             };
+            // This job's pre-claim measured execute PEAK (SP1 only; 0 otherwise), for the dispatcher's
+            // RH2 prove reservation — charges the `server + execute` spike so a concurrent other-backend
+            // proof is not admitted into memory the SP1 execute window will consume. Copy, so captured
+            // by value into the move closure.
+            let execute_peak_for_prove = snapshot.measured_peak.unwrap_or(0);
             let (proof_result, used_slot) = match tokio::task::spawn_blocking(move || {
                 let resolve_backend = backend_str.clone();
                 let po2_for_device = move |device_id: &str| -> Option<u8> {
@@ -5557,6 +5816,7 @@ async fn process_job_lifecycle(
                     Some(&po2_for_device),
                     program_id_bytes,
                     preferred_for_prove.as_deref(),
+                    execute_peak_for_prove,
                 );
                 (r, used)
             })
@@ -6422,6 +6682,13 @@ async fn measure_cycles(
                     MEASURE_TIMEOUT_STRIKES,
                     zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
                 );
+                // PERMANENT: an ELF-fetch failure is submitter-REACHABLE — a hostile submitter serves a
+                // failing/withheld ELF deterministically — so a retry TTL would let it re-trigger a
+                // fresh fetch (a scarce measure-budget slot) every TTL for each of up to 100k distinct
+                // (program, input) pairs, a perpetual sizing DoS. Keep it permanent, as at HEAD. The
+                // genuinely-transient case (a legitimate program whose storage blips during its
+                // never-yet-cached measurement) is narrow — the on-disk ELF cache means a once-fetched
+                // program never hits this — and is the accepted trade-off the strike bound already made.
                 insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
                 clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
             } else {
@@ -6447,6 +6714,9 @@ async fn measure_cycles(
                     MEASURE_FETCH_BUDGET.as_secs(),
                     MEASURE_TIMEOUT_STRIKES
                 );
+                // PERMANENT: an ELF-fetch wall-clock timeout is likewise submitter-REACHABLE (a
+                // deliberately stalling ELF host), so a retry TTL would reopen the same per-pair
+                // re-fetch DoS. Keep it permanent, as at HEAD (see the fetch-failure arm above).
                 insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
                 clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
             } else {
@@ -6486,7 +6756,7 @@ async fn measure_cycles(
     })
     .await;
     match res {
-        Ok(Ok((cycles, journal_len))) => {
+        Ok(Ok((cycles, journal_len, peak_host_bytes))) => {
             // The guest committed `journal_len` bytes. fulfillJob re-encodes the journal
             // AND the input (plus the rest of the descriptor) into its calldata under a fixed gas
             // limit. Both the journal and the input are a deterministic function of (program, input) —
@@ -6531,7 +6801,13 @@ async fn measure_cycles(
                 // short-circuits without re-executing, yet still has its own full fulfill payload
                 // checked against the cap from this cached journal length (see the short-circuit above).
                 insert_journal_len(measured_journal, backend, program_id, input_hash, journal_len);
-                insert_measured(measured, backend, program_id, input_hash, cycles);
+                // Cache the cycle count AND the execute's peak host footprint as ONE merged entry
+                // (finding C-8), so they co-evict: the claim gate reads the peak to check it fits
+                // beside the warm sp1-gpu-server at prove time (finding H1) and the prove reservation
+                // folds it in (finding RH2), and a surviving cycle count always carries its peak rather
+                // than desyncing to a 0 that would silently un-gate. 0 peak = older worker / off-Linux /
+                // portable executor = "unknown, do not gate".
+                insert_measurement(measured, backend, program_id, input_hash, cycles, peak_host_bytes);
                 clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
                 // journal + input fit, but the full fulfill payload also carries THIS descriptor's
                 // callbackExtraData + extraVerifierData + the proof seal — fields outside the (program,
@@ -6587,6 +6863,19 @@ async fn measure_cycles(
                 );
                 return;
             }
+            // A committed proof reclaimed this measurement's resources (dispatcher preemption,
+            // residual A). Nothing about the (program, input) failed — it was healthy and yielded to
+            // a bonded job on the marginal box. TRANSIENT, exactly like `MeasureSlotsBusy`: no strike,
+            // no negative-cache, no TTL — re-measure next tick once the proof has freed the resources.
+            // A hostile guest cannot reach this branch: only the dispatcher's preemption path
+            // constructs `MeasurePreempted`, never a worker error carrying guest text.
+            if is_measure_preempted(&e) {
+                tracing::debug!(
+                    "measure {}: preempted by a claimed proof, not sizing now (transient)",
+                    short_id(program_id)
+                );
+                return;
+            }
             let msg = format!("{e:#}");
             // The message embeds guest/worker-controlled text; sanitize before logging
             // (classification still matches the RAW text — the precise cap phrase, not the sanitized
@@ -6614,7 +6903,12 @@ async fn measure_cycles(
             let clean_cap_trip = lower.contains("session limit")
                 || lower.contains("exceeded cycle limit")
                 || lower.contains("exceededcyclelimit");
-            let wall_clock_timeout = lower.contains("wall-clock watchdog");
+            // A TYPED, dispatcher-generated signal — NOT a substring of the (guest-controlled) message
+            // (finding RH-round2/4). Only the dispatcher's watchdog path constructs
+            // `MeasureWallClockTimeout`, so a guest cannot forge the phrase in its panic text to win
+            // the lenient retry TTL below. (A cap trip is matched by string, but that only ever grants
+            // the SAFE permanent verdict, so forging it is self-defeating.)
+            let wall_clock_timeout = is_measure_wall_clock_timeout(&e);
             if clean_cap_trip {
                 tracing::warn!(
                     "measure {} ({backend}): program exceeds the execute cycle cap — marking infeasible \
@@ -6638,7 +6932,24 @@ async fn measure_cycles(
                         MEASURE_TIMEOUT_STRIKES,
                         msg_log
                     );
-                    insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
+                    // TTL **only** for a WALL-CLOCK TIMEOUT: the watchdog SIGKILLed the guest for not
+                    // finishing in 120s, which a FEASIBLE guest can hit purely under transient host load
+                    // (SP1's CPU executor runs alongside live proofs), so blacklisting it forever loses a
+                    // provable job. A non-wall-clock "execute failure" — a guest panic/trap, a risc0
+                    // image-id or SP1 vkey mismatch — is DETERMINISTIC and submitter-REACHABLE: giving it
+                    // a retry TTL lets a hostile submitter re-trigger a fresh ~full-budget execute every
+                    // TTL for each of up to 100k distinct (program, input) pairs, a perpetual CPU/sizing
+                    // DoS (the exact thing the permanent negative-cache exists to stop). So the
+                    // deterministic case stays PERMANENT, as at HEAD. (Residual, accepted: a guest
+                    // crafted to deterministically time out at ~120s is re-measured once per TTL, bounded
+                    // by the 2-slot measure budget — far weaker than the one-shot-then-permanent flood,
+                    // and indistinguishable from a feasible-but-slow guest, which is the case the TTL is
+                    // for.)
+                    if wall_clock_timeout {
+                        insert_unmeasurable(measured, backend, program_id, input_hash);
+                    } else {
+                        insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
+                    }
                     clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
                 } else {
                     tracing::debug!(
@@ -8274,5 +8585,124 @@ mod r2_sizing_tests {
         // Journal is backend-keyed: the same descriptor under a DIFFERENT backend (no journal there)
         // does not block.
         assert!(!claim_payload_over_cap(&desc_input, &jc, &pc, "risc0", prog, desc));
+    }
+
+    // Finding C-8: the cycle count and the execute peak live in ONE merged entry, so they resolve
+    // together and can never desync (which would let an evicted peak un-gate the H1 claim check).
+    #[test]
+    fn peak_resolves_from_the_same_merged_entry_as_cycles() {
+        let (measured, desc_input) = fresh();
+        let prog = B256::repeat_byte(0xC1);
+        let desc = B256::repeat_byte(0xC2);
+        let ih = keccak256(b"peak-input");
+        insert_desc_input(&desc_input, desc, ih);
+
+        // A real measurement stores cycles AND peak in one value.
+        const PEAK: u64 = 9 * 1024 * 1024 * 1024;
+        insert_measurement(&measured, "sp1", prog, ih, 5_000, PEAK);
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", prog, desc),
+            Some(5_000)
+        );
+        assert_eq!(
+            resolve_measured_peak(&measured, &desc_input, "sp1", prog, desc),
+            Some(PEAK)
+        );
+
+        // A later cycle-only write (e.g. a deterministic UNMEASURABLE verdict) replaces the SAME entry,
+        // so the peak follows the cycles rather than being stranded at the old value.
+        insert_measured(&measured, "sp1", prog, ih, UNMEASURABLE_CYCLES);
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", prog, desc),
+            Some(UNMEASURABLE_CYCLES)
+        );
+        assert_eq!(
+            resolve_measured_peak(&measured, &desc_input, "sp1", prog, desc),
+            Some(0)
+        );
+    }
+
+    // UNMEASURABLE TTL: a wall-clock-timeout verdict is dropped and re-measured after its TTL; every
+    // deterministic / submitter-reachable one (cap trip / mismatch / over-cap / guest panic / ELF
+    // fetch) is permanent.
+    #[test]
+    fn a_nondeterministic_unmeasurable_expires_a_deterministic_one_is_permanent() {
+        let (measured, desc_input) = fresh();
+        let prog = B256::repeat_byte(0xD1);
+
+        // EXPIRING, already past its retry instant: dropped on resolve so a later tick re-measures.
+        let expiring_desc = B256::repeat_byte(0xD2);
+        let expiring_in = keccak256(b"expiring");
+        insert_desc_input(&desc_input, expiring_desc, expiring_in);
+        measured.lock().unwrap().insert(
+            (backend_tag("sp1"), prog, expiring_in),
+            Measured {
+                cycles: UNMEASURABLE_CYCLES,
+                peak_host_bytes: 0,
+                retry_after: Some(std::time::Instant::now() - Duration::from_secs(1)),
+            },
+        );
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", prog, expiring_desc),
+            None
+        );
+        assert!(!measured
+            .lock()
+            .unwrap()
+            .contains_key(&(backend_tag("sp1"), prog, expiring_in)));
+
+        // A not-yet-expired non-deterministic verdict still blacklists (so a flood is still bounded).
+        let live_desc = B256::repeat_byte(0xD3);
+        let live_in = keccak256(b"live");
+        insert_desc_input(&desc_input, live_desc, live_in);
+        insert_unmeasurable(&measured, "sp1", prog, live_in);
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", prog, live_desc),
+            Some(UNMEASURABLE_CYCLES)
+        );
+
+        // DETERMINISTIC: a permanent sentinel (retry_after == None) never expires.
+        let perm_desc = B256::repeat_byte(0xD4);
+        let perm_in = keccak256(b"perm");
+        insert_desc_input(&desc_input, perm_desc, perm_in);
+        insert_measured(&measured, "sp1", prog, perm_in, UNMEASURABLE_CYCLES);
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", prog, perm_desc),
+            Some(UNMEASURABLE_CYCLES)
+        );
+    }
+
+    // Finding RH-round2/4: the wall-clock-timeout discriminant (which grants the lenient retry TTL)
+    // must be the TYPED, dispatcher-only signal — a hostile guest must not be able to forge it by
+    // putting the phrase "wall-clock watchdog" in its panic message.
+    #[test]
+    fn wall_clock_timeout_is_classified_by_type_not_message() {
+        // A genuine, dispatcher-generated typed timeout is recognised.
+        let real: anyhow::Error = anyhow::Error::new(
+            zkminer_prover_protocol::types::MeasureWallClockTimeout {
+                slot_key: "sp1:measure:0".to_string(),
+            },
+        );
+        assert!(is_measure_wall_clock_timeout(&real));
+        // A guest-forged error whose message merely CONTAINS the phrase is NOT — it is a different
+        // error type, so it stays on the permanent-blacklist path.
+        let forged = anyhow::anyhow!("cycle measurement failed: Guest panicked: wall-clock watchdog");
+        assert!(!is_measure_wall_clock_timeout(&forged));
+    }
+
+    /// A preempted measurement (residual A) is classified by its TYPE, is DISTINCT from a wall-clock
+    /// timeout (no retry TTL, just plain transient), and cannot be forged from guest text.
+    #[test]
+    fn preemption_is_classified_by_type_and_is_not_a_timeout() {
+        let real: anyhow::Error =
+            anyhow::Error::new(zkminer_prover_protocol::types::MeasurePreempted {
+                slot_key: "sp1:measure:0".to_string(),
+            });
+        assert!(is_measure_preempted(&real));
+        // Distinct from a wall-clock timeout — a preemption must NOT take the lenient-TTL path.
+        assert!(!is_measure_wall_clock_timeout(&real));
+        // A guest-forged message does not win the transient treatment.
+        let forged = anyhow::anyhow!("cycle measurement failed: Guest panicked: preempted (transient)");
+        assert!(!is_measure_preempted(&forged));
     }
 }

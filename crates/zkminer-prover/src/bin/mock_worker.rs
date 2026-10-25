@@ -4,10 +4,11 @@
 //! answers to Execute and CalibrateSegmentLimit)
 //! and can be configured via environment variables:
 //!
-//! - `MOCK_HANG_ON`: `"benchmark"`, `"prove"`, `"both"` or `"warmup"` — hangs (sleeps forever)
-//!   on the specified command type. Unset or empty = respond normally.
-//! - `MOCK_CRASH_ON`: `"benchmark"`, `"prove"`, `"both"` or `"warmup"` — exits immediately
-//!   with code 1 on the specified command type, simulating a worker crash.
+//! - `MOCK_HANG_ON`: `"benchmark"`, `"prove"`, `"execute"`, `"both"` or `"warmup"` — hangs (sleeps
+//!   forever) on the specified command type. `"both"` covers benchmark + prove + execute. Unset or
+//!   empty = respond normally. `"execute"` holds a measurement in flight until it is SIGKILLed.
+//! - `MOCK_CRASH_ON`: `"benchmark"`, `"prove"`, `"execute"`, `"both"` or `"warmup"` — exits
+//!   immediately with code 1 on the specified command type, simulating a worker crash.
 //! - `MOCK_BACKEND`: backend name for the HelloAck response. Default: `"mock"`.
 
 use std::io::{self, BufReader, BufWriter};
@@ -98,11 +99,24 @@ fn main() {
             // Measures nothing: answers like a guest of 1,000 cycles, so a caller sees a well-formed
             // reply rather than a hang.
             WorkerCommand::Execute { request_id, .. } => {
+                if crash_on == "execute" || crash_on == "both" {
+                    std::process::exit(1);
+                }
+                if hang_on == "execute" || hang_on == "both" {
+                    // Hang forever — simulating an in-flight measurement that holds its slot and its
+                    // ledger reservations until it is SIGKILLed (by the measure watchdog, or by a
+                    // committed proof preempting it). Lets a test hold a measurement in flight
+                    // deterministically. The sleep loop is interruptible only by the signal.
+                    loop {
+                        std::thread::sleep(Duration::from_secs(3600));
+                    }
+                }
                 let resp = WorkerResponse::ExecuteResult {
                     request_id,
                     cycles: 1000,
                     duration_secs: 0.01,
                     journal_len: 0,
+                    peak_host_bytes: 0,
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }

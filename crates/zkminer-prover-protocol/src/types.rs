@@ -5,7 +5,12 @@ use serde::{Deserialize, Serialize};
 /// 4: `BenchmarkEntry` gained `wrap_secs`. The codec is bincode, which is POSITIONAL — an extra field
 /// cannot be defaulted, so a v3 worker's entries do not decode as v4 and would fail mid-benchmark.
 /// Bumping the version makes `handshake` reject a stale worker at spawn with a clear message instead.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// 6: `ExecuteResult` gained `peak_host_bytes` (and, retroactively, relies on `journal_len`). Same
+/// bincode-positional reason: a trailing field a v5 worker omits makes a v6 reader underrun the frame,
+/// so `#[serde(default)]` does NOT give cross-version back-compat on the wire — it only lets a
+/// SAME-version co-built binary that happens not to set the field decode as 0. The bump makes the
+/// handshake reject a mismatched (old) worker at spawn rather than fail cryptically at first Execute.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Maximum frame size: 256 MB (accommodates large risc0 composite receipts).
 pub const MAX_FRAME_SIZE: u32 = 256 * 1024 * 1024;
@@ -139,6 +144,17 @@ pub enum WorkerResponse {
         /// (which omits the field) interoperable: it decodes as 0, i.e. "unknown, do not screen".
         #[serde(default)]
         journal_len: u64,
+        /// Peak RESIDENT host memory (bytes) this measurement's executor child reached — anon plus the
+        /// /dev/shm-mapped guest image. The measure worker is server-less, so this is the execute
+        /// phase's footprint IN ISOLATION; the host reserves it PLUS the warm `sp1-gpu-server`'s
+        /// resident when deciding whether a claimed job is provable-without-OOM (the prove-time
+        /// execute stacks on the resident server). A v6 worker always sets it: the measured peak on
+        /// native x86-64 Linux, else 0 ("unknown" — the portable executor has no such child), and the
+        /// host treats 0 as do-not-gate. `#[serde(default)]` is only a same-version safety net; it does
+        /// NOT give wire back-compat to a v5 worker (bincode is positional) — the `PROTOCOL_VERSION`
+        /// bump to 6 rejects a mismatched worker at the handshake instead.
+        #[serde(default)]
+        peak_host_bytes: u64,
     },
     /// Progress update during proving.
     Progress {
@@ -551,6 +567,72 @@ impl std::fmt::Display for MeasureSlotsBusy {
 }
 
 impl std::error::Error for MeasureSlotsBusy {}
+
+/// A cycle measurement's wall-clock watchdog SIGKILLed the worker because the guest did not finish
+/// within the measure budget.
+///
+/// Typed on purpose (finding RH-round2/4): the measure path treats a genuine wall-clock timeout as
+/// POSSIBLY transient (a feasible guest can miss the budget under transient host load) and gives it a
+/// retry TTL rather than a permanent blacklist. That leniency MUST be driven by a dispatcher-generated
+/// signal — the watchdog's `intentional_kill` — NOT by substring-matching the error text, because a
+/// `WorkerResponse::Error` message carries guest-controlled bytes: a guest could panic with the phrase
+/// "wall-clock watchdog" and forge the TTL, re-opening the perpetual re-measurement DoS the permanent
+/// negative-cache exists to stop. Only the dispatcher's watchdog path constructs this error, so a
+/// `downcast_ref` to it is an unforgeable "this was a real timeout" signal. Everything else — a guest
+/// panic/trap, an image-id/vkey mismatch, a cap trip — stays permanent.
+#[derive(Debug, Clone)]
+pub struct MeasureWallClockTimeout {
+    /// The slot whose worker the watchdog killed, e.g. `sp1:measure:0`.
+    pub slot_key: String,
+}
+
+impl std::fmt::Display for MeasureWallClockTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cycle measurement timed out on {}: the guest did not finish within the measure budget \
+             (wall-clock watchdog) — may be transient host load",
+            self.slot_key,
+        )
+    }
+}
+
+impl std::error::Error for MeasureWallClockTimeout {}
+
+/// A committed (claimed) proof reclaimed this in-flight pre-claim MEASUREMENT's resources by killing
+/// its throwaway measure worker (dispatcher `preempt_measures_for_host` / `preempt_measures_for_shm`).
+///
+/// Typed, and TRANSIENT, for the same reason as `MeasureSlotsBusy`: nothing about the (program, input)
+/// failed — the measurement was healthy and simply YIELDED to a bonded job on the marginal box where a
+/// ~12 GiB measure and an ~18 GiB prove cannot co-fit (host-RAM and, on x86_64, `/dev/shm`). A
+/// measurement is speculative work with no collateral; a claimed proof is bonded and on a deadline, so
+/// giving the proof priority is the correct resolution of that contention (finding RH-round3 residual
+/// A — the "give the committed prove priority over the speculative measure" proper fix). The caller
+/// MUST treat it exactly like `MeasureSlotsBusy`: NO strike, NO negative-cache, NO retry TTL — just
+/// re-measure on a later tick once the proof has freed the resources.
+///
+/// Dispatcher-only and unforgeable: only the preemption path constructs it, never a
+/// `WorkerResponse::Error` carrying guest-controlled text, so a `downcast_ref` to it cannot be forged
+/// by a hostile guest to win the lenient transient treatment.
+#[derive(Debug, Clone)]
+pub struct MeasurePreempted {
+    /// The measure slot whose worker a claimed proof killed to reclaim its resources, e.g.
+    /// `sp1:measure:0`.
+    pub slot_key: String,
+}
+
+impl std::fmt::Display for MeasurePreempted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cycle measurement on {} was preempted to free resources for a claimed proof (transient) \
+             — it will be re-measured on a later tick",
+            self.slot_key,
+        )
+    }
+}
+
+impl std::error::Error for MeasurePreempted {}
 
 /// Not enough of this card's VRAM is free for this backend to be given work on it.
 ///
@@ -1121,5 +1203,27 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// `MeasurePreempted` is a real `std::error::Error`, names its slot, says "transient", and is a
+    /// DISTINCT type from the other transient/timeout measure errors — so the measure path can
+    /// downcast it specifically and treat it like `MeasureSlotsBusy` (no strike, no TTL).
+    #[test]
+    fn measure_preempted_is_a_typed_transient() {
+        let e = MeasurePreempted {
+            slot_key: "sp1:measure:0".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("sp1:measure:0"), "names the slot: {msg}");
+        assert!(msg.contains("transient"), "flagged transient: {msg}");
+
+        // Boxed as a trait object, it downcasts to itself and NOT to the sibling measure errors — the
+        // unforgeable-type property the measure path relies on.
+        let boxed: Box<dyn std::error::Error> = Box::new(MeasurePreempted {
+            slot_key: "sp1:measure:1".to_string(),
+        });
+        assert!(boxed.downcast_ref::<MeasurePreempted>().is_some());
+        assert!(boxed.downcast_ref::<MeasureSlotsBusy>().is_none());
+        assert!(boxed.downcast_ref::<MeasureWallClockTimeout>().is_none());
     }
 }

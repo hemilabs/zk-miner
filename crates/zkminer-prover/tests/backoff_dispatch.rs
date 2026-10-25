@@ -105,6 +105,7 @@ fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
             None,
             None,
             None,
+            0,
         );
         r.map(|_| ()).map_err(|e| format!("{e:#}"))
     });
@@ -140,6 +141,7 @@ fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
         None,
         None,
         None,
+        0,
     );
     let elapsed = t0.elapsed();
     eprintln!("prove #2 returned after {elapsed:?}: ok={}", second.is_ok());

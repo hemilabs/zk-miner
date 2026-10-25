@@ -50,25 +50,73 @@ pub const SP1_WARMUP_PEAK_BYTES: u64 = 15 * 1024 * 1024 * 1024;
 /// default GC), for a peak read from live processes only, by which time the helper has exited.
 pub const SP1_GROTH16_HELPER_PEAK_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
-/// Conservative host-RAM charge for ONE pre-claim SP1 cycle MEASUREMENT on a dedicated CPU measure
-/// worker. The CpuProver executor materialises the (submitter-controlled) guest's touched memory in
-/// host RAM, bounded only by the cycle cap and the wall-clock watchdog — NOT by RSS — so a crafted
-/// guest can balloon multi-GiB. Reserving this against the shared `MemoryLedger` before dispatching
-/// the Execute keeps admitted proofs + live measurements from summing past physical RAM and OOM-ing
-/// the warm sp1-gpu-server. A conservative estimate (the executor baseline plus headroom), clamped to
-/// the admissible budget at the call site; override with `ZKMINER_SP1_MEASURE_PEAK_BYTES`. Too high
-/// defers measurements under mild pressure (a job cannot be claimed until measured); too low
-/// under-charges the ledger. POLICY DEFAULT: 4 GiB.
-pub const SP1_MEASURE_PEAK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// SP1's own `DEFAULT_MEMORY_LIMIT` (executor `opts.rs`): the executor SIGKILLs the guest at this RSS.
+pub const SP1_DEFAULT_MEMORY_LIMIT_BYTES: u64 = 24 * 1024 * 1024 * 1024;
 
-/// Effective SP1 measurement host-RAM charge, honoring the `ZKMINER_SP1_MEASURE_PEAK_BYTES` override.
-pub fn sp1_measure_peak_bytes() -> u64 {
+/// Host-RAM charged to the shared ledger for ONE risc0/openvm pre-claim execute (finding H4), and the
+/// enforced ceiling the risc0 worker's in-process RSS self-guard aborts at. Charge == enforced ceiling
+/// (the `charge == enforced-cap` discipline the SP1 path follows), so admission reserves the true
+/// worst case and the aggregate across per-GPU risc0 slots cannot under-count into the host reserve.
+/// Must equal the risc0 worker's `ZKMINER_RISC0_EXECUTE_MAX_RSS_BYTES` default; an operator who RAISES
+/// that env raises the enforced ceiling above this charge (documented: then size the host reserve up).
+pub const RISC0_EXECUTE_PEAK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The enforced SP1 EXECUTE memory cap for a host with `total` bytes of RAM: `min(SP1's 24 GiB
+/// default, the admissible budget)` (locked #1).
+///
+/// This single number is used in THREE coupled places, and MUST be the same in all of them:
+/// * the `MEMORY_LIMIT` env set on the dedicated MEASURE worker — the in-band ceiling SP1's own
+///   100 ms RSS monitor enforces, turning a ballooning guest into a clean `TooMuchMemory` decline
+///   instead of a host-OOM that kills the warm `sp1-gpu-server`;
+/// * the `MEMORY_LIMIT` env set on the SP1 PROVE worker — EQUAL to the measure one so a guest whose
+///   execute is too heavy declines identically at measure and at prove (measurable ⇔ provable,
+///   finding F); a legitimately-claimed job was measured under this cap, so its prove-phase execute
+///   never trips it, making this a pure safety backstop on the prove path;
+/// * the host-RAM ledger CHARGE for a measurement — so the charge equals the worst-case RSS the cap
+///   allows (charge == enforced cap), closing the old 4 GiB under-charge that let a measure plus
+///   admitted proofs sum past physical RAM.
+///
+/// On a sub-36 GiB host the budget clamps it below 24 GiB (≈18 GiB on a 28 GiB box), which serialises
+/// measurements and leans on prover eviction — the accepted trade. Honors
+/// `ZKMINER_SP1_MEASURE_PEAK_BYTES`, clamped to the computed cap `min(24 GiB, budget)`, so an operator
+/// can only ever LOWER the enforced cap — never raise it above SP1's own default nor past what the
+/// host can actually admit (which would desync the charge from the enforced ceiling).
+pub fn sp1_measure_cap_bytes(total: u64) -> u64 {
+    let mut cap = SP1_DEFAULT_MEMORY_LIMIT_BYTES.min(max_admissible_budget(total));
+    // /dev/shm clamp (finding H3). The native executor stages the guest memory IMAGE in /dev/shm,
+    // whose resident backing grows with touched pages; a tmpfs-FULL write SIGBUSes SYNCHRONOUSLY,
+    // beating the 100 ms-poll `MEMORY_LIMIT`, so if `MEMORY_LIMIT` lets the image reach the tmpfs size
+    // the guest SIGBUSes (→ a strike on a feasible job, or a prove-side slash) instead of declining
+    // cleanly. The resident image + ring ≤ total_RSS, and `MEMORY_LIMIT` bounds total_RSS, so keeping
+    // `MEMORY_LIMIT ≤ dev_shm` holds the shm resident below the tmpfs. We do NOT credit the executor's
+    // anon working set: it was ~7.2 GiB for TYPICAL guests but is NOT an adversarial lower bound — a
+    // crafted guest keeps anon to the image's page tables (tens of MiB for a multi-GiB image) while
+    // ballooning the shm image, so crediting any anon floor is attacker-falsifiable and would SIGBUS.
+    // Instead subtract a small poll-race margin so the 100 ms monitor SIGKILLs before a fast writer
+    // can cross the last pages into a full tmpfs. x86-64-Linux ONLY — that is the sole target that
+    // compiles SP1's native executor (and thus stages in /dev/shm); on linux-aarch64 or linux+profiling
+    // the PORTABLE in-process executor runs, never touching /dev/shm, so clamping MEMORY_LIMIT from an
+    // unrelated tmpfs there would needlessly shrink (or, with a tiny /dev/shm, wedge) the cap. Matches
+    // the x86_64 gating of the paired /dev/shm sufficiency guard.
+    if cfg!(target_arch = "x86_64") {
+        if let Some(shm) = dev_shm_capacity_bytes() {
+            cap = cap.min(shm.saturating_sub(SP1_DEV_SHM_POLL_MARGIN_BYTES));
+        }
+    }
     std::env::var("ZKMINER_SP1_MEASURE_PEAK_BYTES")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(SP1_MEASURE_PEAK_BYTES)
+        .map(|o| o.min(cap))
+        .unwrap_or(cap)
 }
+
+/// Headroom kept BELOW the /dev/shm size when clamping `MEMORY_LIMIT` (finding H3). `MEMORY_LIMIT` is
+/// a 100 ms-poll RSS monitor, so after it is crossed the executor can still dirty pages for up to one
+/// interval before the SIGKILL lands; tmpfs-full SIGBUSes synchronously on the next page. This margin
+/// (comfortably above a ~1 GiB/100 ms tmpfs write burst) ensures the monitor fires with room to spare,
+/// regardless of how small the guest keeps its anon set. Credited as 0 anon = adversarially safe.
+pub const SP1_DEV_SHM_POLL_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// `/proc/pressure/memory`'s `full avg10`, in percent, above which the host is genuinely stalling.
 ///
@@ -101,6 +149,33 @@ pub fn mem_available_bytes() -> Option<u64> {
 /// `MemTotal` from `/proc/meminfo`, in bytes.
 pub fn mem_total_bytes() -> Option<u64> {
     parse_meminfo_kb(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal")
+}
+
+/// Total capacity of the `/dev/shm` tmpfs, in bytes, or `None` if it cannot be stat'd.
+///
+/// The SP1 native executor (x86-64 Linux) stages its trace ring and memory image here. A tmpfs too
+/// small to hold even the bounded ring — the classic 64 MiB Docker default is the usual culprit —
+/// makes every execute SIGBUS the instant the ring is touched, so the measure-pool spawn consults
+/// this to refuse to stand up workers that would only SIGBUS-loop. Total capacity, not free space:
+/// this is a one-time "could this tmpfs ever hold the ring" misconfiguration guard, and transient
+/// occupancy is the host-memory ledger's concern, not this check's.
+#[cfg(target_os = "linux")]
+pub fn dev_shm_capacity_bytes() -> Option<u64> {
+    let path = std::ffi::CString::new("/dev/shm").ok()?;
+    // SAFETY: `statvfs` only reads through `path` and writes the out-param, which it fully
+    // initializes on success (rc == 0); we read the struct only in that case.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    (st.f_blocks as u64).checked_mul(st.f_frsize as u64)
+}
+
+/// Non-Linux: there is no `/dev/shm` tmpfs and the portable executor runs in-process, so there is
+/// nothing to size. `None` means "cannot tell", which the caller treats as "do not block".
+#[cfg(not(target_os = "linux"))]
+pub fn dev_shm_capacity_bytes() -> Option<u64> {
+    None
 }
 
 /// Pull one `kB` field out of `/proc/meminfo` and return it in bytes.
@@ -671,6 +746,58 @@ pub fn plan_host_room(
     None
 }
 
+/// Choose the minimal set of in-flight pre-claim MEASUREMENTS to preempt so a COMMITTED proof of
+/// `want` fits host RAM, biggest-first (fewest kills). The planner for `WorkerPool::
+/// preempt_measures_for_host` (residual A), kept pure so the admission algebra is unit-testable
+/// without live `/proc` readings — the same split as `plan_host_room`.
+///
+/// Returns:
+///  - `Some(vec![])` — it already fits, kill nothing (room appeared since the caller's refusal);
+///  - `Some(victims)` — the minimal biggest-first set whose preemption makes it fit;
+///  - `None` — preempting EVERY measurement still would not fit, so the blocker is another bonded
+///    PROOF, which must never be preempted; the caller refuses.
+///
+/// Unlike `plan_host_room`'s idle workers (whose charge was already released, so freeing them only
+/// raises `available`), a live measurement HOLDS a ledger reservation — so killing it returns its
+/// charge to BOTH `reserved` (its `MemoryReservation` drops) and `available` (its resident pages come
+/// back). The credit to `available` is an upper bound (a CPU executor may hold less than its charge),
+/// which is why the caller re-tests the real reservation after reclaim: an optimistic plan can only
+/// under-reclaim and refuse, never over-admit.
+pub fn plan_measure_preemption(
+    want: u64,
+    resident: u64,
+    reserved: u64,
+    available: u64,
+    total: u64,
+    reserve: u64,
+    // (identifier, host_bytes reserved) per in-flight measurement, any order.
+    measures: &[(String, u64)],
+) -> Option<Vec<String>> {
+    let fits = |reserved: u64, available: u64| {
+        can_admit(want, resident, reserved, available, total, reserve)
+    };
+    if fits(reserved, available) {
+        return Some(Vec::new());
+    }
+    let mut candidates: Vec<&(String, u64)> =
+        measures.iter().filter(|(_, held)| *held > 0).collect();
+    // Biggest-first, ties broken by key for a deterministic plan.
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut freed = 0u64;
+    let mut chosen = Vec::new();
+    for (key, held) in candidates {
+        freed = freed.saturating_add(*held);
+        chosen.push(key.clone());
+        if fits(
+            reserved.saturating_sub(freed),
+            available.saturating_add(freed),
+        ) {
+            return Some(chosen);
+        }
+    }
+    None
+}
+
 /// What to assume a proof costs in host RAM when nothing has measured it, PER BACKEND.
 ///
 /// An unmeasured backend must look expensive, because assuming it is free is what permits the
@@ -853,6 +980,15 @@ pub struct MemoryReservation<'a> {
     bytes: u64,
 }
 
+impl MemoryReservation<'_> {
+    /// How many bytes this reservation holds against its ledger. Used by the dispatcher to record a
+    /// measurement's charge so a committed proof's preemption knows how much each in-flight
+    /// measurement would free.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
 impl Drop for MemoryReservation<'_> {
     fn drop(&mut self) {
         // SATURATING, to match the add. A plain `fetch_sub` that underflows wraps the counter to
@@ -981,6 +1117,43 @@ pub fn classify_pressure(stall_pct: Option<f64>, available: u64, total: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On this Linux host `/dev/shm` exists and has a real capacity, so the statvfs wrapper must
+    /// return a plausible `Some`. Guards against a zeroed-struct / wrong-field-scaling regression
+    /// (an all-zero or absurdly small answer would wrongly disable SP1 measuring).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dev_shm_capacity_is_a_plausible_nonzero_size() {
+        let cap = dev_shm_capacity_bytes().expect("/dev/shm should stat on a Linux CI/dev host");
+        // At least 1 MiB (even a locked-down tmpfs clears this) and sane (< 1 PiB).
+        assert!(cap >= 1024 * 1024, "implausibly small /dev/shm: {cap} bytes");
+        assert!(cap < 1u64 << 50, "implausibly large /dev/shm: {cap} bytes");
+    }
+
+    #[test]
+    fn sp1_measure_cap_never_exceeds_any_of_its_bounds() {
+        // cap = min(24 GiB default, admissible budget, /dev/shm − poll margin [Linux]). The /dev/shm
+        // term is host-dependent, so assert the INVARIANTS that hold on any host, not a fixed value.
+        let shm_bound =
+            dev_shm_capacity_bytes().map(|s| s.saturating_sub(SP1_DEV_SHM_POLL_MARGIN_BYTES));
+        for t in [8u64, 16, 24, 28, 36, 64, 256] {
+            let total = t * 1024 * 1024 * 1024;
+            let cap = sp1_measure_cap_bytes(total);
+            assert!(cap > 0, "cap must be positive at {t} GiB");
+            assert!(cap <= SP1_DEFAULT_MEMORY_LIMIT_BYTES, "cap above SP1 24 GiB default at {t} GiB");
+            assert!(cap <= max_admissible_budget(total), "cap above admissible budget at {t} GiB");
+            if let Some(shm_bound) = shm_bound {
+                assert!(cap <= shm_bound, "cap above the /dev/shm bound at {t} GiB");
+            }
+        }
+        // On a host whose /dev/shm comfortably clears the budget (its +5 GiB credit ≥ the budget), the
+        // /dev/shm term never binds, so the cap is exactly min(24 GiB, budget) — the locked-#1 value.
+        let total = 28u64 * 1024 * 1024 * 1024;
+        let non_shm_cap = SP1_DEFAULT_MEMORY_LIMIT_BYTES.min(max_admissible_budget(total));
+        if shm_bound.map_or(true, |b| b >= non_shm_cap) {
+            assert_eq!(sp1_measure_cap_bytes(total), non_shm_cap);
+        }
+    }
 
     #[test]
     fn meminfo_is_parsed_in_bytes_and_by_exact_key() {
@@ -1803,6 +1976,97 @@ mod budget_tests {
         let big = vec![("sp1:cuda:0".to_string(), 23 * GIB)];
         assert_eq!(
             plan_host_room(6 * GIB, 0, 20 * GIB, 2 * GIB, total, reserve, &big, GIB),
+            None
+        );
+    }
+
+    // ---- plan_measure_preemption (residual A) ----
+
+    /// The canonical marginal-box case: a 12 GiB SP1 MEASURE is in flight and an 18 GiB claimed
+    /// PROVE cannot fit (12 + 18 + 3 > 28). Preempting the one measurement returns its 12 GiB charge
+    /// to `reserved` AND its pages to `available`, and the prove fits — so the plan is exactly that
+    /// one measurement.
+    #[test]
+    fn a_claimed_prove_preempts_the_measure_that_blocks_it() {
+        let total = 28 * GIB;
+        let reserve = DEFAULT_HOST_RESERVE_BYTES;
+        // 12 GiB measure reserved; ~10 GiB available (the measure + OS hold the rest). The prove is
+        // refused now (fits_committed 12 + 18 + 3 = 33 > 28), and freeing the measure's 12 GiB raises
+        // reserved to 0 and available to 22, so 18 + 3 = 21 <= 22 and 18 + 3 <= 28 — it fits.
+        let measures = vec![("sp1:measure:0".to_string(), 12 * GIB)];
+        assert_eq!(
+            plan_measure_preemption(18 * GIB, 0, 12 * GIB, 10 * GIB, total, reserve, &measures),
+            Some(vec!["sp1:measure:0".to_string()]),
+            "preempting the 12 GiB measure must let the 18 GiB prove fit"
+        );
+    }
+
+    /// Already fits (room appeared since the caller's refusal): kill nothing.
+    #[test]
+    fn plan_measure_preemption_kills_nothing_when_it_already_fits() {
+        let total = 28 * GIB;
+        let reserve = DEFAULT_HOST_RESERVE_BYTES;
+        let measures = vec![("sp1:measure:0".to_string(), 12 * GIB)];
+        assert_eq!(
+            plan_measure_preemption(6 * GIB, 0, 12 * GIB, 16 * GIB, total, reserve, &measures),
+            Some(Vec::new()),
+            "6 + 12 + 3 <= 28 and 6 <= 16 free: it fits, so preempt nothing"
+        );
+    }
+
+    /// The blocker is another bonded PROOF, not a measurement: even preempting every measurement
+    /// leaves `reserved` too high. `None` — the caller must never preempt a bonded proof.
+    #[test]
+    fn plan_measure_preemption_refuses_when_a_bonded_proof_is_the_blocker() {
+        let total = 28 * GIB;
+        let reserve = DEFAULT_HOST_RESERVE_BYTES;
+        // 20 GiB held by an in-flight PROOF (not in `measures`) + a 2 GiB measure. Freeing the 2 GiB
+        // measure still leaves 20 + 18 + 3 > 28.
+        let measures = vec![("sp1:measure:0".to_string(), 2 * GIB)];
+        assert_eq!(
+            plan_measure_preemption(18 * GIB, 0, 22 * GIB, 2 * GIB, total, reserve, &measures),
+            None,
+            "a bonded proof holding the RAM must not be preempted — refuse"
+        );
+    }
+
+    /// Biggest-first, minimal set: with two measures, prefer the one whose single preemption suffices
+    /// rather than killing both.
+    #[test]
+    fn plan_measure_preemption_prefers_the_minimal_biggest_first_set() {
+        let total = 28 * GIB;
+        let reserve = DEFAULT_HOST_RESERVE_BYTES;
+        let measures = vec![
+            ("sp1:measure:0".to_string(), 4 * GIB),
+            ("sp1:measure:1".to_string(), 10 * GIB),
+        ];
+        // Need to free ~10 GiB: reserved 14, want 10 -> 14 + 10 + 3 = 27... refuse at 28? 27 <= 28
+        // fits_committed, but available 2 GiB blocks fits_now (10 - 0 + 3 = 13 > 2). Freeing the 10
+        // GiB one: reserved 4, available 12 -> 10 + 3 = 13 > 12 still short; also free the 4 GiB one:
+        // reserved 0, available 16 -> 13 <= 16. So both, biggest first.
+        assert_eq!(
+            plan_measure_preemption(10 * GIB, 0, 14 * GIB, 2 * GIB, total, reserve, &measures),
+            Some(vec!["sp1:measure:1".to_string(), "sp1:measure:0".to_string()]),
+        );
+        // A looser case where freeing only the biggest suffices.
+        let measures2 = vec![
+            ("sp1:measure:0".to_string(), 4 * GIB),
+            ("sp1:measure:1".to_string(), 10 * GIB),
+        ];
+        assert_eq!(
+            plan_measure_preemption(10 * GIB, 0, 14 * GIB, 11 * GIB, total, reserve, &measures2),
+            Some(vec!["sp1:measure:1".to_string()]),
+            "freeing the 10 GiB measure alone makes it fit — do not also kill the 4 GiB one"
+        );
+    }
+
+    /// Nothing is preemptible (empty registry) and it does not fit: `None`.
+    #[test]
+    fn plan_measure_preemption_with_no_measures_refuses() {
+        let total = 28 * GIB;
+        let reserve = DEFAULT_HOST_RESERVE_BYTES;
+        assert_eq!(
+            plan_measure_preemption(18 * GIB, 0, 20 * GIB, 2 * GIB, total, reserve, &[]),
             None
         );
     }

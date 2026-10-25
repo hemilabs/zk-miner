@@ -268,6 +268,11 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             cycles,
                             duration_secs,
                             journal_len,
+                            // risc0 is bounded by its own in-process RSS self-guard + the ledger charge
+                            // (finding H4), not by the SP1-only prove-stacking claim gate (H1), so it
+                            // reports no peak: 0 = "unknown", which leaves `sp1_execute_provable_beside_
+                            // server` ungated for risc0 (it is only consulted for SP1 anyway).
+                            peak_host_bytes: 0,
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -471,6 +476,108 @@ fn prove_session_cycle_limit() -> Option<u64> {
         .filter(|&n| n > 0)
 }
 
+/// Host-RAM ceiling (bytes) for the IN-PROCESS pre-claim execute. risc0's `default_executor().execute()`
+/// runs the submitter-controlled guest in THIS process with only a cycle cap — no RSS bound — so a
+/// crafted guest can balloon host memory and, on a box co-hosting a warm SP1 server, OOM-kill it
+/// (finding H4). The dispatcher charges this execute `RISC0_EXECUTE_PEAK_BYTES` (8 GiB, == this
+/// ceiling) to the shared ledger so it is admitted only when it fits; this ceiling is the matching
+/// ENFORCEMENT (charge == enforced cap) — if the execute's resident set crosses it, the worker aborts
+/// itself, converting an uncontained host-OOM into a bounded slot failure (dispatcher respawns; the
+/// job strike-negative-caches). On a dedicated risc0 MEASURE worker (finding TR1) that abort kills only
+/// the throwaway measure process, never the warm prover. The dispatcher sets this env to
+/// `RISC0_EXECUTE_PEAK_BYTES` on measure workers; override it (0 = unlimited) to raise the ceiling,
+/// but then size the host reserve up, since the ledger charge stays at 8 GiB.
+fn execute_max_rss_bytes() -> Option<u64> {
+    const DEFAULT: u64 = 8 * 1024 * 1024 * 1024;
+    match std::env::var("ZKMINER_RISC0_EXECUTE_MAX_RSS_BYTES") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT),
+        },
+        Err(_) => Some(DEFAULT),
+    }
+}
+
+/// This process's current resident set (VmRSS) in bytes, from `/proc/self/status`. `None` off-Linux or
+/// on a read error (→ the self-guard simply does not fire, same as having no bound).
+#[cfg(target_os = "linux")]
+fn self_vmrss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|kb| kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn self_vmrss_bytes() -> Option<u64> {
+    None
+}
+
+/// Run `f` while a background thread watches this process's resident set; if it crosses
+/// `limit_bytes`, abort the worker to contain the in-process execute balloon (finding H4). Returns
+/// `f`'s result on the normal path. `limit_bytes == None` → no guard.
+fn with_rss_self_guard<T>(limit_bytes: Option<u64>, f: impl FnOnce() -> T) -> T {
+    let Some(limit) = limit_bytes else {
+        return f();
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if let Some(rss) = self_vmrss_bytes() {
+                    if rss > limit {
+                        tracing::error!(
+                            "risc0 execute resident set {} MiB exceeded the {} MiB self-guard — \
+                             aborting the worker to contain the in-process balloon before it OOMs the \
+                             host (ZKMINER_RISC0_EXECUTE_MAX_RSS_BYTES)",
+                            rss / (1024 * 1024),
+                            limit / (1024 * 1024)
+                        );
+                        std::process::exit(101);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+    };
+    // Stop + join via Drop so a PANIC out of `f` (the executor is `catch_unwind`-wrapped at the call
+    // site) still tears the guard thread down, rather than leaking one looping thread per panicking
+    // submission.
+    struct Guard {
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+    let mut guard = Guard {
+        stop,
+        handle: Some(handle),
+    };
+    let out = f();
+    guard.stop.store(true, Ordering::Relaxed);
+    if let Some(h) = guard.handle.take() {
+        let _ = h.join();
+    }
+    out
+}
+
 fn run_execute(
     elf: &[u8],
     input_data: &[u8],
@@ -493,9 +600,11 @@ fn run_execute(
         .build()
         .map_err(|e| anyhow::anyhow!("execute: env build failed: {e}"))?;
 
-    let session = risc0_zkvm::default_executor()
-        .execute(env, elf)
-        .map_err(|e| anyhow::anyhow!("execute: {e}"))?;
+    // In-process RSS self-guard (finding H4): contain a ballooning guest before it OOMs the host.
+    let session = with_rss_self_guard(execute_max_rss_bytes(), || {
+        risc0_zkvm::default_executor().execute(env, elf)
+    })
+    .map_err(|e| anyhow::anyhow!("execute: {e}"))?;
 
     // A guest that does not halt with exit code 0 can NEVER produce a receipt that
     // `receipt.verify(image_id)` accepts (verify builds the expected claim as Halted(0)), so this
