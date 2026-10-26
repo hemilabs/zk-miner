@@ -910,6 +910,45 @@ mod security_tests {
         assert!(!elf_is_pinned(&id), "unpinned once all guards drop");
     }
 
+    // The integrity-hash purge the risc0 ELF-swap binding depends on: `fetch_or_download_elf` reads
+    // the cache with the (co-resolved) verified keccak, so a cached entry whose bytes do NOT match the
+    // expected hash must be dropped and reported as a miss (forcing a hash-enforced re-download), while
+    // a matching entry is returned. keccak256 over the genuine bytes is deterministic from the program,
+    // so this never purges a correct entry.
+    #[test]
+    fn cache_get_purges_on_hash_mismatch_and_returns_on_match() {
+        let dir = std::env::temp_dir().join(format!(
+            "zkminer-elf-hash-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = ElfCache { cache_dir: dir.clone() };
+
+        let id = B256::repeat_byte(0x7e);
+        let bytes = b"the-genuine-risc0-elf-bytes".to_vec();
+        let good = alloy::primitives::keccak256(&bytes);
+        cache.put(&id, &bytes).unwrap();
+
+        // No expected hash -> returned unverified.
+        assert_eq!(cache.get(&id, None).as_deref(), Some(bytes.as_slice()));
+        // Correct hash -> returned, entry kept.
+        assert_eq!(cache.get(&id, Some(good)).as_deref(), Some(bytes.as_slice()));
+        assert!(dir.join(format!("{id}.elf")).exists());
+
+        // Wrong hash (a swapped ELF would land here) -> miss AND the corrupt/stale entry is purged,
+        // so the next fetch cannot serve the mismatching bytes and must re-download under the hash.
+        let wrong = B256::repeat_byte(0xff);
+        assert_eq!(cache.get(&id, Some(wrong)), None, "mismatch must be a miss");
+        assert!(
+            !dir.join(format!("{id}.elf")).exists(),
+            "mismatching entry must be purged"
+        );
+        assert_eq!(cache.get(&id, None), None, "entry is gone after the purge");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn blocks_additional_special_use_ranges() {
         for s in [

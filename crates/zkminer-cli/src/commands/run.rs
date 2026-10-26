@@ -307,6 +307,22 @@ struct Measured {
     /// UNMEASURABLE TTL (finding: UNMEASURABLE had no TTL), scoped down after review to the one
     /// non-submitter-controllable case.
     retry_after: Option<std::time::Instant>,
+    /// keccak256 of the risc0 ELF whose image-id the measure worker verified equals this program's
+    /// `programId` (a successful risc0 execute proves the sized bytes ARE the registered program; the
+    /// worker refuses to size a mismatched image-id). `Some` ONLY for a real risc0 measurement — SP1 is
+    /// bound by the mandatory registry `elf_hash` instead, and every infeasible verdict carries `None`.
+    ///
+    /// It lives in THIS merged entry, co-evicting with `cycles`, so the ELF-byte binding a claim will
+    /// enforce on its re-fetch (see `fetch_or_download_elf`) can NEVER be evicted independently of the
+    /// measurement the claim rides on: a claim proceeds iff a measurement resolves, and that resolve
+    /// (see [`resolve_measured_with_hash`]) hands back this hash in the SAME lock hold. risc0 carries no
+    /// registry `elf_hash`, so without this binding a submitter who swaps the stored ELF after we
+    /// measure — once our cached copy is evicted — has the swapped bytes re-downloaded unverified, which
+    /// reach prove, force a penalized RELEASE, and permanently blacklist a feasible program. An earlier
+    /// fix held this in a SEPARATE program-keyed map; its independent random eviction (same cap as this
+    /// cache) let the hash be dropped while the measurement survived, re-opening the window — hence the
+    /// move into the measurement entry.
+    verified_elf_hash: Option<alloy::primitives::B256>,
 }
 
 /// Measured results keyed by (backend tag, programId, keccak256(inputData)). The backend tag is
@@ -417,12 +433,15 @@ fn insert_measured(
             cycles,
             peak_host_bytes: 0,
             retry_after: None,
+            verified_elf_hash: None,
         },
     );
 }
 
-/// Insert a real measurement: its cycle count AND the execute's peak host footprint, stored in ONE
-/// value so they co-evict (finding C-8). Never expires.
+/// Insert a real measurement: its cycle count, the execute's peak host footprint, and — for risc0 —
+/// the keccak of the image-id-verified ELF, stored in ONE value so they co-evict (finding C-8 and the
+/// independent-eviction residual). Never expires. `verified_elf_hash` is `Some` only for a real risc0
+/// measurement; pass `None` for SP1 and for callers without a verified hash.
 fn insert_measurement(
     cache: &MeasuredCache,
     backend: &str,
@@ -430,6 +449,7 @@ fn insert_measurement(
     input_hash: alloy::primitives::B256,
     cycles: u64,
     peak_host_bytes: u64,
+    verified_elf_hash: Option<alloy::primitives::B256>,
 ) {
     insert_measured_value(
         cache,
@@ -440,6 +460,7 @@ fn insert_measurement(
             cycles,
             peak_host_bytes,
             retry_after: None,
+            verified_elf_hash,
         },
     );
 }
@@ -463,6 +484,7 @@ fn insert_unmeasurable(
             cycles: UNMEASURABLE_CYCLES,
             peak_host_bytes: 0,
             retry_after: Some(std::time::Instant::now() + UNMEASURABLE_RETRY_TTL),
+            verified_elf_hash: None,
         },
     );
 }
@@ -649,6 +671,10 @@ fn program_vkey_mismatched(program_id: alloy::primitives::B256) -> bool {
         .map(|s| s.contains(&program_id))
         .unwrap_or(false)
 }
+
+// The verified risc0 ELF keccak is stored IN the measured-cycles cache entry (see
+// `Measured::verified_elf_hash` and [`resolve_measured_with_hash`]) so it co-evicts with the
+// measurement a claim rides on — never in a separate, independently-evicting map.
 
 /// descriptor hash -> the submitter descriptor's payload length (inputData + callbackExtraData +
 /// extraVerifierData), cached during measurement. The fulfill payload is journal + THIS sum + the proof
@@ -848,6 +874,32 @@ fn resolve_measured_full(
         }
     }
     Some((entry.cycles, entry.peak_host_bytes))
+}
+
+/// Resolve the cycle count AND the verified risc0 ELF keccak for a sighting under ONE lock hold, so
+/// the hash a claim binds its ELF re-fetch to cannot be read-then-evicted independently of the
+/// measurement the claim rides. Because the hash lives in the SAME merged entry as `cycles`, a claim
+/// that resolves a measurement here ALWAYS gets that measurement's verified hash (or `None` for a
+/// risc0 program never measured as a real binding, or SP1). Applies the UNMEASURABLE TTL exactly as
+/// [`resolve_measured`]. Returns `(cycles, verified_elf_hash)`.
+fn resolve_measured_with_hash(
+    measured: &MeasuredCache,
+    desc_input: &DescInputCache,
+    backend: &str,
+    program_id: alloy::primitives::B256,
+    descriptor_hash: alloy::primitives::B256,
+) -> Option<(u64, Option<alloy::primitives::B256>)> {
+    let input_hash = desc_input.lock().ok()?.get(&descriptor_hash)?.input_hash;
+    let key = (backend_tag(backend), program_id, input_hash);
+    let mut m = measured.lock().ok()?;
+    let entry = *m.get(&key)?;
+    if let Some(until) = entry.retry_after {
+        if std::time::Instant::now() >= until {
+            m.remove(&key);
+            return None;
+        }
+    }
+    Some((entry.cycles, entry.verified_elf_hash))
 }
 
 /// Bound on a single cycle measurement. Execution is far cheaper than proving, but a hostile
@@ -3876,16 +3928,24 @@ async fn miner_brain(
                     None => (None, None),
                 }
             } else {
-                (
-                    resolve_measured(
-                        &measured_cycles,
-                        &desc_input_hash,
-                        backend_opt.unwrap_or(""),
-                        job.info.program_id,
-                        snapshot.descriptor_hash,
-                    ),
-                    None,
-                )
+                // Resolve the cycle count AND this program's verified risc0 ELF keccak from the SAME
+                // entry under ONE lock hold, so the hash the claim will bind its ELF re-fetch to
+                // (threaded onto the snapshot below) cannot be dropped independently of the
+                // measurement the claim rides on. `None` for a risc0 program with no real-measurement
+                // binding yet; the re-fetch then falls back to the image-id check at execute/prove.
+                match resolve_measured_with_hash(
+                    &measured_cycles,
+                    &desc_input_hash,
+                    backend_opt.unwrap_or(""),
+                    job.info.program_id,
+                    snapshot.descriptor_hash,
+                ) {
+                    Some((cycles, hash)) => {
+                        snapshot.verified_elf_hash = hash;
+                        (Some(cycles), None)
+                    }
+                    None => (None, None),
+                }
             };
             // Carry the measured count on the snapshot so the prove path (watchdog
             // timeout, min-VRAM, po2) sizes on it instead of the adversarial declared field. Rides
@@ -4301,8 +4361,19 @@ async fn miner_brain(
             {
                 // Collapse to THIS job's backend. See `device_backend_throughputs`.
                 let job_backend = resolve_backend(snapshot.proof_system_id).unwrap_or("");
+                // GENUINE per-backend rows only when any exist — NOT the padded
+                // `throughputs_for_backend` list. The padding credits every card with no row for
+                // this backend at the global-slowest throughput, which the planner's slot model then
+                // treats as a real, idle proving slot: on an asymmetric rig (a card the backend
+                // cannot run, e.g. an arch its binary does not cover) that is a PHANTOM slot, and the
+                // planner over-admits — it believes it has more devices than can serve the backend,
+                // places bonded jobs against the phantom, and the surplus misses its lock deadline
+                // (release penalty / slash). Only when NO card has a genuine row for the backend do
+                // we fall back to the padded list, so a never-measured backend is sized
+                // conservatively rather than refused forever. This mirrors the live claim gate's
+                // `slowest_eligible`, keeping the two admission gates' device sets consistent.
                 let device_throughputs =
-                    throughputs_for_backend(&device_backend_throughputs, job_backend);
+                    planner_throughputs_for_backend(&device_backend_throughputs, job_backend);
                 let slots = queue_model.slots(&device_throughputs);
                 match zkminer_strategy::queue::plan_admission(
                     &slots,
@@ -4632,15 +4703,24 @@ async fn miner_brain(
                     }
                     {
                         let mut set = tokio::task::JoinSet::new();
-                        for (job, _, _) in &batch_jobs {
+                        for (job, snapshot, _) in &batch_jobs {
                             let c = client_c.clone();
                             let st = state_c.clone();
                             let pid = job.info.program_id;
                             let jid = job.info.job_id;
+                            // This probe is the ONLY pre-claim ELF gate for a batch job: batch jobs
+                            // dispatch with already_locked=true -> is_recovery=true, so the
+                            // single-claim path's `!is_recovery` hash-enforcing fetch is SKIPPED for
+                            // them. Thread THIS job's co-resolved risc0 keccak (dropping it was the
+                            // round-2 finding) so a post-measure ELF swap fails the probe here and the
+                            // job is dropped BEFORE collateral is bonded — the same free pre-claim skip
+                            // the single-claim path gets — instead of bonding and then taking a
+                            // penalized release when the prove-time fetch finally rejects the swap.
+                            let expected_hash = snapshot.verified_elf_hash;
                             set.spawn(async move {
                                 let ok = tokio::time::timeout(
                                     MEASURE_FETCH_BUDGET,
-                                    fetch_or_download_elf(&c, &st, pid),
+                                    fetch_or_download_elf(&c, &st, pid, expected_hash),
                                 )
                                 .await
                                 .map(|r| r.is_ok())
@@ -5017,6 +5097,13 @@ struct JobStatusSnapshot {
     /// passed to the dispatcher as a PREFERENCE (tried first, graceful fallback). `None` on paths
     /// without a plan (recovery, non-measurable backends). See `prove_min_vram`'s `preferred_device`.
     preferred_device: Option<String>,
+    /// keccak256 of the risc0 ELF whose image-id was verified when this (program, input) was measured,
+    /// resolved from the measurement cache entry alongside `measured_cycles` (so it co-evicts with it).
+    /// Threaded into `fetch_or_download_elf` on the claim-obtainability and prove fetches as the
+    /// whole-ELF integrity hash for risc0 (which has no registry `elf_hash`), so a post-measure ELF
+    /// swap is rejected at the re-fetch rather than reaching prove as a penalized release + permanent
+    /// blacklist. `None` for SP1 (bound by `elf_hash`), recovery, and risc0 with no measured binding.
+    verified_elf_hash: Option<alloy::primitives::B256>,
 }
 
 impl JobStatusSnapshot {
@@ -5043,6 +5130,7 @@ impl JobStatusSnapshot {
             measured_cycles: None,
             measured_peak: None,
             preferred_device: None,
+            verified_elf_hash: None,
         }
     }
 }
@@ -5276,7 +5364,9 @@ async fn process_job_lifecycle(
     if !is_recovery {
         if let Err(e) = tokio::time::timeout(
             MEASURE_FETCH_BUDGET,
-            fetch_or_download_elf(client, state, program_id),
+            // Enforce the risc0 ELF binding co-resolved with this job's measurement: a swapped,
+            // still-retrievable ELF fails the keccak here and becomes a free pre-claim skip.
+            fetch_or_download_elf(client, state, program_id, snapshot.verified_elf_hash),
         )
         .await
         .map_err(|_| anyhow::anyhow!("ELF fetch exceeded the pre-claim budget"))
@@ -5549,7 +5639,9 @@ async fn process_job_lifecycle(
         lock_deadline,
         "ELF fetch",
         job_id,
-        fetch_or_download_elf(client, state, program_id),
+        // Same risc0 binding at prove: the pin normally makes this a cache hit on the verified bytes,
+        // but if a re-download is forced the co-resolved keccak rejects swapped bytes (no blacklist).
+        fetch_or_download_elf(client, state, program_id, snapshot.verified_elf_hash),
     )
     .await?;
 
@@ -6307,6 +6399,43 @@ fn throughputs_for_backend(rows: &[(String, String, f64)], backend: &str) -> Vec
     v
 }
 
+/// Device throughputs for the LOOK-AHEAD PLANNER's slot model, for one backend.
+///
+/// Unlike [`throughputs_for_backend`] — which pads every device with a pessimistic cross-backend
+/// fallback so the planner can tell "unmeasured" from "absent" — this returns ONLY devices with a
+/// genuine, finite, positive, measured row for `backend` WHENEVER ANY such row exists. A card with no
+/// genuine row for this backend is either incapable of it (an arch its binary does not cover) or
+/// merely unmeasured; either way it must not be modelled as an available proving slot. The planner's
+/// slot model reads a padded card as a real idle GPU and will place bonded jobs against it, so on an
+/// asymmetric rig the padding makes the planner believe it has more backend-capable devices than it
+/// does and over-admit — stranding the surplus past its lock deadline (release penalty / slash).
+///
+/// Only when NO device has a genuine row for `backend` do we fall back to the padded list, so a
+/// never-measured backend (e.g. SP1 on a rig that has only ever benchmarked risc0) is sized
+/// conservatively rather than refused forever — the exact case [`throughputs_for_backend`]'s padding
+/// exists for. The "genuine" test (finite and > 0, matching `backend`) is identical to the live claim
+/// gate's `genuine_throughputs`, so both admission gates agree on which cards can serve the backend.
+fn planner_throughputs_for_backend(
+    rows: &[(String, String, f64)],
+    backend: &str,
+) -> Vec<(String, f64)> {
+    let mut genuine: Vec<(String, f64)> = Vec::new();
+    for (device, row_backend, t) in rows {
+        if row_backend != backend || !t.is_finite() || *t <= 0.0 {
+            continue;
+        }
+        match genuine.iter_mut().find(|(id, _)| id == device) {
+            Some((_, cur)) => *cur = cur.max(*t),
+            None => genuine.push((device.clone(), *t)),
+        }
+    }
+    if genuine.is_empty() {
+        throughputs_for_backend(rows, backend)
+    } else {
+        genuine
+    }
+}
+
 fn resolve_backend(proof_system_id: alloy::primitives::B256) -> Option<&'static str> {
     if proof_system_id == zkminer_chain::auction::risc_zero_v1_id() {
         Some("risc0")
@@ -6658,7 +6787,9 @@ async fn measure_cycles(
     // Sanitize the (URI-bearing) error before logging.
     let elf = match tokio::time::timeout(
         MEASURE_FETCH_BUDGET,
-        fetch_or_download_elf(client, state, program_id),
+        // Measure path (bootstrap): no co-stored hash yet — the risc0 worker's image-id check inside
+        // execute_cycles below is the binding, and it is what first produces the hash we store.
+        fetch_or_download_elf(client, state, program_id, None),
     )
     .await
     {
@@ -6751,12 +6882,26 @@ async fn measure_cycles(
     let input_len = input.len();
     // Blocking: the worker protocol is synchronous. Bounded by the watchdog inside `execute_cycles`.
     let backend_owned = backend.to_string();
+    // risc0 binds the ELF bytes to the programId by image-id, which the worker checks INSIDE
+    // `execute_cycles` (it refuses to size a mismatched ELF). So a successful risc0 execute proves
+    // these exact bytes ARE the registered program: capture their keccak (on this blocking thread,
+    // only for risc0, only on success) so the later claim/prove re-fetch can enforce
+    // measure-ELF == prove-ELF for risc0 the way the registry `elf_hash` does for SP1 — closing the
+    // post-measure ELF-swap slash/blacklist window. The keccak is stored IN the measurement entry
+    // (`Measured::verified_elf_hash`), so it co-evicts with the cycle count a claim rides on. SP1 does
+    // NOT get this: its Execute arm does not derive the vkey, so keccak(elf) here is not a verified
+    // binding; SP1 is bound by the mandatory registry `elf_hash` gate above instead.
+    let capture_risc0_keccak = backend == "risc0";
     let res = tokio::task::spawn_blocking(move || {
-        pool.execute_cycles(&backend_owned, &elf, &input, Some(MEASURE_TIMEOUT), program_id_bytes)
+        let out =
+            pool.execute_cycles(&backend_owned, &elf, &input, Some(MEASURE_TIMEOUT), program_id_bytes);
+        let elf_keccak =
+            (capture_risc0_keccak && out.is_ok()).then(|| alloy::primitives::keccak256(&elf));
+        (out, elf_keccak)
     })
     .await;
     match res {
-        Ok(Ok((cycles, journal_len, peak_host_bytes))) => {
+        Ok((Ok((cycles, journal_len, peak_host_bytes)), elf_keccak)) => {
             // The guest committed `journal_len` bytes. fulfillJob re-encodes the journal
             // AND the input (plus the rest of the descriptor) into its calldata under a fixed gas
             // limit. Both the journal and the input are a deterministic function of (program, input) —
@@ -6807,7 +6952,21 @@ async fn measure_cycles(
                 // folds it in (finding RH2), and a surviving cycle count always carries its peak rather
                 // than desyncing to a 0 that would silently un-gate. 0 peak = older worker / off-Linux /
                 // portable executor = "unknown, do not gate".
-                insert_measurement(measured, backend, program_id, input_hash, cycles, peak_host_bytes);
+                // Store the keccak of the bytes the risc0 worker just image-id-verified IN the
+                // measurement entry, so it co-evicts with the cycle count (never dropped while the
+                // measurement a claim rides survives). A later claim's ELF re-fetch binds to it,
+                // catching a post-measure ELF swap as a clean pre-claim skip rather than a prove-time
+                // penalized release + permanent blacklist. `elf_keccak` is `Some` only for a real
+                // risc0 measurement; SP1 and the infeasible branches pass `None`.
+                insert_measurement(
+                    measured,
+                    backend,
+                    program_id,
+                    input_hash,
+                    cycles,
+                    peak_host_bytes,
+                    elf_keccak,
+                );
                 clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
                 // journal + input fit, but the full fulfill payload also carries THIS descriptor's
                 // callbackExtraData + extraVerifierData + the proof seal — fields outside the (program,
@@ -6834,7 +6993,7 @@ async fn measure_cycles(
                 }
             }
         }
-        Ok(Err(e)) => {
+        Ok((Err(e), _)) => {
             // A host-RAM admission refusal from the measure path (the shared ledger would be
             // over-committed) is TRANSIENT — nothing ran, the program is fine — so never strike or
             // negative-cache it; skip and let a later tick retry once memory frees. Must precede the
@@ -6972,6 +7131,12 @@ async fn fetch_or_download_elf(
     client: &ChainClient,
     state: &zkminer_tui::state::SharedState,
     program_id: alloy::primitives::B256,
+    // The risc0 whole-ELF integrity hash to enforce when the registry carries no `elf_hash` (risc0).
+    // For a CLAIM/PROVE fetch this is `snapshot.verified_elf_hash` — the keccak captured and co-stored
+    // with the measurement this claim rides on — so a post-measure ELF swap is rejected here instead of
+    // reaching prove. `None` on the measure (bootstrap: image-id is the binding) and batch-obtainability
+    // paths, and for SP1 (bound by the registry `elf_hash`, which takes precedence below).
+    expected_risc0_hash: Option<alloy::primitives::B256>,
 ) -> Result<Vec<u8>> {
     let cache = zkminer_chain::programs::ElfCache::new();
     // Query the registry for the canonical content hash so we can verify cached
@@ -6984,9 +7149,13 @@ async fn fetch_or_download_elf(
         Ok(info) => info,
         Err(e) => {
             // Cache I/O (a read of up to MAX_ELF_BYTES plus a keccak over it) runs on a blocking
-            // thread so a large-ELF flood cannot stall the async runtime's worker threads.
+            // thread so a large-ELF flood cannot stall the async runtime's worker threads. Verify
+            // the cached bytes against the risc0 verified-keccak when we have one even here (registry
+            // down), so a swapped ELF that was somehow cached is still rejected; `None` otherwise
+            // (SP1 relies on `elf_hash`, which needs the now-unavailable registry).
+            let risc0_hash = expected_risc0_hash;
             let cache_read = cache.clone();
-            let cached = tokio::task::spawn_blocking(move || cache_read.get(&program_id, None))
+            let cached = tokio::task::spawn_blocking(move || cache_read.get(&program_id, risc0_hash))
                 .await
                 .ok()
                 .flatten();
@@ -7029,18 +7198,26 @@ async fn fetch_or_download_elf(
             info.status
         );
     }
-    // Verify a cached ELF against the SAME quantity the download enforces when it writes the cache:
-    // the program-wide elf_hash (download_elf below is passed info.elf_hash). elf_hash and the per-URI
-    // content_hash are independent, both submitter-controlled, so verifying the read against a per-URI
-    // content_hash that differs from elf_hash would make every cache read mismatch and re-download on
-    // every measure/claim/prove — a decoy content_hash would defeat the cache for free. Use elf_hash
-    // and nothing else: do NOT fall back to a per-URI content_hash when elf_hash is absent, since
-    // download_elf did not enforce that hash on the whole cached file either (only on the one URI it
-    // served, when that URI's hash was non-zero), so a decoy on a different URI would again force a
-    // re-download. elf_hash is absent only for a risc0 program (SP1 is refused without it); there the
-    // cached bytes are returned unverified, which is safe because risc0's image-id binds the bytes to
-    // the programId at execute and prove — a wrong cached ELF simply fails there, it cannot forge.
-    let expected_cache_hash = info.elf_hash;
+    // Verify a cached/downloaded ELF against the SAME quantity the download enforces when it writes
+    // the cache. For SP1 that is the program-wide registry `elf_hash` (mandatory; measure refuses an
+    // SP1 program without it). elf_hash and the per-URI content_hash are independent, both
+    // submitter-controlled, so verifying the read against a per-URI content_hash that differs from
+    // elf_hash would make every cache read mismatch and re-download on every measure/claim/prove — a
+    // decoy content_hash would defeat the cache for free. Do NOT fall back to a per-URI content_hash
+    // when elf_hash is absent, since download_elf did not enforce that hash on the whole cached file
+    // either (only on the one URI it served, when that URI's hash was non-zero), so a decoy on a
+    // different URI would again force a re-download.
+    //
+    // `elf_hash` is absent only for a risc0 program. There we fall back to `expected_risc0_hash` — the
+    // keccak captured when the measure worker image-id-verified this program's ELF, co-stored with the
+    // measurement this claim rides on and threaded in via the snapshot. It binds measure-ELF ==
+    // prove-ELF, so a post-measure swap is rejected HERE (cache purge + a download that fails every
+    // mismatching URI -> a clean fetch failure) rather than reaching prove as a penalized release +
+    // permanent blacklist. It is `None` on the measure/batch paths and when no real measurement binding
+    // exists — there the risc0 image-id check at execute/prove is the binding, as before this fix (a
+    // wrong cached ELF simply fails there, it cannot forge).
+    let integrity_hash = info.elf_hash.or(expected_risc0_hash);
+    let expected_cache_hash = integrity_hash;
     let cache_read = cache.clone();
     let cached = tokio::task::spawn_blocking(move || cache_read.get(&program_id, expected_cache_hash))
         .await
@@ -7061,7 +7238,7 @@ async fn fetch_or_download_elf(
             ),
         );
     }
-    let elf = zkminer_chain::programs::download_elf(&info.storage_uris, info.elf_hash)
+    let elf = zkminer_chain::programs::download_elf(&info.storage_uris, integrity_hash)
         .await
         .map_err(|e| anyhow::anyhow!("ELF download failed: {e:#}"))?;
     // Write the cache on a blocking thread (a disk write of up to MAX_ELF_BYTES plus a prune that
@@ -8146,6 +8323,90 @@ mod tests {
     }
 
     #[test]
+    fn planner_excludes_a_phantom_card_when_a_genuine_row_exists() {
+        // THE F2 CASE. gpu0 runs sp1; gpu1 has only a risc0 row (it cannot run sp1). The padded
+        // `throughputs_for_backend` would hand the planner BOTH cards for sp1 — gpu1 as a phantom
+        // idle slot at the global-slowest figure — and the planner would place bonded sp1 jobs
+        // against a card that can never prove them, over-admitting into a deadline-miss slash. The
+        // planner list must carry gpu0 ONLY.
+        let rows = vec![
+            ("gpu0".to_string(), "sp1".to_string(), 2_000_000.0),
+            ("gpu1".to_string(), "risc0".to_string(), 900_000.0),
+        ];
+        // Confirm the padded list (what the planner used to get) DOES include the phantom...
+        assert_eq!(
+            throughputs_for_backend(&rows, "sp1").len(),
+            2,
+            "padded list credits the phantom card (the bug)"
+        );
+        // ...and the planner list does NOT.
+        let got = planner_throughputs_for_backend(&rows, "sp1");
+        assert_eq!(
+            got,
+            vec![("gpu0".to_string(), 2_000_000.0)],
+            "planner must model only cards with a genuine sp1 row: {got:?}"
+        );
+    }
+
+    #[test]
+    fn planner_keeps_every_genuine_card_on_a_symmetric_rig() {
+        // Both cards have a real sp1 row: both are usable slots, at their own measured figures.
+        let rows = vec![
+            ("gpu0".to_string(), "sp1".to_string(), 2_000_000.0),
+            ("gpu1".to_string(), "sp1".to_string(), 1_400_000.0),
+        ];
+        let mut got = planner_throughputs_for_backend(&rows, "sp1");
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("gpu0".to_string(), 2_000_000.0),
+                ("gpu1".to_string(), 1_400_000.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn planner_falls_back_to_padded_list_when_no_genuine_row() {
+        // No card has an sp1 row at all: fall back to the padded list so a never-measured backend is
+        // sized conservatively rather than refused forever (NoUsableDevice for every sp1 job). This
+        // matches `throughputs_for_backend`, and the conservative-sizing floor keeps each estimate
+        // pessimistic.
+        let rows = vec![
+            ("gpu0".to_string(), "risc0".to_string(), 3_000_000.0),
+            ("gpu1".to_string(), "risc0".to_string(), 1_500_000.0),
+        ];
+        let got = planner_throughputs_for_backend(&rows, "sp1");
+        assert_eq!(got, throughputs_for_backend(&rows, "sp1"));
+        assert_eq!(got.len(), 2, "both cards present on the forever-refused fallback");
+    }
+
+    #[test]
+    fn planner_drops_a_zero_or_nonfinite_genuine_row() {
+        // A card with an sp1 row of 0.0 (or NaN) is not a usable slot: `plan_admission` cannot
+        // estimate on it. With a sibling genuine row present it is dropped outright — NOT padded,
+        // since `genuine` is non-empty — so it can neither be a phantom slot nor drag the fallback in.
+        let rows = vec![
+            ("gpu0".to_string(), "sp1".to_string(), 2_000_000.0),
+            ("gpu1".to_string(), "sp1".to_string(), 0.0),
+            ("gpu2".to_string(), "sp1".to_string(), f64::NAN),
+        ];
+        let got = planner_throughputs_for_backend(&rows, "sp1");
+        assert_eq!(
+            got,
+            vec![("gpu0".to_string(), 2_000_000.0)],
+            "only the finite, positive genuine row survives: {got:?}"
+        );
+    }
+
+    #[test]
+    fn planner_with_no_rows_at_all_is_empty() {
+        // Empty in -> empty out (-> NoUsableDevice -> not claimed this tick), same as the padded fn.
+        assert!(planner_throughputs_for_backend(&[], "sp1").is_empty());
+    }
+
+
+    #[test]
     fn resolve_backend_maps_known_proof_systems() {
         assert_eq!(
             resolve_backend(zkminer_chain::auction::risc_zero_v1_id()),
@@ -8599,7 +8860,7 @@ mod r2_sizing_tests {
 
         // A real measurement stores cycles AND peak in one value.
         const PEAK: u64 = 9 * 1024 * 1024 * 1024;
-        insert_measurement(&measured, "sp1", prog, ih, 5_000, PEAK);
+        insert_measurement(&measured, "sp1", prog, ih, 5_000, PEAK, None);
         assert_eq!(
             resolve_measured(&measured, &desc_input, "sp1", prog, desc),
             Some(5_000)
@@ -8622,6 +8883,79 @@ mod r2_sizing_tests {
         );
     }
 
+    // F1: the verified risc0 ELF keccak is co-stored with the measurement, so a claim that resolves a
+    // measurement ALWAYS gets its hash under one lock hold — it can never be evicted independently (the
+    // residual the independent-map design had).
+    #[test]
+    fn verified_elf_hash_co_resolves_with_the_measurement() {
+        let (measured, desc_input) = fresh();
+        let prog = B256::repeat_byte(0xE1);
+        let desc = B256::repeat_byte(0xE2);
+        let ih = keccak256(b"risc0-input");
+        insert_desc_input(&desc_input, desc, ih);
+
+        let elf_keccak = keccak256(b"the-verified-risc0-elf-bytes");
+        insert_measurement(&measured, "risc0", prog, ih, 42_000, 0, Some(elf_keccak));
+
+        // The hash rides out of the SAME resolve that makes the job claimable.
+        assert_eq!(
+            resolve_measured_with_hash(&measured, &desc_input, "risc0", prog, desc),
+            Some((42_000, Some(elf_keccak))),
+            "a claim resolving this measurement must receive its verified ELF hash"
+        );
+        // And the plain cycle resolve is unchanged.
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "risc0", prog, desc),
+            Some(42_000)
+        );
+    }
+
+    #[test]
+    fn verified_elf_hash_is_none_for_sp1_and_for_infeasible_verdicts() {
+        let (measured, desc_input) = fresh();
+        let prog = B256::repeat_byte(0xE3);
+        let desc = B256::repeat_byte(0xE4);
+        let ih = keccak256(b"sp1-input");
+        insert_desc_input(&desc_input, desc, ih);
+
+        // SP1 carries no co-stored hash (it is bound by the registry elf_hash instead).
+        insert_measurement(&measured, "sp1", prog, ih, 5_000, 7, None);
+        assert_eq!(
+            resolve_measured_with_hash(&measured, &desc_input, "sp1", prog, desc),
+            Some((5_000, None))
+        );
+
+        // A deterministic infeasible verdict (and the cycle-only insert path) carries no hash.
+        let desc2 = B256::repeat_byte(0xE5);
+        let ih2 = keccak256(b"infeasible-input");
+        insert_desc_input(&desc_input, desc2, ih2);
+        insert_measured(&measured, "risc0", prog, ih2, UNMEASURABLE_CYCLES);
+        assert_eq!(
+            resolve_measured_with_hash(&measured, &desc_input, "risc0", prog, desc2),
+            Some((UNMEASURABLE_CYCLES, None))
+        );
+    }
+
+    // A later cycle-only write to the SAME (program, input) replaces the whole entry, so a stale hash
+    // can never outlive the measurement it belonged to.
+    #[test]
+    fn a_cycle_only_rewrite_clears_a_previously_stored_hash() {
+        let (measured, desc_input) = fresh();
+        let prog = B256::repeat_byte(0xE6);
+        let desc = B256::repeat_byte(0xE7);
+        let ih = keccak256(b"rewrite-input");
+        insert_desc_input(&desc_input, desc, ih);
+
+        insert_measurement(&measured, "risc0", prog, ih, 10_000, 0, Some(keccak256(b"old")));
+        // A subsequent cycle-only write (e.g. an UNMEASURABLE verdict) replaces the merged entry.
+        insert_measured(&measured, "risc0", prog, ih, UNMEASURABLE_CYCLES);
+        assert_eq!(
+            resolve_measured_with_hash(&measured, &desc_input, "risc0", prog, desc),
+            Some((UNMEASURABLE_CYCLES, None)),
+            "the hash must follow the entry, not be stranded"
+        );
+    }
+
     // UNMEASURABLE TTL: a wall-clock-timeout verdict is dropped and re-measured after its TTL; every
     // deterministic / submitter-reachable one (cap trip / mismatch / over-cap / guest panic / ELF
     // fetch) is permanent.
@@ -8640,6 +8974,7 @@ mod r2_sizing_tests {
                 cycles: UNMEASURABLE_CYCLES,
                 peak_host_bytes: 0,
                 retry_after: Some(std::time::Instant::now() - Duration::from_secs(1)),
+                verified_elf_hash: None,
             },
         );
         assert_eq!(
