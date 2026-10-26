@@ -388,6 +388,25 @@ where
     map.insert(key, val);
 }
 
+/// Keep the `cap` HIGHEST-`key` elements of `v`, dropping the `len - cap` lowest in O(n) (a single
+/// `select_nth` partition); a no-op when already within `cap`. Reorders the retained elements, so the
+/// caller must not depend on `v`'s order afterwards. Used to bound the Open-candidate set by VALUE
+/// rather than by arrival age — see the `MAX_OPEN_JOBS` cap in the monitor ingest loop.
+fn retain_top_by_key<T, K, F>(v: &mut Vec<T>, cap: usize, key: F)
+where
+    K: Ord,
+    F: Fn(&T) -> K,
+{
+    if v.len() <= cap {
+        return;
+    }
+    let excess = v.len() - cap;
+    // Partition so the `excess` lowest-key elements occupy 0..excess (the pivot at excess-1 lands in
+    // its sorted position, everything before it is <=, everything after >=), then drop them.
+    v.select_nth_unstable_by(excess - 1, |a, b| key(a).cmp(&key(b)));
+    v.drain(0..excess);
+}
+
 /// Cap on both the measured-cycles and descriptor->input-hash maps. Each measured entry costs a full
 /// guest execution, so the cap is a backstop; the resolver map is cheap but bounded for the same
 /// reason.
@@ -1351,14 +1370,22 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                     });
                     // Bound the Open-candidate set. A submitter can post unboundedly
                     // many jobs and leave them Open; every brain tick reads them all via Multicall3
-                    // over the throttled RPC, so an uncapped list is a slow-RPC-starvation DoS. Drop
-                    // the OLDEST beyond the cap (forward-only arrival order) — a still-relevant job
-                    // reappears via the monitor, and stale ones are status-pruned anyway.
+                    // over the throttled RPC, so an uncapped list is a slow-RPC-starvation DoS.
+                    //
+                    // Evict the LEAST VALUABLE jobs (lowest current_price), NOT the oldest. This
+                    // monitor stream is forward-only with a one-shot backfill and no re-discovery (see
+                    // the ingest gate above and the candidate-loop notes), so an evicted Open job is
+                    // gone until some other event re-surfaces it — it does NOT "reappear via the
+                    // monitor" on its own. Dropping by arrival age therefore let a decoy flood
+                    // PERMANENTLY evict a legitimately high-value job that merely arrived early (an
+                    // over-block). Dropping the cheapest instead means a submitter can only push a
+                    // tracked job out by posting an even higher-priced one — which we would rather
+                    // claim, and which costs real on-chain collateral — so the most valuable candidates
+                    // are always retained. current_price here is the min_price captured at ingest, the
+                    // same signal the candidate loop ranks on (a job cancelled/claimed meanwhile is
+                    // pruned by the events below regardless).
                     const MAX_OPEN_JOBS: usize = 4096;
-                    if s.open_jobs.len() > MAX_OPEN_JOBS {
-                        let excess = s.open_jobs.len() - MAX_OPEN_JOBS;
-                        s.open_jobs.drain(0..excess);
-                    }
+                    retain_top_by_key(&mut s.open_jobs, MAX_OPEN_JOBS, |j| j.current_price);
                 }
                 // Event-driven pruning: a job claimed (by ANYONE — including our
                 // own claim, where this is an idempotent no-op) or cancelled is no longer
@@ -8613,6 +8640,32 @@ mod r2_sizing_tests {
             assert_eq!(m.len(), before);
             assert_eq!(m.get(&k), Some(&123));
         }
+    }
+
+    // F3: the Open-candidate cap must keep the HIGHEST-value jobs, so a decoy flood cannot evict a
+    // legitimately high-value job that merely arrived early.
+    #[test]
+    fn retain_top_by_key_keeps_the_highest_value_not_the_oldest() {
+        // (arrival-id, value). The high-value job (99) arrived FIRST; the rest are cheap decoys.
+        let mut v: Vec<(u8, u128)> = vec![(0, 99), (1, 1), (2, 2), (3, 3), (4, 4)];
+        retain_top_by_key(&mut v, 3, |&(_, price)| price);
+        assert_eq!(v.len(), 3);
+        let mut kept: Vec<u128> = v.iter().map(|&(_, p)| p).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![3, 4, 99], "must retain the 3 highest values");
+        assert!(
+            v.iter().any(|&(id, _)| id == 0),
+            "the high-value job that arrived first must survive the flood"
+        );
+    }
+
+    #[test]
+    fn retain_top_by_key_is_a_noop_within_cap() {
+        let mut v: Vec<u128> = vec![5, 1, 9];
+        retain_top_by_key(&mut v, 3, |&p| p);
+        assert_eq!(v.len(), 3);
+        retain_top_by_key(&mut v, 10, |&p| p);
+        assert_eq!(v.len(), 3, "cap above len leaves the vec untouched");
     }
 
     #[test]
