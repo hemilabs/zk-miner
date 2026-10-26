@@ -6,6 +6,31 @@ use std::time::Duration;
 
 use crate::tx::TX_RECEIPT_TIMEOUT;
 
+/// Outcome of a read-only `eth_call` simulation of `fulfillJob` (see
+/// [`ChainClient::simulate_fulfill_job`]). Lets the caller catch a job whose on-chain predicate
+/// (a non-zero `expectedJournalHash`) our proof does not satisfy BEFORE broadcasting a doomed
+/// fulfill that burns gas and eats the release window.
+#[derive(Debug)]
+pub enum FulfillSimulation {
+    /// The simulated `fulfillJob` returned without reverting — safe to broadcast.
+    WouldSucceed,
+    /// The simulation hit an execution revert (for a just-proved predicate job this is the
+    /// deterministic `JournalMismatch`). Carries the truncated error for logging.
+    WouldRevert(String),
+    /// The call could not be classified (a non-revert RPC/transport error). The caller FAILS OPEN
+    /// — proceeds to the real fulfill — so a transient RPC blip never over-blocks a job we could
+    /// actually fulfill. Carries the truncated error for logging.
+    Inconclusive(String),
+}
+
+/// True if `msg` (a formatted call error) indicates an on-chain EXECUTION REVERT rather than a
+/// transport/connection error. Conservative substring match, in the same spirit as the nonce-error
+/// matchers below: a revert reliably contains "revert"/"reverted", and our custom `JournalMismatch`
+/// error is not in the ABI bindings, so it surfaces as a generic execution revert (not by name).
+fn is_execution_revert(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("revert")
+}
+
 /// topic0 of the `JobFulfilled` event (see `bindings.rs`), computed like monitor.rs's other
 /// canonical topics so a change to the event signature is caught by a test rather than
 /// silently breaking the match.
@@ -1034,6 +1059,51 @@ impl ChainClient {
         }
     }
 
+    /// Read-only `eth_call` simulation of `fulfillJob` with our produced proof — a pre-fulfill
+    /// guard for PREDICATE jobs (a non-zero `expectedJournalHash`). The router runs its
+    /// journal-commitment predicate AFTER the verifier accepts and reverts `JournalMismatch`
+    /// (before any payment) when our journal does not satisfy it. We cannot recompute that
+    /// predicate host-side (the `JOURNAL_PREDICATE_DOMAIN_V1` constant is not vendored here), so we
+    /// let the router check it: a satisfiable predicate simulates clean
+    /// ([`FulfillSimulation::WouldSucceed`]); a baited/unsatisfiable one reverts
+    /// ([`FulfillSimulation::WouldRevert`]) so the caller can RELEASE now instead of broadcasting a
+    /// doomed fulfill. NO explicit gas limit is set, so the simulation isolates LOGICAL reverts
+    /// (the predicate / a verifier rejection) from gas effects; and for a just-proved job the
+    /// predicate is a pure function of our journal, so the simulation's verdict matches the real tx
+    /// with no state-drift false positive. A non-revert error is reported
+    /// [`FulfillSimulation::Inconclusive`] so the caller fails OPEN.
+    pub async fn simulate_fulfill_job(
+        &self,
+        job_id: B256,
+        descriptor: JobDescriptor,
+        public_values: Bytes,
+        proof_bytes: Bytes,
+    ) -> Result<FulfillSimulation> {
+        let fulfill = IHemiProveFulfill::new(self.hemi_prove, &*self.provider);
+        match fulfill
+            .fulfillJob(job_id, descriptor, public_values, proof_bytes)
+            .call()
+            .await
+        {
+            Ok(_) => Ok(FulfillSimulation::WouldSucceed),
+            Err(e) => {
+                let raw = format!("{e:#}");
+                // This is a HOSTILE-submitter-driven fulfillJob: a crafted callback/verifier revert
+                // reason can carry terminal-escape / bidi / CRLF bytes. SANITIZE at the source (the
+                // same `sanitize_log` discipline run.rs applies at every other error sink) so BOTH
+                // consumers are injection-safe — the caller's `WouldRevert` Err AND the in-place
+                // `Inconclusive` warn. `sanitize_log` also length-bounds. Classify on the RAW string
+                // so stripping can never change the revert verdict.
+                let msg = crate::programs::sanitize_log(&raw);
+                if is_execution_revert(&raw) {
+                    Ok(FulfillSimulation::WouldRevert(msg))
+                } else {
+                    Ok(FulfillSimulation::Inconclusive(msg))
+                }
+            }
+        }
+    }
+
     /// Fulfill a locked job. Robust to a flaky/inconsistent RPC that drops or
     /// hides txs: on a receipt timeout it polls on-chain state, and if the job is
     /// not yet Fulfilled it re-broadcasts with a freshly-fetched nonce and an
@@ -1838,10 +1908,44 @@ mod h4_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        escalated_fees, is_nonce_error, is_rate_limit_error, is_same_nonce_pending,
-        nonce_retry_backoff, MAX_TX_ATTEMPTS, NONCE_RETRY_UNIT, RELEASE_NONCE_RETRY_UNIT,
+        escalated_fees, is_execution_revert, is_nonce_error, is_rate_limit_error,
+        is_same_nonce_pending, nonce_retry_backoff, MAX_TX_ATTEMPTS, NONCE_RETRY_UNIT,
+        RELEASE_NONCE_RETRY_UNIT,
     };
+    use super::super::programs::sanitize_log;
     use std::time::Duration;
+
+    // The predicate pre-fulfill guard RELEASES (not fulfills) only when a simulated fulfillJob
+    // EXECUTION-reverts; a transport/connection error must stay Inconclusive so the caller fails
+    // OPEN and never over-blocks a job it could actually fulfill.
+    #[test]
+    fn execution_revert_classifier_matches_reverts_not_transport_errors() {
+        // Real revert shapes (geth/anvil/alloy) — must classify as a revert.
+        assert!(is_execution_revert("server returned an error response: execution reverted"));
+        assert!(is_execution_revert(
+            "execution reverted: custom error 0x1a2b3c4d"
+        ));
+        assert!(is_execution_revert("Contract call reverted with: JournalMismatch"));
+        // Transport / connectivity / timeouts — must NOT be read as a predicate failure.
+        assert!(!is_execution_revert("error sending request for url (http://rpc): connection refused"));
+        assert!(!is_execution_revert("request timed out"));
+        assert!(!is_execution_revert("deserialization error: EOF while parsing a value"));
+    }
+
+    // The simulation surfaces a HOSTILE-submitter-driven revert reason; `simulate_fulfill_job`
+    // sanitizes it at the source (via `sanitize_log`) so the in-place Inconclusive warn and the
+    // WouldRevert Err are both injection-safe. Lock in that the sanitizer strips the escape/CRLF
+    // bytes a crafted revert reason could carry, while preserving the "revert" word the classifier
+    // keys on (so sanitization never changes the WouldRevert vs Inconclusive verdict).
+    #[test]
+    fn simulation_error_strings_are_sanitized_for_the_operator_console() {
+        let hostile = "execution reverted: \x1b[2J\x1b]0;pwned\x07evil\r\nforged log line\u{202e}reversed";
+        let safe = sanitize_log(hostile);
+        assert!(!safe.contains('\x1b'), "ANSI/OSC escapes stripped");
+        assert!(!safe.contains('\r') && !safe.contains('\n'), "CRLF stripped (no forged lines)");
+        assert!(!safe.contains('\u{202e}'), "bidi override stripped (no Trojan-Source reorder)");
+        assert!(safe.contains("revert"), "the classifier keyword survives sanitization");
+    }
 
     /// The real ladder length and the real units, read from production rather than restated —
     /// hard-coding `5` and `100ms` here would make lowering either in production invisible to

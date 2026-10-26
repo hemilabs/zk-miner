@@ -4254,10 +4254,19 @@ async fn miner_brain(
             // always waits for a real number. The planner shares this: it needs a real number too.
             // (`backend_opt` was resolved above, before the estimate, for the backend-keyed lookup.)
             let backend_measurable = matches!(backend_opt, Some("risc0") | Some("sp1"));
+            // A claim requires a measurable backend. risc0 and sp1 both execute-size, so a claim
+            // waits for a REAL cycle count. A NON-measurable backend (only OpenVM today, and it is
+            // declined by default in `resolve_backend` unless ZKMINER_ENABLE_OPENVM=1) has no
+            // pre-claim measurement, so sizing would otherwise fall back to the submitter-DECLARED
+            // `expected_cycles` — an adversarial number. Refuse to make such a job claimable on that
+            // declaration alone: a hostile OpenVM job must not be bonded blind (unbounded prove ->
+            // deadline miss -> slash; and an in-process prove with no verified size -> host OOM) on a
+            // count we never verified. It becomes claimable only once a real pre-claim measurement
+            // path exists for that backend.
             let measurable = if backend_measurable {
                 measured_for_job.is_some()
             } else {
-                snapshot.expected_cycles > 0
+                false
             };
 
             // Not yet measured this exact (program, input)? Execute the guest in the
@@ -4586,7 +4595,9 @@ async fn miner_brain(
             // predicate gate (a descriptor fetch that skips a non-zero expectedJournalHash
             // job before locking). Batch claiming has no per-job predicate check, so it
             // must not be used while claim_predicate_jobs=false or we'd lock a predicate
-            // job the operator excluded. (Default claim_predicate_jobs=true → batch freely.)
+            // job the operator excluded. (Default claim_predicate_jobs=FALSE → `no_batch` is forced
+            // true here and we take the gated single-claim path; set claim_predicate_jobs=true to
+            // accept predicate jobs and batch freely.)
             let claim_predicate = state.read().await.runtime_settings.claim_predicate_jobs;
             let no_batch = std::env::var("ZKMINER_NO_BATCH_CLAIM").is_ok() || !claim_predicate;
             if batch.len() == 1 || no_batch {
@@ -6302,6 +6313,60 @@ async fn process_job_lifecycle(
         }
     }
 
+    // RISC Zero groth16 seals must be selector-prefixed for on-chain verification;
+    // the worker returns the bare 256-byte proof, so prepend the 4-byte selector.
+    let seal_bytes: Vec<u8> = if backend == "risc0" {
+        let selector = risc0_seal_selector();
+        let mut s = Vec::with_capacity(selector.len() + proof.seal.len());
+        s.extend_from_slice(&selector);
+        s.extend_from_slice(&proof.seal);
+        s
+    } else {
+        proof.seal.clone()
+    };
+
+    // Predicate pre-fulfill guard (hardening for the `claim_predicate_jobs=true` opt-in). A
+    // non-zero `expectedJournalHash` makes the router run a journal-commitment predicate AFTER the
+    // verifier accepts and revert `JournalMismatch` (before any payment) if our proof's journal
+    // does not satisfy it. We cannot recompute that predicate host-side (its domain constant is not
+    // vendored), so SIMULATE the real fulfillJob via eth_call: a satisfiable predicate simulates
+    // clean and we fulfill normally (never over-blocking honest work); a baited/unsatisfiable one
+    // reverts, so we RELEASE now — recovering collateral with the full deadline margin instead of
+    // broadcasting a doomed fulfill that burns gas and eats the release window. An inconclusive
+    // (non-revert) RPC error fails OPEN to the real fulfill; a stall becomes a release via the
+    // deadline budget. Scoped to predicate jobs, so the normal fulfill hot path is untouched.
+    if descriptor.expectedJournalHash != alloy_primitives::B256::ZERO {
+        let sim = with_deadline_budget(
+            lock_deadline,
+            "predicate fulfill simulation",
+            job_id,
+            client.simulate_fulfill_job(
+                job_id,
+                descriptor.clone(),
+                Bytes::from(proof.journal.clone()),
+                Bytes::from(seal_bytes.clone()),
+            ),
+        )
+        .await?;
+        match sim {
+            zkminer_chain::jobs::FulfillSimulation::WouldRevert(msg) => {
+                return Err(anyhow::anyhow!(
+                    "predicate job {}: fulfill simulation reverted ({msg}) — releasing to recover \
+                     collateral instead of broadcasting a doomed fulfill",
+                    short_id(job_id)
+                ));
+            }
+            zkminer_chain::jobs::FulfillSimulation::Inconclusive(msg) => {
+                tracing::warn!(
+                    "predicate job {}: fulfill simulation inconclusive ({msg}) — proceeding to \
+                     fulfill (fail-open)",
+                    short_id(job_id)
+                );
+            }
+            zkminer_chain::jobs::FulfillSimulation::WouldSucceed => {}
+        }
+    }
+
     // 11. Fulfill on-chain.
     journal_update(journal, |j| j.mark_fulfilling(job_id));
     {
@@ -6314,17 +6379,6 @@ async fn process_job_lifecycle(
             format!("Submitting fulfillment for {}...", short_id(job_id)),
         );
     }
-    // RISC Zero groth16 seals must be selector-prefixed for on-chain verification;
-    // the worker returns the bare 256-byte proof, so prepend the 4-byte selector.
-    let seal_bytes: Vec<u8> = if backend == "risc0" {
-        let selector = risc0_seal_selector();
-        let mut s = Vec::with_capacity(selector.len() + proof.seal.len());
-        s.extend_from_slice(&selector);
-        s.extend_from_slice(&proof.seal);
-        s
-    } else {
-        proof.seal.clone()
-    };
     // Pass the deadline budget INTO fulfill_job rather than wrapping the call in a
     // `tokio::time::timeout` that would DROP the future mid-flight — a dropped fulfill
     // never runs its give-up path, orphaning its nonce (a permanent gap) and failing to
