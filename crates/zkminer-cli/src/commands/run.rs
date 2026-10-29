@@ -407,6 +407,46 @@ where
     v.drain(0..excess);
 }
 
+/// Cap how many Open candidates any single `caller` (the submitter address) may occupy, dropping
+/// that caller's LOWEST-`current_price` jobs beyond `per_caller`. The global cap alone ranks purely
+/// on `current_price = min_price`, which the SUBMITTER chooses — so one hostile address could flood
+/// `>= MAX_OPEN_JOBS` high-priced jobs it will never let us claim and, because the monitor is
+/// forward-only with no re-discovery, PERMANENTLY evict every other submitter's work. Bounding each
+/// caller's footprint first means one address can only ever displace its OWN entries. A no-op (one
+/// O(n) pass) when every caller is within cap; otherwise O(n log n) in the over-cap callers' jobs.
+fn enforce_per_caller_cap(v: &mut Vec<TrackedJob>, per_caller: usize) {
+    use std::collections::{HashMap, HashSet};
+    let mut counts: HashMap<alloy::primitives::Address, usize> = HashMap::new();
+    for j in v.iter() {
+        *counts.entry(j.info.caller).or_insert(0) += 1;
+    }
+    // Cheap early-out: nobody is over the cap (the common case).
+    if counts.values().all(|&c| c <= per_caller) {
+        return;
+    }
+    // For each over-cap caller, drop all but its `per_caller` highest-priced jobs.
+    let mut by_caller: HashMap<alloy::primitives::Address, Vec<(u128, alloy::primitives::B256)>> =
+        HashMap::new();
+    for j in v.iter() {
+        by_caller
+            .entry(j.info.caller)
+            .or_default()
+            .push((j.current_price, j.info.job_id));
+    }
+    let mut to_drop: HashSet<alloy::primitives::B256> = HashSet::new();
+    for (_caller, mut jobs) in by_caller {
+        if jobs.len() <= per_caller {
+            continue;
+        }
+        // Highest price first; everything past `per_caller` is dropped.
+        jobs.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, jid) in jobs.into_iter().skip(per_caller) {
+            to_drop.insert(jid);
+        }
+    }
+    v.retain(|j| !to_drop.contains(&j.info.job_id));
+}
+
 /// Cap on both the measured-cycles and descriptor->input-hash maps. Each measured entry costs a full
 /// guest execution, so the cap is a backstop; the resolver map is cheap but bounded for the same
 /// reason.
@@ -487,7 +527,9 @@ fn insert_measurement(
 /// Insert a WALL-CLOCK-TIMEOUT UNMEASURABLE verdict with a retry deadline `UNMEASURABLE_RETRY_TTL`
 /// out, so a job that only timed out under transient host load is re-measured rather than blacklisted
 /// forever (the UNMEASURABLE TTL). Used ONLY for the wall-clock-timeout strike-out — every
-/// deterministic / submitter-reachable verdict uses permanent [`insert_measured`] instead.
+/// deterministic / submitter-reachable verdict uses permanent [`insert_measured`] instead. (The SP1
+/// "no registry elf_hash yet" decline is self-healing too, but via the program-keyed
+/// [`SP1_ELF_HASH_MISSING`] cooldown checked before the descriptor scan, not this (program,input) entry.)
 fn insert_unmeasurable(
     cache: &MeasuredCache,
     backend: &str,
@@ -541,6 +583,97 @@ fn desc_is_unfulfillable(desc_input: &DescInputCache, descriptor_hash: alloy::pr
     desc_input
         .lock()
         .map(|m| m.get(&descriptor_hash).map(|i| i.over_cap).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+/// Job ids whose submit transaction can NEVER be decoded into a JobDescriptor — the outer tx used an
+/// unrecognized selector (an integrator proxy / multicall wrapper) or calldata too short to carry one
+/// (see [`zkminer_chain::descriptor::UndecodableDescriptor`]). KEYED BY JOB ID, not by descriptorHash:
+/// undecodability is a property of THIS job's immutable submit tx, while the on-chain descriptorHash
+/// EXCLUDES the submitter (`compute_descriptor_hash` hashes only the 9 descriptor fields), so a
+/// DIFFERENT submitter can mint a job carrying a byte-identical descriptor. Keying by descriptorHash
+/// (as an earlier revision did, via the over-cap flag) let a proxy-wrapped decoy permanently EVICT an
+/// honest, fully-decodable job that merely shared that descriptor — a cross-job over-block. The unique
+/// job id skips only the undecodable job itself. Permanent (the submit tx is immutable) and bounded like
+/// the other brain maps so a flood of distinct decoys cannot grow the heap.
+static UNDECODABLE_JOBS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>>,
+> = std::sync::OnceLock::new();
+
+fn undecodable_jobs() -> &'static std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>>
+{
+    UNDECODABLE_JOBS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Record a job whose submit tx is permanently undecodable, so the candidate loop and the measure path
+/// skip it instead of re-running the (up to `DEFAULT_DESCRIPTOR_LOOKBACK_BLOCKS`) descriptor scan every
+/// tick over its whole open lifetime. See [`UNDECODABLE_JOBS`].
+fn mark_job_undecodable(job_id: alloy::primitives::B256) {
+    if let Ok(mut s) = undecodable_jobs().lock() {
+        if s.len() >= MEASURED_CYCLES_CAP && !s.contains(&job_id) {
+            if let Some(k) = s.iter().next().copied() {
+                s.remove(&k);
+            }
+        }
+        s.insert(job_id);
+    }
+}
+
+/// True if this job's submit tx was found permanently undecodable (see [`mark_job_undecodable`]).
+fn job_is_undecodable(job_id: alloy::primitives::B256) -> bool {
+    undecodable_jobs()
+        .lock()
+        .map(|s| s.contains(&job_id))
+        .unwrap_or(false)
+}
+
+/// How long an SP1 program observed with NO registry `elf_hash` is skipped before it is re-checked. A
+/// missing elf_hash is TEMPORAL, not permanent: `registerProgram` takes no elfHash argument (the chain
+/// cannot keccak an off-chain ELF), so the hash is set by a LATER call and a brand-new legit SP1 program
+/// reads `elfHash == ZERO` in the window before that. A PERMANENT negative-cache would over-block such a
+/// program for the whole process lifetime; this self-healing cooldown re-checks and heals once the hash
+/// appears. Program-keyed and consulted BEFORE the descriptor scan, so re-checking a flood of no-hash
+/// decoys costs at most one (mostly-cached) `get_program_info` per TTL each — never the heavy descriptor
+/// scan or an execute. (An earlier revision kept this TTL in the (program,input) measured cache AFTER
+/// the descriptor fetch, so every re-check re-ran the ~500k-block log scan: a sustained RPC DoS.)
+const SP1_ELF_HASH_RECHECK_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// programId -> `Instant` until which an SP1 program observed with no registry `elf_hash` is skipped.
+/// See [`SP1_ELF_HASH_RECHECK_TTL`]. Program-wide (the requirement does not depend on inputData), and
+/// bounded like the other brain maps.
+static SP1_ELF_HASH_MISSING: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, std::time::Instant>>,
+> = std::sync::OnceLock::new();
+
+fn sp1_elf_hash_missing_map(
+) -> &'static std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, std::time::Instant>>
+{
+    SP1_ELF_HASH_MISSING.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record that an SP1 program currently has no registry `elf_hash`, skipping it for a self-healing
+/// cooldown. See [`SP1_ELF_HASH_MISSING`].
+fn mark_sp1_elf_hash_missing(program_id: alloy::primitives::B256) {
+    if let Ok(mut m) = sp1_elf_hash_missing_map().lock() {
+        bounded_insert(
+            &mut m,
+            program_id,
+            std::time::Instant::now() + SP1_ELF_HASH_RECHECK_TTL,
+            MEASURED_CYCLES_CAP,
+        );
+    }
+}
+
+/// True if an SP1 program was recently observed with no registry `elf_hash` and is still within its
+/// re-check cooldown (see [`mark_sp1_elf_hash_missing`]). Self-healing: once the cooldown lapses this
+/// returns false and the program is re-checked (and re-measured if its hash has since been set).
+fn sp1_elf_hash_missing_recently(program_id: alloy::primitives::B256) -> bool {
+    sp1_elf_hash_missing_map()
+        .lock()
+        .map(|m| {
+            m.get(&program_id)
+                .is_some_and(|&until| std::time::Instant::now() < until)
+        })
         .unwrap_or(false)
 }
 
@@ -648,47 +781,204 @@ fn fulfill_payload_over_cap(
         > MAX_FULFILL_PAYLOAD_BYTES
 }
 
-/// Programs whose on-chain `programId` cannot be satisfied by the ELF the submitter serves: the prover
-/// derived the verifying key / image id and it did not equal `programId`, so EVERY job for this program
-/// fails at PROVE — after the collateral-locking claim — and releases at a penalty. SP1 cannot detect
-/// this before claiming (deriving the vkey needs the minutes-long `setup`, far over the measure
-/// watchdog), so the binding is only proven on the prove path. Recording a mismatch here caps the loss
-/// to the jobs already claimed in the batch in flight when its first prove faults — ONE claim WAVE, not
-/// a release penalty per submitted job: once marked, the claim gate, the measure gate, the batch-claim
-/// task, and each per-job lifecycle task all skip every future job for it. Write-once per bad program, read
-/// once per candidate per tick — a process-wide static like the other brain-wide flags in this module,
-/// bounded like the measured cache so a flood of distinct decoy programs cannot grow it. A legitimate
-/// program's vkey always equals its `programId`, so it is never listed and never skipped.
+/// `(programId, backend)` pairs whose on-chain `programId` cannot be satisfied by the ELF the submitter
+/// serves UNDER THAT BACKEND: the prover derived the verifying key / image id and it did not equal
+/// `programId`, so EVERY job for this program ON THIS BACKEND fails at PROVE — after the collateral-
+/// locking claim — and releases at a penalty. SP1 cannot detect this before claiming (deriving the vkey
+/// needs the minutes-long `setup`, far over the measure watchdog), so the binding is only proven on the
+/// prove path. Recording a mismatch here caps the loss to the jobs already claimed in the batch in flight
+/// when its first prove faults — ONE claim WAVE, not a release penalty per submitted job: once marked,
+/// the claim gate, the measure gate, the batch-claim task, and each per-job lifecycle task all skip every
+/// future job for it. Write-once per bad program, read once per candidate per tick — a process-wide static
+/// like the other brain-wide flags, bounded like the measured cache so a flood of distinct decoys cannot
+/// grow it.
+///
+/// KEYED BY BACKEND, not programId alone: `programId` and `proofSystemId` are INDEPENDENT, fully
+/// submitter-controlled fields (`resolve_backend` maps proofSystemId→backend with no binding to
+/// programId), and a risc0 image-id vs an SP1 vkey are different derivations of the same 32-byte space.
+/// Keying by programId alone let a decoy declare a LEGIT risc0 program's public `programId` V with
+/// `proofSystemId=sp1` and serve any valid SP1 ELF (vkey W != V, guaranteed — no collision): the SP1
+/// prove-path vkey gate correctly faults ProgramMismatch and would mark V, PERMANENTLY over-blocking the
+/// legit risc0 program under its real backend. The mismatch verdict is only authoritative for the backend
+/// it was derived under, so we key by it: marking (V, "sp1") never blocks the legit (V, "risc0"), and a
+/// legit program's ELF matches its programId under its OWN backend so (programId, its backend) is never
+/// listed. A given programId has real traffic under exactly one backend, so the extra key dimension never
+/// over-restricts honest work.
 static VKEY_MISMATCH_PROGRAMS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>>,
+    std::sync::Mutex<std::collections::HashSet<(alloy::primitives::B256, &'static str)>>,
 > = std::sync::OnceLock::new();
 
 fn vkey_mismatch_programs(
-) -> &'static std::sync::Mutex<std::collections::HashSet<alloy::primitives::B256>> {
+) -> &'static std::sync::Mutex<std::collections::HashSet<(alloy::primitives::B256, &'static str)>> {
     VKEY_MISMATCH_PROGRAMS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
-/// Record a program whose served ELF can never match its `programId` (a prove-path vkey/image-id
-/// mismatch), so the claim and measure gates skip every future job for it.
-fn mark_program_vkey_mismatch(program_id: alloy::primitives::B256) {
+/// Record a `(programId, backend)` whose served ELF can never match its `programId` UNDER THAT BACKEND,
+/// learned from the TYPED prove-path worker error (`WorkerProofError::is_program_mismatch`) —
+/// authoritative and permanent, so the claim and measure gates skip/evict every future job for it. NOTE:
+/// a pre-fulfill eth_call revert must NOT be recorded here — a revert is a non-authoritative,
+/// non-deterministic signal (a reorg, a router pause, or a load-balanced RPC serving pre-claim state all
+/// revert on a perfectly legitimate program), and a permanent breaker keyed on it would over-block honest
+/// work forever. A sim revert uses the self-healing [`mark_program_sim_reverted`] cooldown instead.
+fn mark_program_vkey_mismatch(program_id: alloy::primitives::B256, backend: &'static str) {
     if let Ok(mut s) = vkey_mismatch_programs().lock() {
-        // Bounded like the brain maps so a flood of distinct decoy programs cannot grow the heap.
-        if s.len() >= MEASURED_CYCLES_CAP && !s.contains(&program_id) {
+        let key = (program_id, backend);
+        // Bounded like the brain maps so a flood of distinct decoys cannot grow the heap.
+        if s.len() >= MEASURED_CYCLES_CAP && !s.contains(&key) {
             if let Some(k) = s.iter().next().copied() {
                 s.remove(&k);
             }
         }
-        s.insert(program_id);
+        s.insert(key);
     }
 }
 
-/// True if a prior prove proved this `programId`'s served ELF cannot satisfy it (see
-/// [`mark_program_vkey_mismatch`]). Such a program is permanently unclaimable.
-fn program_vkey_mismatched(program_id: alloy::primitives::B256) -> bool {
+/// True if a prior prove proved this `(programId, backend)`'s served ELF cannot satisfy it under that
+/// backend (see [`mark_program_vkey_mismatch`]). Permanently unclaimable for THAT backend only.
+fn program_vkey_mismatched(program_id: alloy::primitives::B256, backend: &'static str) -> bool {
     vkey_mismatch_programs()
         .lock()
-        .map(|s| s.contains(&program_id))
+        .map(|s| s.contains(&(program_id, backend)))
         .unwrap_or(false)
+}
+
+/// Convenience consult from a job's submitter-controlled `proofSystemId`: resolves the backend and
+/// checks the `(programId, backend)` breaker. An unsupported proof system (resolve_backend == None) is
+/// never claimed anyway (the backend gate skips it), so it is reported not-mismatched here.
+fn program_vkey_mismatched_for(
+    program_id: alloy::primitives::B256,
+    proof_system_id: alloy::primitives::B256,
+) -> bool {
+    resolve_backend(proof_system_id).is_some_and(|b| program_vkey_mismatched(program_id, b))
+}
+
+/// Cooldown for a pre-fulfill eth_call sim-revert verdict. A revert is NOT an authoritative,
+/// deterministic signal — a reorg that dropped our claim, a router pause window, an already-fulfilled
+/// retry race, or a load-balanced RPC serving a block BEFORE our claim mined (a hazard this codebase
+/// documents at `receipt_fulfilled_this_job`) all surface as `...reverted...` on a perfectly
+/// legitimate program/job. So a sim-revert breaker must SELF-HEAL: skip for the cooldown (so a
+/// genuinely-doomed flood is throttled to ~one claim+prove per window, not per job), then re-evaluate
+/// so a transient revert never permanently over-blocks honest work. Mirrors `ASSIGNED_ELSEWHERE_TTL`.
+const SIM_REVERT_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// `programId` -> `Instant` until which a NON-predicate job whose pre-fulfill simulation reverted is
+/// skipped. A non-predicate revert means the locally-valid proof was rejected on-chain — most likely
+/// the served ELF's vkey/image-id does not correspond to the on-chain `programId` on THIS deployment
+/// (a program-wide, deterministic defect: e.g. a reversed-byte-order programId the prover's both-orders
+/// check let through). We throttle rather than permanently poison because the eth_call revert alone
+/// cannot PROVE the cause is the vkey (vs. a transient chain-state revert above); the authoritative,
+/// permanent breaker remains the TYPED prove-path [`mark_program_vkey_mismatch`]. Program-wide key, so
+/// it is consultable on the descriptor-less candidate and batch-claim paths. Bounded like the brain maps.
+static SIM_REVERT_PROGRAMS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, std::time::Instant>>,
+> = std::sync::OnceLock::new();
+
+fn sim_revert_programs(
+) -> &'static std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, std::time::Instant>> {
+    SIM_REVERT_PROGRAMS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record a program whose NON-predicate pre-fulfill simulation reverted, throttling its future jobs
+/// for `SIM_REVERT_TTL` (see [`SIM_REVERT_PROGRAMS`]).
+fn mark_program_sim_reverted(program_id: alloy::primitives::B256) {
+    if let Ok(mut m) = sim_revert_programs().lock() {
+        bounded_insert(
+            &mut m,
+            program_id,
+            std::time::Instant::now() + SIM_REVERT_TTL,
+            MEASURED_CYCLES_CAP,
+        );
+    }
+}
+
+/// True if this program is still within its sim-revert cooldown. An expired entry returns false (and
+/// is dropped) so the program's jobs are re-evaluated once the transient condition may have cleared.
+fn program_sim_reverted_recently(program_id: alloy::primitives::B256) -> bool {
+    if let Ok(mut m) = sim_revert_programs().lock() {
+        if let Some(&until) = m.get(&program_id) {
+            if std::time::Instant::now() < until {
+                return true;
+            }
+            m.remove(&program_id);
+        }
+    }
+    false
+}
+
+/// `(programId, keccak256(inputData), expectedJournalHash)` tuples whose Phase-2 journal PREDICATE a
+/// real-proof pre-fulfill simulation showed unsatisfiable (`keccak(DOMAIN, proofSystemId, programId,
+/// journal)` != `expectedJournalHash`). Keyed by INPUT, not just `(programId, expectedJournalHash)`:
+/// satisfiability is a function of the committed journal, and the journal is a function of
+/// `(program, input)`, so the unsatisfiable condition is per-INPUT. Omitting input lets an attacker
+/// copy a legit predicate job's PUBLIC `(programId, expectedJournalHash)` verbatim (NO keccak collision
+/// needed), post a decoy with a DIFFERENT input that reverts, and thereby false-skip the legit,
+/// satisfiable job sharing that tuple. Including `keccak256(inputData)` confines a mark to the exact
+/// decoy input and still caps the real ⑤ flood (distinct jobIds sharing ONE unsatisfiable
+/// `(programId, input, expectedJournalHash)` while varying only price/deadline/tag). A COOLDOWN, not a
+/// permanent set: the revert signal is non-authoritative (see [`SIM_REVERT_PROGRAMS`]), so a transient
+/// revert on a satisfiable tuple self-heals rather than over-blocking it forever. Opt-in path only
+/// (`claim_predicate_jobs=true`; default off). Bounded like the other brain maps.
+type PredicateKey = (alloy::primitives::B256, alloy::primitives::B256, alloy::primitives::B256);
+
+static PREDICATE_UNSATISFIABLE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PredicateKey, std::time::Instant>>,
+> = std::sync::OnceLock::new();
+
+fn predicate_unsatisfiable_set(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PredicateKey, std::time::Instant>> {
+    PREDICATE_UNSATISFIABLE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record a `(programId, keccak256(inputData), expectedJournalHash)` whose on-chain journal predicate a
+/// real-proof fulfill simulation showed unsatisfiable, throttling it for `SIM_REVERT_TTL` so the claim
+/// gate skips siblings carrying the exact tuple (see [`PREDICATE_UNSATISFIABLE`]).
+fn mark_predicate_unsatisfiable(
+    program_id: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+    expected_journal_hash: alloy::primitives::B256,
+) {
+    if let Ok(mut m) = predicate_unsatisfiable_set().lock() {
+        bounded_insert(
+            &mut m,
+            (program_id, input_hash, expected_journal_hash),
+            std::time::Instant::now() + SIM_REVERT_TTL,
+            MEASURED_CYCLES_CAP,
+        );
+    }
+}
+
+/// True if this `(programId, keccak256(inputData), expectedJournalHash)` is still within its
+/// unsatisfiable-predicate cooldown. An expired entry returns false (and is dropped) so a tuple whose
+/// revert was transient is re-evaluated (see [`mark_predicate_unsatisfiable`]).
+fn predicate_unsatisfiable(
+    program_id: alloy::primitives::B256,
+    input_hash: alloy::primitives::B256,
+    expected_journal_hash: alloy::primitives::B256,
+) -> bool {
+    if let Ok(mut m) = predicate_unsatisfiable_set().lock() {
+        let key = (program_id, input_hash, expected_journal_hash);
+        if let Some(&until) = m.get(&key) {
+            if std::time::Instant::now() < until {
+                return true;
+            }
+            m.remove(&key);
+        }
+    }
+    false
+}
+
+/// True if the descriptor carries a SUBMITTER-CONTROLLED per-job field that can make `fulfillJob`
+/// revert for a reason OTHER than the program/predicate binding — a callback contract (which, in
+/// strict callback mode, reverts the fulfill when it rejects), crafted `extraVerifierData`, or
+/// `callbackExtraData`. A revert on such a job must NOT be attributed to the programId or the
+/// (programId, input, expectedJournalHash) tuple: an attacker could post a decoy carrying a LEGIT
+/// program's public programId and its legit ELF (the image-id / elf_hash bind passes — no forgery)
+/// plus a reverting lever, and thereby throttle the legit program/tuple that honest requesters share.
+/// Only a LEVER-FREE revert is attributable to the stable binding, so only those are negative-cached.
+fn descriptor_carries_revert_lever(d: &zkminer_contracts::bindings::JobDescriptor) -> bool {
+    d.callbackContract != alloy_primitives::Address::ZERO
+        || !d.extraVerifierData.is_empty()
+        || !d.callbackExtraData.is_empty()
 }
 
 // The verified risc0 ELF keccak is stored IN the measured-cycles cache entry (see
@@ -1303,6 +1593,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                     job_id,
                     program_id,
                     proof_system_id,
+                    caller,
                     min_price,
                     max_price,
                     fulfillment_timeout,
@@ -1341,7 +1632,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                         info: zkminer_chain::jobs::JobInfo {
                             job_id,
                             program_id,
-                            caller: alloy_primitives::Address::ZERO,
+                            caller,
                             status: 0, // Open
                             reopen_count: 0,
                             descriptor_hash: alloy_primitives::B256::ZERO,
@@ -1379,12 +1670,21 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                     // monitor" on its own. Dropping by arrival age therefore let a decoy flood
                     // PERMANENTLY evict a legitimately high-value job that merely arrived early (an
                     // over-block). Dropping the cheapest instead means a submitter can only push a
-                    // tracked job out by posting an even higher-priced one — which we would rather
-                    // claim, and which costs real on-chain collateral — so the most valuable candidates
-                    // are always retained. current_price here is the min_price captured at ingest, the
-                    // same signal the candidate loop ranks on (a job cancelled/claimed meanwhile is
-                    // pruned by the events below regardless).
+                    // tracked job out by posting an even higher-priced one.
+                    //
+                    // But current_price is the submitter's own `min_price`, so a single hostile caller
+                    // could flood >= MAX_OPEN_JOBS high-min_price jobs it can never let us claim
+                    // (assigned to its own second address, or an unprovable/over-cap ELF) and
+                    // PERMANENTLY evict every genuine job by advertised value alone. So enforce
+                    // PER-CALLER FAIRNESS first: no single caller address may hold more than
+                    // MAX_OPEN_JOBS_PER_CALLER of the set, so one address cannot crowd out other
+                    // submitters' work. (A Sybil flood across many funded addresses still costs gas +
+                    // a deposit per job per address and is the documented residual; a fully
+                    // Sybil-proof fix needs on-chain re-discovery or stake-weighting.) The global cap
+                    // then bounds the aggregate, still dropping the cheapest across whoever remains.
                     const MAX_OPEN_JOBS: usize = 4096;
+                    const MAX_OPEN_JOBS_PER_CALLER: usize = 512;
+                    enforce_per_caller_cap(&mut s.open_jobs, MAX_OPEN_JOBS_PER_CALLER);
                     retain_top_by_key(&mut s.open_jobs, MAX_OPEN_JOBS, |j| j.current_price);
                 }
                 // Event-driven pruning: a job claimed (by ANYONE — including our
@@ -3547,6 +3847,28 @@ async fn miner_brain(
             .unwrap_or(0)
             .saturating_sub(in_flight.values().copied().sum::<u128>());
 
+        // Worst-case risc0 po2 an operator `po2_overrides` entry forces this tick, so the CLAIM
+        // gate reserves the SAME host RAM the PROVE gate will. Host memory roughly DOUBLES per po2
+        // step (see `expected_host_peak_at_po2`), while the per-backend peak the claim gate reads is
+        // po2-BLIND. Without this a risc0 job fits the (baseline-po2) claim gate, is bonded, then can
+        // NEVER be admitted to prove at the override po2 (`can_admit`'s committed term is
+        // unsatisfiable at any free-memory level — raising `available` or preempting cannot lower the
+        // requested figure), so it burns the deadline as HostMemoryShortage and releases at a
+        // penalty. Reserving at the override po2 makes such a job fail the claim gate instead (free),
+        // not a release penalty. `None` (no risc0 override) leaves the figure at the baseline, so a
+        // box with no override is unaffected — no over-block. (The dynamic calibration path — a
+        // confident per-device po2 pick > baseline — is not reflected here; it is VRAM-bounded and,
+        // per `confident_po2_for_job`, rarely fires, so it remains a documented residual.)
+        let max_risc0_override_po2: Option<u8> = {
+            let s = state.read().await;
+            s.runtime_settings
+                .po2_overrides
+                .iter()
+                .filter(|((_, backend), _)| backend == "risc0")
+                .map(|(_, po2)| *po2)
+                .max()
+        };
+
         // Highest-priced open jobs first; skip any already in flight.
         let mut candidates: Vec<_> = open_jobs
             .iter()
@@ -3630,32 +3952,88 @@ async fn miner_brain(
             // (once resolved), so the prove path sizes its watchdog/VRAM/po2 on it, not on the
             // adversarial declared `expected_cycles`.
             let mut snapshot = JobStatusSnapshot::from_view(&view);
-            // Skip a descriptor whose fulfill payload a prior measurement found to be over the
+            // EVICT a descriptor whose fulfill payload a prior measurement found to be over the
             // on-chain cap: claiming+proving it would waste a full proof on a fulfill that is
-            // guaranteed to OOG-revert, then release at a penalty. Cheap per-tick re-check; the job
-            // stays in the open set in case the submitter re-submits it under a slimmer descriptor.
+            // guaranteed to OOG-revert, then release at a penalty. over_cap is keyed by THIS
+            // descriptor hash, which is immutable on-chain for this job_id, so the job can never
+            // become claimable — removing it from the Open set (rather than merely skipping) stops a
+            // flood of high-min_price over-cap decoys from permanently occupying the value-ranked
+            // retained slots and starving genuine work (a slimmer re-submission is a DIFFERENT
+            // descriptor hash = a different job_id that re-ingests on its own).
             if desc_is_unfulfillable(&desc_input_hash, snapshot.descriptor_hash) {
                 tracing::debug!(
-                    "Skipping {}: its fulfill payload exceeds the on-chain cap (journal + descriptor \
+                    "Evicting {}: its fulfill payload exceeds the on-chain cap (journal + descriptor \
                      + seal) — proving it would waste a proof on a guaranteed-revert fulfill",
+                    short_id(jid)
+                );
+                state.write().await.open_jobs.retain(|j| j.info.job_id != jid);
+                continue;
+            }
+            // EVICT a program whose served ELF can never satisfy its on-chain programId: a prior prove
+            // derived the verifying key / image id and it did not match, so EVERY job for this program
+            // fails AFTER the collateral-locking claim and releases at a penalty. SP1 cannot check this
+            // before claiming (deriving the vkey needs the minutes-long setup), so it is only learned on
+            // the TYPED prove-path worker error — recording it there caps the loss to the ONE claim wave
+            // already in flight (this claim gate, the batch-claim task, and each per-job lifecycle task
+            // all re-check the mark). The mismatch is program-wide, deterministic, and PERMANENT (the
+            // worker error cannot be forged by guest text), so remove the job from the Open set rather
+            // than merely skip it, so a flood of high-min_price mismatched decoys cannot permanently
+            // occupy the value-ranked retained slots and starve genuine work. A legitimate program's
+            // vkey always matches, so this never false-evicts real work.
+            if program_vkey_mismatched_for(job.info.program_id, snapshot.proof_system_id) {
+                tracing::debug!(
+                    "Evicting {}: its programId cannot be satisfied by the served ELF under this \
+                     backend (vkey/image-id mismatch seen on a prior prove) — any claim would waste a \
+                     proof and release at a penalty",
+                    short_id(jid)
+                );
+                state.write().await.open_jobs.retain(|j| j.info.job_id != jid);
+                continue;
+            }
+            // EVICT a job whose submit tx can never be decoded into a JobDescriptor (an integrator
+            // proxy / multicall wrapper, or calldata too short): without the descriptor we can run
+            // neither the pre-claim predicate gate nor the prove/fulfill, so it is permanently
+            // unclaimable. Keyed by the UNIQUE job_id — NOT the on-chain descriptorHash, which excludes
+            // the submitter and is shared with honest jobs carrying the same descriptor — so this evicts
+            // only the undecodable job itself, never an honest twin. Permanent (the submit tx is
+            // immutable); a re-submission is a different job_id that re-ingests on its own.
+            if job_is_undecodable(jid) {
+                tracing::debug!(
+                    "Evicting {}: its submit tx is undecodable (proxy/multicall wrapper or truncated \
+                     calldata) — its descriptor can never be reconstructed to prove/fulfill it",
+                    short_id(jid)
+                );
+                state.write().await.open_jobs.retain(|j| j.info.job_id != jid);
+                continue;
+            }
+            // SKIP (not evict) an SP1 program observed with no registry elf_hash yet. The elf_hash is set
+            // AFTER registration (registerProgram takes none), so its absence is TEMPORAL — a permanent
+            // evict would drop a legit program whose hash appears later (the monitor is forward-only and
+            // never re-ingests). The self-healing cooldown is consulted HERE, before any measure spawn,
+            // so a flood of no-hash decoys never reaches the heavy descriptor scan in the measure path;
+            // once the cooldown lapses the job is re-evaluated (and claimed if the hash has been set).
+            if resolve_backend(snapshot.proof_system_id) == Some("sp1")
+                && sp1_elf_hash_missing_recently(job.info.program_id)
+            {
+                tracing::trace!(
+                    "Skipping {} this tick: its SP1 program has no registry elf_hash yet (re-check \
+                     pending)",
                     short_id(jid)
                 );
                 continue;
             }
-            // Skip a program whose served ELF can never satisfy its on-chain programId: a prior prove
-            // derived the verifying key / image id and it did not match, so EVERY job for this program
-            // fails at prove AFTER the collateral-locking claim and releases at a penalty. SP1 cannot
-            // check this before claiming (deriving the vkey needs the minutes-long setup), so it is only
-            // learned on the prove path — recording it there caps the loss to the ONE claim wave already
-            // in flight when its first prove faults (this claim gate, the batch-claim task, and each
-            // per-job lifecycle task all re-check the mark), not a release penalty per job. (The job stays
-            // in the open set; the check is a cheap per-tick lookup. A legitimate program's vkey always
-            // matches, so this never false-skips real work.)
-            if program_vkey_mismatched(job.info.program_id) {
+            // SKIP (not evict) a program whose NON-predicate pre-fulfill simulation reverted recently.
+            // Unlike the vkey mismatch above, an eth_call revert is non-authoritative and may be
+            // TRANSIENT (reorg / router pause / stale load-balanced RPC) on a legitimate program, so the
+            // breaker is a self-healing cooldown: skip while it is live (throttling a genuinely-doomed
+            // program's flood to ~one claim+prove per window) and KEEP the job in the Open set so it is
+            // re-evaluated once the cooldown expires — evicting it would permanently drop honest work on
+            // a transient blip (the monitor is forward-only and never re-ingests).
+            if program_sim_reverted_recently(job.info.program_id) {
                 tracing::debug!(
-                    "Skipping {}: its programId cannot be satisfied by the served ELF (vkey/image-id \
-                     mismatch seen on a prior prove) — any claim would waste a proof and release at a \
-                     penalty",
+                    "Skipping {} this tick: its program's fulfill simulation reverted recently — \
+                     throttling re-claim until the cooldown clears (may be a transient chain-state \
+                     revert, so not evicted)",
                     short_id(jid)
                 );
                 continue;
@@ -3796,7 +4174,15 @@ async fn miner_brain(
                     }
                     if !sim_mode {
                         if let Some(pool) = zkminer_prover::engine::worker_pool() {
-                            let want = pool.expected_host_peak(backend);
+                            // Reserve for the po2 the PROVE gate will actually use, not the
+                            // po2-blind baseline — otherwise a risc0 job under an operator po2
+                            // override is claimed here but can never be admitted to prove, and
+                            // releases at a penalty (see `max_risc0_override_po2`).
+                            let want = if backend == "risc0" {
+                                pool.expected_host_peak_at_po2(backend, max_risc0_override_po2)
+                            } else {
+                                pool.expected_host_peak(backend)
+                            };
                             // `in_flight` — claims outstanding, spawned or not — and the real
                             // concurrency bound. NOT a per-tick accumulator: claimed jobs prove
                             // SEQUENTIALLY, so the memory a set of claims can demand at once is
@@ -4295,9 +4681,9 @@ async fn miner_brain(
                 && measured_for_job.is_none()
                 && matches!(eval.recommendation, Recommendation::Claim)
                 // Don't spend a measure slot on a program a prior prove already proved unclaimable
-                // (its served ELF's vkey/image-id can never match its programId); the claim gate skips
-                // it anyway.
-                && !program_vkey_mismatched(pid)
+                // under this backend (its served ELF's vkey/image-id can never match its programId);
+                // the claim gate skips it anyway.
+                && !program_vkey_mismatched_for(pid, snapshot.proof_system_id)
                 // Don't re-spawn a measure task (descriptor fetch + return) every tick for a job the
                 // submitter exclusively assigned to ANOTHER prover; skip it for a cooldown so it cannot
                 // monopolize the per-tick measure budget. Time-bounded, since exclusivity expires.
@@ -4590,16 +4976,24 @@ async fn miner_brain(
             // the endpoint is healthy again → decay the escalated claim-pause window to base.
             claim_backoff_mult = 1;
             last_storm_seen = None;
-            // Force the single-claim path (which claims inside the lifecycle task) when
-            // the operator opted OUT of predicate jobs: only that path runs the
-            // predicate gate (a descriptor fetch that skips a non-zero expectedJournalHash
-            // job before locking). Batch claiming has no per-job predicate check, so it
-            // must not be used while claim_predicate_jobs=false or we'd lock a predicate
-            // job the operator excluded. (Default claim_predicate_jobs=FALSE → `no_batch` is forced
-            // true here and we take the gated single-claim path; set claim_predicate_jobs=true to
-            // accept predicate jobs and batch freely.)
-            let claim_predicate = state.read().await.runtime_settings.claim_predicate_jobs;
-            let no_batch = std::env::var("ZKMINER_NO_BATCH_CLAIM").is_ok() || !claim_predicate;
+            // ALWAYS take the single-claim path (which claims inside the lifecycle task). The batch
+            // path (claimJobBatch) cannot run the two per-job PRE-CLAIM gates the single-claim lifecycle
+            // runs BEFORE locking collateral — both need a descriptor fetch the descriptor-less batch
+            // path does not do:
+            //   * the predicate gate: skip a non-zero expectedJournalHash job when claim_predicate_jobs
+            //     is OFF (so the operator's opt-out is honored), and
+            //   * the predicate-UNSATISFIABLE tuple breaker: skip a (programId, input, expectedJournalHash)
+            //     a prior real fulfill proved unsatisfiable.
+            // Batch-claiming a job either gate would skip bonds collateral that is then voluntarily
+            // released at a 5% floor penalty (RELEASE_PENALTY_FLOOR_BPS) — and because the pre-PROVE
+            // predicate gate releases in SECONDS (no prove runs), a same-tuple predicate-bait flood under
+            // claim_predicate_jobs=true could bleed that penalty at CLAIM-rate, not prove-rate. Batch was
+            // only ever enabled when claim_predicate_jobs=true, i.e. exactly when the tuple breaker is
+            // needed, so batching is unsafe precisely where it ran — disable it under the hostile-
+            // submitter model. Single-claim is the well-tested per-job path and runs both gates before
+            // any bond, so a doomed job costs nothing. (ZKMINER_NO_BATCH_CLAIM is retained as the
+            // documented escape hatch, now redundant since batching is always off.)
+            let no_batch = true;
             if batch.len() == 1 || no_batch {
                 // Single job (or escape hatch): the well-tested per-job path claims
                 // inside the lifecycle task (already_locked=false).
@@ -4706,18 +5100,31 @@ async fn miner_brain(
                     let mut jids = jids;
                     let mut batch_jobs = batch_jobs;
 
-                    // Re-check the vkey/image-id mismatch negative-cache HERE, before the ELF fetches
-                    // and the claim. A concurrent sibling's prove can mark a program unclaimable AFTER
-                    // the brain's claim gate evaluated these candidates but BEFORE this background task
-                    // locks collateral; dropping such jobs now stops a decoy program from locking a
-                    // SECOND batch once its first batch's prove has already proved it unprovable. Cheap
-                    // in-memory lookup, so it runs before the (networked) ELF-obtainability check below.
-                    // Mirrors the unobtainable-drop that follows: drop — never re-queue to open_jobs —
-                    // so it cannot form a collect->reserve-slot->re-queue loop.
+                    // Re-check the PERMANENT vkey/image-id mismatch negative-cache HERE, before the ELF
+                    // fetches and the claim. It is program-keyed, so it is consultable on this
+                    // descriptor-less batch path. A concurrent sibling's prove can mark a program
+                    // unprovable AFTER the brain's claim gate evaluated these candidates but BEFORE this
+                    // background task locks collateral; dropping such jobs now stops a decoy program from
+                    // locking a SECOND batch once its first batch's prove has already proved it
+                    // unprovable. Cheap in-memory lookup, so it runs before the (networked) ELF-
+                    // obtainability check below. Mirrors the unobtainable-drop that follows: drop —
+                    // never re-queue to open_jobs — so it cannot form a collect->reserve-slot->re-queue
+                    // loop; the candidate loop evicts a vkey mismatch next tick.
+                    //
+                    // The SELF-HEALING sim-revert cooldown is deliberately NOT checked here: it must not
+                    // use this drop-FOREVER path (the job is already out of open_jobs from collection, so
+                    // a batch drop never re-ingests under the forward-only monitor — defeating the
+                    // cooldown's self-heal and losing legit work on a transient revert). The candidate
+                    // loop's SKIP-not-evict (program_sim_reverted_recently) is its enforcement point; a
+                    // job that was collected into THIS batch before its program was marked simply
+                    // proceeds to claim+prove and, if it reverts, is re-marked + released — a bounded
+                    // one-wave cost, not a permanent loss.
                     {
                         let drop_mismatch: std::collections::HashSet<B256> = batch_jobs
                             .iter()
-                            .filter(|(job, _, _)| program_vkey_mismatched(job.info.program_id))
+                            .filter(|(job, snapshot, _)| {
+                                program_vkey_mismatched_for(job.info.program_id, snapshot.proof_system_id)
+                            })
                             .map(|(job, _, _)| job.info.job_id)
                             .collect();
                         if !drop_mismatch.is_empty() {
@@ -5299,10 +5706,10 @@ async fn process_job_lifecycle(
     // of letting spawn-window stragglers lock still more collateral. Fresh jobs only: a recovery job
     // already holds its lock and MUST be driven to prove→release by the normal path (its prove faults
     // terminally and `release_and_clean` frees the collateral) — bailing here would strand it to a slash.
-    if !is_recovery && program_vkey_mismatched(program_id) {
+    if !is_recovery && program_vkey_mismatched_for(program_id, snapshot.proof_system_id) {
         tracing::debug!(
-            "Dropping {} before claim: its program's served ELF cannot satisfy its programId \
-             (vkey/image-id mismatch seen on a prior prove) — nothing locked",
+            "Dropping {} before claim: its program's served ELF cannot satisfy its programId under \
+             this backend (vkey/image-id mismatch seen on a prior prove) — nothing locked",
             short_id(job_id)
         );
         let mut s = state.write().await;
@@ -5317,24 +5724,27 @@ async fn process_job_lifecycle(
     //    collateral. Recovery jobs are already locked, so they are never skipped.
     if !is_recovery {
         let claim_predicate = state.read().await.runtime_settings.claim_predicate_jobs;
-        if !claim_predicate {
-            // Bound this pre-claim fetch: the job is already out of `open_jobs` and
-            // holds an in_flight slot, so a black-holing storage URI here would wedge
-            // that concurrency slot forever (the SlotGuard only fires when the task
-            // ends). An open job's lock_deadline is 0, so this uses FETCH_FALLBACK_TIMEOUT.
-            // Checked fetch: fast path via the monitor-cached submit tx, and the
-            // descriptor is HASH-VERIFIED before the gate acts on expectedJournalHash — an
-            // unverified, wrongly-decoded descriptor could otherwise silently skip a good job
-            // or claim an excluded one.
-            let descriptor = with_deadline_budget(
-                snapshot.lock_deadline,
-                "predicate descriptor fetch",
-                job_id,
-                fetch_job_descriptor_checked(client, job_id, snapshot.descriptor_hash),
-            )
-            .await;
-            match descriptor {
-                Ok(d) if d.expectedJournalHash != alloy_primitives::B256::ZERO => {
+        // Bound this pre-claim fetch: the job is already out of `open_jobs` and
+        // holds an in_flight slot, so a black-holing storage URI here would wedge
+        // that concurrency slot forever (the SlotGuard only fires when the task
+        // ends). An open job's lock_deadline is 0, so this uses FETCH_FALLBACK_TIMEOUT.
+        // Checked fetch: fast path via the monitor-cached submit tx, and the
+        // descriptor is HASH-VERIFIED before the gate acts on expectedJournalHash — an
+        // unverified, wrongly-decoded descriptor could otherwise silently skip a good job
+        // or claim an excluded one. (In the default config `claim_predicate=false` this fetch
+        // ran for every job already; `claim_predicate=true` now also fetches here so the
+        // known-unsatisfiable-predicate breaker below can act — an opt-in-only cost.)
+        let descriptor = with_deadline_budget(
+            snapshot.lock_deadline,
+            "predicate descriptor fetch",
+            job_id,
+            fetch_job_descriptor_checked(client, job_id, snapshot.descriptor_hash),
+        )
+        .await;
+        match descriptor {
+            Ok(d) if d.expectedJournalHash != alloy_primitives::B256::ZERO => {
+                if !claim_predicate {
+                    // Predicate claiming is disabled — skip BEFORE locking collateral.
                     let mut s = state.write().await;
                     s.open_jobs.retain(|j| j.info.job_id != job_id);
                     s.add_log(
@@ -5346,19 +5756,45 @@ async fn process_job_lifecycle(
                     );
                     return Ok(());
                 }
-                Ok(_) => {} // non-predicate job — proceed to claim
-                // The gate's skip decision now rides on a hash-VERIFIED fetch, so
-                // if the descriptor can't be verified (unreadable, or a future
-                // descriptor-hash-formula drift) it degrades to "claim". That is safe today
-                // (the formula is consistent; a mis-decoded predicate job is caught by the
-                // unconditional step-6 verify → release), but it silently disables the
-                // exclusion — so make it observable rather than mysterious.
-                Err(e) => tracing::warn!(
-                    "predicate gate: descriptor for {} unverifiable ({e:#}); claiming despite \
-                     claim_predicate_jobs=false — predicate exclusion is not filtering this job",
-                    short_id(job_id)
-                ),
+                // Predicate claiming is ENABLED, but a prior real-proof fulfill simulation already
+                // showed this (programId, keccak256(inputData), expectedJournalHash) predicate
+                // unsatisfiable — claiming again would bond collateral, burn a full proof, and release
+                // at a penalty for a guaranteed `JournalMismatch`. Skip it, throttling a predicate-bait
+                // flood (distinct jobIds sharing the exact unsatisfiable tuple) for the cooldown window.
+                // Keyed by INPUT so a decoy copying a legit job's public (programId, expectedJournalHash)
+                // with a different input cannot false-skip the legit, satisfiable job (see
+                // `mark_predicate_unsatisfiable`).
+                if predicate_unsatisfiable(
+                    d.programId,
+                    alloy::primitives::keccak256(&d.inputData),
+                    d.expectedJournalHash,
+                ) {
+                    let mut s = state.write().await;
+                    s.open_jobs.retain(|j| j.info.job_id != job_id);
+                    s.add_log(
+                        LogLevel::Info,
+                        format!(
+                            "Skipping predicate job {}: its (programId, input, expectedJournalHash) \
+                             predicate was shown unsatisfiable by a recent real-proof fulfill \
+                             simulation — any claim would waste a proof and release at a penalty",
+                            short_id(job_id)
+                        ),
+                    );
+                    return Ok(());
+                }
             }
+            Ok(_) => {} // non-predicate job — proceed to claim
+            // The gate's skip decision now rides on a hash-VERIFIED fetch, so
+            // if the descriptor can't be verified (unreadable, or a future
+            // descriptor-hash-formula drift) it degrades to "claim". That is safe today
+            // (the formula is consistent; a mis-decoded predicate job is caught by the
+            // unconditional step-6 verify → release), but it silently disables the
+            // exclusion — so make it observable rather than mysterious.
+            Err(e) => tracing::warn!(
+                "predicate gate: descriptor for {} unverifiable ({e:#}); claiming despite the \
+                 predicate gate — predicate exclusion is not filtering this job",
+                short_id(job_id)
+            ),
         }
     }
 
@@ -5490,7 +5926,7 @@ async fn process_job_lifecycle(
     // a fresh claim whenever the job still reads open. Confirm ownership: if we already hold it, fall
     // through and drive it to prove->release (never stranded); if we do NOT hold it, leave it (the
     // breadcrumb stays for the abandon path) rather than locking new collateral on a dead-end program.
-    if is_recovery && program_vkey_mismatched(program_id) {
+    if is_recovery && program_vkey_mismatched_for(program_id, snapshot.proof_system_id) {
         let held = matches!(
             client.get_job_status_view(job_id).await,
             Ok(v) if v.prover == client.address
@@ -5699,6 +6135,32 @@ async fn process_job_lifecycle(
     let pool = zkminer_prover::engine::worker_pool()
         .ok_or_else(|| anyhow::anyhow!("no worker pool available"))?;
     let input_bytes: Vec<u8> = descriptor.inputData.to_vec();
+
+    // Pre-PROVE predicate breaker (closes the batch/recovery bypass of the pre-claim gate at the
+    // `!is_recovery` step-0 check). A batch-claimed predicate job reaches here with is_recovery=true,
+    // so it NEVER consulted the pre-claim `predicate_unsatisfiable` gate; without this check a
+    // predicate-bait flood would pay a full Groth16 proof per decoy even after a sibling recorded the
+    // tuple unsatisfiable. The collateral is already bonded on this path (the batch claim ran), but
+    // releasing now — BEFORE the minutes-long prove — recovers it with the full deadline margin (a
+    // pre-deadline release is the collateral rescue, not a slash) and skips the dominant GPU cost,
+    // capping the flood's expensive work to ~one prove per cooldown window. Keyed by INPUT, so it
+    // only skips the exact doomed tuple; a legitimate, satisfiable predicate job was never recorded
+    // (it simulates clean) and so is never skipped here. Also closes the single-claim TOCTOU gap
+    // where a sibling marks the tuple between the pre-claim gate and here.
+    if descriptor.expectedJournalHash != alloy_primitives::B256::ZERO
+        && predicate_unsatisfiable(
+            descriptor.programId,
+            alloy::primitives::keccak256(&descriptor.inputData),
+            descriptor.expectedJournalHash,
+        )
+    {
+        return Err(anyhow::anyhow!(
+            "job {}: its (programId, input, expectedJournalHash) predicate was shown unsatisfiable by \
+             a recent real-proof fulfill simulation — releasing to recover collateral instead of \
+             burning a proof on a guaranteed `JournalMismatch`",
+            short_id(job_id)
+        ));
+    }
 
     // Size the watchdog / VRAM routing / po2 on the quantity admission used — the
     // MEASURED count — not the adversarial declared `expected_cycles`. See `prove_sizing_cycles`.
@@ -6146,7 +6608,11 @@ async fn process_job_lifecycle(
                     // identically. Typed, so
                     // guest-controlled error text can never forge it.
                     if worker_err.map(|w| w.is_program_mismatch()).unwrap_or(false) {
-                        mark_program_vkey_mismatch(program_id);
+                        // Key by the BACKEND that derived the mismatch: a risc0 image-id and an SP1
+                        // vkey are different derivations, and proofSystemId is submitter-controlled, so
+                        // marking programId alone would let an SP1-declared decoy carrying a legit risc0
+                        // programId permanently over-block that program under risc0 (and vice versa).
+                        mark_program_vkey_mismatch(program_id, backend);
                         return Err(anyhow::anyhow!(
                             "proving stopped for {} (served ELF's vkey/image-id does not match its \
                              programId — program is unprovable; skipping its future jobs): {msg}",
@@ -6325,47 +6791,27 @@ async fn process_job_lifecycle(
         proof.seal.clone()
     };
 
-    // Predicate pre-fulfill guard (hardening for the `claim_predicate_jobs=true` opt-in). A
-    // non-zero `expectedJournalHash` makes the router run a journal-commitment predicate AFTER the
-    // verifier accepts and revert `JournalMismatch` (before any payment) if our proof's journal
-    // does not satisfy it. We cannot recompute that predicate host-side (its domain constant is not
-    // vendored), so SIMULATE the real fulfillJob via eth_call: a satisfiable predicate simulates
-    // clean and we fulfill normally (never over-blocking honest work); a baited/unsatisfiable one
-    // reverts, so we RELEASE now — recovering collateral with the full deadline margin instead of
-    // broadcasting a doomed fulfill that burns gas and eats the release window. An inconclusive
-    // (non-revert) RPC error fails OPEN to the real fulfill; a stall becomes a release via the
-    // deadline budget. Scoped to predicate jobs, so the normal fulfill hot path is untouched.
-    if descriptor.expectedJournalHash != alloy_primitives::B256::ZERO {
-        let sim = with_deadline_budget(
-            lock_deadline,
-            "predicate fulfill simulation",
-            job_id,
-            client.simulate_fulfill_job(
-                job_id,
-                descriptor.clone(),
-                Bytes::from(proof.journal.clone()),
-                Bytes::from(seal_bytes.clone()),
-            ),
-        )
-        .await?;
-        match sim {
-            zkminer_chain::jobs::FulfillSimulation::WouldRevert(msg) => {
-                return Err(anyhow::anyhow!(
-                    "predicate job {}: fulfill simulation reverted ({msg}) — releasing to recover \
-                     collateral instead of broadcasting a doomed fulfill",
-                    short_id(job_id)
-                ));
-            }
-            zkminer_chain::jobs::FulfillSimulation::Inconclusive(msg) => {
-                tracing::warn!(
-                    "predicate job {}: fulfill simulation inconclusive ({msg}) — proceeding to \
-                     fulfill (fail-open)",
-                    short_id(job_id)
-                );
-            }
-            zkminer_chain::jobs::FulfillSimulation::WouldSucceed => {}
-        }
-    }
+    // Capture the fields needed to throttle a DOOMED program/tuple, computed BEFORE `descriptor` is
+    // moved into `fulfill_job` below. We do NOT pre-simulate via eth_call anymore: a pre-fulfill
+    // eth_call runs against whatever block a (possibly load-balanced) RPC serves, so a stale/pre-claim
+    // or reorged view returns a spurious "execution reverted" for a job we actually hold and could
+    // fulfill — abandoning a fully-proved job and (worse) throttling its whole program on a transient
+    // blip. Instead we ATTEMPT the real fulfill and throttle only on its AUTHORITATIVE on-chain
+    // outcome (see the `fulfill_result` error arm below): a reverting fulfill is the ground-truth
+    // signal, and a transient revert self-heals because the NEXT attempt simply succeeds.
+    //
+    // `no_lever`: the fulfillJob revert must be attributable to the PROGRAM/PREDICATE binding, NOT to
+    // a submitter-controlled per-job field, or an attacker could post a decoy that carries a LEGIT
+    // program's public programId + its legit ELF (the image-id / elf_hash bind passes — no forgery)
+    // and a reverting callback / crafted extraVerifierData, making the fulfill revert on that per-job
+    // cause and thereby throttling the legit program/tuple that honest requesters share. So we record
+    // a revert ONLY when the descriptor carries no such lever (no callback contract, no extra verifier
+    // data, no callback extra data); a levered job is still released, it just poisons nothing.
+    let fulfill_program_id = descriptor.programId;
+    let fulfill_is_predicate = descriptor.expectedJournalHash != alloy_primitives::B256::ZERO;
+    let fulfill_expected_journal = descriptor.expectedJournalHash;
+    let fulfill_input_hash = alloy::primitives::keccak256(&descriptor.inputData);
+    let fulfill_no_lever = !descriptor_carries_revert_lever(&descriptor);
 
     // 11. Fulfill on-chain.
     journal_update(journal, |j| j.mark_fulfilling(job_id));
@@ -6395,6 +6841,25 @@ async fn process_job_lifecycle(
         )
         .await;
     if let Err(e) = fulfill_result {
+        // AUTHORITATIVE throttle: the real fulfillJob was rejected on-chain. If this was an EXECUTION
+        // revert (not a transport error) AND the descriptor carried no submitter-controlled per-job
+        // revert lever, the rejection is attributable to the program/predicate binding, so throttle
+        // future siblings to cap a doomed-job flood (see the `no_lever` note above). A transport
+        // error (RPC down) is NOT a revert, so `is_execution_revert` is false and nothing is thrown —
+        // a transient blip never throttles. A transient EXECUTION revert (router pause, reorg) throttles
+        // for SIM_REVERT_TTL and SELF-HEALS. The mark feeds the candidate-loop skip, the batch drop,
+        // and (predicate) the pre-claim + pre-prove gates, so the expensive re-prove is what is capped.
+        if fulfill_no_lever && zkminer_chain::jobs::is_execution_revert(&format!("{e:#}")) {
+            if fulfill_is_predicate {
+                mark_predicate_unsatisfiable(
+                    fulfill_program_id,
+                    fulfill_input_hash,
+                    fulfill_expected_journal,
+                );
+            } else {
+                mark_program_sim_reverted(fulfill_program_id);
+            }
+        }
         // `Submitting` is the shutdown's proxy for "a fulfil is IN FLIGHT": the drain
         // excludes such a job from its nearest-deadline cut and ABANDON refuses to release it.
         // The fulfil is OVER here, and the only remaining releaser is this task's own
@@ -6649,6 +7114,50 @@ async fn measure_cycles(
         _ => return,
     }
 
+    // Already known permanently undecodable (proxy/multicall submit tx): skip WITHOUT re-running the
+    // up-to-500k-block descriptor scan. The candidate loop evicts these, but guard here too so a race
+    // in the window before the eviction propagates cannot re-trigger the scan.
+    if job_is_undecodable(job_id) {
+        return;
+    }
+
+    // SP1 requires a program-wide registry `elf_hash` to guarantee measure-ELF == prove-ELF: SP1 has no
+    // cheap programId->bytes binding (its vkey needs the minutes-long `setup`), so the ONLY guarantee is
+    // that `download_elf` enforces `elf_hash` as its `expected_hash` against EVERY served URI, on BOTH
+    // the measure and the prove fetch. A per-URI `content_hash` does NOT suffice — download_elf serves
+    // the first reachable URI and checks only that one (skipping a zero hash), so a zero-hash sibling URL
+    // is served unverified and two URIs pinned to different hashes let a submitter serve cheap-at-measure
+    // / heavy-at-prove: the measure-cheap/prove-heavy SLASH. risc0 is EXEMPT (its image-id binds the
+    // whole ELF to programId at measure AND prove). This requirement is PROGRAM-wide (independent of
+    // inputData), so check it HERE — before the (potentially 500k-block) descriptor scan — and decline a
+    // no-hash program without that scan. The absence is temporal (see SP1_ELF_HASH_RECHECK_TTL), so it is
+    // a self-healing cooldown, not a permanent mark.
+    if backend == "sp1" {
+        if sp1_elf_hash_missing_recently(program_id) {
+            return;
+        }
+        match client.get_program_info(program_id).await {
+            Ok(info) if info.elf_hash.is_none() => {
+                tracing::warn!(
+                    "measure {} (sp1): registry carries no program-wide elf_hash yet — refusing to \
+                     size; re-checking after {}s",
+                    short_id(program_id),
+                    SP1_ELF_HASH_RECHECK_TTL.as_secs()
+                );
+                mark_sp1_elf_hash_missing(program_id);
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(
+                    "measure {} (sp1): program-info fetch failed (transient): {e:#}",
+                    short_id(program_id)
+                );
+                return;
+            }
+        }
+    }
+
     // Locally cached after the first sighting of a descriptor, so a repeat costs no chain traffic.
     // A fetch failure is transient (RPC / storage): cache nothing, retry later.
     // Bound the pre-claim descriptor fetch by wall-clock time. Unlike the prove path
@@ -6664,6 +7173,25 @@ async fn measure_cycles(
     {
         Ok(Ok(d)) => d,
         Ok(Err(e)) => {
+            if e.downcast_ref::<zkminer_chain::descriptor::UndecodableDescriptor>()
+                .is_some()
+            {
+                // PERMANENT, deterministic: the authoritative submit tx's selector is not a known entry
+                // point (a proxy/multicall wrapper) or its calldata is too short — the descriptor can
+                // NEVER be reconstructed, and the submit tx is immutable. Negative-cache it by UNIQUE
+                // JOB ID (NOT descriptorHash, which excludes the submitter and is shared with honest jobs
+                // carrying the same descriptor) so the candidate loop and this path skip it instead of
+                // re-running the up-to-500k-block descriptor scan every tick, WITHOUT false-evicting an
+                // honest twin job. `desc_input`/`descriptor_hash` are deliberately NOT touched here.
+                tracing::warn!(
+                    "measure {}: descriptor is permanently undecodable ({}) — marking this job unclaimable \
+                     so it is not re-scanned every tick",
+                    short_id(program_id),
+                    zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+                );
+                mark_job_undecodable(job_id);
+                return;
+            }
             tracing::debug!(
                 "measure {}: descriptor fetch failed (transient): {}",
                 short_id(program_id),
@@ -6783,48 +7311,9 @@ async fn measure_cycles(
         return;
     }
 
-    // SP1 has no cheap programId->bytes binding (its vkey needs the minutes-long `setup`),
-    // so the ONLY guarantee that the bytes we MEASURE are the bytes we later PROVE is a registry byte
-    // binding that `download_elf` enforces against EVERY served URI. That is `elf_hash` ALONE: it is
-    // passed as `download_elf`'s `expected_hash` on both the measure and the prove path, so whichever
-    // URI wins the first-reachable race is rejected unless it hashes to `elf_hash` — measure-ELF ==
-    // prove-ELF, always. A per-URI `content_hash` does NOT give this: `download_elf` tries URIs in
-    // submitter order and verifies only the ONE it serves against ITS OWN hash (and skips the check
-    // when that hash is zero), so a decoy URI carrying a hash satisfies an `any(content_hash)` test
-    // while a zero-hash sibling URL — attacker-controlled, unverified — is the one downloaded; and two
-    // URIs pinned to DIFFERENT hashes let the attacker serve cheap at measure and heavy at prove by
-    // toggling availability. Both re-open the measure-cheap/prove-heavy SLASH, so require `elf_hash`
-    // specifically; refuse to size (-> never claim) an SP1 program without it and negative-cache it so
-    // it is not re-measured. risc0 is EXEMPT: its image-id binds the whole-ELF bytes to programId at
-    // BOTH measure and prove regardless of the registry hashes.
-    if backend == "sp1" {
-        match client.get_program_info(program_id).await {
-            Ok(info) => {
-                // `elf_hash` ONLY — NOT `any(content_hash)`: a per-URI content hash does not guarantee
-                // measure-ELF == prove-ELF (download_elf serves the first reachable URI and checks only
-                // that one). See the comment above.
-                let bound = info.elf_hash.is_some();
-                if !bound {
-                    tracing::warn!(
-                        "measure {} (sp1): registry carries no program-wide elf_hash — measure-ELF \
-                         cannot be guaranteed == prove-ELF (a per-URI content_hash does not suffice: \
-                         download_elf serves the first reachable URI), refusing to size; marking \
-                         infeasible so it is never claimed",
-                        short_id(program_id)
-                    );
-                    insert_measured(measured, backend, program_id, input_hash, UNMEASURABLE_CYCLES);
-                    return;
-                }
-            }
-            Err(e) => {
-                tracing::debug!(
-                    "measure {} (sp1): program-info fetch failed (transient): {e:#}",
-                    short_id(program_id)
-                );
-                return;
-            }
-        }
-    }
+    // (The SP1 program-wide `elf_hash` requirement is enforced EARLIER — before the descriptor scan
+    // above — via the self-healing SP1_ELF_HASH_MISSING cooldown, so a no-hash program is declined
+    // without paying the scan. See that block near the top of this function.)
 
     // Claim the (backend, program, input) as in-flight BEFORE the expensive fetch +
     // execute. A concurrent burst of the same input under different tags passes the descriptor-hash
@@ -7991,10 +8480,11 @@ async fn recover_claimed_jobs(
         // (release_and_clean frees collateral we hold and retains the breadcrumb otherwise). The mark
         // is process-wide and reset on restart, so the FIRST job of a mismatched program still
         // re-drives once to establish it — nothing legitimate is over-blocked.
-        if program_vkey_mismatched(tracked.info.program_id) {
+        if program_vkey_mismatched_for(tracked.info.program_id, snapshot.proof_system_id) {
             tracing::warn!(
-                "recover: {} belongs to a program already proved unclaimable this session \
-                 (vkey/image-id mismatch) — releasing instead of re-driving a guaranteed-fail prove",
+                "recover: {} belongs to a program already proved unclaimable this session under its \
+                 backend (vkey/image-id mismatch) — releasing instead of re-driving a guaranteed-fail \
+                 prove",
                 jid
             );
             release_and_clean(client, state, journal, jid).await;
@@ -8901,19 +9391,232 @@ mod r2_sizing_tests {
     }
 
     #[test]
-    fn program_vkey_mismatch_skips_every_future_job_for_the_program() {
-        // A program recorded as vkey/image-id-mismatched is permanently unclaimable; an unrelated
-        // program is unaffected. Distinct ids keep it independent of any other test touching the
-        // process-wide set.
+    fn program_vkey_mismatch_is_keyed_by_program_and_backend() {
+        // A (programId, backend) recorded as vkey/image-id-mismatched is permanently unclaimable UNDER
+        // THAT BACKEND; an unrelated program is unaffected. Distinct ids keep it independent of any
+        // other test touching the process-wide set.
         let bad = B256::repeat_byte(0xab);
         let good = B256::repeat_byte(0xcd);
-        assert!(!program_vkey_mismatched(bad));
-        mark_program_vkey_mismatch(bad);
-        assert!(program_vkey_mismatched(bad), "the mismatched program is skipped");
-        assert!(!program_vkey_mismatched(good), "an unrelated program is not skipped");
-        // Idempotent: re-marking does not change membership.
-        mark_program_vkey_mismatch(bad);
-        assert!(program_vkey_mismatched(bad));
+        assert!(!program_vkey_mismatched(bad, "sp1"));
+        mark_program_vkey_mismatch(bad, "sp1");
+        assert!(program_vkey_mismatched(bad, "sp1"), "the mismatched (program, backend) is skipped");
+        assert!(!program_vkey_mismatched(good, "sp1"), "an unrelated program is not skipped");
+        // CRITICAL: a mismatch derived under SP1 must NOT block the SAME programId under risc0 — a
+        // submitter-declared proofSystemId cannot be allowed to cross-contaminate a legit program's
+        // real backend. This is the defect the (programId, backend) key closes.
+        assert!(
+            !program_vkey_mismatched(bad, "risc0"),
+            "a mismatch under one backend must not block the same programId under another"
+        );
+        // Idempotent: re-marking the same (program, backend) does not change membership.
+        mark_program_vkey_mismatch(bad, "sp1");
+        assert!(program_vkey_mismatched(bad, "sp1"));
+    }
+
+    #[test]
+    fn undecodable_job_cache_is_keyed_by_job_id_not_descriptor_hash() {
+        // A job whose submit tx is undecodable (proxy/multicall wrapper) is negative-cached by its
+        // UNIQUE job_id, NOT by the on-chain descriptorHash — which excludes the submitter and is shared
+        // with honest jobs carrying a byte-identical descriptor. Keying by descriptorHash let a proxy-
+        // wrapped decoy permanently evict an honest twin job (the r9 regression this closes). Distinct
+        // ids keep this independent of other tests touching the process-wide set.
+        let decoy_job = B256::repeat_byte(0x71);
+        let honest_twin_job = B256::repeat_byte(0x72); // SAME descriptor, DIFFERENT job_id
+        assert!(!job_is_undecodable(decoy_job));
+        mark_job_undecodable(decoy_job);
+        assert!(job_is_undecodable(decoy_job), "the undecodable job itself is skipped");
+        assert!(
+            !job_is_undecodable(honest_twin_job),
+            "an honest job with a different job_id (even an identical descriptor) is NOT evicted"
+        );
+    }
+
+    #[test]
+    fn sp1_elf_hash_missing_is_a_self_healing_program_keyed_cooldown() {
+        // An SP1 program observed with no registry elf_hash is skipped on a PROGRAM-keyed cooldown (the
+        // requirement is program-wide, independent of inputData) and an unrelated program is unaffected.
+        // The cooldown self-heals when it lapses — asserted by injecting an already-expired deadline,
+        // which must read as not-recently (so the program is re-checked and can be claimed once its hash
+        // is set). Distinct ids keep this independent of other tests touching the process-wide map.
+        let no_hash = B256::repeat_byte(0x81);
+        let other = B256::repeat_byte(0x82);
+        assert!(!sp1_elf_hash_missing_recently(no_hash));
+        mark_sp1_elf_hash_missing(no_hash);
+        assert!(sp1_elf_hash_missing_recently(no_hash), "a no-elf_hash SP1 program is on cooldown");
+        assert!(!sp1_elf_hash_missing_recently(other), "an unrelated program is not affected");
+        // Self-heal: an expired deadline reads as not-recently (re-check, do not permanently over-block).
+        if let Ok(mut m) = sp1_elf_hash_missing_map().lock() {
+            m.insert(no_hash, std::time::Instant::now() - Duration::from_secs(1));
+        }
+        assert!(
+            !sp1_elf_hash_missing_recently(no_hash),
+            "once the cooldown lapses the program is re-checked, not permanently blocked"
+        );
+    }
+
+    #[test]
+    fn predicate_unsatisfiable_is_keyed_by_program_input_and_expected_journal_hash() {
+        // A (programId, keccak256(inputData), expectedJournalHash) tuple recorded by a reverted
+        // real-proof fulfill simulation is skipped on future claims of the EXACT tuple; changing ANY
+        // of the three dimensions is NOT skipped — so a legitimate predicate job is never false-
+        // blocked. Crucially, keying on INPUT defeats the decoy-poison: an attacker copying a legit
+        // job's PUBLIC (programId, expectedJournalHash) but using a different input marks a DIFFERENT
+        // tuple and cannot false-skip the legit, satisfiable job. Distinct ids keep this independent
+        // of other tests touching the process-wide map.
+        let prog = B256::repeat_byte(0x11);
+        let ejh = B256::repeat_byte(0x22);
+        let decoy_in = keccak256(b"attacker-decoy-input");
+        let legit_in = keccak256(b"honest-input");
+        let other_prog = B256::repeat_byte(0x44);
+        assert!(!predicate_unsatisfiable(prog, decoy_in, ejh));
+        // The decoy (same program + same PUBLIC expectedJournalHash, different input) reverts and is
+        // recorded.
+        mark_predicate_unsatisfiable(prog, decoy_in, ejh);
+        assert!(
+            predicate_unsatisfiable(prog, decoy_in, ejh),
+            "the exact baited tuple is skipped"
+        );
+        // The legitimate job shares (prog, ejh) but has a DIFFERENT input — it must NOT be skipped.
+        assert!(
+            !predicate_unsatisfiable(prog, legit_in, ejh),
+            "a different input under the same (program, expectedJournalHash) is NOT skipped — the \
+             decoy cannot poison the legit job"
+        );
+        // A different expectedJournalHash, or a different program, is likewise independent.
+        assert!(!predicate_unsatisfiable(prog, decoy_in, B256::repeat_byte(0x33)));
+        assert!(!predicate_unsatisfiable(other_prog, decoy_in, ejh));
+        // Idempotent.
+        mark_predicate_unsatisfiable(prog, decoy_in, ejh);
+        assert!(predicate_unsatisfiable(prog, decoy_in, ejh));
+    }
+
+    #[test]
+    fn sim_revert_cooldown_throttles_but_does_not_permanently_poison() {
+        // A NON-predicate sim revert throttles the program via a self-healing cooldown — distinct
+        // from the PERMANENT, authoritative vkey-mismatch breaker — so a transient revert (reorg /
+        // router pause / stale load-balanced RPC) on a legitimate program never over-blocks it
+        // forever. Distinct ids keep this independent of other tests.
+        let bad = B256::repeat_byte(0x55);
+        let good = B256::repeat_byte(0x66);
+        assert!(!program_sim_reverted_recently(bad));
+        mark_program_sim_reverted(bad);
+        assert!(
+            program_sim_reverted_recently(bad),
+            "a freshly-reverted program is throttled within the cooldown window"
+        );
+        assert!(
+            !program_sim_reverted_recently(good),
+            "an unrelated program is not throttled"
+        );
+        // The sim-revert cooldown must NOT be the permanent vkey-mismatch breaker: throttling a
+        // program here leaves `program_vkey_mismatched` (the evict-forever path) untouched, so a
+        // transient sim revert can never permanently evict honest work.
+        assert!(
+            !program_vkey_mismatched(bad, "risc0") && !program_vkey_mismatched(bad, "sp1"),
+            "a sim-revert cooldown must not feed the permanent vkey-mismatch eviction set"
+        );
+    }
+
+    #[test]
+    fn revert_lever_gate_distinguishes_submitter_levers_from_a_vanilla_descriptor() {
+        use zkminer_contracts::bindings::JobDescriptor;
+        // Build a descriptor with the three submitter-controlled revert levers set to the given values
+        // and everything else neutral.
+        let mk = |cb: alloy::primitives::Address, verifier: &[u8], cb_data: &[u8]| JobDescriptor {
+            programId: B256::repeat_byte(0x11),
+            proofSystemId: B256::ZERO,
+            callbackContract: cb,
+            assignedProver: alloy::primitives::Address::ZERO,
+            tag: B256::ZERO,
+            inputData: alloy::primitives::Bytes::new(),
+            callbackExtraData: alloy::primitives::Bytes::copy_from_slice(cb_data),
+            extraVerifierData: alloy::primitives::Bytes::copy_from_slice(verifier),
+            expectedJournalHash: B256::ZERO,
+        };
+        // A vanilla descriptor (no callback, no extra-verifier/callback data) has NO submitter lever,
+        // so a fulfill revert on it is attributable to the program/predicate binding and IS recorded.
+        assert!(
+            !descriptor_carries_revert_lever(&mk(alloy::primitives::Address::ZERO, b"", b"")),
+            "a vanilla descriptor carries no revert lever"
+        );
+        // ANY of the three submitter-controlled levers present means a revert could be forged on a
+        // per-job cause, so the gate must refuse to attribute it to the program/tuple (no poison).
+        assert!(
+            descriptor_carries_revert_lever(&mk(alloy::primitives::Address::repeat_byte(0xcc), b"", b"")),
+            "a callback contract is a lever"
+        );
+        assert!(
+            descriptor_carries_revert_lever(&mk(alloy::primitives::Address::ZERO, b"x", b"")),
+            "extraVerifierData is a lever"
+        );
+        assert!(
+            descriptor_carries_revert_lever(&mk(alloy::primitives::Address::ZERO, b"", b"x")),
+            "callbackExtraData is a lever"
+        );
+    }
+
+    #[test]
+    fn per_caller_cap_bounds_one_address_without_evicting_others() {
+        // Build an Open set where one hostile caller holds far more than the cap and a second,
+        // honest caller holds a few LOWER-priced jobs. The per-caller cap must drop only the hostile
+        // caller's cheapest jobs down to the cap and leave every other caller's jobs intact — so a
+        // single address cannot crowd the honest submitter out of the value-ranked global retain.
+        fn mk(caller: u8, jid: u8, price: u128) -> TrackedJob {
+            TrackedJob {
+                info: zkminer_chain::jobs::JobInfo {
+                    job_id: B256::repeat_byte(jid),
+                    caller: alloy::primitives::Address::repeat_byte(caller),
+                    ..Default::default()
+                },
+                status: zkminer_tui::state::MinerJobStatus::Open,
+                current_price: price,
+                gpu_bus_id: None,
+                prover_backend: String::new(),
+                estimated_cycles: 0,
+            }
+        }
+        let cap = 3usize;
+        let mut v = Vec::new();
+        // Hostile caller 0xAA: 6 jobs, prices 100..=105 (all HIGHER than the honest caller's).
+        for i in 0..6u8 {
+            v.push(mk(0xAA, i, 100 + i as u128));
+        }
+        // Honest caller 0xBB: 2 jobs, low prices.
+        v.push(mk(0xBB, 100, 5));
+        v.push(mk(0xBB, 101, 6));
+        enforce_per_caller_cap(&mut v, cap);
+        let hostile = v.iter().filter(|j| j.info.caller == alloy::primitives::Address::repeat_byte(0xAA)).count();
+        let honest = v.iter().filter(|j| j.info.caller == alloy::primitives::Address::repeat_byte(0xBB)).count();
+        assert_eq!(hostile, cap, "the hostile caller is capped to `cap` jobs");
+        assert_eq!(honest, 2, "the honest caller keeps all of its jobs");
+        // The jobs the hostile caller keeps are its HIGHEST-priced (103,104,105 -> jids 3,4,5).
+        let kept: std::collections::HashSet<u8> = v
+            .iter()
+            .filter(|j| j.info.caller == alloy::primitives::Address::repeat_byte(0xAA))
+            .map(|j| j.info.job_id.0[0])
+            .collect();
+        assert_eq!(kept, std::collections::HashSet::from([3, 4, 5]));
+    }
+
+    #[test]
+    fn per_caller_cap_is_a_noop_when_all_within_cap() {
+        fn mk(caller: u8, jid: u8) -> TrackedJob {
+            TrackedJob {
+                info: zkminer_chain::jobs::JobInfo {
+                    job_id: B256::repeat_byte(jid),
+                    caller: alloy::primitives::Address::repeat_byte(caller),
+                    ..Default::default()
+                },
+                status: zkminer_tui::state::MinerJobStatus::Open,
+                current_price: 1,
+                gpu_bus_id: None,
+                prover_backend: String::new(),
+                estimated_cycles: 0,
+            }
+        }
+        let mut v = vec![mk(1, 1), mk(1, 2), mk(2, 3)];
+        enforce_per_caller_cap(&mut v, 4);
+        assert_eq!(v.len(), 3, "nothing dropped when every caller is within cap");
     }
 
     #[test]

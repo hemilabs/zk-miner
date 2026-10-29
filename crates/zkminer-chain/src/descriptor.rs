@@ -16,6 +16,27 @@ use zkminer_contracts::bindings::{IHemiProveCore, JobDescriptor};
 
 use crate::client::ChainClient;
 
+/// A PERMANENT, deterministic reason a job's descriptor can never be reconstructed from its submit
+/// transaction: the calldata's selector is not a known submit entry point (an integrator proxy /
+/// multicall wrapper), or the calldata is too short to carry one. Unlike a transient fetch / RPC /
+/// log-scan miss — which can heal on a later tick — this cannot change for a given job, because the
+/// submit tx's calldata is immutable. Callers should NEGATIVE-CACHE the job on this error instead of
+/// re-running the (up to `DEFAULT_DESCRIPTOR_LOOKBACK_BLOCKS`) descriptor scan + re-occupying a measure
+/// slot for it every tick (a measure-budget + RPC DoS). It is produced only from decoding an
+/// AUTHORITATIVE tx (the one the JobSubmitted-log scan locates, or a hash-verified fast-path tx), so a
+/// stale cached tx cannot yield a false permanent verdict — a wrong-selector fast-path decode is
+/// swallowed and retried via the scan.
+#[derive(Debug, Clone)]
+pub struct UndecodableDescriptor(pub String);
+
+impl std::fmt::Display for UndecodableDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for UndecodableDescriptor {}
+
 /// Default lookback window for JobSubmitted log queries, in blocks.
 /// Hemi produces ~2-second blocks, so 500_000 blocks ≈ 11.5 days — well beyond
 /// any realistic lock_deadline + margin. This bounds the log scan to a range
@@ -171,10 +192,13 @@ async fn decode_descriptor_from_tx(
 
     let calldata = tx.input();
     if calldata.len() < 4 {
-        bail!(
+        // Deterministic & permanent: the authoritative submit tx's calldata cannot carry a selector,
+        // so the descriptor can never be reconstructed. Typed so the caller negative-caches it.
+        return Err(UndecodableDescriptor(format!(
             "Submitting tx calldata is too short: {} bytes",
             calldata.len()
-        );
+        ))
+        .into());
     }
     let selector: [u8; 4] = calldata[..4].try_into().unwrap();
 
@@ -238,10 +262,15 @@ async fn decode_descriptor_from_tx(
             expectedJournalHash: B256::ZERO,
         }
     } else {
-        bail!(
+        // Deterministic & permanent: the authoritative submit tx used an entry point we cannot decode
+        // (an integrator proxy/multicall wrapper), so the descriptor can never be reconstructed for this
+        // job. Typed (not a generic `bail!`) so the measure path negative-caches it instead of re-running
+        // the block scan every tick. The selector is a property of the immutable submit tx calldata.
+        return Err(UndecodableDescriptor(format!(
             "Unsupported submit selector 0x{} — job was not submitted via submitJob/submitJobSimple/submitJobBatch/submitJobDefault (likely an integrator proxy/multicall wrapper). Cannot reconstruct descriptor.",
             alloy::hex::encode(selector)
-        );
+        ))
+        .into());
     };
 
     Ok(descriptor)
@@ -303,6 +332,27 @@ pub fn verify_descriptor_hash(descriptor: &JobDescriptor, expected: B256) -> Res
 mod tests {
     use super::*;
     use alloy::sol_types::SolValue;
+
+    #[test]
+    fn undecodable_descriptor_is_downcastable_through_anyhow() {
+        // The measure path (run.rs) distinguishes a PERMANENT undecodable-selector decode failure
+        // from a transient fetch error by `downcast_ref::<UndecodableDescriptor>()` on the propagated
+        // anyhow::Error, and negative-caches only on the permanent one. Guard that contract: the typed
+        // error must survive the `.into()` + `?` propagation used on the authoritative scan path.
+        let err: anyhow::Error = UndecodableDescriptor("Unsupported submit selector 0xdeadbeef".into()).into();
+        let got = err.downcast_ref::<UndecodableDescriptor>();
+        assert!(got.is_some(), "UndecodableDescriptor must downcast through anyhow");
+        assert!(
+            format!("{err:#}").contains("Unsupported submit selector"),
+            "the message must be preserved for the sanitized log"
+        );
+        // A generic transient error must NOT masquerade as the permanent verdict.
+        let transient: anyhow::Error = anyhow::anyhow!("Failed to fetch submitting transaction");
+        assert!(
+            transient.downcast_ref::<UndecodableDescriptor>().is_none(),
+            "a transient fetch error must not be treated as permanently undecodable"
+        );
+    }
 
     #[test]
     fn topic_matches_canonical_signature() {

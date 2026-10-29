@@ -422,16 +422,24 @@ impl ChainClient {
             .await
             .context("Failed to query ProgramRegistry.getStorageURIs")?;
 
-        // Fetch ELF hash for verification
-        let elf_hash = match registry.getBuildHashes(program_id).call().await {
-            Ok(result) => {
-                if result.elfHash == B256::ZERO {
-                    None
-                } else {
-                    Some(result.elfHash)
-                }
-            }
-            Err(_) => None,
+        // Fetch ELF hash for verification. Distinguish an AUTHORITATIVE "no elf_hash registered yet"
+        // (Ok + elfHash == ZERO) from a NON-AUTHORITATIVE transient RPC failure (a 429/timeout on a
+        // hosted or load-balanced node). The two sibling reads above propagate their errors via `?`;
+        // this one MUST too, because for SP1 a false `elf_hash = None` becomes a session-long over-block
+        // of a legit program (the SP1 measure gate refuses a program with no elf_hash, and this info is
+        // cached). Swallowing `Err` into `None` conflated a transient blip — which the attacker's job
+        // flood can drive the operator RPC into, and which most plausibly hits THIS call as the last of
+        // the three sequential reads — with a genuine no-hash verdict. Propagate instead: a transient
+        // failure then leaves nothing cached and is retried next tick; only a real ZERO read yields None.
+        let build_hashes = registry
+            .getBuildHashes(program_id)
+            .call()
+            .await
+            .context("Failed to query ProgramRegistry.getBuildHashes")?;
+        let elf_hash = if build_hashes.elfHash == B256::ZERO {
+            None
+        } else {
+            Some(build_hashes.elfHash)
         };
 
         let storage_uris: Vec<ResolvedURI> = uris
@@ -452,10 +460,23 @@ impl ChainClient {
             storage_uris,
             elf_hash,
         };
-        self.program_info_cache
-            .lock()
-            .unwrap()
-            .insert(program_id, info.clone());
+        // `elf_hash` is the ONE field that is NOT immutable at registration: `registerProgram` takes no
+        // elfHash argument (the chain cannot keccak an off-chain ELF), so the hash is set by a LATER
+        // call. A brand-new legit SP1 program therefore reads `elfHash == ZERO` in the window between
+        // registration and the hash being set. SP1 REQUIRES the hash to size/claim, and this cache has
+        // no TTL/invalidation, so caching a None for an SP1 program would pin that transient absence for
+        // the whole process lifetime and permanently over-block the program even after its hash appears.
+        // So do NOT cache a None elf_hash for an SP1 program — re-read it until the hash is set, then
+        // cache normally. (The SP1 measure gate re-checks on a self-healing TTL, so this re-read is
+        // bounded, not per-tick.) risc0 legitimately has no registry elf_hash — it is bound by its
+        // image-id — so its None is immutable and cached as before, with no re-read cost.
+        let cacheable = info.elf_hash.is_some() || info.proof_system_id != crate::auction::sp1_v1_id();
+        if cacheable {
+            self.program_info_cache
+                .lock()
+                .unwrap()
+                .insert(program_id, info.clone());
+        }
         Ok(info)
     }
 

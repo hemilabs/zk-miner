@@ -27,7 +27,9 @@ pub enum FulfillSimulation {
 /// transport/connection error. Conservative substring match, in the same spirit as the nonce-error
 /// matchers below: a revert reliably contains "revert"/"reverted", and our custom `JournalMismatch`
 /// error is not in the ABI bindings, so it surfaces as a generic execution revert (not by name).
-fn is_execution_revert(msg: &str) -> bool {
+/// Also used by the fulfill lifecycle to throttle a doomed program/predicate ONLY on an authoritative
+/// on-chain revert (not on a transport error), so a transient RPC blip never over-blocks.
+pub fn is_execution_revert(msg: &str) -> bool {
     msg.to_ascii_lowercase().contains("revert")
 }
 
@@ -335,7 +337,7 @@ pub enum ClaimOutcome {
 }
 
 /// Parsed job data from chain (derived from JobStatusView + events).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct JobInfo {
     pub job_id: B256,
     /// The programId (imageId/vKey) from the JobSubmitted event.
@@ -1129,6 +1131,14 @@ impl ChainClient {
         // success; recycled (abort) or stashed for release (give-up) at the end.
         let mut nonce = self.reserve_nonce().await?;
         let (base_tip, base_max_fee) = self.base_fees().await;
+        // On a PREFLIGHTING RPC (one that eth_call-validates on send), a reverting fulfillJob never
+        // mines — it is rejected at SEND, so the authoritative "fulfillJob transaction reverted"
+        // receipt bail below is never reached. Remember the most recent send-time EXECUTION-revert
+        // reason so the give-up bail can still surface it (carrying the "revert" substring the caller's
+        // `is_execution_revert` throttle keys on). Retrying across attempts is preserved, so a TRANSIENT
+        // send-revert (a stale/load-balanced node) that clears on a later attempt still fulfills and
+        // never reaches the give-up bail — only a revert that persists across every attempt surfaces.
+        let mut last_send_revert: Option<String> = None;
 
         for attempt in 1..=MAX_ATTEMPTS {
             // Enforce the deadline budget in-loop so the give-up/stash path runs.
@@ -1222,13 +1232,22 @@ impl ChainClient {
                     p
                 }
                 Err(e) => {
-                    let msg = format!("{e:#}");
+                    let raw = format!("{e:#}");
+                    // HOSTILE-submitter-driven, like the fulfill SIMULATION path: a preflighting
+                    // RPC (e.g. a hosted provider that eth_call-validates on send) can surface a
+                    // crafted callback/verifier revert reason carrying terminal-escape / bidi /
+                    // CRLF bytes. Classify on the RAW string (the nonce/replacement phrases are
+                    // plain ASCII that `sanitize_log` never touches) but LOG the sanitized form, so
+                    // a crafted reason cannot inject escapes or forge log lines in the operator
+                    // console / TUI — the same `sanitize_log` discipline `simulate_fulfill_job`
+                    // and every `run.rs` error sink already follow. `sanitize_log` also length-bounds.
+                    let msg = crate::programs::sanitize_log(&raw);
                     // A tx is pending at our nonce (our own re-broadcast, or a stuck
                     // predecessor) → KEEP the nonce so the next attempt's escalated fee
                     // displaces it. Walking forward here orphans the pending fulfill and,
                     // worse, breaks the fulfill→release same-nonce displacement the error
                     // path relies on. The top-of-loop status check confirms if it landed.
-                    if is_same_nonce_pending(&msg) {
+                    if is_same_nonce_pending(&raw) {
                         tracing::warn!("fulfillJob replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — bumping fee, keeping nonce");
                         // Give the node a moment before re-bidding. Without this the
                         // whole attempt ladder burns in well under a second, which learns
@@ -1248,7 +1267,7 @@ impl ChainClient {
                         continue;
                     }
                     // Genuine nonce mismatch ⇒ re-fetch and retry fast.
-                    if is_nonce_error(&msg) {
+                    if is_nonce_error(&raw) {
                         tracing::warn!("fulfillJob nonce error (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — re-syncing");
                         // Recycle the abandoned nonce so a "nonce too high"
                         // (a gap below us) doesn't leak it; resync then prunes it from the
@@ -1278,6 +1297,13 @@ impl ChainClient {
                             .await;
                         }
                     } else {
+                        // A send-time EXECUTION revert (preflighting RPC) is deterministic for THIS
+                        // proof — record the reason so the give-up bail surfaces it to the caller's
+                        // throttle. Classify on the RAW string (same as the nonce matchers), store the
+                        // SANITIZED reason (a crafted callback/verifier reason cannot inject escapes).
+                        if is_execution_revert(&raw) {
+                            last_send_revert = Some(msg.clone());
+                        }
                         tracing::warn!(
                             "fulfillJob send failed (attempt {attempt}/{MAX_ATTEMPTS}): {msg}"
                         );
@@ -1408,6 +1434,16 @@ impl ChainClient {
         // advance past a nonce we still need to displace). If the fulfill actually mined,
         // release's send at N gets "nonce too low" → re-syncs → sees the job Fulfilled.
         self.stash_abandoned_nonce(job_id, nonce);
+        // If every send attempt was rejected by an on-chain EXECUTION revert (preflighting RPC), the
+        // proof is deterministically unfulfillable — surface the revert reason so the caller's
+        // `is_execution_revert` throttle fires exactly as it would on a mined status=false receipt.
+        // Otherwise the give-up is a liveness failure (RPC dropping txs), which must NOT throttle.
+        if let Some(reason) = last_send_revert {
+            anyhow::bail!(
+                "fulfillJob reverted on send across {MAX_ATTEMPTS} attempts ({reason}) — the proof was \
+                 rejected on-chain (preflighting RPC)"
+            );
+        }
         anyhow::bail!("fulfillJob failed after {MAX_ATTEMPTS} attempts (RPC may be dropping txs)")
     }
 
@@ -1930,6 +1966,17 @@ mod tests {
         assert!(!is_execution_revert("error sending request for url (http://rpc): connection refused"));
         assert!(!is_execution_revert("request timed out"));
         assert!(!is_execution_revert("deserialization error: EOF while parsing a value"));
+        // fulfill_job give-up wrappers: the preflighting-RPC send-revert give-up MUST carry the
+        // "reverted" keyword so the caller's authoritative-revert throttle fires on that deployment
+        // (a reverting fulfill is rejected at SEND there, never mined, so the mined-receipt bail is
+        // unreachable). The generic liveness give-up (RPC dropping txs) must NOT — it is not a revert.
+        assert!(is_execution_revert(
+            "fulfillJob reverted on send across 5 attempts (execution reverted: JournalMismatch) — \
+             the proof was rejected on-chain (preflighting RPC)"
+        ));
+        assert!(!is_execution_revert(
+            "fulfillJob failed after 5 attempts (RPC may be dropping txs)"
+        ));
     }
 
     // The simulation surfaces a HOSTILE-submitter-driven revert reason; `simulate_fulfill_job`
@@ -1945,6 +1992,32 @@ mod tests {
         assert!(!safe.contains('\r') && !safe.contains('\n'), "CRLF stripped (no forged lines)");
         assert!(!safe.contains('\u{202e}'), "bidi override stripped (no Trojan-Source reorder)");
         assert!(safe.contains("revert"), "the classifier keyword survives sanitization");
+    }
+
+    #[test]
+    fn fulfill_send_error_is_classified_on_raw_but_logged_sanitized() {
+        // The real-send `fulfill_job` error path (like the simulation path) classifies the send
+        // error on the RAW string but LOGS the sanitized form. Sanitizing before classification
+        // must not change the nonce/replacement verdict (those phrases are plain ASCII), and the
+        // logged form must carry no terminal-escape / CRLF / bidi bytes a hostile revert reason
+        // (surfaced by a preflighting RPC) could smuggle in.
+        let hostile_nonce =
+            "nonce too low\x1b[2J\x1b]0;pwned\x07\r\nforged log line\u{202e}reversed";
+        // Classification runs on the raw string and still sees the nonce phrase.
+        assert!(is_nonce_error(hostile_nonce), "classification sees the raw nonce phrase");
+        // The display form is injection-safe.
+        let safe = sanitize_log(hostile_nonce);
+        assert!(!safe.contains('\x1b'), "ANSI/OSC escapes stripped from the logged send error");
+        assert!(!safe.contains('\r') && !safe.contains('\n'), "CRLF stripped (no forged lines)");
+        assert!(!safe.contains('\u{202e}'), "bidi override stripped");
+        assert!(safe.contains("nonce too low"), "the human-readable reason survives");
+        // A crafted catch-all revert reason: not a nonce/replacement phrase, so it falls to the
+        // plain warn! sink — which now logs the sanitized form.
+        let hostile_generic = "execution reverted: \x1b]0;evil\x07\r\nFAKE";
+        assert!(!is_nonce_error(hostile_generic));
+        assert!(!is_same_nonce_pending(hostile_generic));
+        let safe_generic = sanitize_log(hostile_generic);
+        assert!(!safe_generic.contains('\x1b') && !safe_generic.contains('\n'));
     }
 
     /// The real ladder length and the real units, read from production rather than restated —
