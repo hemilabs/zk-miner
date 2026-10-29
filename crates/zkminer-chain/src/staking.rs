@@ -17,9 +17,9 @@ pub struct StakeInfo {
     pub available_collateral: u128,
     pub unstake_amount: u128,
     pub unstake_request_time: u64,
-    /// Block number the current stake was deposited at (was a unix timestamp
-    /// before contract FIX-V1A3, 2026-07-08). Claim eligibility is
-    /// `block.number > deposit_block`; there is no wall-clock staking-age gate.
+    /// Block number the current stake was deposited at (a block number, not a
+    /// unix timestamp). Claim eligibility is `block.number > deposit_block`;
+    /// there is no wall-clock staking-age gate.
     pub deposit_block: u64,
 }
 
@@ -104,7 +104,7 @@ impl ChainClient {
 
     /// Approve HEMI token spending for the staking contract.
     pub async fn approve_hemi_token(&self, spender: Address, amount: U256) -> Result<()> {
-        // [#48] Route through the nonce allocator with an EXPLICIT nonce so this shares one
+        // Route through the nonce allocator with an EXPLICIT nonce so this shares one
         // nonce sequence with the job txs. Without this, staking goes through alloy's
         // independent NonceFiller and can occupy a nonce the allocator hands to a concurrent
         // lifecycle task (a re-stake during live proving), where the keep+escalate path would
@@ -129,45 +129,46 @@ impl ChainClient {
             }
             Err(e) => {
                 self.abort_nonce(nonce);
-                // [review must-fix] An errored send may still have reached the node; if
-                // the tx later mines, the aborted nonce sits in `freed` and would be
-                // re-issued -> permanent "nonce too low" collision (the setup wizard has
-                // no concurrent job task to trigger the self-heal). resync prunes freed
-                // below the mined frontier; harmless no-op otherwise. Mirrors the
-                // job-path abort→resync pattern. (Match moved outside the tx_lock so the
-                // resync read never holds up concurrent senders.)
+                // An errored send may still have reached the node; if the tx later mines,
+                // the aborted nonce sits in `freed` and would be re-issued -> permanent
+                // "nonce too low" collision (the setup wizard has no concurrent job task to
+                // trigger the self-heal). resync prunes freed below the mined frontier;
+                // harmless no-op otherwise, and it follows the same abort→resync pattern as
+                // the job path. The match sits outside the tx_lock so the resync read never
+                // holds up concurrent senders.
                 self.resync_nonce().await.ok();
                 return Err(e).context("Failed to send approve tx");
             }
         };
         let tx_hash = *pending.tx_hash();
         tracing::info!("approve tx sent: {:?}, waiting for receipt...", tx_hash);
-        // [RPC #1] Poll for the receipt (no heartbeat watcher). None (no receipt within
-        // budget, incl. transient RPC/429) → resync + bail, WITHOUT recycling the nonce.
-        // See [R4-A] below: the node accepted this send, so the tx may still be resident.
+        // Poll for the receipt (no heartbeat watcher). None (no receipt within budget,
+        // incl. transient RPC/429) → resync + bail, WITHOUT recycling the nonce. The node
+        // accepted this send, so the tx may still be resident (see the timeout branch below).
         let receipt =
             match crate::tx::await_receipt(&*self.provider, tx_hash, TX_RECEIPT_TIMEOUT).await {
                 Some(r) => r,
                 None => {
-                    // [R4-A] Do NOT abort here. The node ACCEPTED this send — only the RECEIPT
+                    // Do NOT abort here. The node ACCEPTED this send — only the RECEIPT
                     // was not observed — so the tx may well still be resident. `abort` inserts
                     // into `freed` AND writes an abort record, and the `resync` below cannot undo
                     // either: the stake is unmined, so the mined frontier IS this nonce and
-                    // `freed.retain(f >= chain_nonce)` keeps it. That is branch (B)'s literal
-                    // trigger, and the watchdog consumes branch (B) ungated — ~45-105s later it
-                    // bids max(4x base, 2 gwei) with no floor to lift over (staking records no
-                    // fee) and replaces the live stake with a 0-value self-transfer. Nothing
-                    // retries: the caller's StakeUnobserved arm deliberately neither re-sends nor
-                    // revokes, precisely because "the stake tx may still be in the mempool".
+                    // `freed.retain(f >= chain_nonce)` keeps it. That is the gap detector's
+                    // branch (B) trigger, and the watchdog consumes branch (B) ungated — ~45-105s
+                    // later it bids max(4x base, 2 gwei) with no floor to lift over (staking
+                    // records no fee) and replaces the live stake with a 0-value self-transfer.
+                    // Nothing retries: the caller's StakeUnobserved arm deliberately neither
+                    // re-sends nor revokes, precisely because "the stake tx may still be in the
+                    // mempool".
                     //
-                    // Leaving the nonce reserved-but-unresolved is now safe: if the tx really was
-                    // dropped, [A4]'s branch (A) finds the hole off the node's pending count as
-                    // soon as anything is reserved above it, and a restart re-anchors at that same
-                    // pending count. Do NOT substitute `note_unresolved` — it writes the abort
-                    // record, which is the other half of branch (B)'s disjunction.
-                    // [review must-fix] The broadcast tx may mine AFTER the budget; without a
-                    // resync the aborted nonce would be re-issued from `freed` → permanent
-                    // "nonce too low" collision with no job task around to self-heal.
+                    // Leaving the nonce reserved-but-unresolved is safe: if the tx really was
+                    // dropped, the gap detector's branch (A) finds the hole off the node's pending
+                    // count as soon as anything is reserved above it, and a restart re-anchors at
+                    // that same pending count. Do NOT substitute `note_unresolved` — it writes the
+                    // abort record, which is the other half of branch (B)'s disjunction.
+                    // The broadcast tx may mine AFTER the budget; without a resync the aborted
+                    // nonce would be re-issued from `freed` → permanent "nonce too low" collision
+                    // with no job task around to self-heal.
                     self.resync_nonce().await.ok();
                     anyhow::bail!("approve receipt not confirmed (tx {tx_hash:?})");
                 }
@@ -187,7 +188,7 @@ impl ChainClient {
     /// Stake HEMI tokens for a prover.
     pub async fn stake(&self, amount: u128) -> Result<()> {
         let staking = IHemiProveStaking::new(self.hemi_prove_staking, &*self.provider);
-        let nonce = self.reserve_nonce().await?; // [#48] explicit nonce via the shared allocator
+        let nonce = self.reserve_nonce().await?; // explicit nonce via the shared allocator
         let tx = staking.stake(self.address, amount).nonce(nonce);
         let send_result = {
             let _guard = self.tx_lock.lock().await;
@@ -203,7 +204,7 @@ impl ChainClient {
                 self.note_nonce_in_use(nonce);
                 p
             }
-            // [review must-fix] abort→resync: see approve_hemi_token for rationale.
+            // abort→resync: see approve_hemi_token for rationale.
             Err(e) => {
                 self.abort_nonce(nonce);
                 self.resync_nonce().await.ok();
@@ -212,29 +213,30 @@ impl ChainClient {
         };
         let tx_hash = *pending.tx_hash();
         tracing::info!("stake tx sent: {:?}, waiting for receipt...", tx_hash);
-        // [RPC #1] Poll for the receipt (no heartbeat watcher); None → resync + bail, and
-        // deliberately NO abort — see [R4-A] below.
+        // Poll for the receipt (no heartbeat watcher); None → resync + bail, and
+        // deliberately NO abort — see the timeout branch below.
         let receipt =
             match crate::tx::await_receipt(&*self.provider, tx_hash, TX_RECEIPT_TIMEOUT).await {
                 Some(r) => r,
                 None => {
-                    // [R4-A] Do NOT abort here. The node ACCEPTED this send — only the RECEIPT
+                    // Do NOT abort here. The node ACCEPTED this send — only the RECEIPT
                     // was not observed — so the tx may well still be resident. `abort` inserts
                     // into `freed` AND writes an abort record, and the `resync` below cannot undo
                     // either: the stake is unmined, so the mined frontier IS this nonce and
-                    // `freed.retain(f >= chain_nonce)` keeps it. That is branch (B)'s literal
-                    // trigger, and the watchdog consumes branch (B) ungated — ~45-105s later it
-                    // bids max(4x base, 2 gwei) with no floor to lift over (staking records no
-                    // fee) and replaces the live stake with a 0-value self-transfer. Nothing
-                    // retries: the caller's StakeUnobserved arm deliberately neither re-sends nor
-                    // revokes, precisely because "the stake tx may still be in the mempool".
+                    // `freed.retain(f >= chain_nonce)` keeps it. That is the gap detector's
+                    // branch (B) trigger, and the watchdog consumes branch (B) ungated — ~45-105s
+                    // later it bids max(4x base, 2 gwei) with no floor to lift over (staking
+                    // records no fee) and replaces the live stake with a 0-value self-transfer.
+                    // Nothing retries: the caller's StakeUnobserved arm deliberately neither
+                    // re-sends nor revokes, precisely because "the stake tx may still be in the
+                    // mempool".
                     //
-                    // Leaving the nonce reserved-but-unresolved is now safe: if the tx really was
-                    // dropped, [A4]'s branch (A) finds the hole off the node's pending count as
-                    // soon as anything is reserved above it, and a restart re-anchors at that same
-                    // pending count. Do NOT substitute `note_unresolved` — it writes the abort
-                    // record, which is the other half of branch (B)'s disjunction.
-                    self.resync_nonce().await.ok(); // [review must-fix] late-mine self-heal
+                    // Leaving the nonce reserved-but-unresolved is safe: if the tx really was
+                    // dropped, the gap detector's branch (A) finds the hole off the node's pending
+                    // count as soon as anything is reserved above it, and a restart re-anchors at
+                    // that same pending count. Do NOT substitute `note_unresolved` — it writes the
+                    // abort record, which is the other half of branch (B)'s disjunction.
+                    self.resync_nonce().await.ok(); // late-mine self-heal
                                                     // Typed, not a string: the caller MUST be able to tell "not observed" from
                                                     // "definitely failed". await_receipt returns None after absorbing RPC errors
                                                     // and 429s (see tx.rs), so the dominant cause is a tx STILL PENDING, not one
@@ -270,7 +272,7 @@ impl ChainClient {
             );
         }
         let token = ITestnetToken::new(self.hemi_token, &*self.provider);
-        let nonce = self.reserve_nonce().await?; // [#48] explicit nonce via the shared allocator
+        let nonce = self.reserve_nonce().await?; // explicit nonce via the shared allocator
         let tx = token.mint(self.address, U256::from(amount)).nonce(nonce);
         let send_result = {
             let _guard = self.tx_lock.lock().await;
@@ -286,7 +288,7 @@ impl ChainClient {
                 self.note_nonce_in_use(nonce);
                 p
             }
-            // [review must-fix] abort→resync: see approve_hemi_token for rationale.
+            // abort→resync: see approve_hemi_token for rationale.
             Err(e) => {
                 self.abort_nonce(nonce);
                 self.resync_nonce().await.ok();
@@ -295,29 +297,30 @@ impl ChainClient {
         };
         let tx_hash = *pending.tx_hash();
         tracing::info!("mint tx sent: {:?}, waiting for receipt...", tx_hash);
-        // [RPC #1] Poll for the receipt (no heartbeat watcher); None → resync + bail, and
-        // deliberately NO abort — see [R4-A] below.
+        // Poll for the receipt (no heartbeat watcher); None → resync + bail, and
+        // deliberately NO abort — see the timeout branch below.
         let receipt =
             match crate::tx::await_receipt(&*self.provider, tx_hash, TX_RECEIPT_TIMEOUT).await {
                 Some(r) => r,
                 None => {
-                    // [R4-A] Do NOT abort here. The node ACCEPTED this send — only the RECEIPT
+                    // Do NOT abort here. The node ACCEPTED this send — only the RECEIPT
                     // was not observed — so the tx may well still be resident. `abort` inserts
                     // into `freed` AND writes an abort record, and the `resync` below cannot undo
                     // either: the stake is unmined, so the mined frontier IS this nonce and
-                    // `freed.retain(f >= chain_nonce)` keeps it. That is branch (B)'s literal
-                    // trigger, and the watchdog consumes branch (B) ungated — ~45-105s later it
-                    // bids max(4x base, 2 gwei) with no floor to lift over (staking records no
-                    // fee) and replaces the live stake with a 0-value self-transfer. Nothing
-                    // retries: the caller's StakeUnobserved arm deliberately neither re-sends nor
-                    // revokes, precisely because "the stake tx may still be in the mempool".
+                    // `freed.retain(f >= chain_nonce)` keeps it. That is the gap detector's
+                    // branch (B) trigger, and the watchdog consumes branch (B) ungated — ~45-105s
+                    // later it bids max(4x base, 2 gwei) with no floor to lift over (staking
+                    // records no fee) and replaces the live stake with a 0-value self-transfer.
+                    // Nothing retries: the caller's StakeUnobserved arm deliberately neither
+                    // re-sends nor revokes, precisely because "the stake tx may still be in the
+                    // mempool".
                     //
-                    // Leaving the nonce reserved-but-unresolved is now safe: if the tx really was
-                    // dropped, [A4]'s branch (A) finds the hole off the node's pending count as
-                    // soon as anything is reserved above it, and a restart re-anchors at that same
-                    // pending count. Do NOT substitute `note_unresolved` — it writes the abort
-                    // record, which is the other half of branch (B)'s disjunction.
-                    self.resync_nonce().await.ok(); // [review must-fix] late-mine self-heal
+                    // Leaving the nonce reserved-but-unresolved is safe: if the tx really was
+                    // dropped, the gap detector's branch (A) finds the hole off the node's pending
+                    // count as soon as anything is reserved above it, and a restart re-anchors at
+                    // that same pending count. Do NOT substitute `note_unresolved` — it writes the
+                    // abort record, which is the other half of branch (B)'s disjunction.
+                    self.resync_nonce().await.ok(); // late-mine self-heal
                     anyhow::bail!("mint receipt not confirmed (tx {tx_hash:?})");
                 }
             };
@@ -394,16 +397,12 @@ impl ChainClient {
                     }
                 }
                 // The stake tx may still be in the mempool. Revoking now would be actively
-                // harmful, and not only because the allowance is still needed: [R4-A] leaves
-                // the stake's nonce N reserved-but-UNRESOLVED — deliberately not in `freed` —
-                // so the revoke would reserve a FRESH nonce above N and queue behind it. It
+                // harmful, and not only because the allowance is still needed: the stake's
+                // nonce N is left reserved-but-UNRESOLVED — deliberately not in `freed` — so
+                // the revoke would reserve a FRESH nonce above N and queue behind it. It
                 // cannot mine until the stake does, and if the stake was in fact dropped it
                 // never mines at all, leaving a second unresolved nonce stacked on the first.
                 // A dangling one-stake allowance is far cheaper than evicting the stake.
-                //
-                // (This previously described a `freed`-reissue race at N. That mechanism was
-                // real before [R4-A] removed the abort; the conclusion held, the reason did
-                // not. Fourth comment in this file found asserting the pre-[R4-A] behaviour.)
                 if stake_err.downcast_ref::<StakeUnobserved>().is_some() {
                     if did_approve_here {
                         tracing::warn!(
@@ -481,11 +480,11 @@ pub fn fmt_hemi_ceil(wei: u128) -> String {
 /// How many proving slots the operator's collateral can currently fund.
 ///
 /// WHY THIS EXISTS: a miner can lose ~50% of throughput indefinitely with no warning.
-/// Observed live 2026-08-08 — 2 GPUs, `max_concurrent_proofs=2`, but `in_flight` never
-/// exceeded 1/2 because available collateral was 295.75 HEMI against the 300.00 needed for
-/// two concurrent claims. Short by 4.25 HEMI, with 444,804 HEMI sitting in the wallet. The
-/// miner logged 2,851 DEBUG skips and ZERO warnings, because the warning was gated on
-/// "claimed nothing this tick" and so only ever detected TOTAL starvation.
+/// For example, 2 GPUs with `max_concurrent_proofs=2` but `in_flight` never exceeding 1/2
+/// because available collateral is 295.75 HEMI against the 300.00 needed for two concurrent
+/// claims — short by 4.25 HEMI, with 444,804 HEMI sitting in the wallet. A warning gated on
+/// "claimed nothing this tick" stays silent through thousands of DEBUG skips, because it
+/// only ever detects TOTAL starvation, never this partial under-funding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Headroom {
     /// Slots we can fund right now: those already running, plus what the free collateral buys.
@@ -511,13 +510,13 @@ impl Headroom {
 /// snapshot was taken**, and `funded` MUST count the SAME set. Pairing a tick-start
 /// `available` with a post-claim `funded` counts this tick's claims twice and inflates
 /// `fundable` by exactly the number of claims made — which silently cancels a one-slot
-/// shortfall, i.e. precisely the 2026-08-08 incident. It is NOT the brain's tick residual
-/// either (that is the D17 double-count in the other direction).
+/// shortfall (partial under-funding goes undetected). It is NOT the brain's tick residual
+/// either (that double-counts in the other direction).
 /// Measured against the live contract: `locked` already includes live in-flight locks
 /// (`in_flight 2/2` → locked = baseline + 2 x per_claim), so `available` already nets them.
-/// The brain additionally subtracts `Σ(in_flight)` on purpose — the documented "D17"
-/// fail-safe at `run.rs:1938-1958` — which double-counts by up to one reservation. Feeding
-/// that residual in here would inherit the double-count and over-warn.
+/// The brain additionally subtracts `Σ(in_flight)` on purpose — its fail-safe in `run.rs` —
+/// which double-counts by up to one reservation. Feeding that residual in here would inherit
+/// the double-count and over-warn.
 ///
 /// `per_claim` is an UPPER bound (the auction gate reserves at `max_price`), so `fundable`
 /// is conservative and `shortfall` is a ceiling. Say so when reporting it.
@@ -547,14 +546,14 @@ pub fn collateral_headroom(
     };
     let fundable = funded.saturating_add(extra).min(wanted);
     // Deficit for ONE more slot, on the non-saturating on-chain figure. Deliberately NOT
-    // `wanted * per_claim - available`, which re-charges for slots already funded: in the
-    // incident that reads 154.25 instead of 4.25 — a 36x over-recommendation into a contract
-    // whose exit is delayed.
+    // `wanted * per_claim - available`, which re-charges for slots already funded: that form
+    // would read 154.25 instead of 4.25 — a 36x over-recommendation into a contract whose
+    // exit is delayed.
     // Marginal cost of the NEXT slot. `per_claim - available` is only correct while
     // `available < per_claim`; once `available >= per_claim` it saturates to 0 and the
     // message becomes "short ~0.00 HEMI … stake more", which is self-contradictory and
     // unactionable. Reachable on a 4-slot rig with available=250, per_claim=100: two slots
-    // fundable, true cost of the third is 50, old formula said 0.
+    // fundable, true cost of the third is 50, the saturating form said 0.
     // The remainder form is correct in both regimes and yields `per_claim` on an exact
     // multiple, which is right — a full further claim must be funded.
     let shortfall = if fundable >= wanted {
@@ -566,8 +565,9 @@ pub fn collateral_headroom(
         //   (195, per_claim 50, affordable=false) -> "short 5.00"
         //   stake 5 -> (200, ...)                 -> "short 50.00"
         // Two stop/stake/restart cycles, wrong both times. A full claim is the honest ask.
-        // (The incident replay passes either way only by coincidence: there Σ(in_flight) was
-        // exactly 1 x per_claim, so the remainder happened to equal the residual.)
+        // (When Σ(in_flight) happens to be exactly 1 x per_claim, the remainder equals the
+        // residual, so either form gives the same number — but that is coincidence, not
+        // correctness.)
         per_claim
     } else {
         // Marginal cost of the NEXT slot, correct in both regimes; yields `per_claim` on an
@@ -600,7 +600,7 @@ mod headroom_tests {
         for (available, per_claim, funded, wanted, affordable) in [
             (195 * HEMI, 50 * HEMI, 1, 2, false), // the reported case
             (295 * HEMI, 10 * HEMI, 0, 2, false), // total starvation, tiny per_claim
-            (145 * HEMI, 150 * HEMI, 1, 2, true), // the 2026-08-08 incident
+            (145 * HEMI, 150 * HEMI, 1, 2, true), // the partial under-funding case
             (250 * HEMI, 100 * HEMI, 0, 4, true), // multi-slot, remainder regime
             (0, 50 * HEMI, 0, 2, false),
         ] {
@@ -631,7 +631,7 @@ mod headroom_tests {
     use super::*;
     const H: u128 = 1_000_000_000_000_000_000; // 1 HEMI
 
-    /// The live incident, replayed. Must report 1-of-2 and a 4.25 HEMI shortfall.
+    /// A realistic partial-starvation case. Must report 1-of-2 and a 4.25 HEMI shortfall.
     #[test]
     fn replays_the_2026_08_08_incident() {
         // 1 job live; on-chain available already nets its 150 lock.
@@ -644,13 +644,13 @@ mod headroom_tests {
 
     /// The call site pairs a TICK-START `available` with a POST-claim `funded`. Netting out
     /// this tick's reservations is what makes the two describe the same instant; without it
-    /// `fundable` is inflated by the number of claims made and a one-slot shortfall — the
-    /// 2026-08-08 incident — is silently cancelled.
+    /// `fundable` is inflated by the number of claims made and a one-slot shortfall is
+    /// silently cancelled.
     #[test]
     fn tick_start_available_must_be_net_of_this_ticks_claims() {
         let avail_tick_start = 295_750 * H / 1000;
         let per_claim = 150 * H;
-        // WRONG pairing (what the first implementation did): reports healthy.
+        // WRONG pairing: reports healthy.
         let wrong = collateral_headroom(avail_tick_start, per_claim, 1, 2, true);
         assert!(
             !wrong.is_starved(),
@@ -691,8 +691,8 @@ mod headroom_tests {
         assert!(!h.is_starved());
     }
 
-    /// Regression for the fallback that re-hid TOTAL starvation: with a tiny `per_claim`
-    /// the division would clamp `fundable` to `wanted` and report healthy.
+    /// A tiny `per_claim` must not re-hide TOTAL starvation: without the affordability
+    /// veto the division would clamp `fundable` to `wanted` and report healthy.
     #[test]
     fn total_starvation_is_not_masked_by_a_tiny_per_claim() {
         let h = collateral_headroom(295 * H, 10 * H, 0, 2, /* anything_affordable */ false);

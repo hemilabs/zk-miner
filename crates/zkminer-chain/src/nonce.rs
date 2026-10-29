@@ -7,7 +7,7 @@
 //! SAME nonce N to concurrent tasks (reserve never advanced) and relied on
 //! "replacement underpriced"/"nonce too low" retries to sort it out — which meant a
 //! task's escalating re-broadcast could DISPLACE a *sibling's healthy* in-flight tx at
-//! the shared nonce (review R2:639/592).
+//! the shared nonce.
 //!
 //! # Design
 //! This allocator hands out DISTINCT nonces to concurrent callers, so:
@@ -42,13 +42,13 @@ const FEE_FLOOR_MAX_RATCHET: u128 = 8;
 /// Must outlast a STALLED RECOVERY PASS. `recover_claimed_jobs` awaits
 /// `process_job_lifecycle` inline on the same loop, and during a jam every tx it drives
 /// sits above the wedge, so each receipt wait burns the full `TX_RECEIPT_TIMEOUT` for a
-/// receipt that cannot arrive -- one attempt alone exceeded the old 120s value, and
-/// fulfill retries five times. An expiry inside that window opened the claim gate while
-/// the jam was live. The probe re-confirms every ~60s, so this only decides how long a
+/// receipt that cannot arrive -- one attempt alone can exceed 120s, and fulfill retries
+/// five times. An expiry inside that window would open the claim gate while the jam is
+/// still live. The probe re-confirms every ~60s, so this only decides how long a
 /// jam survives when the probe itself cannot run.
 ///
 /// Must be long enough that we do not immediately re-jam, and short enough that a
-/// resolved wedge resumes mining without operator action. The 2026-08-14 wedge took
+/// resolved wedge resumes mining without operator action. A real wedge once took
 /// 4h24m to clear on its own; this only controls how often we RE-TEST, since `commit`
 /// and `resync` clear the record immediately once the frontier moves past it.
 const UNDISPLACEABLE_TTL: std::time::Duration = std::time::Duration::from_secs(900);
@@ -102,8 +102,8 @@ struct Inner {
     ///
     /// A signer with an undisplaceable nonce is JAMMED: that nonce and every higher one
     /// cannot mine until the resident tx clears. Claiming more work in that state bonds
-    /// collateral we have no way to release, which is how three jobs aged past their
-    /// lock deadline on 2026-08-14. Read by `is_jammed` to gate new claims.
+    /// collateral we have no way to release, which is how jobs can age past their lock
+    /// deadline and be slashed. Read by `is_jammed` to gate new claims.
     undisplaceable: BTreeMap<u64, Instant>,
     /// When we last ABORTED a reservation at a nonce — retained even after the nonce is
     /// handed out again. See [`recently_aborted`].
@@ -215,7 +215,7 @@ impl NonceManager {
         // low". `consumed_below` is the watermark that makes that unrepresentable.
         if g.synced && nonce < g.next && nonce >= g.consumed_below {
             g.freed.insert(nonce);
-            // [R2] Amortised expiry. `commit`/`resync` prune everything at/below the mined
+            // Amortised expiry. `commit`/`resync` prune everything at/below the mined
             // frontier, but a nonce ABOVE the frontier that never mines would otherwise sit
             // here forever. Sweeping on insert bounds the map by "aborts within the TTL"
             // instead of by process uptime, at O(live entries) on a path that already
@@ -285,15 +285,15 @@ impl NonceManager {
 
     /// Record that we successfully BROADCAST `(tip, max_fee)` at `nonce`.
     ///
-    /// THE WEDGE THIS FIXES (incident 2026-08-01, all claims blocked ~10 min):
-    /// the fee ladder is seeded per INVOCATION — `claim_job` calls `base_fees()` once and
-    /// restarts `attempt` at 1, and `escalated_fees` uses `steps = attempt - 1`, so attempt
-    /// 1 bids the UNBUMPED base. Meanwhile a give-up recycles the nonce through `freed`,
-    /// and `reserve_locked` hands the LOWEST freed nonce out first — so the next claim gets
-    /// the same nonce and restarts the ladder at base. Once any invocation broadcast at its
-    /// top attempt (1.15^4 ~= 1.749x base), no later invocation could ever clear the node's
-    /// replacement threshold (>1.125x the resident). The loop was arithmetically
-    /// non-terminating and the signer stayed wedged until manual intervention.
+    /// WHY THE HIGH-WATER IS KEYED ON THE NONCE, not the invocation: without it the signer
+    /// can wedge with all claims blocked. The fee ladder is seeded per INVOCATION —
+    /// `claim_job` calls `base_fees()` once and restarts `attempt` at 1, and `escalated_fees`
+    /// uses `steps = attempt - 1`, so attempt 1 bids the UNBUMPED base. Meanwhile a give-up
+    /// recycles the nonce through `freed`, and `reserve_locked` hands the LOWEST freed nonce
+    /// out first — so the next claim gets the same nonce and restarts the ladder at base.
+    /// Once any invocation has broadcast at its top attempt (1.15^4 ~= 1.749x base), no later
+    /// invocation can clear the node's replacement threshold (>1.125x the resident): the loop
+    /// never terminates and the signer stays wedged until manual intervention.
     ///
     /// Recording the high-water mark ON THE NONCE (not the invocation) makes every retry
     /// strictly higher than the resident tx regardless of which call sends it.
@@ -329,9 +329,9 @@ impl NonceManager {
         //
         // The four job paths and the healer reach this. The STAKING paths cannot — alloy's
         // gas filler sets their fee pair, so they have no bid to record — and they share this
-        // same allocator, so they call `note_sent` instead. An earlier version of this comment
-        // claimed every send path recorded here; that was false, and it was the stated licence
-        // for consuming branch (B) ungated.
+        // same allocator, so they call `note_sent` instead. Because not every send path
+        // records here, branch (B) must not be consumed on the assumption that an accepted
+        // broadcast always lands at this function.
         g.aborted_at.remove(&nonce);
         g.unresolved.remove(&nonce);
         let e = g.fee_floor.entry(nonce).or_insert(FeeFloor {
@@ -374,21 +374,21 @@ impl NonceManager {
     /// at or above that nonce can mine.
     ///
     /// Entries age out after `UNDISPLACEABLE_TTL` so a resolved jam (the resident tx
-    /// mined, as happened after 4h24m on 2026-08-14) re-opens claiming on its own without
+    /// mined, which in one observed wedge took 4h24m) re-opens claiming on its own without
     /// needing a restart. They are also pruned by `commit`/`resync` the moment the
     /// frontier passes them, which is the fast path.
     pub fn is_jammed(&self) -> bool {
         let g = self.lock();
         let now = Instant::now();
-        // NON-DESTRUCTIVE. This is a query on the claim hot path; sweeping here made the
-        // question "am I jammed?" DELETE the record it reads. The gate then failed OPEN
-        // during a live jam, and because `jammed_nonce()` could no longer see the deleted
-        // key, the resync probe's `if let Some(j)` never fired again -- the jam could
-        // never be re-armed, since a bailed nonce is in `unresolved` and `reserve_locked`
-        // will never hand it out for a bail arm to re-observe. Fresh claims then draw
-        // clean nonces above the wedge, are accepted into the mempool behind it, and ride
-        // to their lock deadlines: the exact 2026-08-14 loss shape, re-created by this
-        // gate's own timer.
+        // NON-DESTRUCTIVE. This is a query on the claim hot path; sweeping here would make
+        // the question "am I jammed?" DELETE the record it reads. The gate would then fail
+        // OPEN during a live jam, and because `jammed_nonce()` could no longer see the
+        // deleted key, the resync probe's `if let Some(j)` would never fire again -- the jam
+        // could never be re-armed, since a bailed nonce is in `unresolved` and
+        // `reserve_locked` will never hand it out for a bail arm to re-observe. Fresh claims
+        // would then draw clean nonces above the wedge, be accepted into the mempool behind
+        // it, and ride to their lock deadlines -- the exact loss this gate exists to prevent,
+        // re-created by the gate's own timer.
         //
         // Entries are removed only by authority: `commit`/`resync` once the frontier
         // passes the nonce, or `clear_undisplaceable` when the probe confirms it mined.
@@ -455,8 +455,8 @@ impl NonceManager {
     /// The per-nonce fee floor together with whether the ratchet cap has been
     /// exhausted — i.e. whether a strictly-higher replacement is still possible.
     ///
-    /// WHY THIS EXISTS — the cap used to be a LIVELOCK FIXED POINT, and it cost a
-    /// 4h24m wedge and three stranded jobs on 2026-08-14. Once the recorded floor
+    /// WHY THIS EXISTS — a cap that merely clamps is a LIVELOCK FIXED POINT that can wedge
+    /// the signer for hours and strand jobs past their deadlines. Once the recorded floor
     /// passed `origin_max_fee * FEE_FLOOR_MAX_RATCHET`, the read clamped back to the
     /// cap, `fees_over_floor` added its 12.5% margin, and the caller broadcast
     /// `cap * 1.125`. `note_broadcast` recorded that, the next read clamped to `cap`
@@ -474,7 +474,7 @@ impl NonceManager {
         let g = self.lock();
         g.fee_floor.get(&nonce).map(|f| {
             let cap = f.origin_max_fee.saturating_mul(FEE_FLOOR_MAX_RATCHET);
-            // [A2] Cap BOTH, or the ratchet can invert the pair. `max_fee` is capped while
+            // Cap BOTH, or the ratchet can invert the pair. `max_fee` is capped while
             // `tip` is not, so once the cap bites, a recorded tip above it would be returned
             // unchanged and the caller — which rebuilds the EIP-1559 pair WITHOUT
             // `escalated_fees`' defensive `max_fee.max(tip)` clamp (jobs.rs:108) — would
@@ -505,7 +505,7 @@ impl NonceManager {
     /// True if we aborted a reservation at `nonce` within `within` and it has NOT since
     /// mined (a mined nonce is pruned by `commit`/`resync`).
     ///
-    /// WHY THIS EXISTS — the 2026-08-01 wedge went undetected for 10 minutes because
+    /// WHY THIS EXISTS — a wedge can go undetected for minutes because
     /// `is_freed(mined)` alone is a FLICKERING signal: `reserve_locked` removes the nonce
     /// from `freed` the instant it is handed out, and the failing claim loop aborted and
     /// re-reserved the same nonce many times a second. The gap watchdog samples once a
@@ -592,7 +592,7 @@ fn reserve_locked(g: &mut Inner) -> u64 {
 #[cfg(test)]
 mod tests {
 
-    /// [cheap-4] A nonce we have SEEN mine must never come back as a gap.
+    /// A nonce we have SEEN mine must never come back as a gap.
     ///
     /// `abort`'s old guard was `nonce < next` alone, and `commit` sets
     /// `next = max(next, used + 1)` — so after a nonce mines, that test is permanently true
@@ -735,9 +735,9 @@ mod tests {
     }
 
     #[test]
-    /// THE 2026-08-01 WEDGE. Reproduces the exact live state: the claim loop broadcast at
-    /// nonce 7708 up to its top attempt, gave up, aborted (recycling 7708 into `freed`),
-    /// and the next invocation got 7708 back from `reserve_locked` and restarted its ladder
+    /// Reproduces the recycled-nonce wedge: the claim loop broadcasts at
+    /// nonce 7708 up to its top attempt, gives up, aborts (recycling 7708 into `freed`),
+    /// and the next invocation gets 7708 back from `reserve_locked` and restarts its ladder
     /// at the UNBUMPED base — which cannot clear the node's replacement threshold against
     /// the resident tx. Without a per-nonce floor the second invocation's opening bid is
     /// <= the resident's fee and the loop never terminates.
@@ -818,8 +818,8 @@ mod tests {
         );
     }
 
-    /// R1: the incident state. `is_freed` flickers to FALSE the instant the poisoned nonce
-    /// is re-reserved, which is what hid the 2026-08-01 wedge from the once-a-minute
+    /// `is_freed` flickers to FALSE the instant the poisoned nonce
+    /// is re-reserved, which is what can hide a wedge from the once-a-minute
     /// watchdog. The sticky record must survive that re-reservation.
     #[test]
     fn abort_memory_survives_re_reservation() {
@@ -836,7 +836,7 @@ mod tests {
         );
     }
 
-    /// R1: it must NOT fire for a nonce we never aborted (e.g. a healthy in-flight fulfill).
+    /// It must NOT fire for a nonce we never aborted (e.g. a healthy in-flight fulfill).
     #[test]
     fn abort_memory_absent_for_untouched_nonce() {
         let m = NonceManager::new();
@@ -846,7 +846,7 @@ mod tests {
         assert!(!m.recently_aborted(999, Duration::from_secs(600)));
     }
 
-    /// R1: once the nonce MINES it is definitively not a hole — evidence must be dropped,
+    /// Once the nonce MINES it is definitively not a hole — evidence must be dropped,
     /// or the detector would keep offering to heal an already-consumed nonce forever.
     #[test]
     fn abort_memory_cleared_when_nonce_mines() {
@@ -867,7 +867,7 @@ mod tests {
         assert!(!m2.recently_aborted(100, Duration::from_secs(600)));
     }
 
-    /// R1: a fast abort/re-reserve loop must not refresh the timestamp forever — otherwise
+    /// A fast abort/re-reserve loop must not refresh the timestamp forever — otherwise
     /// the TTL never expires and the record is immortal.
     #[test]
     fn abort_memory_keeps_first_timestamp() {
@@ -882,7 +882,7 @@ mod tests {
         assert!(!m.recently_aborted(10, Duration::ZERO));
     }
 
-    /// R2: records above the mined frontier must not accumulate without bound.
+    /// Records above the mined frontier must not accumulate without bound.
     #[test]
     fn abort_memory_is_bounded() {
         let m = NonceManager::new();
@@ -902,7 +902,7 @@ mod tests {
         );
     }
 
-    /// R3/R5: the healer's unconfirmed path must stay DETECTABLE next tick. `claim_gap`
+    /// The healer's unconfirmed path must stay DETECTABLE next tick. `claim_gap`
     /// removes the nonce from `freed` and leaves `next == mined + 1`, so without evidence
     /// neither detector branch can fire and the promised retry never happens.
     #[test]
@@ -933,7 +933,7 @@ mod tests {
         );
     }
 
-    /// [A2] The ratchet cap must never invert the EIP-1559 pair. A node REJECTS a tx with
+    /// The ratchet cap must never invert the EIP-1559 pair. A node REJECTS a tx with
     /// maxPriorityFeePerGas > maxFeePerGas, and because `note_broadcast` only records on
     /// success, such a nonce can never advance its floor again — permanently stuck.
     #[test]
@@ -968,12 +968,12 @@ mod tests {
 mod fee_cap_livelock_tests {
     use super::*;
 
-    /// THE 2026-08-14 BUG. Once the recorded floor passes the cap, the read clamps
-    /// back to the cap forever, so the caller's `floor + 12.5%` reproduces exactly the
-    /// fee already on the wire. A replacement must be STRICTLY higher, so that bid is
-    /// rejected every time — 327 sends over 4h24m, three jobs stranded past deadline.
+    /// Once the recorded floor passes the cap, a plain clamp holds the read at the cap
+    /// forever, so the caller's `floor + 12.5%` reproduces exactly the fee already on the
+    /// wire. A replacement must be STRICTLY higher, so that bid is rejected every time —
+    /// 327 sends over 4h24m, three jobs stranded past deadline.
     ///
-    /// The fixed point must now be reported as exhaustion instead of returned silently.
+    /// The fixed point must be reported as exhaustion instead of returned silently.
     #[test]
     fn a_capped_nonce_reports_exhaustion_instead_of_a_losing_bid() {
         let m = NonceManager::new();
@@ -1180,11 +1180,11 @@ mod false_jam_tests {
 mod healer_bid_tests {
     use super::*;
 
-    /// D2, measured on soak20: the healer is the DESIGNATED unwedger, and it could not
+    /// The healer is the DESIGNATED unwedger, and in the capped-floor regime it could not
     /// win. It read the CAPPED floor and bid `over(cap) = 1.125 x cap`, while the job
     /// paths' exhausted steady state sits at ~1.0415 x cap — only +8.0%, under geth's
-    /// +10% replacement threshold. 259 heal attempts between 22:19 and 02:38, every one
-    /// rejected "replacement transaction underpriced", nonce wedged 4h24m.
+    /// +10% replacement threshold. Every one of 259 heal attempts was rejected
+    /// "replacement transaction underpriced", leaving the nonce wedged 4h24m.
     ///
     /// This drives the REAL allocator to its exhausted steady state and asserts the
     /// healer's bid now clears the threshold.
@@ -1234,14 +1234,13 @@ mod healer_bid_tests {
         );
     }
 
-    /// THE ROUND-2 DEFECT. The heal writes its own lifted bid back as the new
-    /// high-water while its seed stays frozen at 4x base, so the cap stops moving and
-    /// each heal lifts over the PREVIOUS heal. Compounding x9/8 every 60s, and on
-    /// soak20 this path ran 259 consecutive times.
+    /// The heal writes its own lifted bid back as the new high-water while its seed stays
+    /// frozen at 4x base, so the cap stops moving and each heal lifts over the PREVIOUS
+    /// heal. Left unchecked that compounds by x9/8 every 60s and can run hundreds of times.
     ///
-    /// The earlier version of the test above computed one bid as a local expression and
-    /// never fed it back, so it modelled exactly one heal and stayed green while the
-    /// ratchet ran away. This one closes the loop.
+    /// This test feeds each heal's bid back in, the way the real healer does, so a runaway
+    /// ratchet is caught — modelling a single bid without feeding it back would cover only
+    /// one heal and stay green while the ratchet ran away.
     #[test]
     fn repeated_heals_never_escalate_past_the_ceiling() {
         let over = |v: u128| v.saturating_add((v / 8).max(1));
@@ -1280,7 +1279,8 @@ mod healer_bid_tests {
             // replacement margin. Merely-larger is not enough: once the clamp binds, the
             // ratio decays and settles back at exactly the +8.02% that made the original
             // healer a guaranteed loser -- the same fixed point, relocated to the ceiling.
-            // Refusing there is the whole point; sending would be D2 all over again.
+            // Refusing there is the whole point; sending would reproduce the original
+            // guaranteed-loser bid.
             if bid < over(st.broadcast.1) {
                 ceiling_refusals += 1;
                 break;
@@ -1326,14 +1326,15 @@ mod healer_bid_tests {
 mod jam_gate_tests {
     use super::*;
 
-    /// J1. `is_jammed` must NOT delete the record it reads.
+    /// `is_jammed` must NOT delete the record it reads.
     ///
-    /// It is called from the claim hot path. Sweeping there made the query destroy its
-    /// own evidence: the gate failed OPEN during a live jam, and since `jammed_nonce()`
-    /// could no longer see the deleted key, the resync probe could never re-arm it — a
-    /// bailed nonce lives in `unresolved`, so `reserve_locked` never hands it out for a
-    /// bail arm to re-observe. Fresh claims then queue behind the wedge and ride to
-    /// their lock deadlines: the 2026-08-14 loss shape, re-created by the gate's timer.
+    /// It is called from the claim hot path. Sweeping there would make the query destroy
+    /// its own evidence: the gate would fail OPEN during a live jam, and since
+    /// `jammed_nonce()` could no longer see the deleted key, the resync probe could never
+    /// re-arm it — a bailed nonce lives in `unresolved`, so `reserve_locked` never hands it
+    /// out for a bail arm to re-observe. Fresh claims would then queue behind the wedge and
+    /// ride to their lock deadlines — the loss this gate exists to prevent, re-created by
+    /// the gate's own timer.
     #[test]
     fn asking_whether_we_are_jammed_does_not_erase_the_jam() {
         let m = NonceManager::new();
@@ -1368,7 +1369,7 @@ mod jam_gate_tests {
 
     /// A jam must outlast a stalled recovery pass. Each receipt wait during a jam burns
     /// the full TX_RECEIPT_TIMEOUT for a receipt that cannot arrive, and fulfill retries
-    /// five times — the old 120s TTL expired inside a single such pass.
+    /// five times — a 120s TTL would expire inside a single such pass.
     #[test]
     fn the_ttl_outlasts_a_stalled_recovery_pass() {
         let worst_stall = std::time::Duration::from_secs(120) * 5;
@@ -1379,7 +1380,7 @@ mod jam_gate_tests {
         );
     }
 
-    /// J2. A ceiling-reached ladder must be resettable, or a heal that was accepted and
+    /// A ceiling-reached ladder must be resettable, or a heal that was accepted and
     /// then evicted from the mempool vetoes every future heal at that nonce forever.
     #[test]
     fn a_stale_ladder_can_be_reset_when_the_resident_is_gone() {

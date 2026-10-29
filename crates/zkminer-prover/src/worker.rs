@@ -10,6 +10,53 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Environment-variable names that must NEVER be passed to a prover worker or the sp1-gpu-server it
+/// forks (they carry the operator's signing secret). Workers prove; they never sign a chain tx.
+/// Matches the default `ZKMINER_PRIVATE_KEY` plus common secret-bearing patterns; an operator using
+/// a non-standard `key_env_var` that matches none of these should add it here.
+fn is_secret_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.contains("PRIVATE_KEY")
+        || upper.contains("SECRET_KEY")
+        || upper == "MNEMONIC"
+        || upper.ends_with("_MNEMONIC")
+        || upper.contains("SEED_PHRASE")
+        || upper == "ZKMINER_KEYSTORE_PASSWORD"
+}
+
+/// Sanitize a line of worker stderr before it reaches the operator's terminal or log file.
+///
+/// A guest's stdout is routed onto the worker's stderr (fd 1 → 2), so a malicious guest ELF can
+/// emit arbitrary bytes here. Forwarding them verbatim would let it inject ANSI/terminal escape
+/// sequences into the operator's console or forge log lines (via carriage returns). Strip control
+/// characters (keep tab) and cap the length so neither is possible.
+/// Bidi/directional-format chars and line/paragraph separators that `char::is_control()` (Cc-only)
+/// does not catch but that still reorder or forge log lines (Trojan-Source, CVE-2021-42574). Kept in
+/// sync with `zkminer_chain::programs::sanitize_log`'s `is_log_unsafe_format`; a guest's stdout is
+/// forwarded through here, so it needs the same hardening the structured-error sanitizer already has.
+fn is_worker_log_unsafe_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2028}' | '\u{2029}'               // line / paragraph separator (Zl, Zp)
+        | '\u{200E}' | '\u{200F}' | '\u{061C}' // LRM / RLM / ALM
+        | '\u{202A}'..='\u{202E}'             // LRE / RLE / PDF / LRO / RLO
+        | '\u{2066}'..='\u{2069}'             // LRI / RLI / FSI / PDI (isolates)
+    )
+}
+
+fn sanitize_worker_line(line: &str) -> String {
+    const MAX: usize = 2048;
+    let mut out: String = line
+        .chars()
+        .filter(|&c| c == '\t' || (!c.is_control() && !is_worker_log_unsafe_format(c)))
+        .take(MAX)
+        .collect();
+    if line.chars().count() > MAX {
+        out.push_str("…[truncated]");
+    }
+    out
+}
+
 /// When true, worker stderr forwarding is suppressed (TUI mode).
 static SUPPRESS_WORKER_STDERR: AtomicBool = AtomicBool::new(false);
 
@@ -72,10 +119,10 @@ enum ExitProbe {
 ///   * safety: once the number is free the kernel can hand it to an unrelated process
 ///     group, so a late `kill(-pgid, SIGKILL)` would take out somebody else's processes.
 ///
-/// So nothing here reaps until the sweep has run. `ensure_alive` already documents this
-/// contract — "before `WorkerHandle::drop` reaps the zombie" — and `try_wait` broke it:
-/// the liveness check that detects the death was also the thing that destroyed the only
-/// handle the cleanup had.
+/// So nothing here reaps until the sweep has run. This upholds the contract `ensure_alive`
+/// documents — the zombie is reaped only in `WorkerHandle::drop`, after the sweep. Reaping here
+/// (as `try_wait` would) would violate it: the liveness check that detects the death would also
+/// destroy the only handle the cleanup has.
 #[cfg(unix)]
 fn probe_exit_nowait(pid: u32) -> ExitProbe {
     if pid == 0 {
@@ -140,11 +187,10 @@ fn probe_exit_nowait(pid: u32) -> ExitProbe {
 /// pid recycling, a stranger's group. The case this really forbids is the one that costs
 /// everything: `kill(-our_pgid, SIGKILL)` kills the miner and every live prover.
 ///
-/// Note what it does NOT detect, because three comments previously claimed it did: a failed
-/// `setpgid` leaves the worker's pid unequal to our pgid, so this predicate is true and the
-/// signal goes out. Detecting that needs the worker's actual pgrp, and `setpgid` failing already
-/// aborts the spawn (`spawn_on_this_thread`), so the condition is unreachable rather than
-/// screened.
+/// Note what it does NOT detect: a failed `setpgid` leaves the worker's pid unequal to our pgid,
+/// so this predicate is true and the signal goes out. Detecting that would need the worker's
+/// actual pgrp, but `setpgid` failing already aborts the spawn (`spawn_on_this_thread`), so the
+/// condition is unreachable rather than screened.
 #[cfg(unix)]
 fn may_signal_group(pid: u32) -> bool {
     pid != 0 && (pid as i32) != unsafe { libc::getpgrp() }
@@ -153,11 +199,11 @@ fn may_signal_group(pid: u32) -> bool {
 /// Live (non-zombie) members of process group `pgid`, excluding the group leader itself.
 ///
 /// This is the predicate the orphan alarm actually needs. `kill(-pgid, 0)` cannot answer
-/// it: a ZOMBIE leader keeps the group non-empty, so the probe succeeded on every clean
-/// worker exit and the "left process-group members behind" warning fired even when the
-/// worker had forked nothing at all — 6 times in a single SP1-decline run. A zombie holds
-/// no VRAM, so it is not a leak, and raising the alarm on it trains the operator to ignore
-/// the one message that means "go look for 10 GB of held VRAM".
+/// it: a ZOMBIE leader keeps the group non-empty, so the probe succeeds on every clean
+/// worker exit and the "left process-group members behind" warning would fire even when the
+/// worker had forked nothing at all. A zombie holds no VRAM, so it is not a leak, and raising
+/// the alarm on it trains the operator to ignore the one message that means "go look for
+/// 10 GB of held VRAM".
 ///
 /// `proc_root` is a parameter so the discriminator can be tested against a synthetic tree.
 #[cfg(unix)]
@@ -165,13 +211,12 @@ fn live_group_members(proc_root: &Path, pgid: i32) -> Option<Vec<(i32, String)>>
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(proc_root) {
         Ok(e) => e,
-        // `None` means WE COULD NOT LOOK, which is not the same as "nothing leaked" — and since
-        // the group kill is now gated on this scan, folding the two together meant no kill at all.
-        // The condition that causes it is the one this project treats as normal: at the NOFILE
-        // limit (which `is_transient_spawn_error` adds EMFILE/ENFILE for) `read_dir` fails, a
-        // forked `sp1-gpu-server` keeps ~18 GB of VRAM, and nothing kills it. The old
-        // `kill(-pgid, 0)` probe needed no descriptor at all, so this would have been a regression
-        // in exactly that state.
+        // `None` means WE COULD NOT LOOK, which is not the same as "nothing leaked". The group
+        // kill is gated on this scan, so folding the two together would mean no kill at all. The
+        // condition that causes it is one this project treats as normal: at the NOFILE limit
+        // (which `is_transient_spawn_error` adds EMFILE/ENFILE for) `read_dir` fails, a forked
+        // `sp1-gpu-server` keeps ~18 GB of VRAM, and nothing kills it. So `None` is reported
+        // distinctly from an empty list, letting the caller kill the group blind rather than leak.
         Err(e) => {
             tracing::warn!("cannot read {}: {e}", proc_root.display());
             return None;
@@ -187,8 +232,8 @@ fn live_group_members(proc_root: &Path, pgid: i32) -> Option<Vec<(i32, String)>>
         }
         // Read bytes, not a String: `comm` is whatever `prctl(PR_SET_NAME)` was handed and
         // need not be UTF-8. `read_to_string` returns Err(InvalidData) for such a process, so
-        // it would be skipped — and since the group kill is now gated on this scan finding
-        // something, a single non-UTF-8 member meant no kill at all.
+        // it would be skipped — and since the group kill is gated on this scan finding
+        // something, a single non-UTF-8 member would mean no kill at all.
         let Ok(stat_bytes) = std::fs::read(e.path().join("stat")) else {
             continue; // raced exit, or another user's process
         };
@@ -256,13 +301,12 @@ fn sweep_process_group(pid: u32, backend: &str) -> usize {
 /// The sweep, with its two environmental inputs injected so it can be tested.
 ///
 /// Returns the number of live members it found (and therefore signalled). `0` means nothing
-/// leaked. The previous version hardcoded `/proc`, read `getpgrp()` directly and returned `()`,
-/// so neither the reporting nor — more importantly — the self-group refusal below could be
-/// tested at all.
+/// leaked. `/proc` and `getpgrp()` are injected rather than read directly so that the reporting
+/// and — more importantly — the self-group refusal below can be tested at all.
 ///
-/// `kill_group` is injected for the same reason, and because injecting only the SCAN was not
-/// enough: a test supplying a synthetic `/proc` with a live member still reached a real
-/// `kill(-pgid, SIGKILL)`, so the one test exercising the kill path performed one against the
+/// `kill_group` is injected for the same reason: injecting only the SCAN is not enough, because
+/// a test supplying a synthetic `/proc` with a live member would still reach a real
+/// `kill(-pgid, SIGKILL)`, so the one test exercising the kill path would perform one against the
 /// host kernel — harmless as an unprivileged user, a live process group as root or in a
 /// container with low pids.
 #[cfg(unix)]
@@ -290,8 +334,8 @@ fn sweep_process_group_in(
     let leftovers = match live_group_members(proc_root, pgid) {
         Some(l) => l,
         // We could not scan. The pid is still pinned (callers hold an unreaped child), so the
-        // group number is ours and signalling it is safe — and it is what the old unconditional
-        // kill did. Killing blind beats leaking 18 GB of VRAM because a descriptor was unavailable.
+        // group number is ours and signalling it is safe. Killing blind beats leaking 18 GB of
+        // VRAM because a descriptor was unavailable.
         None => {
             tracing::warn!(
                 "worker {backend} (PID {pid}): cannot scan for leaked process-group members, so \
@@ -352,22 +396,23 @@ static SPAWNER: std::sync::OnceLock<std::sync::mpsc::Sender<SpawnRequest>> =
 /// Get (or start) the spawner thread.
 ///
 /// A failed thread creation yields a live channel with no reader, so `spawn` fails cleanly with
-/// "worker-spawner thread is gone" rather than panicking out of whatever called it — which, with
-/// the old `expect`, unwound through `ensure_alive` into `prove_on_slot` WITH THE SLOT GUARD HELD,
-/// poisoning the mutex. `is_backend_healthy` then reads a poisoned slot as healthy forever while
-/// every `try_lock` fails, so the miner keeps claiming for a backend it can never dispatch to.
+/// "worker-spawner thread is gone" rather than panicking out of whatever called it. Panicking here
+/// would unwind through `ensure_alive` into `prove_on_slot` WITH THE SLOT GUARD HELD, poisoning the
+/// mutex. `is_backend_healthy` then reads a poisoned slot as healthy forever while every `try_lock`
+/// fails, so the miner keeps claiming for a backend it can never dispatch to.
 ///
 /// WHY THIS EXISTS: workers are forked with `PR_SET_PDEATHSIG, SIGKILL` so they can't
 /// outlive a crashed miner. That signal is **thread-scoped** — the kernel delivers it
 /// when the thread that forked the child exits, NOT when the process dies. Respawns
 /// happen inside `tokio::task::spawn_blocking`, and tokio retires idle blocking threads
-/// (~10s), so every respawned worker was being SIGKILLed shortly after it went idle.
+/// (~10s), so a worker forked from such a thread gets SIGKILLed shortly after that thread
+/// goes idle.
 ///
-/// Symptom before this fix: the miner ran cleanly until the first 20-proof recycle
-/// forced a respawn, then ~90% of proofs were preceded by
+/// The failure that produces: the miner runs cleanly until the first 20-proof recycle
+/// forces a respawn, then ~90% of proofs are preceded by
 /// `Worker risc0:cuda died (killed by signal 9), will attempt respawn` — permanently,
-/// which also meant workers never survived to 20 proofs and the recycle hygiene the
-/// recycle exists to provide never actually ran.
+/// which also means workers never survive to 20 proofs and the recycle hygiene the
+/// recycle exists to provide never actually runs.
 ///
 /// Forking from one thread that lives for the whole process keeps the crash-cleanup
 /// guarantee (PDEATHSIG still fires if the miner dies, because this thread dies with it)
@@ -445,6 +490,24 @@ impl WorkerHandle {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        // Do NOT let a worker (or the third-party sp1-gpu-server it forks) inherit the
+        // operator's funded signing key. The miner process holds ZKMINER_PRIVATE_KEY in its env;
+        // workers only prove and never sign a chain tx, so the key is pure attack surface there (a
+        // compromise of a prover, the SP1 SDK's CGO code, or a crafted guest should not hand over the
+        // wallet). We rebuild the child env from ours MINUS secret-bearing names, rather than
+        // `env_clear()` alone, so PATH / HOME / LD_LIBRARY_PATH / CUDA_* and everything the worker
+        // genuinely needs are preserved. The dispatcher's explicit overrides are applied last.
+        cmd.env_clear();
+        for (k, v) in std::env::vars_os() {
+            let is_secret = k
+                .to_str()
+                .map(is_secret_env_name)
+                .unwrap_or(false);
+            if !is_secret {
+                cmd.env(k, v);
+            }
+        }
+
         for (k, v) in env_overrides {
             cmd.env(k, v);
         }
@@ -471,11 +534,11 @@ impl WorkerHandle {
                 // Volunteer as the kernel's OOM victim.
                 //
                 // This is the cheapest protection the miner has and the one that decides whether a
-                // memory crunch costs a proof or the whole host. On 2026-10-04 this box was frozen
-                // hard enough to need a power cycle by four concurrent risc0 provers; the kernel
-                // got there eventually, but a `global_oom` is free to pick sshd, systemd or the
-                // miner — and the miner is the process that has to survive in order to RELEASE the
-                // collateral of the job it just lost.
+                // memory crunch costs a proof or the whole host. Four concurrent risc0 provers can
+                // freeze this box hard enough to need a power cycle; the kernel gets there
+                // eventually, but a `global_oom` is free to pick sshd, systemd or the miner — and
+                // the miner is the process that has to survive in order to RELEASE the collateral
+                // of the job it just lost.
                 //
                 // +800 (of the kernel's -1000..=1000 range, added to the heuristic score) makes a prover the
                 // first choice essentially always, and `sp1-gpu-server` INHERITS it, which is the
@@ -500,11 +563,10 @@ impl WorkerHandle {
         // thread setup allocates — and an unwind past a bare local leaks a fully LIVE worker holding
         // VRAM, with no handle left to kill it.
         //
-        // `PR_SET_PDEATHSIG` used to collect it by accident, because the forking thread died with
-        // the panic. It no longer does: that signal is THREAD-scoped, and the spawner's
-        // `catch_unwind` deliberately keeps the thread alive to serve the next request — so the
-        // orphan now survives indefinitely. The guard makes the cleanup explicit instead of relying
-        // on a side effect that was removed.
+        // `PR_SET_PDEATHSIG` does NOT collect it: that signal is THREAD-scoped, and the spawner's
+        // `catch_unwind` deliberately keeps the forking thread alive to serve the next request, so
+        // the orphan would survive indefinitely. This guard makes the cleanup explicit rather than
+        // relying on the forking thread dying with the panic.
         struct SpawnGuard<'a>(Option<Child>, &'a str);
         impl SpawnGuard<'_> {
             fn get(&mut self) -> &mut Child {
@@ -558,22 +620,100 @@ impl WorkerHandle {
             std::thread::Builder::new()
                 .name(format!("worker-stderr-{backend_name}"))
                 .spawn(move || {
-                    use std::io::BufRead;
-                    let reader = BufReader::new(stderr);
-                    for line in reader.lines() {
-                        match line {
-                            Ok(line) if !line.is_empty() => {
-                                // DIAGNOSTIC: surface WITSUM / EVALCHECK_DIFF lines directly to stderr
-                                // (the test harness installs no tracing subscriber, so warn is dropped).
-                                if line.starts_with("[WITSUM]") || line.starts_with("[EVALCHECK_DIFF]") {
-                                    eprintln!("[worker:{backend_name}] {line}");
-                                }
-                                if !SUPPRESS_WORKER_STDERR.load(Ordering::Relaxed) {
-                                    tracing::warn!(target: "worker", "[worker:{backend_name}] {line}");
+                    use std::io::Read;
+                    // Read with a per-line BYTE CAP, not BufRead::lines(): because a guest's stdout
+                    // is dup2'd onto worker stderr, a malicious guest can emit gigabytes with no
+                    // newline, and lines() would allocate the whole run into one String first — a
+                    // free heap-OOM of the miner. Accumulate at most MAX_LINE_BYTES per line, emit
+                    // the (sanitized) prefix, then discard the rest of an over-long line until '\n'.
+                    const MAX_LINE_BYTES: usize = 8192;
+                    let mut reader = BufReader::new(stderr);
+                    let mut buf: Vec<u8> = Vec::with_capacity(256);
+                    let mut discarding = false;
+                    let mut byte = [0u8; 1];
+                    // Aggregate flood cap on forwarding. A guest's stdout is dup2'd onto this
+                    // worker-stderr pipe, so a malicious guest can emit unbounded lines; the
+                    // per-line BYTE cap above bounds each line but not their NUMBER. Unbounded, a guest
+                    // in a tight print loop (free, on the pre-claim EXECUTE measurement path — no claim,
+                    // no collateral) floods the daily-rotated, size-uncapped log and fills the
+                    // operator's disk. Token-bucket it: a burst, then a steady trickle, with the excess
+                    // folded into one periodic "(N dropped)" summary so a genuine late diagnostic still
+                    // gets through while a flood cannot. Per drainer thread = per worker lifetime; a
+                    // respawn resets it. In TUI mode forwarding is gated off ENTIRELY below
+                    // (SUPPRESS_WORKER_STDERR), which closes the rolling-file disk-fill outright; the
+                    // bucket is the headless (operator-redirected stderr) defence-in-depth.
+                    const BUCKET_CAP: u32 = 2048; // lines forwardable back-to-back
+                    const REFILL_PER_SEC: u32 = 32; // steady trickle once the burst is spent
+                    let mut tokens: u32 = BUCKET_CAP;
+                    let mut last_refill = std::time::Instant::now();
+                    let mut dropped: u64 = 0;
+                    let mut emit = |raw: &[u8]| {
+                        if raw.is_empty() {
+                            return;
+                        }
+                        // TUI mode suppresses forwarding to BOTH sinks: the eprintln would corrupt the
+                        // alternate screen (a guest could force it by prefixing "[WITSUM]"), and the
+                        // tracing::warn would flood the rolling log file. The pipe is still drained (we
+                        // read every byte), so the worker never blocks on a full pipe regardless.
+                        if SUPPRESS_WORKER_STDERR.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        // Sanitize (strip control/escape bytes, cap length) before it can reach the
+                        // operator's console or log file.
+                        let line = sanitize_worker_line(&String::from_utf8_lossy(raw));
+                        if line.is_empty() {
+                            return;
+                        }
+                        // Refill the bucket for the time since the last forward, then spend one token.
+                        let now = std::time::Instant::now();
+                        let add = (now.duration_since(last_refill).as_secs_f64()
+                            * REFILL_PER_SEC as f64) as u32;
+                        if add > 0 {
+                            tokens = tokens.saturating_add(add).min(BUCKET_CAP);
+                            last_refill = now;
+                        }
+                        if tokens == 0 {
+                            dropped = dropped.saturating_add(1);
+                            return;
+                        }
+                        tokens -= 1;
+                        if dropped > 0 {
+                            let n = std::mem::take(&mut dropped);
+                            tracing::warn!(
+                                target: "worker",
+                                "[worker:{backend_name}] …{n} line(s) of worker output dropped (flood protection)"
+                            );
+                        }
+                        if line.starts_with("[WITSUM]") || line.starts_with("[EVALCHECK_DIFF]") {
+                            eprintln!("[worker:{backend_name}] {line}");
+                        }
+                        tracing::warn!(target: "worker", "[worker:{backend_name}] {line}");
+                    };
+                    loop {
+                        match reader.read(&mut byte) {
+                            Ok(0) => {
+                                emit(&buf);
+                                break;
+                            }
+                            Ok(_) => {
+                                if byte[0] == b'\n' {
+                                    emit(&buf);
+                                    buf.clear();
+                                    discarding = false;
+                                } else if !discarding {
+                                    buf.push(byte[0]);
+                                    if buf.len() >= MAX_LINE_BYTES {
+                                        // Line too long: emit what we have, then skip to the newline.
+                                        emit(&buf);
+                                        buf.clear();
+                                        discarding = true;
+                                    }
                                 }
                             }
-                            Err(_) => break,
-                            _ => {}
+                            Err(_) => {
+                                emit(&buf);
+                                break;
+                            }
                         }
                     }
                 })
@@ -856,9 +996,9 @@ impl WorkerHandle {
 
     /// Check if the worker process is still alive.
     ///
-    /// Does NOT reap. `try_wait` here was the bug: the liveness check that detects the
-    /// death also destroyed the pid — and hence the process-group number — that the
-    /// forked-helper sweep needs, and freed it for reuse before the later `kill(-pgid)`.
+    /// Does NOT reap. Reaping here (as `try_wait` would) frees the pid — and hence the
+    /// process-group number — that the forked-helper sweep needs, for reuse before the
+    /// later `kill(-pgid)`.
     ///
     /// The cost is that a dead worker stays a zombie until its handle is dropped. That is
     /// bounded by the number of slots, and it is the better trade in both directions: the
@@ -881,8 +1021,7 @@ impl WorkerHandle {
     ///
     /// Distinguishes an external SIGKILL (signal 9) from a panic/abort (6/11) and a clean
     /// exit (code 0 = graceful Shutdown). On unix it reads the zombie without reaping it, so
-    /// it can be called after `is_alive()` has already observed the death; the old
-    /// `try_wait`-Err case is gone with `try_wait` itself.
+    /// it can be called after `is_alive()` has already observed the death.
     pub fn exit_reason(&mut self) -> String {
         #[cfg(unix)]
         {
@@ -914,12 +1053,11 @@ impl WorkerHandle {
     /// Only meaningful once the worker is dead. Two conditions must hold: it died by `SIGKILL`, and
     /// our cgroup subtree's cumulative OOM-kill counter advanced during its lifetime.
     ///
-    /// This exists because the alternative is misattribution, and that has already cost real time
-    /// on this box: an OOM-killed prover surfaces as EOF on its pipe, a broken pipe, or a bare
-    /// "killed by signal 9", all of which read exactly like a prover regression and invite
-    /// debugging the prover. The project's own notes record making that mistake. A host OOM is an
-    /// environmental fact — on a box with less RAM than the workload needs, no amount of prover
-    /// debugging helps — and it deserves to be said out loud.
+    /// This exists because the alternative is misattribution: an OOM-killed prover surfaces as EOF
+    /// on its pipe, a broken pipe, or a bare "killed by signal 9", all of which read exactly like a
+    /// prover bug and invite debugging the prover. A host OOM is an environmental fact — on a box
+    /// with less RAM than the workload needs, no amount of prover debugging helps — and it deserves
+    /// to be said out loud.
     ///
     /// Deliberately conservative. The counter is subtree-wide, so a kill elsewhere in the subtree
     /// during this worker's lifetime can produce a false positive; that is the right direction to
@@ -980,7 +1118,7 @@ impl WorkerHandle {
                 // forked in the gap).
                 let _ = sweep_process_group(pid, &self.backend);
                 // Gated on the SAME refusal the sweep applies. Issuing `kill(-pid)`
-                // unconditionally here voided that guarantee two lines after making it: if
+                // unconditionally here would void that guarantee two lines after making it: if
                 // `setpgid` had failed at spawn, the sweep would decline and this would kill
                 // the miner's own group anyway, every live prover with it.
                 if may_signal_group(pid) {
@@ -1001,13 +1139,13 @@ impl WorkerHandle {
         // uninterruptible sleep, and this call is made microseconds after SIGKILLing a CUDA process
         // — the likeliest place in the whole program to meet a D-state task inside a driver ioctl.
         //
-        // A bare `wait()` here was the hazard that matters most, because of WHO is waiting. Every
+        // A bare `wait()` here is the hazard that matters most, because of WHO is waiting. Every
         // caller of `kill()` holds the slot guard AND the per-GPU guard: the 20-proof recycle, the
         // stream-corruption path, the GPU-OOM path. A wedged reap there parks that card forever,
         // the proving watchdog cannot help (the thread is blocked in `wait`, not in `read`),
         // `abort_at` is never re-evaluated so the collateral strands, and `shutdown_all`'s final
-        // blocking `slot.lock()` never returns — so the miner cannot even exit. Exactly the shape of
-        // the `bus_id_for_slot` deadlock already fixed in this work.
+        // blocking `slot.lock()` never returns — so the miner cannot even exit. It is the same shape
+        // of deadlock as a blocking `bus_id_for_slot` call under the slot guard.
         //
         // The cost of giving up is one zombie, which is bounded by the slot count and which
         // `Drop` tries again to collect. `reaped` records what actually happened: claiming a reap
@@ -1048,11 +1186,10 @@ impl WorkerHandle {
 
         // Wait up to 5 seconds for the process to exit.
         //
-        // The wait does NOT reap (see `probe_exit_nowait`). The old `try_wait` loop
-        // returned early on a clean exit having ALREADY reaped, which freed the process-
-        // group number before anything swept the group — so a `sp1-gpu-server` the worker
-        // had forked survived the one shutdown path most likely to be taken, and became
-        // unreachable: `Drop` then saw ECHILD and had nothing left to kill.
+        // The wait does NOT reap (see `probe_exit_nowait`). Reaping on a clean exit (as a
+        // `try_wait` loop would) frees the process-group number before anything sweeps the group
+        // — so a `sp1-gpu-server` the worker had forked survives the one shutdown path most likely
+        // to be taken, and becomes unreachable: `Drop` then sees ECHILD and has nothing left to kill.
         let start = Instant::now();
         let timeout = Duration::from_secs(5);
         let pid = self.child.id();
@@ -1109,7 +1246,7 @@ impl Drop for WorkerHandle {
         // "check for an orphaned sp1-gpu-server holding VRAM" warning when nothing had
         // leaked -- training the operator to ignore the one alarm that means "go look".
         //
-        // The common case is now ~2.2s, because phase 3 of `shutdown_all` has already
+        // The common case is ~2.2s, because phase 3 of `shutdown_all` has already
         // SIGKILLed the group and the first probe here sees `Exited`. The 10.2s worst case is
         // NOT eliminated: a worker whose `entry.pid` was momentarily 0 is skipped by phases 2
         // and 3, so this poll finds it `Running` and burns the full 2s before killing it.
@@ -1181,19 +1318,17 @@ impl Drop for WorkerHandle {
 
                 // Exited, still a zombie. Kill anything it LEFT BEHIND -- and only that.
                 //
-                // This is the whole point of the fix: the old code `break`ed out of its
-                // wait loop precisely when the worker had already exited -- the
-                // death-and-respawn path drops the handle BECAUSE the worker died -- and so
-                // never group-killed. A forked GPU helper (SP1's `sp1-gpu-server`, a 236MB
-                // CUDA process) then outlived it as an orphan holding VRAM, unreachable
-                // afterwards because the dispatcher zeroes the stored PID around dropping
-                // dropping the handle. Measured in production: 10.3GB still held after the
-                // miner exited, which starved the next run into CUDA OOM panics.
+                // This is the whole point of this arm. Breaking out of the wait loop as soon as
+                // the worker had exited -- the death-and-respawn path drops the handle BECAUSE the
+                // worker died -- would never group-kill. A forked GPU helper (SP1's
+                // `sp1-gpu-server`, a 236MB CUDA process) then outlives it as an orphan holding
+                // VRAM, unreachable afterwards because the dispatcher zeroes the stored PID around
+                // dropping the handle (10.3GB has been seen still held after the miner exited,
+                // which starved the next run into CUDA OOM panics).
                 //
                 // The membership test is `live_group_members`, NOT `kill(-pid, 0)`: the
-                // zombie leader is itself a member, so the old probe reported "members left
-                // behind" on every clean exit -- 6 false alarms in one SP1-decline run, for
-                // a worker that had forked nothing.
+                // zombie leader is itself a member, so that probe would report "members left
+                // behind" on every clean exit, for a worker that had forked nothing.
                 ExitProbe::Exited { .. } => {
                     let _ = sweep_process_group(pid, &self.backend);
                 }
@@ -1206,8 +1341,8 @@ impl Drop for WorkerHandle {
 
         // Now reap -- BOUNDED. `wait()` blocks until the child is reapable, and SIGKILL does not
         // land on a process in uninterruptible sleep (a GPU helper inside a driver ioctl, or
-        // paging a 236MB image in from a stalled mount). `proc::reap_briefly` bounds its reap for
-        // exactly this reason; this one did not.
+        // paging a 236MB image in from a stalled mount). This reap is bounded for that reason,
+        // like `proc::reap_briefly`.
         #[cfg(unix)]
         {
             // Record what actually happened, not what we attempted. `reaped` is the flag every
@@ -1230,19 +1365,18 @@ impl Drop for WorkerHandle {
             self.reaped = true;
         }
 
-        // Join the stderr forwarder -- BOUNDED, and this is the one that mattered.
+        // Join the stderr forwarder -- BOUNDED.
         //
         // That thread ends on EOF of the worker's stderr pipe. The SP1 worker `dup2`s fd 1 onto
         // fd 2, so every grandchild -- `sp1-gpu-server` included -- inherits a copy of the write
         // end; only the IPC descriptor is CLOEXEC. So the join waits for the GPU HELPER, not for
         // the worker.
         //
-        // The old `Drop` got away with an unbounded join by accident: its `kill(-pid, 0)` guard is
-        // true for a zombie leader, so it group-killed unconditionally and the pipe always reached
-        // EOF. The new sweep kills only when it finds a live member, and the `Gone` arm kills
-        // nothing at all -- so an unbounded join here could block forever, holding the slot mutex
-        // (`mark_slot_*` drops the handle under it) or parking the process-wide spawner thread
-        // that every worker is forked from. That is the wedge `proc` was introduced to remove.
+        // An unbounded join is unsafe here: the sweep group-kills only when it finds a live member,
+        // and the `Gone` arm kills nothing at all, so the pipe is not guaranteed to reach EOF. A
+        // blocking join could then hang forever, holding the slot mutex (`mark_slot_*` drops the
+        // handle under it) or parking the process-wide spawner thread that every worker is forked
+        // from.
         if let Some(handle) = self.stderr_task.take() {
             let deadline = Instant::now() + STDERR_JOIN_BUDGET;
             while !handle.is_finished() && Instant::now() < deadline {
@@ -1283,7 +1417,7 @@ fn reap_within(child: &mut Child, budget: Duration) -> bool {
             Ok(Some(_)) => return true,
             // ECHILD means somebody already reaped it, which is as good as us doing it. Any OTHER
             // error is not evidence of a reap, and claiming one is load-bearing: `shutdown()` early
-            // -returns on `self.reaped`, so a spurious error here used to skip the group sweep and
+            // -returns on `self.reaped`, so a spurious error here would skip the group sweep and
             // leak the `sp1-gpu-server` that sweep exists to kill.
             #[cfg(unix)]
             Err(e) if e.raw_os_error() == Some(libc::ECHILD) => return true,
@@ -1300,9 +1434,68 @@ fn reap_within(child: &mut Child, budget: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{comm_from_stat, live_group_members, parse_stat_state_pgrp};
+    #[test]
+    fn sanitize_worker_line_strips_control_and_bidi_and_separators() {
+        use super::sanitize_worker_line;
+        // Cc control (ESC/CR/LF) stripped, printable + tab kept.
+        assert_eq!(sanitize_worker_line("a\r\nb\x1b[31mc\td"), "ab[31mc\td");
+        // Bidi overrides/isolates (Cf) and line/paragraph separators (Zl/Zp) stripped too.
+        for bad in ['\u{202E}', '\u{2066}', '\u{200F}', '\u{061C}', '\u{2028}', '\u{2029}'] {
+            assert_eq!(sanitize_worker_line(&format!("safe{bad}text")), "safetext", "{:?} must go", bad);
+        }
+        // Ordinary unicode preserved.
+        assert_eq!(sanitize_worker_line("café-π"), "café-π");
+    }
+    use super::{
+        comm_from_stat, is_secret_env_name, live_group_members, parse_stat_state_pgrp,
+        sanitize_worker_line,
+    };
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    #[test]
+    fn worker_line_sanitizer_strips_escapes_and_bounds_length() {
+        // ANSI escape + carriage-return log-forging are removed; printable text + tab survive.
+        let evil = "ok\x1b[2J\x1b[31mred\rFAKE: all good\ttab";
+        let clean = sanitize_worker_line(evil);
+        assert!(!clean.contains('\x1b'), "escape must be stripped");
+        assert!(!clean.contains('\r'), "carriage return must be stripped");
+        assert!(clean.contains("ok") && clean.contains("red") && clean.contains('\t'));
+        // Length is bounded.
+        let huge = "A".repeat(10_000);
+        let out = sanitize_worker_line(&huge);
+        assert!(out.len() < 10_000 && out.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn secret_env_names_are_filtered_but_operational_ones_pass() {
+        // Must be stripped from a worker's environment.
+        for s in [
+            "ZKMINER_PRIVATE_KEY",
+            "zkminer_private_key",
+            "PRIVATE_KEY",
+            "ETH_PRIVATE_KEY",
+            "SOME_SECRET_KEY",
+            "MNEMONIC",
+            "WALLET_MNEMONIC",
+            "ZKMINER_KEYSTORE_PASSWORD",
+        ] {
+            assert!(is_secret_env_name(s), "{s} should be treated as secret");
+        }
+        // Must be preserved — the worker needs these.
+        for s in [
+            "PATH",
+            "HOME",
+            "LD_LIBRARY_PATH",
+            "CUDA_VISIBLE_DEVICES",
+            "CUDA_DEVICE_ORDER",
+            "ZKMINER_CUDA_VRAM_BYTES",
+            "NVCC",
+            "TMPDIR",
+        ] {
+            assert!(!is_secret_env_name(s), "{s} must be preserved");
+        }
+    }
 
     /// A throwaway `/proc`-shaped tree. Removed on drop.
     struct FakeProc(PathBuf);
@@ -1328,9 +1521,9 @@ mod tests {
 
         /// As `proc`, but `comm` is raw BYTES.
         ///
-        /// `comm` is whatever `prctl(PR_SET_NAME)` was handed and need not be UTF-8, and the
-        /// previous helper took `&str` through `format!` — so it was structurally incapable of
-        /// expressing the case the byte-oriented read exists for.
+        /// `comm` is whatever `prctl(PR_SET_NAME)` was handed and need not be UTF-8. Taking raw
+        /// bytes (rather than `&str`) is what lets a test express the non-UTF-8 case the
+        /// byte-oriented read exists for.
         fn proc_raw(&self, pid: i32, comm: &[u8], state: char, ppid: i32, pgrp: i32) -> &Self {
             let dir = self.0.join(pid.to_string());
             std::fs::create_dir_all(&dir).unwrap();
@@ -1362,17 +1555,15 @@ mod tests {
         }
     }
 
-    /// [D6] The end-to-end scenario, as it actually occurred. After a clean exit the
-    /// worker is a ZOMBIE group leader, and a zombie keeps its own group non-empty — which
-    /// is why `kill(-pgid, 0)` returned success on every clean stop and the "left
-    /// process-group members behind … could orphan and hold VRAM" warning fired 6 times in
-    /// one SP1-decline run, for a worker that had forked nothing at all.
+    /// The end-to-end scenario. After a clean exit the worker is a ZOMBIE group leader, and a
+    /// zombie keeps its own group non-empty — which is why `kill(-pgid, 0)` returns success on
+    /// every clean stop and a "left process-group members behind … could orphan and hold VRAM"
+    /// warning would fire for a worker that had forked nothing at all.
     ///
     /// Two independent filters exclude it (`pid == pgid` and `state == 'Z'`), so this test
     /// alone cannot fail from either one regressing — it asserts the observable outcome.
     /// `live_leader_alone_is_not_a_leftover` and `zombie_helper_is_not_a_leftover` are the
-    /// discriminators for the two filters; each fails when its own filter is removed
-    /// (verified by restoring both bugs in turn).
+    /// discriminators for the two filters; each fails when its own filter is removed.
     #[test]
     fn zombie_group_leader_is_not_a_leftover() {
         let fp = FakeProc::new("zombie-leader");
@@ -1464,8 +1655,8 @@ mod tests {
     ///
     /// `prctl(PR_SET_NAME)` takes arbitrary bytes. With `read_to_string` such a process yields
     /// `Err(InvalidData)` and is skipped — and because the group kill is gated on this scan
-    /// finding something, ONE such member meant no kill at all: the orphan keeps its VRAM and
-    /// the alarm stays silent. Reverting the read to `read_to_string` makes this fail.
+    /// finding something, ONE such member would mean no kill at all: the orphan keeps its VRAM and
+    /// the alarm stays silent. Using `read_to_string` instead of a byte read makes this fail.
     #[test]
     fn a_non_utf8_comm_does_not_hide_a_leaked_member() {
         let fp = FakeProc::new("non-utf8");
@@ -1497,8 +1688,8 @@ mod tests {
         fp.proc(100, "zkminer-prove-sp1", 'Z', 1, 100)
             .proc(101, "sp1-gpu-server", 'S', 100, 100);
 
-        // The signaller is RECORDED, not performed. Injecting only the `/proc` scan was not
-        // enough: the fake tree supplies a live member, so this call used to reach a real
+        // The signaller is RECORDED, not performed. Injecting only the `/proc` scan is not
+        // enough: the fake tree supplies a live member, so this call would otherwise reach a real
         // `kill(-100, SIGKILL)` against the host kernel — harmless as an unprivileged user, and
         // somebody's live process group as root or in a container where pids are low.
         let signalled = std::cell::RefCell::new(Vec::new());
@@ -1530,9 +1721,9 @@ mod tests {
         );
     }
 
-    /// The refusal has to hold at the OTHER group-kill sites too. `force_kill_group` and `Drop`'s
-    /// `Running` arm used to issue `kill(-pid, SIGKILL)` unconditionally two lines after the sweep
-    /// declined, which voided the guarantee the sweep's own doc makes.
+    /// The refusal has to hold at the OTHER group-kill sites too: `force_kill_group` and `Drop`'s
+    /// `Running` arm must not issue `kill(-pid, SIGKILL)` unconditionally after the sweep has
+    /// declined, which would void the guarantee the sweep's own doc makes.
     #[test]
     #[cfg(unix)]
     fn our_own_pgid_is_never_a_legal_group_target() {
@@ -1549,7 +1740,7 @@ mod tests {
         assert!(super::may_signal_group(ours.wrapping_add(1).max(1)));
     }
 
-    // ---- against the real kernel, contrasting the old predicate with the new ----
+    // ---- against the real kernel, contrasting `kill(-pgid, 0)` with `live_group_members` ----
 
     /// Spawn `sh -c <body>` as its own process-group leader, like a worker.
     #[cfg(unix)]
@@ -1578,13 +1769,13 @@ mod tests {
         panic!("child never exited");
     }
 
-    /// [D6] THE regression test, against the real kernel: for a worker that exited cleanly
-    /// and forked nothing, the OLD predicate (`kill(-pgid, 0) == 0`) succeeds — that is why
-    /// the "left process-group members behind … could orphan and hold VRAM" alarm fired on
-    /// every clean stop — and the NEW predicate reports nothing.
+    /// Against the real kernel: for a worker that exited cleanly and forked nothing, the
+    /// `kill(-pgid, 0) == 0` predicate succeeds — that is why it would raise a "left
+    /// process-group members behind … could orphan and hold VRAM" alarm on every clean stop
+    /// — while `live_group_members` reports nothing.
     ///
-    /// Both halves are asserted, so this fails if either the old behaviour returns or the
-    /// new predicate stops being able to tell the two apart.
+    /// Both halves are asserted, so this fails if either the `kill(-pgid, 0)` behaviour creeps
+    /// back or `live_group_members` stops being able to tell the two apart.
     #[test]
     #[cfg(unix)]
     fn a_zombie_leader_satisfies_the_old_guard_but_is_not_a_leftover() {
@@ -1666,8 +1857,8 @@ mod tests {
     }
 
     /// `probe_exit_nowait` must not reap: the pid — and with it the group number the sweep
-    /// signals — has to stay pinned across repeated probes. This is the property that
-    /// `try_wait` broke.
+    /// signals — has to stay pinned across repeated probes. Reaping (as `try_wait` would) would
+    /// break that.
     #[test]
     #[cfg(unix)]
     fn the_exit_probe_does_not_reap() {

@@ -1,19 +1,16 @@
-//! [A4] Chainless test for `ChainClient::nonce_gap_frontier`.
+//! Chainless test for `ChainClient::nonce_gap_frontier`.
 //!
 //! A loopback JSON-RPC stub reports whatever `latest` and `pending` transaction counts a
 //! test asks for, so the REAL detector runs against controlled chain state with no node.
 //!
-//! THE DEFECT: the detector could only ever nominate the MINED frontier as a hole. Its
-//! external-hole branch required `pending <= mined`, and its local-evidence branch looked
-//! for an abort record at `mined`. A hole ABOVE the mined frontier — the shape left by a
-//! leaked reservation (a task that reserved a nonce then panicked, was cancelled at an
-//! await, or returned down a path that skips `abort`) — satisfies neither: `pending` sits
-//! AT the hole, strictly above `mined`, and there is no local trace at `mined` because the
-//! leak is not at `mined`. Every tx above the hole is queued and unmineable; for a
-//! releaseJob that means its collateral rides to the lock deadline and is lost.
-//!
-//! The fix reads the hole off the node instead of assuming it: `eth_getTransactionCount`
-//! at `pending` IS the lowest nonce with no executable tx.
+//! The detector must be able to nominate a hole ABOVE the mined frontier, not only AT it. A
+//! hole above the mined frontier is the shape left by a leaked reservation (a task that
+//! reserved a nonce then panicked, was cancelled at an await, or returned down a path that
+//! skips `abort`): `pending` sits AT the hole, strictly above `mined`, and there is no local
+//! trace at `mined` because the leak is not at `mined`. Every tx above the hole is queued and
+//! unmineable; for a releaseJob that means its collateral rides to the lock deadline and is
+//! lost. So the detector reads the hole off the node rather than assuming it is the mined
+//! frontier: `eth_getTransactionCount` at `pending` IS the lowest nonce with no executable tx.
 
 use std::sync::{Arc, Mutex};
 
@@ -178,9 +175,10 @@ async fn client_from(anchor_at: u64, mined: u64, pending: u64, next: u64) -> Cha
     client
 }
 
-/// THE A4 REGRESSION. mined=100, txs executable at 100 and 101, hole at 102, queued txs at
-/// 103-104. The old detector returned None here: `pending`(102) > `mined`(100) failed its
-/// `pending <= mined` test, and there is no local abort record at 100.
+/// A hole above the mined frontier: mined=100, txs executable at 100 and 101, hole at 102,
+/// queued txs at 103-104. `pending`(102) is strictly above `mined`(100) and there is no local
+/// abort record at 100, so the detector must read the hole off the node at `pending` rather
+/// than looking only at the mined frontier.
 #[tokio::test(flavor = "multi_thread")]
 async fn detects_a_hole_above_the_mined_frontier() {
     let c = client_with(100, 102, 105).await;
@@ -311,7 +309,7 @@ async fn shutdown_gate_refuses_a_hole_with_no_abort_record() {
     );
 }
 
-/// The motivating A4 case must still heal: every skip arm in the abandon path recycles its
+/// The motivating case must still heal: every skip arm in the abandon path recycles its
 /// nonce through `abort_nonce`, so the hole carries a first-person abort record.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_gate_fills_a_hole_we_provably_abandoned() {
@@ -324,10 +322,10 @@ async fn shutdown_gate_fills_a_hole_we_provably_abandoned() {
     );
 }
 
-/// [D2] Branch (B) runs first and its `recently_aborted` evidence is sticky for 600s and
-/// survives re-reservation. A stale record at `mined` made the detector nominate `mined`,
-/// which the gate then refused (frontier busy) — masking a genuine hole above it on the very
-/// path this gate was added for. The gate must fall through, not give up.
+/// Branch (B) runs first and its `recently_aborted` evidence is sticky for 600s and survives
+/// re-reservation. A stale record at `mined` makes the detector nominate `mined`, which the
+/// gate then refuses (frontier busy) — which would mask a genuine hole above it on the very
+/// path this gate exists for. The gate must fall through, not give up.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stale_abort_record_at_the_frontier_does_not_mask_a_hole_above_it() {
     // mined=100 with an executable tx at 100 (pending=101), hole at 101, 102 broadcast.
@@ -358,11 +356,12 @@ async fn shutdown_gate_never_displaces_an_executable_tx_at_the_frontier() {
 
 /// An empty frontier is NECESSARY but not SUFFICIENT evidence during shutdown.
 ///
-/// This test previously asserted `Some(100)` and so PINNED a bug: in the abandon burst every
-/// nonce is pre-reserved before any task sends, which makes "nothing executable at the
-/// frontier" true BY CONSTRUCTION. With the allocator level with chain — mined=100,
-/// pending=100, next=103, all three jobs still in pre-flight — the gate handed back 100, the
-/// NEAREST-DEADLINE job's live nonce, for a >=4x self-transfer seconds before process::exit.
+/// In the abandon burst every nonce is pre-reserved before any task sends, which makes
+/// "nothing executable at the frontier" true BY CONSTRUCTION. With the allocator level with
+/// chain — mined=100, pending=100, next=103, all three jobs still in pre-flight — treating an
+/// empty frontier as sufficient would hand back 100, the NEAREST-DEADLINE job's live nonce,
+/// for a >=4x self-transfer seconds before process::exit. So the gate also demands a
+/// first-person abort record.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_gate_refuses_an_empty_frontier_we_cannot_prove_we_abandoned() {
     let c = client_with(100, 100, 103).await;
@@ -387,13 +386,13 @@ async fn shutdown_gate_fills_an_empty_frontier_we_provably_abandoned() {
     assert_eq!(c.nonce_gap_safe_to_fill().await.unwrap(), Some(100));
 }
 
-/// [round-1 #2] An ACCEPTED broadcast retires stale abandonment evidence.
+/// An ACCEPTED broadcast retires stale abandonment evidence.
 ///
 /// `aborted_at` deliberately survives re-reservation and `reserve_locked` reissues freed
 /// nonces FIRST, so a nonce recycled by a give-up and then taken by a healthy task still
-/// carried its predecessor's abort record. Branch (B) does no pending read and is consumed
-/// UNGATED by the watchdog, so it nominated that nonce and the healer would evict a live,
-/// executable tx with a >=4x self-transfer.
+/// carries its predecessor's abort record. Branch (B) does no pending read and is consumed
+/// UNGATED by the watchdog, so without retirement it would nominate that nonce and the healer
+/// would evict a live, executable tx with a >=4x self-transfer.
 ///
 /// State: mined=100, everything up to 103 executable (pending=103), so branch (A) cannot
 /// fire and branch (B) is isolated.
@@ -421,7 +420,7 @@ async fn an_accepted_broadcast_clears_the_abort_record() {
     );
 }
 
-/// [round-0 #2] `reserve_locked` reissues the LOWEST freed nonce FIRST, and `aborted_at`
+/// `reserve_locked` reissues the LOWEST freed nonce FIRST, and `aborted_at`
 /// survives that re-reservation. Together that means the abandon burst typically hands the
 /// NEAREST-DEADLINE job a nonce still carrying its predecessor's abort record. That record is
 /// evidence about the PAST, not proof the nonce is unowned — so the gate must refuse.
@@ -442,10 +441,11 @@ async fn shutdown_gate_refuses_a_nonce_re_reserved_after_its_abort() {
     );
 }
 
-/// [round-0 #1] The gate and the detector are DESIGNED to disagree (the D2 fall-through). A
-/// caller that vetted a nonce and then let heal re-derive its own target filled precisely the
+/// The gate and the detector are DESIGNED to disagree (the fall-through above). If a caller
+/// vetted a nonce and then let heal re-derive its own target, heal could fill precisely the
 /// nonce the gate had refused. This pins that they can differ, so the split entry point
-/// (`heal_nonce_gap_at`) is load-bearing rather than cosmetic.
+/// (`heal_nonce_gap_at`) taking the vetted nonce as an argument is load-bearing rather than
+/// cosmetic.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_gate_and_the_detector_can_nominate_different_nonces() {
     let c = client_with(100, 101, 103).await;
@@ -461,7 +461,7 @@ async fn the_gate_and_the_detector_can_nominate_different_nonces() {
     );
 }
 
-/// [round-2 R2-B] The shutdown gate and the broadcast are separated by at least one throttled
+/// The shutdown gate and the broadcast are separated by at least one throttled
 /// RPC round-trip (`base_fees`). In that window a sibling task can take the very nonce the
 /// gate approved — `reserve_locked` hands out the LOWEST freed first — and broadcast an
 /// immediately-executable releaseJob on it. The healer must then refuse rather than evict it.
@@ -489,7 +489,7 @@ async fn a_vetted_heal_refuses_a_nonce_re_reserved_after_the_gate() {
     );
 }
 
-/// [round-3 R3] The staking paths reserve from the SAME allocator as the job paths but cannot
+/// The staking paths reserve from the SAME allocator as the job paths but cannot
 /// record a fee (alloy's gas filler owns their pair). Without an explicit retirement signal a
 /// nonce recycled by a job give-up and then taken by a stake keeps its stale abort record, so
 /// branch (B) nominates it and the UNGATED watchdog evicts the live stake.
@@ -517,8 +517,8 @@ async fn an_accepted_send_with_no_fee_record_still_retires_the_abort() {
     );
 }
 
-/// [round-3 R1] The detector and the gate must judge against the SAME mined frontier. Taking
-/// two independent reads let the gate decide against a frontier the nomination never saw.
+/// The detector and the gate must judge against the SAME mined frontier. Taking
+/// two independent reads would let the gate decide against a frontier the nomination never saw.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_gate_never_nominates_below_the_mined_frontier() {
     for (mined, pending, next) in [(100u64, 100u64, 103u64), (100, 101, 103), (100, 103, 103)] {
@@ -534,13 +534,14 @@ async fn the_gate_never_nominates_below_the_mined_frontier() {
     }
 }
 
-/// [round-4] A fee record must not PERMANENTLY veto healing a hole we provably abandoned.
+/// A fee record must not PERMANENTLY veto healing a hole we provably abandoned.
 ///
 /// `fee_floor` is immortal at a nonce that never mines (`commit` is its only pruner; `resync`
-/// deliberately skips it), and a broadcast tx can be EVICTED — which this codebase names as
-/// the canonical cause of a hole. Requiring `fee_floor(mined).is_none()` outright therefore
-/// short-circuited past both `frontier_has_executable_tx` and `is_freed`, and the shutdown
-/// loop broke on its first iteration with every sibling releaseJob queued above the hole.
+/// deliberately skips it), and a broadcast tx can be EVICTED — which is the canonical cause of
+/// a hole. Requiring `fee_floor(mined).is_none()` outright would therefore short-circuit past
+/// both `frontier_has_executable_tx` and `is_freed`, breaking the shutdown loop on its first
+/// iteration with every sibling releaseJob queued above the hole. An abort record is strictly
+/// later evidence than the fee record and must win.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stale_fee_record_does_not_veto_healing_a_hole_we_abandoned() {
     let c = client_with(100, 100, 103).await;
@@ -572,10 +573,11 @@ async fn a_live_broadcast_at_the_frontier_is_still_refused() {
     );
 }
 
-/// [round-4 R4-A] A staking receipt timeout must NOT arm branch (B) against its own live tx.
-/// The node accepted the send; only the receipt went unobserved. Aborting there put the nonce
-/// in `freed` (and `resync` keeps it, since the unmined stake IS the mined frontier), which is
-/// branch (B)'s literal trigger — and the ungated watchdog then evicts the live stake.
+/// A staking receipt timeout must NOT arm branch (B) against its own live tx.
+/// The node accepted the send; only the receipt went unobserved. Aborting there would put the
+/// nonce in `freed` (and `resync` keeps it, since the unmined stake IS the mined frontier),
+/// which is branch (B)'s literal trigger — and the ungated watchdog would then evict the live
+/// stake.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_accepted_send_with_an_unobserved_receipt_is_not_a_hole() {
     let c = client_with(100, 101, 101).await;
@@ -589,7 +591,7 @@ async fn an_accepted_send_with_an_unobserved_receipt_is_not_a_hole() {
     );
 }
 
-/// [round-5 R1] The shutdown heal must honour the caller's remaining budget, not a hard-coded
+/// The shutdown heal must honour the caller's remaining budget, not a hard-coded
 /// 30s. A 30s wait inside a 20s loop budget is arithmetic, not a race: the first frontier pass
 /// always overruns, the walk becomes single-shot, and shutdown runs past the supervisor kill —
 /// losing the worker reap and the exit-75 verdict that triggers the recovery restart.

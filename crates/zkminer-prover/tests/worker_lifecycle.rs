@@ -397,8 +397,8 @@ fn cycle_measurement_skips_a_recycled_slot() {
             pool.has_idle_worker("mock"),
             "the other worker is idle and live"
         );
-        let cycles = pool
-            .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)))
+        let (cycles, _journal_len, _peak) = pool
+            .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None)
             .expect("measurement must move on to the live worker");
         assert_eq!(cycles, 1000);
         // Bring it back for the next round.
@@ -481,4 +481,102 @@ fn a_warmup_crash_is_an_error() {
     assert!(pool.warm_up("mock", Duration::from_secs(10)).is_err());
     assert_eq!(pool.test_has_handle("mock:generic"), Some(false));
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(1));
+}
+
+/// RESIDUAL A — prove-preempts-measure, end to end.
+///
+/// A pre-claim cycle measurement is held in flight (the mock worker hangs on Execute), so it is
+/// registered as preemptible and holds its slot. A committed proof then PREEMPTS it: the dispatcher
+/// SIGKILLs the measure worker. The measurement thread must observe the kill, reclassify it as the
+/// TYPED transient `MeasurePreempted` (not a wall-clock timeout, not a crash), deregister, and leave
+/// the slot DEAD but not FAILED (its health must not be dinged — the kill was intentional and the
+/// measurement was healthy). This exercises the real cross-thread SIGKILL + recv-fail path, which is
+/// the part that could not be covered by the pure-logic planner tests.
+#[test]
+fn a_committed_proof_preempts_an_inflight_measurement_end_to_end() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    // On the (non-measure-pool) PROVE slot, so the measurement reserves NO host RAM — the test is
+    // then independent of how much RAM the box happens to have free. Hang on Execute so it stays in
+    // flight until it is killed.
+    pool.insert_test_worker(
+        "mock:generic",
+        "mock",
+        mock_worker_path(),
+        mock_env("execute", ""),
+    )
+    .expect("failed to spawn mock worker");
+
+    let pool = Arc::new(pool);
+    let measurer = {
+        let pool = Arc::clone(&pool);
+        std::thread::spawn(move || {
+            // A generous watchdog budget that we never reach — the preemption kills it first.
+            pool.execute_cycles("mock", &[], &[], Some(Duration::from_secs(120)), None)
+        })
+    };
+
+    // Wait until the measurement is actually in flight (registered). Bounded so the test fails loudly
+    // rather than hanging if registration regresses.
+    let mut waited = Duration::ZERO;
+    while pool.test_inflight_measure_count() == 0 {
+        std::thread::sleep(Duration::from_millis(20));
+        waited += Duration::from_millis(20);
+        assert!(
+            waited < Duration::from_secs(10),
+            "measurement never registered as in-flight"
+        );
+    }
+    assert_eq!(pool.test_inflight_measure_count(), 1);
+    // Non-blocking: the measurement HOLDS the slot lock across its recv, so `test_has_handle`
+    // (which takes that lock) would block until the measurement returns — use the try_lock probe.
+    assert!(
+        pool.test_slot_is_held("mock:generic"),
+        "the hanging measurement holds its slot"
+    );
+
+    // Preempt it, exactly as a committed proof short on resources would.
+    pool.test_preempt_all_inflight_measures();
+
+    // The measurement thread unwinds with the TYPED transient.
+    let result = measurer.join().expect("measurer thread panicked");
+    let err = result.expect_err("a preempted measurement must return an error, not a cycle count");
+    assert!(
+        err.downcast_ref::<zkminer_prover_protocol::types::MeasurePreempted>()
+            .is_some(),
+        "a preempted measurement must return the typed MeasurePreempted (got: {err:#})"
+    );
+
+    // Deregistered, slot DEAD (handle gone, pid zeroed) but NOT failed (health untouched).
+    assert_eq!(
+        pool.test_inflight_measure_count(),
+        0,
+        "the registration must be cleared on return"
+    );
+    assert_eq!(pool.test_has_handle("mock:generic"), Some(false));
+    assert_eq!(pool.test_pid("mock:generic"), Some(0));
+    assert_eq!(
+        pool.test_consecutive_failures("mock:generic"),
+        Some(0),
+        "preemption is an intentional kill — it must NOT count against slot health"
+    );
+}
+
+/// A measurement that completes NORMALLY deregisters itself and leaves its slot healthy — the
+/// preemptible window is exactly the in-flight duration, nothing lingers in the registry.
+#[test]
+fn a_normal_measurement_leaves_no_inflight_registration() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+
+    let (cycles, _journal, _peak) = pool
+        .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None)
+        .expect("measurement should succeed");
+    assert_eq!(cycles, 1000);
+    assert_eq!(
+        pool.test_inflight_measure_count(),
+        0,
+        "a finished measurement must not stay registered as preemptible"
+    );
+    assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
 }

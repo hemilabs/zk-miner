@@ -154,12 +154,11 @@ impl SetupStatus {
         self.has_gas = eth_balance > 0;
         self.has_hemi = hemi_balance > 0;
 
-        // [FIX-V1A3, 2026-07-08] The 1h MIN_STAKING_AGE claim gate was removed
-        // on-chain; a stake is claimable from the next block after it lands
-        // (block.number > depositBlock), which is always satisfied by the time
-        // we evaluate jobs. So maturity simply tracks "has an active stake".
-        // `deposit_block` is a block number (not a wall-clock timestamp), so no
-        // age countdown is computed.
+        // The 1h MIN_STAKING_AGE claim gate was removed on-chain; a stake is
+        // claimable from the next block after it lands (block.number > depositBlock),
+        // which is always satisfied by the time we evaluate jobs. So maturity simply
+        // tracks "has an active stake". `deposit_block` is a block number (not a
+        // wall-clock timestamp), so no age countdown is computed.
         if let Some(stake) = stake_info {
             self.has_stake = stake.total_staked >= MIN_STAKE_WEI;
             self.stake_mature = self.has_stake;
@@ -238,10 +237,12 @@ pub struct RuntimeSettings {
     pub token_price_usd: f64,
     pub gas_cost_usd: f64,
     /// Whether to claim jobs carrying a non-zero `expectedJournalHash` (Phase-2
-    /// journal predicate). Default true (claim them). Set false to skip — a
-    /// predicate job whose committed journal our proof can't reproduce reverts
-    /// `JournalMismatch` at fulfill and risks a collateral slash on timeout,
-    /// and zkminer does not yet simulate the predicate before claiming.
+    /// journal predicate). Default FALSE (skip them). A submitter can set an
+    /// unsatisfiable `expectedJournalHash`; our proof then reverts `JournalMismatch`
+    /// at fulfill and risks a collateral slash on timeout, and zkminer does not yet
+    /// simulate the predicate before claiming (reproducing the on-chain
+    /// `JOURNAL_PREDICATE_DOMAIN_V1` predicate is required first). Opt in only on a
+    /// deployment where you accept that risk.
     pub claim_predicate_jobs: bool,
 }
 
@@ -262,7 +263,7 @@ impl Default for RuntimeSettings {
             deadline_safety_margin: 1.5,
             token_price_usd: 0.80,
             gas_cost_usd: 0.01,
-            claim_predicate_jobs: true,
+            claim_predicate_jobs: false,
         }
     }
 }

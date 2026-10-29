@@ -14,7 +14,31 @@ use zkminer_prover_protocol::{
 
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Duplicate `fd` with close-on-exec set (see the risc0/SP1 workers for the rationale).
+#[cfg(unix)]
+fn dup_cloexec(fd: std::os::unix::io::RawFd) -> std::io::Result<std::os::unix::io::RawFd> {
+    let new = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if new < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(new)
+}
+
 fn main() {
+    // Save the real stdout FD for IPC, then redirect FD 1 to stderr so nothing a guest or a native
+    // library prints to stdout can corrupt the length-prefixed bincode control stream the dispatcher
+    // reads (same hardening the SP1 and risc0 workers do).
+    #[cfg(unix)]
+    let ipc_stdout = {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let stdout_fd = io::stdout().as_raw_fd();
+        let ipc_fd = dup_cloexec(stdout_fd).expect("dup(stdout) failed");
+        unsafe { libc::dup2(io::stderr().as_raw_fd(), stdout_fd) };
+        unsafe { std::fs::File::from_raw_fd(ipc_fd) }
+    };
+    #[cfg(not(unix))]
+    let ipc_stdout = io::stdout();
+
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .with_env_filter(
@@ -22,15 +46,15 @@ fn main() {
         )
         .init();
 
-    if let Err(e) = run_worker_loop() {
+    if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
         std::process::exit(1);
     }
 }
 
-fn run_worker_loop() -> Result<()> {
+fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     let mut stdin = BufReader::new(io::stdin().lock());
-    let mut stdout = BufWriter::new(io::stdout().lock());
+    let mut stdout = BufWriter::new(ipc_stdout);
 
     loop {
         let cmd: WorkerCommand = match read_message(&mut stdin) {
@@ -86,7 +110,8 @@ fn run_worker_loop() -> Result<()> {
                 request_id,
                 elf,
                 input_data: _,
-                po2: _, // OpenVM does not use segment sizing
+                po2: _,         // OpenVM does not use segment sizing
+                program_id: _,  // for risc0 this is the image id; OpenVM has no such binding
             } => {
                 tracing::info!("Proving request {request_id} ({} bytes ELF)", elf.len());
                 // OpenVM SDK compiles guests at runtime, so proving is handled differently.

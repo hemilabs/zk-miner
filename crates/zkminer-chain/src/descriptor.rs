@@ -16,6 +16,27 @@ use zkminer_contracts::bindings::{IHemiProveCore, JobDescriptor};
 
 use crate::client::ChainClient;
 
+/// A PERMANENT, deterministic reason a job's descriptor can never be reconstructed from its submit
+/// transaction: the calldata's selector is not a known submit entry point (an integrator proxy /
+/// multicall wrapper), or the calldata is too short to carry one. Unlike a transient fetch / RPC /
+/// log-scan miss — which can heal on a later tick — this cannot change for a given job, because the
+/// submit tx's calldata is immutable. Callers should NEGATIVE-CACHE the job on this error instead of
+/// re-running the (up to `DEFAULT_DESCRIPTOR_LOOKBACK_BLOCKS`) descriptor scan + re-occupying a measure
+/// slot for it every tick (a measure-budget + RPC DoS). It is produced only from decoding an
+/// AUTHORITATIVE tx (the one the JobSubmitted-log scan locates, or a hash-verified fast-path tx), so a
+/// stale cached tx cannot yield a false permanent verdict — a wrong-selector fast-path decode is
+/// swallowed and retried via the scan.
+#[derive(Debug, Clone)]
+pub struct UndecodableDescriptor(pub String);
+
+impl std::fmt::Display for UndecodableDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for UndecodableDescriptor {}
+
 /// Default lookback window for JobSubmitted log queries, in blocks.
 /// Hemi produces ~2-second blocks, so 500_000 blocks ≈ 11.5 days — well beyond
 /// any realistic lock_deadline + margin. This bounds the log scan to a range
@@ -49,7 +70,7 @@ pub async fn fetch_job_descriptor(client: &ChainClient, job_id: B256) -> Result<
     fetch_job_descriptor_with_lookback(client, job_id, DEFAULT_DESCRIPTOR_LOOKBACK_BLOCKS).await
 }
 
-/// [RPC #2] Descriptor fetch with the monitor-cached submit-tx FAST PATH, verified
+/// Descriptor fetch with the monitor-cached submit-tx FAST PATH, verified
 /// against the job's on-chain `descriptorHash` (which every caller already holds from
 /// a JobStatusView / snapshot).
 ///
@@ -63,8 +84,8 @@ pub async fn fetch_job_descriptor(client: &ChainClient, job_id: B256) -> Result<
 /// found (e.g. reorg-replaced), decode failure, hash mismatch — it falls back SILENTLY
 /// to the full scan, so the fast path can only save requests, never change outcomes.
 /// The scan result is then also verified against `expected_hash` (Err on mismatch: the
-/// descriptor is unusable either way, and this closes the previously-unverified
-/// pre-claim predicate-gate path).
+/// descriptor is unusable either way), so the descriptor the pre-claim predicate gate
+/// relies on is always hash-checked.
 pub async fn fetch_job_descriptor_checked(
     client: &ChainClient,
     job_id: B256,
@@ -110,7 +131,7 @@ async fn scan_for_descriptor(
     lookback_blocks: u64,
     known_hash: Option<B256>,
 ) -> Result<JobDescriptor> {
-    // [RPC quick-win] Use the monitor-populated cached head instead of a fresh
+    // Use the monitor-populated cached head instead of a fresh
     // eth_blockNumber. We only fetch a descriptor for a job we've already seen (claimed
     // or under recovery), whose JobSubmitted is necessarily mined and older than any
     // cached head — so the cached value always spans the submit block. Falls back to a
@@ -171,19 +192,23 @@ async fn decode_descriptor_from_tx(
 
     let calldata = tx.input();
     if calldata.len() < 4 {
-        bail!(
+        // Deterministic & permanent: the authoritative submit tx's calldata cannot carry a selector,
+        // so the descriptor can never be reconstructed. Typed so the caller negative-caches it.
+        return Err(UndecodableDescriptor(format!(
             "Submitting tx calldata is too short: {} bytes",
             calldata.len()
-        );
+        ))
+        .into());
     }
     let selector: [u8; 4] = calldata[..4].try_into().unwrap();
 
-    // 3. Decode the descriptor from whichever submit entry point was used. [H1] ALL of
+    // 3. Decode the descriptor from whichever submit entry point was used. ALL of
     //    submitJob/submitJobDefault/submitJobSimple/submitJobBatch emit the same
     //    JobSubmitted event and create ordinary Open jobs, so recovery must handle every
     //    one — else a job submitted via a convenience entry point is claimed (collateral
-    //    locked) but its descriptor can't be reconstructed → unfulfillable → strand (and
-    //    a cheap griefing vector).
+    //    locked) but its descriptor can't be reconstructed → unfulfillable → strand. That
+    //    is also a cheap griefing vector: a submitter can lock up a prover's collateral on
+    //    a job it can never fulfill.
     let descriptor = if selector == IHemiProveCore::submitJobCall::SELECTOR {
         let decoded = IHemiProveCore::submitJobCall::abi_decode(calldata)
             .context("Failed to decode submitJob calldata")?;
@@ -198,7 +223,7 @@ async fn decode_descriptor_from_tx(
         // descriptorHash.
         let decoded = IHemiProveCore::submitJobBatchCall::abi_decode(calldata)
             .context("Failed to decode submitJobBatch calldata")?;
-        // [RPC #2] When the caller already holds the on-chain descriptorHash, use it to
+        // When the caller already holds the on-chain descriptorHash, use it to
         // select the descriptor without the extra getJobStatusView read.
         let want = match known_hash {
             Some(h) => h,
@@ -237,10 +262,15 @@ async fn decode_descriptor_from_tx(
             expectedJournalHash: B256::ZERO,
         }
     } else {
-        bail!(
+        // Deterministic & permanent: the authoritative submit tx used an entry point we cannot decode
+        // (an integrator proxy/multicall wrapper), so the descriptor can never be reconstructed for this
+        // job. Typed (not a generic `bail!`) so the measure path negative-caches it instead of re-running
+        // the block scan every tick. The selector is a property of the immutable submit tx calldata.
+        return Err(UndecodableDescriptor(format!(
             "Unsupported submit selector 0x{} — job was not submitted via submitJob/submitJobSimple/submitJobBatch/submitJobDefault (likely an integrator proxy/multicall wrapper). Cannot reconstruct descriptor.",
             alloy::hex::encode(selector)
-        );
+        ))
+        .into());
     };
 
     Ok(descriptor)
@@ -253,7 +283,7 @@ async fn decode_descriptor_from_tx(
 /// keccak256(abi.encode(
 ///     programId, proofSystemId, callback, assignedProver, tag,
 ///     keccak256(inputData), keccak256(callbackExtraData), keccak256(extraVerifierData),
-///     expectedJournalHash                 // [Phase 2, 2026-07-10] 9th slot, raw bytes32
+///     expectedJournalHash                 // 9th slot, raw bytes32
 /// ))
 /// ```
 ///
@@ -302,6 +332,27 @@ pub fn verify_descriptor_hash(descriptor: &JobDescriptor, expected: B256) -> Res
 mod tests {
     use super::*;
     use alloy::sol_types::SolValue;
+
+    #[test]
+    fn undecodable_descriptor_is_downcastable_through_anyhow() {
+        // The measure path (run.rs) distinguishes a PERMANENT undecodable-selector decode failure
+        // from a transient fetch error by `downcast_ref::<UndecodableDescriptor>()` on the propagated
+        // anyhow::Error, and negative-caches only on the permanent one. Guard that contract: the typed
+        // error must survive the `.into()` + `?` propagation used on the authoritative scan path.
+        let err: anyhow::Error = UndecodableDescriptor("Unsupported submit selector 0xdeadbeef".into()).into();
+        let got = err.downcast_ref::<UndecodableDescriptor>();
+        assert!(got.is_some(), "UndecodableDescriptor must downcast through anyhow");
+        assert!(
+            format!("{err:#}").contains("Unsupported submit selector"),
+            "the message must be preserved for the sanitized log"
+        );
+        // A generic transient error must NOT masquerade as the permanent verdict.
+        let transient: anyhow::Error = anyhow::anyhow!("Failed to fetch submitting transaction");
+        assert!(
+            transient.downcast_ref::<UndecodableDescriptor>().is_none(),
+            "a transient fetch error must not be treated as permanently undecodable"
+        );
+    }
 
     #[test]
     fn topic_matches_canonical_signature() {
