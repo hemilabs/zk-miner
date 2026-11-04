@@ -96,11 +96,12 @@ switch ($Vendor) {
     }
     'intel' {
         # The oneAPI toolkit's offline installer, silently, with only the DPC++/C++ compiler and
-        # ocloc (ahead-of-time compilation for Intel GPUs).
+        # ocloc (ahead-of-time compilation for Intel GPUs), and tcm, whose hwloc the SYCL runtime's
+        # memory manager (UMF) loads.
         Get-Verified $env:ONEAPI_URL $env:ONEAPI_SHA256 "$tmp\oneapi.exe"
         $proc = Start-Process "$tmp\oneapi.exe" -ArgumentList @(
             '-s', '-a', '--silent', '--eula', 'accept',
-            '--components', 'intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.ocloc',
+            '--components', 'intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.ocloc:intel.oneapi.win.tcm',
             '-p=NEED_VS2017_INTEGRATION=0', '-p=NEED_VS2019_INTEGRATION=0', '-p=NEED_VS2022_INTEGRATION=0'
         ) -Wait -PassThru
         if ($proc.ExitCode -ne 0) { throw "oneAPI installer exited with $($proc.ExitCode)" }
@@ -111,12 +112,16 @@ switch ($Vendor) {
         }
         if (-not (Test-Path "$root\compiler\latest\bin\icpx.exe")) { throw 'icpx not found' }
         Set-Env ONEAPI_ROOT $root
-        $runtimeDirs += "$root\compiler\latest\bin"
-        # SYCL's Unified Runtime loads its Level Zero adapters by name; the legacy adapter serves
-        # Arc A cards, V2 the rest (and SP1 on every card).
-        $runtimeAlso += 'ur_adapter_level_zero.dll', 'ur_adapter_level_zero_v2.dll'
+        $runtimeDirs += "$root\compiler\latest\bin", "$root\tcm\latest\bin"
+        # Loaded by name, not imported: SYCL's Unified Runtime loader (through its proxy) and its
+        # Level Zero adapters; the legacy adapter serves Arc A cards, V2 the rest (and SP1 on
+        # every card).
+        $runtimeAlso += 'ur_loader.dll', 'ur_adapter_level_zero.dll', 'ur_adapter_level_zero_v2.dll'
         $doc = "$root\compiler\latest\share\doc\compiler"
         $licenses += "$doc\credist.txt", "$doc\licensing\c\LICENSE.rtf", "$doc\licensing\c\third-party-programs.txt"
+        # tcm's hwloc (BSD), under tcm's own license.
+        $tcmDoc = "$root\tcm\latest\share\doc\tcm\licensing"
+        $licenses += "$tcmDoc\license.txt", "$tcmDoc\third-party-programs.txt"
         Set-Env ZKMINER_REDIST_LIST "$doc\credist.txt"
         Set-Env ZKMINER_REDIST_DIR "$root\compiler\latest\bin"
     }
