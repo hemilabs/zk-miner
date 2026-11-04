@@ -126,6 +126,19 @@ switch ($Vendor) {
         $licenses += "$tcmDoc\license.txt", "$tcmDoc\third-party-programs.txt"
         Set-Env ZKMINER_REDIST_LIST "$doc\credist.txt"
         Set-Env ZKMINER_REDIST_DIR "$root\compiler\latest\bin"
+        # The Level Zero headers, which risc0's Intel kernels include (level_zero/ze_api.h) to load
+        # their ahead-of-time images; oneAPI has none on Windows. The loader version the Linux
+        # build uses (scripts/ci/build-intel-gpu-runtime.sh: v1.32.0), on CPATH for icpx. Headers
+        # only: the driver's ze_loader.dll is loaded at run time.
+        Get-Verified 'https://github.com/oneapi-src/level-zero/archive/d3b3efbdaa27a0aef9a9812cc8fa4260557c1e7c.zip' `
+            '3457BC49AD8D19F4BB827B00425D3EEA8CBF3B642BACC7D9941CD4905F1A016B' "$tmp\level-zero.zip"
+        Expand-Archive "$tmp\level-zero.zip" "$tmp\level-zero-src"
+        $l0 = Get-ChildItem "$tmp\level-zero-src" -Directory | Select-Object -First 1
+        $headers = "$tmp\level-zero-headers"
+        New-Item -ItemType Directory -Force "$headers\level_zero" | Out-Null
+        Copy-Item "$($l0.FullName)\include\*" "$headers\level_zero" -Recurse
+        Set-Env CPATH $headers
+        $licenses += "$($l0.FullName)\LICENSE"
     }
 }
 
