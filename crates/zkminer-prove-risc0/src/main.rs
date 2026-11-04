@@ -18,6 +18,9 @@ use zkminer_prover_protocol::{
 
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 
+#[cfg(all(feature = "rocm", windows))]
+mod hip;
+
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Duplicate `fd` with close-on-exec set.
@@ -54,6 +57,13 @@ fn main() {
                 r.program_name, r.cycles, r.duration_secs, r.throughput, r.weight, r.precompile,
             );
         }
+        return;
+    }
+
+    // The HIP devices, for the host's GPU discovery where there is no rocm-smi (Windows).
+    #[cfg(all(feature = "rocm", windows))]
+    if std::env::args().any(|a| a == "--list-hip-devices") {
+        hip::print_devices();
         return;
     }
 
@@ -437,7 +447,22 @@ fn detect_gpu() -> (bool, Option<String>) {
             }
         }
     }
-    #[cfg(feature = "rocm")]
+    // Windows has neither rocm-smi nor /dev/kfd: ask HIP for the device this worker proves on
+    // (the dispatcher pins it with HIP_VISIBLE_DEVICES, so it is the first one visible).
+    #[cfg(all(feature = "rocm", windows))]
+    {
+        return match hip::devices() {
+            Ok(devices) => match devices.into_iter().next() {
+                Some(d) => (true, Some(d.name)),
+                None => (false, None),
+            },
+            Err(e) => {
+                tracing::warn!("{e}");
+                (false, None)
+            }
+        };
+    }
+    #[cfg(all(feature = "rocm", not(windows)))]
     {
         // Try rocm-smi first (more reliable than sysfs product_name)
         if let Ok(output) = std::process::Command::new("rocm-smi")
