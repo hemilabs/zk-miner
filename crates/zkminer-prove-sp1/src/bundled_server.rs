@@ -22,9 +22,17 @@ use anyhow::{anyhow, Context, Result};
 pub(crate) const INSTALL_ENV: &str = zkminer_prover_protocol::types::SP1_SERVER_INSTALL_ENV;
 
 /// Libraries the server loads from its own directory. On Windows, gnark's Groth16 prover is a DLL
-/// (`sp1gnark.dll`, see hemilabs/sp1's gnark-ffi), where Linux links it into the server statically.
+/// (`sp1gnark.dll`, see hemilabs/sp1's gnark-ffi), where Linux links it into the server statically;
+/// and the MSVC runtime the server links, which a machine with only a GPU driver may not have. A
+/// DLL beside an executable is found before System32's, so the server always gets the runtime it
+/// shipped with. Each is installed if the release ships it beside this worker.
 #[cfg(windows)]
-const COMPANIONS: &[&str] = &["sp1gnark.dll"];
+const COMPANIONS: &[&str] = &[
+    "sp1gnark.dll",
+    "vcruntime140.dll",
+    "vcruntime140_1.dll",
+    "msvcp140.dll",
+];
 #[cfg(not(windows))]
 const COMPANIONS: &[&str] = &[];
 

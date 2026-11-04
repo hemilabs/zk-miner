@@ -535,6 +535,9 @@ jobs:
           scripts\windows\collect-dlls.ps1 -Binaries (@("$out\$name.exe", "$out\sp1gnark.dll") + ($own | ForEach-Object { "$lib\$($_.Name)" })) `
             -SearchDirs ($env:ZKMINER_RUNTIME_DIRS -split ';') -Dest $lib `
             -Also ($env:ZKMINER_RUNTIME_ALSO -split ';' | Where-Object { $_ }) @redist
+          # The MSVC runtime goes beside the worker, which installs it beside the server (its
+          # COMPANIONS): a DLL beside an executable is found before System32's.
+          Get-ChildItem $lib | Where-Object Name -match '^(vcruntime140(_1)?|msvcp140)\.dll$' | Move-Item -Destination $out -Force
           if (-not (Get-ChildItem $lib)) { Remove-Item $lib }
           New-Item -ItemType Directory -Force dist\LICENSES | Out-Null
           $env:ZKMINER_LICENSES -split ';' | Where-Object { $_ } | ForEach-Object {
