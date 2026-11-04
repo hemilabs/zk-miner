@@ -180,17 +180,19 @@ jobs:
           curl -L https://risczero.com/install | bash
           ~/.risc0/bin/rzup install rust
 
-      # `check` runs zkminer-prove-risc0's build script, which compiles the guests and writes
-      # the methods.rs that names them.
+      # `check` runs zkminer-prover's build script, which with `risc0` compiles the same guests
+      # zkminer-prove-risc0 embeds (package.metadata.risc0) into the methods.rs it writes.
+      # (zkminer-prove-risc0's own binaries all need a GPU feature, so a plain check of it builds
+      # nothing.)
       - name: Build the guests
-        run: cargo check --locked -p zkminer-prove-risc0
+        run: cargo check --locked -p zkminer-prover --features risc0
 
       # methods.rs and the binaries it names: the Windows workers' build script embeds exactly
       # these when ZKMINER_RISC0_GUESTS_DIR points at them.
       - name: Collect the guests
         run: |
           set -euo pipefail
-          methods=$(ls target/debug/build/zkminer-prove-risc0-*/out/methods.rs)
+          methods=$(ls target/debug/build/zkminer-prover-*/out/methods.rs)
           [ "$(echo "$methods" | wc -l)" -eq 1 ] || { echo "expected one methods.rs: $methods"; exit 1; }
           mkdir -p risc0-guests
           cp "$methods" risc0-guests/
