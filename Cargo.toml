@@ -88,9 +88,13 @@ zkminer-config = { path = "crates/zkminer-config" }
 
 # Patch risc0 crates to use hemilabs fork (AMD + NVIDIA GPU support)
 #
-# Pinned by REV to branch `zkminer/release-3.0-8007a99` @ 8b16ef0c8 (tag `zkminer-pin-2026-11-02b`):
-# `release-3.0` @ 8007a997 (through hemilabs/risc0 #28) plus the commits zk-miner needs on top of it.
-# The first seven are carried unchanged from `zkminer/measure-matches-prove` @ d7847647c (which stays
+# Pinned by REV to branch `zkminer/witgen-scan-width` @ 0bb393f6e: one Intel fix on top of branch
+# `zkminer/release-3.0-8007a99` @ 8b16ef0c8 (tag `zkminer-pin-2026-11-02b`). The fix sizes the rv32im
+# witgen scans from the card's architecture instead of a SYCL kernel bundle, for which oneAPI 2026.0's
+# runtime picked an ahead-of-time image built for another card: on an Arc B580 the driver rejected it
+# and recompiled the whole witgen module from SPIR-V, about 10 minutes of the first proof.
+# 8b16ef0c8 is `release-3.0` @ 8007a997 (through hemilabs/risc0 #28) plus the commits zk-miner needs on
+# top of it. The first seven are carried unchanged from `zkminer/measure-matches-prove` @ d7847647c (which stays
 # tagged `zkminer-pin-2026-11-02`), most of them so that the risc0 worker's pre-claim measurement
 # executes a guest exactly as its proof will (a guest that measures clean must not fail every proof,
 # after the claim):
@@ -125,23 +129,23 @@ zkminer-config = { path = "crates/zkminer-config" }
 # A rev and not a branch for the reason given on `sppark` below: a branch pin follows a moved head on
 # the next `cargo update` without anyone choosing to.
 [patch.crates-io]
-risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
-risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "8b16ef0c88cc3ebb6a9a543e4fa664ed2fd14dee" }
+risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
+risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "0bb393f6e8859051ce11d6aa8c4b6169fa78a4c7" }
 # Pinned by immutable REV, not a branch: a branch head can silently move the build
 # off a validated commit (which is why the risc0/sp1 patches below carry a
 # do-not-cargo-update warning). 5f68eb3 = hemilabs/risc0-sppark `zkminer/windows-amd`
