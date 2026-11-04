@@ -344,8 +344,12 @@ jobs:
             # rec_fast_assert.cuh by `<verbatim dir>/name`, a path HIP's clang cannot open on Windows.
             # Device asserts compiled out and device printf buffered, as Dockerfile.build's
             # release build does (on Linux, printf and assert need hostcall).
-            rocm)  export NVCC=off RISC0_HIP_ARCH="$HIP_ARCHS" RISC0_HIP_REC_ASSERT=1 \
-                     HIPCC_COMPILE_FLAGS_APPEND='-DNDEBUG -mprintf-kind=buffered' ;;
+            # On a larger runner, clang compiles a file's five GPU targets five at a time
+            # (-parallel-jobs, as Dockerfile.build on Linux's larger runner); each adds that
+            # compiler's memory, so one at a time on a standard one.
+            rocm)  pj=1; [ "$(nproc)" -ge 16 ] && pj=5
+                   export NVCC=off RISC0_HIP_ARCH="$HIP_ARCHS" RISC0_HIP_REC_ASSERT=1 \
+                     HIPCC_COMPILE_FLAGS_APPEND="-DNDEBUG -mprintf-kind=buffered -parallel-jobs=$pj" ;;
           esac
           start=$(date +%s)
           # At least 4 jobs: risc0's build deadlocks on cargo's jobserver below that.
