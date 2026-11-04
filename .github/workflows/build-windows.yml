@@ -259,8 +259,6 @@ jobs:
             feature: cuda
           - vendor: amd
             feature: rocm
-          - vendor: intel
-            feature: intel
     if: >-
       ${{ !cancelled() && needs.risc0-guests.result == 'success' }}
     # Pinned, not windows-latest: nvcc accepts only the MSVC versions its release knows.
@@ -277,7 +275,6 @@ jobs:
           case "${{ matrix.vendor }}" in
             nvidia) want='${{ github.event_name != 'workflow_dispatch' || inputs.build_nvidia }}' ;;
             amd)    want='${{ github.event_name != 'workflow_dispatch' || inputs.build_amd }}' ;;
-            intel)  want='${{ github.event_name != 'workflow_dispatch' || inputs.build_intel }}' ;;
           esac
           echo "build=$want" >> "$GITHUB_OUTPUT"
 
@@ -349,7 +346,6 @@ jobs:
             # release build does (on Linux, printf and assert need hostcall).
             rocm)  export NVCC=off RISC0_HIP_ARCH="$HIP_ARCHS" RISC0_HIP_REC_ASSERT=1 \
                      HIPCC_COMPILE_FLAGS_APPEND='-DNDEBUG -mprintf-kind=buffered' ;;
-            intel) export NVCC=off HIPCC=off ;;
           esac
           start=$(date +%s)
           # At least 4 jobs: risc0's build deadlocks on cargo's jobserver below that.
@@ -410,6 +406,288 @@ jobs:
         if: steps.want.outputs.build == 'true'
         with:
           name: part-risc0-${{ matrix.vendor }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  # -----------------------------------------------------------------------
+  # Intel risc0 device images, compiled on Linux
+  #
+  # oneAPI's Windows ocloc has IGC's MergeAllocas quadratic, which makes the ahead-of-time compile
+  # of risc0's Intel kernels take hours per target (4 h 7 min for the worker on a 16-core machine).
+  # zk-miner's Linux build compiles IGC with it fixed. So the Windows build records the ocloc calls
+  # it would make (intel-ocloc-record), Linux compiles them with that ocloc (intel-zebins), and the
+  # real Windows build replays the images (risc0-windows-intel). Device images are GPU code, the
+  # same whichever OS compiled them.
+  # -----------------------------------------------------------------------
+  intel-ocloc-record:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_intel }}
+    runs-on: ${{ vars.ZKMINER_LARGE_WINDOWS_RUNNER || 'windows-2022' }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Install the toolkit
+        shell: pwsh
+        run: scripts\windows\install-toolkit.ps1 -Vendor intel -Components risc0
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+          rustup default ${{ env.RUST_VERSION }}
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-risc0-intel-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-risc0-intel-
+
+      # The kernels risc0-windows-intel already has cached are not compiled again there, so they
+      # need no image: restore the same cache (never saved from here, as these builds' libraries
+      # hold SPIR-V where the images go).
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            target/release/eval_check_cache
+            target/release/eval_check_cache_rocm
+            target/release/keccak_eval_check_cache
+            target/release/keccak_intel_cache
+            target/release/build/risc0-*-sys-*/out/intel_*_cache*
+          key: windows-risc0-kernels-intel-${{ github.run_id }}
+          restore-keys: windows-risc0-kernels-intel-
+
+      - name: Install the ocloc shim
+        shell: pwsh
+        run: scripts\windows\install-ocloc-shim.ps1 -Mode record -Store "$env:RUNNER_TEMP\ocloc-records"
+
+      # As risc0-windows-intel's build, with stub guests: only its ocloc calls are kept.
+      - name: Record
+        shell: bash
+        env:
+          RUSTFLAGS: '-C target-cpu=x86-64-v3 -C target-feature=+adx'
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+          BINDGEN_EXTRA_CLANG_ARGS: '--target=x86_64-pc-windows-msvc'
+          RISC0_SKIP_BUILD: '1'
+          NVCC: 'off'
+          HIPCC: 'off'
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          jobs=$(( $(nproc) > 4 ? $(nproc) : 4 ))
+          cargo build --locked --release -j $jobs -p zkminer-prove-risc0 --features intel \
+            --bin zkminer-prove-risc0-intel
+          n=$(find "$RUNNER_TEMP/ocloc-records" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+          echo "::notice title=intel ocloc record::$n calls in $(( ($(date +%s) - start) / 60 )) min"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ocloc-records
+          path: ${{ runner.temp }}/ocloc-records/
+          if-no-files-found: warn
+          retention-days: 1
+
+  intel-zebins:
+    needs: intel-ocloc-record
+    runs-on: ${{ vars.ZKMINER_LARGE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      packages: read
+    env:
+      # The commit of max/ci-every-gpu whose Dockerfile.build stages build IGC and ocloc; its CI
+      # caches them in ghcr.io/hemilabs/zk-miner-build-cache. Once that branch is merged, these
+      # come from this checkout instead.
+      LINUX_CI_REF: b42d8ee3f5b0b9beb25d85f00b5b54da88c614ba
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ env.LINUX_CI_REF }}
+          path: linux-ci
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ocloc-records
+          path: ocloc-records
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build ocloc (Linux CI's intel-gpu-runtime stage, from its cache)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          cache="ghcr.io/${OWNER,,}/zk-miner-build-cache"
+          from=()
+          for ref in dist-intel-gpu-runtime dist-intel-gpu-runtime-intel-igc \
+                     dist-intel dist-intel-intel-igc dist-intel-intel-gpu-runtime; do
+            from+=(--cache-from "type=registry,ref=$cache:$ref")
+          done
+          start=$(date +%s)
+          docker buildx build -f linux-ci/Dockerfile.build --target intel-gpu-runtime \
+            "${from[@]}" --load -t zkminer-intel-gpu linux-ci
+          echo "::notice title=ocloc image::$(( ($(date +%s) - start) / 60 )) min"
+
+      - name: Compile the recorded calls
+        run: |
+          set -euo pipefail
+          [ -d ocloc-records ] || mkdir ocloc-records
+          start=$(date +%s)
+          docker run --rm -v "$PWD:/w" -w /w \
+            -e OCLOC=/opt/zkminer-intel-gpu/bin/ocloc \
+            -e LD_LIBRARY_PATH=/opt/zkminer-intel-gpu/lib \
+            zkminer-intel-gpu bash scripts/windows/compile-ocloc-records.sh ocloc-records
+          echo "::notice title=intel images::$(( ($(date +%s) - start) / 60 )) min"
+          # The replay needs only the images and their keys (the directory names).
+          find ocloc-records -mindepth 2 ! -name output.bin -delete
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ocloc-images
+          path: ocloc-records/
+          if-no-files-found: warn
+          retention-days: 1
+
+  risc0-windows-intel:
+    needs: [risc0-guests, intel-zebins]
+    if: >-
+      ${{ !cancelled() && needs.risc0-guests.result == 'success' &&
+          needs.intel-zebins.result == 'success' }}
+    # Pinned, not windows-latest: nvcc accepts only the MSVC versions its release knows.
+    # A larger Windows runner when the repository variable ZKMINER_LARGE_WINDOWS_RUNNER names one
+    # (its label), as build-docker.yml does on Linux: the GPU kernels are most of these jobs.
+    # windows-2022 otherwise (nvcc accepts only the MSVC versions its release knows).
+    runs-on: ${{ vars.ZKMINER_LARGE_WINDOWS_RUNNER || 'windows-2022' }}
+    timeout-minutes: 360
+    steps:
+      - name: Skip a vendor this dispatch left out
+        id: want
+        shell: bash
+        run: echo "build=${{ github.event_name != 'workflow_dispatch' || inputs.build_intel }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        if: steps.want.outputs.build == 'true'
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: steps.want.outputs.build == 'true'
+        with:
+          name: risc0-guests
+          path: risc0-guests
+
+      - name: Install the toolkit
+        if: steps.want.outputs.build == 'true'
+        shell: pwsh
+        run: scripts\windows\install-toolkit.ps1 -Vendor intel -Components risc0
+
+      - name: Install Rust
+        if: steps.want.outputs.build == 'true'
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+          rustup default ${{ env.RUST_VERSION }}
+
+      # Not the whole target/: it outgrows the cache. The slow part to rebuild is the GPU
+      # kernels, whose caches are keyed on the compiler command and version.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: steps.want.outputs.build == 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-risc0-intel-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-risc0-intel-
+
+      # The compiled GPU kernels, which are most of this job (the Intel worker's ahead-of-time
+      # targets took over 4 h on a 16-core machine). risc0 checks each cached library against a
+      # hash of its inputs and compiler, so a restored one that no longer matches is rebuilt.
+      # Saved under this run's key even when the build fails or runs out of time, so a build too
+      # long for one job finishes over several runs, each keeping the libraries it completed.
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: steps.want.outputs.build == 'true'
+        with:
+          path: |
+            target/release/eval_check_cache
+            target/release/eval_check_cache_rocm
+            target/release/keccak_eval_check_cache
+            target/release/keccak_intel_cache
+            target/release/build/risc0-*-sys-*/out/intel_*_cache*
+          key: windows-risc0-kernels-intel-${{ github.run_id }}
+          restore-keys: windows-risc0-kernels-intel-
+
+      # The device images, compiled on Linux by intel-zebins, which ocloc-shim hands the SYCL
+      # compiler in place of compiling them here (see scripts/windows/ocloc-shim). Strict: a call
+      # it has no image for fails the build rather than falling back to hours of oneAPI's ocloc.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: steps.want.outputs.build == 'true'
+        with:
+          name: ocloc-images
+          path: ${{ runner.temp }}/ocloc-images
+
+      - name: Install the ocloc shim
+        if: steps.want.outputs.build == 'true'
+        shell: pwsh
+        run: scripts\windows\install-ocloc-shim.ps1 -Mode replay -Store "$env:RUNNER_TEMP\ocloc-images" -Strict
+
+      - name: Build
+        if: steps.want.outputs.build == 'true'
+        # Short of the job's limit, so the kernels compiled so far are still saved.
+        timeout-minutes: 320
+        shell: bash
+        env:
+          RUSTFLAGS: '-C target-cpu=x86-64-v3 -C target-feature=+adx'
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+          BINDGEN_EXTRA_CLANG_ARGS: '--target=x86_64-pc-windows-msvc'
+          ZKMINER_RISC0_GUESTS_DIR: ${{ github.workspace }}\risc0-guests
+        run: |
+          set -euo pipefail
+          export NVCC=off HIPCC=off
+          start=$(date +%s)
+          # At least 4 jobs: risc0's build deadlocks on cargo's jobserver below that.
+          jobs=$(( $(nproc) > 4 ? $(nproc) : 4 ))
+          cargo build --locked --release -j $jobs -p zkminer-prove-risc0 --features intel \
+            --bin zkminer-prove-risc0-intel
+          echo "::notice title=risc0 intel build::$(( ($(date +%s) - start) / 60 )) min"
+
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: always() && steps.want.outputs.build == 'true'
+        with:
+          path: |
+            target/release/eval_check_cache
+            target/release/eval_check_cache_rocm
+            target/release/keccak_eval_check_cache
+            target/release/keccak_intel_cache
+            target/release/build/risc0-*-sys-*/out/intel_*_cache*
+          key: windows-risc0-kernels-intel-${{ github.run_id }}
+
+      - name: Collect the worker and its DLLs
+        if: steps.want.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          $out = 'dist'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $redist = @{}
+          if ($env:ZKMINER_REDIST_LIST) { $redist = @{ RedistList = $env:ZKMINER_REDIST_LIST; RedistDir = $env:ZKMINER_REDIST_DIR } }
+          $exe = 'target\release\zkminer-prove-risc0-intel.exe'
+          Copy-Item $exe $out
+          # The kernel libraries the -sys crates build beside the binary (Intel), loaded with it.
+          $libs = @(Get-ChildItem target\release\*.dll -ErrorAction SilentlyContinue)
+          $libs | Copy-Item -Destination $out
+          scripts\windows\collect-dlls.ps1 -Binaries (@("$out\$(Split-Path $exe -Leaf)") + ($libs | ForEach-Object { "$out\$($_.Name)" })) `
+            -SearchDirs ($env:ZKMINER_RUNTIME_DIRS -split ';') -Dest $out `
+            -Also ($env:ZKMINER_RUNTIME_ALSO -split ';' | Where-Object { $_ }) @redist
+          New-Item -ItemType Directory -Force dist\LICENSES | Out-Null
+          $env:ZKMINER_LICENSES -split ';' | Where-Object { $_ } | ForEach-Object {
+            Copy-Item $_ "dist\LICENSES\$(Split-Path (Split-Path $_ -Parent) -Leaf)-$(Split-Path $_ -Leaf)" }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.want.outputs.build == 'true'
+        with:
+          name: part-risc0-intel
           path: dist/
           if-no-files-found: error
           retention-days: 1
@@ -600,7 +878,7 @@ jobs:
   # One zip per vendor, in the layout the miner runs from
   # -----------------------------------------------------------------------
   package-windows:
-    needs: [cli-windows, risc0-windows, sp1-worker-windows, sp1-server-windows]
+    needs: [cli-windows, risc0-windows, risc0-windows-intel, sp1-worker-windows, sp1-server-windows]
     if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
