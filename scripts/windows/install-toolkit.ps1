@@ -69,7 +69,8 @@ switch ($Vendor) {
         $licenses += "$root\LICENSE"
     }
     'amd' {
-        # The HIP SDK's packages, unpacked from AMD's installer (a 7-Zip self-extractor) and
+        # The HIP SDK's packages (the compiler and runtime; hiprtc; the header-only hipCUB and
+        # rocPRIM the SP1 server uses), unpacked from AMD's installer (a 7-Zip self-extractor) and
         # administratively from their MSIs: AMD's setup program itself targets Windows 10/11 and
         # would install a display driver, neither of which a build needs.
         Get-Verified $env:HIP_SDK_URL $env:HIP_SDK_SHA256 "$tmp\hip-sdk.exe"
@@ -77,7 +78,8 @@ switch ($Vendor) {
         & "$env:ProgramFiles\7-Zip\7z.exe" e -y "-o$msis" "$tmp\hip-sdk.exe" `
             'Packages\Apps\ROCmSDKPackages\SDKCore\ROCm_SDK_Core.msi' `
             'Packages\Apps\ROCmSDKPackages\RTCRuntime\ROCm_RTC_RT.msi' `
-            'Packages\Apps\ROCmSDKPackages\RTCDevelopment\ROCm_RTC_Dev.msi' | Out-Null
+            'Packages\Apps\ROCmSDKPackages\RTCDevelopment\ROCm_RTC_Dev.msi' `
+            'Packages\Apps\ROCmSDKPackages\LibrariesDevelopment\ROCm_Libs_Dev.msi' | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "7z exited with $LASTEXITCODE" }
         $unpacked = 'C:\hip-sdk'
         foreach ($msi in Get-ChildItem "$msis\*.msi") {
