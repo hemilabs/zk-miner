@@ -465,6 +465,11 @@ fn detect_gpu() -> (bool, Option<String>) {
     }
     #[cfg(feature = "intel")]
     {
+        // Windows has no sysfs. The dispatcher starts this worker only for an Intel GPU it detected
+        // (and pins it with ZE_AFFINITY_MASK); the prover fails loudly if no device is visible.
+        if cfg!(windows) {
+            return (true, Some("Intel GPU".to_string()));
+        }
         // The host pins this worker to one card through ZE_AFFINITY_MASK, which sysfs does not see;
         // name the card only when the box has exactly one Intel GPU, so the name is never another
         // card's. The host names its slots from its own discovery either way.
