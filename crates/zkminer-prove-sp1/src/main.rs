@@ -286,6 +286,21 @@ fn main() {
         }
     }
 
+    // Windows: every build's own DLLs (the MSVC runtime; HIP's or SYCL's runtime) are installed in
+    // `<name>-lib/` beside it, which goes on the PATH the server inherits: Windows looks there for
+    // a DLL that is not beside the executable.
+    #[cfg(windows)]
+    if let Ok(server) = warmup::server_path() {
+        let lib = server.with_file_name(format!("{}-lib", warmup::server_name()));
+        if lib.is_dir() {
+            let mut dirs = vec![lib];
+            dirs.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+            if let Ok(path) = std::env::join_paths(dirs) {
+                std::env::set_var("PATH", path);
+            }
+        }
+    }
+
     if std::env::args().any(|a| a == "--benchmark") {
         // Honour the assigned device here too. Without this, benchmarking card 1 by hand silently
         // measured card 0 — a figure that is then persisted as that card's.
