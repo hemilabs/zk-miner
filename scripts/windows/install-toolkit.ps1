@@ -93,6 +93,8 @@ switch ($Vendor) {
         Set-Env HIPCC "$root\bin\hipcc.exe"
         Add-Path "$root\bin"
         $runtimeDirs += "$root\bin"
+        # amdhip64 is AMD's ROCm CLR (MIT); the SDK installs no license file of its own for it.
+        $licenses += "$PSScriptRoot\licenses\HIP-runtime-LICENSE.md"
     }
     'intel' {
         # The oneAPI toolkit's offline installer, silently, with only the DPC++/C++ compiler and
