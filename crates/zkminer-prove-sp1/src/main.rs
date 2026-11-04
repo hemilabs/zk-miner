@@ -57,6 +57,7 @@ fn pk_cache_capacity() -> usize {
 /// Drop a GPU-resident proving key safely. Dropping a `CudaPk` performs async teardown of the
 /// `sp1-gpu-server` that needs a tokio runtime context (see the shutdown path); without one the Drop
 /// impl panics. Evictions are rare, so a short-lived runtime per eviction is acceptable.
+#[cfg(not(windows))]
 fn drop_pk(pk: CudaPk) {
     match tokio::runtime::Runtime::new() {
         Ok(rt) => rt.block_on(async move {
@@ -64,6 +65,37 @@ fn drop_pk(pk: CudaPk) {
         }),
         Err(e) => {
             tracing::warn!("No tokio runtime to free an evicted SP1 proving key ({e}); leaking it");
+            std::mem::forget(pk);
+        }
+    }
+}
+
+/// Windows: the drop's teardown is a request the key's `Drop` spawns on the current runtime, and a
+/// short-lived runtime cancelled it mid-write. Windows completes a named-pipe write asynchronously,
+/// so the cancel could land between the request's length and its body, leaving half a frame on the
+/// server's pipe: its next request failed to decode ("invalid value: integer `92`") and the server
+/// closed the connection, failing that proof and the next. Seen proving the six benchmark programs
+/// in turn on an RTX 5090, at the fifth (the first eviction). The runtime here lives as long as the
+/// worker, so the request runs to completion; it holds the client's lock while it does, so it is
+/// never interleaved with another.
+#[cfg(windows)]
+fn drop_pk(pk: CudaPk) {
+    static RUNTIME: std::sync::LazyLock<Option<tokio::runtime::Runtime>> =
+        std::sync::LazyLock::new(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .map_err(|e| tracing::warn!("cannot start a runtime to free SP1 proving keys: {e}"))
+                .ok()
+        });
+    match RUNTIME.as_ref() {
+        Some(rt) => {
+            let _context = rt.enter();
+            drop(pk);
+        }
+        None => {
+            tracing::warn!("No tokio runtime to free an evicted SP1 proving key; leaking it");
             std::mem::forget(pk);
         }
     }
