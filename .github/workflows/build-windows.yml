@@ -264,7 +264,10 @@ jobs:
     if: >-
       ${{ !cancelled() && needs.risc0-guests.result == 'success' }}
     # Pinned, not windows-latest: nvcc accepts only the MSVC versions its release knows.
-    runs-on: windows-2022
+    # A larger Windows runner when the repository variable ZKMINER_LARGE_WINDOWS_RUNNER names one
+    # (its label), as build-docker.yml does on Linux: the GPU kernels are most of these jobs.
+    # windows-2022 otherwise (nvcc accepts only the MSVC versions its release knows).
+    runs-on: ${{ vars.ZKMINER_LARGE_WINDOWS_RUNNER || 'windows-2022' }}
     timeout-minutes: 360
     steps:
       - name: Skip a vendor this dispatch left out
@@ -327,7 +330,9 @@ jobs:
             intel) export NVCC=off HIPCC=off ;;
           esac
           start=$(date +%s)
-          cargo build --locked --release -j 4 -p zkminer-prove-risc0 --features ${{ matrix.feature }} \
+          # At least 4 jobs: risc0's build deadlocks on cargo's jobserver below that.
+          jobs=$(( $(nproc) > 4 ? $(nproc) : 4 ))
+          cargo build --locked --release -j $jobs -p zkminer-prove-risc0 --features ${{ matrix.feature }} \
             --bin zkminer-prove-risc0-${{ matrix.feature }}
           echo "::notice title=risc0 ${{ matrix.vendor }} build::$(( ($(date +%s) - start) / 60 )) min"
 
@@ -453,7 +458,10 @@ jobs:
           - vendor: intel
             backend: sycl
             name: sp1-gpu-server-sycl
-    runs-on: windows-2022
+    # A larger Windows runner when the repository variable ZKMINER_LARGE_WINDOWS_RUNNER names one
+    # (its label), as build-docker.yml does on Linux: the GPU kernels are most of these jobs.
+    # windows-2022 otherwise (nvcc accepts only the MSVC versions its release knows).
+    runs-on: ${{ vars.ZKMINER_LARGE_WINDOWS_RUNNER || 'windows-2022' }}
     timeout-minutes: 360
     steps:
       - name: Skip a vendor this dispatch left out
