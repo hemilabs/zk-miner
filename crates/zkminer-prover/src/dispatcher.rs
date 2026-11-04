@@ -538,6 +538,21 @@ impl ProvingWatchdog {
                                 );
                             }
                         }
+                        // Windows has no process groups; the worker itself is terminated, under the
+                        // same identity check (see `memory::terminate_if_our_worker`).
+                        #[cfg(windows)]
+                        {
+                            let expected_start = starttime_ref.load(Ordering::Acquire);
+                            if !crate::memory::terminate_if_our_worker(
+                                current_pid,
+                                (expected_start != 0).then_some(expected_start),
+                            ) {
+                                tracing::warn!(
+                                    "not killing PID {current_pid} for {slot_key}: it is no longer \
+                                     our worker (exited, and the number may have been reused)"
+                                );
+                            }
+                        }
                     }
                 })
                 .ok()
@@ -7252,6 +7267,12 @@ impl WorkerPool {
                                     "not killing PID {pid} for {key}: it is no longer our worker"
                                 );
                             }
+                            #[cfg(windows)]
+                            if !crate::memory::terminate_if_our_worker(pid, expected_start) {
+                                tracing::warn!(
+                                    "not killing PID {pid} for {key}: it is no longer our worker"
+                                );
+                            }
                         }
                     }
                 }
@@ -7558,9 +7579,12 @@ impl WorkerPool {
             let Some((pid, expected_start)) = entry.signal_target() else {
                 continue;
             };
+            // Unix only: Windows has no SIGTERM, so its workers are terminated in phase 3.
+            #[cfg(not(unix))]
+            let _ = (key, pid, expected_start);
+            #[cfg(unix)]
             if crate::memory::pid_is_our_worker(pid, expected_start) {
                 tracing::info!("Sending SIGTERM to worker {key} (PID {pid})");
-                #[cfg(unix)]
                 unsafe {
                     // Signal the GROUP, not just the leader: a forked GPU helper
                     // (SP1's sp1-gpu-server) should get a chance to release its VRAM
@@ -7591,6 +7615,9 @@ impl WorkerPool {
                     libc::kill(pid as i32, libc::SIGKILL);
                 }
             }
+            // Windows: no SIGTERM in phase 2, so survivors are every worker still running.
+            #[cfg(windows)]
+            crate::memory::terminate_if_our_worker(pid, expected_start);
         }
 
         // Brief pause for EOF to propagate through pipes
@@ -7618,6 +7645,8 @@ impl WorkerPool {
                                     libc::kill(pid as i32, libc::SIGKILL);
                                 }
                             }
+                            #[cfg(windows)]
+                            crate::memory::terminate_if_our_worker(pid, expected_start);
                         }
                         std::thread::sleep(Duration::from_millis(100));
                     }

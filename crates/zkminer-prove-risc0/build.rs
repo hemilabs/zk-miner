@@ -6,10 +6,20 @@ fn main() {
     // LD_LIBRARY_PATH. DT_RPATH, not DT_RUNPATH: the kernel
     // libraries load libsycl themselves and have no search path of their own, and only an RPATH on the
     // executable applies to its libraries' dependencies too.
-    if std::env::var_os("CARGO_FEATURE_INTEL").is_some() {
+    // (A GNU-ld rpath: Windows finds a binary's DLLs beside it instead.)
+    if std::env::var_os("CARGO_FEATURE_INTEL").is_some()
+        && std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
+    {
         println!(
             "cargo:rustc-link-arg-bin=zkminer-prove-risc0-intel=-Wl,--disable-new-dtags,-rpath,$ORIGIN/zkminer-intel/lib:$ORIGIN"
         );
+    }
+
+    println!("cargo:rerun-if-env-changed=ZKMINER_RISC0_GUESTS_DIR");
+    // Embed guests built elsewhere: rzup, which compiles them, does not run on Windows.
+    if let Some(dir) = std::env::var_os("ZKMINER_RISC0_GUESTS_DIR") {
+        import_prebuilt_guests(std::path::Path::new(&dir));
+        return;
     }
 
     // Skip guest compilation when RISC0_SKIP_BUILD is set (for CI/fast dev builds).
@@ -126,4 +136,66 @@ pub const MINIMAL_PROOF_ID: [u32; 8] = [0u32; 8];
         "cargo:rerun-if-changed={}",
         guest_dir.join("minimal-proof/src/main.rs").display()
     );
+}
+
+/// Embed guests from `dir`: the `methods.rs` a real build of this crate generated
+/// (with `risc0_build`) and the guest binaries it names, all copied into `dir`.
+///
+/// `methods.rs` names each binary by an absolute path on the machine that built it;
+/// those are repointed at the file of the same name in `dir`. The image IDs are kept
+/// as generated, so they always match the binaries they were computed from.
+fn import_prebuilt_guests(dir: &std::path::Path) {
+    let methods_src = dir.join("methods.rs");
+    println!("cargo:rerun-if-changed={}", methods_src.display());
+    let methods = std::fs::read_to_string(&methods_src).unwrap_or_else(|e| {
+        panic!(
+            "ZKMINER_RISC0_GUESTS_DIR: reading {}: {e}",
+            methods_src.display()
+        )
+    });
+
+    let mut out = String::new();
+    let mut guests = 0;
+    for line in methods.lines() {
+        // Generated lines are `pub const X_ELF: &[u8] = include_bytes!("<path>");` and
+        // `pub const X_PATH: &str = "<path>";`, with the path as a Rust string literal.
+        let is_elf = line.contains("include_bytes!(\"");
+        let is_path = line.contains("_PATH: &str = \"");
+        if !(is_elf || is_path) {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let start = line.find('"').unwrap() + 1;
+        let end = line.rfind('"').unwrap();
+        // Unescape the literal's backslashes; a Windows build of it would double them.
+        let original = line[start..end].replace("\\\\", "\\");
+        let name = original
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_else(|| panic!("no file name in {original:?}"));
+        let local = dir.join(name);
+        assert!(
+            local.is_file(),
+            "ZKMINER_RISC0_GUESTS_DIR: {} is missing {name}, which methods.rs names",
+            dir.display()
+        );
+        println!("cargo:rerun-if-changed={}", local.display());
+        out.push_str(&line[..start - 1]);
+        out.push_str(&format!("{:?}", local.display().to_string()));
+        out.push_str(&line[end + 1..]);
+        out.push('\n');
+        if is_elf {
+            guests += 1;
+        }
+    }
+    assert!(
+        guests > 0,
+        "ZKMINER_RISC0_GUESTS_DIR: {} names no guest binaries",
+        methods_src.display()
+    );
+
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(std::path::Path::new(&out_dir).join("methods.rs"), out)
+        .expect("failed to write methods.rs");
 }

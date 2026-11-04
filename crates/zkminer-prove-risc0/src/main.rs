@@ -101,7 +101,11 @@ fn main() {
         unsafe { libc::dup2(io::stderr().as_raw_fd(), stdout_fd) };
         unsafe { std::fs::File::from_raw_fd(ipc_fd) }
     };
-    #[cfg(not(unix))]
+    // Windows: the same isolation through the C runtime (ipc.rs): circom-witnesscalc and other
+    // native code print to the process's stdout, which now goes to stderr.
+    #[cfg(windows)]
+    let ipc_stdout = zkminer_prover_protocol::ipc::take_ipc_stdout();
+    #[cfg(not(any(unix, windows)))]
     let ipc_stdout = io::stdout();
 
     tracing_subscriber::fmt()
