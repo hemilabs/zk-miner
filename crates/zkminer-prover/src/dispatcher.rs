@@ -623,6 +623,10 @@ fn gpu_vram_bytes(
         return amd_vram_bytes(pci_bus_id?);
     }
     if gpu_tag == "intel" {
+        // Windows has no xe query: the size comes from the adapter's driver key (discovery).
+        if cfg!(windows) {
+            return crate::discovery::intel_vram_bytes(idx);
+        }
         // The xe driver's own count of the card's device memory (sysfs has none): see
         // `discovery::intel_vram`. Unknown on i915, which keeps the unsized behaviour.
         return crate::discovery::intel_vram(pci_bus_id?).map(|(total, _)| total);
@@ -1973,6 +1977,16 @@ impl WorkerPool {
                     if std::env::var_os("ONEAPI_DEVICE_SELECTOR").is_none() {
                         env.insert("ONEAPI_DEVICE_SELECTOR".into(), "level_zero:*".into());
                     }
+                }
+                // On Windows, the card's capacity, as for CUDA above: the risc0 worker keeps its
+                // Groth16 proving key cached on the GPU between proofs only on a card it knows has
+                // room (`release_groth16_cache_if_tight`).
+                #[cfg(windows)]
+                if let Some(vram) = gpu_vram_bytes(gpu_tag, device_index, pci_bus_id) {
+                    env.insert(
+                        zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
+                        vram.to_string(),
+                    );
                 }
             }
             _ => {}
