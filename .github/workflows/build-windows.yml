@@ -537,7 +537,9 @@ jobs:
             -Also ($env:ZKMINER_RUNTIME_ALSO -split ';' | Where-Object { $_ }) @redist
           # The MSVC runtime goes beside the worker, which installs it beside the server (its
           # COMPANIONS): a DLL beside an executable is found before System32's.
-          Get-ChildItem $lib | Where-Object Name -match '^(vcruntime140(_1)?|msvcp140)\.dll$' | Move-Item -Destination $out -Force
+          # So does the server's own library (SYCL: sp1_gpu_sycl.dll), which must always be the one
+          # built with it.
+          Get-ChildItem $lib | Where-Object Name -match '^(vcruntime140(_1)?|msvcp140|sp1_gpu_sycl)\.dll$' | Move-Item -Destination $out -Force
           if (-not (Get-ChildItem $lib)) { Remove-Item $lib }
           New-Item -ItemType Directory -Force dist\LICENSES | Out-Null
           $env:ZKMINER_LICENSES -split ';' | Where-Object { $_ } | ForEach-Object {

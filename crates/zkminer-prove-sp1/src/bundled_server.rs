@@ -25,10 +25,13 @@ pub(crate) const INSTALL_ENV: &str = zkminer_prover_protocol::types::SP1_SERVER_
 /// (`sp1gnark.dll`, see hemilabs/sp1's gnark-ffi), where Linux links it into the server statically;
 /// and the MSVC runtime the server links, which a machine with only a GPU driver may not have. A
 /// DLL beside an executable is found before System32's, so the server always gets the runtime it
-/// shipped with. Each is installed if the release ships it beside this worker.
+/// shipped with. And the SYCL build's own kernels, `sp1_gpu_sycl.dll`: beside it, it is replaced
+/// with the server, never left from an older build to shadow the new one (a DLL beside the
+/// executable wins over one on PATH). Each is installed if the release ships it beside this worker.
 #[cfg(windows)]
 const COMPANIONS: &[&str] = &[
     "sp1gnark.dll",
+    "sp1_gpu_sycl.dll",
     "vcruntime140.dll",
     "vcruntime140_1.dll",
     "msvcp140.dll",
