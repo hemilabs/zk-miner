@@ -312,8 +312,27 @@ jobs:
           key: windows-risc0-${{ matrix.vendor }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: windows-risc0-${{ matrix.vendor }}-
 
+      # The compiled GPU kernels, which are most of this job (the Intel worker's ahead-of-time
+      # targets took over 4 h on a 16-core machine). risc0 checks each cached library against a
+      # hash of its inputs and compiler, so a restored one that no longer matches is rebuilt.
+      # Saved under this run's key even when the build fails or runs out of time, so a build too
+      # long for one job finishes over several runs, each keeping the libraries it completed.
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: steps.want.outputs.build == 'true'
+        with:
+          path: |
+            target/release/eval_check_cache
+            target/release/eval_check_cache_rocm
+            target/release/keccak_eval_check_cache
+            target/release/keccak_intel_cache
+            target/release/build/risc0-*-sys-*/out/intel_*_cache*
+          key: windows-risc0-kernels-${{ matrix.vendor }}-${{ github.run_id }}
+          restore-keys: windows-risc0-kernels-${{ matrix.vendor }}-
+
       - name: Build
         if: steps.want.outputs.build == 'true'
+        # Short of the job's limit, so the kernels compiled so far are still saved.
+        timeout-minutes: 320
         shell: bash
         env:
           RUSTFLAGS: '-C target-cpu=x86-64-v3 -C target-feature=+adx'
@@ -326,7 +345,10 @@ jobs:
             cuda)  export HIPCC=off NVCC_APPEND_FLAGS="$RISC0_NVCC_FLAGS" ;;
             # RISC0_HIP_REC_ASSERT=1: the pinned risc0's recursion-sys build includes
             # rec_fast_assert.cuh by `<verbatim dir>/name`, a path HIP's clang cannot open on Windows.
-            rocm)  export NVCC=off RISC0_HIP_ARCH="$HIP_ARCHS" RISC0_HIP_REC_ASSERT=1 ;;
+            # Device asserts compiled out and device printf buffered, as Dockerfile.build's
+            # release build does (on Linux, printf and assert need hostcall).
+            rocm)  export NVCC=off RISC0_HIP_ARCH="$HIP_ARCHS" RISC0_HIP_REC_ASSERT=1 \
+                     HIPCC_COMPILE_FLAGS_APPEND='-DNDEBUG -mprintf-kind=buffered' ;;
             intel) export NVCC=off HIPCC=off ;;
           esac
           start=$(date +%s)
@@ -335,6 +357,17 @@ jobs:
           cargo build --locked --release -j $jobs -p zkminer-prove-risc0 --features ${{ matrix.feature }} \
             --bin zkminer-prove-risc0-${{ matrix.feature }}
           echo "::notice title=risc0 ${{ matrix.vendor }} build::$(( ($(date +%s) - start) / 60 )) min"
+
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: always() && steps.want.outputs.build == 'true'
+        with:
+          path: |
+            target/release/eval_check_cache
+            target/release/eval_check_cache_rocm
+            target/release/keccak_eval_check_cache
+            target/release/keccak_intel_cache
+            target/release/build/risc0-*-sys-*/out/intel_*_cache*
+          key: windows-risc0-kernels-${{ matrix.vendor }}-${{ github.run_id }}
 
       # The runner has no GPU, so check what the binary carries instead: every GPU module must
       # have native code for every architecture, so each appears equally often.
