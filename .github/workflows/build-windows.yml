@@ -1,24 +1,33 @@
 name: Build Windows Binaries
 
+# Native Windows builds of every GPU worker, both zkVMs, for NVIDIA, AMD and Intel, packaged so
+# they run with only the GPU driver installed: one zip per vendor holding the CLI, the workers,
+# the SP1 servers they install, every runtime DLL they load (the MSVC runtime included) and the
+# redistribution terms those DLLs ship under.
+#
+# Toolkits are installed by script from the vendors' own installers, each checked against a
+# pinned SHA-256: only GitHub-owned actions are used, as the repo's action allowlist requires.
+# The guests are built on Linux, where the RISC Zero and SP1 toolchains run, and embedded.
+
 on:
   workflow_dispatch:
     inputs:
-      build_cli:
-        description: 'Build CLI (.exe)'
+      build_nvidia:
+        description: 'NVIDIA workers (CUDA)'
         type: boolean
         default: true
-      build_cuda:
-        description: 'Build CUDA prover (.exe)'
+      build_amd:
+        description: 'AMD workers (HIP)'
+        type: boolean
+        default: true
+      build_intel:
+        description: 'Intel workers (SYCL)'
         type: boolean
         default: true
 
-  # NO tag trigger. The cuda-windows job below references a non-allowlisted
-  # action, which fails the entire run at STARTUP -- so a tag would reliably put
-  # a red check on an otherwise-good release. release.yml owns the tag path and
-  # gets its Windows CLI from the Dockerfile's cross-compile instead. Restore
-  # this trigger once `Jimver/cuda-toolkit@*` is allowlisted.
+  # NO tag trigger: release.yml owns the tag path. Wiring these zips into releases is a separate
+  # change, once this has run green.
 
-  # Callable from release.yml so a tagged release reuses these exact jobs.
   workflow_call:
     inputs:
       retention_days:
@@ -26,15 +35,15 @@ on:
         type: number
         default: 14
         required: false
-      # Declared so the job `if:` below evaluates true when CALLED. Without these
-      # the guards read an undefined `inputs.build_cli` under a manually
-      # dispatched release and BOTH Windows jobs silently skip, producing a
-      # release with no Windows binaries at all.
-      build_cli:
+      build_nvidia:
         type: boolean
         default: true
         required: false
-      build_cuda:
+      build_amd:
+        type: boolean
+        default: true
+        required: false
+      build_intel:
         type: boolean
         default: true
         required: false
@@ -48,14 +57,38 @@ concurrency:
 
 env:
   RUST_VERSION: '1.97.1'
+  # Not 12.9: its CCCL 2.8 headers do not compile for Blackwell (sm_100/sm_120) under MSVC.
+  # Matches Dockerfile.build's CUDA_VERSION.
   CUDA_VERSION: '12.8.0'
+  CUDA_INSTALLER_SHA256: '89e7c44b526b6e30ec5089f221e918090d11f1d5b33c48fbfe08c6ac13f8a95c'
+  # AMD HIP SDK 7.2 (Adrenalin 26.Q3 PRO edition), Authenticode-signed by AMD.
+  HIP_SDK_URL: 'https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-26.Q3-Win11-For-HIP.exe'
+  HIP_SDK_SHA256: '24bc203a10d731c35d3130a652ee2e83097d5d90b3d296810e5bce6745bd8b57'
+  HIP_SDK_VERSION: '7.2'
+  # Intel oneAPI 2026.0 (DPC++/C++ compiler 2026.0.0 build 20260331, ocloc), Authenticode-signed.
+  ONEAPI_URL: 'https://registrationcenter-download.intel.com/akdlm/IRC_NAS/bae85ab1-cfcd-4251-8d42-a0c27949ea33/intel-oneapi-toolkit-2026.0.0.193_offline.exe'
+  ONEAPI_SHA256: '42ebdf4dbdc4a32e5d28d89d0440ce325512aa8b68c20bb9aaef3e8fb17a8619'
+  PROTOC_VERSION: '29.3'
+  PROTOC_SHA256: '57ea59e9f551ad8d71ffaa9b5cfbe0ca1f4e720972a1db7ec2d12ab44bff9383'
+  # GPU targets, exact rather than generic ones (gfx11-generic proved invalid proofs on an
+  # RX 7900 XTX on Linux): RX 7900/7800/7600, RX 9070/9060. Intel: Arc A (acm-g10), B580/B570
+  # (bmg-g21), Pro B60/B70 (bmg-g31), and SPIR-V for any other device's driver to compile.
+  HIP_ARCHS: 'gfx1100,gfx1101,gfx1102,gfx1200,gfx1201'
+  RISC0_INTEL_SYCL_TARGETS: 'intel_gpu_acm_g10,intel_gpu_bmg_g21,intel_gpu_bmg_g31,spir64'
+  # NVIDIA: as Dockerfile.build's build-cuda and build-sp1-server.
+  RISC0_NVCC_FLAGS: >-
+    --threads 2
+    -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80
+    -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89
+    -gencode arch=compute_90,code=sm_90 -gencode arch=compute_100,code=sm_100
+    -gencode arch=compute_120,code=[sm_120,compute_120]
+  SP1_CUDA_ARCHS: '80,86,89,90,100,120'
 
 jobs:
   # -----------------------------------------------------------------------
-  # CLI — cross-compiled from Linux (fast, ~5 min)
+  # CLI — cross-compiled from Linux, the C runtime linked statically
   # -----------------------------------------------------------------------
   cli-windows:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_cli }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
@@ -63,9 +96,7 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y lld llvm
 
-      # rustup is preinstalled on GitHub runners. `dtolnay/rust-toolchain` is NOT
-      # on this repo's allowed-actions list, and an action outside that list fails
-      # the whole run at startup before any job executes.
+      # rustup is preinstalled on GitHub runners; `dtolnay/rust-toolchain` is not allowlisted.
       - name: Install Rust
         run: |
           rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
@@ -82,54 +113,29 @@ jobs:
           restore-keys: windows-cli-
 
       - name: Install cargo-xwin
-        run: cargo install cargo-xwin
+        run: cargo install --locked cargo-xwin
 
       - name: Cross-compile CLI for Windows
         env:
           RUSTFLAGS: '-C target-cpu=x86-64-v3 -C target-feature=+crt-static'
         run: |
-          cargo xwin build --release --target x86_64-pc-windows-msvc \
+          cargo xwin build --locked --release --target x86_64-pc-windows-msvc \
             -p zkminer-cli --bin zkminer
-
-      - name: Package artifact
-        run: |
-          mkdir -p dist
-          cp target/x86_64-pc-windows-msvc/release/zkminer.exe dist/
-          cd dist && sha256sum zkminer.exe > zkminer.exe.sha256
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: zkminer-windows-cli
-          path: dist/zkminer.exe*
+          name: part-cli
+          path: target/x86_64-pc-windows-msvc/release/zkminer.exe
           if-no-files-found: error
-          retention-days: ${{ inputs.retention_days || 14 }}
+          retention-days: 1
 
   # -----------------------------------------------------------------------
-  # CUDA prover — native Windows build (requires MSVC + CUDA toolkit)
-  #
-  # BLOCKED BY POLICY: `Jimver/cuda-toolkit` is not on this repo's
-  # allowed-actions list (`allowed_actions: selected`), and referencing an action
-  # outside that list fails the entire run at startup. So this job cannot run as
-  # written, and release.yml deliberately does NOT call this workflow -- it would
-  # take the release down with it. To ship a native Windows prover, either add
-  # `Jimver/cuda-toolkit@*` to the allowlist or replace this step with a manual
-  # silent install of the CUDA network installer.
+  # Host crates' unit tests on Windows (the runner has no GPU)
   # -----------------------------------------------------------------------
-  cuda-windows:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_cuda }}
-    runs-on: windows-latest
+  test-windows:
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
-        with:
-          submodules: recursive
-
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.30
-        id: cuda-toolkit
-        with:
-          cuda: ${{ env.CUDA_VERSION }}
-          method: network
-          sub-packages: '["nvcc", "cudart", "thrust", "visual_studio_integration"]'
 
       - name: Install Rust
         run: |
@@ -142,35 +148,429 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: windows-cuda-${{ hashFiles('Cargo.lock') }}-${{ env.CUDA_VERSION }}
-          restore-keys: windows-cuda-
+          key: windows-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-test-
 
-      - name: Build CUDA prover
+      - name: Test
+        run: |
+          cargo test --locked --lib --bins -p zkminer-prover-protocol -p zkminer-prover -p zkminer-cli
+
+  # -----------------------------------------------------------------------
+  # Guests — built on Linux, where rzup and Succinct's toolchain run
+  # -----------------------------------------------------------------------
+  risc0-guests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+          rustup default ${{ env.RUST_VERSION }}
+
+      # As Dockerfile.build's cuda-base. GITHUB_TOKEN: rzup asks GitHub's API for releases,
+      # which is rate-limited per IP when unauthenticated.
+      - name: Install the RISC Zero toolchain
         env:
-          RISC0_SKIP_BUILD: '1'
-          RISC0_SKIP_BUILD_KERNELS: '1'
-          RUSTFLAGS: '-C target-cpu=x86-64-v3'
-          NVCC_APPEND_FLAGS: >-
-            -gencode arch=compute_75,code=sm_75
-            -gencode arch=compute_80,code=sm_80
-            -gencode arch=compute_86,code=sm_86
-            -gencode arch=compute_89,code=sm_89
-            -gencode arch=compute_90,code=sm_90
-            -gencode arch=compute_100,code=sm_100
-            -gencode arch=compute_120,code=compute_120
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cargo build --release -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda
+          curl -L https://risczero.com/install | bash
+          ~/.risc0/bin/rzup install rust
 
-      - name: Package artifact
-        shell: bash
+      # `check` runs zkminer-prove-risc0's build script, which compiles the guests and writes
+      # the methods.rs that names them.
+      - name: Build the guests
+        run: cargo check --locked -p zkminer-prove-risc0
+
+      # methods.rs and the binaries it names: the Windows workers' build script embeds exactly
+      # these when ZKMINER_RISC0_GUESTS_DIR points at them.
+      - name: Collect the guests
         run: |
-          mkdir -p dist
-          cp target/release/zkminer-prove-risc0-cuda.exe dist/
-          cd dist && sha256sum zkminer-prove-risc0-cuda.exe > zkminer-prove-risc0-cuda.exe.sha256
+          set -euo pipefail
+          methods=$(ls target/debug/build/zkminer-prove-risc0-*/out/methods.rs)
+          [ "$(echo "$methods" | wc -l)" -eq 1 ] || { echo "expected one methods.rs: $methods"; exit 1; }
+          mkdir -p risc0-guests
+          cp "$methods" risc0-guests/
+          grep -o 'include_bytes!("[^"]*")' "$methods" \
+            | sed -e 's/^include_bytes!("//' -e 's/")$//' \
+            | while read -r guest; do cp "$guest" risc0-guests/; done
+          ls -l risc0-guests
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: zkminer-windows-cuda
-          path: dist/zkminer-prove-risc0-cuda.exe*
+          name: risc0-guests
+          path: risc0-guests/
           if-no-files-found: error
+          retention-days: 7
+
+  sp1-guests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+          rustup default ${{ env.RUST_VERSION }}
+
+      # The version Dockerfile.build's build-sp1 installs.
+      - name: Install the SP1 toolchain
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -L https://sp1up.succinct.xyz | bash
+          ~/.sp1/bin/sp1up --version 6.0.1
+
+      # What sp1_build does from the worker's build script on Linux: each guest is its own
+      # workspace, and its ELF lands in its target/elf-compilation.
+      - name: Build the guests
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.sp1/bin:$PATH"
+          mkdir -p sp1-guests
+          for guest in fibonacci sha256-chain ecdsa-verify bigint-mul memory-merkle chacha-mix; do
+            (cd "crates/zkminer-prover/guests/sp1/$guest" && cargo prove build)
+            cp "crates/zkminer-prover/guests/sp1/$guest/target/elf-compilation/riscv64im-succinct-zkvm-elf/release/$guest-sp1-guest" sp1-guests/
+          done
+          ls -l sp1-guests
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sp1-guests
+          path: sp1-guests/
+          if-no-files-found: error
+          retention-days: 7
+
+  # -----------------------------------------------------------------------
+  # RISC Zero workers, one per vendor
+  # -----------------------------------------------------------------------
+  risc0-windows:
+    needs: risc0-guests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vendor: nvidia
+            feature: cuda
+          - vendor: amd
+            feature: rocm
+          - vendor: intel
+            feature: intel
+    if: >-
+      ${{ !cancelled() && needs.risc0-guests.result == 'success' }}
+    # Pinned, not windows-latest: nvcc accepts only the MSVC versions its release knows.
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+      - name: Skip a vendor this dispatch left out
+        id: want
+        shell: bash
+        run: |
+          case "${{ matrix.vendor }}" in
+            nvidia) want='${{ github.event_name != 'workflow_dispatch' || inputs.build_nvidia }}' ;;
+            amd)    want='${{ github.event_name != 'workflow_dispatch' || inputs.build_amd }}' ;;
+            intel)  want='${{ github.event_name != 'workflow_dispatch' || inputs.build_intel }}' ;;
+          esac
+          echo "build=$want" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        if: steps.want.outputs.build == 'true'
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: steps.want.outputs.build == 'true'
+        with:
+          name: risc0-guests
+          path: risc0-guests
+
+      - name: Install the toolkit
+        if: steps.want.outputs.build == 'true'
+        shell: pwsh
+        run: scripts\windows\install-toolkit.ps1 -Vendor ${{ matrix.vendor }} -Components risc0
+
+      - name: Install Rust
+        if: steps.want.outputs.build == 'true'
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+          rustup default ${{ env.RUST_VERSION }}
+
+      # Not the whole target/: it outgrows the cache. The slow part to rebuild is the GPU
+      # kernels, whose caches are keyed on the compiler command and version.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: steps.want.outputs.build == 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-risc0-${{ matrix.vendor }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-risc0-${{ matrix.vendor }}-
+
+      - name: Build
+        if: steps.want.outputs.build == 'true'
+        shell: bash
+        env:
+          RUSTFLAGS: '-C target-cpu=x86-64-v3 -C target-feature=+adx'
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+          BINDGEN_EXTRA_CLANG_ARGS: '--target=x86_64-pc-windows-msvc'
+          ZKMINER_RISC0_GUESTS_DIR: ${{ github.workspace }}\risc0-guests
+        run: |
+          set -euo pipefail
+          case "${{ matrix.feature }}" in
+            cuda)  export HIPCC=off NVCC_APPEND_FLAGS="$RISC0_NVCC_FLAGS" ;;
+            rocm)  export NVCC=off RISC0_HIP_ARCH="$HIP_ARCHS" ;;
+            intel) export NVCC=off HIPCC=off ;;
+          esac
+          start=$(date +%s)
+          cargo build --locked --release -j 4 -p zkminer-prove-risc0 --features ${{ matrix.feature }} \
+            --bin zkminer-prove-risc0-${{ matrix.feature }}
+          echo "::notice title=risc0 ${{ matrix.vendor }} build::$(( ($(date +%s) - start) / 60 )) min"
+
+      # The runner has no GPU, so check what the binary carries instead: every GPU module must
+      # have native code for every architecture, so each appears equally often.
+      - name: Check the embedded GPU code
+        if: steps.want.outputs.build == 'true' && matrix.vendor == 'nvidia'
+        shell: pwsh
+        run: |
+          $exe = 'target\release\zkminer-prove-risc0-cuda.exe'
+          $elf = cuobjdump --list-elf $exe
+          $counts = @{}
+          foreach ($sm in 75, 80, 86, 89, 90, 100, 120) {
+            $counts[$sm] = @($elf | Select-String "\.sm_$sm\.cubin").Count
+          }
+          $counts.GetEnumerator() | Sort-Object Name | ForEach-Object { "sm_$($_.Name): $($_.Value) modules" }
+          if (($counts.Values | Measure-Object -Minimum).Minimum -eq 0) { throw 'an architecture has no native code' }
+          if (@($counts.Values | Sort-Object -Unique).Count -ne 1) { throw 'architectures carry different module counts' }
+          if (-not (cuobjdump --list-ptx $exe | Select-String '\.sm_120\.ptx')) { throw 'no compute_120 PTX' }
+
+      - name: Collect the worker and its DLLs
+        if: steps.want.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          $out = 'dist'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $redist = @{}
+          if ($env:ZKMINER_REDIST_LIST) { $redist = @{ RedistList = $env:ZKMINER_REDIST_LIST; RedistDir = $env:ZKMINER_REDIST_DIR } }
+          $exe = 'target\release\zkminer-prove-risc0-${{ matrix.feature }}.exe'
+          Copy-Item $exe $out
+          # The kernel libraries the -sys crates build beside the binary (Intel), loaded with it.
+          $libs = @(Get-ChildItem target\release\*.dll -ErrorAction SilentlyContinue)
+          $libs | Copy-Item -Destination $out
+          scripts\windows\collect-dlls.ps1 -Binaries (@("$out\$(Split-Path $exe -Leaf)") + ($libs | ForEach-Object { "$out\$($_.Name)" })) `
+            -SearchDirs ($env:ZKMINER_RUNTIME_DIRS -split ';') -Dest $out `
+            -Also ($env:ZKMINER_RUNTIME_ALSO -split ';' | Where-Object { $_ }) @redist
+          New-Item -ItemType Directory -Force dist\LICENSES | Out-Null
+          $env:ZKMINER_LICENSES -split ';' | Where-Object { $_ } | ForEach-Object {
+            Copy-Item $_ "dist\LICENSES\$(Split-Path (Split-Path $_ -Parent) -Leaf)-$(Split-Path $_ -Leaf)" }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.want.outputs.build == 'true'
+        with:
+          name: part-risc0-${{ matrix.vendor }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  # -----------------------------------------------------------------------
+  # SP1 worker — one binary for every vendor; it drives the vendor's server
+  # -----------------------------------------------------------------------
+  sp1-worker-windows:
+    needs: sp1-guests
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sp1-guests
+          path: sp1-guests
+
+      - name: Install the toolkit
+        shell: pwsh
+        run: scripts\windows\install-toolkit.ps1 -Vendor none -Components sp1-worker
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+          rustup default ${{ env.RUST_VERSION }}
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-sp1-worker-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-sp1-worker-
+
+      - name: Build
+        shell: bash
+        env:
+          RUSTFLAGS: '-C target-cpu=x86-64-v3 -C target-feature=+adx'
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+          ZKMINER_SP1_GUESTS_DIR: ${{ github.workspace }}\sp1-guests
+        run: |
+          start=$(date +%s)
+          cargo build --locked --release -p zkminer-prove-sp1 --bin zkminer-prove-sp1
+          echo "::notice title=sp1 worker build::$(( ($(date +%s) - start) / 60 )) min"
+
+      - name: Collect the worker and its DLLs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\zkminer-prove-sp1.exe dist\
+          scripts\windows\collect-dlls.ps1 -Binaries dist\zkminer-prove-sp1.exe `
+            -SearchDirs ($env:ZKMINER_RUNTIME_DIRS -split ';') -Dest dist
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: part-sp1-worker
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  # -----------------------------------------------------------------------
+  # sp1-gpu-server, one build per vendor, from the hemilabs/sp1 commit Cargo.lock pins (with
+  # that commit's own Cargo.lock), as Dockerfile.build's build-sp1-server does
+  # -----------------------------------------------------------------------
+  sp1-server-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vendor: nvidia
+            backend: cuda
+            name: sp1-gpu-server
+          - vendor: amd
+            backend: hip
+            name: sp1-gpu-server-hip
+          - vendor: intel
+            backend: sycl
+            name: sp1-gpu-server-sycl
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+      - name: Skip a vendor this dispatch left out
+        id: want
+        shell: bash
+        run: |
+          case "${{ matrix.vendor }}" in
+            nvidia) want='${{ github.event_name != 'workflow_dispatch' || inputs.build_nvidia }}' ;;
+            amd)    want='${{ github.event_name != 'workflow_dispatch' || inputs.build_amd }}' ;;
+            intel)  want='${{ github.event_name != 'workflow_dispatch' || inputs.build_intel }}' ;;
+          esac
+          echo "build=$want" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        if: steps.want.outputs.build == 'true'
+
+      - name: Install the toolkit
+        if: steps.want.outputs.build == 'true'
+        shell: pwsh
+        run: scripts\windows\install-toolkit.ps1 -Vendor ${{ matrix.vendor }} -Components sp1-server
+
+      - name: Install Rust
+        if: steps.want.outputs.build == 'true'
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+          rustup default ${{ env.RUST_VERSION }}
+
+      - name: Build
+        if: steps.want.outputs.build == 'true'
+        shell: bash
+        env:
+          RUSTFLAGS: '-C target-cpu=x86-64-v3 -C target-feature=+adx'
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+          BINDGEN_EXTRA_CLANG_ARGS: '--target=x86_64-pc-windows-msvc'
+          SP1_GPU_BACKEND: ${{ matrix.backend }}
+          GOPROXY: 'https://proxy.golang.org,direct'
+          CARGO_TARGET_DIR: target-sp1-server
+        run: |
+          set -euo pipefail
+          case "${{ matrix.backend }}" in
+            cuda) export CUDA_ARCHS="$SP1_CUDA_ARCHS" ;;
+            hip)  export HIP_ARCHS ;;
+            sycl) export SP1_SYCL_TARGETS='spir64_gen,intel_gpu_acm_g10,spir64' SP1_SYCL_DEVICE='bmg-g21,bmg-g31' ;;
+          esac
+          rev=$(grep -o 'git+https://github.com/hemilabs/sp1?[^#"]*#[0-9a-f]\{40\}' Cargo.lock | head -1 | cut -d'#' -f2)
+          test -n "$rev"
+          echo "building sp1-gpu-server ($SP1_GPU_BACKEND) at hemilabs/sp1 $rev"
+          start=$(date +%s)
+          cargo install --locked --root sp1-server --git https://github.com/hemilabs/sp1 --rev "$rev" sp1-gpu-server
+          echo "::notice title=sp1-gpu-server ${{ matrix.backend }} build::$(( ($(date +%s) - start) / 60 )) min"
+
+      - name: Check the embedded GPU code
+        if: steps.want.outputs.build == 'true' && matrix.vendor == 'nvidia'
+        shell: pwsh
+        run: |
+          $elf = cuobjdump --list-elf sp1-server\bin\sp1-gpu-server.exe
+          foreach ($sm in $env:SP1_CUDA_ARCHS -split ',') {
+            $n = @($elf | Select-String "\.sm_$sm\.cubin").Count
+            "sm_${sm}: $n images"
+            if ($n -lt 1) { throw "sm_$sm has no native code" }
+          }
+
+      # The server goes beside the SP1 worker under its vendor's name, with sp1gnark.dll (gnark's
+      # Groth16 prover, which the server loads from beside itself) and, for HIP and SYCL, its
+      # libraries in `<name>-lib/`, which the worker installs with it and puts on its PATH.
+      - name: Collect the server and its DLLs
+        if: steps.want.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          $out = 'dist'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $name = '${{ matrix.name }}'
+          $redist = @{}
+          if ($env:ZKMINER_REDIST_LIST) { $redist = @{ RedistList = $env:ZKMINER_REDIST_LIST; RedistDir = $env:ZKMINER_REDIST_DIR } }
+          Copy-Item sp1-server\bin\sp1-gpu-server.exe "$out\$name.exe"
+          Copy-Item target-sp1-server\release\sp1gnark.dll $out
+          $lib = "$out\$name-lib"
+          New-Item -ItemType Directory -Force $lib | Out-Null
+          $own = @(Get-ChildItem target-sp1-server\release\*.dll | Where-Object Name -ne 'sp1gnark.dll')
+          $own | Copy-Item -Destination $lib
+          scripts\windows\collect-dlls.ps1 -Binaries (@("$out\$name.exe", "$out\sp1gnark.dll") + ($own | ForEach-Object { "$lib\$($_.Name)" })) `
+            -SearchDirs ($env:ZKMINER_RUNTIME_DIRS -split ';') -Dest $lib `
+            -Also ($env:ZKMINER_RUNTIME_ALSO -split ';' | Where-Object { $_ }) @redist
+          if (-not (Get-ChildItem $lib)) { Remove-Item $lib }
+          New-Item -ItemType Directory -Force dist\LICENSES | Out-Null
+          $env:ZKMINER_LICENSES -split ';' | Where-Object { $_ } | ForEach-Object {
+            Copy-Item $_ "dist\LICENSES\$(Split-Path (Split-Path $_ -Parent) -Leaf)-$(Split-Path $_ -Leaf)" }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.want.outputs.build == 'true'
+        with:
+          name: part-sp1-server-${{ matrix.vendor }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  # -----------------------------------------------------------------------
+  # One zip per vendor, in the layout the miner runs from
+  # -----------------------------------------------------------------------
+  package-windows:
+    needs: [cli-windows, risc0-windows, sp1-worker-windows, sp1-server-windows]
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        vendor: [nvidia, amd, intel]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: part-*
+          path: parts
+
+      - name: Assemble
+        run: scripts/windows/package.sh ${{ matrix.vendor }} parts dist
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zkminer-windows-${{ matrix.vendor }}-x86_64
+          path: dist/*.zip
+          if-no-files-found: ignore
           retention-days: ${{ inputs.retention_days || 14 }}
