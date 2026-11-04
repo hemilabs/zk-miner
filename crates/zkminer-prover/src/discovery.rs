@@ -343,7 +343,7 @@ fn detect_intel_gpus_windows() -> Vec<DetectedGpu> {
 
 /// The VRAM of Intel GPU `device_index` (as numbered by `detect_intel_gpus`), where the platform
 /// reports it: on Windows, from the adapter's driver key. `None` elsewhere or if unknown.
-pub(crate) fn intel_vram_bytes(device_index: u32) -> Option<u64> {
+pub fn intel_vram_bytes(device_index: u32) -> Option<u64> {
     #[cfg(windows)]
     {
         query_windows_intel_gpus()

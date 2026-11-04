@@ -840,6 +840,10 @@ fn detect_gpus() -> Vec<GpuInfo> {
         }
     }
 
+    // Windows has no DRM cards to scan: Intel and AMD GPUs come from the prover's discovery.
+    #[cfg(windows)]
+    gpus.extend(crate::windows_gpus::intel_and_amd_gpus(idx));
+
     gpus
 }
 
