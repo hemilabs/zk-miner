@@ -485,32 +485,6 @@ jobs:
           n=$(find "$RUNNER_TEMP/ocloc-records" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
           echo "::notice title=intel ocloc record::$n calls in $(( ($(date +%s) - start) / 60 )) min"
 
-      # Experiment (temporary): the recursion eval_check for the A770 at other reload distances
-      # (RISC0_RECURSION_REMAT_G, default 150), to find one whose Linux IGC build spills less than
-      # 16 KB per thread. Only recorded here; intel-zebins compiles them with the rest.
-      - name: Record recursion variants (A770)
-        continue-on-error: true
-        shell: bash
-        env:
-          RUSTFLAGS: '-C target-cpu=x86-64-v3 -C target-feature=+adx'
-          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
-          BINDGEN_EXTRA_CLANG_ARGS: '--target=x86_64-pc-windows-msvc'
-          RISC0_SKIP_BUILD: '1'
-          NVCC: 'off'
-          HIPCC: 'off'
-          RISC0_INTEL_SYCL_TARGETS: 'intel_gpu_acm_g10'
-        run: |
-          set -euo pipefail
-          jobs=$(( $(nproc) > 4 ? $(nproc) : 4 ))
-          for g in 50 100; do
-            before=$(find "$RUNNER_TEMP/ocloc-records" -mindepth 1 -maxdepth 1 -type d | wc -l)
-            RISC0_RECURSION_REMAT_G=$g CARGO_TARGET_DIR="target-remat-$g" \
-              cargo build --locked --release -j $jobs -p zkminer-prove-risc0 --features intel \
-              --bin zkminer-prove-risc0-intel
-            after=$(find "$RUNNER_TEMP/ocloc-records" -mindepth 1 -maxdepth 1 -type d | wc -l)
-            echo "::notice title=recursion remat $g::$((after - before)) new ocloc calls"
-          done
-
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ocloc-records
