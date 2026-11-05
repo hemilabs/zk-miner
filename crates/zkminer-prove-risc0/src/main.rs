@@ -18,6 +18,9 @@ use zkminer_prover_protocol::{
 
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 
+#[cfg(all(feature = "rocm", windows))]
+mod hip;
+
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Duplicate `fd` with close-on-exec set.
@@ -54,6 +57,13 @@ fn main() {
                 r.program_name, r.cycles, r.duration_secs, r.throughput, r.weight, r.precompile,
             );
         }
+        return;
+    }
+
+    // The HIP devices, for the host's GPU discovery where there is no rocm-smi (Windows).
+    #[cfg(all(feature = "rocm", windows))]
+    if std::env::args().any(|a| a == "--list-hip-devices") {
+        hip::print_devices();
         return;
     }
 
@@ -101,7 +111,11 @@ fn main() {
         unsafe { libc::dup2(io::stderr().as_raw_fd(), stdout_fd) };
         unsafe { std::fs::File::from_raw_fd(ipc_fd) }
     };
-    #[cfg(not(unix))]
+    // Windows: the same isolation through the C runtime (ipc.rs): circom-witnesscalc and other
+    // native code print to the process's stdout, which now goes to stderr.
+    #[cfg(windows)]
+    let ipc_stdout = zkminer_prover_protocol::ipc::take_ipc_stdout();
+    #[cfg(not(any(unix, windows)))]
     let ipc_stdout = io::stdout();
 
     tracing_subscriber::fmt()
@@ -433,7 +447,22 @@ fn detect_gpu() -> (bool, Option<String>) {
             }
         }
     }
-    #[cfg(feature = "rocm")]
+    // Windows has neither rocm-smi nor /dev/kfd: ask HIP for the device this worker proves on
+    // (the dispatcher pins it with HIP_VISIBLE_DEVICES, so it is the first one visible).
+    #[cfg(all(feature = "rocm", windows))]
+    {
+        return match hip::devices() {
+            Ok(devices) => match devices.into_iter().next() {
+                Some(d) => (true, Some(d.name)),
+                None => (false, None),
+            },
+            Err(e) => {
+                tracing::warn!("{e}");
+                (false, None)
+            }
+        };
+    }
+    #[cfg(all(feature = "rocm", not(windows)))]
     {
         // Try rocm-smi first (more reliable than sysfs product_name)
         if let Ok(output) = std::process::Command::new("rocm-smi")
@@ -461,6 +490,11 @@ fn detect_gpu() -> (bool, Option<String>) {
     }
     #[cfg(feature = "intel")]
     {
+        // Windows has no sysfs. The dispatcher starts this worker only for an Intel GPU it detected
+        // (and pins it with ZE_AFFINITY_MASK); the prover fails loudly if no device is visible.
+        if cfg!(windows) {
+            return (true, Some("Intel GPU".to_string()));
+        }
         // The host pins this worker to one card through ZE_AFFINITY_MASK, which sysfs does not see;
         // name the card only when the box has exactly one Intel GPU, so the name is never another
         // card's. The host names its slots from its own discovery either way.
@@ -968,7 +1002,15 @@ fn run_execute(
 /// The saving from keeping it turned out small: wraps after a release ran 2.08-2.12 s on the 5080
 /// against 2.01-2.05 s on the cache-keeping 4090, so at most ~0.1 s. The threshold is therefore cheap to
 /// get wrong in the conservative direction, which is why an unknown size releases.
+#[cfg(not(all(feature = "intel", windows)))]
 const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// On Intel under Windows the threshold is higher: risc0 proves its segments at po2 21 there, and
+/// a 23M-cycle keccak job's segments alone peaked at 23 GB of a 32 GB Arc Pro B70. With the cache
+/// kept from the previous proof, the same segments ran with the card full and up to 5.8 GB spilled
+/// into shared system memory (WDDM's spill), at 2-5x the time (2026-10-14).
+#[cfg(all(feature = "intel", windows))]
+const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 48 * 1024 * 1024 * 1024;
 
 /// Free the Groth16 prover and SRS cached on the GPU if this card cannot also hold the next STARK.
 ///

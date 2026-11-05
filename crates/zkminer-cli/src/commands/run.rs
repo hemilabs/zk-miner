@@ -365,7 +365,9 @@ pub(crate) fn hold_instance_lock() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".zkminer");
     // Private to this user: anyone who can open the lock file can hold it (flock needs no write
-    // access), and a held lock keeps a restarted miner from recovering its locks.
+    // access), and a held lock keeps a restarted miner from recovering its locks. (On Windows the
+    // profile directory is already private to its user.)
+    #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
@@ -374,7 +376,10 @@ pub(crate) fn hold_instance_lock() -> Result<()> {
             .create(&dir)
             .with_context(|| format!("create {}", dir.display()))?;
     }
+    #[cfg(windows)]
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("miner.lock");
+    #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
@@ -385,6 +390,13 @@ pub(crate) fn hold_instance_lock() -> Result<()> {
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?
     };
+    #[cfg(windows)]
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
     match file.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(

@@ -158,6 +158,19 @@ pub fn probe_static() -> HardwareInfo {
             core_ids.len() as u32
         };
     }
+    // Windows has no /proc/cpuinfo.
+    #[cfg(windows)]
+    {
+        let name = zkminer_prover::benchmark::get_cpu_info();
+        if name != "Unknown CPU" {
+            info.cpu.model = shorten_cpu_name(&name);
+        }
+        info.cpu.threads = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1);
+        info.cpu.cores =
+            zkminer_prover::benchmark::physical_core_count().unwrap_or(info.cpu.threads);
+    }
 
     // Detect GPUs
     info.gpus = detect_gpus();
@@ -826,6 +839,10 @@ fn detect_gpus() -> Vec<GpuInfo> {
             idx += 1;
         }
     }
+
+    // Windows has no DRM cards to scan: Intel and AMD GPUs come from the prover's discovery.
+    #[cfg(windows)]
+    gpus.extend(crate::windows_gpus::intel_and_amd_gpus(idx));
 
     gpus
 }

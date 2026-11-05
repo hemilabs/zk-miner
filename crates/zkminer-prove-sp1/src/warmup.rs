@@ -82,12 +82,16 @@ pub(crate) fn warm_up() -> Result<WarmupReport> {
     })
 }
 
-/// `~/.sp1/bin/sp1-gpu-server`, where the SDK runs it from.
+/// `~/.sp1/bin/sp1-gpu-server` (`.exe` on Windows), where the SDK runs it from. The home directory
+/// is found as the SDK finds it: `HOME`, or on Windows, which does not set it, `USERPROFILE`.
 pub(crate) fn server_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|home| !home.is_empty()))
         .ok_or_else(|| anyhow!("$HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".sp1/bin").join(server_name()))
+    Ok(PathBuf::from(home)
+        .join(".sp1/bin")
+        .join(format!("{}{}", server_name(), std::env::consts::EXE_SUFFIX)))
 }
 
 /// The build of `sp1-gpu-server` this worker's SDK runs: `SP1_GPU_SERVER_NAME` (set by the dispatcher
@@ -216,8 +220,10 @@ fn download(staging: &Path) -> Result<()> {
     ))
 }
 
-/// An exclusive `flock` on `path`, held until the file is dropped.
+/// An exclusive lock on `path`, held until the file is dropped: `flock` on Unix, `LockFileEx` on
+/// Windows (std's `File::lock`).
 fn lock(path: &Path) -> Result<File> {
+    #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
     let file = fs::OpenOptions::new()
         .create(true)
@@ -225,6 +231,7 @@ fn lock(path: &Path) -> Result<File> {
         .write(true)
         .open(path)
         .with_context(|| format!("cannot open {}", path.display()))?;
+    #[cfg(unix)]
     loop {
         // SAFETY: flock on a descriptor we own.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
@@ -234,6 +241,12 @@ fn lock(path: &Path) -> Result<File> {
         if err.kind() != std::io::ErrorKind::Interrupted {
             return Err(err).with_context(|| format!("cannot lock {}", path.display()));
         }
+    }
+    #[cfg(windows)]
+    {
+        file.lock()
+            .with_context(|| format!("cannot lock {}", path.display()))?;
+        Ok(file)
     }
 }
 
@@ -406,6 +419,7 @@ mod tests {
 
     /// The probe tells a helper-hosting server from one that rejects the argument, as the pinned
     /// v6.0.2 server does, without starting either as a server.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_helper_probe_reads_the_servers_answer() {
         // Other tests in this binary briefly point PATH elsewhere, and the scripts are written with

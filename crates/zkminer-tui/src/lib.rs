@@ -6,6 +6,8 @@ pub mod nvml;
 pub mod screens;
 pub mod state;
 pub mod theme;
+#[cfg(windows)]
+mod windows_gpus;
 
 pub use app::run_tui;
 pub use state::{new_shared_state, MinerState, SharedState, TuiContext};

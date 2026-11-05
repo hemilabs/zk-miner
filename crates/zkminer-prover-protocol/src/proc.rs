@@ -450,7 +450,9 @@ fn reap_briefly(child: &mut std::process::Child) {
     }
 }
 
-#[cfg(test)]
+// Unix: the children are `/bin/sh` scripts, and several cases are POSIX-specific (ETXTBSY, errno
+// classes). Windows covers the same contract with native commands in `windows_tests`.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
@@ -803,7 +805,8 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+// Unix: these fork shell grandchildren and probe ETXTBSY.
+#[cfg(all(test, unix))]
 mod capture_tests {
     use super::*;
 
@@ -922,5 +925,85 @@ mod capture_tests {
             dt < Duration::from_secs(2),
             "retries must stay bounded: {dt:?}"
         );
+    }
+}
+
+/// The runner's contract on Windows, which uses it for every `nvidia-smi` and `--version` probe:
+/// a child that finishes reports its exit status and output, one that hangs is killed on OUR
+/// budget, and a binary that does not exist is a permanent spawn failure. The hanging child is
+/// PowerShell, not `cmd /C timeout`: one process, so killing it ends it, with no grandchild left
+/// holding the pipes.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn cmd(script: &str) -> Command {
+        let mut c = Command::new("cmd");
+        c.args(["/C", script]);
+        c
+    }
+
+    #[test]
+    fn a_healthy_child_reports_success_and_its_stdout() {
+        let (outcome, stdout) = output_with_timeout_capturing_stdout(
+            &mut cmd("echo NVIDIA GeForce RTX 5090"),
+            Duration::from_secs(10),
+            64 * 1024,
+        );
+        assert!(
+            matches!(outcome, Outcome::Ran { success: true, .. }),
+            "{}",
+            outcome.describe()
+        );
+        assert_eq!(stdout.trim(), "NVIDIA GeForce RTX 5090");
+    }
+
+    #[test]
+    fn a_failing_child_reports_failure_and_its_stderr() {
+        match output_with_timeout(
+            &mut cmd("echo it broke 1>&2 & exit 3"),
+            Duration::from_secs(10),
+            64 * 1024,
+        ) {
+            Outcome::Ran { success, stderr } => {
+                assert!(!success);
+                assert_eq!(stderr.trim(), "it broke");
+            }
+            other => panic!("expected a completed run, got {}", other.describe()),
+        }
+    }
+
+    #[test]
+    fn a_hanging_child_is_killed_on_our_budget() {
+        let mut c = Command::new("powershell");
+        c.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::Error.WriteLine('about to wedge'); Start-Sleep -Seconds 60",
+        ]);
+        let t0 = Instant::now();
+        let outcome = output_with_timeout(&mut c, Duration::from_secs(5), 64 * 1024);
+        let took = t0.elapsed();
+        match outcome {
+            Outcome::TimedOut { stderr } => {
+                assert!(stderr.contains("about to wedge"), "{stderr:?}")
+            }
+            other => panic!("expected a timeout, got {}", other.describe()),
+        }
+        assert!(
+            took < Duration::from_secs(20),
+            "returned after {took:?}, not on the 5 s budget"
+        );
+    }
+
+    #[test]
+    fn an_absent_binary_is_a_permanent_spawn_failure() {
+        let mut c = Command::new("zkminer-no-such-binary-for-this-test");
+        match output_with_timeout(&mut c, Duration::from_secs(5), 1024) {
+            Outcome::SpawnFailed { transient, .. } => assert!(!transient),
+            other => panic!("expected a spawn failure, got {}", other.describe()),
+        }
     }
 }

@@ -21,6 +21,24 @@ use anyhow::{anyhow, Context, Result};
 /// Set to `0` to leave `~/.sp1/bin/sp1-gpu-server` alone.
 pub(crate) const INSTALL_ENV: &str = zkminer_prover_protocol::types::SP1_SERVER_INSTALL_ENV;
 
+/// Libraries the server loads from its own directory. On Windows, gnark's Groth16 prover is a DLL
+/// (`sp1gnark.dll`, see hemilabs/sp1's gnark-ffi), where Linux links it into the server statically;
+/// and the MSVC runtime the server links, which a machine with only a GPU driver may not have. A
+/// DLL beside an executable is found before System32's, so the server always gets the runtime it
+/// shipped with. And the SYCL build's own kernels, `sp1_gpu_sycl.dll`: beside it, it is replaced
+/// with the server, never left from an older build to shadow the new one (a DLL beside the
+/// executable wins over one on PATH). Each is installed if the release ships it beside this worker.
+#[cfg(windows)]
+const COMPANIONS: &[&str] = &[
+    "sp1gnark.dll",
+    "sp1_gpu_sycl.dll",
+    "vcruntime140.dll",
+    "vcruntime140_1.dll",
+    "msvcp140.dll",
+];
+#[cfg(not(windows))]
+const COMPANIONS: &[&str] = &[];
+
 /// Installs the server shipped beside this executable, if there is one; see the module docs.
 /// Never fails the worker: without it the SDK runs whatever is installed, as before.
 pub(crate) fn install_bundled_server() {
@@ -31,7 +49,10 @@ pub(crate) fn install_bundled_server() {
     let name = crate::warmup::server_name();
     let Some(bundled) = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(&name)))
+        .and_then(|exe| {
+            exe.parent()
+                .map(|dir| dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
+        })
         .filter(|path| path.is_file())
     else {
         // Not a release layout (a development build, say): nothing shipped to install.
@@ -71,6 +92,21 @@ pub(crate) fn install_bundled_server() {
             target.display()
         ),
     }
+    // What the server loads from beside itself, shipped beside it in turn.
+    if let (Some(from_dir), Some(to_dir)) = (bundled.parent(), target.parent()) {
+        for name in COMPANIONS {
+            let from = from_dir.join(name);
+            if !from.is_file() {
+                continue;
+            }
+            if let Err(e) = install(&from, &to_dir.join(name)) {
+                tracing::warn!(
+                    "could not install {} beside the server ({e:#})",
+                    from.display()
+                );
+            }
+        }
+    }
 }
 
 /// Copies `from` to `to`, executable, unless `to` already has the same contents. Whether it
@@ -89,11 +125,17 @@ pub(crate) fn install(from: &Path, to: &Path) -> Result<bool> {
     let temp = dir.join(format!(".{base}.{}.tmp", std::process::id()));
     let copied = (|| -> Result<()> {
         fs::copy(from, &temp).with_context(|| format!("cannot copy to {}", temp.display()))?;
+        // Windows has no execute bit: an .exe runs as copied.
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&temp, fs::Permissions::from_mode(0o755))?;
         }
+        #[cfg(not(windows))]
         fs::File::open(&temp)?.sync_all()?;
+        // Opened for writing: Windows flushes only through a handle with write access.
+        #[cfg(windows)]
+        fs::OpenOptions::new().write(true).open(&temp)?.sync_all()?;
         fs::rename(&temp, to).with_context(|| format!("cannot replace {}", to.display()))
     })();
     if copied.is_err() {
@@ -133,7 +175,6 @@ fn same_contents(a: &Path, b: &Path) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::warmup::TestDir;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn installs_when_missing_or_different_and_not_otherwise() {
@@ -144,10 +185,14 @@ mod tests {
 
         assert!(install(&shipped, &installed).unwrap(), "missing: installed");
         assert_eq!(fs::read(&installed).unwrap(), fs::read(&shipped).unwrap());
-        assert_eq!(
-            fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
         assert!(
             !install(&shipped, &installed).unwrap(),
             "the same: left alone"

@@ -538,6 +538,21 @@ impl ProvingWatchdog {
                                 );
                             }
                         }
+                        // Windows has no process groups; the worker itself is terminated, under the
+                        // same identity check (see `memory::terminate_if_our_worker`).
+                        #[cfg(windows)]
+                        {
+                            let expected_start = starttime_ref.load(Ordering::Acquire);
+                            if !crate::memory::terminate_if_our_worker(
+                                current_pid,
+                                (expected_start != 0).then_some(expected_start),
+                            ) {
+                                tracing::warn!(
+                                    "not killing PID {current_pid} for {slot_key}: it is no longer \
+                                     our worker (exited, and the number may have been reused)"
+                                );
+                            }
+                        }
                     }
                 })
                 .ok()
@@ -608,6 +623,10 @@ fn gpu_vram_bytes(
         return amd_vram_bytes(pci_bus_id?);
     }
     if gpu_tag == "intel" {
+        // Windows has no xe query: the size comes from the adapter's driver key (discovery).
+        if cfg!(windows) {
+            return crate::discovery::intel_vram_bytes(idx);
+        }
         // The xe driver's own count of the card's device memory (sysfs has none): see
         // `discovery::intel_vram`. Unknown on i915, which keeps the unsized behaviour.
         return crate::discovery::intel_vram(pci_bus_id?).map(|(total, _)| total);
@@ -804,12 +823,21 @@ enum PidOwner {
 }
 
 /// Parent pid of `pid` from `/proc`, or `None` when the process is gone or there is no `/proc`.
+#[cfg(not(windows))]
 fn proc_parent(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     match crate::memory::parent_of_stat(&stat)? {
         ppid if ppid > 0 => Some(ppid as u32),
         _ => None,
     }
+}
+
+/// Parent pid of `pid`, or `None` when the process is gone or its parent cannot be confirmed (see
+/// `memory::parent_pid`). Without it nothing on a card attributes to a slot, so our own warm
+/// `sp1-gpu-server` read as foreign and its slot refused its own next proof.
+#[cfg(windows)]
+fn proc_parent(pid: u32) -> Option<u32> {
+    crate::memory::parent_pid(pid)
 }
 
 /// Walk `pid`'s parent chain to find whose it is.
@@ -1061,11 +1089,12 @@ fn apps_we_can_attribute(
 /// `slot_pids` maps each live worker's PUBLISHED pid to its slot key. With an empty map, everything of
 /// ours reads as `unattributed` (or `draining`) — still ours, never foreign.
 ///
-/// Also `None` when a context of OURS is on the card but the driver will not say how much it holds —
-/// every process under Windows' WDDM reports "[N/A]". Its memory is then inside `memory.used` with no
-/// way to credit it, so our own warm worker would read as somebody else's and its slot would refuse
-/// its own next proof, indefinitely, telling the operator to close a process that is ours. No opinion
-/// is the honest answer, as for any other unreadable card.
+/// Also `None` when a context of OURS is on the card but the driver will not say how much it holds.
+/// Its memory is then inside `memory.used` with no way to credit it, so our own warm worker would read
+/// as somebody else's and its slot would refuse its own next proof, indefinitely, telling the operator
+/// to close a process that is ours. No opinion is the honest answer, as for any other unreadable card.
+/// Windows' WDDM reports "[N/A]" for every process, so there the figures come from Windows' own
+/// per-process accounting instead (`windows_gpu_memory`).
 fn read_card_occupancy(
     device_index: u32,
     slot_pids: &HashMap<u32, String>,
@@ -1089,6 +1118,8 @@ fn read_card_occupancy(
     let apps = nvidia_smi_query("--query-compute-apps=pid,used_gpu_memory", device_index)
         .map(|out| parse_compute_apps(&out))
         .unwrap_or_default();
+    #[cfg(windows)]
+    let apps = crate::windows_gpu_memory::fill_unreported(apps);
     let miner = std::process::id();
     let retired = retired_groups();
     let owner = |pid: u32| owner_of(pid, miner, slot_pids, &retired);
@@ -1946,6 +1977,16 @@ impl WorkerPool {
                     if std::env::var_os("ONEAPI_DEVICE_SELECTOR").is_none() {
                         env.insert("ONEAPI_DEVICE_SELECTOR".into(), "level_zero:*".into());
                     }
+                }
+                // On Windows, the card's capacity, as for CUDA above: the risc0 worker keeps its
+                // Groth16 proving key cached on the GPU between proofs only on a card it knows has
+                // room (`release_groth16_cache_if_tight`).
+                #[cfg(windows)]
+                if let Some(vram) = gpu_vram_bytes(gpu_tag, device_index, pci_bus_id) {
+                    env.insert(
+                        zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
+                        vram.to_string(),
+                    );
                 }
             }
             _ => {}
@@ -7252,6 +7293,12 @@ impl WorkerPool {
                                     "not killing PID {pid} for {key}: it is no longer our worker"
                                 );
                             }
+                            #[cfg(windows)]
+                            if !crate::memory::terminate_if_our_worker(pid, expected_start) {
+                                tracing::warn!(
+                                    "not killing PID {pid} for {key}: it is no longer our worker"
+                                );
+                            }
                         }
                     }
                 }
@@ -7558,9 +7605,12 @@ impl WorkerPool {
             let Some((pid, expected_start)) = entry.signal_target() else {
                 continue;
             };
+            // Unix only: Windows has no SIGTERM, so its workers are terminated in phase 3.
+            #[cfg(not(unix))]
+            let _ = (key, pid, expected_start);
+            #[cfg(unix)]
             if crate::memory::pid_is_our_worker(pid, expected_start) {
                 tracing::info!("Sending SIGTERM to worker {key} (PID {pid})");
-                #[cfg(unix)]
                 unsafe {
                     // Signal the GROUP, not just the leader: a forked GPU helper
                     // (SP1's sp1-gpu-server) should get a chance to release its VRAM
@@ -7591,6 +7641,9 @@ impl WorkerPool {
                     libc::kill(pid as i32, libc::SIGKILL);
                 }
             }
+            // Windows: no SIGTERM in phase 2, so survivors are every worker still running.
+            #[cfg(windows)]
+            crate::memory::terminate_if_our_worker(pid, expected_start);
         }
 
         // Brief pause for EOF to propagate through pipes
@@ -7618,6 +7671,8 @@ impl WorkerPool {
                                     libc::kill(pid as i32, libc::SIGKILL);
                                 }
                             }
+                            #[cfg(windows)]
+                            crate::memory::terminate_if_our_worker(pid, expected_start);
                         }
                         std::thread::sleep(Duration::from_millis(100));
                     }
