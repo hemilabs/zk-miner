@@ -831,16 +831,29 @@ jobs:
           start=$(date +%s)
           cargo install --locked --root sp1-server --git https://github.com/hemilabs/sp1 --rev "$rev" sp1-gpu-server
           echo "::notice title=sp1-gpu-server ${{ matrix.backend }} build::$(( ($(date +%s) - start) / 60 )) min"
+          # SP1's GPU Groth16 prover, which the CUDA server runs for the final wrap (else gnark on
+          # the CPU: on an RTX 4090, 21.3 -> 16.2 s per chacha-mix proof). Its own target dir, so
+          # the server's sp1gnark.dll stays the one built with the server; the helper loads it from
+          # beside itself in the release.
+          if [ "${{ matrix.backend }}" = cuda ]; then
+            start=$(date +%s)
+            CARGO_TARGET_DIR=target-sp1-helper cargo install --locked --root sp1-server \
+              --git https://github.com/hemilabs/sp1 --rev "$rev" sp1-recursion-gnark-ffi \
+              --bin groth16_gpu_helper --features native,cuda
+            echo "::notice title=groth16_gpu_helper build::$(( ($(date +%s) - start) / 60 )) min"
+          fi
 
       - name: Check the embedded GPU code
         if: steps.want.outputs.build == 'true' && matrix.vendor == 'nvidia'
         shell: pwsh
         run: |
-          $elf = cuobjdump --list-elf sp1-server\bin\sp1-gpu-server.exe
-          foreach ($sm in $env:SP1_CUDA_ARCHS -split ',') {
-            $n = @($elf | Select-String "\.sm_$sm\.cubin").Count
-            "sm_${sm}: $n images"
-            if ($n -lt 1) { throw "sm_$sm has no native code" }
+          foreach ($bin in 'sp1-gpu-server', 'groth16_gpu_helper') {
+            $elf = cuobjdump --list-elf "sp1-server\bin\$bin.exe"
+            foreach ($sm in $env:SP1_CUDA_ARCHS -split ',') {
+              $n = @($elf | Select-String "\.sm_$sm\.cubin").Count
+              "${bin} sm_${sm}: $n images"
+              if ($n -lt 1) { throw "$bin sm_$sm has no native code" }
+            }
           }
 
       # The server goes beside the SP1 worker under its vendor's name, with sp1gnark.dll (gnark's
@@ -857,11 +870,15 @@ jobs:
           if ($env:ZKMINER_REDIST_LIST) { $redist = @{ RedistList = $env:ZKMINER_REDIST_LIST; RedistDir = $env:ZKMINER_REDIST_DIR } }
           Copy-Item sp1-server\bin\sp1-gpu-server.exe "$out\$name.exe"
           Copy-Item target-sp1-server\release\sp1gnark.dll $out
+          # The CUDA build's GPU Groth16 prover, beside the worker, which points the server at it.
+          $helper = 'sp1-server\bin\groth16_gpu_helper.exe'
+          if (Test-Path $helper) { Copy-Item $helper $out }
           $lib = "$out\$name-lib"
           New-Item -ItemType Directory -Force $lib | Out-Null
           $own = @(Get-ChildItem target-sp1-server\release\*.dll | Where-Object Name -ne 'sp1gnark.dll')
           $own | Copy-Item -Destination $lib
-          scripts\windows\collect-dlls.ps1 -Binaries (@("$out\$name.exe", "$out\sp1gnark.dll") + ($own | ForEach-Object { "$lib\$($_.Name)" })) `
+          $bins = @("$out\$name.exe", "$out\sp1gnark.dll") + @(Get-ChildItem "$out\groth16_gpu_helper.exe" -ErrorAction SilentlyContinue | ForEach-Object FullName)
+          scripts\windows\collect-dlls.ps1 -Binaries ($bins + ($own | ForEach-Object { "$lib\$($_.Name)" })) `
             -SearchDirs ($env:ZKMINER_RUNTIME_DIRS -split ';') -Dest $lib `
             -Also ($env:ZKMINER_RUNTIME_ALSO -split ';' | Where-Object { $_ }) @redist
           # The MSVC runtime goes beside the worker, which installs it beside the server (its

@@ -1206,6 +1206,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     apply_sp1_worker_tuning(sp1_scale, available_vram);
     #[cfg(windows)]
     windows_tuning::apply_sycl_wrap_persistent_pk(vram_bytes);
+    #[cfg(windows)]
+    windows_tuning::apply_cuda_groth16_helper();
     match cuda_device_id {
         Some(id) => tracing::info!("SP1 worker will drive CUDA device {id}"),
         None => tracing::info!(
