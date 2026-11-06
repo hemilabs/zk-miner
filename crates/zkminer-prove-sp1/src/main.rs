@@ -176,6 +176,8 @@ mod bundled_server;
 mod warmup;
 #[cfg(windows)]
 mod windows_job;
+#[cfg(windows)]
+mod windows_tuning;
 
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -1202,6 +1204,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             .unwrap_or_else(|| "unknown".into()),
     );
     apply_sp1_worker_tuning(sp1_scale, available_vram);
+    #[cfg(windows)]
+    windows_tuning::apply_sycl_wrap_persistent_pk(vram_bytes);
     match cuda_device_id {
         Some(id) => tracing::info!("SP1 worker will drive CUDA device {id}"),
         None => tracing::info!(
