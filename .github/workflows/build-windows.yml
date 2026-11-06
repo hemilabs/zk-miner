@@ -344,10 +344,14 @@ jobs:
             # rec_fast_assert.cuh by `<verbatim dir>/name`, a path HIP's clang cannot open on Windows.
             # Device asserts compiled out and device printf buffered, as Dockerfile.build's
             # release build does (on Linux, printf and assert need hostcall).
-            # On a larger runner, clang compiles a file's five GPU targets five at a time
-            # (-parallel-jobs, as Dockerfile.build on Linux's larger runner); each adds that
-            # compiler's memory, so one at a time on a standard one.
-            rocm)  pj=1; [ "$(nproc)" -ge 16 ] && pj=5
+            # clang compiles a file's five GPU targets -parallel-jobs at a time, each adding that
+            # compiler's memory, so the count follows the runner's RAM: one per 24 GB, 1 to 5.
+            # Five at a time (with cargo's 16 jobs) starved the 16-core, 64 GB runner on a full
+            # kernel rebuild until GitHub lost contact with it, twice; a 96 GB machine was fine.
+            rocm)  mem_gb=$(powershell -NoProfile -Command \
+                     "[math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)" | tr -d '\r')
+                   pj=$(( mem_gb / 24 )); [ "$pj" -lt 1 ] && pj=1; [ "$pj" -gt 5 ] && pj=5
+                   echo "::notice title=rocm parallel jobs::$pj (RAM ${mem_gb} GB)"
                    export NVCC=off RISC0_HIP_ARCH="$HIP_ARCHS" RISC0_HIP_REC_ASSERT=1 \
                      HIPCC_COMPILE_FLAGS_APPEND="-DNDEBUG -mprintf-kind=buffered -parallel-jobs=$pj" ;;
           esac
