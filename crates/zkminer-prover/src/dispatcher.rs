@@ -672,6 +672,10 @@ const ROCM_SCRATCH_LIMIT_FALLBACK: u64 = 16 * 1024 * 1024 * 1024;
 
 /// An AMD card's total VRAM in bytes, from the amdgpu driver's sysfs entry for its PCI bus id.
 fn amd_vram_bytes(pci_bus_id: &str) -> Option<u64> {
+    // Windows has no amdgpu sysfs: the size the HIP runtime reported at discovery.
+    if cfg!(windows) {
+        return crate::discovery::amd_hip_vram_bytes(pci_bus_id);
+    }
     amd_mem_info(pci_bus_id, "vram_total").filter(|v| *v > 0)
 }
 

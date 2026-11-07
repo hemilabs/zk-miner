@@ -751,7 +751,37 @@ fn detect_amd_gpus_windows(
         );
         return Vec::new();
     }
-    parse_hip_device_list(&stdout)
+    let gpus = parse_hip_device_list_with_vram(&stdout);
+    if let Ok(mut known) = AMD_HIP_VRAM.lock() {
+        let known = known.get_or_insert_with(HashMap::new);
+        for (gpu, vram) in &gpus {
+            if let Some(vram) = vram {
+                known.insert(gpu.pci_bus_id.clone(), *vram);
+            }
+        }
+    }
+    gpus.into_iter().map(|(gpu, _)| gpu).collect()
+}
+
+/// Each discrete AMD GPU's memory as the HIP runtime reported it to the last
+/// `detect_amd_gpus_windows`, by PCI bus id. Windows has no amdgpu sysfs to read it from.
+#[cfg(windows)]
+static AMD_HIP_VRAM: std::sync::Mutex<Option<HashMap<String, u64>>> = std::sync::Mutex::new(None);
+
+/// The memory of the AMD GPU at `pci_bus_id`, where the platform reports it without sysfs: on
+/// Windows, what the HIP runtime said at discovery (`--list-hip-devices`). `None` elsewhere, before
+/// discovery, or if unknown.
+pub fn amd_hip_vram_bytes(pci_bus_id: &str) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let key = normalize_pci_bus_id(pci_bus_id);
+        AMD_HIP_VRAM.lock().ok()?.as_ref()?.get(&key).copied()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pci_bus_id;
+        None
+    }
 }
 
 /// The ROCm worker binary to list HIP devices with: an explicitly configured one, else the first
@@ -777,8 +807,17 @@ fn find_hip_probe(
 
 /// Parse `index|pci_bus_id|integrated|total_mem|name` lines (a ROCm worker's
 /// `--list-hip-devices`) into the discrete AMD GPUs, keeping HIP's own index.
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn parse_hip_device_list(output: &str) -> Vec<DetectedGpu> {
+    parse_hip_device_list_with_vram(output)
+        .into_iter()
+        .map(|(gpu, _)| gpu)
+        .collect()
+}
+
+/// [`parse_hip_device_list`], with each GPU's memory in bytes as HIP reports it (`total_mem`).
+#[cfg(any(windows, test))]
+fn parse_hip_device_list_with_vram(output: &str) -> Vec<(DetectedGpu, Option<u64>)> {
     output
         .lines()
         .filter_map(|line| {
@@ -786,7 +825,7 @@ fn parse_hip_device_list(output: &str) -> Vec<DetectedGpu> {
             let device_index = parts.next()?.trim().parse::<u32>().ok()?;
             let pci_bus_id = normalize_pci_bus_id(parts.next()?);
             let integrated = parts.next()?.trim() != "0";
-            let _total_mem = parts.next()?;
+            let total_mem = parts.next()?.trim().parse::<u64>().ok().filter(|b| *b > 0);
             let name = parts.next()?.trim().to_string();
             if integrated {
                 tracing::debug!("Skipping integrated AMD GPU [{device_index}] {name}");
@@ -795,14 +834,15 @@ fn parse_hip_device_list(output: &str) -> Vec<DetectedGpu> {
             if pci_bus_id.is_empty() {
                 return None;
             }
-            Some(DetectedGpu {
+            let gpu = DetectedGpu {
                 gpu_tag: "rocm".to_string(),
                 device_index,
                 pci_bus_id,
                 name,
                 // Not a CUDA device; CUDA compute capability does not apply.
                 compute_cap: None,
-            })
+            };
+            Some((gpu, total_mem))
         })
         .collect()
 }
@@ -1671,6 +1711,15 @@ mod tests {
         // The index is HIP's, not the position among discrete GPUs.
         assert_eq!(gpus[1].device_index, 2);
         assert_eq!(gpus[1].pci_bus_id, "0000:2d:00.0");
+        let with_vram = parse_hip_device_list_with_vram(out);
+        assert_eq!(with_vram[0].1, Some(17_095_983_104));
+        assert_eq!(with_vram[1].1, Some(25_753_026_560));
+        // An unreadable or zero size is unknown, not zero.
+        let odd = parse_hip_device_list_with_vram("0|0000:03:00.0|0|?|X\n1|0000:04:00.0|0|0|Y");
+        assert_eq!(
+            odd.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+            [None, None]
+        );
     }
 
     #[test]
