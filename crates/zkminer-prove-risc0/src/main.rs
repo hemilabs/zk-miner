@@ -422,11 +422,16 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             WorkerCommand::ProgramId { request_id, elf } => {
                 // The image id alone: no execution. The ELF is submitter-controlled and reaches
                 // risc0's parser here, which can panic on a malformed one (see the Execute arm), so a
-                // panic is contained and reported as a property of the ELF.
+                // panic is contained and reported as a property of the ELF. Under the same RSS
+                // self-guard as Execute: the image id maps every loadable word up to a segment's
+                // `p_memsz`, so a tiny crafted ELF can ask for gigabytes, and the worker exits rather
+                // than let it OOM the host.
                 let started = std::time::Instant::now();
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    verify_program_id(&elf, None)
-                }));
+                let outcome = with_rss_self_guard(execute_max_rss_bytes(), || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        verify_program_id(&elf, None)
+                    }))
+                });
                 let resp = match outcome {
                     Ok(Ok(program_id)) => WorkerResponse::ProgramIdResult {
                         request_id,

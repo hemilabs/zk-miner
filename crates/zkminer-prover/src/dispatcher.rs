@@ -4326,7 +4326,14 @@ impl WorkerPool {
                     },
                 ));
             }
-            return Err(e);
+            // Typed, so a caller can tell nothing ran (the miner's measure path still strikes it, as
+            // it did the untyped error: its text carries no cap phrase).
+            return Err(anyhow::Error::new(
+                zkminer_prover_protocol::types::MeasureWorkerGone {
+                    slot_key: key.to_string(),
+                    message: format!("{e:#}"),
+                },
+            ));
         }
 
         // Bound it the same way a proof is bounded: the watchdog SIGKILLs the worker if the
@@ -4460,10 +4467,15 @@ impl WorkerPool {
     /// served SP1 ELF IS the job's program before it reports a measurement of it: SP1's `Execute` does
     /// not check that, and the registry's `elf_hash` binds the bytes to the registrant's word only.
     ///
-    /// Runs on the same slots as [`Self::execute_cycles`], charged to the host-RAM ledger the same
-    /// way, and bounded by `timeout` the same way (a watchdog SIGKILL comes back as the typed
-    /// `MeasureWallClockTimeout`). Not registered as preemptible: only a process that proves nothing
-    /// calls it, so no committed proof can need its memory.
+    /// Runs on the same slots as [`Self::execute_cycles`] and is bounded by `timeout` the same way (a
+    /// watchdog SIGKILL comes back as the typed `MeasureWallClockTimeout`). On a dedicated measure
+    /// worker it is charged to the host-RAM ledger as a measurement of the backend is, but it takes no
+    /// `/dev/shm` reservation, as an SP1 `Execute` does. When the backend has NO measure
+    /// pool and the request falls back to a prove worker, nothing is charged at all, and a watchdog
+    /// kill would group-kill that prove worker (an SP1 one with its `sp1-gpu-server`): a miner must not
+    /// call it then. Not registered as preemptible: only a process that proves nothing calls it
+    /// (`zkminer simulate`, whose pool is measure-only), so no committed proof can need its memory. A
+    /// worker found dead when the request is sent is the typed `MeasureWorkerGone`.
     pub fn derive_program_id(
         &self,
         backend: &str,
@@ -4515,9 +4527,14 @@ impl WorkerPool {
             elf: elf.to_vec(),
         }) {
             // A closed pipe: the worker died while idle. Clear the slot so the next request revives
-            // it (see the same arm in `execute_cycles`).
+            // it (see the same arm in `execute_cycles`), and say so typed: nothing ran.
             Self::mark_slot_dead(&mut slot, entry);
-            return Err(e);
+            return Err(anyhow::Error::new(
+                zkminer_prover_protocol::types::MeasureWorkerGone {
+                    slot_key: key.to_string(),
+                    message: format!("{e:#}"),
+                },
+            ));
         }
         let _watchdog = timeout.map(|t| {
             ProvingWatchdog::new(

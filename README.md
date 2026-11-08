@@ -331,18 +331,72 @@ transaction and checked against its on-chain hash (a `submitTx` hint saves the l
 program's ELF from the ProgramRegistry, those bytes bound to the job's `programId`, and one execution
 on a measure worker at `--po2` (risc0, default 20). The binding is derived, never trusted: the risc0
 image id, or the SP1 verifying-key hash from SP1's `setup` on the CPU (minutes per program, cached on
-disk per ELF under `--cache-dir`, default `~/.zkminer/simulate`). A report's `outcome` is `measured`
-(with `cycles`, a decimal string), `not_served`, `undecodable`, `no_program`, `program_mismatch`,
-`too_heavy`, `failed`, `timeout` or `unavailable`; `retryable` says whether asking again can change it.
+disk per ELF under `--cache-dir`, default `~/.zkminer/simulate`). SP1 PLONK jobs are measured by the
+SP1 worker (the same ELF and vkey hash as Groth16), though the miner does not claim them. A
+journal-prefix job runs on its prover's input, `abi.encode(jobId, prover)` and then `inputData`
+(risc0; an SP1 one is reported `failed`, since its prefix is a stdin buffer of its own).
+
+A report's `outcome` is one of:
+
+| outcome | meaning | `retryable` |
+|---|---|---|
+| `measured` | executed; `cycles` is the count (a decimal string) | no |
+| `not_served` | its proof system is not one this build measures (OpenVM, unknown) | no |
+| `no_worker` | no measure worker for its backend runs here | yes |
+| `undecodable` | its descriptor can never be rebuilt | no |
+| `no_program` | the program is not in the registry, or has no storage URIs | yes |
+| `program_mismatch` | the ELF the registry declares (its keccak256 is the registry `elf_hash` or a URI's content hash) is not the job's program | no |
+| `too_heavy` | past the executor's cycle cap, or above `--max-cycles` (default 4e9, risc0's keccak charge included) | no |
+| `failed` | the guest or the worker failed, or bytes the registry does not vouch for did not bind | yes, a few times |
+| `timeout` | the execution or the program-id derivation hit its bound | yes, a few times |
+| `unavailable` | nothing conclusive: the RPC, the registry or the ELF host failed, a worker was busy or found dead, or the program's last derivation failed and is remembered | yes |
+
+A program whose ELF did not bind (refused, another id, a derivation past its bound) is remembered
+under `--cache-dir` for `--program-failure-ttl-secs` (default 6 h, 0 = off): its other jobs are
+answered from that memory, `unavailable` (or `program_mismatch` when that was the verdict), instead
+of each paying a download and a derivation. `--execute-timeout-secs` (default 600) and
+`--program-id-timeout-secs` (default 900) bound one execution and one derivation, each at most 86400.
+
+With `--stdin`, a READY line comes first, once the measure workers run and before any request is
+read; a reader should send nothing before it:
+
+```json
+{"schema":1,"ready":true,"backends":["risc0","sp1"],"zkminerVersion":"0.1.0","protocolVersion":11}
+```
+
+(`backends`: those with a live measure worker, sorted.) A line that is not a request is answered
+`{"error":"invalid_request","reason":"…","schema":1}` in its place.
 
 It signs and sends nothing (the watch-only client), and starts measure workers only, never a prover,
-so it runs on a host without a GPU: build the CPU worker and name it.
+so it runs on a host without a GPU: build the CPU risc0 worker and, for SP1 jobs, the SP1 worker
+(not a default workspace member; it needs the SP1 toolchain, installed with `sp1up`), and name them.
 
 ```bash
 cargo build --release -p zkminer-prove-risc0 --features cpu --bin zkminer-prove-risc0-cpu
+CARGO_TARGET_DIR=target-sp1 cargo build --release -p zkminer-prove-sp1
 zkminer --config simulate.toml simulate --stdin \
-    --risc0-worker target/release/zkminer-prove-risc0-cpu --sp1-worker target/release/zkminer-prove-sp1
+    --risc0-worker target/release/zkminer-prove-risc0-cpu \
+    --sp1-worker target-sp1/release/zkminer-prove-sp1
 ```
+
+Reading the counts:
+
+- **Units differ by backend.** risc0's count is cycles with every segment padded to its power of two
+  at `--po2`, plus a charge of 2^20 for each keccak proof request (a price, not cycles: about a 2^20
+  segment's proving time; doubled per step of a larger keccak po2). SP1's is
+  the RV64 instruction count, where a precompile (keccak, sha, ...) counts once. On the same program
+  and input, risc0 reports about twice SP1's figure: never add or compare the two.
+- **po2.** risc0 counts depend on the segment size: a job proven on a small card (po2 16) has about
+  1.8 times the po2-20 count. A report carries the `po2` it was measured at; changing `--po2` mixes
+  sizes in what was already stored.
+- **sys_rand.** A guest's randomness is seeded from this host's key file, not its prover's (which is
+  secret), so a guest that reads it may take another path, and commit another journal, than the
+  proven run. `binding` (`satisfied`, `fails`, `unchecked`, `none`) says whether the measured journal
+  satisfies the job's binding; `fails` means the measured run is provably not the proven one.
+
+**Never run `simulate` on a host that runs a miner.** The miner's host-RAM and `/dev/shm` ledgers are
+per process: a simulate measurement (an SP1 one stages gigabytes in `/dev/shm` and may hold up to
+24 GiB) is invisible to a miner beside it, and the two can together OOM or SIGBUS its proofs.
 
 ## Layout
 

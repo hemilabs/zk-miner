@@ -648,6 +648,35 @@ impl std::fmt::Display for MeasureSlotsBusy {
 
 impl std::error::Error for MeasureSlotsBusy {}
 
+/// The measure worker chosen for a sizing request (`Execute`, `ProgramId`) was already dead when the
+/// request was SENT to it: the pipe was closed while the worker sat idle (an OOM kill or an operator's
+/// kill between requests). Nothing ran, so nothing about the (program, input) is known; the dispatcher
+/// has cleared the slot, so the next request revives it.
+///
+/// Typed so a caller can tell this from a worker that died DURING a request (which may be the
+/// guest's doing, and stays an untyped error): `zkminer simulate` reports it `unavailable`, not a
+/// strike-counted failure. Only the dispatcher's send-failure arms construct it, never from worker
+/// text.
+#[derive(Debug, Clone)]
+pub struct MeasureWorkerGone {
+    /// The slot whose worker was gone, e.g. `risc0:measure:0`.
+    pub slot_key: String,
+    /// The send error (the OS's text, e.g. "Broken pipe").
+    pub message: String,
+}
+
+impl std::fmt::Display for MeasureWorkerGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "measure worker {} was gone when the request was sent ({}); nothing ran (transient)",
+            self.slot_key, self.message
+        )
+    }
+}
+
+impl std::error::Error for MeasureWorkerGone {}
+
 /// A worker answered a `ProgramId` request with `InvalidInput`: its SDK refused to derive a program
 /// id from these bytes (risc0: not an ELF it can compute an image id for; SP1: `setup` failed on it).
 /// Typed so a caller can tell the worker's verdict on the ELF from everything else that can fail

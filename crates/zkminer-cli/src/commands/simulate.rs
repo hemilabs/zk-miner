@@ -16,8 +16,18 @@
 //!    takes minutes of CPU, so it is cached per ELF on disk. A measurement of an ELF that is not the
 //!    job's program says nothing about the job, so it is never reported;
 //! 5. one `Execute` on a dedicated measure worker (`WorkerPool::execute_cycles`, with its watchdog
-//!    and host-RAM ledger), at the segment size given (risc0);
+//!    and host-RAM ledger), at the segment size given (risc0), on the input its prover ran: the
+//!    job's `inputData`, after `abi.encode(jobId, prover)` for a journal-prefix job (risc0 only);
 //! 6. the job's journal binding checked against the measured journal, as advice.
+//!
+//! A program whose ELF did not bind (refused, another id, or a derivation past its bound) is
+//! remembered on disk for `--program-failure-ttl-secs`, so its other jobs do not each pay a download
+//! and a derivation (an SP1 `setup` is minutes): they are answered `unavailable` from the memory
+//! (`program_mismatch` when that was the verdict) until it expires. A count above `--max-cycles` is
+//! `too_heavy`, never `measured`.
+//!
+//! In `--stdin` mode a READY line comes first, once the measure workers run and before any request
+//! is read: `{"schema":1,"ready":true,"backends":[…],"zkminerVersion":"…","protocolVersion":…}`.
 //!
 //! The pool starts measure workers only (`WorkerPool::measure_only`): no prove worker, no GPU
 //! context, no `sp1-gpu-server`. A host with no GPU names `zkminer-prove-risc0-cpu` (and an SP1
@@ -33,11 +43,13 @@ use std::time::{Duration, Instant};
 
 use alloy::primitives::{keccak256, Address, B256};
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use zkminer_chain::binding::{BindingMismatch, JOURNAL_PREFIX_BYTES, JOURNAL_PREFIX_MARKER};
 use zkminer_chain::client::ChainClient;
 use zkminer_chain::programs::sanitize_log;
 use zkminer_config::ZkMinerConfig;
+use zkminer_contracts::bindings::JobDescriptor;
 use zkminer_prover::dispatcher::WorkerPool;
 use zkminer_prover::engine::init_worker_pool;
 use zkminer_prover_protocol::{BACKEND_RISC0, BACKEND_SP1};
@@ -53,6 +65,15 @@ pub const REPORT_SCHEMA: u32 = 1;
 /// The longest request line read from stdin. A job id with a tx hint is under 200 bytes.
 const MAX_REQUEST_LINE: usize = 4096;
 
+/// `--max-cycles`: the largest count reported as `measured`. Twice the risc0 executor's own session
+/// cap (2e9 user cycles), which risc0's padding and keccak charge can push a feasible guest past; far
+/// above any real proof (~1e8). A count above it is guest-steered (a guest can buy keccak charges at
+/// a few hundred cycles each) and would dominate every sum it entered.
+pub const DEFAULT_MAX_CYCLES: u64 = 4_000_000_000;
+
+/// `--program-failure-ttl-secs`: how long a program whose ELF did not bind is answered from memory.
+pub const DEFAULT_PROGRAM_FAILURE_TTL_SECS: u64 = 6 * 3600;
+
 /// Options for one `simulate` run (see the `Simulate` command's flags).
 pub struct SimulateOptions {
     /// Job ids from the command line.
@@ -65,6 +86,10 @@ pub struct SimulateOptions {
     pub execute_timeout: Duration,
     /// Bound on one program-id derivation (SP1's setup).
     pub program_id_timeout: Duration,
+    /// The largest cycle count reported as `measured` (see [`DEFAULT_MAX_CYCLES`]).
+    pub max_cycles: u64,
+    /// How long a program whose ELF did not bind is answered from memory; zero = never.
+    pub program_failure_ttl: Duration,
     /// Worker binaries that override `[prover.worker_binaries]`.
     pub risc0_worker: Option<PathBuf>,
     pub sp1_worker: Option<PathBuf>,
@@ -105,12 +130,12 @@ pub fn parse_request(line: &str) -> Result<Request> {
 }
 
 /// How a job came out. `measured` is the only one with a cycle count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     /// Executed: `cycles` is the count.
     Measured,
-    /// Its proof system is not one this build measures (SP1 PLONK, OpenVM, unknown).
+    /// Its proof system is not one this build measures (OpenVM, unknown).
     NotServed,
     /// This build measures it, but no measure worker for its backend runs here (none was named, or
     /// it could not start). Says nothing about the job; changes when the operator adds the worker.
@@ -119,9 +144,11 @@ pub enum Outcome {
     Undecodable,
     /// No ELF source: the program is not in the ProgramRegistry, or has no storage URIs. May change.
     NoProgram,
-    /// The ELF served for the program is not the job's program (its image id / vkey differs).
+    /// The ELF the registry declares for the program (its keccak256 is the registry's `elf_hash` or
+    /// a URI's content hash) is not the job's program: its image id / vkey differs, or the risc0
+    /// worker refuses it. Bytes the registry does not vouch for say this as `failed`.
     ProgramMismatch,
-    /// The guest ran past the executor's cycle cap.
+    /// The guest ran past the executor's cycle cap, or its count is above `--max-cycles`.
     TooHeavy,
     /// The guest failed on this input, or the worker did. Retry a few times at most.
     Failed,
@@ -183,7 +210,8 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub program_check_secs: Option<f64>,
     /// Total cycles as proving reports them: risc0, every segment padded to its power of two at
-    /// `po2` (plus keccak proofs); SP1, its instruction count.
+    /// `po2`, plus a 2^20 charge per keccak proof request; SP1, its RV64 instruction count (a
+    /// precompile counts once). Not one unit: never add the two. At most `--max-cycles`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cycles: Option<String>,
     /// The risc0 segment size measured at; absent for SP1.
@@ -257,9 +285,12 @@ pub fn redact_urls(text: &str) -> String {
     while let Some(i) = rest.find("://") {
         // The scheme: the ASCII letters (and + - .) just before "://".
         let head = &rest[..i];
+        // On a char boundary: the char before the scheme may be multi-byte ("“https://…").
         let scheme_start = head
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
-            .map_or(0, |p| p + 1);
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |(p, c)| p + c.len_utf8());
         let after = &rest[i + 3..];
         let end = after
             .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '>' | '<'))
@@ -305,6 +336,9 @@ fn classify_execute_error(e: &anyhow::Error) -> Outcome {
         .is_some()
         || e.downcast_ref::<zkminer_prover_protocol::types::MeasureSlotsBusy>()
             .is_some()
+        // The worker was already dead when the request was sent (it died while idle): nothing ran.
+        || e.downcast_ref::<zkminer_prover_protocol::types::MeasureWorkerGone>()
+            .is_some()
         || is_measure_preempted(e)
     {
         return Outcome::Unavailable;
@@ -328,14 +362,15 @@ fn classify_execute_error(e: &anyhow::Error) -> Outcome {
 }
 
 /// Classify a failed `derive_program_id`. Only the worker's own refusal of the bytes is about the
-/// program, and only risc0's is conclusive (computing an image id is deterministic); SP1's `setup`
-/// can also fail for reasons of the host, so its refusal is a strike-counted failure. Everything else
-/// (no worker, a dead or killed one, an internal error) says nothing about the program.
-fn classify_program_id_error(backend: &str, e: &anyhow::Error) -> Outcome {
-    if e.downcast_ref::<zkminer_prover_protocol::types::ProgramIdRefused>()
-        .is_some()
-    {
-        return if backend == BACKEND_RISC0 {
+/// program, and only risc0's is conclusive (computing an image id is deterministic), and only about
+/// bytes the registry vouches for (`vouched`, see [`bytes_vouched`]): a mirror's 200 error page or a
+/// cut-short body is refused too, and says nothing about the program, so it is a strike-counted
+/// failure. SP1's `setup` can also fail for reasons of the host, so its refusal is a failure too.
+/// Everything else (no worker, a dead or killed one, an internal error) says nothing about the
+/// program.
+fn classify_program_id_error(backend: &str, e: &anyhow::Error, vouched: bool) -> Outcome {
+    if is_program_id_refusal(e) {
+        return if backend == BACKEND_RISC0 && vouched {
             Outcome::ProgramMismatch
         } else {
             Outcome::Failed
@@ -345,6 +380,193 @@ fn classify_program_id_error(backend: &str, e: &anyhow::Error) -> Outcome {
         Outcome::Unavailable => Outcome::Unavailable,
         Outcome::Timeout => Outcome::Timeout,
         _ => Outcome::Failed,
+    }
+}
+
+fn is_program_id_refusal(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<zkminer_prover_protocol::types::ProgramIdRefused>()
+        .is_some()
+}
+
+/// Whether the registry vouches for these bytes: their keccak256 is the program's registry
+/// `elf_hash`, or a storage URI's (nonzero) content hash. Only then does a failure to bind them say
+/// something about the program; otherwise the download may be anything a URI answered with.
+fn bytes_vouched(
+    registry_elf_hash: Option<B256>,
+    content_hashes: impl IntoIterator<Item = B256>,
+    elf_hash: &B256,
+) -> bool {
+    registry_elf_hash == Some(*elf_hash)
+        || content_hashes
+            .into_iter()
+            .any(|h| h != B256::ZERO && h == *elf_hash)
+}
+
+/// What a reason adds when the bytes that failed to bind were not vouched for.
+const UNVERIFIED_DOWNLOAD: &str = "; the download was not verified (its keccak256 is neither the \
+     registry's elf_hash nor a URI's content hash), so this says nothing final about the program";
+
+/// The binding verdict as a report states it. `none_bound`: the job has no binding at all (no
+/// `expectedJournalHash`, no marker). The SP1 proof nonce binds the seal, not the journal, so it is
+/// `unchecked`, never `fails`.
+fn binding_label(none_bound: bool, verdict: Option<Result<(), BindingMismatch>>) -> &'static str {
+    if none_bound {
+        return "none";
+    }
+    match verdict {
+        Some(Ok(())) => "satisfied",
+        Some(Err(BindingMismatch::NonceUnchecked)) | None => "unchecked",
+        Some(Err(_)) => "fails",
+    }
+}
+
+/// The backend that measures `proof_system_id` here: the miner's, plus SP1 PLONK, which the miner
+/// does not claim (it cannot prove PLONK) but which executes and binds exactly as SP1 Groth16 does
+/// (the same ELF, the same vkey hash). For simulate only: the miner's `resolve_backend` is unchanged.
+pub fn simulate_backend(proof_system_id: B256) -> Option<&'static str> {
+    match zkminer_chain::auction::ProofSystem::from_id(proof_system_id) {
+        Some(zkminer_chain::auction::ProofSystem::Sp1Plonk) => Some(BACKEND_SP1),
+        _ => resolve_backend(proof_system_id),
+    }
+}
+
+/// The input the job's prover ran the guest on: its `inputData`, after the 64-byte
+/// `abi.encode(jobId, prover)` for a journal-prefix job (INTERACTION_GUIDE §3a: the host passes the
+/// prefix as input, the guest commits it first). risc0's input is one byte stream, so the prefix and
+/// the input written one after the other are those bytes concatenated, exactly. SP1's stdin is a list
+/// of buffers (the guest reads the prefix as one of its own), which one `Execute` input cannot
+/// reproduce, so an SP1 prefix job is not measured. Nor is one with no lock holder: the prefix names
+/// the prover.
+fn guest_input(
+    d: &JobDescriptor,
+    job_id: B256,
+    prover: Address,
+    backend: &str,
+) -> Result<Vec<u8>, (Outcome, &'static str)> {
+    if zkminer_chain::binding::marker(d.journalFields) != Some(JOURNAL_PREFIX_MARKER) {
+        return Ok(d.inputData.to_vec());
+    }
+    if backend != BACKEND_RISC0 {
+        return Err((
+            Outcome::Failed,
+            "a journal-prefix job: its prover passed abi.encode(jobId, prover) as an SP1 stdin buffer \
+             of its own, which one Execute input cannot reproduce, so a measurement here would be of \
+             another run",
+        ));
+    }
+    if prover == Address::ZERO {
+        return Err((
+            Outcome::Unavailable,
+            "a journal-prefix job with no prover: its input begins with abi.encode(jobId, prover), \
+             and no one holds its lock",
+        ));
+    }
+    let mut input = Vec::with_capacity(JOURNAL_PREFIX_BYTES + d.inputData.len());
+    input.extend_from_slice(job_id.as_slice());
+    input.extend_from_slice(B256::left_padding_from(prover.as_slice()).as_slice());
+    input.extend_from_slice(&d.inputData);
+    Ok(input)
+}
+
+/// Why a measured count is not reported as one: above `max`.
+fn over_cycle_cap(cycles: u64, max: u64) -> Option<String> {
+    (cycles > max).then(|| {
+        format!("measured {cycles} cycles, above the {max} reported at most (--max-cycles)")
+    })
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// One program whose ELF did not bind, as remembered (see [`ProgramFailureMemo`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct RememberedFailure {
+    /// The outcome the derivation gave the job it ran for.
+    outcome: Outcome,
+    /// Its reason, sanitized.
+    reason: String,
+    /// When, in Unix seconds.
+    at: u64,
+}
+
+impl RememberedFailure {
+    /// The outcome a later job of the program gets from the memory: the verdict itself when it was
+    /// final (`program_mismatch`), else `unavailable`. Nothing new was learned about this job, so a
+    /// reader must not count it as one more strike against it; the program is derived afresh once the
+    /// memory expires.
+    fn outcome_now(&self) -> Outcome {
+        if self.outcome == Outcome::ProgramMismatch {
+            Outcome::ProgramMismatch
+        } else {
+            Outcome::Unavailable
+        }
+    }
+}
+
+/// Programs whose ELF lately failed to bind (the worker refused it, it derived to another id, or the
+/// derivation hit its bound), on disk, keyed by backend, SDK and `programId`, for `ttl`. Without it a
+/// program's every job pays a download and a derivation, an SP1 `setup` being minutes of CPU on the
+/// one queue, and a registrant who serves fresh trailing bytes each time defeats the per-ELF id
+/// cache. A program whose bytes bound is unaffected: binding clears its entry, and an ELF cached for
+/// it (bytes that bound) overrides the memory.
+struct ProgramFailureMemo {
+    dir: PathBuf,
+    ttl: Duration,
+}
+
+impl ProgramFailureMemo {
+    fn path(&self, backend: &str, sdk: &str, program_id: &B256) -> PathBuf {
+        let sdk = alloy::hex::encode(&keccak256(sdk.as_bytes())[..8]);
+        self.dir.join(format!(
+            "{backend}-{sdk}-{}",
+            alloy::hex::encode(program_id)
+        ))
+    }
+
+    /// The remembered failure, and its age in seconds, while it is younger than `ttl`.
+    fn get(&self, backend: &str, sdk: &str, program_id: &B256) -> Option<(RememberedFailure, u64)> {
+        if self.ttl.is_zero() {
+            return None;
+        }
+        let path = self.path(backend, sdk, program_id);
+        let text = std::fs::read_to_string(&path).ok()?;
+        let Ok(m) = serde_json::from_str::<RememberedFailure>(&text) else {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        };
+        let age = unix_now().saturating_sub(m.at);
+        if age >= self.ttl.as_secs() {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        Some((m, age))
+    }
+
+    fn put(&self, backend: &str, sdk: &str, program_id: &B256, outcome: Outcome, reason: &str) {
+        if self.ttl.is_zero() {
+            return;
+        }
+        let m = RememberedFailure {
+            outcome,
+            reason: sanitize_log(&redact_urls(reason)),
+            at: unix_now(),
+        };
+        let path = self.path(backend, sdk, program_id);
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        let write = std::fs::create_dir_all(&self.dir)
+            .and_then(|()| std::fs::write(&tmp, serde_json::to_vec(&m).unwrap_or_default()))
+            .and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(e) = write {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::warn!("simulate: could not remember a program's failure to bind ({e})");
+        }
+    }
+
+    fn clear(&self, backend: &str, sdk: &str, program_id: &B256) {
+        let _ = std::fs::remove_file(self.path(backend, sdk, program_id));
     }
 }
 
@@ -395,12 +617,25 @@ struct Simulator {
     /// [`ProgramIdCache`]).
     served: HashMap<&'static str, String>,
     ids: ProgramIdCache,
+    failures: ProgramFailureMemo,
     po2: u8,
     execute_timeout: Duration,
     program_id_timeout: Duration,
+    max_cycles: u64,
 }
 
 impl Simulator {
+    /// Whether the registry vouches for the bytes (see [`bytes_vouched`]); `None` when it cannot be
+    /// read. Read moments ago by the ELF fetch, so usually from the client's short-lived cache.
+    async fn vouched(&self, program_id: B256, elf_hash: &B256) -> Option<bool> {
+        let info = self.client.get_program_info(program_id).await.ok()?;
+        Some(bytes_vouched(
+            info.elf_hash,
+            info.storage_uris.iter().map(|u| u.content_hash),
+            elf_hash,
+        ))
+    }
+
     async fn simulate(&self, req: &Request) -> Report {
         let job_id = req.job_id;
         let mut r = Report::new(job_id);
@@ -433,7 +668,7 @@ impl Simulator {
         );
         // Decided before the descriptor and the ELF, which cost requests a job we cannot measure
         // here does not need.
-        let Some(backend) = resolve_backend(view.proofSystemId) else {
+        let Some(backend) = simulate_backend(view.proofSystemId) else {
             return r.end(
                 Outcome::NotServed,
                 "this build does not measure its proof system",
@@ -486,6 +721,25 @@ impl Simulator {
 
         if program_id == B256::ZERO {
             return r.end(Outcome::ProgramMismatch, "its programId is zero");
+        }
+        // Decided before the ELF: a job whose proven run cannot be reproduced here costs no download.
+        let input = match guest_input(&d, job_id, view.prover, backend) {
+            Ok(input) => std::sync::Arc::new(input),
+            Err((outcome, why)) => return r.end(outcome, why),
+        };
+        // A program whose ELF lately failed to bind is not downloaded and derived again for each of
+        // its jobs; bytes cached for it (bytes that bound) override the memory.
+        if let Some((m, age)) = self.failures.get(backend, &sdk, &program_id) {
+            if !zkminer_chain::programs::ElfCache::new().contains(&program_id) {
+                let left = self.failures.ttl.as_secs().saturating_sub(age);
+                return r.end(
+                    m.outcome_now(),
+                    format!(
+                        "remembered from {age} s ago (derived again in {left} s): {}",
+                        m.reason
+                    ),
+                );
+            }
         }
 
         // The registry's `elf_hash` is not enforced, for either backend: the program id derived
@@ -545,24 +799,67 @@ impl Simulator {
                         d.program_id
                     }
                     Ok(Err(e)) => {
-                        return r.end(
-                            classify_program_id_error(backend, &e),
-                            format!("program id: {e:#}"),
-                        )
+                        let refused = is_program_id_refusal(&e);
+                        // Only a risc0 refusal can be final, and only of bytes the registry vouches for.
+                        let vouched = if refused && backend == BACKEND_RISC0 {
+                            match self.vouched(program_id, &elf_hash).await {
+                                Some(v) => v,
+                                None => {
+                                    return r.end(
+                                        Outcome::Unavailable,
+                                        format!(
+                                            "program id: {e:#}; and the registry could not be read \
+                                             to tell whether it declares these bytes"
+                                        ),
+                                    )
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        let outcome = classify_program_id_error(backend, &e, vouched);
+                        let reason = format!(
+                            "program id: {e:#}{}",
+                            if refused && backend == BACKEND_RISC0 && !vouched {
+                                UNVERIFIED_DOWNLOAD
+                            } else {
+                                ""
+                            }
+                        );
+                        if refused || is_measure_wall_clock_timeout(&e) {
+                            self.failures
+                                .put(backend, &sdk, &program_id, outcome, &reason);
+                        }
+                        return r.end(outcome, reason);
                     }
                     Err(join) => return r.end(Outcome::Failed, format!("program id task: {join}")),
                 }
             }
         };
         if !program_id_matches(backend, &derived, &program_id) {
-            return r.end(
-                Outcome::ProgramMismatch,
-                format!(
-                    "the ELF served for {program_id} derives to 0x{}",
-                    alloy::hex::encode(derived)
-                ),
-            );
+            let derived_hex = alloy::hex::encode(derived);
+            let Some(vouched) = self.vouched(program_id, &elf_hash).await else {
+                return r.end(
+                    Outcome::Unavailable,
+                    format!(
+                        "the ELF served for {program_id} derives to 0x{derived_hex}; and the registry \
+                         could not be read to tell whether it declares these bytes"
+                    ),
+                );
+            };
+            let (outcome, note) = if vouched {
+                (Outcome::ProgramMismatch, "")
+            } else {
+                (Outcome::Failed, UNVERIFIED_DOWNLOAD)
+            };
+            let reason =
+                format!("the ELF served for {program_id} derives to 0x{derived_hex}{note}");
+            self.failures
+                .put(backend, &sdk, &program_id, outcome, &reason);
+            return r.end(outcome, reason);
         }
+        // Bound: nothing to remember against the program.
+        self.failures.clear(backend, &sdk, &program_id);
         {
             // Bound: these bytes ARE the program, so later jobs of it skip the download.
             let elf = elf.clone();
@@ -577,7 +874,6 @@ impl Simulator {
             .await;
         }
 
-        let input = std::sync::Arc::new(d.inputData.to_vec());
         let size = (backend == BACKEND_RISC0).then_some(self.po2);
         let (pool, elf2, input2, timeout) =
             (self.pool, elf.clone(), input.clone(), self.execute_timeout);
@@ -598,27 +894,31 @@ impl Simulator {
             Ok(Err(e)) => return r.end(classify_execute_error(&e), format!("execute: {e:#}")),
             Err(join) => return r.end(Outcome::Failed, format!("execute task: {join}")),
         };
-        r.cycles = Some(m.cycles.to_string());
         r.po2 = size;
         r.execute_secs = Some(m.duration_secs);
         r.peak_host_bytes = Some(m.peak_host_bytes);
+        if let Some(why) = over_cycle_cap(m.cycles, self.max_cycles) {
+            return r.end(Outcome::TooHeavy, why);
+        }
+        r.cycles = Some(m.cycles.to_string());
         r.journal_bytes = Some(m.journal_len);
         r.journal_hash = m.journal.as_ref().map(keccak256);
-        r.binding = Some(if d.expectedJournalHash == B256::ZERO {
-            "none"
-        } else {
-            let measured = m.journal.as_ref().map(|j| {
-                (
-                    keccak256(&d.inputData),
-                    std::sync::Arc::<[u8]>::from(j.as_slice()),
-                )
-            });
-            match measured_binding_verdict(&d, &measured, job_id, view.prover) {
-                Some(Ok(())) => "satisfied",
-                Some(Err(_)) => "fails",
-                None => "unchecked",
-            }
+        // Measured on this descriptor's input (after its prefix, for a journal-prefix job, which the
+        // binding check expects the journal to begin with).
+        let measured = m.journal.as_ref().map(|j| {
+            (
+                keccak256(&d.inputData),
+                std::sync::Arc::<[u8]>::from(j.as_slice()),
+            )
         });
+        let none_bound = d.expectedJournalHash == B256::ZERO
+            && zkminer_chain::binding::marker(d.journalFields).is_none();
+        r.binding = Some(binding_label(
+            none_bound,
+            (!none_bound)
+                .then(|| measured_binding_verdict(&d, &measured, job_id, view.prover))
+                .flatten(),
+        ));
         r.end(Outcome::Measured, "")
     }
 }
@@ -682,6 +982,35 @@ fn emit_invalid(out: &mut impl Write, reason: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `--stdin` READY line: the measure workers run (`backends`, sorted) and requests are read from
+/// now on. A reader sends nothing before it, so a process that dies starting up never takes a request
+/// with it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Ready<'a> {
+    schema: u32,
+    ready: bool,
+    backends: &'a [&'a str],
+    zkminer_version: &'static str,
+    protocol_version: u32,
+}
+
+fn emit_ready(out: &mut impl Write, backends: &[&str]) -> Result<()> {
+    serde_json::to_writer(
+        &mut *out,
+        &Ready {
+            schema: REPORT_SCHEMA,
+            ready: true,
+            backends,
+            zkminer_version: env!("CARGO_PKG_VERSION"),
+            protocol_version: zkminer_prover_protocol::PROTOCOL_VERSION,
+        },
+    )?;
+    out.write_all(b"\n")?;
+    out.flush()?;
+    Ok(())
+}
+
 /// Write one report as a JSON line and flush, so a reader on a pipe sees it at once.
 fn emit(out: &mut impl Write, report: &Report) -> Result<()> {
     serde_json::to_writer(&mut *out, report)?;
@@ -702,6 +1031,7 @@ pub async fn run(config_path: Option<&Path>, opts: SimulateOptions) -> Result<()
         zkminer_prover_protocol::RISC0_JOB_PO2_MIN,
         zkminer_prover_protocol::RISC0_JOB_PO2_MAX
     );
+    anyhow::ensure!(opts.max_cycles > 0, "--max-cycles must be at least 1");
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
     // No key is read (the client signs with a throwaway one), so none must reach a worker either.
@@ -781,11 +1111,20 @@ pub async fn run(config_path: Option<&Path>, opts: SimulateOptions) -> Result<()
         ids: ProgramIdCache {
             dir: root.join("program-ids"),
         },
+        failures: ProgramFailureMemo {
+            dir: root.join("program-failures"),
+            ttl: opts.program_failure_ttl,
+        },
         po2: opts.po2,
         execute_timeout: opts.execute_timeout,
         program_id_timeout: opts.program_id_timeout,
+        max_cycles: opts.max_cycles,
     };
     let mut out = std::io::stdout().lock();
+    if opts.stdin {
+        // Before any report (a `--job` one included) and before reading a request.
+        emit_ready(&mut out, &names)?;
+    }
     for job_id in &opts.jobs {
         let report = sim
             .simulate(&Request {
@@ -839,8 +1178,8 @@ pub async fn run(config_path: Option<&Path>, opts: SimulateOptions) -> Result<()
         }
     }
     if let Some(p) = zkminer_prover::engine::worker_pool() {
+        // `close` shuts every worker down itself.
         p.close();
-        p.shutdown_all();
     }
     Ok(())
 }
@@ -884,7 +1223,23 @@ mod tests {
             parse_request(&format!(r#"{{"jobId":"{}","extra":1}}"#, id(1))).is_err(),
             "unknown fields are refused, not ignored"
         );
-        assert!(parse_request(&"0".repeat(MAX_REQUEST_LINE + 1)).is_err());
+        // Over the length bound: a request that would parse but for its length (padded inside the
+        // JSON, where `trim` does not reach) is refused for its length alone.
+        let valid = format!(r#"{{"jobId":"{}"}}"#, id(1));
+        assert!(parse_request(&valid).is_ok());
+        let padded = format!(r#"{{"jobId":"{}"{}}}"#, id(1), " ".repeat(MAX_REQUEST_LINE));
+        let err = parse_request(&padded).expect_err("over the bound");
+        assert!(format!("{err:#}").contains("too long"), "{err:#}");
+        let at_bound = format!(
+            r#"{{"jobId":"{}"{}}}"#,
+            id(1),
+            " ".repeat(MAX_REQUEST_LINE - valid.len())
+        );
+        assert_eq!(at_bound.len(), MAX_REQUEST_LINE);
+        assert!(
+            parse_request(&at_bound).is_ok(),
+            "the bound itself is allowed"
+        );
     }
 
     #[test]
@@ -908,6 +1263,17 @@ mod tests {
             slots: 2,
         });
         assert_eq!(classify_execute_error(&busy), Outcome::Unavailable);
+        // A worker found dead when the request was sent: nothing ran.
+        let gone = anyhow::Error::new(zkminer_prover_protocol::types::MeasureWorkerGone {
+            slot_key: "risc0:measure:0".into(),
+            message: "Send error: Broken pipe (os error 32)".into(),
+        });
+        assert_eq!(classify_execute_error(&gone), Outcome::Unavailable);
+        // Its text is not the type.
+        let forged = anyhow::anyhow!(
+            "cycle measurement failed: measure worker risc0:measure:0 was gone when the request was sent"
+        );
+        assert_eq!(classify_execute_error(&forged), Outcome::Failed);
         let timeout = anyhow::Error::new(MeasureWallClockTimeout {
             slot_key: "risc0:measure:0".into(),
         });
@@ -924,9 +1290,9 @@ mod tests {
     }
 
     #[test]
-    fn only_a_risc0_refusal_of_the_bytes_is_a_mismatch() {
+    fn only_a_risc0_refusal_of_vouched_bytes_is_a_mismatch() {
         use zkminer_prover_protocol::types::{
-            MeasureSlotsBusy, MeasureWallClockTimeout, ProgramIdRefused,
+            MeasureSlotsBusy, MeasureWallClockTimeout, MeasureWorkerGone, ProgramIdRefused,
         };
         let refused = || {
             anyhow::Error::new(ProgramIdRefused {
@@ -934,23 +1300,30 @@ mod tests {
             })
         };
         assert_eq!(
-            classify_program_id_error(BACKEND_RISC0, &refused()),
+            classify_program_id_error(BACKEND_RISC0, &refused(), true),
             Outcome::ProgramMismatch
         );
         assert_eq!(
-            classify_program_id_error(BACKEND_SP1, &refused()),
+            classify_program_id_error(BACKEND_RISC0, &refused(), false),
             Outcome::Failed,
-            "SP1 setup can fail for the host"
+            "bytes the registry does not vouch for may be a mirror's error page"
         );
+        for vouched in [true, false] {
+            assert_eq!(
+                classify_program_id_error(BACKEND_SP1, &refused(), vouched),
+                Outcome::Failed,
+                "SP1 setup can fail for the host"
+            );
+        }
         // Anything not the worker's verdict says nothing about the program.
         let dead = anyhow::anyhow!("Worker sp1 died");
         assert_eq!(
-            classify_program_id_error(BACKEND_SP1, &dead),
+            classify_program_id_error(BACKEND_SP1, &dead, true),
             Outcome::Failed
         );
         let no_worker = anyhow::anyhow!("no worker registered for backend 'sp1'");
         assert_eq!(
-            classify_program_id_error(BACKEND_SP1, &no_worker),
+            classify_program_id_error(BACKEND_SP1, &no_worker, true),
             Outcome::Failed
         );
         let busy = anyhow::Error::new(MeasureSlotsBusy {
@@ -958,22 +1331,269 @@ mod tests {
             slots: 2,
         });
         assert_eq!(
-            classify_program_id_error(BACKEND_SP1, &busy),
+            classify_program_id_error(BACKEND_SP1, &busy, true),
             Outcome::Unavailable
+        );
+        let gone = anyhow::Error::new(MeasureWorkerGone {
+            slot_key: "sp1:measure:0".into(),
+            message: "Send error: Broken pipe".into(),
+        });
+        assert_eq!(
+            classify_program_id_error(BACKEND_SP1, &gone, true),
+            Outcome::Unavailable,
+            "a worker that died while idle ran nothing"
         );
         let slow = anyhow::Error::new(MeasureWallClockTimeout {
             slot_key: "sp1:measure:0".into(),
         });
         assert_eq!(
-            classify_program_id_error(BACKEND_RISC0, &slow),
+            classify_program_id_error(BACKEND_RISC0, &slow, true),
             Outcome::Timeout
         );
         // A forged refusal text is not the typed refusal.
         let forged = anyhow::anyhow!("the worker refused to derive a program id: x");
         assert_eq!(
-            classify_program_id_error(BACKEND_RISC0, &forged),
+            classify_program_id_error(BACKEND_RISC0, &forged, true),
             Outcome::Failed
         );
+    }
+
+    #[test]
+    fn bytes_are_vouched_for_by_the_registry_elf_hash_or_a_content_hash() {
+        let (h, other) = (id(0x11), id(0x22));
+        assert!(bytes_vouched(Some(h), [], &h));
+        assert!(bytes_vouched(None, [B256::ZERO, h], &h));
+        assert!(!bytes_vouched(Some(other), [other], &h));
+        assert!(
+            !bytes_vouched(None, [], &h),
+            "no hash at all vouches for nothing"
+        );
+        assert!(
+            !bytes_vouched(None, [B256::ZERO], &B256::ZERO),
+            "a zero content hash is no hash"
+        );
+    }
+
+    #[test]
+    fn sp1_plonk_is_measured_by_the_sp1_backend_in_simulate_only() {
+        use zkminer_chain::auction::ProofSystem;
+        assert_eq!(
+            simulate_backend(ProofSystem::Sp1Plonk.id()),
+            Some(BACKEND_SP1)
+        );
+        assert_eq!(
+            simulate_backend(ProofSystem::Sp1Groth16.id()),
+            Some(BACKEND_SP1)
+        );
+        assert_eq!(
+            simulate_backend(ProofSystem::Risc0Groth16.id()),
+            Some(BACKEND_RISC0)
+        );
+        assert_eq!(simulate_backend(id(0x99)), None);
+        // The miner still does not serve PLONK: it cannot prove it.
+        assert_eq!(resolve_backend(ProofSystem::Sp1Plonk.id()), None);
+    }
+
+    #[test]
+    fn the_nonce_marker_is_unchecked_never_fails() {
+        assert_eq!(binding_label(true, None), "none");
+        assert_eq!(binding_label(false, Some(Ok(()))), "satisfied");
+        assert_eq!(
+            binding_label(false, Some(Err(BindingMismatch::NonceUnchecked))),
+            "unchecked"
+        );
+        assert_eq!(
+            binding_label(false, Some(Err(BindingMismatch::Prefix))),
+            "fails"
+        );
+        assert_eq!(
+            binding_label(
+                false,
+                Some(Err(BindingMismatch::Journal {
+                    expected: id(1),
+                    computed: id(2)
+                }))
+            ),
+            "fails"
+        );
+        assert_eq!(binding_label(false, None), "unchecked");
+        // Through the binding check itself: a nonce-marked job's journal is never judged.
+        let mut d = descriptor(B256::ZERO);
+        d.journalFields.0[..4]
+            .copy_from_slice(&zkminer_chain::binding::PROOF_NONCE_MARKER.to_be_bytes());
+        d.expectedJournalHash = id(5);
+        let verdict = zkminer_chain::binding::check_journal_binding(&d, b"j", id(1), Address::ZERO);
+        assert_eq!(binding_label(false, Some(verdict)), "unchecked");
+    }
+
+    fn descriptor(fields: B256) -> JobDescriptor {
+        JobDescriptor {
+            programId: id(0xaa),
+            proofSystemId: zkminer_chain::auction::ProofSystem::Risc0Groth16.id(),
+            callbackContract: Address::ZERO,
+            assignedProver: Address::ZERO,
+            tag: B256::ZERO,
+            inputData: vec![1u8, 2, 3].into(),
+            callbackExtraData: Default::default(),
+            extraVerifierData: Default::default(),
+            expectedJournalHash: B256::ZERO,
+            journalFields: fields,
+        }
+    }
+
+    #[test]
+    fn a_journal_prefix_job_runs_on_its_provers_input() {
+        let mut prefix_fields = B256::ZERO;
+        prefix_fields.0[..4].copy_from_slice(&JOURNAL_PREFIX_MARKER.to_be_bytes());
+        let job = id(0x22);
+        let prover = Address::repeat_byte(0x33);
+
+        // No marker, or the SP1 nonce (it binds the seal): the job's input, as it is.
+        let plain = descriptor(B256::ZERO);
+        assert_eq!(
+            guest_input(&plain, job, prover, BACKEND_SP1).unwrap(),
+            vec![1, 2, 3]
+        );
+        let mut nonce = B256::ZERO;
+        nonce.0[..4].copy_from_slice(&zkminer_chain::binding::PROOF_NONCE_MARKER.to_be_bytes());
+        assert_eq!(
+            guest_input(&descriptor(nonce), job, prover, BACKEND_SP1).unwrap(),
+            vec![1, 2, 3]
+        );
+
+        // risc0: abi.encode(jobId, prover), then the input.
+        let d = descriptor(prefix_fields);
+        let input = guest_input(&d, job, prover, BACKEND_RISC0).unwrap();
+        assert_eq!(input.len(), JOURNAL_PREFIX_BYTES + 3);
+        assert_eq!(&input[..32], job.as_slice());
+        assert_eq!(&input[32..44], &[0u8; 12]);
+        assert_eq!(&input[44..64], prover.as_slice());
+        assert_eq!(&input[64..], &[1, 2, 3]);
+        // A guest that commits its input's first 64 bytes then its output satisfies the prefix check
+        // against the same (job, prover): the measured run is the one the binding names.
+        let mut journal = input[..64].to_vec();
+        journal.extend_from_slice(b"out");
+        assert_eq!(
+            zkminer_chain::binding::check_journal_binding(&d, &journal, job, prover),
+            Ok(())
+        );
+
+        // No one to name: nothing to run.
+        let (outcome, _) = guest_input(&d, job, Address::ZERO, BACKEND_RISC0).unwrap_err();
+        assert_eq!(outcome, Outcome::Unavailable);
+        // SP1 reads the prefix as a stdin buffer of its own: not reproducible by one Execute input.
+        let (outcome, why) = guest_input(&d, job, prover, BACKEND_SP1).unwrap_err();
+        assert_eq!(outcome, Outcome::Failed);
+        assert!(why.contains("journal-prefix"), "{why}");
+    }
+
+    #[test]
+    fn a_count_above_the_cap_is_never_measured() {
+        assert_eq!(over_cycle_cap(DEFAULT_MAX_CYCLES, DEFAULT_MAX_CYCLES), None);
+        let why = over_cycle_cap(1_000_000_000_000, DEFAULT_MAX_CYCLES).unwrap();
+        assert!(
+            why.contains("1000000000000"),
+            "the count is in the reason: {why}"
+        );
+        let r = Report::new(id(1)).end(Outcome::TooHeavy, &why);
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["outcome"], "too_heavy");
+        assert_eq!(v["retryable"], false);
+        assert!(v.get("cycles").is_none());
+    }
+
+    #[test]
+    fn the_ready_line_is_exact() {
+        let mut out = Vec::new();
+        emit_ready(&mut out, &["risc0", "sp1"]).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "{{\"schema\":1,\"ready\":true,\"backends\":[\"risc0\",\"sp1\"],\
+                 \"zkminerVersion\":\"{}\",\"protocolVersion\":{}}}\n",
+                env!("CARGO_PKG_VERSION"),
+                zkminer_prover_protocol::PROTOCOL_VERSION
+            )
+        );
+    }
+
+    #[test]
+    fn a_failure_to_bind_is_remembered_per_program_for_its_ttl() {
+        let dir = std::env::temp_dir().join(format!("zkminer-sim-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let memo = ProgramFailureMemo {
+            dir: dir.clone(),
+            ttl: Duration::from_secs(3600),
+        };
+        let (p, q, sdk) = (id(1), id(2), "sp1-sdk 6.8.1");
+        assert!(memo.get(BACKEND_SP1, sdk, &p).is_none());
+        memo.put(
+            BACKEND_SP1,
+            sdk,
+            &p,
+            Outcome::Failed,
+            "the ELF served derives to 0x12 (see https://h/KEY)",
+        );
+        let (m, age) = memo.get(BACKEND_SP1, sdk, &p).expect("remembered");
+        assert!(age < 5);
+        assert_eq!(m.outcome, Outcome::Failed);
+        assert!(!m.reason.contains("KEY"), "stored redacted: {}", m.reason);
+        assert_eq!(
+            m.outcome_now(),
+            Outcome::Unavailable,
+            "a remembered failure is no new strike"
+        );
+        assert!(memo.get(BACKEND_SP1, sdk, &q).is_none(), "per program");
+        assert!(memo.get(BACKEND_RISC0, sdk, &p).is_none(), "per backend");
+        assert!(
+            memo.get(BACKEND_SP1, "sp1-sdk 6.9.0", &p).is_none(),
+            "per SDK"
+        );
+
+        memo.put(
+            BACKEND_RISC0,
+            sdk,
+            &q,
+            Outcome::ProgramMismatch,
+            "declared bytes, other id",
+        );
+        assert_eq!(
+            memo.get(BACKEND_RISC0, sdk, &q).unwrap().0.outcome_now(),
+            Outcome::ProgramMismatch,
+            "a final verdict stays final"
+        );
+        memo.clear(BACKEND_RISC0, sdk, &q);
+        assert!(
+            memo.get(BACKEND_RISC0, sdk, &q).is_none(),
+            "bytes that bound clear it"
+        );
+
+        // Expired: forgotten (and removed).
+        let old = RememberedFailure {
+            outcome: Outcome::Timeout,
+            reason: "slow".into(),
+            at: unix_now() - 3600,
+        };
+        std::fs::write(
+            memo.path(BACKEND_SP1, sdk, &p),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        assert!(memo.get(BACKEND_SP1, sdk, &p).is_none());
+        assert!(!memo.path(BACKEND_SP1, sdk, &p).exists());
+        // Garbage: ignored.
+        std::fs::write(memo.path(BACKEND_SP1, sdk, &p), "not json").unwrap();
+        assert!(memo.get(BACKEND_SP1, sdk, &p).is_none());
+
+        // A zero TTL remembers nothing.
+        let off = ProgramFailureMemo {
+            dir: dir.join("off"),
+            ttl: Duration::ZERO,
+        };
+        off.put(BACKEND_SP1, sdk, &p, Outcome::Failed, "x");
+        assert!(off.get(BACKEND_SP1, sdk, &p).is_none());
+        assert!(!off.dir.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1006,6 +1626,79 @@ mod tests {
             "status view unreadable: https://rpc.example.com/KEY123",
         );
         assert!(!r.reason.unwrap().contains("KEY123"));
+    }
+
+    #[test]
+    fn a_multibyte_char_before_a_scheme_is_kept_whole() {
+        assert_eq!(redact_urls("é://x"), "é://x");
+        assert_eq!(redact_urls("see “https://h/x”"), "see “https://h/…");
+        assert_eq!(redact_urls("详见https://h/x"), "详见https://h/…");
+        assert_eq!(
+            redact_urls("Guest panicked: →ws://a"),
+            "Guest panicked: →ws://a"
+        );
+        assert_eq!(redact_urls("→https://host/KEY"), "→https://host/…");
+        assert_eq!(redact_urls("😀http://u:p@h/k"), "😀http://h/…");
+        // Through a report, as a guest's panic text reaches one.
+        let r = Report::new(id(1)).end(
+            Outcome::Failed,
+            "execute: cycle measurement failed: Guest panicked: é://x “https://h/SECRET”",
+        );
+        assert!(!r.reason.unwrap().contains("SECRET"));
+    }
+
+    #[test]
+    fn redacting_never_panics_on_any_text() {
+        // Every mix of multi-byte, scheme and separator pieces, up to four long: no panic, and no
+        // URL path survives.
+        const PIECES: [&str; 18] = [
+            "é",
+            "“",
+            "”",
+            "详",
+            "→",
+            "😀",
+            "\u{301}",
+            "a",
+            "Z9",
+            "+",
+            "-.",
+            " ",
+            "/",
+            "@",
+            "://",
+            "https://h/SECRET",
+            "x://",
+            "\u{feff}",
+        ];
+        let n = PIECES.len();
+        let mut checked = 0;
+        for len in 1..=4u32 {
+            for mut k in 0..n.pow(len) {
+                let mut text = String::new();
+                for _ in 0..len {
+                    text.push_str(PIECES[k % n]);
+                    k /= n;
+                }
+                let out = redact_urls(&text);
+                assert!(!out.contains("SECRET"), "{text:?} -> {out:?}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, n + n.pow(2) + n.pow(3) + n.pow(4));
+        // And a long pseudo-random walk over a wider alphabet (a fixed LCG: reproducible).
+        let alphabet: Vec<char> = "a:/é“详→😀@?#.+- \u{301}\u{10ffff}".chars().collect();
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..2_000 {
+            let mut text = String::new();
+            for _ in 0..24 {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                text.push(alphabet[(seed >> 33) as usize % alphabet.len()]);
+            }
+            let _ = redact_urls(&text);
+        }
     }
 
     #[test]

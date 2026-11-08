@@ -2071,8 +2071,11 @@ async fn watch_only_reports_every_job() {
 /// `ZKMINER_LOCALNET_SP1_WORKER` set the SP1 program's too (its vkey derived on the CPU, minutes).
 /// Each measurable job must come back `measured` with its program bound (image id / vkey), a risc0
 /// count a power of two (one segment), and the binding verdict its case implies; the decoy ELF must
-/// come back `program_mismatch` and the unreachable one `unavailable`; an unknown job id
-/// `unavailable`; and the same reports through `--stdin` with submit-tx hints. Nothing is sent.
+/// come back `program_mismatch` (its URI's content hash vouches for those bytes) and the unreachable
+/// one `unavailable`; a journal-prefix job, open (no prover to name in its input), `unavailable` under
+/// risc0 and `failed` under SP1 (not reproducible); an unknown job id `unavailable`; and through
+/// `--stdin`, with submit-tx hints, a READY line first and then the same outcomes and counts. Nothing
+/// is sent.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs anvil, the release risc0 worker (a CPU one serves) and the 743111 RPC; see the module docs"]
 async fn simulate_reports_every_job() {
@@ -2157,6 +2160,15 @@ async fn simulate_reports_every_job() {
                     failures.push(format!("{what}: {outcome}, not a retryable unavailable: {r}"));
                 }
             }
+            Case::PrefixMarker => {
+                // Its input begins with abi.encode(jobId, prover), and an open job has no prover; an
+                // SP1 guest reads the prefix as a stdin buffer of its own, which simulate cannot pass.
+                let want = if sp1_job { "failed" } else { "unavailable" };
+                let reason = r["reason"].as_str().unwrap_or_default();
+                if outcome != want || r["retryable"] != true || !reason.contains("journal-prefix") {
+                    failures.push(format!("{what}: {outcome}, not a retryable {want} for its prefix: {r}"));
+                }
+            }
             case => {
                 if outcome != "measured" {
                     failures.push(format!("{what}: {outcome}, not measured: {r}"));
@@ -2221,10 +2233,28 @@ async fn simulate_reports_every_job() {
         .expect("start zkminer simulate --stdin");
     child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
     let out = child.wait_with_output().expect("wait for zkminer simulate --stdin");
+    if !out.status.success() {
+        failures.push(format!("zkminer simulate --stdin exited {}", out.status));
+    }
     let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
         .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("--stdin: not JSON ({e}): {l}")))
         .collect();
+    // First, before any request is read: READY, naming the backends with a live measure worker.
+    let mut backends = vec!["risc0"];
+    if sp1.is_some() {
+        backends.push("sp1");
+    }
+    let ready = serde_json::json!({
+        "schema": 1,
+        "ready": true,
+        "backends": backends,
+        "zkminerVersion": env!("CARGO_PKG_VERSION"),
+        "protocolVersion": zkminer_prover_protocol::PROTOCOL_VERSION,
+    });
+    if lines.first() != Some(&ready) {
+        failures.push(format!("--stdin's first line is {:?}, not {ready}", lines.first()));
+    }
     let ids: Vec<&str> = lines.iter().filter_map(|r| r["jobId"].as_str()).collect();
     if ids != [first.id.to_string(), world.jobs[1].id.to_string()] {
         failures.push(format!("--stdin reported {ids:?}"));
@@ -2232,10 +2262,37 @@ async fn simulate_reports_every_job() {
     // One line out per line in: the garbage line is answered, in its place.
     let shape: Vec<&str> = lines
         .iter()
-        .map(|r| if r["error"] == "invalid_request" { "invalid" } else { "report" })
+        .map(|r| {
+            if r["ready"] == true {
+                "ready"
+            } else if r["error"] == "invalid_request" {
+                "invalid"
+            } else {
+                "report"
+            }
+        })
         .collect();
-    if shape != ["report", "invalid", "report"] {
+    if shape != ["ready", "report", "invalid", "report"] {
         failures.push(format!("--stdin answered {shape:?}"));
+    }
+    // The indexer's own path (stdin, a submit-tx hint for the first) gives what `--job` gave.
+    for r in lines.iter().filter(|r| r["jobId"].is_string()) {
+        let id: B256 = r["jobId"].as_str().unwrap().parse().unwrap();
+        let Some(via_job) = report_of(id) else {
+            continue;
+        };
+        for field in ["outcome", "retryable", "cycles", "po2", "binding", "programCheck", "elfHash", "inputHash", "journalHash"] {
+            if r[field] != via_job[field] {
+                failures.push(format!(
+                    "--stdin's {field} for {id} is {}, --job's {}",
+                    r[field], via_job[field]
+                ));
+            }
+        }
+        let cycles: u64 = r["cycles"].as_str().and_then(|c| c.parse().ok()).unwrap_or(0);
+        if r["outcome"] != "measured" || cycles == 0 {
+            failures.push(format!("--stdin: {id} not measured with a count: {r}"));
+        }
     }
     if !String::from_utf8_lossy(&out.stderr).contains("skipping a request line") {
         failures.push("--stdin did not say it skipped the garbage line".into());

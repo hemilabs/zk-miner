@@ -77,10 +77,10 @@ openvm: dist/zkminer-prove-openvm
 
 test:
 	cargo test
-	cargo test -p zkminer-prover --features testing --test worker_lifecycle
+	cargo test -p zkminer-prover --features testing --test worker_lifecycle --test measure_only
 
 test-integration:
-	cargo test -p zkminer-prover --features testing --test worker_lifecycle
+	cargo test -p zkminer-prover --features testing --test worker_lifecycle --test measure_only
 
 # End-to-end tests, run inside the `e2e` Docker stage.
 # Extra cargo test args: make e2e E2E_ARGS="smoke"

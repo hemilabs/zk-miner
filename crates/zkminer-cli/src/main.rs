@@ -109,14 +109,23 @@ enum Commands {
         /// The risc0 segment size to measure at (risc0 cycle counts are padded per segment).
         #[arg(long, default_value_t = zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2)]
         po2: u8,
-        /// Bound on one execution, in seconds.
+        /// Bound on one execution, in seconds (at most 86400).
         #[arg(long, default_value_t = 600)]
         execute_timeout_secs: u64,
-        /// Bound on deriving one program's id, in seconds (SP1's setup on the CPU: seconds for a small
-        /// guest, minutes for a large one). Requests are served one at a time, so this also bounds how
-        /// long one new program can hold the queue.
+        /// Bound on deriving one program's id, in seconds, at most 86400 (SP1's setup on the CPU:
+        /// seconds for a small guest, minutes for a large one). Requests are served one at a time, so
+        /// this also bounds how long one new program can hold the queue.
         #[arg(long, default_value_t = 900)]
         program_id_timeout_secs: u64,
+        /// The largest cycle count reported as `measured`; a measurement above it (risc0's keccak
+        /// charge included) is reported `too_heavy`, with the count in its reason.
+        #[arg(long, default_value_t = commands::simulate::DEFAULT_MAX_CYCLES)]
+        max_cycles: u64,
+        /// How long, in seconds, a program whose ELF did not bind (refused, a different id, or a
+        /// derivation that timed out) is answered from memory instead of downloaded and derived
+        /// again; 0 = never remembered.
+        #[arg(long, default_value_t = commands::simulate::DEFAULT_PROGRAM_FAILURE_TTL_SECS)]
+        program_failure_ttl_secs: u64,
         /// The risc0 worker binary (e.g. zkminer-prove-risc0-cpu); overrides the config.
         #[arg(long)]
         risc0_worker: Option<std::path::PathBuf>,
@@ -251,20 +260,28 @@ async fn main() -> Result<()> {
             po2,
             execute_timeout_secs,
             program_id_timeout_secs,
+            max_cycles,
+            program_failure_ttl_secs,
             risc0_worker,
             sp1_worker,
             cache_dir,
         } => {
+            // Clamped: a bound near u64::MAX would overflow the watchdog's deadline arithmetic.
+            const MAX_BOUND_SECS: u64 = 86_400;
             commands::simulate::run(
                 config_path,
                 commands::simulate::SimulateOptions {
                     jobs,
                     stdin,
                     po2,
-                    execute_timeout: std::time::Duration::from_secs(execute_timeout_secs.max(1)),
-                    program_id_timeout: std::time::Duration::from_secs(
-                        program_id_timeout_secs.max(1),
+                    execute_timeout: std::time::Duration::from_secs(
+                        execute_timeout_secs.clamp(1, MAX_BOUND_SECS),
                     ),
+                    program_id_timeout: std::time::Duration::from_secs(
+                        program_id_timeout_secs.clamp(1, MAX_BOUND_SECS),
+                    ),
+                    max_cycles,
+                    program_failure_ttl: std::time::Duration::from_secs(program_failure_ttl_secs),
                     risc0_worker,
                     sp1_worker,
                     cache_dir,
@@ -324,6 +341,8 @@ mod tests {
                 stdin,
                 po2,
                 execute_timeout_secs,
+                max_cycles,
+                program_failure_ttl_secs,
                 ..
             } => {
                 assert_eq!(
@@ -336,6 +355,29 @@ mod tests {
                 assert!(stdin);
                 assert_eq!(po2, 21);
                 assert_eq!(execute_timeout_secs, 600);
+                assert_eq!(max_cycles, 4_000_000_000);
+                assert_eq!(program_failure_ttl_secs, 6 * 3600);
+            }
+            _ => panic!("not a simulate command"),
+        }
+        let cli = Cli::try_parse_from([
+            "zkminer",
+            "simulate",
+            "--stdin",
+            "--max-cycles",
+            "1000",
+            "--program-failure-ttl-secs",
+            "0",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Simulate {
+                max_cycles,
+                program_failure_ttl_secs,
+                ..
+            } => {
+                assert_eq!(max_cycles, 1000);
+                assert_eq!(program_failure_ttl_secs, 0);
             }
             _ => panic!("not a simulate command"),
         }

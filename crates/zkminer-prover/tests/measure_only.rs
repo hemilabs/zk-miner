@@ -198,6 +198,107 @@ fn a_derivation_past_its_bound_is_a_typed_timeout_and_frees_the_slot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Block until `pid` has exited (a zombie or gone): its pipes are closed from then on.
+fn wait_exited(pid: u32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| {
+                s.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+            });
+        if matches!(state.as_deref(), None | Some("Z") | Some("X")) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pid {pid} did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_worker_found_dead_when_a_request_is_sent_is_typed_gone() {
+    use zkminer_prover_protocol::types::MeasureWorkerGone;
+    let dir = temp_dir("gone");
+    let binaries = HashMap::from([("risc0".to_string(), wrapper(&dir, "risc0", &[]))]);
+    let (pool, _) = measure_only_pool(binaries);
+    // Both measure workers die while idle (an OOM kill between requests, say).
+    for i in 0..2 {
+        let (live, pid, _) = pool.test_measure_slot_state("risc0", i).unwrap();
+        assert!(live && pid > 0);
+        let killed = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        wait_exited(pid);
+    }
+    let err = pool
+        .derive_program_id("risc0", b"elf", Some(Duration::from_secs(30)))
+        .expect_err("its worker is gone");
+    assert!(
+        err.downcast_ref::<MeasureWorkerGone>().is_some(),
+        "typed, so a caller can tell nothing ran: {err:#}"
+    );
+    let err = pool
+        .execute_cycles(
+            "risc0",
+            b"elf",
+            &[1],
+            Some(Duration::from_secs(30)),
+            None,
+            Some(20),
+        )
+        .expect_err("its worker is gone too");
+    assert!(
+        err.downcast_ref::<MeasureWorkerGone>().is_some(),
+        "the same on the execute path: {err:#}"
+    );
+    // Both slots were cleared, not scored, and the next request revives one.
+    for i in 0..2 {
+        let (live, _, failures) = pool.test_measure_slot_state("risc0", i).unwrap();
+        assert!(!live, "slot {i} cleared");
+        assert_eq!(failures, 0, "slot {i} not scored against");
+    }
+    let d = pool
+        .derive_program_id("risc0", b"elf", Some(Duration::from_secs(30)))
+        .expect("a revived worker derives");
+    assert_eq!(d.program_id, keccak256(b"elf").0);
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_worker_that_dies_during_a_request_is_not_gone() {
+    // The death is the request's (it may be the guest's doing): untyped, and the slot is scored.
+    let dir = temp_dir("dies-during");
+    let binaries = HashMap::from([(
+        "risc0".to_string(),
+        wrapper(&dir, "risc0", &[("MOCK_CRASH_ON", "execute")]),
+    )]);
+    let (pool, _) = measure_only_pool(binaries);
+    let err = pool
+        .execute_cycles(
+            "risc0",
+            b"elf",
+            &[1],
+            Some(Duration::from_secs(30)),
+            None,
+            Some(20),
+        )
+        .expect_err("it died");
+    assert!(
+        err.downcast_ref::<zkminer_prover_protocol::types::MeasureWorkerGone>()
+            .is_none(),
+        "{err:#}"
+    );
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn no_measure_worker_means_none_live() {
     let pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
