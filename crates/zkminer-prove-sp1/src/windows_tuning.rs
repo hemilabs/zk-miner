@@ -54,28 +54,6 @@ pub(crate) fn apply_hip_readbacks() {
     }
 }
 
-/// Keep the trace LDEs on a 16 GB AMD card (`SP1_GPU_DROP_LDES=0`).
-///
-/// `sp1-gpu-server` drops a shard's low-degree extensions after its trace commit and re-encodes them
-/// later on every card of 20 GB or less, trading time for memory. On Windows a 16 GB HIP card proves
-/// at most 2^27-element shards (no device memory arena there), and with the LDEs kept an RX 9070 XT
-/// peaked at 13.8 GiB of its 15.06 GiB video memory budget. Through zk-miner, every proof verified:
-/// sha256-chain (213M cycles) 62-64 -> 57-59 s, chacha-mix 19-20 -> 17-18 s; SP1's node bench,
-/// 720M-cycle fibonacci: core 11.30 -> 10.40 s, compressed 19.08 -> 17.84 s. A card that also drives
-/// a display gets a smaller budget, and the server then proves 2^26-element shards, whose LDEs take
-/// half the memory (not measured). From 15 GiB of card memory; a value the operator set wins.
-pub(crate) fn apply_hip_keep_ldes(vram_bytes: Option<u64>) {
-    const VAR: &str = "SP1_GPU_DROP_LDES";
-    if std::env::var_os(VAR).is_some() || crate::warmup::server_name() != "sp1-gpu-server-hip" {
-        return;
-    }
-    if vram_bytes.is_some_and(|b| b >= 15 << 30) {
-        tracing::info!("SP1 tuning: {VAR}=0 (16 GB AMD card on Windows: the LDEs stay on the card)");
-        // SAFETY: single-threaded startup, before any prover, server or thread exists.
-        unsafe { std::env::set_var(VAR, "0") };
-    }
-}
-
 /// The wrap prover's persistent proving key (`SP1_WRAP_PERSISTENT_PK`) on a 16 GB Intel card.
 ///
 /// `sp1-gpu-server` keeps the Groth16/PLONK key between proofs only on cards with 24 GB or more,

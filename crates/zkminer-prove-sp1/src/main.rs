@@ -1210,8 +1210,6 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     windows_tuning::apply_cuda_groth16_helper();
     #[cfg(windows)]
     windows_tuning::apply_hip_readbacks();
-    #[cfg(windows)]
-    windows_tuning::apply_hip_keep_ldes(vram_bytes);
     match cuda_device_id {
         Some(id) => tracing::info!("SP1 worker will drive CUDA device {id}"),
         None => tracing::info!(
