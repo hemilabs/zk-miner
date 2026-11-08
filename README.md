@@ -383,13 +383,17 @@ A `measured` report also says whether its count is evidence of the proven run:
   backend is known to have a worker).
 
 A count is evidence when `proven` is `matches`, `hostInput` is `false` and `binding` is not `fails`.
+That catches an honest mismatch and a nondeterministic guest. It does not bind the run to the proven
+one: the chain never checks the input, so a requester who is also the prover can prove another
+input with the same journal and choose a count up to `--max-cycles`. A keccak request the guest
+never assumes costs its prover nothing, so a run with one reports `hostInput: true`.
 
 risc0 guests' `sys_rand` is seeded from a key made for each run, never this host's
 `~/.zkminer/risc0-sys-rand.key` (neither read nor created, so a HOME it cannot write is fine), and
 the journal comes back for it: in simulate it backs no proof.
 
 **The failure memory.** A program whose ELF did not bind (refused, another id, a derivation past its
-bound, a worker that died deriving it) is remembered under `<cache-dir>/program-failures` for
+bound, or for a shorter 15 minutes a worker that died deriving it, which may be the host's doing) is remembered under `<cache-dir>/program-failures` for
 `--program-failure-ttl-secs` (default 6 h, 0 = off), and one whose ELF could not be fetched for
 15 minutes (at most that TTL). Its other jobs are answered from the memory, `unavailable` (or
 `program_mismatch` when that was the verdict), instead of each paying a download and a derivation, or

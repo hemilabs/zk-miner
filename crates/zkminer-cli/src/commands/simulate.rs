@@ -24,8 +24,9 @@
 //!    job's `inputData`, after `abi.encode(jobId, prover)` for a journal-prefix job (risc0 only);
 //! 6. the measured journal against the job's binding, and against the fulfil's `publicValues` when
 //!    the request carries them (`proven`), and whether the guest read host entropy (`hostInput`).
-//!    A count is evidence of the proven run only when the journal is the proven one and the guest
-//!    read nothing a prover chooses.
+//!    These catch an honest mismatch and a nondeterministic guest. They do not bind the run to the
+//!    proven one: the chain never checks the input, so a requester who is also the prover can
+//!    prove another input with the same journal, and choose a count up to `--max-cycles`.
 //!
 //! risc0 guests' `sys_rand` is seeded from a key of this run's own (never `~/.zkminer`'s, which is
 //! neither read nor created), and the journal comes back for it: here it backs no proof.
@@ -34,7 +35,7 @@
 //! that died deriving it), or could not be fetched, is remembered on disk (`<cache-dir>/program-
 //! failures`), so its other jobs do not each pay a download and a derivation (an SP1 `setup` is
 //! minutes): they are answered `unavailable` from the memory (`program_mismatch` when that was the
-//! verdict) until it expires, for `--program-failure-ttl-secs`, or [`FETCH_FAILURE_TTL`] for a fetch.
+//! verdict) until it expires, for `--program-failure-ttl-secs`, or [`FETCH_FAILURE_TTL`] for a fetch or a worker that died.
 //! A memory holds only while the program's registry entry reads as it did (its `elf_hash` and
 //! URIs), and only for this zkminer build. A count above `--max-cycles` is `too_heavy`, never
 //! `measured`.
@@ -1340,7 +1341,9 @@ impl Simulator {
                 &RememberedFailure::new(
                     outcome,
                     &reason,
-                    self.failures.ttl,
+                    // A worker that died deriving may be the host's doing (an OOM kill): remembered
+                    // briefly, so one death does not hold every job of the program for hours.
+                    if died { FETCH_FAILURE_TTL } else { self.failures.ttl },
                     registry,
                     Some(elf_hash),
                 ),
@@ -1515,20 +1518,6 @@ pub async fn run(config_path: Option<&Path>, opts: SimulateOptions) -> Result<()
     .map_err(|e| anyhow::anyhow!("worker discovery task panicked: {e}"))?;
     init_worker_pool(pool);
     let pool = zkminer_prover::engine::worker_pool().context("worker pool not initialised")?;
-    // SP1's measure worker builds its CPU prover on first use (~15 s): before READY, and outside
-    // any request's bound, so a request's bound is the request's alone.
-    if pool.measure_workers_live(BACKEND_SP1) > 0 {
-        let ok = tokio::task::spawn_blocking(move || {
-            pool.warm_measure_worker(BACKEND_SP1, SP1_SETUP_BOUND)
-        })
-        .await
-        .unwrap_or(false);
-        if !ok {
-            tracing::warn!(
-                "simulate: the SP1 measure worker could not be set up now; each SP1 request tries again"
-            );
-        }
-    }
     // The backends with a live measure worker, and each one's SDK version (it keys the program-id
     // cache). A job for any other backend is answered `no_worker` without a request to the chain
     // beyond its status view.
@@ -1543,6 +1532,22 @@ pub async fn run(config_path: Option<&Path>, opts: SimulateOptions) -> Result<()
             "no measure worker started: name a risc0 and/or an SP1 worker binary (--risc0-worker, \
              --sp1-worker, or [prover.worker_binaries])"
         );
+    }
+    // SP1's measure worker builds its CPU prover on first use (~15 s): before READY, and outside
+    // any request's bound, so a request's bound is the request's alone. After `served` is built: a
+    // warm-up that fails must not drop SP1 for this process's whole life (the worker is revived by
+    // the next SP1 request).
+    if served.contains_key(BACKEND_SP1) {
+        let ok = tokio::task::spawn_blocking(move || {
+            pool.warm_measure_worker(BACKEND_SP1, SP1_SETUP_BOUND)
+        })
+        .await
+        .unwrap_or(false);
+        if !ok {
+            tracing::warn!(
+                "simulate: the SP1 measure worker could not be set up now; each SP1 request tries again"
+            );
+        }
     }
     let mut names: Vec<&str> = served.keys().copied().collect();
     names.sort_unstable();

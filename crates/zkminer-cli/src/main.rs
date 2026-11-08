@@ -103,7 +103,9 @@ enum Commands {
         #[arg(long = "job", value_name = "JOB_ID")]
         jobs: Vec<alloy::primitives::B256>,
         /// Then read requests from stdin until EOF, one per line: a job id, or
-        /// {"jobId": "0x…", "submitTx": "0x…"} (the submitting tx saves the descriptor's log scan).
+        /// {"jobId": "0x…", "submitTx": "0x…", "publicValues": "0x…"} (the submitting tx saves the
+        /// descriptor's log scan; the fulfil's public values let the report say whether the measured
+        /// journal is the proven one).
         #[arg(long)]
         stdin: bool,
         /// The risc0 segment size to measure at (risc0 cycle counts are padded per segment).

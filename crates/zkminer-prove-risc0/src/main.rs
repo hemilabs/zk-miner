@@ -919,14 +919,26 @@ fn job_segment_po2(po2: Option<u8>) -> anyhow::Result<u8> {
     Ok(po2)
 }
 
+/// A keccak request the guest never assumes is charged in the cycle count but binds nothing in the
+/// receipt, so a prover need not prove it: that part of the count is free to inflate. Reports the
+/// evidence as unknown (`None` fails closed in `simulate`); the miner's own sizing ignores the field.
+fn reads_given_keccak(reads: Option<u64>, keccak_cycles: u64, assumptions: usize) -> Option<u64> {
+    if keccak_cycles > 0 && assumptions == 0 {
+        None
+    } else {
+        reads
+    }
+}
+
 /// Counts the guest's `sys_rand` calls during an execution, for `ExecuteResult.host_entropy_reads`.
 ///
 /// `sys_rand` is the one syscall risc0's executor answers from host entropy (seeded here, see
 /// [`sys_rand_seed`], but by a key the job's prover does not share): `sys_getenv` and `sys_argv` read
 /// an environment and arguments this worker leaves empty, `sys_read` the job's input, `sys_cycle_count`
 /// the run itself, and the keccak and verify calls are checked functions of what the guest passes.
-/// So a guest that reads none beyond its runtime's own draw ran the path its input gives, whoever
-/// runs it.
+/// So reading none beyond its runtime's own draw rules out a guest whose path depends on host
+/// entropy. It does not bind the run to the proven one: the chain never checks the input, so a
+/// requester who is also the prover can prove another input with the same journal.
 ///
 /// The executor exposes no count, so this counts the line the pinned fork's handler logs at DEBUG
 /// for each call (`risc0/zkvm/src/host/server/exec/syscall/random.rs`: `SYS_RANDOM: <words>`), with a
@@ -1121,6 +1133,8 @@ fn run_execute(
     // Measured at `po2`, the size the job proves at on its card. Each keccak request is a further
     // proof of its own (a 2^17-row keccak STARK, its lift and a join), priced here as a 2^20 segment.
     let cycles: u64 = session.segments.iter().map(|s| 1u64 << s.po2).sum::<u64>() + keccak.cycles;
+    let host_entropy_reads =
+        reads_given_keccak(host_entropy_reads, keccak.cycles, assumptions.0.len());
     // The journal the guest committed here is byte-identical to the one the later proof
     // would carry at this segment size (both are a deterministic function of (ELF, input) at the size
     // both run at, which a guest can tell — `sys_rand` included, via the shared seed — and the image-id
@@ -1911,6 +1925,14 @@ mod sys_rand_tests {
 mod sys_rand_draw_tests {
     use super::sys_rand_draws::{self, Draws};
     use super::*;
+
+    #[test]
+    fn a_keccak_charge_the_guest_never_assumes_is_no_evidence() {
+        assert_eq!(reads_given_keccak(Some(0), 1 << 20, 0), None, "charged, assumed by nothing");
+        assert_eq!(reads_given_keccak(Some(0), 1 << 20, 1), Some(0), "assumed: bound in the receipt");
+        assert_eq!(reads_given_keccak(Some(0), 0, 0), Some(0), "no keccak at all");
+        assert_eq!(reads_given_keccak(Some(3), 1 << 20, 1), Some(3));
+    }
 
     #[test]
     fn only_draws_past_the_runtimes_own_count() {
