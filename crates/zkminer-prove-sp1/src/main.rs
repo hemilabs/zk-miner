@@ -1927,6 +1927,12 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             peak_host_bytes,
                             // One no fulfil could carry is reported by its length alone.
                             journal: (journal.len() <= EXECUTE_JOURNAL_MAX_BYTES).then_some(journal),
+                            // Nothing the guest reads is host entropy: an SP1 guest's `sys_rand` is an
+                            // in-guest PRNG with a fixed seed (sp1-zkvm `syscalls/sys.rs`, PRNG_SEED),
+                            // and the executor answers every syscall from the stdin (HINT_LEN /
+                            // HINT_READ), the run itself, or a hook, which is a fixed function of what
+                            // the guest wrote to it. The proof nonce is not visible to the guest.
+                            host_entropy_reads: Some(0),
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -2003,6 +2009,31 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         message: "SP1 setup panicked on this ELF (malformed or hostile program)"
                             .to_string(),
                     },
+                };
+                write_message(&mut stdout, &resp)?;
+            }
+
+            WorkerCommand::Warmup { request_id } if sp1_measure_only() => {
+                // A measure-only worker proves nothing, so it needs no Groth16 artifacts: its one
+                // setup is the CPU prover its `Execute` and `ProgramId` run on (~15 s on first use),
+                // built here, outside any request's watchdog, when the host asks (`zkminer simulate`
+                // does before READY and after a respawn).
+                let started = Instant::now();
+                let resp = if cpu_prover(&mut cpu_executor).is_some() {
+                    WorkerResponse::WarmupDone {
+                        request_id,
+                        summary: format!(
+                            "CPU prover ready in {:.1}s",
+                            started.elapsed().as_secs_f64()
+                        ),
+                        groth16_helper: false,
+                    }
+                } else {
+                    WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::Internal,
+                        message: "failed to initialise the SP1 CPU executor for sizing".to_string(),
+                    }
                 };
                 write_message(&mut stdout, &resp)?;
             }

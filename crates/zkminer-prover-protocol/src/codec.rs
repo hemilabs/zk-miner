@@ -243,6 +243,49 @@ mod tests {
         const _: () = assert!(PROTOCOL_VERSION >= 11);
     }
 
+    /// v11 also gave `ExecuteResult` its last field, `host_entropy_reads`: every value round-trips,
+    /// `None` included (an unknown count, which a reader must not take for zero), and the fields
+    /// before it keep their places.
+    #[test]
+    fn an_execute_result_carries_its_host_entropy_reads() {
+        for reads in [None, Some(0), Some(1), Some(u64::MAX)] {
+            let mut buf = Vec::new();
+            write_message(
+                &mut buf,
+                &WorkerResponse::ExecuteResult {
+                    request_id: 3,
+                    cycles: 1 << 20,
+                    duration_secs: 0.5,
+                    journal_len: 2,
+                    peak_host_bytes: 7,
+                    journal: Some(vec![0xab, 0xcd]),
+                    host_entropy_reads: reads,
+                },
+            )
+            .unwrap();
+            match read_message::<_, WorkerResponse>(&mut Cursor::new(buf)).unwrap() {
+                WorkerResponse::ExecuteResult {
+                    request_id,
+                    cycles,
+                    journal_len,
+                    peak_host_bytes,
+                    journal,
+                    host_entropy_reads,
+                    ..
+                } => {
+                    assert_eq!(
+                        (request_id, cycles, journal_len, peak_host_bytes),
+                        (3, 1 << 20, 2, 7)
+                    );
+                    assert_eq!(journal.as_deref(), Some(&[0xab, 0xcd][..]));
+                    assert_eq!(host_entropy_reads, reads);
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+        const _: () = assert!(PROTOCOL_VERSION >= 11);
+    }
+
     #[test]
     fn round_trip_response() {
         let resp = WorkerResponse::HelloAck {

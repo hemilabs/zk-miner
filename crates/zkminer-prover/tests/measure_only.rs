@@ -93,7 +93,37 @@ fn a_measure_only_pool_starts_measure_workers_and_no_prover() {
         )
         .expect("the mock measures");
     assert_eq!(m.cycles, 1020, "1,000 plus the segment size asked for");
+    assert_eq!(
+        m.host_entropy_reads,
+        Some(0),
+        "the worker's count of host-entropy reads comes through"
+    );
     pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_uncounted_host_entropy_read_stays_unknown() {
+    let dir = temp_dir("entropy");
+    for (value, want) in [("3", Some(3)), ("unknown", None)] {
+        let binaries = HashMap::from([(
+            "risc0".to_string(),
+            wrapper(&dir, "risc0", &[("MOCK_HOST_ENTROPY_READS", value)]),
+        )]);
+        let (pool, _) = measure_only_pool(binaries);
+        let m = pool
+            .execute_cycles(
+                "risc0",
+                b"elf",
+                &[],
+                Some(Duration::from_secs(30)),
+                None,
+                None,
+            )
+            .expect("the mock measures");
+        assert_eq!(m.host_entropy_reads, want, "{value}: never read as 0");
+        pool.shutdown_all();
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -146,7 +176,13 @@ fn a_worker_that_dies_deriving_is_not_a_refusal() {
     assert!(
         err.downcast_ref::<zkminer_prover_protocol::types::ProgramIdRefused>()
             .is_none(),
-        "a death says nothing about the program: {err:#}"
+        "a death is not the worker's refusal: {err:#}"
+    );
+    // Typed, so `zkminer simulate` can remember the program rather than derive it again per job.
+    assert!(
+        err.downcast_ref::<zkminer_prover_protocol::types::MeasureWorkerDied>()
+            .is_some(),
+        "{err:#}"
     );
     // The dead slot is cleared and scored, so the next request revives it.
     let states: Vec<_> = (0..2)
@@ -271,6 +307,67 @@ fn a_worker_found_dead_when_a_request_is_sent_is_typed_gone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// SP1's measure worker is set up (its CPU prover built) outside any request's bound, once per
+/// spawn, on the worker the next request will use; a worker that died idle is respawned and set up
+/// again before a request finds it gone.
+#[test]
+fn the_next_sp1_measure_worker_is_set_up_once_per_spawn() {
+    let dir = temp_dir("warm");
+    let binaries = HashMap::from([
+        ("sp1".to_string(), wrapper(&dir, "sp1", &[])),
+        ("risc0".to_string(), wrapper(&dir, "risc0", &[])),
+    ]);
+    let (pool, _) = measure_only_pool(binaries);
+    // risc0 has no such setup: ready while a worker runs.
+    assert!(pool.warm_measure_worker("risc0", Duration::from_secs(5)));
+    if !pool.measure_worker_count("sp1").is_some_and(|n| n > 0) {
+        // This host's /dev/shm is too small for an SP1 measure pool (see the first test).
+        pool.shutdown_all();
+        return;
+    }
+    assert!(pool.warm_measure_worker("sp1", Duration::from_secs(30)));
+    let (_, pid, _) = pool.test_measure_slot_state("sp1", 0).unwrap();
+    assert!(pool.warm_measure_worker("sp1", Duration::from_secs(30)), "still set up");
+    assert_eq!(pool.test_measure_slot_state("sp1", 0).unwrap().1, pid, "the same worker");
+    // It dies idle: respawned and set up before any request.
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    wait_exited(pid);
+    assert!(pool.warm_measure_worker("sp1", Duration::from_secs(30)));
+    let (live, new_pid, _) = pool.test_measure_slot_state("sp1", 0).unwrap();
+    assert!(live && new_pid != pid, "a new worker in the same slot");
+    // And the request after it runs on it.
+    pool.derive_program_id("sp1", b"elf", Some(Duration::from_secs(30)))
+        .expect("a set-up worker derives");
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_set_up_past_its_bound_is_killed_and_reports_not_ready() {
+    let dir = temp_dir("warm-hang");
+    let binaries = HashMap::from([(
+        "sp1".to_string(),
+        wrapper(&dir, "sp1", &[("MOCK_HANG_ON", "warmup")]),
+    )]);
+    let (pool, _) = measure_only_pool(binaries);
+    if !pool.measure_worker_count("sp1").is_some_and(|n| n > 0) {
+        pool.shutdown_all();
+        return;
+    }
+    let started = std::time::Instant::now();
+    assert!(!pool.warm_measure_worker("sp1", Duration::from_secs(2)));
+    assert!(started.elapsed() < Duration::from_secs(20), "bounded");
+    let (live, _, failures) = pool.test_measure_slot_state("sp1", 0).unwrap();
+    assert!(!live, "the watchdog killed it");
+    assert_eq!(failures, 0, "its own bound's kill is not scored against the slot");
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_worker_that_dies_during_a_request_is_not_gone() {
     // The death is the request's (it may be the guest's doing): untyped, and the slot is scored.
@@ -358,6 +455,14 @@ fn the_risc0_worker_derives_its_guests_image_id_and_measures_it() {
     let dir = temp_dir("risc0-real");
     // The risc0 worker exports its fibonacci guest only.
     let (fib, fib_id) = export(&worker, "fibonacci", &dir);
+    // As `zkminer simulate` runs it under the indexer's unit: a HOME it cannot write (so no key file
+    // can be read or made there) and a `sys_rand` key for this run only, passed as not ephemeral. The
+    // worker must still return the journal, or every binding reads `unchecked`.
+    let home = dir.join("read-only-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
+    std::env::set_var("HOME", &home);
+    zkminer_prover::worker::set_risc0_sys_rand_key([0x5a; 32], false);
     let pool = real_pool("risc0", worker);
     let d = pool
         .derive_program_id("risc0", &fib, Some(Duration::from_secs(60)))
@@ -395,9 +500,16 @@ fn the_risc0_worker_derives_its_guests_image_id_and_measures_it() {
     assert_eq!(
         m.journal.as_deref(),
         Some(&55u64.to_le_bytes()[..]),
-        "fibonacci(10) = 55"
+        "fibonacci(10) = 55, returned under the per-run key"
+    );
+    // It reads no host entropy past its runtime's own draw; and this build's count works (else None).
+    assert_eq!(m.host_entropy_reads, Some(0));
+    assert!(
+        !home.join(".zkminer").exists(),
+        "nothing was created under HOME"
     );
     pool.shutdown_all();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 /// [`RISC0_JOB_PO2_MAX`]. A v9 worker would measure every job at 20 whatever the host asked.
 /// 11: `ProgramId` / `ProgramIdResult`: the program id a chain binds a proof of an ELF to (the risc0
 /// image id, the SP1 verifying-key hash), derived without executing it. A v10 worker cannot decode the
-/// command, so the handshake refuses it.
+/// command, so the handshake refuses it. And `ExecuteResult` gained `host_entropy_reads`, whether the
+/// guest read host-supplied nondeterministic input (both in the same unreleased version).
 pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
@@ -215,6 +216,21 @@ pub enum WorkerResponse {
         /// journal-bound job on this measurement. `Some(vec![])` is a guest that committed nothing.
         #[serde(default)]
         journal: Option<Vec<u8>>,
+        /// How many times the guest read host-supplied nondeterministic input during this execution,
+        /// beyond what every guest's runtime reads by itself. A guest that branched on such input may
+        /// have run another path, and committed another journal, when its prover ran it, so a
+        /// measurement with any is no evidence of the proven run.
+        ///
+        /// risc0: the guest's `sys_rand` calls (the only syscall the host answers from entropy rather
+        /// than from the job's input or the run itself), less the one 4-word draw risc0's guest
+        /// runtime makes before `main` for its memory-image entropy. A guest that reads that draw's
+        /// bytes cannot be told from one that does not. `None` when the run drew nothing at all: a
+        /// guest without risc0's runtime, or a count that does not work in this build.
+        /// SP1: always `Some(0)`: its guests' `sys_rand` is an in-guest PRNG with a fixed seed, and
+        /// its executor answers every syscall from the input (hints), the run, or a deterministic hook.
+        /// `None` from any other worker: not counted.
+        #[serde(default)]
+        host_entropy_reads: Option<u64>,
     },
     /// Progress update during proving.
     Progress {
@@ -676,6 +692,32 @@ impl std::fmt::Display for MeasureWorkerGone {
 }
 
 impl std::error::Error for MeasureWorkerGone {}
+
+/// The measure worker died DURING a `ProgramId` request: its pipe closed before it answered, and
+/// not by the request's own watchdog (that is [`MeasureWallClockTimeout`]). The derivation is a pure
+/// function of the ELF, so a death there is most often the ELF's doing (an image that balloons the
+/// SDK past the worker's RSS guard, or past the host's memory); a host OOM that picked the worker
+/// reads the same. Typed so a caller can remember the program for a while instead of downloading and
+/// deriving it again for each of its jobs. Only the dispatcher's receive-failure arm constructs it.
+#[derive(Debug, Clone)]
+pub struct MeasureWorkerDied {
+    /// The slot whose worker died, e.g. `sp1:measure:0`.
+    pub slot_key: String,
+    /// The receive error.
+    pub message: String,
+}
+
+impl std::fmt::Display for MeasureWorkerDied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "measure worker {} died while deriving a program id ({})",
+            self.slot_key, self.message
+        )
+    }
+}
+
+impl std::error::Error for MeasureWorkerDied {}
 
 /// A worker answered a `ProgramId` request with `InvalidInput`: its SDK refused to derive a program
 /// id from these bytes (risc0: not an ELF it can compute an image id for; SP1: `setup` failed on it).

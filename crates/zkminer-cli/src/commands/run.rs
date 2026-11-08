@@ -11096,6 +11096,9 @@ async fn measure_cycles(
                     journal,
                     peak_host_bytes,
                     duration_secs,
+                    // Simulate's evidence rule; the miner's own measure-matches-prove guarantee is the
+                    // shared seed key, not this count.
+                    host_entropy_reads: _,
                 } = measurement;
                 if paces_claims {
                     clear_preclaim_strikes(job_id);

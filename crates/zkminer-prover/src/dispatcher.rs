@@ -77,6 +77,9 @@ pub struct ExecuteMeasurement {
     pub peak_host_bytes: u64,
     /// How long the execute took, in seconds: what a proof spends executing the guest again.
     pub duration_secs: f64,
+    /// How many times the guest read host-supplied nondeterministic input (risc0: `sys_rand` past its
+    /// runtime's own draw), `None` = not counted; see `WorkerResponse::ExecuteResult`.
+    pub host_entropy_reads: Option<u64>,
 }
 
 /// What a `ProgramId` request derived (see [`WorkerPool::derive_program_id`]).
@@ -1711,6 +1714,9 @@ pub struct WorkerPool {
     memory_ledger: crate::memory::MemoryLedger,
     /// Backends whose one-time setup has completed on this host; see `warm_up`.
     warmed: Mutex<HashSet<String>>,
+    /// Measure slot key -> the pid of the worker in it whose setup has run; see
+    /// `warm_measure_worker`. A respawned worker has another pid, so it is set up again.
+    measure_warm_pids: Mutex<HashMap<String, u32>>,
     /// Whether SP1's server proves Groth16 in a helper process, as its warm-up reported. A peak read
     /// from live processes must then add the helper's; see `host_peak_for_slot`.
     sp1_groth16_helper: AtomicBool,
@@ -1791,6 +1797,7 @@ impl WorkerPool {
             expected_peaks: Mutex::new(HashMap::new()),
             memory_ledger: crate::memory::MemoryLedger::default(),
             warmed: Mutex::new(HashSet::new()),
+            measure_warm_pids: Mutex::new(HashMap::new()),
             sp1_groth16_helper: AtomicBool::new(false),
             workers: HashMap::new(),
             measure_workers: HashMap::new(),
@@ -2671,6 +2678,113 @@ impl WorkerPool {
     /// exceeded the pool on >=3-GPU rigs (over-spawning into the "all slots busy" race).
     pub fn measure_worker_count(&self, backend: &str) -> Option<usize> {
         self.measure_workers.get(backend).map(|p| p.len())
+    }
+
+    /// Runs the one-time setup of the measure worker `backend`'s next request will run on, now,
+    /// outside any request's watchdog, unless that worker has run it since it was (re)spawned:
+    /// for SP1, building the CPU prover its `Execute` and `ProgramId` run on (~15 s, and the memory it
+    /// then keeps). Without it the first request after each spawn pays that inside its own bound, so
+    /// a tight bound fails every request (each kill respawns a cold worker). The worker is the one
+    /// `measure_slot` picks: the first live one, else the first it would revive, revived (or
+    /// respawned, if it died idle) here. Only that one, so an idle second worker never holds a CPU
+    /// prover it does not use. Charged to the host-RAM ledger as a measurement is, and bounded by
+    /// `timeout` (a watchdog kill). Only SP1 has such a setup (risc0: true while one runs). For
+    /// `zkminer simulate`, which calls it before its READY line and before each SP1 request; the
+    /// miner keeps its SP1 measure worker lazy. Whether that worker is now set up.
+    pub fn warm_measure_worker(&self, backend: &str, timeout: Duration) -> bool {
+        if backend != zkminer_prover_protocol::BACKEND_SP1 {
+            return self.measure_workers_live(backend) > 0;
+        }
+        let Some(pool) = self.measure_workers.get(backend) else {
+            return false;
+        };
+        // Never waits on a lock: a slot in use is running a request (never in simulate, which is
+        // serial), and `measure_slot` would pass it over too.
+        let chosen = pool
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| {
+                let sl = e.slot.try_lock().ok()?;
+                sl.handle.is_some().then_some((i, e, sl))
+            })
+            .or_else(|| {
+                pool.iter().enumerate().find_map(|(i, e)| {
+                    let sl = e.slot.try_lock().ok()?;
+                    (sl.handle.is_none() && Self::slot_dispatchable(&sl)).then_some((i, e, sl))
+                })
+            });
+        let Some((i, entry, mut slot)) = chosen else {
+            return false;
+        };
+        let key = format!("{backend}:measure:{i}");
+        // A worker that died idle is respawned here, before a request would find it gone.
+        if let Err(e) = self.ensure_alive(&mut slot, entry) {
+            tracing::debug!("{key}: could not start it to set it up: {e:#}");
+            return false;
+        }
+        let Some(pid) = slot.handle.as_ref().map(|h| h.pid()) else {
+            return false;
+        };
+        entry.publish_pid(pid);
+        let warmed_pid = self
+            .measure_warm_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied();
+        if warmed_pid == Some(pid) {
+            return true;
+        }
+        let total = crate::memory::mem_total_bytes().unwrap_or(u64::MAX);
+        let Some(_mem) = self.reserve_host_memory(crate::memory::sp1_measure_cap_bytes(total), &key)
+        else {
+            tracing::debug!("{key}: no host memory to set it up in now; its first request will");
+            return false;
+        };
+        static MEASURE_WARMUP_REQUEST: AtomicU64 = AtomicU64::new(1);
+        // Disjoint from the other request ids (execute ids set the top bit, program-id ones the next).
+        let request_id =
+            MEASURE_WARMUP_REQUEST.fetch_add(1, Ordering::Relaxed) | 0x2000_0000_0000_0000;
+        entry.intentional_kill.store(false, Ordering::Release);
+        let Some(handle) = slot.handle.as_mut() else {
+            return false;
+        };
+        if handle.send(&WorkerCommand::Warmup { request_id }).is_err() {
+            Self::mark_slot_dead(&mut slot, entry);
+            return false;
+        }
+        let watchdog = ProvingWatchdog::new(
+            entry.pid.clone(),
+            entry.pid_starttime.clone(),
+            timeout,
+            key.clone(),
+            entry.intentional_kill.clone(),
+        );
+        let response = handle.recv();
+        drop(watchdog);
+        match response {
+            Ok(WorkerResponse::WarmupDone { summary, .. }) => {
+                tracing::info!("{key} set up: {summary}");
+                self.measure_warm_pids
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, pid);
+                true
+            }
+            Ok(other) => {
+                tracing::warn!("{key}: its set-up answered {other:?}");
+                false
+            }
+            Err(e) => {
+                tracing::warn!("{key} died setting up: {e:#}");
+                if entry.intentional_kill.load(Ordering::Acquire) {
+                    Self::mark_slot_dead(&mut slot, entry);
+                } else {
+                    Self::mark_slot_failed(&mut slot, entry);
+                }
+                false
+            }
+        }
     }
 
     /// How many of `backend`'s measure workers are running now (a busy one counts). 0 when it has
@@ -4422,6 +4536,7 @@ impl WorkerPool {
                 journal_len,
                 peak_host_bytes,
                 journal,
+                host_entropy_reads,
                 ..
             } => {
                 tracing::debug!(
@@ -4452,6 +4567,7 @@ impl WorkerPool {
                     journal: whole_journal(journal, journal_len),
                     peak_host_bytes,
                     duration_secs,
+                    host_entropy_reads,
                 })
             }
             WorkerResponse::Error { message, .. } => {
@@ -4475,7 +4591,8 @@ impl WorkerPool {
     /// kill would group-kill that prove worker (an SP1 one with its `sp1-gpu-server`): a miner must not
     /// call it then. Not registered as preemptible: only a process that proves nothing calls it
     /// (`zkminer simulate`, whose pool is measure-only), so no committed proof can need its memory. A
-    /// worker found dead when the request is sent is the typed `MeasureWorkerGone`.
+    /// worker found dead when the request is sent is the typed `MeasureWorkerGone`; one that dies
+    /// while deriving (not by the watchdog) is the typed `MeasureWorkerDied`.
     pub fn derive_program_id(
         &self,
         backend: &str,
@@ -4557,8 +4674,15 @@ impl WorkerPool {
                         },
                     ));
                 }
+                // Died mid-derivation: scored against the slot as any crash is, and typed, so the
+                // caller can remember the program (the derivation is a function of the bytes alone).
                 Self::mark_slot_failed(&mut slot, entry);
-                return Err(e);
+                return Err(anyhow::Error::new(
+                    zkminer_prover_protocol::types::MeasureWorkerDied {
+                        slot_key: key.to_string(),
+                        message: format!("{e:#}"),
+                    },
+                ));
             }
         };
         match response {

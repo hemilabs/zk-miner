@@ -24,6 +24,8 @@
 //!   and seal.
 //! - `MOCK_PROVE_DELAY_SECS`: how long a Prove takes (default 0), so a test can act while a lock
 //!   is held.
+//! - `MOCK_HOST_ENTROPY_READS`: what an Execute reports as `host_entropy_reads`: a number, or
+//!   `unknown` for `None`. Default: 0.
 
 use std::io::{self, BufReader, BufWriter};
 use std::time::Duration;
@@ -168,6 +170,11 @@ fn main() {
                     journal_len: journal.len() as u64,
                     peak_host_bytes: 0,
                     journal: Some(journal.clone()),
+                    host_entropy_reads: match std::env::var("MOCK_HOST_ENTROPY_READS") {
+                        Ok(v) if v == "unknown" => None,
+                        Ok(v) => Some(v.trim().parse().expect("MOCK_HOST_ENTROPY_READS")),
+                        Err(_) => Some(0),
+                    },
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }

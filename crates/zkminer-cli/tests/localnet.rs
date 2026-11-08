@@ -2070,12 +2070,16 @@ async fn watch_only_reports_every_job() {
 /// `zkminer simulate` over every job: the RISC Zero program's cases, and with
 /// `ZKMINER_LOCALNET_SP1_WORKER` set the SP1 program's too (its vkey derived on the CPU, minutes).
 /// Each measurable job must come back `measured` with its program bound (image id / vkey), a risc0
-/// count a power of two (one segment), and the binding verdict its case implies; the decoy ELF must
-/// come back `program_mismatch` (its URI's content hash vouches for those bytes) and the unreachable
-/// one `unavailable`; a journal-prefix job, open (no prover to name in its input), `unavailable` under
-/// risc0 and `failed` under SP1 (not reproducible); an unknown job id `unavailable`; and through
-/// `--stdin`, with submit-tx hints, a READY line first and then the same outcomes and counts. Nothing
-/// is sent.
+/// count a power of two (one segment), the binding verdict its case implies, no host input and the
+/// worker's SDK; the decoy ELF must come back `program_mismatch` (its URI's content hash vouches for
+/// those bytes) and the unreachable one `unavailable`; a journal-prefix job, open (no prover to name
+/// in its input), `unavailable` under risc0 and `not_served` under SP1 (never reproducible); an
+/// unknown job id `unavailable`. Then through `--stdin`, with submit-tx hints and the public values a
+/// fulfil would carry, a READY line first, the same outcomes and counts, `proven` matching the honest
+/// journal and differing from another, and the decoy and the unreachable ELF answered from the
+/// memory of the first run. Every run has a HOME it cannot write, as the indexer's unit gives it:
+/// the risc0 journal still comes back, so the bindings are judged. And `--max-cycles` below a count
+/// makes it `too_heavy`. Nothing is sent.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs anvil, the release risc0 worker (a CPU one serves) and the 743111 RPC; see the module docs"]
 async fn simulate_reports_every_job() {
@@ -2101,6 +2105,12 @@ async fn simulate_reports_every_job() {
     if let Some(w) = &sp1 {
         args.extend(["--sp1-worker".into(), w.display().to_string()]);
     }
+    // A HOME it cannot write, as the indexer's unit gives it (ProtectSystem=strict): no sys_rand key
+    // file can be read or made there, and none is needed.
+    let home = dir.0.join("read-only-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o500)).unwrap();
+    let home_env = [("HOME", home.display().to_string())];
     let unknown = keccak256(b"zkminer localnet: no such job");
     let mut run_args = args.clone();
     for job in &world.jobs {
@@ -2108,7 +2118,7 @@ async fn simulate_reports_every_job() {
     }
     run_args.extend(["--job".into(), unknown.to_string()]);
     let argv: Vec<&str> = run_args.iter().map(String::as_str).collect();
-    let out = Miner::command(&dir.0, &config, &[], "simulate", &argv, &[])
+    let out = Miner::command(&dir.0, &config, &[], "simulate", &argv, &home_env)
         .stdin(Stdio::null())
         .output()
         .expect("run zkminer simulate");
@@ -2161,12 +2171,13 @@ async fn simulate_reports_every_job() {
                 }
             }
             Case::PrefixMarker => {
-                // Its input begins with abi.encode(jobId, prover), and an open job has no prover; an
-                // SP1 guest reads the prefix as a stdin buffer of its own, which simulate cannot pass.
-                let want = if sp1_job { "failed" } else { "unavailable" };
+                // Its input begins with abi.encode(jobId, prover), and an open job has no prover (for
+                // now: retryable); an SP1 guest reads the prefix as a stdin buffer of its own, which
+                // simulate can never pass (final).
+                let (want, retryable) = if sp1_job { ("not_served", false) } else { ("unavailable", true) };
                 let reason = r["reason"].as_str().unwrap_or_default();
-                if outcome != want || r["retryable"] != true || !reason.contains("journal-prefix") {
-                    failures.push(format!("{what}: {outcome}, not a retryable {want} for its prefix: {r}"));
+                if outcome != want || r["retryable"] != retryable || !reason.contains("journal-prefix") {
+                    failures.push(format!("{what}: {outcome}, not {want} (retryable {retryable}) for its prefix: {r}"));
                 }
             }
             case => {
@@ -2199,6 +2210,17 @@ async fn simulate_reports_every_job() {
                 if r["inputBytes"] != program.input.len() as u64 {
                     failures.push(format!("{what}: inputBytes {} for a {}-byte input", r["inputBytes"], program.input.len()));
                 }
+                // No public values were sent; the guest reads no host entropy (risc0: none past its
+                // runtime's draw, counted; SP1: none to read); the worker names its SDK.
+                if r["proven"] != "unknown" || r["hostInput"] != false || r["hostInputReads"] != 0 {
+                    failures.push(format!("{what}: proven unknown, hostInput false and 0 reads expected: {r}"));
+                }
+                if !r["sdkVersion"].as_str().is_some_and(|v| !v.is_empty()) {
+                    failures.push(format!("{what}: no sdkVersion: {r}"));
+                }
+                if r["journalHash"] != serde_json::json!(keccak256(&program.journal).to_string()) {
+                    failures.push(format!("{what}: the journal did not come back under a read-only HOME: {r}"));
+                }
             }
         }
     }
@@ -2210,22 +2232,40 @@ async fn simulate_reports_every_job() {
         other => failures.push(format!("an unknown job id: {other:?}")),
     }
 
-    // The same through --stdin, with the submitting tx as a hint, a garbage line skipped, and a
-    // bare id; and now every SP1 vkey comes from the cache.
+    // The same through --stdin, as the indexer asks: the submitting tx as a hint and the public
+    // values a fulfil would carry (the honest journal, then another), a garbage line skipped, a bare
+    // id; the decoy and the unreachable ELF now answered from the first run's memory; and every SP1
+    // vkey from the cache.
     let submitted = world.logs::<IHemiProveCore::JobSubmitted>().await;
-    let first = &world.jobs[0];
+    let risc0_job = |case: Case| {
+        world
+            .jobs
+            .iter()
+            .find(|j| j.case == case && !is_sp1_id(world.program_of(j).proof_system))
+            .unwrap_or_else(|| panic!("no risc0 {case:?} job"))
+    };
+    let (first, second) = (risc0_job(Case::Full), risc0_job(Case::Fields));
+    let (decoy, unreachable) = (risc0_job(Case::DecoyElf), risc0_job(Case::ElfUnreachable));
     let tx = submitted
         .iter()
         .find(|(id, _)| *id == first.id)
         .map(|(_, l)| l.tx)
         .expect("the first job's JobSubmitted");
+    let program = world.program_of(first);
+    let hex = |b: &[u8]| format!("0x{}", alloy::hex::encode(b));
     let input = format!(
-        "{{\"jobId\":\"{}\",\"submitTx\":\"{tx}\"}}\nnot a request\n{}\n",
+        "{{\"jobId\":\"{}\",\"submitTx\":\"{tx}\",\"publicValues\":\"{}\"}}\nnot a request\n{}\n\
+         {{\"jobId\":\"{}\",\"publicValues\":\"{}\"}}\n{}\n{}\n",
         first.id,
-        world.jobs[1].id
+        hex(&program.journal),
+        second.id,
+        first.id,
+        hex(&program.wrong_journal()),
+        decoy.id,
+        unreachable.id,
     );
     let argv: Vec<&str> = args.iter().map(String::as_str).chain(["--stdin"]).collect();
-    let mut child = Miner::command(&dir.0, &config, &[], "simulate", &argv, &[])
+    let mut child = Miner::command(&dir.0, &config, &[], "simulate", &argv, &home_env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2255,8 +2295,12 @@ async fn simulate_reports_every_job() {
     if lines.first() != Some(&ready) {
         failures.push(format!("--stdin's first line is {:?}, not {ready}", lines.first()));
     }
-    let ids: Vec<&str> = lines.iter().filter_map(|r| r["jobId"].as_str()).collect();
-    if ids != [first.id.to_string(), world.jobs[1].id.to_string()] {
+    let ids: Vec<String> = lines.iter().filter_map(|r| r["jobId"].as_str().map(str::to_string)).collect();
+    let want_ids: Vec<String> = [first.id, second.id, first.id, decoy.id, unreachable.id]
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+    if ids != want_ids {
         failures.push(format!("--stdin reported {ids:?}"));
     }
     // One line out per line in: the garbage line is answered, in its place.
@@ -2272,16 +2316,19 @@ async fn simulate_reports_every_job() {
             }
         })
         .collect();
-    if shape != ["ready", "report", "invalid", "report"] {
+    if shape != ["ready", "report", "invalid", "report", "report", "report", "report"] {
         failures.push(format!("--stdin answered {shape:?}"));
     }
-    // The indexer's own path (stdin, a submit-tx hint for the first) gives what `--job` gave.
-    for r in lines.iter().filter(|r| r["jobId"].is_string()) {
+    let reports: Vec<&serde_json::Value> = lines.iter().filter(|r| r["jobId"].is_string()).collect();
+    // The indexer's own path gives what `--job` gave for the measurable ones, and says whether the
+    // count is of the proven run: the honest journal matches, another differs, none is unknown.
+    for (r, proven) in reports.iter().take(3).zip(["matches", "unknown", "differs"]) {
         let id: B256 = r["jobId"].as_str().unwrap().parse().unwrap();
         let Some(via_job) = report_of(id) else {
+            failures.push(format!("--stdin: {id} has no --job report"));
             continue;
         };
-        for field in ["outcome", "retryable", "cycles", "po2", "binding", "programCheck", "elfHash", "inputHash", "journalHash"] {
+        for field in ["outcome", "retryable", "cycles", "po2", "binding", "programCheck", "elfHash", "inputHash", "journalHash", "hostInput", "sdkVersion"] {
             if r[field] != via_job[field] {
                 failures.push(format!(
                     "--stdin's {field} for {id} is {}, --job's {}",
@@ -2293,6 +2340,17 @@ async fn simulate_reports_every_job() {
         if r["outcome"] != "measured" || cycles == 0 {
             failures.push(format!("--stdin: {id} not measured with a count: {r}"));
         }
+        if r["proven"] != proven || r["hostInput"] != false {
+            failures.push(format!("--stdin: {id} should be proven {proven} with no host input: {r}"));
+        }
+    }
+    // Remembered: the decoy's verdict (its URI still vouches for the bytes), and the unreachable
+    // ELF's fetch failure, neither fetched again.
+    for (r, outcome) in reports.iter().skip(3).zip(["program_mismatch", "unavailable"]) {
+        let reason = r["reason"].as_str().unwrap_or_default();
+        if r["outcome"] != outcome || !reason.contains("remembered from") || !r["elfHash"].is_null() {
+            failures.push(format!("--stdin: {outcome} from memory expected: {r}"));
+        }
     }
     if !String::from_utf8_lossy(&out.stderr).contains("skipping a request line") {
         failures.push("--stdin did not say it skipped the garbage line".into());
@@ -2301,6 +2359,30 @@ async fn simulate_reports_every_job() {
         if r["programCheckSecs"].as_f64().unwrap_or(0.0) > 0.0 && r["programCheck"] == "vkey" {
             failures.push(format!("--stdin derived an SP1 vkey the cache holds: {r}"));
         }
+    }
+
+    // `--max-cycles` below the count: `too_heavy`, final, the count only in the reason.
+    let mut capped: Vec<String> = args.clone();
+    capped.extend(["--max-cycles".into(), "1".into(), "--job".into(), first.id.to_string()]);
+    let argv: Vec<&str> = capped.iter().map(String::as_str).collect();
+    let out = Miner::command(&dir.0, &config, &[], "simulate", &argv, &home_env)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run zkminer simulate --max-cycles 1");
+    let capped: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    match capped.as_slice() {
+        [r] if r["outcome"] == "too_heavy"
+            && r["retryable"] == false
+            && r["cycles"].is_null()
+            && r["reason"].as_str().is_some_and(|w| w.contains("--max-cycles")) => {}
+        other => failures.push(format!("--max-cycles 1: {other:?}")),
+    }
+    std::fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700)).ok();
+    if std::fs::read_dir(&home).map_or(true, |mut d| d.next().is_some()) {
+        failures.push("simulate wrote under its HOME".into());
     }
 
     // Simulating sends nothing.

@@ -109,12 +109,13 @@ enum Commands {
         /// The risc0 segment size to measure at (risc0 cycle counts are padded per segment).
         #[arg(long, default_value_t = zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2)]
         po2: u8,
-        /// Bound on one execution, in seconds (at most 86400).
+        /// Bound on one execution, in seconds: at least 60 (a lower value is raised to it), at most
+        /// 86400. An SP1 worker's one-time setup is not part of it.
         #[arg(long, default_value_t = 600)]
         execute_timeout_secs: u64,
-        /// Bound on deriving one program's id, in seconds, at most 86400 (SP1's setup on the CPU:
-        /// seconds for a small guest, minutes for a large one). Requests are served one at a time, so
-        /// this also bounds how long one new program can hold the queue.
+        /// Bound on deriving one program's id, in seconds: at least 60, at most 86400 (SP1's setup on
+        /// the CPU: seconds for a small guest, minutes for a large one). Requests are served one at a
+        /// time, so this also bounds how long one new program can hold the queue.
         #[arg(long, default_value_t = 900)]
         program_id_timeout_secs: u64,
         /// The largest cycle count reported as `measured`; a measurement above it (risc0's keccak
@@ -266,19 +267,16 @@ async fn main() -> Result<()> {
             sp1_worker,
             cache_dir,
         } => {
-            // Clamped: a bound near u64::MAX would overflow the watchdog's deadline arithmetic.
-            const MAX_BOUND_SECS: u64 = 86_400;
             commands::simulate::run(
                 config_path,
                 commands::simulate::SimulateOptions {
                     jobs,
                     stdin,
                     po2,
-                    execute_timeout: std::time::Duration::from_secs(
-                        execute_timeout_secs.clamp(1, MAX_BOUND_SECS),
-                    ),
-                    program_id_timeout: std::time::Duration::from_secs(
-                        program_id_timeout_secs.clamp(1, MAX_BOUND_SECS),
+                    execute_timeout: simulate_bound("--execute-timeout-secs", execute_timeout_secs),
+                    program_id_timeout: simulate_bound(
+                        "--program-id-timeout-secs",
+                        program_id_timeout_secs,
                     ),
                     max_cycles,
                     program_failure_ttl: std::time::Duration::from_secs(program_failure_ttl_secs),
@@ -299,9 +297,53 @@ async fn main() -> Result<()> {
     }
 }
 
+/// A `simulate` bound in seconds, clamped to `MIN_BOUND_SECS..=86400`: below the minimum a request's
+/// own overhead would fail every request; far above it, the watchdog's deadline arithmetic overflows.
+fn simulate_bound(flag: &str, secs: u64) -> std::time::Duration {
+    const MAX_BOUND_SECS: u64 = 86_400;
+    let min = commands::simulate::MIN_BOUND_SECS;
+    let clamped = secs.clamp(min, MAX_BOUND_SECS);
+    if clamped != secs {
+        tracing::warn!("{flag} {secs} is outside {min}..={MAX_BOUND_SECS}: using {clamped}");
+    }
+    std::time::Duration::from_secs(clamped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simulate_bounds_are_clamped_to_their_minimum() {
+        let cli = Cli::try_parse_from([
+            "zkminer",
+            "simulate",
+            "--stdin",
+            "--max-cycles",
+            "12345",
+            "--execute-timeout-secs",
+            "5",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Simulate {
+                max_cycles,
+                execute_timeout_secs,
+                program_id_timeout_secs,
+                ..
+            } => {
+                assert_eq!(max_cycles, 12_345);
+                assert_eq!(execute_timeout_secs, 5);
+                assert_eq!(program_id_timeout_secs, 900);
+            }
+            _ => panic!("not a simulate command"),
+        }
+        let min = commands::simulate::MIN_BOUND_SECS;
+        assert_eq!(simulate_bound("x", 5).as_secs(), min);
+        assert_eq!(simulate_bound("x", 0).as_secs(), min);
+        assert_eq!(simulate_bound("x", 600).as_secs(), 600);
+        assert_eq!(simulate_bound("x", u64::MAX).as_secs(), 86_400);
+    }
 
     #[test]
     fn watch_only_flags_parse_and_conflict_as_documented() {
@@ -355,7 +397,7 @@ mod tests {
                 assert!(stdin);
                 assert_eq!(po2, 21);
                 assert_eq!(execute_timeout_secs, 600);
-                assert_eq!(max_cycles, 4_000_000_000);
+                assert_eq!(max_cycles, 1_000_000_000);
                 assert_eq!(program_failure_ttl_secs, 6 * 3600);
             }
             _ => panic!("not a simulate command"),
