@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "scope": "po2-20 synthetic CPU oracle and reuse, same shader and seed, 32/64/128/256 threads",
+  "engine_commit": "7222459e351a81ecb55ac75f8804edc4c51e08d9",
+  "shader_sha256": "7439b9c48fe7287c7f25f809c60bf230e370d4cc4ad039559db7298d84cd040c",
+  "shader_metadata_sha256": "883317b4506865212eaf65cbfcb6b85522470ebd6135095ddd7f98e44aaaa4a8",
+  "generator_sha256": "189dc1c861e4bcaa0412fac2889ff820ddaeca4a0a7efeb0a4b5996c753bd5ac",
+  "collector_sha256": "93fc175d49c30b642de9cc5e2ddb3504996a260e84bc7d2cca20376110fe01ae",
+  "csv_sha256": "54b236fee090ac2541634f533d59f9364beffe2dd3a4fc2fe8f2fd02c367cf81",
+  "selected_threads": 256,
+  "rows": [
+    {
+      "threads": 32,
+      "po2": 20,
+      "seed": 7,
+      "shader_sha256": "7439b9c48fe7287c7f25f809c60bf230e370d4cc4ad039559db7298d84cd040c",
+      "log_sha256": "4070931c6046c724e359ca9969461f20508bdb592f099fa7f392e09a7da41834",
+      "first_split_gpu_seconds": 3.100693667307496,
+      "reuse_split_gpu_seconds": 3.1324281245470047,
+      "output_sha256": "9299d40217d9e1f45d4f1e5e7724e07201751b038d03eca99edf29f8f6156444",
+      "static_threadgroup_bytes": 32768,
+      "cpu_matched": true,
+      "reuse_matched": true
+    },
+    {
+      "threads": 64,
+      "po2": 20,
+      "seed": 7,
+      "shader_sha256": "7439b9c48fe7287c7f25f809c60bf230e370d4cc4ad039559db7298d84cd040c",
+      "log_sha256": "bea165243d81b0674f2740670795102a17c30841c6f23052c3b3f511de5727a4",
+      "first_split_gpu_seconds": 2.0940975826233625,
+      "reuse_split_gpu_seconds": 1.965954376384616,
+      "output_sha256": "9299d40217d9e1f45d4f1e5e7724e07201751b038d03eca99edf29f8f6156444",
+      "static_threadgroup_bytes": 32768,
+      "cpu_matched": true,
+      "reuse_matched": true
+    },
+    {
+      "threads": 128,
+      "po2": 20,
+      "seed": 7,
+      "shader_sha256": "7439b9c48fe7287c7f25f809c60bf230e370d4cc4ad039559db7298d84cd040c",
+      "log_sha256": "cfd4b8b0b53cec60859bc234e00288e0a092f70c3cdd39a96c940ccaa7750ead",
+      "first_split_gpu_seconds": 1.1764133758842945,
+      "reuse_split_gpu_seconds": 1.178693501278758,
+      "output_sha256": "9299d40217d9e1f45d4f1e5e7724e07201751b038d03eca99edf29f8f6156444",
+      "static_threadgroup_bytes": 32768,
+      "cpu_matched": true,
+      "reuse_matched": true
+    },
+    {
+      "threads": 256,
+      "po2": 20,
+      "seed": 7,
+      "shader_sha256": "7439b9c48fe7287c7f25f809c60bf230e370d4cc4ad039559db7298d84cd040c",
+      "log_sha256": "6f661cc8639d56128347c27a320c08b6fedce96f80786c0659a8491ead88362f",
+      "first_split_gpu_seconds": 0.9902704171836376,
+      "reuse_split_gpu_seconds": 0.9938777089118958,
+      "output_sha256": "9299d40217d9e1f45d4f1e5e7724e07201751b038d03eca99edf29f8f6156444",
+      "static_threadgroup_bytes": 32768,
+      "cpu_matched": true,
+      "reuse_matched": true
+    }
+  ]
+}

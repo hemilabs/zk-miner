@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "scope": "one true cold-driver proof under newly created standard macOS account zkmac; no prior worker run in that account and no driver-cache deletion",
+  "raw_run_dir": "/Users/Shared/wp6b-cold-reading-826dbf2840994069b10a5878e71a6840",
+  "raw_result_sha256": "cf725000dcf59e40e499b25a1b4ba69c09ff2958de43e85422925269a281a00a",
+  "raw_test_log_sha256": "4fe9838672e8c8337feda11d215aa31b581f866cd7f5ce9e0b34201138750094",
+  "raw_script_sha256": "9a5a75fa08b0b2f694525b323fcbbb26ea068420e1ff3ae6d50a264139f89982",
+  "raw_script_commit": "5e8e92ff9861e5a2a40aebb75b6a562ce94404e4",
+  "current_script_sha256_after_cache_path_fix": "e285b221f7bb7aaea73776925ddb44d09568621e00efe2afcdf0f1f32ac96208",
+  "worker_sha256": "f65ff7a374e4471404d9bc52dab57d010e12cb5af4d0f5197053b0f8107060ab",
+  "worker_manifest_sha256": "9656a51c5c778c512ebe8faf29e7353e52bbd52a1bb0ff0ca2511f7480270e9a",
+  "engine_commit": "7816a0002642bf97bbcdd82bd55ebaa22d84ad80",
+  "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "acceptance_binary_sha256": "7e18802d2c1514c6e262d05aba4899d7ac84214692f215176269c9ad2c9d9d22",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "helper_manifest_sha256": "cab3b912750594cefb8b8da8b300f0b100ed6ccfaf81ee4a041503b966dca830",
+  "program_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+  "input_sha256": "64ed86b909d6d0502b64b28db0ea1272ffb358e20e9b1d88b63ccb07fa900cf5",
+  "host_conditions": {
+    "user": "zkmac",
+    "browser_closed": true,
+    "reserve_override": false,
+    "thermal_before": "nominal",
+    "thermal_after": "nominal",
+    "host_before_path": "/Users/Shared/wp6b-cold-reading-826dbf2840994069b10a5878e71a6840/host-before.json",
+    "host_before_sha256": "f08c19b88a313d1670075a7dd9383431f94a8ec8fb791167348005448a5f9235",
+    "host_after_path": "/Users/Shared/wp6b-cold-reading-826dbf2840994069b10a5878e71a6840/host-after.json",
+    "host_after_sha256": "86a5556e4505f5fb0d372a3974e8682c996ae2d3b930e6df8ebafdeaf79e4e8e"
+  },
+  "spans_ms": {
+    "spawn_to_handshake": 106.36541700000001,
+    "handshake_to_first_proof_request": 0.000709,
+    "request_to_first_completed_gpu_dispatch": 25128.991
+  },
+  "complete_proof_ms": 62467.201417,
+  "external_verifier_ms": 20.896167000000002,
+  "tamper_rejections": 3,
+  "verification": {
+    "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+    "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+    "journal_hex": "f0e2bc9a78563412",
+    "negative_tests": [
+      "wrong_image",
+      "modified_journal",
+      "corrupt_seal"
+    ],
+    "verification": "passed"
+  },
+  "proof_worker_record_sha256": "f1fd14436464232c0fd4151cc305dd9144a45517e7c23645996068a65d0e0ac6",
+  "proof_verification_record_sha256": "c99361d629bfa9b4ab5955fcf5fc4d37ba26c0c03bd96cf4dfffb0c7dc6eaf2d",
+  "method": "first login to newly created zkmac account; source and binary verification and host snapshot ran before one direct WorkerHandle launch; no discovery spawn, execute validation, harness warmup or other proof in the measured spans",
+  "timebase": "spawn and handshake use monotonic Instant; cross-process request and GPU completion use UNIX epoch nanosecond markers on the same host",
+  "cache_directory_diagnostic": {
+    "raw_reported_path": "/private/var/folders/bb/C/com.apple.gpuarchiver",
+    "raw_reported_entry_count": 0,
+    "valid": false,
+    "reason": "raw script used parent.parent of TMPDIR, omitting the per-user hash directory; that count is not used to classify the cold reading",
+    "corrected_method": "dirname(TMPDIR)/C/com.apple.gpuarchiver; script corrected after the raw run, without altering the measured proof",
+    "cold_classification_basis": "new account first login with no prior worker run; first dispatch took 25.129 s versus 0.057 s on the warm account"
+  }
+}

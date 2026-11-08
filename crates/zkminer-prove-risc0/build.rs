@@ -1,4 +1,8 @@
 fn main() {
+    if std::env::var_os("CARGO_FEATURE_MACOS").is_some() {
+        embed_macos_guests();
+        return;
+    }
     // The Intel worker loads its SYCL kernels from shared libraries the risc0 -sys crates build (and
     // oneAPI's SYCL runtime), none of which is on the system's search path and none of which the build
     // gives an rpath. Look for them in `zkminer-intel/lib/` next to the binary, where
@@ -137,4 +141,21 @@ pub const MINIMAL_PROOF_ID: [u32; 8] = [0u32; 8];
         "cargo:rerun-if-changed={}",
         guest_dir.join("minimal-proof/src/main.rs").display()
     );
+}
+
+fn embed_macos_guests() {
+    assert!(std::env::var_os("RISC0_SKIP_BUILD").is_none(), "macOS acceptance rejects guest stubs");
+    println!("cargo:rerun-if-env-changed=ZKMINER_RISC0_GUEST_DIR");
+    let dir = std::path::PathBuf::from(std::env::var_os("ZKMINER_RISC0_GUEST_DIR")
+        .expect("build the authentic Mac guests first and set ZKMINER_RISC0_GUEST_DIR"));
+    let mut code = String::new();
+    for (name, constant) in [("fibonacci", "FIBONACCI"), ("sha256-chain", "SHA256_CHAIN")] {
+        let path = dir.join(format!("{name}.bin")).canonicalize().expect("missing packed guest");
+        let bytes = std::fs::read(&path).expect("cannot read packed guest");
+        let id = risc0_binfmt::compute_image_id(&bytes).expect("invalid packed guest");
+        code.push_str(&format!("pub const {constant}_ELF: &[u8] = include_bytes!({path:?});\npub const {constant}_ID: [u32; 8] = {:?};\n", id.as_words()));
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    std::fs::write(std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("methods.rs"), code)
+        .expect("cannot write guest metadata");
 }

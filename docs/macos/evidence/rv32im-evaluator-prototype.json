@@ -1,0 +1,2512 @@
+{
+  "schema_version": 1,
+  "status": "completed",
+  "build": {
+    "source": {
+      "engine_commit": "0515e0bdebcd1f5f2d24cef91691ebd5b0c5d0a6",
+      "inputs": {
+        "/Users/dbur/dev/zk-miner/tools/macos-rv32im-metal/src/main.rs": "5c17e12069b35f891ff882b37581c556e31927394a17678f9155f5003061bc6c",
+        "/Users/dbur/dev/zk-miner/tools/macos-rv32im-metal/field-compat.metal": "13743c4ed6ec4de938a3121a6e9de83c5b423d5b8022c87267be3afa5573cdf4",
+        "/Users/dbur/dev/zk-miner/tools/macos-rv32im-metal/eval-check.metal": "ce35e10fa64967422acec4cd3a717ea69a01def77b92a7ff87614c77a8f0055d",
+        "/Users/dbur/dev/zk-miner/tools/macos-rv32im-metal/Cargo.toml": "6b2d677e7fb86be211749b7bbb646c3412391bca3e05ab96b62779f932ae645a",
+        "/Users/dbur/dev/zk-miner/tools/macos-rv32im-metal/Cargo.lock": "bd8f2810c1b032ccd66324ab90bd81a23a403c4cf51591a451499abdc34b911f",
+        "/Users/dbur/dev/zk-miner/scripts/macos/generate-rv32im-metal.py": "6c45182b6eaef1617a7ba7a39102c171047dc9686c3d021d8019ef87ab437114",
+        "/Users/dbur/dev/zk-miner/scripts/macos/test-rv32im-evaluator.py": "5ffb8f19b6fad14172e287b14f5a01d3d52ea552f24f1c013c95da0b4e012a6c",
+        "/Users/dbur/dev/zk-miner/scripts/macos/env.sh": "d4ea1b6cfb9e24c3edfa767a32c533648a4f1c123278b01d5c378c078e574835",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/engine.toml": "21f7c0c172b013e5565d32b2f9f085201910eca504e398b4164406bf74b8fbcf",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal": "4de746306b22bd756e919f2d27d28848e28ed7e4fabcb6e6c526537bac01708b",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.json": "34b012225856f637dc02fd9f56757cea605b8d5c270efaaffd3764e369ee167f"
+      }
+    },
+    "binary_sha256": "ecfe23ac6287487c446b54bd598a1fe13d8ddcbfe03a92f016bc30d432274975",
+    "metadata_sha256": "d8c6ed63dcaa26c89688068b31aa67ad8bfd7dfacd7e9c860f0cfc1a28961633",
+    "toolchain": "1.93.0",
+    "environment": {
+      "RUSTFLAGS": null,
+      "CARGO_ENCODED_RUSTFLAGS": null,
+      "CARGO_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/cargo",
+      "RUSTUP_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/rustup",
+      "SDKROOT": null,
+      "DEVELOPER_DIR": null
+    }
+  },
+  "collector_sha256": "04069244ec45344cd1b3b2ebd9d7fc484bfcc7376dbbec045a218ae291995455",
+  "generated_source": {
+    "engine_commit": "0515e0bdebcd1f5f2d24cef91691ebd5b0c5d0a6",
+    "generator_sha256": "6c45182b6eaef1617a7ba7a39102c171047dc9686c3d021d8019ef87ab437114",
+    "source_sha256": "4de746306b22bd756e919f2d27d28848e28ed7e4fabcb6e6c526537bac01708b",
+    "source_files": {
+      "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0/risc0/circuit/rv32im-sys/kernels/cuda/eval_check_0.cu": "581a6ca6d374cfe3bddc4b531c7ec4a21cb81e0878b945bc693887ca6f4067a1",
+      "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0/risc0/circuit/rv32im-sys/kernels/cuda/eval_check_1.cu": "14fdb25c500b7d11191134dd6b62bba6d977aa13eca118d3e46792286a9dbbd1",
+      "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0/risc0/circuit/rv32im-sys/kernels/cuda/eval_check_2.cu": "9ed99616ad286ab7658b35430a3237488cf03d6d3c5a79a82eb269b4ba39b4e9",
+      "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0/risc0/circuit/rv32im-sys/kernels/cuda/eval_check_3.cu": "cc1066a10496d3be01d9a83b6429d7557b473f540a9e51c560348bd413cd0699",
+      "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0/risc0/circuit/rv32im-sys/kernels/cxx/rust_poly_fp_0.cpp": "11b5280f30d8284ac3fbeb567292b72ff5586ffa97d593d77c2fc299c677df75",
+      "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0/risc0/circuit/rv32im-sys/kernels/cxx/rust_poly_fp_1.cpp": "dc994ffaff0da1aaa0bd3060d3e37e7ac63dd1b0e03d8188f03ee121df5c561e",
+      "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0/risc0/circuit/rv32im-sys/kernels/cxx/rust_poly_fp_2.cpp": "8d4a12023b457b58e6b05af93968bc96f9b9368258f262378f4e54aee0aa2f66",
+      "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0/risc0/circuit/rv32im-sys/kernels/cxx/rust_poly_fp_3.cpp": "aade9d4948171552e7089972c8bab5d57071fe22d792c9d83f8aa0079f7cb04a",
+      "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0/risc0/build_kernel/kernels/metal/fp.h": "6eb7a4fe5173b915ec5952b82e2aae3fe0594067d8ba7630e48deed8b87e857c",
+      "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0/risc0/build_kernel/kernels/metal/fpext.h": "a7139d5e0917c0413ef885f6d6442dfb995f1a12c047e97b0033f07a0f7059b2",
+      "/Users/dbur/dev/zk-miner/tools/macos-rv32im-metal/field-compat.metal": "13743c4ed6ec4de938a3121a6e9de83c5b423d5b8022c87267be3afa5573cdf4",
+      "/Users/dbur/dev/zk-miner/tools/macos-rv32im-metal/eval-check.metal": "ce35e10fa64967422acec4cd3a717ea69a01def77b92a7ff87614c77a8f0055d",
+      "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0/risc0/circuit/rv32im/src/zirgen/info.rs": "4d7b76bc2843e55a4a0429c52542b94a2cd30120e7f6ca4ecad10a16494ddb30"
+    },
+    "function_count": 21,
+    "poly_mix_exponents": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88,
+      89,
+      90,
+      91,
+      92,
+      93,
+      94,
+      95,
+      96,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      107,
+      108,
+      109,
+      110,
+      111,
+      112,
+      113,
+      114,
+      115,
+      116,
+      117,
+      118,
+      119,
+      120,
+      121,
+      122,
+      123,
+      124,
+      125,
+      126,
+      127,
+      128,
+      129,
+      130,
+      131,
+      132,
+      133,
+      134,
+      135,
+      136,
+      137,
+      138,
+      139,
+      140,
+      141,
+      142,
+      143,
+      144,
+      145,
+      146,
+      147,
+      148,
+      149,
+      150,
+      151,
+      152,
+      153,
+      154,
+      155,
+      156,
+      157,
+      158,
+      159,
+      160,
+      161,
+      162,
+      163,
+      164,
+      165,
+      166,
+      167,
+      168,
+      169,
+      170,
+      171,
+      172,
+      173,
+      174,
+      175,
+      176,
+      177,
+      178,
+      179,
+      180,
+      181,
+      182,
+      183,
+      185,
+      187,
+      188,
+      190,
+      197,
+      198,
+      199,
+      200,
+      201,
+      202,
+      203,
+      204,
+      205,
+      206,
+      207,
+      208,
+      209,
+      210,
+      211,
+      212,
+      213,
+      214,
+      215,
+      216,
+      217,
+      218,
+      219,
+      220,
+      221,
+      222,
+      223,
+      224,
+      225,
+      226,
+      227,
+      228,
+      229,
+      230,
+      231,
+      232,
+      233,
+      234,
+      235,
+      236,
+      237,
+      238,
+      239,
+      240,
+      241,
+      242,
+      243,
+      244,
+      245,
+      246,
+      247,
+      248,
+      249,
+      250,
+      251,
+      252,
+      253,
+      254,
+      255,
+      256,
+      257,
+      258,
+      259,
+      260,
+      261,
+      262,
+      263,
+      264,
+      265,
+      266,
+      267,
+      268,
+      269,
+      270,
+      271,
+      272,
+      273,
+      274,
+      275,
+      276,
+      277,
+      278,
+      279,
+      280,
+      283,
+      298,
+      304,
+      310,
+      317,
+      323,
+      326,
+      328,
+      329,
+      334,
+      335,
+      343,
+      349,
+      350,
+      355,
+      361,
+      362,
+      363,
+      364,
+      365,
+      366,
+      367,
+      368,
+      369,
+      370,
+      371,
+      372,
+      373,
+      374,
+      375,
+      376,
+      377,
+      378,
+      379,
+      380,
+      381,
+      382,
+      383,
+      384,
+      385,
+      386,
+      387,
+      388,
+      389,
+      390,
+      391,
+      392,
+      393,
+      394,
+      395,
+      396,
+      397,
+      398,
+      399,
+      400,
+      401,
+      402,
+      403,
+      404,
+      405,
+      406,
+      407,
+      408,
+      409,
+      410,
+      411,
+      412,
+      413,
+      414,
+      415,
+      416,
+      417,
+      418,
+      419,
+      420,
+      453,
+      456,
+      471,
+      487,
+      513,
+      521,
+      578,
+      586,
+      621,
+      635,
+      651,
+      658,
+      670,
+      681,
+      704,
+      705,
+      706,
+      707,
+      708,
+      709,
+      710,
+      711,
+      712,
+      713,
+      714,
+      715,
+      716,
+      717,
+      718,
+      719,
+      720,
+      721,
+      722,
+      723,
+      724,
+      725,
+      726,
+      727,
+      728,
+      729,
+      761,
+      825,
+      828,
+      853,
+      854,
+      855,
+      856,
+      857,
+      858,
+      859,
+      860,
+      861,
+      862,
+      863,
+      864,
+      865,
+      866,
+      867,
+      868,
+      869,
+      870,
+      871,
+      872,
+      1007,
+      1040,
+      1127,
+      1214,
+      1428,
+      1544,
+      1825,
+      2301,
+      2452,
+      2620,
+      3504,
+      3924,
+      5931,
+      6340,
+      7044,
+      7760,
+      7761,
+      7762,
+      7763,
+      7764,
+      7765,
+      7766,
+      7767,
+      7768,
+      7769,
+      7770,
+      7771,
+      7772,
+      7773,
+      7776,
+      7779,
+      7782,
+      7786,
+      7789,
+      7792,
+      7796,
+      7806,
+      7816,
+      7826,
+      7840,
+      7857,
+      7867,
+      7878,
+      7898,
+      7908,
+      7927,
+      7929,
+      7936
+    ],
+    "cpu_cuda_normalized_body_sha256": {
+      "rv32im_v2_19": "d7729533dd2680032719d9e26907387e4f3c30f67a84c102a5489ccbfcde3da3",
+      "rv32im_v2_15": "3ecb4c9b468f2749d30c702f148a4ed027b0925571832676aed57c7bb78c1ae8",
+      "rv32im_v2_11": "aecc6c30aed39cad47dd75878931d8bd9dcfb11270a0755ba952c3c6e33a1a3b",
+      "rv32im_v2_7": "1a10de7300ca0a391a762d07691930c04c81fe0e220ca40040f4fc9a89a54b8a",
+      "rv32im_v2_3": "48054f0f35c6f58463b4c800187f21c6d62551e28ebf7271e429cc12f9d7610a",
+      "poly_fp": "760a78c7c2bb7dc21c880828560d40526188ab7b866e13994191e4709c61e068",
+      "rv32im_v2_18": "575a1c29c646ccf7cdfe8b6aed2157c88242d62024267aee397988b566938852",
+      "rv32im_v2_14": "68278ceda944829574829f3d126f51f1a12a170e4d7b6a245168b5c2a0532b17",
+      "rv32im_v2_10": "a1da56ab380dcd4c66eb2251d6b3144b1788803e768c6a539a24d577d091297d",
+      "rv32im_v2_6": "b9abf1cd97e0de1135a91679a3032d18ccd75852b1bb388e6b7790d5b04e512b",
+      "rv32im_v2_2": "71e2c09bb62a5e02b078d226d50586d48440fe3e2590cee511eaa8b9383e28f3",
+      "rv32im_v2_17": "a08cdbd79926f149837b7856a0fee27bf2c42586a1f7fbb6beafa701853339d9",
+      "rv32im_v2_13": "8f06fff2a16256e8cb641afb4a853fd89de2078b8e4f0585a054c67992fe665b",
+      "rv32im_v2_9": "9da375800af25d6e4ced2b37f43e54ec689b44a4b853fb44c30b111d0d99ce81",
+      "rv32im_v2_5": "6a2d9f6424b500790358e2c5e0fbe479ae33027cf4b1854f4b64e9b3decf3a2f",
+      "rv32im_v2_1": "a07f46741dd4af68eec49bcccda320d1ecaae9d42f13d322c639265157a9b3da",
+      "rv32im_v2_16": "d71c24eeb8d578de4797911f445a0e9f7225efe3e3a0b23e70c8c6b90201220c",
+      "rv32im_v2_12": "eddb70cbfa0f39a967b64e4a90fda8ee2b30df1899bcfd1b13ff07e9adf47244",
+      "rv32im_v2_8": "2be1044c6317d32c59690eade02af08d645f48b3a201231b06f1f24977cbdaec",
+      "rv32im_v2_4": "e50d227a9f73af6227306eb112084a1c553899d786b782359b79772029a0a5da",
+      "rv32im_v2_0": "3999f1fa5f55b7f84b4e8ddc3619a2f66daa284750b853cfb465872e0c4e0feb"
+    },
+    "translation": "thread/device pointer address spaces, explicit poly_mix argument, noinline function boundaries; original polynomial statements retained"
+  },
+  "verified_worker_binary_sha256": "d157305ba0e0830671c6b8f6238dc68e59ae8a68dc3454865c2084c21bc347b9",
+  "attempts": [
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/80625f8dbf1c4ef2972f1892844f14ef",
+      "result_sha256": "91e88e50b47a25580b81c6fde7722fa883e1c0587f7236f266b100a23236256a",
+      "status": "failed",
+      "source_matches_final_candidate": false,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "compile",
+        "1"
+      ],
+      "threads_per_threadgroup": null,
+      "binary_sha256": "bbc461d7a0a4f291794257a053c7b147f709aefb59c3c705c5cc4f66d54b07f6",
+      "shader_sha256": "57d9aca399a97b29cbeb736b22defb5176e6bcb16b22670d2aedf520be1ff606",
+      "elapsed_seconds": 2.819572292268276,
+      "failure_excerpt": "Error: RV32IM MSL compilation: rv32im_v2_3.msl:1053:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1055:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1057:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1118:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1120:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1122:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1128:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1130:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1132:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1137:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1139:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1141:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1164:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1166:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1168:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1170:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1172:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1174:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1176:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1178:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1180:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1182:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1184:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1186:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1188:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1190:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1192:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1194:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1214:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1216:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1218:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1221:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1223:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1225:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1227:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1229:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1231:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1250:23: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1253:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1255:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_3.msl:1257:22: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:319:19: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:321:19: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:323:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:326:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:328:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:330:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:333:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:335:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:337:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:340:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:342:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:344:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:347:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:349:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:351:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:354:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:356:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:358:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:361:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:363:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:365:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:368:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:370:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:372:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:387:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:389:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:391:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:425:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:427:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:429:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:453:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:455:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:457:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:489:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:491:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:493:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:530:20: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:532:21: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:534:21: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:575:21: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:577:21: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:579:21: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:602:21: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:604:21: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:606:21: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:629:21: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:631:21: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:633:21: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v2_2.msl:644:21: error: invalid operands to binary expression ('Fp' and 'FpExt')\nrv32im_v",
+      "failure_log_bytes": 4330079,
+      "failure_diagnostics": [],
+      "compilation": [],
+      "cases": [],
+      "artifact_hashes": {
+        "plan.json": "a5dec9ce9020f34c2f09b6cb1e23235a7e1c30403c8de185202c26184aa0e719",
+        "stdout.jsonl": "6853ac8f60d1cbdf628d796fe16b7aecfbf97a87755e414a82893ebbe55e4e7b",
+        "stderr.log": "d590909a2af959bd2a62ed81f5affdd0c99180ca0b4cdadb88ee8e38d68a8662"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/d6d980f9b44a4c7cba05914a1ec9f52d",
+      "result_sha256": "e73415d59b2f948d6f1f33f8be62fc47e267b8d304f7358e35aa92ef0087ce6f",
+      "status": "passed",
+      "source_matches_final_candidate": false,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "compile",
+        "1"
+      ],
+      "threads_per_threadgroup": null,
+      "binary_sha256": "bbc461d7a0a4f291794257a053c7b147f709aefb59c3c705c5cc4f66d54b07f6",
+      "shader_sha256": "56bc256b8f950fc35d4f3ddd60397937d7d32bb846feacb1c98428ce80af05b5",
+      "elapsed_seconds": 50.774127623066306,
+      "failure_excerpt": null,
+      "failure_log_bytes": 0,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 9.925366667,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 40.267332417,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 45492371456,
+            "lifetime_peak_physical_footprint_bytes": 70582920,
+            "physical_footprint_bytes": 64586376,
+            "pressure_level": 1,
+            "rss_bytes": 96288768
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [],
+      "artifact_hashes": {
+        "plan.json": "1d499ad0adf7effcb9a0987e8ea524492ac4cc5f87056115c76242908e9503ad",
+        "stdout.jsonl": "1400875c9a25d58edbfc69414f6fff2ba5e46dd61b24290a00e53d81d7b7a156",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/aa288b9b1e0b4c85bb562ebf421a16d4",
+      "result_sha256": "e971f7cbe7c66e34c7e718487e6ac7a5462a06e86b2f7a593a28cb6afc81c7e4",
+      "status": "failed",
+      "source_matches_final_candidate": false,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "4",
+        "1"
+      ],
+      "threads_per_threadgroup": null,
+      "binary_sha256": "bbc461d7a0a4f291794257a053c7b147f709aefb59c3c705c5cc4f66d54b07f6",
+      "shader_sha256": "56bc256b8f950fc35d4f3ddd60397937d7d32bb846feacb1c98428ce80af05b5",
+      "elapsed_seconds": 0.5131168309599161,
+      "failure_excerpt": "thread 'main' (130658310) panicked at /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0/risc0/zkp/src/hal/metal.rs:591:13:\nassertion `left == right` failed: Metal kernel eval_check failed (command status Error)\n  left: Error\n right: Completed",
+      "failure_log_bytes": 322,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 0.006528416,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 0.003091417,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 46244347904,
+            "lifetime_peak_physical_footprint_bytes": 36192928,
+            "physical_footprint_bytes": 36192928,
+            "pressure_level": 1,
+            "rss_bytes": 67862528
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [],
+      "artifact_hashes": {
+        "plan.json": "f405b50b2e451a6aeacb493d5e6bcd5c142e718370df836acbbc19affa512766",
+        "stdout.jsonl": "4ebeabb05bc698876ea2f62716861c9a0004380bf649cfb0f485e6ee22350a27",
+        "stderr.log": "8d192307d13ba268a9c043c68f6eb3b9a0f1850f083a5e6404ac7dfe45d8da61"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/72ee78a0659b4e9493f9a5deb84c445a",
+      "result_sha256": "e0d71bb08419594a2aaf418ce0128f6bdbb8313211af78f73938500ec0124453",
+      "status": "passed",
+      "source_matches_final_candidate": false,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "4",
+        "1"
+      ],
+      "threads_per_threadgroup": null,
+      "binary_sha256": "236cb40ceed04fb7e260db373a93ab5bfa5e8ccb44cb02273491dd46604a2ce6",
+      "shader_sha256": "56bc256b8f950fc35d4f3ddd60397937d7d32bb846feacb1c98428ce80af05b5",
+      "elapsed_seconds": 0.8286561667919159,
+      "failure_excerpt": null,
+      "failure_log_bytes": 0,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 0.0084885,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 0.003900084,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 47117926400,
+            "lifetime_peak_physical_footprint_bytes": 36242056,
+            "physical_footprint_bytes": 36242056,
+            "pressure_level": 1,
+            "rss_bytes": 67928064
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [
+        {
+          "case_seconds": 0.155281458,
+          "command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "compared_field_elements": 256,
+          "completed_dispatches": 1,
+          "cpu_evaluation_seconds": 0.002629459,
+          "domain": 64,
+          "gpu_dispatch_seconds": 0.151384417,
+          "guards_preserved": true,
+          "input_hashes": [
+            "757b6fdc2d0c556ed3988a363cdd06bd9891011409e3d80256d7db3112831980",
+            "681c32d4f9cab85d735156f79d80549c5f7bc4582106140bec0d1ea8354e1dd9",
+            "dcba07feda61dcc57296be4f6b229c13c12c69bc7c7ae98f986ebefe0f5838f5",
+            "7fb5416b3276f0c70415e62b4ef09396454acfb4721b1b141e50d5604e338527"
+          ],
+          "inputs_unchanged": true,
+          "isolated_evaluation_ratio_cpu_over_gpu": 0.017369416562868552,
+          "memory": {
+            "available_estimate_bytes": 47117926400,
+            "lifetime_peak_physical_footprint_bytes": 8628880032,
+            "physical_footprint_bytes": 8628880032,
+            "pressure_level": 1,
+            "rss_bytes": 72318976
+          },
+          "offset_elements": 7,
+          "output_sha256": "8685a4ea42bd9359fb8931b5994e65d8648fb4d9a7956b18d299589084df9ddf",
+          "po2": 4,
+          "seed": 1,
+          "status": "matched"
+        }
+      ],
+      "artifact_hashes": {
+        "plan.json": "25b79594cd3198cc47cd3b8ee7a3ae9d68e682453a8be5e9a7c99da9e3c7d78f",
+        "stdout.jsonl": "a66e014a2e0a45a8d09ba3daf0ba6e24191d078c8e36ffe298b62b4b15f0f3b2",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/71eebb4645ac4310b544219f346a1ff1",
+      "result_sha256": "7917f49a9a7a0f7c1ab86ba9b89b1c2c3ffd21b9b530107e222a37206757a85d",
+      "status": "failed",
+      "source_matches_final_candidate": false,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "4",
+        "2"
+      ],
+      "threads_per_threadgroup": 1024,
+      "binary_sha256": "236cb40ceed04fb7e260db373a93ab5bfa5e8ccb44cb02273491dd46604a2ce6",
+      "shader_sha256": "56bc256b8f950fc35d4f3ddd60397937d7d32bb846feacb1c98428ce80af05b5",
+      "elapsed_seconds": 0.778973126783967,
+      "failure_excerpt": "Error: Metal command failed: code=8, Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)",
+      "failure_log_bytes": 112,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 0.008535792,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 0.003826833,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 47269101568,
+            "lifetime_peak_physical_footprint_bytes": 36176472,
+            "physical_footprint_bytes": 36176472,
+            "pressure_level": 1,
+            "rss_bytes": 67895296
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [],
+      "artifact_hashes": {
+        "plan.json": "48dfe514663ef812a2a33882592755cdb0cf3d87704cb8cefa70b0f52501cb58",
+        "stdout.jsonl": "a526c3dd21ebc7ebd0e0617034a0f0d6fd6a6b2516c507753cbf4ce443b19a07",
+        "stderr.log": "2955e220b0e7317bcab481e0387d5a54820c0ddaea106f2bb04838842031cad4"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/cab9e0584d8d45afad5e1fdb17d14c18",
+      "result_sha256": "abf66db7cd40d6dd30d50e1a8a132b8b01adcdc0182e8204c03b1f02390ef79f",
+      "status": "passed",
+      "source_matches_final_candidate": false,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "4",
+        "2"
+      ],
+      "threads_per_threadgroup": 32,
+      "binary_sha256": "35b3814d16296079409a8e2b0a24222bcc7e55e1225a3dd17286f1dd64cff9cb",
+      "shader_sha256": "56bc256b8f950fc35d4f3ddd60397937d7d32bb846feacb1c98428ce80af05b5",
+      "elapsed_seconds": 0.8674212917685509,
+      "failure_excerpt": null,
+      "failure_log_bytes": 0,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 0.008492417,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 0.003932,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 47185412096,
+            "lifetime_peak_physical_footprint_bytes": 36176520,
+            "physical_footprint_bytes": 36176520,
+            "pressure_level": 1,
+            "rss_bytes": 67846144
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [
+        {
+          "case_seconds": 0.170026083,
+          "command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "compared_field_elements": 256,
+          "completed_dispatches": 2,
+          "cpu_evaluation_seconds": 0.0029265,
+          "domain": 64,
+          "gpu_dispatch_seconds": 0.15779875,
+          "guards_preserved": true,
+          "input_hashes": [
+            "fac7a86a9f5eca058f6f89f75ad15db093240666cd8d07433aaff0a95df0e97e",
+            "79a9824c9c9f7694fca3c8d1d5dc16478b4a3ce387125d423e7bbf10f8fc4c01",
+            "b57d564b756000fb33e745494847cdc3d6289e6615bf67e7cb1bb8621664644f",
+            "8d3fec4db4b27752264cdb13ef8983ffe16776efae810d6f1f1b1108131d741f"
+          ],
+          "inputs_unchanged": true,
+          "isolated_evaluation_ratio_cpu_over_gpu": 0.018545774285284262,
+          "memory": {
+            "available_estimate_bytes": 47185412096,
+            "lifetime_peak_physical_footprint_bytes": 8628798136,
+            "physical_footprint_bytes": 8628798136,
+            "pressure_level": 1,
+            "rss_bytes": 72220672
+          },
+          "offset_elements": 7,
+          "output_sha256": "217b8fa3d343ff33cf95dc3da926b62de7634cdbf5167ec43598f6976ab8e094",
+          "po2": 4,
+          "reuse_command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "reuse_dispatch_seconds": 0.007739917,
+          "reuse_matched": true,
+          "seed": 2,
+          "status": "matched"
+        }
+      ],
+      "artifact_hashes": {
+        "plan.json": "45f2fdbaebff2e90ff226806f33e69aeacb857ff9fb2ec62e6b0299595a7aae4",
+        "stdout.jsonl": "f43aa7b27c9ea1d2d60fbc1640e6e7b9713bb2e16e62c0c0c1847fa75b5b30bd",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/81c807d403d7442b919fa23c8672a0fb",
+      "result_sha256": "a6637e9be0dfadcf2ca73657c706f0ce678223e8c8af5368d3a07915171aa04e",
+      "status": "passed",
+      "source_matches_final_candidate": false,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "8",
+        "3"
+      ],
+      "threads_per_threadgroup": 32,
+      "binary_sha256": "35b3814d16296079409a8e2b0a24222bcc7e55e1225a3dd17286f1dd64cff9cb",
+      "shader_sha256": "56bc256b8f950fc35d4f3ddd60397937d7d32bb846feacb1c98428ce80af05b5",
+      "elapsed_seconds": 0.6337934155017138,
+      "failure_excerpt": null,
+      "failure_log_bytes": 0,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 0.006383917,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 0.003155208,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 47007645696,
+            "lifetime_peak_physical_footprint_bytes": 36127296,
+            "physical_footprint_bytes": 36127296,
+            "pressure_level": 1,
+            "rss_bytes": 67846144
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [
+        {
+          "case_seconds": 0.172125917,
+          "command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "compared_field_elements": 4096,
+          "completed_dispatches": 2,
+          "cpu_evaluation_seconds": 0.005458541,
+          "domain": 1024,
+          "gpu_dispatch_seconds": 0.153379833,
+          "guards_preserved": true,
+          "input_hashes": [
+            "8436b58356667d55bc51fe0d4c7593e81cd630f544162f01499cb27e5bd6ccbf",
+            "ce56ad9c77bb49f83b4da61c7e739aa8b1cef3e94aacaec22e6c7c604b8c9363",
+            "6b0d0b00a5b0a07db0cde9b5f4bf2539c0f182eb2f175bb0fe86073efc9dfe32",
+            "d43f1880d9c5c9382e30233b6d970b21dddbcb02fcd93dbad802b8e8f0f4e33c"
+          ],
+          "inputs_unchanged": true,
+          "isolated_evaluation_ratio_cpu_over_gpu": 0.03558838794667354,
+          "memory": {
+            "available_estimate_bytes": 38386106368,
+            "lifetime_peak_physical_footprint_bytes": 8629977712,
+            "physical_footprint_bytes": 8629977712,
+            "pressure_level": 1,
+            "rss_bytes": 73449472
+          },
+          "offset_elements": 7,
+          "output_sha256": "af4d53a82ef81456d1f179f8d5d31c1b4286340d1a601f5b29d6bcf8d9929f82",
+          "po2": 8,
+          "reuse_command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "reuse_dispatch_seconds": 0.007415333,
+          "reuse_matched": true,
+          "seed": 3,
+          "status": "matched"
+        }
+      ],
+      "artifact_hashes": {
+        "plan.json": "3e1abb598c7c61da72b4c648854f7ea49b1ba7d554943046ea90cd89913304cb",
+        "stdout.jsonl": "cec78ac20d7193dcc43aae8c9eb02144ca8c1e225d1539c30bc9680825c7c4f6",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/ef1a616802e14c5fb9c0660ffc341e09",
+      "result_sha256": "bf74f68a3ec84101de3eb645a72d49946f75541b40f28eefcff9a73d80f0dfb2",
+      "status": "failed",
+      "source_matches_final_candidate": false,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "14",
+        "5"
+      ],
+      "threads_per_threadgroup": 32,
+      "binary_sha256": "35b3814d16296079409a8e2b0a24222bcc7e55e1225a3dd17286f1dd64cff9cb",
+      "shader_sha256": "56bc256b8f950fc35d4f3ddd60397937d7d32bb846feacb1c98428ce80af05b5",
+      "elapsed_seconds": 1.0196266248822212,
+      "failure_excerpt": "Error: CPU/Metal mismatch po2=14 seed=5 cycle=18400 component=0: 0x1b47ce3c != 0x6a95a1e9",
+      "failure_log_bytes": 90,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 0.006237291,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 0.002992917,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 38386106368,
+            "lifetime_peak_physical_footprint_bytes": 36209312,
+            "physical_footprint_bytes": 36209312,
+            "pressure_level": 1,
+            "rss_bytes": 67862528
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [],
+      "artifact_hashes": {
+        "plan.json": "b3056ee787045544e1dfb0ac271384ee9ae5f98593705765d6ba4839080d8eda",
+        "stdout.jsonl": "9590b60c05a7f50b45a6e397e9b3ce65f9ff00824e3d2db2bd1d5644086e6e55",
+        "stderr.log": "96633926089ae671bcb84e7919fda5adadc9fafb86427221a0d073e5e7ec22b6"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/4cf40e3455d548b1b90eae3c5a076e18",
+      "result_sha256": "40c884e070c3a2514a075498827561fdb5016c34c8f23f9bc534bee4027343d8",
+      "status": "failed",
+      "source_matches_final_candidate": false,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "14",
+        "5"
+      ],
+      "threads_per_threadgroup": 32,
+      "binary_sha256": "46533566e1a74388d7791658f4f4d21f3474ae4ad3a56e8d1759fbd61794417f",
+      "shader_sha256": "56bc256b8f950fc35d4f3ddd60397937d7d32bb846feacb1c98428ce80af05b5",
+      "elapsed_seconds": 1.2467371243983507,
+      "failure_excerpt": "Error: CPU/Metal mismatch po2=14 seed=5 cycle=33344 component=0: 0x28f85249 != 0x101b1e84",
+      "failure_log_bytes": 90,
+      "failure_diagnostics": [
+        {
+          "domain": 65536,
+          "examples": [
+            {
+              "actual": [
+                1855750509,
+                1221055635,
+                1665292774,
+                1914288609
+              ],
+              "cycle": 26368,
+              "expected": [
+                1740770812,
+                1546716430,
+                599271839,
+                1031476559
+              ],
+              "ratio": [
+                73467683,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "actual": [
+                1596013731,
+                1863454961,
+                1906688342,
+                1204622360
+              ],
+              "cycle": 26369,
+              "expected": [
+                915988087,
+                1173616229,
+                1441327647,
+                287346622
+              ],
+              "ratio": [
+                721831394,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "actual": [
+                560301218,
+                1544706646,
+                1191976321,
+                729127358
+              ],
+              "cycle": 26370,
+              "expected": [
+                1344615657,
+                498327166,
+                1501250023,
+                1519682832
+              ],
+              "ratio": [
+                1939798240,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "actual": [
+                1247707286,
+                301908384,
+                1305622821,
+                447518680
+              ],
+              "cycle": 26371,
+              "expected": [
+                1056379154,
+                1170721556,
+                1608813725,
+                371716979
+              ],
+              "ratio": [
+                1291434529,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "actual": [
+                1993950640,
+                799281890,
+                942830962,
+                371246606
+              ],
+              "cycle": 26372,
+              "expected": [
+                1825164886,
+                1583517521,
+                1290053482,
+                504002345
+              ],
+              "ratio": [
+                73467683,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "actual": [
+                932785996,
+                727734889,
+                1254595707,
+                325857253
+              ],
+              "cycle": 26373,
+              "expected": [
+                1399180192,
+                369394676,
+                236927351,
+                1270550737
+              ],
+              "ratio": [
+                721831394,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "actual": [
+                1596936472,
+                901599856,
+                1054911477,
+                1378980907
+              ],
+              "cycle": 26374,
+              "expected": [
+                809106889,
+                1323775733,
+                1761348735,
+                1021564368
+              ],
+              "ratio": [
+                1939798240,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "actual": [
+                701964147,
+                1273636328,
+                1525131537,
+                1482098078
+              ],
+              "cycle": 26375,
+              "expected": [
+                1434152128,
+                1948411275,
+                1732964510,
+                1738183258
+              ],
+              "ratio": [
+                1291434529,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "actual": [
+                1898334815,
+                1210337378,
+                1872546236,
+                1684512117
+              ],
+              "cycle": 26376,
+              "expected": [
+                818888292,
+                1651326116,
+                1137476612,
+                771846972
+              ],
+              "ratio": [
+                73467683,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "actual": [
+                400632335,
+                677672136,
+                1096009318,
+                1227737562
+              ],
+              "cycle": 26377,
+              "expected": [
+                1012952729,
+                1029927909,
+                207898454,
+                730507513
+              ],
+              "ratio": [
+                721831394,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "actual": [
+                1276773929,
+                554165453,
+                1625833328,
+                1758300994
+              ],
+              "cycle": 26378,
+              "expected": [
+                35614841,
+                461705903,
+                1883908261,
+                2006440828
+              ],
+              "ratio": [
+                1939798240,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "actual": [
+                1563632872,
+                714258578,
+                957803865,
+                602271848
+              ],
+              "cycle": 26379,
+              "expected": [
+                1705108567,
+                1755003289,
+                908051974,
+                1558604787
+              ],
+              "ratio": [
+                1291434529,
+                0,
+                0,
+                0
+              ]
+            }
+          ],
+          "mismatched_cycles": 256
+        }
+      ],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 0.006761875,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 0.003187709,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 47729508352,
+            "lifetime_peak_physical_footprint_bytes": 36078168,
+            "physical_footprint_bytes": 36078168,
+            "pressure_level": 1,
+            "rss_bytes": 67796992
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [],
+      "artifact_hashes": {
+        "plan.json": "6be926c296bfdc3864612f0f37358c885a6650a9d6b0da6f8e7e58c8b73c99ed",
+        "stdout.jsonl": "8d0bad12223cf9a0af979a0d45f926c09796565901b7df1c69387de60ce55cb6",
+        "stderr.log": "56bd82a9945fbf2cde5c49b70bae2ca63b6e5d73a662d1c9569874d37706b9cf"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/fb46a751543c4a4db588626ad56d4210",
+      "result_sha256": "f05bc65f7de2f8dd60d4e5dbdddd54ebd0e97eeb857245f6b13d149b06dba959",
+      "status": "passed",
+      "source_matches_final_candidate": false,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "14",
+        "5"
+      ],
+      "threads_per_threadgroup": 32,
+      "binary_sha256": "aacc3213aaa506848ca854164d15aa04fbba729b97677dcde7706233b68effb3",
+      "shader_sha256": "4de746306b22bd756e919f2d27d28848e28ed7e4fabcb6e6c526537bac01708b",
+      "elapsed_seconds": 51.37936325185001,
+      "failure_excerpt": null,
+      "failure_log_bytes": 0,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 9.790342834,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 40.159224583,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 46869463040,
+            "lifetime_peak_physical_footprint_bytes": 70501000,
+            "physical_footprint_bytes": 64504456,
+            "pressure_level": 1,
+            "rss_bytes": 96223232
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [
+        {
+          "case_seconds": 0.879579792,
+          "command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "compared_field_elements": 262144,
+          "completed_dispatches": 2,
+          "cpu_evaluation_seconds": 0.299975875,
+          "domain": 65536,
+          "gpu_dispatch_seconds": 0.212557417,
+          "guards_preserved": true,
+          "input_hashes": [
+            "6a7df14fef3f6d07f00d9e2250c518eb152af80044266db97aa8d296ce360c07",
+            "6d35cdf3781056fef47b136d26aede9f0dc0c38e658b2ed0d750951678c888ac",
+            "3bd1643a1c16a9bd6bf21ff86aa146d9304854b5c0dce084cf4344c41eb68cb0",
+            "fb476d1db13fbd626381aacb24c647d3699e73553c990dbb014a7b1347bbb343"
+          ],
+          "inputs_unchanged": true,
+          "isolated_evaluation_ratio_cpu_over_gpu": 1.4112698546764897,
+          "memory": {
+            "available_estimate_bytes": 38197952512,
+            "lifetime_peak_physical_footprint_bytes": 8741176088,
+            "physical_footprint_bytes": 8741176088,
+            "pressure_level": 1,
+            "rss_bytes": 184565760
+          },
+          "normalization": [
+            740059418,
+            1291067696,
+            1144486276,
+            1422735472
+          ],
+          "offset_elements": 7,
+          "output_sha256": "85c4779036a03f59f8a761629889dff79d75bef5ba4db8456d025432d8c7fbac",
+          "po2": 14,
+          "reuse_command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "reuse_dispatch_seconds": 0.095245125,
+          "reuse_matched": true,
+          "seed": 5,
+          "status": "matched"
+        }
+      ],
+      "artifact_hashes": {
+        "plan.json": "ad9589c932ad51772a4b913e9a9f21bffbaff3097082ff45a0d8ba1b37b243f5",
+        "stdout.jsonl": "a157991a178d492e87fb998cc55c8246e39856844009f58819d5007242c04ea2",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/09cc1cd33168415fb859b14beb412050",
+      "result_sha256": "5862ea2b114eb89db910bbfbde9fc54e0c287721c2a313bea70a691c600d7adb",
+      "status": "passed",
+      "source_matches_final_candidate": true,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "18",
+        "7"
+      ],
+      "threads_per_threadgroup": 32,
+      "binary_sha256": "ecfe23ac6287487c446b54bd598a1fe13d8ddcbfe03a92f016bc30d432274975",
+      "shader_sha256": "4de746306b22bd756e919f2d27d28848e28ed7e4fabcb6e6c526537bac01708b",
+      "elapsed_seconds": 12.60926741734147,
+      "failure_excerpt": null,
+      "failure_log_bytes": 0,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 0.008664791,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 0.003978542,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 47788294144,
+            "lifetime_peak_physical_footprint_bytes": 36192856,
+            "physical_footprint_bytes": 36192856,
+            "pressure_level": 1,
+            "rss_bytes": 67928064
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [
+        {
+          "case_seconds": 11.774122875,
+          "command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "compared_field_elements": 4194304,
+          "completed_dispatches": 2,
+          "cpu_evaluation_seconds": 4.380760208,
+          "domain": 1048576,
+          "gpu_dispatch_seconds": 1.544538416,
+          "guards_preserved": true,
+          "input_hashes": [
+            "8d86f44932206aedca2c5eb1f05eba87ebc7bef24ec1d240ceb81cea6c7d8688",
+            "54f0be566b0a72a500283aff43b8b07e14aa398191bd08953c0df8ca696289d1",
+            "e39d18a9d41c0b898c05be22ee2e851b2a662b00b6ececfc7eb950828044d4c4",
+            "43fdc0ea7b3fbdff9ffbfcbac7146df9300f12168893d2e7e389e28af8673d78"
+          ],
+          "inputs_unchanged": true,
+          "isolated_evaluation_ratio_cpu_over_gpu": 2.836290870216853,
+          "memory": {
+            "available_estimate_bytes": 42676600832,
+            "lifetime_peak_physical_footprint_bytes": 9980413536,
+            "physical_footprint_bytes": 1591559776,
+            "pressure_level": 1,
+            "rss_bytes": 1423212544
+          },
+          "normalization": [
+            238133625,
+            351938352,
+            1602939684,
+            1378296264
+          ],
+          "offset_elements": 7,
+          "output_sha256": "0a2e0fe2a342942fd0dc5403926f79200e681664ac0c94ffed525d14a7ae5e26",
+          "po2": 18,
+          "reuse_command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "reuse_dispatch_seconds": 1.513268,
+          "reuse_matched": true,
+          "seed": 7,
+          "status": "matched"
+        }
+      ],
+      "artifact_hashes": {
+        "plan.json": "6fbdc5b0d3c79cf0dff1a0b3ee9a63c836afe80afadfaa044513eadbb018cb92",
+        "stdout.jsonl": "30e6a3aa9ad1106415782167a77efa178cbdd0134ad425942299ac3877034e5b",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/dbf0873510e349d282e84e074f62119d",
+      "result_sha256": "3fa6ecbe5d1df014ed1358d20da33b297574f80d6778b0ed159cf9fac5b86369",
+      "status": "passed",
+      "source_matches_final_candidate": true,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "4",
+        "11"
+      ],
+      "threads_per_threadgroup": 32,
+      "binary_sha256": "ecfe23ac6287487c446b54bd598a1fe13d8ddcbfe03a92f016bc30d432274975",
+      "shader_sha256": "4de746306b22bd756e919f2d27d28848e28ed7e4fabcb6e6c526537bac01708b",
+      "elapsed_seconds": 0.6364723332226276,
+      "failure_excerpt": null,
+      "failure_log_bytes": 0,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 0.006401375,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 0.003062125,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 48748888064,
+            "lifetime_peak_physical_footprint_bytes": 36192856,
+            "physical_footprint_bytes": 36192856,
+            "pressure_level": 1,
+            "rss_bytes": 67928064
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [
+        {
+          "case_seconds": 0.163874458,
+          "command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "compared_field_elements": 256,
+          "completed_dispatches": 2,
+          "cpu_evaluation_seconds": 0.001079959,
+          "domain": 64,
+          "gpu_dispatch_seconds": 0.155484958,
+          "guards_preserved": true,
+          "input_hashes": [
+            "395ed3ac67bf7660bf2062e849de8cee960031b897a206e66b838e527e8fe40e",
+            "2001afe49fb2453ca8f5a48fe2e053cf69a99783cb160c4278653fff2965684c",
+            "7e8f568ed7587abb81785c737040f2a33ec7ae7f70b22571655c5a7019785a06",
+            "2753ce461ad872f20a46d7cf58bcc005d1b6bc6a521731791346dbf6a3f9b91c"
+          ],
+          "inputs_unchanged": true,
+          "isolated_evaluation_ratio_cpu_over_gpu": 0.006945745838642474,
+          "memory": {
+            "available_estimate_bytes": 48748888064,
+            "lifetime_peak_physical_footprint_bytes": 8628830856,
+            "physical_footprint_bytes": 8628830856,
+            "pressure_level": 1,
+            "rss_bytes": 72302592
+          },
+          "normalization": [
+            984834668,
+            1056489984,
+            1639581345,
+            1154996488
+          ],
+          "offset_elements": 7,
+          "output_sha256": "e992e5198d40be386ff536de799f2bf06c69304dbbd66bd0ba2a353193698296",
+          "po2": 4,
+          "reuse_command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "reuse_dispatch_seconds": 0.006064791,
+          "reuse_matched": true,
+          "seed": 11,
+          "status": "matched"
+        }
+      ],
+      "artifact_hashes": {
+        "plan.json": "9da5c5c90978e4491279f680261aa5cf589846ece98cfe9250bcd0dbc3bd62be",
+        "stdout.jsonl": "6c57372972fd33148815da7b6be44a9018867d72ec57b943fbb3fd4cee499b8e",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/2616dbb22be14c5ca5e3a8e82b755e47",
+      "result_sha256": "93d84539fbf7fa70f0f7ce5e75982aecff5472d6b1a1ab4e47b6b5d87fbdd196",
+      "status": "passed",
+      "source_matches_final_candidate": true,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "8",
+        "13"
+      ],
+      "threads_per_threadgroup": 32,
+      "binary_sha256": "ecfe23ac6287487c446b54bd598a1fe13d8ddcbfe03a92f016bc30d432274975",
+      "shader_sha256": "4de746306b22bd756e919f2d27d28848e28ed7e4fabcb6e6c526537bac01708b",
+      "elapsed_seconds": 0.6456135008484125,
+      "failure_excerpt": null,
+      "failure_log_bytes": 0,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 0.00626425,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 0.002953625,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 48748888064,
+            "lifetime_peak_physical_footprint_bytes": 36176472,
+            "physical_footprint_bytes": 36176472,
+            "pressure_level": 1,
+            "rss_bytes": 67911680
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [
+        {
+          "case_seconds": 0.172513709,
+          "command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "compared_field_elements": 4096,
+          "completed_dispatches": 2,
+          "cpu_evaluation_seconds": 0.005236584,
+          "domain": 1024,
+          "gpu_dispatch_seconds": 0.153618958,
+          "guards_preserved": true,
+          "input_hashes": [
+            "484239958bb514441aa9a7184b0a9b42c9bde02c9a26dd8cf2800750486130a6",
+            "0f7ba3f6d22faaf49418f792f1cb5af691ea1593b49c1114caa79882bd3c268e",
+            "63f2a844d285dff6c4249e22fab1bcf1cd938077d710c414c4cd01bf6ad42364",
+            "bd6d89052e91f2ec5fba8273113df46db973f2adedea2b12411e1b900a6e5c8f"
+          ],
+          "inputs_unchanged": true,
+          "isolated_evaluation_ratio_cpu_over_gpu": 0.03408813643951419,
+          "memory": {
+            "available_estimate_bytes": 48748888064,
+            "lifetime_peak_physical_footprint_bytes": 8630174344,
+            "physical_footprint_bytes": 8630174344,
+            "pressure_level": 1,
+            "rss_bytes": 73646080
+          },
+          "normalization": [
+            105662458,
+            238237692,
+            1909743770,
+            67489182
+          ],
+          "offset_elements": 7,
+          "output_sha256": "6c13942881c504e6cbf98d3e50df6f6ae70cdab2b0a05b1671c674d25c4d6fd4",
+          "po2": 8,
+          "reuse_command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "reuse_dispatch_seconds": 0.007744125,
+          "reuse_matched": true,
+          "seed": 13,
+          "status": "matched"
+        }
+      ],
+      "artifact_hashes": {
+        "plan.json": "3b1f30f5527013f597dfe8d1573d8a8d77e4a2573756f8c08bf8b4deb6e22c40",
+        "stdout.jsonl": "76cb6fd5f38a3489171d4bc0b1c6c328fc1045859fe76bb6852e6f631c1e8ffd",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/ade18dad1f5c47df81b67f3ccccb5bb5",
+      "result_sha256": "ede8ed56f1071a86a179408f08999a662c7411bf342fc085e44a7a1606d833d7",
+      "status": "passed",
+      "source_matches_final_candidate": true,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "14",
+        "17"
+      ],
+      "threads_per_threadgroup": 32,
+      "binary_sha256": "ecfe23ac6287487c446b54bd598a1fe13d8ddcbfe03a92f016bc30d432274975",
+      "shader_sha256": "4de746306b22bd756e919f2d27d28848e28ed7e4fabcb6e6c526537bac01708b",
+      "elapsed_seconds": 1.1371289994567633,
+      "failure_excerpt": null,
+      "failure_log_bytes": 0,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 0.00630875,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 0.002955833,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 48706437120,
+            "lifetime_peak_physical_footprint_bytes": 36209288,
+            "physical_footprint_bytes": 36209288,
+            "pressure_level": 1,
+            "rss_bytes": 67911680
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [
+        {
+          "case_seconds": 0.876863292,
+          "command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "compared_field_elements": 262144,
+          "completed_dispatches": 2,
+          "cpu_evaluation_seconds": 0.298225,
+          "domain": 65536,
+          "gpu_dispatch_seconds": 0.212348666,
+          "guards_preserved": true,
+          "input_hashes": [
+            "41e7e8a354b1470ea3c93f320d6050dc9e9ada0256e5632763c415da704af009",
+            "1b8cf4bbbbc7d2c3425ed2bb7f867302a3ff6baecf6ce7438f5d49966eb97012",
+            "cde10ea5afce9c59c790debcdc5bf99c85dab02110e20332a6b652551a829e0b",
+            "333b76780a91716365536eb406d3c9c7df61e860fa8c42853e3704cce4dd87df"
+          ],
+          "inputs_unchanged": true,
+          "isolated_evaluation_ratio_cpu_over_gpu": 1.4044119307064544,
+          "memory": {
+            "available_estimate_bytes": 40007057408,
+            "lifetime_peak_physical_footprint_bytes": 8712700648,
+            "physical_footprint_bytes": 8712700648,
+            "pressure_level": 1,
+            "rss_bytes": 156106752
+          },
+          "normalization": [
+            740059418,
+            1291067696,
+            1144486276,
+            1422735472
+          ],
+          "offset_elements": 7,
+          "output_sha256": "897967168828cdb0ec32f70936b7474e63ad69177da9547ad2911feb48b339e4",
+          "po2": 14,
+          "reuse_command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "reuse_dispatch_seconds": 0.094129875,
+          "reuse_matched": true,
+          "seed": 17,
+          "status": "matched"
+        }
+      ],
+      "artifact_hashes": {
+        "plan.json": "11ae8297ef69186fa8d46eadb669bb2dda182c8948f880fdb1c4b3426ff5b8db",
+        "stdout.jsonl": "a580d9dbabf5a3043f4f4a15b903719a1595a7f34334618a13605bed92473226",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/6efa889edd15433893c6e918db7bcfbe",
+      "result_sha256": "57bdc7adc9a9a89219776e014d9769b7115132f6691d7b32a46d29ca1d081538",
+      "status": "passed",
+      "source_matches_final_candidate": true,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "20",
+        "19"
+      ],
+      "threads_per_threadgroup": 32,
+      "binary_sha256": "ecfe23ac6287487c446b54bd598a1fe13d8ddcbfe03a92f016bc30d432274975",
+      "shader_sha256": "4de746306b22bd756e919f2d27d28848e28ed7e4fabcb6e6c526537bac01708b",
+      "elapsed_seconds": 49.07767129316926,
+      "failure_excerpt": null,
+      "failure_log_bytes": 0,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 0.006393708,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 0.002915416,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 48693477376,
+            "lifetime_peak_physical_footprint_bytes": 36209264,
+            "physical_footprint_bytes": 36209264,
+            "pressure_level": 1,
+            "rss_bytes": 67928064
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [
+        {
+          "case_seconds": 48.624504542,
+          "command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "compared_field_elements": 16777216,
+          "completed_dispatches": 2,
+          "cpu_evaluation_seconds": 19.2579415,
+          "domain": 4194304,
+          "gpu_dispatch_seconds": 5.846810792,
+          "guards_preserved": true,
+          "input_hashes": [
+            "e58efb4657086038ccfca212ef942d7bd15c11fd402520ee6afa8566c86c36ff",
+            "8ea060581830962c23a8797dc598d152fcfa1b16477878d3a18b0903627d3338",
+            "526284471c00b67db7650fafc5d05c6e9e1e1628baeae6e77a5045a9a099e069",
+            "3a6116fe2a19d84543d266c4a45e07855ef3fc707b2928efa8de65d5bc554d48"
+          ],
+          "inputs_unchanged": true,
+          "isolated_evaluation_ratio_cpu_over_gpu": 3.2937514458908113,
+          "memory": {
+            "available_estimate_bytes": 43100258304,
+            "lifetime_peak_physical_footprint_bytes": 14034031056,
+            "physical_footprint_bytes": 5645177296,
+            "pressure_level": 1,
+            "rss_bytes": 5474828288
+          },
+          "normalization": [
+            389510501,
+            1643799235,
+            776968452,
+            357437022
+          ],
+          "offset_elements": 7,
+          "output_sha256": "a8aacfa6e45a5214c65e7f03465bcb1c149c6d2f23cd7cb79849a603d4ba3b4e",
+          "po2": 20,
+          "reuse_command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "reuse_dispatch_seconds": 5.853254583,
+          "reuse_matched": true,
+          "seed": 19,
+          "status": "matched"
+        }
+      ],
+      "artifact_hashes": {
+        "plan.json": "bc8bfbdbed3ca19b42d38075e6717a347d85e924379c17dd3a0f329f114b16c6",
+        "stdout.jsonl": "399fe070d33bb3c8d8cfee70a8975be4875c2469863146baca0f5d0645650769",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/2933492a071a40c791024a70bf1dd828",
+      "result_sha256": "44368e2a76f93a6db6a6b0ffd71d2b1a9d8dba1e9f86a3ecfd3161947c003d9a",
+      "status": "passed",
+      "source_matches_final_candidate": true,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "20",
+        "23"
+      ],
+      "threads_per_threadgroup": 32,
+      "binary_sha256": "ecfe23ac6287487c446b54bd598a1fe13d8ddcbfe03a92f016bc30d432274975",
+      "shader_sha256": "4de746306b22bd756e919f2d27d28848e28ed7e4fabcb6e6c526537bac01708b",
+      "elapsed_seconds": 49.57045371085405,
+      "failure_excerpt": null,
+      "failure_log_bytes": 0,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 0.006316584,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 0.002933583,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 48484335616,
+            "lifetime_peak_physical_footprint_bytes": 36242056,
+            "physical_footprint_bytes": 36242056,
+            "pressure_level": 1,
+            "rss_bytes": 67944448
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [
+        {
+          "case_seconds": 48.904613667,
+          "command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "compared_field_elements": 16777216,
+          "completed_dispatches": 2,
+          "cpu_evaluation_seconds": 19.469045666,
+          "domain": 4194304,
+          "gpu_dispatch_seconds": 5.84516525,
+          "guards_preserved": true,
+          "input_hashes": [
+            "c83e67c770dab6f13fbec9dcc1060347241fbeb80fdad066e97839c11d79063a",
+            "0f49d0dea21d38fa2086527fd93f8512d69bb5a9d95eca846edd8ac14bd63d6b",
+            "acbf56a62d31da1975c1adddbaf6983b659ed9257764a55a85c931660c143812",
+            "8cf6ace178c73d6fdb8782ec5070fa00378eded8b146e25d2124617069dc1c06"
+          ],
+          "inputs_unchanged": true,
+          "isolated_evaluation_ratio_cpu_over_gpu": 3.3307947394643804,
+          "memory": {
+            "available_estimate_bytes": 43097718784,
+            "lifetime_peak_physical_footprint_bytes": 14034211280,
+            "physical_footprint_bytes": 5645373904,
+            "pressure_level": 1,
+            "rss_bytes": 5475024896
+          },
+          "normalization": [
+            389510501,
+            1643799235,
+            776968452,
+            357437022
+          ],
+          "offset_elements": 7,
+          "output_sha256": "eaf1ad63104e255e2bdad6623e3c5e7f5c999fbfd8d46f87ef57964bce86d3ed",
+          "po2": 20,
+          "reuse_command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "reuse_dispatch_seconds": 5.8482165,
+          "reuse_matched": true,
+          "seed": 23,
+          "status": "matched"
+        }
+      ],
+      "artifact_hashes": {
+        "plan.json": "73d9d3044a44cf0c4602f9e1ea21869dd8699f81e4f29df050c1c424f6bc604f",
+        "stdout.jsonl": "8c8e58584e4920dda83e4864202588de157e37a0b8c0134b2bf4fef1ad70c16f",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/8c4b13e889f742ad80a981682ca77003",
+      "result_sha256": "bf2c6e4d178acf334094fd15ca302a81359502ae7d38de6abb1fa8db915cfade",
+      "status": "passed",
+      "source_matches_final_candidate": true,
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype",
+        "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/evaluator.metal",
+        "4",
+        "29"
+      ],
+      "threads_per_threadgroup": 32,
+      "binary_sha256": "ecfe23ac6287487c446b54bd598a1fe13d8ddcbfe03a92f016bc30d432274975",
+      "shader_sha256": "4de746306b22bd756e919f2d27d28848e28ed7e4fabcb6e6c526537bac01708b",
+      "elapsed_seconds": 0.6315384563058615,
+      "failure_excerpt": null,
+      "failure_log_bytes": 0,
+      "failure_diagnostics": [],
+      "compilation": [
+        {
+          "data": {
+            "library_seconds": 0.006507666,
+            "max_threads_per_threadgroup": 1024,
+            "pipeline_seconds": 0.003069125,
+            "static_threadgroup_bytes": 0,
+            "thread_execution_width": 32
+          },
+          "memory": {
+            "available_estimate_bytes": 43097718784,
+            "lifetime_peak_physical_footprint_bytes": 36209240,
+            "physical_footprint_bytes": 36209240,
+            "pressure_level": 1,
+            "rss_bytes": 67944448
+          },
+          "phase": "compiled"
+        }
+      ],
+      "cases": [
+        {
+          "case_seconds": 0.170082708,
+          "command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "compared_field_elements": 256,
+          "completed_dispatches": 2,
+          "cpu_evaluation_seconds": 0.001054084,
+          "domain": 64,
+          "gpu_dispatch_seconds": 0.161728417,
+          "guards_preserved": true,
+          "input_hashes": [
+            "d4d37831c15724a85ca6b4f3b326a9709408d87a0a6457673d8e33f4fbc9d5a0",
+            "c1615730edfbeb491b8139b9d05eef7dc7a7e9dc1ef6fdc8d2d39a39891c67fd",
+            "eaa7c55ff898bab8cc93b35872d5fa1192c738c4f4c613c656638b1b90771c5d",
+            "03be4201d487a45ec72c1545732efc146aa071ecfceba4dda4f08c3dd57b67dd"
+          ],
+          "inputs_unchanged": true,
+          "isolated_evaluation_ratio_cpu_over_gpu": 0.006517617741846815,
+          "memory": {
+            "available_estimate_bytes": 43097718784,
+            "lifetime_peak_physical_footprint_bytes": 8628699784,
+            "physical_footprint_bytes": 8628699784,
+            "pressure_level": 1,
+            "rss_bytes": 72171520
+          },
+          "normalization": [
+            984834668,
+            1056489984,
+            1639581345,
+            1154996488
+          ],
+          "offset_elements": 7,
+          "output_sha256": "f9afee798ca2331e37ec83eb71bda1366d1307681911f073b8e14dc8fd0a5106",
+          "po2": 4,
+          "reuse_command": {
+            "status": "Completed",
+            "threads_per_threadgroup": 32
+          },
+          "reuse_dispatch_seconds": 0.005769,
+          "reuse_matched": true,
+          "seed": 29,
+          "status": "matched"
+        }
+      ],
+      "artifact_hashes": {
+        "plan.json": "2d53a138ab84d0d912f8cda8c685d31a360cfcfa0a5d9b86c68fe0bdc0a944c9",
+        "stdout.jsonl": "9e4360497e016a1628b4c5393b60bfa8adb9b18cad8b72b73c5da54200112037",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  ],
+  "final_candidate_cases": [
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/09cc1cd33168415fb859b14beb412050",
+      "result_sha256": "5862ea2b114eb89db910bbfbde9fc54e0c287721c2a313bea70a691c600d7adb",
+      "case_seconds": 11.774122875,
+      "command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "compared_field_elements": 4194304,
+      "completed_dispatches": 2,
+      "cpu_evaluation_seconds": 4.380760208,
+      "domain": 1048576,
+      "gpu_dispatch_seconds": 1.544538416,
+      "guards_preserved": true,
+      "input_hashes": [
+        "8d86f44932206aedca2c5eb1f05eba87ebc7bef24ec1d240ceb81cea6c7d8688",
+        "54f0be566b0a72a500283aff43b8b07e14aa398191bd08953c0df8ca696289d1",
+        "e39d18a9d41c0b898c05be22ee2e851b2a662b00b6ececfc7eb950828044d4c4",
+        "43fdc0ea7b3fbdff9ffbfcbac7146df9300f12168893d2e7e389e28af8673d78"
+      ],
+      "inputs_unchanged": true,
+      "isolated_evaluation_ratio_cpu_over_gpu": 2.836290870216853,
+      "memory": {
+        "available_estimate_bytes": 42676600832,
+        "lifetime_peak_physical_footprint_bytes": 9980413536,
+        "physical_footprint_bytes": 1591559776,
+        "pressure_level": 1,
+        "rss_bytes": 1423212544
+      },
+      "normalization": [
+        238133625,
+        351938352,
+        1602939684,
+        1378296264
+      ],
+      "offset_elements": 7,
+      "output_sha256": "0a2e0fe2a342942fd0dc5403926f79200e681664ac0c94ffed525d14a7ae5e26",
+      "po2": 18,
+      "reuse_command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "reuse_dispatch_seconds": 1.513268,
+      "reuse_matched": true,
+      "seed": 7,
+      "status": "matched"
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/dbf0873510e349d282e84e074f62119d",
+      "result_sha256": "3fa6ecbe5d1df014ed1358d20da33b297574f80d6778b0ed159cf9fac5b86369",
+      "case_seconds": 0.163874458,
+      "command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "compared_field_elements": 256,
+      "completed_dispatches": 2,
+      "cpu_evaluation_seconds": 0.001079959,
+      "domain": 64,
+      "gpu_dispatch_seconds": 0.155484958,
+      "guards_preserved": true,
+      "input_hashes": [
+        "395ed3ac67bf7660bf2062e849de8cee960031b897a206e66b838e527e8fe40e",
+        "2001afe49fb2453ca8f5a48fe2e053cf69a99783cb160c4278653fff2965684c",
+        "7e8f568ed7587abb81785c737040f2a33ec7ae7f70b22571655c5a7019785a06",
+        "2753ce461ad872f20a46d7cf58bcc005d1b6bc6a521731791346dbf6a3f9b91c"
+      ],
+      "inputs_unchanged": true,
+      "isolated_evaluation_ratio_cpu_over_gpu": 0.006945745838642474,
+      "memory": {
+        "available_estimate_bytes": 48748888064,
+        "lifetime_peak_physical_footprint_bytes": 8628830856,
+        "physical_footprint_bytes": 8628830856,
+        "pressure_level": 1,
+        "rss_bytes": 72302592
+      },
+      "normalization": [
+        984834668,
+        1056489984,
+        1639581345,
+        1154996488
+      ],
+      "offset_elements": 7,
+      "output_sha256": "e992e5198d40be386ff536de799f2bf06c69304dbbd66bd0ba2a353193698296",
+      "po2": 4,
+      "reuse_command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "reuse_dispatch_seconds": 0.006064791,
+      "reuse_matched": true,
+      "seed": 11,
+      "status": "matched"
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/2616dbb22be14c5ca5e3a8e82b755e47",
+      "result_sha256": "93d84539fbf7fa70f0f7ce5e75982aecff5472d6b1a1ab4e47b6b5d87fbdd196",
+      "case_seconds": 0.172513709,
+      "command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "compared_field_elements": 4096,
+      "completed_dispatches": 2,
+      "cpu_evaluation_seconds": 0.005236584,
+      "domain": 1024,
+      "gpu_dispatch_seconds": 0.153618958,
+      "guards_preserved": true,
+      "input_hashes": [
+        "484239958bb514441aa9a7184b0a9b42c9bde02c9a26dd8cf2800750486130a6",
+        "0f7ba3f6d22faaf49418f792f1cb5af691ea1593b49c1114caa79882bd3c268e",
+        "63f2a844d285dff6c4249e22fab1bcf1cd938077d710c414c4cd01bf6ad42364",
+        "bd6d89052e91f2ec5fba8273113df46db973f2adedea2b12411e1b900a6e5c8f"
+      ],
+      "inputs_unchanged": true,
+      "isolated_evaluation_ratio_cpu_over_gpu": 0.03408813643951419,
+      "memory": {
+        "available_estimate_bytes": 48748888064,
+        "lifetime_peak_physical_footprint_bytes": 8630174344,
+        "physical_footprint_bytes": 8630174344,
+        "pressure_level": 1,
+        "rss_bytes": 73646080
+      },
+      "normalization": [
+        105662458,
+        238237692,
+        1909743770,
+        67489182
+      ],
+      "offset_elements": 7,
+      "output_sha256": "6c13942881c504e6cbf98d3e50df6f6ae70cdab2b0a05b1671c674d25c4d6fd4",
+      "po2": 8,
+      "reuse_command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "reuse_dispatch_seconds": 0.007744125,
+      "reuse_matched": true,
+      "seed": 13,
+      "status": "matched"
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/ade18dad1f5c47df81b67f3ccccb5bb5",
+      "result_sha256": "ede8ed56f1071a86a179408f08999a662c7411bf342fc085e44a7a1606d833d7",
+      "case_seconds": 0.876863292,
+      "command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "compared_field_elements": 262144,
+      "completed_dispatches": 2,
+      "cpu_evaluation_seconds": 0.298225,
+      "domain": 65536,
+      "gpu_dispatch_seconds": 0.212348666,
+      "guards_preserved": true,
+      "input_hashes": [
+        "41e7e8a354b1470ea3c93f320d6050dc9e9ada0256e5632763c415da704af009",
+        "1b8cf4bbbbc7d2c3425ed2bb7f867302a3ff6baecf6ce7438f5d49966eb97012",
+        "cde10ea5afce9c59c790debcdc5bf99c85dab02110e20332a6b652551a829e0b",
+        "333b76780a91716365536eb406d3c9c7df61e860fa8c42853e3704cce4dd87df"
+      ],
+      "inputs_unchanged": true,
+      "isolated_evaluation_ratio_cpu_over_gpu": 1.4044119307064544,
+      "memory": {
+        "available_estimate_bytes": 40007057408,
+        "lifetime_peak_physical_footprint_bytes": 8712700648,
+        "physical_footprint_bytes": 8712700648,
+        "pressure_level": 1,
+        "rss_bytes": 156106752
+      },
+      "normalization": [
+        740059418,
+        1291067696,
+        1144486276,
+        1422735472
+      ],
+      "offset_elements": 7,
+      "output_sha256": "897967168828cdb0ec32f70936b7474e63ad69177da9547ad2911feb48b339e4",
+      "po2": 14,
+      "reuse_command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "reuse_dispatch_seconds": 0.094129875,
+      "reuse_matched": true,
+      "seed": 17,
+      "status": "matched"
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/6efa889edd15433893c6e918db7bcfbe",
+      "result_sha256": "57bdc7adc9a9a89219776e014d9769b7115132f6691d7b32a46d29ca1d081538",
+      "case_seconds": 48.624504542,
+      "command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "compared_field_elements": 16777216,
+      "completed_dispatches": 2,
+      "cpu_evaluation_seconds": 19.2579415,
+      "domain": 4194304,
+      "gpu_dispatch_seconds": 5.846810792,
+      "guards_preserved": true,
+      "input_hashes": [
+        "e58efb4657086038ccfca212ef942d7bd15c11fd402520ee6afa8566c86c36ff",
+        "8ea060581830962c23a8797dc598d152fcfa1b16477878d3a18b0903627d3338",
+        "526284471c00b67db7650fafc5d05c6e9e1e1628baeae6e77a5045a9a099e069",
+        "3a6116fe2a19d84543d266c4a45e07855ef3fc707b2928efa8de65d5bc554d48"
+      ],
+      "inputs_unchanged": true,
+      "isolated_evaluation_ratio_cpu_over_gpu": 3.2937514458908113,
+      "memory": {
+        "available_estimate_bytes": 43100258304,
+        "lifetime_peak_physical_footprint_bytes": 14034031056,
+        "physical_footprint_bytes": 5645177296,
+        "pressure_level": 1,
+        "rss_bytes": 5474828288
+      },
+      "normalization": [
+        389510501,
+        1643799235,
+        776968452,
+        357437022
+      ],
+      "offset_elements": 7,
+      "output_sha256": "a8aacfa6e45a5214c65e7f03465bcb1c149c6d2f23cd7cb79849a603d4ba3b4e",
+      "po2": 20,
+      "reuse_command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "reuse_dispatch_seconds": 5.853254583,
+      "reuse_matched": true,
+      "seed": 19,
+      "status": "matched"
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/2933492a071a40c791024a70bf1dd828",
+      "result_sha256": "44368e2a76f93a6db6a6b0ffd71d2b1a9d8dba1e9f86a3ecfd3161947c003d9a",
+      "case_seconds": 48.904613667,
+      "command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "compared_field_elements": 16777216,
+      "completed_dispatches": 2,
+      "cpu_evaluation_seconds": 19.469045666,
+      "domain": 4194304,
+      "gpu_dispatch_seconds": 5.84516525,
+      "guards_preserved": true,
+      "input_hashes": [
+        "c83e67c770dab6f13fbec9dcc1060347241fbeb80fdad066e97839c11d79063a",
+        "0f49d0dea21d38fa2086527fd93f8512d69bb5a9d95eca846edd8ac14bd63d6b",
+        "acbf56a62d31da1975c1adddbaf6983b659ed9257764a55a85c931660c143812",
+        "8cf6ace178c73d6fdb8782ec5070fa00378eded8b146e25d2124617069dc1c06"
+      ],
+      "inputs_unchanged": true,
+      "isolated_evaluation_ratio_cpu_over_gpu": 3.3307947394643804,
+      "memory": {
+        "available_estimate_bytes": 43097718784,
+        "lifetime_peak_physical_footprint_bytes": 14034211280,
+        "physical_footprint_bytes": 5645373904,
+        "pressure_level": 1,
+        "rss_bytes": 5475024896
+      },
+      "normalization": [
+        389510501,
+        1643799235,
+        776968452,
+        357437022
+      ],
+      "offset_elements": 7,
+      "output_sha256": "eaf1ad63104e255e2bdad6623e3c5e7f5c999fbfd8d46f87ef57964bce86d3ed",
+      "po2": 20,
+      "reuse_command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "reuse_dispatch_seconds": 5.8482165,
+      "reuse_matched": true,
+      "seed": 23,
+      "status": "matched"
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/8c4b13e889f742ad80a981682ca77003",
+      "result_sha256": "bf2c6e4d178acf334094fd15ca302a81359502ae7d38de6abb1fa8db915cfade",
+      "case_seconds": 0.170082708,
+      "command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "compared_field_elements": 256,
+      "completed_dispatches": 2,
+      "cpu_evaluation_seconds": 0.001054084,
+      "domain": 64,
+      "gpu_dispatch_seconds": 0.161728417,
+      "guards_preserved": true,
+      "input_hashes": [
+        "d4d37831c15724a85ca6b4f3b326a9709408d87a0a6457673d8e33f4fbc9d5a0",
+        "c1615730edfbeb491b8139b9d05eef7dc7a7e9dc1ef6fdc8d2d39a39891c67fd",
+        "eaa7c55ff898bab8cc93b35872d5fa1192c738c4f4c613c656638b1b90771c5d",
+        "03be4201d487a45ec72c1545732efc146aa071ecfceba4dda4f08c3dd57b67dd"
+      ],
+      "inputs_unchanged": true,
+      "isolated_evaluation_ratio_cpu_over_gpu": 0.006517617741846815,
+      "memory": {
+        "available_estimate_bytes": 43097718784,
+        "lifetime_peak_physical_footprint_bytes": 8628699784,
+        "physical_footprint_bytes": 8628699784,
+        "pressure_level": 1,
+        "rss_bytes": 72171520
+      },
+      "normalization": [
+        984834668,
+        1056489984,
+        1639581345,
+        1154996488
+      ],
+      "offset_elements": 7,
+      "output_sha256": "f9afee798ca2331e37ec83eb71bda1366d1307681911f073b8e14dc8fd0a5106",
+      "po2": 4,
+      "reuse_command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "reuse_dispatch_seconds": 0.005769,
+      "reuse_matched": true,
+      "seed": 29,
+      "status": "matched"
+    }
+  ],
+  "full_domain_cases": [
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/6efa889edd15433893c6e918db7bcfbe",
+      "result_sha256": "57bdc7adc9a9a89219776e014d9769b7115132f6691d7b32a46d29ca1d081538",
+      "case_seconds": 48.624504542,
+      "command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "compared_field_elements": 16777216,
+      "completed_dispatches": 2,
+      "cpu_evaluation_seconds": 19.2579415,
+      "domain": 4194304,
+      "gpu_dispatch_seconds": 5.846810792,
+      "guards_preserved": true,
+      "input_hashes": [
+        "e58efb4657086038ccfca212ef942d7bd15c11fd402520ee6afa8566c86c36ff",
+        "8ea060581830962c23a8797dc598d152fcfa1b16477878d3a18b0903627d3338",
+        "526284471c00b67db7650fafc5d05c6e9e1e1628baeae6e77a5045a9a099e069",
+        "3a6116fe2a19d84543d266c4a45e07855ef3fc707b2928efa8de65d5bc554d48"
+      ],
+      "inputs_unchanged": true,
+      "isolated_evaluation_ratio_cpu_over_gpu": 3.2937514458908113,
+      "memory": {
+        "available_estimate_bytes": 43100258304,
+        "lifetime_peak_physical_footprint_bytes": 14034031056,
+        "physical_footprint_bytes": 5645177296,
+        "pressure_level": 1,
+        "rss_bytes": 5474828288
+      },
+      "normalization": [
+        389510501,
+        1643799235,
+        776968452,
+        357437022
+      ],
+      "offset_elements": 7,
+      "output_sha256": "a8aacfa6e45a5214c65e7f03465bcb1c149c6d2f23cd7cb79849a603d4ba3b4e",
+      "po2": 20,
+      "reuse_command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "reuse_dispatch_seconds": 5.853254583,
+      "reuse_matched": true,
+      "seed": 19,
+      "status": "matched"
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/runs/2933492a071a40c791024a70bf1dd828",
+      "result_sha256": "44368e2a76f93a6db6a6b0ffd71d2b1a9d8dba1e9f86a3ecfd3161947c003d9a",
+      "case_seconds": 48.904613667,
+      "command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "compared_field_elements": 16777216,
+      "completed_dispatches": 2,
+      "cpu_evaluation_seconds": 19.469045666,
+      "domain": 4194304,
+      "gpu_dispatch_seconds": 5.84516525,
+      "guards_preserved": true,
+      "input_hashes": [
+        "c83e67c770dab6f13fbec9dcc1060347241fbeb80fdad066e97839c11d79063a",
+        "0f49d0dea21d38fa2086527fd93f8512d69bb5a9d95eca846edd8ac14bd63d6b",
+        "acbf56a62d31da1975c1adddbaf6983b659ed9257764a55a85c931660c143812",
+        "8cf6ace178c73d6fdb8782ec5070fa00378eded8b146e25d2124617069dc1c06"
+      ],
+      "inputs_unchanged": true,
+      "isolated_evaluation_ratio_cpu_over_gpu": 3.3307947394643804,
+      "memory": {
+        "available_estimate_bytes": 43097718784,
+        "lifetime_peak_physical_footprint_bytes": 14034211280,
+        "physical_footprint_bytes": 5645373904,
+        "pressure_level": 1,
+        "rss_bytes": 5475024896
+      },
+      "normalization": [
+        389510501,
+        1643799235,
+        776968452,
+        357437022
+      ],
+      "offset_elements": 7,
+      "output_sha256": "eaf1ad63104e255e2bdad6623e3c5e7f5c999fbfd8d46f87ef57964bce86d3ed",
+      "po2": 20,
+      "reuse_command": {
+        "status": "Completed",
+        "threads_per_threadgroup": 32
+      },
+      "reuse_dispatch_seconds": 5.8482165,
+      "reuse_matched": true,
+      "seed": 23,
+      "status": "matched"
+    }
+  ],
+  "totals": {
+    "attempts": 17,
+    "failed_attempts": 5,
+    "final_candidate_cases": 7,
+    "full_domain_cases": 2,
+    "final_candidate_completed_dispatches": 14,
+    "compared_field_elements_including_reuse": 76030976
+  },
+  "decision": "Isolated evaluator feasibility passes; proceed to shared-buffer circuit adapter and whole-proof validation. No full-port or complete-throughput acceptance yet.",
+  "final-state.json": {
+    "path": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/final-state.json",
+    "sha256": "aafa3c7cb306c58ab5f84a8ad2dfeaf93edf4548e09ac6bfdbd03dcc641ff899",
+    "contents": {
+      "proof_or_evaluator_processes": [],
+      "colima_list_exit_code": 0,
+      "colima_profiles": [
+        {
+          "name": "default",
+          "status": "Running",
+          "arch": "aarch64",
+          "cpus": 4,
+          "memory": 8589934592,
+          "disk": 42949672960,
+          "runtime": "docker"
+        },
+        {
+          "name": "hemi-macos-cpu",
+          "status": "Stopped",
+          "arch": "aarch64",
+          "cpus": 6,
+          "memory": 34359738368,
+          "disk": 85899345920,
+          "runtime": "docker"
+        }
+      ]
+    }
+  },
+  "archive/candidate/manifest.json": {
+    "path": "/Users/dbur/dev/zk-miner/target/macos/rv32im-metal/archive/candidate/manifest.json",
+    "sha256": "082ddf6637740b9bb8dee3163c01eeaac02eb588f487bad085da5e04954e018f",
+    "contents": {
+      "engine_commit": "0515e0bdebcd1f5f2d24cef91691ebd5b0c5d0a6",
+      "binary_sha256": "ecfe23ac6287487c446b54bd598a1fe13d8ddcbfe03a92f016bc30d432274975",
+      "files": {
+        "scripts/macos/collect-rv32im-evaluator.py": "04069244ec45344cd1b3b2ebd9d7fc484bfcc7376dbbec045a218ae291995455",
+        "scripts/macos/env.sh": "d4ea1b6cfb9e24c3edfa767a32c533648a4f1c123278b01d5c378c078e574835",
+        "scripts/macos/generate-rv32im-metal.py": "6c45182b6eaef1617a7ba7a39102c171047dc9686c3d021d8019ef87ab437114",
+        "scripts/macos/test-rv32im-evaluator.py": "5ffb8f19b6fad14172e287b14f5a01d3d52ea552f24f1c013c95da0b4e012a6c",
+        "target/macos/rv32im-metal/build/release/hemi-macos-rv32im-metal-prototype": "ecfe23ac6287487c446b54bd598a1fe13d8ddcbfe03a92f016bc30d432274975",
+        "target/macos/rv32im-metal/build.json": "eb8c7a738030fe96fcb0fb3603f91d09741cc0bd8fecb6dbe95c533764f67282",
+        "target/macos/rv32im-metal/engine.toml": "21f7c0c172b013e5565d32b2f9f085201910eca504e398b4164406bf74b8fbcf",
+        "target/macos/rv32im-metal/evaluator.json": "34b012225856f637dc02fd9f56757cea605b8d5c270efaaffd3764e369ee167f",
+        "target/macos/rv32im-metal/evaluator.metal": "4de746306b22bd756e919f2d27d28848e28ed7e4fabcb6e6c526537bac01708b",
+        "target/macos/rv32im-metal/metadata.json": "d8c6ed63dcaa26c89688068b31aa67ad8bfd7dfacd7e9c860f0cfc1a28961633",
+        "tools/macos-rv32im-metal/Cargo.lock": "bd8f2810c1b032ccd66324ab90bd81a23a403c4cf51591a451499abdc34b911f",
+        "tools/macos-rv32im-metal/Cargo.toml": "6b2d677e7fb86be211749b7bbb646c3412391bca3e05ab96b62779f932ae645a",
+        "tools/macos-rv32im-metal/eval-check.metal": "ce35e10fa64967422acec4cd3a717ea69a01def77b92a7ff87614c77a8f0055d",
+        "tools/macos-rv32im-metal/field-compat.metal": "13743c4ed6ec4de938a3121a6e9de83c5b423d5b8022c87267be3afa5573cdf4",
+        "tools/macos-rv32im-metal/src/main.rs": "5c17e12069b35f891ff882b37581c556e31927394a17678f9155f5003061bc6c"
+      }
+    }
+  },
+  "limitations": [
+    "Synthetic field matrices; no valid RV32IM witness or complete proof is generated by this harness.",
+    "Isolated CPU/Metal evaluation observations with fixed ordering, not a counterbalanced whole-proof benchmark.",
+    "GPU dispatch includes command submission/completion; pipeline compiled before timing. Reuse dispatch follows CPU comparison.",
+    "Physical footprint uses proc_pid_rusage RUSAGE_INFO_V4. Driver compiler services are outside this process; host availability is guarded.",
+    "The four-entry normalization table is checked against modular-u64 arithmetic; every output is compared to CPU per-cycle normalization.",
+    "The earlier divergent-normalization mismatch mechanism is unconfirmed; retain the failing observations and do not reuse that wrapper.",
+    "The 1024-thread failure is a confirmed Metal out-of-memory error. Retain 32 threads; do not adopt the HAL maximum automatically.",
+    "No verifier, control IDs, proof format, worker implementation or engine source changed."
+  ]
+}

@@ -1,0 +1,850 @@
+{
+  "schema_version": 1,
+  "status": "measured",
+  "scope": "one verified 10M diagnostic proof per fixture with per-command GPU timing",
+  "engine_parent": "dcbe9f4b9140a48d4792ffcd3a3eba19897be175",
+  "engine_commit": "09c2f4d2836cbcd88cd29e65b6a6bdd8db262416",
+  "miner_commit_at_measurement": "9bc7466eaf6a4b48d8655d39f69cc89fa40f0298",
+  "measurement_time_engine_diff_sha256": "da79e9fe14d4e56518c0261fb77ccf6e090d76e9a3ffab7d6c0a1344ab14acd0",
+  "worker_binary_unchanged_after_commit": true,
+  "worker_sha256": "9b7ab90957fefe60232e871a2823056d8683c8852476666483a8721b08cce545",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "profile_result_sha256": "69e905dd6e39d41b3bbd48947e746056b4974aa94acf5e72d3aa142f710db69f",
+  "profile_script_sha256": "223965b1f080e0c1ca314d59e89c0efd48e715d189d49ed1e603b0ed6b168432",
+  "collector_sha256": "cf6664dc0a160e29b96baf710c87847a58b7e2b9d30a94ac46b8ef66fe3af0e2",
+  "source_hashes": {
+    "risc0/zkp/src/hal/metal.rs": "9fd77771c6c740a207ba0709ac954efe1dd8d61474218bd637b3ca0f16802dc2",
+    "risc0/zkvm/src/host/server/prove/prover_impl.rs": "8cfd77bdf8fca37466cf3ef12261193a640306c9f77410abefb997634053755b"
+  },
+  "profiles": [
+    {
+      "fixture": "arithmetic-10m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/83ae93123b5943988db764e321ba59d6",
+      "run_result_sha256": "77c373028774d98da3c250e9d986b19634cbb74292aa2483a7d892a2f48f981f",
+      "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+      "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+      "worker_sidecar_sha256": "6b7e33ba9e0473057b133528d9e427d9e6c87f96d96ee0ffe07d8d688a3ce3e1",
+      "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+      "gpu_command_count": 8767,
+      "gpu_seconds": 83.228579,
+      "synchronous_overlap_seconds": 0.0,
+      "stages": [
+        {
+          "fixture": "arithmetic-10m",
+          "stage": "constraint_evaluation",
+          "wall_seconds": 57.295,
+          "gpu_seconds": 55.902211,
+          "dispatch_wall_seconds": 57.294388999999995,
+          "host_dispatch_overhead_seconds": 1.3921779999999941,
+          "wall_outside_matched_dispatch_seconds": 0.0006110000000063565,
+          "gpu_fraction_of_wall": 0.9756909154376473,
+          "gpu_within_10_percent_of_wall": true,
+          "command_count": 10
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "stage": "merkle_commitments",
+          "wall_seconds": 3.8726,
+          "gpu_seconds": 3.606635999999985,
+          "dispatch_wall_seconds": 4.059582999999998,
+          "host_dispatch_overhead_seconds": 0.4529470000000133,
+          "wall_outside_matched_dispatch_seconds": -0.18698299999999834,
+          "gpu_fraction_of_wall": 0.9313215927283957,
+          "gpu_within_10_percent_of_wall": true,
+          "command_count": 1163
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "stage": "polynomial_transforms",
+          "wall_seconds": 17.6932,
+          "gpu_seconds": 15.450333000000036,
+          "dispatch_wall_seconds": 17.382615999999988,
+          "host_dispatch_overhead_seconds": 1.932282999999952,
+          "wall_outside_matched_dispatch_seconds": 0.31058400000001285,
+          "gpu_fraction_of_wall": 0.8732356498541832,
+          "gpu_within_10_percent_of_wall": false,
+          "command_count": 1873
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "stage": "witness_generation",
+          "wall_seconds": 1.7098,
+          "gpu_seconds": 0.0,
+          "dispatch_wall_seconds": 0.0,
+          "host_dispatch_overhead_seconds": 0.0,
+          "wall_outside_matched_dispatch_seconds": 1.7098,
+          "gpu_fraction_of_wall": 0.0,
+          "gpu_within_10_percent_of_wall": null,
+          "command_count": 0
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "stage": "accumulation",
+          "wall_seconds": 6.3306000000000004,
+          "gpu_seconds": 0.0,
+          "dispatch_wall_seconds": 0.0,
+          "host_dispatch_overhead_seconds": 0.0,
+          "wall_outside_matched_dispatch_seconds": 6.3306000000000004,
+          "gpu_fraction_of_wall": 0.0,
+          "gpu_within_10_percent_of_wall": null,
+          "command_count": 0
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "stage": "other_segment_protocol",
+          "wall_seconds": 2.305099999999996,
+          "gpu_seconds": 0.0,
+          "dispatch_wall_seconds": 0.0,
+          "host_dispatch_overhead_seconds": 0.0,
+          "wall_outside_matched_dispatch_seconds": 2.305099999999996,
+          "gpu_fraction_of_wall": 0.0,
+          "gpu_within_10_percent_of_wall": null,
+          "command_count": 0
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "stage": "recursion",
+          "wall_seconds": 11.715812792000001,
+          "gpu_seconds": 7.571945000000066,
+          "dispatch_wall_seconds": 9.503815999999992,
+          "host_dispatch_overhead_seconds": 1.9318709999999255,
+          "wall_outside_matched_dispatch_seconds": 2.2119967920000096,
+          "gpu_fraction_of_wall": 0.6463012967542872,
+          "gpu_within_10_percent_of_wall": false,
+          "command_count": 5539
+        }
+      ],
+      "kernels": {
+        "other_segment_gpu/eltwise_copy_fp": {
+          "commands": 31,
+          "gpu_seconds": 0.052103000000000003,
+          "dispatch_wall_seconds": 0.5096600000000001,
+          "pipeline_seconds": 0.00044899999999999996
+        },
+        "polynomial_transforms/multi_ntt_rev_step": {
+          "commands": 640,
+          "gpu_seconds": 2.961785000000001,
+          "dispatch_wall_seconds": 3.2701049999999983,
+          "pipeline_seconds": 0.004208999999999994
+        },
+        "other_segment_gpu/eltwise_mul_factor_fp": {
+          "commands": 31,
+          "gpu_seconds": 0.050702000000000004,
+          "dispatch_wall_seconds": 0.05991500000000001,
+          "pipeline_seconds": 0.00018499999999999997
+        },
+        "polynomial_transforms/zk_shift": {
+          "commands": 21,
+          "gpu_seconds": 0.24202699999999996,
+          "dispatch_wall_seconds": 0.24763700000000002,
+          "pipeline_seconds": 0.00010800000000000004
+        },
+        "polynomial_transforms/batch_expand": {
+          "commands": 61,
+          "gpu_seconds": 0.16935400000000003,
+          "dispatch_wall_seconds": 1.4740490000000002,
+          "pipeline_seconds": 0.00025899999999999984
+        },
+        "polynomial_transforms/multi_ntt_fwd_step": {
+          "commands": 1100,
+          "gpu_seconds": 11.959570000000019,
+          "dispatch_wall_seconds": 12.25392099999999,
+          "pipeline_seconds": 0.006721000000000038
+        },
+        "polynomial_transforms/multi_bit_reverse": {
+          "commands": 51,
+          "gpu_seconds": 0.11759700000000002,
+          "dispatch_wall_seconds": 0.13690399999999994,
+          "pipeline_seconds": 0.00035600000000000003
+        },
+        "merkle_commitments/poseidon2_rows": {
+          "commands": 61,
+          "gpu_seconds": 3.116237,
+          "dispatch_wall_seconds": 3.3079699999999996,
+          "pipeline_seconds": 0.0002939999999999999
+        },
+        "merkle_commitments/poseidon2_fold": {
+          "commands": 1102,
+          "gpu_seconds": 0.49039900000000336,
+          "dispatch_wall_seconds": 0.7516129999999994,
+          "pipeline_seconds": 0.003515999999999949
+        },
+        "constraint_evaluation/eval_check": {
+          "commands": 10,
+          "gpu_seconds": 55.902211,
+          "dispatch_wall_seconds": 57.294388999999995,
+          "pipeline_seconds": 8.299999999999998e-05
+        },
+        "other_segment_gpu/multi_poly_eval": {
+          "commands": 40,
+          "gpu_seconds": 0.42954699999999996,
+          "dispatch_wall_seconds": 0.539292,
+          "pipeline_seconds": 0.0003479999999999999
+        },
+        "other_segment_gpu/mix_poly_coeffs": {
+          "commands": 40,
+          "gpu_seconds": 0.15942899999999993,
+          "dispatch_wall_seconds": 0.17562899999999995,
+          "pipeline_seconds": 0.0003880000000000001
+        },
+        "other_segment_gpu/eltwise_sum_fpext": {
+          "commands": 10,
+          "gpu_seconds": 0.0038640000000000002,
+          "dispatch_wall_seconds": 0.01586,
+          "pipeline_seconds": 0.00023599999999999996
+        },
+        "other_segment_gpu/fri_fold": {
+          "commands": 30,
+          "gpu_seconds": 0.0018090000000000003,
+          "dispatch_wall_seconds": 0.008907000000000002,
+          "pipeline_seconds": 0.00013199999999999993
+        },
+        "recursion/eltwise_copy_fp": {
+          "commands": 40,
+          "gpu_seconds": 0.012418000000000002,
+          "dispatch_wall_seconds": 0.18783300000000003,
+          "pipeline_seconds": 0.0006420000000000001
+        },
+        "recursion/multi_ntt_rev_step": {
+          "commands": 1100,
+          "gpu_seconds": 0.5639839999999999,
+          "dispatch_wall_seconds": 0.8526639999999994,
+          "pipeline_seconds": 0.0035099999999999554
+        },
+        "recursion/eltwise_mul_factor_fp": {
+          "commands": 59,
+          "gpu_seconds": 0.009665000000000005,
+          "dispatch_wall_seconds": 0.024284,
+          "pipeline_seconds": 0.00020599999999999972
+        },
+        "recursion/zk_shift": {
+          "commands": 40,
+          "gpu_seconds": 0.04763499999999997,
+          "dispatch_wall_seconds": 0.057798,
+          "pipeline_seconds": 0.00013899999999999986
+        },
+        "recursion/batch_expand": {
+          "commands": 116,
+          "gpu_seconds": 0.03884500000000002,
+          "dispatch_wall_seconds": 0.36078499999999986,
+          "pipeline_seconds": 0.00031699999999999963
+        },
+        "recursion/multi_ntt_fwd_step": {
+          "commands": 1860,
+          "gpu_seconds": 2.3938669999999935,
+          "dispatch_wall_seconds": 2.85962,
+          "pipeline_seconds": 0.005571000000000043
+        },
+        "recursion/multi_bit_reverse": {
+          "commands": 97,
+          "gpu_seconds": 0.021265000000000003,
+          "dispatch_wall_seconds": 0.04443900000000003,
+          "pipeline_seconds": 0.000412
+        },
+        "recursion/poseidon2_rows": {
+          "commands": 116,
+          "gpu_seconds": 0.7131509999999999,
+          "dispatch_wall_seconds": 0.8176150000000002,
+          "pipeline_seconds": 0.0003399999999999996
+        },
+        "recursion/poseidon2_fold": {
+          "commands": 1864,
+          "gpu_seconds": 0.33319300000000196,
+          "dispatch_wall_seconds": 0.7711179999999993,
+          "pipeline_seconds": 0.004456999999999964
+        },
+        "recursion/eval_check": {
+          "commands": 19,
+          "gpu_seconds": 3.209357,
+          "dispatch_wall_seconds": 3.22316,
+          "pipeline_seconds": 0.0007100000000000006
+        },
+        "recursion/multi_poly_eval": {
+          "commands": 76,
+          "gpu_seconds": 0.17887900000000007,
+          "dispatch_wall_seconds": 0.19882800000000006,
+          "pipeline_seconds": 0.00028399999999999964
+        },
+        "recursion/mix_poly_coeffs": {
+          "commands": 76,
+          "gpu_seconds": 0.04516400000000001,
+          "dispatch_wall_seconds": 0.071962,
+          "pipeline_seconds": 0.0003049999999999998
+        },
+        "recursion/eltwise_sum_fpext": {
+          "commands": 19,
+          "gpu_seconds": 0.002065,
+          "dispatch_wall_seconds": 0.018806999999999997,
+          "pipeline_seconds": 0.0002620000000000001
+        },
+        "recursion/fri_fold": {
+          "commands": 57,
+          "gpu_seconds": 0.002457000000000001,
+          "dispatch_wall_seconds": 0.014903000000000003,
+          "pipeline_seconds": 0.00018199999999999973
+        }
+      },
+      "pipeline_limits": {
+        "segment/eltwise_copy_fp": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/multi_ntt_rev_step": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/eltwise_mul_factor_fp": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/zk_shift": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/batch_expand": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/multi_ntt_fwd_step": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/multi_bit_reverse": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/poseidon2_rows": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/poseidon2_fold": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/eval_check": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/multi_poly_eval": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 4096
+        },
+        "segment/mix_poly_coeffs": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/eltwise_sum_fpext": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/fri_fold": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/eltwise_copy_fp": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/multi_ntt_rev_step": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/eltwise_mul_factor_fp": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/zk_shift": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/batch_expand": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/multi_ntt_fwd_step": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/multi_bit_reverse": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/poseidon2_rows": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/poseidon2_fold": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/eval_check": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/multi_poly_eval": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 4096
+        },
+        "recursion/mix_poly_coeffs": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/eltwise_sum_fpext": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/fri_fold": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        }
+      }
+    },
+    {
+      "fixture": "hash-10m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/5f81383d8c1747a69b5535605a7bc17b",
+      "run_result_sha256": "2ff5806c592a28473977b3c74dbb59528b0b910f4da39b7c3730cce0a9236201",
+      "program_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+      "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+      "worker_sidecar_sha256": "d3ac200427565ca6df7e455a0d25c3e0e15309953f5155837ef45257dcb6a6fb",
+      "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+      "gpu_command_count": 8767,
+      "gpu_seconds": 83.09295200000001,
+      "synchronous_overlap_seconds": 0.0,
+      "stages": [
+        {
+          "fixture": "hash-10m",
+          "stage": "constraint_evaluation",
+          "wall_seconds": 57.2066,
+          "gpu_seconds": 55.811804,
+          "dispatch_wall_seconds": 57.205804,
+          "host_dispatch_overhead_seconds": 1.3939999999999984,
+          "wall_outside_matched_dispatch_seconds": 0.0007960000000011291,
+          "gpu_fraction_of_wall": 0.9756182678222443,
+          "gpu_within_10_percent_of_wall": true,
+          "command_count": 10
+        },
+        {
+          "fixture": "hash-10m",
+          "stage": "merkle_commitments",
+          "wall_seconds": 3.8545,
+          "gpu_seconds": 3.59751199999997,
+          "dispatch_wall_seconds": 4.060319999999998,
+          "host_dispatch_overhead_seconds": 0.4628080000000283,
+          "wall_outside_matched_dispatch_seconds": -0.20581999999999834,
+          "gpu_fraction_of_wall": 0.9333277986768634,
+          "gpu_within_10_percent_of_wall": true,
+          "command_count": 1163
+        },
+        {
+          "fixture": "hash-10m",
+          "stage": "polynomial_transforms",
+          "wall_seconds": 17.6219,
+          "gpu_seconds": 15.50974100000002,
+          "dispatch_wall_seconds": 17.418212999999998,
+          "host_dispatch_overhead_seconds": 1.9084719999999784,
+          "wall_outside_matched_dispatch_seconds": 0.20368700000000217,
+          "gpu_fraction_of_wall": 0.8801401097498011,
+          "gpu_within_10_percent_of_wall": false,
+          "command_count": 1873
+        },
+        {
+          "fixture": "hash-10m",
+          "stage": "witness_generation",
+          "wall_seconds": 3.5258000000000003,
+          "gpu_seconds": 0.0,
+          "dispatch_wall_seconds": 0.0,
+          "host_dispatch_overhead_seconds": 0.0,
+          "wall_outside_matched_dispatch_seconds": 3.5258000000000003,
+          "gpu_fraction_of_wall": 0.0,
+          "gpu_within_10_percent_of_wall": null,
+          "command_count": 0
+        },
+        {
+          "fixture": "hash-10m",
+          "stage": "accumulation",
+          "wall_seconds": 6.9105,
+          "gpu_seconds": 0.0,
+          "dispatch_wall_seconds": 0.0,
+          "host_dispatch_overhead_seconds": 0.0,
+          "wall_outside_matched_dispatch_seconds": 6.9105,
+          "gpu_fraction_of_wall": 0.0,
+          "gpu_within_10_percent_of_wall": null,
+          "command_count": 0
+        },
+        {
+          "fixture": "hash-10m",
+          "stage": "other_segment_protocol",
+          "wall_seconds": 2.3985000000000127,
+          "gpu_seconds": 0.0,
+          "dispatch_wall_seconds": 0.0,
+          "host_dispatch_overhead_seconds": 0.0,
+          "wall_outside_matched_dispatch_seconds": 2.3985000000000127,
+          "gpu_fraction_of_wall": 0.0,
+          "gpu_within_10_percent_of_wall": null,
+          "command_count": 0
+        },
+        {
+          "fixture": "hash-10m",
+          "stage": "recursion",
+          "wall_seconds": 11.561833833000001,
+          "gpu_seconds": 7.4459890000000915,
+          "dispatch_wall_seconds": 9.406353000000017,
+          "host_dispatch_overhead_seconds": 1.9603639999999256,
+          "wall_outside_matched_dispatch_seconds": 2.1554808329999844,
+          "gpu_fraction_of_wall": 0.6440145315657115,
+          "gpu_within_10_percent_of_wall": false,
+          "command_count": 5539
+        }
+      ],
+      "kernels": {
+        "other_segment_gpu/eltwise_copy_fp": {
+          "commands": 31,
+          "gpu_seconds": 0.064194,
+          "dispatch_wall_seconds": 0.46694000000000013,
+          "pipeline_seconds": 0.00043099999999999996
+        },
+        "polynomial_transforms/multi_ntt_rev_step": {
+          "commands": 640,
+          "gpu_seconds": 3.0222759999999975,
+          "dispatch_wall_seconds": 3.256295,
+          "pipeline_seconds": 0.004026999999999976
+        },
+        "other_segment_gpu/eltwise_mul_factor_fp": {
+          "commands": 31,
+          "gpu_seconds": 0.05007400000000001,
+          "dispatch_wall_seconds": 0.05815,
+          "pipeline_seconds": 0.00017199999999999998
+        },
+        "polynomial_transforms/zk_shift": {
+          "commands": 21,
+          "gpu_seconds": 0.24022599999999988,
+          "dispatch_wall_seconds": 0.24551699999999999,
+          "pipeline_seconds": 0.00011399999999999997
+        },
+        "polynomial_transforms/batch_expand": {
+          "commands": 61,
+          "gpu_seconds": 0.18096600000000007,
+          "dispatch_wall_seconds": 1.523803000000001,
+          "pipeline_seconds": 0.00024399999999999986
+        },
+        "polynomial_transforms/multi_ntt_fwd_step": {
+          "commands": 1100,
+          "gpu_seconds": 11.948045000000024,
+          "dispatch_wall_seconds": 12.260435,
+          "pipeline_seconds": 0.0058890000000000175
+        },
+        "polynomial_transforms/multi_bit_reverse": {
+          "commands": 51,
+          "gpu_seconds": 0.11822800000000004,
+          "dispatch_wall_seconds": 0.132163,
+          "pipeline_seconds": 0.0002479999999999998
+        },
+        "merkle_commitments/poseidon2_rows": {
+          "commands": 61,
+          "gpu_seconds": 3.095831,
+          "dispatch_wall_seconds": 3.2712290000000004,
+          "pipeline_seconds": 0.00024399999999999975
+        },
+        "merkle_commitments/poseidon2_fold": {
+          "commands": 1102,
+          "gpu_seconds": 0.5016810000000042,
+          "dispatch_wall_seconds": 0.7890910000000005,
+          "pipeline_seconds": 0.003013999999999955
+        },
+        "constraint_evaluation/eval_check": {
+          "commands": 10,
+          "gpu_seconds": 55.811804,
+          "dispatch_wall_seconds": 57.205804,
+          "pipeline_seconds": 7.199999999999999e-05
+        },
+        "other_segment_gpu/multi_poly_eval": {
+          "commands": 40,
+          "gpu_seconds": 0.441189,
+          "dispatch_wall_seconds": 0.553908,
+          "pipeline_seconds": 0.00027199999999999994
+        },
+        "other_segment_gpu/mix_poly_coeffs": {
+          "commands": 40,
+          "gpu_seconds": 0.16445199999999996,
+          "dispatch_wall_seconds": 0.181663,
+          "pipeline_seconds": 0.000281
+        },
+        "other_segment_gpu/eltwise_sum_fpext": {
+          "commands": 10,
+          "gpu_seconds": 0.006141,
+          "dispatch_wall_seconds": 0.014269000000000002,
+          "pipeline_seconds": 0.000189
+        },
+        "other_segment_gpu/fri_fold": {
+          "commands": 30,
+          "gpu_seconds": 0.0018560000000000004,
+          "dispatch_wall_seconds": 0.009673000000000001,
+          "pipeline_seconds": 0.0001369999999999999
+        },
+        "recursion/eltwise_copy_fp": {
+          "commands": 40,
+          "gpu_seconds": 0.017035,
+          "dispatch_wall_seconds": 0.20082299999999992,
+          "pipeline_seconds": 0.0005420000000000001
+        },
+        "recursion/multi_ntt_rev_step": {
+          "commands": 1100,
+          "gpu_seconds": 0.6431309999999988,
+          "dispatch_wall_seconds": 0.9294209999999994,
+          "pipeline_seconds": 0.003267999999999957
+        },
+        "recursion/eltwise_mul_factor_fp": {
+          "commands": 59,
+          "gpu_seconds": 0.009569000000000006,
+          "dispatch_wall_seconds": 0.023844000000000004,
+          "pipeline_seconds": 0.0002079999999999997
+        },
+        "recursion/zk_shift": {
+          "commands": 40,
+          "gpu_seconds": 0.04645499999999997,
+          "dispatch_wall_seconds": 0.05615500000000001,
+          "pipeline_seconds": 0.0001259999999999999
+        },
+        "recursion/batch_expand": {
+          "commands": 116,
+          "gpu_seconds": 0.04410300000000002,
+          "dispatch_wall_seconds": 0.371918,
+          "pipeline_seconds": 0.0002849999999999995
+        },
+        "recursion/multi_ntt_fwd_step": {
+          "commands": 1860,
+          "gpu_seconds": 2.354257999999994,
+          "dispatch_wall_seconds": 2.8290869999999995,
+          "pipeline_seconds": 0.005705000000000023
+        },
+        "recursion/multi_bit_reverse": {
+          "commands": 97,
+          "gpu_seconds": 0.019542,
+          "dispatch_wall_seconds": 0.04233699999999999,
+          "pipeline_seconds": 0.00030199999999999975
+        },
+        "recursion/poseidon2_rows": {
+          "commands": 116,
+          "gpu_seconds": 0.6899889999999997,
+          "dispatch_wall_seconds": 0.7919490000000002,
+          "pipeline_seconds": 0.0002899999999999994
+        },
+        "recursion/poseidon2_fold": {
+          "commands": 1864,
+          "gpu_seconds": 0.32862500000000155,
+          "dispatch_wall_seconds": 0.7707669999999992,
+          "pipeline_seconds": 0.004210999999999922
+        },
+        "recursion/eval_check": {
+          "commands": 19,
+          "gpu_seconds": 3.068817,
+          "dispatch_wall_seconds": 3.082064,
+          "pipeline_seconds": 0.0006690000000000008
+        },
+        "recursion/multi_poly_eval": {
+          "commands": 76,
+          "gpu_seconds": 0.17586000000000004,
+          "dispatch_wall_seconds": 0.19614800000000002,
+          "pipeline_seconds": 0.00028899999999999976
+        },
+        "recursion/mix_poly_coeffs": {
+          "commands": 76,
+          "gpu_seconds": 0.04348800000000001,
+          "dispatch_wall_seconds": 0.074531,
+          "pipeline_seconds": 0.00023799999999999963
+        },
+        "recursion/eltwise_sum_fpext": {
+          "commands": 19,
+          "gpu_seconds": 0.0027300000000000002,
+          "dispatch_wall_seconds": 0.022457999999999992,
+          "pipeline_seconds": 0.00011400000000000006
+        },
+        "recursion/fri_fold": {
+          "commands": 57,
+          "gpu_seconds": 0.002387000000000001,
+          "dispatch_wall_seconds": 0.014851000000000001,
+          "pipeline_seconds": 0.0001429999999999998
+        }
+      },
+      "pipeline_limits": {
+        "segment/eltwise_copy_fp": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/multi_ntt_rev_step": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/eltwise_mul_factor_fp": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/zk_shift": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/batch_expand": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/multi_ntt_fwd_step": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/multi_bit_reverse": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/poseidon2_rows": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/poseidon2_fold": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/eval_check": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/multi_poly_eval": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 4096
+        },
+        "segment/mix_poly_coeffs": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/eltwise_sum_fpext": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "segment/fri_fold": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/eltwise_copy_fp": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/multi_ntt_rev_step": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/eltwise_mul_factor_fp": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/zk_shift": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/batch_expand": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/multi_ntt_fwd_step": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/multi_bit_reverse": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/poseidon2_rows": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/poseidon2_fold": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/eval_check": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/multi_poly_eval": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 4096
+        },
+        "recursion/mix_poly_coeffs": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/eltwise_sum_fpext": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        },
+        "recursion/fri_fold": {
+          "thread_execution_width": 32,
+          "max_total_threads_per_threadgroup": 1024,
+          "static_threadgroup_memory_length": 0
+        }
+      }
+    }
+  ],
+  "verified_proofs": 2,
+  "negative_checks": 6,
+  "notes": [
+    "GPUStartTime/GPUEndTime measure device execution for one kernel per command buffer.",
+    "Dispatch wall includes GPU execution, queue/synchronization cost and pipeline creation; the stage remainder includes CPU work and timer-scope differences.",
+    "The current synchronous Metal path has no CPU/GPU segment overlap.",
+    "The transform GPU-only fraction misses the brief's 10% wall-reconciliation threshold; host dispatch overhead is reported separately."
+  ],
+  "csv_sha256": "2cbc0d778ed84a4385d74846e532d7a75a5457a1834ec9b15a2874c8356f296f"
+}

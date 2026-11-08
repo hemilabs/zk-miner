@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "source_spec_sha256": "a8627ca24baec008b140a4bb75f9ef8bb75fd67281e9a8e628c328afb6542a09",
+  "engine_commit": "bca7044c5480d0efddcb2a035dd569035d0c8cde",
+  "candidate_worker_sha256": "11f24f54deb671a8dc890927f8ca512d93891c4ebb604d1f3587c770b03113c7",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "collector_sha256": "1f3d0da403e306a76b6ba30fcf329c0ec86a1d69c1f57340ff6f2f5b7bb62eea",
+  "generator_check_log_sha256": "0527a5d8a1cea1820b3d16c183ea79d278233e8d1be0a784889c2b3f9b306676",
+  "metal_port_sha256": "b7c85cdd1b6fb93b1e37885362989ac2c539b3fdeb7a0b6c7d3e44ead9b33e31",
+  "paired_evidence_sha256": "e10aaf9c7c28511dd3417192a141c768198d9b394f27974640f5d85f20527730",
+  "split_iteration_evidence_sha256": "cd9300da086b5dd609cf25bd6ec0352ef6c96d83c79d1b46949dbdf6aff648a2",
+  "differentials": {
+    "arithmetic_10m": {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/ad358ff1ea1249c39d3880b0759af55f",
+      "result_sha256": "65a65f9925946ac9a5251d913b2e3805ef1ff5bbcbc61cf2afe5084bedc8a766",
+      "log_sha256": "702c1219671ccb4d3fe6155bc630e1617f62ac7fcc74c6954a050a2387abc5c7",
+      "worker_sidecar_sha256": "7d981a877aabf01d68bf8d33a4de5bc69de580dfa74dea19750a4cf8de609be3",
+      "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+      "user_cycles": 10003116,
+      "recursion_cpu_checks": 19,
+      "recursion_shader_sha256": "f72900511d2804d1519b4bc860f2d3a123677272fa48ba08c2080806771e7de5"
+    },
+    "hash_10m": {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/d73d072648a944cdbe774b8c0299bca3",
+      "result_sha256": "9edb5d096fd6623ff79f3a71b31c6b98d97544af04bd4de87edae899d0dcfc23",
+      "log_sha256": "bd1db5bf37422fc0dcd6ed77fd079f3a34eddb496ea095dfab656ddb23ca738d",
+      "worker_sidecar_sha256": "ce7cd07c1a52d27032d556035d77186316339e179ac57ee48944867f84e110d8",
+      "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+      "user_cycles": 10003440,
+      "recursion_cpu_checks": 19,
+      "recursion_shader_sha256": "f72900511d2804d1519b4bc860f2d3a123677272fa48ba08c2080806771e7de5"
+    }
+  },
+  "lifecycle": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/d4378a7605034611bde7efcaa8ef7859",
+    "result_sha256": "5136e49d7bb11c84a93295b55ae41b8f976a434c1797f504e2cbae19632f47e1",
+    "log_sha256": "f38df13446f79976a6c849196c0b0e527fc26e5ef3b09f18d5f8b1840cd3c3cf",
+    "verified_proofs": 21,
+    "tamper_rejections": 63,
+    "idle_first_bytes": 4595388592,
+    "idle_after_request_20_bytes": 4138651560,
+    "idle_drift_fraction": -0.09939029591428293,
+    "idle_growth_at_most_5_percent": true
+  },
+  "fallback_proof": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/90505cd189c74e5980834caa8b772f8d",
+    "result_sha256": "fcd334cb279801af211ecb815988ca4c41a35172343a1cdcf752e1e0ffbbe93c",
+    "log_sha256": "547daba39fd1c9b9ef09ffc4e5c60c9c2a5b2f55d2e95dfa10bed12ac3fe6e78",
+    "worker_sidecar_sha256": "08265c9eb67e52192dc8e293751f418c53330c65e39eadca4056dd702b58a269",
+    "verification_sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1"
+  },
+  "limit_controls": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/2e102502b1ad456b9caa1164ba346c2b",
+    "result_sha256": "605bba531b5cebab5a94bba8b885e4d6c1681dbeb8689fb125bd431e9154f7b0",
+    "log_sha256": "7f68fda0730bd6584d6610a113252b3092b626686753dfbe9a1131515ec2326b"
+  },
+  "cpu_only_build": {
+    "log_sha256": "5dc8df7ee698bfa064927f5362b1d9dc29fcc9525755e6168b3269d93d59c776",
+    "manifest_sha256": "33566069336bb2869abc5b1cdfb510b7de2bdb006d5567a27a3d46b118584005",
+    "unit_tests_passed": 5
+  },
+  "linux_feature_paths": {
+    "result_sha256": "2f8d3595171089c732f2686c0776f8b4d4a240bef50d2812e166bce06ef68e2d",
+    "checks": {
+      "recursion_prove_metal": "passed",
+      "rv32im_prove": "passed",
+      "zkvm_prove_metal_recursion": "passed"
+    }
+  }
+}

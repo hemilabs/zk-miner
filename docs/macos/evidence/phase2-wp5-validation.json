@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "status": "passed_with_default_change_gate_missed",
+  "source_spec_sha256": "7b67d229839eb5f9d424dc27fed31906e766ea8bcea3c9d892e323d9ebcf5df7",
+  "engine_commit": "748e7a202bbb15520fdf7782057b7096df3e2bfd",
+  "candidate_worker_sha256": "0417a5d1043582a7047855b8764c255b5507597b870f3e45a03ba8141af507a6",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "paired_evidence_sha256": "5a4c805ca5a4552739057590b3516b98ef2c73d5587c7f76f15d2bc105cec8de",
+  "feasibility_evidence_sha256": "9879ffbe1e0226bf036e80ff5bcb9c9fdf2aea3ace1182f943b73c624bca5fe1",
+  "default_segment_po2": 20,
+  "default_pipeline_enabled": true,
+  "optional_profile": {
+    "segment_po2": 21,
+    "pipeline_enabled": false
+  },
+  "lifecycle": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/f9c39f8229c2448f99fbf4dd8cc90378",
+    "result_sha256": "fdfe3a7d65ba3ba2136094ebcd239daf8001307b9720e20b278ec85241a73475",
+    "request_ledger_sha256": "1bbf336e7c7963651ba70c086bbde5612310b6358586c38487eab6387537cfb1",
+    "verified_proofs": 21,
+    "tamper_rejections": 63,
+    "idle_first_bytes": 4721922368,
+    "idle_after_request_20_bytes": 3905802056,
+    "idle_drift_fraction": -0.1728364526979026,
+    "idle_growth_at_most_5_percent": true,
+    "helper_cancel": "passed",
+    "helper_timeout": "passed",
+    "restart": "passed",
+    "shutdown": "passed"
+  },
+  "lifecycle_failed_attempts": [
+    {
+      "log": "wp5-lifecycle.log",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/ab7090c0a27c413b9cd54fcb6dd341c6",
+      "result_sha256": "59a3e3c0e0adee2675299960f9ea741c32c76cc7e1965118726782cd21765c30",
+      "error": "Command ['/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build/debug/deps/macos_worker-9116c14936aff687', 'native_worker_proofs_failure_restart_and_shutdown', '--exact', '--ignored', '--nocapture'] returned non-zero exit status 101."
+    },
+    {
+      "log": "wp5-lifecycle-host.log",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/6f91aadfe8ec4c2fb2bd800239e83b5c",
+      "result_sha256": "59a3e3c0e0adee2675299960f9ea741c32c76cc7e1965118726782cd21765c30",
+      "error": "Command ['/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build/debug/deps/macos_worker-9116c14936aff687', 'native_worker_proofs_failure_restart_and_shutdown', '--exact', '--ignored', '--nocapture'] returned non-zero exit status 101."
+    },
+    {
+      "log": "wp5-lifecycle-final.log",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/a5ea2ad301ee41378273df99f8233f54",
+      "result_sha256": "59a3e3c0e0adee2675299960f9ea741c32c76cc7e1965118726782cd21765c30",
+      "error": "Command ['/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build/debug/deps/macos_worker-9116c14936aff687', 'native_worker_proofs_failure_restart_and_shutdown', '--exact', '--ignored', '--nocapture'] returned non-zero exit status 101."
+    }
+  ],
+  "cpu_only_build": {
+    "log": "target/macos/phase2/wp5-cpu-build.log",
+    "log_sha256": "55ba990859c2b62e6745bdfdd2286ecc5f359afefcd27d95d018afc388314ede",
+    "manifest_sha256": "7c523d8e741061de11261f5e40c47aec8e12aaff89de3cd45c674ffac397341d",
+    "worker_sha256": "c5549227b1f067f5c7c10f854e1c0cfbdc0dca88fe126b79d23c86efb9c222ab",
+    "unit_tests_passed": 5
+  },
+  "calibration_unit_test": {
+    "log": "target/macos/phase2/wp5-calibration-test.log",
+    "sha256": "ca8c682605a8aabea0f6ed5ee2738e4f9e6d2368626e4026c325e9eae5f0bb5e",
+    "passed": 1
+  },
+  "protocol_unit_tests": {
+    "log": "target/macos/phase2/wp5-protocol-test.log",
+    "sha256": "d0edc3c48f9109b92f5798a16fe5631207a0a17379cb0e0d7902df4e5b60c55a",
+    "passed": 32
+  },
+  "limit_controls": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/9ca848a56b8d4496be6ecd9d3420deda",
+    "result_sha256": "2740fe50ed178397eb0fc1f663de3544395e84492709de7c19e36bc202f4a030",
+    "rejected_po2": 22,
+    "status": "passed"
+  },
+  "linux_feature_paths": {
+    "result": "target/macos/phase2/wp5-linux/result.json",
+    "sha256": "f4ee32a52e09dc3f3c7a74843df447637a1d41ad032f62316bf0bda4308f4bec",
+    "checks": {
+      "recursion_prove_metal": "passed",
+      "rv32im_prove": "passed",
+      "zkvm_prove_metal_recursion": "passed"
+    }
+  },
+  "po20_serial_screens": [
+    {
+      "fixture": "arithmetic-10m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/bc2a791f904d469faf35361b52e3683e",
+      "result_sha256": "1f2ec39bd55caaa29806589d97e067e88b518c1be7e2ece554400451bd25a5f7",
+      "request_ledger_sha256": "cd2fdf122bfd72d93e5942042badc95e3e8f47a0101950c40212268b68fbe1e1",
+      "warmup_complete_seconds": 74.627425625,
+      "warm_complete_seconds": 67.62521945799999,
+      "warm_guard_peak_footprint_bytes": 16794784184,
+      "verified_proofs": 2,
+      "tamper_rejections": 6,
+      "pressure_normal": true
+    },
+    {
+      "fixture": "hash-10m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/245805873fe14e5084c285ff5b5229de",
+      "result_sha256": "abdefdefeaf472b02dcca131d7b43e915790ccdbe92891f492262d4798ab54ee",
+      "request_ledger_sha256": "4c1b816ae33a16e9e761d66880d434e2b04c94c49ec9fdf122faedd863a79cc9",
+      "warmup_complete_seconds": 73.712901501,
+      "warm_complete_seconds": 66.338950583,
+      "warm_guard_peak_footprint_bytes": 17827486536,
+      "verified_proofs": 2,
+      "tamper_rejections": 6,
+      "pressure_normal": true
+    },
+    {
+      "fixture": "arithmetic-46m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/5a24c2bf5f1341fbab951d9ab29b687f",
+      "result_sha256": "56938f3420ccb7acb12f05e7469ac3ea3b11d88fd121c021ec7279bfcafb91f5",
+      "request_ledger_sha256": "7e8d4a3f5c6a4208abe40f1b553ecfa269889dca15b627a2165ea7ad6fe82e35",
+      "warmup_complete_seconds": 235.10656483399998,
+      "warm_complete_seconds": 227.05967629199998,
+      "warm_guard_peak_footprint_bytes": 17486845016,
+      "verified_proofs": 2,
+      "tamper_rejections": 6,
+      "pressure_normal": true
+    }
+  ],
+  "source_hashes": {
+    "crates/zkminer-prover-protocol/src/macos.rs": "fbc7bf9083d7d03847b2bb938a6802f95c0c5bc51b114ad9aa8df48b8f6c4a88",
+    "crates/zkminer-prover/src/engine.rs": "c8c41c30ed8f459446a6f4c617015b7cf0f6c856cfab266d00d4ba0d81db31ba",
+    "crates/zkminer-prover/tests/macos_worker.rs": "88e165c4f554a807a5f58d8db88836d971be4a584ef0ac7c397535f6b1e12f5a",
+    "scripts/macos/test-native-worker.py": "e320db06583b23869cd05245ab8c5b6eea5c42be200889d4f63257eac3c507ba"
+  },
+  "paired_campaign_failures": 0
+}

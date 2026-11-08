@@ -1,0 +1,209 @@
+{
+  "schema_version": 1,
+  "scope": "timing-only synthetic po2-20 dispatch; never used for proofs; CPU oracle intentionally not checked",
+  "fallback_shader_sha256": "2f61db29536c7cb473ff5d1d69203cd58bd048c4372fc94a61b13ed8ba5961c8",
+  "main_only_shader_sha256": "034a85f141c8bf2b78c3c56dc5471888ec6cfe3fe38730495036734fbb95970b",
+  "main_only_metadata_sha256": "e350c0a37edb9cd7337875f521ee66abcf2bbe9364753e2fe5ed723e3a23b8c0",
+  "transform_script_sha256": "e8d7999df9a74424be6107cb26ad7f618cdea5a8f97034c086b1d66780d234b3",
+  "prototype_source_sha256": "79b74aa7064bfb89c66819854aa8445d87c59a00c631391ff02be78cfe042200",
+  "prototype_binary_sha256": "107d3cd0ff6115caaf98645c0c04f648475b6ec90d0a32e9df2f068f8a36b6cc",
+  "threadgroup_size": 256,
+  "po2": 20,
+  "seed": 1,
+  "samples": [
+    {
+      "order": 1,
+      "variant": "fallback",
+      "first_gpu_seconds": 4.647491499781609,
+      "repeat_gpu_seconds": 4.686681501567364,
+      "first_wall_seconds": 4.798277541,
+      "repeat_wall_seconds": 4.752040583,
+      "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+      "thread_execution_width": 32,
+      "max_threads_per_threadgroup": 1024,
+      "static_threadgroup_bytes": 0,
+      "raw_log_sha256": "12514279e9d52d2f0966ad61af552ed481cb03342ef4a514023090652a3c3a48"
+    },
+    {
+      "order": 2,
+      "variant": "main-only",
+      "first_gpu_seconds": 4.368132833391428,
+      "repeat_gpu_seconds": 4.3783994987607,
+      "first_wall_seconds": 4.52112175,
+      "repeat_wall_seconds": 4.44804375,
+      "output_sha256": "f756289bef505a44fdbe772f1378e9020a2232b26c9cb88895260ddd9932bbc4",
+      "thread_execution_width": 32,
+      "max_threads_per_threadgroup": 1024,
+      "static_threadgroup_bytes": 0,
+      "raw_log_sha256": "33b018e920a82a1b357c4ff3a333c45b454470256d8e549138ce16fa30065328"
+    },
+    {
+      "order": 3,
+      "variant": "fallback",
+      "first_gpu_seconds": 4.851853000000119,
+      "repeat_gpu_seconds": 4.839457251131535,
+      "first_wall_seconds": 5.010437916,
+      "repeat_wall_seconds": 4.907203375,
+      "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+      "thread_execution_width": 32,
+      "max_threads_per_threadgroup": 1024,
+      "static_threadgroup_bytes": 0,
+      "raw_log_sha256": "fa84f640c00ee45f84fa5f2b0d5d802a3a74ac517010d20280bf65f9c1817b6e"
+    },
+    {
+      "order": 4,
+      "variant": "main-only",
+      "first_gpu_seconds": 4.494311291724443,
+      "repeat_gpu_seconds": 4.4737991243600845,
+      "first_wall_seconds": 4.6556325,
+      "repeat_wall_seconds": 4.532132375,
+      "output_sha256": "f756289bef505a44fdbe772f1378e9020a2232b26c9cb88895260ddd9932bbc4",
+      "thread_execution_width": 32,
+      "max_threads_per_threadgroup": 1024,
+      "static_threadgroup_bytes": 0,
+      "raw_log_sha256": "5082906a9503cc652289210771dca0bf82f3e198a144032c02cf5624bc6d7583"
+    },
+    {
+      "order": 5,
+      "variant": "fallback",
+      "first_gpu_seconds": 4.99105766788125,
+      "repeat_gpu_seconds": 4.996492125093937,
+      "first_wall_seconds": 5.150281041,
+      "repeat_wall_seconds": 5.064777042,
+      "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+      "thread_execution_width": 32,
+      "max_threads_per_threadgroup": 1024,
+      "static_threadgroup_bytes": 0,
+      "raw_log_sha256": "146f74fc69b49971069a27cceed675ceec63e819177b9db119e5dc05841506b7"
+    },
+    {
+      "order": 6,
+      "variant": "main-only",
+      "first_gpu_seconds": 4.4901004154235125,
+      "repeat_gpu_seconds": 4.483130250126123,
+      "first_wall_seconds": 4.649134625,
+      "repeat_wall_seconds": 4.552831166,
+      "output_sha256": "f756289bef505a44fdbe772f1378e9020a2232b26c9cb88895260ddd9932bbc4",
+      "thread_execution_width": 32,
+      "max_threads_per_threadgroup": 1024,
+      "static_threadgroup_bytes": 0,
+      "raw_log_sha256": "bb59b78dc31b4ffcf0035d36d5f83a4ee3217127bf90463efca19fa9d5b203de"
+    },
+    {
+      "order": 7,
+      "variant": "main-only",
+      "first_gpu_seconds": 4.462225124239922,
+      "repeat_gpu_seconds": 4.469866501167417,
+      "first_wall_seconds": 4.615402041,
+      "repeat_wall_seconds": 4.5361452920000005,
+      "output_sha256": "f756289bef505a44fdbe772f1378e9020a2232b26c9cb88895260ddd9932bbc4",
+      "thread_execution_width": 32,
+      "max_threads_per_threadgroup": 1024,
+      "static_threadgroup_bytes": 0,
+      "raw_log_sha256": "1c205f25679a02be9888f970b90aaaa18f5132598be1c9e858e8cfbc5496630e"
+    },
+    {
+      "order": 8,
+      "variant": "fallback",
+      "first_gpu_seconds": 4.97900920920074,
+      "repeat_gpu_seconds": 4.978974875062704,
+      "first_wall_seconds": 5.136101042,
+      "repeat_wall_seconds": 5.048764833,
+      "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+      "thread_execution_width": 32,
+      "max_threads_per_threadgroup": 1024,
+      "static_threadgroup_bytes": 0,
+      "raw_log_sha256": "27790a85dd8b0987fd267800424ebe25a1592bbc06e44387447b001a6bce76b0"
+    },
+    {
+      "order": 9,
+      "variant": "main-only",
+      "first_gpu_seconds": 4.474201750010252,
+      "repeat_gpu_seconds": 4.463494749739766,
+      "first_wall_seconds": 4.631606416,
+      "repeat_wall_seconds": 4.531895458,
+      "output_sha256": "f756289bef505a44fdbe772f1378e9020a2232b26c9cb88895260ddd9932bbc4",
+      "thread_execution_width": 32,
+      "max_threads_per_threadgroup": 1024,
+      "static_threadgroup_bytes": 0,
+      "raw_log_sha256": "adf2774e954a4e41ff7339d106752e923025a975b1e3e4b4cb1a3ab0fd56493a"
+    },
+    {
+      "order": 10,
+      "variant": "fallback",
+      "first_gpu_seconds": 4.983058959245682,
+      "repeat_gpu_seconds": 4.969366250559688,
+      "first_wall_seconds": 5.143447416,
+      "repeat_wall_seconds": 5.039153291,
+      "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+      "thread_execution_width": 32,
+      "max_threads_per_threadgroup": 1024,
+      "static_threadgroup_bytes": 0,
+      "raw_log_sha256": "f54f07c0c8e482730812ec08f22d2e4b40bafb941771856e60c5738856305860"
+    }
+  ],
+  "sample_csv_sha256": "f0c328141dbbdb6d35524f43083b1742a9aed2508304b1ac8ecfe0a9dd05a69e",
+  "pairs": [
+    {
+      "pair": 1,
+      "order": [
+        "fallback",
+        "main-only"
+      ],
+      "fallback_repeat_gpu_seconds": 4.686681501567364,
+      "main_only_repeat_gpu_seconds": 4.3783994987607,
+      "ratio": 1.0704097474188736,
+      "saved_gpu_seconds": 0.3082820028066635
+    },
+    {
+      "pair": 2,
+      "order": [
+        "fallback",
+        "main-only"
+      ],
+      "fallback_repeat_gpu_seconds": 4.839457251131535,
+      "main_only_repeat_gpu_seconds": 4.4737991243600845,
+      "ratio": 1.0817332465332252,
+      "saved_gpu_seconds": 0.36565812677145004
+    },
+    {
+      "pair": 3,
+      "order": [
+        "fallback",
+        "main-only"
+      ],
+      "fallback_repeat_gpu_seconds": 4.996492125093937,
+      "main_only_repeat_gpu_seconds": 4.483130250126123,
+      "ratio": 1.1145096944157202,
+      "saved_gpu_seconds": 0.5133618749678135
+    },
+    {
+      "pair": 4,
+      "order": [
+        "main-only",
+        "fallback"
+      ],
+      "fallback_repeat_gpu_seconds": 4.978974875062704,
+      "main_only_repeat_gpu_seconds": 4.469866501167417,
+      "ratio": 1.1138978924230334,
+      "saved_gpu_seconds": 0.5091083738952875
+    },
+    {
+      "pair": 5,
+      "order": [
+        "main-only",
+        "fallback"
+      ],
+      "fallback_repeat_gpu_seconds": 4.969366250559688,
+      "main_only_repeat_gpu_seconds": 4.463494749739766,
+      "ratio": 1.113335296484759,
+      "saved_gpu_seconds": 0.5058715008199215
+    }
+  ],
+  "fallback_repeat_gpu_median_seconds": 4.969366250559688,
+  "main_only_repeat_gpu_median_seconds": 4.469866501167417,
+  "median_ratio": 1.1117482477970684,
+  "median_gpu_seconds_saved": 0.49949974939227104,
+  "diagnosis": "percent-scale improvement; removing LogUp does not confirm a multiples-scale live-state hypothesis",
+  "proof_eligible": false
+}

@@ -1,0 +1,470 @@
+{
+  "schema_version": 1,
+  "status": "profile_gate_failed",
+  "source_spec_sha256": "299ebd441aa2e1c0c70f7587a88b8cc32154d0835a0eaea0d807adef11028597",
+  "scope": "one externally verified 10M GPU diagnostic per fixture; counts compared with the WP0 GPU profile",
+  "profile_run": "target/macos/step6-assessment/profile-runs/76ae45c08977415da1ba37d99fc8ec45",
+  "profile_result_sha256": "67f39ccc9c91947919b9280628a0324022b37334ca948cbcc3ee1daee27be7a0",
+  "baseline_wp0_profile_sha256": "3ef1c6827af8849dcdc8c50520f4332795ad336568f83cdaebc241f9a8a754ae",
+  "engine_commit": "2e1d34e130122cdc74ad788f7f47d74c0a357c7c",
+  "worker_sha256": "2a2373f7dc7297a14d3a6d67ce11368701a55e9ff406510c1423a39af1a7bb43",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "profile_script_sha256": "f492a25751a6bcc30b654a2ff5981dc80410ba8f49bbd22e591ffa58245a864e",
+  "collector_sha256": "fd6e88a0087bc9494861ad9633c27e84df7319aa2f96d4668537e7af398df929",
+  "verified_proofs": 2,
+  "tamper_rejections": 6,
+  "profiles": [
+    {
+      "fixture": "arithmetic-10m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/7cd076064c3a4c7e9e9426a65ab647e2",
+      "run_result_sha256": "7334238b7dcd318b1487963ec8da3f0b9d48611ba51e9de7e79816b012be09f0",
+      "worker_sidecar_sha256": "89030f92c5f906396c2ace13792010908adaf076c4da8b447c07f623eb98352f",
+      "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+      "gpu_command_count": 999,
+      "gpu_seconds": 43.905427,
+      "stages": [
+        {
+          "fixture": "arithmetic-10m",
+          "stage": "constraint_evaluation",
+          "wall_seconds": 17.536900000000003,
+          "gpu_seconds": 16.739496000000003,
+          "dispatch_wall_seconds": 17.535162000000003,
+          "host_dispatch_overhead_seconds": 0.7956660000000007,
+          "wall_outside_matched_dispatch_seconds": 0.0017379999999995732,
+          "command_count": 30,
+          "wp0_command_count": 10,
+          "command_reduction_ratio": 0.3333333333333333,
+          "command_gate_passed": null,
+          "host_overhead_gate_passed": null
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "stage": "merkle_commitments",
+          "wall_seconds": 3.6757,
+          "gpu_seconds": 3.559315999999999,
+          "dispatch_wall_seconds": 3.770939,
+          "host_dispatch_overhead_seconds": 0.21162300000000078,
+          "wall_outside_matched_dispatch_seconds": -0.09523899999999985,
+          "command_count": 61,
+          "wp0_command_count": 1163,
+          "command_reduction_ratio": 19.065573770491802,
+          "command_gate_passed": true,
+          "host_overhead_gate_passed": true
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "stage": "polynomial_transforms",
+          "wall_seconds": 17.209699999999998,
+          "gpu_seconds": 15.477084000000003,
+          "dispatch_wall_seconds": 17.374778,
+          "host_dispatch_overhead_seconds": 1.897693999999996,
+          "wall_outside_matched_dispatch_seconds": -0.16507800000000117,
+          "command_count": 143,
+          "wp0_command_count": 1873,
+          "command_reduction_ratio": 13.097902097902098,
+          "command_gate_passed": true,
+          "host_overhead_gate_passed": false
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "stage": "witness_generation",
+          "wall_seconds": 1.7475,
+          "gpu_seconds": 0.0,
+          "dispatch_wall_seconds": 0.0,
+          "host_dispatch_overhead_seconds": 0.0,
+          "wall_outside_matched_dispatch_seconds": 1.7475,
+          "command_count": 0,
+          "wp0_command_count": 0,
+          "command_reduction_ratio": null,
+          "command_gate_passed": null,
+          "host_overhead_gate_passed": null
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "stage": "accumulation",
+          "wall_seconds": 6.4379,
+          "gpu_seconds": 0.0,
+          "dispatch_wall_seconds": 0.0,
+          "host_dispatch_overhead_seconds": 0.0,
+          "wall_outside_matched_dispatch_seconds": 6.4379,
+          "command_count": 0,
+          "wp0_command_count": 0,
+          "command_reduction_ratio": null,
+          "command_gate_passed": null,
+          "host_overhead_gate_passed": null
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "stage": "other_segment_protocol",
+          "wall_seconds": 2.0778999999999996,
+          "gpu_seconds": 0.0,
+          "dispatch_wall_seconds": 0.0,
+          "host_dispatch_overhead_seconds": 0.0,
+          "wall_outside_matched_dispatch_seconds": 2.0778999999999996,
+          "command_count": 0,
+          "wp0_command_count": 0,
+          "command_reduction_ratio": null,
+          "command_gate_passed": null,
+          "host_overhead_gate_passed": null
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "stage": "recursion",
+          "wall_seconds": 10.338524042,
+          "gpu_seconds": 7.542463000000002,
+          "dispatch_wall_seconds": 8.235933999999999,
+          "host_dispatch_overhead_seconds": 0.6934709999999962,
+          "wall_outside_matched_dispatch_seconds": 2.102590042000001,
+          "command_count": 635,
+          "wp0_command_count": 5539,
+          "command_reduction_ratio": 8.722834645669291,
+          "command_gate_passed": false,
+          "host_overhead_gate_passed": false
+        }
+      ],
+      "kernels": {
+        "polynomial_transforms/batch_transforms": {
+          "commands": 92,
+          "gpu_seconds": 15.360770999999998,
+          "dispatch_wall_seconds": 17.203962,
+          "pipeline_seconds": 0.003233999999999999
+        },
+        "polynomial_transforms/multi_bit_reverse": {
+          "commands": 51,
+          "gpu_seconds": 0.11631300000000003,
+          "dispatch_wall_seconds": 0.17081599999999994,
+          "pipeline_seconds": 0.000708
+        },
+        "merkle_commitments/batch_merkle": {
+          "commands": 61,
+          "gpu_seconds": 3.559315999999999,
+          "dispatch_wall_seconds": 3.770939,
+          "pipeline_seconds": 0.0016899999999999994
+        },
+        "other_segment_gpu/eltwise_copy_fp": {
+          "commands": 10,
+          "gpu_seconds": 2e-05,
+          "dispatch_wall_seconds": 0.002336,
+          "pipeline_seconds": 0.00014399999999999998
+        },
+        "constraint_evaluation/ef_prep": {
+          "commands": 10,
+          "gpu_seconds": 0.002878,
+          "dispatch_wall_seconds": 0.011324999999999998,
+          "pipeline_seconds": 0.00016099999999999998
+        },
+        "constraint_evaluation/ef_eval_split": {
+          "commands": 10,
+          "gpu_seconds": 16.73264,
+          "dispatch_wall_seconds": 17.492255,
+          "pipeline_seconds": 5.599999999999999e-05
+        },
+        "constraint_evaluation/ef_combine": {
+          "commands": 10,
+          "gpu_seconds": 0.003978,
+          "dispatch_wall_seconds": 0.031582,
+          "pipeline_seconds": 0.000206
+        },
+        "other_segment_gpu/multi_poly_eval": {
+          "commands": 40,
+          "gpu_seconds": 0.423461,
+          "dispatch_wall_seconds": 0.542799,
+          "pipeline_seconds": 0.00045500000000000006
+        },
+        "other_segment_gpu/mix_poly_coeffs": {
+          "commands": 40,
+          "gpu_seconds": 0.15656899999999999,
+          "dispatch_wall_seconds": 0.17401099999999997,
+          "pipeline_seconds": 0.00031400000000000015
+        },
+        "other_segment_gpu/eltwise_sum_fpext": {
+          "commands": 10,
+          "gpu_seconds": 0.004462000000000001,
+          "dispatch_wall_seconds": 0.012772,
+          "pipeline_seconds": 0.000244
+        },
+        "other_segment_gpu/fri_fold": {
+          "commands": 30,
+          "gpu_seconds": 0.0025559999999999997,
+          "dispatch_wall_seconds": 0.016540000000000003,
+          "pipeline_seconds": 0.00021599999999999994
+        },
+        "recursion/batch_transforms": {
+          "commands": 175,
+          "gpu_seconds": 3.0343310000000008,
+          "dispatch_wall_seconds": 3.5043390000000016,
+          "pipeline_seconds": 0.004865999999999996
+        },
+        "recursion/multi_bit_reverse": {
+          "commands": 97,
+          "gpu_seconds": 0.019932000000000002,
+          "dispatch_wall_seconds": 0.05024599999999998,
+          "pipeline_seconds": 0.0006350000000000003
+        },
+        "recursion/batch_merkle": {
+          "commands": 116,
+          "gpu_seconds": 1.0119480000000005,
+          "dispatch_wall_seconds": 1.1173,
+          "pipeline_seconds": 0.0023410000000000006
+        },
+        "recursion/eval_check": {
+          "commands": 19,
+          "gpu_seconds": 3.248479,
+          "dispatch_wall_seconds": 3.2595170000000007,
+          "pipeline_seconds": 0.0007419999999999999
+        },
+        "recursion/multi_poly_eval": {
+          "commands": 76,
+          "gpu_seconds": 0.17841500000000005,
+          "dispatch_wall_seconds": 0.19827199999999995,
+          "pipeline_seconds": 0.000352
+        },
+        "recursion/mix_poly_coeffs": {
+          "commands": 76,
+          "gpu_seconds": 0.044575000000000004,
+          "dispatch_wall_seconds": 0.07479000000000002,
+          "pipeline_seconds": 0.00031799999999999987
+        },
+        "recursion/eltwise_sum_fpext": {
+          "commands": 19,
+          "gpu_seconds": 0.0023899999999999998,
+          "dispatch_wall_seconds": 0.016334,
+          "pipeline_seconds": 0.000197
+        },
+        "recursion/fri_fold": {
+          "commands": 57,
+          "gpu_seconds": 0.002393000000000001,
+          "dispatch_wall_seconds": 0.015135999999999998,
+          "pipeline_seconds": 0.0001869999999999998
+        }
+      }
+    },
+    {
+      "fixture": "hash-10m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/c1b02e43f9d24c9bb59b63c255d6a788",
+      "run_result_sha256": "7b81069df6c04f36e4bcece2cb4d52f265b3f77b8125ef698b74baa0f53e17a8",
+      "worker_sidecar_sha256": "19229b2c7724f95f724bee4a338035dea0a75b149584edefb346fbb3e6cb0234",
+      "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+      "gpu_command_count": 999,
+      "gpu_seconds": 44.000347999999995,
+      "stages": [
+        {
+          "fixture": "hash-10m",
+          "stage": "constraint_evaluation",
+          "wall_seconds": 17.5758,
+          "gpu_seconds": 16.805052,
+          "dispatch_wall_seconds": 17.574138,
+          "host_dispatch_overhead_seconds": 0.7690860000000015,
+          "wall_outside_matched_dispatch_seconds": 0.0016619999999996082,
+          "command_count": 30,
+          "wp0_command_count": 10,
+          "command_reduction_ratio": 0.3333333333333333,
+          "command_gate_passed": null,
+          "host_overhead_gate_passed": null
+        },
+        {
+          "fixture": "hash-10m",
+          "stage": "merkle_commitments",
+          "wall_seconds": 3.6838,
+          "gpu_seconds": 3.5536619999999988,
+          "dispatch_wall_seconds": 3.7790889999999995,
+          "host_dispatch_overhead_seconds": 0.2254270000000007,
+          "wall_outside_matched_dispatch_seconds": -0.09528899999999929,
+          "command_count": 61,
+          "wp0_command_count": 1163,
+          "command_reduction_ratio": 19.065573770491802,
+          "command_gate_passed": true,
+          "host_overhead_gate_passed": true
+        },
+        {
+          "fixture": "hash-10m",
+          "stage": "polynomial_transforms",
+          "wall_seconds": 17.1296,
+          "gpu_seconds": 15.513036999999999,
+          "dispatch_wall_seconds": 17.293669,
+          "host_dispatch_overhead_seconds": 1.7806320000000024,
+          "wall_outside_matched_dispatch_seconds": -0.16406900000000135,
+          "command_count": 143,
+          "wp0_command_count": 1873,
+          "command_reduction_ratio": 13.097902097902098,
+          "command_gate_passed": true,
+          "host_overhead_gate_passed": false
+        },
+        {
+          "fixture": "hash-10m",
+          "stage": "witness_generation",
+          "wall_seconds": 3.5059,
+          "gpu_seconds": 0.0,
+          "dispatch_wall_seconds": 0.0,
+          "host_dispatch_overhead_seconds": 0.0,
+          "wall_outside_matched_dispatch_seconds": 3.5059,
+          "command_count": 0,
+          "wp0_command_count": 0,
+          "command_reduction_ratio": null,
+          "command_gate_passed": null,
+          "host_overhead_gate_passed": null
+        },
+        {
+          "fixture": "hash-10m",
+          "stage": "accumulation",
+          "wall_seconds": 6.988,
+          "gpu_seconds": 0.0,
+          "dispatch_wall_seconds": 0.0,
+          "host_dispatch_overhead_seconds": 0.0,
+          "wall_outside_matched_dispatch_seconds": 6.988,
+          "command_count": 0,
+          "wp0_command_count": 0,
+          "command_reduction_ratio": null,
+          "command_gate_passed": null,
+          "host_overhead_gate_passed": null
+        },
+        {
+          "fixture": "hash-10m",
+          "stage": "other_segment_protocol",
+          "wall_seconds": 2.062599999999996,
+          "gpu_seconds": 0.0,
+          "dispatch_wall_seconds": 0.0,
+          "host_dispatch_overhead_seconds": 0.0,
+          "wall_outside_matched_dispatch_seconds": 2.062599999999996,
+          "command_count": 0,
+          "wp0_command_count": 0,
+          "command_reduction_ratio": null,
+          "command_gate_passed": null,
+          "host_overhead_gate_passed": null
+        },
+        {
+          "fixture": "hash-10m",
+          "stage": "recursion",
+          "wall_seconds": 10.283738791,
+          "gpu_seconds": 7.540570999999992,
+          "dispatch_wall_seconds": 8.262780999999995,
+          "host_dispatch_overhead_seconds": 0.7222100000000031,
+          "wall_outside_matched_dispatch_seconds": 2.0209577910000043,
+          "command_count": 635,
+          "wp0_command_count": 5539,
+          "command_reduction_ratio": 8.722834645669291,
+          "command_gate_passed": false,
+          "host_overhead_gate_passed": false
+        }
+      ],
+      "kernels": {
+        "polynomial_transforms/batch_transforms": {
+          "commands": 92,
+          "gpu_seconds": 15.397058999999995,
+          "dispatch_wall_seconds": 17.141079,
+          "pipeline_seconds": 0.003364000000000001
+        },
+        "polynomial_transforms/multi_bit_reverse": {
+          "commands": 51,
+          "gpu_seconds": 0.115978,
+          "dispatch_wall_seconds": 0.15259000000000011,
+          "pipeline_seconds": 0.0006750000000000004
+        },
+        "merkle_commitments/batch_merkle": {
+          "commands": 61,
+          "gpu_seconds": 3.5536619999999988,
+          "dispatch_wall_seconds": 3.7790889999999995,
+          "pipeline_seconds": 0.0016790000000000002
+        },
+        "other_segment_gpu/eltwise_copy_fp": {
+          "commands": 10,
+          "gpu_seconds": 2.1000000000000002e-05,
+          "dispatch_wall_seconds": 0.004412,
+          "pipeline_seconds": 0.00015900000000000002
+        },
+        "constraint_evaluation/ef_prep": {
+          "commands": 10,
+          "gpu_seconds": 0.002638,
+          "dispatch_wall_seconds": 0.010683,
+          "pipeline_seconds": 0.000158
+        },
+        "constraint_evaluation/ef_eval_split": {
+          "commands": 10,
+          "gpu_seconds": 16.798613,
+          "dispatch_wall_seconds": 17.537256,
+          "pipeline_seconds": 4.9999999999999996e-05
+        },
+        "constraint_evaluation/ef_combine": {
+          "commands": 10,
+          "gpu_seconds": 0.0038009999999999993,
+          "dispatch_wall_seconds": 0.026199000000000004,
+          "pipeline_seconds": 0.000214
+        },
+        "other_segment_gpu/multi_poly_eval": {
+          "commands": 40,
+          "gpu_seconds": 0.42357400000000006,
+          "dispatch_wall_seconds": 0.548589,
+          "pipeline_seconds": 0.000503
+        },
+        "other_segment_gpu/mix_poly_coeffs": {
+          "commands": 40,
+          "gpu_seconds": 0.15764599999999993,
+          "dispatch_wall_seconds": 0.175359,
+          "pipeline_seconds": 0.00031200000000000005
+        },
+        "other_segment_gpu/eltwise_sum_fpext": {
+          "commands": 10,
+          "gpu_seconds": 0.0045520000000000005,
+          "dispatch_wall_seconds": 0.01285,
+          "pipeline_seconds": 0.00023
+        },
+        "other_segment_gpu/fri_fold": {
+          "commands": 30,
+          "gpu_seconds": 0.0022329999999999997,
+          "dispatch_wall_seconds": 0.021781000000000002,
+          "pipeline_seconds": 0.00016199999999999998
+        },
+        "recursion/batch_transforms": {
+          "commands": 175,
+          "gpu_seconds": 3.0320669999999996,
+          "dispatch_wall_seconds": 3.5314409999999987,
+          "pipeline_seconds": 0.005140999999999998
+        },
+        "recursion/multi_bit_reverse": {
+          "commands": 97,
+          "gpu_seconds": 0.019998000000000005,
+          "dispatch_wall_seconds": 0.04866099999999999,
+          "pipeline_seconds": 0.0007240000000000006
+        },
+        "recursion/batch_merkle": {
+          "commands": 116,
+          "gpu_seconds": 1.0137739999999995,
+          "dispatch_wall_seconds": 1.1195419999999994,
+          "pipeline_seconds": 0.0024489999999999994
+        },
+        "recursion/eval_check": {
+          "commands": 19,
+          "gpu_seconds": 3.2479389999999997,
+          "dispatch_wall_seconds": 3.259987,
+          "pipeline_seconds": 0.0007309999999999999
+        },
+        "recursion/multi_poly_eval": {
+          "commands": 76,
+          "gpu_seconds": 0.17820300000000006,
+          "dispatch_wall_seconds": 0.19836999999999996,
+          "pipeline_seconds": 0.00034099999999999994
+        },
+        "recursion/mix_poly_coeffs": {
+          "commands": 76,
+          "gpu_seconds": 0.043935000000000016,
+          "dispatch_wall_seconds": 0.07348299999999999,
+          "pipeline_seconds": 0.0003259999999999998
+        },
+        "recursion/eltwise_sum_fpext": {
+          "commands": 19,
+          "gpu_seconds": 0.0022310000000000003,
+          "dispatch_wall_seconds": 0.015864,
+          "pipeline_seconds": 0.000228
+        },
+        "recursion/fri_fold": {
+          "commands": 57,
+          "gpu_seconds": 0.0024240000000000004,
+          "dispatch_wall_seconds": 0.015432999999999999,
+          "pipeline_seconds": 0.00017399999999999984
+        }
+      }
+    }
+  ],
+  "note": "GPUStartTime/GPUEndTime cover whole batched command buffers. Individual dispatches retain their completed-dispatch counts in sidecars; command_count counts committed buffers. This is a diagnostic profile, not a paired latency campaign.",
+  "csv_sha256": "5f4dd0da80581e87f3c5eefb326c1eb63f9f3d3615b11c15bb32794ce59efd52"
+}

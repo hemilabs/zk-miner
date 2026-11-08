@@ -1,0 +1,807 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "scope": "Five counterbalanced warm 10M arithmetic pairs: committed step-5 stack versus current parent-refreshed stack. Includes upstream changes; not isolated attribution to Metal.",
+  "engine_revision": "dcbe9f4b9140a48d4792ffcd3a3eba19897be175",
+  "worker_sha256": "f876cf8e7591e7f9ea98085ccb259ad22f767d54715023b79c5b9caf2e74fc08",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "baseline": {
+    "binary": "/Users/dbur/dev/zk-miner/target/macos/recursion-metal-final-build/zkminer-prove-risc0",
+    "binary_sha256": "d157305ba0e0830671c6b8f6238dc68e59ae8a68dc3454865c2084c21bc347b9",
+    "manifest_sha256": "a3413f5171576da64244046222290c68de0b9aed521d76842fba1d124c677e7b",
+    "miner_commit": "55b6d877124926847cb27c5885e4b222603b5e94",
+    "engine_commit": "1f6eb352d366edc0cfad6f17a76ce41387d48f36",
+    "matched_miner_inputs": {
+      "Cargo.lock": "75d710409c3107e465ca0520bb7c551e8027c47ecb7c8e3b13d9b106cad5c6b9",
+      "Cargo.toml": "6d62c06c33b867de1177afe1b4f220f70557e87e9175e3bd7574e56d0d66fed2",
+      "crates/zkminer-prove-risc0/Cargo.toml": "853a713040f3f179df3b99c3e55edf2ed67df044a11acfc08a45538d1e033f4c",
+      "crates/zkminer-prove-risc0/build.rs": "a6311821df1d5d69671acb372ca5c6a6608df3789d7cd9113975ba6d99ea1ac6",
+      "crates/zkminer-prove-risc0/src/macos.rs": "3d412ea39a076e89e2545708f2cb882e5a6c7a6f242f2b7e6e8b34c92c3e4fda",
+      "crates/zkminer-prove-risc0/src/macos_metal.rs": "0362e42524cdb32b269019ec99965308bf5f4812d4b8576fec138d16c1b47f05",
+      "crates/zkminer-prove-risc0/src/main.rs": "e635521b15f4db34c52164160cf863e5b31d144df6de2ace4ea9e07a943365e4",
+      "crates/zkminer-prover-protocol/Cargo.toml": "a646a1d0024007d0172aa8a1b4efb5ebc1b5df2364950d5475279ee6250dbdcd",
+      "crates/zkminer-prover-protocol/src/codec.rs": "70543a49b7d6c4df969ec05033bbcf934c450d8cdfcf261ced7536b3e0145f86",
+      "crates/zkminer-prover-protocol/src/lib.rs": "cf49912fe2eeb919ecd36c90cbf1290634224a9ab502cba32b523e0f17f65c59",
+      "crates/zkminer-prover-protocol/src/macos.rs": "46bffe46c057fd567e195dae2401ff6ef0af2d051d10dbc2358fca184d66b334",
+      "crates/zkminer-prover-protocol/src/proc.rs": "5b1bba5de4b31c09eb07510f2480e57b82b5d65ac4d480142e0e7d4c4c06af10",
+      "crates/zkminer-prover-protocol/src/types.rs": "684640701892d81adc2f3d717d5c61bd4f1f434d2ef3e8bc72165f19dd6fea89",
+      "scripts/macos/build-worker.py": "cdf09159fea5824d8294917a3762b4e6898b1a3a64dfcde39ab47ef27e92b3d0",
+      "scripts/macos/check-source.py": "39bda05bea2f8eb86e7e0d045a72b0e1dbaf66a067c8b40480771758944b63dd",
+      "scripts/macos/env.sh": "d4ea1b6cfb9e24c3edfa767a32c533648a4f1c123278b01d5c378c078e574835",
+      "scripts/macos/local-engine.py": "b3045c21b11c7a0aa32b9cc9909bccb587bf5ab30f06539f3cf09a4a015244c4",
+      "scripts/macos/worker_provenance.py": "0594a372af5547a6c7c9a6f38c1befb88a9a5ed6c0214cc77530ddf961010add"
+    },
+    "engine_patch_sha256": "eece344bfcc276c49cbb06d4f430bfbe3be3675625243c5819aca3551e83d696"
+  },
+  "criterion": {
+    "recorded_before_any_proof": true,
+    "metric": "WorkerPool prove_call_ms + unchanged independent verifier elapsed_ms",
+    "paired_fixture": "Fibonacci(1000000), >=10M guest cycles, po2 20, 18 Rayon/18 Go",
+    "measured_pairs": 5,
+    "excluded_first_process_warmups_per_case": 1,
+    "order": "A/B then B/A alternating each round",
+    "required_median_speedup": 2.0,
+    "required_faster_pairs": 4,
+    "usefulness_seconds": 600,
+    "comparison_scope": "Committed step-5 stack versus current parent-refreshed stack; includes upstream changes and is not an isolated Metal-only attribution.",
+    "speedup_formula": "median(baseline complete time) / median(candidate complete time)",
+    "stretch_fixture": "Fibonacci(4600000), >=46M guest cycles, po2 20; one complete observation",
+    "proposed_stretch_seconds": 600,
+    "failures_excluded": false,
+    "admission_wait_policy": "Only typed before-dispatch host-memory refusals wait for approximately ten minutes at most per request. Waits are recorded separately and excluded from successful prove-call timing. Dispatched proof failures are never retried."
+  },
+  "host_reserve_gib": 16,
+  "colima": "left running",
+  "verified_proofs_including_warmups": 12,
+  "negative_checks": 36,
+  "current_tip_proofs": 6,
+  "current_tip_negative_checks": 18,
+  "baseline_proofs": 6,
+  "baseline_negative_checks": 18,
+  "measured_pairs": 5,
+  "measured_complete_seconds": {
+    "0": [
+      420.82885270800006,
+      427.191923166,
+      423.426033792,
+      428.801669167,
+      432.259616083
+    ],
+    "1": [
+      117.17693304100001,
+      117.179767126,
+      117.191532125,
+      117.691307541,
+      117.99981241699999
+    ]
+  },
+  "median_complete_seconds": {
+    "0": 427.191923166,
+    "1": 117.191532125
+  },
+  "complete_seconds_range": {
+    "0": [
+      420.82885270800006,
+      432.259616083
+    ],
+    "1": [
+      117.17693304100001,
+      117.99981241699999
+    ]
+  },
+  "median_speedup": 3.6452456540148677,
+  "faster_pairs": 5,
+  "speed_gate_passed": true,
+  "arithmetic_usefulness_passed": true,
+  "worker_identities": {
+    "0": [
+      {
+        "pid": 49533,
+        "start_time_us": 1793735268243890
+      }
+    ],
+    "1": [
+      {
+        "pid": 49545,
+        "start_time_us": 1793735272917620
+      }
+    ]
+  },
+  "pressure_levels": [
+    1
+  ],
+  "thermal_states": [
+    "fair"
+  ],
+  "thermal_scope": "Post-proof OS thermal observations; nominal/fair reports may be unknown. No causal thermal or statistical-significance claim.",
+  "largest_guard_peak_footprint_bytes": 20900794928,
+  "idle_worker_footprint_range_bytes": {
+    "0": [
+      5184557616,
+      9843253048
+    ],
+    "1": [
+      4901245224,
+      5134225944
+    ]
+  },
+  "footprint_scope": "Each active worker and its native helper group; excludes the other retained worker and other host processes.",
+  "environment_change": {
+    "before_restart": "Owner quit Brave completely; zero Brave processes observed before the prior attempt ended.",
+    "during_campaign": [],
+    "comparison_scope": "Fresh five-pair campaign; previous partial measurements are not pooled. Same host, counterbalanced whole-stack comparison; includes parent changes and is not isolated Metal-only attribution or a statistical-significance result.",
+    "colima": "Left running; no memory policy change.",
+    "end_observation": {
+      "observed_at": "2026-11-03T20:44:31.022642+00:00",
+      "owned_workers_or_helpers": 0,
+      "brave_processes": 0,
+      "estimated_available_gib": 59.37544250488281,
+      "pressure_level": 1,
+      "guard_policy": "unchanged",
+      "default_colima_vm_pid": 4037
+    }
+  },
+  "source_archive": {
+    "miner_base_commit": "548ef7e5b4bd07e817cfa1ccccefdeebce6c4119",
+    "files": {
+      "acceptance-binary": "2ed9c368d02b6ab7794c7c884735e2b0da4714de76163e655fd4fdfb21a2dcf1",
+      "macos_worker.rs": "41c88c2bef03c4c1ddfac5b8d5876f5d14e8e2d2e7068b54d6e113c8f52c6348",
+      "test-native-worker.py": "53281c0e4e843091f35edfa8f332fc4fe88699bfe72c48b88f2f075a4ece8331",
+      "worker-source.patch": "d82d58534c2316d7b6895a83bf8cad430ac27e42034059d2521c5b0f4dce1c09",
+      "candidate-worker": "f876cf8e7591e7f9ea98085ccb259ad22f767d54715023b79c5b9caf2e74fc08",
+      "baseline-worker": "d157305ba0e0830671c6b8f6238dc68e59ae8a68dc3454865c2084c21bc347b9",
+      "native-helper-manifest.json": "084b2f250d6153c09d2e24b9165d22608d67a03b9f7acce774f0600938c79566"
+    },
+    "harness_manifest_sha256": "bb3270ec96fc6dc511d1d78eaf72369b5db6d032a4bbc54be08908476954f13a"
+  },
+  "total_admission_wait_ms": 0.0,
+  "admission_events": [],
+  "pairs": [
+    {
+      "round": 1,
+      "baseline_seconds": 420.82885270800006,
+      "candidate_seconds": 117.17693304100001,
+      "speedup": 3.5913967176522084
+    },
+    {
+      "round": 2,
+      "baseline_seconds": 427.191923166,
+      "candidate_seconds": 117.179767126,
+      "speedup": 3.645611641356591
+    },
+    {
+      "round": 3,
+      "baseline_seconds": 423.426033792,
+      "candidate_seconds": 117.191532125,
+      "speedup": 3.6131111703562433
+    },
+    {
+      "round": 4,
+      "baseline_seconds": 428.801669167,
+      "candidate_seconds": 117.691307541,
+      "speedup": 3.643443837325189
+    },
+    {
+      "round": 5,
+      "baseline_seconds": 432.259616083,
+      "candidate_seconds": 117.99981241699999,
+      "speedup": 3.6632229088249404
+    }
+  ],
+  "proofs": [
+    {
+      "round": 0,
+      "case": 0,
+      "warmup": true,
+      "segment_hal": "cpu",
+      "worker_pid": 49533,
+      "worker_start_time_us": 1793735268243890,
+      "complete_seconds": 419.247973209,
+      "prove_call_ms": 419213.125209,
+      "independent_verifier_ms": 34.848,
+      "admission_wait_ms": 0.0,
+      "stage_ms": {
+        "execution_and_segment": 382637.454084,
+        "identity_and_wrap": 24557.643,
+        "recursion": 11411.440792,
+        "verification": 1.768042
+      },
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 14109287496,
+      "idle_worker_footprint_bytes": 5184557616,
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 1,
+        "thermal_state_name": "fair"
+      },
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "artifact_directory": "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-0-case-0",
+      "artifact_sha256": {
+        "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+        "worker.json": "9455eaa6ce2802a2fa6e0d00a4a945c309f6e9f630e69df11ee907ad2c9ae8b4",
+        "resource.json": "8fc1e3a2dac4b874de6b56a9f774dee0ea72cd3dd4f0f033a02a39422663543c",
+        "timing.json": "47ea3ba8882c08a80d763738ced6397f859433a671232f893530f9de4ca0b2a1",
+        "seal.bin": "c36d6990ab0adf1b8b76f536f6c7d91ce7728930e7366c60a67067f812cbd57e",
+        "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+        "receipt.bin": "530fd833407f9b7c718ce8546f0084480e55a3458859bddc2107da3620feb95f"
+      }
+    },
+    {
+      "round": 0,
+      "case": 1,
+      "warmup": true,
+      "segment_hal": "metal",
+      "worker_pid": 49545,
+      "worker_start_time_us": 1793735272917620,
+      "complete_seconds": 124.236499708,
+      "prove_call_ms": 124200.490833,
+      "independent_verifier_ms": 36.008875,
+      "admission_wait_ms": 0.0,
+      "stage_ms": {
+        "execution_and_segment": 88146.79375,
+        "identity_and_wrap": 24500.88525,
+        "recursion": 11268.49525,
+        "verification": 1.745959
+      },
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 16552445344,
+      "idle_worker_footprint_bytes": 4901245224,
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 1,
+        "thermal_state_name": "fair"
+      },
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "artifact_directory": "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-0-case-1",
+      "artifact_sha256": {
+        "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+        "worker.json": "5a0ac65042bf7a48739b8b44814adfa82535782d885cbf25d4fc93d1d968cc91",
+        "resource.json": "8f6af5f29111674b2dfa1970c044ffa132209f1e3c0c0b62dc1c5ed28c93cded",
+        "timing.json": "46ea0cc579efc9f79adedb82a310404f3b6525e9c58db74c0d0ef0ca6522b1e7",
+        "seal.bin": "76f21fa8d03f00d28d83f583ef4ccbf2763ae05bd8c90f935011d630fe9fb9e5",
+        "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+        "receipt.bin": "2bf8785f88762c138c5a5079c0b009dfc15d47fbb1f64ec0a3eb976bccf8b278"
+      }
+    },
+    {
+      "round": 1,
+      "case": 1,
+      "warmup": false,
+      "segment_hal": "metal",
+      "worker_pid": 49545,
+      "worker_start_time_us": 1793735272917620,
+      "complete_seconds": 117.17693304100001,
+      "prove_call_ms": 117140.68608300001,
+      "independent_verifier_ms": 36.246958,
+      "admission_wait_ms": 0.0,
+      "stage_ms": {
+        "execution_and_segment": 87922.894292,
+        "identity_and_wrap": 17219.37475,
+        "recursion": 11211.448959,
+        "verification": 1.770375
+      },
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 20719112536,
+      "idle_worker_footprint_bytes": 5040148872,
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 1,
+        "thermal_state_name": "fair"
+      },
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "artifact_directory": "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-1-case-1",
+      "artifact_sha256": {
+        "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+        "worker.json": "1b7732f70c830e517803ad2395fffc006396138c3372335439be05806d89a6a1",
+        "resource.json": "e413858dc31ceb469ea6da107963160b7766313ef672764915b34d532aff72e5",
+        "timing.json": "5b2b90d5f5ca036736d0177a3be34c483817c94975f7fe4ccf123b5e63bc5315",
+        "seal.bin": "f9324993e1f1e1e40c9dee93624411c38e40fa2541c886785ec3b316c4cbeaf5",
+        "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+        "receipt.bin": "367e3aa12584c5170e541523409da7098c4ddd6c7174f82d2f1aa8ee7bdc49ff"
+      }
+    },
+    {
+      "round": 1,
+      "case": 0,
+      "warmup": false,
+      "segment_hal": "cpu",
+      "worker_pid": 49533,
+      "worker_start_time_us": 1793735268243890,
+      "complete_seconds": 420.82885270800006,
+      "prove_call_ms": 420808.16650000005,
+      "independent_verifier_ms": 20.686208,
+      "admission_wait_ms": 0.0,
+      "stage_ms": {
+        "execution_and_segment": 391741.223542,
+        "identity_and_wrap": 17418.000165999998,
+        "recursion": 11178.324209,
+        "verification": 1.705958
+      },
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 17452234408,
+      "idle_worker_footprint_bytes": 9738034952,
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 1,
+        "thermal_state_name": "fair"
+      },
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "artifact_directory": "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-1-case-0",
+      "artifact_sha256": {
+        "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+        "worker.json": "ace0fd9b48bab4388df04bc8c2b11dbce029b8c7a64fef6616773b97005c3a3e",
+        "resource.json": "f32c70eb4c2be8d24cf9db55ecf92a0c10198ba081dd773c972d1f339fdf37c4",
+        "timing.json": "0974a53f05184b3daa1b51d2fd9de684a023aa84f041a9ab38f0168b9ccf7ae5",
+        "seal.bin": "d9d48b4898bdc0ef6b39e69a2013349391a8e5c7c3baee81cd7b1a18e0249ce2",
+        "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+        "receipt.bin": "85b2ce94238096e6fa633b840ed1aa95768440cdef25c91364a6442039e2493d"
+      }
+    },
+    {
+      "round": 2,
+      "case": 0,
+      "warmup": false,
+      "segment_hal": "cpu",
+      "worker_pid": 49533,
+      "worker_start_time_us": 1793735268243890,
+      "complete_seconds": 427.191923166,
+      "prove_call_ms": 427157.514958,
+      "independent_verifier_ms": 34.408208,
+      "admission_wait_ms": 0.0,
+      "stage_ms": {
+        "execution_and_segment": 398444.924875,
+        "identity_and_wrap": 17239.82675,
+        "recursion": 11018.184792,
+        "verification": 1.772042
+      },
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 17452234408,
+      "idle_worker_footprint_bytes": 8852511848,
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 1,
+        "thermal_state_name": "fair"
+      },
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "artifact_directory": "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-2-case-0",
+      "artifact_sha256": {
+        "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+        "worker.json": "1ea7f03c24d7bb18049914803a8189b317f7c5532d87d890b631877d1a3f4111",
+        "resource.json": "cb60c31f28972d75f7bd95f775a8e0d58dbbd8367eb07e4af666fda3338abfb5",
+        "timing.json": "93508bd76cd167efce00fdc5d9bd4fec378de715df35daeb618c014c4faa4628",
+        "seal.bin": "f473206b78d61526033766e461d3d371214e1c662d2760f2f9d1a4116806331f",
+        "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+        "receipt.bin": "094810796ec484cc012b801fe208f8cb38da9ce443a59e395746eaaf98afc829"
+      }
+    },
+    {
+      "round": 2,
+      "case": 1,
+      "warmup": false,
+      "segment_hal": "metal",
+      "worker_pid": 49545,
+      "worker_start_time_us": 1793735272917620,
+      "complete_seconds": 117.179767126,
+      "prove_call_ms": 117144.055959,
+      "independent_verifier_ms": 35.711167,
+      "admission_wait_ms": 0.0,
+      "stage_ms": {
+        "execution_and_segment": 87732.332,
+        "identity_and_wrap": 17324.606792000002,
+        "recursion": 11209.28375,
+        "verification": 1.718125
+      },
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 20823478688,
+      "idle_worker_footprint_bytes": 4992111032,
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 1,
+        "thermal_state_name": "fair"
+      },
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "artifact_directory": "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-2-case-1",
+      "artifact_sha256": {
+        "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+        "worker.json": "cf5e7cc166a7c5fafffbf7ed86521ff7d500f08978a38da5994cb15fcbd298bb",
+        "resource.json": "eb8ffe1527c495b96fe0256e624a5d6418815432f5ec7c3c3a3ba153f544a83b",
+        "timing.json": "c973fe268b294320b07351d14cacf7d2c6b080ad24ef962ac1ac363a621f9d48",
+        "seal.bin": "9b85fe1fc4bdea1dee3328e5978077465e33023ef5127f68bb01cc11146ced5a",
+        "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+        "receipt.bin": "46be698b155658a9be0e8140bfa1b7ae9bc3cb10e0f39c5cb8dbaaf8d3b0ad85"
+      }
+    },
+    {
+      "round": 3,
+      "case": 1,
+      "warmup": false,
+      "segment_hal": "metal",
+      "worker_pid": 49545,
+      "worker_start_time_us": 1793735272917620,
+      "complete_seconds": 117.191532125,
+      "prove_call_ms": 117154.7935,
+      "independent_verifier_ms": 36.738625,
+      "admission_wait_ms": 0.0,
+      "stage_ms": {
+        "execution_and_segment": 87601.508208,
+        "identity_and_wrap": 17410.836124999998,
+        "recursion": 11229.633625,
+        "verification": 1.719541
+      },
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 20865487360,
+      "idle_worker_footprint_bytes": 5096378856,
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 1,
+        "thermal_state_name": "fair"
+      },
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "artifact_directory": "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-3-case-1",
+      "artifact_sha256": {
+        "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+        "worker.json": "63accbac1524447c2f8840f0e0a8cf3f4f71a60de1e80447938d8086913310d5",
+        "resource.json": "ebc44c8ac93b41d1edd4c0ece003d64333622da8bf956936f7a7ad4f61eec322",
+        "timing.json": "4abfeff24324ebd155abdf292f532c6aa7f436103c765c3932f392181e780f06",
+        "seal.bin": "b32156adf32486b34841313ae56370ddeafd902ec66cf139cc4e64ec7178da45",
+        "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+        "receipt.bin": "25a5b7a9ff45c4636fcfc0cfe324d50ad112e7aad6bd7a8ea81b792163f427fa"
+      }
+    },
+    {
+      "round": 3,
+      "case": 0,
+      "warmup": false,
+      "segment_hal": "cpu",
+      "worker_pid": 49533,
+      "worker_start_time_us": 1793735268243890,
+      "complete_seconds": 423.426033792,
+      "prove_call_ms": 423391.84745799995,
+      "independent_verifier_ms": 34.186334,
+      "admission_wait_ms": 0.0,
+      "stage_ms": {
+        "execution_and_segment": 394279.05399999995,
+        "identity_and_wrap": 17156.499875,
+        "recursion": 11029.468583,
+        "verification": 1.728875
+      },
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 17452234408,
+      "idle_worker_footprint_bytes": 8875924656,
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 1,
+        "thermal_state_name": "fair"
+      },
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "artifact_directory": "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-3-case-0",
+      "artifact_sha256": {
+        "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+        "worker.json": "97b21e7d14dddb86b724dc8f63abcf8f1977c917dbb34bae0c803c0624a4d04e",
+        "resource.json": "5d416202129002d23ebb81e5a4381bea34b3e094d01c17e9aab1cac3e19e0805",
+        "timing.json": "8deeb7007f8b7cc2bc3113e0386831798151ebd3cd7ed4dcf2673f584747219d",
+        "seal.bin": "f1e861b12cd54e24172119bf7e5bd4a4d0b0c77257878b20c5f30ed882bdce21",
+        "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+        "receipt.bin": "782e78bfc6ceec19cdced04dd74e2459a529471c011ddd95f3c1e444d0c6081e"
+      }
+    },
+    {
+      "round": 4,
+      "case": 0,
+      "warmup": false,
+      "segment_hal": "cpu",
+      "worker_pid": 49533,
+      "worker_start_time_us": 1793735268243890,
+      "complete_seconds": 428.801669167,
+      "prove_call_ms": 428772.605125,
+      "independent_verifier_ms": 29.064041999999997,
+      "admission_wait_ms": 0.0,
+      "stage_ms": {
+        "execution_and_segment": 399944.932125,
+        "identity_and_wrap": 17357.027875,
+        "recursion": 11191.415041,
+        "verification": 1.712916
+      },
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 17452234408,
+      "idle_worker_footprint_bytes": 8856607872,
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 1,
+        "thermal_state_name": "fair"
+      },
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "artifact_directory": "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-4-case-0",
+      "artifact_sha256": {
+        "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+        "worker.json": "0ae4c466a60de62ee93caa026c5b75ea379391626bd7cc812e2766ee4f3d765e",
+        "resource.json": "3f887c75541ca749afcc9e72e43164ab902b0ed9efab4ed9e57b07d9022e182d",
+        "timing.json": "2f08852fdff82266b7905c75f642d40a748663e4f5545091d964cc33b25c2cee",
+        "seal.bin": "fb9e71ac31fa8cf9ea4acb5885a58a5c88b06c38fb3fd680a6819a3a875aa9ba",
+        "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+        "receipt.bin": "aa103cc0aff0aa0c1f5dca11be7c4be1ad6fa085ea548b464792d5819d250f16"
+      }
+    },
+    {
+      "round": 4,
+      "case": 1,
+      "warmup": false,
+      "segment_hal": "metal",
+      "worker_pid": 49545,
+      "worker_start_time_us": 1793735272917620,
+      "complete_seconds": 117.691307541,
+      "prove_call_ms": 117655.465833,
+      "independent_verifier_ms": 35.841708,
+      "admission_wait_ms": 0.0,
+      "stage_ms": {
+        "execution_and_segment": 88510.713417,
+        "identity_and_wrap": 17439.073208,
+        "recursion": 11208.58825,
+        "verification": 1.723333
+      },
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 20883919360,
+      "idle_worker_footprint_bytes": 5117301248,
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 1,
+        "thermal_state_name": "fair"
+      },
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "artifact_directory": "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-4-case-1",
+      "artifact_sha256": {
+        "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+        "worker.json": "60af125ac43a4b404e334038f5b54172b40e98b210c4d05cf9a61368d0bb19ad",
+        "resource.json": "57424feceeff19664b9b7f1584563c8200f0bfa1a75638d6ca7b9fc71030df91",
+        "timing.json": "a97e620ac16fb8a244019985c67c5c1541bff4cee0c5c26460eeffacdebc1935",
+        "seal.bin": "8bef040b91f62653bef8b25c90104d115deea0a018abebdabdefab4baf3bccb7",
+        "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+        "receipt.bin": "692cf1dff006ae0adb633722c8fd07fe6927f5e0a2cbd189d8adb414468ead8d"
+      }
+    },
+    {
+      "round": 5,
+      "case": 1,
+      "warmup": false,
+      "segment_hal": "metal",
+      "worker_pid": 49545,
+      "worker_start_time_us": 1793735272917620,
+      "complete_seconds": 117.99981241699999,
+      "prove_call_ms": 117974.307875,
+      "independent_verifier_ms": 25.504542,
+      "admission_wait_ms": 0.0,
+      "stage_ms": {
+        "execution_and_segment": 89045.051416,
+        "identity_and_wrap": 17480.524541000003,
+        "recursion": 11294.490667,
+        "verification": 1.758875
+      },
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 20900794928,
+      "idle_worker_footprint_bytes": 5134225944,
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 1,
+        "thermal_state_name": "fair"
+      },
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "artifact_directory": "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-5-case-1",
+      "artifact_sha256": {
+        "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+        "worker.json": "082291b3b8945dabaf15dabc4484dd8fa39bf115a2e359b565c13c6f8d823896",
+        "resource.json": "bb9cc1f62c86819a62a966b08ac80b1b6d07e67d5a18ebe6098d3de45c67921e",
+        "timing.json": "ad6097cf3e35a49ba30b567abf49bc14c87c0cd6872f94204d2494e00bbde2cd",
+        "seal.bin": "6062843d4eb50531c9cedc9a0a37a756a1314297d0650e6ebc3d4fd7f34a1da7",
+        "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+        "receipt.bin": "dbbede2fe04abed890649f66d7e1b776d0fa557f860fd38ac93bd5ba80a26b8d"
+      }
+    },
+    {
+      "round": 5,
+      "case": 0,
+      "warmup": false,
+      "segment_hal": "cpu",
+      "worker_pid": 49533,
+      "worker_start_time_us": 1793735268243890,
+      "complete_seconds": 432.259616083,
+      "prove_call_ms": 432224.52550000005,
+      "independent_verifier_ms": 35.090583,
+      "admission_wait_ms": 0.0,
+      "stage_ms": {
+        "execution_and_segment": 402628.095333,
+        "identity_and_wrap": 17493.903875,
+        "recursion": 11136.615917,
+        "verification": 1.704167
+      },
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 17557649112,
+      "idle_worker_footprint_bytes": 9843253048,
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 1,
+        "thermal_state_name": "fair"
+      },
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "artifact_directory": "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-5-case-0",
+      "artifact_sha256": {
+        "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+        "worker.json": "6adb8214980a976112dbe3c60bef5e1e393fb673b21d5f8b868edb0e0980ebfe",
+        "resource.json": "f9c3d027b69d580353b26709fbaf4db7a0195a9bce9eb098b2381d678c31e252",
+        "timing.json": "a29aca64f621f1f08dd6cd41f3050c0a3291efe7506511bb5fa5f345aa8c2b27",
+        "seal.bin": "5ba526441fe63389721db889912cc659f66e831346b6fa27b228553535ccab4a",
+        "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+        "receipt.bin": "3ddc6275ca2f329526946f70959dab1d92ac3c90dff4a25c5b66be7dbc2b2f03"
+      }
+    }
+  ],
+  "campaign": "target/macos/review-rv32im/bbb711fdb0ae413095ec04292684a0fc",
+  "raw_run": "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275",
+  "artifact_sha256": {
+    "target/macos/review-rv32im/bbb711fdb0ae413095ec04292684a0fc/result.json": "1acae4b38cd835bc5fdc5d3b4863c815f0ffd23fff612b3afc6c4261bfed8df5",
+    "target/macos/review-rv32im/bbb711fdb0ae413095ec04292684a0fc/criterion.json": "2f68e965de327d885bc6f4c885f1a36e80147498d7a88ecd6531a8e5c258d3b1",
+    "target/macos/review-rv32im/bbb711fdb0ae413095ec04292684a0fc/driver-source.py": "8b6f021136ed56f6dbbe1d459cac7c34e8f4483d6937339d2530ae1c23312ace",
+    "target/macos/review-rv32im/bbb711fdb0ae413095ec04292684a0fc/environment-events.json": "02977926db1a27a8e3011fe6496a6edb8afe5fd96f7e6525f23935d70e1f2db4",
+    "target/macos/review-rv32im/bbb711fdb0ae413095ec04292684a0fc/source-archive.json": "9825ce7bce3ae22a7d839140a4131137c173f1a0ede3f36375ce6582545840a0",
+    "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/result.json": "cce8bf48c9a6558f6cd21f200688c2e6bf4c6f751f9fdc04b05453d9d88a4cec",
+    "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance-build.json": "bb3270ec96fc6dc511d1d78eaf72369b5db6d032a4bbc54be08908476954f13a",
+    "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/requests.jsonl": "6ddce5318b1e9e13ed486a9758d2656a258c264b96d5baa89d1df43a5ddb7280"
+  },
+  "worker_source_patch": "docs/macos/evidence/rv32im-review-worker.patch",
+  "worker_source_patch_sha256": "d82d58534c2316d7b6895a83bf8cad430ac27e42034059d2521c5b0f4dce1c09"
+}

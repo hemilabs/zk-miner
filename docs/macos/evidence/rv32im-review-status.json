@@ -1,0 +1,266 @@
+{
+  "schema_version": 1,
+  "engine_revision": "dcbe9f4b9140a48d4792ffcd3a3eba19897be175",
+  "status": "review_followup_validation_complete",
+  "worker_builds": {
+    "native": {
+      "source": {
+        "kind": "native",
+        "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+        "engine_path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "engine_head": "dcbe9f4b9140a48d4792ffcd3a3eba19897be175",
+        "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "engine_untracked_files": {},
+        "config_path": "/Users/dbur/dev/zk-miner/target/macos/rv32im-worker/engine.toml",
+        "inputs": {
+          "Cargo.lock": "75d710409c3107e465ca0520bb7c551e8027c47ecb7c8e3b13d9b106cad5c6b9",
+          "Cargo.toml": "6d62c06c33b867de1177afe1b4f220f70557e87e9175e3bd7574e56d0d66fed2",
+          "crates/zkminer-prove-risc0/Cargo.toml": "1209837d1b246094dd2f247c2553dc89caa1f9a4bc99eaaf50ba9e5be7dd8cfc",
+          "crates/zkminer-prove-risc0/build.rs": "a6311821df1d5d69671acb372ca5c6a6608df3789d7cd9113975ba6d99ea1ac6",
+          "crates/zkminer-prove-risc0/src/macos.rs": "cfb5f05d6e4d5f502e9c325e20d207291ecf5764441968fcb871a7bd3ad38945",
+          "crates/zkminer-prove-risc0/src/main.rs": "bb2b33a20a87857b623bb08e4d6799b4adbc9c1f5be20509f58074e3ab31698b",
+          "crates/zkminer-prover-protocol/Cargo.toml": "a646a1d0024007d0172aa8a1b4efb5ebc1b5df2364950d5475279ee6250dbdcd",
+          "crates/zkminer-prover-protocol/src/codec.rs": "70543a49b7d6c4df969ec05033bbcf934c450d8cdfcf261ced7536b3e0145f86",
+          "crates/zkminer-prover-protocol/src/lib.rs": "cf49912fe2eeb919ecd36c90cbf1290634224a9ab502cba32b523e0f17f65c59",
+          "crates/zkminer-prover-protocol/src/macos.rs": "46bffe46c057fd567e195dae2401ff6ef0af2d051d10dbc2358fca184d66b334",
+          "crates/zkminer-prover-protocol/src/proc.rs": "5b1bba5de4b31c09eb07510f2480e57b82b5d65ac4d480142e0e7d4c4c06af10",
+          "crates/zkminer-prover-protocol/src/types.rs": "684640701892d81adc2f3d717d5c61bd4f1f434d2ef3e8bc72165f19dd6fea89",
+          "rust-toolchain.toml": "f0815f7685d7aff345137c830314cf78d4d0dc7bc71328561fc6823b7fbb23cb",
+          "scripts/macos/build-worker.py": "f4b643f94a25a064aee8325a619e6e3fe0924ade1e6ef324211b537b4e64fd09",
+          "scripts/macos/check-source.py": "efb531f241f88b8af9d56481744913d7d2b14b45a0cfc4f4c80ec68a73f272a0",
+          "scripts/macos/env.sh": "d4ea1b6cfb9e24c3edfa767a32c533648a4f1c123278b01d5c378c078e574835",
+          "scripts/macos/local-engine.py": "b3045c21b11c7a0aa32b9cc9909bccb587bf5ab30f06539f3cf09a4a015244c4",
+          "scripts/macos/worker_provenance.py": "a8fe5b34bb67e91f4a2f81644f26a5fcfac1af12e86e87b654dbcecec7ddd89a",
+          "target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+          "target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/sha256-chain.bin": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+          "target/macos/rv32im-worker/engine.toml": "fae0c4b5c952b939b1a79030e01e2ad40f6a032b28b8c736fb218ea61f0fa116"
+        }
+      },
+      "build_environment": {
+        "RUSTFLAGS": null,
+        "CARGO_ENCODED_RUSTFLAGS": null,
+        "DEVELOPER_DIR": null,
+        "TOOLCHAINS": null,
+        "SDKROOT": null,
+        "CC": null,
+        "CXX": null,
+        "CFLAGS": null,
+        "CXXFLAGS": null,
+        "AR": null,
+        "RUSTC": null,
+        "RUSTC_WRAPPER": null,
+        "RUSTC_WORKSPACE_WRAPPER": null,
+        "CARGO_BUILD_JOBS": "6",
+        "CARGO_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/cargo",
+        "RUSTUP_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/rustup",
+        "RISC0_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/risc0",
+        "ZKMINER_RISC0_GUEST_DIR": "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release",
+        "PROTOC": "/Users/dbur/dev/zk-miner/target/macos/bootstrap/protoc-36.2/bin/protoc"
+      },
+      "binary_sha256": "24876d07bf2a504e38346f690f48756d2bdbd836fac493b832f24b75d910a172",
+      "metadata_sha256": "06fdd3d68753c1bceb4526056f78765b4bdc16a853fb320ce6e633f022989b86",
+      "local_lock_sha256": "b6dbe0c9500af04460b9ac8197b03ae25d00a63a695c441692436c1334758819",
+      "host_toolchain": "1.93.0"
+    },
+    "native-rv32im-metal": {
+      "source": {
+        "kind": "native-rv32im-metal",
+        "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+        "engine_path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "engine_head": "dcbe9f4b9140a48d4792ffcd3a3eba19897be175",
+        "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "engine_untracked_files": {},
+        "config_path": "/Users/dbur/dev/zk-miner/target/macos/rv32im-worker/engine.toml",
+        "inputs": {
+          "Cargo.lock": "75d710409c3107e465ca0520bb7c551e8027c47ecb7c8e3b13d9b106cad5c6b9",
+          "Cargo.toml": "6d62c06c33b867de1177afe1b4f220f70557e87e9175e3bd7574e56d0d66fed2",
+          "crates/zkminer-prove-risc0/Cargo.toml": "1209837d1b246094dd2f247c2553dc89caa1f9a4bc99eaaf50ba9e5be7dd8cfc",
+          "crates/zkminer-prove-risc0/build.rs": "a6311821df1d5d69671acb372ca5c6a6608df3789d7cd9113975ba6d99ea1ac6",
+          "crates/zkminer-prove-risc0/src/macos.rs": "cfb5f05d6e4d5f502e9c325e20d207291ecf5764441968fcb871a7bd3ad38945",
+          "crates/zkminer-prove-risc0/src/main.rs": "bb2b33a20a87857b623bb08e4d6799b4adbc9c1f5be20509f58074e3ab31698b",
+          "crates/zkminer-prover-protocol/Cargo.toml": "a646a1d0024007d0172aa8a1b4efb5ebc1b5df2364950d5475279ee6250dbdcd",
+          "crates/zkminer-prover-protocol/src/codec.rs": "70543a49b7d6c4df969ec05033bbcf934c450d8cdfcf261ced7536b3e0145f86",
+          "crates/zkminer-prover-protocol/src/lib.rs": "cf49912fe2eeb919ecd36c90cbf1290634224a9ab502cba32b523e0f17f65c59",
+          "crates/zkminer-prover-protocol/src/macos.rs": "46bffe46c057fd567e195dae2401ff6ef0af2d051d10dbc2358fca184d66b334",
+          "crates/zkminer-prover-protocol/src/proc.rs": "5b1bba5de4b31c09eb07510f2480e57b82b5d65ac4d480142e0e7d4c4c06af10",
+          "crates/zkminer-prover-protocol/src/types.rs": "684640701892d81adc2f3d717d5c61bd4f1f434d2ef3e8bc72165f19dd6fea89",
+          "rust-toolchain.toml": "f0815f7685d7aff345137c830314cf78d4d0dc7bc71328561fc6823b7fbb23cb",
+          "scripts/macos/build-worker.py": "f4b643f94a25a064aee8325a619e6e3fe0924ade1e6ef324211b537b4e64fd09",
+          "scripts/macos/check-source.py": "efb531f241f88b8af9d56481744913d7d2b14b45a0cfc4f4c80ec68a73f272a0",
+          "scripts/macos/env.sh": "d4ea1b6cfb9e24c3edfa767a32c533648a4f1c123278b01d5c378c078e574835",
+          "scripts/macos/local-engine.py": "b3045c21b11c7a0aa32b9cc9909bccb587bf5ab30f06539f3cf09a4a015244c4",
+          "scripts/macos/worker_provenance.py": "a8fe5b34bb67e91f4a2f81644f26a5fcfac1af12e86e87b654dbcecec7ddd89a",
+          "target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+          "target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/sha256-chain.bin": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+          "target/macos/rv32im-worker/engine.toml": "fae0c4b5c952b939b1a79030e01e2ad40f6a032b28b8c736fb218ea61f0fa116"
+        }
+      },
+      "build_environment": {
+        "RUSTFLAGS": null,
+        "CARGO_ENCODED_RUSTFLAGS": null,
+        "DEVELOPER_DIR": null,
+        "TOOLCHAINS": null,
+        "SDKROOT": null,
+        "CC": null,
+        "CXX": null,
+        "CFLAGS": null,
+        "CXXFLAGS": null,
+        "AR": null,
+        "RUSTC": null,
+        "RUSTC_WRAPPER": null,
+        "RUSTC_WORKSPACE_WRAPPER": null,
+        "CARGO_BUILD_JOBS": "6",
+        "CARGO_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/cargo",
+        "RUSTUP_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/rustup",
+        "RISC0_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/risc0",
+        "ZKMINER_RISC0_GUEST_DIR": "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release",
+        "PROTOC": "/Users/dbur/dev/zk-miner/target/macos/bootstrap/protoc-36.2/bin/protoc"
+      },
+      "binary_sha256": "f876cf8e7591e7f9ea98085ccb259ad22f767d54715023b79c5b9caf2e74fc08",
+      "metadata_sha256": "3d8eb045ed9dd13b6e44ec5e0f9c2c899ab67d2d8627271f0bbbcfa2c96c6936",
+      "local_lock_sha256": "b6dbe0c9500af04460b9ac8197b03ae25d00a63a695c441692436c1334758819",
+      "host_toolchain": "1.93.0"
+    }
+  },
+  "fresh_worker_unit_tests": {
+    "native": 5,
+    "native-rv32im-metal": 5
+  },
+  "prior_exact_3747d12ff_units": {
+    "metal_primitives": 18,
+    "recursion_cpu_differential": 1,
+    "padding": 2
+  },
+  "proof_admission": {
+    "status": "refused_before_dispatch",
+    "available_gib": 30.5,
+    "default_budget_gib": 24,
+    "default_reserve_gib": 16,
+    "log": "/Users/dbur/dev/zk-miner/target/macos/review-followup/20261102T192422Z/tip-smoke.log",
+    "log_sha256": "e0aeb1cd1a979f138f0efd64819f9590359d797d8de63be53c7dc4abf78308d5",
+    "scope": "Historical initial refusal before owner freed memory; single-proof admission subsequently succeeded at default settings."
+  },
+  "runtime_changes": "Legacy fold-only worker path and probe removed; old build/mode/probe requests reject with migration guidance. SDK compatibility feature rejects compilation. Proving pipeline and Metal kernels are unchanged by the retirement checkpoint.",
+  "raw_artifact_directory": "/Users/dbur/dev/zk-miner/target/macos/review-followup/20261102T192422Z",
+  "pending": [],
+  "fresh_engine_unit_tests": {
+    "metal_primitives": 18,
+    "recursion_cpu_differential": 1,
+    "padding": 2
+  },
+  "focused_test_count": 31,
+  "unit_artifacts": [
+    {
+      "name": "final-recursion-evaluator",
+      "exit_code": 0,
+      "log": "/Users/dbur/dev/zk-miner/target/macos/review-followup/20261102T192422Z/final-recursion-evaluator.log",
+      "sha256": "e30ac63fe9a12571404d7be05b3a0924c35b1bd77903d542d5d9feac6d5555d5"
+    },
+    {
+      "name": "final-metal-primitives",
+      "exit_code": 0,
+      "log": "/Users/dbur/dev/zk-miner/target/macos/review-followup/20261102T192422Z/final-metal-primitives.log",
+      "sha256": "5102ce5f64652037d0475a3654fb02a7e829e5e6eda465c48d032fab6df85a97"
+    },
+    {
+      "name": "final-padding-tests",
+      "exit_code": 0,
+      "log": "/Users/dbur/dev/zk-miner/target/macos/review-followup/20261102T192422Z/final-padding-tests.log",
+      "sha256": "04a3fc5bf2866acf335958bf0251b344d95a90a221fcb6a8b8d474cd157faf5b"
+    }
+  ],
+  "upstream_draft_prs": [
+    {
+      "branch": "codex/upstream-final-segment-padding",
+      "url": "https://github.com/hemilabs/risc0/pull/30",
+      "draft": true
+    },
+    {
+      "branch": "codex/upstream-locked-circom",
+      "url": "https://github.com/hemilabs/risc0/pull/31",
+      "draft": true
+    },
+    {
+      "branch": "codex/upstream-native-helper-lifetime",
+      "url": "https://github.com/hemilabs/risc0/pull/32",
+      "draft": true
+    }
+  ],
+  "latest_host_observation": {
+    "estimated_available_gib": 59.37544250488281,
+    "method": "Same conservative free + half of min(file-backed,inactive) pages used by the macOS guard; no worker resident-credit adjustment",
+    "default_initial_requirement_gib": 40,
+    "scope": "After completed campaign, worker/helper shutdown and source audit",
+    "observed_at": "2026-11-03T20:44:31.022642+00:00",
+    "pressure_level": 1
+  },
+  "candidate_miner_diff_sha256": "c17782ffc6c81002af674699ba7c743cbca44070c29488660e18ddf786bbbc83",
+  "confirmed_benchmark_scope": "10M arithmetic five-pair gate plus five warm samples for both usefulness fixtures",
+  "resource_choice": "owner frees host memory; leave Colima running",
+  "current_tip_correctness": "docs/macos/evidence/rv32im-current-tip-validation.json",
+  "metal_profiles": "docs/macos/evidence/rv32im-metal-current-profile.json",
+  "completed_current_tip_proofs": 22,
+  "completed_current_tip_negative_checks": 66,
+  "warm_hash_validation": "docs/macos/evidence/rv32im-warm-hash-validation.json",
+  "paired_attempt": "docs/macos/evidence/rv32im-paired-attempt.json",
+  "measured_pairs": 5,
+  "updated_at": "2026-11-03T20:44:32.146748+00:00",
+  "paired_admission": "Fresh complete campaign: zero admission waits at default guard settings after owner quit Brave. Earlier refusals and partial interruption preserved separately.",
+  "fresh_validation_summary": {
+    "current_tip_verified_proofs": 22,
+    "current_tip_negative_checks": 66,
+    "baseline_verified_proofs": 10,
+    "baseline_negative_checks": 30,
+    "arithmetic_warm_median_seconds": 117.191532125,
+    "hash_warm_median_seconds": 120.799821375,
+    "paired_median_speedup": 3.6452456540148677,
+    "faster_pairs": 5,
+    "stretch_seconds": 484.740118,
+    "stretch_guest_cycles": 46003116,
+    "stretch_segments": 46
+  },
+  "paired_retry": {
+    "campaign": "target/macos/review-rv32im/bbb711fdb0ae413095ec04292684a0fc",
+    "raw_run": "target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275",
+    "status": "passed",
+    "planned_proof_requests": 12,
+    "outer_suite_timeout_seconds": 29400,
+    "per_proof_watchdog_seconds": 1800,
+    "default_reserve_gib": 16,
+    "colima_state": "left running",
+    "brave_state": "owner quit before fresh restart",
+    "partial_measurements_pooled": false,
+    "measured_pairs": 5,
+    "total_admission_wait_ms": 0
+  },
+  "paired_interrupted_attempt": "docs/macos/evidence/rv32im-paired-interrupted.json",
+  "suite_budget_check_log": "target/macos/review-followup/20261102T192422Z/suite-budget-check.log",
+  "paired_gate": "docs/macos/evidence/rv32im-five-pair-validation.json",
+  "paired_proof_csv": "docs/macos/evidence/rv32im-five-pair-proofs.csv",
+  "median_speedup": 3.6452456540148677,
+  "faster_pairs": 5,
+  "arithmetic_warm_median_seconds": 117.191532125,
+  "hash_warm_median_seconds": 120.799821375,
+  "largest_review_guard_peak_gib": 19.783146560192108,
+  "candidate_miner_diff_sha256_scope": "Review-start working diff. Final worker source inputs and archived runtime patch are bound separately by rv32im-five-pair-validation.json.",
+  "runtime_worker_patch_sha256": "d82d58534c2316d7b6895a83bf8cad430ac27e42034059d2521c5b0f4dce1c09",
+  "cleanup": {
+    "observed_at": "2026-11-03T20:44:31.022642+00:00",
+    "owned_workers_or_helpers": 0,
+    "brave_processes": 0,
+    "estimated_available_gib": 59.37544250488281,
+    "pressure_level": 1,
+    "guard_policy": "unchanged",
+    "default_colima_vm_pid": 4037,
+    "default_colima_status": "running; verified by colima --profile default status",
+    "source_and_binary_integrity": "passed; resident worker, CPU worker, verifier and native helper bundle"
+  },
+  "publication": {
+    "authorization_date": "2026-11-03",
+    "record": "docs/macos/evidence/rv32im-review-publication.json",
+    "miner_revision_scope": "the miner commit containing the publication record",
+    "engine_commit": "dcbe9f4b9140a48d4792ffcd3a3eba19897be175",
+    "fork_branch": "codex/hemi-macos-metal",
+    "post_push_verification_artifact": "target/macos/publication/20261103T223926Z/publication-result.json"
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "device_id": "cpu",
+  "device_label": "Mac native CPU",
+  "prover_backend": "risc0",
+  "throughput": 22693.361434574574,
+  "power_watts": 0.0,
+  "optimal_po2": 20,
+  "memory_usage_bytes": 0,
+  "max_feasible_po2": 20,
+  "program_throughputs": {
+    "fibonacci": 22542.888848469727,
+    "sha256-chain": 22843.834020679424
+  },
+  "po2_samples": [],
+  "program_stages": [
+    {
+      "program_name": "fibonacci",
+      "cycles": 10485760,
+      "stark_secs": 452.40824820899996,
+      "wrap_secs": 17.2665135
+    },
+    {
+      "program_name": "fibonacci",
+      "cycles": 10485760,
+      "stark_secs": 466.862154083,
+      "wrap_secs": 17.576779375
+    },
+    {
+      "program_name": "fibonacci",
+      "cycles": 10485760,
+      "stark_secs": 455.684332208,
+      "wrap_secs": 20.525787083
+    },
+    {
+      "program_name": "fibonacci",
+      "cycles": 10485760,
+      "stark_secs": 483.876064876,
+      "wrap_secs": 17.886777208999998
+    },
+    {
+      "program_name": "fibonacci",
+      "cycles": 10485760,
+      "stark_secs": 465.147127792,
+      "wrap_secs": 17.797508209
+    },
+    {
+      "program_name": "sha256-chain",
+      "cycles": 10485760,
+      "stark_secs": 457.88103325000003,
+      "wrap_secs": 17.433947666
+    },
+    {
+      "program_name": "sha256-chain",
+      "cycles": 10485760,
+      "stark_secs": 459.019269292,
+      "wrap_secs": 17.452898709
+    },
+    {
+      "program_name": "sha256-chain",
+      "cycles": 10485760,
+      "stark_secs": 460.01534833400007,
+      "wrap_secs": 17.4588715
+    },
+    {
+      "program_name": "sha256-chain",
+      "cycles": 10485760,
+      "stark_secs": 464.39066875000003,
+      "wrap_secs": 19.220809125
+    },
+    {
+      "program_name": "sha256-chain",
+      "cycles": 10485760,
+      "stark_secs": 455.752043667,
+      "wrap_secs": 17.277353166
+    }
+  ],
+  "pci_bus_id": "",
+  "host_peak_bytes": 13507831960
+}

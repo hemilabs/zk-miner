@@ -1,0 +1,20 @@
+[package]
+name = "hemi-macos-rv32im-metal-prototype"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+metal = "0.29"
+objc = "0.2"
+rayon = "1"
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
+risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
+risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8", features = ["metal-runtime"] }

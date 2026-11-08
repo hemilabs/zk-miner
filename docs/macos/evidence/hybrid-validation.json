@@ -1,0 +1,884 @@
+{
+  "milestone": "Complete one-stage hybrid Groth16 proof, repeated and multi-segment, plus CPU regression",
+  "date": "2026-10-31",
+  "engine": {
+    "path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+    "head": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+    "pinned_base": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+    "branch": "codex/hemi-macos-metal",
+    "patch_sha256": "4b45f8fe75be7d200d5be1a397c3882ecd2a41d1e830e74514b72aa4c6d3829a"
+  },
+  "miner": {
+    "path": "/Users/dbur/dev/zk-miner",
+    "branch": "codex/hemi-macos-metal",
+    "previous_head": "0070e0b45c105ce9488bd9d2d2fef1b14af61e1f",
+    "milestone_commit": "containing commit"
+  },
+  "unchanged_verifier_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+  "current_build_seals": {
+    "hybrid": {
+      "source": {
+        "kind": "hybrid",
+        "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+        "engine_path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "engine_head": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+        "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "inputs": {
+          "scripts/macos/proof_provenance.py": "5e6b2950433da2c24ed8166e46c22f3f4b7ebcc198cbc2a9141a9bae704c4f59",
+          "scripts/macos/env.sh": "7f6f9a87ba5b1915d427ca59de1a2930cb23f24af6c39b273f44350902a1afe4",
+          "scripts/macos/check-source.py": "74984a609430d8f1f03c2720cd775a308b50455f0ba79a421d3d421595143605",
+          "tools/macos-hybrid/Cargo.toml": "88206086a64e1b0d5a5ac50dc7b1e272f982a7b9e38d1217755ba21edf3f2397",
+          "tools/macos-hybrid/Cargo.lock": "5e3f8bdcca2e0334a5307b7739134881143b8f498e3a98cc95bc0d11cfc8df62",
+          "tools/macos-proof/src/main.rs": "b520205c2582fad43555ae443eb6c636f03bd5a3fd642b4f5f1b004a33bb91e0",
+          "target/macos/hybrid-engine.toml": "4ceec928b625b49cb87d71dd9300c145468afd84fdf570b4f96b34e64bb1e881",
+          "scripts/macos/build-hybrid.sh": "53aa1cd89f300ba52dddc198ae5a654494b0bbd3ea75c8b69c5b9bddf507877b",
+          "scripts/macos/local-engine.py": "b3045c21b11c7a0aa32b9cc9909bccb587bf5ab30f06539f3cf09a4a015244c4"
+        }
+      },
+      "build_environment": {
+        "RUSTFLAGS": null,
+        "CARGO_ENCODED_RUSTFLAGS": null,
+        "DEVELOPER_DIR": null,
+        "TOOLCHAINS": null,
+        "SDKROOT": null
+      },
+      "binary_sha256": "87f377f1e7f19233c9df955dac0c6420e97027a4f6cea8fc2bcfd38044a98c4f",
+      "metadata_sha256": "3585a3bf683a52b88850d1f6bb5fbec68c9888518dab27ece1b1c121135c40c1",
+      "host_toolchain": "1.93.0"
+    },
+    "verifier": {
+      "source": {
+        "kind": "verifier",
+        "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+        "inputs": {
+          "scripts/macos/proof_provenance.py": "5e6b2950433da2c24ed8166e46c22f3f4b7ebcc198cbc2a9141a9bae704c4f59",
+          "scripts/macos/env.sh": "7f6f9a87ba5b1915d427ca59de1a2930cb23f24af6c39b273f44350902a1afe4",
+          "scripts/macos/check-source.py": "74984a609430d8f1f03c2720cd775a308b50455f0ba79a421d3d421595143605",
+          "target/macos/unchanged-verifier/Cargo.toml": "9445d02008b6349ac9f1832acc00ac1a68b70b200d0a2382c05e5d361f20a29a",
+          "target/macos/unchanged-verifier/Cargo.lock": "8c494780d49a95aaeec068d2c516aea1743c4f14ceb31dff00625deee97cc17e",
+          "target/macos/unchanged-verifier/src/main.rs": "b520205c2582fad43555ae443eb6c636f03bd5a3fd642b4f5f1b004a33bb91e0",
+          "tools/macos-proof/Verifier.Cargo.lock": "8c494780d49a95aaeec068d2c516aea1743c4f14ceb31dff00625deee97cc17e",
+          "scripts/macos/build-verifier.sh": "3cd88f4b460084926cde536c737fe3b2e9ebd3a85f93e8121b15252b47f21530"
+        }
+      },
+      "build_environment": {
+        "RUSTFLAGS": null,
+        "CARGO_ENCODED_RUSTFLAGS": null,
+        "DEVELOPER_DIR": null,
+        "TOOLCHAINS": null,
+        "SDKROOT": null
+      },
+      "binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+      "metadata_sha256": "0f87d4511d814f6ee25b2a33a391792fa541412789761600c67678e535b6c5bd",
+      "host_toolchain": "1.93.0"
+    },
+    "cpu": {
+      "engine_head": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+      "engine_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "host_toolchain": "1.93.0",
+      "requested_mode": "cpu",
+      "inputs": {
+        "tools/macos-proof/Cargo.toml": "9445d02008b6349ac9f1832acc00ac1a68b70b200d0a2382c05e5d361f20a29a",
+        "tools/macos-proof/Cargo.lock": "1c163039293881958635d69e483755dce4f9310148df22867f104d8d072294b9",
+        "tools/macos-proof/src/main.rs": "b520205c2582fad43555ae443eb6c636f03bd5a3fd642b4f5f1b004a33bb91e0",
+        "target/macos/local-engine.toml": "4ceec928b625b49cb87d71dd9300c145468afd84fdf570b4f96b34e64bb1e881",
+        "target/macos/cpu-hybrid-regression-metadata.json": "60441fc5aaa004d22c5eac09c8b03d2b0b4338dc0ad4dd8f46c64d50f0a90982"
+      },
+      "binary_sha256": "b861c8f5c4b0c1640e4a7d3b42b35b8ed051f8c9782cef80d99928b907f38e88",
+      "source_guard_log": "target/macos/cpu-hybrid-regression-source-check.txt",
+      "build_features": "all-features (prove only; hybrid is not exposed by this manifest)"
+    }
+  },
+  "final_hybrid_binary_identical_to_all_accepted_runs": true,
+  "final_verifier_rechecked_all_three_hybrid_receipts": true,
+  "cpu_metal_public_output_comparison": {
+    "matched_fields": [
+      "image_id",
+      "elf_sha256",
+      "input_sha256",
+      "journal_hex",
+      "po2",
+      "stats"
+    ],
+    "expected_values": {
+      "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+      "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+      "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+      "journal_hex": "6d1a000000000000",
+      "po2": 18,
+      "stats": {
+        "paging_cycles": 16300,
+        "reserved_cycles": 13152,
+        "segments": 1,
+        "total_cycles": 32768,
+        "user_cycles": 3316
+      }
+    },
+    "receipt_bytes_compared": false
+  },
+  "differential": {
+    "id": "767200b6ed0c46058d177bee61fe6354",
+    "status": "passed_cpu_metal_differential",
+    "verified_build": {
+      "source": {
+        "engine_path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "engine_head": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+        "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "harness_inputs": {
+          "tools/macos-metal/Cargo.toml": "0100e95926478a59d0538948650097559d54a349d91c32d3a455fd509c64488a",
+          "tools/macos-metal/Cargo.lock": "9282d4034fa2f3ba5d8aae501a69328090671e036294f8643ae0c36707fae188",
+          "tools/macos-metal/src/main.rs": "257ba5d10ab01f5e514152eda222a5eaf493484a96a46f713ca06f624e5fb93d"
+        },
+        "override_config_sha256": "4ceec928b625b49cb87d71dd9300c145468afd84fdf570b4f96b34e64bb1e881"
+      },
+      "binary_sha256": "b4ffed4fe63f7f8c0dcf504bec9abeb13975073e0fcaadedfc92213a75b650b5",
+      "metadata_sha256": "18fb5b85232607a19e7978565c9aa75e2c94b17418036160ceb6c639f0d018e5",
+      "host_toolchain": "1.93.0",
+      "build_environment": {
+        "RUSTFLAGS": null,
+        "CARGO_ENCODED_RUSTFLAGS": null,
+        "DEVELOPER_DIR": null,
+        "TOOLCHAINS": null,
+        "SDKROOT": null
+      }
+    },
+    "elapsed_seconds": 1.3403893318027258
+  },
+  "differential_summary": {
+    "cases": 235,
+    "completed_dispatches": 451,
+    "bridge_cases": 13,
+    "bridge_completed_dispatches": 47,
+    "case_file": "hybrid-bridge-cases.json",
+    "not_a_performance_benchmark": true
+  },
+  "acceptance_control_tests": {
+    "passed": 8,
+    "synthetic_fixtures_are_not_proof_evidence": true
+  },
+  "runs": [
+    {
+      "run_id": "d4e86941bd7b464f9954aa24ea1b2375",
+      "workload": "fibonacci",
+      "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+      "helper_arch": "linux/amd64",
+      "helper_context": "colima-hemi-macos-cpu",
+      "requested_mode": "metal",
+      "status": "complete_independently_verified",
+      "native_peak_rss_bytes": 1974861824,
+      "prover_binary_sha256": "87f377f1e7f19233c9df955dac0c6420e97027a4f6cea8fc2bcfd38044a98c4f",
+      "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+      "runner_sha256": "5f80a4ed8e7c3223fb939513381994a1f447c4eed2c0c51d6d9695023aba557f",
+      "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+      "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+      "expected_journal_hex": "6d1a000000000000",
+      "helper_endpoint": "unix:///Users/dbur/.colima/hemi-macos-cpu/docker.sock",
+      "rss_method": "ps RSS of owned native prover, sampled every 5s; excludes VM/helper",
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/hybrid/release/hemi-macos-hybrid-proof",
+        "prove",
+        "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/d4e86941bd7b464f9954aa24ea1b2375/input.bin",
+        "6d1a000000000000",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/d4e86941bd7b464f9954aa24ea1b2375/proof",
+        "18"
+      ],
+      "verifier_build": {
+        "source": {
+          "kind": "verifier",
+          "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+          "inputs": {
+            "scripts/macos/proof_provenance.py": "5e6b2950433da2c24ed8166e46c22f3f4b7ebcc198cbc2a9141a9bae704c4f59",
+            "scripts/macos/env.sh": "7f6f9a87ba5b1915d427ca59de1a2930cb23f24af6c39b273f44350902a1afe4",
+            "scripts/macos/check-source.py": "74984a609430d8f1f03c2720cd775a308b50455f0ba79a421d3d421595143605",
+            "target/macos/unchanged-verifier/Cargo.toml": "63b49b5af371de4e89f14b046d4784cde62e2943e1fbadac797ec9b6f21457c0",
+            "target/macos/unchanged-verifier/Cargo.lock": "8c494780d49a95aaeec068d2c516aea1743c4f14ceb31dff00625deee97cc17e",
+            "target/macos/unchanged-verifier/src/main.rs": "b520205c2582fad43555ae443eb6c636f03bd5a3fd642b4f5f1b004a33bb91e0",
+            "tools/macos-proof/Verifier.Cargo.lock": "8c494780d49a95aaeec068d2c516aea1743c4f14ceb31dff00625deee97cc17e",
+            "scripts/macos/build-verifier.sh": "3cd88f4b460084926cde536c737fe3b2e9ebd3a85f93e8121b15252b47f21530"
+          }
+        },
+        "build_environment": {
+          "RUSTFLAGS": null,
+          "CARGO_ENCODED_RUSTFLAGS": null,
+          "DEVELOPER_DIR": null,
+          "TOOLCHAINS": null,
+          "SDKROOT": null
+        },
+        "binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+        "metadata_sha256": "06a236415649689cc64479f38799e083317045ca3bcdb96bd2794d575019a00c",
+        "host_toolchain": "1.93.0"
+      },
+      "hybrid_build": {
+        "source": {
+          "kind": "hybrid",
+          "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+          "engine_path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+          "engine_head": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+          "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "inputs": {
+            "scripts/macos/proof_provenance.py": "5e6b2950433da2c24ed8166e46c22f3f4b7ebcc198cbc2a9141a9bae704c4f59",
+            "scripts/macos/env.sh": "7f6f9a87ba5b1915d427ca59de1a2930cb23f24af6c39b273f44350902a1afe4",
+            "scripts/macos/check-source.py": "74984a609430d8f1f03c2720cd775a308b50455f0ba79a421d3d421595143605",
+            "tools/macos-hybrid/Cargo.toml": "b4b3d5864be9bc8bfaf2953896e80944245897eebe5747a4737510a7d3844dee",
+            "tools/macos-hybrid/Cargo.lock": "5e3f8bdcca2e0334a5307b7739134881143b8f498e3a98cc95bc0d11cfc8df62",
+            "tools/macos-proof/src/main.rs": "b520205c2582fad43555ae443eb6c636f03bd5a3fd642b4f5f1b004a33bb91e0",
+            "target/macos/hybrid-engine.toml": "4ceec928b625b49cb87d71dd9300c145468afd84fdf570b4f96b34e64bb1e881",
+            "scripts/macos/build-hybrid.sh": "53aa1cd89f300ba52dddc198ae5a654494b0bbd3ea75c8b69c5b9bddf507877b",
+            "scripts/macos/local-engine.py": "b3045c21b11c7a0aa32b9cc9909bccb587bf5ab30f06539f3cf09a4a015244c4"
+          }
+        },
+        "build_environment": {
+          "RUSTFLAGS": null,
+          "CARGO_ENCODED_RUSTFLAGS": null,
+          "DEVELOPER_DIR": null,
+          "TOOLCHAINS": null,
+          "SDKROOT": null
+        },
+        "binary_sha256": "87f377f1e7f19233c9df955dac0c6420e97027a4f6cea8fc2bcfd38044a98c4f",
+        "metadata_sha256": "3585a3bf683a52b88850d1f6bb5fbec68c9888518dab27ece1b1c121135c40c1",
+        "host_toolchain": "1.93.0"
+      },
+      "proof": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "failures": 0,
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+        "journal_hex": "6d1a000000000000",
+        "observed_stages": {
+          "groth16": "local_linux_amd64_helper",
+          "identity": "cpu",
+          "metal_stage": {
+            "completed_dispatches": 194,
+            "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+            "name": "segment_poseidon2_merkle_fold",
+            "segments": [
+              {
+                "completed_dispatches": 194,
+                "fold_calls": 90,
+                "input_digests": 1065972,
+                "output_digests": 532986,
+                "peak_staging_bytes": 524288,
+                "po2": 15,
+                "segment_index": 0,
+                "staging_limit_bytes": 524288
+              }
+            ]
+          },
+          "other_segment_operations": "cpu",
+          "recursion": "cpu"
+        },
+        "po2": 18,
+        "proof_kind": "groth16",
+        "requested_mode": "metal",
+        "stage_ms": {
+          "execution_and_segment": 3167.0405,
+          "identity_and_wrap": 156087.350458,
+          "recursion": 8034.786875,
+          "verification": 1.749042
+        },
+        "stats": {
+          "paging_cycles": 16300,
+          "reserved_cycles": 13152,
+          "segments": 1,
+          "total_cycles": 32768,
+          "user_cycles": 3316
+        },
+        "total_ms": 167315.42325000002,
+        "verification": "in_process_passed_independent_pending"
+      },
+      "verification": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "journal_hex": "6d1a000000000000",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      },
+      "total_ms": 168439.41995874047,
+      "artifacts": {
+        "target/macos/runs/d4e86941bd7b464f9954aa24ea1b2375/proof/receipt.bin": {
+          "sha256": "679a29315edbf7304acdb8b937c064f0f627a0fc899f6530315875ce1b6b851e",
+          "bytes": 513
+        },
+        "target/macos/runs/d4e86941bd7b464f9954aa24ea1b2375/proof/seal.bin": {
+          "sha256": "5c5546e028e3e1ee9e0524992a1e4956fa227b9a21d7e9432faeafce2a7b35cf",
+          "bytes": 256
+        },
+        "target/macos/runs/d4e86941bd7b464f9954aa24ea1b2375/proof/journal.bin": {
+          "sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+          "bytes": 8
+        },
+        "target/macos/runs/d4e86941bd7b464f9954aa24ea1b2375/proof/proof.json": {
+          "sha256": "c10cc128eb4ddd83462e75900517c30f6fc9f266b4cf27aa00b7e9a93009661f",
+          "bytes": 1458
+        },
+        "target/macos/runs/d4e86941bd7b464f9954aa24ea1b2375/proof/verification.json": {
+          "sha256": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+          "bytes": 322
+        },
+        "target/macos/runs/d4e86941bd7b464f9954aa24ea1b2375/prover.log": {
+          "sha256": "9f5b4cfac0810e60124702080781395a4a7f53d87ef37dd2222f26433fcf6466",
+          "bytes": 1531
+        },
+        "target/macos/runs/d4e86941bd7b464f9954aa24ea1b2375/verifier.log": {
+          "sha256": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+          "bytes": 284
+        }
+      }
+    },
+    {
+      "run_id": "1ad9ae716a73463584b840fcf268bac4",
+      "workload": "fibonacci",
+      "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+      "helper_arch": "linux/amd64",
+      "helper_context": "colima-hemi-macos-cpu",
+      "requested_mode": "metal",
+      "status": "complete_independently_verified",
+      "native_peak_rss_bytes": 1974681600,
+      "prover_binary_sha256": "87f377f1e7f19233c9df955dac0c6420e97027a4f6cea8fc2bcfd38044a98c4f",
+      "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+      "runner_sha256": "5f80a4ed8e7c3223fb939513381994a1f447c4eed2c0c51d6d9695023aba557f",
+      "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+      "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+      "expected_journal_hex": "6d1a000000000000",
+      "helper_endpoint": "unix:///Users/dbur/.colima/hemi-macos-cpu/docker.sock",
+      "rss_method": "ps RSS of owned native prover, sampled every 5s; excludes VM/helper",
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/hybrid/release/hemi-macos-hybrid-proof",
+        "prove",
+        "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/1ad9ae716a73463584b840fcf268bac4/input.bin",
+        "6d1a000000000000",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/1ad9ae716a73463584b840fcf268bac4/proof",
+        "18"
+      ],
+      "verifier_build": {
+        "source": {
+          "kind": "verifier",
+          "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+          "inputs": {
+            "scripts/macos/proof_provenance.py": "5e6b2950433da2c24ed8166e46c22f3f4b7ebcc198cbc2a9141a9bae704c4f59",
+            "scripts/macos/env.sh": "7f6f9a87ba5b1915d427ca59de1a2930cb23f24af6c39b273f44350902a1afe4",
+            "scripts/macos/check-source.py": "74984a609430d8f1f03c2720cd775a308b50455f0ba79a421d3d421595143605",
+            "target/macos/unchanged-verifier/Cargo.toml": "63b49b5af371de4e89f14b046d4784cde62e2943e1fbadac797ec9b6f21457c0",
+            "target/macos/unchanged-verifier/Cargo.lock": "8c494780d49a95aaeec068d2c516aea1743c4f14ceb31dff00625deee97cc17e",
+            "target/macos/unchanged-verifier/src/main.rs": "b520205c2582fad43555ae443eb6c636f03bd5a3fd642b4f5f1b004a33bb91e0",
+            "tools/macos-proof/Verifier.Cargo.lock": "8c494780d49a95aaeec068d2c516aea1743c4f14ceb31dff00625deee97cc17e",
+            "scripts/macos/build-verifier.sh": "3cd88f4b460084926cde536c737fe3b2e9ebd3a85f93e8121b15252b47f21530"
+          }
+        },
+        "build_environment": {
+          "RUSTFLAGS": null,
+          "CARGO_ENCODED_RUSTFLAGS": null,
+          "DEVELOPER_DIR": null,
+          "TOOLCHAINS": null,
+          "SDKROOT": null
+        },
+        "binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+        "metadata_sha256": "06a236415649689cc64479f38799e083317045ca3bcdb96bd2794d575019a00c",
+        "host_toolchain": "1.93.0"
+      },
+      "hybrid_build": {
+        "source": {
+          "kind": "hybrid",
+          "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+          "engine_path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+          "engine_head": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+          "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "inputs": {
+            "scripts/macos/proof_provenance.py": "5e6b2950433da2c24ed8166e46c22f3f4b7ebcc198cbc2a9141a9bae704c4f59",
+            "scripts/macos/env.sh": "7f6f9a87ba5b1915d427ca59de1a2930cb23f24af6c39b273f44350902a1afe4",
+            "scripts/macos/check-source.py": "74984a609430d8f1f03c2720cd775a308b50455f0ba79a421d3d421595143605",
+            "tools/macos-hybrid/Cargo.toml": "b4b3d5864be9bc8bfaf2953896e80944245897eebe5747a4737510a7d3844dee",
+            "tools/macos-hybrid/Cargo.lock": "5e3f8bdcca2e0334a5307b7739134881143b8f498e3a98cc95bc0d11cfc8df62",
+            "tools/macos-proof/src/main.rs": "b520205c2582fad43555ae443eb6c636f03bd5a3fd642b4f5f1b004a33bb91e0",
+            "target/macos/hybrid-engine.toml": "4ceec928b625b49cb87d71dd9300c145468afd84fdf570b4f96b34e64bb1e881",
+            "scripts/macos/build-hybrid.sh": "53aa1cd89f300ba52dddc198ae5a654494b0bbd3ea75c8b69c5b9bddf507877b",
+            "scripts/macos/local-engine.py": "b3045c21b11c7a0aa32b9cc9909bccb587bf5ab30f06539f3cf09a4a015244c4"
+          }
+        },
+        "build_environment": {
+          "RUSTFLAGS": null,
+          "CARGO_ENCODED_RUSTFLAGS": null,
+          "DEVELOPER_DIR": null,
+          "TOOLCHAINS": null,
+          "SDKROOT": null
+        },
+        "binary_sha256": "87f377f1e7f19233c9df955dac0c6420e97027a4f6cea8fc2bcfd38044a98c4f",
+        "metadata_sha256": "3585a3bf683a52b88850d1f6bb5fbec68c9888518dab27ece1b1c121135c40c1",
+        "host_toolchain": "1.93.0"
+      },
+      "proof": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "failures": 0,
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+        "journal_hex": "6d1a000000000000",
+        "observed_stages": {
+          "groth16": "local_linux_amd64_helper",
+          "identity": "cpu",
+          "metal_stage": {
+            "completed_dispatches": 194,
+            "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+            "name": "segment_poseidon2_merkle_fold",
+            "segments": [
+              {
+                "completed_dispatches": 194,
+                "fold_calls": 90,
+                "input_digests": 1065972,
+                "output_digests": 532986,
+                "peak_staging_bytes": 524288,
+                "po2": 15,
+                "segment_index": 0,
+                "staging_limit_bytes": 524288
+              }
+            ]
+          },
+          "other_segment_operations": "cpu",
+          "recursion": "cpu"
+        },
+        "po2": 18,
+        "proof_kind": "groth16",
+        "requested_mode": "metal",
+        "stage_ms": {
+          "execution_and_segment": 2817.360792,
+          "identity_and_wrap": 156147.997834,
+          "recursion": 7623.696791,
+          "verification": 1.847875
+        },
+        "stats": {
+          "paging_cycles": 16300,
+          "reserved_cycles": 13152,
+          "segments": 1,
+          "total_cycles": 32768,
+          "user_cycles": 3316
+        },
+        "total_ms": 166614.3215,
+        "verification": "in_process_passed_independent_pending"
+      },
+      "verification": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "journal_hex": "6d1a000000000000",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      },
+      "total_ms": 166855.95303960145,
+      "artifacts": {
+        "target/macos/runs/1ad9ae716a73463584b840fcf268bac4/proof/receipt.bin": {
+          "sha256": "a302658ca1151ad125f059b3ce976aa56fd0cd1ab0735bcb05f728a55aaa83d9",
+          "bytes": 513
+        },
+        "target/macos/runs/1ad9ae716a73463584b840fcf268bac4/proof/seal.bin": {
+          "sha256": "e21e3689f905b969ba8268e0a281b1761f475f229b53bf9960b9d92a1428e589",
+          "bytes": 256
+        },
+        "target/macos/runs/1ad9ae716a73463584b840fcf268bac4/proof/journal.bin": {
+          "sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+          "bytes": 8
+        },
+        "target/macos/runs/1ad9ae716a73463584b840fcf268bac4/proof/proof.json": {
+          "sha256": "75e6b5cb7dc1b606fda79d2c7da6530e806c2d1119bcbfac440b02eb9368ebb7",
+          "bytes": 1453
+        },
+        "target/macos/runs/1ad9ae716a73463584b840fcf268bac4/proof/verification.json": {
+          "sha256": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+          "bytes": 322
+        },
+        "target/macos/runs/1ad9ae716a73463584b840fcf268bac4/prover.log": {
+          "sha256": "46c46a22bf97c5eb2c2c78ede6c8ca2b0a529874faf9674427844d484213fe89",
+          "bytes": 1526
+        },
+        "target/macos/runs/1ad9ae716a73463584b840fcf268bac4/verifier.log": {
+          "sha256": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+          "bytes": 284
+        }
+      }
+    },
+    {
+      "run_id": "0551842728b9449ab3d85de41a3668f8",
+      "workload": "segment-boundary",
+      "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+      "helper_arch": "linux/amd64",
+      "helper_context": "colima-hemi-macos-cpu",
+      "requested_mode": "metal",
+      "status": "complete_independently_verified",
+      "native_peak_rss_bytes": 2757492736,
+      "prover_binary_sha256": "87f377f1e7f19233c9df955dac0c6420e97027a4f6cea8fc2bcfd38044a98c4f",
+      "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+      "runner_sha256": "5f80a4ed8e7c3223fb939513381994a1f447c4eed2c0c51d6d9695023aba557f",
+      "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+      "input_sha256": "226868b59be3e5e479cc22d7bda11055bad06bb205b77454ea36c65885f5c284",
+      "expected_journal_hex": "f0febc9a78563412",
+      "helper_endpoint": "unix:///Users/dbur/.colima/hemi-macos-cpu/docker.sock",
+      "rss_method": "ps RSS of owned native prover, sampled every 5s; excludes VM/helper",
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/hybrid/release/hemi-macos-hybrid-proof",
+        "prove",
+        "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/segment-boundary.bin",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/0551842728b9449ab3d85de41a3668f8/input.bin",
+        "f0febc9a78563412",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/0551842728b9449ab3d85de41a3668f8/proof",
+        "16"
+      ],
+      "verifier_build": {
+        "source": {
+          "kind": "verifier",
+          "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+          "inputs": {
+            "scripts/macos/proof_provenance.py": "5e6b2950433da2c24ed8166e46c22f3f4b7ebcc198cbc2a9141a9bae704c4f59",
+            "scripts/macos/env.sh": "7f6f9a87ba5b1915d427ca59de1a2930cb23f24af6c39b273f44350902a1afe4",
+            "scripts/macos/check-source.py": "74984a609430d8f1f03c2720cd775a308b50455f0ba79a421d3d421595143605",
+            "target/macos/unchanged-verifier/Cargo.toml": "63b49b5af371de4e89f14b046d4784cde62e2943e1fbadac797ec9b6f21457c0",
+            "target/macos/unchanged-verifier/Cargo.lock": "8c494780d49a95aaeec068d2c516aea1743c4f14ceb31dff00625deee97cc17e",
+            "target/macos/unchanged-verifier/src/main.rs": "b520205c2582fad43555ae443eb6c636f03bd5a3fd642b4f5f1b004a33bb91e0",
+            "tools/macos-proof/Verifier.Cargo.lock": "8c494780d49a95aaeec068d2c516aea1743c4f14ceb31dff00625deee97cc17e",
+            "scripts/macos/build-verifier.sh": "3cd88f4b460084926cde536c737fe3b2e9ebd3a85f93e8121b15252b47f21530"
+          }
+        },
+        "build_environment": {
+          "RUSTFLAGS": null,
+          "CARGO_ENCODED_RUSTFLAGS": null,
+          "DEVELOPER_DIR": null,
+          "TOOLCHAINS": null,
+          "SDKROOT": null
+        },
+        "binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+        "metadata_sha256": "06a236415649689cc64479f38799e083317045ca3bcdb96bd2794d575019a00c",
+        "host_toolchain": "1.93.0"
+      },
+      "hybrid_build": {
+        "source": {
+          "kind": "hybrid",
+          "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+          "engine_path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+          "engine_head": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+          "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "inputs": {
+            "scripts/macos/proof_provenance.py": "5e6b2950433da2c24ed8166e46c22f3f4b7ebcc198cbc2a9141a9bae704c4f59",
+            "scripts/macos/env.sh": "7f6f9a87ba5b1915d427ca59de1a2930cb23f24af6c39b273f44350902a1afe4",
+            "scripts/macos/check-source.py": "74984a609430d8f1f03c2720cd775a308b50455f0ba79a421d3d421595143605",
+            "tools/macos-hybrid/Cargo.toml": "b4b3d5864be9bc8bfaf2953896e80944245897eebe5747a4737510a7d3844dee",
+            "tools/macos-hybrid/Cargo.lock": "5e3f8bdcca2e0334a5307b7739134881143b8f498e3a98cc95bc0d11cfc8df62",
+            "tools/macos-proof/src/main.rs": "b520205c2582fad43555ae443eb6c636f03bd5a3fd642b4f5f1b004a33bb91e0",
+            "target/macos/hybrid-engine.toml": "4ceec928b625b49cb87d71dd9300c145468afd84fdf570b4f96b34e64bb1e881",
+            "scripts/macos/build-hybrid.sh": "53aa1cd89f300ba52dddc198ae5a654494b0bbd3ea75c8b69c5b9bddf507877b",
+            "scripts/macos/local-engine.py": "b3045c21b11c7a0aa32b9cc9909bccb587bf5ab30f06539f3cf09a4a015244c4"
+          }
+        },
+        "build_environment": {
+          "RUSTFLAGS": null,
+          "CARGO_ENCODED_RUSTFLAGS": null,
+          "DEVELOPER_DIR": null,
+          "TOOLCHAINS": null,
+          "SDKROOT": null
+        },
+        "binary_sha256": "87f377f1e7f19233c9df955dac0c6420e97027a4f6cea8fc2bcfd38044a98c4f",
+        "metadata_sha256": "3585a3bf683a52b88850d1f6bb5fbec68c9888518dab27ece1b1c121135c40c1",
+        "host_toolchain": "1.93.0"
+      },
+      "proof": {
+        "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+        "failures": 0,
+        "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+        "input_sha256": "226868b59be3e5e479cc22d7bda11055bad06bb205b77454ea36c65885f5c284",
+        "journal_hex": "f0febc9a78563412",
+        "observed_stages": {
+          "groth16": "local_linux_amd64_helper",
+          "identity": "cpu",
+          "metal_stage": {
+            "completed_dispatches": 1269,
+            "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+            "name": "segment_poseidon2_merkle_fold",
+            "segments": [
+              {
+                "completed_dispatches": 325,
+                "fold_calls": 96,
+                "input_digests": 2131956,
+                "output_digests": 1065978,
+                "peak_staging_bytes": 524288,
+                "po2": 16,
+                "segment_index": 0,
+                "staging_limit_bytes": 524288
+              },
+              {
+                "completed_dispatches": 250,
+                "fold_calls": 78,
+                "input_digests": 1607670,
+                "output_digests": 803835,
+                "peak_staging_bytes": 524288,
+                "po2": 16,
+                "segment_index": 1,
+                "staging_limit_bytes": 524288
+              },
+              {
+                "completed_dispatches": 250,
+                "fold_calls": 78,
+                "input_digests": 1607670,
+                "output_digests": 803835,
+                "peak_staging_bytes": 524288,
+                "po2": 16,
+                "segment_index": 2,
+                "staging_limit_bytes": 524288
+              },
+              {
+                "completed_dispatches": 250,
+                "fold_calls": 78,
+                "input_digests": 1607670,
+                "output_digests": 803835,
+                "peak_staging_bytes": 524288,
+                "po2": 16,
+                "segment_index": 3,
+                "staging_limit_bytes": 524288
+              },
+              {
+                "completed_dispatches": 194,
+                "fold_calls": 90,
+                "input_digests": 1065972,
+                "output_digests": 532986,
+                "peak_staging_bytes": 524288,
+                "po2": 15,
+                "segment_index": 4,
+                "staging_limit_bytes": 524288
+              }
+            ]
+          },
+          "other_segment_operations": "cpu",
+          "recursion": "cpu"
+        },
+        "po2": 16,
+        "proof_kind": "groth16",
+        "requested_mode": "metal",
+        "stage_ms": {
+          "execution_and_segment": 23025.627666999997,
+          "identity_and_wrap": 154164.90612499998,
+          "recursion": 60345.685416,
+          "verification": 1.812333
+        },
+        "stats": {
+          "paging_cycles": 35483,
+          "reserved_cycles": 133352,
+          "segments": 5,
+          "total_cycles": 294912,
+          "user_cycles": 126077
+        },
+        "total_ms": 237596.19075,
+        "verification": "in_process_passed_independent_pending"
+      },
+      "verification": {
+        "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+        "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+        "journal_hex": "f0febc9a78563412",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      },
+      "total_ms": 237821.77087664604,
+      "artifacts": {
+        "target/macos/runs/0551842728b9449ab3d85de41a3668f8/proof/receipt.bin": {
+          "sha256": "889ce955e1dc0ef419afc958d34147e39ba3e62f8e5f250ee826f4a4c9308de3",
+          "bytes": 513
+        },
+        "target/macos/runs/0551842728b9449ab3d85de41a3668f8/proof/seal.bin": {
+          "sha256": "7235ded8a83376c79fc9896057984644e3c478d683bde16614d84c036395d639",
+          "bytes": 256
+        },
+        "target/macos/runs/0551842728b9449ab3d85de41a3668f8/proof/journal.bin": {
+          "sha256": "118809efe7677d03153ce329b5af919e724a6f742dc98154e3df4ebbf54b574b",
+          "bytes": 8
+        },
+        "target/macos/runs/0551842728b9449ab3d85de41a3668f8/proof/proof.json": {
+          "sha256": "de484d05b4f2822097a368b1e0d75a0fd62766b88c9ea7fbacd2b681df84dd10",
+          "bytes": 2637
+        },
+        "target/macos/runs/0551842728b9449ab3d85de41a3668f8/proof/verification.json": {
+          "sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1",
+          "bytes": 322
+        },
+        "target/macos/runs/0551842728b9449ab3d85de41a3668f8/prover.log": {
+          "sha256": "5e0c8f663b778821e3c96eabd37fcd2e42fa86919589a3e1368ea86baa1b50b8",
+          "bytes": 2256
+        },
+        "target/macos/runs/0551842728b9449ab3d85de41a3668f8/verifier.log": {
+          "sha256": "eaad05f59663ae87a1136d91dcf4a45cb1131d99b4e99f209b1c3842bbf20009",
+          "bytes": 284
+        }
+      }
+    },
+    {
+      "run_id": "08b5cca54b024b9ca9d3400f41b23b1b",
+      "workload": "fibonacci",
+      "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+      "helper_arch": "linux/amd64",
+      "helper_context": "colima-hemi-macos-cpu",
+      "requested_mode": "cpu",
+      "status": "complete_independently_verified",
+      "native_peak_rss_bytes": 1961508864,
+      "prover_binary_sha256": "b861c8f5c4b0c1640e4a7d3b42b35b8ed051f8c9782cef80d99928b907f38e88",
+      "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+      "runner_sha256": "5f80a4ed8e7c3223fb939513381994a1f447c4eed2c0c51d6d9695023aba557f",
+      "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+      "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+      "expected_journal_hex": "6d1a000000000000",
+      "helper_endpoint": "unix:///Users/dbur/.colima/hemi-macos-cpu/docker.sock",
+      "rss_method": "ps RSS of owned native prover, sampled every 5s; excludes VM/helper",
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/cpu/release/hemi-macos-proof",
+        "prove",
+        "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/08b5cca54b024b9ca9d3400f41b23b1b/input.bin",
+        "6d1a000000000000",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/08b5cca54b024b9ca9d3400f41b23b1b/proof",
+        "18"
+      ],
+      "verifier_build": {
+        "source": {
+          "kind": "verifier",
+          "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+          "inputs": {
+            "scripts/macos/proof_provenance.py": "5e6b2950433da2c24ed8166e46c22f3f4b7ebcc198cbc2a9141a9bae704c4f59",
+            "scripts/macos/env.sh": "7f6f9a87ba5b1915d427ca59de1a2930cb23f24af6c39b273f44350902a1afe4",
+            "scripts/macos/check-source.py": "74984a609430d8f1f03c2720cd775a308b50455f0ba79a421d3d421595143605",
+            "target/macos/unchanged-verifier/Cargo.toml": "9445d02008b6349ac9f1832acc00ac1a68b70b200d0a2382c05e5d361f20a29a",
+            "target/macos/unchanged-verifier/Cargo.lock": "8c494780d49a95aaeec068d2c516aea1743c4f14ceb31dff00625deee97cc17e",
+            "target/macos/unchanged-verifier/src/main.rs": "b520205c2582fad43555ae443eb6c636f03bd5a3fd642b4f5f1b004a33bb91e0",
+            "tools/macos-proof/Verifier.Cargo.lock": "8c494780d49a95aaeec068d2c516aea1743c4f14ceb31dff00625deee97cc17e",
+            "scripts/macos/build-verifier.sh": "3cd88f4b460084926cde536c737fe3b2e9ebd3a85f93e8121b15252b47f21530"
+          }
+        },
+        "build_environment": {
+          "RUSTFLAGS": null,
+          "CARGO_ENCODED_RUSTFLAGS": null,
+          "DEVELOPER_DIR": null,
+          "TOOLCHAINS": null,
+          "SDKROOT": null
+        },
+        "binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+        "metadata_sha256": "0f87d4511d814f6ee25b2a33a391792fa541412789761600c67678e535b6c5bd",
+        "host_toolchain": "1.93.0"
+      },
+      "proof": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "failures": 0,
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+        "journal_hex": "6d1a000000000000",
+        "observed_stages": {
+          "groth16": "local_linux_amd64_helper",
+          "identity": "cpu",
+          "recursion": "cpu",
+          "segment": "cpu"
+        },
+        "po2": 18,
+        "proof_kind": "groth16",
+        "requested_mode": "cpu",
+        "stage_ms": {
+          "execution_and_segment": 2857.799333,
+          "identity_and_wrap": 154669.45420799998,
+          "recursion": 7347.988875,
+          "verification": 1.797
+        },
+        "stats": {
+          "paging_cycles": 16300,
+          "reserved_cycles": 13152,
+          "segments": 1,
+          "total_cycles": 32768,
+          "user_cycles": 3316
+        },
+        "total_ms": 164906.007042,
+        "verification": "in_process_passed_independent_pending"
+      },
+      "verification": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "journal_hex": "6d1a000000000000",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      },
+      "total_ms": 165580.984916538,
+      "artifacts": {
+        "target/macos/runs/08b5cca54b024b9ca9d3400f41b23b1b/proof/receipt.bin": {
+          "sha256": "de2a2e04f8a72064792565fed0130c9218d3b9d2f3dddc3e4e641a789274271e",
+          "bytes": 513
+        },
+        "target/macos/runs/08b5cca54b024b9ca9d3400f41b23b1b/proof/seal.bin": {
+          "sha256": "604bacb634e9e9cf1494e49eb62b7402a92b3a6354f90f99ba592321f41b378d",
+          "bytes": 256
+        },
+        "target/macos/runs/08b5cca54b024b9ca9d3400f41b23b1b/proof/journal.bin": {
+          "sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+          "bytes": 8
+        },
+        "target/macos/runs/08b5cca54b024b9ca9d3400f41b23b1b/proof/proof.json": {
+          "sha256": "8eae990f3f06867ebef273d6000b9901610fb52933056c996c9eaaae055424b3",
+          "bytes": 912
+        },
+        "target/macos/runs/08b5cca54b024b9ca9d3400f41b23b1b/proof/verification.json": {
+          "sha256": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+          "bytes": 322
+        },
+        "target/macos/runs/08b5cca54b024b9ca9d3400f41b23b1b/prover.log": {
+          "sha256": "888d41004c142701b7387c589c9ed69f19a165e30d16608d3c24b10ec07d48cc",
+          "bytes": 1149
+        },
+        "target/macos/runs/08b5cca54b024b9ca9d3400f41b23b1b/verifier.log": {
+          "sha256": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+          "bytes": 284
+        }
+      }
+    }
+  ],
+  "commands_executed": [
+    "sh scripts/macos/build-hybrid.sh /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+    "sh scripts/macos/build-verifier.sh",
+    "sh scripts/macos/build-metal.sh /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+    "python3 scripts/macos/test-metal.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --mode all",
+    "python3 scripts/macos/test-proof-controls.py",
+    "cargo +1.93.0 build --locked --release --manifest-path tools/macos-proof/Cargo.toml --all-features --config target/macos/local-engine.toml --target-dir target/macos/cpu",
+    "python3 scripts/macos/smoke.py --context colima-hemi-macos-cpu --mode metal --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --workload fibonacci --po2 18 --repeat 2",
+    "python3 scripts/macos/smoke.py --context colima-hemi-macos-cpu --mode metal --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --workload segment-boundary --po2 16 --repeat 1",
+    "python3 scripts/macos/smoke.py --context colima-hemi-macos-cpu --mode cpu --workload fibonacci --po2 18 --repeat 1",
+    "cargo +1.93.0 metadata --locked --offline --filter-platform aarch64-apple-darwin --manifest-path /private/tmp/hemi-fresh-verifier-jg5zkxrw/Cargo.toml --format-version 1",
+    "git apply --reverse --check /Users/dbur/dev/zk-miner/docs/macos/evidence/hemi-hybrid.patch"
+  ],
+  "failures_and_review_fixes": [
+    "Unfiltered offline metadata requested uncached android_system_properties; actual platform filter fixed it without updating versions.",
+    "Workspace unit test blocked by uncached maybe-async; not counted as passed.",
+    "Two concurrent-development builds refused provenance seals after source/HEAD changes; stable committed rebuild accepted.",
+    "Synthetic control fixture initially failed macOS path canonicalization; fixed and passed.",
+    "Review fixed per-chunk native autorelease resources, request counter serialization, Intel shadow type inference, and fresh verifier lock seeding.",
+    "Final whitespace check found a trailing blank line in hybrid manifest; removed and rebuilt binary was identical to accepted runs."
+  ],
+  "limits": [
+    "Only segment Poseidon2 Merkle folds use Metal. Other native stages remain CPU; final wrapper is local emulated Linux/amd64.",
+    "Worker forced-Metal mode is still disabled; extended hybrid worker acceptance remains future work.",
+    "512 KiB peak staging describes temporary buffer data, not total native/driver/helper physical memory.",
+    "RSS is sampled every 5 seconds and excludes VM/helper; helper has separate 24 GiB/6 CPU limit.",
+    "No full GPU fault injection, non-Mac runtime testing, twenty-request hybrid stability or controlled speedup benchmark.",
+    "Existing pinned tiny-tail lift_13 artifact limitation unchanged."
+  ],
+  "authorization": {
+    "push": false,
+    "wallet_access": false,
+    "network_jobs": false,
+    "transactions": false,
+    "privileged_installation": false
+  },
+  "command_context": "Commands run from miner root with scripts/macos/env.sh, except git apply in engine checkout.",
+  "wrapping_vm_final_state": "stopped after verifying dedicated context contained no containers"
+}

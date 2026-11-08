@@ -1,0 +1,34 @@
+{
+  "status": "diagnostic_only_wp3_in_progress",
+  "spec_sha256": "07467098c3493a0bbc0f543b0960676ba3a3e21ebd1fb7a65d10bb8dec40dc97",
+  "baseline": {
+    "checkpoint": "WP2",
+    "archive": "target/macos/phase2/wp2-baseline",
+    "manifest_sha256": "274a86fb0e10438983285aed6232a6ef922fcb7a73d3cec4bb64f7be9420ca19"
+  },
+  "method": "One complete arithmetic-10m po2-20 proof per variant; external unchanged verifier and three tamper rejections; RISC0_METAL_GPU_PROFILE=1; steady segment median over segments 1..9 of sum(batch_transforms dispatch_wall_ms). These are diagnostics, not the five-pair gate campaign.",
+  "variants": [
+    {
+      "name": "full_grid",
+      "engine_commit": "c83fbf5a874613a545cd363e3cd8e9da294426d2",
+      "worker_sha256": "33e779aa6dc7935ecf7b096fce34cf4d552374e70befa7fa3976dddfa16dd63c",
+      "run": "target/macos/native-wrap/worker-runs/be49e0b85bfc478f91be49d0da1cd3ee",
+      "result_sha256": "523463f1a013c028dec937269da5d63572857cf5fd2c933e0aa60d338902dc60",
+      "steady_transform_wall_ms_median": 2420.433,
+      "steady_transform_wall_ms_range": [2388.044, 2442.198],
+      "verified_proofs": 1
+    },
+    {
+      "name": "bounded_grid_per_column",
+      "engine_commit": "3bd319cca8f26e954418dbd43c5f2ae9940b0086",
+      "worker_sha256": "6e64813a09fc3f4c482b438971b4bb048a3458a900c33442dc2db20d36f5b9b0",
+      "run": "target/macos/native-wrap/worker-runs/23fe15c5c6ac4600af44e5a8cc6f7652",
+      "result_sha256": "359aed4bee2eb39dc47232c0ff067d20fe9dd81579b23b1f8737bb8ec3db1b97",
+      "steady_transform_wall_ms_median": 2219.713,
+      "steady_transform_wall_ms_range": [2198.027, 2263.24],
+      "verified_proofs": 1
+    }
+  ],
+  "finding": "Launch-grid changes alone do not approach the 800 ms per-segment gate; implement radix-4/8 shared-memory stages, resident precomputed twiddles, and fused commit flow before the paired campaign.",
+  "next": "Port the CUDA nttq commit path into Metal, then run exact primitive and complete-proof correctness checks before timing. The legacy grid remains default while full and per-column grids are opt-in diagnostics."
+}

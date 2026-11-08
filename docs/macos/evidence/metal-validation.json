@@ -1,0 +1,272 @@
+{
+  "engine_pin": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+  "engine_cpu_checkpoint": "e274e19ee6e77bcd5704ca25c9880bd143f0783c",
+  "engine_metal_commit": "130f98fb91f6c5ccb1d243a498bf303c760c6388",
+  "miner_cpu_checkpoint": "3503563849661f0e99b5ad9c7da7229bd561ea4f",
+  "miner_continuation": "this evidence and harness are committed together on codex/hemi-macos-metal; use git log -1 for the containing commit",
+  "hardware": {
+    "physical_memory_bytes": 137438953472,
+    "logical_cpus": 18,
+    "metal_devices": [
+      {
+        "max_buffer_bytes": 86586540032,
+        "supported_family_ids": [
+          1001,
+          1002,
+          1003,
+          1004,
+          1005,
+          1006,
+          1007,
+          1008,
+          1009,
+          1010,
+          2002,
+          5001,
+          5002
+        ],
+        "unified_memory": true,
+        "name": "Apple M5 Max",
+        "recommended_max_working_set_bytes": 115448725504,
+        "currently_allocated_bytes": 65536
+      }
+    ],
+    "active_cpus": 18
+  },
+  "provisioning": {
+    "compiler": "existing MTLDevice runtime source compiler",
+    "offline_metal_compiler": "absent",
+    "privileged_installation": false,
+    "global_developer_selection_changed": false
+  },
+  "initial_basic": {
+    "cases": [
+      {
+        "elements": 257,
+        "operation": "add",
+        "result": "matched"
+      }
+    ],
+    "compiler": "runtime source",
+    "completed_dispatches": 1,
+    "device": "Apple M5 Max",
+    "mode": "basic",
+    "proof_acceleration": "not enabled",
+    "verification": "CPU/Metal primitive equality only"
+  },
+  "initial_empty_failure": "Error: unexpected add dispatch count 1\n",
+  "runs": [
+    {
+      "id": "e9f0a59558fb4647b088f6a02f014b13",
+      "mode": "all",
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/metal/release/hemi-macos-metal-tests",
+        "all"
+      ],
+      "status": "failed",
+      "binary_sha256": "0cd66f99be23b8fe2d24bbbdaf06309b9d153d5121cf9b87da234c018c57a169",
+      "engine_head": "e274e19ee6e77bcd5704ca25c9880bd143f0783c",
+      "engine_working_diff_sha256": "0546d695b694722ae974cefcc9c062d223458e180e4d327d2c1f4ce11053335e",
+      "miner_head": "3503563849661f0e99b5ad9c7da7229bd561ea4f",
+      "full_proof_acceleration": false,
+      "max_sampled_native_rss_bytes": 32768,
+      "rss_method": "ps RSS of this native harness, sampled at up to 1-second intervals; not a Metal allocation peak",
+      "exit_code": 1,
+      "error": "harness failed (1); see stderr.log",
+      "elapsed_seconds": 0.5346302483230829,
+      "case_count": 188,
+      "completed_dispatches": 371,
+      "successful_case_dispatches": 370,
+      "kernel_source_sha256": "d6e139373b2d85992a6a17eadd77b81ff1326b0f7cfed9247dea235ab8324c5f",
+      "differential_error": "Poseidon2 HAL differential: poseidon2 hash rows/sentinel mismatch: rows=1, columns=0",
+      "stdout_path": "/Users/dbur/dev/zk-miner/target/macos/metal-runs/e9f0a59558fb4647b088f6a02f014b13/stdout.json",
+      "stdout_sha256": "d33827e1823388c0492098d18e697373b0dee50ae220240fa7504b5049daae98",
+      "stderr_sha256": "76505821bc4877b737037c7e9302f93c3221b06a2b2e5125a0beea0eaf011bc7"
+    },
+    {
+      "id": "8eedc773ef5d4f11a3c79a14bdf22a89",
+      "mode": "all",
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/metal/release/hemi-macos-metal-tests",
+        "all"
+      ],
+      "status": "passed_cpu_metal_differential",
+      "binary_sha256": "431afadc9d079f868b660111dd0d4bb05ebf59ab0eefde53d50a8e0d8ca4b49a",
+      "engine_head": "e274e19ee6e77bcd5704ca25c9880bd143f0783c",
+      "engine_working_diff_sha256": "3a6fd395d76b43f6cb374d89d0e3d956354dec8ee831dc377f68cc51f8be648a",
+      "miner_head": "3503563849661f0e99b5ad9c7da7229bd561ea4f",
+      "full_proof_acceleration": false,
+      "max_sampled_native_rss_bytes": 32768,
+      "rss_method": "ps RSS of this native harness, sampled at up to 1-second intervals; not a Metal allocation peak",
+      "exit_code": 0,
+      "elapsed_seconds": 0.5934383310377598,
+      "case_count": 222,
+      "completed_dispatches": 404,
+      "successful_case_dispatches": 404,
+      "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+      "differential_error": null,
+      "stdout_path": "/Users/dbur/dev/zk-miner/target/macos/metal-runs/8eedc773ef5d4f11a3c79a14bdf22a89/stdout.json",
+      "stdout_sha256": "1aecdcd9e53a4e9270b43c110a70ec3a96f89fce9e8c81051a90c9e27bd8c657",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "54482afeee90464dbca9fbc8183d5b06",
+      "mode": "all",
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/metal/release/hemi-macos-metal-tests",
+        "all"
+      ],
+      "status": "passed_cpu_metal_differential",
+      "binary_sha256": "431afadc9d079f868b660111dd0d4bb05ebf59ab0eefde53d50a8e0d8ca4b49a",
+      "engine_head": "130f98fb91f6c5ccb1d243a498bf303c760c6388",
+      "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "miner_head": "3503563849661f0e99b5ad9c7da7229bd561ea4f",
+      "full_proof_acceleration": false,
+      "max_sampled_native_rss_bytes": 32768,
+      "rss_method": "ps RSS of this native harness, sampled at up to 1-second intervals; not a Metal allocation peak",
+      "verified_build": {
+        "source": {
+          "engine_path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+          "engine_head": "130f98fb91f6c5ccb1d243a498bf303c760c6388",
+          "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "harness_inputs": {
+            "tools/macos-metal/Cargo.toml": "0100e95926478a59d0538948650097559d54a349d91c32d3a455fd509c64488a",
+            "tools/macos-metal/Cargo.lock": "9282d4034fa2f3ba5d8aae501a69328090671e036294f8643ae0c36707fae188",
+            "tools/macos-metal/src/main.rs": "add3fa0e991452e87d0b0143f43e937d6944b269b163e2a0b1b5d6880666f843"
+          },
+          "override_config_sha256": "805d17520b5699b3e8baf0f0ff039b82977ef4b89fe4fbb53ca309afcbca0649"
+        },
+        "binary_sha256": "431afadc9d079f868b660111dd0d4bb05ebf59ab0eefde53d50a8e0d8ca4b49a",
+        "metadata_sha256": "18fb5b85232607a19e7978565c9aa75e2c94b17418036160ceb6c639f0d018e5",
+        "host_toolchain": "1.93.0",
+        "build_environment": {
+          "RUSTFLAGS": null,
+          "CARGO_ENCODED_RUSTFLAGS": null,
+          "DEVELOPER_DIR": null,
+          "TOOLCHAINS": null,
+          "SDKROOT": null
+        }
+      },
+      "exit_code": 0,
+      "elapsed_seconds": 0.3357808757573366,
+      "case_count": 222,
+      "completed_dispatches": 404,
+      "successful_case_dispatches": 404,
+      "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+      "differential_error": null,
+      "stdout_path": "/Users/dbur/dev/zk-miner/target/macos/metal-runs/54482afeee90464dbca9fbc8183d5b06/stdout.json",
+      "stdout_sha256": "1aecdcd9e53a4e9270b43c110a70ec3a96f89fce9e8c81051a90c9e27bd8c657",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "sealed_build": {
+    "source": {
+      "engine_path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+      "engine_head": "130f98fb91f6c5ccb1d243a498bf303c760c6388",
+      "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "harness_inputs": {
+        "tools/macos-metal/Cargo.toml": "0100e95926478a59d0538948650097559d54a349d91c32d3a455fd509c64488a",
+        "tools/macos-metal/Cargo.lock": "9282d4034fa2f3ba5d8aae501a69328090671e036294f8643ae0c36707fae188",
+        "tools/macos-metal/src/main.rs": "add3fa0e991452e87d0b0143f43e937d6944b269b163e2a0b1b5d6880666f843"
+      },
+      "override_config_sha256": "805d17520b5699b3e8baf0f0ff039b82977ef4b89fe4fbb53ca309afcbca0649"
+    },
+    "binary_sha256": "431afadc9d079f868b660111dd0d4bb05ebf59ab0eefde53d50a8e0d8ca4b49a",
+    "metadata_sha256": "18fb5b85232607a19e7978565c9aa75e2c94b17418036160ceb6c639f0d018e5",
+    "host_toolchain": "1.93.0",
+    "build_environment": {
+      "RUSTFLAGS": null,
+      "CARGO_ENCODED_RUSTFLAGS": null,
+      "DEVELOPER_DIR": null,
+      "TOOLCHAINS": null,
+      "SDKROOT": null
+    }
+  },
+  "build_guard_tests": [
+    {
+      "case": "matching_source_and_binary",
+      "result": "accepted"
+    },
+    {
+      "case": "wrong_engine",
+      "result": "rejected",
+      "reason": "Metal source inputs changed since the recorded build; rebuild before testing"
+    },
+    {
+      "case": "changed_binary",
+      "result": "rejected",
+      "reason": "Metal executable differs from the recorded build; rebuild before testing"
+    }
+  ],
+  "revision_guard_tests": [
+    {
+      "name": "implicit_descendant",
+      "exit_code": 2,
+      "expected_success": false
+    },
+    {
+      "name": "reviewed_descendant",
+      "exit_code": 0,
+      "expected_success": true
+    },
+    {
+      "name": "wrong_revision",
+      "exit_code": 2,
+      "expected_success": false
+    },
+    {
+      "name": "upstream",
+      "exit_code": 2,
+      "expected_success": false
+    }
+  ],
+  "cpu_feature_guard_rejection": "usage: check-source.py [-h] (--engine ENGINE | --unchanged-verifier)\n                       [--metal-runtime]\n                       metadata\ncheck-source.py: error: unexpected features in risc0-sys: {'metal', 'metal-runtime'}\n",
+  "cpu_regression": {
+    "run_id": "f738364b836b4e3a902203f6151f6276",
+    "proof": {
+      "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+      "failures": 0,
+      "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+      "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+      "journal_hex": "6d1a000000000000",
+      "po2": 18,
+      "proof_kind": "groth16",
+      "requested_mode": "cpu",
+      "stage_ms": {
+        "execution_and_segment": 2724.4585839999995,
+        "identity_and_wrap": 155107.207,
+        "recursion": 7516.840292000001,
+        "verification": 1.789667
+      },
+      "stats": {
+        "paging_cycles": 16300,
+        "reserved_cycles": 13152,
+        "segments": 1,
+        "total_cycles": 32768,
+        "user_cycles": 3316
+      },
+      "total_ms": 165379.881958,
+      "verification": "in_process_passed_independent_pending"
+    },
+    "independent_verifier": {
+      "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+      "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+      "journal_hex": "6d1a000000000000",
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "verification": "passed"
+    },
+    "prover_binary_sha256": "f5dabd8550b2e2a4f8a7a1a878453b55e5ebcf882b5e9f7f0a75e89c172e9b03",
+    "source_check": "risc0-binfmt 3.0.5 ['rand', 'std']\nrisc0-build 3.0.6 []\nrisc0-build-kernel 2.1.0 []\nrisc0-circuit-keccak 4.0.6 ['prove', 'std']\nrisc0-circuit-keccak-sys 4.0.3 []\nrisc0-circuit-recursion 4.0.5 ['prove', 'risc0-circuit-recursion-sys', 'std']\nrisc0-circuit-recursion-sys 4.0.3 []\nrisc0-circuit-rv32im 4.0.5 ['execute', 'prove', 'std']\nrisc0-circuit-rv32im-sys 4.0.3 []\nrisc0-core 3.0.2 ['perf']\nrisc0-groth16 3.0.5 ['prove', 'std']\nrisc0-sys 1.5.0 []\nrisc0-zkos-v1compat 2.2.3 []\nrisc0-zkp 3.0.5 ['default', 'prove', 'std']\nrisc0-zkvm 3.0.6 ['client', 'disable-dev-mode', 'prove', 'std']\nrisc0-zkvm-platform 2.2.3 ['export-getrandom', 'export-libm', 'export-syscalls', 'rust-runtime']\nrzup 0.5.2 []\nverified source and feature closure of 17 engine packages\n"
+  },
+  "patch_sha256": "e5f792f8a08dd2e977d2b80b6f667e44918340a2bd3228f90fd53350983f22a1",
+  "limitations": [
+    "No complete proof uses Metal yet; worker forced-metal still rejects.",
+    "No offline Metal compiler install or full offline build.",
+    "No injected GPU command fault, full-stage FRI/circuit coverage, production memory budget, speedup or extended stability claim.",
+    "RSS samples captured startup only for subsecond differential runs; not useful as peak memory measurements."
+  ]
+}

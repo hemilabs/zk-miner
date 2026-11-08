@@ -1,0 +1,26 @@
+[
+  {
+    "check": "reject_RISC0_DEV_MODE",
+    "exit": 1,
+    "stderr": "Error: unset RISC0_DEV_MODE for acceptance testing"
+  },
+  {
+    "check": "reject_BONSAI_API_URL",
+    "exit": 1,
+    "stderr": "Error: unset BONSAI_API_URL for acceptance testing"
+  },
+  {
+    "check": "reject_RISC0_SKIP_BUILD",
+    "exit": 1,
+    "stderr": "Error: unset RISC0_SKIP_BUILD for acceptance testing"
+  },
+  {
+    "check": "reject_RISC0_SKIP_BUILD_KERNELS",
+    "exit": 1,
+    "stderr": "Error: unset RISC0_SKIP_BUILD_KERNELS for acceptance testing"
+  },
+  {
+    "check": "reject_upstream_head",
+    "exit": 2
+  }
+]

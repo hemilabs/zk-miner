@@ -1,0 +1,13 @@
+fixture,category,seconds,segment_percent
+arithmetic-10m,constraint_evaluation,195.6269,51.50528238311344
+arithmetic-10m,merkle_commitments,118.2323,31.128582001273763
+arithmetic-10m,polynomial_transforms,40.8464,10.754172183547379
+arithmetic-10m,witness_generation,1.4938,0.39329249108325515
+arithmetic-10m,accumulation,6.3513,1.6721907876670765
+arithmetic-10m,other_segment_protocol,17.268399999999986,4.546480153315088
+hash-10m,constraint_evaluation,199.3055,51.41453131130782
+hash-10m,merkle_commitments,119.27669999999999,30.76962565939961
+hash-10m,polynomial_transforms,41.3835,10.675637433595696
+hash-10m,witness_generation,3.3385,0.8612276770224662
+hash-10m,accumulation,6.8263,1.7609700439294478
+hash-10m,other_segment_protocol,17.513800000000003,4.518007874744967

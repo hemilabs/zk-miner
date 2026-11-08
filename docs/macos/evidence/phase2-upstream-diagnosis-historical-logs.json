@@ -1,0 +1,378 @@
+{
+  "schema_version": 1,
+  "scope": "historical absolute-run log comparison; exact request-to-first-submit needs paired harness because the WP8-lite runner did not record request epochs",
+  "arms": {
+    "wp8lite": [
+      {
+        "fixture": "arithmetic-10m",
+        "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/44e477f958eb43d38c25395a8f5b3782",
+        "test_log_sha256": "ccf814876ce4d3b7f2f2e1967242b84647d9ab096147d9741430d2eb5d9fc2e7",
+        "gpu_submit_count": 60,
+        "bundle_rehash_or_identity_mismatch_lines": [],
+        "proof_sidecars": [
+          {
+            "proof": "proof-0",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "306a39885decc2ae8c414f8b8790e2ecc3ff573033186423ed8ee91edcfd2c7f"
+          },
+          {
+            "proof": "proof-1",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "8732ef3b4b46b296a50177e26a6e68a00af0ea52624c0b3262da9b48ce88052c"
+          },
+          {
+            "proof": "proof-2",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "37607026792c16d67dbce0943864c122b14ae24c3e0329911b2d3d93550d98b2"
+          },
+          {
+            "proof": "proof-3",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "2b3ecc75919d6293791eea227a566bf5b51100dae076fdc68874132d887af9d6"
+          },
+          {
+            "proof": "proof-4",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "7bc0f12143e4d821ceb04e92ed9a69d42a563b1818edb6d634feb6e671f43157"
+          },
+          {
+            "proof": "proof-5",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "f675c322a24bf40fc68f2d67dc60fd3a107508993eb98cca93a72c5a239f7248"
+          }
+        ]
+      },
+      {
+        "fixture": "hash-10m",
+        "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/7c7099cfa4d94050a8ddec911710ac08",
+        "test_log_sha256": "4dd7fc01e830629478fdc4e38bb4ab86b149aa2644955e3cac7adb0e905d2210",
+        "gpu_submit_count": 60,
+        "bundle_rehash_or_identity_mismatch_lines": [],
+        "proof_sidecars": [
+          {
+            "proof": "proof-0",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "46176d240007517c6a81299555c52217f7375efe592e86bec718c0b24ce4d6b2"
+          },
+          {
+            "proof": "proof-1",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "1ade4b260c7ad47eb1382ba97587035ccff9b59c10f2cc1bd65e12585fc3e3ec"
+          },
+          {
+            "proof": "proof-2",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "110cd2cef45230d28b8928696bff7e151fa4b2282af256cdaaff05688d6543f8"
+          },
+          {
+            "proof": "proof-3",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "2bef4b2b1d9acf39688949444d0c3c107663aa2999554be47e263526ea781a63"
+          },
+          {
+            "proof": "proof-4",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "ec2e9bb230ee660477b3326b76ec0785ca879eadc36f5d72eb7dc602d83be083"
+          },
+          {
+            "proof": "proof-5",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "c7db7d81709cd85999a490193ce6d05a1303b014e58d2c2270c7624eb84ce2e3"
+          }
+        ]
+      },
+      {
+        "fixture": "arithmetic-46m",
+        "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/128fda17b9e642c4882a90d1e9eb380f",
+        "test_log_sha256": "21bd5c24698427ca08c45cbbb33bdd56a6352d2a304feaccd99c90bff62cc913",
+        "gpu_submit_count": 276,
+        "bundle_rehash_or_identity_mismatch_lines": [],
+        "proof_sidecars": [
+          {
+            "proof": "proof-0",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "0862740cb403fda669a55b55e1c50bcedf111316f104800eb67222c2d2984871"
+          },
+          {
+            "proof": "proof-1",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "5021ae479eec329be2105234306aa4a4ad4c6d24a358a217a36c97097773eb2a"
+          },
+          {
+            "proof": "proof-2",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "e6f6223635c0f1f536ab3ffb095cc067cd670796e3dcc12275216cf2ff613e1d"
+          },
+          {
+            "proof": "proof-3",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "4d149d4ff8a19b20e0ef1b9d3fedb7fe36f0e244b069355a21fd2eb7f4b7a151"
+          },
+          {
+            "proof": "proof-4",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "86b3cdf89e6ea185e518f4abd8ac602e0b65db8d2fe069a65b6477d6650082cb"
+          },
+          {
+            "proof": "proof-5",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "477acf88abc55d91194832f5ab3a1b253da8853eacbb78316e8eebd99bd33645"
+          }
+        ]
+      }
+    ],
+    "merged": [
+      {
+        "fixture": "arithmetic-10m",
+        "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/1dac084ae04f4373a94414709947fbea",
+        "test_log_sha256": "a8aa2ff9bffcaaf1459c1a62fb280ac35cd55cc66d8a98a90c503a432da36081",
+        "gpu_submit_count": 60,
+        "bundle_rehash_or_identity_mismatch_lines": [],
+        "proof_sidecars": [
+          {
+            "proof": "proof-0",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "2f30e5c0bc38054a3061d2fff372227cf86d9589542d77c77d1108b558717559"
+          },
+          {
+            "proof": "proof-1",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "a2b66d3f67ad6d51eab96f2085a19f37d0ac63ae2ffb175d08b412d0b898f1da"
+          },
+          {
+            "proof": "proof-2",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "6b90c5e79b50260c24677be8fd4ce5ca22116292df27deb6a5352045df6b14ed"
+          },
+          {
+            "proof": "proof-3",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "741b71879b3405d07741a220c710d099633dbfac73d3385520cc244cb71c6eea"
+          },
+          {
+            "proof": "proof-4",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "09d440bf0ecf5bd44c6283bc5302cb7e480ee3c3062669eb6daeaf1ca6962499"
+          },
+          {
+            "proof": "proof-5",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "02550d846857dfc0a214cebbf59b4205e7c3e75299c9e5f2cbc6d9c03322ec3a"
+          }
+        ]
+      },
+      {
+        "fixture": "hash-10m",
+        "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/f38507f1c2e9426f8ce8d7f7d4ace7d9",
+        "test_log_sha256": "e350003e5c26b2059b7753b2e9ae7d30f2a325351a014293063b8c8b9227a8f0",
+        "gpu_submit_count": 60,
+        "bundle_rehash_or_identity_mismatch_lines": [],
+        "proof_sidecars": [
+          {
+            "proof": "proof-0",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "19821e8fad0c4b1c640e90b144d48b5112a1ddf1a9e8fac5ff41e7c0af43c74e"
+          },
+          {
+            "proof": "proof-1",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "63331654f07dad6fe540bffb496ae83a58ca2186e0442ca191d7b3a71f089376"
+          },
+          {
+            "proof": "proof-2",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "b1d9caf3fcbd0e4e106cb56b86987421e223b5194ec3d61f315602b7f044e759"
+          },
+          {
+            "proof": "proof-3",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "82104b022b70621c0fcc61d5492708dd6ae086cca92ce0b36841351b2ab99e55"
+          },
+          {
+            "proof": "proof-4",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "f8c94834eb194a7e4fdbb90d7d10699af599967f2fb4322b12418b7bf5e5837e"
+          },
+          {
+            "proof": "proof-5",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "461ede5dbf6a54523b191cec5fbd0f2cf3d69fe17b4a09bd1c943d3eee52f3e6"
+          }
+        ]
+      },
+      {
+        "fixture": "arithmetic-46m",
+        "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/d364fdc056374e3e924550b10444403b",
+        "test_log_sha256": "b7c621a59f80bc77e09309d7f7357898be95a41562729b0c74df7d3070e3df4d",
+        "gpu_submit_count": 276,
+        "bundle_rehash_or_identity_mismatch_lines": [],
+        "proof_sidecars": [
+          {
+            "proof": "proof-0",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "e5eddc59d1a3af35052c7b4c0e4721597fa48d27761ad2bdd5798c961e91f789"
+          },
+          {
+            "proof": "proof-1",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "a403a7bc028df552221142872737e0c0b137bdad481e7b1c0a61ffa9dcbd4c56"
+          },
+          {
+            "proof": "proof-2",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "f9394d37d3f52920604254e4bb104608a8a31266d3d38f05aef8e411659b46df"
+          },
+          {
+            "proof": "proof-3",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "414be1c60aeedfcf85bf596e2a3e8788a082e295053d0cb6fdf6fe256e8caa5c"
+          },
+          {
+            "proof": "proof-4",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "4a73b5629d518b24af650b3b6cdf5838190e282c442104341a6d1390db083a8b"
+          },
+          {
+            "proof": "proof-5",
+            "rayon_threads": 18,
+            "gomaxprocs": 18,
+            "segment_hal": "metal",
+            "recursion_hal": "metal",
+            "worker_sidecar_sha256": "7ff1dee783184aa1703e5023f7bb13bf24f42db2e584a3c31a42e4b05ae928b2"
+          }
+        ]
+      }
+    ]
+  },
+  "native_bundle_file_identity_at_diagnosis": {
+    "prover": {
+      "size": 13433810,
+      "mtime_ns": 1793983526711133584,
+      "inode": 121546314,
+      "device": 16777232
+    },
+    "stark_verify.cs": {
+      "size": 260664474,
+      "mtime_ns": 1793983526016505847,
+      "inode": 121545096,
+      "device": 16777232
+    },
+    "stark_verify_final.pk.dmp": {
+      "size": 2255766633,
+      "mtime_ns": 1793983526608950303,
+      "inode": 121545097,
+      "device": 16777232
+    },
+    "stark_verify_graph.bin": {
+      "size": 251721088,
+      "mtime_ns": 1793983513927716453,
+      "inode": 121534845,
+      "device": 16777232
+    }
+  }
+}

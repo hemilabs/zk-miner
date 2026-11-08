@@ -1,0 +1,38 @@
+{
+  "checked_at": "2026-11-03 20:23:01 UTC",
+  "pull_requests": [
+    {
+      "number": 30,
+      "url": "https://github.com/hemilabs/risc0/pull/30",
+      "state": "open",
+      "draft": true,
+      "merged": false,
+      "head": "f9455a5181cb733e45085ee0daf25afe7737eb66",
+      "head_branch": "codex/upstream-final-segment-padding",
+      "base": "release-3.0",
+      "author": "dimitryB"
+    },
+    {
+      "number": 31,
+      "url": "https://github.com/hemilabs/risc0/pull/31",
+      "state": "open",
+      "draft": true,
+      "merged": false,
+      "head": "1d363933d0b95b2ecc58f9ccc1f401a499c0e518",
+      "head_branch": "codex/upstream-locked-circom",
+      "base": "release-3.0",
+      "author": "dimitryB"
+    },
+    {
+      "number": 32,
+      "url": "https://github.com/hemilabs/risc0/pull/32",
+      "state": "open",
+      "draft": true,
+      "merged": false,
+      "head": "6b4e43dd53cc58d769549d53571f1eb393249d3c",
+      "head_branch": "codex/upstream-native-helper-lifetime",
+      "base": "release-3.0",
+      "author": "dimitryB"
+    }
+  ]
+}

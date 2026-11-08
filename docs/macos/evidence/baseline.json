@@ -1,0 +1,82 @@
+{
+  "miner": {
+    "path": "/Users/dbur/dev/zk-miner",
+    "sha": "1bbdd68edf66f4bb9e72d2aad73e41ae36751d0e",
+    "branch": "codex/hemi-macos-cpu",
+    "status": "?? docs/macos/\n?? scripts/\n?? tools/",
+    "lockfile_sha256": "3cdf30e0f792fcbf0697ecda9f9b3af2cfbb3c8dba00b0f899ce2e4267b88b05"
+  },
+  "engine": {
+    "path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+    "sha": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+    "branch": "codex/hemi-macos-cpu",
+    "status": "M risc0/sys/build.rs\n M risc0/zkp/Cargo.toml\n M risc0/zkp/build.rs\n M risc0/zkp/src/hal/mod.rs\n M risc0/zkvm/Cargo.toml",
+    "lockfile_sha256": "98199e0dedef45542ff5e200a30bf17710ff087829bf3d22240303f4f6ff2c93"
+  },
+  "upstream": {
+    "path": "/Users/dbur/dev/risc0-parent",
+    "sha": "164c64bb3a844d393bb7addc5781c705c647f2d5",
+    "branch": "main",
+    "status": "",
+    "lockfile_sha256": "b61698541dbde2c136408b37d97046e40c461625d1a779f711e2e9b13d7cab2d"
+  },
+  "hardware": {
+    "physical_memory_bytes": 137438953472,
+    "logical_cpus": 18,
+    "metal_devices": [
+      {
+        "max_buffer_bytes": 86586540032,
+        "supported_family_ids": [
+          1001,
+          1002,
+          1003,
+          1004,
+          1005,
+          1006,
+          1007,
+          1008,
+          1009,
+          1010,
+          2002,
+          5001,
+          5002
+        ],
+        "unified_memory": true,
+        "name": "Apple M5 Max",
+        "recommended_max_working_set_bytes": 115448725504,
+        "currently_allocated_bytes": 65536
+      }
+    ],
+    "active_cpus": 18
+  },
+  "guest": {
+    "source": "/Users/dbur/dev/zk-miner/crates/zkminer-prover/guests/risc0/fibonacci",
+    "source_sha256": "6752e729c1b54d846d2e295e4736ea6d4d6729421e86c13b993dfb62b6741a34",
+    "elf": "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci",
+    "elf_sha256": "683875f3e781bef8541049b2c8e892b8dba6a6d58923ffd0710167a96e396eee",
+    "command": [
+      "cargo",
+      "+risc0",
+      "build",
+      "--release",
+      "--target",
+      "riscv32im-risc0-zkvm-elf",
+      "--manifest-path",
+      "/Users/dbur/dev/zk-miner/target/macos/guests/fibonacci/Cargo.toml",
+      "--config",
+      "/Users/dbur/dev/zk-miner/target/macos/local-engine.toml",
+      "--target-dir",
+      "/Users/dbur/dev/zk-miner/target/macos/guest-build"
+    ],
+    "program": "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin",
+    "packing": {
+      "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+      "kernel_elf_sha256": "7ffd942e4e8babd771094f549ad080cfea8ecb2c05c986e275c011f41979d921",
+      "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+      "user_elf_sha256": "683875f3e781bef8541049b2c8e892b8dba6a6d58923ffd0710167a96e396eee"
+    }
+  },
+  "prover_sha256": "dfd1f1177e690db73a635b96ad020911797aa742e04b6b83b70d4945fd627975",
+  "verifier_sha256": "54aafe6e146a79ba86dda0c800fa51bc40a5a59d571cb444bd3eedc3426fb801",
+  "harness_lock_sha256": "1c163039293881958635d69e483755dce4f9310148df22867f104d8d072294b9"
+}

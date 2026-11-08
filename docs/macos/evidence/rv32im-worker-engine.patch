@@ -1,0 +1,637 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index babc4833f..401d0a1c6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7066,6 +7066,7 @@ dependencies = [
+  "gdbstub",
+  "gdbstub_arch",
+  "malachite",
++ "metal",
+  "num-derive",
+  "num-traits",
+  "parking_lot",
+diff --git a/risc0/circuit/rv32im/Cargo.toml b/risc0/circuit/rv32im/Cargo.toml
+index a385196e9..b10b7dd21 100644
+--- a/risc0/circuit/rv32im/Cargo.toml
++++ b/risc0/circuit/rv32im/Cargo.toml
+@@ -54,6 +54,9 @@ risc0-sys = { workspace = true, optional = true }
+ smallvec = { version = "1.13", optional = true }
+ wide = { version = "0.7", optional = true }
+ 
++[target.'cfg(target_os = "macos")'.dependencies]
++metal = { workspace = true, optional = true }
++
+ [dev-dependencies]
+ clap = { version = "4.5", features = ["derive"] }
+ flate2 = "1.0"
+@@ -83,6 +86,7 @@ intel = [
+ ]
+ default = []
+ metal-hybrid = ["prove", "risc0-zkp/metal-runtime"]
++metal = ["prove", "risc0-zkp/metal-runtime", "dep:metal"]
+ # entropy_finder = []
+ execute = [
+   "anyhow/backtrace",
+diff --git a/risc0/circuit/rv32im/src/lib.rs b/risc0/circuit/rv32im/src/lib.rs
+index bc7b5919f..cd62a37b6 100644
+--- a/risc0/circuit/rv32im/src/lib.rs
++++ b/risc0/circuit/rv32im/src/lib.rs
+@@ -14,6 +14,11 @@
+ 
+ #![cfg_attr(not(feature = "std"), no_std)]
+ 
++#[cfg(all(feature = "metal", not(all(target_os = "macos", target_arch = "aarch64"))))]
++compile_error!("RV32IM Metal requires Apple Silicon macOS");
++#[cfg(all(feature = "metal", any(feature = "cuda", feature = "rocm", feature = "intel", feature = "metal-hybrid")))]
++compile_error!("RV32IM Metal must be selected separately from other segment backends");
++
+ #[cfg(feature = "execute")]
+ pub mod execute;
+ #[cfg(feature = "prove")]
+diff --git a/risc0/circuit/rv32im/src/prove/hal/mod.rs b/risc0/circuit/rv32im/src/prove/hal/mod.rs
+index 6efbd7ab2..999e174e9 100644
+--- a/risc0/circuit/rv32im/src/prove/hal/mod.rs
++++ b/risc0/circuit/rv32im/src/prove/hal/mod.rs
+@@ -13,6 +13,8 @@
+ // limitations under the License.
+ 
+ pub(crate) mod cpu;
++#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
++pub(crate) mod metal;
+ #[cfg(feature = "cuda")]
+ pub(crate) mod cuda;
+ #[cfg(feature = "rocm")]
+diff --git a/risc0/circuit/rv32im/src/prove/mod.rs b/risc0/circuit/rv32im/src/prove/mod.rs
+index d754e61f2..73e379186 100644
+--- a/risc0/circuit/rv32im/src/prove/mod.rs
++++ b/risc0/circuit/rv32im/src/prove/mod.rs
+@@ -25,6 +25,8 @@ use crate::execute::segment::Segment;
+ 
+ pub use risc0_zkp::hal::cpu::MetalFoldStats;
+ pub use witgen::PreflightResults;
++#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
++pub use self::hal::metal::{metal_rv32im_stats, metal_rv32im_kernel_source, MetalRv32imStats};
+ 
+ const GLOBAL_MIX: usize = 0;
+ const GLOBAL_OUT: usize = 1;
+@@ -82,6 +84,16 @@ pub fn release_intel_scratch() {
+ }
+ 
+ pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
++    match std::env::var("RISC0_SEGMENT_HAL").as_deref() {
++        Err(std::env::VarError::NotPresent) | Ok("cpu") => {},
++        Ok("metal") => {
++            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
++            return self::hal::metal::segment_prover();
++            #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
++            anyhow::bail!("RV32IM Metal is not compiled into this engine");
++        },
++        _ => anyhow::bail!("RISC0_SEGMENT_HAL must be cpu or metal"),
++    }
+     cfg_if! {
+         if #[cfg(feature = "cuda")] {
+             self::hal::cuda::segment_prover()
+diff --git a/risc0/zkvm/Cargo.toml b/risc0/zkvm/Cargo.toml
+index 5aac6ad5b..2bf6805b2 100644
+--- a/risc0/zkvm/Cargo.toml
++++ b/risc0/zkvm/Cargo.toml
+@@ -215,6 +215,8 @@ heap-embedded-alloc = ["risc0-zkvm-platform/heap-embedded-alloc"]
+ metal = ["prove", "risc0-zkp/metal"]
+ # Opt-in Poseidon2 lift/join; CPU witness/accumulation and identity-p254.
+ metal-recursion = ["prove", "risc0-circuit-recursion/metal"]
++# Opt-in shared Metal RV32IM transforms/commitments/constraints; CPU witness/accumulation.
++metal-rv32im = ["prove", "risc0-circuit-rv32im/metal"]
+ # Opt-in, in-process CPU prover with only segment Poseidon2 Merkle folds on Metal.
+ metal-hybrid = ["prove", "risc0-circuit-rv32im/metal-hybrid"]
+ prove = [
+diff --git a/risc0/zkvm/src/lib.rs b/risc0/zkvm/src/lib.rs
+index 16c08b574..adb5ddf6d 100644
+--- a/risc0/zkvm/src/lib.rs
++++ b/risc0/zkvm/src/lib.rs
+@@ -103,6 +103,13 @@ pub use self::host::client::prove::local::MetalSegmentReport;
+ #[cfg(all(feature = "metal-recursion", target_os = "macos", target_arch = "aarch64"))]
+ pub use risc0_circuit_recursion::prove::{metal_recursion_stats, metal_recursion_kernel_source, MetalRecursionStats};
+ 
++#[cfg(all(feature = "metal-rv32im", not(all(target_os = "macos", target_arch = "aarch64"))))]
++compile_error!("metal-rv32im requires Apple Silicon macOS");
++#[cfg(all(feature = "metal-rv32im", any(feature = "cuda", feature = "rocm", feature = "intel", feature = "metal-hybrid")))]
++compile_error!("metal-rv32im must be selected separately from other segment backends");
++#[cfg(all(feature = "metal-rv32im", target_os = "macos", target_arch = "aarch64"))]
++pub use risc0_circuit_rv32im::prove::{metal_rv32im_stats, metal_rv32im_kernel_source, MetalRv32imStats};
++
+ #[cfg(not(target_os = "zkvm"))]
+ #[cfg(any(feature = "client", feature = "prove"))]
+ pub use bytes::Bytes;
+diff --git a/risc0/circuit/rv32im/build.rs b/risc0/circuit/rv32im/build.rs
+new file mode 100644
+--- /dev/null
++++ b/risc0/circuit/rv32im/build.rs
+@@ -0,0 +1,33 @@
++fn main() {
++    #[cfg(feature = "metal")]
++    {
++        use std::{env, path::PathBuf, process::Command};
++        assert_eq!(env::var("CARGO_CFG_TARGET_OS").as_deref(), Ok("macos"));
++        assert_eq!(env::var("CARGO_CFG_TARGET_ARCH").as_deref(), Ok("aarch64"));
++        let package = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
++        let root = package.ancestors().nth(3).unwrap();
++        for path in [
++            package.join("metal"),
++            root.join("risc0/circuit/rv32im-sys/kernels"),
++            root.join("risc0/build_kernel/kernels/metal"),
++            package.join("src/zirgen/info.rs"),
++        ] {
++            println!("cargo:rerun-if-changed={}", path.display());
++        }
++        let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("rv32im.metal");
++        let result = Command::new("python3")
++            .arg(package.join("metal/generate.py"))
++            .arg("--engine")
++            .arg(root)
++            .arg("--output")
++            .arg(&output)
++            .output()
++            .unwrap();
++        assert!(
++            result.status.success(),
++            "RV32IM Metal generation failed: {}",
++            String::from_utf8_lossy(&result.stderr)
++        );
++        println!("cargo:rustc-env=RV32IM_METAL_SOURCE={}", output.display());
++    }
++}
+diff --git a/risc0/circuit/rv32im/metal/eval-check.metal b/risc0/circuit/rv32im/metal/eval-check.metal
+new file mode 100644
+--- /dev/null
++++ b/risc0/circuit/rv32im/metal/eval-check.metal
+@@ -0,0 +1,23 @@
++
++kernel void eval_check(device Fp* check,
++                      const device Fp* ctrl,
++                      const device Fp* data,
++                      const device Fp* accum,
++                      const device Fp* mix,
++                      const device Fp* out,
++                      const device FpExt* poly_mix,
++                      const device Fp* normalization,
++                      const device uint& po2,
++                      const device uint& domain,
++                      uint cycle [[thread_position_in_grid]]) {
++    if (cycle >= domain) return;
++    FpExt tot = poly_fp(cycle, domain, ctrl, out, data, mix, accum, poly_mix);
++    // The domain is 4 * steps: (3 * rou^cycle)^steps has period four.
++    // Host-generated factors are checked against the CPU's original per-cycle
++    // exponentiation for every output. Avoid that divergent power loop here.
++    FpExt ret = tot * normalization[cycle & 3u];
++    check[domain * 0 + cycle] = ret.elems[0];
++    check[domain * 1 + cycle] = ret.elems[1];
++    check[domain * 2 + cycle] = ret.elems[2];
++    check[domain * 3 + cycle] = ret.elems[3];
++}
+diff --git a/risc0/circuit/rv32im/metal/field-compat.metal b/risc0/circuit/rv32im/metal/field-compat.metal
+new file mode 100644
+--- /dev/null
++++ b/risc0/circuit/rv32im/metal/field-compat.metal
+@@ -0,0 +1,7 @@
++// The retained Metal FpExt header makes Fp promotion explicit. The generated
++// RV32IM polynomial uses the mixed addition/subtraction supported by CUDA.
++// Keep those promotions here, without rewriting generated arithmetic.
++constexpr inline FpExt operator+(Fp a, FpExt b) { return FpExt(a) + b; }
++constexpr inline FpExt operator-(Fp a, FpExt b) { return FpExt(a) - b; }
++constexpr inline FpExt operator+(FpExt a, Fp b) { return a + FpExt(b); }
++constexpr inline FpExt operator-(FpExt a, Fp b) { return a - FpExt(b); }
+diff --git a/risc0/circuit/rv32im/metal/generate.py b/risc0/circuit/rv32im/metal/generate.py
+new file mode 100644
+--- /dev/null
++++ b/risc0/circuit/rv32im/metal/generate.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++"""Translate the pinned RV32IM polynomial's address spaces, preserving its arithmetic."""
++import argparse
++import hashlib
++import json
++from pathlib import Path
++import re
++import subprocess
++
++
++def sha(path):
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def calls(body):
++    # Generated calls can span lines. Balance parentheses rather than matching
++    # an argument list with a regex; preserve all original arguments verbatim.
++    matches=list(re.finditer(r'\brv32im_v2_\d+\(',body))
++    for m in reversed(matches):
++        depth=1;end=m.end()
++        while depth:
++            if body[end]=='(':depth+=1
++            elif body[end]==')':depth-=1
++            end+=1
++        body=body[:end-1]+', poly_mix'+body[end-1:]
++    return body
++
++
++def normalize(body):
++    # Compare generated CUDA against the authoritative CPU oracle. These are
++    # spelling changes plus commutation of field products, not simplification
++    # of the circuit: both Fp and FpExt multiply in the same commutative field.
++    body=re.sub(r'//[^\n]*|/\*.*?\*/','',body,flags=re.S)
++    body=re.sub(r'\bcycle\b','idx',body)
++    body=re.sub(r'\bsteps\b','size',body)
++    body=body.replace('kInvRate','INV_RATE').replace('size_t mask','uint32_t mask')
++    body=re.sub(r'\b(?:constexpr\s+)?(?:FpExt|Fp|auto)\s+(x\d+)',r'var \1',body)
++    body=re.sub(r'\s+','',body).replace('idx,size,poly_mix,','idx,size,')
++    for i,name in [(0,'accum'),(1,'data'),(2,'out'),(3,'mix')]:body=body.replace(f'args[{i}]',name)
++    body=re.sub(r'(x\d+)\*(poly_mix\[\d+\])',r'\2*\1',body)
++    return body.replace('{','(').replace('}',')')
++
++
++def main():
++    parser=argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--engine',type=Path,required=True)
++    parser.add_argument('--output',type=Path,required=True)
++    args=parser.parse_args();engine=args.engine.resolve()
++    base=engine/'risc0/circuit/rv32im-sys/kernels/cuda'
++    chunks=sorted(base.glob('eval_check_[0-9].cu'))
++    assert len(chunks)==4
++    functions={};sources=[];cuda_bodies={}
++    for path in chunks:
++        sources.append(path)
++        text=path.read_text()
++        found=list(re.finditer(r'__device__ FpExt (rv32im_v2_\d+|poly_fp)\((.*?)\) \{(.*?)\n\}',text,re.S))
++        assert len(found)==text.count('__device__ FpExt '), 'generated function structure changed'
++        for m in found:
++            name,signature,body=m.groups()
++            cuda_bodies[name]=normalize(body)
++            structural=re.sub(r'FpExt x\d+\{[0-9, ]+\};','',body)
++            assert name not in functions and '{' not in structural and '}' not in structural
++            signature=re.sub(r'const Fp\*', 'const device Fp*',signature)
++            signature=re.sub(r'(?<!device )\b(Fp(?:Ext)?)\*',r'thread \1*',signature)
++            signature+=', const device FpExt* poly_mix'
++            prefix='__attribute__((noinline)) ' if name!='poly_fp' else ''
++            declaration=f'{prefix}FpExt {name}({signature})'
++            functions[name]=(declaration,calls(body))
++    assert set(functions)=={'poly_fp'}|{f'rv32im_v2_{i}' for i in range(20)}
++    cpu_bodies={}
++    for path in sorted((base.parent/'cxx').glob('rust_poly_fp_*.cpp')):
++        sources.append(path)
++        for m in re.finditer(r'FpExt (rv32im_v2_\d+|poly_fp)\([^;{]+?\) \{(.*?)\n\}',path.read_text(),re.S):
++            assert m[1] not in cpu_bodies
++            cpu_bodies[m[1]]=normalize(m[2])
++    assert cpu_bodies==cuda_bodies, 'CPU/CUDA polynomial differs beyond the reviewed spelling/field-product normalization'
++    source='// Derived from the pinned generated circuit; do not hand-edit arithmetic.\n'
++    for path in [engine/'risc0/build_kernel/kernels/metal'/name for name in ['fp.h','fpext.h']]:
++        sources.append(path)
++        source+=f'\n#line 1 "{path.name}"\n'
++        for line in path.read_text().splitlines():
++            if line.strip() in ['#pragma once','#include "fp.h"']:continue
++            assert not line.strip().startswith('#include "'),line
++            source+=line+'\n'
++    compat=Path(__file__).resolve().parent/'field-compat.metal'
++    source+=compat.read_text();sources.append(compat)
++    source+='\nusing namespace metal;\nconstant uint INV_RATE = 4;\n'
++    source+='\n'.join(d+';' for d,_ in functions.values())+'\n'
++    for name,(declaration,body) in functions.items():
++        source+=f'\n#line 1 "{name}.msl"\n{declaration} {{{body}\n}}\n'
++    wrapper=Path(__file__).resolve().parent/'eval-check.metal'
++    source+=wrapper.read_text();sources.append(wrapper)
++    info=engine/'risc0/circuit/rv32im/src/zirgen/info.rs';sources.append(info)
++    powers=re.search(r'pub const POLY_MIX_POWERS: &\[usize\] = &\[(.*?)\];',info.read_text(),re.S)
++    exponents=[int(x) for x in re.findall(r'\d+',powers[1])]
++    assert len(exponents)==458
++    args.output.parent.mkdir(parents=True,exist_ok=True)
++    args.output.write_text(source)
++    report={'engine_root':str(engine),
++        'generator_sha256':sha(Path(__file__)),'source_sha256':sha(args.output),
++        'source_files':{str(p):sha(p) for p in sources},'function_count':len(functions),
++        'poly_mix_exponents':exponents,
++        'cpu_cuda_normalized_body_sha256':{name:hashlib.sha256(body.encode()).hexdigest() for name,body in cuda_bodies.items()},
++        'translation':'thread/device pointer address spaces, explicit poly_mix argument, noinline function boundaries; original polynomial statements retained'}
++    args.output.with_suffix('.json').write_text(json.dumps(report,indent=2)+'\n')
++    print(json.dumps(report,indent=2))
++
++
++if __name__=='__main__':main()
+diff --git a/risc0/circuit/rv32im/src/prove/hal/metal.rs b/risc0/circuit/rv32im/src/prove/hal/metal.rs
+new file mode 100644
+--- /dev/null
++++ b/risc0/circuit/rv32im/src/prove/hal/metal.rs
+@@ -0,0 +1,316 @@
++//! Opt-in RV32IM prover using synchronous shared Metal buffers. CPU witness and
++//! accumulation retain the pinned routines and pre_data aliasing. A single
++//! proving thread owns the HAL for its lifetime, also sequencing recursion.
++use super::{
++    CircuitAccumulator, CircuitWitnessGenerator, MetaBuffer, SegmentProver, SegmentProverImpl,
++    StepMode,
++};
++use crate::{
++    prove::{witgen::preflight::PreflightTrace, GLOBAL_MIX, GLOBAL_OUT},
++    zirgen::{
++        circuit::{ExtVal, Val, REGISTER_GROUP_ACCUM, REGISTER_GROUP_CODE, REGISTER_GROUP_DATA},
++        info::POLY_MIX_POWERS,
++        taps::TAPSET,
++        CircuitImpl,
++    },
++};
++use anyhow::{ensure, Result};
++use metal::{CompileOptions, ComputePipelineDescriptor, MTLSize};
++use rayon::prelude::*;
++use risc0_circuit_rv32im_sys::{
++    risc0_circuit_rv32im_cpu_accum, risc0_circuit_rv32im_cpu_poly_fp,
++    risc0_circuit_rv32im_cpu_witgen, RawAccumBuffers, RawBuffer, RawExecBuffers, RawPreflightTrace,
++};
++use risc0_core::scope;
++use risc0_sys::ffi_wrap;
++use risc0_zkp::{
++    adapter::CircuitInfo,
++    field::{map_pow, Elem, ExtElem as _, RootsOfUnity},
++    hal::{
++        metal::{BufferImpl, KernelArg, MetalHalPoseidon2},
++        AccumPreflight, Buffer, CircuitHal, Hal,
++    },
++    INV_RATE,
++};
++use std::{
++    cell::RefCell,
++    sync::{
++        atomic::{AtomicU64, Ordering},
++        Arc, Weak,
++    },
++};
++
++const SOURCE: &str = include_str!(env!("RV32IM_METAL_SOURCE"));
++static CPU_CHECKS: AtomicU64 = AtomicU64::new(0);
++static CHECKS: AtomicU64 = AtomicU64::new(0);
++static POINTS: AtomicU64 = AtomicU64::new(0);
++static WITNESS_CALLS: AtomicU64 = AtomicU64::new(0);
++static ACCUM_CALLS: AtomicU64 = AtomicU64::new(0);
++thread_local! { static HALS: RefCell<Vec<Weak<MetalHalPoseidon2>>> = const { RefCell::new(Vec::new()) }; }
++
++#[derive(Clone, Copy, Debug, serde::Serialize)]
++pub struct MetalRv32imStats {
++    pub completed_constraint_checks: u64,
++    pub evaluation_points: u64,
++    pub completed_dispatches: u64,
++    pub cpu_witness_calls: u64,
++    pub cpu_differential_checks: u64,
++    pub cpu_accumulation_calls: u64,
++}
++pub fn metal_rv32im_stats() -> MetalRv32imStats {
++    MetalRv32imStats {
++        completed_constraint_checks: CHECKS.load(Ordering::Relaxed),
++        cpu_differential_checks: CPU_CHECKS.load(Ordering::Relaxed),
++        evaluation_points: POINTS.load(Ordering::Relaxed),
++        cpu_witness_calls: WITNESS_CALLS.load(Ordering::Relaxed),
++        cpu_accumulation_calls: ACCUM_CALLS.load(Ordering::Relaxed),
++        completed_dispatches: HALS.with(|hals| {
++            hals.borrow()
++                .iter()
++                .filter_map(Weak::upgrade)
++                .map(|h| h.completed_dispatches())
++                .sum()
++        }),
++    }
++}
++pub fn metal_rv32im_kernel_source() -> &'static str {
++    SOURCE
++}
++
++struct MetalCircuitHal {
++    hal: Arc<MetalHalPoseidon2>,
++    kernel: ComputePipelineDescriptor,
++}
++impl MetalCircuitHal {
++    fn new(hal: Arc<MetalHalPoseidon2>) -> Result<Self> {
++        let started = std::time::Instant::now();
++        let options = CompileOptions::new();
++        options.set_fast_math_enabled(false);
++        let library = hal
++            .device
++            .new_library_with_source(SOURCE, &options)
++            .map_err(|e| anyhow::anyhow!("RV32IM Metal compilation failed: {e}"))?;
++        let function = library
++            .get_function("eval_check", None)
++            .map_err(|e| anyhow::anyhow!(e))?;
++        let kernel = ComputePipelineDescriptor::new();
++        kernel.set_compute_function(Some(&function));
++        hal.device
++            .new_compute_pipeline_state_with_function(&function)
++            .map_err(|e| anyhow::anyhow!(e))?;
++        HALS.with(|hals| hals.borrow_mut().push(Arc::downgrade(&hal)));
++        tracing::info!(
++            seconds = started.elapsed().as_secs_f64(),
++            "RV32IM Metal evaluator compiled"
++        );
++        Ok(Self { hal, kernel })
++    }
++}
++
++// StorageModeShared and synchronous command completion precede CPU writes.
++// Pass mapped raw pointers directly: do not create shared Rust slices around
++// memory the C++ witness/accumulation routines are allowed to mutate.
++fn raw(buffer: &MetaBuffer<MetalHalPoseidon2>) -> RawBuffer {
++    assert_eq!(
++        buffer.buf.size(),
++        buffer.rows.checked_mul(buffer.cols).unwrap()
++    );
++    RawBuffer {
++        buf: buffer.buf.as_ptr().cast::<Val>(),
++        rows: buffer.rows,
++        cols: buffer.cols,
++        checked: buffer.checked,
++    }
++}
++fn raw_trace(trace: &PreflightTrace) -> RawPreflightTrace {
++    RawPreflightTrace {
++        cycles: trace.cycles.as_ptr(),
++        txns: trace.txns.as_ptr(),
++        bigint_bytes: trace.bigint_bytes.as_ptr(),
++        txns_len: trace.txns.len().try_into().unwrap(),
++        bigint_bytes_len: trace.bigint_bytes.len().try_into().unwrap(),
++        table_split_cycle: trace.table_split_cycle,
++    }
++}
++impl CircuitWitnessGenerator<MetalHalPoseidon2> for MetalCircuitHal {
++    fn generate_witness(
++        &self,
++        mode: StepMode,
++        preflight: &PreflightTrace,
++        global: &MetaBuffer<MetalHalPoseidon2>,
++        data: &MetaBuffer<MetalHalPoseidon2>,
++        _pre_data: &MetaBuffer<MetalHalPoseidon2>,
++    ) -> Result<()> {
++        scope!("cpu_shared_witgen");
++        let mut pre_data = raw(data);
++        pre_data.checked = false;
++        let buffers = RawExecBuffers {
++            global: raw(global),
++            data: raw(data),
++            pre_data,
++        };
++        let trace = raw_trace(preflight);
++        ffi_wrap(|| unsafe {
++            risc0_circuit_rv32im_cpu_witgen(
++                mode as u32,
++                &buffers,
++                &trace,
++                preflight.cycles.len().try_into().unwrap(),
++            )
++        })?;
++        WITNESS_CALLS.fetch_add(1, Ordering::Relaxed);
++        Ok(())
++    }
++}
++impl CircuitAccumulator<MetalHalPoseidon2> for MetalCircuitHal {
++    fn step_accum(
++        &self,
++        preflight: &PreflightTrace,
++        data: &MetaBuffer<MetalHalPoseidon2>,
++        accum: &MetaBuffer<MetalHalPoseidon2>,
++        global: &MetaBuffer<MetalHalPoseidon2>,
++        mix: &MetaBuffer<MetalHalPoseidon2>,
++    ) -> Result<()> {
++        scope!("cpu_shared_accumulate");
++        let buffers = RawAccumBuffers {
++            data: raw(data),
++            accum: raw(accum),
++            global: raw(global),
++            mix: raw(mix),
++        };
++        let trace = raw_trace(preflight);
++        ffi_wrap(|| unsafe {
++            risc0_circuit_rv32im_cpu_accum(
++                &buffers,
++                &trace,
++                preflight.cycles.len().try_into().unwrap(),
++            )
++        })?;
++        ACCUM_CALLS.fetch_add(1, Ordering::Relaxed);
++        Ok(())
++    }
++}
++
++impl CircuitHal<MetalHalPoseidon2> for MetalCircuitHal {
++    fn eval_check(
++        &self,
++        check: &BufferImpl<Val>,
++        groups: &[&BufferImpl<Val>],
++        globals: &[&BufferImpl<Val>],
++        poly_mix: ExtVal,
++        po2: usize,
++        steps: usize,
++    ) {
++        assert!((14..=20).contains(&po2), "RV32IM Metal supports po2 14..20");
++        assert_eq!(steps, 1usize << po2);
++        assert_eq!(INV_RATE, 4);
++        let domain = steps.checked_mul(INV_RATE).unwrap();
++        assert_eq!(check.size(), domain * 4);
++        for group in [
++            REGISTER_GROUP_CODE,
++            REGISTER_GROUP_DATA,
++            REGISTER_GROUP_ACCUM,
++        ] {
++            assert_eq!(groups[group].size(), domain * TAPSET.group_size(group));
++        }
++        assert_eq!(globals[GLOBAL_OUT].size(), CircuitImpl::OUTPUT_SIZE);
++        assert_eq!(globals[GLOBAL_MIX].size(), CircuitImpl::MIX_SIZE);
++        let powers = self
++            .hal
++            .copy_from_extelem("rv32im_poly_mix", &map_pow(poly_mix, POLY_MIX_POWERS));
++        let rou = Val::ROU_FWD[po2 + 2];
++        let normalization: Vec<_> = (0..4)
++            .map(|cycle| {
++                let x = rou.pow(cycle);
++                ((Val::new(3) * x).pow(steps) - Val::ONE).inv()
++            })
++            .collect();
++        let factors = self
++            .hal
++            .copy_from_elem("rv32im_normalization", &normalization);
++        // The reported maximum of 1024 threads exhausts private/spill backing.
++        // Keep the independently validated 32-thread configuration and await
++        // completion before CPU access, input release or the next segment.
++        self.hal.dispatch(
++            &self.kernel,
++            &[
++                check.as_arg(),
++                groups[REGISTER_GROUP_CODE].as_arg(),
++                groups[REGISTER_GROUP_DATA].as_arg(),
++                groups[REGISTER_GROUP_ACCUM].as_arg(),
++                globals[GLOBAL_MIX].as_arg(),
++                globals[GLOBAL_OUT].as_arg(),
++                powers.as_arg(),
++                factors.as_arg(),
++                KernelArg::Integer(po2 as u32),
++                KernelArg::Integer(domain as u32),
++            ],
++            domain as u64,
++            Some((
++                MTLSize::new((domain / 32) as u64, 1, 1),
++                MTLSize::new(32, 1, 1),
++            )),
++        );
++        if std::env::var("RISC0_RV32IM_METAL_CHECK_CPU").as_deref() == Ok("1") {
++            // All GPU writes completed above. The shared buffers remain alive
++            // and immutable throughout these CPU oracle reads; no extra trace
++            // copies or second HAL are needed.
++            let view = |buffer: &BufferImpl<Val>| unsafe {
++                std::slice::from_raw_parts(buffer.as_ptr().cast::<Val>(), buffer.size())
++            };
++            let data = view(groups[REGISTER_GROUP_DATA]);
++            let accum = view(groups[REGISTER_GROUP_ACCUM]);
++            let mix = view(globals[GLOBAL_MIX]);
++            let out = view(globals[GLOBAL_OUT]);
++            let actual = view(check);
++            let pows = map_pow(poly_mix, POLY_MIX_POWERS);
++            (0..domain).into_par_iter().for_each(|cycle| {
++                let args = [accum.as_ptr(), data.as_ptr(), out.as_ptr(), mix.as_ptr()];
++                let mut total = ExtVal::ZERO;
++                ffi_wrap(|| unsafe { risc0_circuit_rv32im_cpu_poly_fp(cycle, domain,
++                    pows.as_ptr(), args.as_ptr(), &mut total) }).expect("CPU constraint oracle failed");
++                let x = rou.pow(cycle);
++                let y = (Val::new(3) * x).pow(steps);
++                let expected = total * (y - Val::ONE).inv();
++                for component in 0..4 {
++                    assert_eq!(actual[component * domain + cycle], expected.elems()[component],
++                        "RV32IM Metal differs from CPU: po2={po2}, cycle={cycle}, component={component}");
++                }
++            });
++            CPU_CHECKS.fetch_add(1, Ordering::Relaxed);
++            tracing::info!(
++                po2,
++                domain,
++                "RV32IM Metal valid-witness CPU differential passed"
++            );
++        }
++        CHECKS.fetch_add(1, Ordering::Relaxed);
++        POINTS.fetch_add(domain as u64, Ordering::Relaxed);
++        tracing::info!(po2, domain, "RV32IM Metal constraint check completed");
++    }
++    fn accumulate(
++        &self,
++        _: &AccumPreflight,
++        _: &BufferImpl<Val>,
++        _: &BufferImpl<Val>,
++        _: &BufferImpl<Val>,
++        _: &BufferImpl<Val>,
++        _: &BufferImpl<Val>,
++        _: usize,
++    ) {
++        unreachable!("RV32IM uses CircuitAccumulator");
++    }
++}
++
++pub(crate) fn segment_prover() -> Result<Box<dyn SegmentProver>> {
++    metal::objc::rc::autoreleasepool(|| {
++        let hal = Arc::new(MetalHalPoseidon2::new());
++        ensure!(
++            hal.device.has_unified_memory(),
++            "RV32IM Metal requires unified memory"
++        );
++        let circuit = Arc::new(MetalCircuitHal::new(hal.clone())?);
++        let factory = move || (hal.clone(), circuit.clone());
++        Ok(Box::new(SegmentProverImpl::new(factory)) as Box<dyn SegmentProver>)
++    })
++}

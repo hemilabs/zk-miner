@@ -412,6 +412,19 @@ pub fn risc0_job_throughput(row: &DeviceBenchmark, po2: u8) -> f64 {
 }
 
 impl DeviceBenchmark {
+    /// Fixed identity/wrap plus cycle-scaled segment and recursion cost. Refuse
+    /// tiny-only calibration: its fixed overhead is not a large-job rate.
+    pub fn measured_risc0_seconds(&self, cycles: u64) -> Option<f64> {
+        if self.prover_backend != "risc0" || cycles == 0
+            || !self.program_stages.iter().any(|s| s.cycles >= 10_000_000) {
+            return None;
+        }
+        let rate = self.stark_rate()?;
+        let fixed = self.wrap_secs()?;
+        let seconds = fixed + cycles as f64 / rate;
+        (rate.is_finite() && rate > 0.0 && fixed.is_finite() && fixed >= 0.0
+            && seconds.is_finite() && seconds > 0.0).then_some(seconds)
+    }
     /// This device's STARK proving rate weighted by cycles: total cycles over total STARK seconds
     /// across the programs in `program_stages`, or `None` without any.
     ///
@@ -1699,7 +1712,10 @@ fn build_gpu_device_benchmarks_from_workers(
     let mut benchmarks = Vec::new();
 
     for r in worker_results {
-        if r.entries.is_empty() || r.gpu_tag == "generic" {
+        let native_cpu = cfg!(target_os = "macos") && r.gpu_tag == "generic"
+            && r.entries.first().is_some_and(|e| e.prover_backend == "risc0")
+            && std::env::var("ZKMINER_RISC0_WRAP").as_deref() == Ok("native");
+        if r.entries.is_empty() || (r.gpu_tag == "generic" && !native_cpu) {
             continue;
         }
 
@@ -1707,11 +1723,18 @@ fn build_gpu_device_benchmarks_from_workers(
         // Tag-qualified: `device_index` is sequential WITHIN a vendor, so a cuda
         // card and a rocm card both carry index 0 and the bare `gpu{idx}` form
         // made them collide onto one row. Must match `WorkerPool::benchmark_device_id`.
-        let device_id = crate::dispatcher::WorkerPool::gpu_device_id(&r.gpu_tag, &idx.to_string());
-        let device_label = match &r.gpu_name {
+        let device_id = if native_cpu { CPU_DEVICE_ID.into() }
+            else { crate::dispatcher::WorkerPool::gpu_device_id(&r.gpu_tag, &idx.to_string()) };
+        let device_label = if native_cpu {
+            if std::env::var("RISC0_RECURSION_HAL").as_deref() == Ok("metal") {
+                "Native Mac CPU + Metal recursion".to_string()
+            } else {
+                "Native Mac CPU".to_string()
+            }
+        } else { match &r.gpu_name {
             Some(name) => format!("GPU{idx} {name}"),
             None => format!("GPU{idx} ({})", r.gpu_tag),
-        };
+        }};
         let slot_key = &r.slot_key;
         let entries = &r.entries;
         let vram_bytes = r.vram_bytes;
@@ -1770,6 +1793,7 @@ fn build_gpu_device_benchmarks_from_workers(
         // "not VRAM-derived — do NOT trust max_feasible_po2". Any future po2
         // calibration must gate on that before raising a device's segment size.
         let (optimal_po2, memory_usage_bytes) = match vram_bytes {
+            _ if native_cpu => (20, 0),
             Some(vram) if vram > 0 => find_optimal_po2(vram, backend, true),
             _ => {
                 tracing::warn!(
@@ -1788,6 +1812,7 @@ fn build_gpu_device_benchmarks_from_workers(
         // disagreeing about the same file.
         let measured = per_card_watts.get(&pci_bus_id).copied();
         let power_watts = match measured {
+            _ if native_cpu => 0.0, // No separate proving card; host CPU draw is counted separately.
             Some(w) if w >= MIN_PLAUSIBLE_GPU_WATTS => w,
             Some(w) => {
                 tracing::warn!(
@@ -3998,6 +4023,7 @@ mod tests {
         let mut rows =
             build_gpu_device_benchmarks_from_workers(&[gpu_slot(Some(24 << 30))], &BTreeMap::new());
         let d = &mut rows[0];
+        assert_eq!(d.measured_risc0_seconds(10_000_000), None);
         let stage = |name: &str, cycles: u64, stark: f64, wrap: f64| ProgramStage {
             program_name: name.to_string(),
             cycles,
@@ -4019,6 +4045,11 @@ mod tests {
         );
         // Predict sha256-chain end to end and compare with what was measured (35.82 + 2.02 s).
         let predicted = d.wrap_secs().unwrap() + 46_137_344.0 / rate;
+        assert_eq!(d.measured_risc0_seconds(46_137_344), Some(predicted));
+        // Fixed wrapping remains even for a one-cycle request; it must not be
+        // amortized into a throughput that predicts a nearly free tiny proof.
+        assert!(d.measured_risc0_seconds(1).unwrap() >= 2.02);
+        assert_eq!(d.measured_risc0_seconds(0), None);
         let measured = 35.82 + 2.02;
         assert!(
             (predicted - measured).abs() / measured < 0.05,

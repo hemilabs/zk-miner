@@ -1,0 +1,1406 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "source_spec_sha256": "a7ab34ce1697757bcb73622aebe0b503d42b38e3a601942f76e90fd5744f581c",
+  "engine_commit": "6521f87c2daf873c54d011a33d48fee8097db924",
+  "candidate_worker_sha256": "625589c35f6583bfaf4510a00d6f98dceb781b004064500ce38b44b42d659be7",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "collector_sha256": "6773792432c0e1453847428ab8c439562dbe2476d11946d1efda3324b8d2daf0",
+  "paired_evidence_sha256": "e99369c87a9267014089fc145467e3cdac73448e5b17a40943b6e607f499110e",
+  "differentials": {
+    "14": {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/002dd9c881134382a48511be7d871d76",
+      "result_sha256": "4e46774f6f20597ee1858d8448b93ff99d164a4bfccc41944f0e28db7fb1641a",
+      "log_sha256": "ad4af1804c775a1e04f63ddbe3e8136d55cacb69fcf83666d10c2b7d8438bb2f",
+      "worker_sidecar_sha256": "f664bca36faff612fe8f84bb01f3a70d12ba2fad6cf76add6730e6fdbf4ae71d",
+      "verification_sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1",
+      "segments": 22,
+      "cpu_differential_checks": 22
+    },
+    "18": {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/cde4d0748a32434d9286ec3a67a23dd5",
+      "result_sha256": "a70912f6de7e0c95d8fcd187915f6404057d0bd52f60ddcafc8f20723c02189b",
+      "log_sha256": "80fdf2b1c265325b522fb084e6b6d281642c68768dab13f561f4ce99e7655777",
+      "worker_sidecar_sha256": "a4c7970a342b0061ee362eb97afb0e61737a20035d9e720eff53ba3474026be5",
+      "verification_sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1",
+      "segments": 1,
+      "cpu_differential_checks": 1
+    },
+    "20": {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/6c1a97de1cbc451b82e6f1050a594b2d",
+      "result_sha256": "287c3f94f15d75e602ab5db58544cdb6e6c80faa22f0a669a22c61e7339eec19",
+      "log_sha256": "f0844e08f03a6e31fb0009f82f53c09e4cfc49ec1524b19e6c8e839b46841c4c",
+      "worker_sidecar_sha256": "d08b62636a3c463ff69c05d4d710aa82c4cd8d34e3e4836d8626134ad71d4431",
+      "verification_sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1",
+      "segments": 1,
+      "cpu_differential_checks": 1
+    }
+  },
+  "lifecycle": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/987676fbf1684f7abf96e51a22dac616",
+    "result_sha256": "687f2e43345cc421128cf047126997e1c00f98720987281e330d66755c98a513",
+    "log_sha256": "15b7bc42d3eb988636758b7a79f8693a2599f57913c201907ff5b658c0fbd3cd",
+    "verified_proofs": 21,
+    "tamper_rejections": 63,
+    "idle_first_bytes": 4722168104,
+    "idle_after_request_20_bytes": 3878964992,
+    "idle_drift_fraction": -0.17856270539918923,
+    "idle_growth_at_most_5_percent": true,
+    "cancellations": {
+      "helper-cancel": {
+        "ledger_event": {
+          "case": "helper-cancel",
+          "error": "Worker risc0 process died (EOF)",
+          "observed_running_helper": {
+            "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-64538-1793988055949412000-3",
+            "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+            "input_sha256": "226868b59be3e5e479cc22d7bda11055bad06bb205b77454ea36c65885f5c284",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "metal",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "metal_shared_buffers",
+              "recursion": "metal",
+              "recursion_metal": {
+                "completed_constraint_checks": 43,
+                "cpu_differential_checks": 0,
+                "cpu_stages": [
+                  "witness",
+                  "accumulation"
+                ],
+                "eval_check_split": true,
+                "evaluation_points": 45088768,
+                "gpu_kernels": {
+                  "recursion/batch_eval_u": {
+                    "command_buffers": 43,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 0.37804658099999994,
+                    "gpu_seconds": 0.3679334186017513,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "recursion/batch_expand": {
+                    "command_buffers": 0,
+                    "commands": 172,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0004976699999999999,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/batch_expand_bitrev": {
+                    "command_buffers": 0,
+                    "commands": 88,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000148123,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/batch_merkle": {
+                    "command_buffers": 260,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 2.4361850540000005,
+                    "gpu_seconds": 2.2239748630672693,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "recursion/batch_mix_poly": {
+                    "command_buffers": 43,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 0.13896533400000002,
+                    "gpu_seconds": 0.10103229247033596,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "recursion/batch_recursion_eval_check_split": {
+                    "command_buffers": 43,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 2.55730037,
+                    "gpu_seconds": 2.5337486285716295,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "recursion/batch_transforms": {
+                    "command_buffers": 303,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 2.8677959900000025,
+                    "gpu_seconds": 1.8368667662143707,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "recursion/eltwise_copy_fp": {
+                    "command_buffers": 0,
+                    "commands": 88,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0012167529999999997,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eltwise_mul_factor_fp": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 8.932800000000001e-05,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eltwise_sum_fpext": {
+                    "command_buffers": 43,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.051974083,
+                    "gpu_seconds": 0.007570493966341019,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000368547,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eval_check_part0": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00044854600000000013,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eval_check_part1": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0001831639999999999,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eval_check_part2": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00011746000000000004,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eval_check_part3": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00011807599999999996,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eval_check_part4": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00015299599999999997,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eval_check_part5": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000181957,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/fri_fold": {
+                    "command_buffers": 129,
+                    "commands": 129,
+                    "dispatch_wall_seconds": 0.02967250500000002,
+                    "gpu_seconds": 0.005403975024819374,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0003676650000000001,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/mix_poly_coeffs": {
+                    "command_buffers": 0,
+                    "commands": 172,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00021882599999999995,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/multi_bit_reverse": {
+                    "command_buffers": 129,
+                    "commands": 129,
+                    "dispatch_wall_seconds": 0.031177668999999988,
+                    "gpu_seconds": 0.005625208839774132,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0007847959999999999,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/multi_ntt_fwd_step": {
+                    "command_buffers": 0,
+                    "commands": 1564,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000321826,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/multi_ntt_fwd_tile": {
+                    "command_buffers": 0,
+                    "commands": 260,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0004285029999999999,
+                    "static_threadgroup_memory_length": 16384,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/multi_ntt_rev_step": {
+                    "command_buffers": 0,
+                    "commands": 872,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0005572460000000001,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/multi_ntt_rev_tile": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00010666600000000004,
+                    "static_threadgroup_memory_length": 16384,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/multi_ntt_rev_tile_commit": {
+                    "command_buffers": 0,
+                    "commands": 88,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00016700100000000004,
+                    "static_threadgroup_memory_length": 16384,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/multi_poly_eval": {
+                    "command_buffers": 43,
+                    "commands": 172,
+                    "dispatch_wall_seconds": 0.040055081000000006,
+                    "gpu_seconds": 0.02993837185204029,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000328747,
+                    "static_threadgroup_memory_length": 4096,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/poseidon2_fold": {
+                    "command_buffers": 0,
+                    "commands": 4168,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0004503690000000002,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/poseidon2_rows": {
+                    "command_buffers": 0,
+                    "commands": 260,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0014251659999999998,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  }
+                },
+                "kernel_source_sha256": "f72900511d2804d1519b4bc860f2d3a123677272fa48ba08c2080806771e7de5"
+              },
+              "rv32im_metal": {
+                "completed_command_buffers": 486,
+                "completed_constraint_checks": 22,
+                "completed_dispatches": 2909,
+                "cpu_accumulation_calls": 22,
+                "cpu_differential_checks": 0,
+                "cpu_stages": [
+                  "witness",
+                  "accumulation",
+                  "scatter",
+                  "prefix_products",
+                  "zeroize"
+                ],
+                "cpu_witness_calls": 22,
+                "evalfast_phase_split": true,
+                "evaluation_points": 1441792,
+                "gpu_kernels": {
+                  "segment/batch_eval_u": {
+                    "command_buffers": 22,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 0.020162919,
+                    "gpu_seconds": 0.016752000898122787,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "segment/batch_expand": {
+                    "command_buffers": 0,
+                    "commands": 66,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0004786689999999999,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/batch_expand_bitrev": {
+                    "command_buffers": 0,
+                    "commands": 45,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 8.729400000000002e-05,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/batch_merkle": {
+                    "command_buffers": 111,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 0.30266367000000005,
+                    "gpu_seconds": 0.2713578324764967,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "segment/batch_mix_poly": {
+                    "command_buffers": 22,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 0.018699544,
+                    "gpu_seconds": 0.014772210270166395,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "segment/batch_rv32im_eval_check": {
+                    "command_buffers": 22,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 0.5788679990000001,
+                    "gpu_seconds": 0.4089041668921709,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "segment/batch_transforms": {
+                    "command_buffers": 133,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 0.45988483999999974,
+                    "gpu_seconds": 0.26797207444906235,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "segment/ef_combine": {
+                    "command_buffers": 0,
+                    "commands": 22,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 3.2251e-05,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/ef_eval_split": {
+                    "command_buffers": 0,
+                    "commands": 22,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 3.996000000000001e-05,
+                    "static_threadgroup_memory_length": 32768,
+                    "thread_execution_width": 32
+                  },
+                  "segment/ef_prep": {
+                    "command_buffers": 0,
+                    "commands": 22,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 5.7e-05,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/eltwise_copy_fp": {
+                    "command_buffers": 22,
+                    "commands": 67,
+                    "dispatch_wall_seconds": 0.004205830999999999,
+                    "gpu_seconds": 4.9622729420661926e-05,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000488457,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/eltwise_mul_factor_fp": {
+                    "command_buffers": 0,
+                    "commands": 22,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 7.5294e-05,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/eltwise_sum_fpext": {
+                    "command_buffers": 22,
+                    "commands": 22,
+                    "dispatch_wall_seconds": 0.010349916999999998,
+                    "gpu_seconds": 0.0004285406321287155,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000191333,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/fri_fold": {
+                    "command_buffers": 44,
+                    "commands": 44,
+                    "dispatch_wall_seconds": 0.010982998000000002,
+                    "gpu_seconds": 0.0015550460666418076,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00019562699999999995,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/mix_poly_coeffs": {
+                    "command_buffers": 0,
+                    "commands": 88,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00015066699999999997,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/multi_bit_reverse": {
+                    "command_buffers": 66,
+                    "commands": 66,
+                    "dispatch_wall_seconds": 0.015679538,
+                    "gpu_seconds": 0.0003906227648258209,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0004319520000000001,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/multi_ntt_fwd_step": {
+                    "command_buffers": 0,
+                    "commands": 356,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000172838,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/multi_ntt_fwd_tile": {
+                    "command_buffers": 0,
+                    "commands": 111,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00022950499999999983,
+                    "static_threadgroup_memory_length": 16384,
+                    "thread_execution_width": 32
+                  },
+                  "segment/multi_ntt_rev_step": {
+                    "command_buffers": 0,
+                    "commands": 178,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00018995999999999992,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/multi_ntt_rev_tile": {
+                    "command_buffers": 0,
+                    "commands": 22,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000115499,
+                    "static_threadgroup_memory_length": 16384,
+                    "thread_execution_width": 32
+                  },
+                  "segment/multi_ntt_rev_tile_commit": {
+                    "command_buffers": 0,
+                    "commands": 45,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 9.141600000000002e-05,
+                    "static_threadgroup_memory_length": 16384,
+                    "thread_execution_width": 32
+                  },
+                  "segment/multi_poly_eval": {
+                    "command_buffers": 22,
+                    "commands": 88,
+                    "dispatch_wall_seconds": 0.004349539999999999,
+                    "gpu_seconds": 0.0012162476778030396,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0003306670000000001,
+                    "static_threadgroup_memory_length": 4096,
+                    "thread_execution_width": 32
+                  },
+                  "segment/poseidon2_fold": {
+                    "command_buffers": 0,
+                    "commands": 1512,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0002609600000000001,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/poseidon2_rows": {
+                    "command_buffers": 0,
+                    "commands": 111,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0005934569999999999,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  }
+                },
+                "hal_kernel_source_sha256": "5e67b4f14a729158796d2af2534ba45092e52683bd8b090dd6f50305db1d8b1e",
+                "kernel_source_sha256": "7439b9c48fe7287c7f25f809c60bf230e370d4cc4ad039559db7298d84cd040c",
+                "normalization": "period_four_table",
+                "threads_per_threadgroup": 256
+              },
+              "segment": "metal"
+            },
+            "operation": "prove",
+            "phase": "wrapping",
+            "po2": 14,
+            "proof_kind": "succinct",
+            "rayon_threads": 18,
+            "recursion_cpu_stages": [
+              "witness",
+              "accumulation",
+              "identity_p254"
+            ],
+            "recursion_hal": "metal",
+            "request_id": 21,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "segment_hal": "metal",
+            "stage_ms": {
+              "execution_and_segment": 1214.058625,
+              "recursion": 12516.576333
+            },
+            "staging_limit_bytes": null,
+            "stats": {
+              "paging_cycles": 94215,
+              "reserved_cycles": 140156,
+              "segments": 22,
+              "total_cycles": 360448,
+              "user_cycles": 126077
+            },
+            "total_ms": 13914.843416,
+            "worker_pid": 72532
+          },
+          "status": "expected_failure"
+        },
+        "worker_group_gone": true,
+        "no_owned_helper_after": true
+      },
+      "helper-timeout": {
+        "ledger_event": {
+          "case": "helper-timeout",
+          "elapsed_seconds": 33.336873791,
+          "error": "Worker risc0 process died (EOF)",
+          "observed_running_helper": {
+            "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-64538-1793988076040155000-4",
+            "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+            "input_sha256": "226868b59be3e5e479cc22d7bda11055bad06bb205b77454ea36c65885f5c284",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "metal",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "metal_shared_buffers",
+              "recursion": "metal",
+              "recursion_metal": {
+                "completed_constraint_checks": 43,
+                "cpu_differential_checks": 0,
+                "cpu_stages": [
+                  "witness",
+                  "accumulation"
+                ],
+                "eval_check_split": true,
+                "evaluation_points": 45088768,
+                "gpu_kernels": {
+                  "recursion/batch_eval_u": {
+                    "command_buffers": 43,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 0.3777742929999998,
+                    "gpu_seconds": 0.3679027110338211,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "recursion/batch_expand": {
+                    "command_buffers": 0,
+                    "commands": 172,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00044745800000000024,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/batch_expand_bitrev": {
+                    "command_buffers": 0,
+                    "commands": 88,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00014329000000000005,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/batch_merkle": {
+                    "command_buffers": 260,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 2.4326517000000005,
+                    "gpu_seconds": 2.2232357393950224,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "recursion/batch_mix_poly": {
+                    "command_buffers": 43,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 0.138948416,
+                    "gpu_seconds": 0.1011094655841589,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "recursion/batch_recursion_eval_check_split": {
+                    "command_buffers": 43,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 2.570380329999999,
+                    "gpu_seconds": 2.5468255821615458,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "recursion/batch_transforms": {
+                    "command_buffers": 303,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 2.866713168000002,
+                    "gpu_seconds": 1.838203618302941,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "recursion/eltwise_copy_fp": {
+                    "command_buffers": 0,
+                    "commands": 88,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.001051173,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eltwise_mul_factor_fp": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 8.608200000000002e-05,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eltwise_sum_fpext": {
+                    "command_buffers": 43,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.053425835,
+                    "gpu_seconds": 0.008131951093673706,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00030396099999999994,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eval_check_part0": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0003749979999999998,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eval_check_part1": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00015816599999999995,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eval_check_part2": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00011408500000000004,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eval_check_part3": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000117504,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eval_check_part4": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00015612999999999988,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/eval_check_part5": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00017570499999999996,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/fri_fold": {
+                    "command_buffers": 129,
+                    "commands": 129,
+                    "dispatch_wall_seconds": 0.029351714000000004,
+                    "gpu_seconds": 0.005397414788603783,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0003757030000000002,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/mix_poly_coeffs": {
+                    "command_buffers": 0,
+                    "commands": 172,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000166916,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/multi_bit_reverse": {
+                    "command_buffers": 129,
+                    "commands": 129,
+                    "dispatch_wall_seconds": 0.03181791399999999,
+                    "gpu_seconds": 0.005630526691675186,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0007025390000000002,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/multi_ntt_fwd_step": {
+                    "command_buffers": 0,
+                    "commands": 1564,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00031165999999999985,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/multi_ntt_fwd_tile": {
+                    "command_buffers": 0,
+                    "commands": 260,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0004164590000000004,
+                    "static_threadgroup_memory_length": 16384,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/multi_ntt_rev_step": {
+                    "command_buffers": 0,
+                    "commands": 872,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0004465810000000001,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/multi_ntt_rev_tile": {
+                    "command_buffers": 0,
+                    "commands": 43,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00014216299999999995,
+                    "static_threadgroup_memory_length": 16384,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/multi_ntt_rev_tile_commit": {
+                    "command_buffers": 0,
+                    "commands": 88,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000162748,
+                    "static_threadgroup_memory_length": 16384,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/multi_poly_eval": {
+                    "command_buffers": 43,
+                    "commands": 172,
+                    "dispatch_wall_seconds": 0.039315290999999995,
+                    "gpu_seconds": 0.02989904209971428,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000191624,
+                    "static_threadgroup_memory_length": 4096,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/poseidon2_fold": {
+                    "command_buffers": 0,
+                    "commands": 4168,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0004532800000000004,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "recursion/poseidon2_rows": {
+                    "command_buffers": 0,
+                    "commands": 260,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0012430000000000006,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  }
+                },
+                "kernel_source_sha256": "f72900511d2804d1519b4bc860f2d3a123677272fa48ba08c2080806771e7de5"
+              },
+              "rv32im_metal": {
+                "completed_command_buffers": 486,
+                "completed_constraint_checks": 22,
+                "completed_dispatches": 2909,
+                "cpu_accumulation_calls": 22,
+                "cpu_differential_checks": 0,
+                "cpu_stages": [
+                  "witness",
+                  "accumulation",
+                  "scatter",
+                  "prefix_products",
+                  "zeroize"
+                ],
+                "cpu_witness_calls": 22,
+                "evalfast_phase_split": true,
+                "evaluation_points": 1441792,
+                "gpu_kernels": {
+                  "segment/batch_eval_u": {
+                    "command_buffers": 22,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 0.020294249,
+                    "gpu_seconds": 0.01674146018922329,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "segment/batch_expand": {
+                    "command_buffers": 0,
+                    "commands": 66,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000404498,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/batch_expand_bitrev": {
+                    "command_buffers": 0,
+                    "commands": 45,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 8.787399999999999e-05,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/batch_merkle": {
+                    "command_buffers": 111,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 0.29832154899999996,
+                    "gpu_seconds": 0.2669004611670971,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "segment/batch_mix_poly": {
+                    "command_buffers": 22,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 0.018536334,
+                    "gpu_seconds": 0.014769164845347404,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "segment/batch_rv32im_eval_check": {
+                    "command_buffers": 22,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 0.5792584570000001,
+                    "gpu_seconds": 0.4177429582923651,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "segment/batch_transforms": {
+                    "command_buffers": 133,
+                    "commands": 0,
+                    "dispatch_wall_seconds": 0.4646332090000002,
+                    "gpu_seconds": 0.2916338350623846,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 0,
+                    "pipeline_seconds": 0.0,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 0
+                  },
+                  "segment/ef_combine": {
+                    "command_buffers": 0,
+                    "commands": 22,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 3.3168999999999994e-05,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/ef_eval_split": {
+                    "command_buffers": 0,
+                    "commands": 22,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 3.9373e-05,
+                    "static_threadgroup_memory_length": 32768,
+                    "thread_execution_width": 32
+                  },
+                  "segment/ef_prep": {
+                    "command_buffers": 0,
+                    "commands": 22,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 5.9126e-05,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/eltwise_copy_fp": {
+                    "command_buffers": 22,
+                    "commands": 67,
+                    "dispatch_wall_seconds": 0.004220749,
+                    "gpu_seconds": 5.041062831878662e-05,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00048021,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/eltwise_mul_factor_fp": {
+                    "command_buffers": 0,
+                    "commands": 22,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 7.6834e-05,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/eltwise_sum_fpext": {
+                    "command_buffers": 22,
+                    "commands": 22,
+                    "dispatch_wall_seconds": 0.012579789,
+                    "gpu_seconds": 0.0004406683146953583,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000210041,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/fri_fold": {
+                    "command_buffers": 44,
+                    "commands": 44,
+                    "dispatch_wall_seconds": 0.009925127,
+                    "gpu_seconds": 0.0015562530606985092,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00017799799999999996,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/mix_poly_coeffs": {
+                    "command_buffers": 0,
+                    "commands": 88,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000138086,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/multi_bit_reverse": {
+                    "command_buffers": 66,
+                    "commands": 66,
+                    "dispatch_wall_seconds": 0.016766538,
+                    "gpu_seconds": 0.0003942064940929413,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00048503900000000015,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/multi_ntt_fwd_step": {
+                    "command_buffers": 0,
+                    "commands": 356,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00016408100000000006,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/multi_ntt_fwd_tile": {
+                    "command_buffers": 0,
+                    "commands": 111,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.000225624,
+                    "static_threadgroup_memory_length": 16384,
+                    "thread_execution_width": 32
+                  },
+                  "segment/multi_ntt_rev_step": {
+                    "command_buffers": 0,
+                    "commands": 178,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0001934209999999999,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/multi_ntt_rev_tile": {
+                    "command_buffers": 0,
+                    "commands": 22,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00013891900000000002,
+                    "static_threadgroup_memory_length": 16384,
+                    "thread_execution_width": 32
+                  },
+                  "segment/multi_ntt_rev_tile_commit": {
+                    "command_buffers": 0,
+                    "commands": 45,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 9.087700000000004e-05,
+                    "static_threadgroup_memory_length": 16384,
+                    "thread_execution_width": 32
+                  },
+                  "segment/multi_poly_eval": {
+                    "command_buffers": 22,
+                    "commands": 88,
+                    "dispatch_wall_seconds": 0.004486333,
+                    "gpu_seconds": 0.0012166686356067655,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0003506240000000001,
+                    "static_threadgroup_memory_length": 4096,
+                    "thread_execution_width": 32
+                  },
+                  "segment/poseidon2_fold": {
+                    "command_buffers": 0,
+                    "commands": 1512,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.00026799999999999995,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  },
+                  "segment/poseidon2_rows": {
+                    "command_buffers": 0,
+                    "commands": 111,
+                    "dispatch_wall_seconds": 0.0,
+                    "gpu_seconds": 0.0,
+                    "invalid_gpu_timestamps": 0,
+                    "max_total_threads_per_threadgroup": 1024,
+                    "pipeline_seconds": 0.0006266230000000002,
+                    "static_threadgroup_memory_length": 0,
+                    "thread_execution_width": 32
+                  }
+                },
+                "hal_kernel_source_sha256": "5e67b4f14a729158796d2af2534ba45092e52683bd8b090dd6f50305db1d8b1e",
+                "kernel_source_sha256": "7439b9c48fe7287c7f25f809c60bf230e370d4cc4ad039559db7298d84cd040c",
+                "normalization": "period_four_table",
+                "threads_per_threadgroup": 256
+              },
+              "segment": "metal"
+            },
+            "operation": "prove",
+            "phase": "wrapping",
+            "po2": 14,
+            "proof_kind": "succinct",
+            "rayon_threads": 18,
+            "recursion_cpu_stages": [
+              "witness",
+              "accumulation",
+              "identity_p254"
+            ],
+            "recursion_hal": "metal",
+            "request_id": 22,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "segment_hal": "metal",
+            "stage_ms": {
+              "execution_and_segment": 1215.1985,
+              "recursion": 12481.724792
+            },
+            "staging_limit_bytes": null,
+            "stats": {
+              "paging_cycles": 94215,
+              "reserved_cycles": 140156,
+              "segments": 22,
+              "total_cycles": 360448,
+              "user_cycles": 126077
+            },
+            "total_ms": 13881.366375,
+            "worker_pid": 72582
+          },
+          "status": "expected_failure",
+          "timeout_seconds": 28
+        },
+        "worker_group_gone": true,
+        "no_owned_helper_after": true,
+        "phase_evidence": {
+          "timeout_after_wrapping_start_seconds": 14.118633625000001,
+          "maximum_recent_identity_seconds": 12.338799999999999,
+          "conclusion": "watchdog reached the wrap after identity_p254"
+        }
+      }
+    }
+  },
+  "limit_controls": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/183089f0799b49008cd33c9d0d2a0f1e",
+    "result_sha256": "29bdd41b454b96d57418cc675f63c594b9595ed177b568b6bcd21a4679b6e7b1",
+    "log_sha256": "fe4c72cdcd50aee4726de96932b73a20802971abce6904f71812d702d4263ff5"
+  },
+  "parent_death": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/phase2/wp8lite-parent-death/9a7363aba5704fe8a002e4663b177325",
+    "result_sha256": "cf0b446efbaad697aa6a0c1b05a53e2a27cac75e7509a45768f45916ee660157",
+    "log_sha256": "ecf9674d5ca131c94a8ee12ad124f8bacff537e59742e5b41d74150179dab558",
+    "cases": [
+      {
+        "stage": "identity",
+        "helper_pid": 73197,
+        "parent_pid": 73196,
+        "result": "helper_exited_without_proof"
+      },
+      {
+        "stage": "prove",
+        "helper_pid": 73204,
+        "parent_pid": 73203,
+        "result": "helper_exited_without_proof"
+      }
+    ]
+  },
+  "cpu_only_build": {
+    "log_sha256": "c49315c3880c05f286ce7512356c7f0a5d8a475a58665b48943e4c7ffab4d614",
+    "manifest_sha256": "9cf2fd7a352421538468c1365681306f2bbb399a506c3393963de26b6e6071f3",
+    "unit_tests_passed": 5
+  },
+  "linux_feature_paths": {
+    "result_sha256": "13bf708a47227ea926d52667976858412a6d182564c5fc87ec7042d808ed5d3c",
+    "checks": {
+      "recursion_prove_metal": "passed",
+      "rv32im_prove": "passed",
+      "zkvm_prove_metal_recursion": "passed"
+    }
+  }
+}

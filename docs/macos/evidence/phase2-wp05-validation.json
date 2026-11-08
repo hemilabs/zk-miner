@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "source_spec_sha256": "299ebd441aa2e1c0c70f7587a88b8cc32154d0835a0eaea0d807adef11028597",
+  "engine_commit": "6b3ec9539fb3a4e5c267c2a4f8f81d6d90ac577d",
+  "worker_sha256": "5ac4d226119a7823128edb174d2676b4ead816452e615e215272d10f9a530c91",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "collector_sha256": "06b95865a0d48026005dbcb4d680cf6ad644191edc6565f418152ce285fbdae2",
+  "metal_primitive_tests": 20,
+  "recursion_primitive_offset_differential": "passed",
+  "cpu_only_feature_build": "passed",
+  "linux_feature_check": {
+    "source_revision": "58a249e1ff316cafd2b4593700ffefe7dd2b0304",
+    "result_sha256": "5547a42b1033ed39778d1ee2a4360ad9216a6320e31eba0ff9db2e0c0859f963",
+    "scope": "Only macOS-gated metal.rs changed in the final revision; the supported Linux feature path is unchanged.",
+    "checks": {
+      "recursion_prove_metal": "passed",
+      "zkvm_prove_metal_recursion": "passed"
+    }
+  },
+  "real_witness_differentials": [
+    {
+      "po2": 14,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/df5246cb8b1747d1a9dfaa8397491e26",
+      "result_sha256": "e0798e2b869031226f7e5df50fb609a37385f41716a19fd4cb384eb4a9431f6f",
+      "worker_sidecar_sha256": "d6a4ea19b771eb4a8948c27a46c3a5313f97a2fc9127a43becce74665ebd1d65",
+      "verification_sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1",
+      "segments": 22,
+      "cpu_differential_checks": 22,
+      "completed_dispatches": 4780,
+      "completed_command_buffers": 620
+    },
+    {
+      "po2": 18,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/efc833d8f97944b9a04bf9c92e440c35",
+      "result_sha256": "79dae9580a131aed366bbba8fce1c7950df4ac6b81d3fdf83c2b697e743b8a30",
+      "worker_sidecar_sha256": "0587d77d8470bb0c409448f496ebf69ca9bd9da1eec62d4da570929d88a93fc9",
+      "verification_sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1",
+      "segments": 1,
+      "cpu_differential_checks": 1,
+      "completed_dispatches": 350,
+      "completed_command_buffers": 35
+    },
+    {
+      "po2": 20,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/b1f81c57bbab4f17857a7492129bb87d",
+      "result_sha256": "079b3da96e42317b8ccbe1c1317398fa8b43394474c0ced1ee82e34c9e57905c",
+      "worker_sidecar_sha256": "eb7a375c293a39239675b6d71281525aa8d45021e1853d018d3fcd1486eb1d1a",
+      "verification_sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1",
+      "segments": 1,
+      "cpu_differential_checks": 1,
+      "completed_dispatches": 350,
+      "completed_command_buffers": 35
+    }
+  ],
+  "lifecycle": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/0fdade08482b45e88a4bcb732576633c",
+    "result_sha256": "11aabb6d3e90d0cf8314e94790f781ea5387ce6059b14e106048471b24171988",
+    "request_ledger_sha256": "774544e887f0ce34782eeba6537b00f6f5d409fd7cdfc5d492e002cb9ce91809",
+    "verified_proofs": 21,
+    "tamper_rejections": 63,
+    "recovery_verification_sha256": "c99361d629bfa9b4ab5955fcf5fc4d37ba26c0c03bd96cf4dfffb0c7dc6eaf2d",
+    "idle_first_bytes": 4571320424,
+    "idle_last_bytes": 3908030088,
+    "idle_first_to_last_fraction": -0.14509819362424115,
+    "idle_growth_at_most_5_percent": true,
+    "pressure_levels": [
+      1
+    ],
+    "helper_cancel": true,
+    "helper_timeout": true,
+    "worker_timeout": true,
+    "restart": true,
+    "shutdown": true
+  },
+  "failed_lifecycle_attempt": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/624659388d8a4d1b86469a1d0ef0e571",
+    "result_sha256": "a4cacce4a6be6f93aab8232375e99b9a311961c267f9e9e9862366b167c03e5e",
+    "test_log_sha256": "d145bccbacde3fa0fcc211611d28c0d3422d5d0ebd0e0beaaab2cb41cac69e1c",
+    "verified_steady_proofs": 20,
+    "tamper_rejections": 60,
+    "reason": "The 10-second helper timeout killed the partial sidecar before completed_constraint_checks was recorded; the 20 steady proofs completed.",
+    "failure_timeout_seconds": 10
+  }
+}

@@ -39,7 +39,10 @@ use std::time::Duration;
 ///
 /// The OS, the miner, the TUI, and the page cache the prover itself needs to read a 236 MB binary.
 /// Too small and the cap does not prevent a freeze; too large and a legitimate proof is refused.
+#[cfg(not(target_os = "macos"))]
 pub const DEFAULT_HOST_RESERVE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+pub const DEFAULT_HOST_RESERVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Host memory SP1's one-time warm-up (`WorkerPool::warm_up`) may use at peak: where the server
 /// runs Groth16 in a helper, building the stripped circuit reads the full one (13.9 GB measured on
@@ -139,6 +142,7 @@ const CAP_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// The kernel's own estimate of what can be allocated without swapping — NOT `MemFree`, which
 /// excludes reclaimable page cache and on this box reads ~9 GB while 26 GB is actually available.
+#[cfg(not(target_os = "macos"))]
 pub fn mem_available_bytes() -> Option<u64> {
     parse_meminfo_kb(
         &std::fs::read_to_string("/proc/meminfo").ok()?,
@@ -147,10 +151,26 @@ pub fn mem_available_bytes() -> Option<u64> {
 }
 
 /// `MemTotal` from `/proc/meminfo`, in bytes.
+#[cfg(not(target_os = "macos"))]
 pub fn mem_total_bytes() -> Option<u64> {
     parse_meminfo_kb(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal")
 }
 
+#[cfg(target_os = "macos")]
+pub fn mem_available_bytes() -> Option<u64> { crate::macos::available_bytes() }
+
+pub fn host_reserve_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    { crate::macos::reserve_bytes() }
+    #[cfg(not(target_os = "macos"))]
+    { DEFAULT_HOST_RESERVE_BYTES }
+}
+
+#[cfg(target_os = "macos")]
+pub fn native_memory_observation(pid: u32) -> serde_json::Value { crate::macos::observation(pid) }
+
+#[cfg(target_os = "macos")]
+pub fn mem_total_bytes() -> Option<u64> { crate::macos::total_bytes() }
 /// Total capacity of the `/dev/shm` tmpfs, in bytes, or `None` if it cannot be stat'd.
 ///
 /// The SP1 native executor (x86-64 Linux) stages its trace ring and memory image here. A tmpfs too
@@ -391,6 +411,8 @@ pub(crate) fn sanitize_unit(s: &str) -> String {
 ///   almost nothing, so the undercount is negligible — but it is also why `cap_process_memory`'s
 ///   ceiling is not retroactive.
 pub fn peak_memory_of_pid(pid: u32, expected_unit: Option<&str>) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    { let _ = expected_unit; return crate::macos::peak_bytes(pid); }
     let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     let rel = cg.lines().next()?.rsplit_once("::").map(|(_, p)| p)?.trim();
 
@@ -444,6 +466,11 @@ pub fn peak_memory_of_pid(pid: u32, expected_unit: Option<&str>) -> Option<u64> 
 /// we did not create describes something other than this worker.
 #[cfg(unix)]
 pub fn anon_memory_of_pid(pid: u32, expected_unit: Option<&str>) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = expected_unit;
+        return crate::macos::group_memory(pid).and_then(|g| g.worker.footprint_bytes.checked_add(g.helper_footprint_bytes));
+    }
     let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     let rel = cg.lines().next()?.rsplit_once("::").map(|(_, p)| p)?.trim();
     // Exact unit, for the reason given on `peak_memory_of_pid`.
@@ -529,7 +556,7 @@ pub(crate) fn starttime_of_stat(stat: &str) -> Option<u64> {
 /// `(pid, starttime)` for a live process, or `None` if it is gone.
 ///
 /// Captured at spawn and re-checked before any signal: see `pid_is_our_worker`.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn pid_starttime(pid: u32) -> Option<u64> {
     starttime_of_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
@@ -558,7 +585,7 @@ pub fn pid_starttime(pid: u32) -> Option<u64> {
 /// Cheaper than `pidfd_open` plumbing and needs no extra per-worker state, which matters because the
 /// pid atomic is written from sixteen places. Unreadable `/proc` answers `false`: not signalling a
 /// worker leaks a process, while signalling a stranger's group can take down the machine.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn pid_is_our_worker(pid: u32, expected_starttime: Option<u64>) -> bool {
     if pid == 0 {
         return false;
@@ -583,6 +610,14 @@ pub fn pid_is_our_worker(pid: u32, expected_starttime: Option<u64>) -> bool {
         Some(expected) => starttime_of_stat(&stat) == Some(expected),
         None => true,
     }
+}
+
+#[cfg(target_os = "macos")]
+pub fn pid_starttime(pid: u32) -> Option<u64> { crate::macos::start_time(pid) }
+
+#[cfg(target_os = "macos")]
+pub fn pid_is_our_worker(pid: u32, expected_starttime: Option<u64>) -> bool {
+    crate::macos::owned_group(pid, expected_starttime)
 }
 
 /// Non-unix: there is no `/proc` to prove identity with, and no process groups to signal, so the
@@ -819,6 +854,21 @@ pub fn plan_measure_preemption(
 pub fn unmeasured_peak_for(backend: &str) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     match backend {
+        #[cfg(target_os = "macos")]
+        "risc0" if std::env::var("ZKMINER_RISC0_WRAP").as_deref() == Ok("native") => {
+            // Recursion Metal's measured first-process group peak was 17.3 GiB.
+            // Keep its initial budget above that peak; measured calibration
+            // still applies the existing safety factor and host clamp.
+            if std::env::var("RISC0_SEGMENT_HAL").as_deref() == Ok("metal") {
+                // Resident groups coexist with the evaluator's measured 8 GiB
+                // private backing. Keep admission conservative until calibrated.
+                24 * GIB
+            } else if std::env::var("RISC0_RECURSION_HAL").as_deref() == Ok("metal") {
+                20 * GIB
+            } else {
+                16 * GIB
+            }
+        }
         "risc0" | "openvm" => 6 * GIB,
         // `mock_worker` speaks the protocol and allocates nothing; `crates/zkminer-prover/src/bin/`
         // builds it and the integration tests register it as a backend. Charging it the
@@ -876,15 +926,15 @@ pub const MIN_TRUSTED_PEAK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// reporting "cannot fit it right now" in perpetuity is worse than saying the box is too small.
 pub fn max_admissible_budget(total: u64) -> u64 {
     // Both terms must leave room for the reserve ON TOP of the budget, because that is what
-    // `can_admit` tests. Returning `min(¾·total, total − reserve)` and adding the reserve afterwards
-    // would make the bound satisfiable only where `0.75·T + reserve <= 0.92·T`, i.e. `T >= 18 GiB` —
-    // reintroducing the permanent silent refusal for every host smaller than this one. Subtracting
-    // the reserve from both terms avoids that: a 16 GiB box bounds a budget at 9 GiB, which an idle
-    // 14.7 GiB of `MemAvailable` can admit.
-    let headroom = total.saturating_sub(DEFAULT_HOST_RESERVE_BYTES);
+    // `can_admit` tests. The first version returned `min(¾·total, total − reserve)` and added the
+    // reserve afterwards, which made the bound satisfiable only where `0.75·T + reserve <= 0.92·T`,
+    // i.e. `T >= 18 GiB` — so it reintroduced the permanent silent refusal it was written to remove,
+    // for every host smaller than this one. Subtracting the reserve from both terms fixes it:
+    // a 16 GiB box now bounds a budget at 9 GiB, which an idle 14.7 GiB of `MemAvailable` can admit.
+    let headroom = total.saturating_sub(host_reserve_bytes());
     let bound = (total / 4 * 3)
-        .saturating_sub(DEFAULT_HOST_RESERVE_BYTES)
-        .min(headroom.saturating_sub(DEFAULT_HOST_RESERVE_BYTES));
+        .saturating_sub(host_reserve_bytes())
+        .min(headroom.saturating_sub(host_reserve_bytes()));
     // Never ZERO. A zero budget is not maximally safe, it is maximally unsafe: `can_admit`'s
     // committed term becomes `reserved + 0 + reserve <= total`, independent of the proof, so a host
     // too small to run anything would admit without limit. Floor it at the trust threshold, which is
@@ -1098,8 +1148,8 @@ pub fn classify_pressure(stall_pct: Option<f64>, available: u64, total: u64) -> 
     // of per-job refusals; a half-reserve minimum would let the free-memory backstop trigger only
     // once `available` was already well below the 3 GiB that admission insists on, i.e. after
     // everything had been silently refused. On a kernel without PSI — the only case this backstop
-    // exists for — that would make this backstop effectively dead.
-    let floor = (total / 10).max(DEFAULT_HOST_RESERVE_BYTES * 3 / 2);
+    // exists for — that made layer 4 effectively dead.
+    let floor = (total / 10).max(host_reserve_bytes().saturating_mul(3) / 2);
     if let Some(p) = stall_pct {
         if p >= STALL_CRITICAL_PERCENT {
             return PressureState::Critical;
@@ -1114,7 +1164,7 @@ pub fn classify_pressure(stall_pct: Option<f64>, available: u64, total: u64) -> 
     // read as an absence of pressure, which is the direction that froze this box.
     // Critical at the reserve itself: below that, admission refuses everything anyway, so the host
     // is past braking and into losing time.
-    if available <= DEFAULT_HOST_RESERVE_BYTES.max(floor / 2) {
+    if available <= host_reserve_bytes().max(floor / 2) {
         PressureState::Critical
     } else if available <= floor {
         PressureState::Brake
@@ -1345,6 +1395,8 @@ mod tests {
     #[test]
     fn pressure_brakes_on_stall_before_memory_runs_out() {
         let gib = 1024 * 1024 * 1024;
+        // Between the platform reserve and its 1.5x brake floor.
+        let braking_available = DEFAULT_HOST_RESERVE_BYTES * 4 / 3;
         let total = 28 * gib;
         // Quiet and roomy.
         assert_eq!(
@@ -1367,7 +1419,7 @@ mod tests {
         // The floor now sits ABOVE the admission reserve, so the brake fires while the gate would
         // still admit — which is the point of a brake. 4 GiB free on a 28 GiB box: floor is 4.5 GiB.
         assert_eq!(
-            classify_pressure(None, 4 * gib, total),
+            classify_pressure(None, braking_available, total),
             PressureState::Brake
         );
         // And at or below the reserve itself the host is past braking: admission refuses everything
@@ -1386,6 +1438,7 @@ mod tests {
         // and this arm exists for the two cases the gate cannot cover: a kernel with no PSI at all,
         // and a host so short that even admission's own reserve is gone.
         let brake_floor = (total / 10).max(DEFAULT_HOST_RESERVE_BYTES * 3 / 2);
+        #[cfg(not(target_os = "macos"))]
         assert!(
             !can_admit(
                 unmeasured_peak_for("risc0"),
@@ -1398,6 +1451,8 @@ mod tests {
             "the gate is expected to have refused long before the free-memory arm trips; if this \
              ever passes, the arm has become the primary signal and its thresholds need rethinking"
         );
+        #[cfg(target_os = "macos")]
+        assert_eq!(classify_pressure(None, brake_floor - 1, total), PressureState::Brake);
         // PSI quiet but memory nearly gone: do not report Ok anyway. Nothing has stalled yet only
         // because nothing has tried to allocate; the next proof is what would. At 2 GiB — under
         // admission's own 3 GiB reserve — that is Critical, not merely Brake.
@@ -1406,7 +1461,7 @@ mod tests {
             PressureState::Critical
         );
         assert_eq!(
-            classify_pressure(Some(0.0), 4 * gib, total),
+            classify_pressure(Some(0.0), braking_available, total),
             PressureState::Brake
         );
     }
@@ -1432,7 +1487,7 @@ mod tests {
         // On a small host the absolute minimum applies rather than a derisory 10%.
         assert_eq!(
             classify_pressure(Some(0.0), 8 * gib, 8 * gib),
-            PressureState::Ok
+            if DEFAULT_HOST_RESERVE_BYTES >= 8 * gib { PressureState::Critical } else { PressureState::Ok }
         );
     }
 

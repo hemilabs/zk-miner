@@ -1,0 +1,13 @@
+index,phase,mode,sample,run_id,status,error,worker_pid,worker_start_time_us,request_id,execution_and_segment_ms,recursion_ms,identity_and_emulated_wrap_ms,worker_verification_ms,worker_total_ms,prove_call_ms,external_verifier_ms,identity_p254_diagnostic_ms,shrink_wrap_diagnostic_ms,supervisor_and_ipc_residual_ms,request_observation_window_ms,request_peak_rss_bytes,idle_rss_bytes,metal_dispatches,run_elapsed_seconds,trial_elapsed_seconds
+0,warmup,cpu,0,257de3edef294d10b2f03edda0048d95,complete_independently_verified,,10607,1793491003592867,1,2695.3283340000003,7365.808540999999,154341.318917,1.763791,164432.255208,164731.123959,39.937124999999995,33146.2,121187.1,298.8687510000018,164864.40300000002,1965539328,1048363008,0,184.91101383417845,185.0878753773868
+1,warmup,metal,0,dc005b12db1d44a5a98dad07ecb7ed01,failed,real native worker acceptance failed (101); see test.log,,,,,,,,,,,,,,,,,,,
+2,measured,cpu,1,,unattempted,,,,,,,,,,,,,,,,,,,,
+3,measured,metal,1,,unattempted,,,,,,,,,,,,,,,,,,,,
+4,measured,cpu,2,,unattempted,,,,,,,,,,,,,,,,,,,,
+5,measured,metal,2,,unattempted,,,,,,,,,,,,,,,,,,,,
+6,measured,cpu,3,,unattempted,,,,,,,,,,,,,,,,,,,,
+7,measured,metal,3,,unattempted,,,,,,,,,,,,,,,,,,,,
+8,measured,cpu,4,,unattempted,,,,,,,,,,,,,,,,,,,,
+9,measured,metal,4,,unattempted,,,,,,,,,,,,,,,,,,,,
+10,measured,cpu,5,,unattempted,,,,,,,,,,,,,,,,,,,,
+11,measured,metal,5,,unattempted,,,,,,,,,,,,,,,,,,,,

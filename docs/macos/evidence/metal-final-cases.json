@@ -1,0 +1,2321 @@
+{
+  "case_count": 222,
+  "cases": [
+    {
+      "completed_dispatches": 0,
+      "note": "empty work is not counted as GPU execution",
+      "operation": "direct_empty_alloc_copy_add",
+      "result": "no-op"
+    },
+    {
+      "completed_dispatches": 1,
+      "operation": "nested_slice_ranges_and_reuse",
+      "rejected_host_ranges": 5,
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 0,
+      "note": "host ownership contract; no GPU work",
+      "operation": "shared_allocation_lifetime",
+      "result": "matched",
+      "tracked_bytes": 256
+    },
+    {
+      "completed_dispatches": 0,
+      "elements": 0,
+      "offsets": [
+        0,
+        0,
+        0
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 0,
+      "elements": 0,
+      "offsets": [
+        0,
+        0
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 0,
+      "elements": 0,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 0,
+      "elements": 0,
+      "offsets": [
+        1,
+        2
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 0,
+      "elements": 0,
+      "offsets": [
+        7,
+        2,
+        5
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 0,
+      "elements": 0,
+      "offsets": [
+        7,
+        5
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "offsets": [
+        0,
+        0,
+        0
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "offsets": [
+        0,
+        0
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "offsets": [
+        1,
+        2
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "offsets": [
+        7,
+        2,
+        5
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "offsets": [
+        7,
+        5
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 2,
+      "offsets": [
+        0,
+        0,
+        0
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 2,
+      "offsets": [
+        0,
+        0
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 2,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 2,
+      "offsets": [
+        1,
+        2
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 2,
+      "offsets": [
+        7,
+        2,
+        5
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 2,
+      "offsets": [
+        7,
+        5
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 7,
+      "offsets": [
+        0,
+        0,
+        0
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 7,
+      "offsets": [
+        0,
+        0
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 7,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 7,
+      "offsets": [
+        1,
+        2
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 7,
+      "offsets": [
+        7,
+        2,
+        5
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 7,
+      "offsets": [
+        7,
+        5
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 31,
+      "offsets": [
+        0,
+        0,
+        0
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 31,
+      "offsets": [
+        0,
+        0
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 31,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 31,
+      "offsets": [
+        1,
+        2
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 31,
+      "offsets": [
+        7,
+        2,
+        5
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 31,
+      "offsets": [
+        7,
+        5
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 32,
+      "offsets": [
+        0,
+        0,
+        0
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 32,
+      "offsets": [
+        0,
+        0
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 32,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 32,
+      "offsets": [
+        1,
+        2
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 32,
+      "offsets": [
+        7,
+        2,
+        5
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 32,
+      "offsets": [
+        7,
+        5
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "offsets": [
+        0,
+        0,
+        0
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "offsets": [
+        0,
+        0
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "offsets": [
+        1,
+        2
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "offsets": [
+        7,
+        2,
+        5
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "offsets": [
+        7,
+        5
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 255,
+      "offsets": [
+        0,
+        0,
+        0
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 255,
+      "offsets": [
+        0,
+        0
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 255,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 255,
+      "offsets": [
+        1,
+        2
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 255,
+      "offsets": [
+        7,
+        2,
+        5
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 255,
+      "offsets": [
+        7,
+        5
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 256,
+      "offsets": [
+        0,
+        0,
+        0
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 256,
+      "offsets": [
+        0,
+        0
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 256,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 256,
+      "offsets": [
+        1,
+        2
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 256,
+      "offsets": [
+        7,
+        2,
+        5
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 256,
+      "offsets": [
+        7,
+        5
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "offsets": [
+        0,
+        0,
+        0
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "offsets": [
+        0,
+        0
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "offsets": [
+        1,
+        2
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "offsets": [
+        7,
+        2,
+        5
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "offsets": [
+        7,
+        5
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1023,
+      "offsets": [
+        0,
+        0,
+        0
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1023,
+      "offsets": [
+        0,
+        0
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1023,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1023,
+      "offsets": [
+        1,
+        2
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1023,
+      "offsets": [
+        7,
+        2,
+        5
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1023,
+      "offsets": [
+        7,
+        5
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1024,
+      "offsets": [
+        0,
+        0,
+        0
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1024,
+      "offsets": [
+        0,
+        0
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1024,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1024,
+      "offsets": [
+        1,
+        2
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1024,
+      "offsets": [
+        7,
+        2,
+        5
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1024,
+      "offsets": [
+        7,
+        5
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "offsets": [
+        0,
+        0,
+        0
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "offsets": [
+        0,
+        0
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "offsets": [
+        1,
+        2
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "offsets": [
+        7,
+        2,
+        5
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "offsets": [
+        7,
+        5
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 4096,
+      "offsets": [
+        0,
+        0,
+        0
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 4096,
+      "offsets": [
+        0,
+        0
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 4096,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 4096,
+      "offsets": [
+        1,
+        2
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 4096,
+      "offsets": [
+        7,
+        2,
+        5
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 4096,
+      "offsets": [
+        7,
+        5
+      ],
+      "operation": "copy",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 9,
+      "offsets": [
+        1,
+        3,
+        2
+      ],
+      "operation": "add",
+      "oracle": "CPU HAL and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "factor_input": 0,
+      "factor_reduced": 0,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "factor_input": 1,
+      "factor_reduced": 1,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "factor_input": 2,
+      "factor_reduced": 2,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "factor_input": 1006632960,
+      "factor_reduced": 1006632960,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "factor_input": 2013265919,
+      "factor_reduced": 2013265919,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "factor_input": 2013265920,
+      "factor_reduced": 2013265920,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "factor_input": 2013265921,
+      "factor_reduced": 0,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "factor_input": 2013265922,
+      "factor_reduced": 1,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1,
+      "factor_input": 4294967295,
+      "factor_reduced": 268435453,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "factor_input": 0,
+      "factor_reduced": 0,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "factor_input": 1,
+      "factor_reduced": 1,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "factor_input": 2,
+      "factor_reduced": 2,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "factor_input": 1006632960,
+      "factor_reduced": 1006632960,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "factor_input": 2013265919,
+      "factor_reduced": 2013265919,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "factor_input": 2013265920,
+      "factor_reduced": 2013265920,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "factor_input": 2013265921,
+      "factor_reduced": 0,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "factor_input": 2013265922,
+      "factor_reduced": 1,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 33,
+      "factor_input": 4294967295,
+      "factor_reduced": 268435453,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "factor_input": 0,
+      "factor_reduced": 0,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "factor_input": 1,
+      "factor_reduced": 1,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "factor_input": 2,
+      "factor_reduced": 2,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "factor_input": 1006632960,
+      "factor_reduced": 1006632960,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "factor_input": 2013265919,
+      "factor_reduced": 2013265919,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "factor_input": 2013265920,
+      "factor_reduced": 2013265920,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "factor_input": 2013265921,
+      "factor_reduced": 0,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "factor_input": 2013265922,
+      "factor_reduced": 1,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 257,
+      "factor_input": 4294967295,
+      "factor_reduced": 268435453,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "factor_input": 0,
+      "factor_reduced": 0,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "factor_input": 1,
+      "factor_reduced": 1,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "factor_input": 2,
+      "factor_reduced": 2,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "factor_input": 1006632960,
+      "factor_reduced": 1006632960,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "factor_input": 2013265919,
+      "factor_reduced": 2013265919,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "factor_input": 2013265920,
+      "factor_reduced": 2013265920,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "factor_input": 2013265921,
+      "factor_reduced": 0,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "factor_input": 2013265922,
+      "factor_reduced": 1,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 1,
+      "elements": 1025,
+      "factor_input": 4294967295,
+      "factor_reduced": 268435453,
+      "offset": 3,
+      "operation": "multiply_factor",
+      "oracle": "Rust field multiplication and independent modular u64",
+      "result": "matched"
+    },
+    {
+      "completed_dispatches": 2,
+      "forward_dispatches": 1,
+      "input_offset": 1,
+      "inverse_dispatches": 1,
+      "operation": "ntt_roundtrip",
+      "output_offset": 3,
+      "polynomials": 1,
+      "result": "CPU intermediates and original input matched",
+      "row_elements": 1
+    },
+    {
+      "completed_dispatches": 2,
+      "forward_dispatches": 1,
+      "input_offset": 1,
+      "inverse_dispatches": 1,
+      "operation": "ntt_roundtrip",
+      "output_offset": 3,
+      "polynomials": 3,
+      "result": "CPU intermediates and original input matched",
+      "row_elements": 1
+    },
+    {
+      "completed_dispatches": 4,
+      "forward_dispatches": 2,
+      "input_offset": 1,
+      "inverse_dispatches": 2,
+      "operation": "ntt_roundtrip",
+      "output_offset": 3,
+      "polynomials": 1,
+      "result": "CPU intermediates and original input matched",
+      "row_elements": 2
+    },
+    {
+      "completed_dispatches": 4,
+      "forward_dispatches": 2,
+      "input_offset": 1,
+      "inverse_dispatches": 2,
+      "operation": "ntt_roundtrip",
+      "output_offset": 3,
+      "polynomials": 3,
+      "result": "CPU intermediates and original input matched",
+      "row_elements": 2
+    },
+    {
+      "completed_dispatches": 6,
+      "forward_dispatches": 3,
+      "input_offset": 1,
+      "inverse_dispatches": 3,
+      "operation": "ntt_roundtrip",
+      "output_offset": 3,
+      "polynomials": 1,
+      "result": "CPU intermediates and original input matched",
+      "row_elements": 4
+    },
+    {
+      "completed_dispatches": 6,
+      "forward_dispatches": 3,
+      "input_offset": 1,
+      "inverse_dispatches": 3,
+      "operation": "ntt_roundtrip",
+      "output_offset": 3,
+      "polynomials": 3,
+      "result": "CPU intermediates and original input matched",
+      "row_elements": 4
+    },
+    {
+      "completed_dispatches": 10,
+      "forward_dispatches": 5,
+      "input_offset": 1,
+      "inverse_dispatches": 5,
+      "operation": "ntt_roundtrip",
+      "output_offset": 3,
+      "polynomials": 1,
+      "result": "CPU intermediates and original input matched",
+      "row_elements": 16
+    },
+    {
+      "completed_dispatches": 10,
+      "forward_dispatches": 5,
+      "input_offset": 1,
+      "inverse_dispatches": 5,
+      "operation": "ntt_roundtrip",
+      "output_offset": 3,
+      "polynomials": 3,
+      "result": "CPU intermediates and original input matched",
+      "row_elements": 16
+    },
+    {
+      "completed_dispatches": 16,
+      "forward_dispatches": 8,
+      "input_offset": 1,
+      "inverse_dispatches": 8,
+      "operation": "ntt_roundtrip",
+      "output_offset": 3,
+      "polynomials": 1,
+      "result": "CPU intermediates and original input matched",
+      "row_elements": 128
+    },
+    {
+      "completed_dispatches": 16,
+      "forward_dispatches": 8,
+      "input_offset": 1,
+      "inverse_dispatches": 8,
+      "operation": "ntt_roundtrip",
+      "output_offset": 3,
+      "polynomials": 3,
+      "result": "CPU intermediates and original input matched",
+      "row_elements": 128
+    },
+    {
+      "completed_dispatches": 18,
+      "forward_dispatches": 9,
+      "input_offset": 1,
+      "inverse_dispatches": 9,
+      "operation": "ntt_roundtrip",
+      "output_offset": 3,
+      "polynomials": 1,
+      "result": "CPU intermediates and original input matched",
+      "row_elements": 256
+    },
+    {
+      "completed_dispatches": 18,
+      "forward_dispatches": 9,
+      "input_offset": 1,
+      "inverse_dispatches": 9,
+      "operation": "ntt_roundtrip",
+      "output_offset": 3,
+      "polynomials": 3,
+      "result": "CPU intermediates and original input matched",
+      "row_elements": 256
+    },
+    {
+      "completed_dispatches": 22,
+      "forward_dispatches": 11,
+      "input_offset": 1,
+      "inverse_dispatches": 11,
+      "operation": "ntt_roundtrip",
+      "output_offset": 3,
+      "polynomials": 1,
+      "result": "CPU intermediates and original input matched",
+      "row_elements": 1024
+    },
+    {
+      "completed_dispatches": 22,
+      "forward_dispatches": 11,
+      "input_offset": 1,
+      "inverse_dispatches": 11,
+      "operation": "ntt_roundtrip",
+      "output_offset": 3,
+      "polynomials": 3,
+      "result": "CPU intermediates and original input matched",
+      "row_elements": 1024
+    },
+    {
+      "completed_dispatches": 1,
+      "expand_bits": 1,
+      "operation": "expanded_ntt",
+      "polynomials": 1,
+      "result": "matched",
+      "row_elements": 1
+    },
+    {
+      "completed_dispatches": 1,
+      "expand_bits": 2,
+      "operation": "expanded_ntt",
+      "polynomials": 1,
+      "result": "matched",
+      "row_elements": 1
+    },
+    {
+      "completed_dispatches": 1,
+      "expand_bits": 1,
+      "operation": "expanded_ntt",
+      "polynomials": 3,
+      "result": "matched",
+      "row_elements": 1
+    },
+    {
+      "completed_dispatches": 1,
+      "expand_bits": 2,
+      "operation": "expanded_ntt",
+      "polynomials": 3,
+      "result": "matched",
+      "row_elements": 1
+    },
+    {
+      "completed_dispatches": 2,
+      "expand_bits": 1,
+      "operation": "expanded_ntt",
+      "polynomials": 1,
+      "result": "matched",
+      "row_elements": 2
+    },
+    {
+      "completed_dispatches": 2,
+      "expand_bits": 2,
+      "operation": "expanded_ntt",
+      "polynomials": 1,
+      "result": "matched",
+      "row_elements": 2
+    },
+    {
+      "completed_dispatches": 2,
+      "expand_bits": 1,
+      "operation": "expanded_ntt",
+      "polynomials": 3,
+      "result": "matched",
+      "row_elements": 2
+    },
+    {
+      "completed_dispatches": 2,
+      "expand_bits": 2,
+      "operation": "expanded_ntt",
+      "polynomials": 3,
+      "result": "matched",
+      "row_elements": 2
+    },
+    {
+      "completed_dispatches": 5,
+      "expand_bits": 1,
+      "operation": "expanded_ntt",
+      "polynomials": 1,
+      "result": "matched",
+      "row_elements": 16
+    },
+    {
+      "completed_dispatches": 5,
+      "expand_bits": 2,
+      "operation": "expanded_ntt",
+      "polynomials": 1,
+      "result": "matched",
+      "row_elements": 16
+    },
+    {
+      "completed_dispatches": 5,
+      "expand_bits": 1,
+      "operation": "expanded_ntt",
+      "polynomials": 3,
+      "result": "matched",
+      "row_elements": 16
+    },
+    {
+      "completed_dispatches": 5,
+      "expand_bits": 2,
+      "operation": "expanded_ntt",
+      "polynomials": 3,
+      "result": "matched",
+      "row_elements": 16
+    },
+    {
+      "completed_dispatches": 8,
+      "expand_bits": 1,
+      "operation": "expanded_ntt",
+      "polynomials": 1,
+      "result": "matched",
+      "row_elements": 128
+    },
+    {
+      "completed_dispatches": 8,
+      "expand_bits": 2,
+      "operation": "expanded_ntt",
+      "polynomials": 1,
+      "result": "matched",
+      "row_elements": 128
+    },
+    {
+      "completed_dispatches": 8,
+      "expand_bits": 1,
+      "operation": "expanded_ntt",
+      "polynomials": 3,
+      "result": "matched",
+      "row_elements": 128
+    },
+    {
+      "completed_dispatches": 8,
+      "expand_bits": 2,
+      "operation": "expanded_ntt",
+      "polynomials": 3,
+      "result": "matched",
+      "row_elements": 128
+    },
+    {
+      "columns": 0,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "sha256"
+    },
+    {
+      "columns": 1,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "sha256"
+    },
+    {
+      "columns": 15,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "sha256"
+    },
+    {
+      "columns": 16,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "sha256"
+    },
+    {
+      "columns": 17,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "sha256"
+    },
+    {
+      "columns": 31,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "sha256"
+    },
+    {
+      "columns": 32,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "sha256"
+    },
+    {
+      "columns": 33,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "sha256"
+    },
+    {
+      "columns": 0,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "sha256"
+    },
+    {
+      "columns": 1,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "sha256"
+    },
+    {
+      "columns": 15,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "sha256"
+    },
+    {
+      "columns": 16,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "sha256"
+    },
+    {
+      "columns": 17,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "sha256"
+    },
+    {
+      "columns": 31,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "sha256"
+    },
+    {
+      "columns": 32,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "sha256"
+    },
+    {
+      "columns": 33,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "sha256"
+    },
+    {
+      "columns": 0,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "sha256"
+    },
+    {
+      "columns": 1,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "sha256"
+    },
+    {
+      "columns": 15,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "sha256"
+    },
+    {
+      "columns": 16,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "sha256"
+    },
+    {
+      "columns": 17,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "sha256"
+    },
+    {
+      "columns": 31,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "sha256"
+    },
+    {
+      "columns": 32,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "sha256"
+    },
+    {
+      "columns": 33,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "sha256"
+    },
+    {
+      "buffer_offset": 0,
+      "completed_dispatches": 1,
+      "inputs": 2,
+      "operation": "hash_fold",
+      "outputs": 1,
+      "result": "matched",
+      "suite": "sha256"
+    },
+    {
+      "buffer_offset": 3,
+      "completed_dispatches": 1,
+      "inputs": 2,
+      "operation": "hash_fold",
+      "outputs": 1,
+      "result": "matched",
+      "suite": "sha256"
+    },
+    {
+      "buffer_offset": 0,
+      "completed_dispatches": 1,
+      "inputs": 4,
+      "operation": "hash_fold",
+      "outputs": 2,
+      "result": "matched",
+      "suite": "sha256"
+    },
+    {
+      "buffer_offset": 3,
+      "completed_dispatches": 1,
+      "inputs": 4,
+      "operation": "hash_fold",
+      "outputs": 2,
+      "result": "matched",
+      "suite": "sha256"
+    },
+    {
+      "buffer_offset": 0,
+      "completed_dispatches": 1,
+      "inputs": 6,
+      "operation": "hash_fold",
+      "outputs": 3,
+      "result": "matched",
+      "suite": "sha256"
+    },
+    {
+      "buffer_offset": 3,
+      "completed_dispatches": 1,
+      "inputs": 6,
+      "operation": "hash_fold",
+      "outputs": 3,
+      "result": "matched",
+      "suite": "sha256"
+    },
+    {
+      "buffer_offset": 0,
+      "completed_dispatches": 1,
+      "inputs": 32,
+      "operation": "hash_fold",
+      "outputs": 16,
+      "result": "matched",
+      "suite": "sha256"
+    },
+    {
+      "buffer_offset": 3,
+      "completed_dispatches": 1,
+      "inputs": 32,
+      "operation": "hash_fold",
+      "outputs": 16,
+      "result": "matched",
+      "suite": "sha256"
+    },
+    {
+      "buffer_offset": 0,
+      "completed_dispatches": 1,
+      "inputs": 66,
+      "operation": "hash_fold",
+      "outputs": 33,
+      "result": "matched",
+      "suite": "sha256"
+    },
+    {
+      "buffer_offset": 3,
+      "completed_dispatches": 1,
+      "inputs": 66,
+      "operation": "hash_fold",
+      "outputs": 33,
+      "result": "matched",
+      "suite": "sha256"
+    },
+    {
+      "columns": 0,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 1,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 15,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 16,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 17,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 31,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 32,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 33,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 1,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 0,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 1,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 15,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 16,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 17,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 31,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 32,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 33,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 3,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 0,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 1,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 15,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 16,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 17,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 31,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 32,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "poseidon2"
+    },
+    {
+      "columns": 33,
+      "completed_dispatches": 1,
+      "input_offset": 2,
+      "matrix_layout": "column-major",
+      "operation": "hash_rows",
+      "output_offset": 3,
+      "result": "matched",
+      "rows": 33,
+      "suite": "poseidon2"
+    },
+    {
+      "buffer_offset": 0,
+      "completed_dispatches": 1,
+      "inputs": 2,
+      "operation": "hash_fold",
+      "outputs": 1,
+      "result": "matched",
+      "suite": "poseidon2"
+    },
+    {
+      "buffer_offset": 3,
+      "completed_dispatches": 1,
+      "inputs": 2,
+      "operation": "hash_fold",
+      "outputs": 1,
+      "result": "matched",
+      "suite": "poseidon2"
+    },
+    {
+      "buffer_offset": 0,
+      "completed_dispatches": 1,
+      "inputs": 4,
+      "operation": "hash_fold",
+      "outputs": 2,
+      "result": "matched",
+      "suite": "poseidon2"
+    },
+    {
+      "buffer_offset": 3,
+      "completed_dispatches": 1,
+      "inputs": 4,
+      "operation": "hash_fold",
+      "outputs": 2,
+      "result": "matched",
+      "suite": "poseidon2"
+    },
+    {
+      "buffer_offset": 0,
+      "completed_dispatches": 1,
+      "inputs": 6,
+      "operation": "hash_fold",
+      "outputs": 3,
+      "result": "matched",
+      "suite": "poseidon2"
+    },
+    {
+      "buffer_offset": 3,
+      "completed_dispatches": 1,
+      "inputs": 6,
+      "operation": "hash_fold",
+      "outputs": 3,
+      "result": "matched",
+      "suite": "poseidon2"
+    },
+    {
+      "buffer_offset": 0,
+      "completed_dispatches": 1,
+      "inputs": 32,
+      "operation": "hash_fold",
+      "outputs": 16,
+      "result": "matched",
+      "suite": "poseidon2"
+    },
+    {
+      "buffer_offset": 3,
+      "completed_dispatches": 1,
+      "inputs": 32,
+      "operation": "hash_fold",
+      "outputs": 16,
+      "result": "matched",
+      "suite": "poseidon2"
+    },
+    {
+      "buffer_offset": 0,
+      "completed_dispatches": 1,
+      "inputs": 66,
+      "operation": "hash_fold",
+      "outputs": 33,
+      "result": "matched",
+      "suite": "poseidon2"
+    },
+    {
+      "buffer_offset": 3,
+      "completed_dispatches": 1,
+      "inputs": 66,
+      "operation": "hash_fold",
+      "outputs": 33,
+      "result": "matched",
+      "suite": "poseidon2"
+    }
+  ],
+  "compiler": "runtime source",
+  "completed_dispatches": 404,
+  "device": "Apple M5 Max",
+  "error": null,
+  "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+  "limits": "at most 4096 data elements per arithmetic case; no invalid GPU accesses",
+  "mode": "all",
+  "proof_acceleration": "not enabled",
+  "status": "passed",
+  "successful_case_dispatches": 404,
+  "verification": "CPU/Metal primitive equality only"
+}

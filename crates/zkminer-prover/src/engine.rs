@@ -55,6 +55,74 @@ pub trait ProvingEngine: Send + Sync {
     }
 }
 
+/// Resolve the po2 to use for a proof, applying the priority chain:
+///   1. Manual override from po2_overrides (if set for this device+backend)
+///   2. Dynamic selection via Po2Profile calibration data
+///   3. None (let the SDK use its default)
+///
+/// Returns None for non-risc0 backends (SP1/OpenVM ignore po2).
+pub fn resolve_po2(
+    device_id: &str,
+    backend: &str,
+    estimated_cycles: u64,
+    po2_overrides: &std::collections::HashMap<(String, String), u8>,
+    po2_profile: Option<&crate::benchmark::Po2Profile>,
+) -> Option<u8> {
+    if backend != "risc0" {
+        return None;
+    }
+
+    // Priority 1: Manual override
+    let key = (device_id.to_string(), backend.to_string());
+    if let Some(&po2) = po2_overrides.get(&key) {
+        return Some(po2);
+    }
+
+    // Priority 2: Dynamic selection from calibration data
+    if let Some(profile) = po2_profile {
+        if estimated_cycles > 0 {
+            // Only override the SDK when calibration shows a DECISIVE winner. A plain
+            // argmax would act on differences inside measurement noise, which measured
+            // 5% SLOWER than the default on a 4090 — see `confident_po2_for_job`.
+            if let Some(po2) = profile.confident_po2_for_job(estimated_cycles) {
+                #[cfg(target_os = "macos")]
+                if !macos_profile_po2_allowed(
+                    po2,
+                    std::env::var("ZKMINER_RISC0_WRAP").as_deref() == Ok("native"),
+                    std::env::var("RISC0_SEGMENT_PIPELINE").as_deref() != Ok("0"),
+                ) {
+                    return None; // Keep the selected Mac pipeline's segment setting.
+                }
+                return Some(po2);
+            }
+        }
+    }
+
+    // Priority 3: Let the SDK choose
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_profile_po2_allowed(po2: u8, native: bool, pipeline_enabled: bool) -> bool {
+    if !native {
+        return po2 == 18;
+    }
+    po2 == zkminer_prover_protocol::macos::DEFAULT_NATIVE_SEGMENT_PO2
+        || (!pipeline_enabled && po2 == zkminer_prover_protocol::macos::MAX_SEGMENT_PO2)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    #[test]
+    fn calibration_allows_po2_21_only_without_native_pipelining() {
+        for po2 in 13..=24 {
+            assert_eq!(super::macos_profile_po2_allowed(po2, true, true), po2 == 20);
+            assert_eq!(super::macos_profile_po2_allowed(po2, true, false), (20..=21).contains(&po2));
+            assert_eq!(super::macos_profile_po2_allowed(po2, false, true), po2 == 18);
+        }
+    }
+}
+
 /// How a backend is available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendSource {

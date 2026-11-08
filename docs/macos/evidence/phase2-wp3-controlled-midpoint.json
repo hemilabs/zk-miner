@@ -1,0 +1,349 @@
+{
+  "schema_version": 1,
+  "status": "complete",
+  "source_spec_sha256": "f92bf25a4d8d6c94f83acca60383ff7b81fc04e0c5bd1ada20ec603df72d4454",
+  "scope": "sealed WP3 checkpoint absolute midpoint; browser closed, default 16 GiB reserve, nominal at start",
+  "campaign_run": "target/macos/phase2/wp3-controlled-midpoint/31af0c229dcd4696822f9ab212d4e99a",
+  "campaign_result_sha256": "2ce157cbcacb025557ba348e5c2da98dac0bfb8df76034d08bbc5cf74725056d",
+  "baseline_manifest_sha256": "8f1f57c81a2955c91c7aa773c8309822d13557f8527bf1b2c93b4b2953888836",
+  "worker_sha256": "f8d02da3e636cd38a7a2610ed068a0f59e9b5bf8928e0221454a479ac86e2c39",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "engine_commit": "8520c737725698ddb156ccda2a41e0521213b878",
+  "driver_sha256": "869b51e26bda6684acd1823f33f02b8026f9ee7d331cf26bd409c60f688faa19",
+  "acceptance_runner_sha256": "6f91fa435a40074b6dc7cdda2ccbb87ec0873eb709b38179ea26e6e5f3c58cfb",
+  "collector_sha256": "4ef17be0fe91ea5fa8cc3d3cc3f22fa3301c3b818f489572671488e79c7dcf7d",
+  "verified_proofs": 12,
+  "tamper_rejections": 36,
+  "midpoint_at_most_60_seconds_both": false,
+  "fixtures": [
+    {
+      "fixture": "arithmetic-10m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/b5ea6342d87f4b208426c6d796c8a10d",
+      "result_sha256": "9d56b541ce4bb837547725537cd3560ed85daaeb7828e20309638dddd5702d94",
+      "request_ledger_sha256": "ffdb89691f55670ba672c34920532c46bba68e6895b53543c61f4a458dd7e1d9",
+      "median_complete_seconds": 59.55620566699999,
+      "range_complete_seconds": [
+        58.486701167,
+        60.51017029200001
+      ],
+      "max_measured_admission_wait_upper_bound_seconds": 0.13580379099999706,
+      "admission_wait_note": "standalone harness records total request elapsed, prove and verifier times; residual is a conservative upper bound including non-admission overhead",
+      "max_guard_peak_footprint_bytes": 23474935448,
+      "rows": [
+        {
+          "fixture": "arithmetic-10m",
+          "case": "proof-0",
+          "warmup": true,
+          "complete_seconds": 67.40996054200001,
+          "admission_wait_upper_bound_seconds": 0.03484024999999014,
+          "guard_peak_footprint_bytes": 18278255136,
+          "idle_worker_footprint_bytes": 4953248112,
+          "pressure_level": 1,
+          "worker_pid": 49501,
+          "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+          "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+          "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+          "seal_sha256": "6c319cfd15d837215b226de0cdc5710e4fd56066b8d94b8c88668f6001f15e26",
+          "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e"
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "case": "proof-1",
+          "warmup": false,
+          "complete_seconds": 60.51017029200001,
+          "admission_wait_upper_bound_seconds": 0.03205733299999317,
+          "guard_peak_footprint_bytes": 22378206320,
+          "idle_worker_footprint_bytes": 5098492416,
+          "pressure_level": 1,
+          "worker_pid": 49501,
+          "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+          "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+          "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+          "seal_sha256": "c805f10ea375008d906e879ffe24cb0dd7dd0b4121f1b9c5a8c2a445ef22222f",
+          "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e"
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "case": "proof-2",
+          "warmup": false,
+          "complete_seconds": 58.486701167,
+          "admission_wait_upper_bound_seconds": 0.13580379099999706,
+          "guard_peak_footprint_bytes": 23474935448,
+          "idle_worker_footprint_bytes": 5115433496,
+          "pressure_level": 1,
+          "worker_pid": 49501,
+          "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+          "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+          "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+          "seal_sha256": "e2770046047fceac95c21a80b64f2b53042d81c4722cb3d296e562c72c4a7df4",
+          "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e"
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "case": "proof-3",
+          "warmup": false,
+          "complete_seconds": 59.522397083,
+          "admission_wait_upper_bound_seconds": 0.058360166999991865,
+          "guard_peak_footprint_bytes": 23474935448,
+          "idle_worker_footprint_bytes": 5123101208,
+          "pressure_level": 1,
+          "worker_pid": 49501,
+          "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+          "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+          "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+          "seal_sha256": "11e0ed7d4c5c09bc7285fe7dead20a278b1b0a68bab7eda50661b5792c19161f",
+          "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e"
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "case": "proof-4",
+          "warmup": false,
+          "complete_seconds": 59.55620566699999,
+          "admission_wait_upper_bound_seconds": 0.04747691600000668,
+          "guard_peak_footprint_bytes": 23474935448,
+          "idle_worker_footprint_bytes": 5139780120,
+          "pressure_level": 1,
+          "worker_pid": 49501,
+          "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+          "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+          "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+          "seal_sha256": "022d80499e11321f791432d47d9bbef68087e7cf8516e8246376a931ac02f821",
+          "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e"
+        },
+        {
+          "fixture": "arithmetic-10m",
+          "case": "proof-5",
+          "warmup": false,
+          "complete_seconds": 59.581587834,
+          "admission_wait_upper_bound_seconds": 0.10468004099999988,
+          "guard_peak_footprint_bytes": 23474935448,
+          "idle_worker_footprint_bytes": 5146104368,
+          "pressure_level": 1,
+          "worker_pid": 49501,
+          "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+          "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+          "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+          "seal_sha256": "333aeb6f92390b989fac892894f52a10b4ba33a350e61f36b2ea0993f2b2e44d",
+          "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e"
+        }
+      ],
+      "host_before": {
+        "path": "/Users/dbur/dev/zk-miner/target/macos/phase2/wp3-controlled-midpoint/31af0c229dcd4696822f9ab212d4e99a/host-arithmetic-10m-before.json",
+        "sha256": "38bbd943cb95312bcc099fdc76c6c4c56a7e0bf0915577b0a885e7988c91ac34",
+        "observation": {
+          "observed_utc": "2026-11-05T23:34:36.507337+00:00",
+          "estimated_available_bytes": 52580982784,
+          "estimated_available_method": "free pages plus half of the lesser of file-backed and inactive pages",
+          "thermal": {
+            "low_power_false_may_mean_unknown": true,
+            "low_power_mode_enabled": false,
+            "schema_version": 1,
+            "thermal_nominal_may_mean_unknown": true,
+            "thermal_state": 0,
+            "thermal_state_name": "nominal"
+          },
+          "background_process_present": {
+            "brave": false,
+            "chatgpt_codex": true,
+            "claude": true,
+            "colima": true,
+            "vscode": false,
+            "xcode": false
+          },
+          "scope": "instantaneous host observation; process changes are recorded by the campaign driver"
+        }
+      },
+      "host_after": {
+        "path": "/Users/dbur/dev/zk-miner/target/macos/phase2/wp3-controlled-midpoint/31af0c229dcd4696822f9ab212d4e99a/host-arithmetic-10m-after.json",
+        "sha256": "a7ec1f853d9525c76cd990a16dc357517b6fc5aa12be9e1e2a91128ad43f7d1b",
+        "observation": {
+          "observed_utc": "2026-11-05T23:41:07.752480+00:00",
+          "estimated_available_bytes": 52945739776,
+          "estimated_available_method": "free pages plus half of the lesser of file-backed and inactive pages",
+          "thermal": {
+            "low_power_false_may_mean_unknown": true,
+            "low_power_mode_enabled": false,
+            "schema_version": 1,
+            "thermal_nominal_may_mean_unknown": true,
+            "thermal_state": 1,
+            "thermal_state_name": "fair"
+          },
+          "background_process_present": {
+            "brave": false,
+            "chatgpt_codex": true,
+            "claude": true,
+            "colima": true,
+            "vscode": false,
+            "xcode": false
+          },
+          "scope": "instantaneous host observation; process changes are recorded by the campaign driver"
+        }
+      }
+    },
+    {
+      "fixture": "hash-10m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/095574e5b73d4aa2b8853808a075da9e",
+      "result_sha256": "efc6e369a1729cb4321c99602c2830d34d1c273137675294fb526303a746384c",
+      "request_ledger_sha256": "81b49741ba228b3107bc5a4046866a5819170b5b0b21817bf361ca1cd72af537",
+      "median_complete_seconds": 60.369211999,
+      "range_complete_seconds": [
+        60.34580791700001,
+        61.3546955
+      ],
+      "max_measured_admission_wait_upper_bound_seconds": 0.11937850100000114,
+      "admission_wait_note": "standalone harness records total request elapsed, prove and verifier times; residual is a conservative upper bound including non-admission overhead",
+      "max_guard_peak_footprint_bytes": 23742899872,
+      "rows": [
+        {
+          "fixture": "hash-10m",
+          "case": "proof-0",
+          "warmup": true,
+          "complete_seconds": 66.65210566599998,
+          "admission_wait_upper_bound_seconds": 0.04965045900001237,
+          "guard_peak_footprint_bytes": 18342840816,
+          "idle_worker_footprint_bytes": 5053485592,
+          "pressure_level": 1,
+          "worker_pid": 54048,
+          "program_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+          "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+          "journal_sha256": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+          "seal_sha256": "84e128e47fbe61c4a1f6b99aba8bceb308b360456774b1870902e84180abb675",
+          "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5"
+        },
+        {
+          "fixture": "hash-10m",
+          "case": "proof-1",
+          "warmup": false,
+          "complete_seconds": 60.350902291,
+          "admission_wait_upper_bound_seconds": 0.10343566700000048,
+          "guard_peak_footprint_bytes": 23550203568,
+          "idle_worker_footprint_bytes": 5202989736,
+          "pressure_level": 1,
+          "worker_pid": 54048,
+          "program_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+          "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+          "journal_sha256": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+          "seal_sha256": "2909356d8135f62fcfc70b95ef514d3f7634fd653385a6a3f250521bb963ef42",
+          "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5"
+        },
+        {
+          "fixture": "hash-10m",
+          "case": "proof-2",
+          "warmup": false,
+          "complete_seconds": 60.369211999,
+          "admission_wait_upper_bound_seconds": 0.11937850100000114,
+          "guard_peak_footprint_bytes": 23550203568,
+          "idle_worker_footprint_bytes": 5222011560,
+          "pressure_level": 1,
+          "worker_pid": 54048,
+          "program_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+          "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+          "journal_sha256": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+          "seal_sha256": "37ce3fe6035238be3081111c9787e0f0b6097c130de519be6e084abea395dc33",
+          "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5"
+        },
+        {
+          "fixture": "hash-10m",
+          "case": "proof-3",
+          "warmup": false,
+          "complete_seconds": 60.34580791700001,
+          "admission_wait_upper_bound_seconds": 0.06640799899999787,
+          "guard_peak_footprint_bytes": 23550203568,
+          "idle_worker_footprint_bytes": 5238887104,
+          "pressure_level": 1,
+          "worker_pid": 54048,
+          "program_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+          "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+          "journal_sha256": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+          "seal_sha256": "e712cc0bbe02053f5779f5df5bb846c7f9eafc21d87b552a11943fdec5413afe",
+          "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5"
+        },
+        {
+          "fixture": "hash-10m",
+          "case": "proof-4",
+          "warmup": false,
+          "complete_seconds": 61.3546955,
+          "admission_wait_upper_bound_seconds": 0.09550495799999946,
+          "guard_peak_footprint_bytes": 23550203568,
+          "idle_worker_footprint_bytes": 5453583040,
+          "pressure_level": 1,
+          "worker_pid": 54048,
+          "program_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+          "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+          "journal_sha256": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+          "seal_sha256": "bacfa30271f914579e4becfd0d2511614c72e26a166d61e57ca6f98598a3d2c6",
+          "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5"
+        },
+        {
+          "fixture": "hash-10m",
+          "case": "proof-5",
+          "warmup": false,
+          "complete_seconds": 61.348599041,
+          "admission_wait_upper_bound_seconds": 0.07458249999999876,
+          "guard_peak_footprint_bytes": 23742899872,
+          "idle_worker_footprint_bytes": 5474456280,
+          "pressure_level": 1,
+          "worker_pid": 54048,
+          "program_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+          "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+          "journal_sha256": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+          "seal_sha256": "4653f28e90aac5244b9fbf5f74e4c5ce3c2ee1de0d6807b15c65d376c42b51d8",
+          "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5"
+        }
+      ],
+      "host_before": {
+        "path": "/Users/dbur/dev/zk-miner/target/macos/phase2/wp3-controlled-midpoint/31af0c229dcd4696822f9ab212d4e99a/host-hash-10m-before.json",
+        "sha256": "6e8d29d02073bbc4596fabcf7dd748e175318eb669255d1edd67ee3c0d9c7b96",
+        "observation": {
+          "observed_utc": "2026-11-05T23:41:07.809988+00:00",
+          "estimated_available_bytes": 52947320832,
+          "estimated_available_method": "free pages plus half of the lesser of file-backed and inactive pages",
+          "thermal": {
+            "low_power_false_may_mean_unknown": true,
+            "low_power_mode_enabled": false,
+            "schema_version": 1,
+            "thermal_nominal_may_mean_unknown": true,
+            "thermal_state": 1,
+            "thermal_state_name": "fair"
+          },
+          "background_process_present": {
+            "brave": false,
+            "chatgpt_codex": true,
+            "claude": true,
+            "colima": true,
+            "vscode": false,
+            "xcode": false
+          },
+          "scope": "instantaneous host observation; process changes are recorded by the campaign driver"
+        }
+      },
+      "host_after": {
+        "path": "/Users/dbur/dev/zk-miner/target/macos/phase2/wp3-controlled-midpoint/31af0c229dcd4696822f9ab212d4e99a/host-hash-10m-after.json",
+        "sha256": "9d73a6e94cf00d4db90a39a2405c49be2e87748441a1bb47257e0d84caee809b",
+        "observation": {
+          "observed_utc": "2026-11-05T23:47:44.564216+00:00",
+          "estimated_available_bytes": 53613682688,
+          "estimated_available_method": "free pages plus half of the lesser of file-backed and inactive pages",
+          "thermal": {
+            "low_power_false_may_mean_unknown": true,
+            "low_power_mode_enabled": false,
+            "schema_version": 1,
+            "thermal_nominal_may_mean_unknown": true,
+            "thermal_state": 1,
+            "thermal_state_name": "fair"
+          },
+          "background_process_present": {
+            "brave": false,
+            "chatgpt_codex": true,
+            "claude": true,
+            "colima": true,
+            "vscode": false,
+            "xcode": false
+          },
+          "scope": "instantaneous host observation; process changes are recorded by the campaign driver"
+        }
+      }
+    }
+  ],
+  "csv_sha256": "23b17789624333646b4b5bb50f6ec51e2ae4f626b4c686b3927559dc06486af4"
+}

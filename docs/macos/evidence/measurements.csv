@@ -1,0 +1,14 @@
+source,run,workload,po2,status,total_seconds,native_sampled_peak_rss_bytes,segments,error
+harness,d5c3df7d83ac44769860a5074068fcb3,fibonacci(20),18,failed,1.1392386239022017,32768,,prover exited 1; see prover.log
+harness,facaf950c92d42b7b96cce08422118cb,fibonacci(20),18,complete_independently_verified,166.47136779129505,1961607168,1,
+harness,9cc541fcd4c54dcdad7c9ad5dd93204b,fibonacci(20),18,complete_independently_verified,167.1914960425347,1963048960,1,
+harness,d811a606185449119e0563797f4aaeef,sha256-chain,18,complete_independently_verified,174.72543241642416,2571124736,1,
+harness,03aeaeb7f00441f4823b0f1f59925e7c,segment-boundary,14,failed,294.87636566720903,2271281152,,prover exited 1; see prover.log
+harness,f2bd8b662cc34b94b17cd83d1eb4cade,segment-boundary,18,failed,188.619098957628,2942107648,1,multi-segment workload produced fewer than two segments; lower po2
+harness,a519537bdfd14f90afa0c536ea5d8ae5,segment-boundary,16,complete_independently_verified,241.99956441670656,2746236928,5,
+worker,proof-0,fibonacci(20),18,complete_independently_verified,164.478,,,
+worker,proof-1,fibonacci(20),18,complete_independently_verified,159.875,,,
+worker,proof-2,fibonacci(20),18,complete_independently_verified,167.932,,,
+worker,proof-after-restart,fibonacci(20),18,complete_independently_verified,164.781,,,
+worker,intentional-timeout,fibonacci(20),18,expected_timeout,70,,,deadline during actual wrapping; cleaned and restarted
+worker,initial-startup,none,,failed,,,,free-only memory estimate rejected startup; corrected subsequently

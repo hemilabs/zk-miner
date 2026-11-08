@@ -1,0 +1,17 @@
+#!/bin/sh
+# CPU-only diagnostic build: the host lacks Apple's Metal compiler.
+# Emit an empty artifact only for the Metal asset path; CPU kernels compile normally.
+set -eu
+case " $* " in
+  *' metal '*|*' metallib '*)
+    output=
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = '-o' ]; then shift; output=$1; break; fi
+      shift
+    done
+    test -n "$output"
+    mkdir -p "$(dirname "$output")"
+    : > "$output"
+    ;;
+  *) exec /usr/bin/xcrun "$@" ;;
+esac

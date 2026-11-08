@@ -1,0 +1,28 @@
+{
+  "binary": "/Users/dbur/dev/zk-miner/target/macos/recursion-metal-final-build/zkminer-prove-risc0",
+  "binary_sha256": "d157305ba0e0830671c6b8f6238dc68e59ae8a68dc3454865c2084c21bc347b9",
+  "manifest_sha256": "a3413f5171576da64244046222290c68de0b9aed521d76842fba1d124c677e7b",
+  "miner_commit": "55b6d877124926847cb27c5885e4b222603b5e94",
+  "engine_commit": "1f6eb352d366edc0cfad6f17a76ce41387d48f36",
+  "matched_miner_inputs": {
+    "Cargo.lock": "75d710409c3107e465ca0520bb7c551e8027c47ecb7c8e3b13d9b106cad5c6b9",
+    "Cargo.toml": "6d62c06c33b867de1177afe1b4f220f70557e87e9175e3bd7574e56d0d66fed2",
+    "crates/zkminer-prove-risc0/Cargo.toml": "853a713040f3f179df3b99c3e55edf2ed67df044a11acfc08a45538d1e033f4c",
+    "crates/zkminer-prove-risc0/build.rs": "a6311821df1d5d69671acb372ca5c6a6608df3789d7cd9113975ba6d99ea1ac6",
+    "crates/zkminer-prove-risc0/src/macos.rs": "3d412ea39a076e89e2545708f2cb882e5a6c7a6f242f2b7e6e8b34c92c3e4fda",
+    "crates/zkminer-prove-risc0/src/macos_metal.rs": "0362e42524cdb32b269019ec99965308bf5f4812d4b8576fec138d16c1b47f05",
+    "crates/zkminer-prove-risc0/src/main.rs": "e635521b15f4db34c52164160cf863e5b31d144df6de2ace4ea9e07a943365e4",
+    "crates/zkminer-prover-protocol/Cargo.toml": "a646a1d0024007d0172aa8a1b4efb5ebc1b5df2364950d5475279ee6250dbdcd",
+    "crates/zkminer-prover-protocol/src/codec.rs": "70543a49b7d6c4df969ec05033bbcf934c450d8cdfcf261ced7536b3e0145f86",
+    "crates/zkminer-prover-protocol/src/lib.rs": "cf49912fe2eeb919ecd36c90cbf1290634224a9ab502cba32b523e0f17f65c59",
+    "crates/zkminer-prover-protocol/src/macos.rs": "46bffe46c057fd567e195dae2401ff6ef0af2d051d10dbc2358fca184d66b334",
+    "crates/zkminer-prover-protocol/src/proc.rs": "5b1bba5de4b31c09eb07510f2480e57b82b5d65ac4d480142e0e7d4c4c06af10",
+    "crates/zkminer-prover-protocol/src/types.rs": "684640701892d81adc2f3d717d5c61bd4f1f434d2ef3e8bc72165f19dd6fea89",
+    "scripts/macos/build-worker.py": "cdf09159fea5824d8294917a3762b4e6898b1a3a64dfcde39ab47ef27e92b3d0",
+    "scripts/macos/check-source.py": "39bda05bea2f8eb86e7e0d045a72b0e1dbaf66a067c8b40480771758944b63dd",
+    "scripts/macos/env.sh": "d4ea1b6cfb9e24c3edfa767a32c533648a4f1c123278b01d5c378c078e574835",
+    "scripts/macos/local-engine.py": "b3045c21b11c7a0aa32b9cc9909bccb587bf5ab30f06539f3cf09a4a015244c4",
+    "scripts/macos/worker_provenance.py": "0594a372af5547a6c7c9a6f38c1befb88a9a5ed6c0214cc77530ddf961010add"
+  },
+  "engine_patch_sha256": "eece344bfcc276c49cbb06d4f430bfbe3be3675625243c5819aca3551e83d696"
+}

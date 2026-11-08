@@ -1,0 +1,709 @@
+{
+  "note": "Correctness runs, not a controlled performance comparison.",
+  "hardware": {
+    "physical_memory_bytes": 137438953472,
+    "logical_cpus": 18,
+    "metal_devices": [
+      {
+        "max_buffer_bytes": 86586540032,
+        "supported_family_ids": [
+          1001,
+          1002,
+          1003,
+          1004,
+          1005,
+          1006,
+          1007,
+          1008,
+          1009,
+          1010,
+          2002,
+          5001,
+          5002
+        ],
+        "unified_memory": true,
+        "name": "Apple M5 Max",
+        "recommended_max_working_set_bytes": 115448725504,
+        "currently_allocated_bytes": 65536
+      }
+    ],
+    "active_cpus": 18
+  },
+  "harness_attempts": [
+    {
+      "run_id": "d5c3df7d83ac44769860a5074068fcb3",
+      "workload": "fibonacci(20)",
+      "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+      "helper_arch": "linux/amd64",
+      "helper_context": "colima-hemi-macos-cpu",
+      "requested_mode": "cpu",
+      "status": "failed",
+      "native_peak_rss_bytes": 32768,
+      "rss_method": "ps RSS of owned native prover, sampled every 5s; excludes VM/helper",
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/cpu/release/hemi-macos-proof",
+        "prove",
+        "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/d5c3df7d83ac44769860a5074068fcb3/input.bin",
+        "6d1a000000000000",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/d5c3df7d83ac44769860a5074068fcb3/proof",
+        "18"
+      ],
+      "error": "prover exited 1; see prover.log",
+      "total_ms": 1139.2386239022017
+    },
+    {
+      "run_id": "facaf950c92d42b7b96cce08422118cb",
+      "workload": "fibonacci(20)",
+      "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+      "helper_arch": "linux/amd64",
+      "helper_context": "colima-hemi-macos-cpu",
+      "requested_mode": "cpu",
+      "status": "complete_independently_verified",
+      "native_peak_rss_bytes": 1961607168,
+      "rss_method": "ps RSS of owned native prover, sampled every 5s; excludes VM/helper",
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/cpu/release/hemi-macos-proof",
+        "prove",
+        "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/facaf950c92d42b7b96cce08422118cb/input.bin",
+        "6d1a000000000000",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/facaf950c92d42b7b96cce08422118cb/proof",
+        "18"
+      ],
+      "total_ms": 166471.36779129505,
+      "proof_report": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "failures": 0,
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+        "journal_hex": "6d1a000000000000",
+        "po2": 18,
+        "proof_kind": "groth16",
+        "requested_mode": "cpu",
+        "stage_ms": {
+          "execution_and_segment": 2689.257708,
+          "identity_and_wrap": 155995.225083,
+          "recursion": 7395.4025,
+          "verification": 1.78875
+        },
+        "stats": {
+          "paging_cycles": 16300,
+          "reserved_cycles": 13152,
+          "segments": 1,
+          "total_cycles": 32768,
+          "user_cycles": 3316
+        },
+        "total_ms": 166105.192208,
+        "verification": "in_process_passed_independent_pending"
+      },
+      "verification_report": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "journal_hex": "6d1a000000000000",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      }
+    },
+    {
+      "run_id": "9cc541fcd4c54dcdad7c9ad5dd93204b",
+      "workload": "fibonacci(20)",
+      "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+      "helper_arch": "linux/amd64",
+      "helper_context": "colima-hemi-macos-cpu",
+      "requested_mode": "cpu",
+      "status": "complete_independently_verified",
+      "native_peak_rss_bytes": 1963048960,
+      "rss_method": "ps RSS of owned native prover, sampled every 5s; excludes VM/helper",
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/cpu/release/hemi-macos-proof",
+        "prove",
+        "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/9cc541fcd4c54dcdad7c9ad5dd93204b/input.bin",
+        "6d1a000000000000",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/9cc541fcd4c54dcdad7c9ad5dd93204b/proof",
+        "18"
+      ],
+      "total_ms": 167191.4960425347,
+      "proof_report": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "failures": 0,
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+        "journal_hex": "6d1a000000000000",
+        "po2": 18,
+        "proof_kind": "groth16",
+        "requested_mode": "cpu",
+        "stage_ms": {
+          "execution_and_segment": 2753.441417,
+          "identity_and_wrap": 156884.765084,
+          "recursion": 7471.96325,
+          "verification": 1.7553340000000002
+        },
+        "stats": {
+          "paging_cycles": 16300,
+          "reserved_cycles": 13152,
+          "segments": 1,
+          "total_cycles": 32768,
+          "user_cycles": 3316
+        },
+        "total_ms": 167136.283917,
+        "verification": "in_process_passed_independent_pending"
+      },
+      "verification_report": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "journal_hex": "6d1a000000000000",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      }
+    },
+    {
+      "run_id": "d811a606185449119e0563797f4aaeef",
+      "workload": "sha256-chain",
+      "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+      "helper_arch": "linux/amd64",
+      "helper_context": "colima-hemi-macos-cpu",
+      "requested_mode": "cpu",
+      "status": "complete_independently_verified",
+      "native_peak_rss_bytes": 2571124736,
+      "rss_method": "ps RSS of owned native prover, sampled every 5s; excludes VM/helper",
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/cpu/release/hemi-macos-proof",
+        "prove",
+        "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/sha256-chain.bin",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/d811a606185449119e0563797f4aaeef/input.bin",
+        "43f66f29297b60a3a6a09f54f383bf01a44d6c3baa727796983637a32fcb0583",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/d811a606185449119e0563797f4aaeef/proof",
+        "18"
+      ],
+      "total_ms": 174725.43241642416,
+      "proof_report": {
+        "elf_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+        "failures": 0,
+        "image_id": "58518a60c949a92b89ddcfa8c8b44f65ebbf17ee16c0dffa738ed55563e0a623",
+        "input_sha256": "075de2b906dbd7066da008cab735bee896370154603579a50122f9b88545bd45",
+        "journal_hex": "43f66f29297b60a3a6a09f54f383bf01a44d6c3baa727796983637a32fcb0583",
+        "po2": 18,
+        "proof_kind": "groth16",
+        "requested_mode": "cpu",
+        "stage_ms": {
+          "execution_and_segment": 10196.251290999999,
+          "identity_and_wrap": 156866.276875,
+          "recursion": 7569.182707999999,
+          "verification": 1.800083
+        },
+        "stats": {
+          "paging_cycles": 21738,
+          "reserved_cycles": 61986,
+          "segments": 1,
+          "total_cycles": 131072,
+          "user_cycles": 47348
+        },
+        "total_ms": 174658.97791699998,
+        "verification": "in_process_passed_independent_pending"
+      },
+      "verification_report": {
+        "elf_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+        "image_id": "58518a60c949a92b89ddcfa8c8b44f65ebbf17ee16c0dffa738ed55563e0a623",
+        "journal_hex": "43f66f29297b60a3a6a09f54f383bf01a44d6c3baa727796983637a32fcb0583",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      }
+    },
+    {
+      "run_id": "03aeaeb7f00441f4823b0f1f59925e7c",
+      "workload": "segment-boundary",
+      "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+      "helper_arch": "linux/amd64",
+      "helper_context": "colima-hemi-macos-cpu",
+      "requested_mode": "cpu",
+      "status": "failed",
+      "native_peak_rss_bytes": 2271281152,
+      "rss_method": "ps RSS of owned native prover, sampled every 5s; excludes VM/helper",
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/cpu/release/hemi-macos-proof",
+        "prove",
+        "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/segment-boundary.bin",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/03aeaeb7f00441f4823b0f1f59925e7c/input.bin",
+        "f0febc9a78563412",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/03aeaeb7f00441f4823b0f1f59925e7c/proof",
+        "14"
+      ],
+      "error": "prover exited 1; see prover.log",
+      "total_ms": 294876.36566720903
+    },
+    {
+      "run_id": "f2bd8b662cc34b94b17cd83d1eb4cade",
+      "workload": "segment-boundary",
+      "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+      "helper_arch": "linux/amd64",
+      "helper_context": "colima-hemi-macos-cpu",
+      "requested_mode": "cpu",
+      "status": "failed",
+      "native_peak_rss_bytes": 2942107648,
+      "rss_method": "ps RSS of owned native prover, sampled every 5s; excludes VM/helper",
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/cpu/release/hemi-macos-proof",
+        "prove",
+        "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/segment-boundary.bin",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/f2bd8b662cc34b94b17cd83d1eb4cade/input.bin",
+        "f0febc9a78563412",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/f2bd8b662cc34b94b17cd83d1eb4cade/proof",
+        "18"
+      ],
+      "error": "multi-segment workload produced fewer than two segments; lower po2",
+      "total_ms": 188619.098957628,
+      "proof_report": {
+        "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+        "failures": 0,
+        "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+        "input_sha256": "226868b59be3e5e479cc22d7bda11055bad06bb205b77454ea36c65885f5c284",
+        "journal_hex": "f0febc9a78563412",
+        "po2": 18,
+        "proof_kind": "groth16",
+        "requested_mode": "cpu",
+        "stage_ms": {
+          "execution_and_segment": 20849.361084,
+          "identity_and_wrap": 160063.161542,
+          "recursion": 7415.7429170000005,
+          "verification": 1.8315
+        },
+        "stats": {
+          "paging_cycles": 16339,
+          "reserved_cycles": 119728,
+          "segments": 1,
+          "total_cycles": 262144,
+          "user_cycles": 126077
+        },
+        "total_ms": 188357.420125,
+        "verification": "in_process_passed_independent_pending"
+      },
+      "verification_report": {
+        "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+        "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+        "journal_hex": "f0febc9a78563412",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      }
+    },
+    {
+      "run_id": "a519537bdfd14f90afa0c536ea5d8ae5",
+      "workload": "segment-boundary",
+      "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+      "helper_arch": "linux/amd64",
+      "helper_context": "colima-hemi-macos-cpu",
+      "requested_mode": "cpu",
+      "status": "complete_independently_verified",
+      "native_peak_rss_bytes": 2746236928,
+      "rss_method": "ps RSS of owned native prover, sampled every 5s; excludes VM/helper",
+      "command": [
+        "/Users/dbur/dev/zk-miner/target/macos/cpu/release/hemi-macos-proof",
+        "prove",
+        "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/segment-boundary.bin",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/a519537bdfd14f90afa0c536ea5d8ae5/input.bin",
+        "f0febc9a78563412",
+        "/Users/dbur/dev/zk-miner/target/macos/runs/a519537bdfd14f90afa0c536ea5d8ae5/proof",
+        "16"
+      ],
+      "total_ms": 241999.56441670656,
+      "proof_report": {
+        "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+        "failures": 0,
+        "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+        "input_sha256": "226868b59be3e5e479cc22d7bda11055bad06bb205b77454ea36c65885f5c284",
+        "journal_hex": "f0febc9a78563412",
+        "po2": 16,
+        "proof_kind": "groth16",
+        "requested_mode": "cpu",
+        "stage_ms": {
+          "execution_and_segment": 23622.460166,
+          "identity_and_wrap": 155025.038541,
+          "recursion": 63216.658041999995,
+          "verification": 1.804625
+        },
+        "stats": {
+          "paging_cycles": 35483,
+          "reserved_cycles": 133352,
+          "segments": 5,
+          "total_cycles": 294912,
+          "user_cycles": 126077
+        },
+        "total_ms": 241926.423916,
+        "verification": "in_process_passed_independent_pending"
+      },
+      "verification_report": {
+        "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+        "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+        "journal_hex": "f0febc9a78563412",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      }
+    }
+  ],
+  "worker_proofs": [
+    {
+      "directory": "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-2/proof-0",
+      "verification": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "journal_hex": "6d1a000000000000",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      },
+      "seal_sha256": "af0a007412572d3b2ead1b4b4876113ebef7c6aa41ecf9f5adf67b3f32bf8dde",
+      "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+      "cycles": 32768,
+      "seconds": 164.478
+    },
+    {
+      "directory": "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-2/proof-1",
+      "verification": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "journal_hex": "6d1a000000000000",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      },
+      "seal_sha256": "8634fb7782eef21b5a112f2720dc35286545815f294a89f01e9b9da1c27cf3b8",
+      "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+      "cycles": 32768,
+      "seconds": 159.875
+    },
+    {
+      "directory": "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-2/proof-2",
+      "verification": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "journal_hex": "6d1a000000000000",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      },
+      "seal_sha256": "b8c710e0b637f1a238922d2ded2eb7f26d9efbf4ee1a679976e7b14a63518d3e",
+      "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+      "cycles": 32768,
+      "seconds": 167.932
+    },
+    {
+      "directory": "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-2/proof-after-restart",
+      "verification": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "journal_hex": "6d1a000000000000",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      },
+      "seal_sha256": "4b99e2bbe1d08b7ecac3842d6337e0323bb13382495ad1ddbe0d1c2fad5b0595",
+      "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+      "cycles": 32768,
+      "seconds": 164.781
+    }
+  ],
+  "artifacts": {
+    "miner_lock": {
+      "path": "/Users/dbur/dev/zk-miner/Cargo.lock",
+      "sha256": "e825c4acb6010706428b98a42515c3cacdb8da0029d6ac3e16bc750caca27b8b"
+    },
+    "harness_lock": {
+      "path": "/Users/dbur/dev/zk-miner/tools/macos-proof/Cargo.lock",
+      "sha256": "1c163039293881958635d69e483755dce4f9310148df22867f104d8d072294b9"
+    },
+    "worker_local_lock": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/worker-local-Cargo.lock",
+      "sha256": "5d1691de2bd8b72803ee15c624833764a55510faadf059fc99faee12013e23e8"
+    },
+    "verifier_lock": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/unchanged-verifier/Cargo.lock",
+      "sha256": "8c494780d49a95aaeec068d2c516aea1743c4f14ceb31dff00625deee97cc17e"
+    },
+    "worker_metadata": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/worker-metadata.json",
+      "sha256": "d9e53201bf7a9f1b8cac90f3f312589983fb396c2cb101817e19b14e762984e4"
+    },
+    "verifier_metadata": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/verifier-metadata.json",
+      "sha256": "0f87d4511d814f6ee25b2a33a391792fa541412789761600c67678e535b6c5bd"
+    },
+    "worker_binary": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/worker/release/zkminer-prove-risc0",
+      "sha256": "a5eae47f1dccfbbf06f1feb5d4f13fd3c44f228ee3846eab9c22c0b68fd9d318"
+    },
+    "miner_binary": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/miner/release/zkminer",
+      "sha256": "d1afa64fa13bf2a38a78a4a4ab36cebf580dd83304ce99977868cc16cc12c0f8"
+    },
+    "prover_binary": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/cpu/release/hemi-macos-proof",
+      "sha256": "dfd1f1177e690db73a635b96ad020911797aa742e04b6b83b70d4945fd627975"
+    },
+    "verifier_binary": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/verifier/release/hemi-macos-proof",
+      "sha256": "fca9d79ede878b7739b3c0d97caa7816613c75b2c86af194fc5b4c75e53a4762"
+    }
+  },
+  "worker_suite_completion": "4 real verified proofs; invalid guest, version mismatch, missing helper, forced Metal rejection, wrap watchdog, restart, shutdown passed\n",
+  "worker_suite_log_sha256": "d7af947a20aed24bc89eb72f14cdec52a8d8e67f7b94dfe7522759b5c8dd133c",
+  "worker_suite_log": "/Users/dbur/dev/zk-miner/target/macos/test-worker-acceptance-2.log",
+  "other_failures": [
+    {
+      "status": "failed",
+      "stage": "initial_worker_startup",
+      "reason": "free-only memory guard killed startup; corrected estimate tested subsequently",
+      "log": "/Users/dbur/dev/zk-miner/target/macos/test-worker-acceptance.log",
+      "log_sha256": "0efe3b9e84a69a53b8b19590acc81214f3972863c8f9d676c64c3cc42c7ca099"
+    }
+  ],
+  "test_logs": [
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-macos-final-pass.log",
+      "sha256": "9a80f49a1608009378ccb3f4877ab391aa5e249b7195daa2b2cda4ac57caa875",
+      "results": [
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 199 filtered out; finished in 0.01s"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-macos-observations-final.log",
+      "sha256": "fe9b5db2f551ec8fc954a13324aa5859ce768fc374a01dc13e8b07685ce160eb",
+      "results": [
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 199 filtered out; finished in 0.01s"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-macos-process-fixed.log",
+      "sha256": "d8307b109df5dd64e93a881ecb8a3242a8f703ae16bd80cc8711f36029489aae",
+      "results": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 199 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-macos-process.log",
+      "sha256": "b2dc74245282d7e01c9b3e1bf3b02683c49b35f976cf20ee14b2754a66e23bd3",
+      "results": [
+        "error: could not compile `zkminer-prover` (lib test) due to 1 previous error; 3 warnings emitted"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-memory-final.log",
+      "sha256": "65299dba738e257d9a7cb3a72d28d37389b086f43bd501f94dde5692eb6bea37",
+      "results": [
+        "test result: FAILED. 10 passed; 2 failed; 0 ignored; 0 measured; 189 filtered out; finished in 1.11s"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-memory-portable.log",
+      "sha256": "8bd26a16128c28575b5c9b219fdd2cbc89677fc20f0e838b1014069459437a79",
+      "results": [
+        "test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 189 filtered out; finished in 1.10s"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-mode-preflight.log",
+      "sha256": "68941c02a1f33f4c97717d37cce5a38736f4c2bc0e0d78e58eb8d8e0e092f9f6",
+      "results": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 4.13s"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-protocol-final.log",
+      "sha256": "df95aa5ed9cf2268c21ac8f00cea613bdc6f9f58f5573388063a1c6b9ba328f3",
+      "results": [
+        "test result: FAILED. 23 passed; 9 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-protocol-portable.log",
+      "sha256": "70b937695fa15e674790523e7c05bc36febf943d6eea3284bbc606dfb70528f4",
+      "results": [
+        "test result: FAILED. 23 passed; 8 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-protocol-verified.log",
+      "sha256": "bb0178e7c3b44e7c4a80c5d8c805dbf4b108c09d11cef7bacd46ca08514461a9",
+      "results": [
+        "test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.63s"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-worker-acceptance-2.log",
+      "sha256": "d7af947a20aed24bc89eb72f14cdec52a8d8e67f7b94dfe7522759b5c8dd133c",
+      "results": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 744.21s"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-worker-acceptance.log",
+      "sha256": "0efe3b9e84a69a53b8b19590acc81214f3972863c8f9d676c64c3cc42c7ca099",
+      "results": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-worker-unit-final-pass.log",
+      "sha256": "0830f46ff4f5d227f7c1af096e949eab37c5685667edfb2d219af9fc96117c87",
+      "results": [
+        "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 187 filtered out; finished in 0.03s"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-worker-unit-final.log",
+      "sha256": "ef6f06efab5fdebb5d1ac206c773d16c36ea005ff322eeba36385bff22aad2d0",
+      "results": [
+        "test result: FAILED. 12 passed; 2 failed; 0 ignored; 0 measured; 187 filtered out; finished in 0.03s"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-worker-unit-portable.log",
+      "sha256": "f904dad4968c618c73835b3fe69c0cdb9c7e477927cde41b562b211eff92bf78",
+      "results": [
+        "test result: FAILED. 12 passed; 2 failed; 0 ignored; 0 measured; 187 filtered out; finished in 0.03s"
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/test-worker-unit-verified.log",
+      "sha256": "c69823f1ef5c6f6532cb78e2867fd3583390d4be7191876df5a5e1eb897b11a7",
+      "results": [
+        "test result: FAILED. 13 passed; 1 failed; 0 ignored; 0 measured; 187 filtered out; finished in 0.01s"
+      ]
+    }
+  ],
+  "helper_artifacts": "x86_64\n/app:\ntotal 2502588\n-rwxrwxr-x 1 root root        851 Feb 10  2025 prover.sh\n-rw-r--r-- 1 root root  260664474 Apr  3  2025 stark_verify.cs\n-rw-r--r-- 1 root root   46203464 Apr  3  2025 stark_verify.dat\n-rw-r--r-- 1 root root 2255766633 Apr  3  2025 stark_verify_final.pk.dmp\n\n/usr/local/bin:\ntotal 158880\n-rwxr-xr-x 1 root root  14627939 Apr  3  2025 prover\n-rwxr-xr-x 1 root root 148060624 Apr  3  2025 stark_verify\n0670f7c8ce8fe757d0cf4808c5d5cd92c85ac7a96ea98170c2f6f756d49e80b5  /app/stark_verify.cs\n6d76b07e187e3329b1d82498a5f826366c3b2e04fc6d99de3d790248eb1ea71f  /app/stark_verify_final.pk.dmp\nf120ed88d4d090f7b4b78aef7dcc94bd98ecff6e592ea9f7a629c4279231b8b4  /app/stark_verify.dat\na30a45c2f38b116fd123fee219ec3e40925670b64585f196e291a22d3cef281e  /usr/local/bin/prover\ne407f61d2c6b9ee338e8194e10bef6ed815bd7497f9fac4687aa4944faa169c9  /usr/local/bin/stark_verify\n",
+  "guests": {
+    "fibonacci": {
+      "source": "/Users/dbur/dev/zk-miner/crates/zkminer-prover/guests/risc0/fibonacci",
+      "source_sha256": "6752e729c1b54d846d2e295e4736ea6d4d6729421e86c13b993dfb62b6741a34",
+      "elf": "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci",
+      "elf_sha256": "683875f3e781bef8541049b2c8e892b8dba6a6d58923ffd0710167a96e396eee",
+      "command": [
+        "cargo",
+        "+risc0",
+        "build",
+        "--release",
+        "--target",
+        "riscv32im-risc0-zkvm-elf",
+        "--manifest-path",
+        "/Users/dbur/dev/zk-miner/target/macos/guests/fibonacci/Cargo.toml",
+        "--config",
+        "/Users/dbur/dev/zk-miner/target/macos/local-engine.toml",
+        "--target-dir",
+        "/Users/dbur/dev/zk-miner/target/macos/guest-build"
+      ],
+      "program": "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin",
+      "packing": {
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "kernel_elf_sha256": "7ffd942e4e8babd771094f549ad080cfea8ecb2c05c986e275c011f41979d921",
+        "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "user_elf_sha256": "683875f3e781bef8541049b2c8e892b8dba6a6d58923ffd0710167a96e396eee"
+      }
+    },
+    "segment-boundary": {
+      "source": "/Users/dbur/dev/zk-miner/crates/zkminer-prover/guests/risc0/segment-boundary",
+      "source_sha256": "cde4b9571111160e4a3aefe7258d0c482a9102fbb099e0a20d069904668b5e57",
+      "elf": "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/segment-boundary",
+      "elf_sha256": "f6d7b2b9f4b4df24ffb6fa4035a7ef2f3deed6ee050b91850e93ce632e544108",
+      "command": [
+        "cargo",
+        "+risc0",
+        "build",
+        "--release",
+        "--target",
+        "riscv32im-risc0-zkvm-elf",
+        "--manifest-path",
+        "/Users/dbur/dev/zk-miner/target/macos/guests/segment-boundary/Cargo.toml",
+        "--config",
+        "/Users/dbur/dev/zk-miner/target/macos/local-engine.toml",
+        "--target-dir",
+        "/Users/dbur/dev/zk-miner/target/macos/guest-build"
+      ],
+      "program": "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/segment-boundary.bin",
+      "packing": {
+        "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+        "kernel_elf_sha256": "7ffd942e4e8babd771094f549ad080cfea8ecb2c05c986e275c011f41979d921",
+        "program_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+        "user_elf_sha256": "f6d7b2b9f4b4df24ffb6fa4035a7ef2f3deed6ee050b91850e93ce632e544108"
+      }
+    },
+    "sha256-chain": {
+      "source": "/Users/dbur/dev/zk-miner/crates/zkminer-prover/guests/risc0/sha256-chain",
+      "source_sha256": "afacd42ea25c94ead76dc88a364785801b9d094bc58a4c54f378f764112f6c3d",
+      "elf": "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/sha256-chain",
+      "elf_sha256": "abb6a5c2ce8921165043b565d1e6911d3bfbe1823b78adee9cc9db67bb4f1b48",
+      "command": [
+        "cargo",
+        "+risc0",
+        "build",
+        "--release",
+        "--target",
+        "riscv32im-risc0-zkvm-elf",
+        "--manifest-path",
+        "/Users/dbur/dev/zk-miner/target/macos/guests/sha256-chain/Cargo.toml",
+        "--config",
+        "/Users/dbur/dev/zk-miner/target/macos/local-engine.toml",
+        "--target-dir",
+        "/Users/dbur/dev/zk-miner/target/macos/guest-build"
+      ],
+      "program": "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/sha256-chain.bin",
+      "packing": {
+        "image_id": "58518a60c949a92b89ddcfa8c8b44f65ebbf17ee16c0dffa738ed55563e0a623",
+        "kernel_elf_sha256": "7ffd942e4e8babd771094f549ad080cfea8ecb2c05c986e275c011f41979d921",
+        "program_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+        "user_elf_sha256": "abb6a5c2ce8921165043b565d1e6911d3bfbe1823b78adee9cc9db67bb4f1b48"
+      }
+    }
+  },
+  "revisions": {
+    "miner": {
+      "path": "/Users/dbur/dev/zk-miner",
+      "head": "1bbdd68edf66f4bb9e72d2aad73e41ae36751d0e"
+    },
+    "engine": {
+      "path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+      "head": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d"
+    },
+    "supplied_hemi": {
+      "path": "/Users/dbur/dev/risc0",
+      "head": "6b673a0c26c0c195c1e4c9e59408de25fc434492"
+    },
+    "upstream_read_only": {
+      "path": "/Users/dbur/dev/risc0-parent",
+      "head": "164c64bb3a844d393bb7addc5781c705c647f2d5"
+    }
+  },
+  "engine_patch_sha256": "d528444aa0448ba9fdf837f2703a9d032f777f4ab334840a9a15a31c0789d3ac"
+}

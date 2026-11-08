@@ -6842,6 +6842,7 @@ async fn miner_brain(
             } else {
                 (!benchmarks.is_simulated()).then_some(conservative_cps)
             };
+            let estimated_cycles = known_cycles.unwrap_or(FALLBACK_ESTIMATED_CYCLES);
 
             // Backstop the per-descriptor fulfill-payload screen at the claim gate, evaluated HERE —
             // right after resolve_measured — so the measured-cycle and journal-length caches are read
@@ -7223,6 +7224,30 @@ async fn miner_brain(
                     });
                 }
             }
+            #[cfg(target_os = "macos")]
+            if resolve_backend(snapshot.proof_system_id) == Some("risc0") {
+                let limits = zkminer_prover_protocol::macos::Risc0Limits::from_environment(
+                    std::env::var("ZKMINER_RISC0_WRAP").as_deref() == Ok("native"),
+                );
+                let compatible = limits.and_then(|limits| {
+                    limits.validate_claim(known_cycles.unwrap_or(0), None)?;
+                    Ok(limits)
+                });
+                let limits = match compatible {
+                    Ok(limits) => limits,
+                    Err(error) => {
+                        tracing::debug!("Skipping {} before claim: {error}", short_id(jid));
+                        continue;
+                    }
+                };
+                let settings = state.read().await;
+                if settings.runtime_settings.po2_overrides.iter().any(|((_, b), &po2)|
+                    b == "risc0" && (limits.validate_po2(Some(po2)).is_err() || po2 != limits.default_segment_po2)) {
+                    tracing::warn!("Skipping {} before claim: macOS claim timing requires the default segment setting", short_id(jid));
+                    continue;
+                }
+            }
+
             // A bypassed claim occupies a GPU without being committed to the model, so the
             // model then UNDER-reports that device and the planner would place a later job as
             // though the card were idle — void at depth 1, not just depth 2. Refuse to plan

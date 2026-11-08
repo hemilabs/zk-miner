@@ -1,0 +1,36 @@
+[package]
+name = "hemi-macos-native-wrap"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+default = ["prove"]
+prove = ["risc0-zkvm/prove"]
+
+[dependencies]
+anyhow = "1"
+bincode = "1.3"
+hex = "0.4"
+serde_json = "1"
+sha2 = "0.10"
+risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8", features = ["native-groth16"] }
+risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8", default-features = false, features = ["std", "disable-dev-mode"] }
+risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8", default-features = false }
+risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
+
+[[bin]]
+name = "hemi-native-wrap"
+path = "src/main.rs"
+
+[[bin]]
+name = "hemi-workload-execute"
+path = "src/workload.rs"
+
+[profile.release]
+opt-level = 3
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("hybrid"))'] }

@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "identity": "dimitryB <5238240+dimitryB@users.noreply.github.com>",
+  "scope": "Author/committer-only rewrite; all source trees and pending implementation files preserved.",
+  "repositories": [
+    {
+      "repository": "dimitryB/zk-miner",
+      "branch": "codex/hemi-macos-metal",
+      "old_local_head": "4cbfb3ee689df6a4723e03e82317aa789910ca66",
+      "rewritten_local_head": "55b6d877124926847cb27c5885e4b222603b5e94",
+      "old_published_head": "0b79eea7c30f1d59635bbee7c855bb6f167e529b",
+      "rewritten_published_head": "c05f5b116c12f0930f87d1480f70ab8949b04b44",
+      "commits": [
+        {
+          "old": "3503563849661f0e99b5ad9c7da7229bd561ea4f",
+          "new": "c649a4c96db1627f814191e2de185c889b4bdc5e",
+          "tree_unchanged": "1e2a0a3ade1633a8862e5625f5f5888da14017c7",
+          "published": true
+        },
+        {
+          "old": "0070e0b45c105ce9488bd9d2d2fef1b14af61e1f",
+          "new": "59fba69a283afa36fceb7d9e7e44068a25327a3a",
+          "tree_unchanged": "855648deef01a728840f09ab0578d0a5e900e6e8",
+          "published": true
+        },
+        {
+          "old": "3b2720110c1721a53d19c09a6ff2a16235aeb9be",
+          "new": "75fbd0039aa80e60b6ef2fea5bfab497b2e6a597",
+          "tree_unchanged": "b1fa72574c3a71d8032f005a852de7c28b24468c",
+          "published": true
+        },
+        {
+          "old": "b871d7ed0f0de83d99cc3e5674bfba95c3f04d7f",
+          "new": "97dda3b659fa3581c3a6907b790a09da6feb8436",
+          "tree_unchanged": "aafff548469acb3e3eff19959c70ea717a1bc0a3",
+          "published": true
+        },
+        {
+          "old": "244a3a1eb69e2ed611fa1b52e00abfaae31b32f7",
+          "new": "637f1034812beb0ea348dc095d23e3be94e858d0",
+          "tree_unchanged": "17d0bd7de7373c80ced9ec7d0aa8eaf81f9e8e9c",
+          "published": true
+        },
+        {
+          "old": "461965ecea246b86be1133a2185b31d4c1919ead",
+          "new": "a3069088ca975b931fb22c801b88a72a5142a7a8",
+          "tree_unchanged": "b73f024fc966b1637668a20572ba75b0b07fcdf0",
+          "published": true
+        },
+        {
+          "old": "f077e8d0ac6229f5305750baff7257de2b8421b6",
+          "new": "f94ee7731e988a25bd35b9247c0b966d1cca1915",
+          "tree_unchanged": "be6ec807d19bd5ba59227d809ce463d2b0844707",
+          "published": true
+        },
+        {
+          "old": "a3342fb80ec2fcfba909f921e381c6636fefb731",
+          "new": "090402e7512f28e6bd3c601710a55135c0a18b1e",
+          "tree_unchanged": "37ff057b0e64df57bd5589f701bd451f7080e4a5",
+          "published": true
+        },
+        {
+          "old": "42c40dfb28b0f40b450d3cd94ed65ba551b65372",
+          "new": "fce90750f8b6111c30b35b66dad38252b0a8ecb0",
+          "tree_unchanged": "3471813541d1139b648a384898bbb8d974c2b99a",
+          "published": true
+        },
+        {
+          "old": "0b79eea7c30f1d59635bbee7c855bb6f167e529b",
+          "new": "c05f5b116c12f0930f87d1480f70ab8949b04b44",
+          "tree_unchanged": "b17f55c7744d8205f6c6615992414db639b06bc3",
+          "published": true
+        },
+        {
+          "old": "09a6910ee9be6babba755339726e18c565b3d72d",
+          "new": "3f57b46a3807bed764f22128067438764fdbffd5",
+          "tree_unchanged": "e12a3aec58eb4ba213e723d1074e7376b88c9a12",
+          "published": false
+        },
+        {
+          "old": "4cbfb3ee689df6a4723e03e82317aa789910ca66",
+          "new": "55b6d877124926847cb27c5885e4b222603b5e94",
+          "tree_unchanged": "179ef908417d2306d92060cd6fb1f9ec01a40294",
+          "published": false
+        }
+      ]
+    },
+    {
+      "repository": "dimitryB/risc0",
+      "branch": "codex/hemi-macos-metal",
+      "old_local_head": "0515e0bdebcd1f5f2d24cef91691ebd5b0c5d0a6",
+      "rewritten_local_head": "1f6eb352d366edc0cfad6f17a76ce41387d48f36",
+      "old_published_head": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+      "rewritten_published_head": "cae985c43e83e94d6295d07b4ed8ebf6aab4b9a5",
+      "commits": [
+        {
+          "old": "e274e19ee6e77bcd5704ca25c9880bd143f0783c",
+          "new": "a75403428cc62ca0e9ef9a080d8f90000ceaa99c",
+          "tree_unchanged": "bd5a09c788adab8174e0dcb7e91b561864c3c81e",
+          "published": true
+        },
+        {
+          "old": "130f98fb91f6c5ccb1d243a498bf303c760c6388",
+          "new": "6586f9405f83612310f92834276251243817ead0",
+          "tree_unchanged": "20bdbd2b9cd3eb1b6d96fb82060a9d3dd0fc7889",
+          "published": true
+        },
+        {
+          "old": "56a5347e4fec305956f052fe2d4c9ab4cd9f6224",
+          "new": "accd187007e4a93ec96b54b9bca1702ec0f78e70",
+          "tree_unchanged": "4e4ddd2338eef3071c7c8090deb7c71e01df9edd",
+          "published": true
+        },
+        {
+          "old": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+          "new": "cae985c43e83e94d6295d07b4ed8ebf6aab4b9a5",
+          "tree_unchanged": "a0ae8b8c76051d95a5f9298f8badb7f63da739a7",
+          "published": true
+        },
+        {
+          "old": "98d940d4ba694c56f9978a2a0f70703e727bca7f",
+          "new": "28d0e7b936877ac5e60ea1ff4c2eac35b2b38ad7",
+          "tree_unchanged": "90322d32fa9e0849dc4dd3ce629933292b5610e9",
+          "published": false
+        },
+        {
+          "old": "0515e0bdebcd1f5f2d24cef91691ebd5b0c5d0a6",
+          "new": "1f6eb352d366edc0cfad6f17a76ce41387d48f36",
+          "tree_unchanged": "92ec66eb63ceef24f8bff02c10660dbe70b7926e",
+          "published": false
+        }
+      ]
+    }
+  ]
+}

@@ -4,17 +4,30 @@
 //! Stderr is used for logging (captured and forwarded by host).
 
 use std::io::{self, BufReader, BufWriter};
+#[cfg(not(feature = "macos"))]
 use std::time::Instant;
 
+#[cfg(all(feature = "macos", not(all(target_os = "macos", target_arch = "aarch64"))))]
+compile_error!("the macos worker requires aarch64-apple-darwin");
+#[cfg(all(feature = "macos", any(feature = "cuda", feature = "rocm", feature = "intel")))]
+compile_error!("macos mode cannot be combined with CUDA, ROCm or Intel");
+#[cfg(feature = "macos")]
+mod macos;
+#[cfg(feature = "macos-metal")]
+compile_error!("macos-metal is retired; use macos-rv32im-metal with RISC0_SEGMENT_HAL=metal");
+#[cfg(not(feature = "macos"))]
 mod groth16_component;
 
 use anyhow::{Context, Result};
+#[cfg(not(feature = "macos"))]
 use risc0_zkvm::Prover as _;
+#[cfg(not(feature = "macos"))]
 use zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV;
+#[cfg(not(feature = "macos"))]
+use zkminer_prover_protocol::{BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY, BENCH_MEMORY_MERKLE};
 use zkminer_prover_protocol::{
     is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
-    WorkerResponse, BACKEND_RISC0, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
-    BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
+    WorkerResponse, BACKEND_RISC0, BENCH_FIBONACCI, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
     PROTOCOL_VERSION, RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN,
 };
 
@@ -62,6 +75,19 @@ fn use_shipped_level_zero_driver() {
 fn main() {
     #[cfg(feature = "intel")]
     use_shipped_level_zero_driver();
+
+    #[cfg(feature = "macos-recursion-metal")]
+    if std::env::args().nth(1).as_deref() == Some("--macos-recursion-probe") {
+        match macos::recursion_device_probe() {
+            Ok(value) => { println!("{value}"); return; }
+            Err(error) => { eprintln!("recursion Metal probe failed: {error:#}"); std::process::exit(1); }
+        }
+    }
+    #[cfg(feature = "macos")]
+    if std::env::args().nth(1).as_deref() == Some("--macos-metal-probe") {
+        eprintln!("The fold-only Metal probe is retired; use RISC0_SEGMENT_HAL=metal on a macos-rv32im-metal worker");
+        std::process::exit(2);
+    }
 
     // Direct benchmark mode runs the operator's own guests and prints a human table to the REAL
     // stdout, so it must come before the fd-1 redirect below. It speaks no IPC.
@@ -120,7 +146,7 @@ fn main() {
     // that stream and churn the GPU prover. The SP1 worker does the same for gnark's CGO prints. The
     // worker's own IPC frames go only through the saved descriptor.
     #[cfg(unix)]
-    let ipc_stdout = {
+    let mut ipc_stdout = {
         use std::os::unix::io::{AsRawFd, FromRawFd};
         let stdout_fd = io::stdout().as_raw_fd(); // FD 1
         let ipc_fd = dup_cloexec(stdout_fd).expect("dup(stdout) failed");
@@ -128,7 +154,7 @@ fn main() {
         unsafe { std::fs::File::from_raw_fd(ipc_fd) }
     };
     #[cfg(not(unix))]
-    let ipc_stdout = io::stdout();
+    let mut ipc_stdout = io::stdout();
 
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
@@ -140,6 +166,16 @@ fn main() {
     // Load (or create) the `sys_rand` key now, outside any job: a failure inside a job's panic
     // containment would be blamed on that job's program.
     sys_rand_key();
+
+    #[cfg(feature = "macos")]
+    if let Err(error) = macos::preflight() {
+        tracing::error!("macOS worker unavailable: {error:#}");
+        let _ = write_message(&mut ipc_stdout, &WorkerResponse::Error {
+            request_id: 0, kind: ErrorKind::ProofFailed,
+            message: format!("macOS worker unavailable: {error:#}"),
+        });
+        std::process::exit(1);
+    }
 
     if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
@@ -166,6 +202,14 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
 
         match cmd {
             WorkerCommand::Hello { protocol_version } => {
+                #[cfg(feature = "macos")]
+                if protocol_version != PROTOCOL_VERSION {
+                    write_message(&mut stdout, &WorkerResponse::Error {
+                        request_id: 0, kind: ErrorKind::ProtocolError,
+                        message: format!("expected protocol {PROTOCOL_VERSION}, received {protocol_version}"),
+                    })?;
+                    break;
+                }
                 tracing::info!("Hello from host (protocol v{protocol_version})");
                 let resp = WorkerResponse::HelloAck {
                     protocol_version: PROTOCOL_VERSION,
@@ -178,17 +222,15 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
 
             WorkerCommand::Capabilities => {
                 let (gpu_available, gpu_name) = detect_gpu();
+                #[cfg(feature = "macos")]
+                let supported_benchmarks = vec![BENCH_FIBONACCI.to_string(), BENCH_SHA256_CHAIN.to_string()];
+                #[cfg(not(feature = "macos"))]
+                let supported_benchmarks = vec![BENCH_FIBONACCI.to_string(), BENCH_SHA256_CHAIN.to_string(),
+                    BENCH_ECDSA_VERIFY.to_string(), BENCH_BIGINT_MUL.to_string(), BENCH_MEMORY_MERKLE.to_string(), BENCH_CHACHA_MIX.to_string()];
                 let resp = WorkerResponse::CapabilitiesReport {
                     backend: BACKEND_RISC0.to_string(),
                     version: risc0_zkvm::VERSION.to_string(),
-                    supported_benchmarks: vec![
-                        BENCH_FIBONACCI.to_string(),
-                        BENCH_SHA256_CHAIN.to_string(),
-                        BENCH_ECDSA_VERIFY.to_string(),
-                        BENCH_BIGINT_MUL.to_string(),
-                        BENCH_MEMORY_MERKLE.to_string(),
-                        BENCH_CHACHA_MIX.to_string(),
-                    ],
+                    supported_benchmarks,
                     gpu_available,
                     gpu_name,
                 };
@@ -235,7 +277,14 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // repeatable and drives a release-penalty/slash. Contain it here and answer with an
                 // error (typed by what panicked, below) instead of dying.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_proof(&elf, &input_data, po2, program_id)
+                    #[cfg(feature = "macos")]
+                    {
+                        verify_program_id(&elf, program_id)?;
+                        if program_id.is_some() { job_segment_po2(po2)?; }
+                        macos::prove(request_id, &elf, &input_data, po2)
+                    }
+                    #[cfg(not(feature = "macos"))]
+                    { run_proof(&elf, &input_data, po2, program_id) }
                 }));
                 match outcome {
                     Ok(Ok((journal, seal, duration_secs, cycles))) => {
@@ -404,6 +453,11 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             }
 
             WorkerCommand::Warmup { request_id } => {
+                #[cfg(feature = "macos")]
+                let resp = WorkerResponse::WarmupDone {
+                    request_id, summary: macos::warmup_summary(), groth16_helper: true,
+                };
+                #[cfg(not(feature = "macos"))]
                 let resp = match warm_up() {
                     Ok(summary) => WorkerResponse::WarmupDone {
                         request_id,
@@ -445,6 +499,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
 }
 
 fn detect_gpu() -> (bool, Option<String>) {
+    #[cfg(feature = "macos")]
+    return macos::capabilities();
     #[cfg(feature = "cuda")]
     {
         if let Ok(output) = std::process::Command::new("nvidia-smi")
@@ -586,6 +642,7 @@ fn verify_program_id(elf: &[u8], program_id: Option<[u8; 32]>) -> anyhow::Result
 /// negative-caches — rather than the watchdog SIGKILL (indistinguishable from a transient crash). 2e9
 /// is still ~21× the largest proof observed on this market (~9.3e7), so it cannot false-cap a real
 /// job. Override with `ZKMINER_RISC0_EXECUTE_MAX_CYCLES` (0 = unlimited).
+#[cfg(not(feature = "macos"))]
 fn execute_session_cycle_limit() -> Option<u64> {
     const DEFAULT: u64 = 2_000_000_000;
     match std::env::var("ZKMINER_RISC0_EXECUTE_MAX_CYCLES") {
@@ -601,6 +658,7 @@ fn execute_session_cycle_limit() -> Option<u64> {
 /// Optional cycle cap for the PROVE path, honoured only when the operator sets
 /// `ZKMINER_RISC0_MAX_SESSION_CYCLES`. Unset = SDK default (no cap), so a legitimately large proof
 /// is never cut short by surprise.
+#[cfg(not(feature = "macos"))]
 fn prove_session_cycle_limit() -> Option<u64> {
     std::env::var("ZKMINER_RISC0_MAX_SESSION_CYCLES")
         .ok()
@@ -867,6 +925,19 @@ impl KeccakAudit {
 /// outside [`RISC0_JOB_PO2_MIN`]..=[`RISC0_JOB_PO2_MAX`] is refused (an InvalidInput, by its "po2
 /// value" text): the host measures and proves a job at sizes in that range only.
 fn job_segment_po2(po2: Option<u8>) -> anyhow::Result<u8> {
+    #[cfg(feature = "macos")]
+    {
+        // The local Mac worker also accepts po2 14/15 for bounded diagnostic
+        // proofs. `macos::bound_env` checks the selected mode's exact limits.
+        let default = if cfg!(feature = "macos-native-wrap") {
+            zkminer_prover_protocol::macos::DEFAULT_NATIVE_SEGMENT_PO2
+        } else {
+            18
+        };
+        return Ok(po2.unwrap_or(default));
+    }
+    #[cfg(not(feature = "macos"))]
+    {
     let po2 = po2.unwrap_or(RISC0_DEFAULT_JOB_PO2);
     if !(RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX).contains(&po2) {
         anyhow::bail!(
@@ -874,6 +945,7 @@ fn job_segment_po2(po2: Option<u8>) -> anyhow::Result<u8> {
         );
     }
     Ok(po2)
+    }
 }
 
 fn run_execute(
@@ -890,6 +962,8 @@ fn run_execute(
     let started = Instant::now();
 
     let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
+    #[cfg(feature = "macos")]
+    macos::bound_env(&mut env_builder, Some(po2))?;
     if !input_data.is_empty() {
         env_builder.write_slice(input_data);
     }
@@ -897,6 +971,7 @@ fn run_execute(
     // At the size the job will be proven at, on the card the host asked for: the guest can tell (see
     // `RISC0_DEFAULT_JOB_PO2`).
     env_builder.segment_limit_po2(po2 as u32);
+    #[cfg(not(feature = "macos"))]
     if let Some(limit) = execute_session_cycle_limit() {
         env_builder.session_limit(Some(limit));
     }
@@ -913,6 +988,8 @@ fn run_execute(
         risc0_zkvm::local_executor().execute(env, elf)
     })
     .map_err(|e| anyhow::anyhow!("execute: {e}"))?;
+    #[cfg(feature = "macos")]
+    macos::check_guest_cycles(session.cycles())?;
 
     // A guest that does not halt with exit code 0 can NEVER produce a receipt that
     // `receipt.verify(image_id)` accepts (verify builds the expected claim as Halted(0)), so this
@@ -994,6 +1071,7 @@ fn run_execute(
 /// The saving from keeping it turned out small: wraps after a release ran 2.08-2.12 s on the 5080
 /// against 2.01-2.05 s on the cache-keeping 4090, so at most ~0.1 s. The threshold is therefore cheap to
 /// get wrong in the conservative direction, which is why an unknown size releases.
+#[cfg(not(feature = "macos"))]
 const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 /// Free the Groth16 prover and SRS cached on the GPU if this card cannot also hold the next STARK.
@@ -1007,6 +1085,7 @@ const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 ///
 /// Called whether the proof succeeded or not: a wrap that failed part-way can still have built the
 /// cache, and the retry that follows needs the room most.
+#[cfg(not(feature = "macos"))]
 fn release_groth16_cache_if_tight() {
     static DECISION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let release = *DECISION.get_or_init(|| {
@@ -1038,10 +1117,12 @@ fn release_groth16_cache_if_tight() {
 /// which would also refuse our `sys_rand` seed). Every caller pairs it with options built with dev
 /// mode off, whatever `RISC0_DEV_MODE` says: a dev-mode receipt is fake, and claiming on one ends in a
 /// penalized release.
+#[cfg(not(feature = "macos"))]
 fn local_prover() -> risc0_zkvm::LocalProver {
     risc0_zkvm::LocalProver::new("local")
 }
 
+#[cfg(not(feature = "macos"))]
 fn run_proof(
     elf: &[u8],
     input_data: &[u8],
@@ -1126,6 +1207,7 @@ fn run_proof(
 
 /// The index of the segment whose seal did not verify, from the prover's (host-generated) context
 /// "verify segment N" or "verify segment (last) N", in `msg` lowercased.
+#[cfg(not(feature = "macos"))]
 fn failed_segment(msg: &str) -> Option<u64> {
     let rest = msg.split("verify segment ").nth(1)?;
     let rest = rest.strip_prefix("(last) ").unwrap_or(rest);
@@ -1134,10 +1216,12 @@ fn failed_segment(msg: &str) -> Option<u64> {
 }
 
 /// Whether an invalid proof failed at the segment the one before it did (both known).
+#[cfg(not(feature = "macos"))]
 fn failed_twice(segment: Option<u64>, last: Option<u64>) -> bool {
     segment.is_some() && segment == last
 }
 
+#[cfg(not(feature = "macos"))]
 fn run_proof_once(
     elf: &[u8],
     input_data: &[u8],
@@ -1252,6 +1336,9 @@ fn run_benchmarks_streaming<W: std::io::Write>(
     // All 6 canonical programs matching BENCHMARK_PROGRAMS weights.
     // Input sizes tuned so each completes in 5-30s on a mid-range GPU,
     // keeping total benchmark time under 2 minutes on a 4090.
+    #[cfg(feature = "macos")]
+    let benchmarks = macos::benchmarks();
+    #[cfg(not(feature = "macos"))]
     let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
         (
             BENCH_FIBONACCI,
@@ -1332,6 +1419,9 @@ fn run_benchmarks() -> Vec<BenchmarkEntry> {
     // All 6 canonical programs matching BENCHMARK_PROGRAMS weights.
     // Input sizes tuned so each completes in 5-30s on a mid-range GPU,
     // keeping total benchmark time under 2 minutes on a 4090.
+    #[cfg(feature = "macos")]
+    let benchmarks = macos::benchmarks();
+    #[cfg(not(feature = "macos"))]
     let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
         (
             BENCH_FIBONACCI,
@@ -1394,6 +1484,17 @@ fn run_benchmarks() -> Vec<BenchmarkEntry> {
     results
 }
 
+#[cfg(feature = "macos")]
+fn benchmark_program(
+    name: &str, elf: &[u8], input: &[u8], weight: f64, precompile: bool,
+) -> Option<BenchmarkEntry> {
+    match macos::benchmark(name, elf, input, weight, precompile) {
+        Ok(entry) => Some(entry),
+        Err(error) => { tracing::error!("{name}: benchmark failed: {error:#}"); None }
+    }
+}
+
+#[cfg(not(feature = "macos"))]
 fn benchmark_program(
     name: &str,
     elf: &[u8],
@@ -1536,6 +1637,7 @@ fn benchmark_program(
 ///
 /// Cost: this is a real proof per po2 step, so a full sweep is minutes per GPU. That is
 /// why calibration is opt-in (`zkminer benchmark --calibrate`), never a default run.
+#[cfg(not(feature = "macos"))]
 const CALIBRATION_ITERS: u32 = 6_000_000;
 
 /// The one-time setup before a first proof (`WorkerCommand::Warmup`), which the miner runs before it
@@ -1546,7 +1648,7 @@ const CALIBRATION_ITERS: u32 = 6_000_000;
 /// disk (`~/.cache/libsycl_cache`, `~/.cache/neo_compiler_cache`), so one small proof through the
 /// full Groth16 pipeline compiles everything once for every later process. It is verified, so a
 /// broken card fails here, not on a job.
-#[cfg(feature = "intel")]
+#[cfg(all(feature = "intel", not(feature = "macos")))]
 fn warm_up() -> Result<String> {
     let component = groth16_component::ensure_installed()?;
     let start = Instant::now();
@@ -1568,12 +1670,18 @@ fn warm_up() -> Result<String> {
     ))
 }
 
-#[cfg(not(feature = "intel"))]
+#[cfg(all(not(feature = "intel"), not(feature = "macos")))]
 fn warm_up() -> Result<String> {
     groth16_component::ensure_installed()
 }
 
 /// Run a po2 calibration: prove fibonacci at the specified segment po2 and measure throughput.
+#[cfg(feature = "macos")]
+fn run_po2_calibration(_request_id: u64, _po2: u8) -> Result<WorkerResponse> {
+    anyhow::bail!("CPU bootstrap calibration is unsupported; use bounded local workloads")
+}
+
+#[cfg(not(feature = "macos"))]
 fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
     let input = CALIBRATION_ITERS.to_le_bytes();
     let env = risc0_zkvm::ExecutorEnv::builder()
@@ -1755,7 +1863,7 @@ mod sys_rand_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "macos")))]
 mod retry_tests {
     use super::*;
 

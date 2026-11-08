@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "status": "diagnostic_complete",
+  "source_spec_sha256": "7b67d229839eb5f9d424dc27fed31906e766ea8bcea3c9d892e323d9ebcf5df7",
+  "engine_commit": "748e7a202bbb15520fdf7782057b7096df3e2bfd",
+  "candidate_worker_sha256": "0417a5d1043582a7047855b8764c255b5507597b870f3e45a03ba8141af507a6",
+  "baseline_manifest_sha256": "8f1f57c81a2955c91c7aa773c8309822d13557f8527bf1b2c93b4b2953888836",
+  "scope": "po2 21 resident memory feasibility before the fixed paired campaign; no diagnostic row substitutes for a five-pair median",
+  "po21_serial_repeat2": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/698c2b32f1594c15b6278e28e85623dd",
+    "outer_status": "passed",
+    "outer_error": null,
+    "result_sha256": "d4835fc5e634c4b4dac94e7822f22d1a28148fc31a5ecb9a72df78b622ea2ba7",
+    "test_log_sha256": "0c609c8e789d0e2032b1c73a1fef9de4f7a775335de4e6fbc247639177f1ec69",
+    "proofs": [
+      {
+        "case": "proof-0",
+        "po2": 21,
+        "segments": 5,
+        "user_cycles": 10003116,
+        "complete_seconds": 70.38630683399998,
+        "guard_peak_footprint_bytes": 20626245696,
+        "pressure_level": 1,
+        "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e"
+      },
+      {
+        "case": "proof-1",
+        "po2": 21,
+        "segments": 5,
+        "user_cycles": 10003116,
+        "complete_seconds": 62.39711225,
+        "guard_peak_footprint_bytes": 24627336112,
+        "pressure_level": 1,
+        "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e"
+      }
+    ]
+  },
+  "po21_pipeline_repeat2": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/28b402c042694091a3cad57a087c48c1",
+    "outer_status": "failed",
+    "outer_error": "Command ['/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build/debug/deps/macos_worker-9116c14936aff687', 'native_worker_proofs_failure_restart_and_shutdown', '--exact', '--ignored', '--nocapture'] returned non-zero exit status 101.",
+    "result_sha256": "ae2a772abc98d7599a9676c717ca8c54995e0d4c8b8ce4229483f7b05360f621",
+    "test_log_sha256": "513f957ea831c9898d99bac03e866410b30372a9034e71f164ef857cc3527fa8",
+    "proofs": [
+      {
+        "case": "proof-0",
+        "po2": 21,
+        "segments": 5,
+        "user_cycles": 10003116,
+        "complete_seconds": 65.350738375,
+        "guard_peak_footprint_bytes": 31576264760,
+        "pressure_level": 1,
+        "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e"
+      }
+    ],
+    "guard_stop": {
+      "footprint_bytes": 35255359656,
+      "pressure_level": 1,
+      "limit_bytes": 34359738368,
+      "failed_request": "proof-1"
+    }
+  },
+  "po21_pipeline_single": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/e179a066613f4533b4e1205e64d54416",
+    "outer_status": "passed",
+    "outer_error": null,
+    "result_sha256": "0e4fb0f8700a1a77a407be6d2a13797680219adc046a684b8a33f73b4c9cbaaf",
+    "test_log_sha256": "5d72bdd35284e99855efc00023de56c8db870951cdfcaab3d6f012b4f9a14d3d",
+    "proofs": [
+      {
+        "case": "proof-0",
+        "po2": 21,
+        "segments": 5,
+        "user_cycles": 10003116,
+        "complete_seconds": 65.351118876,
+        "guard_peak_footprint_bytes": 31408492576,
+        "pressure_level": 1,
+        "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e"
+      }
+    ]
+  },
+  "po21_pipeline_46m": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/ac36ce4cbe7b4084a24e0f1b43e917d6",
+    "outer_status": "failed",
+    "outer_error": "WorkerPool acceptance sources changed during the run",
+    "result_sha256": "b0b9f2014299be5349defe9c7ce49c8d2eb840f4f7c57890ac3a2ad8598fa0e3",
+    "test_log_sha256": "f0cfa9a73f4be5deb2e56465a52b0d90edeed08484cd01de5b953b6082e3ae82",
+    "proofs": [
+      {
+        "case": "proof-0",
+        "po2": 21,
+        "segments": 23,
+        "user_cycles": 46003116,
+        "complete_seconds": 199.353050834,
+        "guard_peak_footprint_bytes": 31240425552,
+        "pressure_level": 1,
+        "verification_sha256": "56df0dc8c2fe653e74c638d316e479fb303b69106dce5e4078e245238498dfd4"
+      }
+    ],
+    "outer_status_reason": "acceptance harness source changed during run; inner proof verified, diagnostic only"
+  },
+  "paired_pipeline_smoke": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/74041f8fdb244b92b2c7827801605c73",
+    "outer_status": "failed",
+    "outer_error": "Command ['/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build/debug/deps/macos_worker-5fdbcfcffbb8ffec', 'native_thread_comparison', '--exact', '--ignored', '--nocapture'] returned non-zero exit status 101.",
+    "result_sha256": "067e1990efeb67cea5c71d658b68b8dd26a81044551e98ce5ff2dc1885653f98",
+    "test_log_sha256": "6a04191c6dd995ca567169d4155db0dc77546481071c540396be7c7dd13437fa",
+    "proofs": []
+  },
+  "decision": "po2 21 pipeline is infeasible at the unchanged 32 GiB ceiling on a second resident proof; compare po2 21 serial against sealed po2 20 pipeline"
+}

@@ -1,0 +1,2581 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-01",
+  "status": "native_thread_and_admission_milestone_passed",
+  "miner_head": "0b79eea7c30f1d59635bbee7c855bb6f167e529b",
+  "engine_head": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+  "committed_or_pushed": false,
+  "defaults": {
+    "rayon_threads": 18,
+    "gomaxprocs": 18,
+    "thread_range": [
+      1,
+      18
+    ],
+    "host_reserve_gib": 16,
+    "host_reserve_range_gib": [
+      8,
+      64
+    ],
+    "unmeasured_native_budget_gib": 16,
+    "group_footprint_cap_gib": 32,
+    "inflight_estimated_headroom_floor_gib": 8
+  },
+  "build_manifests": {
+    "worker-native-build.json": "3d0507e0964604ebf34c7587b3ad0c1143910cf185044411162c4d36071d8bd0",
+    "verifier-build.json": "77182657a8e306f16e39e8a59abc89050b49f8e0a2d545cbda634c8f6c2c6f0f"
+  },
+  "engine_patch_sha256": "1cf9e23d0eb7fb855b9f08c24f753e1dde1ad2271c7afba8a777c006de479090",
+  "validation_scripts": {
+    "build-native-wrap.py": "3f3d4ad1f0cf54347aa7f46f21a143275e9526648fc1a99823f590bc358384f3",
+    "test-native-admission.py": "9e77f29eb596bd5e76a602fdbfec8d25b65fb51669307146956492efbc3c28de",
+    "test-native-thread-controls.py": "2a87c1375ab43abbcfdeb7204b66f2ab51247eae3a00bf5ac6e56f77dccc4120",
+    "test-native-worker.py": "cd68a484b8eda6c251a3c6fc683ca05443dffcb40348a1f38738c5770296599d",
+    "test-native-wrap.py": "a8c80a7bfce6b0a1b75f1dd6b93b569ef6d4cf2c73fccfd92e1585d61a599314",
+    "tune-native-go.py": "d0ce1786af4220460f9b2c0d6febf018c930a4001fb6013299ce090b138e5c35"
+  },
+  "verified_complete_worker_proofs": 31,
+  "verified_fixed_witness_rewraps": 18,
+  "negative_rejections": 147,
+  "worker_runs": [
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/4e3bfe41cddd47e3a7993e0673ad999b",
+      "status": "passed",
+      "files": {
+        "result.json": "698b4fb70862362b0fc1376fc4919204696a22787d4507ab04701eac89dad2ae",
+        "test.log": "1621757f13f6c891073006cad545591c0797bb34679822ba2a2149b84d4fd6cf",
+        "acceptance-build.json": "bf51dba3da86f50a096fbce6a101a3ccacd3b77fcc0b417c9661e4bd4b9ba680",
+        "acceptance/complete.json": "b467e900e5e3db24b7b7e97457fe95a9732ebfe4f60387d81fc9e0a8d97ab9d8",
+        "acceptance/requests.jsonl": "3974b226f93dba118dca90c4f49403ef0cb0ad3825a98df1fb6dfb6d9eab6474"
+      },
+      "worker_binary_sha256": "2f5b2a1094967f2067553c4806a521bcaca67fd5959b381a09331a90768c558f",
+      "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+      "verified_proofs": 12,
+      "negative_rejections": 36,
+      "proofs": [
+        {
+          "case": "round-0-case-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-32265-1793561873615108000-0",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 6,
+            "request_id": 1,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "182dbc42f81dd8dc0580168a4a48bdb47efc563841a6d3729244416cd37cb00f",
+            "stage_ms": {
+              "execution_and_segment": 2676.473708,
+              "identity_and_wrap": 45967.364333,
+              "recursion": 7446.248292,
+              "verification": 1.76575
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 56115.459833,
+            "worker_pid": 32266
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "c3b5965adefa4c325f145e15516ccee4d3187914270b87ca8809d46abbbebb98",
+            "resource.json": "ea14085d3f344393f3bff58f213780fd7c0e094c616d10d3a2a6fe4b78380ef2",
+            "seal.bin": "182dbc42f81dd8dc0580168a4a48bdb47efc563841a6d3729244416cd37cb00f",
+            "timing.json": "1230d4bdaeaccd0f48dfbaba18a5ed94b365f8513fe3482172eeedec5d25cada",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "ae7d60add478585395ef7fea0a433955aa79085de183341d7dca883bc7eaf4fc"
+          }
+        },
+        {
+          "case": "round-0-case-1",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-32265-1793561878745886000-1",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 12,
+            "request_id": 2,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "615af73719e06f4aaf2288d3b01b3a39a8ab093fc65ed10588caa2bc5f8b39ec",
+            "stage_ms": {
+              "execution_and_segment": 1586.5442079999998,
+              "identity_and_wrap": 32371.402417,
+              "recursion": 4781.776292,
+              "verification": 1.781958
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 38767.011542,
+            "worker_pid": 32267
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "828a25a20069fbc6dc253114953402cd9e4df000a78fb334b6a0201cf814c563",
+            "resource.json": "f51226f55d8487790be857a07e1519966df1c9d82e056afbbed93f4c27151830",
+            "seal.bin": "615af73719e06f4aaf2288d3b01b3a39a8ab093fc65ed10588caa2bc5f8b39ec",
+            "timing.json": "392099eaf1257688fa8f4d2771be79e73d197811f9f209d17c002f73e5f47823",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "15654609d29999e8042d94132844f5ab739b2f13ee67fbebaf67cdf2746e43c4"
+          }
+        },
+        {
+          "case": "round-0-case-2",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-32265-1793561883240697000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 3,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "d7806eff6543d1ee615411cf7ffeb50a9952443d671ae35160cf48b624e2fe9a",
+            "stage_ms": {
+              "execution_and_segment": 1245.792167,
+              "identity_and_wrap": 28095.651458,
+              "recursion": 3905.680667,
+              "verification": 1.761167
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 33275.449333,
+            "worker_pid": 32268
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "a3ef720546c02ecb8f283138795bad8b2ec4002152197ff19b91298b11179896",
+            "resource.json": "971d3b7f468b67cbfefb36e1c9d3a7a36d3b5b81e412f48e823e8652dfd8d22d",
+            "seal.bin": "d7806eff6543d1ee615411cf7ffeb50a9952443d671ae35160cf48b624e2fe9a",
+            "timing.json": "85b6a32b06302d3457730e1f05ed9e08def6b5ab74d52858ecaee61ca22e0641",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "4842fcf8f2548a86df08aca7420e0d19a8c39c5f257202027e4094400f6ae4a1"
+          }
+        },
+        {
+          "case": "round-1-case-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-32265-1793561873615108000-0",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 6,
+            "request_id": 6,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "39d57a87dcfdabb69e1db32f131aa54e465fa5c4d308845c712384ad721554f4",
+            "stage_ms": {
+              "execution_and_segment": 2623.778958,
+              "identity_and_wrap": 36685.809667,
+              "recursion": 6569.8318340000005,
+              "verification": 1.734959
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 45906.703333000005,
+            "worker_pid": 32266
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "14e40e20727f6e7abf4cd8c7db8bc05ff4fbe0aabf68b3e197c38a09f327e6f2",
+            "resource.json": "0f60bfe3af77e2c466387a7da536bfded655c8ca7b330fc288ba7ddff02a76dc",
+            "seal.bin": "39d57a87dcfdabb69e1db32f131aa54e465fa5c4d308845c712384ad721554f4",
+            "timing.json": "3907dc28e4856283af0326a1c0e825b7cbab0278f49bb9a93362e6c69c9b70b5",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "51dd9f2706e4d896c1c956ae464602fadd40d6c66526803df5d14bb5a78114d6"
+          }
+        },
+        {
+          "case": "round-1-case-1",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-32265-1793561878745886000-1",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 12,
+            "request_id": 5,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "58a0d2aae7580d3cdad186d2dd64f3ac1aee70203c4967aeec9cae58c4f36400",
+            "stage_ms": {
+              "execution_and_segment": 1546.344459,
+              "identity_and_wrap": 24899.444917,
+              "recursion": 4176.520417,
+              "verification": 1.762541
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 30649.597042,
+            "worker_pid": 32267
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "19487a6b2717eec3d96172e9be37249569385c6b09c4646d94f224b738c11417",
+            "resource.json": "1c4750442280e3e90f7f7ce43c4d406063ffe3ea8c9420905f23633e3feda9e5",
+            "seal.bin": "58a0d2aae7580d3cdad186d2dd64f3ac1aee70203c4967aeec9cae58c4f36400",
+            "timing.json": "92ba3a304ea53d4116cab6d98680688e5ef91ac05bfb48b89989a21dc3edbd00",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "e03b3fc85d354d6ac3b8731e1fdc7a285d82a431af8ec5f7104c385880a98730"
+          }
+        },
+        {
+          "case": "round-1-case-2",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-32265-1793561883240697000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 4,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "37f35d4063a4a77f051091c5f254a16c2955ebc8527c0b2ba528ed334c086ab2",
+            "stage_ms": {
+              "execution_and_segment": 1182.8016670000002,
+              "identity_and_wrap": 21100.473334,
+              "recursion": 3382.737916,
+              "verification": 1.730958
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 25693.588333,
+            "worker_pid": 32268
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "e3202a9da001a4736638513fe420f2374b320cb8efd5ce473847fac1d35b36d2",
+            "resource.json": "ddf88ea9c1d68fe966b6330115d59d2ddfe89697d27f11929ed86f5defed4c60",
+            "seal.bin": "37f35d4063a4a77f051091c5f254a16c2955ebc8527c0b2ba528ed334c086ab2",
+            "timing.json": "39b6308017c4e8ba609178eb0600092648440bccbc34f0d820c9242bf8d59115",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "a2ff2d4928f6c313b526f38d390e288712351c89fc4e4e313e4e5e918790a239"
+          }
+        },
+        {
+          "case": "round-2-case-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-32265-1793561873615108000-0",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 6,
+            "request_id": 7,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "65a23c6dbc4904aa40bfa1d76d886df86a461a11488806fb574de369d68b0af1",
+            "stage_ms": {
+              "execution_and_segment": 2683.955834,
+              "identity_and_wrap": 36240.127041,
+              "recursion": 6318.030334,
+              "verification": 1.715542
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 45269.356792000006,
+            "worker_pid": 32266
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "c4894baf33e5ed455e71d0895a11a9a449b82eb7e5aa2e7150e19b79afe8f06f",
+            "resource.json": "57b78a1cba6dde55d94a755371fe2992f295ca7e90f8314fdeaa96532cd03933",
+            "seal.bin": "65a23c6dbc4904aa40bfa1d76d886df86a461a11488806fb574de369d68b0af1",
+            "timing.json": "befd392583989c7fb5dc0b807988115c3514b9e6ac93e7acf87a3cd5de095a19",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "ffb998b0c25434026591bfd9577e710da6e7ca1e3ece4c20d707f8164be442a8"
+          }
+        },
+        {
+          "case": "round-2-case-1",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-32265-1793561878745886000-1",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 12,
+            "request_id": 8,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "4c006c8f5d8d9f1594700a903f7d17c258788efd89126125db3ebf7544e56f59",
+            "stage_ms": {
+              "execution_and_segment": 1561.861667,
+              "identity_and_wrap": 24585.843708,
+              "recursion": 4172.703917,
+              "verification": 1.700292
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 30346.721709,
+            "worker_pid": 32267
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "50d509ba4e7b820d01b75bc97609125f2a417dade97c9bdcdd2d33f8c393e27f",
+            "resource.json": "b26e1e5ed14396bae588b9b27e982090554eda6a13a44f62007f035e50c72e1c",
+            "seal.bin": "4c006c8f5d8d9f1594700a903f7d17c258788efd89126125db3ebf7544e56f59",
+            "timing.json": "7b92e770756336ef29beadd5b432aaa34f214063aa85e074188c1735f298fa40",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "ab34ed0921101a82ed7c90c8a9a0c225b900e3f7a441797e57ea0b15c94e7c46"
+          }
+        },
+        {
+          "case": "round-2-case-2",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-32265-1793561883240697000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 9,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "cc45b2a8dccbb3408774f325de0559b3e923a4da1e1124e1f15cc1139a169407",
+            "stage_ms": {
+              "execution_and_segment": 1192.616083,
+              "identity_and_wrap": 21120.813708,
+              "recursion": 3471.596333,
+              "verification": 1.722834
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 25811.68325,
+            "worker_pid": 32268
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "97ec3cb05cadd6e9bf05fc144234200b20d23ec2a7708929ede6461a342636c6",
+            "resource.json": "8a4e8b9720eece6fa0353499ab12a4916d98f8ee6ec4fa04b8c8208c4fb28339",
+            "seal.bin": "cc45b2a8dccbb3408774f325de0559b3e923a4da1e1124e1f15cc1139a169407",
+            "timing.json": "7931aa94374ba2e3c1b0774aa6a29fc607238119a21aa320376a3a1ef691b14d",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "51696400a2e5e4360a5a5afc3ac605e2e6a6b4f548bf2a0cb5a077b0037538d6"
+          }
+        },
+        {
+          "case": "round-3-case-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-32265-1793561873615108000-0",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 6,
+            "request_id": 12,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "e137a35dfd30b9c167f6468444dd6b8fcd84dd2846a14f7a4dc68f8c6976da0e",
+            "stage_ms": {
+              "execution_and_segment": 2637.00225,
+              "identity_and_wrap": 36520.182458,
+              "recursion": 6242.995290999999,
+              "verification": 1.735375
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 45426.926208,
+            "worker_pid": 32266
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "17b0d1a03e4be516943ca9f9b08acec7d15ae8ca938714b316076fe89f7403f2",
+            "resource.json": "3032807863b04cf2405eaeaf9c966eac184af4f9f1a3ddee557ddb519bd0f171",
+            "seal.bin": "e137a35dfd30b9c167f6468444dd6b8fcd84dd2846a14f7a4dc68f8c6976da0e",
+            "timing.json": "ac32494f9673ec2ece71ac2a863b5d99a4ef9a28bbd5a94d5cd5c6d7459d7e0f",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "102d3825fd02a7177ddaca5b25afa9a8f414bd3fd05586b1d79ee58a07273739"
+          }
+        },
+        {
+          "case": "round-3-case-1",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-32265-1793561878745886000-1",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 12,
+            "request_id": 11,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "78732654125650f9b058182d29d221c81ea8579df6b5c570354ed33ec795ba32",
+            "stage_ms": {
+              "execution_and_segment": 1544.510292,
+              "identity_and_wrap": 24831.908542,
+              "recursion": 4195.58425,
+              "verification": 1.7085
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 30598.839292,
+            "worker_pid": 32267
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "1aa833babc8e9304a59a3a056f58649ce7d98929c5287b3037d70a69acc60f6d",
+            "resource.json": "96e7bad6477d2e35d1ab57a396ec41eed52fa957c82e70437740212b36fb7961",
+            "seal.bin": "78732654125650f9b058182d29d221c81ea8579df6b5c570354ed33ec795ba32",
+            "timing.json": "557f91e459b4b2a762ee780c68074ba28d04122ad5fd0bb8b7566bfbad7696e3",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "805c37be267dfa7dec8737b4a038fb0e9378e40fe0c00e2f9290fa77bc5d480c"
+          }
+        },
+        {
+          "case": "round-3-case-2",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-32265-1793561883240697000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 10,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "f55d47ed6b089a58aecd15bdb97313c2f160226c12541f33d2af9225649a9663",
+            "stage_ms": {
+              "execution_and_segment": 1192.246208,
+              "identity_and_wrap": 21041.864125,
+              "recursion": 3452.418667,
+              "verification": 1.731292
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 25714.461167,
+            "worker_pid": 32268
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "9ea5ff6e96c1724fff8195628c6e10095dfbcd03f5cbf4cb6a307b8e2f496a28",
+            "resource.json": "f0b1cd4c78f75c8a330479d1430d478c9dbf37293e253d72849e4dd12387fa7f",
+            "seal.bin": "f55d47ed6b089a58aecd15bdb97313c2f160226c12541f33d2af9225649a9663",
+            "timing.json": "2fec1a3d05d12546b2442a5187fd13299f921d8fe856296823e2a367c7414b4b",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "d3b7548590e3a27fb2050ad55450d4c4465ea624e5a2fc4784b0be057ff4008a"
+          }
+        }
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/1f51fe69dbf54339947f84a435200518",
+      "status": "passed",
+      "files": {
+        "result.json": "05c0219a5b98d1db5b186ac99a12b25c6e6bff097f86f44b3f6cb8862063795f",
+        "test.log": "8f0a23b360c8a3671f6b52ecf78a251b1ede25d3b6b3dc7240dbb873d7ccdc6c",
+        "acceptance-build.json": "8de1734dc65a01fbff0d557b3d00e96bd1e1fbe400cc55f5edc485a9522d0a32",
+        "acceptance/complete.json": "37422a9f940c6f67026ac8b4a7216d262762aafe66e56668c09b48cd90b368a7",
+        "acceptance/requests.jsonl": "d48613e430031ad0798aa086ffcfb9f9076a7df592f31989c36eaa752ff4e5cf"
+      },
+      "worker_binary_sha256": "3f5e4ce6f8542f73341dc724a21961cb90913939ada2aaadf13de7b4e43338f7",
+      "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+      "verified_proofs": 12,
+      "negative_rejections": 36,
+      "proofs": [
+        {
+          "case": "round-0-case-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-37782-1793562610115809000-0",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 6,
+            "request_id": 1,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "b107078b4b3e9cd2522d7689a9dd1a25c35775c1f062035309ddfee25065894b",
+            "stage_ms": {
+              "execution_and_segment": 2674.078166,
+              "identity_and_wrap": 47163.745625,
+              "recursion": 7379.189292,
+              "verification": 1.723958
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 57244.70875,
+            "worker_pid": 37783
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "1c8a60514db25d5f9822e6b995a76a6240830588180319b47cfccdb83bfaa01e",
+            "resource.json": "d7534e11f828106a161177543306b7f28d5c6f65e5435feeb8b9cd5f53b56b1c",
+            "seal.bin": "b107078b4b3e9cd2522d7689a9dd1a25c35775c1f062035309ddfee25065894b",
+            "timing.json": "3eb9501c58c442c2a47efc86394dc9097ab9d42006da743d84a9c4543bcd6809",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "e241fa54440a14ebef3261ac865f70ccfa63fea3ff59c6c8ada3ba46daa20dff"
+          }
+        },
+        {
+          "case": "round-0-case-1",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-37782-1793562615258277000-1",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 2,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "54baa692e85aaca3f1f79ff983268f4293eeb58d550c7a054c7e6f46d772a785",
+            "stage_ms": {
+              "execution_and_segment": 1250.872958,
+              "identity_and_wrap": 25047.32525,
+              "recursion": 4046.011917,
+              "verification": 1.892875
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 30372.252625,
+            "worker_pid": 37784
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "e7ec8e72aaeb1203831b6f49e7614b52f72052bc30f162892d51e7412991efca",
+            "resource.json": "0ad275ed4e37d1c3239a4d61f96b3482d17295fb8873c333bd569b28ce6ea50a",
+            "seal.bin": "54baa692e85aaca3f1f79ff983268f4293eeb58d550c7a054c7e6f46d772a785",
+            "timing.json": "6492e18da149cfc6257106e3809d9b9b24385f53c1589659ef8b6469756bc830",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "0ccdbbf563fc711de36f323e87d9a3094e4ee216829052441781193fd8043028"
+          }
+        },
+        {
+          "case": "round-1-case-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-37782-1793562610115809000-0",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 6,
+            "request_id": 4,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "7e1cff3ff5a368b70a0f978ceae09349b7e1e34693148d0a32b6882d902073e9",
+            "stage_ms": {
+              "execution_and_segment": 2720.749625,
+              "identity_and_wrap": 37359.307542,
+              "recursion": 6502.327125,
+              "verification": 1.736875
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 46609.4345,
+            "worker_pid": 37783
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "95b08b2d5bf01c5c0ecca60e2951fb5acca0f0f50b297841b8fc6da6358654ab",
+            "resource.json": "34177f04616fd07b92f4e58c902d431a9f9f2b7fdd752e3dfe93802be98b8de3",
+            "seal.bin": "7e1cff3ff5a368b70a0f978ceae09349b7e1e34693148d0a32b6882d902073e9",
+            "timing.json": "90c0ea2df4826aa317d4e18f7482b9ee40b9d403380e9e6b5e9991c8d595ab52",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "1125b64308ae5a4a53714da7b535f2c87acb2e3c2a907da2f8495c41ceef2f67"
+          }
+        },
+        {
+          "case": "round-1-case-1",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-37782-1793562615258277000-1",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 3,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "58c90f442fdbd14f70d38153ae715837eaab0a05a9463edb221cb18a11357f97",
+            "stage_ms": {
+              "execution_and_segment": 1210.491042,
+              "identity_and_wrap": 17810.43825,
+              "recursion": 3454.966875,
+              "verification": 1.747042
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 22503.507125,
+            "worker_pid": 37784
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "9c68f450d815d2130a7f694fb33404f7f99d2c204031d236c6773c65eb027f9e",
+            "resource.json": "632cfec9531d27815c89ab73da050bdb256a6b8a7ce6f9a7c76f6c089dc0909a",
+            "seal.bin": "58c90f442fdbd14f70d38153ae715837eaab0a05a9463edb221cb18a11357f97",
+            "timing.json": "b07898bb8be726396cdd7a38c615cffda04525ae442bf39028f134a169b21121",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "47d16c02d908b30c60f600378a5092849a84802dd9f2f60b8a73ea57800958ef"
+          }
+        },
+        {
+          "case": "round-2-case-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-37782-1793562610115809000-0",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 6,
+            "request_id": 5,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "df3d9bbadd6aacb63de1bb017571f9dc033cc351c396c341034350b4420b81c9",
+            "stage_ms": {
+              "execution_and_segment": 2648.013,
+              "identity_and_wrap": 36126.178125000006,
+              "recursion": 6351.654916,
+              "verification": 1.721375
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 45153.199417,
+            "worker_pid": 37783
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "d765687c76550e33632922016ce40f2a0764f53e4e2feb0b159db032c02f1256",
+            "resource.json": "ffba5177ef829eeb0ad5b645d258ae8c6689fdf725c8015cb0021cc265b8feeb",
+            "seal.bin": "df3d9bbadd6aacb63de1bb017571f9dc033cc351c396c341034350b4420b81c9",
+            "timing.json": "5b50506cdfebfcdf3cee20c67645440f668aefd0fedd4a85c0055996897c181d",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "130bb20390cd55db859b1b24f9290b7fe0a64b93170b47651f3ad85b7c5a3730"
+          }
+        },
+        {
+          "case": "round-2-case-1",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-37782-1793562615258277000-1",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 6,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "e3693a900d155a39ff841a1258d2820ea78452813086416caf4269493e3cd442",
+            "stage_ms": {
+              "execution_and_segment": 1251.87425,
+              "identity_and_wrap": 17672.492416,
+              "recursion": 3468.942083,
+              "verification": 1.7697500000000002
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 22420.892666,
+            "worker_pid": 37784
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "0eced413b5b1e57e21ba76d424b4dd92873bb024eac251ec96d3031d4a2aca5f",
+            "resource.json": "cfd17e8dea546d9662b6eba84c0fe8f32e6b958f0a1ecbb796497c9c7746fd58",
+            "seal.bin": "e3693a900d155a39ff841a1258d2820ea78452813086416caf4269493e3cd442",
+            "timing.json": "dbe573806fe16a937492cb9a2ecedff42be0e08447b38c4de98fa4f688de089e",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "337d4afd16825712540a25cf7e0c24c93093946187ceeb9b06eb07f0b28b7fde"
+          }
+        },
+        {
+          "case": "round-3-case-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-37782-1793562610115809000-0",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 6,
+            "request_id": 8,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "044099e7333fa4856a3e6507ff68371e2c89e0e3d619455ef4f35606e8eb9e1d",
+            "stage_ms": {
+              "execution_and_segment": 2625.335625,
+              "identity_and_wrap": 37034.882959,
+              "recursion": 6384.180084,
+              "verification": 1.758834
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 46070.851583,
+            "worker_pid": 37783
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "d0c196c3c8c9a837948f065cc7b90448d9356d905ac1548680400ccbcb826ff4",
+            "resource.json": "aec2b1485abac4ddbb216f6e5bfd38df6a194c78d351227f19cbc670caa5c46c",
+            "seal.bin": "044099e7333fa4856a3e6507ff68371e2c89e0e3d619455ef4f35606e8eb9e1d",
+            "timing.json": "270c555aec245b2032b734b7eafba1e589e5a50d0a7e1d4727f50f9b19a88223",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "01a34ea3b5334b9644ca895155cf8ad35d164c053b6c1002755bd9572d21764d"
+          }
+        },
+        {
+          "case": "round-3-case-1",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-37782-1793562615258277000-1",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 7,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "6f235fb41dba54bd18c8eddda0ab962629fa2dc17b176e14092a32ca82d709c9",
+            "stage_ms": {
+              "execution_and_segment": 1199.081917,
+              "identity_and_wrap": 17752.43975,
+              "recursion": 3495.321,
+              "verification": 1.870167
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 22474.565333,
+            "worker_pid": 37784
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "0841f65d46d4c522f21ad8488afa4f6782756294491f01a3458e859de9a82ec8",
+            "resource.json": "86b765b57b51480620f454e1757741707d2a964593d5e52aa421853f60fe1b51",
+            "seal.bin": "6f235fb41dba54bd18c8eddda0ab962629fa2dc17b176e14092a32ca82d709c9",
+            "timing.json": "9a90681c02563daa5c2ec2cd03b87e24aef0de7a8d8d1fe6b882f46f04162c63",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "a8ff625e00e2d3a3243259196789ed75ee43619f21156faedb1a9748aa7e8e32"
+          }
+        },
+        {
+          "case": "round-4-case-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-37782-1793562610115809000-0",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 6,
+            "request_id": 9,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "9add94150ea02fbbb491d9f51dd1dca958192ba832e3176208a107a7c3bd3be2",
+            "stage_ms": {
+              "execution_and_segment": 2620.3112920000003,
+              "identity_and_wrap": 35829.421708,
+              "recursion": 6262.160458,
+              "verification": 1.753917
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 44739.459458,
+            "worker_pid": 37783
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "83e76a52eb095554625e5b3678c7be45b746dfb0a7803b30ccf5948a9cfae3e5",
+            "resource.json": "c3376bc3b36881249b3f3b3f9cf4cda16de2b34918abae3af57c7af8787935a9",
+            "seal.bin": "9add94150ea02fbbb491d9f51dd1dca958192ba832e3176208a107a7c3bd3be2",
+            "timing.json": "89662eb6970217be11b4d54147c1b3a702874441a7e0662cc6d93bcf42abef10",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "208d080dd932135f048e5d328e5211348167f94765df3b90820798abb9d42e03"
+          }
+        },
+        {
+          "case": "round-4-case-1",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-37782-1793562615258277000-1",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 10,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "80da880b310daa0230b5a1c24902378f9e41d8b9bf3e2990a0c0f741d4f1b725",
+            "stage_ms": {
+              "execution_and_segment": 1195.389916,
+              "identity_and_wrap": 17148.843958,
+              "recursion": 3423.814792,
+              "verification": 1.770458
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 21794.333583,
+            "worker_pid": 37784
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "fbedc0a7f96412b583a8f3462b1089352f611c27f18cf448e3a67b142b072de8",
+            "resource.json": "9003e0e83af8ef336806b39647c26f6c8dca58d3991e37bc38afa58733e169e1",
+            "seal.bin": "80da880b310daa0230b5a1c24902378f9e41d8b9bf3e2990a0c0f741d4f1b725",
+            "timing.json": "79744f0df53a7e7b6e5671c3e76da78daf1578490868bfbdebe4f7593cd582d7",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "e689c4e0546a9979a06ec22eefaa00985f16a75fadae501f4e9b30f2e19c930a"
+          }
+        },
+        {
+          "case": "round-5-case-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 6,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-37782-1793562610115809000-0",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 6,
+            "request_id": 12,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "a9c80c447626e2e795db8c462203152ad63bdd5ff11e5bafd1f3aac16da915b5",
+            "stage_ms": {
+              "execution_and_segment": 2658.022833,
+              "identity_and_wrap": 36964.251542,
+              "recursion": 6421.392,
+              "verification": 1.725834
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 46069.07375,
+            "worker_pid": 37783
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "6e9fc5562344d6990ea5130e52f342440052f0332fb893b3800f9c7d616da0ea",
+            "resource.json": "68f45febbe923b0bff5315db18e94de8840fc22569c5ec85bcea00d42f8a6aba",
+            "seal.bin": "a9c80c447626e2e795db8c462203152ad63bdd5ff11e5bafd1f3aac16da915b5",
+            "timing.json": "9a62673c8a067023eb38d3710109bafa11b235e789f16d80aaed717bdc363dbc",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "643e4e42789a399e2ea1aa68ca2039aba5976abff26924017ed54225f42a129f"
+          }
+        },
+        {
+          "case": "round-5-case-1",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-37782-1793562615258277000-1",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 11,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "bcac26bb1d9d9ce2ba086c50d1e6249f3faf43d416e4c76371ffb3d917fff22a",
+            "stage_ms": {
+              "execution_and_segment": 1177.682791,
+              "identity_and_wrap": 17451.951458,
+              "recursion": 3396.5809999999997,
+              "verification": 1.731458
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 22054.080417,
+            "worker_pid": 37784
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "10af973d392258a66bb80a29f887ee82b165080e24f051c0b53ccd915594b669",
+            "resource.json": "c2f53bd226952231f5af292d51ea29b7220f3f38985a1faef6b2ae20171008c7",
+            "seal.bin": "bcac26bb1d9d9ce2ba086c50d1e6249f3faf43d416e4c76371ffb3d917fff22a",
+            "timing.json": "2f95962861c9c41f72d3ced0536755072a2ccdeeb9cde45915d70f49c5f466e7",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "310c10c0ac9d1fc241244be8b1d0c96a473a47c404a476e384baac702f436524"
+          }
+        }
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/eee31eba2a1641a6bb5e4fddc6f5eef3",
+      "status": "passed",
+      "files": {
+        "result.json": "ccb2da78f5d04fabee0d9f5d474016f6be2c1f4b8dd3fe9561f334fe53af419d",
+        "test.log": "f4e998fd0d0bf059f3b6944c6041eabeffe523f20eec925d956b5ef19f540a02",
+        "acceptance-build.json": "caf2d618231be05b74ba07db944267e8a877980626f67491bdd4bb572b48f342",
+        "acceptance/complete.json": "ec6aa708cf8bd39e4b784cf7f3df4ced3f2aa0be60b69cd73c0cf4e86eec0eb5",
+        "acceptance/requests.jsonl": "b10729f23428d93a8ed090ea0edf45f47add0d1ea878d5e6c0f6fdbfdbe591d1"
+      },
+      "worker_binary_sha256": "3f5e4ce6f8542f73341dc724a21961cb90913939ada2aaadf13de7b4e43338f7",
+      "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+      "verified_proofs": 1,
+      "negative_rejections": 3,
+      "proofs": [
+        {
+          "case": "proof-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-44171-1793563111631983000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 1,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "0c6c42a06e7c089d8e5e31caec7557249e69fd8a6cd95173dc2be9eb2e4bd37d",
+            "stage_ms": {
+              "execution_and_segment": 1470.047833,
+              "identity_and_wrap": 27879.949125,
+              "recursion": 4678.796458,
+              "verification": 1.7965
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 34054.352125,
+            "worker_pid": 44214
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "197d4037c406ada0f93a5b3bde45ae383eb492a62cc11e5224f7fae5dd8c1726",
+            "resource.json": "e60e388e00ee55d2db6b00a1ccb47a8d352b305e95aba0bc2f810a19df260469",
+            "seal.bin": "0c6c42a06e7c089d8e5e31caec7557249e69fd8a6cd95173dc2be9eb2e4bd37d",
+            "timing.json": "41a40c74225b010c1cf3a3194fafc93d1819019903e8efa467e14deb56b77d12",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "258de51b4d464e9bb81943e9a6dfd76af38af6210c32c9376360664f1cf87bb3"
+          }
+        }
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/03216b8a73924200be15e19858641d4b",
+      "status": "passed",
+      "files": {
+        "result.json": "de1737086674e9a0c21ff11d053b6c39d17483091c2f2bbf2e00291e15ed5a32",
+        "test.log": "bb622f8d6a9357976b18d2d46085de38ea47f745ba13ce7703e03841e5630a29",
+        "acceptance-build.json": "caf2d618231be05b74ba07db944267e8a877980626f67491bdd4bb572b48f342",
+        "acceptance/complete.json": "8ee6f657b96f85645f1ea2f1bae454c8fad7bb8a6b4c54e2234582d925c000c2",
+        "acceptance/requests.jsonl": "4dd90d906d8e5e26121a412f9e2c29a6cf7a6225cecf4032a1d3d8fa4e887fbc"
+      },
+      "worker_binary_sha256": "3f5e4ce6f8542f73341dc724a21961cb90913939ada2aaadf13de7b4e43338f7",
+      "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+      "verified_proofs": 1,
+      "negative_rejections": 3,
+      "proofs": [
+        {
+          "case": "proof-0",
+          "worker": {
+            "elf_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-44704-1793563166219635000-2",
+            "image_id": "58518a60c949a92b89ddcfa8c8b44f65ebbf17ee16c0dffa738ed55563e0a623",
+            "input_sha256": "075de2b906dbd7066da008cab735bee896370154603579a50122f9b88545bd45",
+            "journal_hex": "43f66f29297b60a3a6a09f54f383bf01a44d6c3baa727796983637a32fcb0583",
+            "journal_sha256": "4cd16d6f3feb4d6a96bc4d4145fbb3dc87817ed74b4afdf9f2d1e193d4b17f9b",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 1,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "d08c5c6fcf2195d3b8ec54347b7e14216b9700526c99cd2d6f4bda1bee5ebe59",
+            "stage_ms": {
+              "execution_and_segment": 5728.824708,
+              "identity_and_wrap": 26480.809708,
+              "recursion": 4739.800625,
+              "verification": 1.921541
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 21738,
+              "reserved_cycles": 61986,
+              "segments": 1,
+              "total_cycles": 131072,
+              "user_cycles": 47348
+            },
+            "total_ms": 36978.807667,
+            "worker_pid": 44765
+          },
+          "artifacts": {
+            "journal.bin": "4cd16d6f3feb4d6a96bc4d4145fbb3dc87817ed74b4afdf9f2d1e193d4b17f9b",
+            "receipt.bin": "0b608b9b366f66c81dd01f8c619c88676bdc665e8e7381e4a4c4f1a01fe35bde",
+            "resource.json": "a29e051f6edb1deafbd347deda62a83bd389f0b3d58adde61b04a627fbfc8acb",
+            "seal.bin": "d08c5c6fcf2195d3b8ec54347b7e14216b9700526c99cd2d6f4bda1bee5ebe59",
+            "timing.json": "4109c5959c00b42bd26f7a03f43a2486da3a5a24740087ba93c15371457501ff",
+            "verification.json": "972d6daa788c9b85b12ce8248eae233600cc229eda2e8c16b66e9b553f2c1a8b",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "cc5d0e16f590d4866ca36c04e1b40df894d4dbff62b4d1454bc20b8a67365340",
+            "worker.json": "0206943509314b7a7224fe37f15098a21118ac9cf84f1ee6ea960f9a294bfaad"
+          }
+        }
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/17a9835a97354d47a9b3c03fb708e173",
+      "status": "passed",
+      "files": {
+        "result.json": "d54aeaf01fecc448b7c54c071835e474eb671e52d3861ab0761da2adfd369b0a",
+        "test.log": "86bf0c3daa0d7468b151cbcb12a0337fceeb36c46e0c73738b54f9eaadddcc10",
+        "acceptance-build.json": "caf2d618231be05b74ba07db944267e8a877980626f67491bdd4bb572b48f342",
+        "acceptance/complete.json": "f29ccdaf1782b064312ef043651e0c26ecd378ab15297d0e7cf0604f145c99a3",
+        "acceptance/requests.jsonl": "c9763b9636c9d165d3fa9c0547a0f0fc9396c971212015676cfc7588a0b54f5a"
+      },
+      "worker_binary_sha256": "3f5e4ce6f8542f73341dc724a21961cb90913939ada2aaadf13de7b4e43338f7",
+      "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+      "verified_proofs": 1,
+      "negative_rejections": 3,
+      "proofs": [
+        {
+          "case": "proof-0",
+          "worker": {
+            "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-45273-1793563223708601000-2",
+            "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+            "input_sha256": "226868b59be3e5e479cc22d7bda11055bad06bb205b77454ea36c65885f5c284",
+            "journal_hex": "f0febc9a78563412",
+            "journal_sha256": "118809efe7677d03153ce329b5af919e724a6f742dc98154e3df4ebbf54b574b",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 16,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 1,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "0e7fa3014ffa6b1183b53a095318b850a09f3ecd722e8ed9080d77fa16c73f6f",
+            "stage_ms": {
+              "execution_and_segment": 10658.31325,
+              "identity_and_wrap": 24752.374583,
+              "recursion": 32386.704792000004,
+              "verification": 1.717167
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 35483,
+              "reserved_cycles": 133352,
+              "segments": 5,
+              "total_cycles": 294912,
+              "user_cycles": 126077
+            },
+            "total_ms": 67858.205542,
+            "worker_pid": 45340
+          },
+          "artifacts": {
+            "journal.bin": "118809efe7677d03153ce329b5af919e724a6f742dc98154e3df4ebbf54b574b",
+            "receipt.bin": "5d6512ea76bcd2f4b4a22a084aab1b3bf9953495e778d99b6f33c2a7948a87de",
+            "resource.json": "3a7ba766687062da9f13535df7356bb3257b6ce399b4c93c7d460c3ad4067c98",
+            "seal.bin": "0e7fa3014ffa6b1183b53a095318b850a09f3ecd722e8ed9080d77fa16c73f6f",
+            "timing.json": "0d08fa075fe58d1a6b9eb196eb0c43183ecf711cdae1e83fe414ef4800909872",
+            "verification.json": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "eaad05f59663ae87a1136d91dcf4a45cb1131d99b4e99f209b1c3842bbf20009",
+            "worker.json": "2d8517df9af2c25c4502438a2df94119788075cb9a56e793c889f4c5d2e5fc74"
+          }
+        }
+      ]
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/a5d741f9b2254c8e81c171a46623744f",
+      "status": "passed",
+      "files": {
+        "result.json": "da531278d77aaa3c1913ca8c42a3c96a454e37a905fa2068675e6c9c49714d00",
+        "test.log": "6df5c728db747932424bb2b01a05ef9413d07618edd15a4be26198f4902857d3",
+        "acceptance-build.json": "caf2d618231be05b74ba07db944267e8a877980626f67491bdd4bb572b48f342",
+        "acceptance/complete.json": "98cd2961bddd8181db6439a3d6348ccd55cbde4569e41791fe0e339cb9699d45",
+        "acceptance/requests.jsonl": "f607a47fbbf9ca042e22c7f49ccec4bb83754c4768cef85cea3102a2679dc738"
+      },
+      "worker_binary_sha256": "3f5e4ce6f8542f73341dc724a21961cb90913939ada2aaadf13de7b4e43338f7",
+      "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+      "verified_proofs": 4,
+      "negative_rejections": 12,
+      "proofs": [
+        {
+          "case": "proof-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-46184-1793563313338744000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 1,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "a84c2b2713823ab540cba4d8061d340c88e89464f1569ceceaa492ecfa32733b",
+            "stage_ms": {
+              "execution_and_segment": 1243.308167,
+              "identity_and_wrap": 24581.67025,
+              "recursion": 3963.294458,
+              "verification": 1.752
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 29819.158708,
+            "worker_pid": 46234
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "9a82f4a3827329f193262698aca2934a9c8bf90e6dab6134f2829a7b32537aff",
+            "resource.json": "4ef6647bd1fb3f4020a104bbd649fef59636144f3c161b23e0566e7173c62960",
+            "seal.bin": "a84c2b2713823ab540cba4d8061d340c88e89464f1569ceceaa492ecfa32733b",
+            "timing.json": "a0b986fde9c732d43bca6a29e59f4c4e21f88e8442672da7ed10f329188f4f65",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "4ab017d9be98df73c10026acae7c3c15c2924220f3789be87d5522ccf5320212"
+          }
+        },
+        {
+          "case": "proof-1",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-46184-1793563313338744000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 2,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "58c6390467c97d8a5b1d0d39a2e8923cb850665c5c9a18467a4b6985d30d7887",
+            "stage_ms": {
+              "execution_and_segment": 1172.880209,
+              "identity_and_wrap": 17461.275625,
+              "recursion": 3452.9516249999997,
+              "verification": 1.752708
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 22113.341917,
+            "worker_pid": 46234
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "e9d22163484fc5b8ba4704e81cc28433fcdf5c83ed09681e4f2ca653911267b7",
+            "resource.json": "56868806f59942559cc967a0ce379e86290d7f72b2416c759c8631262251187c",
+            "seal.bin": "58c6390467c97d8a5b1d0d39a2e8923cb850665c5c9a18467a4b6985d30d7887",
+            "timing.json": "6dcfcdb9ee8c57cb4aee919218491720622f7a0f6af5d02bb5c436d12cc3641a",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "42658b4cd199bd70f9958da39c768a26069b25e2ed5088899179197fa7caa8fd"
+          }
+        },
+        {
+          "case": "proof-2",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-46184-1793563313338744000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 3,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "65b3fcd289798bef0ed58876603c2d73b3265f9d0e4f114d54676e3b5c75f733",
+            "stage_ms": {
+              "execution_and_segment": 1175.403875,
+              "identity_and_wrap": 17775.014208,
+              "recursion": 3535.255291,
+              "verification": 1.727417
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 22511.977833,
+            "worker_pid": 46234
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "3dba113ad7bef6de690f7e8bdf155edb0b5767321ff8780e3624fdcc1ccfe627",
+            "resource.json": "09bd9f7df001ba2788408eddcbfbdbb6438ddd8c87b0af7ff2b4abe86a4a7050",
+            "seal.bin": "65b3fcd289798bef0ed58876603c2d73b3265f9d0e4f114d54676e3b5c75f733",
+            "timing.json": "ebb6f3ad30662bca1581e21b56e24445b0e957ba07c630e06bf77d6971229970",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "fbaf64a30d66427decd8f883762f43bbf1af35117a2fd84b54e0c7a1ee429e32"
+          }
+        },
+        {
+          "case": "proof-after-restart",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-46184-1793563433915672000-4",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 6,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "321483ef1af655ccc0c0771f965eb1571dde379d167251b2c9105b568ec8dc18",
+            "stage_ms": {
+              "execution_and_segment": 1231.465292,
+              "identity_and_wrap": 24941.263416,
+              "recursion": 3964.981458,
+              "verification": 1.7849579999999998
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 30163.665999999997,
+            "worker_pid": 48085
+          },
+          "artifacts": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "7f4ba4e64a4e24c1c599a6b755f6478fc0302ac09daf3128b1dded6af7494144",
+            "resource.json": "c5bc4269a054a747a88382b3796bc195e489e65748d345350c021bf4e6670ace",
+            "seal.bin": "321483ef1af655ccc0c0771f965eb1571dde379d167251b2c9105b568ec8dc18",
+            "timing.json": "226bf21314414db16da13b3fa99b74b85e22639fd000cd921a4e0dd90d9128ba",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "c9f1b1cb479019ea3ec35e615ac9d5c4ba7b5cdc6a8b2fd448afa11a4f472c4a"
+          }
+        }
+      ]
+    }
+  ],
+  "rayon_screen": {
+    "measured_samples_per_setting": 3,
+    "excluded_warmups_per_setting": 1,
+    "seconds": {
+      "6": {
+        "n": 3,
+        "median": 45.426926208,
+        "minimum": 45.269356792,
+        "maximum": 45.906703333
+      },
+      "12": {
+        "n": 3,
+        "median": 30.598839292,
+        "minimum": 30.346721709,
+        "maximum": 30.649597042
+      },
+      "18": {
+        "n": 3,
+        "median": 25.714461167,
+        "minimum": 25.693588333,
+        "maximum": 25.811683249999998
+      }
+    }
+  },
+  "go_screen": {
+    "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/go-tuning/b59364cac27e481ab9697bf5af867025",
+    "result_sha256": "f23d293b9ff037bf6925a9b957e1ab569428acc5fc5b58a4e7487cb6a2e2f22a",
+    "witness_sha256": "671db659a52781913aa4873c57a9a90450d2130c4f9ea58623df498fe35d81af",
+    "method": "one warmup per Go setting; five measured rounds, reversing setting order each round; includes loading and child startup",
+    "seconds": {
+      "6": {
+        "n": 5,
+        "median": 7.943508543074131,
+        "minimum": 7.834460457786918,
+        "maximum": 8.012722622603178
+      },
+      "12": {
+        "n": 5,
+        "median": 5.268146542832255,
+        "minimum": 5.245970832183957,
+        "maximum": 5.303459044545889
+      },
+      "18": {
+        "n": 5,
+        "median": 4.571153167635202,
+        "minimum": 4.519596790894866,
+        "maximum": 4.641618249937892
+      }
+    },
+    "proof_artifacts": {
+      "round-0-go-12": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "557795462ce1c354a464cbf938a312c6b089d14d5e698645177dc6cad0fe07b4",
+        "prover.log": "b1efd5d55449c536f6215cdd9238fa77bf193519b0e4a7f5d1a97b20166c1249",
+        "receipt.bin": "679744adb5f698f09820360d3869a61b0a5d22a8603b9b673bc147f3172e4b8b",
+        "seal.bin": "a50bac59d33d073cf3fe3164dc1f7b09c473e203237b87f6b2676d32b3a44067",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-0-go-18": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "0d2d2f84dcfd3cc0749a657b7479c62541551bc905d742bf71892ef08fe0da68",
+        "prover.log": "9ad251a554bfb4113f75e8c416d72231f7c24b4a9ff19b1a2f690d0136e8a885",
+        "receipt.bin": "719402577ac1a5411eab3af0edf63ee9b80bde6456575f7d11473c9820378da5",
+        "seal.bin": "5b0381966a44b34cf2c52318d596c666c78f953c0b559405d6874f187c095b93",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-0-go-6": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "d538dc9e4e2d3eb1a722a8a604b0a4f46d8c74621c01b68fb2e5041e4b01b5ad",
+        "prover.log": "45084c9ca2c7700a562d607c6ece9e1482182fa1f0ca3e766c5decc76d6d3991",
+        "receipt.bin": "91d1c15262b272d44382fc9ccef6b72d84a4cce7df348cbc3031ea3d8ae88d5e",
+        "seal.bin": "f2420866a5adf6f4da7b55ea47fc48992382bb68b4d89b066d0bc4e388c0cc5c",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-1-go-12": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "d148e74e263e4608dbba99a46dce25edd7e24c36f55c1bcf318f1b15ce87f42e",
+        "prover.log": "0b3fffe217365a28b1201b5194a3937396a2d4c0d6af816ffffc72ccdf83cbe0",
+        "receipt.bin": "9f0eabf81816e6a5c602e3ab05a2ca0880199cb66442355e60f5598dd56eb8ea",
+        "seal.bin": "7fd0cf077d0409789cb3d12c834b92bdb153a7d2605f52f5c15eb26a9fcb0f14",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-1-go-18": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "2dd5949cbcfd7669e168869508f3e0e20aba51f9dc6f8fca613b16ffe3bf472b",
+        "prover.log": "cd4423da16702eda2fe0416ea6dde61471b5f4ba40a136dcbc0fcba281b9808e",
+        "receipt.bin": "089957c933e0c3ff98f10bc2a0c99a163abf6068444111ac9bed5c151398ecb9",
+        "seal.bin": "4aa2e4ca1b9eb7f84f3fa28552c09a7134ca7b3bd7febdccee8d14630aa13ec1",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-1-go-6": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "8640e3c2f55ccf80bdd95402b0bf4cb1bc92b55ee216e13f2c8d486855290768",
+        "prover.log": "c3809478bf01ebce58f7b25cecde4cecb724618cbb8ec01cd384b86f2ef40740",
+        "receipt.bin": "504324462c0efe177119e2d46f6fac26b29518ffb3ffd9bdd67d5a1f3a29dea0",
+        "seal.bin": "8398f74525783fc4fb6868c3e68c119a51bdf7efdfc3ae47df81adc3efbcc0c9",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-2-go-12": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "88622dbc0a0aad7770906ea9e71d58f6033ca53876054308d79c5606e6b13419",
+        "prover.log": "937a1d29450cafa7fffcdea6c8e802d622a717f0f145f6dccb7561e7c8e840f5",
+        "receipt.bin": "29a5cad1afe2ac82370b8845ce9fd8697d8a3ccee701d5f5ec98bb885a5bdfb5",
+        "seal.bin": "317397266a642a4064f077580acc3448dbc60f98fcf186f6dadb70e6dacba585",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-2-go-18": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "eac931fde355ac76c1ab96bf8c2dbb680b3d4014fa5b6cced314b40aa9f4e1df",
+        "prover.log": "3585baf4408fe4362ea243bde8355279923fd1eac2175e1387fcb60de0c3b889",
+        "receipt.bin": "8039a6e31f6e711291efa0a56479d21cb3b5b63f8a3fd50775d82d7c47ba065a",
+        "seal.bin": "69fcd7f7e9963a0cccd1f007edc22f73fcc4288ea015ff9f2566211aaeaa9ca3",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-2-go-6": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "65eded00bbbd0dc2db3ef503f2c0dab889161987182323a1fa7bd07896c41758",
+        "prover.log": "3428bceefb45be0a4b1c2e499c2e09c6b699f99a3e100c9a9599df57c594cf31",
+        "receipt.bin": "c957abc85f5c68ab0e27585e59f84974d6f094d0b1775822e55e166b65abd487",
+        "seal.bin": "7abe33c6bdaf6ed8ba8e7f4a58b77c2cfbede17012d784bc88bc9e5a55ec533a",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-3-go-12": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "01eae9f32d7a1c97fe665dbcb0eda726fd476e8c70c06d7b0fba59cc9b1c083b",
+        "prover.log": "a01c501b0afb14f3867ea909411bd3a40a61eeafebd625674a8223c62da09122",
+        "receipt.bin": "9846ae1be4a24111c5b6214657d8cfd5b95aa764233617ada50ba1a8c51c1e93",
+        "seal.bin": "567348727edd10d9b00c6399c6bd67ea9897847347773e2e38ea2498e83a8cbb",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-3-go-18": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "abe17af2a58a62ce074ba5880059c31e7bc3ced546c54c09318634160cd3ef24",
+        "prover.log": "7589a111439abb9ad312e5fb3228215df629092dd8780c6ea1e0baa40624becf",
+        "receipt.bin": "e39e0b11a4930461ea12f70fb65770afa81b36deda9993c19d35b0c489e84922",
+        "seal.bin": "7d7ed1cbe0ccf2c49ebc9eea119c2888ec21826f562136677ae9649b00493532",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-3-go-6": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "784ba12dd5c4f4312794161adfb6f7c4ea36efd9a5d9f9e41ff42d465c96c4ba",
+        "prover.log": "3934446dc6e2358f63f7a4dd2cd9cdd7a1b743d1e312e7b2a2c169a845576e39",
+        "receipt.bin": "d12102898155fd5ec1854b5a185f684f31f6da8ca8b78050b018a329d7d6b810",
+        "seal.bin": "8c0f34af3cc717644c4747324e53d3c6427177e81462615515d52dc0c793325c",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-4-go-12": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "d56e4f9d04804a10971e67bd2411e5f06933be64e4e44795122b86e3b92cec3c",
+        "prover.log": "94b392a8a9cd9980d47f02dc447f7267d9b33a19aef816a9f063c5ef39bc4ab1",
+        "receipt.bin": "6caf57caad2173177155bf6843acc916c459b6c37bb0dd59b7db6a67bac028f0",
+        "seal.bin": "58516c92219a397bd55f45685198f2eaab1d4a574078f3f89f6a1e1d714483d1",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-4-go-18": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "c511da87508e7b0cec6b920433da63a8f88ed7cad8425e09bee0cf7f9bb57d92",
+        "prover.log": "a0baa32f2500bc23e197578215b6dc68c1e7f510740b21155ab767b63334cf40",
+        "receipt.bin": "ad6d531e4e5af421bb6391341c175bdb2111654728968983f908c327d78abc43",
+        "seal.bin": "a896efa91e9a5c99a1f7d484ea0190a75b2d1339fe913fe6f1a3e76756808193",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-4-go-6": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "36c42ba38eb6e198cd7a35c995e31700424bee514aeca84b03a5a7d7e5a3e4f7",
+        "prover.log": "be3561420de793df4afe373c085612c45ae9b30dc2d9ad744c827a594ce7983e",
+        "receipt.bin": "f6722d4f12f18b7363fe2926ea54e01a233d159f4e651f678b471d92c65c3f0e",
+        "seal.bin": "b93d31d1fc2c555feb5539578499301a0c5fe9cc39a2a4c47e1fc8fd888ef170",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-5-go-12": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "a3b155a26ec6aa067fbfd6b226ecb76a6f6c605db291d7d7121c02c6ddea61bf",
+        "prover.log": "bcaf117bd6e519316d9324cea71f63d37d0a8264cb00c0f662bed4ea0c44cc0f",
+        "receipt.bin": "f1c7d530e57326e479cf2d69ed71332bcbecec211c6131e73c5b8361efc5a748",
+        "seal.bin": "60274699c6de935ff4947bcf9a5c44fcd6153d32728a73a5af8bc779dbb4b924",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-5-go-18": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "6748413a9c1dbe2d3cbfd4b30b73c65dca1faec2769286cd76e06093cda50dad",
+        "prover.log": "dd36b619b40b3b958586f7da52364770236f4a13dc3eb6a40aeeb9b0946d8ed9",
+        "receipt.bin": "69ec83dfda3887da3ec1bab44a09db786f60d951e9522c368c72020897ee7070",
+        "seal.bin": "6fdc3c5a203869ce8a8a8a669509d4452ad2dcfe5f1f64b6ff0f9c84ab07130f",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      },
+      "round-5-go-6": {
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "proof.json": "0b7ee4878202876c5686975b9816db0717b27b0f385eec5cca4acecf91e157e5",
+        "prover.log": "8ffa388bd09f5a0da0e3430d0194e16636dcaff524a16942ece762519ac9b8ff",
+        "receipt.bin": "bd0dc86a8a5778b48db7718f56016f14c2df87906fc5f9a3b26f6274cb37717e",
+        "seal.bin": "32c2252fa2290c17af72fe55ff6c6cca6bf20cc5de1b18b63da180e7336229cb",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      }
+    }
+  },
+  "paired_comparison": {
+    "excluded_warmups": 2,
+    "measured_pairs": 5,
+    "worker_body_ratio_of_medians": 2.0547386063651745,
+    "settings": [
+      {
+        "rayon_threads": 6,
+        "gomaxprocs": 6,
+        "seconds": {
+          "worker_body": {
+            "n": 5,
+            "median": 46.06907375,
+            "minimum": 44.739459458,
+            "maximum": 46.609434500000006
+          },
+          "supervisor_prove_call": {
+            "n": 5,
+            "median": 46.217216959,
+            "minimum": 45.207824125,
+            "maximum": 47.210166708
+          },
+          "execution_and_segment": {
+            "n": 5,
+            "median": 2.6480129999999997,
+            "minimum": 2.6203112920000002,
+            "maximum": 2.720749625
+          },
+          "recursion": {
+            "n": 5,
+            "median": 6.384180084,
+            "minimum": 6.262160458,
+            "maximum": 6.502327125
+          },
+          "identity_and_wrap": {
+            "n": 5,
+            "median": 36.964251542,
+            "minimum": 35.829421708,
+            "maximum": 37.359307542
+          },
+          "verification": {
+            "n": 5,
+            "median": 0.001736875,
+            "minimum": 0.001721375,
+            "maximum": 0.001758834
+          }
+        },
+        "resources_per_sample": [
+          {
+            "worker_footprint_peak_bytes": 4225895928,
+            "helper_footprint_peak_bytes": 7709579168,
+            "simultaneous_group_footprint_peak_bytes": 11926480304,
+            "guard_lifetime_group_peak_bytes": 11926480304,
+            "estimated_available_minimum_bytes": 35768090624,
+            "pressure_levels": [
+              1
+            ]
+          },
+          {
+            "worker_footprint_peak_bytes": 4216901136,
+            "helper_footprint_peak_bytes": 7709284232,
+            "simultaneous_group_footprint_peak_bytes": 11244233680,
+            "guard_lifetime_group_peak_bytes": 11926480304,
+            "estimated_available_minimum_bytes": 36036083712,
+            "pressure_levels": [
+              1
+            ]
+          },
+          {
+            "worker_footprint_peak_bytes": 4059221424,
+            "helper_footprint_peak_bytes": 7710939040,
+            "simultaneous_group_footprint_peak_bytes": 11770160464,
+            "guard_lifetime_group_peak_bytes": 11926480304,
+            "estimated_available_minimum_bytes": 37730451456,
+            "pressure_levels": [
+              1
+            ]
+          },
+          {
+            "worker_footprint_peak_bytes": 4062563760,
+            "helper_footprint_peak_bytes": 7341495960,
+            "simultaneous_group_footprint_peak_bytes": 10898891536,
+            "guard_lifetime_group_peak_bytes": 11926480304,
+            "estimated_available_minimum_bytes": 39230111744,
+            "pressure_levels": [
+              1
+            ]
+          },
+          {
+            "worker_footprint_peak_bytes": 3614346384,
+            "helper_footprint_peak_bytes": 7710545824,
+            "simultaneous_group_footprint_peak_bytes": 11324875824,
+            "guard_lifetime_group_peak_bytes": 11926480304,
+            "estimated_available_minimum_bytes": 37639471104,
+            "pressure_levels": [
+              1
+            ]
+          }
+        ],
+        "thermal_observations": [
+          {
+            "low_power_false_may_mean_unknown": true,
+            "low_power_mode_enabled": false,
+            "schema_version": 1,
+            "thermal_nominal_may_mean_unknown": true,
+            "thermal_state": 0,
+            "thermal_state_name": "nominal"
+          },
+          {
+            "low_power_false_may_mean_unknown": true,
+            "low_power_mode_enabled": false,
+            "schema_version": 1,
+            "thermal_nominal_may_mean_unknown": true,
+            "thermal_state": 0,
+            "thermal_state_name": "nominal"
+          },
+          {
+            "low_power_false_may_mean_unknown": true,
+            "low_power_mode_enabled": false,
+            "schema_version": 1,
+            "thermal_nominal_may_mean_unknown": true,
+            "thermal_state": 0,
+            "thermal_state_name": "nominal"
+          },
+          {
+            "low_power_false_may_mean_unknown": true,
+            "low_power_mode_enabled": false,
+            "schema_version": 1,
+            "thermal_nominal_may_mean_unknown": true,
+            "thermal_state": 0,
+            "thermal_state_name": "nominal"
+          },
+          {
+            "low_power_false_may_mean_unknown": true,
+            "low_power_mode_enabled": false,
+            "schema_version": 1,
+            "thermal_nominal_may_mean_unknown": true,
+            "thermal_state": 0,
+            "thermal_state_name": "nominal"
+          }
+        ]
+      },
+      {
+        "rayon_threads": 18,
+        "gomaxprocs": 18,
+        "seconds": {
+          "worker_body": {
+            "n": 5,
+            "median": 22.420892666,
+            "minimum": 21.794333583,
+            "maximum": 22.503507125
+          },
+          "supervisor_prove_call": {
+            "n": 5,
+            "median": 23.126349583,
+            "minimum": 22.135949333,
+            "maximum": 23.136993458
+          },
+          "execution_and_segment": {
+            "n": 5,
+            "median": 1.199081917,
+            "minimum": 1.177682791,
+            "maximum": 1.25187425
+          },
+          "recursion": {
+            "n": 5,
+            "median": 3.454966875,
+            "minimum": 3.396581,
+            "maximum": 3.495321
+          },
+          "identity_and_wrap": {
+            "n": 5,
+            "median": 17.672492416,
+            "minimum": 17.148843958,
+            "maximum": 17.81043825
+          },
+          "verification": {
+            "n": 5,
+            "median": 0.00176975,
+            "minimum": 0.001731458,
+            "maximum": 0.0018701669999999998
+          }
+        },
+        "resources_per_sample": [
+          {
+            "worker_footprint_peak_bytes": 4337929816,
+            "helper_footprint_peak_bytes": 7716739000,
+            "simultaneous_group_footprint_peak_bytes": 11923072456,
+            "guard_lifetime_group_peak_bytes": 11943896496,
+            "estimated_available_minimum_bytes": 35534503936,
+            "pressure_levels": [
+              1
+            ]
+          },
+          {
+            "worker_footprint_peak_bytes": 4223487504,
+            "helper_footprint_peak_bytes": 7713707960,
+            "simultaneous_group_footprint_peak_bytes": 11906377160,
+            "guard_lifetime_group_peak_bytes": 11943896496,
+            "estimated_available_minimum_bytes": 35947216896,
+            "pressure_levels": [
+              1
+            ]
+          },
+          {
+            "worker_footprint_peak_bytes": 4225191464,
+            "helper_footprint_peak_bytes": 7715510200,
+            "simultaneous_group_footprint_peak_bytes": 11879474584,
+            "guard_lifetime_group_peak_bytes": 11943896496,
+            "estimated_available_minimum_bytes": 35905732608,
+            "pressure_levels": [
+              1
+            ]
+          },
+          {
+            "worker_footprint_peak_bytes": 3704458504,
+            "helper_footprint_peak_bytes": 7345608344,
+            "simultaneous_group_footprint_peak_bytes": 11050050464,
+            "guard_lifetime_group_peak_bytes": 11943896496,
+            "estimated_available_minimum_bytes": 39161298944,
+            "pressure_levels": [
+              1
+            ]
+          },
+          {
+            "worker_footprint_peak_bytes": 3707784456,
+            "helper_footprint_peak_bytes": 7713462152,
+            "simultaneous_group_footprint_peak_bytes": 11421246608,
+            "guard_lifetime_group_peak_bytes": 11943896496,
+            "estimated_available_minimum_bytes": 38792183808,
+            "pressure_levels": [
+              1
+            ]
+          }
+        ],
+        "thermal_observations": [
+          {
+            "low_power_false_may_mean_unknown": true,
+            "low_power_mode_enabled": false,
+            "schema_version": 1,
+            "thermal_nominal_may_mean_unknown": true,
+            "thermal_state": 0,
+            "thermal_state_name": "nominal"
+          },
+          {
+            "low_power_false_may_mean_unknown": true,
+            "low_power_mode_enabled": false,
+            "schema_version": 1,
+            "thermal_nominal_may_mean_unknown": true,
+            "thermal_state": 0,
+            "thermal_state_name": "nominal"
+          },
+          {
+            "low_power_false_may_mean_unknown": true,
+            "low_power_mode_enabled": false,
+            "schema_version": 1,
+            "thermal_nominal_may_mean_unknown": true,
+            "thermal_state": 0,
+            "thermal_state_name": "nominal"
+          },
+          {
+            "low_power_false_may_mean_unknown": true,
+            "low_power_mode_enabled": false,
+            "schema_version": 1,
+            "thermal_nominal_may_mean_unknown": true,
+            "thermal_state": 0,
+            "thermal_state_name": "nominal"
+          },
+          {
+            "low_power_false_may_mean_unknown": true,
+            "low_power_mode_enabled": false,
+            "schema_version": 1,
+            "thermal_nominal_may_mean_unknown": true,
+            "thermal_state": 0,
+            "thermal_state_name": "nominal"
+          }
+        ]
+      }
+    ]
+  },
+  "cache_warm": {
+    "cache_warmed_bytes": 2255766633,
+    "read_seconds": 0.06962008401751518,
+    "physical_pressure_forced": false,
+    "allocation_buffer_bytes": 4194304,
+    "kernel_pressure": "1"
+  },
+  "admission_refusal": {
+    "attempted": false,
+    "error": "host RAM is short for risc0:generic: needs ~16.0 GiB, 97.0 GiB already reserved by proofs in flight, 49.6 GiB available",
+    "helper_count_after": 0,
+    "host_available_at_refusal_bytes": 53206040576,
+    "host_available_bytes": 53203959808,
+    "host_reserve_bytes": 17179869184,
+    "host_total_bytes": 137438953472,
+    "kind": "in_flight_reservation_admission",
+    "needed_bytes": 17179869184,
+    "physical_memory_pressure": false,
+    "reservation_count": 97,
+    "reserved_after_bytes": 0,
+    "reserved_before_bytes": 0,
+    "reserved_held_bytes": 104152956928,
+    "sidecar_count_after": 0,
+    "sidecar_count_before": 0,
+    "step_bytes": 1073741824,
+    "worker_pid_after": 44214,
+    "worker_pid_before": 44214
+  },
+  "unit_tests": {
+    "worker": 3,
+    "macos_process_and_memory": 5,
+    "memory": 12
+  },
+  "test_logs": {
+    "tuned-worker-build.log": "39d0f2b77b7076baaebe1dfcdf9bfa85f72d748573e4a3fb090104405d6b81cc",
+    "tuned-platform-tests.log": "76ea4a3ece0d383bb4a956a1482c1e9c8ec38832b4a61589dfd3f4b22a63af8b",
+    "tuned-memory-tests.log": "9adfed799f9b6757d2088801ec8bb098323c11dfb2cbe6183c01ce7b7191ed80"
+  },
+  "invalid_thread_controls": {
+    "status": "passed",
+    "cases": [
+      {
+        "variable": "ZKMINER_RISC0_CPU_THREADS",
+        "value": "0",
+        "status": "rejected_before_admission"
+      },
+      {
+        "variable": "ZKMINER_RISC0_CPU_THREADS",
+        "value": "19",
+        "status": "rejected_before_admission"
+      },
+      {
+        "variable": "ZKMINER_RISC0_CPU_THREADS",
+        "value": "-1",
+        "status": "rejected_before_admission"
+      },
+      {
+        "variable": "ZKMINER_RISC0_CPU_THREADS",
+        "value": "invalid",
+        "status": "rejected_before_admission"
+      },
+      {
+        "variable": "RISC0_GROTH16_NATIVE_THREADS",
+        "value": "0",
+        "status": "rejected_before_admission"
+      },
+      {
+        "variable": "RISC0_GROTH16_NATIVE_THREADS",
+        "value": "19",
+        "status": "rejected_before_admission"
+      },
+      {
+        "variable": "RISC0_GROTH16_NATIVE_THREADS",
+        "value": "-1",
+        "status": "rejected_before_admission"
+      },
+      {
+        "variable": "RISC0_GROTH16_NATIVE_THREADS",
+        "value": "invalid",
+        "status": "rejected_before_admission"
+      }
+    ]
+  },
+  "preproof_failed_attempt": {
+    "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/e99fdb3f3f0b484b853cbeb8c985bc11",
+    "result_sha256": "13d6377920e702ada388175245661689503ca4f995be22dcf95d03795c282b4d",
+    "reason": "Follow-up queue omitted env.sh; cargo executable missing before test build or proof. Corrected environment and reran as a separately preserved attempt.",
+    "cache_warm_record_sha256": "ce7fd7800c1016651de7fe889f2c686fddfbf21b20eb3b7230b539d5cbe295e1"
+  },
+  "limitations": [
+    "Small fixed fixtures only; existing 4,194,304-cycle and po2 limits remain.",
+    "10M-cycle usefulness and 46M stretch targets untested; native 20-request gate remains open.",
+    "Memory samples are not exact peaks or a kernel hard cap. No global physical memory pressure was induced.",
+    "Pressure decision boundaries were unit-tested; live host pressure was normal.",
+    "Thermal nominal can mean unavailable; no frequency/energy measurements or statistical significance claim.",
+    "Go screen excludes witness generation; final worker comparison includes it.",
+    "GPU runtime regression tests and Linux execution were not run in this step."
+  ],
+  "final_checks": {
+    "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/tuning-final-checks.json",
+    "sha256": "eaa499cf69f15fcba98bede2b334217caf13ffac6c7c5eb9d4697a74247b924d",
+    "results": {
+      "native_proof_processes_remaining": [],
+      "dedicated_vm": "Stopped",
+      "default_vm": "Running",
+      "root_lock_unchanged": true,
+      "verifier_binary_unchanged": true,
+      "worker_provenance": "verified",
+      "verifier_provenance": "verified",
+      "miner_head": "0b79eea7c30f1d59635bbee7c855bb6f167e529b",
+      "engine_head": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+      "git_diff_check": "passed in both repositories",
+      "committed_or_pushed": false
+    }
+  }
+}

@@ -113,6 +113,77 @@ use zkminer_prover_protocol::{
     read_message, write_message, FrameError, WorkerCommand, WorkerResponse, PROTOCOL_VERSION,
 };
 
+// The sealed Phase 2 baseline speaks v5. This adapter is compiled only into the
+// local acceptance harness, so both sealed workers can use the same supervisor.
+#[cfg(feature = "testing")]
+#[derive(serde::Serialize)]
+#[allow(dead_code)]
+enum V5Command<'a> {
+    Hello { protocol_version: u32 },
+    Capabilities,
+    Benchmark,
+    Prove { request_id: u64, elf: &'a [u8], input_data: &'a [u8], po2: Option<u8> },
+    Execute { request_id: u64, elf: &'a [u8], input_data: &'a [u8] },
+    Cancel { request_id: u64 },
+    Shutdown,
+    CalibrateSegmentLimit { request_id: u64, po2: u8 },
+    Warmup { request_id: u64 },
+}
+
+#[cfg(feature = "testing")]
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+enum V5Response {
+    HelloAck { protocol_version: u32, backend: String, sdk_version: String, worker_version: String },
+    CapabilitiesReport { backend: String, version: String, supported_benchmarks: Vec<String>,
+        gpu_available: bool, gpu_name: Option<String> },
+    BenchmarkResult { results: Vec<zkminer_prover_protocol::types::BenchmarkEntry> },
+    BenchmarkProgress { entry: zkminer_prover_protocol::types::BenchmarkEntry,
+        program_index: u32, total_programs: u32 },
+    ProofResult { request_id: u64, journal: Vec<u8>, seal: Vec<u8>,
+        duration_secs: f64, cycles: u64 },
+    ExecuteResult { request_id: u64, cycles: u64, duration_secs: f64 },
+    Progress { request_id: u64, fraction: f64, elapsed_secs: f64,
+        segments: Option<(u32, u32)> },
+    Cancelled { request_id: u64 },
+    Error { request_id: u64, kind: V5ErrorKind, message: String },
+    CalibrationResult { request_id: u64, po2: u8, segment_count: u32,
+        total_cycles: u64, prove_duration_secs: f64 },
+    WarmupDone { request_id: u64, summary: String, groth16_helper: bool },
+}
+
+#[cfg(feature = "testing")]
+#[derive(serde::Deserialize)]
+enum V5ErrorKind { ProofFailed, InvalidInput, ResourceExhausted, ProtocolError, Internal }
+
+#[cfg(feature = "testing")]
+impl V5Response {
+    fn into_current(self) -> Result<WorkerResponse> {
+        use zkminer_prover_protocol::types::ErrorKind;
+        Ok(match self {
+            Self::HelloAck { protocol_version, backend, sdk_version, worker_version } =>
+                WorkerResponse::HelloAck { protocol_version, backend, sdk_version, worker_version },
+            Self::ProofResult { request_id, journal, seal, duration_secs, cycles } =>
+                WorkerResponse::ProofResult { request_id, journal, seal, duration_secs, cycles },
+            Self::Progress { request_id, fraction, elapsed_secs, segments } =>
+                WorkerResponse::Progress { request_id, fraction, elapsed_secs, segments },
+            Self::Cancelled { request_id } => WorkerResponse::Cancelled { request_id },
+            Self::Error { request_id, kind, message } => WorkerResponse::Error {
+                request_id,
+                kind: match kind {
+                    V5ErrorKind::ProofFailed => ErrorKind::ProofFailed,
+                    V5ErrorKind::InvalidInput => ErrorKind::InvalidInput,
+                    V5ErrorKind::ResourceExhausted => ErrorKind::ResourceExhausted,
+                    V5ErrorKind::ProtocolError => ErrorKind::ProtocolError,
+                    V5ErrorKind::Internal => ErrorKind::Internal,
+                },
+                message,
+            },
+            _ => bail!("unexpected v5 worker response in sealed proof campaign"),
+        })
+    }
+}
+
 /// Typed error indicating the worker process died (EOF on its stdout pipe).
 /// Used instead of string matching to distinguish "worker died" from "stream corrupted".
 #[derive(Debug)]
@@ -380,6 +451,10 @@ fn may_signal_group(pid: u32) -> bool {
 /// `proc_root` is a parameter so the discriminator can be tested against a synthetic tree.
 #[cfg(unix)]
 fn live_group_members(proc_root: &Path, pgid: i32) -> Option<Vec<(i32, String)>> {
+    #[cfg(target_os = "macos")]
+    if proc_root == Path::new("/proc") {
+        return crate::macos::group_members(pgid);
+    }
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(proc_root) {
         Ok(e) => e,
@@ -538,6 +613,11 @@ pub struct WorkerHandle {
     pub path: PathBuf,
     pub sdk_version: Option<String>,
     pub worker_version: Option<String>,
+    /// Process launch through the completed Hello handshake, including parent
+    /// supervision setup. Measured before `Command::spawn` and after HelloAck.
+    pub spawn_to_handshake_ms: f64,
+    #[cfg(feature = "testing")]
+    legacy_protocol_v5: bool,
     child: Child,
     reader: BufReader<ChildStdout>,
     writer: BufWriter<ChildStdin>,
@@ -552,6 +632,10 @@ pub struct WorkerHandle {
     /// process exits, so the question has to be asked of an ancestor, which means asking it as a
     /// DELTA. See `memory::oom_kill_count`.
     oom_kills_at_spawn: Option<u64>,
+    #[cfg(target_os = "macos")]
+    _memory_guard: crate::macos::MemoryGuard,
+    #[cfg(target_os = "macos")]
+    _helper_lease: Option<crate::macos::HelperLease>,
 }
 
 /// Request to the spawner thread: build a worker, hand back the handle.
@@ -678,6 +762,14 @@ impl WorkerHandle {
             RISC0_SYS_RAND_KEY.get(),
         ));
 
+        #[cfg(target_os = "macos")]
+        let helper_lease = {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+            crate::macos::HelperLease::configure(backend, &mut cmd, env_overrides)
+                .with_context(|| format!("{} macOS helper configuration", zkminer_prover_protocol::types::WORKER_DECLINED))?
+        };
+
         // Kill worker if parent process dies (prevents orphan GPU processes after host crash).
         // PR_SET_PDEATHSIG is Linux-specific.
         #[cfg(target_os = "linux")]
@@ -719,6 +811,7 @@ impl WorkerHandle {
             });
         }
 
+        let launch_started = Instant::now();
         let child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn worker {backend} at {}", path.display()))?;
@@ -782,6 +875,11 @@ impl WorkerHandle {
 
         // Spawn stderr reader thread that forwards to tracing
         let backend_name = backend.to_string();
+        #[cfg(feature = "testing")]
+        let paired_diagnostic = std::env::var("ZKMINER_MACOS_PAIRED_DIAGNOSTICS")
+            .ok().as_deref() == Some("1");
+        #[cfg(feature = "testing")]
+        let diagnostic_pid = spawn_guard.get().id();
         let stderr_task = child_stderr.map(|stderr| {
             std::thread::Builder::new()
                 .name(format!("worker-stderr-{backend_name}"))
@@ -829,6 +927,14 @@ impl WorkerHandle {
                         let line = sanitize_worker_line(&String::from_utf8_lossy(raw));
                         if line.is_empty() {
                             return;
+                        }
+                        #[cfg(feature = "testing")]
+                        if paired_diagnostic && (line.contains("gpu_submit")
+                            || line.contains("bundle") || line.contains("rehash")
+                            || line.contains("identity mismatch")) {
+                            let observed_epoch_ns = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                            eprintln!("[paired_worker] pid={diagnostic_pid} observed_epoch_ns={observed_epoch_ns} {line}");
                         }
                         // Refill the bucket for the time since the last forward, then spend one token.
                         let now = std::time::Instant::now();
@@ -890,7 +996,8 @@ impl WorkerHandle {
         // NOT a wrapper process — see `memory::cap_process_memory` for why that distinction is
         // load-bearing for every pid-keyed path in this file.
         let pid_for_cap = spawn_guard.get().id();
-        match crate::memory::worker_memory_ceiling_bytes(crate::memory::DEFAULT_HOST_RESERVE_BYTES)
+        #[cfg(not(target_os = "macos"))]
+        match crate::memory::worker_memory_ceiling_bytes(crate::memory::host_reserve_bytes())
         {
             Some(ceiling) => {
                 match crate::memory::cap_process_memory(pid_for_cap, backend, ceiling) {
@@ -916,6 +1023,9 @@ impl WorkerHandle {
         // Baseline for attributing a later SIGKILL. See `WorkerHandle::died_of_host_oom`.
         let oom_kills_at_spawn = crate::memory::oom_kill_count();
 
+        #[cfg(target_os = "macos")]
+        let memory_guard = crate::macos::MemoryGuard::new(pid_for_cap)?;
+
         // The handle takes ownership from here, so the guard stops being responsible for it.
         let child = spawn_guard.release();
 
@@ -924,23 +1034,33 @@ impl WorkerHandle {
             path: path.clone(),
             sdk_version: None,
             worker_version: None,
+            spawn_to_handshake_ms: 0.0,
+            #[cfg(feature = "testing")]
+            legacy_protocol_v5: env_overrides.get("ZKMINER_TEST_LEGACY_PROTOCOL")
+                .is_some_and(|value| value == "5"),
             child,
             reader,
             writer,
             stderr_task,
             reaped: false,
             oom_kills_at_spawn,
+            #[cfg(target_os = "macos")]
+            _memory_guard: memory_guard,
+            #[cfg(target_os = "macos")]
+            _helper_lease: helper_lease,
         };
 
         // Perform Hello handshake
         handle.handshake()?;
+        handle.spawn_to_handshake_ms = launch_started.elapsed().as_secs_f64() * 1000.0;
 
         Ok(handle)
     }
 
     fn handshake(&mut self) -> Result<()> {
+        let expected_protocol = self.expected_protocol();
         let cmd = WorkerCommand::Hello {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: expected_protocol,
         };
         self.send(&cmd)?;
 
@@ -1012,9 +1132,9 @@ impl WorkerHandle {
                 sdk_version,
                 worker_version,
             } => {
-                if protocol_version != PROTOCOL_VERSION {
+                if protocol_version != expected_protocol {
                     bail!(
-                        "Protocol version mismatch with {}: expected {PROTOCOL_VERSION}, got {protocol_version}",
+                        "Protocol version mismatch with {}: expected {expected_protocol}, got {protocol_version}",
                         self.backend
                     );
                 }
@@ -1060,12 +1180,47 @@ impl WorkerHandle {
 
     /// Send a command to the worker.
     pub fn send(&mut self, cmd: &WorkerCommand) -> Result<()> {
+        #[cfg(feature = "testing")]
+        if self.legacy_protocol_v5 {
+            let legacy = match cmd {
+                WorkerCommand::Hello { .. } => V5Command::Hello { protocol_version: 5 },
+                WorkerCommand::Capabilities => V5Command::Capabilities,
+                WorkerCommand::Benchmark => V5Command::Benchmark,
+                WorkerCommand::Prove { request_id, elf, input_data, po2, .. } =>
+                    V5Command::Prove { request_id: *request_id, elf, input_data, po2: *po2 },
+                WorkerCommand::Execute { request_id, elf, input_data, .. } =>
+                    V5Command::Execute { request_id: *request_id, elf, input_data },
+                WorkerCommand::Cancel { request_id } => V5Command::Cancel { request_id: *request_id },
+                WorkerCommand::Shutdown => V5Command::Shutdown,
+                WorkerCommand::CalibrateSegmentLimit { request_id, po2 } =>
+                    V5Command::CalibrateSegmentLimit { request_id: *request_id, po2: *po2 },
+                WorkerCommand::Warmup { request_id } => V5Command::Warmup { request_id: *request_id },
+            };
+            return write_message(&mut self.writer, &legacy)
+                .map_err(|error| anyhow::anyhow!("Send v5 error: {error}"));
+        }
         write_message(&mut self.writer, cmd).map_err(|e| anyhow::anyhow!("Send error: {e}"))
+    }
+
+    fn expected_protocol(&self) -> u32 {
+        #[cfg(feature = "testing")]
+        if self.legacy_protocol_v5 { return 5; }
+        PROTOCOL_VERSION
     }
 
     /// Receive a response from the worker.
     pub fn recv(&mut self) -> Result<WorkerResponse> {
-        read_message(&mut self.reader).map_err(|e| match e {
+        #[cfg(feature = "testing")]
+        if self.legacy_protocol_v5 {
+            return read_message::<_, V5Response>(&mut self.reader)
+                .map_err(|e| match e {
+                    FrameError::UnexpectedEof => WorkerDied { backend: self.backend.clone() }.into(),
+                    other => anyhow::anyhow!("Recv v5 error from {}: {other}", self.backend),
+                })?
+                .into_current();
+        }
+        let response = read_message(&mut self.reader);
+        response.map_err(|e| match e {
             FrameError::UnexpectedEof => WorkerDied {
                 backend: self.backend.clone(),
             }
@@ -2241,12 +2396,16 @@ mod tests {
         wait_for_zombie(pid);
 
         // The old guard: a zombie keeps its own group non-empty.
+        #[cfg(not(target_os = "macos"))]
         let old_guard_fires = unsafe { libc::kill(-(pid as i32), 0) } == 0;
+        #[cfg(not(target_os = "macos"))]
         assert!(
             old_guard_fires,
             "precondition: the old kill(-pgid, 0) guard must still succeed for a zombie \
              leader — if the kernel no longer behaves this way, the bug this test pins is gone"
         );
+        // Darwin removes the empty group and stops exposing proc_pidinfo after
+        // exit. waitid(WNOWAIT), exercised above and below, still owns the child.
 
         // The new predicate: nothing was left behind.
         assert!(
@@ -2331,6 +2490,7 @@ mod tests {
                 other => panic!("probe {i} lost the zombie: {other:?}"),
             }
             // Still signallable, i.e. the group number is still ours.
+            #[cfg(not(target_os = "macos"))]
             assert_eq!(unsafe { libc::kill(-(pid as i32), 0) }, 0);
         }
         let _ = child.wait();

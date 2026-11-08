@@ -1,0 +1,5 @@
+run_id,mode,workload,segments,completed_gpu_dispatches,wall_seconds,native_sampled_peak_rss_bytes,status
+d4e86941bd7b464f9954aa24ea1b2375,metal,fibonacci,1,194,168.439,1974861824,complete_independently_verified
+1ad9ae716a73463584b840fcf268bac4,metal,fibonacci,1,194,166.856,1974681600,complete_independently_verified
+0551842728b9449ab3d85de41a3668f8,metal,segment-boundary,5,1269,237.822,2757492736,complete_independently_verified
+08b5cca54b024b9ca9d3400f41b23b1b,cpu,fibonacci,1,0,165.581,1961508864,complete_independently_verified

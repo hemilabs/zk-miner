@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "engine_sha": "bcdca76fc8e83d0a42b5fecbda5f048e01cd2bce",
+  "container_image": "rust:1.93-trixie",
+  "container_image_id": "sha256:ecbe59a8408895edd02d9ef422504b8501dd9fa1526de27a45b73406d734d659",
+  "compiler": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+  "compile_network": "disabled (--pull never, --network none, cargo --offline --locked)",
+  "recursion_archive_sha256": "744b999f0a35b3c86753311c7efb2a0054be21727095cf105af6ee7d3f4d8849",
+  "source_snapshot_hashes": {
+    "Cargo.lock": "03c6a81edabb059f7a32c25c8b38ed02799f9a0a626b8fa64104e822ad51258e",
+    "risc0/circuit/recursion/src/prove/hal/metal.rs": "82c587d38a322d672c5e307cef642622d83623d528e77def95ba1624b307df36",
+    "risc0/sys/build.rs": "9fcec08b058d9c502a941587fedf085ff1fd16bf8feefec4547ea9647083c29d",
+    "risc0/sys/kernels/zkp/metal/poseidon254.metal": "870d44085815b96d0cace87798dc32776b6026505e76890bc000aa8eb13f4097",
+    "risc0/zkp/src/core/hash/poseidon_254/mod.rs": "3f3ee979c6e57f666bd5b44ac71b019254e492c9c9e5f681af394d0099be49ba",
+    "risc0/zkp/src/hal/metal.rs": "c094bbc25b33c9c96a04e9bee3bf91b689483885db0084a57eb4638a61e06f7c"
+  },
+  "checks": {
+    "recursion_prove_metal": "passed",
+    "rv32im_prove": "passed",
+    "zkvm_prove_metal_recursion": "passed"
+  },
+  "logs": {
+    "recursion_prove_metal": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/phase2/wp8-linux/recursion.log",
+      "sha256": "ca6d752cef4667bd1f18027c5fd02e6c94a9a90f4860818ae9c6993c0ef48d46",
+      "result": "passed"
+    },
+    "rv32im_prove": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/phase2/wp8-linux/rv32im.log",
+      "sha256": "214c61bff206a9318dc9b9a4530df6a92356afd558af297958385b0c81397ad4",
+      "result": "passed"
+    },
+    "zkvm_prove_metal_recursion": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/phase2/wp8-linux/zkvm.log",
+      "sha256": "21582c84f1fe17513605d8c705e7ef045db1e26da37ebe76c757c8bda9db71bf",
+      "result": "passed"
+    }
+  },
+  "runner_sha256": "3e316378bb3ef2f4c45f9cd89636b412419dc32a4440d9d507b9d984189370f4",
+  "collector_sha256": "c41d66e7d1553540018ebbb78d74401542b25402f06fba6f98adc822c3e7a270"
+}

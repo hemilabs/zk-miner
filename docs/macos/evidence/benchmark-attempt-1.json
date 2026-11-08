@@ -1,0 +1,4061 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-11-01T00:02:07.268279+00:00",
+  "status": "failed",
+  "command": [
+    "/opt/homebrew/opt/python@3.15/bin/python3.15",
+    "/Users/dbur/dev/zk-miner/scripts/macos/summarize-benchmark.py",
+    "--benchmark",
+    "target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27",
+    "--output",
+    "docs/macos/evidence/benchmark-attempt-1.json",
+    "--csv",
+    "docs/macos/evidence/benchmark-attempt-1.csv"
+  ],
+  "collector": {
+    "path": "/Users/dbur/dev/zk-miner/scripts/macos/summarize-benchmark.py",
+    "sha256": "e6c3a98854e12de2d63e1d6f275bad69e95f7ec034213fe22851b16a0105ba00",
+    "bytes": 25944
+  },
+  "acceptance_collector": {
+    "path": "/Users/dbur/dev/zk-miner/scripts/macos/summarize-worker.py",
+    "sha256": "cc4eb9f507e8342d629dd28ae5f292421b3d53e1edd6d29f9297d64107658a28",
+    "bytes": 28967
+  },
+  "acceptance_collection_command": [
+    "/opt/homebrew/opt/python@3.15/bin/python3.15",
+    "/Users/dbur/dev/zk-miner/scripts/macos/summarize-worker.py",
+    "--runs",
+    "257de3edef294d10b2f03edda0048d95",
+    "dc005b12db1d44a5a98dad07ecb7ed01",
+    "--output",
+    "/var/folders/zz/1y02rrps2jbbz5s7p2qfb6pc0000gn/T/hemi-benchmark-evidence-fqa2eq__/acceptance.json",
+    "--csv",
+    "/var/folders/zz/1y02rrps2jbbz5s7p2qfb6pc0000gn/T/hemi-benchmark-evidence-fqa2eq__/acceptance.csv"
+  ],
+  "plan": {
+    "schema_version": 1,
+    "created_at_utc": "2026-10-31T23:56:32.134992+00:00",
+    "command": [
+      "/opt/homebrew/opt/python@3.15/bin/python3.15",
+      "/Users/dbur/dev/zk-miner/scripts/macos/benchmark-worker.py",
+      "--engine",
+      "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+      "--context",
+      "colima-hemi-macos-cpu",
+      "--samples",
+      "5"
+    ],
+    "miner_sha": "461965ecea246b86be1133a2185b31d4c1919ead",
+    "engine_sha": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+    "engine_path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+    "sources": {
+      "/Users/dbur/dev/zk-miner/scripts/macos/benchmark-worker.py": "ebc8a59e764790cd594a110c16d84710f243c5c8f821b6083cad56235cc0220c",
+      "/Users/dbur/dev/zk-miner/scripts/macos/benchmark-thermal.m": "360321cbc23b2e3623ac386ea2c3894659525697b681dd018fe3bf957c230135",
+      "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal": "5b806fed2d6d023ae57c5c5716b2f1087f6de784cc97fa3bbea2e80d655a6260"
+    },
+    "source_inputs": {
+      "Cargo.lock": "75d710409c3107e465ca0520bb7c551e8027c47ecb7c8e3b13d9b106cad5c6b9",
+      "Cargo.toml": "6d62c06c33b867de1177afe1b4f220f70557e87e9175e3bd7574e56d0d66fed2",
+      "crates/zkminer-config/Cargo.toml": "17b097097a9837b87d2eeb2caf943d24c30ca72c7d67041a60d4bcabca9bc958",
+      "crates/zkminer-config/src/config.rs": "4ba88192cc5734f198d3b5b325ade825bf481a0b1a0beb377750fca03b854aa1",
+      "crates/zkminer-config/src/lib.rs": "a8541f79fdf60bec1640500402b8ed60120f338835634463e85af14d2c06fd0e",
+      "crates/zkminer-config/src/wallet.rs": "92a27b38933ca168d312019433c42fda84a4beb16be465553fa89f9a011916ec",
+      "crates/zkminer-prover/Cargo.toml": "d6d07731e7f0bacd47536bc910f23e4499e4a424ac7e7b7bc863eff359655f7c",
+      "crates/zkminer-prover/build.rs": "199b21e7fdf3d8ab730a5c767e20b1b65ef2aeaf32cc6dcbba962caf4d6c0ec2",
+      "crates/zkminer-prover/guests/openvm/bigint-mul/Cargo.toml": "9faa0332214318fd18f7f56dc921f3aa083171385719eef1d61d6f70a839058e",
+      "crates/zkminer-prover/guests/openvm/bigint-mul/src/main.rs": "21aacf29aba0d1195d58b26c8459fbbf17cbb5a4e3adb682e42ae4ff316ba5ad",
+      "crates/zkminer-prover/guests/openvm/chacha-mix/Cargo.toml": "bea96340598bbcfd78a5a1d10349479238ff0c8a1241b542eca0f0aafeb0f191",
+      "crates/zkminer-prover/guests/openvm/chacha-mix/src/main.rs": "06c885f05c1901fc670987a63e3c979dd689ae2d255b2d6ecacb10e9cec89d5d",
+      "crates/zkminer-prover/guests/openvm/ecdsa-verify/Cargo.toml": "b6120b321883044e374f53f556cc033340e3212d93d24e382fe55101f0d35ae3",
+      "crates/zkminer-prover/guests/openvm/ecdsa-verify/src/main.rs": "f2e9c2e4157bc3fe10cea11c0b797a16cbf3e9ff05ab694f3570fa165e302ded",
+      "crates/zkminer-prover/guests/openvm/fibonacci/Cargo.lock": "486b912298ba0bae2bd85b3cd4338f71de14c221e97b043b1e8a6d9e27a052d4",
+      "crates/zkminer-prover/guests/openvm/fibonacci/Cargo.toml": "1d38f8e4444fcaa1109581257d75f9ab57253ff1647521f95d40a81f5d587bd8",
+      "crates/zkminer-prover/guests/openvm/fibonacci/src/main.rs": "387045e7b11e19bed25e5f73d311aae8ac9bf78bf337a60016844651369a239b",
+      "crates/zkminer-prover/guests/openvm/memory-merkle/Cargo.toml": "cd43ff7d690ca9aeab646616828ff23cd26df7a35ce641a7fd4940a1fb848c2f",
+      "crates/zkminer-prover/guests/openvm/memory-merkle/src/main.rs": "4459c0f8fbe558571f500a58d4ab02e4da804f95816b14c92449b765a588fb0c",
+      "crates/zkminer-prover/guests/openvm/sha256-chain/Cargo.toml": "ebb6b7a3825b7edbcdd1b784dfb6f2c4aca08aa555e595bb5dd614f773b49cc8",
+      "crates/zkminer-prover/guests/openvm/sha256-chain/src/main.rs": "3adc8ce21f80f74b5b484786b5bc1cd9b8254e48e2c6855d23b79e472552cf5e",
+      "crates/zkminer-prover/guests/openvm/sha256-merkle/Cargo.lock": "bdf5bad508bda152c9a6c9703c03ffa2b44569a25d0b0120238b008e17892333",
+      "crates/zkminer-prover/guests/openvm/sha256-merkle/Cargo.toml": "d4ef3465c9180255303a051431f5894f43ed57f3f7200d3e1954f0fc6068fc55",
+      "crates/zkminer-prover/guests/openvm/sha256-merkle/src/main.rs": "48d25a058075d4582d27c79b95f1292ae9a9dd168b90f68152aa94b1c3a30159",
+      "crates/zkminer-prover/guests/risc0/babybear-stress/Cargo.lock": "1de23568c2fb6910ecf0717741bfe137e5b49097c4514fd44c62f7cec657250d",
+      "crates/zkminer-prover/guests/risc0/babybear-stress/Cargo.toml": "49e1557dcf9d62c0ac6fe300e7dd48823f7ba34280a61ffe3400f25d8288acce",
+      "crates/zkminer-prover/guests/risc0/babybear-stress/src/main.rs": "be066a4766644f837c784012b93e7baeaca9286dd69426af3c44dcb1ecf2e3ff",
+      "crates/zkminer-prover/guests/risc0/bigint-mul/Cargo.lock": "59472874edc8b54189cc940e89ad6aff20a054147afcce5794a35261ddef5ab3",
+      "crates/zkminer-prover/guests/risc0/bigint-mul/Cargo.toml": "d881bb198db26d32a3b2fa7ba2d7bbca2c040e976ddce8a60c4ea1017141a681",
+      "crates/zkminer-prover/guests/risc0/bigint-mul/src/main.rs": "220733b8e68c7708b588cc506d2303a75c9715b6a358a1957695a29300d5b50f",
+      "crates/zkminer-prover/guests/risc0/chacha-mix/Cargo.lock": "a71cf953bdbbaea974dc6a6d8795fc0a791b9fbee88552e28cc69dc250edf635",
+      "crates/zkminer-prover/guests/risc0/chacha-mix/Cargo.toml": "0813dca917d1ff2fec1c5652e78a40f878493ce1de5aea5b24c809398bb7b891",
+      "crates/zkminer-prover/guests/risc0/chacha-mix/src/main.rs": "44d99e59a773ba1ac3e09f8c9eff0065bacadaf383bed20f604ccb1116898e70",
+      "crates/zkminer-prover/guests/risc0/ecdsa-verify/Cargo.lock": "a1bc35973ddd3bc6ab704b3f428c8653c687c64e08bf40b4e92b6baaff9b4e97",
+      "crates/zkminer-prover/guests/risc0/ecdsa-verify/Cargo.toml": "28c1d834be2516529cee0e0a52dd75afc3e80619e0dba66202e8bd0792157e2b",
+      "crates/zkminer-prover/guests/risc0/ecdsa-verify/src/main.rs": "6733c7eb597c364a42de0fb7890dab89520f49252c78d50894f759e70df2d128",
+      "crates/zkminer-prover/guests/risc0/edge-case-arith/Cargo.lock": "ac7b761b23a0cc8247edcf8dc97eff4fff00493d0d543df8d1b9f3422453d531",
+      "crates/zkminer-prover/guests/risc0/edge-case-arith/Cargo.toml": "bf65dc146b84fad021619a6e4a664a6870f197cfa52e5aae9bf8580a73eac767",
+      "crates/zkminer-prover/guests/risc0/edge-case-arith/src/main.rs": "1b418066f8260ff66068f6cd9056b5f1db9bab203faa718bdd4028a24bbc2eb7",
+      "crates/zkminer-prover/guests/risc0/fibonacci/Cargo.lock": "b40e81865bfb9c8fad24819b4792665454d779ec86797ecc0440b4842769d11c",
+      "crates/zkminer-prover/guests/risc0/fibonacci/Cargo.toml": "1e0c7898b3d484d59fe26367979d76882308a12b730a09e5bf6fc87ff1bbac2f",
+      "crates/zkminer-prover/guests/risc0/fibonacci/src/main.rs": "6752e729c1b54d846d2e295e4736ea6d4d6729421e86c13b993dfb62b6741a34",
+      "crates/zkminer-prover/guests/risc0/memory-merkle/Cargo.lock": "ecac1684326d3b4e4b67652bdb78d31c4568f1e6f098957aa473eeaa30ffbf9e",
+      "crates/zkminer-prover/guests/risc0/memory-merkle/Cargo.toml": "9ff6fd138e2cde69de3e8af89b569102e231d63e2e52ded96b2461445877d6c0",
+      "crates/zkminer-prover/guests/risc0/memory-merkle/src/main.rs": "0bd9819edb1ed8793f88b7a41419dd1e9193575a70615e57af173292917ef16d",
+      "crates/zkminer-prover/guests/risc0/memory-stress/Cargo.lock": "0fee7401f9ba1d72cc468530b6a011f557009ea7ddb1df8978ca1bb242af28b6",
+      "crates/zkminer-prover/guests/risc0/memory-stress/Cargo.toml": "bcf6fd1773273b62bb074346d758720d5fc558c7b1503aafe7a969ab03c7f43e",
+      "crates/zkminer-prover/guests/risc0/memory-stress/src/main.rs": "4f0e75ec0306e658decc54d952608f93f23e07cec6fbb21d5187b1aca205181c",
+      "crates/zkminer-prover/guests/risc0/minimal-proof/Cargo.lock": "a4531e603cfeb598f016ca1d542686fd36ebf3561cd9e44c50cf1a76b536de92",
+      "crates/zkminer-prover/guests/risc0/minimal-proof/Cargo.toml": "6a053502e9b0a09351a47f7de9e068d23ae1243acefd8bdb8dfd06c9428c0c29",
+      "crates/zkminer-prover/guests/risc0/minimal-proof/src/main.rs": "15ad6cf4134b167f65b0ca29f8aa717a405bda61377614c3e9985c3094ef1ed7",
+      "crates/zkminer-prover/guests/risc0/precompile-interleave/Cargo.lock": "c28e07b4ebd8b21f155c5273d9baa7afe1b6ff66b796ac72cde1faa25e0f691e",
+      "crates/zkminer-prover/guests/risc0/precompile-interleave/Cargo.toml": "daa3978a0187ba09f6df3291e82b21930eaaae1f44b511f524644da5dbb6300c",
+      "crates/zkminer-prover/guests/risc0/precompile-interleave/src/main.rs": "58ed99db1f51040c8934e836f3e5888ca0c366b553e00c9312724d2aaf9a9707",
+      "crates/zkminer-prover/guests/risc0/rv32im-torture/Cargo.lock": "51f2856a35a36b8910a74b9ca435fc32786cc98b85730da88b316ebd71afa888",
+      "crates/zkminer-prover/guests/risc0/rv32im-torture/Cargo.toml": "126045162f6900cc6b8db6baf093dfc125413c46f4987ca426a19ec09e6fe29e",
+      "crates/zkminer-prover/guests/risc0/rv32im-torture/src/main.rs": "63723230237c3c64e4d0ef83b4adf8dbe4a0235af2114cc3d2de3e9ebc6fac00",
+      "crates/zkminer-prover/guests/risc0/segment-boundary/Cargo.lock": "20d2ef2a2f3e4d62bdc40b76bc3e3dfe7ed378e458f492418b40a2c92885fde0",
+      "crates/zkminer-prover/guests/risc0/segment-boundary/Cargo.toml": "5adcc0b03b3eafb8d0342f6069b9f5ae13e6b6fb0bcabfb202ed7bea0ce04a6a",
+      "crates/zkminer-prover/guests/risc0/segment-boundary/src/main.rs": "cde4b9571111160e4a3aefe7258d0c482a9102fbb099e0a20d069904668b5e57",
+      "crates/zkminer-prover/guests/risc0/sha256-chain/Cargo.lock": "7b0ea8a9588a03eb37b98178a99efc1e53f00a2e07159828d5ca9dd74baa18d7",
+      "crates/zkminer-prover/guests/risc0/sha256-chain/Cargo.toml": "eb904012ac6f0c82d37a175d8680d56e1e6596e948b433ef67626b5fabf28118",
+      "crates/zkminer-prover/guests/risc0/sha256-chain/src/main.rs": "afacd42ea25c94ead76dc88a364785801b9d094bc58a4c54f378f764112f6c3d",
+      "crates/zkminer-prover/guests/sp1/bigint-mul/Cargo.lock": "a300151829ce04a2a1f2156cb108db2de4e568e5067cbae0b39a4a8015ff6e59",
+      "crates/zkminer-prover/guests/sp1/bigint-mul/Cargo.toml": "773b816417b1ba465d44f8d855b193faaaf42052924bd3e47916f7eddf03aaaa",
+      "crates/zkminer-prover/guests/sp1/bigint-mul/src/main.rs": "169e9f5322a26f1eabe6717c851e734d119e40f863421122e7659b149b96b441",
+      "crates/zkminer-prover/guests/sp1/chacha-mix/Cargo.lock": "864259a51bb1cd79b3e71b673cc86352b85405aaf8868d9f7d3357f37f1ff22b",
+      "crates/zkminer-prover/guests/sp1/chacha-mix/Cargo.toml": "6a36d39e036f2e8940b0202ed145851c7428ef84a056e11b1fdec9effaa7c3b6",
+      "crates/zkminer-prover/guests/sp1/chacha-mix/src/main.rs": "044d819535d699df882c3916e26c17f50499fd8b385c1548bb86f8945c29ab38",
+      "crates/zkminer-prover/guests/sp1/ecdsa-verify/Cargo.lock": "dfdc89108c54be54b67a1a97cab1e06074ee5b7f94e004f032bdebe714dc903c",
+      "crates/zkminer-prover/guests/sp1/ecdsa-verify/Cargo.toml": "dc9445e364289941c43eceb3f9b8b0fb34baf69415ef33e987ccf1c15d8c3dd2",
+      "crates/zkminer-prover/guests/sp1/ecdsa-verify/src/main.rs": "3916c9ddd4989566c385acc3c168ee01b97290fb784f18c7714523637cc0fcbf",
+      "crates/zkminer-prover/guests/sp1/edge-case-arith/Cargo.lock": "24c49568eb0a63a4f50eb8781d0f8fbdef9efa1e2b1c50bb01fd38225f1a09df",
+      "crates/zkminer-prover/guests/sp1/edge-case-arith/Cargo.toml": "5e9467c6f873f2168e2f9766672a3e92fd914e8246aa860045a94d505c2eeb28",
+      "crates/zkminer-prover/guests/sp1/edge-case-arith/src/main.rs": "367fce463098cf5794ebf414666362fdd6941061743c027836fbe4199002be1f",
+      "crates/zkminer-prover/guests/sp1/fibonacci/Cargo.lock": "50263dc9cd15dc1530660a59b2e658ce2fd9f8b857e019cd0900a48dd3609d35",
+      "crates/zkminer-prover/guests/sp1/fibonacci/Cargo.toml": "a9a6f5a3d8889d011247adf2f05e25789e7dd01f7c6f441eb189c62c71d656dd",
+      "crates/zkminer-prover/guests/sp1/fibonacci/src/main.rs": "ef9c485048aadb2ae17decd756ebec482e56d7aa81132b2d92e245f5fdc5369a",
+      "crates/zkminer-prover/guests/sp1/memory-merkle/Cargo.lock": "40c8a65c0f64a090d314a530c852c10210ef46016637026118be8cac3730ff8d",
+      "crates/zkminer-prover/guests/sp1/memory-merkle/Cargo.toml": "cc5850d4b27650d58c79306c753c2d8d4afffa279d1b183aa56ba5be0902406b",
+      "crates/zkminer-prover/guests/sp1/memory-merkle/src/main.rs": "75531151765bd65da2ffdcbd6e9c35dd767a96097bc0de61293bfd8fa05f14e1",
+      "crates/zkminer-prover/guests/sp1/memory-stress/Cargo.lock": "70e74fc5ea7e8255c1956e960c01e9d0a1dc706aebd9a7337f471f8490f75ea0",
+      "crates/zkminer-prover/guests/sp1/memory-stress/Cargo.toml": "172bf970964325a2c6b32df9a166b239aa672cf6eff267a4660763e84958b4dd",
+      "crates/zkminer-prover/guests/sp1/memory-stress/src/main.rs": "0db849f5c6f97708c6e170e52cbc1bba919c60a88f1264dbce7710db62acab98",
+      "crates/zkminer-prover/guests/sp1/minimal-proof/Cargo.lock": "ba2f6c7731ccbf184c86e5401f4881229be5b317871b6c3e9291a479632c8951",
+      "crates/zkminer-prover/guests/sp1/minimal-proof/Cargo.toml": "0d181a89b56b41321967b37cad26e548487cfd16e676bc29058d3b141cde916b",
+      "crates/zkminer-prover/guests/sp1/minimal-proof/src/main.rs": "c952f9ea3a3908acdcbe8dd8a99a7e740aac80887f228a4b18630b11e2e073ea",
+      "crates/zkminer-prover/guests/sp1/precompile-interleave/Cargo.lock": "54e5fd37c6c41374fe954e5a2c7dd3e1de0111d1cdaa2f07610a235fa98daab7",
+      "crates/zkminer-prover/guests/sp1/precompile-interleave/Cargo.toml": "26c5b98dd11270fec2f01e363a66275934ad7ce347f2623c3e8a59b2851d850f",
+      "crates/zkminer-prover/guests/sp1/precompile-interleave/src/main.rs": "8a8cac99ca204a3401175e07a807fe6270f551bb67d9832d2b45c0189ad34a6e",
+      "crates/zkminer-prover/guests/sp1/rv32im-torture/Cargo.lock": "158145d53218212aebb620d0d87ffd475b15ab2ce7950d70f96e581c16706a36",
+      "crates/zkminer-prover/guests/sp1/rv32im-torture/Cargo.toml": "cb869ef56f27a6f8a3ed2be5c28589474ecb3212a9887ab5a62d6a25de478484",
+      "crates/zkminer-prover/guests/sp1/rv32im-torture/src/main.rs": "392c645f45d5110d80b3ef9f367db55741115016550e5c5fc04913148b4b6fcf",
+      "crates/zkminer-prover/guests/sp1/segment-boundary/Cargo.lock": "2493f2c862fdfac5d4d92d3110f37eec6c48b544bf3d704a228dc488527dc036",
+      "crates/zkminer-prover/guests/sp1/segment-boundary/Cargo.toml": "693b4e33949e724b34c96a521f25c68220af7fb4ef8e4127d7ef7c9c2c7db849",
+      "crates/zkminer-prover/guests/sp1/segment-boundary/src/main.rs": "e0e8bab0149de2a1cebdbc03feb6220e0a33d17cdcec72a64cbab1f1975a434a",
+      "crates/zkminer-prover/guests/sp1/sha256-chain/Cargo.lock": "b7a25760ea668556ba0c0a9cd6b71a3b38c8d504a211c2572eadaac648d43297",
+      "crates/zkminer-prover/guests/sp1/sha256-chain/Cargo.toml": "b95b88325ac1eecc5018ce29ab18944ebee9a41edc663b8988ee301746daa1b0",
+      "crates/zkminer-prover/guests/sp1/sha256-chain/src/main.rs": "c474afdce4efa3a66c4114e93e7f49adbb13ea8de5c17227cbc0acecdf2f7bea",
+      "crates/zkminer-prover/src/benchmark.rs": "329c098dc6f691eb105471fc6c1e8f90e61c479f5cf16028ace3742d525ef3fc",
+      "crates/zkminer-prover/src/bin/mock_worker.rs": "fc388d58ba5a08712f7e084dea50cf4dcf04d74b44f3a50a0fae9fe0866d951b",
+      "crates/zkminer-prover/src/descriptor.rs": "197a0e7cb46746082c5d1f94f43c7783fed55726931a31117d30d3c30e0c9f1e",
+      "crates/zkminer-prover/src/discovery.rs": "505f7f93239e176566ff920d1c2bbef7f31a901e1bd5afd373ce89a9b9f6591b",
+      "crates/zkminer-prover/src/dispatcher.rs": "25c5afddee639207f7555e29f553beefe648b18167ee6e0f845eb851ddbae0eb",
+      "crates/zkminer-prover/src/engine.rs": "9a17cc27972bed2980ff2311f914b3380a8d99c6fdbeeaf9bbbdbb91bb07efaa",
+      "crates/zkminer-prover/src/gpu_code.rs": "26e0db67bfddaa9769d1d7e54fc95339cab78d7e5fa3c7d044e007c6ee047bfc",
+      "crates/zkminer-prover/src/lib.rs": "d72b5fc0866a029f0116094e4c37ca102b294da221cb74ed1c6e4e66ac787f76",
+      "crates/zkminer-prover/src/macos.rs": "3fa22b3da69f36fa7ef024398be75c78930383ece253de4147bce4d57b1a0eac",
+      "crates/zkminer-prover/src/memory.rs": "8a6db9267b6cb129e0de3ae02e9d6524c636f3a8a0df8b9d9d12672f351d3891",
+      "crates/zkminer-prover/src/openvm.rs": "533f0d6ec6641579be0c935aefbeb08e2fe35d9f898561957e7bc6c2950bfdfc",
+      "crates/zkminer-prover/src/registry.rs": "6f8a32ecec7f1dd6cdbba8f1ceee7845ba9ef6ab15b5493cb335a07546d4907a",
+      "crates/zkminer-prover/src/risc0.rs": "af5ea20336b588f2c7f3e2ce4e808338659e0ec59a901a950117936d06d44f37",
+      "crates/zkminer-prover/src/sp1.rs": "b605f366e11138222478cfd4b8cf0288b5c240bb8058b710bd01367e8ff3e6d4",
+      "crates/zkminer-prover/src/worker.rs": "4c304e35b0ae843bdf0ed2e264b25b51bea1161e612bbd228b0d3722c7470011",
+      "crates/zkminer-prover/tests/backoff_dispatch.rs": "76f2eb4c6d6b3613f55eee4f2e47b0d6247006abb49de0f4f2f023e6a51b3347",
+      "crates/zkminer-prover/tests/comprehensive_zkvm_test.rs": "c7d391d2cd3b43ec8909c2c803a748b30d5b1be49d47b6ee82371cb67289b2e9",
+      "crates/zkminer-prover/tests/cross_backend_host_ram.rs": "462eb20060209f3d1de3ba2a81b786121095f5444e5b078c4a94e6b1f284876a",
+      "crates/zkminer-prover/tests/cross_backend_vram.rs": "9bb3445570fb46811e53e123c48956618abbab43bb0535c85a0f26b406e8e1c4",
+      "crates/zkminer-prover/tests/macos_worker.rs": "6a0a79aaa50d73eb5a765b504e01d5e5554fdbe2916cd9d181820719775a763d",
+      "crates/zkminer-prover/tests/oom_routing.rs": "a1783defedaee456711311d7c43b0fbda297f796f9e442257f52434c59de6feb",
+      "crates/zkminer-prover/tests/orphan_reaping.rs": "4399619b46f6326522127af583427dde5cde3cb35878fbbbf7b04876c52f4c93",
+      "crates/zkminer-prover/tests/proof_format_test.rs": "e25f0a75ce7550295255001990185f888dfe40f379dcb6b09776b71acb0d9fa9",
+      "crates/zkminer-prover/tests/risc0_groth16_vram.rs": "5b0c9235cd054f0c1bc20c1e09a9b424d4459caf97b72af9f107e34dac7024f6",
+      "crates/zkminer-prover/tests/rocm_sha256_regression.rs": "46e2fc12dc7d4aa545a8c07d7aff4a9e692a00a83e21d38b58e3105b3b75a2f4",
+      "crates/zkminer-prover/tests/sha_bisect.rs": "ba8f09c086346c88782e5e0df5d498bc9cbdd7a586570e156b8ab26f0597d9cc",
+      "crates/zkminer-prover/tests/sp1_large_proof.rs": "b5e295c70375aad310339c0685a9ba328b1b8ac12422868e474a1d195a46ec0c",
+      "crates/zkminer-prover/tests/sp1_proof_test.rs": "8d8c897726665c8e7511dfa7f32ffd2fd112e6e61532cfb61a29b2a0ecb1256f",
+      "crates/zkminer-prover/tests/sp1_warm_slot_vram.rs": "64b294202a2ae116a0375dc09d2d81e8fe54468f93b46e1cf75ecf7f5d154080",
+      "crates/zkminer-prover/tests/sp1_warmup_live.rs": "ed35739b40ecb365dc84b13e6636f51a5d2e7e72858ad12402139eee40d73934",
+      "crates/zkminer-prover/tests/worker_lifecycle.rs": "ced2cc33280b97b81c785a3b22aeb1aecc63b8409dd4f1710411979cd261c694",
+      "crates/zkminer-prover-protocol/Cargo.toml": "a646a1d0024007d0172aa8a1b4efb5ebc1b5df2364950d5475279ee6250dbdcd",
+      "crates/zkminer-prover-protocol/src/codec.rs": "70543a49b7d6c4df969ec05033bbcf934c450d8cdfcf261ced7536b3e0145f86",
+      "crates/zkminer-prover-protocol/src/lib.rs": "540d80cbfc01cb62c5e0c6ad2c6309088c22dbef52f309417dd745ec44225b6b",
+      "crates/zkminer-prover-protocol/src/proc.rs": "5b1bba5de4b31c09eb07510f2480e57b82b5d65ac4d480142e0e7d4c4c06af10",
+      "crates/zkminer-prover-protocol/src/types.rs": "684640701892d81adc2f3d717d5c61bd4f1f434d2ef3e8bc72165f19dd6fea89",
+      "scripts/macos/proof_provenance.py": "5e6b2950433da2c24ed8166e46c22f3f4b7ebcc198cbc2a9141a9bae704c4f59",
+      "scripts/macos/smoke.py": "5f80a4ed8e7c3223fb939513381994a1f447c4eed2c0c51d6d9695023aba557f",
+      "scripts/macos/test-worker.py": "8198b5edf3059bb999169e435b9f3f41f3d345f72a5dfd2b3ef70be4c82608f3",
+      "scripts/macos/worker_provenance.py": "8c82109dd115ed12a6f0685630462f9c034245784cff65d468009f0e665995d0"
+    },
+    "fixed_settings": {
+      "worker_kind": "metal",
+      "workload": "fibonacci",
+      "po2": 18,
+      "staging_bytes": 524288,
+      "repeat": 1,
+      "proof_only": true,
+      "context": "colima-hemi-macos-cpu",
+      "rayon_threads": 6,
+      "helper_cpus": 6,
+      "helper_memory_bytes": 25769803776,
+      "vm_cpus": 6,
+      "vm_memory_bytes": 34359738368
+    },
+    "methodology": {
+      "comparison": "same sealed Metal-capable executable, explicit CPU versus forced Metal",
+      "warmup": "one complete verified Groth16 proof per mode excluded from measured summaries",
+      "process_state": "fresh supervised pool per trial; readiness and execute validation precede proving; no persistent warm-process claim",
+      "order": "CPU then Metal warmups, then alternating CPU/Metal measured pairs; no automatic retries or selective exclusions",
+      "cold_start": "pool startup measured separately; OS, runtime and helper caches warmed, never flushed; no cold-boot claim",
+      "telemetry": "before/after and about every 10 seconds; nonprivileged thermal category, power source, load average, top ps CPU names",
+      "thermal_limit": "Foundation nominal may also mean unsupported/unknown; pmset absence of warnings is not temperature measurement",
+      "power_limit": "power source and low-power-mode only, no wattage/energy or profitability measurement",
+      "resources": "existing admission and worker/helper limits retained; RSS excludes helper/VM and unmeasured Metal driver allocations",
+      "background": "existing applications and default VM left running; no compilation or unrelated tests scheduled during measured trials"
+    },
+    "trials": [
+      {
+        "index": 0,
+        "phase": "warmup",
+        "mode": "cpu",
+        "sample": 0
+      },
+      {
+        "index": 1,
+        "phase": "warmup",
+        "mode": "metal",
+        "sample": 0
+      },
+      {
+        "index": 2,
+        "phase": "measured",
+        "mode": "cpu",
+        "sample": 1
+      },
+      {
+        "index": 3,
+        "phase": "measured",
+        "mode": "metal",
+        "sample": 1
+      },
+      {
+        "index": 4,
+        "phase": "measured",
+        "mode": "cpu",
+        "sample": 2
+      },
+      {
+        "index": 5,
+        "phase": "measured",
+        "mode": "metal",
+        "sample": 2
+      },
+      {
+        "index": 6,
+        "phase": "measured",
+        "mode": "cpu",
+        "sample": 3
+      },
+      {
+        "index": 7,
+        "phase": "measured",
+        "mode": "metal",
+        "sample": 3
+      },
+      {
+        "index": 8,
+        "phase": "measured",
+        "mode": "cpu",
+        "sample": 4
+      },
+      {
+        "index": 9,
+        "phase": "measured",
+        "mode": "metal",
+        "sample": 4
+      },
+      {
+        "index": 10,
+        "phase": "measured",
+        "mode": "cpu",
+        "sample": 5
+      },
+      {
+        "index": 11,
+        "phase": "measured",
+        "mode": "metal",
+        "sample": 5
+      }
+    ]
+  },
+  "campaign_result": {
+    "status": "failed",
+    "plan_sha256": "5e3bba1e2433d7f490c39120e28db53925ee2675f504a0c218afa309284d9a1e",
+    "source_inputs_unchanged": true,
+    "completed_trials": 1,
+    "failed_trials": 1,
+    "unattempted_trials": 10,
+    "started_at_utc": "2026-10-31T23:56:32.134992+00:00",
+    "ended_at_utc": "2026-10-31T23:59:55.173361+00:00",
+    "elapsed_seconds": 203.03686495870352,
+    "error": "RuntimeError: real native worker acceptance failed (101); see test.log"
+  },
+  "trial_ledger": [
+    {
+      "index": 0,
+      "phase": "warmup",
+      "mode": "cpu",
+      "sample": 0,
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "/Users/dbur/dev/zk-miner/scripts/macos/test-worker.py",
+        "--engine",
+        "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "--worker-kind",
+        "metal",
+        "--mode",
+        "cpu",
+        "--context",
+        "colima-hemi-macos-cpu",
+        "--proof-only",
+        "--repeat",
+        "1",
+        "--workload",
+        "fibonacci",
+        "--po2",
+        "18",
+        "--staging-bytes",
+        "524288",
+        "--timeout",
+        "900"
+      ],
+      "started_at_utc": "2026-10-31T23:56:32.372045+00:00",
+      "status": "complete_independently_verified",
+      "error": null,
+      "run_id": "257de3edef294d10b2f03edda0048d95",
+      "returncode": 0,
+      "ended_at_utc": "2026-10-31T23:59:37.461301+00:00",
+      "elapsed_seconds": 185.0878753773868,
+      "log_sha256": "ec0dbd7db685a59b5cb97df146fc98016989134bb98cb25d6074b0f5c6298aee",
+      "telemetry_sha256": "a9c6e1f11e34985308f42db51017f6770e077dd8389dfe0d6bc3122cf048bd9b"
+    },
+    {
+      "index": 1,
+      "phase": "warmup",
+      "mode": "metal",
+      "sample": 0,
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "/Users/dbur/dev/zk-miner/scripts/macos/test-worker.py",
+        "--engine",
+        "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "--worker-kind",
+        "metal",
+        "--mode",
+        "metal",
+        "--context",
+        "colima-hemi-macos-cpu",
+        "--proof-only",
+        "--repeat",
+        "1",
+        "--workload",
+        "fibonacci",
+        "--po2",
+        "18",
+        "--staging-bytes",
+        "524288",
+        "--timeout",
+        "900"
+      ],
+      "started_at_utc": "2026-10-31T23:59:37.471783+00:00",
+      "status": "failed",
+      "error": "real native worker acceptance failed (101); see test.log",
+      "run_id": "dc005b12db1d44a5a98dad07ecb7ed01",
+      "returncode": 1,
+      "ended_at_utc": "2026-10-31T23:59:55.164666+00:00",
+      "elapsed_seconds": 17.69276537746191,
+      "log_sha256": "f11449ce1f6c1d67bf4431233d14ef68ac425fd27145d538651c01a07fa8f28c",
+      "telemetry_sha256": "aa6b525f6a23ca9e7727b6db2e770bcf407e1bbb37ad6290dfda82ad6b2122b0"
+    }
+  ],
+  "unattempted_trials": [
+    {
+      "index": 2,
+      "phase": "measured",
+      "mode": "cpu",
+      "sample": 1
+    },
+    {
+      "index": 3,
+      "phase": "measured",
+      "mode": "metal",
+      "sample": 1
+    },
+    {
+      "index": 4,
+      "phase": "measured",
+      "mode": "cpu",
+      "sample": 2
+    },
+    {
+      "index": 5,
+      "phase": "measured",
+      "mode": "metal",
+      "sample": 2
+    },
+    {
+      "index": 6,
+      "phase": "measured",
+      "mode": "cpu",
+      "sample": 3
+    },
+    {
+      "index": 7,
+      "phase": "measured",
+      "mode": "metal",
+      "sample": 3
+    },
+    {
+      "index": 8,
+      "phase": "measured",
+      "mode": "cpu",
+      "sample": 4
+    },
+    {
+      "index": 9,
+      "phase": "measured",
+      "mode": "metal",
+      "sample": 4
+    },
+    {
+      "index": 10,
+      "phase": "measured",
+      "mode": "cpu",
+      "sample": 5
+    },
+    {
+      "index": 11,
+      "phase": "measured",
+      "mode": "metal",
+      "sample": 5
+    }
+  ],
+  "baseline": {
+    "hardware": {
+      "command": [
+        "sysctl",
+        "hw.model",
+        "hw.ncpu",
+        "hw.memsize",
+        "machdep.cpu.brand_string"
+      ],
+      "returncode": 0,
+      "stdout": "hw.model: Mac17,6\nhw.ncpu: 18\nhw.memsize: 137438953472\nmachdep.cpu.brand_string: Apple M5 Max\n",
+      "stderr": ""
+    },
+    "os": {
+      "command": [
+        "sw_vers"
+      ],
+      "returncode": 0,
+      "stdout": "ProductName:\t\tmacOS\nProductVersion:\t\t26.4\nBuildVersion:\t\t25E246\n",
+      "stderr": ""
+    },
+    "sdk": {
+      "command": [
+        "xcrun",
+        "--show-sdk-version"
+      ],
+      "returncode": 0,
+      "stdout": "26.4\n",
+      "stderr": ""
+    },
+    "vms": {
+      "command": [
+        "colima",
+        "list",
+        "--json"
+      ],
+      "returncode": 0,
+      "stdout": "{\"name\":\"default\",\"status\":\"Running\",\"arch\":\"aarch64\",\"cpus\":4,\"memory\":8589934592,\"disk\":42949672960,\"runtime\":\"docker\"}\n{\"name\":\"hemi-macos-cpu\",\"status\":\"Running\",\"arch\":\"aarch64\",\"cpus\":6,\"memory\":34359738368,\"disk\":85899345920,\"runtime\":\"docker\"}\n",
+      "stderr": ""
+    },
+    "helper_image": {
+      "command": [
+        "docker",
+        "--context",
+        "colima-hemi-macos-cpu",
+        "image",
+        "inspect",
+        "risczero/risc0-groth16-prover:v2025-04-03.1"
+      ],
+      "returncode": 0,
+      "stdout": "[\n    {\n        \"Id\": \"sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee\",\n        \"RepoTags\": [\n            \"risczero/risc0-groth16-prover:v2025-04-03.1\"\n        ],\n        \"RepoDigests\": [\n            \"risczero/risc0-groth16-prover@sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee\"\n        ],\n        \"Config\": {},\n        \"Architecture\": \"\",\n        \"Os\": \"\",\n        \"Size\": 2981,\n        \"RootFS\": {},\n        \"Metadata\": {\n            \"LastTagTime\": \"2026-10-31T16:09:41.891809975Z\"\n        },\n        \"Descriptor\": {\n            \"mediaType\": \"application/vnd.docker.distribution.manifest.list.v2+json\",\n            \"digest\": \"sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee\",\n            \"size\": 772\n        },\n        \"Identity\": {\n            \"Pull\": [\n                {\n                    \"Repository\": \"docker.io/risczero/risc0-groth16-prover\"\n                }\n            ]\n        }\n    }\n]\n",
+      "stderr": ""
+    },
+    "helper_limits": {
+      "command": [
+        "docker",
+        "--context",
+        "colima-hemi-macos-cpu",
+        "info",
+        "--format",
+        "{{json .NCPU}} {{json .MemTotal}}"
+      ],
+      "returncode": 0,
+      "stdout": "6 33585696768\n",
+      "stderr": ""
+    },
+    "helper_containers": {
+      "command": [
+        "docker",
+        "--context",
+        "colima-hemi-macos-cpu",
+        "ps",
+        "-a",
+        "--format",
+        "{{.Names}}"
+      ],
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    }
+  },
+  "comparison_identity": {
+    "fixture": {
+      "workload": "fibonacci",
+      "program_path": "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin",
+      "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+      "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+      "expected_journal_hex": "6d1a000000000000",
+      "po2": 18,
+      "min_segments": 1
+    },
+    "worker_binary_sha256": "2c3bf297141cdf9623a8d997d0fcdf560ef0e547fd51531c5a179f3de97329f4",
+    "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+    "acceptance_build": "e56ee92d0a92a990a75caecebc7bc1f46fc991849e7c2a9b521a4bd28bcd2967",
+    "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+    "helper_arch": "linux/amd64",
+    "helper_context": "colima-hemi-macos-cpu",
+    "helper_endpoint": "unix:///Users/dbur/.colima/hemi-macos-cpu/docker.sock",
+    "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+    "stats": {
+      "paging_cycles": 16300,
+      "reserved_cycles": 13152,
+      "segments": 1,
+      "total_cycles": 32768,
+      "user_cycles": 3316
+    },
+    "journal_hex": "6d1a000000000000"
+  },
+  "measurements": [
+    {
+      "index": 0,
+      "phase": "warmup",
+      "mode": "cpu",
+      "sample": 0,
+      "run_id": "257de3edef294d10b2f03edda0048d95",
+      "worker_pid": 10607,
+      "worker_start_time_us": 1793491003592867,
+      "request_id": 1,
+      "execution_and_segment_ms": 2695.3283340000003,
+      "recursion_ms": 7365.808540999999,
+      "identity_and_emulated_wrap_ms": 154341.318917,
+      "worker_verification_ms": 1.763791,
+      "worker_total_ms": 164432.255208,
+      "prove_call_ms": 164731.123959,
+      "external_verifier_ms": 39.937124999999995,
+      "identity_p254_diagnostic_ms": 33146.2,
+      "shrink_wrap_diagnostic_ms": 121187.1,
+      "rounded_wrap_diagnostics": {
+        "values": {
+          "identity_p254_ms": 33146.2,
+          "get_seal_ms": 0.0,
+          "shrink_wrap_ms": 121187.1,
+          "total_ms": 154333.3
+        },
+        "raw_line": "2026-10-31T23:59:31.169169Z  WARN worker: [worker:risc0] [succinct_to_groth16] identity_p254=33146.2ms get_seal=0.0ms shrink_wrap=121187.1ms total=154333.3ms",
+        "source_artifact": {
+          "path": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/257de3edef294d10b2f03edda0048d95/test.log",
+          "sha256": "86f67eebbc38e9ed105209e6041c3e52f0eb77ded2529a6f7811e7f7f1cad66c",
+          "bytes": 2673
+        },
+        "rounding_ms": 0.1,
+        "scope": "rounded production stderr diagnostics, not separate benchmark instrumentation; identity_p254 includes helper prestart and preparation, shrink_wrap includes the helper call and buffer release"
+      },
+      "supervisor_and_ipc_residual_ms": 298.8687510000018,
+      "request_observation_window_ms": 164864.40300000002,
+      "request_peak_rss_bytes": 1965539328,
+      "idle_rss_bytes": 1048363008,
+      "periodic_host_memory": {
+        "scope": "host observations accompanying identity-matched periodic native worker RSS samples",
+        "sample_count": 154,
+        "host_available_min_bytes": 21679898624,
+        "host_available_max_bytes": 35386736640,
+        "host_available_unknown_count": 0,
+        "host_total_observed_bytes": [
+          137438953472
+        ],
+        "host_total_unknown_count": 0
+      },
+      "metal_dispatches": 0,
+      "run_elapsed_seconds": 184.91101383417845,
+      "trial_elapsed_seconds": 185.0878753773868,
+      "proof_call_timing": {
+        "external_verifier_ms": 39.937124999999995,
+        "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+        "method": "monotonic std::time::Instant elapsed wall time",
+        "prove_call_ms": 164731.123959,
+        "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+        "request_id": 1,
+        "same_worker_as_before_prove": true,
+        "schema_version": 1,
+        "worker_pid": 10607,
+        "worker_pid_before_prove": 10607,
+        "worker_start_time_us": 1793491003592867,
+        "worker_start_time_us_before_prove": 1793491003592867
+      },
+      "setup_and_cleanup_timing": {
+        "cleanup": {
+          "drop_pool_ms": 2205.3988329999997,
+          "post_cleanup_checks_ms": 99.274458,
+          "scope": "WorkerPool shutdown and drop followed by helper absence and process-group checks",
+          "shutdown_all_ms": 2249.50325,
+          "total_ms": 4554.195958,
+          "worker_pid": 10607,
+          "worker_start_time_us": 1793491003592867
+        },
+        "method": "monotonic std::time::Instant elapsed wall time",
+        "schema_version": 1,
+        "setup": {
+          "identity_scope": "spawned identity immediately after discovery; worker identity after valid/invalid execution validation; null start identity denotes no live worker",
+          "invalid_execute_cycles_ms": 1001.2571669999999,
+          "pool_discover_and_spawn_ms": 107.341167,
+          "pool_new_ms": 0.023375,
+          "spawned_worker_pid": 10607,
+          "spawned_worker_start_time_us": 1793491003592867,
+          "total_ms": 3120.199542,
+          "valid_execute_cycles_ms": 1006.4377499999999,
+          "worker_pid": 10607,
+          "worker_start_time_us": 1793491003592867,
+          "worker_warmup_ms": 1005.1327080000001
+        },
+        "setup_scope": "fresh WorkerPool initialization, discovery/startup, warmup and valid/invalid execute-cycle validation; excludes preceding mode/protocol preflight; no proof has been requested; the validation worker may be retired before proving"
+      },
+      "stats": {
+        "paging_cycles": 16300,
+        "reserved_cycles": 13152,
+        "segments": 1,
+        "total_cycles": 32768,
+        "user_cycles": 3316
+      }
+    }
+  ],
+  "statistics": null,
+  "telemetry": {
+    "0": {
+      "raw_artifact": {
+        "path": "/Users/dbur/dev/zk-miner/target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27/trial-00/telemetry.jsonl",
+        "sha256": "a9c6e1f11e34985308f42db51017f6770e077dd8389dfe0d6bc3122cf048bd9b",
+        "bytes": 51078
+      },
+      "observations": [
+        {
+          "at_utc": "2026-10-31T23:56:32.372149+00:00",
+          "elapsed_seconds": 8.300133049488068e-05,
+          "label": "before",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t85%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 2.02 2.40 2.19 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1126,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 100.0,
+                "rss_bytes": 9265790976,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 10416,
+                "ppid": 32232,
+                "pcpu": 17.1,
+                "rss_bytes": 24412160,
+                "executable_basename": "Python"
+              },
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 6.2,
+                "rss_bytes": 2197405696,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 32231,
+                "ppid": 32169,
+                "pcpu": 3.9,
+                "rss_bytes": 1007091712,
+                "executable_basename": "Codex (Renderer)"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 2.7,
+                "rss_bytes": 4596219904,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 509,
+                "ppid": 1,
+                "pcpu": 2.0,
+                "rss_bytes": 111001600,
+                "executable_basename": "Activity Monitor"
+              },
+              {
+                "pid": 137,
+                "ppid": 1,
+                "pcpu": 1.7,
+                "rss_bytes": 25772032,
+                "executable_basename": "opendirectoryd"
+              },
+              {
+                "pid": 32232,
+                "ppid": 32169,
+                "pcpu": 1.3,
+                "rss_bytes": 805011456,
+                "executable_basename": "codex"
+              },
+              {
+                "pid": 24766,
+                "ppid": 93193,
+                "pcpu": 1.1,
+                "rss_bytes": 2017050624,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 162,
+                "ppid": 1,
+                "pcpu": 1.0,
+                "rss_bytes": 5570560,
+                "executable_basename": "notifyd"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 1.0,
+                "rss_bytes": 316768256,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 96,
+                "ppid": 1,
+                "pcpu": 0.8,
+                "rss_bytes": 78086144,
+                "executable_basename": "logd"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:56:42.429394+00:00",
+          "elapsed_seconds": 10.057326793670654,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t85%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 1.86 2.36 2.17 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1142,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 100.4,
+                "rss_bytes": 9266102272,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 24766,
+                "ppid": 93193,
+                "pcpu": 15.9,
+                "rss_bytes": 2018459648,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 2.6,
+                "rss_bytes": 4596219904,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 10416,
+                "ppid": 32232,
+                "pcpu": 1.8,
+                "rss_bytes": 25264128,
+                "executable_basename": "Python"
+              },
+              {
+                "pid": 509,
+                "ppid": 1,
+                "pcpu": 1.7,
+                "rss_bytes": 111001600,
+                "executable_basename": "Activity Monitor"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 1.6,
+                "rss_bytes": 316833792,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 93254,
+                "ppid": 93193,
+                "pcpu": 0.8,
+                "rss_bytes": 440123392,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 162,
+                "ppid": 1,
+                "pcpu": 0.7,
+                "rss_bytes": 5570560,
+                "executable_basename": "notifyd"
+              },
+              {
+                "pid": 9016,
+                "ppid": 9015,
+                "pcpu": 0.6,
+                "rss_bytes": 93650944,
+                "executable_basename": "codex"
+              },
+              {
+                "pid": 93199,
+                "ppid": 93193,
+                "pcpu": 0.6,
+                "rss_bytes": 360546304,
+                "executable_basename": "Brave Browser Helper"
+              },
+              {
+                "pid": 1,
+                "ppid": 0,
+                "pcpu": 0.5,
+                "rss_bytes": 28852224,
+                "executable_basename": "launchd"
+              },
+              {
+                "pid": 170,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 7962624,
+                "executable_basename": "cfprefsd"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:56:52.518089+00:00",
+          "elapsed_seconds": 20.14592875353992,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t85%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 2.65 2.51 2.23 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1143,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 10607,
+                "ppid": 10479,
+                "pcpu": 598.3,
+                "rss_bytes": 1371602944,
+                "executable_basename": "zkminer-prove-risc0"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 100.0,
+                "rss_bytes": 9266151424,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 24766,
+                "ppid": 93193,
+                "pcpu": 17.7,
+                "rss_bytes": 2014035968,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 2.0,
+                "rss_bytes": 4596252672,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 509,
+                "ppid": 1,
+                "pcpu": 1.2,
+                "rss_bytes": 111001600,
+                "executable_basename": "Activity Monitor"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 1.0,
+                "rss_bytes": 316817408,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 32232,
+                "ppid": 32169,
+                "pcpu": 0.7,
+                "rss_bytes": 805011456,
+                "executable_basename": "codex"
+              },
+              {
+                "pid": 353,
+                "ppid": 1,
+                "pcpu": 0.5,
+                "rss_bytes": 42860544,
+                "executable_basename": "AppleCentauriAlpha"
+              },
+              {
+                "pid": 93199,
+                "ppid": 93193,
+                "pcpu": 0.3,
+                "rss_bytes": 360529920,
+                "executable_basename": "Brave Browser Helper"
+              },
+              {
+                "pid": 139,
+                "ppid": 1,
+                "pcpu": 0.2,
+                "rss_bytes": 14123008,
+                "executable_basename": "launchservicesd"
+              },
+              {
+                "pid": 30187,
+                "ppid": 30181,
+                "pcpu": 0.2,
+                "rss_bytes": 81149952,
+                "executable_basename": "Claude Helper"
+              },
+              {
+                "pid": 10454,
+                "ppid": 10416,
+                "pcpu": 0.1,
+                "rss_bytes": 26198016,
+                "executable_basename": "Python"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:57:02.587675+00:00",
+          "elapsed_seconds": 30.215432584285736,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t85%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 3.39 2.67 2.29 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1143,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 10607,
+                "ppid": 10479,
+                "pcpu": 590.0,
+                "rss_bytes": 1856241664,
+                "executable_basename": "zkminer-prove-risc0"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 100.0,
+                "rss_bytes": 9266102272,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 2.3,
+                "rss_bytes": 4596334592,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 1.4,
+                "rss_bytes": 316833792,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 509,
+                "ppid": 1,
+                "pcpu": 1.0,
+                "rss_bytes": 111001600,
+                "executable_basename": "Activity Monitor"
+              },
+              {
+                "pid": 30204,
+                "ppid": 30181,
+                "pcpu": 0.9,
+                "rss_bytes": 1005338624,
+                "executable_basename": "Claude Helper (Renderer)"
+              },
+              {
+                "pid": 93254,
+                "ppid": 93193,
+                "pcpu": 0.9,
+                "rss_bytes": 438534144,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 93199,
+                "ppid": 93193,
+                "pcpu": 0.6,
+                "rss_bytes": 360529920,
+                "executable_basename": "Brave Browser Helper"
+              },
+              {
+                "pid": 93277,
+                "ppid": 93193,
+                "pcpu": 0.6,
+                "rss_bytes": 336019456,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 32231,
+                "ppid": 32169,
+                "pcpu": 0.4,
+                "rss_bytes": 1010008064,
+                "executable_basename": "Codex (Renderer)"
+              },
+              {
+                "pid": 32232,
+                "ppid": 32169,
+                "pcpu": 0.4,
+                "rss_bytes": 805011456,
+                "executable_basename": "codex"
+              },
+              {
+                "pid": 10454,
+                "ppid": 10416,
+                "pcpu": 0.3,
+                "rss_bytes": 26312704,
+                "executable_basename": "Python"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:57:12.666031+00:00",
+          "elapsed_seconds": 40.29374975338578,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t84%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 3.95 2.82 2.34 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1143,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 10607,
+                "ppid": 10479,
+                "pcpu": 594.6,
+                "rss_bytes": 1856241664,
+                "executable_basename": "zkminer-prove-risc0"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 100.0,
+                "rss_bytes": 9266266112,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 3.4,
+                "rss_bytes": 4596252672,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 10416,
+                "ppid": 32232,
+                "pcpu": 1.6,
+                "rss_bytes": 25903104,
+                "executable_basename": "Python"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 1.3,
+                "rss_bytes": 316817408,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 56801,
+                "ppid": 56800,
+                "pcpu": 1.0,
+                "rss_bytes": 399704064,
+                "executable_basename": "claude"
+              },
+              {
+                "pid": 509,
+                "ppid": 1,
+                "pcpu": 0.7,
+                "rss_bytes": 111001600,
+                "executable_basename": "Activity Monitor"
+              },
+              {
+                "pid": 32232,
+                "ppid": 32169,
+                "pcpu": 0.7,
+                "rss_bytes": 804765696,
+                "executable_basename": "codex"
+              },
+              {
+                "pid": 162,
+                "ppid": 1,
+                "pcpu": 0.6,
+                "rss_bytes": 5570560,
+                "executable_basename": "notifyd"
+              },
+              {
+                "pid": 353,
+                "ppid": 1,
+                "pcpu": 0.5,
+                "rss_bytes": 42860544,
+                "executable_basename": "AppleCentauriAlpha"
+              },
+              {
+                "pid": 30181,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 503300096,
+                "executable_basename": "Claude"
+              },
+              {
+                "pid": 1,
+                "ppid": 0,
+                "pcpu": 0.3,
+                "rss_bytes": 28803072,
+                "executable_basename": "launchd"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:57:22.744467+00:00",
+          "elapsed_seconds": 50.37212229333818,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t84%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 4.49 2.97 2.40 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1129,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 10607,
+                "ppid": 10479,
+                "pcpu": 600.0,
+                "rss_bytes": 1856258048,
+                "executable_basename": "zkminer-prove-risc0"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 100.0,
+                "rss_bytes": 9266135040,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 93277,
+                "ppid": 93193,
+                "pcpu": 17.6,
+                "rss_bytes": 333922304,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 4.9,
+                "rss_bytes": 4596252672,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 11036,
+                "ppid": 99702,
+                "pcpu": 4.0,
+                "rss_bytes": 69795840,
+                "executable_basename": "chatter"
+              },
+              {
+                "pid": 176,
+                "ppid": 1,
+                "pcpu": 2.3,
+                "rss_bytes": 25772032,
+                "executable_basename": "runningboardd"
+              },
+              {
+                "pid": 56801,
+                "ppid": 56800,
+                "pcpu": 1.8,
+                "rss_bytes": 399704064,
+                "executable_basename": "claude"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 1.1,
+                "rss_bytes": 316817408,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 32232,
+                "ppid": 32169,
+                "pcpu": 0.8,
+                "rss_bytes": 804765696,
+                "executable_basename": "codex"
+              },
+              {
+                "pid": 509,
+                "ppid": 1,
+                "pcpu": 0.6,
+                "rss_bytes": 111001600,
+                "executable_basename": "Activity Monitor"
+              },
+              {
+                "pid": 137,
+                "ppid": 1,
+                "pcpu": 0.5,
+                "rss_bytes": 25788416,
+                "executable_basename": "opendirectoryd"
+              },
+              {
+                "pid": 353,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 42860544,
+                "executable_basename": "AppleCentauriAlpha"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:57:32.824542+00:00",
+          "elapsed_seconds": 60.452045960351825,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t84%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 4.63 3.05 2.44 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1130,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 205.4,
+                "rss_bytes": 4525785088,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 99.0,
+                "rss_bytes": 9266184192,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 11190,
+                "ppid": 99702,
+                "pcpu": 12.3,
+                "rss_bytes": 67960832,
+                "executable_basename": "chatter"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 2.9,
+                "rss_bytes": 4596252672,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 56801,
+                "ppid": 56800,
+                "pcpu": 1.5,
+                "rss_bytes": 399802368,
+                "executable_basename": "claude"
+              },
+              {
+                "pid": 137,
+                "ppid": 1,
+                "pcpu": 1.0,
+                "rss_bytes": 25804800,
+                "executable_basename": "opendirectoryd"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 0.8,
+                "rss_bytes": 316817408,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 162,
+                "ppid": 1,
+                "pcpu": 0.5,
+                "rss_bytes": 5570560,
+                "executable_basename": "notifyd"
+              },
+              {
+                "pid": 1,
+                "ppid": 0,
+                "pcpu": 0.4,
+                "rss_bytes": 28803072,
+                "executable_basename": "launchd"
+              },
+              {
+                "pid": 96,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 78643200,
+                "executable_basename": "logd"
+              },
+              {
+                "pid": 509,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 111001600,
+                "executable_basename": "Activity Monitor"
+              },
+              {
+                "pid": 10454,
+                "ppid": 10416,
+                "pcpu": 0.2,
+                "rss_bytes": 26312704,
+                "executable_basename": "Python"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:57:42.884208+00:00",
+          "elapsed_seconds": 70.51164233498275,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t84%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 4.37 3.05 2.45 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1130,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 100.0,
+                "rss_bytes": 12346982400,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 99.1,
+                "rss_bytes": 9266380800,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 24766,
+                "ppid": 93193,
+                "pcpu": 3.4,
+                "rss_bytes": 2015412224,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 2.6,
+                "rss_bytes": 4596252672,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 1.2,
+                "rss_bytes": 316768256,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 31574,
+                "ppid": 31573,
+                "pcpu": 1.0,
+                "rss_bytes": 353107968,
+                "executable_basename": "claude"
+              },
+              {
+                "pid": 162,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 5570560,
+                "executable_basename": "notifyd"
+              },
+              {
+                "pid": 93199,
+                "ppid": 93193,
+                "pcpu": 0.4,
+                "rss_bytes": 360546304,
+                "executable_basename": "Brave Browser Helper"
+              },
+              {
+                "pid": 353,
+                "ppid": 1,
+                "pcpu": 0.3,
+                "rss_bytes": 42860544,
+                "executable_basename": "AppleCentauriAlpha"
+              },
+              {
+                "pid": 32232,
+                "ppid": 32169,
+                "pcpu": 0.3,
+                "rss_bytes": 804765696,
+                "executable_basename": "codex"
+              },
+              {
+                "pid": 93269,
+                "ppid": 93193,
+                "pcpu": 0.3,
+                "rss_bytes": 943538176,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 170,
+                "ppid": 1,
+                "pcpu": 0.2,
+                "rss_bytes": 7962624,
+                "executable_basename": "cfprefsd"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:57:52.943765+00:00",
+          "elapsed_seconds": 80.57112491875887,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t84%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 4.01 3.01 2.44 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1129,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 100.0,
+                "rss_bytes": 9266413568,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 100.0,
+                "rss_bytes": 12575621120,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 24766,
+                "ppid": 93193,
+                "pcpu": 3.0,
+                "rss_bytes": 2014642176,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 2.2,
+                "rss_bytes": 4596252672,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 48637,
+                "ppid": 1,
+                "pcpu": 1.4,
+                "rss_bytes": 250429440,
+                "executable_basename": "GlobalProtect"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 1.3,
+                "rss_bytes": 316768256,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 353,
+                "ppid": 1,
+                "pcpu": 0.5,
+                "rss_bytes": 42860544,
+                "executable_basename": "AppleCentauriAlpha"
+              },
+              {
+                "pid": 4037,
+                "ppid": 1,
+                "pcpu": 0.5,
+                "rss_bytes": 15214280704,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 42953,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 20889600,
+                "executable_basename": "trustd"
+              },
+              {
+                "pid": 93199,
+                "ppid": 93193,
+                "pcpu": 0.4,
+                "rss_bytes": 360546304,
+                "executable_basename": "Brave Browser Helper"
+              },
+              {
+                "pid": 32232,
+                "ppid": 32169,
+                "pcpu": 0.3,
+                "rss_bytes": 804913152,
+                "executable_basename": "codex"
+              },
+              {
+                "pid": 93269,
+                "ppid": 93193,
+                "pcpu": 0.3,
+                "rss_bytes": 943538176,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:58:03.002307+00:00",
+          "elapsed_seconds": 90.6295910011977,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t84%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 3.78 3.00 2.44 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1129,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 100.0,
+                "rss_bytes": 12764807168,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 99.7,
+                "rss_bytes": 9266462720,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 2.2,
+                "rss_bytes": 4596301824,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 48637,
+                "ppid": 1,
+                "pcpu": 1.6,
+                "rss_bytes": 250445824,
+                "executable_basename": "GlobalProtect"
+              },
+              {
+                "pid": 32169,
+                "ppid": 1,
+                "pcpu": 1.1,
+                "rss_bytes": 587530240,
+                "executable_basename": "ChatGPT"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 0.9,
+                "rss_bytes": 316817408,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 32232,
+                "ppid": 32169,
+                "pcpu": 0.4,
+                "rss_bytes": 804945920,
+                "executable_basename": "codex"
+              },
+              {
+                "pid": 42953,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 20889600,
+                "executable_basename": "trustd"
+              },
+              {
+                "pid": 93199,
+                "ppid": 93193,
+                "pcpu": 0.3,
+                "rss_bytes": 360546304,
+                "executable_basename": "Brave Browser Helper"
+              },
+              {
+                "pid": 10454,
+                "ppid": 10416,
+                "pcpu": 0.2,
+                "rss_bytes": 26312704,
+                "executable_basename": "Python"
+              },
+              {
+                "pid": 353,
+                "ppid": 1,
+                "pcpu": 0.1,
+                "rss_bytes": 42860544,
+                "executable_basename": "AppleCentauriAlpha"
+              },
+              {
+                "pid": 509,
+                "ppid": 1,
+                "pcpu": 0.1,
+                "rss_bytes": 111001600,
+                "executable_basename": "Activity Monitor"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:58:13.064165+00:00",
+          "elapsed_seconds": 100.69139954447746,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t84%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 4.35 3.15 2.50 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1129,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 595.8,
+                "rss_bytes": 13899055104,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 99.7,
+                "rss_bytes": 9266479104,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 94490,
+                "ppid": 1,
+                "pcpu": 8.2,
+                "rss_bytes": 39534592,
+                "executable_basename": "PerfPowerServices"
+              },
+              {
+                "pid": 176,
+                "ppid": 1,
+                "pcpu": 5.2,
+                "rss_bytes": 25706496,
+                "executable_basename": "runningboardd"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 2.8,
+                "rss_bytes": 4596252672,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 308,
+                "ppid": 1,
+                "pcpu": 1.8,
+                "rss_bytes": 489848832,
+                "executable_basename": "mds_stores"
+              },
+              {
+                "pid": 48637,
+                "ppid": 1,
+                "pcpu": 1.6,
+                "rss_bytes": 250445824,
+                "executable_basename": "GlobalProtect"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 1.2,
+                "rss_bytes": 316768256,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 93269,
+                "ppid": 93193,
+                "pcpu": 0.5,
+                "rss_bytes": 944963584,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 10454,
+                "ppid": 10416,
+                "pcpu": 0.4,
+                "rss_bytes": 26312704,
+                "executable_basename": "Python"
+              },
+              {
+                "pid": 32169,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 584073216,
+                "executable_basename": "ChatGPT"
+              },
+              {
+                "pid": 42953,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 20889600,
+                "executable_basename": "trustd"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:58:23.142210+00:00",
+          "elapsed_seconds": 110.7693855445832,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t84%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 4.76 3.27 2.55 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1129,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 546.1,
+                "rss_bytes": 13986299904,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 99.3,
+                "rss_bytes": 9266397184,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 2.5,
+                "rss_bytes": 4596219904,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 4037,
+                "ppid": 1,
+                "pcpu": 0.9,
+                "rss_bytes": 15214280704,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 0.8,
+                "rss_bytes": 316817408,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 48637,
+                "ppid": 1,
+                "pcpu": 0.6,
+                "rss_bytes": 250429440,
+                "executable_basename": "GlobalProtect"
+              },
+              {
+                "pid": 93193,
+                "ppid": 1,
+                "pcpu": 0.6,
+                "rss_bytes": 939655168,
+                "executable_basename": "Brave Browser"
+              },
+              {
+                "pid": 162,
+                "ppid": 1,
+                "pcpu": 0.5,
+                "rss_bytes": 5570560,
+                "executable_basename": "notifyd"
+              },
+              {
+                "pid": 10454,
+                "ppid": 10416,
+                "pcpu": 0.3,
+                "rss_bytes": 26312704,
+                "executable_basename": "Python"
+              },
+              {
+                "pid": 93254,
+                "ppid": 93193,
+                "pcpu": 0.3,
+                "rss_bytes": 439369728,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 1,
+                "ppid": 0,
+                "pcpu": 0.2,
+                "rss_bytes": 28852224,
+                "executable_basename": "launchd"
+              },
+              {
+                "pid": 42953,
+                "ppid": 1,
+                "pcpu": 0.2,
+                "rss_bytes": 20889600,
+                "executable_basename": "trustd"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:58:33.217374+00:00",
+          "elapsed_seconds": 120.84446225315332,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t84%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 6.46 3.68 2.70 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1129,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 593.2,
+                "rss_bytes": 15082356736,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 99.1,
+                "rss_bytes": 9266642944,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 2.0,
+                "rss_bytes": 4596219904,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 0.8,
+                "rss_bytes": 316817408,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 48637,
+                "ppid": 1,
+                "pcpu": 0.8,
+                "rss_bytes": 250445824,
+                "executable_basename": "GlobalProtect"
+              },
+              {
+                "pid": 93199,
+                "ppid": 93193,
+                "pcpu": 0.7,
+                "rss_bytes": 360513536,
+                "executable_basename": "Brave Browser Helper"
+              },
+              {
+                "pid": 10416,
+                "ppid": 32232,
+                "pcpu": 0.6,
+                "rss_bytes": 25968640,
+                "executable_basename": "Python"
+              },
+              {
+                "pid": 32169,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 584957952,
+                "executable_basename": "ChatGPT"
+              },
+              {
+                "pid": 10454,
+                "ppid": 10416,
+                "pcpu": 0.3,
+                "rss_bytes": 26312704,
+                "executable_basename": "Python"
+              },
+              {
+                "pid": 1,
+                "ppid": 0,
+                "pcpu": 0.1,
+                "rss_bytes": 28803072,
+                "executable_basename": "launchd"
+              },
+              {
+                "pid": 137,
+                "ppid": 1,
+                "pcpu": 0.1,
+                "rss_bytes": 25788416,
+                "executable_basename": "opendirectoryd"
+              },
+              {
+                "pid": 162,
+                "ppid": 1,
+                "pcpu": 0.1,
+                "rss_bytes": 5570560,
+                "executable_basename": "notifyd"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:58:43.294221+00:00",
+          "elapsed_seconds": 130.92120704427361,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t84%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 6.62 3.80 2.76 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1132,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 597.9,
+                "rss_bytes": 15478702080,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 98.9,
+                "rss_bytes": 9266659328,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 12050,
+                "ppid": 99702,
+                "pcpu": 13.5,
+                "rss_bytes": 69779456,
+                "executable_basename": "chatter"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 3.8,
+                "rss_bytes": 4596236288,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 137,
+                "ppid": 1,
+                "pcpu": 1.4,
+                "rss_bytes": 25804800,
+                "executable_basename": "opendirectoryd"
+              },
+              {
+                "pid": 162,
+                "ppid": 1,
+                "pcpu": 0.8,
+                "rss_bytes": 5570560,
+                "executable_basename": "notifyd"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 0.8,
+                "rss_bytes": 316768256,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 1,
+                "ppid": 0,
+                "pcpu": 0.6,
+                "rss_bytes": 28803072,
+                "executable_basename": "launchd"
+              },
+              {
+                "pid": 48637,
+                "ppid": 1,
+                "pcpu": 0.6,
+                "rss_bytes": 250445824,
+                "executable_basename": "GlobalProtect"
+              },
+              {
+                "pid": 96,
+                "ppid": 1,
+                "pcpu": 0.5,
+                "rss_bytes": 78315520,
+                "executable_basename": "logd"
+              },
+              {
+                "pid": 10454,
+                "ppid": 10416,
+                "pcpu": 0.3,
+                "rss_bytes": 26312704,
+                "executable_basename": "Python"
+              },
+              {
+                "pid": 93254,
+                "ppid": 93193,
+                "pcpu": 0.3,
+                "rss_bytes": 439140352,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:58:53.361503+00:00",
+          "elapsed_seconds": 140.98844633437693,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t83%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 6.84 3.94 2.82 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1131,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 597.1,
+                "rss_bytes": 15765192704,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 98.2,
+                "rss_bytes": 9266724864,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 1.9,
+                "rss_bytes": 4596269056,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 308,
+                "ppid": 1,
+                "pcpu": 1.8,
+                "rss_bytes": 489799680,
+                "executable_basename": "mds_stores"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 1.2,
+                "rss_bytes": 316817408,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 162,
+                "ppid": 1,
+                "pcpu": 0.5,
+                "rss_bytes": 5570560,
+                "executable_basename": "notifyd"
+              },
+              {
+                "pid": 10454,
+                "ppid": 10416,
+                "pcpu": 0.4,
+                "rss_bytes": 26312704,
+                "executable_basename": "Python"
+              },
+              {
+                "pid": 59948,
+                "ppid": 59947,
+                "pcpu": 0.4,
+                "rss_bytes": 335167488,
+                "executable_basename": "claude"
+              },
+              {
+                "pid": 48637,
+                "ppid": 1,
+                "pcpu": 0.3,
+                "rss_bytes": 250429440,
+                "executable_basename": "GlobalProtect"
+              },
+              {
+                "pid": 1,
+                "ppid": 0,
+                "pcpu": 0.2,
+                "rss_bytes": 28786688,
+                "executable_basename": "launchd"
+              },
+              {
+                "pid": 96,
+                "ppid": 1,
+                "pcpu": 0.2,
+                "rss_bytes": 77905920,
+                "executable_basename": "logd"
+              },
+              {
+                "pid": 170,
+                "ppid": 1,
+                "pcpu": 0.2,
+                "rss_bytes": 8011776,
+                "executable_basename": "cfprefsd"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:59:03.439042+00:00",
+          "elapsed_seconds": 151.06588254496455,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t83%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 6.70 4.01 2.85 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1131,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 391.4,
+                "rss_bytes": 15917711360,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 99.2,
+                "rss_bytes": 9265889280,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 24766,
+                "ppid": 93193,
+                "pcpu": 15.8,
+                "rss_bytes": 2015494144,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 2.2,
+                "rss_bytes": 4596301824,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 1.4,
+                "rss_bytes": 313753600,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 93193,
+                "ppid": 1,
+                "pcpu": 0.8,
+                "rss_bytes": 939655168,
+                "executable_basename": "Brave Browser"
+              },
+              {
+                "pid": 353,
+                "ppid": 1,
+                "pcpu": 0.7,
+                "rss_bytes": 42729472,
+                "executable_basename": "AppleCentauriAlpha"
+              },
+              {
+                "pid": 10416,
+                "ppid": 32232,
+                "pcpu": 0.6,
+                "rss_bytes": 25968640,
+                "executable_basename": "Python"
+              },
+              {
+                "pid": 86600,
+                "ppid": 93193,
+                "pcpu": 0.6,
+                "rss_bytes": 511623168,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 99081,
+                "ppid": 93193,
+                "pcpu": 0.6,
+                "rss_bytes": 813219840,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 32232,
+                "ppid": 32169,
+                "pcpu": 0.5,
+                "rss_bytes": 804880384,
+                "executable_basename": "codex"
+              },
+              {
+                "pid": 48637,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 248987648,
+                "executable_basename": "GlobalProtect"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:59:13.509439+00:00",
+          "elapsed_seconds": 161.13620400056243,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t83%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 6.91 4.14 2.91 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1130,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 401.1,
+                "rss_bytes": 15929556992,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 99.8,
+                "rss_bytes": 9266102272,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 16.5,
+                "rss_bytes": 315244544,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 32231,
+                "ppid": 32169,
+                "pcpu": 7.4,
+                "rss_bytes": 1008648192,
+                "executable_basename": "Codex (Renderer)"
+              },
+              {
+                "pid": 93199,
+                "ppid": 93193,
+                "pcpu": 6.6,
+                "rss_bytes": 361349120,
+                "executable_basename": "Brave Browser Helper"
+              },
+              {
+                "pid": 93269,
+                "ppid": 93193,
+                "pcpu": 5.9,
+                "rss_bytes": 986710016,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 3.5,
+                "rss_bytes": 4596219904,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 93193,
+                "ppid": 1,
+                "pcpu": 3.3,
+                "rss_bytes": 939720704,
+                "executable_basename": "Brave Browser"
+              },
+              {
+                "pid": 32169,
+                "ppid": 1,
+                "pcpu": 3.2,
+                "rss_bytes": 583680000,
+                "executable_basename": "ChatGPT"
+              },
+              {
+                "pid": 30181,
+                "ppid": 1,
+                "pcpu": 1.8,
+                "rss_bytes": 500563968,
+                "executable_basename": "Claude"
+              },
+              {
+                "pid": 32232,
+                "ppid": 32169,
+                "pcpu": 1.1,
+                "rss_bytes": 804929536,
+                "executable_basename": "codex"
+              },
+              {
+                "pid": 517,
+                "ppid": 1,
+                "pcpu": 1.0,
+                "rss_bytes": 373800960,
+                "executable_basename": "Finder"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:59:23.577056+00:00",
+          "elapsed_seconds": 171.20374337770045,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t83%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 6.69 4.18 2.94 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1130,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 397.5,
+                "rss_bytes": 15937421312,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 97.7,
+                "rss_bytes": 9266151424,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 2.1,
+                "rss_bytes": 4596416512,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 1.2,
+                "rss_bytes": 315179008,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 162,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 5095424,
+                "executable_basename": "notifyd"
+              },
+              {
+                "pid": 10454,
+                "ppid": 10416,
+                "pcpu": 0.4,
+                "rss_bytes": 26312704,
+                "executable_basename": "Python"
+              },
+              {
+                "pid": 32232,
+                "ppid": 32169,
+                "pcpu": 0.4,
+                "rss_bytes": 804945920,
+                "executable_basename": "codex"
+              },
+              {
+                "pid": 353,
+                "ppid": 1,
+                "pcpu": 0.3,
+                "rss_bytes": 42729472,
+                "executable_basename": "AppleCentauriAlpha"
+              },
+              {
+                "pid": 1,
+                "ppid": 0,
+                "pcpu": 0.2,
+                "rss_bytes": 27721728,
+                "executable_basename": "launchd"
+              },
+              {
+                "pid": 170,
+                "ppid": 1,
+                "pcpu": 0.2,
+                "rss_bytes": 7667712,
+                "executable_basename": "cfprefsd"
+              },
+              {
+                "pid": 48637,
+                "ppid": 1,
+                "pcpu": 0.2,
+                "rss_bytes": 248971264,
+                "executable_basename": "GlobalProtect"
+              },
+              {
+                "pid": 137,
+                "ppid": 1,
+                "pcpu": 0.1,
+                "rss_bytes": 23445504,
+                "executable_basename": "opendirectoryd"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:59:33.639003+00:00",
+          "elapsed_seconds": 181.26566920801997,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t83%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 6.26 4.18 2.96 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1134,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 99.1,
+                "rss_bytes": 9266053120,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 24766,
+                "ppid": 93193,
+                "pcpu": 18.3,
+                "rss_bytes": 2014674944,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 32169,
+                "ppid": 1,
+                "pcpu": 11.2,
+                "rss_bytes": 578535424,
+                "executable_basename": "ChatGPT"
+              },
+              {
+                "pid": 12723,
+                "ppid": 1,
+                "pcpu": 5.7,
+                "rss_bytes": 18251776,
+                "executable_basename": "mdworker_shared"
+              },
+              {
+                "pid": 12725,
+                "ppid": 1,
+                "pcpu": 5.6,
+                "rss_bytes": 12664832,
+                "executable_basename": "mdworker_shared"
+              },
+              {
+                "pid": 12724,
+                "ppid": 1,
+                "pcpu": 5.5,
+                "rss_bytes": 12910592,
+                "executable_basename": "mdworker_shared"
+              },
+              {
+                "pid": 12726,
+                "ppid": 1,
+                "pcpu": 5.4,
+                "rss_bytes": 12910592,
+                "executable_basename": "mdworker_shared"
+              },
+              {
+                "pid": 12727,
+                "ppid": 1,
+                "pcpu": 5.4,
+                "rss_bytes": 12664832,
+                "executable_basename": "mdworker_shared"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 3.8,
+                "rss_bytes": 4596416512,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 30204,
+                "ppid": 30181,
+                "pcpu": 2.2,
+                "rss_bytes": 986988544,
+                "executable_basename": "Claude Helper (Renderer)"
+              },
+              {
+                "pid": 93254,
+                "ppid": 93193,
+                "pcpu": 2.2,
+                "rss_bytes": 439992320,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 2.0,
+                "rss_bytes": 315179008,
+                "executable_basename": "WindowServer"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:59:37.405146+00:00",
+          "elapsed_seconds": 185.03172096051276,
+          "label": "after",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t83%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 6.26 4.18 2.96 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1131,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 99.0,
+                "rss_bytes": 9266069504,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 19.0,
+                "rss_bytes": 315211776,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 93199,
+                "ppid": 93193,
+                "pcpu": 10.0,
+                "rss_bytes": 365854720,
+                "executable_basename": "Brave Browser Helper"
+              },
+              {
+                "pid": 93269,
+                "ppid": 93193,
+                "pcpu": 8.3,
+                "rss_bytes": 1022328832,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 4.7,
+                "rss_bytes": 4596416512,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 93193,
+                "ppid": 1,
+                "pcpu": 4.4,
+                "rss_bytes": 939655168,
+                "executable_basename": "Brave Browser"
+              },
+              {
+                "pid": 56801,
+                "ppid": 56800,
+                "pcpu": 2.0,
+                "rss_bytes": 399785984,
+                "executable_basename": "claude"
+              },
+              {
+                "pid": 509,
+                "ppid": 1,
+                "pcpu": 1.7,
+                "rss_bytes": 91226112,
+                "executable_basename": "Activity Monitor"
+              },
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 1.0,
+                "rss_bytes": 15949299712,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 137,
+                "ppid": 1,
+                "pcpu": 0.5,
+                "rss_bytes": 23478272,
+                "executable_basename": "opendirectoryd"
+              },
+              {
+                "pid": 48637,
+                "ppid": 1,
+                "pcpu": 0.5,
+                "rss_bytes": 248987648,
+                "executable_basename": "GlobalProtect"
+              },
+              {
+                "pid": 161,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 30605312,
+                "executable_basename": "bluetoothd"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        }
+      ],
+      "summary": {
+        "observation_count": 20,
+        "labels": {
+          "before": 1,
+          "periodic": 18,
+          "after": 1
+        },
+        "thermal_state_observations": {
+          "nominal": 20
+        },
+        "low_power_mode_observations": {
+          "false": 20
+        },
+        "unavailable_observation_counts": {},
+        "unparsed_process_lines": 0,
+        "maximum_observed_ps_pcpu_by_executable_basename": {
+          "fseventsd": 100.4,
+          "Python": 17.1,
+          "com.apple.Virtualization.VirtualMachine": 597.9,
+          "Codex (Renderer)": 7.4,
+          "idea": 4.9,
+          "Activity Monitor": 2.0,
+          "opendirectoryd": 1.7,
+          "codex": 1.3,
+          "Brave Browser Helper (Renderer)": 18.3,
+          "notifyd": 1.0,
+          "WindowServer": 19.0,
+          "logd": 0.8,
+          "Brave Browser Helper": 10.0,
+          "launchd": 0.6,
+          "cfprefsd": 0.4,
+          "zkminer-prove-risc0": 600.0,
+          "AppleCentauriAlpha": 0.7,
+          "launchservicesd": 0.2,
+          "Claude Helper": 0.2,
+          "Claude Helper (Renderer)": 2.2,
+          "claude": 2.0,
+          "Claude": 1.8,
+          "chatter": 13.5,
+          "runningboardd": 5.2,
+          "GlobalProtect": 1.6,
+          "trustd": 0.4,
+          "ChatGPT": 11.2,
+          "PerfPowerServices": 8.2,
+          "mds_stores": 1.8,
+          "Brave Browser": 4.4,
+          "Finder": 1.0,
+          "mdworker_shared": 5.7,
+          "bluetoothd": 0.4
+        },
+        "scope": "coarse categories and ps decaying CPU averages; includes proving, VM and unrelated apps; unknown thermal state may appear nominal; no wattage, interval CPU utilization or throttle-free claim"
+      }
+    },
+    "1": {
+      "raw_artifact": {
+        "path": "/Users/dbur/dev/zk-miner/target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27/trial-01/telemetry.jsonl",
+        "sha256": "aa6b525f6a23ca9e7727b6db2e770bcf407e1bbb37ad6290dfda82ad6b2122b0",
+        "bytes": 7712
+      },
+      "observations": [
+        {
+          "at_utc": "2026-10-31T23:59:37.471879+00:00",
+          "elapsed_seconds": 8.925050497055054e-05,
+          "label": "before",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t83%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 6.26 4.18 2.96 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1132,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 99.0,
+                "rss_bytes": 9266069504,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 19.0,
+                "rss_bytes": 315211776,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 93199,
+                "ppid": 93193,
+                "pcpu": 10.0,
+                "rss_bytes": 365854720,
+                "executable_basename": "Brave Browser Helper"
+              },
+              {
+                "pid": 93269,
+                "ppid": 93193,
+                "pcpu": 8.3,
+                "rss_bytes": 1022328832,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 4.7,
+                "rss_bytes": 4596416512,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 93193,
+                "ppid": 1,
+                "pcpu": 4.4,
+                "rss_bytes": 939655168,
+                "executable_basename": "Brave Browser"
+              },
+              {
+                "pid": 56801,
+                "ppid": 56800,
+                "pcpu": 2.0,
+                "rss_bytes": 399785984,
+                "executable_basename": "claude"
+              },
+              {
+                "pid": 509,
+                "ppid": 1,
+                "pcpu": 1.7,
+                "rss_bytes": 91226112,
+                "executable_basename": "Activity Monitor"
+              },
+              {
+                "pid": 9272,
+                "ppid": 1,
+                "pcpu": 1.0,
+                "rss_bytes": 15949299712,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 137,
+                "ppid": 1,
+                "pcpu": 0.5,
+                "rss_bytes": 23478272,
+                "executable_basename": "opendirectoryd"
+              },
+              {
+                "pid": 48637,
+                "ppid": 1,
+                "pcpu": 0.5,
+                "rss_bytes": 248987648,
+                "executable_basename": "GlobalProtect"
+              },
+              {
+                "pid": 161,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 30605312,
+                "executable_basename": "bluetoothd"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:59:47.530756+00:00",
+          "elapsed_seconds": 10.05895391665399,
+          "label": "periodic",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t83%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 5.46 4.10 2.95 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1139,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 100.0,
+                "rss_bytes": 9266249728,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 8.1,
+                "rss_bytes": 315195392,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 6.0,
+                "rss_bytes": 4596383744,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 93269,
+                "ppid": 93193,
+                "pcpu": 4.3,
+                "rss_bytes": 1022918656,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 93199,
+                "ppid": 93193,
+                "pcpu": 4.0,
+                "rss_bytes": 365461504,
+                "executable_basename": "Brave Browser Helper"
+              },
+              {
+                "pid": 56801,
+                "ppid": 56800,
+                "pcpu": 1.8,
+                "rss_bytes": 399704064,
+                "executable_basename": "claude"
+              },
+              {
+                "pid": 93193,
+                "ppid": 1,
+                "pcpu": 1.7,
+                "rss_bytes": 939655168,
+                "executable_basename": "Brave Browser"
+              },
+              {
+                "pid": 10416,
+                "ppid": 32232,
+                "pcpu": 1.6,
+                "rss_bytes": 25985024,
+                "executable_basename": "Python"
+              },
+              {
+                "pid": 509,
+                "ppid": 1,
+                "pcpu": 1.1,
+                "rss_bytes": 91226112,
+                "executable_basename": "Activity Monitor"
+              },
+              {
+                "pid": 162,
+                "ppid": 1,
+                "pcpu": 0.5,
+                "rss_bytes": 5095424,
+                "executable_basename": "notifyd"
+              },
+              {
+                "pid": 4037,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 15214280704,
+                "executable_basename": "com.apple.Virtualization.VirtualMachine"
+              },
+              {
+                "pid": 1,
+                "ppid": 0,
+                "pcpu": 0.3,
+                "rss_bytes": 27721728,
+                "executable_basename": "launchd"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        },
+        {
+          "at_utc": "2026-10-31T23:59:55.085429+00:00",
+          "elapsed_seconds": 17.613559667021036,
+          "label": "after",
+          "thermal": {
+            "command": [
+              "/Users/dbur/dev/zk-miner/target/macos/benchmark-tools/thermal"
+            ],
+            "returncode": 0,
+            "stdout": "{\"low_power_false_may_mean_unknown\":true,\"low_power_mode_enabled\":false,\"schema_version\":1,\"thermal_nominal_may_mean_unknown\":true,\"thermal_state\":0,\"thermal_state_name\":\"nominal\"}\n",
+            "stderr": ""
+          },
+          "thermal_history": {
+            "command": [
+              "pmset",
+              "-g",
+              "therm"
+            ],
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+            "stderr": ""
+          },
+          "power_source": {
+            "command": [
+              "pmset",
+              "-g",
+              "batt"
+            ],
+            "returncode": 0,
+            "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7209059)\t83%; AC attached; not charging present: true\n",
+            "stderr": ""
+          },
+          "load_average": {
+            "command": [
+              "sysctl",
+              "vm.loadavg"
+            ],
+            "returncode": 0,
+            "stdout": "vm.loadavg: { 5.18 4.07 2.94 }\n",
+            "stderr": ""
+          },
+          "processes": {
+            "command": [
+              "ps",
+              "-A",
+              "-o",
+              "pid=,ppid=,pcpu=,rss=,comm="
+            ],
+            "returncode": 0,
+            "error": null,
+            "observed_count": 1137,
+            "unparsed_count": 0,
+            "top_cpu": [
+              {
+                "pid": 100,
+                "ppid": 1,
+                "pcpu": 99.6,
+                "rss_bytes": 9266233344,
+                "executable_basename": "fseventsd"
+              },
+              {
+                "pid": 169,
+                "ppid": 1,
+                "pcpu": 21.1,
+                "rss_bytes": 315211776,
+                "executable_basename": "WindowServer"
+              },
+              {
+                "pid": 93199,
+                "ppid": 93193,
+                "pcpu": 13.3,
+                "rss_bytes": 365461504,
+                "executable_basename": "Brave Browser Helper"
+              },
+              {
+                "pid": 93269,
+                "ppid": 93193,
+                "pcpu": 11.4,
+                "rss_bytes": 993837056,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 93193,
+                "ppid": 1,
+                "pcpu": 5.9,
+                "rss_bytes": 939655168,
+                "executable_basename": "Brave Browser"
+              },
+              {
+                "pid": 99702,
+                "ppid": 1,
+                "pcpu": 4.4,
+                "rss_bytes": 4596416512,
+                "executable_basename": "idea"
+              },
+              {
+                "pid": 24766,
+                "ppid": 93193,
+                "pcpu": 2.2,
+                "rss_bytes": 2015461376,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 48637,
+                "ppid": 1,
+                "pcpu": 1.5,
+                "rss_bytes": 248971264,
+                "executable_basename": "GlobalProtect"
+              },
+              {
+                "pid": 10416,
+                "ppid": 32232,
+                "pcpu": 0.4,
+                "rss_bytes": 25985024,
+                "executable_basename": "Python"
+              },
+              {
+                "pid": 42953,
+                "ppid": 1,
+                "pcpu": 0.4,
+                "rss_bytes": 20938752,
+                "executable_basename": "trustd"
+              },
+              {
+                "pid": 93254,
+                "ppid": 93193,
+                "pcpu": 0.4,
+                "rss_bytes": 439222272,
+                "executable_basename": "Brave Browser Helper (Renderer)"
+              },
+              {
+                "pid": 161,
+                "ppid": 1,
+                "pcpu": 0.3,
+                "rss_bytes": 30523392,
+                "executable_basename": "bluetoothd"
+              }
+            ],
+            "method": "ps pcpu is a decaying average, not an interval CPU counter; top 12 names only"
+          }
+        }
+      ],
+      "summary": null
+    }
+  },
+  "benchmark_artifacts": {
+    "baseline.json": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27/baseline.json",
+      "sha256": "2c7bb39261b3bd893803639d784d1990dbf3a84f6de79705d4a884cefa26705d",
+      "bytes": 2884
+    },
+    "build-seals.json": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27/build-seals.json",
+      "sha256": "3611c5d7a921158a3b383e88b869ef7d4e9a80e10c90a73aa180c8c4f2d85dfb",
+      "bytes": 9431
+    },
+    "plan.json": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27/plan.json",
+      "sha256": "5e3bba1e2433d7f490c39120e28db53925ee2675f504a0c218afa309284d9a1e",
+      "bytes": 21546
+    },
+    "result.json": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27/result.json",
+      "sha256": "54be236077a6172cc077afaf42e4484696d84beecf30c93870e3efd484af4f54",
+      "bytes": 456
+    },
+    "trial-00/command.log": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27/trial-00/command.log",
+      "sha256": "ec0dbd7db685a59b5cb97df146fc98016989134bb98cb25d6074b0f5c6298aee",
+      "bytes": 225
+    },
+    "trial-00/telemetry.jsonl": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27/trial-00/telemetry.jsonl",
+      "sha256": "a9c6e1f11e34985308f42db51017f6770e077dd8389dfe0d6bc3122cf048bd9b",
+      "bytes": 51078
+    },
+    "trial-01/command.log": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27/trial-01/command.log",
+      "sha256": "f11449ce1f6c1d67bf4431233d14ef68ac425fd27145d538651c01a07fa8f28c",
+      "bytes": 254
+    },
+    "trial-01/telemetry.jsonl": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27/trial-01/telemetry.jsonl",
+      "sha256": "aa6b525f6a23ca9e7727b6db2e770bcf407e1bbb37ad6290dfda82ad6b2122b0",
+      "bytes": 7712
+    },
+    "trials.jsonl": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27/trials.jsonl",
+      "sha256": "8b7eb0064f6148ae4d399fcfedc68f8a187108a68e632804a79c9f7958daebc8",
+      "bytes": 1803
+    }
+  },
+  "acceptance_evidence": {
+    "path": "/Users/dbur/dev/zk-miner/docs/macos/evidence/benchmark-attempt-1-acceptance.json",
+    "sha256": "636a8ca58e22809aa2e444738a50b556a17df4cda3f81699dbac730b62d48d2b",
+    "csv_path": "/Users/dbur/dev/zk-miner/docs/macos/evidence/benchmark-attempt-1-acceptance.csv",
+    "csv_sha256": "4f3c3e465ce8a6b061630e700c53ac9b4614a2d7e680ca47800110b8dc881250",
+    "totals": {
+      "selected_runs": 2,
+      "accepted_runs": 1,
+      "failed_runs": 1,
+      "accepted_full_groth16_proofs": 1,
+      "accepted_negative_rejections": 3,
+      "diagnostic_timing_one_ulp_differences": 0,
+      "expected_admission_refusals": 0,
+      "unexpected_failed_request_rows": 1,
+      "validated_saved_proofs_in_failed_runs": 0,
+      "ledger_status_counts": {
+        "started": 2,
+        "complete_independently_verified": 1,
+        "failed": 1
+      },
+      "unexpected_terminal_rows": 1,
+      "unterminated_cases": 0,
+      "failed_proof_artifact_checks": 0
+    }
+  },
+  "interpretation": {
+    "primary_metric": "execution_and_segment_ms: witness/execution plus all segment operations and per-request backend initialization; no isolated Metal-kernel timing",
+    "wrap": "identity_and_emulated_wrap_ms combines native identity p254 and the local emulated linux/amd64 helper; not native ARM Groth16",
+    "wrap_diagnostics": "identity_p254_diagnostic_ms and shrink_wrap_diagnostic_ms come from exactly one production stderr line per trial, rounded to 0.1 ms; identity includes helper prestart overhead",
+    "startup": "setup discovery/spawn times the validation worker, which can be retired before proving; actual prove_call includes admission/replacement/IPC; residual is not pure startup",
+    "verification": "worker verification is the final SDK check; external_verifier_ms includes unchanged verifier process startup, positive and three negative checks",
+    "warmup": "first complete CPU and Metal proofs are retained but excluded; each trial uses a fresh pool, with no cold-boot or persistent warmed worker claim",
+    "statistics": "all planned measured trials retained; paired descriptive ratios and per-mode median/range/sample deviation; no outlier removal or causal/significance claim",
+    "telemetry": "nonprivileged coarse thermal/power categories and decaying ps CPU averages; nominal/low-power false can mean unknown; no wattage/energy measurement"
+  }
+}

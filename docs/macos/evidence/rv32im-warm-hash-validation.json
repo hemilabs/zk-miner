@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "scope": "Five warm 10M hashing proofs on one persistent worker, excluding the recorded first-process warm-up",
+  "engine_revision": "dcbe9f4b9140a48d4792ffcd3a3eba19897be175",
+  "worker_sha256": "f876cf8e7591e7f9ea98085ccb259ad22f767d54715023b79c5b9caf2e74fc08",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "host_reserve_gib": 16,
+  "measured_complete_seconds": [
+    124.662564625,
+    122.64712574999999,
+    120.799821375,
+    120.17602750000002,
+    120.172845459
+  ],
+  "median_complete_seconds": 120.799821375,
+  "usefulness_target_seconds": 600,
+  "usefulness_target_passed": true,
+  "verified_proofs_including_warmup": 6,
+  "negative_checks": 18,
+  "proofs": [
+    {
+      "directory": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/3745b3ab9d4a4b569f80ca2264147674/acceptance/proof-0",
+      "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+      "worker_sha256": "52884b0871d59a0392e287f404cc69a9c6bc619db57e9fd0094f71a2b7c62b3c",
+      "resource_sha256": "75411fbe2810abcb790f33605988ac9737000f4bc98abdcf9721553c937da63f"
+    },
+    {
+      "directory": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/3745b3ab9d4a4b569f80ca2264147674/acceptance/proof-1",
+      "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+      "worker_sha256": "54b4bf87140eefbc6eb4f0027b60b382d541f12857ba21b679f46b843499ea65",
+      "resource_sha256": "a68404a9c90789dd0a1c6ea4666386b6ec862eb40414e4557b5aad432c745e26"
+    },
+    {
+      "directory": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/3745b3ab9d4a4b569f80ca2264147674/acceptance/proof-2",
+      "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+      "worker_sha256": "acecb438ff2c44253c34547cdbfb1530be4f02851ce810e7f9a0765792b41357",
+      "resource_sha256": "f9d4f41e5bfa0812f73bf34873791807fb84f186e8b9978a5b3dc95ee9ff0834"
+    },
+    {
+      "directory": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/3745b3ab9d4a4b569f80ca2264147674/acceptance/proof-3",
+      "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+      "worker_sha256": "f59c018df33ba7d4420a9144bc739182ad201300c0f85ee30a598155481aca8f",
+      "resource_sha256": "14b675e49cbbddeab5ec11ad7c0fc210a2c0440fdb2ef4739f942cd47e576aa0"
+    },
+    {
+      "directory": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/3745b3ab9d4a4b569f80ca2264147674/acceptance/proof-4",
+      "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+      "worker_sha256": "ad0886599588beff1b2c34f48e5b1f99fcee7c25972def0bdf52fd9c1dc4618a",
+      "resource_sha256": "7b23e3cc89701330a709b2b13d45a06f3c0fa495ae9d9ead7d8447674e1bed3f"
+    },
+    {
+      "directory": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/3745b3ab9d4a4b569f80ca2264147674/acceptance/proof-5",
+      "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+      "worker_sha256": "bf7bc3e03ddb9fb3dca8ddbefe9fc186a35792e119d1c0bd705e0260cab2e3b7",
+      "resource_sha256": "e7c1025a1e8f7e3154129a532d9d9ae6a5ff4033515a3d1b3427f721409f663b"
+    }
+  ],
+  "raw_campaign": "/Users/dbur/dev/zk-miner/target/macos/review-rv32im/793f529cf86e47c9aa8e6065ef2f1601",
+  "raw_campaign_sha256": "1f252bfca2e4e6fbb7daf760d8d9dd63ffb992d5389d82f0d341ce70ffc5217a"
+}

@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "status": "complete",
+  "gate_passed": true,
+  "scope": "browser-closed absolute WP8 identity-time gate; one excluded warmup and five measured proofs per 10M fixture",
+  "raw_run": "/Users/dbur/dev/zk-miner/target/macos/phase2/wp8-reading/3cf7db11cf184ec4bba2737f258862d5",
+  "raw_result_sha256": "e4c63df84e2e638ee3c305467cb072591120730bd608e46808c5f4e51e063910",
+  "spec_sha256": "9a0e052f6c1e72a1a8a31d3081fe3a3604bbfe11cb9fd661e30109c21c12f6f1",
+  "engine_sha": "bcdca76fc8e83d0a42b5fecbda5f048e01cd2bce",
+  "worker_sha256": "9b2532dd859292c53545f14324b5ef264ce2d6fbc4e686863e276f45078e0a55",
+  "worker_manifest_sha256": "1841887196b5686e577e515e7fdfc62656a321f58d0a982c16b7d9e4dfa7b728",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "helper_manifest_sha256": "cab3b912750594cefb8b8da8b300f0b100ed6ccfaf81ee4a041503b966dca830",
+  "reading_driver_sha256": "e7f27e5bfad775c9b21b45ea029fc91549800afc498282e38bb09e41cc1838c1",
+  "collector_sha256": "fcf56d2404af6b3be13440fb5b4adf8aa2fde1a20fc1a1892b7f0d78edddb510",
+  "acceptance_build_sha256": "c74a65fbadb48ac8220c3b815fd9dad6406a6af57cf4250a3886dba933192edd",
+  "conditions": {
+    "browser_closed": true,
+    "default_reserve_gib": 8,
+    "rayon_threads": 18,
+    "go_threads": 18,
+    "po2": 20,
+    "warmup_per_fixture": 1,
+    "measured_per_fixture": 5,
+    "one_proof_in_flight": true
+  },
+  "idle_since_utc": "2026-11-08T03:50:19.373148+00:00",
+  "idle_gap_seconds": 900.086971,
+  "host_start": {
+    "path": "/Users/dbur/dev/zk-miner/target/macos/phase2/wp8-reading/3cf7db11cf184ec4bba2737f258862d5/host-start.json",
+    "sha256": "39edf24f4d430db9d72ad6f48363f469073d88f624ff133573352e451d0d74a8",
+    "observation": {
+      "observed_utc": "2026-11-08T04:05:19.542109+00:00",
+      "estimated_available_bytes": 70143664128,
+      "estimated_available_method": "free pages plus half of the lesser of file-backed and inactive pages",
+      "kernel_memory_free_percent": 95,
+      "kernel_memory_free_percent_method": "memory_pressure -Q; a pressure metric, not free physical pages",
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 0,
+        "thermal_state_name": "nominal"
+      },
+      "background_process_present": {
+        "brave": false,
+        "chatgpt_codex": true,
+        "claude": true,
+        "colima": true,
+        "vscode": false,
+        "xcode": false,
+        "zed": false
+      },
+      "scope": "instantaneous host observation; process changes are recorded by the campaign driver"
+    }
+  },
+  "host_end": {
+    "path": "/Users/dbur/dev/zk-miner/target/macos/phase2/wp8-reading/3cf7db11cf184ec4bba2737f258862d5/host-end.json",
+    "sha256": "37fb81f6e2bda9511ad93a7f6efeaf25b68d79540a8e5946ec5413159e215a24",
+    "observation": {
+      "observed_utc": "2026-11-08T04:14:09.996810+00:00",
+      "estimated_available_bytes": 69939306496,
+      "estimated_available_method": "free pages plus half of the lesser of file-backed and inactive pages",
+      "kernel_memory_free_percent": 95,
+      "kernel_memory_free_percent_method": "memory_pressure -Q; a pressure metric, not free physical pages",
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 0,
+        "thermal_state_name": "nominal"
+      },
+      "background_process_present": {
+        "brave": false,
+        "chatgpt_codex": true,
+        "claude": true,
+        "colima": true,
+        "vscode": false,
+        "xcode": false,
+        "zed": false
+      },
+      "scope": "instantaneous host observation; process changes are recorded by the campaign driver"
+    }
+  },
+  "verified_proofs": 12,
+  "tamper_rejections": 36,
+  "fixtures": [
+    {
+      "fixture": "arithmetic-10m",
+      "run_path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/7087a08038b747aaaa8369b884f77362",
+      "identity_seconds": {
+        "median": 2.7241999999999997,
+        "min": 2.7105,
+        "max": 2.7638000000000003
+      },
+      "complete_seconds": {
+        "median": 40.417810665999994,
+        "min": 40.411616292,
+        "max": 41.407384208
+      },
+      "identity_merkle_gpu_seconds": {
+        "median": 2.4719015415757895,
+        "min": 2.4657137524336576,
+        "max": 2.5160996671766043
+      },
+      "identity_gate_le_4_seconds": true,
+      "verified_proofs": 6,
+      "tamper_rejections": 18
+    },
+    {
+      "fixture": "hashing-10m",
+      "run_path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/8d9c86df91684088b5eb79fd65c7e12f",
+      "identity_seconds": {
+        "median": 2.7173000000000003,
+        "min": 2.7098,
+        "max": 2.7258
+      },
+      "complete_seconds": {
+        "median": 40.405057332000005,
+        "min": 39.410668209,
+        "max": 40.41672020800001
+      },
+      "identity_merkle_gpu_seconds": {
+        "median": 2.466189291328192,
+        "min": 2.4647392090409994,
+        "max": 2.468860710039735
+      },
+      "identity_gate_le_4_seconds": true,
+      "verified_proofs": 6,
+      "tamper_rejections": 18
+    }
+  ],
+  "csv_sha256": "0e552e70ca006e440ed5f1c2b2ea01835bd2a953952bf50e4c193b81ef531667"
+}

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "collector_sha256": "832786e94b36b710e783204138390c8c13f940b6390b61c94e8d7f2faf6ef47b",
+  "engine_commit": "fca0c099582f15729f98af0743f45bc56c217705",
+  "previous_wp1_engine_commit": "afd4342f90160c60829818dca953bcfe952a5639",
+  "worker_sha256": "c5f369bb7f76d6bdb61823149997e850bbb47299981be58cde17ae7aff31b7f5",
+  "cpu_worker_sha256": "e2720f1e1bc841e8660fdc9e20f67c9be18e971263c3a974e1ef74fdfa79d240",
+  "previous_wp1_worker_sha256": "9b0f07321888abf9292c466fe4d3dee93d499de3dca8b03cec491020d66bc2c1",
+  "unchanged_verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "shader_sha256": "2f61db29536c7cb473ff5d1d69203cd58bd048c4372fc94a61b13ed8ba5961c8",
+  "removed_probe_paths": [
+    "tools/macos-hybrid/Cargo.toml",
+    "tools/macos-hybrid/Cargo.lock",
+    "scripts/macos/build-hybrid.sh"
+  ],
+  "removed_engine_paths": [
+    "risc0/zkp/src/hal/metal_fold.rs"
+  ],
+  "retained_verifier_source": "tools/macos-proof/src/main.rs remains pinned to preserve the unchanged external verifier",
+  "native_unit_tests": 5,
+  "cpu_unit_tests": 5,
+  "proof_control_unit_tests": 8,
+  "proof_control_log_sha256": "4322b8d15793fe0c13ba818e827f602097cad088d9cbe4f8cf3d48cdeb38863e",
+  "proof_run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/f3ec430c576b40e3bc64e336c49d5657",
+  "proof_result_sha256": "da60431df99edbfd898dd5384c0b429f06214bbd917352343d92e9ac00983ada",
+  "proof": {
+    "worker_sidecar_sha256": "271e46492109ec549eaa594cc494b4743a0268f7c2fdbf89d031b8fbe61793bc",
+    "verification_sha256": "561957af71a204bf2776a571d01b9d28172871faf231a39eb3d81756853e8af7"
+  },
+  "proof_cpu_differential_checks": 1,
+  "lifecycle_run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/7b19327b8bfc4c448c79b487af23871e",
+  "lifecycle_result_sha256": "de7bb7228054f8a62475256f784138f3cc7d6386d70c2879adbb40244dcb9163",
+  "lifecycle_verified_proofs": 21,
+  "lifecycle_negative_checks": 63,
+  "lifecycle_idle_first_bytes": 4524625952,
+  "lifecycle_idle_last_bytes": 4493807624,
+  "lifecycle_idle_drift_fraction": -0.0068112432556722835,
+  "pressure_levels_observed": [
+    1
+  ],
+  "helper_cancel": true,
+  "worker_timeout": true,
+  "restart": true,
+  "shutdown": true,
+  "linux_feature_compile": "not run: only aarch64-apple-darwin installed in the pinned local toolchain",
+  "new_dependencies_or_version_bumps": []
+}

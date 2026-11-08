@@ -1,0 +1,399 @@
+{
+  "schema_version": 1,
+  "status": "performance_gate_missed",
+  "scope": "bounded WP1 split, reduction, and threadgroup iterations; one diagnostic 10M proof per fixture, not a five-pair campaign",
+  "engine_commit": "afd4342f90160c60829818dca953bcfe952a5639",
+  "worker_sha256": "9b0f07321888abf9292c466fe4d3dee93d499de3dca8b03cec491020d66bc2c1",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "shader_sha256": "2f61db29536c7cb473ff5d1d69203cd58bd048c4372fc94a61b13ed8ba5961c8",
+  "shader_metadata_sha256": "c2b86fa567f6583ef9b91020835e9124d5be4cae7c2a6c58357f1034628dfcb0",
+  "collector_sha256": "f9f8689b8d4e946e7681b67883b9056d20bb4f914ed0875a907d56fb5fa17c99",
+  "original_baseline": {
+    "worker_sha256": "1c70d2ef9eb3dddd94ded3588eedf7c93f3cca176a5b4a9d660ec570637938d8",
+    "profile_sha256": "3ef1c6827af8849dcdc8c50520f4332795ad336568f83cdaebc241f9a8a754ae"
+  },
+  "prototype": {
+    "tested_tool_source_sha256": "fc41d14020a238ecfa2735fb7f5c52bfeb538c3554d96b0975e2b184d4386a3b",
+    "committed_tool_source_sha256": "5c23b89dca44f107252a8dae3d684cc4cf675f854c20e5a93bde806b3007fce0",
+    "tested_tool_binary_sha256": "00826db1d6ce1fd5e82aea662d070f19e780f8df2ff68e9fe6ecdd420ad3a08b",
+    "tested_source_rustfmt_matches_committed": true,
+    "variants": {
+      "candidate-all": {
+        "shader_sha256": "2f61db29536c7cb473ff5d1d69203cd58bd048c4372fc94a61b13ed8ba5961c8",
+        "metadata_sha256": "ff12b9cfe8c496a068f8eee2876c15b3cf8e97d3200ce4e9691e675b195f4066",
+        "raw_log_sha256": "2b02d194c4967ce5d2403ee0e01bcd1c13353f945dc95aaf8e5545145fd85495",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "compiler": {
+          "library_seconds": 9.092795416,
+          "max_threads_per_threadgroup": 1024,
+          "pipeline_seconds": 0.005814292,
+          "static_threadgroup_bytes": 0,
+          "thread_execution_width": 32
+        },
+        "cases": [
+          {
+            "po2": 4,
+            "domain": 64,
+            "compared_field_elements": 256,
+            "gpu_dispatch_seconds": 0.140447834,
+            "reuse_dispatch_seconds": 0.007026625,
+            "output_sha256": "8685a4ea42bd9359fb8931b5994e65d8648fb4d9a7956b18d299589084df9ddf",
+            "status": "matched"
+          },
+          {
+            "po2": 8,
+            "domain": 1024,
+            "compared_field_elements": 4096,
+            "gpu_dispatch_seconds": 0.008096,
+            "reuse_dispatch_seconds": 0.008237125,
+            "output_sha256": "6d9aae99516ca596f214167d4d4509b81e3d71564adc5f85c031a0918f939721",
+            "status": "matched"
+          },
+          {
+            "po2": 14,
+            "domain": 65536,
+            "compared_field_elements": 262144,
+            "gpu_dispatch_seconds": 0.070482583,
+            "reuse_dispatch_seconds": 0.088138834,
+            "output_sha256": "5ea53bf6151578bd1ef7d38cb83bdb9b327a8da6c537776afa4ddd83d6953381",
+            "status": "matched"
+          },
+          {
+            "po2": 18,
+            "domain": 1048576,
+            "compared_field_elements": 4194304,
+            "gpu_dispatch_seconds": 1.246580792,
+            "reuse_dispatch_seconds": 1.285237083,
+            "output_sha256": "963a51c2e4457a5e164919a9bc4080680f81d44cd3dd3fa995a1e32377c5804f",
+            "status": "matched"
+          },
+          {
+            "po2": 20,
+            "domain": 4194304,
+            "compared_field_elements": 16777216,
+            "gpu_dispatch_seconds": 4.805554625,
+            "reuse_dispatch_seconds": 4.8989185,
+            "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+            "status": "matched"
+          }
+        ]
+      },
+      "candidate-fast-all": {
+        "shader_sha256": "a4dfaca4cddacba017f50623ef830bd4a41acca51597f7d3418542a4b3d91fea",
+        "metadata_sha256": "3a2ab9e8d4049deaee1a3b6b67ed25cecb3fb8c09f72012d0163396bd5d8c53e",
+        "raw_log_sha256": "9e182fd82cf66ac2e3ecb44f8832a16e4d1a594a0aa93176dd737ec32882eb1d",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "compiler": {
+          "library_seconds": 9.204764583,
+          "max_threads_per_threadgroup": 1024,
+          "pipeline_seconds": 26.131898125,
+          "static_threadgroup_bytes": 0,
+          "thread_execution_width": 32
+        },
+        "cases": [
+          {
+            "po2": 4,
+            "domain": 64,
+            "compared_field_elements": 256,
+            "gpu_dispatch_seconds": 0.139791083,
+            "reuse_dispatch_seconds": 0.007394542,
+            "output_sha256": "8685a4ea42bd9359fb8931b5994e65d8648fb4d9a7956b18d299589084df9ddf",
+            "status": "matched"
+          },
+          {
+            "po2": 8,
+            "domain": 1024,
+            "compared_field_elements": 4096,
+            "gpu_dispatch_seconds": 0.007565125,
+            "reuse_dispatch_seconds": 0.007147625,
+            "output_sha256": "6d9aae99516ca596f214167d4d4509b81e3d71564adc5f85c031a0918f939721",
+            "status": "matched"
+          },
+          {
+            "po2": 14,
+            "domain": 65536,
+            "compared_field_elements": 262144,
+            "gpu_dispatch_seconds": 0.068329083,
+            "reuse_dispatch_seconds": 0.085789292,
+            "output_sha256": "5ea53bf6151578bd1ef7d38cb83bdb9b327a8da6c537776afa4ddd83d6953381",
+            "status": "matched"
+          },
+          {
+            "po2": 18,
+            "domain": 1048576,
+            "compared_field_elements": 4194304,
+            "gpu_dispatch_seconds": 1.359267333,
+            "reuse_dispatch_seconds": 1.39736775,
+            "output_sha256": "963a51c2e4457a5e164919a9bc4080680f81d44cd3dd3fa995a1e32377c5804f",
+            "status": "matched"
+          },
+          {
+            "po2": 20,
+            "domain": 4194304,
+            "compared_field_elements": 16777216,
+            "gpu_dispatch_seconds": 5.372136167,
+            "reuse_dispatch_seconds": 5.372767125,
+            "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+            "status": "matched"
+          }
+        ]
+      },
+      "candidate-fast-fp-all": {
+        "shader_sha256": "5ebf8198e80d953417bce8a251a8bad54a68cf8a8c355d44e243ae215609de57",
+        "metadata_sha256": "c7985d8cf5ea496836a1cec3bff3335b1b028394df97daf25b523cdb1c146dbb",
+        "raw_log_sha256": "a833296df7ee7ce86127a6e332988334c4142ecc206ee97bd4477fc7be0d6c7c",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "compiler": {
+          "library_seconds": 9.547258708,
+          "max_threads_per_threadgroup": 1024,
+          "pipeline_seconds": 31.018652125,
+          "static_threadgroup_bytes": 0,
+          "thread_execution_width": 32
+        },
+        "cases": [
+          {
+            "po2": 4,
+            "domain": 64,
+            "compared_field_elements": 256,
+            "gpu_dispatch_seconds": 0.141427916,
+            "reuse_dispatch_seconds": 0.008141416,
+            "output_sha256": "8685a4ea42bd9359fb8931b5994e65d8648fb4d9a7956b18d299589084df9ddf",
+            "status": "matched"
+          },
+          {
+            "po2": 8,
+            "domain": 1024,
+            "compared_field_elements": 4096,
+            "gpu_dispatch_seconds": 0.008475333,
+            "reuse_dispatch_seconds": 0.008668792,
+            "output_sha256": "6d9aae99516ca596f214167d4d4509b81e3d71564adc5f85c031a0918f939721",
+            "status": "matched"
+          },
+          {
+            "po2": 14,
+            "domain": 65536,
+            "compared_field_elements": 262144,
+            "gpu_dispatch_seconds": 0.070327333,
+            "reuse_dispatch_seconds": 0.08503925,
+            "output_sha256": "5ea53bf6151578bd1ef7d38cb83bdb9b327a8da6c537776afa4ddd83d6953381",
+            "status": "matched"
+          },
+          {
+            "po2": 18,
+            "domain": 1048576,
+            "compared_field_elements": 4194304,
+            "gpu_dispatch_seconds": 1.354934083,
+            "reuse_dispatch_seconds": 1.4075315,
+            "output_sha256": "963a51c2e4457a5e164919a9bc4080680f81d44cd3dd3fa995a1e32377c5804f",
+            "status": "matched"
+          },
+          {
+            "po2": 20,
+            "domain": 4194304,
+            "compared_field_elements": 16777216,
+            "gpu_dispatch_seconds": 5.314261041,
+            "reuse_dispatch_seconds": 5.205371375,
+            "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+            "status": "matched"
+          }
+        ]
+      }
+    },
+    "threadgroups": [
+      {
+        "variant": "original",
+        "threads": 32,
+        "first_dispatch_seconds": 5.988842333,
+        "repeat_dispatch_seconds": 5.942319833,
+        "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+        "log_sha256": "46f10e38ee1fea5ecde855531dbf1457c6efc4302f1f177838d22fced4db9497"
+      },
+      {
+        "variant": "original",
+        "threads": 64,
+        "first_dispatch_seconds": 5.859471458,
+        "repeat_dispatch_seconds": 5.888062125,
+        "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+        "log_sha256": "b3fec2a742d325ca8268e1e52d24be3780fe4e2643256e3fe2b482bafbb4ad3d"
+      },
+      {
+        "variant": "original",
+        "threads": 128,
+        "first_dispatch_seconds": 5.822169667,
+        "repeat_dispatch_seconds": 5.770736333,
+        "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+        "log_sha256": "ec84be8befa5f9c5a607ed2233ea8f130b86a0036e6fd3eefeb90d34bfd00ebf"
+      },
+      {
+        "variant": "original",
+        "threads": 256,
+        "first_dispatch_seconds": 5.537413041,
+        "repeat_dispatch_seconds": 5.543153333,
+        "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+        "log_sha256": "7142b139e399877c3cb2b5a40747e378a9fcfff0996b04a8fcef679fb6928464"
+      },
+      {
+        "variant": "split",
+        "threads": 32,
+        "first_dispatch_seconds": 5.097788917,
+        "repeat_dispatch_seconds": 5.08743975,
+        "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+        "log_sha256": "ae52cd993594df68ed9fcffade0091f9c9ba3a27c5800dfc16cc7d84d17a1a9c"
+      },
+      {
+        "variant": "split",
+        "threads": 64,
+        "first_dispatch_seconds": 5.070866459,
+        "repeat_dispatch_seconds": 5.079152375,
+        "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+        "log_sha256": "003a2217b8ac5b0a2b2d712429710da255f8171192d5d4e54156374dacf31738"
+      },
+      {
+        "variant": "split",
+        "threads": 128,
+        "first_dispatch_seconds": 4.990175666,
+        "repeat_dispatch_seconds": 5.033371666,
+        "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+        "log_sha256": "b28ac4d66b21daeadf739d9080d09a7b879c998bb2f27629c33f59e66fbbf4a7"
+      },
+      {
+        "variant": "split",
+        "threads": 256,
+        "first_dispatch_seconds": 4.843417375,
+        "repeat_dispatch_seconds": 4.86606975,
+        "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+        "log_sha256": "ae8963459bca54f10c8e23111789dc257e8902c7fb7825f700f1194a71dbaf03"
+      }
+    ],
+    "threadgroup_csv_sha256": "9432858dc2ebd5edc6cbf974aa8a976720fcdcbe6adacf127742f0a7036247c9"
+  },
+  "real_witness_differentials": [
+    {
+      "po2": 14,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/7ad4b804a7a84d41873f8a9a790b5962",
+      "result_sha256": "c65628c4e1acbaa2c122edcc242aee1d69c3435b5333e8aad5c7d088ff6c8d00",
+      "sidecar_sha256": "0fda983c87dc473676fd79409ba4acf8138b38478d64a4ec0313cfa5979a7518",
+      "verification_sha256": "561957af71a204bf2776a571d01b9d28172871faf231a39eb3d81756853e8af7",
+      "segments": 5,
+      "cpu_differential_checks": 5
+    },
+    {
+      "po2": 18,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/43c9bcc07a5e45cdaa9d0920ec03b7c3",
+      "result_sha256": "f15f52d63e2aa06abf8282bce466858d38e545c4baeeb86a32141acf8acf9256",
+      "sidecar_sha256": "62919af34a59b92d5e679eb1d0e4416dd56e6f7df8862c0e1442c550e0e58f21",
+      "verification_sha256": "561957af71a204bf2776a571d01b9d28172871faf231a39eb3d81756853e8af7",
+      "segments": 1,
+      "cpu_differential_checks": 1
+    },
+    {
+      "po2": 20,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/c1431ba0f88a4fa59be939c244d61c91",
+      "result_sha256": "ae366191b095a5b6e4796dcb30b34f241e974fdab1c5cc45699c88f31ae74be7",
+      "sidecar_sha256": "4625ef6652b9d68165038542bc1c4a3d16b7eea9605b405d20fc9a111937071e",
+      "verification_sha256": "561957af71a204bf2776a571d01b9d28172871faf231a39eb3d81756853e8af7",
+      "segments": 1,
+      "cpu_differential_checks": 1
+    }
+  ],
+  "precommit_tracked_diff_sha256": "2c59a5d5db8524f3d3983107874a7fc31dfeb859cd2f025d6e7f5e086e4f22a9",
+  "precommit_untracked_files": {
+    "risc0/circuit/rv32im/metal/fast-ext.metal": "ba1866514cfe757ee26e52ac66319b0ed8f38820699394088ca123973daa13c4",
+    "risc0/circuit/rv32im/metal/split.py": "81b11ce196cf58d0801f0c937c14e8fb8dd112c2c7400394e5183fbf0715c028"
+  },
+  "diagnostic_profiles": [
+    {
+      "fixture": "arithmetic-10m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/d5deeb7dce7740e49e5be24e43748426",
+      "result_sha256": "c999982849591d8c7c12411805317bdb198fc4ec5c05c3b02cc52c3c10cf1a56",
+      "worker_sidecar_sha256": "7d9070a7b2fd574d556d7accffdf9086f7992759e434a2a2ac4787cabec884ac",
+      "complete_seconds": 118.59322016700001,
+      "baseline_diagnostic_complete_seconds": 128.052856125,
+      "constraint_wall_seconds": 47.8129,
+      "constraint_gpu_seconds": 46.49490999999999,
+      "constraint_dispatch_wall_seconds": 47.812252,
+      "constraint_commands": 10,
+      "guard_peak_footprint_bytes": 16553952672,
+      "host_reserve_bytes": 12884901888,
+      "pressure_level_after": 1,
+      "baseline_constraint_wall_seconds": 57.295,
+      "baseline_constraint_gpu_seconds": 55.902211
+    },
+    {
+      "fixture": "hash-10m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/ee02dd5897b54e3385aa20671823c3ff",
+      "result_sha256": "e5de0f941a1cc1cff4a0d2af3bed516e787d51ebd75cc09f3e1e51b865ba5114",
+      "worker_sidecar_sha256": "ab5718af43b0bd803738e267d11a7502cf6df293db2ffd51c84e541dbe8d25cb",
+      "complete_seconds": 124.648348292,
+      "baseline_diagnostic_complete_seconds": 129.15681291700002,
+      "constraint_wall_seconds": 51.058699999999995,
+      "constraint_gpu_seconds": 49.81176399999999,
+      "constraint_dispatch_wall_seconds": 51.057776000000004,
+      "constraint_commands": 10,
+      "guard_peak_footprint_bytes": 16566732264,
+      "host_reserve_bytes": 12884901888,
+      "pressure_level_after": 1,
+      "baseline_constraint_wall_seconds": 57.2066,
+      "baseline_constraint_gpu_seconds": 55.811804
+    }
+  ],
+  "profile_result_sha256": "5fe3b362b87563942b392f6aaa984176ffd636ea9c088dc7a76392afe54691ca",
+  "hash_profile_host_snapshot": {
+    "sha256": "7c685ca9bf0cfda0ffbd3827a687b3a898c44f2c8b136edeb0b205698ed05177",
+    "observation": {
+      "observed_utc": "2026-11-04T18:11:21.982793+00:00",
+      "estimated_available_bytes": 30218223616,
+      "estimated_available_method": "free pages plus half of the lesser of file-backed and inactive pages",
+      "thermal": {
+        "low_power_false_may_mean_unknown": true,
+        "low_power_mode_enabled": false,
+        "schema_version": 1,
+        "thermal_nominal_may_mean_unknown": true,
+        "thermal_state": 1,
+        "thermal_state_name": "fair"
+      },
+      "background_process_present": {
+        "brave": true,
+        "chatgpt_codex": true,
+        "claude": true,
+        "colima": true,
+        "vscode": false,
+        "xcode": false
+      },
+      "scope": "instantaneous host observation; no app or VM was stopped for timing"
+    }
+  },
+  "validation": {
+    "native_unit_tests": 5,
+    "cpu_unit_tests": 5,
+    "limit_rejections": 9,
+    "limits_run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/c6114d96173f4993b8c729bd1df682c0",
+    "limits_result_sha256": "89f7565e8cb88b28e8581586bbd13e5d999ae6e6d43a8990f6bdb24086699b94",
+    "lifecycle_run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/3f083b2d4a774067b262a6f964f7afa7",
+    "lifecycle_result_sha256": "a58f5c93a863053b08f9f33a6c0042fecb68cea3ef07091d04fac121c1c93bd5",
+    "lifecycle_verified_proofs": 21,
+    "lifecycle_negative_checks": 63,
+    "lifecycle_idle_first_bytes": 4524691512,
+    "lifecycle_idle_last_bytes": 4505686048,
+    "lifecycle_idle_min_bytes": 4499279904,
+    "lifecycle_idle_max_bytes": 4610445416,
+    "lifecycle_idle_drift_fraction": -0.004200388899352703,
+    "pressure_levels_observed": [
+      1
+    ],
+    "helper_cancel": true,
+    "helper_timeout": false,
+    "worker_timeout": true,
+    "restart": true,
+    "shutdown": true
+  },
+  "gate": {
+    "segment_wall_limit_seconds": 2.0,
+    "observed_arithmetic_per_segment_seconds": 4.78129,
+    "observed_hash_per_segment_seconds": 5.1058699999999995,
+    "paired_10m_saving_gate_seconds": 25.0,
+    "paired_campaign": "not run: per-segment gate already missed in the bounded iteration"
+  },
+  "linux_feature_compile": "not run: only aarch64-apple-darwin installed in the pinned local toolchain",
+  "new_dependencies_or_version_bumps": []
+}

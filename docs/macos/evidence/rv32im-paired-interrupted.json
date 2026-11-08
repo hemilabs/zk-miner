@@ -1,0 +1,316 @@
+{
+  "schema_version": 1,
+  "status": "interrupted_by_outer_suite_timeout",
+  "gate_status": "incomplete",
+  "cause": "Runner used repeat=1 to compute 2400 seconds instead of budgeting all twelve comparison requests. Active round-3 CPU proof was interrupted by the outer timeout. No completed proof or dispatched proof failure was retried or excluded.",
+  "verified_proofs": 7,
+  "negative_checks": 21,
+  "completed_pairs": 2,
+  "candidate_verified_proofs": 4,
+  "baseline_verified_proofs": 3,
+  "proofs": [
+    {
+      "round": 0,
+      "case": 0,
+      "warmup": true,
+      "timings": {
+        "external_verifier_ms": 29.764833,
+        "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+        "method": "monotonic std::time::Instant elapsed wall time",
+        "prove_call_ms": 419980.508667,
+        "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+        "request_id": 1,
+        "same_worker_as_before_prove": true,
+        "schema_version": 1,
+        "worker_pid": 24904,
+        "worker_pid_before_prove": 24904,
+        "worker_start_time_us": 1793732688571759,
+        "worker_start_time_us_before_prove": 1793732688571759
+      },
+      "admission_wait_ms": 0.0,
+      "worker_pid": 24904,
+      "artifact_directory": "target/macos/native-wrap/worker-runs/5d3e4c59f6e945c9a668ba21c203abb2/acceptance/round-0-case-0",
+      "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 13903061944,
+      "pressure_levels": [
+        1
+      ],
+      "idle_worker_footprint_bytes": 4852158760
+    },
+    {
+      "round": 0,
+      "case": 1,
+      "warmup": true,
+      "timings": {
+        "external_verifier_ms": 35.899874999999994,
+        "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+        "method": "monotonic std::time::Instant elapsed wall time",
+        "prove_call_ms": 213162.316209,
+        "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+        "request_id": 2,
+        "same_worker_as_before_prove": true,
+        "schema_version": 1,
+        "worker_pid": 24906,
+        "worker_pid_before_prove": 24906,
+        "worker_start_time_us": 1793732693270679,
+        "worker_start_time_us_before_prove": 1793732693270679
+      },
+      "admission_wait_ms": 0.0,
+      "worker_pid": 24906,
+      "artifact_directory": "target/macos/native-wrap/worker-runs/5d3e4c59f6e945c9a668ba21c203abb2/acceptance/round-0-case-1",
+      "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 16556836256,
+      "pressure_levels": [
+        1
+      ],
+      "idle_worker_footprint_bytes": 5424321168
+    },
+    {
+      "round": 1,
+      "case": 1,
+      "warmup": false,
+      "timings": {
+        "external_verifier_ms": 35.0115,
+        "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+        "method": "monotonic std::time::Instant elapsed wall time",
+        "prove_call_ms": 118969.90825000001,
+        "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+        "request_id": 3,
+        "same_worker_as_before_prove": true,
+        "schema_version": 1,
+        "worker_pid": 24906,
+        "worker_pid_before_prove": 24906,
+        "worker_start_time_us": 1793732693270679,
+        "worker_start_time_us_before_prove": 1793732693270679
+      },
+      "admission_wait_ms": 0.0,
+      "worker_pid": 24906,
+      "artifact_directory": "target/macos/native-wrap/worker-runs/5d3e4c59f6e945c9a668ba21c203abb2/acceptance/round-1-case-1",
+      "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 21241991872,
+      "pressure_levels": [
+        1
+      ],
+      "idle_worker_footprint_bytes": 4933800280
+    },
+    {
+      "round": 1,
+      "case": 0,
+      "warmup": false,
+      "timings": {
+        "external_verifier_ms": 35.6975,
+        "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+        "method": "monotonic std::time::Instant elapsed wall time",
+        "prove_call_ms": 424941.81254199997,
+        "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+        "request_id": 4,
+        "same_worker_as_before_prove": true,
+        "schema_version": 1,
+        "worker_pid": 24904,
+        "worker_pid_before_prove": 24904,
+        "worker_start_time_us": 1793732688571759,
+        "worker_start_time_us_before_prove": 1793732688571759
+      },
+      "admission_wait_ms": 0.0,
+      "worker_pid": 24904,
+      "artifact_directory": "target/macos/native-wrap/worker-runs/5d3e4c59f6e945c9a668ba21c203abb2/acceptance/round-1-case-0",
+      "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 17435686544,
+      "pressure_levels": [
+        1
+      ],
+      "idle_worker_footprint_bytes": 9721945840
+    },
+    {
+      "round": 2,
+      "case": 0,
+      "warmup": false,
+      "timings": {
+        "external_verifier_ms": 35.4325,
+        "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+        "method": "monotonic std::time::Instant elapsed wall time",
+        "prove_call_ms": 422853.538458,
+        "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+        "request_id": 5,
+        "same_worker_as_before_prove": true,
+        "schema_version": 1,
+        "worker_pid": 24904,
+        "worker_pid_before_prove": 24904,
+        "worker_start_time_us": 1793732688571759,
+        "worker_start_time_us_before_prove": 1793732688571759
+      },
+      "admission_wait_ms": 0.0,
+      "worker_pid": 24904,
+      "artifact_directory": "target/macos/native-wrap/worker-runs/5d3e4c59f6e945c9a668ba21c203abb2/acceptance/round-2-case-0",
+      "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 17435686544,
+      "pressure_levels": [
+        1
+      ],
+      "idle_worker_footprint_bytes": 8547867560
+    },
+    {
+      "round": 2,
+      "case": 1,
+      "warmup": false,
+      "timings": {
+        "external_verifier_ms": 27.812375,
+        "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+        "method": "monotonic std::time::Instant elapsed wall time",
+        "prove_call_ms": 120574.200459,
+        "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+        "request_id": 6,
+        "same_worker_as_before_prove": true,
+        "schema_version": 1,
+        "worker_pid": 24906,
+        "worker_pid_before_prove": 24906,
+        "worker_start_time_us": 1793732693270679,
+        "worker_start_time_us_before_prove": 1793732693270679
+      },
+      "admission_wait_ms": 132078.95528999998,
+      "worker_pid": 24906,
+      "artifact_directory": "target/macos/native-wrap/worker-runs/5d3e4c59f6e945c9a668ba21c203abb2/acceptance/round-2-case-1",
+      "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 21241991872,
+      "pressure_levels": [
+        1
+      ],
+      "idle_worker_footprint_bytes": 5015622000
+    },
+    {
+      "round": 3,
+      "case": 1,
+      "warmup": false,
+      "timings": {
+        "external_verifier_ms": 29.866708,
+        "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+        "method": "monotonic std::time::Instant elapsed wall time",
+        "prove_call_ms": 129588.869125,
+        "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+        "request_id": 7,
+        "same_worker_as_before_prove": true,
+        "schema_version": 1,
+        "worker_pid": 24906,
+        "worker_pid_before_prove": 24906,
+        "worker_start_time_us": 1793732693270679,
+        "worker_start_time_us_before_prove": 1793732693270679
+      },
+      "admission_wait_ms": 0.0,
+      "worker_pid": 24906,
+      "artifact_directory": "target/macos/native-wrap/worker-runs/5d3e4c59f6e945c9a668ba21c203abb2/acceptance/round-3-case-1",
+      "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+      "stats": {
+        "paging_cycles": 39642,
+        "reserved_cycles": 443002,
+        "segments": 10,
+        "total_cycles": 10485760,
+        "user_cycles": 10003116
+      },
+      "guard_peak_footprint_bytes": 21241991872,
+      "pressure_levels": [
+        1
+      ],
+      "idle_worker_footprint_bytes": 5022290288
+    }
+  ],
+  "admission_events": [
+    {
+      "case": 1,
+      "error": "host RAM is short for risc0:generic: needs ~24.0 GiB, 0.0 GiB already reserved by proofs in flight, 34.5 GiB available",
+      "event": "admission_wait_started",
+      "round": 2,
+      "worker_pid": 24906
+    },
+    {
+      "admission_wait_ms": 132078.95528999998,
+      "case": 1,
+      "event": "admission_wait_finished",
+      "round": 2
+    }
+  ],
+  "environment_change": {
+    "observed_at": "2026-11-03T19:36:42.072020+00:00",
+    "owner_action": "Owner agreed to quit Brave during round-2 resident Metal pre-dispatch admission wait.",
+    "brave_processes_observed": 0,
+    "timing_scope": "Wait occurred after measured round-2 baseline and before dispatch of round-2 Metal; waits are recorded separately and no measured proof row is removed.",
+    "comparison_limitation": "Background application state changed during the campaign. This is a same-host, counterbalanced whole-stack gate under recorded conditions, not isolated Metal-only attribution or a statistical-significance result.",
+    "colima": "Left running; no memory policy change."
+  },
+  "campaign": "target/macos/review-rv32im/17aadc44828941c78e9934581de44382",
+  "raw_run": "target/macos/native-wrap/worker-runs/5d3e4c59f6e945c9a668ba21c203abb2",
+  "source_archive": {
+    "miner_base_commit": "548ef7e5b4bd07e817cfa1ccccefdeebce6c4119",
+    "files": {
+      "acceptance-binary": "2ed9c368d02b6ab7794c7c884735e2b0da4714de76163e655fd4fdfb21a2dcf1",
+      "macos_worker.rs": "41c88c2bef03c4c1ddfac5b8d5876f5d14e8e2d2e7068b54d6e113c8f52c6348",
+      "test-native-worker.py": "de4f0ba65732b3889317a7dd7531700a8413d8f19fc214b38f48f580594eaaf3",
+      "worker-source.patch": "d82d58534c2316d7b6895a83bf8cad430ac27e42034059d2521c5b0f4dce1c09"
+    },
+    "harness_manifest_sha256": "bb3270ec96fc6dc511d1d78eaf72369b5db6d032a4bbc54be08908476954f13a"
+  },
+  "artifact_sha256": {
+    "target/macos/review-rv32im/17aadc44828941c78e9934581de44382/result.json": "b139d5eacd3a50e63661d8643c7f1267f445dba1529c288c787d0fba20c78be5",
+    "target/macos/native-wrap/worker-runs/5d3e4c59f6e945c9a668ba21c203abb2/result.json": "ab23a8b183b4c4367beab3663bb11d6b891c6c11b64cf4d2612709c6cac3a360",
+    "target/macos/native-wrap/worker-runs/5d3e4c59f6e945c9a668ba21c203abb2/acceptance/requests.jsonl": "0bfd72004b34e3e286f3213ca3d5619a06dba7a95459de8e092dc94536eafd69",
+    "target/macos/native-wrap/worker-runs/5d3e4c59f6e945c9a668ba21c203abb2/test.log": "713d9ec2131b0190f9f4282d7fbe301c4f5000b4e052d0b5d7c6e993acb0f6cb"
+  },
+  "correction": "Suite budget now counts all cases times samples+one warm-up, each per-proof watchdog and permitted admission waits, plus cleanup overhead. Production proof watchdog and memory policy unchanged.",
+  "suite_budget_checks": "target/macos/review-followup/20261102T192422Z/suite-budget-check.log",
+  "suite_budget_checks_sha256": "06491025f7b6cc90a61067efee59c3b7d0af56f0cf66b962176a141ccfc82ef8",
+  "largest_guard_peak_footprint_bytes": 21241991872,
+  "footprint_scope": "Active worker and its native helper group; excludes the other retained worker and other host processes.",
+  "engine_revision": "dcbe9f4b9140a48d4792ffcd3a3eba19897be175",
+  "worker_sha256": "f876cf8e7591e7f9ea98085ccb259ad22f767d54715023b79c5b9caf2e74fc08",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "interrupted_request": {
+    "case": 0,
+    "round": 3,
+    "worker_pid": 24904,
+    "request_id": 8,
+    "status": "interrupted_before_completion",
+    "sidecar": "target/macos/native-wrap/worker-runs/5d3e4c59f6e945c9a668ba21c203abb2/sidecars/24904-8.json",
+    "sidecar_sha256": "1dd41630155207035cae8d29bed1d5be954ddcd496a2340e05b45fa87a1ee2f2"
+  }
+}

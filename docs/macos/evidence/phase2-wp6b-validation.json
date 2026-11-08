@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "scope": "WP6b source-bound warm-driver startup and final-worker correctness; true cold-driver reading collected separately under zkmac",
+  "spec_sha256": "ecd565ffba5582c00c1191d8a427cd5bb48d90440b21b8d0423735e9e7847031",
+  "wp7_merge_commit": "12a88f3f0a7123f419b0177dd7dbdac1b0edf224",
+  "engine_commit": "7816a0002642bf97bbcdd82bd55ebaa22d84ad80",
+  "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "worker_build_manifest": {
+    "path": "target/macos/worker-native-rv32im-metal-build.json",
+    "sha256": "9656a51c5c778c512ebe8faf29e7353e52bbd52a1bb0ff0ca2511f7480270e9a",
+    "binary_sha256": "f65ff7a374e4471404d9bc52dab57d010e12cb5af4d0f5197053b0f8107060ab",
+    "source_inputs_sha256": "b0f44397d7b7afe960670a1607c72f960bd98a6bc6946f0baa9222cb23e5edfe"
+  },
+  "miner_source_file_sha256": {
+    "crates/zkminer-prove-risc0/src/macos.rs": "d9299dd5abe5815a843405cbf9b23cb27feb72689c06844f8df7fb4ff8d855ab",
+    "crates/zkminer-prover/src/worker.rs": "3a7a56a32b9a41b35772b0d245046ee1d024cc5f3590d0854c91c1737a6dafdb",
+    "crates/zkminer-prover/tests/macos_worker.rs": "9c3fd16cc40916ecd8874d3245a2f6c10a3fb77afe033c9c49bd3bbfe2c9e001",
+    "scripts/macos/build-worker.py": "fb0b19f95a7e50a7c3d600fdb996d4788e7f897e72b892ef82c0fd3eea9bfcdc",
+    "scripts/macos/test-native-worker.py": "eb8842cac913b0e4f752d45bda005c00e98b42f7e455bb8991c159a88c78caf2",
+    "scripts/macos/phase2-wp6b-fresh-user.py": "e285b221f7bb7aaea73776925ddb44d09568621e00efe2afcdf0f1f32ac96208"
+  },
+  "acceptance_build": {
+    "path": "target/macos/native-wrap/worker-runs/6144257da32d40a18d119eedf85cec4f/acceptance-build.json",
+    "binary_sha256": "7e18802d2c1514c6e262d05aba4899d7ac84214692f215176269c9ad2c9d9d22",
+    "source_inputs_sha256": "e2f10333b1eddf950a59b446e04f4f0307a96bd1c53d26b52174272a71456dbc"
+  },
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "helper_manifest_sha256": "cab3b912750594cefb8b8da8b300f0b100ed6ccfaf81ee4a041503b966dca830",
+  "sha_acceleration": {
+    "feature": "sha2/asm-aarch64",
+    "dependency_tree": "target/macos/worker-native-rv32im-metal-tree.txt",
+    "tree_sha256": "d2a24e1389ba073886b349b44a525b660e9e97ffdaa472ffc8e75302b430f554",
+    "sha2_asm_present": true
+  },
+  "conditions": {
+    "browser_closed": true,
+    "browser_check": "pgrep -x Brave Browser and pgrep -x Safari returned no main process before controlled startup runs; host snapshots show Brave absent",
+    "host_reserve_override": false,
+    "host_reserve_bytes": 8589934592,
+    "rayon_threads": 18,
+    "go_threads": 18,
+    "host_during": {
+      "path": "target/macos/phase2/wp6b-host-during-validation.json",
+      "sha256": "b6da0d8d951a145042a4e16d04f4b0128856e8b8cc5165e5506b080fd59932cd",
+      "thermal": "nominal"
+    },
+    "host_after": {
+      "path": "target/macos/phase2/wp6b-host-after-validation.json",
+      "sha256": "126277bbc031a101342096ae456abd6ed9cafb00efe1e25d03e112a5346d2427",
+      "thermal": "fair"
+    }
+  },
+  "spawn_to_handshake": {
+    "baseline": {
+      "worker_sha256": "625589c35f6583bfaf4510a00d6f98dceb781b004064500ce38b44b42d659be7",
+      "checkpoint_manifest_sha256": "c8d537ec642be3edc7d3baec9763084b3d492cb8fd3af7ffdaa8c7556dc39574",
+      "run": "target/macos/phase2/wp6b-baseline-handshake.ooe5OX/evidence/complete.json",
+      "run_sha256": "4041545cf15b53d54ca47acd51dee2f119f90941915d1a8c9789ac34129cd212",
+      "samples_ms": [
+        6054.592708,
+        4612.761709,
+        4619.4505
+      ],
+      "median_ms": 4619.4505
+    },
+    "candidate": {
+      "run": "target/macos/native-wrap/worker-runs/d2553ebdc63944b28e9dd77c7e48bf6e",
+      "result_sha256": "d72ba9cf0fc488729d0c093f44d809d8919878fc337b9b3ebc9c8a9622ec667e",
+      "samples_ms": [
+        105.79704199999999,
+        106.722416,
+        212.0675
+      ],
+      "median_ms": 106.722416
+    },
+    "median_saved_ms": 4512.728084,
+    "gate_ms": 1000,
+    "passed": true
+  },
+  "build_time_warmup": {
+    "run_dir": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/6144257da32d40a18d119eedf85cec4f",
+    "workload": "segment-boundary",
+    "po2": 14,
+    "complete_proofs": 1,
+    "tamper_rejections": 3,
+    "prove_call_ms": 29164.470208000002,
+    "request_to_first_completed_gpu_dispatch_ms": 88.688,
+    "external_verifier_ms": 32.949042
+  },
+  "first_request_after_build": {
+    "run": "target/macos/phase2/wp6b-cold-reading-a91329bb7541409e92dedebb618f78e5",
+    "result_sha256": "4896930a45645b2c2ef436ac6afec99355f4a27b864abde64b4f91bd75d25967",
+    "method": "direct WorkerHandle; warm driver; no discovery spawn, execute validation, or harness warmup inside spans",
+    "spans": {
+      "dispatch_epoch_ns": 1794004914763887000,
+      "external_verifier_ms": 19.799667,
+      "handshake_to_request_ms": 0.0005,
+      "request_epoch_ns": 1794004914706767000,
+      "request_to_first_completed_gpu_dispatch_ms": 57.12,
+      "scope": "one WorkerHandle launch and one direct proof request; no discovery spawn, execute validation, or harness warmup in the three spans",
+      "spawn_to_handshake_ms": 105.88208300000001,
+      "status": "cold_timing_verified",
+      "tamper_rejections": 3,
+      "worker_pid": 54544
+    },
+    "request_to_first_dispatch_gate_ms": 5000,
+    "passed": true,
+    "cross_process_timebase": "UNIX epoch nanosecond markers on one host; launch and handshake spans use monotonic Instant"
+  },
+  "corrupt_bundle": {
+    "run": "target/macos/native-wrap/worker-runs/0029adc0e14648df8af48d6dd400bd9f",
+    "result_sha256": "836ae0fb1890bb7f68054dfbf1bf8d75fff82f605c1efa4d01ff2900f5a1ed1e",
+    "result": {
+      "error": "native artifact hash mismatch: prover",
+      "handshake_succeeded": true,
+      "proof_failed_before_helper": true,
+      "status": "corrupt_bundle_rejected",
+      "worker_pid": 54733
+    }
+  },
+  "limit_controls": {
+    "run": "target/macos/native-wrap/worker-runs/acbb3f00312d4aea83d6885284fa13b6",
+    "result_sha256": "f717d4360c940a13d52a3594621a28ddbcad5b798007b0918e1385d228bfb9e2",
+    "cases_passed": 9
+  },
+  "cpu_differentials": {
+    "14": {
+      "run": "target/macos/native-wrap/worker-runs/396570ddd1064c1b8b16621c4cefceca",
+      "result_sha256": "560fdb8bb6b09e4c203bb51e5e9a28f6b2a74772deb24b4092a7f24266986ff1",
+      "verified_proofs": 1,
+      "tamper_rejections": 3,
+      "segment_cpu_checks": 8,
+      "recursion_cpu_checks": 15
+    },
+    "18": {
+      "run": "target/macos/native-wrap/worker-runs/5394d873c29c490791f73666e3e2aaa8",
+      "result_sha256": "f518191cbd3eeedb255d69352ade8b30536899a3a8f5d29c12ef17d78330d315",
+      "verified_proofs": 1,
+      "tamper_rejections": 3,
+      "segment_cpu_checks": 1,
+      "recursion_cpu_checks": 1
+    },
+    "20": {
+      "run": "target/macos/native-wrap/worker-runs/5b0ab48206b6442397440fef879851eb",
+      "result_sha256": "e27feae627cde7c681c7070e47909dbd973bce48c9f4f88bb2dfcbc091239024",
+      "verified_proofs": 1,
+      "tamper_rejections": 3,
+      "segment_cpu_checks": 1,
+      "recursion_cpu_checks": 1
+    }
+  },
+  "lifecycle": {
+    "run": "target/macos/native-wrap/worker-runs/bdc2bdc5743647ca8c046ebc1b53ec2c",
+    "result_sha256": "5b26780927c0d2fdd0ff69da8d572e7d08f3d00457c6b9eb925e196bd8a2f94f",
+    "verified_proofs": 21,
+    "tamper_rejections": 63,
+    "helper_cancel": true,
+    "worker_timeout": true,
+    "restart": true,
+    "shutdown": true,
+    "request_1_idle_rss_bytes": 4446306304,
+    "request_20_idle_rss_bytes": 4492115968,
+    "idle_change_percent": 1.0302858343067545
+  },
+  "macos_cpu_only": {
+    "command": "cargo +1.93.0 check --offline --locked -p zkminer-prover --no-default-features",
+    "log": "target/macos/phase2/wp6b-cpu-only-macos.log",
+    "log_sha256": "1a26c8a1abe6fbec48c8c5d989f683e22d25b789df02a2643200310c79649638",
+    "status": "passed"
+  },
+  "linux_cpu_only": {
+    "status": "not_rerun",
+    "reason": "Colima default and hemi-macos-cpu profiles reported Broken during WP6b; WP7 source-bound Linux CPU-only check passed, and WP6b changes are Mac native-feature gated"
+  },
+  "archive_pr_comment": "https://github.com/dimitryB/risc0/pull/1#issuecomment-6697430623",
+  "engine_wp6b_pr": "https://github.com/dimitryB/risc0/pull/2",
+  "true_cold": {
+    "evidence_path": "docs/macos/evidence/phase2-wp6b-cold.json",
+    "evidence_sha256": "4410bc66a24add1d0aad08f7bb9159bb441ede1608c137771068ff36ff19ee0d",
+    "raw_run_dir": "/Users/Shared/wp6b-cold-reading-826dbf2840994069b10a5878e71a6840",
+    "raw_result_sha256": "cf725000dcf59e40e499b25a1b4ba69c09ff2958de43e85422925269a281a00a",
+    "spans_ms": {
+      "spawn_to_handshake": 106.36541700000001,
+      "handshake_to_first_proof_request": 0.000709,
+      "request_to_first_completed_gpu_dispatch": 25128.991
+    },
+    "complete_proof_ms": 62467.201417,
+    "tamper_rejections": 3,
+    "status": "passed"
+  }
+}

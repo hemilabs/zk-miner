@@ -1,0 +1,271 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-01",
+  "status": "arm64_wrapper_feasibility_passed",
+  "scope": "Rewrapped retained identity-p254 inputs; no fresh guest execution, STARK/recursion proving, or worker integration in this campaign.",
+  "build": {
+    "directory": "/Users/dbur/dev/zk-miner/target/macos/arm64-wrap-builds/fcafe2c4fbec45f0a81bb939254d09b7",
+    "result_sha256": "f04acf8b9cd783dac136c45af242d2304ae87ac901007b3476be539286564d19",
+    "build_seconds": 325.54380658082664,
+    "engine_head": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+    "engine_diff_sha256": "892243251c354f1c116649948a5885c1006d528d19678ce743a0a3ed19633694",
+    "image_id": "sha256:75e360af5ce65deffeee8a8db0765e9fbbdbdb2d85bb5fe93d5eb6c43ca8e052",
+    "buildkit_sha256": "45914fb716061fe24ba430b99736ddc4b159400dafb7979f07e560f78c05311f",
+    "artifacts_sha256": "b143af270da9d6bebda6391feb3632af739d6e93612c02d54381c96008591028",
+    "source_files": {
+      "README.md": "253deb9ed8d51e2bf2ee195523a23f9728bf06e817f99f9d037db5aa5d2f9cad",
+      "circom-compat/.gitignore": "710d51224a5c50fab1c37395f57215ed5e68856da1c8402fdb6d9660d279645e",
+      "circom-compat/README.md": "7acaf82bcec7306d40555a0f084e5e9b3feb33a1ba27468ec5dc1049a6aa0c69",
+      "circom-compat/cmd/converter/main.go": "0ab50a8c4e0c7b4db1a74b0862a4b19c499ab8dbcd315ebc8077f207edef0ec2",
+      "circom-compat/cmd/prover/main.go": "a4fe531e5a490fb52c782ef861a21f339c632a971b274dc9bca3b579519fd6f5",
+      "circom-compat/go.mod": "088070d0af3cebedf81bc426a3a4e940efd4f42b0616de2312cfd20aa461e8db",
+      "circom-compat/go.sum": "54d7cedfa7017aa1886a014e48cb56e41d2965b8b799821d55d42e74b3663581",
+      "circom-compat/internal/utils/io.go": "85a53e9ab46e38d63b823719476a9e41f81a0abb4b924c38af805dd1a73ea75f",
+      "circom-compat/pkg/circom/file.go": "d562f26eff8a5c88fff0ed4be4b2382beb50147a8d825b3c453577ee6e1d3458",
+      "circom-compat/pkg/circom/json/proof.go": "67aa1fab9b4be9188c401f9ffb85768482928dd43d2ba2aa966cae61952963c6",
+      "circom-compat/pkg/circom/json/public.go": "9b17073610fa48065f3866e77360876c4f1c387d4e0c4fb31c23f40a5d46dddb",
+      "circom-compat/pkg/circom/r1cs.go": "067d6c4d4294acde89c763998bdae77c4225cd6e11c29e9014310aa78b7e2010",
+      "circom-compat/pkg/circom/wtns.go": "ff63a416fd554867cd0cf5c023b7edc82d0a02ea0111125d6585b3cde8f4a5bf",
+      "circom-compat/pkg/circom/zkey.go": "693db6e4a7b2238770cfade75e4517029663c9b97021c2b880dcb936a6e26cb0",
+      "circom-compat/test/converter_test.go": "cf9a62b9e0c7d56c53fd1cd7f8fca0e086e17cdac898832bc7f5403f94f95537",
+      "circom-compat/test/data/multiplier2.circom": "4725f76f83985890b7f7c8f8d0997dd0238f2a77ce7824b8a79d3f4b30fdbc8d",
+      "circom-compat/test/data/multiplier2.r1cs": "18e7e2acedabd39db3efaa8a9b457e3dbd3883ae1c421be4a725eec530574ee2",
+      "circom-compat/test/data/multiplier2_final.zkey": "a5917f80be57cc1ccfd476fbab581134099228a8f1d72dd0f5c727e6e1e52498",
+      "circom-compat/test/prover_test.go": "4eeff03aa5cc46c30b835f6014cc515b64a9c66a3e6ced82044fecbd6d9d154b",
+      "docker/ceremony.Dockerfile": "ff8962f81eef6d2b1051a05bf9529e2ce0992a298f6a3b8adba8d0d166739f9c",
+      "docker/prover.Dockerfile": "47a7268758d18ed345d372832d85d092d1304b1eb29a8ff65b27b945ac49bb12",
+      "groth16/.gitignore": "69893f296860c716f1a633e0728faf8aace79e4de4f10e86fbf895bd58754976",
+      "groth16/p0tionConfig.json": "a4436b6b4c820eda853aa0b2022b1ac384230ad2d58cf5683d97784fdb3fff65",
+      "groth16/risc0.circom": "c83994e7877fdb3d3c1f16013005621e4f5b4fe0d86f36ca6787d2fd9727e2fc",
+      "groth16/stark_verify.circom": "a3789471909ba1a13cca783dc5269b25b6d41295abe60234a8075f750017518c",
+      "groth16/verifier.sol": "14bdf78c8b6168b12a5235395d42b8daabb48ee29d49913bb06d20071f156fd6",
+      "scripts/build.sh": "bc6712070baf5ecce21cd587e18fb7f43a56dd9f3c20903313451cb917e455f9",
+      "scripts/chunk.py": "2be181f2e52fa7895bbb8eab0a5dda8b2c11efe996dafbd876afc86b694575a0",
+      "scripts/install_prover.sh": "33ff133753e6c01f66c5397cffa3d4a2d3b1eee62e3c7d581863bfb8c884c138",
+      "scripts/outline.py": "90f43b48af89aafce71a56465cb6bedf8b22df0fa4092b9c973f93737e7db273",
+      "scripts/prover.sh": "62f369d86687b95eefe0f2c99390147219f86452445c653c235e1b088d886f8b",
+      "scripts/replacement-Makefile": "2a22f765e70cfde78f80b407df99186b0f2cec096632cdaf7021a9fc4d92e7c9",
+      "scripts/run_ceremony.sh": "a6d80575708ff60387be96ca8a32b991ebd15f5a1d043adcb1c22c2e149bab65"
+    },
+    "circuit_lfs": {
+      "path": "groth16/stark_verify.circom",
+      "url": "https://media.githubusercontent.com/media/risc0/risc0/a793ffdfb07d62cc5397edc5f3c97a67e61988a4/groth16_proof/groth16/stark_verify.circom",
+      "sha256": "a3789471909ba1a13cca783dc5269b25b6d41295abe60234a8075f750017518c",
+      "size": 58353446
+    }
+  },
+  "final_runner_cached_build": {
+    "directory": "/Users/dbur/dev/zk-miner/target/macos/arm64-wrap-builds/6ecc1f125fb54a9c9488a2e9aac6a78f",
+    "result_sha256": "4d37ef203e5a445abdd6f2650ff6bf19a0566a934ccee2c112f98a5f0931b27b",
+    "build_seconds": 1.206006707623601,
+    "image_id": "sha256:ffa17de67e230ba65219bb0c9439dd10d004a509a0b9baff2439c64b3f01e623",
+    "source_files_match_measured_build": true
+  },
+  "runtime": {
+    "uname_machine": "aarch64",
+    "prover_elf_machine": 183,
+    "witness_elf_machine": 183,
+    "helper_cpus": 6,
+    "gomaxprocs": 6,
+    "helper_memory_limit_bytes": 25769803776,
+    "vm_cpus": 6,
+    "vm_memory_bytes": 34359738368,
+    "network": "none"
+  },
+  "circuit_constraints": 5676573,
+  "circuit_witness_elements": 5635930,
+  "verification": {
+    "new_proofs": 4,
+    "new_proof_negative_rejections": 12,
+    "reference_proofs_rechecked": 4,
+    "reference_negative_rejections": 12,
+    "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+    "verifier_engine": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d"
+  },
+  "tests": {
+    "wrap_controls": 5,
+    "failures": 0,
+    "sdk_seal_byte_equality_fixtures": 3
+  },
+  "limitations": [
+    "One sample per workload/layout; not a five-pair controlled benchmark.",
+    "Serial stage timings use VM wall clock; host call time uses monotonic time and includes Docker launch/exit.",
+    "The pipeline entrypoint overlaps witness generation and loading; only its total was timed.",
+    "24 GiB is a helper limit, not a measured peak.",
+    "Native macOS helper, thread tuning, 10M-cycle acceptance, and non-Mac GPU runtime regression remain pending."
+  ],
+  "runs": [
+    {
+      "run_id": "14b53d756f8347a9abd00af61a6b4c1d",
+      "workload": "fibonacci",
+      "layout": "serial",
+      "stats": {
+        "paging_cycles": 16300,
+        "reserved_cycles": 13152,
+        "segments": 1,
+        "total_cycles": 32768,
+        "user_cycles": 3316
+      },
+      "status": "complete_independently_verified",
+      "source_run": "/Users/dbur/dev/zk-miner/target/macos/runs/08b5cca54b024b9ca9d3400f41b23b1b",
+      "wrap_call_seconds": 15.676932832226157,
+      "verification": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "journal_hex": "6d1a000000000000",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      },
+      "seal_sha256": "a1bd0fb91777ee9ccab11282c72671c1e37aeb24355b2bf346d07c5663081001",
+      "input_json_sha256": "f332e2df6cefdaf89671a75de105e3f8e08f22734c45cf61f24b9441f3e54f51",
+      "identity_seal_sha256": "0e84aed1ce35df113b52a6fea5082f367344d2493896df79e3b0896dd01b2d4a",
+      "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+      "stage_seconds": {
+        "witness": 4.668136655,
+        "prover_including_load": 10.005843174,
+        "serial_total": 14.673979829
+      },
+      "files": {
+        "result.json": "bcae1396aab89da172d6b9e701c3fa4298608af3a71643b9fd17ef2a361f441d",
+        "helper.log": "49fba5343772b08ed1d3f73c9ceb08d611a6b14fe7adda2502127111ba2fd519",
+        "proof.json": "132b7346dfcc538bd8709a00104e50295921fe0292a616fc6f7fdc8e08474694",
+        "seal.bin": "a1bd0fb91777ee9ccab11282c72671c1e37aeb24355b2bf346d07c5663081001",
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      }
+    },
+    {
+      "run_id": "57360d2f575f473bb3507d37c5ae5610",
+      "workload": "sha256-chain",
+      "layout": "serial",
+      "stats": {
+        "paging_cycles": 21738,
+        "reserved_cycles": 61986,
+        "segments": 1,
+        "total_cycles": 131072,
+        "user_cycles": 47348
+      },
+      "status": "complete_independently_verified",
+      "source_run": "/Users/dbur/dev/zk-miner/target/macos/runs/d811a606185449119e0563797f4aaeef",
+      "wrap_call_seconds": 14.5525703728199,
+      "verification": {
+        "elf_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+        "image_id": "58518a60c949a92b89ddcfa8c8b44f65ebbf17ee16c0dffa738ed55563e0a623",
+        "journal_hex": "43f66f29297b60a3a6a09f54f383bf01a44d6c3baa727796983637a32fcb0583",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      },
+      "seal_sha256": "4b5d846be8a5fa24b31c14bb0ee8646f3ce1349099b59fb5a2c79ef5b3de596b",
+      "input_json_sha256": "f62e60d2d558a074e7528a58cd14d64ecb7349e8b7c842153ceb9e4e235e3ef1",
+      "identity_seal_sha256": "c12b7915d53ddf263e4a3b8ec760bcfbe2402c694591c968e40a5c24c6a96807",
+      "elf_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+      "stage_seconds": {
+        "witness": 4.655984165,
+        "prover_including_load": 9.82100019,
+        "serial_total": 14.476984355
+      },
+      "files": {
+        "result.json": "7742a20713a553fcf934412166c6122f95f84cc47f94c29b5ffddb7fa424c63a",
+        "helper.log": "8b26af977caaf9400b836ef3e85999129fdfbf4460be20d95b79f8d3f3087dcc",
+        "proof.json": "d817cf2746788eca8bc12ee5bf5081d3d62b77a6a293504a55f6cbffa8ce6a3c",
+        "seal.bin": "4b5d846be8a5fa24b31c14bb0ee8646f3ce1349099b59fb5a2c79ef5b3de596b",
+        "journal.bin": "4cd16d6f3feb4d6a96bc4d4145fbb3dc87817ed74b4afdf9f2d1e193d4b17f9b",
+        "verification.json": "972d6daa788c9b85b12ce8248eae233600cc229eda2e8c16b66e9b553f2c1a8b",
+        "verifier.log": "cc5d0e16f590d4866ca36c04e1b40df894d4dbff62b4d1454bc20b8a67365340"
+      }
+    },
+    {
+      "run_id": "2a40d8aa0b6f4e7181d52842f3ad1e64",
+      "workload": "segment-boundary",
+      "layout": "serial",
+      "stats": {
+        "paging_cycles": 35483,
+        "reserved_cycles": 133352,
+        "segments": 5,
+        "total_cycles": 294912,
+        "user_cycles": 126077
+      },
+      "status": "complete_independently_verified",
+      "source_run": "/Users/dbur/dev/zk-miner/target/macos/runs/a519537bdfd14f90afa0c536ea5d8ae5",
+      "wrap_call_seconds": 14.580486126244068,
+      "verification": {
+        "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+        "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+        "journal_hex": "f0febc9a78563412",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      },
+      "seal_sha256": "3187c35b579553806974905e4d5dfbf762c05c048f203256b46398f682112762",
+      "input_json_sha256": "55b33fc49eb877e1b631f57224d5941764307ee8a45741d18833f08d2e787c64",
+      "identity_seal_sha256": "680da5189e6899d638d1e6ee8e063dafd16e7503e85f756bacf13ad61c4bebad",
+      "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+      "stage_seconds": {
+        "witness": 4.704191494,
+        "prover_including_load": 9.795833138,
+        "serial_total": 14.500024632
+      },
+      "files": {
+        "result.json": "5406b50f11a0361bc7a7ff4ca396831c3cd63fd838a030238a22d55e5641f14f",
+        "helper.log": "ded75e84910360f8dc328c970346812c16cf8ef7492d6d6a5a754bdd858652c3",
+        "proof.json": "d470947eaacaea5de632b84276f0a774a29bd0b8f8d2768dc5920b317be6d4a8",
+        "seal.bin": "3187c35b579553806974905e4d5dfbf762c05c048f203256b46398f682112762",
+        "journal.bin": "118809efe7677d03153ce329b5af919e724a6f742dc98154e3df4ebbf54b574b",
+        "verification.json": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1",
+        "verifier.log": "eaad05f59663ae87a1136d91dcf4a45cb1131d99b4e99f209b1c3842bbf20009"
+      }
+    },
+    {
+      "run_id": "911e7675408f42c69feb678d1324f1c1",
+      "workload": "fibonacci",
+      "layout": "pipeline",
+      "stats": {
+        "paging_cycles": 16300,
+        "reserved_cycles": 13152,
+        "segments": 1,
+        "total_cycles": 32768,
+        "user_cycles": 3316
+      },
+      "status": "complete_independently_verified",
+      "source_run": "/Users/dbur/dev/zk-miner/target/macos/runs/08b5cca54b024b9ca9d3400f41b23b1b",
+      "wrap_call_seconds": 11.311882333829999,
+      "verification": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "journal_hex": "6d1a000000000000",
+        "negative_tests": [
+          "wrong_image",
+          "modified_journal",
+          "corrupt_seal"
+        ],
+        "verification": "passed"
+      },
+      "seal_sha256": "6b043a602ab1117dad1fca7c9645c4c96486d192a0d0a7a8902509a4635e8c0e",
+      "input_json_sha256": "f332e2df6cefdaf89671a75de105e3f8e08f22734c45cf61f24b9441f3e54f51",
+      "identity_seal_sha256": "0e84aed1ce35df113b52a6fea5082f367344d2493896df79e3b0896dd01b2d4a",
+      "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+      "stage_seconds": null,
+      "files": {
+        "result.json": "808f9e819005e76719b6607ff1c92afc215b0c46d781556fd2aa81633f096b06",
+        "helper.log": "ee226694836a527b70591db2e8eb152d3370c4c40a39dba05b50079d96174f03",
+        "proof.json": "08b488ea706ed9704237d0de7ded4dce2b5efe6092b1242e7c08c99d4c83f91f",
+        "seal.bin": "6b043a602ab1117dad1fca7c9645c4c96486d192a0d0a7a8902509a4635e8c0e",
+        "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+        "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+        "verifier.log": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7"
+      }
+    }
+  ]
+}

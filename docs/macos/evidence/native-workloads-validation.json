@@ -1,0 +1,3844 @@
+{
+  "schema_version": 1,
+  "status": "campaign_completed",
+  "campaign": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/workload-campaigns/2edca085145446d5a3e89270d6087a7a",
+  "collector_sha256": "5cde1c38a0089853ae6a9552cfdf067e996d2f32dccb7f846dce767ab40e380b",
+  "campaign_sha256": "381367d2613e499fd540e17ab7cb5b0a76b6e4c7b4eed1889f1541607356f320",
+  "plan_sha256": "9130eb1d86f0f9a34b4e64c408e0141d762406fcbd6d3944dae2afb71448b0e5",
+  "worker_binary_sha256": "c840171455402715f8cfb39b2235698b910c016c2d4b24cea8bab473eb9a9e85",
+  "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "useful_target_passed": true,
+  "cases": [
+    {
+      "name": "limits",
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "/Users/dbur/dev/zk-miner/scripts/macos/test-native-worker.py",
+        "--engine",
+        "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "--limit-controls",
+        "--repeat",
+        "1",
+        "--proof-only"
+      ],
+      "status": "passed",
+      "started": "2026-11-01T22:03:02.534824+00:00",
+      "seconds": 11.792096581310034,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/7a31f153d3c24228b6d2dfc1d5aeb6be",
+      "result_sha256": "1f4bf9c00b213bd3f4efcb38f686fa0a74b8e820687d9204f3d5d86d4b64b9ab",
+      "run_hashes": {
+        "result.json": "1f4bf9c00b213bd3f4efcb38f686fa0a74b8e820687d9204f3d5d86d4b64b9ab",
+        "acceptance-build.json": "94980e18540e07d92ed03b3a6f45e2a9a0ae2e19938ad42035b1d5f78cce6768",
+        "test.log": "558aa7a97a14f6789b4db582b8f8fcba071c3526686af5b5814d61c07fd5de57",
+        "acceptance/complete.json": "5f2b30d99b4e7c0549fa63a4d7b27ec8507a36785308244ca3951f7f5af9174c"
+      },
+      "proofs": []
+    },
+    {
+      "name": "tiny-tail",
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "/Users/dbur/dev/zk-miner/scripts/macos/test-native-worker.py",
+        "--engine",
+        "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "--workload",
+        "segment-boundary",
+        "--iterations",
+        "0",
+        "--po2",
+        "14",
+        "--repeat",
+        "1",
+        "--proof-only"
+      ],
+      "status": "passed",
+      "started": "2026-11-01T22:03:14.332761+00:00",
+      "seconds": 80.47324779070914,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/637ad9d9b31b471e9c1aaed4a9e87c46",
+      "result_sha256": "52c2571357e5170dae7af99d561c5bbdf768ead32a5e2728b512edf3cae505a9",
+      "run_hashes": {
+        "result.json": "52c2571357e5170dae7af99d561c5bbdf768ead32a5e2728b512edf3cae505a9",
+        "acceptance-build.json": "94980e18540e07d92ed03b3a6f45e2a9a0ae2e19938ad42035b1d5f78cce6768",
+        "test.log": "cf02caee5535f74a554e1565b8631e95d0a882985a17e1fa60e17b1e295bbd46",
+        "acceptance/complete.json": "05f0ee558986f0da9af27c7bfe9f46189e0d668932474557688def8e6f4e5f83",
+        "acceptance/requests.jsonl": "16b0d509cb1628daf11207e2a092e218e0b4bf329d583a3560a3e4ffaf446b9c"
+      },
+      "proofs": [
+        {
+          "case": "proof-0",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-78140-1793570600794238000-2",
+            "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+            "input_sha256": "7c9fa136d4413fa6173637e883b6998d32e1d675f88cddff9dcbcf331820f4b8",
+            "journal_hex": "f0debc9a78563412",
+            "journal_sha256": "54d0f38d95f8d3402c0171bbeac9c182e0908b4e17130986474268e763738fc5",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 14,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 1,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "ea2bd2ac679e826f2db27392ed093fc063013f2da97c7881c79e5f289bd84c3f",
+            "stage_ms": {
+              "execution_and_segment": 2970.126708,
+              "identity_and_wrap": 24935.949666,
+              "recursion": 32016.022625,
+              "verification": 1.748791
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 42404,
+              "reserved_cycles": 36326,
+              "segments": 5,
+              "total_cycles": 81920,
+              "user_cycles": 3190
+            },
+            "total_ms": 59981.498083,
+            "worker_pid": 78204
+          },
+          "timings": {
+            "external_verifier_ms": 36.354749999999996,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 60582.993209,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 1,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 78204,
+            "worker_pid_before_prove": 78204,
+            "worker_start_time_us": 1793570600794420,
+            "worker_start_time_us_before_prove": 1793570600794420
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 4573302504,
+            "sampled_helper_footprint_peak_bytes": 7344805528,
+            "sampled_group_footprint_peak_bytes": 11918042496,
+            "guard_lifetime_group_peak_bytes": 11918042496,
+            "estimated_host_available_minimum_bytes": 41439969280,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "54d0f38d95f8d3402c0171bbeac9c182e0908b4e17130986474268e763738fc5",
+            "receipt.bin": "c872a19fa9ad682a2bf83ce79f5012f6698efb177bef443bf6dfa7d6eeaeee02",
+            "resource.json": "98141ac6e81317fb74078d7797e03d09f3edb6699d8b079aeb08dbf614ab937d",
+            "seal.bin": "ea2bd2ac679e826f2db27392ed093fc063013f2da97c7881c79e5f289bd84c3f",
+            "timing.json": "2d9455bcc0c397317037c1de0e6052228050212688ab3b78d7a2b0114ff1d33d",
+            "verification.json": "561957af71a204bf2776a571d01b9d28172871faf231a39eb3d81756853e8af7",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "44b6cb4bb6efc34a4b82523d6e0ffbbea285df26c968bbbd7f37d94324cd3241",
+            "worker.json": "64e1df1c038d571f774972199f2db89f8b6e862e71477bc9f6c538b6489402d5"
+          }
+        }
+      ]
+    },
+    {
+      "name": "segment-boundary",
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "/Users/dbur/dev/zk-miner/scripts/macos/test-native-worker.py",
+        "--engine",
+        "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "--workload",
+        "segment-boundary",
+        "--repeat",
+        "1",
+        "--proof-only"
+      ],
+      "status": "passed",
+      "started": "2026-11-01T22:04:34.832566+00:00",
+      "seconds": 89.66998962312937,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/ead3eb80dbd243868473c78022c93bef",
+      "result_sha256": "af1c90699a73d6bfd3d887c481039fdeae8fb9c85c82d43f9be64952b76d8ba6",
+      "run_hashes": {
+        "result.json": "af1c90699a73d6bfd3d887c481039fdeae8fb9c85c82d43f9be64952b76d8ba6",
+        "acceptance-build.json": "94980e18540e07d92ed03b3a6f45e2a9a0ae2e19938ad42035b1d5f78cce6768",
+        "test.log": "b44788b67bed6c0c2a99cdd41a4426d7c99654407b4cdbea48de016c5e647b47",
+        "acceptance/complete.json": "f29ccdaf1782b064312ef043651e0c26ecd378ab15297d0e7cf0604f145c99a3",
+        "acceptance/requests.jsonl": "bb8f139af4871b8901fce8f23a201bf458a4b7e540c66222e9cc2e38b2dab279"
+      },
+      "proofs": [
+        {
+          "case": "proof-0",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-78937-1793570681308925000-2",
+            "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+            "input_sha256": "226868b59be3e5e479cc22d7bda11055bad06bb205b77454ea36c65885f5c284",
+            "journal_hex": "f0febc9a78563412",
+            "journal_sha256": "118809efe7677d03153ce329b5af919e724a6f742dc98154e3df4ebbf54b574b",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 16,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 1,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "b3603d0219f81936911211e1a805b8228ca49d6f2a5e1c512a6feb23a2478695",
+            "stage_ms": {
+              "execution_and_segment": 10440.381041,
+              "identity_and_wrap": 25279.140792,
+              "recursion": 33528.110292,
+              "verification": 1.734916
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 35483,
+              "reserved_cycles": 133352,
+              "segments": 5,
+              "total_cycles": 294912,
+              "user_cycles": 126077
+            },
+            "total_ms": 69313.369584,
+            "worker_pid": 78994
+          },
+          "timings": {
+            "external_verifier_ms": 21.557334,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 69650.40424999999,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 1,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 78994,
+            "worker_pid_before_prove": 78994,
+            "worker_start_time_us": 1793570681309067,
+            "worker_start_time_us_before_prove": 1793570681309067
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 4895444976,
+            "sampled_helper_footprint_peak_bytes": 7688869792,
+            "sampled_group_footprint_peak_bytes": 12584265616,
+            "guard_lifetime_group_peak_bytes": 12609447824,
+            "estimated_host_available_minimum_bytes": 40544993280,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "118809efe7677d03153ce329b5af919e724a6f742dc98154e3df4ebbf54b574b",
+            "receipt.bin": "7bf69e79679b2387a85912812fac475de01da3d4e2616cdd1c46ea3f64c4b700",
+            "resource.json": "c96753daa3f83757d1ab4f861033156a9a889970cb5c3890b66453bbf2be1da2",
+            "seal.bin": "b3603d0219f81936911211e1a805b8228ca49d6f2a5e1c512a6feb23a2478695",
+            "timing.json": "e983b9e876b2db68d99e44cf06819e4d08e6f463e617b30a71b4d111c6c790a0",
+            "verification.json": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "eaad05f59663ae87a1136d91dcf4a45cb1131d99b4e99f209b1c3842bbf20009",
+            "worker.json": "ca595e499b204deba9d60856020a5c928e0a7d77f52c29d1a03694278f81dab1"
+          }
+        }
+      ]
+    },
+    {
+      "name": "arithmetic-10m",
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "/Users/dbur/dev/zk-miner/scripts/macos/test-native-worker.py",
+        "--engine",
+        "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "--workload",
+        "fibonacci",
+        "--iterations",
+        "1000000",
+        "--min-guest-cycles",
+        "10000000",
+        "--repeat",
+        "5",
+        "--warmup",
+        "--proof-only",
+        "--timeout-seconds",
+        "1800",
+        "--po2",
+        "20"
+      ],
+      "status": "passed",
+      "started": "2026-11-01T22:06:04.503632+00:00",
+      "seconds": 2940.0142511688173,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/e41b569eb8d145a68f1d7d46fed2b164",
+      "result_sha256": "2599c77eab2c22cd8959cbb30c0ad62dd19f5d0c68b9ebc504325002058460e7",
+      "measured_complete_seconds": [
+        470.78540270800005,
+        485.06549995800003,
+        476.894592,
+        502.43912550000005,
+        483.927494709
+      ],
+      "median_complete_seconds": 483.927494709,
+      "useful_target_passed": true,
+      "run_hashes": {
+        "result.json": "2599c77eab2c22cd8959cbb30c0ad62dd19f5d0c68b9ebc504325002058460e7",
+        "acceptance-build.json": "94980e18540e07d92ed03b3a6f45e2a9a0ae2e19938ad42035b1d5f78cce6768",
+        "test.log": "3ff061c989effd823fdf4da59453301a7f8e1278edb2da99ac52b56b9df213aa",
+        "acceptance/complete.json": "3d67e7a5f819241d14eb1f31748bbd99fc3338ce48b43c58e135adc21dc16bac",
+        "acceptance/requests.jsonl": "2d93ffa1aebf0a5b547a6bebadc580a3f369e523f6d94e5d306c0e4148648510"
+      },
+      "proofs": [
+        {
+          "case": "proof-0",
+          "warmup": true,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-79864-1793570771017992000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+            "journal_hex": "bb14577088ab06c5",
+            "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 1,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "ff8c3cc35b8e415e6d251e8cb5547fed8b8e88a9b068d881f7278d7a2a46f032",
+            "stage_ms": {
+              "execution_and_segment": 388001.269334,
+              "identity_and_wrap": 26513.417125,
+              "recursion": 78464.18616699999,
+              "verification": 1.733834
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 39642,
+              "reserved_cycles": 443002,
+              "segments": 10,
+              "total_cycles": 10485760,
+              "user_cycles": 10003116
+            },
+            "total_ms": 493117.910667,
+            "worker_pid": 79921
+          },
+          "timings": {
+            "external_verifier_ms": 20.110792,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 494123.189459,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 1,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 79921,
+            "worker_pid_before_prove": 79921,
+            "worker_start_time_us": 1793570771018139,
+            "worker_start_time_us_before_prove": 1793570771018139
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 10342620888,
+            "sampled_helper_footprint_peak_bytes": 7352260296,
+            "sampled_group_footprint_peak_bytes": 12153530016,
+            "guard_lifetime_group_peak_bytes": 12153530016,
+            "estimated_host_available_minimum_bytes": 40396390400,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+            "receipt.bin": "d8a39ec4005f08417c9c325a7c28440ee47e03f18fbf5d1e15e34e8bbc865a03",
+            "resource.json": "1f214652b75109656557bb2df4d4ee326dfd5d129fb62b35bb31f0512400a2fc",
+            "seal.bin": "ff8c3cc35b8e415e6d251e8cb5547fed8b8e88a9b068d881f7278d7a2a46f032",
+            "timing.json": "cdaab2532638c9c17b6c9de6786e9235da2b472e6567608c9c774377d062ec51",
+            "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "cc30750b5d557304d23e09fa32f331aa76da410bf91039a2585e06ee4f7545af",
+            "worker.json": "8cbd70e58cc7c150dde217ba1b93a6d9fbab55438126ce2f0b23a9f97904a676"
+          }
+        },
+        {
+          "case": "proof-1",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-79864-1793570771017992000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+            "journal_hex": "bb14577088ab06c5",
+            "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 2,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "b659b2c57b4d58e33f6bebc83e4bd3c1b6e1544d444f75255796ffb3f1b8404f",
+            "stage_ms": {
+              "execution_and_segment": 386732.223542,
+              "identity_and_wrap": 17266.513499999997,
+              "recursion": 65676.02466699999,
+              "verification": 1.751167
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 39642,
+              "reserved_cycles": 443002,
+              "segments": 10,
+              "total_cycles": 10485760,
+              "user_cycles": 10003116
+            },
+            "total_ms": 469804.363792,
+            "worker_pid": 79921
+          },
+          "timings": {
+            "external_verifier_ms": 29.722583,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 470755.680125,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 2,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 79921,
+            "worker_pid_before_prove": 79921,
+            "worker_start_time_us": 1793570771018139,
+            "worker_start_time_us_before_prove": 1793570771018139
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 13258450808,
+            "sampled_helper_footprint_peak_bytes": 7713314720,
+            "sampled_group_footprint_peak_bytes": 13258450808,
+            "guard_lifetime_group_peak_bytes": 13258450808,
+            "estimated_host_available_minimum_bytes": 38703628288,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+            "receipt.bin": "b3e642b24f81a6d0e5132afc78719077c4b4638388f9fe69422ea874840f5462",
+            "resource.json": "9ec02aa65de145274213aa4a260ab3c08946cedaf873876997d6e93bd704e903",
+            "seal.bin": "b659b2c57b4d58e33f6bebc83e4bd3c1b6e1544d444f75255796ffb3f1b8404f",
+            "timing.json": "28442073d5688df4bce4df37e2e74abf15b1e43c72c38cbaac32cfb86cf7d605",
+            "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "cc30750b5d557304d23e09fa32f331aa76da410bf91039a2585e06ee4f7545af",
+            "worker.json": "046a5e8239e41a699158f59f32fea5d93add8278f5f52c60ae8e1c0dfe13375d"
+          }
+        },
+        {
+          "case": "proof-2",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-79864-1793570771017992000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+            "journal_hex": "bb14577088ab06c5",
+            "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 3,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "a21bc49d15a51fc4588f83bda1d79f86097339134a85e72919337029b256bdf4",
+            "stage_ms": {
+              "execution_and_segment": 396674.440125,
+              "identity_and_wrap": 17576.779375000002,
+              "recursion": 70187.71395800001,
+              "verification": 1.716125
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 39642,
+              "reserved_cycles": 443002,
+              "segments": 10,
+              "total_cycles": 10485760,
+              "user_cycles": 10003116
+            },
+            "total_ms": 484571.173208,
+            "worker_pid": 79921
+          },
+          "timings": {
+            "external_verifier_ms": 30.147875000000003,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 485035.352083,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 3,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 79921,
+            "worker_pid_before_prove": 79921,
+            "worker_start_time_us": 1793570771018139,
+            "worker_start_time_us_before_prove": 1793570771018139
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 13434939400,
+            "sampled_helper_footprint_peak_bytes": 7346607768,
+            "sampled_group_footprint_peak_bytes": 13434939400,
+            "guard_lifetime_group_peak_bytes": 13434939400,
+            "estimated_host_available_minimum_bytes": 38704611328,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+            "receipt.bin": "1bcd147148c7af696d503f6608a4f1a596a6e418162ce7d22c5f695093dcb70c",
+            "resource.json": "35fe83952fbd7ee8ab02b0c09bcc736015c220d3bb7597ee5b50bacdacec3017",
+            "seal.bin": "a21bc49d15a51fc4588f83bda1d79f86097339134a85e72919337029b256bdf4",
+            "timing.json": "1f5eac89ac0ef0f33bf659b9b836ceefe1780cf5587569e3ebf5f15958b9ec08",
+            "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "cc30750b5d557304d23e09fa32f331aa76da410bf91039a2585e06ee4f7545af",
+            "worker.json": "69482eadbf68e2cf58f6260a1a29cf60c02c34963d2f29e15b3aa1bb08db7615"
+          }
+        },
+        {
+          "case": "proof-3",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-79864-1793570771017992000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+            "journal_hex": "bb14577088ab06c5",
+            "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 4,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "361fcb3e68a454be7bf114a27b87944681fd93aed3c30e0101c584d463aed36c",
+            "stage_ms": {
+              "execution_and_segment": 383056.393958,
+              "identity_and_wrap": 20525.787083,
+              "recursion": 72627.93825,
+              "verification": 1.757708
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 39642,
+              "reserved_cycles": 443002,
+              "segments": 10,
+              "total_cycles": 10485760,
+              "user_cycles": 10003116
+            },
+            "total_ms": 476343.990042,
+            "worker_pid": 79921
+          },
+          "timings": {
+            "external_verifier_ms": 20.405333000000002,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 476874.186667,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 4,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 79921,
+            "worker_pid_before_prove": 79921,
+            "worker_start_time_us": 1793570771018139,
+            "worker_start_time_us_before_prove": 1793570771018139
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 12946499280,
+            "sampled_helper_footprint_peak_bytes": 7714117560,
+            "sampled_group_footprint_peak_bytes": 12948957408,
+            "guard_lifetime_group_peak_bytes": 13434939400,
+            "estimated_host_available_minimum_bytes": 38241943552,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+            "receipt.bin": "29ba25111fd83bd01786e764912d1039ea89e89a5364596bc765cd03ddfe1aec",
+            "resource.json": "740b3d0fca88a58b2ab9c6cadd42c791361291d5577f6e03ed535e71329ee2aa",
+            "seal.bin": "361fcb3e68a454be7bf114a27b87944681fd93aed3c30e0101c584d463aed36c",
+            "timing.json": "0e6654434347a5e04b7593facbfc39b2e988e177d2f517f1f3715e8a58cb95df",
+            "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "cc30750b5d557304d23e09fa32f331aa76da410bf91039a2585e06ee4f7545af",
+            "worker.json": "12880b70fe9c4545a3c218c87f42126ec5b0ae61ac2905ecde16e502cdab1d76"
+          }
+        },
+        {
+          "case": "proof-4",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-79864-1793570771017992000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+            "journal_hex": "bb14577088ab06c5",
+            "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 5,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "4486dfa109990c95f6a9f7ed1c9ab71db0c754b69f62913ce81dd5151ffbdf1c",
+            "stage_ms": {
+              "execution_and_segment": 417827.474834,
+              "identity_and_wrap": 17886.777209,
+              "recursion": 66048.590042,
+              "verification": 1.701041
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 39642,
+              "reserved_cycles": 443002,
+              "segments": 10,
+              "total_cycles": 10485760,
+              "user_cycles": 10003116
+            },
+            "total_ms": 501892.627666,
+            "worker_pid": 79921
+          },
+          "timings": {
+            "external_verifier_ms": 28.195625,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 502410.92987500003,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 5,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 79921,
+            "worker_pid_before_prove": 79921,
+            "worker_start_time_us": 1793570771018139,
+            "worker_start_time_us_before_prove": 1793570771018139
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 13368338368,
+            "sampled_helper_footprint_peak_bytes": 7715690448,
+            "sampled_group_footprint_peak_bytes": 13368338368,
+            "guard_lifetime_group_peak_bytes": 13434939400,
+            "estimated_host_available_minimum_bytes": 35308929024,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+            "receipt.bin": "b68186f8ee0a654f7b5a65da7b139bce1404162bc7175e9e4553f73328e1bfac",
+            "resource.json": "d0601ff2c3a4173dba6812968199aeed5351b5937087cdc9b0176cb26598cac7",
+            "seal.bin": "4486dfa109990c95f6a9f7ed1c9ab71db0c754b69f62913ce81dd5151ffbdf1c",
+            "timing.json": "645afc28aa5168657ac59ce04043f794ac1397a26ad825ac9a01fe3990d68e10",
+            "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "cc30750b5d557304d23e09fa32f331aa76da410bf91039a2585e06ee4f7545af",
+            "worker.json": "0e570eee7b3be0a8d632c98856bb65251a2d97d846bf78d475d06b91336c0a7c"
+          }
+        },
+        {
+          "case": "proof-5",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-79864-1793570771017992000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+            "journal_hex": "bb14577088ab06c5",
+            "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 6,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "12f9af2d3358d4144af26b749b05a8b5f431b8b074a79680727757c12e3bb961",
+            "stage_ms": {
+              "execution_and_segment": 397249.639625,
+              "identity_and_wrap": 17797.508209,
+              "recursion": 67897.488167,
+              "verification": 1.710791
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 39642,
+              "reserved_cycles": 443002,
+              "segments": 10,
+              "total_cycles": 10485760,
+              "user_cycles": 10003116
+            },
+            "total_ms": 483075.163833,
+            "worker_pid": 79921
+          },
+          "timings": {
+            "external_verifier_ms": 31.352249999999998,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 483896.142459,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 6,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 79921,
+            "worker_pid_before_prove": 79921,
+            "worker_start_time_us": 1793570771018139,
+            "worker_start_time_us_before_prove": 1793570771018139
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 12904294048,
+            "sampled_helper_footprint_peak_bytes": 7171528224,
+            "sampled_group_footprint_peak_bytes": 12904294048,
+            "guard_lifetime_group_peak_bytes": 13434939400,
+            "estimated_host_available_minimum_bytes": 35908091904,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+            "receipt.bin": "81b330bed833de839e95b33addd621c83265e692bd3903d5b63996e5a3339615",
+            "resource.json": "8cefca4796ef082d8a67ca0e80905812e8325b0459ba2f69f678bc07c88c28f5",
+            "seal.bin": "12f9af2d3358d4144af26b749b05a8b5f431b8b074a79680727757c12e3bb961",
+            "timing.json": "1a85c0e41d6cab81220b389add8cd759e4dd28588e532331306bd555fc35bf65",
+            "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "cc30750b5d557304d23e09fa32f331aa76da410bf91039a2585e06ee4f7545af",
+            "worker.json": "6523ddc8c501ea4d12404ec8b987fd01248828551198d6444f195bde23b237c1"
+          }
+        }
+      ],
+      "worker_body_seconds": {
+        "n": 5,
+        "median": 483.075163833,
+        "minimum": 469.804363792,
+        "maximum": 501.892627666
+      },
+      "complete_seconds": {
+        "n": 5,
+        "median": 483.927494709,
+        "minimum": 470.78540270800005,
+        "maximum": 502.43912550000005
+      },
+      "stages_seconds": {
+        "execution_and_segment": {
+          "n": 5,
+          "median": 396.67444012500005,
+          "minimum": 383.056393958,
+          "maximum": 417.827474834
+        },
+        "identity_and_wrap": {
+          "n": 5,
+          "median": 17.797508209,
+          "minimum": 17.2665135,
+          "maximum": 20.525787083
+        },
+        "recursion": {
+          "n": 5,
+          "median": 67.897488167,
+          "minimum": 65.676024667,
+          "maximum": 72.62793825
+        },
+        "verification": {
+          "n": 5,
+          "median": 0.001716125,
+          "minimum": 0.001701041,
+          "maximum": 0.001757708
+        }
+      }
+    },
+    {
+      "name": "hash-10m",
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "/Users/dbur/dev/zk-miner/scripts/macos/test-native-worker.py",
+        "--engine",
+        "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "--workload",
+        "sha256-chain",
+        "--iterations",
+        "2262",
+        "--min-guest-cycles",
+        "10000000",
+        "--repeat",
+        "5",
+        "--warmup",
+        "--proof-only",
+        "--timeout-seconds",
+        "1800",
+        "--po2",
+        "20"
+      ],
+      "status": "passed",
+      "started": "2026-11-01T22:55:04.600545+00:00",
+      "seconds": 2910.176772251725,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/b4c770592ed84fa4ac869db213481a0d",
+      "result_sha256": "cf080bb5778a4b9045fc0034f13d19691ce9348f0ee995f78c778562774e8cd2",
+      "measured_complete_seconds": [
+        476.083553833,
+        476.853305418,
+        477.892510541,
+        483.927017292,
+        473.8385555830001
+      ],
+      "median_complete_seconds": 476.853305418,
+      "useful_target_passed": true,
+      "run_hashes": {
+        "result.json": "cf080bb5778a4b9045fc0034f13d19691ce9348f0ee995f78c778562774e8cd2",
+        "acceptance-build.json": "94980e18540e07d92ed03b3a6f45e2a9a0ae2e19938ad42035b1d5f78cce6768",
+        "test.log": "07403e4652a06e23841aa03737b283dd16ce24b53729f2a5458d74bcc8df2c0a",
+        "acceptance/complete.json": "f7eb28ea965ebbd2b9cd3e6bb43ce9123b402a00947c34330ecb677fb15609ab",
+        "acceptance/requests.jsonl": "5346a592c6f6745d2fdaee70717406ad0e1f23f303231600d8e6a05ab48052bc"
+      },
+      "proofs": [
+        {
+          "case": "proof-0",
+          "warmup": true,
+          "worker": {
+            "elf_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-17190-1793573711083015000-2",
+            "image_id": "58518a60c949a92b89ddcfa8c8b44f65ebbf17ee16c0dffa738ed55563e0a623",
+            "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+            "journal_hex": "7b3b9da440ac877e14646d0dbff269ec24926a37a504819bae0e7b2f6226b5b4",
+            "journal_sha256": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 1,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "2f58635033ad601ef0b0483ec63d5a616952626ee1561a26a7c9097f9b923346",
+            "stage_ms": {
+              "execution_and_segment": 400679.857375,
+              "identity_and_wrap": 24733.231542,
+              "recursion": 68505.805792,
+              "verification": 1.737291
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 109720,
+              "reserved_cycles": 372600,
+              "segments": 10,
+              "total_cycles": 10485760,
+              "user_cycles": 10003440
+            },
+            "total_ms": 494056.268958,
+            "worker_pid": 17259
+          },
+          "timings": {
+            "external_verifier_ms": 33.029416999999995,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 495025.84341699997,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 1,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 17259,
+            "worker_pid_before_prove": 17259,
+            "worker_start_time_us": 1793573711083226,
+            "worker_start_time_us_before_prove": 1793573711083226
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 10327596736,
+            "sampled_helper_footprint_peak_bytes": 7353308896,
+            "sampled_group_footprint_peak_bytes": 12159493840,
+            "guard_lifetime_group_peak_bytes": 12159493840,
+            "estimated_host_available_minimum_bytes": 38460850176,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+            "receipt.bin": "2338fb12b6e8e884c07ad3b696bfb7a33c98fd517a2dc36ff6b26a5dbb9e5d59",
+            "resource.json": "ea27fb99d80d8b27734a3771c15657d68b2a6ca7161098b00c9b76502a37034e",
+            "seal.bin": "2f58635033ad601ef0b0483ec63d5a616952626ee1561a26a7c9097f9b923346",
+            "timing.json": "01a3e928e513083b50f30ba4f224be6389802c14721f45f58a2713a3b88308ec",
+            "verification.json": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "d5b6427ab0f3498bb97d22a80f5dd444bab188e60c9dcc8bf494c97110497c5b",
+            "worker.json": "46048cae8855866556c5f1c1349c27a1f03d7c814620d893ac4801a520f8aa65"
+          }
+        },
+        {
+          "case": "proof-1",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-17190-1793573711083015000-2",
+            "image_id": "58518a60c949a92b89ddcfa8c8b44f65ebbf17ee16c0dffa738ed55563e0a623",
+            "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+            "journal_hex": "7b3b9da440ac877e14646d0dbff269ec24926a37a504819bae0e7b2f6226b5b4",
+            "journal_sha256": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 2,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "e0dde525f9c0176200bec32171e7b7e34f2baaa95182834115b46e7305520b54",
+            "stage_ms": {
+              "execution_and_segment": 390981.014375,
+              "identity_and_wrap": 17433.947666,
+              "recursion": 66900.018875,
+              "verification": 1.715209
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 109720,
+              "reserved_cycles": 372600,
+              "segments": 10,
+              "total_cycles": 10485760,
+              "user_cycles": 10003440
+            },
+            "total_ms": 475446.391458,
+            "worker_pid": 17259
+          },
+          "timings": {
+            "external_verifier_ms": 33.404999999999994,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 476050.148833,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 2,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 17259,
+            "worker_pid_before_prove": 17259,
+            "worker_start_time_us": 1793573711083226,
+            "worker_start_time_us_before_prove": 1793573711083226
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 13251848056,
+            "sampled_helper_footprint_peak_bytes": 7345378944,
+            "sampled_group_footprint_peak_bytes": 13251848056,
+            "guard_lifetime_group_peak_bytes": 13251848056,
+            "estimated_host_available_minimum_bytes": 37629313024,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+            "receipt.bin": "7f3dd5501ba3037d357056a48ed7a420c89ae07f5a739b2edb5fcfdd3c6c91c8",
+            "resource.json": "686341b5df3aeb91aa0b7ee1e269ff37bdddd1894708e54d87f6d5d2dfdd7758",
+            "seal.bin": "e0dde525f9c0176200bec32171e7b7e34f2baaa95182834115b46e7305520b54",
+            "timing.json": "0a244abdd1dbadda916982295e5b1a6fbd88e8a8d2e5acc7b4e8acf7f5705f19",
+            "verification.json": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "d5b6427ab0f3498bb97d22a80f5dd444bab188e60c9dcc8bf494c97110497c5b",
+            "worker.json": "62c53a8fe81c13b3d65b7362e545b172949b22c5763a0ca67634c9b105b4ae8a"
+          }
+        },
+        {
+          "case": "proof-2",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-17190-1793573711083015000-2",
+            "image_id": "58518a60c949a92b89ddcfa8c8b44f65ebbf17ee16c0dffa738ed55563e0a623",
+            "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+            "journal_hex": "7b3b9da440ac877e14646d0dbff269ec24926a37a504819bae0e7b2f6226b5b4",
+            "journal_sha256": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 3,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "522eabb35414286631776f6a2ff8490193c06c3a6d50caa6843603ab9722b63c",
+            "stage_ms": {
+              "execution_and_segment": 392631.577667,
+              "identity_and_wrap": 17452.898709,
+              "recursion": 66387.691625,
+              "verification": 1.7135
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 109720,
+              "reserved_cycles": 372600,
+              "segments": 10,
+              "total_cycles": 10485760,
+              "user_cycles": 10003440
+            },
+            "total_ms": 476604.04425,
+            "worker_pid": 17259
+          },
+          "timings": {
+            "external_verifier_ms": 33.796834,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 476819.508584,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 3,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 17259,
+            "worker_pid_before_prove": 17259,
+            "worker_start_time_us": 1793573711083226,
+            "worker_start_time_us_before_prove": 1793573711083226
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 13448865872,
+            "sampled_helper_footprint_peak_bytes": 7353849544,
+            "sampled_group_footprint_peak_bytes": 13448865872,
+            "guard_lifetime_group_peak_bytes": 13448865872,
+            "estimated_host_available_minimum_bytes": 37335842816,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+            "receipt.bin": "00ab2b77f4520058924fee00d2ae04bce5128d8da776618689ac0e3c002a4367",
+            "resource.json": "cf801beb93816d3976032434050bef0393375cdc8304d013d228d15476be3573",
+            "seal.bin": "522eabb35414286631776f6a2ff8490193c06c3a6d50caa6843603ab9722b63c",
+            "timing.json": "e9ab715f8d77155482cb29c7bc1ba2201b993d1c41ead86b1368c2bc0c757b69",
+            "verification.json": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "d5b6427ab0f3498bb97d22a80f5dd444bab188e60c9dcc8bf494c97110497c5b",
+            "worker.json": "8b278d838b45a609b9269c461527d4168726f3338a84ac211d68c03ef6f0f71a"
+          }
+        },
+        {
+          "case": "proof-3",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-17190-1793573711083015000-2",
+            "image_id": "58518a60c949a92b89ddcfa8c8b44f65ebbf17ee16c0dffa738ed55563e0a623",
+            "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+            "journal_hex": "7b3b9da440ac877e14646d0dbff269ec24926a37a504819bae0e7b2f6226b5b4",
+            "journal_sha256": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 4,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "21dbf6bfd52184ff962f9e41a504cb42ca0eb01dbba5c785ba54f3903bb5f755",
+            "stage_ms": {
+              "execution_and_segment": 390767.042459,
+              "identity_and_wrap": 17458.8715,
+              "recursion": 69248.305875,
+              "verification": 1.738958
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 109720,
+              "reserved_cycles": 372600,
+              "segments": 10,
+              "total_cycles": 10485760,
+              "user_cycles": 10003440
+            },
+            "total_ms": 477606.009542,
+            "worker_pid": 17259
+          },
+          "timings": {
+            "external_verifier_ms": 33.389958,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 477859.120583,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 4,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 17259,
+            "worker_pid_before_prove": 17259,
+            "worker_start_time_us": 1793573711083226,
+            "worker_start_time_us_before_prove": 1793573711083226
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 13324281792,
+            "sampled_helper_footprint_peak_bytes": 7711610808,
+            "sampled_group_footprint_peak_bytes": 13324281792,
+            "guard_lifetime_group_peak_bytes": 13448865872,
+            "estimated_host_available_minimum_bytes": 37540265984,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+            "receipt.bin": "0b193172d5ee2524004f61c6829ec30f763d01d972e45b8942701b2417505d28",
+            "resource.json": "3a557b2071d242a351a7cd5f277edae1479948d0da9fb3e991bc002df8e55dca",
+            "seal.bin": "21dbf6bfd52184ff962f9e41a504cb42ca0eb01dbba5c785ba54f3903bb5f755",
+            "timing.json": "959f7bab0f57b716630f730316c06db994a60c5301996b36b2d55a73f26baa2e",
+            "verification.json": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "d5b6427ab0f3498bb97d22a80f5dd444bab188e60c9dcc8bf494c97110497c5b",
+            "worker.json": "5ce0266e6f5fa2eced0b4f7ecd92727286ea0355b2e73870fe89646540b8d8c4"
+          }
+        },
+        {
+          "case": "proof-4",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-17190-1793573711083015000-2",
+            "image_id": "58518a60c949a92b89ddcfa8c8b44f65ebbf17ee16c0dffa738ed55563e0a623",
+            "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+            "journal_hex": "7b3b9da440ac877e14646d0dbff269ec24926a37a504819bae0e7b2f6226b5b4",
+            "journal_sha256": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 5,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "f59b8c01b530d2744d6c390018ff4871cd448de042192b4d94ca38eb107a206f",
+            "stage_ms": {
+              "execution_and_segment": 386540.347,
+              "identity_and_wrap": 19220.809125,
+              "recursion": 77850.32175,
+              "verification": 1.7636660000000002
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 109720,
+              "reserved_cycles": 372600,
+              "segments": 10,
+              "total_cycles": 10485760,
+              "user_cycles": 10003440
+            },
+            "total_ms": 483748.2210829999,
+            "worker_pid": 17259
+          },
+          "timings": {
+            "external_verifier_ms": 22.340167,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 483904.677125,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 5,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 17259,
+            "worker_pid_before_prove": 17259,
+            "worker_start_time_us": 1793573711083226,
+            "worker_start_time_us_before_prove": 1793573711083226
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 13507848344,
+            "sampled_helper_footprint_peak_bytes": 7715608528,
+            "sampled_group_footprint_peak_bytes": 13507848344,
+            "guard_lifetime_group_peak_bytes": 13507831960,
+            "estimated_host_available_minimum_bytes": 37361352704,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+            "receipt.bin": "aac0c76c637ae517f02db03f52aee192239c75991b8ea0e98c67d988a1b70e72",
+            "resource.json": "10934c53687babe72d757310842290b37f1002c86d4ce8994efbb6cd738247bb",
+            "seal.bin": "f59b8c01b530d2744d6c390018ff4871cd448de042192b4d94ca38eb107a206f",
+            "timing.json": "18770baee4cf6351fe2e6f03bcca7c0047ae2dfb8e30981197d32b83669dd6bf",
+            "verification.json": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "d5b6427ab0f3498bb97d22a80f5dd444bab188e60c9dcc8bf494c97110497c5b",
+            "worker.json": "cc9487ae4e388887fe77466a1dcd4ee1efbc5c1121ea0fe1cf8c92ab4ed7cba8"
+          }
+        },
+        {
+          "case": "proof-5",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-17190-1793573711083015000-2",
+            "image_id": "58518a60c949a92b89ddcfa8c8b44f65ebbf17ee16c0dffa738ed55563e0a623",
+            "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+            "journal_hex": "7b3b9da440ac877e14646d0dbff269ec24926a37a504819bae0e7b2f6226b5b4",
+            "journal_sha256": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 6,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "ba9e320f906f598c7a236363640b469ab5774ada056e95ac1453f2c46c2dd3b7",
+            "stage_ms": {
+              "execution_and_segment": 389920.539042,
+              "identity_and_wrap": 17277.353166,
+              "recursion": 65831.50462499999,
+              "verification": 1.7269169999999998
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 109720,
+              "reserved_cycles": 372600,
+              "segments": 10,
+              "total_cycles": 10485760,
+              "user_cycles": 10003440
+            },
+            "total_ms": 473160.1255,
+            "worker_pid": 17259
+          },
+          "timings": {
+            "external_verifier_ms": 22.115042000000003,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 473816.44054100005,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 6,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 17259,
+            "worker_pid_before_prove": 17259,
+            "worker_start_time_us": 1793573711083226,
+            "worker_start_time_us_before_prove": 1793573711083226
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 13176907640,
+            "sampled_helper_footprint_peak_bytes": 7715248032,
+            "sampled_group_footprint_peak_bytes": 13176907640,
+            "guard_lifetime_group_peak_bytes": 13507831960,
+            "estimated_host_available_minimum_bytes": 37090639872,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+            "receipt.bin": "f42b9397cae446c31d9c6811cd0d3c76c90caf44ba959fa4a892d78d6fdb1409",
+            "resource.json": "2d4fa58a93d0958f34a5f158df1061229de7a29430f28269e95cd3cb144ceff8",
+            "seal.bin": "ba9e320f906f598c7a236363640b469ab5774ada056e95ac1453f2c46c2dd3b7",
+            "timing.json": "c5b009482424973afdf522e7ed1858dbb0b2446eedc831626d7c876fdb8ca5e1",
+            "verification.json": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "d5b6427ab0f3498bb97d22a80f5dd444bab188e60c9dcc8bf494c97110497c5b",
+            "worker.json": "d3361b176f4a948ffabae16390713c46d340166fdb08820edebb6160945facb1"
+          }
+        }
+      ],
+      "worker_body_seconds": {
+        "n": 5,
+        "median": 476.60404424999996,
+        "minimum": 473.16012550000005,
+        "maximum": 483.7482210829999
+      },
+      "complete_seconds": {
+        "n": 5,
+        "median": 476.853305418,
+        "minimum": 473.8385555830001,
+        "maximum": 483.927017292
+      },
+      "stages_seconds": {
+        "execution_and_segment": {
+          "n": 5,
+          "median": 390.76704245900004,
+          "minimum": 386.540347,
+          "maximum": 392.631577667
+        },
+        "identity_and_wrap": {
+          "n": 5,
+          "median": 17.452898709,
+          "minimum": 17.277353166,
+          "maximum": 19.220809125
+        },
+        "recursion": {
+          "n": 5,
+          "median": 66.900018875,
+          "minimum": 65.831504625,
+          "maximum": 77.85032175
+        },
+        "verification": {
+          "n": 5,
+          "median": 0.001726917,
+          "minimum": 0.0017135,
+          "maximum": 0.001763666
+        }
+      }
+    },
+    {
+      "name": "arithmetic-46m",
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "/Users/dbur/dev/zk-miner/scripts/macos/test-native-worker.py",
+        "--engine",
+        "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "--workload",
+        "fibonacci",
+        "--iterations",
+        "4600000",
+        "--min-guest-cycles",
+        "46000000",
+        "--repeat",
+        "1",
+        "--proof-only",
+        "--timeout-seconds",
+        "3600",
+        "--po2",
+        "20"
+      ],
+      "status": "passed",
+      "started": "2026-11-01T23:43:34.834110+00:00",
+      "seconds": 2160.2623098324984,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/4a06930827f949f6838961bcaca682ff",
+      "result_sha256": "de33e5e68a0fb5444f0729634a25e0fd0076f465a58af89ceac7b97ca8d35387",
+      "run_hashes": {
+        "result.json": "de33e5e68a0fb5444f0729634a25e0fd0076f465a58af89ceac7b97ca8d35387",
+        "acceptance-build.json": "94980e18540e07d92ed03b3a6f45e2a9a0ae2e19938ad42035b1d5f78cce6768",
+        "test.log": "85a475b4971fc268f6056347b0d4ad2006be2263f58bae19e690c566d632997c",
+        "acceptance/complete.json": "d047f1e45f8f9f2a333417daf23fbf40ef2583a5705ddf2f117d8ba5f3f997fa",
+        "acceptance/requests.jsonl": "4a14439c815ffc9315c9e92ea02598e886becd7540d2205051a7a40213f77417"
+      },
+      "proofs": [
+        {
+          "case": "proof-0",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-54394-1793576621390620000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "8b40bb496031c61211b8420fc58cb8bd3df1348f4ae40e58421bd583e5814ce1",
+            "journal_hex": "bb9d28f8f19a8ddb",
+            "journal_sha256": "5db83159a953e858b9d88df86128164c4a3afad85e904572c67e58f53501d2c1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 1,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "ff6f2e02d75e61e16e4bc74d52a692fc8a96b879decfa7801643249019019b35",
+            "stage_ms": {
+              "execution_and_segment": 1790131.505625,
+              "identity_and_wrap": 24587.242709,
+              "recursion": 324377.75974999997,
+              "verification": 1.7155
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 105198,
+              "reserved_cycles": 1339750,
+              "segments": 46,
+              "total_cycles": 47448064,
+              "user_cycles": 46003116
+            },
+            "total_ms": 2139636.370625,
+            "worker_pid": 54451
+          },
+          "timings": {
+            "external_verifier_ms": 25.46825,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 2139814.227417,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 1,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 54451,
+            "worker_pid_before_prove": 54451,
+            "worker_start_time_us": 1793576621390780,
+            "worker_start_time_us_before_prove": 1793576621390780
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 11724628752,
+            "sampled_helper_footprint_peak_bytes": 7353587352,
+            "sampled_group_footprint_peak_bytes": 12424832888,
+            "guard_lifetime_group_peak_bytes": 12424832888,
+            "estimated_host_available_minimum_bytes": 34844409856,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "5db83159a953e858b9d88df86128164c4a3afad85e904572c67e58f53501d2c1",
+            "receipt.bin": "c84b3f1a540b885f1323d04eb91a08a4a9c213f9f272aff2f2e162c5db9a6499",
+            "resource.json": "6915d31b6990ac5a3452aadd36467e877d413fda1d17b3f266d15ca0a8feff7d",
+            "seal.bin": "ff6f2e02d75e61e16e4bc74d52a692fc8a96b879decfa7801643249019019b35",
+            "timing.json": "aa55b46e5bafa0f82fbda6a7bd416854670d42cdf0ba90348b952504c6ea408d",
+            "verification.json": "56df0dc8c2fe653e74c638d316e479fb303b69106dce5e4078e245238498dfd4",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "889d00cd2a30d55b022cbd923afcf46a9613d3c46d1a8d5f2f9ffbd53b39e2b6",
+            "worker.json": "20ad21557180aeb7b7dcfc0f89182ccb56541e1eeb7ab1ef17624b650e016311"
+          }
+        }
+      ]
+    },
+    {
+      "name": "twenty-request-lifecycle",
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "/Users/dbur/dev/zk-miner/scripts/macos/test-native-worker.py",
+        "--engine",
+        "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "--repeat",
+        "20",
+        "--po2",
+        "20"
+      ],
+      "status": "passed",
+      "started": "2026-11-02T00:19:35.085217+00:00",
+      "seconds": 598.4669227078557,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/0caa0bf744be45e99cfc33fd6627ed06",
+      "result_sha256": "246e762df6ccd122e100871123f591e82d6bb6bd3ac34c19069139ff1d8d491f",
+      "run_hashes": {
+        "result.json": "246e762df6ccd122e100871123f591e82d6bb6bd3ac34c19069139ff1d8d491f",
+        "acceptance-build.json": "94980e18540e07d92ed03b3a6f45e2a9a0ae2e19938ad42035b1d5f78cce6768",
+        "test.log": "ffc1994c7df9cdff2c613273fc08ac6bde6da229bad76df20d305ab5c316cf53",
+        "acceptance/complete.json": "203d13d0ac9cb76586a91d519bac6a12a7aee47ccf4a0330bf0774e5cb0b3bb6",
+        "acceptance/requests.jsonl": "cb6bb40941e5ec118d7f4cf86ffbd497ac0e511a275ce587c61868c8790d1abd"
+      },
+      "proofs": [
+        {
+          "case": "proof-0",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 1,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "b7f7b1dd478b639e70c57c5f2ca9e1ba4be64661b9cd341dc70aae6c9ae4169f",
+            "stage_ms": {
+              "execution_and_segment": 1236.933208,
+              "identity_and_wrap": 24202.151083,
+              "recursion": 3952.69275,
+              "verification": 1.7715
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 29422.4455,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 36.480458,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 30171.862708,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 1,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 4228255248,
+            "sampled_helper_footprint_peak_bytes": 7715182520,
+            "sampled_group_footprint_peak_bytes": 11943224776,
+            "guard_lifetime_group_peak_bytes": 11943224776,
+            "estimated_host_available_minimum_bytes": 37162696704,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "1ffdeb6c7f337b2733d108edbf73c2eb8da133ca6d3eb4f1fd78176d6d29b352",
+            "resource.json": "343584380080740da5ecb4ba4b3222315c6a86be2363658b9054df7acf85f67f",
+            "seal.bin": "b7f7b1dd478b639e70c57c5f2ca9e1ba4be64661b9cd341dc70aae6c9ae4169f",
+            "timing.json": "2786652b8eba5a5f10be743a49366a0504186f0b6b15d2501630e67b069e048c",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "98879d925022199bb755d6a880af90fb94c85cef8ee4517a4ed9161c9492aca4"
+          }
+        },
+        {
+          "case": "proof-1",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 2,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "e5b1ca5992f194ac773d5a12de70abe34d2f20b636b1e51a091de861decf39c0",
+            "stage_ms": {
+              "execution_and_segment": 1185.365625,
+              "identity_and_wrap": 17648.735208000002,
+              "recursion": 3524.68,
+              "verification": 1.815958
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 22385.068625,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 22.817458,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 23134.527250000003,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 2,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 4336586328,
+            "sampled_helper_footprint_peak_bytes": 7345198744,
+            "sampled_group_footprint_peak_bytes": 11681785072,
+            "guard_lifetime_group_peak_bytes": 11943224776,
+            "estimated_host_available_minimum_bytes": 37367922688,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "ad1db535451a0b9e2d90f6a1371c6243c57739c7938d1155af7f7cf4c5189448",
+            "resource.json": "498e4c2dfe78e10d369c554d24293c12949db699b396eb094fd38e70982954bc",
+            "seal.bin": "e5b1ca5992f194ac773d5a12de70abe34d2f20b636b1e51a091de861decf39c0",
+            "timing.json": "72a39595ab17657ef51b17fbcc567a8a0eb54df875e3b2a687b4ba0822590fea",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "830f7142538f8d4feeb3b2def6582acdbcf9bde8b2ebbb0333a24c8b6e118bbc"
+          }
+        },
+        {
+          "case": "proof-2",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 3,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "256e2a2e1bb1b8d3b15f9b6b9a3bbb46e57f88be64578087746b463092188745",
+            "stage_ms": {
+              "execution_and_segment": 1248.065625,
+              "identity_and_wrap": 18140.084542,
+              "recursion": 3786.016041,
+              "verification": 1.775333
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 23199.378417,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 23.533375,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 24211.090958,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 3,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 4298329688,
+            "sampled_helper_footprint_peak_bytes": 7713478560,
+            "sampled_group_footprint_peak_bytes": 12011808248,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 36801298432,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "ad3b4d27d72cf9976044a6b1c8433686d3fac243bc693347fb3062449d40ddfa",
+            "resource.json": "5eba14538a1d666c280e3c900b7d88a60740aa1e02bcd9e45e38bd01ace8bb65",
+            "seal.bin": "256e2a2e1bb1b8d3b15f9b6b9a3bbb46e57f88be64578087746b463092188745",
+            "timing.json": "4b0e768a2769c7dbaee1193b0d8615a15bb7d1c6ce9d42ab975eb3d5750747dd",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "4baecb0f684ca4d33c6910fd2c21c766bdb8ddc8c9fba742a94ae8d907b2faec"
+          }
+        },
+        {
+          "case": "proof-3",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 4,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "8c069e1fd6c30024751a85f8390a37225aad99d3df6df608dc59269843f1c18c",
+            "stage_ms": {
+              "execution_and_segment": 1416.36925,
+              "identity_and_wrap": 19947.715,
+              "recursion": 4014.995417,
+              "verification": 1.760333
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 25404.476166999997,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 22.3775,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 26249.352291,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 4,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 4301966936,
+            "sampled_helper_footprint_peak_bytes": 7713757064,
+            "sampled_group_footprint_peak_bytes": 11926037912,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 36930977792,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "d40b39ab4c770f82faf820dc92ce8f4f6b5db7834eef71d860060618a7220259",
+            "resource.json": "2c1857ed6ae742d431864537f181d39b2b4ff09be9617f4bcd37ec560e97f2f7",
+            "seal.bin": "8c069e1fd6c30024751a85f8390a37225aad99d3df6df608dc59269843f1c18c",
+            "timing.json": "67b6577d1834df45e9bcaf1b7caef0b347c04c7a02e9f65c8debd3ee053b0cc1",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "d6e18181eb48e44a688076ce36e532394d1ba924f50e17ee1a6afa176b6a9c13"
+          }
+        },
+        {
+          "case": "proof-4",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 5,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "f207a54c781ded218fefce6dcab0b7f1e9fe21f9d46f9ac261399079bc418430",
+            "stage_ms": {
+              "execution_and_segment": 1422.383875,
+              "identity_and_wrap": 19694.069541,
+              "recursion": 4096.962665999999,
+              "verification": 1.750042
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 25238.889875,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 20.778000000000002,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 25282.157375,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 5,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 4220685840,
+            "sampled_helper_footprint_peak_bytes": 7346214576,
+            "sampled_group_footprint_peak_bytes": 11543684288,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 37422448640,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "071b219871d623ae9bdaed206267be947edc8202a5ecbb0001349ed9a0fcd530",
+            "resource.json": "70f4df7f2487764b5f5cd542197f5322c9dcbbfbfd06c82c123fd719f19b290e",
+            "seal.bin": "f207a54c781ded218fefce6dcab0b7f1e9fe21f9d46f9ac261399079bc418430",
+            "timing.json": "8040981b0fe3c8fcf9f5fc561221c64f844fa1829a9a33beecb9370324c37d4e",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "2c42ebbcfdd5e0f414d04e22adb7f1ba5d0e35acc9e2f726216d0e4d5024d18f"
+          }
+        },
+        {
+          "case": "proof-5",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 6,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "a6a7c9edc1954dae5baa57936dd10b88d4796111013e876128273a23eca98b08",
+            "stage_ms": {
+              "execution_and_segment": 1446.0635,
+              "identity_and_wrap": 20081.629125,
+              "recursion": 4225.766874999999,
+              "verification": 1.749958
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 25779.065083,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 22.827167,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 26290.622834,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 6,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 4269641280,
+            "sampled_helper_footprint_peak_bytes": 7713707936,
+            "sampled_group_footprint_peak_bytes": 11901330864,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 37135040512,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "259a722dfc2d533ea9e30db97972dd3241a61d3e50e5d812067117e178758a3a",
+            "resource.json": "2603686831786677a7357015538b556c8c6759658b86aad32724ca097127d42a",
+            "seal.bin": "a6a7c9edc1954dae5baa57936dd10b88d4796111013e876128273a23eca98b08",
+            "timing.json": "2cd7d044677ffb57187a96a1dfb93213aac36e4ae603cfddb7c24be2f537ad1b",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "5e25d3f8f74c1de69e241998d89fd6b1eb4ac8f58593653dd657f4b5368a8fba"
+          }
+        },
+        {
+          "case": "proof-6",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 7,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "7f5443a9ac0f43858b178f64ab051c27c0418082a53275e0b8bdda784308ae27",
+            "stage_ms": {
+              "execution_and_segment": 1258.751625,
+              "identity_and_wrap": 17724.630708,
+              "recursion": 3619.565625,
+              "verification": 1.727459
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 22627.836959,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 25.272333,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 23180.133083,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 7,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 4217998888,
+            "sampled_helper_footprint_peak_bytes": 7315543728,
+            "sampled_group_footprint_peak_bytes": 11533542616,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 37427838976,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "18fb6e32b39e2692bb7c89d574306b9346ee7d9f8d5c75a193815f657c964b0e",
+            "resource.json": "c1350b8c21ae19ea70943dce8d1d0510889e0b02612e3f3c3572904f11d6a1f0",
+            "seal.bin": "7f5443a9ac0f43858b178f64ab051c27c0418082a53275e0b8bdda784308ae27",
+            "timing.json": "3c90f79d72aeacc8421b8e08448c716b377b3d317286cc9aece98356e4e2daf8",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "9641fc94124794a2fa5b17bbd85d386492788ef6f7ba764fa49694abf7d6c461"
+          }
+        },
+        {
+          "case": "proof-7",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 8,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "b13dce6ac103c5a247ab7e64a551c1390cdbd6fb0f12b05449e287862fc6a585",
+            "stage_ms": {
+              "execution_and_segment": 1204.218584,
+              "identity_and_wrap": 19540.178916999997,
+              "recursion": 4192.69825,
+              "verification": 1.820916
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 24962.277583,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 24.836917,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 25255.10075,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 8,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 4217998888,
+            "sampled_helper_footprint_peak_bytes": 7715149752,
+            "sampled_group_footprint_peak_bytes": 11888682440,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 36963205120,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "d3e46f968cd6e22773deacad5847f43e4fc585a0e9357be874954083be971650",
+            "resource.json": "5f3d58257bbb27b0fa1c9f369dcb1fbe1ffbc17df3bc3854a3fe4d673dee6206",
+            "seal.bin": "b13dce6ac103c5a247ab7e64a551c1390cdbd6fb0f12b05449e287862fc6a585",
+            "timing.json": "f358b40d028b67b19e2539efe27ff29e70573c166db5622bc2371f101963377d",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "4ca39a3fb07359a934d19ef2d1de419bbe612c84e2a2b111e0c472d713f2adfb"
+          }
+        },
+        {
+          "case": "proof-8",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 9,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "2d2d53d4737bdaf61b08e2ccb94f2fe91f0aed0be348c75b2dea73c02934276d",
+            "stage_ms": {
+              "execution_and_segment": 1231.086125,
+              "identity_and_wrap": 17486.839541999998,
+              "recursion": 3501.8702080000003,
+              "verification": 1.725959
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 22246.631042,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 23.969082999999998,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 23220.680583,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 9,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 4192800272,
+            "sampled_helper_footprint_peak_bytes": 7713937336,
+            "sampled_group_footprint_peak_bytes": 11906737608,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 36800086016,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "42f046223db572ce9d726b723d02e930ebe1c18fc79eaf9226dffe1a4f294cfd",
+            "resource.json": "81c55a8b998126397dccb35ee640c9b753939138250394b035f95c279182e010",
+            "seal.bin": "2d2d53d4737bdaf61b08e2ccb94f2fe91f0aed0be348c75b2dea73c02934276d",
+            "timing.json": "5d2dd150b62d1981a353c41f4c9e009589c5c25ac35a07c80fe615006a40f225",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "5fc64db7a0c5993947213323f769b364150c2402053032a39f619c99b578bea5"
+          }
+        },
+        {
+          "case": "proof-9",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 10,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "420dedc38bd26b1d9e33c96c8e71cac0069a7bf1c0d2918da9a69ac1997ae4ae",
+            "stage_ms": {
+              "execution_and_segment": 1188.337542,
+              "identity_and_wrap": 17287.845957999998,
+              "recursion": 3449.94475,
+              "verification": 1.753
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 21952.824208,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 36.177333,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 22215.221208,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 10,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 4192849424,
+            "sampled_helper_footprint_peak_bytes": 7715542944,
+            "sampled_group_footprint_peak_bytes": 11908392368,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 36676911104,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "5c598a7f039049ec0fabe7a83c452b7e54ddbbc52db74a4fe6d3bb0a913f47b6",
+            "resource.json": "dbf00c2ab6193f37689e7875dc2ac3c99a123cfa3544d524eb6071b82dd2e8a6",
+            "seal.bin": "420dedc38bd26b1d9e33c96c8e71cac0069a7bf1c0d2918da9a69ac1997ae4ae",
+            "timing.json": "4fa3ca41ae16ae802df2e15eba17b660c64c3b174ad78587a9cf7acc3b0abe5c",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "41b1503fbf6aebbed20937298b5a6efe3e6d96dd3052c91d4aa8cfd4ac049d7b"
+          }
+        },
+        {
+          "case": "proof-10",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 11,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "43b118bb6368f2d21fc8b33cd7392c1348af2863816aa8b577559badc62fbbe8",
+            "stage_ms": {
+              "execution_and_segment": 1179.108917,
+              "identity_and_wrap": 17151.480792000002,
+              "recursion": 3400.14225,
+              "verification": 1.715541
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 21756.888541999997,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 35.55,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 22221.002541,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 11,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 4192849424,
+            "sampled_helper_footprint_peak_bytes": 7715264440,
+            "sampled_group_footprint_peak_bytes": 11370980448,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 37194973184,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "8dea790a45f40d25a9f654d34b3a67d52ab5c8f75081b51e4118cfeb75538d98",
+            "resource.json": "e82bcfea0848fdd65b2e952e4091591315af9f40875670ae174f2fce8d7be793",
+            "seal.bin": "43b118bb6368f2d21fc8b33cd7392c1348af2863816aa8b577559badc62fbbe8",
+            "timing.json": "ca449d582ef5beae1ff5b3737a5fc34a16d62eb9457d40f7ab314ab53970ef49",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "fb9bb774b30e4e4e2691e6747bb72418cba1ebbff2061419ed054b0a2c041eff"
+          }
+        },
+        {
+          "case": "proof-11",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 12,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "cc9cbce1e2b92843de0d46507951c3d71ddc433106ab856123dfa4891bb538f5",
+            "stage_ms": {
+              "execution_and_segment": 1194.93875,
+              "identity_and_wrap": 17317.255291999998,
+              "recursion": 3374.8525,
+              "verification": 1.708541
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 21913.538209,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 20.314167,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 22225.701,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 12,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 3655748776,
+            "sampled_helper_footprint_peak_bytes": 7713953672,
+            "sampled_group_footprint_peak_bytes": 11369702448,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 37199855616,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "4253061c8ec3391714261e9c966f1684f74ba0bfef28c4ee2031fabff1db68d5",
+            "resource.json": "eff820ba4aebb8838c63cf69943edd6d1353c2f0e7c2b2bc00813794a6dfb811",
+            "seal.bin": "cc9cbce1e2b92843de0d46507951c3d71ddc433106ab856123dfa4891bb538f5",
+            "timing.json": "1f58ee749f6f9071c1375faa57c25850fcb763bdb737fbd6e817f6a252977609",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "1523ca296a9a1a20ddd67b8516038a5b26b1e3f3eca97f6697f431be98f2d315"
+          }
+        },
+        {
+          "case": "proof-12",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 13,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "f1081107b4530d3fd0a21fd1137366ebddb18f3427b1030fa6581abbcd51c334",
+            "stage_ms": {
+              "execution_and_segment": 1174.9317079999998,
+              "identity_and_wrap": 17153.489208,
+              "recursion": 3389.119541,
+              "verification": 1.749458
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 21744.060458,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 35.609375,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 22237.55025,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 13,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 3655748776,
+            "sampled_helper_footprint_peak_bytes": 7714314120,
+            "sampled_group_footprint_peak_bytes": 11370062896,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 37190172672,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "620c8d4564759d7544430d9de42860979aecb63689d306f50997963d0f39c740",
+            "resource.json": "cb9b891e8ad401ab9c8ab8245c119a47274a5f3b77253e6f8f0cd4c2dc63b485",
+            "seal.bin": "f1081107b4530d3fd0a21fd1137366ebddb18f3427b1030fa6581abbcd51c334",
+            "timing.json": "757a06a9d28a18f125970d74d67b66b1eced97680be46229fd4da2ebc89dce03",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "7fde79e4edf7e217c520c3472b246a1b147c80ac2825619e9ca0fb190a98d25e"
+          }
+        },
+        {
+          "case": "proof-13",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 14,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "bc0ceb5324508137956251d77e6345adbff01551b9ee06d533f6a18678de27aa",
+            "stage_ms": {
+              "execution_and_segment": 1175.873542,
+              "identity_and_wrap": 17141.62175,
+              "recursion": 3392.446625,
+              "verification": 1.734125
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 21736.440709,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 36.329834,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 22198.159292,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 14,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 3655814312,
+            "sampled_helper_footprint_peak_bytes": 7344510616,
+            "sampled_group_footprint_peak_bytes": 11000324928,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 37566955520,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "91d27d8cde791d67fad6fd23268234cad3471bc9eff6c9cc933d6f7f9d1890dc",
+            "resource.json": "ec261857b258b30f53cd8837eb31b351fa6aebf9345d154dcb8f64293a5f9831",
+            "seal.bin": "bc0ceb5324508137956251d77e6345adbff01551b9ee06d533f6a18678de27aa",
+            "timing.json": "692f019ac887d67d99eae1895e52ed9b926004d65e76bb787a56704d44235621",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "8fedaad2601e99ce4739ec2f239170f6c493bc8055f764f044e6e2d8a9b98e39"
+          }
+        },
+        {
+          "case": "proof-14",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 15,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "456e8dd6809ad355e2205aa8e52cbb3b7d565817142534ab9633305e2516e9d9",
+            "stage_ms": {
+              "execution_and_segment": 1224.960875,
+              "identity_and_wrap": 17430.087292,
+              "recursion": 3406.8480409999997,
+              "verification": 1.74275
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 22088.614125,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 35.16825,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 22170.440292,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 15,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 3655830696,
+            "sampled_helper_footprint_peak_bytes": 7355209392,
+            "sampled_group_footprint_peak_bytes": 11011040088,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 37569789952,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "a4f7014dfade7bbb06005f48a29cec9b088bdb9d468c6ff6a299760d1e7808f5",
+            "resource.json": "ffb06fc11f3ef0994fc1009abf3a2cf31fbc96d41b6f17cc31be67278edb220a",
+            "seal.bin": "456e8dd6809ad355e2205aa8e52cbb3b7d565817142534ab9633305e2516e9d9",
+            "timing.json": "4fad5c47333e9563399cf538768a14ca43fb0c6c141afff8325bff0a5734013d",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "952cad1d88e3995bce98238f6b0f716502b48a265cbc362f49aad3166ca7c8b6"
+          }
+        },
+        {
+          "case": "proof-15",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 16,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "4c99610ed9d5bb6557db43f3a4d6f339a388847441ff525eb715250bc1dc4171",
+            "stage_ms": {
+              "execution_and_segment": 1178.621167,
+              "identity_and_wrap": 17130.862666999998,
+              "recursion": 3382.847834,
+              "verification": 1.756042
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 21718.724542,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 35.769166999999996,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 22225.293292,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 16,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 3655830696,
+            "sampled_helper_footprint_peak_bytes": 7714166688,
+            "sampled_group_footprint_peak_bytes": 11369997384,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 37420777472,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "d1d2a783321b4538e8619cec7dcc56191874e66009e52170d9437e013dcc8e37",
+            "resource.json": "c05e5c8755c9a9c3cfe227297db2b7229faf8733670b2beb2ab0b9c782dca4b5",
+            "seal.bin": "4c99610ed9d5bb6557db43f3a4d6f339a388847441ff525eb715250bc1dc4171",
+            "timing.json": "cbb29c9ce4ab07b962c30264dd6b37032199bb7b1abcbbc8e41716b1000f96d3",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "699aac237c35f0d104005646e8fdbbb9e3f2ffdd569ec9daadc2fd5ddd221935"
+          }
+        },
+        {
+          "case": "proof-16",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 17,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "56d82289c0bcfdec76abb5386348f233e216ec3e9c1a719ebcff6aaf1794f65f",
+            "stage_ms": {
+              "execution_and_segment": 1177.038917,
+              "identity_and_wrap": 17375.596917,
+              "recursion": 3391.22025,
+              "verification": 1.761834
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 21970.304,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 36.102458,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 22226.24875,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 17,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 3655830696,
+            "sampled_helper_footprint_peak_bytes": 7344658096,
+            "sampled_group_footprint_peak_bytes": 11000488792,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 37808914432,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "87c6f6083aec00542f88e0c7d0e735699b7d40a84b8b7f9d93ccc3558c5885e9",
+            "resource.json": "1c0a425887f0ee3d66c94c93be2b17ad09cb5893f51fdda1d8341fcbd4e9e932",
+            "seal.bin": "56d82289c0bcfdec76abb5386348f233e216ec3e9c1a719ebcff6aaf1794f65f",
+            "timing.json": "48bf4f64f11c971cdc6415d59c64574814b007aa38a9b3a366358d063e936684",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "f6b32b6a9540a60690f020cac8a27fa693c2c51481c0bb55bc37e7718b5ec11e"
+          }
+        },
+        {
+          "case": "proof-17",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 18,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "642cf3a31327d84b1355bee2a0986499fced237dff9e8ff50d9e2c55d310e49c",
+            "stage_ms": {
+              "execution_and_segment": 1175.0605,
+              "identity_and_wrap": 17100.282334,
+              "recursion": 3367.691417,
+              "verification": 1.741416
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 21669.906625,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 35.723958,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 22208.634792,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 18,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 3655830696,
+            "sampled_helper_footprint_peak_bytes": 7301453440,
+            "sampled_group_footprint_peak_bytes": 10957284136,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 37811273728,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "ed58fddb7fdf919d5ff3803f725db1d9c0525ec1fb655c7546d2635eb7bd7fa6",
+            "resource.json": "f8b9c71eb12f1bfc80b047e4276f13b1b525ce366e9ac0cc5a235971ed079644",
+            "seal.bin": "642cf3a31327d84b1355bee2a0986499fced237dff9e8ff50d9e2c55d310e49c",
+            "timing.json": "45ed51938c1f736a77ebdc5df9702e6cfba7a97e455d0efaa9c029bcfe7f7e74",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "b82cda0fa9d5463b81bfc870a2d3c2a64ae5451b79ff900f0c02271a90fadbde"
+          }
+        },
+        {
+          "case": "proof-18",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 19,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "cd7f94f81461ef19c151352ea21f89e0d4fa47d3a0a546ce8df35c2cb26b95b9",
+            "stage_ms": {
+              "execution_and_segment": 1178.509292,
+              "identity_and_wrap": 17161.8265,
+              "recursion": 3371.9139170000003,
+              "verification": 1.717875
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 21738.797958,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 36.092709,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 22213.101417,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 19,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 3655863464,
+            "sampled_helper_footprint_peak_bytes": 7352112816,
+            "sampled_group_footprint_peak_bytes": 11007976280,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 37673074688,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "ce6764c734ab8bb72cb7a8ffb45e1d2b34c3a359a23dfc9bdfbbb0c6785ba946",
+            "resource.json": "0296c61d6274e88a4ecdf8866de463554e0439de806dce47e6dbdfa1f33252b4",
+            "seal.bin": "cd7f94f81461ef19c151352ea21f89e0d4fa47d3a0a546ce8df35c2cb26b95b9",
+            "timing.json": "b8bbf0a8519106c0d5da5d05a3ab32bb69dafd83c351b35205eae3d8ec8e6390",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "e4c6762e2a26ff5d915e76e5257a96fbfe26979f0bb0a66f5437cf06c8b6c328"
+          }
+        },
+        {
+          "case": "proof-19",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793578781649581000-2",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 20,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "d067409288ca7daee3de2214188267b7003129a46645e039d36b49d11a11626a",
+            "stage_ms": {
+              "execution_and_segment": 1176.6353330000002,
+              "identity_and_wrap": 17116.258416,
+              "recursion": 3426.724417,
+              "verification": 1.733042
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 21745.769291999997,
+            "worker_pid": 81514
+          },
+          "timings": {
+            "external_verifier_ms": 36.754416,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 22188.608458000002,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 20,
+            "same_worker_as_before_prove": true,
+            "schema_version": 1,
+            "worker_pid": 81514,
+            "worker_pid_before_prove": 81514,
+            "worker_start_time_us": 1793578781649772,
+            "worker_start_time_us_before_prove": 1793578781649772
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 3655863464,
+            "sampled_helper_footprint_peak_bytes": 7713740680,
+            "sampled_group_footprint_peak_bytes": 11369604144,
+            "guard_lifetime_group_peak_bytes": 12011808248,
+            "estimated_host_available_minimum_bytes": 37345198080,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "c400bc3244dbae68cd45778c3a5b9fb4e0a63f2c4c01aebf20d27ed7d374d9c3",
+            "resource.json": "1c6b74432ba4637a06bd4f683d79e084c27b559897289977a06415f7b7eee9fc",
+            "seal.bin": "d067409288ca7daee3de2214188267b7003129a46645e039d36b49d11a11626a",
+            "timing.json": "d48662fedae048d825da79f5e08ded94031ba0124aa7b716a4cc67c9d2baaeb6",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "6c65b8c33f61080bf53e3ea2475a5f0e7cea4b2d4f865bdc2e911a70abf3d11c"
+          }
+        },
+        {
+          "case": "proof-after-restart",
+          "warmup": false,
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "gomaxprocs": 18,
+            "helper_arch": "darwin/arm64",
+            "helper_container": "zkminer-macos-81434-1793579332827418000-5",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "max_guest_cycles": 67108864,
+            "minimum_segment_po2": 14,
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "native_darwin_arm64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 20,
+            "proof_kind": "groth16",
+            "rayon_threads": 18,
+            "request_id": 23,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "f5ae22a94e34b86b1f9eaefbc5a5820912ad9b8bf3ea91daa6ed0941e1ece481",
+            "stage_ms": {
+              "execution_and_segment": 1222.2013330000002,
+              "identity_and_wrap": 24432.04825,
+              "recursion": 3944.888833,
+              "verification": 1.7815839999999998
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 29625.1575,
+            "worker_pid": 88800
+          },
+          "timings": {
+            "external_verifier_ms": 35.479291,
+            "external_verifier_scope": "external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+            "method": "monotonic std::time::Instant elapsed wall time",
+            "prove_call_ms": 34970.446208,
+            "prove_call_scope": "immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
+            "request_id": 23,
+            "same_worker_as_before_prove": false,
+            "schema_version": 1,
+            "worker_pid": 88800,
+            "worker_pid_before_prove": 0,
+            "worker_start_time_us": 1793579332827508,
+            "worker_start_time_us_before_prove": null
+          },
+          "memory": {
+            "sampled_worker_footprint_peak_bytes": 4232531472,
+            "sampled_helper_footprint_peak_bytes": 7712757664,
+            "sampled_group_footprint_peak_bytes": 11945223600,
+            "guard_lifetime_group_peak_bytes": 11945223600,
+            "estimated_host_available_minimum_bytes": 37001543680,
+            "pressure_levels": [
+              1
+            ]
+          },
+          "artifact_hashes": {
+            "journal.bin": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "receipt.bin": "8e55066b397ded79a03f5eb6a0c3f1397c8784db1b88ae22ab1182ee58ede994",
+            "resource.json": "45d9aafb9edf02f8458337a7dd467b5dc1c5d87bce74e07e6ab2b01c627a2dfb",
+            "seal.bin": "f5ae22a94e34b86b1f9eaefbc5a5820912ad9b8bf3ea91daa6ed0941e1ece481",
+            "timing.json": "e5c7fed46986e1425c95cbc4b7b1221992e8661fe00510cb1f9590670e77f5e7",
+            "verification.json": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+            "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "verifier.stdout": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+            "worker.json": "d0cc9a547a35533f9f3fbcd888cd63252b0d75d0ff14fbca4e77156c2ad5dafc"
+          }
+        }
+      ]
+    }
+  ],
+  "verified_proofs": 36,
+  "negative_rejections": 108,
+  "timing_model": {
+    "fixed_identity_wrap_seconds": 17.5178254375,
+    "padded_cycles_per_stark_second": 22691.360424165654,
+    "scope": "po2 20 native CPU; segment/recursion scaling from ten measured 10M proofs; fixed identity and wrapping retained"
+  },
+  "frozen_stretch_forecast": {
+    "frozen_at": "2026-11-01T23:44:55.758295+00:00",
+    "scope": "predicted from ten completed warm 10M proofs before the 46M proof completes",
+    "input_runs": {
+      "arithmetic-10m": {
+        "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/e41b569eb8d145a68f1d7d46fed2b164",
+        "result_sha256": "2599c77eab2c22cd8959cbb30c0ad62dd19f5d0c68b9ebc504325002058460e7"
+      },
+      "hash-10m": {
+        "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/b4c770592ed84fa4ac869db213481a0d",
+        "result_sha256": "cf080bb5778a4b9045fc0034f13d19691ce9348f0ee995f78c778562774e8cd2"
+      }
+    },
+    "padded_cycles_per_stark_second": 22691.360424165654,
+    "fixed_identity_wrap_seconds": 17.5178254375,
+    "stretch_total_cycles": 47448064,
+    "predicted_stretch_body_seconds": 2108.5367468711024,
+    "cold_startup_not_in_model": true
+  },
+  "frozen_stretch_forecast_sha256": "6045c735f45ea1648632cbc9c43c3fc043659e8bc744704e620210a3067fab7e",
+  "stretch_prediction": {
+    "predicted_body_seconds": 2108.5367468711024,
+    "observed_body_seconds": 2139.636370625
+  },
+  "validation": {
+    "linux": {
+      "status": "passed",
+      "image_id": "sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31",
+      "repo_digests": [
+        "rust@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31"
+      ],
+      "architecture": "arm64",
+      "test_binary": "/work/target/debug/deps/risc0_circuit_rv32im-70f4d91476cb5a1e",
+      "test_binary_sha256": "dfbae3f5027cadb9b3c27d0cdef452b371ab81334af291329ccdd3fb40f13890",
+      "rust_toolchain": "1.93.0",
+      "build_flags": "-Dwarnings -Adead_code (existing unused prover fields in execution-only subset)",
+      "tests": 4,
+      "runtime_network": "none"
+    },
+    "linux_result_sha256": "8fcdd6c64fde3414e991dbb2d4af08bdbcaf54009698a4ce869c7fa0a5d88690",
+    "linux_test_log_sha256": "793415727c9248b1cc4530830a032fee487d0c94529ed509b7cf424e7e83313d",
+    "boundary_before_sha256": "700a91c18f2f23ee1acae5529ced812442ea4c7904f71c188f421435b6bd7388",
+    "boundary_after_sha256": "9a4e8fc0bf2a3cc8d03d0d2fdbef1a78d2915c4224241366810d0ada03b2ef70",
+    "logs": {
+      "workload-engine-tests.log": "fc391c7aaeef20250259f626f0822afc67475a7d1f5914932e278f7e64f60fef",
+      "workload-po220-limits-tests.log": "a2250ce713aeaa3e8021a1d87936ae44bc00a9101d195c1efd003c6b622ff447",
+      "workload-po220-benchmark-tests.log": "08cbaa05d109f95fab022982e21cd14eab4d08664dcd8fbd64c1a1a7acc71abf",
+      "workload-po220-cli-check.log": "a5dfa9c24a358589ab70b366c3490af4217270eb6b3167be0a5c887508b92fd6",
+      "workload-po220-worker-build.log": "2612d80c0a4dc6e117e3ab1330be84ff0a427b12e43eba11a4c7855f4cfbd685"
+    },
+    "final_logs": {
+      "workload-final-engine-tests.log": "f31a454c50b60f78f28ce4e476118f972d2a961af23d66d5884f4b53063a0bf7",
+      "workload-final-cli-check.log": "f937ea79410e535213e1471f6e26b73ae8846e1771797ee790aa601d2c6afb23"
+    },
+    "final_state": {
+      "observed_at_utc": "2026-11-02T00:37:43.231408+00:00",
+      "heads": {
+        "/Users/dbur/dev/zk-miner": "0b79eea7c30f1d59635bbee7c855bb6f167e529b",
+        "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c"
+      },
+      "root_lock_unchanged": true,
+      "both_diff_checks_passed": true,
+      "worker_binary_sha256": "c840171455402715f8cfb39b2235698b910c016c2d4b24cea8bab473eb9a9e85",
+      "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+      "runtime": {
+        "owned_proof_processes": [],
+        "vm_profiles": [
+          {
+            "name": "default",
+            "status": "Running",
+            "arch": "aarch64",
+            "cpus": 4,
+            "memory": 8589934592,
+            "disk": 42949672960,
+            "runtime": "docker"
+          },
+          {
+            "name": "hemi-macos-cpu",
+            "status": "Stopped",
+            "arch": "aarch64",
+            "cpus": 6,
+            "memory": 34359738368,
+            "disk": 85899345920,
+            "runtime": "docker"
+          }
+        ]
+      },
+      "engine_patch_sha256": "efd6edb9a620415e9959a773c7aa7e92c7cda0190f4fecf4afbba55e8132d046"
+    },
+    "final_state_sha256": "246ab1fdc1e3a5e17524c4e9fe694f078bd1cc00c570ff1e05ac5b31c3e5332f"
+  },
+  "campaign_source_archive": {
+    "engine_patch_sha256": "efd6edb9a620415e9959a773c7aa7e92c7cda0190f4fecf4afbba55e8132d046",
+    "driver_path": "target/macos/native-wrap/workload-campaigns/2edca085145446d5a3e89270d6087a7a/driver-source.py",
+    "driver_sha256": "42c52a8d74e236498493a89a4eb82efcd4602ad573233e3a70c3f5bfcf1418ec",
+    "acceptance_binary": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/step4-po220-acceptance/macos_worker-9116c14936aff687",
+    "acceptance_binary_sha256": "7eb02f0b3eef60aaa7b4d172cf8c29b3471e8f6aa39f6b9f2f6dad714a4efc0d",
+    "acceptance_build_sha256": "94980e18540e07d92ed03b3a6f45e2a9a0ae2e19938ad42035b1d5f78cce6768"
+  },
+  "post_campaign_validation": {
+    "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/5f33ba4a900e4d829142e4170d7455fb",
+    "verified_proofs": 1,
+    "negative_rejections": 3,
+    "calibration": {
+      "expected_host_budget_bytes": 27015663920,
+      "measured_peak_bytes": 13507831960,
+      "profile_sha256": "36ebd566c64b3925658454daadf609f5819a2c25a399881bda4bb400112121ce",
+      "requested_po2": 19
+    },
+    "refusal": {
+      "attempted": false,
+      "error": "host RAM is short for risc0:generic: needs ~25.2 GiB, 87.0 GiB already reserved by proofs in flight, 44.3 GiB available",
+      "helper_count_after": 0,
+      "host_available_at_refusal_bytes": 47610970112,
+      "host_available_bytes": 47611904000,
+      "host_reserve_bytes": 17179869184,
+      "host_total_bytes": 137438953472,
+      "kind": "in_flight_reservation_admission",
+      "needed_bytes": 27015663920,
+      "physical_memory_pressure": false,
+      "reservation_count": 87,
+      "reserved_after_bytes": 0,
+      "reserved_before_bytes": 0,
+      "reserved_held_bytes": 93415538688,
+      "sidecar_count_after": 0,
+      "sidecar_count_before": 0,
+      "step_bytes": 1073741824,
+      "worker_pid_after": 90276,
+      "worker_pid_before": 90276
+    },
+    "worker": {
+      "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+      "error": null,
+      "fallback_reason": null,
+      "gomaxprocs": 18,
+      "helper_arch": "darwin/arm64",
+      "helper_container": "zkminer-macos-90205-1793579636136816000-2",
+      "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+      "input_sha256": "5a8b351238c5624a1894ef2f5a4bd688ac6fb7714e32f3976ff067a66dfd7d53",
+      "journal_hex": "e50fdcc004b6cdf4",
+      "journal_sha256": "73c725831ed507705d1609ef5f3976a38d623fb11cccde5d362edcfd31edadf4",
+      "max_guest_cycles": 67108864,
+      "minimum_segment_po2": 14,
+      "observed_mode": "cpu",
+      "observed_stages": {
+        "groth16": "native_darwin_arm64_helper",
+        "identity": "cpu",
+        "other_segment_operations": "cpu",
+        "recursion": "cpu",
+        "segment": "cpu"
+      },
+      "operation": "prove",
+      "phase": "complete",
+      "po2": 19,
+      "proof_kind": "groth16",
+      "rayon_threads": 18,
+      "request_id": 1,
+      "requested_mode": "cpu",
+      "schema_version": 1,
+      "seal_sha256": "c0f2c081d95eec9eccc83d8389d4376ada682bf25ae480393e0e1838f97f75c0",
+      "stage_ms": {
+        "execution_and_segment": 21964.083333,
+        "identity_and_wrap": 26347.484792,
+        "recursion": 11776.788125,
+        "verification": 2.0755830000000004
+      },
+      "staging_limit_bytes": 524288,
+      "stats": {
+        "paging_cycles": 25074,
+        "reserved_cycles": 61634,
+        "segments": 2,
+        "total_cycles": 589824,
+        "user_cycles": 503116
+      },
+      "total_ms": 60125.862709,
+      "worker_pid": 90276
+    },
+    "artifact_hashes": {
+      "journal.bin": "73c725831ed507705d1609ef5f3976a38d623fb11cccde5d362edcfd31edadf4",
+      "receipt.bin": "eb6182ba60843c155cacb6cb0f8ac3492ac8dcb0a8f44ec1cc1066d215c64cb3",
+      "resource.json": "fd3b138386b2d951e5e16cd57fb730cc11853485c4cdd3df0a4346f7d033d1ce",
+      "seal.bin": "c0f2c081d95eec9eccc83d8389d4376ada682bf25ae480393e0e1838f97f75c0",
+      "timing.json": "54b4eb0c14b55fdc3e63e7e0246bef326d6fb30c319db3379bf10e9a7a401df3",
+      "verification.json": "d4bbbd46d6af5fe253a9117bb147fe5d0bb44d029fb1faf854730127f01aec8a",
+      "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "verifier.stdout": "588dbe577a92a3dfde11f1735fc69bdbcd69ce24cd33141bb9d241e3506418e6",
+      "worker.json": "e20c85cad68dd27f1e4a86cb82154157370fa88e3da913d3fdf61bd5d904ee49"
+    },
+    "run_hashes": {
+      "result.json": "ed6f97d5032d8ad051b4687f3458523318362daca2d60a26d1d79b344f6d3f2b",
+      "acceptance-build.json": "d791f869d21638a580ec29a657b5a60b94c684695ff82283070611ac620d1635",
+      "test.log": "7311c2f25de0da4babe64616b16d786d0e6dc3583ed0c88da8e1a7abc3617b7c",
+      "acceptance/complete.json": "389a9e24d8ffa29224c449ff8336ac690b6de6fc154df0cd1639e379e4418035",
+      "acceptance/calibration.json": "f09258f1f2f50cb245d7e1120ed33551c93959f0394ace2bd95af66e0c238ea4",
+      "acceptance/pressure.json": "89295759327627cf668c54375a1956067eb478624dcbffd22b3c1be48b42a160"
+    },
+    "acceptance_binary_archive": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/step4-final-acceptance/macos_worker-9116c14936aff687",
+      "sha256": "0a84add501df13d6b0882cc6013d03c339e367dc71f28ed6128726b0f55b93a3"
+    }
+  },
+  "retained_po218_screen": {
+    "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/workload-campaigns/a90a508b35fc4e9d926e9582781284bf",
+    "status": "failed",
+    "result_sha256": "b2e393a0b221beaa6429496b5debfb7f665ef9847f345accb7e1894697e62a5e",
+    "plan_sha256": "00e8d03558d80f540014af2d5f127e97e04b539bdd5f4675fba51d3e71a69a86",
+    "intentional_cancellation": {
+      "reason": "Po2-18 sizing screen: segment proving alone took 403.655s. Preserve the completed first proof and screen po2 20 under the same 32-GiB guard before final five-proof acceptance. Remaining po2-18 slots intentionally cancelled, not discarded or retried.",
+      "screen_completed_proofs": 1,
+      "screen_first_body_ms": 731067.264291,
+      "cancelled_wrapper_pid": 69376,
+      "command": "/opt/homebrew/Cellar/python@3.15/3.15.1/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents/MacOS/Python /Users/dbur/dev/zk-miner/scripts/macos/test-native-worker.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --workload fibonacci --iterations 1000000 --min-guest-cycles 10000000 --repeat 5 --warmup --proof-only --timeout-seconds 1800"
+    },
+    "replan_sha256": "43e93bb39a6decc3d408a08a2624274f93f10d04f8f6508c1096a066dc85f483",
+    "verified_proofs": [
+      {
+        "case": "tiny-tail",
+        "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/b8f04c52a6d046c0be45ac94a1ac8d74/acceptance/proof-0",
+        "worker": {
+          "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+          "error": null,
+          "fallback_reason": null,
+          "gomaxprocs": 18,
+          "helper_arch": "darwin/arm64",
+          "helper_container": "zkminer-macos-67304-1793569458246056000-2",
+          "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+          "input_sha256": "7c9fa136d4413fa6173637e883b6998d32e1d675f88cddff9dcbcf331820f4b8",
+          "journal_hex": "f0debc9a78563412",
+          "journal_sha256": "54d0f38d95f8d3402c0171bbeac9c182e0908b4e17130986474268e763738fc5",
+          "max_guest_cycles": 67108864,
+          "minimum_segment_po2": 14,
+          "observed_mode": "cpu",
+          "observed_stages": {
+            "groth16": "native_darwin_arm64_helper",
+            "identity": "cpu",
+            "other_segment_operations": "cpu",
+            "recursion": "cpu",
+            "segment": "cpu"
+          },
+          "operation": "prove",
+          "phase": "complete",
+          "po2": 14,
+          "proof_kind": "groth16",
+          "rayon_threads": 18,
+          "request_id": 1,
+          "requested_mode": "cpu",
+          "schema_version": 1,
+          "seal_sha256": "ae7a348de6554f7085a9024485bb68b2c9a4f1fce9e01edf39e9918a4b1c7d3d",
+          "stage_ms": {
+            "execution_and_segment": 3013.691875,
+            "identity_and_wrap": 25213.056375,
+            "recursion": 32710.788792000003,
+            "verification": 1.739375
+          },
+          "staging_limit_bytes": 524288,
+          "stats": {
+            "paging_cycles": 42404,
+            "reserved_cycles": 36326,
+            "segments": 5,
+            "total_cycles": 81920,
+            "user_cycles": 3190
+          },
+          "total_ms": 61000.23625,
+          "worker_pid": 67448
+        },
+        "artifacts": {
+          "journal.bin": "54d0f38d95f8d3402c0171bbeac9c182e0908b4e17130986474268e763738fc5",
+          "receipt.bin": "ee0b5b46ff57a8b5641a4980b413bcf0153126207f3dc9301476cdafc091e701",
+          "resource.json": "fc6ffad919be815e486307ebba30851c18f516a7799ffe764fdf8825e0c9338c",
+          "seal.bin": "ae7a348de6554f7085a9024485bb68b2c9a4f1fce9e01edf39e9918a4b1c7d3d",
+          "timing.json": "54c8f94a64f6a289a051713ad2476e7bbfd576f19796537412ed8430c57fc78e",
+          "verification.json": "561957af71a204bf2776a571d01b9d28172871faf231a39eb3d81756853e8af7",
+          "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "verifier.stdout": "44b6cb4bb6efc34a4b82523d6e0ffbbea285df26c968bbbd7f37d94324cd3241",
+          "worker.json": "b50006eae0cacb7ee7572e240842925c86376a938a9dae6ba09b5f140f0bc11c"
+        }
+      },
+      {
+        "case": "segment-boundary",
+        "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/324eaaaef9374a16b9610982651da341/acceptance/proof-0",
+        "worker": {
+          "elf_sha256": "695f00d49cdb6619b6ea7d5e4066ff16b92922e27a097de55dcbcf6bfabd2125",
+          "error": null,
+          "fallback_reason": null,
+          "gomaxprocs": 18,
+          "helper_arch": "darwin/arm64",
+          "helper_container": "zkminer-macos-68388-1793569539520283000-2",
+          "image_id": "897a33b565441c387467797cc737e293285832951dd0599001cf01c2fa8d0de4",
+          "input_sha256": "226868b59be3e5e479cc22d7bda11055bad06bb205b77454ea36c65885f5c284",
+          "journal_hex": "f0febc9a78563412",
+          "journal_sha256": "118809efe7677d03153ce329b5af919e724a6f742dc98154e3df4ebbf54b574b",
+          "max_guest_cycles": 67108864,
+          "minimum_segment_po2": 14,
+          "observed_mode": "cpu",
+          "observed_stages": {
+            "groth16": "native_darwin_arm64_helper",
+            "identity": "cpu",
+            "other_segment_operations": "cpu",
+            "recursion": "cpu",
+            "segment": "cpu"
+          },
+          "operation": "prove",
+          "phase": "complete",
+          "po2": 16,
+          "proof_kind": "groth16",
+          "rayon_threads": 18,
+          "request_id": 1,
+          "requested_mode": "cpu",
+          "schema_version": 1,
+          "seal_sha256": "78ba55d7c69c074279615735704ef595f26603521928cd995d341e611912b25a",
+          "stage_ms": {
+            "execution_and_segment": 10582.337083,
+            "identity_and_wrap": 25233.006167,
+            "recursion": 33852.724209,
+            "verification": 1.728
+          },
+          "staging_limit_bytes": 524288,
+          "stats": {
+            "paging_cycles": 35483,
+            "reserved_cycles": 133352,
+            "segments": 5,
+            "total_cycles": 294912,
+            "user_cycles": 126077
+          },
+          "total_ms": 69734.019709,
+          "worker_pid": 68433
+        },
+        "artifacts": {
+          "journal.bin": "118809efe7677d03153ce329b5af919e724a6f742dc98154e3df4ebbf54b574b",
+          "receipt.bin": "e3243494bc452b2c62a0a63cf8ad43b39ede00092bb1fad5f7797c27a9ba950a",
+          "resource.json": "feb8f78464385d17707cb9fd18deace427d6ca5e02e4ccab7514c4d8484ee29e",
+          "seal.bin": "78ba55d7c69c074279615735704ef595f26603521928cd995d341e611912b25a",
+          "timing.json": "88ac422588c6b9e1f820a1776d0750c75e8e7e1b1bd8efba8c093744b05bc52e",
+          "verification.json": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1",
+          "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "verifier.stdout": "eaad05f59663ae87a1136d91dcf4a45cb1131d99b4e99f209b1c3842bbf20009",
+          "worker.json": "d0d54c2db233d95718e5be61ed3b9185116c1054dee196528f0fafac395b9a01"
+        }
+      },
+      {
+        "case": "arithmetic-10m",
+        "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/23cede34b79949ffb01e21c97fbc6ad0/acceptance/proof-0",
+        "worker": {
+          "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+          "error": null,
+          "fallback_reason": null,
+          "gomaxprocs": 18,
+          "helper_arch": "darwin/arm64",
+          "helper_container": "zkminer-macos-69383-1793569629833304000-2",
+          "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+          "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+          "journal_hex": "bb14577088ab06c5",
+          "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+          "max_guest_cycles": 67108864,
+          "minimum_segment_po2": 14,
+          "observed_mode": "cpu",
+          "observed_stages": {
+            "groth16": "native_darwin_arm64_helper",
+            "identity": "cpu",
+            "other_segment_operations": "cpu",
+            "recursion": "cpu",
+            "segment": "cpu"
+          },
+          "operation": "prove",
+          "phase": "complete",
+          "po2": 18,
+          "proof_kind": "groth16",
+          "rayon_threads": 18,
+          "request_id": 1,
+          "requested_mode": "cpu",
+          "schema_version": 1,
+          "seal_sha256": "d70ad1f2900ff10d2b5c5082322f18a496057f8c12864e7e426fd9100e8314ef",
+          "stage_ms": {
+            "execution_and_segment": 403654.837125,
+            "identity_and_wrap": 24690.4195,
+            "recursion": 302261.19779099996,
+            "verification": 1.7557079999999998
+          },
+          "staging_limit_bytes": 524288,
+          "stats": {
+            "paging_cycles": 101556,
+            "reserved_cycles": 1298592,
+            "segments": 44,
+            "total_cycles": 11403264,
+            "user_cycles": 10003116
+          },
+          "total_ms": 731067.264291,
+          "worker_pid": 69443
+        },
+        "artifacts": {
+          "journal.bin": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+          "receipt.bin": "ad352778996c9bf2dc3896e21f612f8b989c2fe3352f9bd01dd16ad2e533e13b",
+          "resource.json": "6accfc22e42d30bc11dd65bd257e5978c8b596b4981a3a9751cf2029a690dece",
+          "seal.bin": "d70ad1f2900ff10d2b5c5082322f18a496057f8c12864e7e426fd9100e8314ef",
+          "timing.json": "04f2a269a3c64a0d6fc3db7dce9e7184cee54fdd0b11fa2e5f277f2789e8e661",
+          "verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+          "verifier.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "verifier.stdout": "cc30750b5d557304d23e09fa32f331aa76da410bf91039a2585e06ee4f7545af",
+          "worker.json": "68491efc0b77292fe2e91f52eca1cb51e2c359dd414afa9c29101f9d59d330a5"
+        }
+      }
+    ]
+  },
+  "limitations": [
+    "Five measured warm proofs per fixed 10M fixture; one excluded first-process warmup each, not cold-boot timing.",
+    "One arithmetic stretch proof only; hashing stretch sized but not proved in this campaign.",
+    "Physical footprints are sampled, not an exact peak or a kernel-enforced memory cap.",
+    "Thermal nominal can mean unavailable; no energy or frequency measurements.",
+    "Deadline scaling is workload-dependent and does not establish marketplace feasibility.",
+    "Linux execution tests passed; Linux GPU proving runtime was not tested."
+  ],
+  "measured_csv_sha256": "447b25a3964d1e48f2dcb12dbca095763486ed377e5e9775475f3102f7cb71df"
+}

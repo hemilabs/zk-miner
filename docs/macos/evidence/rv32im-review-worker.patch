@@ -1,0 +1,495 @@
+diff --git a/crates/zkminer-prove-risc0/Cargo.toml b/crates/zkminer-prove-risc0/Cargo.toml
+index cc306b9..9737a52 100644
+--- a/crates/zkminer-prove-risc0/Cargo.toml
++++ b/crates/zkminer-prove-risc0/Cargo.toml
+@@ -20,10 +20,8 @@ required-features = ["rocm"]
+ 
+ [features]
+ macos = ["risc0-zkvm/disable-dev-mode", "dep:serde_json", "dep:sha2"]
+-# The local build script also enables risc0-zkvm/metal-hybrid explicitly.
+-# Do not reference that local-only engine feature here: the unchanged Git pin
+-# must still resolve for existing CPU/CUDA/ROCm builds.
+-macos-metal = ["macos", "dep:risc0-zkp", "dep:metal"]
++# Deprecated compatibility name: compilation emits migration guidance.
++macos-metal = ["macos"]
+ # Build tooling also selects the local engine's native-groth16 feature.
+ macos-native-wrap = ["macos"]
+ # Build tooling also enables the local engine's metal-recursion feature.
+diff --git a/crates/zkminer-prove-risc0/src/macos.rs b/crates/zkminer-prove-risc0/src/macos.rs
+index 1518964..9aca16b 100644
+--- a/crates/zkminer-prove-risc0/src/macos.rs
++++ b/crates/zkminer-prove-risc0/src/macos.rs
+@@ -1,4 +1,4 @@
+-//! Local macOS CPU / bounded Metal worker selection and proof diagnostics.
++//! Local macOS CPU / resident Metal worker selection and proof diagnostics.
+ use anyhow::{bail, ensure, Context, Result};
+ use risc0_zkvm::{LocalProver, Prover, ProverOpts};
+ use serde_json::{json, Value};
+@@ -13,19 +13,13 @@ use std::{
+     time::{Duration, Instant},
+ };
+ 
+-#[cfg(feature = "macos-metal")]
+-const STAGE: &str = "segment_poseidon2_merkle_fold";
+-const DEFAULT_STAGING_BYTES: usize = 512 * 1024;
+ const HELPER_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+-#[cfg(any(feature = "macos-metal", feature = "macos-recursion-metal"))]
++#[cfg(feature = "macos-recursion-metal")]
+ const METAL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+ 
+ struct Config {
+     requested: String,
+-    metal: bool,
+-    fallback: Option<String>,
+     probe: Option<Value>,
+-    staging_bytes: usize,
+     evidence_dir: Option<PathBuf>,
+     helper_container: String,
+     cpu_threads: usize,
+@@ -44,66 +38,18 @@ fn hash(bytes: &[u8]) -> String {
+     format!("{:x}", Sha256::digest(bytes))
+ }
+ 
+-fn select_mode(
+-    requested: &str,
+-    available: Result<Value>,
+-) -> Result<(bool, Option<Value>, Option<String>)> {
++fn legacy_mode(requested: &str) -> Result<()> {
+     match requested {
+-        "cpu" => Ok((false, None, None)),
+-        "metal" => Ok((
+-            true,
+-            Some(available.context("forced Metal unavailable")?),
+-            None,
+-        )),
+-        "auto" => match available {
+-            Ok(probe) => Ok((true, Some(probe), None)),
+-            Err(error) => Ok((false, None, Some(format!("{error:#}")))),
+-        },
+-        other => bail!("unknown ZKMINER_RISC0_MODE {other:?}; use cpu, auto, or metal"),
++        "cpu" | "auto" => Ok(()),
++        "metal" => bail!("ZKMINER_RISC0_MODE=metal selected the retired fold-only backend; build macos-rv32im-metal and use RISC0_SEGMENT_HAL=metal"),
++        other => bail!("unknown ZKMINER_RISC0_MODE {other:?}; remove this deprecated selector and use RISC0_SEGMENT_HAL=cpu or metal"),
+     }
+ }
+ 
+-#[cfg(feature = "macos-metal")]
+-fn probe_metal(staging_bytes: usize) -> Result<Value> {
+-    let (status, stdout) = zkminer_prover_protocol::proc::output_with_timeout_capturing_stdout(
+-        Command::new(std::env::current_exe()?)
+-            .args(["--macos-metal-probe", &staging_bytes.to_string()]),
+-        METAL_PROBE_TIMEOUT,
+-        64 * 1024,
+-    );
+-    ensure!(
+-        matches!(
+-            status,
+-            zkminer_prover_protocol::proc::Outcome::Ran { success: true, .. }
+-        ),
+-        "bounded Metal probe failed: {}",
+-        status.describe()
+-    );
+-    let probe: Value = serde_json::from_str(&stdout).context("invalid Metal probe response")?;
+-    ensure!(
+-        probe["stage"] == STAGE
+-            && probe["staging_limit_bytes"] == staging_bytes
+-            && probe["completed_dispatches"]
+-                .as_u64()
+-                .is_some_and(|v| v > 0)
+-            && probe["device_name"].as_str().is_some_and(|s| !s.is_empty())
+-            && probe["unified_memory"] == true
+-            && probe["max_buffer_bytes"]
+-                .as_u64()
+-                .is_some_and(|n| n >= staging_bytes as u64),
+-        "Metal probe did not establish the required stage and device capabilities"
+-    );
+-    Ok(probe)
+-}
+-#[cfg(not(feature = "macos-metal"))]
+-fn probe_metal(_staging_bytes: usize) -> Result<Value> {
+-    bail!("worker was compiled without the macos-metal feature")
+-}
+-
+ pub fn capabilities() -> (bool, Option<String>) {
+     let c = config();
+     (
+-        c.metal || c.segment_hal == "metal" || c.recursion_hal == "metal",
++        c.segment_hal == "metal" || c.recursion_hal == "metal",
+         c.probe
+             .as_ref()
+             .or(c.recursion_probe.as_ref())
+@@ -116,15 +62,10 @@ pub fn warmup_summary() -> String {
+     if cfg!(feature = "macos-native-wrap") {
+         return format!("Native helper ready; segments {}; Poseidon2 recursion {}; witness, accumulation and identity-p254 CPU", c.segment_hal, c.recursion_hal);
+     }
+-    if c.metal {
+-        format!("Metal ready: segment Poseidon2 Merkle folds; other native stages CPU; emulated Groth16 helper preflight passed; staging={} bytes", c.staging_bytes)
+-    } else {
+-        format!(
+-            "CPU ready; emulated Groth16 helper preflight passed; requested={}; fallback={}",
+-            c.requested,
+-            c.fallback.as_deref().unwrap_or("none")
+-        )
+-    }
++    format!(
++        "CPU ready; emulated Groth16 helper preflight passed; requested={}",
++        c.requested
++    )
+ }
+ 
+ fn recursion_mode(value: Option<&str>) -> Result<&'static str> {
+@@ -193,10 +134,6 @@ fn prover() -> LocalProver {
+     if config().segment_hal == "metal" {
+         return LocalProver::new("macos-rv32im-metal-worker");
+     }
+-    #[cfg(feature = "macos-metal")]
+-    if config().metal {
+-        return LocalProver::new_metal("macos-metal-worker", config().staging_bytes);
+-    }
+     LocalProver::new("macos-cpu-worker")
+ }
+ 
+@@ -282,18 +219,14 @@ pub fn preflight() -> Result<()> {
+             "unset {key} for native worker acceptance"
+         );
+     }
+-    let requested = std::env::var("ZKMINER_RISC0_MODE").unwrap_or_else(|_| "auto".into());
+-    ensure!(
+-        ["cpu", "auto", "metal"].contains(&requested.as_str()),
+-        "unknown ZKMINER_RISC0_MODE {requested:?}; use cpu, auto, or metal"
+-    );
+-    let staging_bytes: usize = std::env::var("ZKMINER_RISC0_METAL_STAGING_BYTES")
+-        .map(|s| s.parse())
+-        .unwrap_or(Ok(DEFAULT_STAGING_BYTES))
+-        .context("invalid ZKMINER_RISC0_METAL_STAGING_BYTES")?;
++    let requested = std::env::var("ZKMINER_RISC0_MODE").unwrap_or_else(|_| "cpu".into());
++    legacy_mode(&requested)?;
++    if std::env::var_os("ZKMINER_RISC0_MODE").is_some() {
++        tracing::warn!("ZKMINER_RISC0_MODE is deprecated; select segments with RISC0_SEGMENT_HAL");
++    }
+     ensure!(
+-        (4096..=16 * 1024 * 1024).contains(&staging_bytes),
+-        "Metal staging budget must be 4096..=16777216 bytes"
++        std::env::var_os("ZKMINER_RISC0_METAL_STAGING_BYTES").is_none(),
++        "ZKMINER_RISC0_METAL_STAGING_BYTES belongs to the retired fold-only backend; unset it"
+     );
+     #[cfg(feature = "macos-native-wrap")]
+     let (context, name) = {
+@@ -353,12 +286,7 @@ pub fn preflight() -> Result<()> {
+         ensure!(_dir.is_dir(), "shared helper work directory does not exist");
+         (context, name)
+     };
+-    let available = if requested == "cpu" {
+-        Err(anyhow::anyhow!("CPU explicitly selected"))
+-    } else {
+-        probe_metal(staging_bytes)
+-    };
+-    let (metal, mut probe, fallback) = select_mode(&requested, available)?;
++    let mut probe = None;
+     let recursion_value = match std::env::var("RISC0_RECURSION_HAL") {
+         Ok(value) => Some(value),
+         Err(std::env::VarError::NotPresent) => None,
+@@ -381,10 +309,6 @@ pub fn preflight() -> Result<()> {
+         differential == "0" || segment_hal == "metal",
+         "CPU differential requires RV32IM Metal"
+     );
+-    ensure!(
+-        !(metal && segment_hal == "metal"),
+-        "select RV32IM Metal separately from the legacy fold-only mode"
+-    );
+     if segment_hal == "metal" {
+         probe = probe_recursion("metal")?;
+     }
+@@ -394,10 +318,7 @@ pub fn preflight() -> Result<()> {
+     }
+     let state = Config {
+         requested,
+-        metal,
+-        fallback,
+         probe,
+-        staging_bytes,
+         evidence_dir,
+         helper_container: name.clone(),
+         cpu_threads,
+@@ -409,8 +330,8 @@ pub fn preflight() -> Result<()> {
+     };
+     tracing::info!(
+         "macos_mode {}",
+-        json!({"requested_mode":state.requested,"observed_mode":if metal || segment_hal == "metal" {"metal"} else {"cpu"},
+-        "fallback_reason":state.fallback,"probe":state.probe,"staging_limit_bytes":staging_bytes,
++        json!({"requested_mode":state.requested,"observed_mode":if segment_hal == "metal" {"metal"} else {"cpu"},
++        "fallback_reason":null,"probe":state.probe,"staging_limit_bytes":null,
+         "segment_hal":segment_hal,"poseidon2_recursion":recursion_hal,"recursion_probe":state.recursion_probe,
+         "witness_accumulation_identity_p254":"cpu","groth16":if cfg!(feature = "macos-native-wrap") { "native_darwin_arm64_helper" } else { "local_linux_amd64_helper" }})
+     );
+@@ -540,14 +461,14 @@ fn prove_staged(
+         format!("{}-benchmark-{request_id}.json", std::process::id())
+     };
+     let mut report = json!({"schema_version":1,"worker_pid":std::process::id(),"request_id":request_id,
+-        "operation":operation,"requested_mode":c.requested,"observed_mode":if c.metal || c.segment_hal == "metal" {"metal"} else {"cpu"},
+-        "fallback_reason":c.fallback,"phase":"started","proof_kind":null,"image_id":null,
++        "operation":operation,"requested_mode":c.requested,"observed_mode":if c.segment_hal == "metal" {"metal"} else {"cpu"},
++        "fallback_reason":null,"phase":"started","proof_kind":null,"image_id":null,
+         "elf_sha256":hash(elf),"input_sha256":hash(input),"po2":po2.unwrap_or(c.limits.default_segment_po2),
+         "helper_container":c.helper_container,"helper_arch":if cfg!(feature = "macos-native-wrap") { "darwin/arm64" } else { "linux/amd64 (emulated)" },
+         "rayon_threads":c.cpu_threads,"gomaxprocs":if cfg!(feature = "macos-native-wrap") { Some(c.go_threads) } else { None },
+         "max_guest_cycles":c.limits.max_guest_cycles,"minimum_segment_po2":14,
+         "segment_hal":c.segment_hal,"recursion_hal":c.recursion_hal,"recursion_cpu_stages":["witness","accumulation","identity_p254"],
+-        "staging_limit_bytes":c.staging_bytes,"stage_ms":{},"error":null});
++        "staging_limit_bytes":null,"stage_ms":{},"error":null});
+     write_report(&report, &filename)?;
+     let result = (|| -> Result<Completed> {
+         let image = risc0_zkvm::compute_image_id(elf).context("invalid program binary")?;
+@@ -567,29 +488,6 @@ fn prove_staged(
+         report["stats"] = serde_json::to_value(&info.stats)?;
+         let mut observed = json!({"other_segment_operations":"cpu","recursion":c.recursion_hal,
+             "identity":"cpu","groth16":if cfg!(feature = "macos-native-wrap") { "native_darwin_arm64_helper" } else { "local_linux_amd64_helper" }});
+-        #[cfg(feature = "macos-metal")]
+-        if c.metal {
+-            let segments = prover.metal_stage_reports();
+-            ensure!(
+-                segments.len() == info.stats.segments,
+-                "Metal evidence missing for a proved segment"
+-            );
+-            for (index, stage) in segments.iter().enumerate() {
+-                ensure!(
+-                    stage.segment_index as usize == index
+-                        && stage.completed_dispatches > 0
+-                        && stage.fold_calls > 0
+-                        && stage.output_digests > 0
+-                        && stage.input_digests == 2 * stage.output_digests
+-                        && stage.peak_staging_bytes <= stage.staging_limit_bytes
+-                        && stage.staging_limit_bytes == c.staging_bytes,
+-                    "inconsistent or absent Metal work in segment {index}"
+-                );
+-            }
+-            let completed: u64 = segments.iter().map(|s| s.completed_dispatches).sum();
+-            observed["metal_stage"] = json!({"name":STAGE,"segments":segments,"completed_dispatches":completed,
+-                "kernel_source_sha256":hash(risc0_zkp::hal::metal::runtime_kernel_source().as_bytes())});
+-        }
+         #[cfg(feature = "macos-rv32im-metal")]
+         {
+             let after = risc0_zkvm::metal_rv32im_stats();
+@@ -624,7 +522,7 @@ fn prove_staged(
+                 );
+             }
+         }
+-        if !c.metal && c.segment_hal == "cpu" {
++        if c.segment_hal == "cpu" {
+             observed["segment"] = json!("cpu");
+         }
+         report["observed_stages"] = observed;
+@@ -775,20 +673,12 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn mode_selection_never_falls_back_for_forced_metal() {
+-        assert!(select_mode("metal", Err(anyhow::anyhow!("device unavailable"))).is_err());
+-        let (metal, probe, reason) =
+-            select_mode("auto", Err(anyhow::anyhow!("device unavailable"))).unwrap();
+-        assert!(!metal && probe.is_none());
+-        assert!(reason.unwrap().contains("device unavailable"));
+-        assert!(select_mode("invalid", Ok(json!({}))).is_err());
+-        let (metal, _, reason) = select_mode("cpu", Err(anyhow::anyhow!("ignored"))).unwrap();
+-        assert!(!metal && reason.is_none());
+-        assert!(
+-            select_mode("auto", Ok(json!({"available":true})))
+-                .unwrap()
+-                .0
+-        );
++    fn retired_fold_selector_is_rejected_with_migration_guidance() {
++        let message = legacy_mode("metal").unwrap_err().to_string();
++        assert!(message.contains("RISC0_SEGMENT_HAL=metal"));
++        assert!(legacy_mode("cpu").is_ok());
++        assert!(legacy_mode("auto").is_ok());
++        assert!(legacy_mode("invalid").is_err());
+     }
+ 
+     #[test]
+@@ -818,7 +708,7 @@ mod tests {
+     fn startup_probe_budgets_fit_the_existing_handshake() {
+         use zkminer_prover_protocol::proc::{max_overhead, HANDSHAKE_TIMEOUT};
+         let probes = 2 * (HELPER_PROBE_TIMEOUT + max_overhead());
+-        #[cfg(any(feature = "macos-metal", feature = "macos-recursion-metal"))]
++        #[cfg(feature = "macos-recursion-metal")]
+         let probes = probes + METAL_PROBE_TIMEOUT + max_overhead();
+         assert!(probes + Duration::from_millis(500) < HANDSHAKE_TIMEOUT);
+     }
+diff --git a/crates/zkminer-prove-risc0/src/macos_metal.rs b/crates/zkminer-prove-risc0/src/macos_metal.rs
+deleted file mode 100644
+index ae0a47d..0000000
+--- a/crates/zkminer-prove-risc0/src/macos_metal.rs
++++ /dev/null
+@@ -1,108 +0,0 @@
+-//! Isolated capability probe for the validated Metal Merkle-fold stage.
+-//!
+-//! The worker supervisor runs this in a bounded subprocess. A compiler, device,
+-//! or dispatch failure therefore cannot silently select a different proving mode.
+-
+-use anyhow::{ensure, Context, Result};
+-use risc0_zkp::{
+-    core::digest::Digest,
+-    field::baby_bear::{BabyBear, BabyBearElem},
+-    hal::{cpu::CpuHal, metal::MetalHalPoseidon2, metal_fold::MetalPoseidon2Fold, Buffer, Hal},
+-};
+-use serde_json::{json, Value};
+-
+-/// Compile the retained kernels and compare real, bounded Metal work with CPU.
+-/// This checks device usability; complete proof acceptance is a separate gate.
+-pub fn probe(staging_bytes: usize) -> Result<Value> {
+-    ensure!(
+-        (4096..=16 * 1024 * 1024).contains(&staging_bytes),
+-        "Metal probe staging budget must be between 4 KiB and 16 MiB"
+-    );
+-    let (device_name, max_buffer_bytes, recommended_working_set_bytes, unified_memory, suite) =
+-        metal::objc::rc::autoreleasepool(|| {
+-            let hal = MetalHalPoseidon2::new();
+-            (
+-                hal.device.name().to_owned(),
+-                hal.device.max_buffer_length() as u64,
+-                hal.device.recommended_max_working_set_size(),
+-                hal.device.has_unified_memory(),
+-                hal.get_hash_suite().clone(),
+-            )
+-        });
+-    ensure!(
+-        unified_memory,
+-        "Metal hybrid proving requires unified memory"
+-    );
+-    ensure!(
+-        max_buffer_bytes >= staging_bytes as u64,
+-        "Metal maximum buffer size is below the required staging budget"
+-    );
+-    ensure!(
+-        recommended_working_set_bytes >= staging_bytes as u64,
+-        "Metal recommended working set is below the required staging budget"
+-    );
+-
+-    // At the default budget this exercises a full staging chunk and a tail,
+-    // with a nonzero CPU buffer offset and unchanged prefix/suffix sentinels. All digest words are reduced
+-    // Montgomery BabyBear values, matching the retained Poseidon2 representation.
+-    const OUTPUTS: usize = 4097;
+-    const OFFSET: usize = 3;
+-    const GUARD: usize = 5;
+-    let sentinel = Digest::from([BabyBearElem::new(17).as_u32_montgomery(); 8]);
+-    let mut initial = vec![sentinel; OFFSET + OUTPUTS * 4 + GUARD];
+-    for i in 0..OUTPUTS * 2 {
+-        initial[OFFSET + OUTPUTS * 2 + i] = Digest::from(std::array::from_fn(|j| {
+-            BabyBearElem::new((i as u32).wrapping_mul(37).wrapping_add(j as u32 * 73))
+-                .as_u32_montgomery()
+-        }));
+-    }
+-    let cpu = CpuHal::<BabyBear>::new(suite.clone());
+-    let hybrid =
+-        CpuHal::<BabyBear, _>::with_hash_fold(suite, MetalPoseidon2Fold::new(staging_bytes)?);
+-    let expected = cpu.copy_from_digest("metal_probe_expected", &initial);
+-    let actual = hybrid.copy_from_digest("metal_probe_actual", &initial);
+-    cpu.hash_fold(&expected.slice(OFFSET, OUTPUTS * 4), OUTPUTS * 2, OUTPUTS);
+-    hybrid.hash_fold(&actual.slice(OFFSET, OUTPUTS * 4), OUTPUTS * 2, OUTPUTS);
+-    let mut matched = false;
+-    expected.view(|expected| actual.view(|actual| matched = expected == actual));
+-    ensure!(
+-        matched,
+-        "Metal fold probe differs from CPU output or changed sentinels"
+-    );
+-
+-    let stats = hybrid
+-        .metal_stats()
+-        .context("Metal probe produced no stage counters")?;
+-    let outputs_per_chunk = staging_bytes / (4 * std::mem::size_of::<Digest>());
+-    let expected_dispatches = OUTPUTS.div_ceil(outputs_per_chunk) as u64;
+-    ensure!(
+-        stats.completed_dispatches == expected_dispatches && stats.fold_calls == 1,
+-        "Metal probe did not complete the required GPU chunks"
+-    );
+-    ensure!(
+-        stats.output_digests == OUTPUTS as u64 && stats.input_digests == (OUTPUTS * 2) as u64,
+-        "Metal probe processed an unexpected amount of work"
+-    );
+-    ensure!(
+-        stats.peak_staging_bytes
+-            == outputs_per_chunk.min(OUTPUTS) * 4 * std::mem::size_of::<Digest>()
+-            && stats.staging_limit_bytes == staging_bytes,
+-        "Metal probe staging budget was not enforced"
+-    );
+-
+-    Ok(json!({
+-        "device_name": device_name,
+-        "max_buffer_bytes": max_buffer_bytes,
+-        "recommended_working_set_bytes": recommended_working_set_bytes,
+-        "unified_memory": unified_memory,
+-        "completed_dispatches": stats.completed_dispatches,
+-        "stage": "segment_poseidon2_merkle_fold",
+-        "staging_limit_bytes": stats.staging_limit_bytes,
+-        "peak_staging_bytes": stats.peak_staging_bytes,
+-        "fold_calls": stats.fold_calls,
+-        "input_digests": stats.input_digests,
+-        "output_digests": stats.output_digests,
+-        "differential": "matched_cpu",
+-        "compiler": "runtime_source"
+-    }))
+-}
+diff --git a/crates/zkminer-prove-risc0/src/main.rs b/crates/zkminer-prove-risc0/src/main.rs
+index 2c27d11..43e553c 100644
+--- a/crates/zkminer-prove-risc0/src/main.rs
++++ b/crates/zkminer-prove-risc0/src/main.rs
+@@ -14,7 +14,7 @@ compile_error!("macos mode cannot be combined with CUDA or ROCm");
+ #[cfg(feature = "macos")]
+ mod macos;
+ #[cfg(feature = "macos-metal")]
+-mod macos_metal;
++compile_error!("macos-metal is retired; use macos-rv32im-metal with RISC0_SEGMENT_HAL=metal");
+ 
+ use anyhow::{Context, Result};
+ #[cfg(not(feature = "macos"))]
+@@ -38,18 +38,10 @@ fn main() {
+             Err(error) => { eprintln!("recursion Metal probe failed: {error:#}"); std::process::exit(1); }
+         }
+     }
+-    // Isolated, bounded capability probe: no IPC, guest, helper or network path.
+-    #[cfg(feature = "macos-metal")]
++    #[cfg(feature = "macos")]
+     if std::env::args().nth(1).as_deref() == Some("--macos-metal-probe") {
+-        let result = (|| -> anyhow::Result<serde_json::Value> {
+-            let budget: usize = std::env::args().nth(2)
+-                .context("missing Metal staging budget")?.parse()?;
+-            macos_metal::probe(budget)
+-        })();
+-        match result {
+-            Ok(value) => { println!("{value}"); return; }
+-            Err(error) => { eprintln!("Metal probe failed: {error:#}"); std::process::exit(1); }
+-        }
++        eprintln!("The fold-only Metal probe is retired; use RISC0_SEGMENT_HAL=metal on a macos-rv32im-metal worker");
++        std::process::exit(2);
+     }
+     tracing_subscriber::fmt()
+         .with_writer(io::stderr)
+diff --git a/scripts/macos/build-worker.py b/scripts/macos/build-worker.py
+index aaa10ad..62b7312 100644
+--- a/scripts/macos/build-worker.py
++++ b/scripts/macos/build-worker.py
+@@ -28,6 +28,15 @@ def check_lock_delta(original, local):
+             b["dependencies"] = [d for d in b.get("dependencies", []) if d != "risc0-build-kernel"]
+         if key[0] == "risc0-circuit-rv32im" and "metal" not in a.get("dependencies", []):
+             b["dependencies"] = [d for d in b.get("dependencies", []) if d != "metal"]
++        # Reviewed release-3.0 additions use packages already present in the
++        # pinned lock; package versions and every other edge remain checked.
++        parent_edges = {
++            ("risc0-build-kernel", "2.1.0"): "jobserver",
++            ("risc0-groth16-sys", "0.1.0"): "risc0-sys",
++        }
++        dependency = parent_edges.get(key)
++        if dependency and dependency not in a.get("dependencies", []):
++            b["dependencies"] = [d for d in b.get("dependencies", []) if d != dependency]
+         valid = valid and a == b
+     return valid
+ 
+@@ -40,6 +49,8 @@ def main():
+     parser.add_argument("--mode", choices=["cpu", "metal", "native", "native-recursion-metal", "native-rv32im-metal"], default="cpu")
+     parser.add_argument("--tests", action="store_true", help="run the selected worker unit tests before sealing")
+     args = parser.parse_args()
++    if args.mode == "metal":
++        parser.error("the fold-only metal build is retired; use --mode native-rv32im-metal")
+     root = Path(__file__).resolve().parents[2]
+     output = root / "target/macos"
+     config, engine = args.config.resolve(), args.engine.resolve()

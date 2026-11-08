@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "status": "diagnostic_stopped_after_arithmetic_gate_miss",
+  "reason": "The five-pair arithmetic median saved less than the required 1.5 seconds; the hash harness was stopped before completing its fixture.",
+  "source_spec_sha256": "a7ab34ce1697757bcb73622aebe0b503d42b38e3a601942f76e90fd5744f581c",
+  "engine_commit": "cd018ee7281d58ab529d04b1ee8c4ce8a9cfa8d2",
+  "campaign_run": "/Users/dbur/dev/zk-miner/target/macos/phase2/wp8lite-pairs/b74efa16cabe4f758032dcc13998c79a",
+  "campaign_result_sha256": "77cd1bbc838973f7eb18e1d5cda2321afaca4c5245f899a042e326dd18c68386",
+  "arithmetic_result_sha256": "e49a37c494637f220bb935e23fa70097a07543de40453d81f86fea151f165f75",
+  "baseline_worker_sha256": "6e4150dd25170ba2c90cff9510bef4b6ed86a87de1f7f79860a0a416533c7f69",
+  "candidate_worker_sha256": "3a7e27a5978acbb491a8b24b3f88bbc9ebc8c35318af3d7b3bc3b853140271fb",
+  "helper_manifest_sha256": "b7366f929e0d1cee4b396500c7fa5f9e6a7ec47d2abc2e00b1f126c4fa256de7",
+  "verified_arithmetic_proofs": 12,
+  "arithmetic_median_complete_seconds": {
+    "wp1b_baseline": 50.534010833,
+    "wp8lite_first": 50.503844251
+  },
+  "arithmetic_saving_seconds": 0.03016658200000677,
+  "arithmetic_complete_seconds": {
+    "wp1b_baseline": [
+      53.560105626,
+      51.495309416,
+      50.522382791000005,
+      50.501294792,
+      50.534010833
+    ],
+    "wp8lite_first": [
+      53.564347958000006,
+      51.549921293000004,
+      50.47759712599999,
+      49.493765834,
+      50.503844251
+    ]
+  },
+  "hash_fixture_status": "failed"
+}

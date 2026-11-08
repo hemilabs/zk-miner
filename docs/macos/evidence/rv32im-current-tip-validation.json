@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "status": "correctness_and_stretch_passed",
+  "engine_revision": "dcbe9f4b9140a48d4792ffcd3a3eba19897be175",
+  "worker_sha256": "f876cf8e7591e7f9ea98085ccb259ad22f767d54715023b79c5b9caf2e74fc08",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "host_reserve_gib": 16,
+  "verified_proofs": 4,
+  "negative_checks": 12,
+  "focused_tests": 31,
+  "cases": [
+    {
+      "name": "tip-smoke",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/9ed8eb52453649d58c21bb1773f90ad5",
+      "result_sha256": "e7395e5518938782ee9eae1e3a2382ad6cf1e4ee7e786a9bcb1ff99cb5bed2a2",
+      "complete_seconds": [
+        34.234615749
+      ],
+      "proofs": [
+        {
+          "verification_sha256": "561957af71a204bf2776a571d01b9d28172871faf231a39eb3d81756853e8af7",
+          "worker_sha256": "31f8b301ab518a55fcae0adbebc04633ccf881ddee2627c8a147e28a175caf4f",
+          "stats": {
+            "paging_cycles": 42404,
+            "reserved_cycles": 36326,
+            "segments": 5,
+            "total_cycles": 81920,
+            "user_cycles": 3190
+          },
+          "segment_hal": "metal",
+          "recursion_hal": "metal"
+        }
+      ]
+    },
+    {
+      "name": "tip-full-domain-differential",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/0552232412e9419188b541378f5a14cd",
+      "result_sha256": "6371a5f6a6ed77e34c4469f8dfe39fcf8f422da06895c518bba4389c1361d428",
+      "complete_seconds": [
+        75.439365667
+      ],
+      "proofs": [
+        {
+          "verification_sha256": "4098df86aa29284c17d5c24fcb28f4231c239b36f955a7b9404c103b4c87f8ee",
+          "worker_sha256": "1717fa9860384e2d28553944dfca7d71a3572d4dab330df47d479da9c315771e",
+          "stats": {
+            "paging_cycles": 25074,
+            "reserved_cycles": 44674,
+            "segments": 2,
+            "total_cycles": 1572864,
+            "user_cycles": 1503116
+          },
+          "segment_hal": "metal",
+          "recursion_hal": "metal"
+        }
+      ]
+    },
+    {
+      "name": "tip-hash-10m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/108290f8335d41f19315944ffb0d630e",
+      "result_sha256": "9672e599f3165302b53556fb986ed0ded807dd96d776c7a0ab9baffeece07fb8",
+      "complete_seconds": [
+        132.959401208
+      ],
+      "proofs": [
+        {
+          "verification_sha256": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5",
+          "worker_sha256": "b4ab4a0924b3d61588a137245cf5726c9b7e715199b198a5362abfdb0581a92f",
+          "stats": {
+            "paging_cycles": 109720,
+            "reserved_cycles": 372600,
+            "segments": 10,
+            "total_cycles": 10485760,
+            "user_cycles": 10003440
+          },
+          "segment_hal": "metal",
+          "recursion_hal": "metal"
+        }
+      ]
+    }
+  ],
+  "campaign": "/Users/dbur/dev/zk-miner/target/macos/review-rv32im/a4e3503a224148aa912974ac2db8f8d6",
+  "stretch_status": "passed",
+  "performance_gate": "pending",
+  "metal_profiles": "pending",
+  "stretch": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/c31a15ae0bef4b0297a431a72a4796d3",
+    "result_sha256": "461535e759903384b9ff0e3bc9ea1ee2f0eb573bb97da9d6847d4f725404152e",
+    "verification_sha256": "56df0dc8c2fe653e74c638d316e479fb303b69106dce5e4078e245238498dfd4",
+    "resource_sha256": "5d9faff4d3d6f18eef47eb162683e883eddbc94c29ae78ad0801b562e66b480d",
+    "complete_seconds": 484.740118,
+    "stats": {
+      "paging_cycles": 105198,
+      "reserved_cycles": 1339750,
+      "segments": 46,
+      "total_cycles": 47448064,
+      "user_cycles": 46003116
+    },
+    "proposed_600_second_target_passed": true,
+    "guard_peak_footprint_bytes": 16537011520,
+    "pressure_levels": [
+      1
+    ]
+  },
+  "correctness_campaign_sha256": "fca4f87ec8b84eef6b0a73f056c3f42b5dd52252d9012640c86486df08e49555"
+}

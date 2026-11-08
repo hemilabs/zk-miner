@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [[bin]]
+name = "zkminer-prove-risc0"
+path = "src/main.rs"
+required-features = ["macos"]
+
+[[bin]]
 name = "zkminer-prove-risc0-cuda"
 path = "src/main.rs"
 required-features = ["cuda"]
@@ -19,6 +24,15 @@ path = "src/main.rs"
 required-features = ["intel"]
 
 [features]
+macos = ["risc0-zkvm/disable-dev-mode", "dep:serde_json", "dep:sha2"]
+# Deprecated compatibility name: compilation emits migration guidance.
+macos-metal = ["macos"]
+# Build tooling also selects the local engine's native-groth16 feature.
+macos-native-wrap = ["macos"]
+# Build tooling also enables the local engine's metal-recursion feature.
+macos-recursion-metal = ["macos-native-wrap", "dep:metal"]
+# Tooling also selects the local engine's metal-rv32im + metal-recursion features.
+macos-rv32im-metal = ["macos-recursion-metal", "dep:risc0-zkp"]
 cuda = ["risc0-zkvm/cuda", "risc0-groth16/cuda"]
 rocm = ["risc0-zkvm/rocm", "risc0-groth16/rocm"]
 # Intel Arc / Data Center GPUs through SYCL on Level Zero. Built with oneAPI's `icpx` (see the README's
@@ -72,3 +86,11 @@ tempfile = "3"
 
 [build-dependencies]
 risc0-build = "3.0"
+risc0-binfmt = "3.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+serde_json = { workspace = true, optional = true }
+sha2 = { version = "0.10", optional = true }
+risc0-zkp = { version = "3.0", default-features = false, optional = true }
+metal = { version = "0.29", optional = true }

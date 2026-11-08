@@ -1,0 +1,1544 @@
+{
+  "schema_version": 1,
+  "status": "complete",
+  "source_engine_commit": "0515e0bdebcd1f5f2d24cef91691ebd5b0c5d0a6",
+  "source_miner_commit": "4cbfb3ee689df6a4723e03e82317aa789910ca66",
+  "latest_profile_sha256": "87ab2625c751e00792837e504e1b630c5f378cae0edf263a643de66aeea96ad1",
+  "diagnostic_plan_sha256": "7e8b952bcd0c82a1112b64507a72f0db908eacc2c7f329aa7906f18f72249ea5",
+  "diagnostic_result_sha256": "472569d27d330f10749802cc9e19b68f367542264c961235182a71c317165e27",
+  "assessment_script_sha256": "7ca1066d9f5b4058d195e1957e5ce19c73c40bb8952c1c170cc51e2ccdfc768d",
+  "worker_binary_sha256": "d157305ba0e0830671c6b8f6238dc68e59ae8a68dc3454865c2084c21bc347b9",
+  "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "device": {
+    "device_name": "Apple M5 Max",
+    "max_buffer_bytes": 86586540032,
+    "scope": "device only; shader compilation is on the proof path",
+    "unified_memory": true
+  },
+  "device_sha256": "aba7a1e5cd16b3c3fc8e1c63115ece1924587ff1bd1ffd45f57b07f21c480181",
+  "latest_observations": [
+    {
+      "fixture": "arithmetic-10m",
+      "complete_seconds": 418.32250287500005,
+      "stage_seconds": 381.356039083,
+      "stage_share_percent": 91.16316632790704,
+      "optimistic_combined_stage_scenarios": {
+        "acceleratable_seconds": 381.356039083,
+        "remaining_floor_seconds": 36.96646379200007,
+        "ideal_speedup_ceiling": 11.316270477716872,
+        "phase_speedup_needed_for_2x_complete": 2.2146781810149996,
+        "conditional_seconds": {
+          "1.5": 291.20382318066675,
+          "2": 227.64448333350006,
+          "3": 164.08514348633338,
+          "5": 113.23767160860007,
+          "10": 75.10206770030007
+        },
+        "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+      }
+    },
+    {
+      "fixture": "hash-10m",
+      "complete_seconds": 421.23575033300006,
+      "stage_seconds": 384.6027965,
+      "stage_share_percent": 91.30345565303027,
+      "optimistic_combined_stage_scenarios": {
+        "acceleratable_seconds": 384.6027965,
+        "remaining_floor_seconds": 36.632953833000045,
+        "ideal_speedup_ceiling": 11.498820222177619,
+        "phase_speedup_needed_for_2x_complete": 2.2105524636975913,
+        "conditional_seconds": {
+          "1.5": 293.03481816633337,
+          "2": 228.93435208300005,
+          "3": 164.8338859996667,
+          "5": 113.55351313300005,
+          "10": 75.09323348300005
+        },
+        "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+      }
+    }
+  ],
+  "diagnostics": [
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/374cce303e19480b94e3c50fcd3fb9f6",
+      "worker": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "error": null,
+        "fallback_reason": null,
+        "gomaxprocs": 18,
+        "helper_arch": "darwin/arm64",
+        "helper_container": "zkminer-macos-49353-1793592672833408000-2",
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+        "journal_hex": "bb14577088ab06c5",
+        "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+        "max_guest_cycles": 67108864,
+        "minimum_segment_po2": 14,
+        "observed_mode": "cpu",
+        "observed_stages": {
+          "groth16": "native_darwin_arm64_helper",
+          "identity": "cpu",
+          "other_segment_operations": "cpu",
+          "recursion": "metal",
+          "recursion_metal": {
+            "completed_constraint_checks": 19,
+            "cpu_stages": [
+              "witness",
+              "accumulation"
+            ],
+            "evaluation_points": 19922944,
+            "kernel_source_sha256": "137564beae0d2804c66d1957411d6be97b6b4d7b9cb4d7868eecdc80b0c69bb5"
+          },
+          "segment": "cpu"
+        },
+        "operation": "prove",
+        "phase": "complete",
+        "po2": 20,
+        "proof_kind": "groth16",
+        "rayon_threads": 18,
+        "recursion_cpu_stages": [
+          "witness",
+          "accumulation",
+          "identity_p254"
+        ],
+        "recursion_hal": "metal",
+        "request_id": 1,
+        "requested_mode": "cpu",
+        "schema_version": 1,
+        "seal_sha256": "409ec0889f7e013492267ecdf5984fcf09635d7d63fa22b9ab2b7eeb8e4f03d6",
+        "stage_ms": {
+          "execution_and_segment": 379960.8315,
+          "identity_and_wrap": 24368.736292,
+          "recursion": 11390.378083,
+          "verification": 1.735667
+        },
+        "staging_limit_bytes": 524288,
+        "stats": {
+          "paging_cycles": 39642,
+          "reserved_cycles": 443002,
+          "segments": 10,
+          "total_cycles": 10485760,
+          "user_cycles": 10003116
+        },
+        "total_ms": 415851.780875,
+        "worker_pid": 49407
+      },
+      "complete_seconds": 416.15829249899997,
+      "execution_and_segment_seconds": 379.9608315,
+      "summed_segment_prover_seconds": 379.8191,
+      "execution_preflight_and_caller_residual_seconds": 0.14173149999999168,
+      "exclusive_segment_seconds": {
+        "constraint_evaluation": 195.6269,
+        "merkle_commitments": 118.2323,
+        "polynomial_transforms": 40.8464,
+        "witness_generation": 1.4938,
+        "accumulation": 6.3513,
+        "other_segment_protocol": 17.268399999999986
+      },
+      "exclusive_segment_percent": {
+        "constraint_evaluation": 51.50528238311344,
+        "merkle_commitments": 31.128582001273763,
+        "polynomial_transforms": 10.754172183547379,
+        "witness_generation": 0.39329249108325515,
+        "accumulation": 1.6721907876670765,
+        "other_segment_protocol": 4.546480153315088
+      },
+      "timers": {
+        "begin": [
+          {
+            "witgen": 196.2,
+            "data_commit": 9810.3,
+            "accum": 609.6,
+            "accum_commit": 5173.2,
+            "main": 16938.2,
+            "total": 39808.8
+          },
+          {
+            "witgen": 140.0,
+            "data_commit": 9641.4,
+            "accum": 608.9,
+            "accum_commit": 5041.0,
+            "main": 15431.5,
+            "total": 38174.1
+          },
+          {
+            "witgen": 153.0,
+            "data_commit": 9629.7,
+            "accum": 601.5,
+            "accum_commit": 5023.2,
+            "main": 15407.6,
+            "total": 38130.6
+          },
+          {
+            "witgen": 140.7,
+            "data_commit": 9689.5,
+            "accum": 606.2,
+            "accum_commit": 5008.1,
+            "main": 15444.7,
+            "total": 37943.5
+          },
+          {
+            "witgen": 153.7,
+            "data_commit": 9527.6,
+            "accum": 601.9,
+            "accum_commit": 5004.7,
+            "main": 15288.1,
+            "total": 37582.6
+          },
+          {
+            "witgen": 136.4,
+            "data_commit": 9498.6,
+            "accum": 605.9,
+            "accum_commit": 4975.2,
+            "main": 15216.3,
+            "total": 37531.7
+          },
+          {
+            "witgen": 149.9,
+            "data_commit": 9500.7,
+            "accum": 619.7,
+            "accum_commit": 5090.4,
+            "main": 15360.8,
+            "total": 37705.5
+          },
+          {
+            "witgen": 138.8,
+            "data_commit": 9467.7,
+            "accum": 629.1,
+            "accum_commit": 5019.6,
+            "main": 15255.5,
+            "total": 37564.1
+          },
+          {
+            "witgen": 150.5,
+            "data_commit": 9476.4,
+            "accum": 617.5,
+            "accum_commit": 4979.2,
+            "main": 15224.0,
+            "total": 37581.2
+          },
+          {
+            "witgen": 134.6,
+            "data_commit": 9514.6,
+            "accum": 851.0,
+            "accum_commit": 4968.4,
+            "main": 15468.8,
+            "total": 37797.0
+          }
+        ],
+        "start_finalize": [
+          {
+            "alloc": 3.2,
+            "eval_check_launch": 19921.7,
+            "post_eval_check": 0.0,
+            "total": 19925.0
+          },
+          {
+            "alloc": 7.5,
+            "eval_check_launch": 19830.7,
+            "post_eval_check": 0.0,
+            "total": 19838.2
+          },
+          {
+            "alloc": 0.3,
+            "eval_check_launch": 19830.3,
+            "post_eval_check": 0.0,
+            "total": 19830.6
+          },
+          {
+            "alloc": 0.3,
+            "eval_check_launch": 19600.7,
+            "post_eval_check": 0.0,
+            "total": 19601.0
+          },
+          {
+            "alloc": 0.3,
+            "eval_check_launch": 19402.6,
+            "post_eval_check": 0.0,
+            "total": 19402.9
+          },
+          {
+            "alloc": 0.3,
+            "eval_check_launch": 19407.4,
+            "post_eval_check": 0.0,
+            "total": 19407.7
+          },
+          {
+            "alloc": 1.2,
+            "eval_check_launch": 19440.7,
+            "post_eval_check": 0.0,
+            "total": 19441.9
+          },
+          {
+            "alloc": 7.3,
+            "eval_check_launch": 19373.9,
+            "post_eval_check": 0.0,
+            "total": 19381.3
+          },
+          {
+            "alloc": 0.3,
+            "eval_check_launch": 19429.6,
+            "post_eval_check": 0.0,
+            "total": 19429.9
+          },
+          {
+            "alloc": 0.3,
+            "eval_check_launch": 19389.3,
+            "post_eval_check": 0.0,
+            "total": 19389.6
+          }
+        ],
+        "finalize": [
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 100.3,
+            "check_commit": 1148.6,
+            "eval_u": 787.7,
+            "combos": 586.2,
+            "fri": 318.1,
+            "total": 2945.5
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 100.1,
+            "check_commit": 1135.1,
+            "eval_u": 778.5,
+            "combos": 572.8,
+            "fri": 313.5,
+            "total": 2904.4
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 99.8,
+            "check_commit": 1130.2,
+            "eval_u": 770.5,
+            "combos": 576.3,
+            "fri": 310.5,
+            "total": 2892.4
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 99.5,
+            "check_commit": 1135.6,
+            "eval_u": 763.9,
+            "combos": 575.6,
+            "fri": 318.1,
+            "total": 2897.8
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 99.6,
+            "check_commit": 1150.7,
+            "eval_u": 758.0,
+            "combos": 570.9,
+            "fri": 307.3,
+            "total": 2891.5
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 99.5,
+            "check_commit": 1156.0,
+            "eval_u": 758.3,
+            "combos": 577.5,
+            "fri": 311.6,
+            "total": 2907.7
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 99.4,
+            "check_commit": 1157.0,
+            "eval_u": 759.3,
+            "combos": 572.9,
+            "fri": 309.2,
+            "total": 2902.8
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 99.4,
+            "check_commit": 1150.5,
+            "eval_u": 760.1,
+            "combos": 578.0,
+            "fri": 334.0,
+            "total": 2927.2
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 99.5,
+            "check_commit": 1140.6,
+            "eval_u": 764.7,
+            "combos": 585.9,
+            "fri": 332.1,
+            "total": 2927.3
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 99.4,
+            "check_commit": 1132.6,
+            "eval_u": 781.6,
+            "combos": 591.2,
+            "fri": 329.3,
+            "total": 2938.5
+          }
+        ],
+        "groups": {
+          "code": [
+            {
+              "ntt": 92.1,
+              "bitrev": 3.2,
+              "merkle": 1027.0,
+              "total": 1122.3
+            }
+          ],
+          "data": [
+            {
+              "ntt": 1424.2,
+              "bitrev": 50.8,
+              "merkle": 7032.9,
+              "total": 8507.8
+            },
+            {
+              "ntt": 1415.9,
+              "bitrev": 49.8,
+              "merkle": 7034.2,
+              "total": 8500.0
+            },
+            {
+              "ntt": 1416.1,
+              "bitrev": 50.7,
+              "merkle": 7029.5,
+              "total": 8496.2
+            },
+            {
+              "ntt": 1421.9,
+              "bitrev": 50.5,
+              "merkle": 7068.5,
+              "total": 8541.0
+            },
+            {
+              "ntt": 1398.3,
+              "bitrev": 51.2,
+              "merkle": 6956.6,
+              "total": 8406.1
+            },
+            {
+              "ntt": 1397.5,
+              "bitrev": 49.4,
+              "merkle": 6926.3,
+              "total": 8373.1
+            },
+            {
+              "ntt": 1392.8,
+              "bitrev": 50.8,
+              "merkle": 6935.7,
+              "total": 8379.3
+            },
+            {
+              "ntt": 1395.7,
+              "bitrev": 50.1,
+              "merkle": 6901.3,
+              "total": 8347.1
+            },
+            {
+              "ntt": 1392.5,
+              "bitrev": 49.9,
+              "merkle": 6910.4,
+              "total": 8352.7
+            },
+            {
+              "ntt": 1404.4,
+              "bitrev": 48.1,
+              "merkle": 6935.9,
+              "total": 8388.5
+            }
+          ],
+          "accum": [
+            {
+              "ntt": 713.0,
+              "bitrev": 26.3,
+              "merkle": 3779.0,
+              "total": 4518.2
+            },
+            {
+              "ntt": 708.0,
+              "bitrev": 25.2,
+              "merkle": 3739.0,
+              "total": 4472.2
+            },
+            {
+              "ntt": 705.6,
+              "bitrev": 25.5,
+              "merkle": 3730.9,
+              "total": 4462.0
+            },
+            {
+              "ntt": 698.1,
+              "bitrev": 25.4,
+              "merkle": 3720.1,
+              "total": 4443.6
+            },
+            {
+              "ntt": 692.4,
+              "bitrev": 26.1,
+              "merkle": 3726.5,
+              "total": 4445.0
+            },
+            {
+              "ntt": 694.6,
+              "bitrev": 24.5,
+              "merkle": 3704.8,
+              "total": 4424.0
+            },
+            {
+              "ntt": 696.9,
+              "bitrev": 25.7,
+              "merkle": 3726.6,
+              "total": 4449.3
+            },
+            {
+              "ntt": 695.4,
+              "bitrev": 26.8,
+              "merkle": 3708.6,
+              "total": 4430.8
+            },
+            {
+              "ntt": 696.7,
+              "bitrev": 26.8,
+              "merkle": 3704.2,
+              "total": 4427.8
+            },
+            {
+              "ntt": 694.5,
+              "bitrev": 26.6,
+              "merkle": 3697.5,
+              "total": 4418.5
+            }
+          ],
+          "check": [
+            {
+              "ntt": 126.4,
+              "bitrev": 5.1,
+              "merkle": 1016.0,
+              "total": 1147.4
+            },
+            {
+              "ntt": 112.1,
+              "bitrev": 4.9,
+              "merkle": 1016.6,
+              "total": 1133.7
+            },
+            {
+              "ntt": 111.3,
+              "bitrev": 4.6,
+              "merkle": 1013.1,
+              "total": 1129.0
+            },
+            {
+              "ntt": 110.9,
+              "bitrev": 5.5,
+              "merkle": 1018.0,
+              "total": 1134.4
+            },
+            {
+              "ntt": 110.2,
+              "bitrev": 5.9,
+              "merkle": 1033.4,
+              "total": 1149.5
+            },
+            {
+              "ntt": 111.1,
+              "bitrev": 6.6,
+              "merkle": 1037.1,
+              "total": 1154.8
+            },
+            {
+              "ntt": 111.5,
+              "bitrev": 5.3,
+              "merkle": 1039.1,
+              "total": 1155.9
+            },
+            {
+              "ntt": 112.2,
+              "bitrev": 5.7,
+              "merkle": 1031.4,
+              "total": 1149.3
+            },
+            {
+              "ntt": 111.3,
+              "bitrev": 5.4,
+              "merkle": 1018.4,
+              "total": 1135.1
+            },
+            {
+              "ntt": 112.1,
+              "bitrev": 5.7,
+              "merkle": 1013.7,
+              "total": 1131.4
+            }
+          ]
+        },
+        "make_coeffs": [
+          {
+            "intt_zk": 26.4
+          },
+          {
+            "intt_zk": 1151.7
+          },
+          {
+            "intt_zk": 579.8
+          },
+          {
+            "intt_zk": 1126.8
+          },
+          {
+            "intt_zk": 550.4
+          },
+          {
+            "intt_zk": 1118.9
+          },
+          {
+            "intt_zk": 554.1
+          },
+          {
+            "intt_zk": 1134.0
+          },
+          {
+            "intt_zk": 557.3
+          },
+          {
+            "intt_zk": 1106.8
+          },
+          {
+            "intt_zk": 551.1
+          },
+          {
+            "intt_zk": 1108.0
+          },
+          {
+            "intt_zk": 542.8
+          },
+          {
+            "intt_zk": 1105.0
+          },
+          {
+            "intt_zk": 565.7
+          },
+          {
+            "intt_zk": 1104.4
+          },
+          {
+            "intt_zk": 569.2
+          },
+          {
+            "intt_zk": 1107.5
+          },
+          {
+            "intt_zk": 544.0
+          },
+          {
+            "intt_zk": 1111.4
+          },
+          {
+            "intt_zk": 540.8
+          }
+        ]
+      },
+      "conditional_scenarios": {
+        "transforms_and_merkle_only": {
+          "acceleratable_seconds": 159.0787,
+          "remaining_floor_seconds": 257.079592499,
+          "ideal_speedup_ceiling": 1.6187916296802858,
+          "phase_speedup_needed_for_2x_complete": null,
+          "conditional_seconds": {
+            "1.5": 363.13205916566665,
+            "2": 336.618942499,
+            "3": 310.1058258323333,
+            "5": 288.895332499,
+            "10": 272.987462499
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        },
+        "constraint_only": {
+          "acceleratable_seconds": 195.6269,
+          "remaining_floor_seconds": 220.53139249899996,
+          "ideal_speedup_ceiling": 1.8870705335109472,
+          "phase_speedup_needed_for_2x_complete": null,
+          "conditional_seconds": {
+            "1.5": 350.94932583233333,
+            "2": 318.344842499,
+            "3": 285.74035916566663,
+            "5": 259.65677249899994,
+            "10": 240.09408249899997
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        },
+        "constraint_transforms_merkle": {
+          "acceleratable_seconds": 354.7056,
+          "remaining_floor_seconds": 61.452692498999966,
+          "ideal_speedup_ceiling": 6.7720107220000525,
+          "phase_speedup_needed_for_2x_complete": 2.419110541973333,
+          "conditional_seconds": {
+            "1.5": 297.92309249899995,
+            "2": 238.80549249899997,
+            "3": 179.687892499,
+            "5": 132.39381249899998,
+            "10": 96.92325249899997
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        },
+        "witness_and_accumulation_only": {
+          "acceleratable_seconds": 7.8451,
+          "remaining_floor_seconds": 408.31319249899997,
+          "ideal_speedup_ceiling": 1.0192134374889668,
+          "phase_speedup_needed_for_2x_complete": null,
+          "conditional_seconds": {
+            "1.5": 413.54325916566665,
+            "2": 412.23574249899997,
+            "3": 410.9282258323333,
+            "5": 409.882212499,
+            "10": 409.097702499
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        }
+      },
+      "artifact_hashes": {
+        "result.json": "bf09f4b8d6856f3f28b77320cfa86b529aaba5a9c91874d15c69f3c7b17dec55",
+        "test.log": "1dcf8322629e2bd9919c07706f360b6a27f5b308989d08ac80f3919de630e366",
+        "acceptance-build.json": "b36f246fa53c1ebaca10d830e4a7084753e93cd400b2d5e7a7d88db04c1817d2",
+        "acceptance/complete.json": "a6ae172444e5f49a1641758b51da10de7a4a34396d84231b93579215eee9acfa",
+        "acceptance/proof-0/worker.json": "313145a57d7871f4c1fbc993b91f661fdfe5b97217bc45036b38d1656cbc9d14",
+        "acceptance/proof-0/verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e"
+      },
+      "fixture": "arithmetic-10m"
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/98913ace29f947c2819c151f825b44ea",
+      "worker": {
+        "elf_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+        "error": null,
+        "fallback_reason": null,
+        "gomaxprocs": 18,
+        "helper_arch": "darwin/arm64",
+        "helper_container": "zkminer-macos-53731-1793593109045411000-2",
+        "image_id": "58518a60c949a92b89ddcfa8c8b44f65ebbf17ee16c0dffa738ed55563e0a623",
+        "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+        "journal_hex": "7b3b9da440ac877e14646d0dbff269ec24926a37a504819bae0e7b2f6226b5b4",
+        "journal_sha256": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+        "max_guest_cycles": 67108864,
+        "minimum_segment_po2": 14,
+        "observed_mode": "cpu",
+        "observed_stages": {
+          "groth16": "native_darwin_arm64_helper",
+          "identity": "cpu",
+          "other_segment_operations": "cpu",
+          "recursion": "metal",
+          "recursion_metal": {
+            "completed_constraint_checks": 19,
+            "cpu_stages": [
+              "witness",
+              "accumulation"
+            ],
+            "evaluation_points": 19922944,
+            "kernel_source_sha256": "137564beae0d2804c66d1957411d6be97b6b4d7b9cb4d7868eecdc80b0c69bb5"
+          },
+          "segment": "cpu"
+        },
+        "operation": "prove",
+        "phase": "complete",
+        "po2": 20,
+        "proof_kind": "groth16",
+        "rayon_threads": 18,
+        "recursion_cpu_stages": [
+          "witness",
+          "accumulation",
+          "identity_p254"
+        ],
+        "recursion_hal": "metal",
+        "request_id": 1,
+        "requested_mode": "cpu",
+        "schema_version": 1,
+        "seal_sha256": "e78c392be2c4da79c7a7e25b038d1d6c7ca69b1237f0a3505590f64545546c5e",
+        "stage_ms": {
+          "execution_and_segment": 387812.076958,
+          "identity_and_wrap": 24923.111083,
+          "recursion": 11362.52325,
+          "verification": 1.71
+        },
+        "staging_limit_bytes": 524288,
+        "stats": {
+          "paging_cycles": 109720,
+          "reserved_cycles": 372600,
+          "segments": 10,
+          "total_cycles": 10485760,
+          "user_cycles": 10003440
+        },
+        "total_ms": 424237.218334,
+        "worker_pid": 53777
+      },
+      "complete_seconds": 425.239714208,
+      "execution_and_segment_seconds": 387.81207695800003,
+      "summed_segment_prover_seconds": 387.6443,
+      "execution_preflight_and_caller_residual_seconds": 0.16777695800004722,
+      "exclusive_segment_seconds": {
+        "constraint_evaluation": 199.3055,
+        "merkle_commitments": 119.27669999999999,
+        "polynomial_transforms": 41.3835,
+        "witness_generation": 3.3385,
+        "accumulation": 6.8263,
+        "other_segment_protocol": 17.513800000000003
+      },
+      "exclusive_segment_percent": {
+        "constraint_evaluation": 51.41453131130782,
+        "merkle_commitments": 30.76962565939961,
+        "polynomial_transforms": 10.675637433595696,
+        "witness_generation": 0.8612276770224662,
+        "accumulation": 1.7609700439294478,
+        "other_segment_protocol": 4.518007874744967
+      },
+      "timers": {
+        "begin": [
+          {
+            "witgen": 359.1,
+            "data_commit": 9790.1,
+            "accum": 656.3,
+            "accum_commit": 5136.4,
+            "main": 17054.1,
+            "total": 39886.1
+          },
+          {
+            "witgen": 341.9,
+            "data_commit": 9681.1,
+            "accum": 665.6,
+            "accum_commit": 5040.1,
+            "main": 15729.1,
+            "total": 38281.2
+          },
+          {
+            "witgen": 318.7,
+            "data_commit": 9513.1,
+            "accum": 655.4,
+            "accum_commit": 4972.8,
+            "main": 15460.3,
+            "total": 37934.6
+          },
+          {
+            "witgen": 343.0,
+            "data_commit": 9477.2,
+            "accum": 663.9,
+            "accum_commit": 4977.5,
+            "main": 15461.9,
+            "total": 37843.9
+          },
+          {
+            "witgen": 316.0,
+            "data_commit": 9650.6,
+            "accum": 643.2,
+            "accum_commit": 5280.3,
+            "main": 15890.4,
+            "total": 40536.5
+          },
+          {
+            "witgen": 354.6,
+            "data_commit": 9963.2,
+            "accum": 696.1,
+            "accum_commit": 5098.5,
+            "main": 16112.6,
+            "total": 39036.8
+          },
+          {
+            "witgen": 325.1,
+            "data_commit": 9624.3,
+            "accum": 676.7,
+            "accum_commit": 5035.2,
+            "main": 15661.5,
+            "total": 38460.4
+          },
+          {
+            "witgen": 343.3,
+            "data_commit": 9604.8,
+            "accum": 664.0,
+            "accum_commit": 5071.0,
+            "main": 15683.3,
+            "total": 38541.5
+          },
+          {
+            "witgen": 322.7,
+            "data_commit": 9600.6,
+            "accum": 674.3,
+            "accum_commit": 5053.8,
+            "main": 15651.6,
+            "total": 38470.1
+          },
+          {
+            "witgen": 314.1,
+            "data_commit": 9604.0,
+            "accum": 830.8,
+            "accum_commit": 5037.8,
+            "main": 15787.0,
+            "total": 38653.2
+          }
+        ],
+        "start_finalize": [
+          {
+            "alloc": 3.3,
+            "eval_check_launch": 19786.4,
+            "post_eval_check": 0.0,
+            "total": 19789.6
+          },
+          {
+            "alloc": 0.4,
+            "eval_check_launch": 19626.1,
+            "post_eval_check": 0.0,
+            "total": 19626.5
+          },
+          {
+            "alloc": 0.3,
+            "eval_check_launch": 19539.4,
+            "post_eval_check": 0.0,
+            "total": 19539.6
+          },
+          {
+            "alloc": 0.3,
+            "eval_check_launch": 19480.5,
+            "post_eval_check": 0.0,
+            "total": 19480.8
+          },
+          {
+            "alloc": 0.3,
+            "eval_check_launch": 21343.3,
+            "post_eval_check": 0.0,
+            "total": 21343.6
+          },
+          {
+            "alloc": 0.3,
+            "eval_check_launch": 19948.7,
+            "post_eval_check": 0.0,
+            "total": 19949.0
+          },
+          {
+            "alloc": 0.3,
+            "eval_check_launch": 19876.4,
+            "post_eval_check": 0.0,
+            "total": 19876.7
+          },
+          {
+            "alloc": 8.0,
+            "eval_check_launch": 19914.2,
+            "post_eval_check": 0.0,
+            "total": 19922.2
+          },
+          {
+            "alloc": 7.8,
+            "eval_check_launch": 19878.4,
+            "post_eval_check": 0.0,
+            "total": 19886.3
+          },
+          {
+            "alloc": 0.6,
+            "eval_check_launch": 19912.1,
+            "post_eval_check": 0.0,
+            "total": 19912.7
+          }
+        ],
+        "finalize": [
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 103.6,
+            "check_commit": 1184.4,
+            "eval_u": 797.3,
+            "combos": 625.8,
+            "fri": 326.4,
+            "total": 3042.3
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 100.1,
+            "check_commit": 1157.9,
+            "eval_u": 771.0,
+            "combos": 579.6,
+            "fri": 312.6,
+            "total": 2925.6
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 100.0,
+            "check_commit": 1151.0,
+            "eval_u": 767.1,
+            "combos": 591.4,
+            "fri": 320.5,
+            "total": 2934.7
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 100.6,
+            "check_commit": 1136.0,
+            "eval_u": 765.5,
+            "combos": 581.2,
+            "fri": 313.1,
+            "total": 2901.2
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 103.4,
+            "check_commit": 1365.7,
+            "eval_u": 872.1,
+            "combos": 611.5,
+            "fri": 344.9,
+            "total": 3302.5
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 100.2,
+            "check_commit": 1186.1,
+            "eval_u": 776.1,
+            "combos": 587.6,
+            "fri": 320.4,
+            "total": 2975.1
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 99.9,
+            "check_commit": 1149.8,
+            "eval_u": 774.3,
+            "combos": 577.7,
+            "fri": 315.8,
+            "total": 2922.1
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 100.1,
+            "check_commit": 1163.4,
+            "eval_u": 777.8,
+            "combos": 577.8,
+            "fri": 311.9,
+            "total": 2936.0
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 100.1,
+            "check_commit": 1150.1,
+            "eval_u": 776.6,
+            "combos": 588.3,
+            "fri": 312.1,
+            "total": 2932.1
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 100.2,
+            "check_commit": 1167.9,
+            "eval_u": 776.2,
+            "combos": 594.4,
+            "fri": 309.8,
+            "total": 2953.4
+          }
+        ],
+        "groups": {
+          "code": [
+            {
+              "ntt": 92.9,
+              "bitrev": 2.9,
+              "merkle": 989.0,
+              "total": 1084.8
+            }
+          ],
+          "data": [
+            {
+              "ntt": 1457.5,
+              "bitrev": 50.6,
+              "merkle": 6973.4,
+              "total": 8481.5
+            },
+            {
+              "ntt": 1412.2,
+              "bitrev": 48.8,
+              "merkle": 7089.1,
+              "total": 8550.1
+            },
+            {
+              "ntt": 1395.6,
+              "bitrev": 49.6,
+              "merkle": 6946.6,
+              "total": 8391.9
+            },
+            {
+              "ntt": 1396.7,
+              "bitrev": 49.1,
+              "merkle": 6909.4,
+              "total": 8355.2
+            },
+            {
+              "ntt": 1393.9,
+              "bitrev": 49.3,
+              "merkle": 7084.6,
+              "total": 8527.7
+            },
+            {
+              "ntt": 1499.7,
+              "bitrev": 53.4,
+              "merkle": 7218.8,
+              "total": 8771.9
+            },
+            {
+              "ntt": 1420.3,
+              "bitrev": 49.4,
+              "merkle": 7018.0,
+              "total": 8487.7
+            },
+            {
+              "ntt": 1426.3,
+              "bitrev": 51.1,
+              "merkle": 6990.1,
+              "total": 8467.4
+            },
+            {
+              "ntt": 1418.1,
+              "bitrev": 51.4,
+              "merkle": 6985.1,
+              "total": 8454.6
+            },
+            {
+              "ntt": 1421.2,
+              "bitrev": 50.2,
+              "merkle": 6994.1,
+              "total": 8465.5
+            }
+          ],
+          "accum": [
+            {
+              "ntt": 706.1,
+              "bitrev": 27.4,
+              "merkle": 3754.9,
+              "total": 4488.4
+            },
+            {
+              "ntt": 701.2,
+              "bitrev": 24.9,
+              "merkle": 3743.8,
+              "total": 4469.9
+            },
+            {
+              "ntt": 696.5,
+              "bitrev": 24.9,
+              "merkle": 3696.6,
+              "total": 4417.9
+            },
+            {
+              "ntt": 699.6,
+              "bitrev": 28.3,
+              "merkle": 3698.1,
+              "total": 4426.1
+            },
+            {
+              "ntt": 781.5,
+              "bitrev": 28.4,
+              "merkle": 3826.6,
+              "total": 4636.5
+            },
+            {
+              "ntt": 706.8,
+              "bitrev": 26.0,
+              "merkle": 3779.0,
+              "total": 4511.8
+            },
+            {
+              "ntt": 706.1,
+              "bitrev": 27.4,
+              "merkle": 3742.6,
+              "total": 4476.1
+            },
+            {
+              "ntt": 719.2,
+              "bitrev": 29.1,
+              "merkle": 3751.8,
+              "total": 4500.1
+            },
+            {
+              "ntt": 702.7,
+              "bitrev": 26.7,
+              "merkle": 3759.5,
+              "total": 4488.8
+            },
+            {
+              "ntt": 710.5,
+              "bitrev": 24.4,
+              "merkle": 3744.3,
+              "total": 4479.3
+            }
+          ],
+          "check": [
+            {
+              "ntt": 119.0,
+              "bitrev": 6.0,
+              "merkle": 1058.1,
+              "total": 1183.2
+            },
+            {
+              "ntt": 112.1,
+              "bitrev": 5.7,
+              "merkle": 1037.3,
+              "total": 1155.1
+            },
+            {
+              "ntt": 111.8,
+              "bitrev": 5.6,
+              "merkle": 1032.5,
+              "total": 1149.9
+            },
+            {
+              "ntt": 111.4,
+              "bitrev": 5.9,
+              "merkle": 1017.5,
+              "total": 1134.8
+            },
+            {
+              "ntt": 129.3,
+              "bitrev": 7.4,
+              "merkle": 1218.9,
+              "total": 1355.6
+            },
+            {
+              "ntt": 116.3,
+              "bitrev": 5.5,
+              "merkle": 1063.1,
+              "total": 1184.9
+            },
+            {
+              "ntt": 114.1,
+              "bitrev": 4.7,
+              "merkle": 1029.2,
+              "total": 1147.9
+            },
+            {
+              "ntt": 112.5,
+              "bitrev": 5.8,
+              "merkle": 1044.0,
+              "total": 1162.2
+            },
+            {
+              "ntt": 111.9,
+              "bitrev": 5.7,
+              "merkle": 1031.3,
+              "total": 1148.9
+            },
+            {
+              "ntt": 112.2,
+              "bitrev": 5.2,
+              "merkle": 1049.4,
+              "total": 1166.8
+            }
+          ]
+        },
+        "make_coeffs": [
+          {
+            "intt_zk": 26.8
+          },
+          {
+            "intt_zk": 1153.4
+          },
+          {
+            "intt_zk": 567.0
+          },
+          {
+            "intt_zk": 1114.4
+          },
+          {
+            "intt_zk": 549.9
+          },
+          {
+            "intt_zk": 1106.4
+          },
+          {
+            "intt_zk": 546.5
+          },
+          {
+            "intt_zk": 1105.4
+          },
+          {
+            "intt_zk": 542.6
+          },
+          {
+            "intt_zk": 1106.4
+          },
+          {
+            "intt_zk": 636.5
+          },
+          {
+            "intt_zk": 1176.1
+          },
+          {
+            "intt_zk": 579.5
+          },
+          {
+            "intt_zk": 1120.4
+          },
+          {
+            "intt_zk": 551.9
+          },
+          {
+            "intt_zk": 1122.8
+          },
+          {
+            "intt_zk": 563.6
+          },
+          {
+            "intt_zk": 1131.4
+          },
+          {
+            "intt_zk": 555.6
+          },
+          {
+            "intt_zk": 1121.9
+          },
+          {
+            "intt_zk": 550.8
+          }
+        ]
+      },
+      "conditional_scenarios": {
+        "transforms_and_merkle_only": {
+          "acceleratable_seconds": 160.66019999999997,
+          "remaining_floor_seconds": 264.57951420800003,
+          "ideal_speedup_ceiling": 1.607228418575508,
+          "phase_speedup_needed_for_2x_complete": null,
+          "conditional_seconds": {
+            "1.5": 371.686314208,
+            "2": 344.909614208,
+            "3": 318.13291420800005,
+            "5": 296.71155420800005,
+            "10": 280.645534208
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        },
+        "constraint_only": {
+          "acceleratable_seconds": 199.3055,
+          "remaining_floor_seconds": 225.93421420800001,
+          "ideal_speedup_ceiling": 1.882139523217652,
+          "phase_speedup_needed_for_2x_complete": null,
+          "conditional_seconds": {
+            "1.5": 358.80454754133336,
+            "2": 325.58696420800004,
+            "3": 292.36938087466666,
+            "5": 265.79531420800004,
+            "10": 245.86476420800003
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        },
+        "constraint_transforms_merkle": {
+          "acceleratable_seconds": 359.96569999999997,
+          "remaining_floor_seconds": 65.27401420800004,
+          "ideal_speedup_ceiling": 6.514686117709033,
+          "phase_speedup_needed_for_2x_complete": 2.442998682046781,
+          "conditional_seconds": {
+            "1.5": 305.25114754133335,
+            "2": 245.25686420800002,
+            "3": 185.2625808746667,
+            "5": 137.26715420800002,
+            "10": 101.27058420800003
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        },
+        "witness_and_accumulation_only": {
+          "acceleratable_seconds": 10.1648,
+          "remaining_floor_seconds": 415.074914208,
+          "ideal_speedup_ceiling": 1.0244890733023346,
+          "phase_speedup_needed_for_2x_complete": null,
+          "conditional_seconds": {
+            "1.5": 421.8514475413333,
+            "2": 420.157314208,
+            "3": 418.46318087466665,
+            "5": 417.107874208,
+            "10": 416.091394208
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        }
+      },
+      "artifact_hashes": {
+        "result.json": "0ea4bb760bb799ce8d9e14931790b971f50925f8d0b6222a15479850d0c4403c",
+        "test.log": "fde1adaa560be708fa495ce920e8e31f9930dfcdcea076a8175cae3828c36781",
+        "acceptance-build.json": "b36f246fa53c1ebaca10d830e4a7084753e93cd400b2d5e7a7d88db04c1817d2",
+        "acceptance/complete.json": "2043fdde98b8513d5fc2b5ff1fad95eee4a9ad5f5e899c224d039cc1ed88b871",
+        "acceptance/proof-0/worker.json": "5e8cd55269baef46da32be05f57cb1fa6bdb5859594dd8d2215a19144ef51a5b",
+        "acceptance/proof-0/verification.json": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5"
+      },
+      "fixture": "hash-10m"
+    }
+  ],
+  "checkpoint_continuity": {
+    "path": "/Users/dbur/dev/zk-miner/target/macos/step6-assessment/step5-after-commit.json",
+    "sha256": "2613cb0129ce7b5cfc69d24d35ec47ff0897a5a6070056973a5aaf1f439dbe44",
+    "result": {
+      "worker_build": {
+        "source": {
+          "kind": "native-recursion-metal",
+          "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+          "engine_path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+          "engine_head": "0515e0bdebcd1f5f2d24cef91691ebd5b0c5d0a6",
+          "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "engine_untracked_files": {},
+          "config_path": "/Users/dbur/dev/zk-miner/target/macos/local-engine.toml",
+          "inputs": {
+            "Cargo.lock": "75d710409c3107e465ca0520bb7c551e8027c47ecb7c8e3b13d9b106cad5c6b9",
+            "Cargo.toml": "6d62c06c33b867de1177afe1b4f220f70557e87e9175e3bd7574e56d0d66fed2",
+            "crates/zkminer-prove-risc0/Cargo.toml": "853a713040f3f179df3b99c3e55edf2ed67df044a11acfc08a45538d1e033f4c",
+            "crates/zkminer-prove-risc0/build.rs": "a6311821df1d5d69671acb372ca5c6a6608df3789d7cd9113975ba6d99ea1ac6",
+            "crates/zkminer-prove-risc0/src/macos.rs": "3d412ea39a076e89e2545708f2cb882e5a6c7a6f242f2b7e6e8b34c92c3e4fda",
+            "crates/zkminer-prove-risc0/src/macos_metal.rs": "0362e42524cdb32b269019ec99965308bf5f4812d4b8576fec138d16c1b47f05",
+            "crates/zkminer-prove-risc0/src/main.rs": "e635521b15f4db34c52164160cf863e5b31d144df6de2ace4ea9e07a943365e4",
+            "crates/zkminer-prover-protocol/Cargo.toml": "a646a1d0024007d0172aa8a1b4efb5ebc1b5df2364950d5475279ee6250dbdcd",
+            "crates/zkminer-prover-protocol/src/codec.rs": "70543a49b7d6c4df969ec05033bbcf934c450d8cdfcf261ced7536b3e0145f86",
+            "crates/zkminer-prover-protocol/src/lib.rs": "cf49912fe2eeb919ecd36c90cbf1290634224a9ab502cba32b523e0f17f65c59",
+            "crates/zkminer-prover-protocol/src/macos.rs": "46bffe46c057fd567e195dae2401ff6ef0af2d051d10dbc2358fca184d66b334",
+            "crates/zkminer-prover-protocol/src/proc.rs": "5b1bba5de4b31c09eb07510f2480e57b82b5d65ac4d480142e0e7d4c4c06af10",
+            "crates/zkminer-prover-protocol/src/types.rs": "684640701892d81adc2f3d717d5c61bd4f1f434d2ef3e8bc72165f19dd6fea89",
+            "rust-toolchain.toml": "f0815f7685d7aff345137c830314cf78d4d0dc7bc71328561fc6823b7fbb23cb",
+            "scripts/macos/build-worker.py": "cdf09159fea5824d8294917a3762b4e6898b1a3a64dfcde39ab47ef27e92b3d0",
+            "scripts/macos/check-source.py": "39bda05bea2f8eb86e7e0d045a72b0e1dbaf66a067c8b40480771758944b63dd",
+            "scripts/macos/env.sh": "d4ea1b6cfb9e24c3edfa767a32c533648a4f1c123278b01d5c378c078e574835",
+            "scripts/macos/local-engine.py": "b3045c21b11c7a0aa32b9cc9909bccb587bf5ab30f06539f3cf09a4a015244c4",
+            "scripts/macos/worker_provenance.py": "0594a372af5547a6c7c9a6f38c1befb88a9a5ed6c0214cc77530ddf961010add",
+            "target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/sha256-chain.bin": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+            "target/macos/local-engine.toml": "4ceec928b625b49cb87d71dd9300c145468afd84fdf570b4f96b34e64bb1e881"
+          }
+        },
+        "build_environment": {
+          "RUSTFLAGS": null,
+          "CARGO_ENCODED_RUSTFLAGS": null,
+          "DEVELOPER_DIR": null,
+          "TOOLCHAINS": null,
+          "SDKROOT": null,
+          "CC": null,
+          "CXX": null,
+          "CFLAGS": null,
+          "CXXFLAGS": null,
+          "AR": null,
+          "RUSTC": null,
+          "RUSTC_WRAPPER": null,
+          "RUSTC_WORKSPACE_WRAPPER": null,
+          "CARGO_BUILD_JOBS": "6",
+          "CARGO_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/cargo",
+          "RUSTUP_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/rustup",
+          "RISC0_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/risc0",
+          "ZKMINER_RISC0_GUEST_DIR": "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release",
+          "PROTOC": "/Users/dbur/dev/zk-miner/target/macos/bootstrap/protoc-36.2/bin/protoc"
+        },
+        "binary_sha256": "d157305ba0e0830671c6b8f6238dc68e59ae8a68dc3454865c2084c21bc347b9",
+        "metadata_sha256": "3611a8261995a87000515219ab5f72ff2fecc32c3c194b6ba3d24415394fbc7e",
+        "local_lock_sha256": "64b6b7b23485b9494f941ef552701301ca14024aa45d2d403c67c43d5a30720e",
+        "host_toolchain": "1.93.0"
+      },
+      "binary_unchanged": true,
+      "engine_commit_matches_measured_patch": true,
+      "compiled_inputs_unchanged": true,
+      "miner_head": "4cbfb3ee689df6a4723e03e82317aa789910ca66"
+    }
+  },
+  "port_inventory": {
+    "existing_rv32im_metal_files": 0,
+    "generated_constraint_chunks": 4,
+    "generated_constraint_functions": 20,
+    "generated_constraint_chunk_lines": 26686,
+    "generated_cuda_steps_lines": 62013,
+    "declared_poly_scratch_arrays": [
+      {
+        "type": "Fp",
+        "entries": 1007
+      },
+      {
+        "type": "FpExt",
+        "entries": 144
+      }
+    ],
+    "declared_poly_scratch_bytes_per_invocation": 6332,
+    "scratch_scope": "Declared arrays in CUDA poly_fp; not measured registers/spill allocation or Metal peak memory",
+    "tap_group_columns": {
+      "accum": 103,
+      "code": 1,
+      "data": 211
+    }
+  },
+  "memory_lower_bounds": [
+    {
+      "po2": 18,
+      "groups": {
+        "accum": {
+          "coeff_bytes": 108003328,
+          "evaluated_bytes": 432013312,
+          "merkle_nodes_bytes": 67108864
+        },
+        "code": {
+          "coeff_bytes": 1048576,
+          "evaluated_bytes": 4194304,
+          "merkle_nodes_bytes": 67108864
+        },
+        "data": {
+          "coeff_bytes": 221249536,
+          "evaluated_bytes": 884998144,
+          "merkle_nodes_bytes": 67108864
+        }
+      },
+      "committed_groups_and_trees_bytes": 1852833792,
+      "largest_buffer_bytes": 884998144,
+      "fits_observed_device_single_buffer_limit": true,
+      "scope": "Simultaneously retained group allocations only; excludes check group, raw witness, trace, scratch, driver allocations, helper and allocator retention; not a peak forecast"
+    },
+    {
+      "po2": 20,
+      "groups": {
+        "accum": {
+          "coeff_bytes": 432013312,
+          "evaluated_bytes": 1728053248,
+          "merkle_nodes_bytes": 268435456
+        },
+        "code": {
+          "coeff_bytes": 4194304,
+          "evaluated_bytes": 16777216,
+          "merkle_nodes_bytes": 268435456
+        },
+        "data": {
+          "coeff_bytes": 884998144,
+          "evaluated_bytes": 3539992576,
+          "merkle_nodes_bytes": 268435456
+        }
+      },
+      "committed_groups_and_trees_bytes": 7411335168,
+      "largest_buffer_bytes": 3539992576,
+      "fits_observed_device_single_buffer_limit": true,
+      "scope": "Simultaneously retained group allocations only; excludes check group, raw witness, trace, scratch, driver allocations, helper and allocator retention; not a peak forecast"
+    }
+  ],
+  "source_hashes": {
+    "risc0/circuit/rv32im/src/prove/hal/mod.rs": "fab8a99623fd7fc105d2af8da77b5cff2b54ca03532c4dba213188eddb9283df",
+    "risc0/circuit/rv32im/src/prove/hal/cpu.rs": "bcb41c437e11aff9653d6f4e7a41713dac8b842db21b21cb41ef6bcc17804a71",
+    "risc0/circuit/rv32im/src/prove/hal/cuda.rs": "d6a03a76dcab52195f4fbff08fe7a990408adb04d59187ec77c8a35c314d98c8",
+    "risc0/circuit/rv32im/src/prove/witgen/mod.rs": "6ebc971c0f78dc7412268068ab5bcbe8a36615c9b874007af0358d05f867a687",
+    "risc0/circuit/rv32im/src/zirgen/defs.rs.inc": "a8535321a4d02c31a9b75e3330993f823463b733f999199abde5fe0d36f2393b",
+    "risc0/zkp/src/hal/metal.rs": "0889b0db4982389ebcc76dd4a02c1ed9b251a1a75172532753d963242dcdbe24",
+    "risc0/zkp/src/prove/prover.rs": "b79c0fcd95a5658d2091f7215cb34757448e79c940d6a36b2007f054ef1ba55e",
+    "risc0/zkp/src/prove/poly_group.rs": "207697d8e876d910cb0e72609505a5de40149238d1b46521c514aacb28e1c55f",
+    "risc0/zkp/src/prove/merkle.rs": "2613eb3b5cbcd654e96dd6ca4c0f83ff3854b61600be903fce95b42433c76ad1",
+    "risc0/circuit/rv32im-sys/kernels/cuda/eval_check.cuh": "48f7e86736dff77d86d9f194e0f9859f68cc68bc0aab6edac6a1d24c71f8603d",
+    "risc0/circuit/rv32im-sys/kernels/cuda/eval_check_kernel.cu": "bb30d6022f753d58ba457996e4e1ffb518742bb4a1122e26daeb8b595edc059a",
+    "risc0/circuit/rv32im-sys/kernels/cuda/eval_check_0.cu": "581a6ca6d374cfe3bddc4b531c7ec4a21cb81e0878b945bc693887ca6f4067a1",
+    "risc0/circuit/rv32im-sys/kernels/cuda/eval_check_1.cu": "14fdb25c500b7d11191134dd6b62bba6d977aa13eca118d3e46792286a9dbbd1",
+    "risc0/circuit/rv32im-sys/kernels/cuda/eval_check_2.cu": "9ed99616ad286ab7658b35430a3237488cf03d6d3c5a79a82eb269b4ba39b4e9",
+    "risc0/circuit/rv32im-sys/kernels/cuda/eval_check_3.cu": "cc1066a10496d3be01d9a83b6429d7557b473f540a9e51c560348bd413cd0699"
+  },
+  "decision": {
+    "original_usefulness_target": "already met by five-sample native CPU acceptance",
+    "full_port": "not required for the agreed target; separate scalability investment",
+    "proposed_next_gate": "First de-risk full-domain Metal constraint evaluation; then integrate existing Metal transforms/Merkle with shared CPU witness/accumulation. Require measured complete-proof gain before a full port commitment.",
+    "proposed_scalability_gate": "If a new 2x complete-throughput objective is selected, roughly 2.42..2.44x effective speedup of the combined constraint/transform/Merkle phases is necessary under the constant-other-cost model; measure the whole job to confirm.",
+    "gate_scope": "Proposed follow-up criterion, not a user-approved replacement for the original 10M/10-minute goal",
+    "defer": "GPU witness/accumulation until measured workloads justify them",
+    "implementation_started": false
+  },
+  "limitations": [
+    "Two single verbose diagnostic proofs, not new warm medians; log timing rounds to 0.1 ms.",
+    "CPU eval_check is synchronous: eval_check_launch measures its work, not just GPU launch latency.",
+    "Merkle timers combine leaf hashing and tree folding; no measured split is available.",
+    "Do not sum nested timers; exclusive categories reconcile to segment totals.",
+    "Conditional speedups require unmeasured Metal compiler/occupancy/bandwidth behavior; no guaranteed port speedup.",
+    "Arithmetic and hashing do not establish BigInt/ECDSA or marketplace workload performance."
+  ],
+  "profile_csv_sha256": "b05661668db83d2ce17399d0250d5c454dfa392354a97f6434d69e73939afee6"
+}

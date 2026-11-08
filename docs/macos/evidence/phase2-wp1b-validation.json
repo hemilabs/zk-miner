@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "source_spec_sha256": "a8627ca24baec008b140a4bb75f9ef8bb75fd67281e9a8e628c328afb6542a09",
+  "engine_commit": "7222459e351a81ecb55ac75f8804edc4c51e08d9",
+  "candidate_worker_sha256": "6e4150dd25170ba2c90cff9510bef4b6ed86a87de1f7f79860a0a416533c7f69",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "collector_sha256": "cb22b1366597ba5387250692f16cd8e4a64c2d7856df7df50eb1ddd96fa07b62",
+  "generator_check_log_sha256": "d6dea1c2b34ed69c32e41c586f695ae6eb528399393fa27f0c0cda9cf16fd5ff",
+  "metal_port_sha256": "189dc1c861e4bcaa0412fac2889ff820ddaeca4a0a7efeb0a4b5996c753bd5ac",
+  "paired_evidence_sha256": "3920fe31f70ea3fec1f3255f9053cceb1928159bd57c3771b56d294a4deb48a0",
+  "sweep_evidence_sha256": "7e5528c17d16d8eccf9d2508801da5a1a2d5ca075e8cc71dcaeeb0cb3da705c4",
+  "differentials": {
+    "14": {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/586446db3f5b48a8bed66aa9928d0164",
+      "result_sha256": "f9014120cb7437817e0460ca9bf0efcd186631e6ed24c490d6a8ed0b42b1d57b",
+      "log_sha256": "ec0c3d2339bae0bccb1b386f787c75a1cdb8d715f23b69031a407846cc1a5ac8",
+      "worker_sidecar_sha256": "7e6791e99a9d1bf1adedcba045f55453c93760743c52280e0ea102e28e60a212",
+      "verification_sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1",
+      "po2": 14,
+      "segments": 22,
+      "cpu_differential_checks": 22
+    },
+    "18": {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/fd19d8fe00df417db35b642be13bff78",
+      "result_sha256": "53ea07776ed823dda54cd68f1b5db8ef40f15d93168d419cfebf0c10e88315b2",
+      "log_sha256": "8a0f7d8546e2a88ad1048ee7377dc7c5e129759284bf8ada9342170cd27c07dc",
+      "worker_sidecar_sha256": "ceba9487d3cdeb73d6070d0f51af95898bd595f97ca1d8001cf951833947f61b",
+      "verification_sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1",
+      "po2": 18,
+      "segments": 1,
+      "cpu_differential_checks": 1
+    },
+    "20": {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/cd6bf84283634420a1dcf660b75f1668",
+      "result_sha256": "efc0a84b3a191b9aeba26d886734d37400dc0736a653c049f04b0ab9e6f0fd7e",
+      "log_sha256": "4c627c9b2cef3152c9841ff89955cb73d61d7caaa6fddcf4314e17cbfe466572",
+      "worker_sidecar_sha256": "1ab3a99e322f3932b22ea248f142d91e34b2efd2d16f01652e8367ff2d3d36b7",
+      "verification_sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1",
+      "po2": 20,
+      "segments": 1,
+      "cpu_differential_checks": 1
+    }
+  },
+  "lifecycle": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/006957867ab54e7d905a0a6fe9db6739",
+    "result_sha256": "d051e4f9eec40c17c8050b70af9f891c6a89373bed0d2757da2722128a42c811",
+    "log_sha256": "6277e3ee37d309afc813c0a731fa1574af9046d09e549ebb6d8277ee952dc895",
+    "verified_proofs": 21,
+    "tamper_rejections": 63,
+    "idle_first_bytes": 4724953408,
+    "idle_after_request_20_bytes": 4391440512,
+    "idle_drift_fraction": -0.07058543591886356,
+    "idle_growth_at_most_5_percent": true
+  },
+  "fallback_proof": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/fb7ed9421cee437ab0dce4dcf1cf08d2",
+    "result_sha256": "f9014120cb7437817e0460ca9bf0efcd186631e6ed24c490d6a8ed0b42b1d57b",
+    "log_sha256": "3765a83f377096e92135046a9a8809e5125b584ce81848ac0f75b08e8b86d32e",
+    "worker_sidecar_sha256": "b326605ffd90a0310ae34b57254ebd1f8738effde9a047cb584b554b67ba6898",
+    "verification_sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1"
+  },
+  "limit_controls": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/7f9b1f27eaed415189d87d6491158116",
+    "result_sha256": "266bcc860eb44417a13e51328229d3fb317f2b54ea1e077c6cdbc14864046154",
+    "log_sha256": "6e38cf95657e65775c26ad799964d6c73c73284c9e59e60b977e2a7e7b9523d8"
+  },
+  "cpu_only_build": {
+    "log_sha256": "554aad6265f24b05fcabee6475e126797531e3521a0b1289a7662f44c8002ad9",
+    "manifest_sha256": "c230415604ce8060e27cc2c8cdb2079d6283e0d2dec0d2159e54de53e8df1e7f",
+    "unit_tests_passed": 5
+  },
+  "linux_feature_paths": {
+    "result_sha256": "35fbd32d31f47727e388e210f9b68b0c83f751c5cf29e510aa170546f282b74f",
+    "checks": {
+      "recursion_prove_metal": "passed",
+      "rv32im_prove": "passed",
+      "zkvm_prove_metal_recursion": "passed"
+    }
+  }
+}

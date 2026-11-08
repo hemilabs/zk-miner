@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "status": "complete",
+  "source_spec_sha256": "f92bf25a4d8d6c94f83acca60383ff7b81fc04e0c5bd1ada20ec603df72d4454",
+  "iteration_engine_commit": "a9120a42e74296e273e249f9634613a8e322925a",
+  "revert_engine_commit": "bc5dfd6eb30dd6ba35e8b65ca4dae5119bf532ec",
+  "primitive_suite": {
+    "log": "/Users/dbur/dev/zk-miner/target/macos/phase2/wp2b-primitive.log",
+    "log_sha256": "7b1e05444db783ed203ddcaa6dd175a72e3d603ec3e08b70daec7dc0bbf258a5",
+    "passed": 21,
+    "failed": 0
+  },
+  "complete_proof_diagnostic": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/e0c0a85f952b47b294150a44e5038ef9",
+    "result_sha256": "4ba0ab47c5effa98d5aef08819e1a673c2f66d703e6acfb410db1048b268cd80",
+    "test_log_sha256": "c7946bfec936c56beb31089f502d20a044ed28d7b1e503a2c36a5b1da5481e9b",
+    "verified_proofs": 1,
+    "tamper_rejections": 3,
+    "candidate_worker_sha256": "ec49326e64137d101fe63356800608a3ff4266cabe3849c828af753256a6d648",
+    "overlapped_data_transform_gpu_ms_median": 1655.912,
+    "previous_eval_check_gpu_ms_median": 1627.297,
+    "steady_data_commit_wall_ms_median": 1986.4,
+    "scope": "one verbose GPU-profiled complete arithmetic proof; diagnostic only, not a paired latency gate"
+  },
+  "paired_evidence": "docs/macos/evidence/phase2-wp2b-paired.json",
+  "decision": "reject second queue: paired four-second saving missed on both fixtures; retain sealed WP3 worker",
+  "reverted_tree_equal_to_wp3": true
+}

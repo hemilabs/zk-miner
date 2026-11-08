@@ -1,0 +1,1355 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "scope": "Synchronous Metal dispatch wall time plus CPU/shared-buffer stages; diagnostic observations, not hardware occupancy counters or warm timing samples.",
+  "engine_revision": "dcbe9f4b9140a48d4792ffcd3a3eba19897be175",
+  "worker_sha256": "f876cf8e7591e7f9ea98085ccb259ad22f767d54715023b79c5b9caf2e74fc08",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "verified_proofs": 2,
+  "negative_checks": 6,
+  "host_reserve_gib": 16,
+  "raw_campaign": "/Users/dbur/dev/zk-miner/target/macos/review-rv32im/85ec94cde8134a74b63c3fa6ef1e27a2",
+  "raw_campaign_sha256": "706e2ff684442d00db20f5973160ad7afc20b86843399965191ebe761bc13cdb",
+  "profiles": [
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/f809451dbc6a49b39c721303805b6b24",
+      "worker": {
+        "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "error": null,
+        "fallback_reason": null,
+        "gomaxprocs": 18,
+        "helper_arch": "darwin/arm64",
+        "helper_container": "zkminer-macos-97829-1793670078706051000-2",
+        "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+        "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+        "journal_hex": "bb14577088ab06c5",
+        "journal_sha256": "00a60ca38ea47660a7e69ebae4b544b15445d9299126b6f5d4a7f635f3cd83c4",
+        "max_guest_cycles": 67108864,
+        "minimum_segment_po2": 14,
+        "observed_mode": "metal",
+        "observed_stages": {
+          "groth16": "native_darwin_arm64_helper",
+          "identity": "cpu",
+          "other_segment_operations": "metal_shared_buffers",
+          "recursion": "metal",
+          "recursion_metal": {
+            "completed_constraint_checks": 19,
+            "cpu_stages": [
+              "witness",
+              "accumulation"
+            ],
+            "evaluation_points": 19922944,
+            "kernel_source_sha256": "137564beae0d2804c66d1957411d6be97b6b4d7b9cb4d7868eecdc80b0c69bb5"
+          },
+          "rv32im_metal": {
+            "completed_constraint_checks": 10,
+            "completed_dispatches": 3228,
+            "cpu_accumulation_calls": 10,
+            "cpu_differential_checks": 0,
+            "cpu_stages": [
+              "witness",
+              "accumulation",
+              "scatter",
+              "prefix_products",
+              "zeroize"
+            ],
+            "cpu_witness_calls": 10,
+            "evaluation_points": 41943040,
+            "hal_kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+            "kernel_source_sha256": "4de746306b22bd756e919f2d27d28848e28ed7e4fabcb6e6c526537bac01708b",
+            "normalization": "period_four_table",
+            "threads_per_threadgroup": 32
+          },
+          "segment": "metal"
+        },
+        "operation": "prove",
+        "phase": "complete",
+        "po2": 20,
+        "proof_kind": "groth16",
+        "rayon_threads": 18,
+        "recursion_cpu_stages": [
+          "witness",
+          "accumulation",
+          "identity_p254"
+        ],
+        "recursion_hal": "metal",
+        "request_id": 1,
+        "requested_mode": "cpu",
+        "schema_version": 1,
+        "seal_sha256": "6993bebbe2c14d78eec55c20f6dbc3b9d1d769cad97fa2f4d3823e38f29d4909",
+        "segment_hal": "metal",
+        "stage_ms": {
+          "execution_and_segment": 88801.40487500001,
+          "identity_and_wrap": 26973.71675,
+          "recursion": 11580.247167,
+          "verification": 1.731833
+        },
+        "staging_limit_bytes": null,
+        "stats": {
+          "paging_cycles": 39642,
+          "reserved_cycles": 443002,
+          "segments": 10,
+          "total_cycles": 10485760,
+          "user_cycles": 10003116
+        },
+        "total_ms": 127491.850417,
+        "worker_pid": 97885
+      },
+      "complete_seconds": 127.652791417,
+      "execution_and_segment_seconds": 88.801404875,
+      "summed_segment_prover_seconds": 88.6583,
+      "execution_preflight_and_caller_residual_seconds": 0.1431048750000059,
+      "exclusive_segment_seconds": {
+        "constraint_evaluation": 56.478300000000004,
+        "merkle_commitments": 3.7947,
+        "polynomial_transforms": 17.8297,
+        "witness_generation": 1.7514,
+        "accumulation": 6.4453000000000005,
+        "other_segment_protocol": 2.3588999999999913
+      },
+      "exclusive_segment_percent": {
+        "constraint_evaluation": 63.70334193188907,
+        "merkle_commitments": 4.280140720045388,
+        "polynomial_transforms": 20.11058186317581,
+        "witness_generation": 1.9754495630978715,
+        "accumulation": 7.269821325245353,
+        "other_segment_protocol": 2.6606645965465066
+      },
+      "timers": {
+        "begin": [
+          {
+            "witgen": 184.1,
+            "data_commit": 1316.9,
+            "accum": 599.4,
+            "accum_commit": 664.9,
+            "main": 2852.8,
+            "total": 8872.5
+          },
+          {
+            "witgen": 176.9,
+            "data_commit": 1353.7,
+            "accum": 638.3,
+            "accum_commit": 675.1,
+            "main": 2854.1,
+            "total": 8865.5
+          },
+          {
+            "witgen": 167.9,
+            "data_commit": 1330.3,
+            "accum": 633.5,
+            "accum_commit": 668.5,
+            "main": 2809.1,
+            "total": 8783.8
+          },
+          {
+            "witgen": 170.1,
+            "data_commit": 1334.4,
+            "accum": 645.7,
+            "accum_commit": 672.5,
+            "main": 2833.3,
+            "total": 8841.1
+          },
+          {
+            "witgen": 168.5,
+            "data_commit": 1378.3,
+            "accum": 636.6,
+            "accum_commit": 665.4,
+            "main": 2857.6,
+            "total": 8868.2
+          },
+          {
+            "witgen": 174.7,
+            "data_commit": 1361.6,
+            "accum": 621.2,
+            "accum_commit": 666.9,
+            "main": 2833.6,
+            "total": 8825.8
+          },
+          {
+            "witgen": 169.3,
+            "data_commit": 1359.8,
+            "accum": 612.5,
+            "accum_commit": 685.4,
+            "main": 2836.8,
+            "total": 8845.6
+          },
+          {
+            "witgen": 173.1,
+            "data_commit": 1356.1,
+            "accum": 604.1,
+            "accum_commit": 682.6,
+            "main": 2825.1,
+            "total": 8833.7
+          },
+          {
+            "witgen": 180.9,
+            "data_commit": 1351.7,
+            "accum": 630.3,
+            "accum_commit": 665.5,
+            "main": 2837.6,
+            "total": 8850.5
+          },
+          {
+            "witgen": 185.9,
+            "data_commit": 1337.6,
+            "accum": 823.7,
+            "accum_commit": 667.5,
+            "main": 3024.6,
+            "total": 9071.6
+          }
+        ],
+        "start_finalize": [
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5669.1,
+            "post_eval_check": 0.0,
+            "total": 5669.2
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5655.5,
+            "post_eval_check": 0.0,
+            "total": 5655.5
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5614.4,
+            "post_eval_check": 0.0,
+            "total": 5614.4
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5651.1,
+            "post_eval_check": 0.0,
+            "total": 5651.1
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5649.6,
+            "post_eval_check": 0.0,
+            "total": 5649.6
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5639.5,
+            "post_eval_check": 0.0,
+            "total": 5639.5
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5648.4,
+            "post_eval_check": 0.0,
+            "total": 5648.4
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5648.3,
+            "post_eval_check": 0.0,
+            "total": 5648.3
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5642.3,
+            "post_eval_check": 0.0,
+            "total": 5642.4
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5660.1,
+            "post_eval_check": 0.0,
+            "total": 5660.1
+          }
+        ],
+        "finalize": [
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 23.5,
+            "check_commit": 104.6,
+            "eval_u": 55.7,
+            "combos": 89.3,
+            "fri": 69.0,
+            "total": 344.0
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 28.8,
+            "check_commit": 107.4,
+            "eval_u": 53.8,
+            "combos": 89.9,
+            "fri": 67.0,
+            "total": 348.8
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 23.7,
+            "check_commit": 106.5,
+            "eval_u": 54.4,
+            "combos": 92.4,
+            "fri": 71.3,
+            "total": 350.2
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 27.0,
+            "check_commit": 106.5,
+            "eval_u": 55.5,
+            "combos": 89.7,
+            "fri": 69.2,
+            "total": 349.9
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 23.8,
+            "check_commit": 106.1,
+            "eval_u": 57.2,
+            "combos": 91.8,
+            "fri": 73.1,
+            "total": 353.9
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 23.3,
+            "check_commit": 104.9,
+            "eval_u": 55.3,
+            "combos": 89.6,
+            "fri": 69.9,
+            "total": 345.8
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 23.9,
+            "check_commit": 108.3,
+            "eval_u": 54.9,
+            "combos": 90.6,
+            "fri": 72.9,
+            "total": 353.5
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 23.7,
+            "check_commit": 108.8,
+            "eval_u": 55.7,
+            "combos": 89.9,
+            "fri": 72.6,
+            "total": 352.4
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 39.6,
+            "check_commit": 103.9,
+            "eval_u": 55.9,
+            "combos": 93.2,
+            "fri": 68.5,
+            "total": 362.9
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 52.2,
+            "check_commit": 105.9,
+            "eval_u": 54.3,
+            "combos": 93.1,
+            "fri": 72.4,
+            "total": 379.6
+          }
+        ],
+        "groups": {
+          "code": [
+            {
+              "ntt": 16.6,
+              "bitrev": 0.0,
+              "merkle": 47.5,
+              "total": 64.0
+            }
+          ],
+          "data": [
+            {
+              "ntt": 861.8,
+              "bitrev": 0.0,
+              "merkle": 210.7,
+              "total": 1072.5
+            },
+            {
+              "ntt": 870.4,
+              "bitrev": 0.0,
+              "merkle": 211.8,
+              "total": 1082.3
+            },
+            {
+              "ntt": 869.2,
+              "bitrev": 0.0,
+              "merkle": 213.1,
+              "total": 1082.3
+            },
+            {
+              "ntt": 871.2,
+              "bitrev": 0.0,
+              "merkle": 211.9,
+              "total": 1083.1
+            },
+            {
+              "ntt": 870.1,
+              "bitrev": 0.0,
+              "merkle": 211.6,
+              "total": 1081.7
+            },
+            {
+              "ntt": 863.8,
+              "bitrev": 0.0,
+              "merkle": 214.6,
+              "total": 1078.4
+            },
+            {
+              "ntt": 871.3,
+              "bitrev": 0.0,
+              "merkle": 215.6,
+              "total": 1086.9
+            },
+            {
+              "ntt": 866.5,
+              "bitrev": 0.0,
+              "merkle": 212.3,
+              "total": 1078.8
+            },
+            {
+              "ntt": 874.1,
+              "bitrev": 0.0,
+              "merkle": 213.3,
+              "total": 1087.4
+            },
+            {
+              "ntt": 871.3,
+              "bitrev": 0.0,
+              "merkle": 215.0,
+              "total": 1086.3
+            }
+          ],
+          "accum": [
+            {
+              "ntt": 416.7,
+              "bitrev": 0.0,
+              "merkle": 120.0,
+              "total": 536.7
+            },
+            {
+              "ntt": 423.6,
+              "bitrev": 0.0,
+              "merkle": 120.3,
+              "total": 543.9
+            },
+            {
+              "ntt": 418.5,
+              "bitrev": 0.0,
+              "merkle": 122.2,
+              "total": 540.7
+            },
+            {
+              "ntt": 421.5,
+              "bitrev": 0.0,
+              "merkle": 120.4,
+              "total": 541.9
+            },
+            {
+              "ntt": 415.9,
+              "bitrev": 0.0,
+              "merkle": 119.9,
+              "total": 535.8
+            },
+            {
+              "ntt": 418.9,
+              "bitrev": 0.0,
+              "merkle": 120.4,
+              "total": 539.2
+            },
+            {
+              "ntt": 417.8,
+              "bitrev": 0.0,
+              "merkle": 137.8,
+              "total": 555.6
+            },
+            {
+              "ntt": 418.7,
+              "bitrev": 0.0,
+              "merkle": 134.7,
+              "total": 553.4
+            },
+            {
+              "ntt": 415.1,
+              "bitrev": 0.0,
+              "merkle": 119.9,
+              "total": 535.0
+            },
+            {
+              "ntt": 418.0,
+              "bitrev": 0.0,
+              "merkle": 120.6,
+              "total": 538.6
+            }
+          ],
+          "check": [
+            {
+              "ntt": 67.5,
+              "bitrev": 0.0,
+              "merkle": 37.1,
+              "total": 104.6
+            },
+            {
+              "ntt": 67.5,
+              "bitrev": 0.0,
+              "merkle": 39.9,
+              "total": 107.3
+            },
+            {
+              "ntt": 68.4,
+              "bitrev": 0.0,
+              "merkle": 38.1,
+              "total": 106.5
+            },
+            {
+              "ntt": 69.3,
+              "bitrev": 0.0,
+              "merkle": 37.2,
+              "total": 106.5
+            },
+            {
+              "ntt": 68.3,
+              "bitrev": 0.0,
+              "merkle": 37.9,
+              "total": 106.1
+            },
+            {
+              "ntt": 67.6,
+              "bitrev": 0.0,
+              "merkle": 37.2,
+              "total": 104.9
+            },
+            {
+              "ntt": 69.9,
+              "bitrev": 0.0,
+              "merkle": 38.4,
+              "total": 108.2
+            },
+            {
+              "ntt": 68.0,
+              "bitrev": 0.0,
+              "merkle": 40.8,
+              "total": 108.8
+            },
+            {
+              "ntt": 66.5,
+              "bitrev": 0.0,
+              "merkle": 37.4,
+              "total": 103.9
+            },
+            {
+              "ntt": 68.7,
+              "bitrev": 0.0,
+              "merkle": 37.1,
+              "total": 105.8
+            }
+          ]
+        },
+        "make_coeffs": [
+          {
+            "intt_zk": 14.3
+          },
+          {
+            "intt_zk": 244.4
+          },
+          {
+            "intt_zk": 128.1
+          },
+          {
+            "intt_zk": 271.4
+          },
+          {
+            "intt_zk": 131.1
+          },
+          {
+            "intt_zk": 247.9
+          },
+          {
+            "intt_zk": 127.7
+          },
+          {
+            "intt_zk": 251.3
+          },
+          {
+            "intt_zk": 130.5
+          },
+          {
+            "intt_zk": 296.5
+          },
+          {
+            "intt_zk": 129.6
+          },
+          {
+            "intt_zk": 283.2
+          },
+          {
+            "intt_zk": 127.6
+          },
+          {
+            "intt_zk": 272.9
+          },
+          {
+            "intt_zk": 129.7
+          },
+          {
+            "intt_zk": 277.2
+          },
+          {
+            "intt_zk": 129.2
+          },
+          {
+            "intt_zk": 264.3
+          },
+          {
+            "intt_zk": 130.5
+          },
+          {
+            "intt_zk": 251.3
+          },
+          {
+            "intt_zk": 128.8
+          }
+        ]
+      },
+      "conditional_scenarios": {
+        "transforms_and_merkle_only": {
+          "acceleratable_seconds": 21.624399999999998,
+          "remaining_floor_seconds": 106.02839141700001,
+          "ideal_speedup_ceiling": 1.2039491471199746,
+          "phase_speedup_needed_for_2x_complete": null,
+          "conditional_seconds": {
+            "1.5": 120.44465808366667,
+            "2": 116.84059141700001,
+            "3": 113.23652475033334,
+            "5": 110.353271417,
+            "10": 108.19083141700001
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        },
+        "constraint_only": {
+          "acceleratable_seconds": 56.478300000000004,
+          "remaining_floor_seconds": 71.174491417,
+          "ideal_speedup_ceiling": 1.7935188418713475,
+          "phase_speedup_needed_for_2x_complete": null,
+          "conditional_seconds": {
+            "1.5": 108.826691417,
+            "2": 99.41364141700001,
+            "3": 90.000591417,
+            "5": 82.470151417,
+            "10": 76.822321417
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        },
+        "constraint_transforms_merkle": {
+          "acceleratable_seconds": 78.1027,
+          "remaining_floor_seconds": 49.550091417000004,
+          "ideal_speedup_ceiling": 2.5762372533828253,
+          "phase_speedup_needed_for_2x_complete": 5.470792608875796,
+          "conditional_seconds": {
+            "1.5": 101.61855808366667,
+            "2": 88.601441417,
+            "3": 75.58432475033334,
+            "5": 65.17063141700001,
+            "10": 57.36036141700001
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        },
+        "witness_and_accumulation_only": {
+          "acceleratable_seconds": 8.1967,
+          "remaining_floor_seconds": 119.45609141700001,
+          "ideal_speedup_ceiling": 1.0686168440869772,
+          "phase_speedup_needed_for_2x_complete": null,
+          "conditional_seconds": {
+            "1.5": 124.92055808366668,
+            "2": 123.554441417,
+            "3": 122.18832475033335,
+            "5": 121.09543141700001,
+            "10": 120.27576141700001
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        }
+      },
+      "artifact_hashes": {
+        "result.json": "7dac53847b3c5aab6e27758ad853d89c0eee39501a259bea8770e0135b9689fe",
+        "test.log": "efb64cf28348f01ef9de118ba8442faaaaa581c9c98ae56196ac1aaa8f6fe14e",
+        "acceptance-build.json": "33f767c90750bd3b887569e45a25965647d0c47d28f4b66a141883c4f2c2b16c",
+        "acceptance/complete.json": "12e5eccd8954388d31940a13976e2493598da68ee2743ee54c41ff7e93c60879",
+        "acceptance/proof-0/worker.json": "894e62f6f60997e21d49d2a41c172a86b781c89aafa8c2dc5d15ed82a1b5f63f",
+        "acceptance/proof-0/verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e"
+      }
+    },
+    {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/aa9dfbd19bcb43b0a26ccf9093e9c752",
+      "worker": {
+        "elf_sha256": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+        "error": null,
+        "fallback_reason": null,
+        "gomaxprocs": 18,
+        "helper_arch": "darwin/arm64",
+        "helper_container": "zkminer-macos-99303-1793670226251338000-2",
+        "image_id": "58518a60c949a92b89ddcfa8c8b44f65ebbf17ee16c0dffa738ed55563e0a623",
+        "input_sha256": "91bac864b72812cb76e340534f816f170bd2f6200bb48159bac05679ce3ccc4c",
+        "journal_hex": "7b3b9da440ac877e14646d0dbff269ec24926a37a504819bae0e7b2f6226b5b4",
+        "journal_sha256": "38099a9e239d9262461aedc0d2ed5e2d97331234e2a961fb0f9f28b27972784e",
+        "max_guest_cycles": 67108864,
+        "minimum_segment_po2": 14,
+        "observed_mode": "metal",
+        "observed_stages": {
+          "groth16": "native_darwin_arm64_helper",
+          "identity": "cpu",
+          "other_segment_operations": "metal_shared_buffers",
+          "recursion": "metal",
+          "recursion_metal": {
+            "completed_constraint_checks": 19,
+            "cpu_stages": [
+              "witness",
+              "accumulation"
+            ],
+            "evaluation_points": 19922944,
+            "kernel_source_sha256": "137564beae0d2804c66d1957411d6be97b6b4d7b9cb4d7868eecdc80b0c69bb5"
+          },
+          "rv32im_metal": {
+            "completed_constraint_checks": 10,
+            "completed_dispatches": 3228,
+            "cpu_accumulation_calls": 10,
+            "cpu_differential_checks": 0,
+            "cpu_stages": [
+              "witness",
+              "accumulation",
+              "scatter",
+              "prefix_products",
+              "zeroize"
+            ],
+            "cpu_witness_calls": 10,
+            "evaluation_points": 41943040,
+            "hal_kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+            "kernel_source_sha256": "4de746306b22bd756e919f2d27d28848e28ed7e4fabcb6e6c526537bac01708b",
+            "normalization": "period_four_table",
+            "threads_per_threadgroup": 32
+          },
+          "segment": "metal"
+        },
+        "operation": "prove",
+        "phase": "complete",
+        "po2": 20,
+        "proof_kind": "groth16",
+        "rayon_threads": 18,
+        "recursion_cpu_stages": [
+          "witness",
+          "accumulation",
+          "identity_p254"
+        ],
+        "recursion_hal": "metal",
+        "request_id": 1,
+        "requested_mode": "cpu",
+        "schema_version": 1,
+        "seal_sha256": "fcfdbe2ad9bde39f7c51a0c53e7f1042120e02d919e4252d5d2e25a1e7d04129",
+        "segment_hal": "metal",
+        "stage_ms": {
+          "execution_and_segment": 91213.200958,
+          "identity_and_wrap": 25257.9715,
+          "recursion": 11439.429041,
+          "verification": 1.705458
+        },
+        "staging_limit_bytes": null,
+        "stats": {
+          "paging_cycles": 109720,
+          "reserved_cycles": 372600,
+          "segments": 10,
+          "total_cycles": 10485760,
+          "user_cycles": 10003440
+        },
+        "total_ms": 128049.80479100002,
+        "worker_pid": 99351
+      },
+      "complete_seconds": 128.682329,
+      "execution_and_segment_seconds": 91.213200958,
+      "summed_segment_prover_seconds": 91.0542,
+      "execution_preflight_and_caller_residual_seconds": 0.15900095800000713,
+      "exclusive_segment_seconds": {
+        "constraint_evaluation": 56.465199999999996,
+        "merkle_commitments": 3.7913,
+        "polynomial_transforms": 17.7892,
+        "witness_generation": 3.65,
+        "accumulation": 6.9565,
+        "other_segment_protocol": 2.402000000000001
+      },
+      "exclusive_segment_percent": {
+        "constraint_evaluation": 62.012735271958896,
+        "merkle_commitments": 4.163783768348962,
+        "polynomial_transforms": 19.536935144122953,
+        "witness_generation": 4.008601470333054,
+        "accumulation": 7.639955103663533,
+        "other_segment_protocol": 2.6379892415726034
+      },
+      "timers": {
+        "begin": [
+          {
+            "witgen": 372.6,
+            "data_commit": 1320.2,
+            "accum": 685.0,
+            "accum_commit": 671.9,
+            "main": 3142.0,
+            "total": 9183.9
+          },
+          {
+            "witgen": 377.4,
+            "data_commit": 1340.8,
+            "accum": 703.0,
+            "accum_commit": 680.3,
+            "main": 3110.4,
+            "total": 9131.3
+          },
+          {
+            "witgen": 351.8,
+            "data_commit": 1332.7,
+            "accum": 663.5,
+            "accum_commit": 686.9,
+            "main": 3044.6,
+            "total": 9084.6
+          },
+          {
+            "witgen": 350.1,
+            "data_commit": 1337.1,
+            "accum": 665.4,
+            "accum_commit": 674.7,
+            "main": 3037.5,
+            "total": 9057.7
+          },
+          {
+            "witgen": 375.9,
+            "data_commit": 1343.5,
+            "accum": 676.5,
+            "accum_commit": 678.0,
+            "main": 3083.8,
+            "total": 9115.0
+          },
+          {
+            "witgen": 355.0,
+            "data_commit": 1340.1,
+            "accum": 656.4,
+            "accum_commit": 680.2,
+            "main": 3041.6,
+            "total": 9067.1
+          },
+          {
+            "witgen": 375.0,
+            "data_commit": 1336.2,
+            "accum": 673.3,
+            "accum_commit": 670.7,
+            "main": 3064.6,
+            "total": 9067.8
+          },
+          {
+            "witgen": 380.2,
+            "data_commit": 1332.6,
+            "accum": 681.6,
+            "accum_commit": 666.4,
+            "main": 3071.2,
+            "total": 9067.9
+          },
+          {
+            "witgen": 376.8,
+            "data_commit": 1331.1,
+            "accum": 702.2,
+            "accum_commit": 674.1,
+            "main": 3093.7,
+            "total": 9090.1
+          },
+          {
+            "witgen": 335.2,
+            "data_commit": 1331.9,
+            "accum": 849.6,
+            "accum_commit": 667.5,
+            "main": 3193.7,
+            "total": 9188.8
+          }
+        ],
+        "start_finalize": [
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5660.2,
+            "post_eval_check": 0.0,
+            "total": 5660.3
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5645.1,
+            "post_eval_check": 0.0,
+            "total": 5645.1
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5657.4,
+            "post_eval_check": 0.0,
+            "total": 5657.5
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5654.0,
+            "post_eval_check": 0.0,
+            "total": 5654.0
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5637.8,
+            "post_eval_check": 0.0,
+            "total": 5637.8
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5634.9,
+            "post_eval_check": 0.0,
+            "total": 5634.9
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5646.4,
+            "post_eval_check": 0.0,
+            "total": 5646.4
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5641.6,
+            "post_eval_check": 0.0,
+            "total": 5641.7
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5644.6,
+            "post_eval_check": 0.0,
+            "total": 5644.7
+          },
+          {
+            "alloc": 0.0,
+            "eval_check_launch": 5643.2,
+            "post_eval_check": 0.0,
+            "total": 5643.2
+          }
+        ],
+        "finalize": [
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 35.8,
+            "check_commit": 108.1,
+            "eval_u": 54.7,
+            "combos": 99.4,
+            "fri": 74.5,
+            "total": 374.8
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 41.0,
+            "check_commit": 112.0,
+            "eval_u": 54.7,
+            "combos": 89.9,
+            "fri": 69.8,
+            "total": 368.9
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 44.2,
+            "check_commit": 111.2,
+            "eval_u": 55.1,
+            "combos": 89.9,
+            "fri": 72.2,
+            "total": 374.5
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 23.7,
+            "check_commit": 105.2,
+            "eval_u": 54.5,
+            "combos": 100.0,
+            "fri": 72.8,
+            "total": 359.0
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 49.1,
+            "check_commit": 105.7,
+            "eval_u": 54.5,
+            "combos": 100.0,
+            "fri": 74.6,
+            "total": 386.1
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 44.3,
+            "check_commit": 104.4,
+            "eval_u": 54.3,
+            "combos": 101.3,
+            "fri": 77.4,
+            "total": 383.3
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 23.9,
+            "check_commit": 105.8,
+            "eval_u": 54.4,
+            "combos": 89.2,
+            "fri": 74.8,
+            "total": 349.9
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 23.8,
+            "check_commit": 105.9,
+            "eval_u": 54.2,
+            "combos": 89.7,
+            "fri": 71.7,
+            "total": 348.0
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 23.7,
+            "check_commit": 105.1,
+            "eval_u": 54.3,
+            "combos": 89.5,
+            "fri": 70.6,
+            "total": 344.8
+          },
+          {
+            "eval_check_dep": 0.0,
+            "check_intt": 23.8,
+            "check_commit": 105.1,
+            "eval_u": 54.2,
+            "combos": 89.6,
+            "fri": 69.2,
+            "total": 344.9
+          }
+        ],
+        "groups": {
+          "code": [
+            {
+              "ntt": 19.5,
+              "bitrev": 0.0,
+              "merkle": 48.8,
+              "total": 68.2
+            }
+          ],
+          "data": [
+            {
+              "ntt": 864.3,
+              "bitrev": 0.0,
+              "merkle": 210.3,
+              "total": 1074.7
+            },
+            {
+              "ntt": 875.2,
+              "bitrev": 0.0,
+              "merkle": 213.4,
+              "total": 1088.5
+            },
+            {
+              "ntt": 867.2,
+              "bitrev": 0.0,
+              "merkle": 212.4,
+              "total": 1079.6
+            },
+            {
+              "ntt": 871.9,
+              "bitrev": 0.0,
+              "merkle": 217.9,
+              "total": 1089.8
+            },
+            {
+              "ntt": 872.6,
+              "bitrev": 0.0,
+              "merkle": 217.8,
+              "total": 1090.4
+            },
+            {
+              "ntt": 867.8,
+              "bitrev": 0.0,
+              "merkle": 215.7,
+              "total": 1083.5
+            },
+            {
+              "ntt": 870.3,
+              "bitrev": 0.0,
+              "merkle": 214.2,
+              "total": 1084.5
+            },
+            {
+              "ntt": 868.1,
+              "bitrev": 0.0,
+              "merkle": 212.2,
+              "total": 1080.3
+            },
+            {
+              "ntt": 868.3,
+              "bitrev": 0.0,
+              "merkle": 212.6,
+              "total": 1080.9
+            },
+            {
+              "ntt": 869.8,
+              "bitrev": 0.0,
+              "merkle": 212.1,
+              "total": 1081.9
+            }
+          ],
+          "accum": [
+            {
+              "ntt": 417.8,
+              "bitrev": 0.0,
+              "merkle": 118.6,
+              "total": 536.3
+            },
+            {
+              "ntt": 420.3,
+              "bitrev": 0.0,
+              "merkle": 119.3,
+              "total": 539.7
+            },
+            {
+              "ntt": 419.1,
+              "bitrev": 0.0,
+              "merkle": 138.0,
+              "total": 557.2
+            },
+            {
+              "ntt": 424.0,
+              "bitrev": 0.0,
+              "merkle": 120.2,
+              "total": 544.2
+            },
+            {
+              "ntt": 424.1,
+              "bitrev": 0.0,
+              "merkle": 120.3,
+              "total": 544.4
+            },
+            {
+              "ntt": 422.3,
+              "bitrev": 0.0,
+              "merkle": 120.6,
+              "total": 542.9
+            },
+            {
+              "ntt": 418.8,
+              "bitrev": 0.0,
+              "merkle": 120.6,
+              "total": 539.4
+            },
+            {
+              "ntt": 416.0,
+              "bitrev": 0.0,
+              "merkle": 119.5,
+              "total": 535.6
+            },
+            {
+              "ntt": 423.4,
+              "bitrev": 0.0,
+              "merkle": 121.8,
+              "total": 545.1
+            },
+            {
+              "ntt": 418.8,
+              "bitrev": 0.0,
+              "merkle": 119.8,
+              "total": 538.6
+            }
+          ],
+          "check": [
+            {
+              "ntt": 67.5,
+              "bitrev": 0.0,
+              "merkle": 40.5,
+              "total": 108.1
+            },
+            {
+              "ntt": 71.4,
+              "bitrev": 0.0,
+              "merkle": 40.5,
+              "total": 112.0
+            },
+            {
+              "ntt": 70.8,
+              "bitrev": 0.0,
+              "merkle": 40.4,
+              "total": 111.2
+            },
+            {
+              "ntt": 67.6,
+              "bitrev": 0.0,
+              "merkle": 37.6,
+              "total": 105.2
+            },
+            {
+              "ntt": 67.5,
+              "bitrev": 0.0,
+              "merkle": 38.1,
+              "total": 105.6
+            },
+            {
+              "ntt": 67.2,
+              "bitrev": 0.0,
+              "merkle": 37.2,
+              "total": 104.4
+            },
+            {
+              "ntt": 67.7,
+              "bitrev": 0.0,
+              "merkle": 38.0,
+              "total": 105.8
+            },
+            {
+              "ntt": 67.5,
+              "bitrev": 0.0,
+              "merkle": 38.4,
+              "total": 105.8
+            },
+            {
+              "ntt": 67.6,
+              "bitrev": 0.0,
+              "merkle": 37.4,
+              "total": 105.1
+            },
+            {
+              "ntt": 68.0,
+              "bitrev": 0.0,
+              "merkle": 37.1,
+              "total": 105.1
+            }
+          ]
+        },
+        "make_coeffs": [
+          {
+            "intt_zk": 14.8
+          },
+          {
+            "intt_zk": 245.5
+          },
+          {
+            "intt_zk": 135.6
+          },
+          {
+            "intt_zk": 252.3
+          },
+          {
+            "intt_zk": 140.6
+          },
+          {
+            "intt_zk": 253.0
+          },
+          {
+            "intt_zk": 129.7
+          },
+          {
+            "intt_zk": 247.2
+          },
+          {
+            "intt_zk": 130.5
+          },
+          {
+            "intt_zk": 253.0
+          },
+          {
+            "intt_zk": 133.5
+          },
+          {
+            "intt_zk": 256.6
+          },
+          {
+            "intt_zk": 137.2
+          },
+          {
+            "intt_zk": 251.7
+          },
+          {
+            "intt_zk": 131.3
+          },
+          {
+            "intt_zk": 252.2
+          },
+          {
+            "intt_zk": 130.8
+          },
+          {
+            "intt_zk": 250.2
+          },
+          {
+            "intt_zk": 129.0
+          },
+          {
+            "intt_zk": 250.0
+          },
+          {
+            "intt_zk": 128.8
+          }
+        ]
+      },
+      "conditional_scenarios": {
+        "transforms_and_merkle_only": {
+          "acceleratable_seconds": 21.5805,
+          "remaining_floor_seconds": 107.10182900000001,
+          "ideal_speedup_ceiling": 1.2014951584066786,
+          "phase_speedup_needed_for_2x_complete": null,
+          "conditional_seconds": {
+            "1.5": 121.48882900000001,
+            "2": 117.89207900000001,
+            "3": 114.29532900000001,
+            "5": 111.41792900000002,
+            "10": 109.25987900000001
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        },
+        "constraint_only": {
+          "acceleratable_seconds": 56.465199999999996,
+          "remaining_floor_seconds": 72.21712900000001,
+          "ideal_speedup_ceiling": 1.7818809856038444,
+          "phase_speedup_needed_for_2x_complete": null,
+          "conditional_seconds": {
+            "1.5": 109.86059566666668,
+            "2": 100.44972900000002,
+            "3": 91.03886233333334,
+            "5": 83.51016900000002,
+            "10": 77.86364900000001
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        },
+        "constraint_transforms_merkle": {
+          "acceleratable_seconds": 78.0457,
+          "remaining_floor_seconds": 50.63662900000001,
+          "ideal_speedup_ceiling": 2.5412894092930234,
+          "phase_speedup_needed_for_2x_complete": 5.6948810851706755,
+          "conditional_seconds": {
+            "1.5": 102.66709566666668,
+            "2": 89.659479,
+            "3": 76.65186233333334,
+            "5": 66.24576900000001,
+            "10": 58.44119900000001
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        },
+        "witness_and_accumulation_only": {
+          "acceleratable_seconds": 10.6065,
+          "remaining_floor_seconds": 118.07582900000001,
+          "ideal_speedup_ceiling": 1.089827868157504,
+          "phase_speedup_needed_for_2x_complete": null,
+          "conditional_seconds": {
+            "1.5": 125.14682900000001,
+            "2": 123.37907900000002,
+            "3": 121.61132900000001,
+            "5": 120.19712900000002,
+            "10": 119.13647900000001
+          },
+          "scope": "Amdahl what-if with all other time unchanged; not a measured or predicted Metal speedup"
+        }
+      },
+      "artifact_hashes": {
+        "result.json": "9672e599f3165302b53556fb986ed0ded807dd96d776c7a0ab9baffeece07fb8",
+        "test.log": "befcde914e490c13ea6b7c00b092e13bc1d2247ba6189bbe6f646a96fedcd5ae",
+        "acceptance-build.json": "33f767c90750bd3b887569e45a25965647d0c47d28f4b66a141883c4f2c2b16c",
+        "acceptance/complete.json": "1678c8a45b1a413e49bfc36bf253d9ecf5ec565f3ece59baaaca0fd8041e4ff5",
+        "acceptance/proof-0/worker.json": "09d0ff585e970f9f9cd7cef44cad8785277e3c3dc9621fe3da138422e76b9bac",
+        "acceptance/proof-0/verification.json": "b73401248e3016ad7ec1bb72191f54243c8d605398be78ec27908971bd96f0a5"
+      }
+    }
+  ]
+}

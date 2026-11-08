@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "generated_at_utc": "2026-11-01T00:01:55.505014+00:00",
+  "command": [
+    "/opt/homebrew/opt/python@3.15/bin/python3.15",
+    "/Users/dbur/dev/zk-miner/scripts/macos/test-benchmark-summary-controls.py",
+    "--benchmark",
+    "target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27",
+    "--output",
+    "docs/macos/evidence/benchmark-summary-controls.json"
+  ],
+  "scope": "controlled schedule/statistical cases plus read-only timing/identity bindings from one actual finalized warmup; no cryptographic verification or proving executed",
+  "proofs_generated_or_verified": 0,
+  "control_cases_passed": 13,
+  "control_cases_failed": 0,
+  "artifacts": {
+    "controls": {
+      "path": "/Users/dbur/dev/zk-miner/scripts/macos/test-benchmark-summary-controls.py",
+      "sha256": "396ff0ce1b4cae59f253095219e11883464c50007dcb881d0fb1b38f581831f8",
+      "bytes": 7364
+    },
+    "collector": {
+      "path": "/Users/dbur/dev/zk-miner/scripts/macos/summarize-benchmark.py",
+      "sha256": "e6c3a98854e12de2d63e1d6f275bad69e95f7ec034213fe22851b16a0105ba00",
+      "bytes": 25944
+    },
+    "actual_plan": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27/plan.json",
+      "sha256": "5e3bba1e2433d7f490c39120e28db53925ee2675f504a0c218afa309284d9a1e",
+      "bytes": 21546
+    },
+    "actual_worker": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/257de3edef294d10b2f03edda0048d95/acceptance/proof-0/worker.json",
+      "sha256": "ef717a841af46c1f58c0c1052ad5ac335897f99146730d5c2450710638b77238",
+      "bytes": 1385
+    },
+    "actual_resource": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/257de3edef294d10b2f03edda0048d95/acceptance/proof-0/resource.json",
+      "sha256": "7df11c6a5c618fdee42c0f491a8cf2c60c9537823f982f0ffb51d79a47a34fd6",
+      "bytes": 46401
+    },
+    "actual_timing": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/257de3edef294d10b2f03edda0048d95/acceptance/proof-0/timing.json",
+      "sha256": "dd578b516a64fe9413d9fb71de520b57c953d6ea2e93e9289048cab8d384f2f8",
+      "bytes": 766
+    },
+    "actual_run_timing": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/257de3edef294d10b2f03edda0048d95/acceptance/timing.json",
+      "sha256": "f8d8beef5fc4b67c0fd4a3226e961bc9784e7081aec9da49a536f77c02fb7325",
+      "bytes": 1266
+    },
+    "actual_ledger": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/257de3edef294d10b2f03edda0048d95/acceptance/requests.jsonl",
+      "sha256": "381b6c7f7d300fd9abf23b352ece1e5efd7ab6d2b8d2ad727857b6f6c806d739",
+      "bytes": 37844
+    },
+    "actual_test_log": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/257de3edef294d10b2f03edda0048d95/test.log",
+      "sha256": "86f67eebbc38e9ed105209e6041c3e52f0eb77ded2529a6f7811e7f7f1cad66c",
+      "bytes": 2673
+    }
+  },
+  "cases": [
+    {
+      "case": "declared alternating schedule",
+      "expected": "accept",
+      "observed": "accept",
+      "outcome": "passed"
+    },
+    {
+      "case": "swapped scheduled mode",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "trial ledger is not an ordered prefix of the plan"
+    },
+    {
+      "case": "reused acceptance run",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "invalid or duplicate acceptance run ID"
+    },
+    {
+      "case": "failed prefix retains unattempted trials",
+      "expected": "accept",
+      "observed": "accept",
+      "outcome": "passed"
+    },
+    {
+      "case": "attempt after failure",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "campaign continued or retried after a failed trial"
+    },
+    {
+      "case": "known twofold ratios exclude extreme warmups",
+      "expected": "accept",
+      "observed": "accept",
+      "outcome": "passed"
+    },
+    {
+      "case": "missing measured mode",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "missing or extra campaign measurements"
+    },
+    {
+      "case": "zero timing cannot become infinite speedup",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "statistical sample must be finite and positive"
+    },
+    {
+      "case": "nonfinite timing cannot enter statistics",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "statistical sample must be finite and positive"
+    },
+    {
+      "case": "actual saved timing and worker identity bind",
+      "expected": "accept",
+      "observed": "accept",
+      "outcome": "passed"
+    },
+    {
+      "case": "changed timing request identity",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "saved proof timing differs from the acceptance ledger"
+    },
+    {
+      "case": "changed resource prove-call duration",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "proof/resource call timings differ"
+    },
+    {
+      "case": "ambiguous duplicate wrapping diagnostic",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "single-proof trial needs exactly one production Groth16 stage diagnostic"
+    }
+  ]
+}

@@ -1,0 +1,400 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "scope": "WP7 admission estimator on 128 GiB Apple Silicon Mac; separate from WP6 engine archive PR",
+  "spec_sha256": "ecd565ffba5582c00c1191d8a427cd5bb48d90440b21b8d0423735e9e7847031",
+  "branch": "codex/hemi-macos-metal-wp7",
+  "engine_head": "6521f87c2daf873c54d011a33d48fee8097db924",
+  "engine_clean_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "worker_sha256": "625589c35f6583bfaf4510a00d6f98dceb781b004064500ce38b44b42d659be7",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "acceptance_binary_sha256": "efd6dc7536838ab5c99fd365705e30eba8340421f979fc66e14742a313233cc4",
+  "acceptance_source_sha256": {
+    "Cargo.lock": "75d710409c3107e465ca0520bb7c551e8027c47ecb7c8e3b13d9b106cad5c6b9",
+    "crates/zkminer-prover/src/dispatcher.rs": "9bdabb96f3cf3842bc56c22f70931ea5751e5a0314f2a8899ca8177346ea3c81",
+    "crates/zkminer-prover/src/macos.rs": "7ef8a286d303215ca7fcb12127abe470baa29da19f6e313f383228637c6eb81a",
+    "crates/zkminer-prover/src/memory.rs": "6e7c799b3384ba2f8b4686357219a660661b5fd8a85b8496e3649a658fdaed2b",
+    "crates/zkminer-prover/tests/macos_worker.rs": "7fd27fbf3a772357eb028c205d3db2d1924345ee2faaf2574370cf1cf0179a67"
+  },
+  "host_before_10m": {
+    "observed_utc": "2026-11-06T20:38:52.332927+00:00",
+    "estimated_available_bytes": 69652094976,
+    "estimated_available_method": "free pages plus half of the lesser of file-backed and inactive pages",
+    "kernel_memory_free_percent": 80,
+    "kernel_memory_free_percent_method": "memory_pressure -Q; a pressure metric, not free physical pages",
+    "thermal": {
+      "low_power_false_may_mean_unknown": true,
+      "low_power_mode_enabled": false,
+      "schema_version": 1,
+      "thermal_nominal_may_mean_unknown": true,
+      "thermal_state": 0,
+      "thermal_state_name": "nominal"
+    },
+    "background_process_present": {
+      "brave": true,
+      "chatgpt_codex": true,
+      "claude": true,
+      "colima": true,
+      "vscode": false,
+      "xcode": false,
+      "zed": true
+    },
+    "scope": "instantaneous host observation; process changes are recorded by the campaign driver"
+  },
+  "host_after_10m": {
+    "observed_utc": "2026-11-06T20:40:36.624597+00:00",
+    "estimated_available_bytes": 69154332672,
+    "estimated_available_method": "free pages plus half of the lesser of file-backed and inactive pages",
+    "kernel_memory_free_percent": 80,
+    "kernel_memory_free_percent_method": "memory_pressure -Q; a pressure metric, not free physical pages",
+    "thermal": {
+      "low_power_false_may_mean_unknown": true,
+      "low_power_mode_enabled": false,
+      "schema_version": 1,
+      "thermal_nominal_may_mean_unknown": true,
+      "thermal_state": 0,
+      "thermal_state_name": "nominal"
+    },
+    "background_process_present": {
+      "brave": true,
+      "chatgpt_codex": true,
+      "claude": true,
+      "colima": true,
+      "vscode": false,
+      "xcode": false,
+      "zed": true
+    },
+    "scope": "instantaneous host observation; process changes are recorded by the campaign driver"
+  },
+  "normal_desktop_10m": {
+    "run": "target/macos/native-wrap/worker-runs/c1ebd27d0a5d4d34a2cfc758a7e343b6",
+    "fixture": "fibonacci arithmetic, 1,000,000 iterations, >=10,000,000 guest cycles, po2 20, 18 Rayon/Go threads",
+    "reserve_override": null,
+    "default_reserve_gib": 8,
+    "verified_proofs": 1,
+    "tamper_rejections": 3,
+    "prove_call_ms": 58535.007584,
+    "worker_total_ms": 58040.934625,
+    "admission_wait_upper_bound_ms": 494.07295899999735,
+    "admission_wait_upper_bound_method": "prove call wall time minus worker-reported total; includes IPC and host handling, so admission wait cannot exceed this gap",
+    "same_worker_before_and_after": true,
+    "refusals": 0
+  },
+  "real_pressure": {
+    "run": "target/macos/native-wrap/worker-runs/489fe9328e2d4a4a9c551a7ce885e60f",
+    "details": {
+      "allocator_command": "memory_pressure -l warn -s 30",
+      "attempted": false,
+      "error": "host RAM is short for risc0:generic: needs ~24.0 GiB, 0.0 GiB already reserved by proofs in flight, 0.0 GiB available",
+      "helper_count_after": 0,
+      "host_reserve_bytes": 8589934592,
+      "kind": "real_allocation_kernel_pressure",
+      "recovered_level": 1,
+      "recovery_ms": 32.392666,
+      "refusal_ms": 0.49716699999999997,
+      "sidecar_count_after": 0,
+      "sidecar_count_before": 0,
+      "time_to_warning_ms": 22309.067082999998,
+      "warning_level": 2
+    },
+    "proof_after_recovery_verified": 1,
+    "tamper_rejections_after_recovery": 3
+  },
+  "logical_reservation": {
+    "attempted": false,
+    "error": "host RAM is short for risc0:generic: needs ~24.0 GiB, 97.0 GiB already reserved by proofs in flight, 61.1 GiB available",
+    "helper_count_after": 0,
+    "host_available_at_refusal_bytes": 65596063744,
+    "host_available_bytes": 65599553536,
+    "host_reserve_bytes": 8589934592,
+    "host_total_bytes": 137438953472,
+    "kind": "in_flight_reservation_admission",
+    "needed_bytes": 25769803776,
+    "physical_memory_pressure": false,
+    "reservation_count": 97,
+    "reserved_after_bytes": 0,
+    "reserved_before_bytes": 0,
+    "reserved_held_bytes": 104152956928,
+    "sidecar_count_after": 0,
+    "sidecar_count_before": 0,
+    "step_bytes": 1073741824,
+    "worker_pid_after": 21596,
+    "worker_pid_before": 21596
+  },
+  "bounded_pressure_probe": {
+    "run": "target/macos/phase2/wp7-kernel-pressure-probe.json",
+    "before": {
+      "pressure_level": 1,
+      "kernel_memory_free_percent": 86
+    },
+    "warning_sample": {
+      "elapsed_s": 31.417,
+      "pressure_level": 2,
+      "kernel_memory_free_percent": 48
+    },
+    "after": {
+      "pressure_level": 1,
+      "kernel_memory_free_percent": 81
+    }
+  },
+  "unit_tests": {
+    "macos_policy_passed": 6,
+    "memory_ledger_passed": 12
+  },
+  "feature_paths": {
+    "macos_cpu_only": {
+      "status": "passed",
+      "command": "cargo check --offline --locked -p zkminer-prover --no-default-features",
+      "log_path": "target/macos/phase2/wp7-cpu-only-check.log",
+      "log_sha256": "f5e952af096a494b54b38cea6ee2627c481adc681e6533f0231de89366174add"
+    },
+    "linux_cpu_only": {
+      "status": "passed",
+      "command": "cargo check --offline --locked -p zkminer-prover --no-default-features",
+      "log_path": "target/macos/phase2/wp7-linux/check.log",
+      "log_sha256": "ae7062aaad39affe8feeaf941425f752d169e52c7c8f63ed8007ce0924195cbd"
+    }
+  },
+  "initial_spec_sha256": "c7cd2ab3cf8f6f67fb4deeabfd9ed86c28d24aa98c0e7c1a7b578640718d475d",
+  "merge_conditions": {
+    "status": "passed",
+    "engine_head": "6521f87c2daf873c54d011a33d48fee8097db924",
+    "worker_sha256_before_and_after": "625589c35f6583bfaf4510a00d6f98dceb781b004064500ce38b44b42d659be7",
+    "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+    "acceptance_binary_sha256": "20f893fb6e4d4eda23982232a52f6694910ff4cc1824590561a83987cfd05bcd",
+    "source_sha256": {
+      "Cargo.lock": "75d710409c3107e465ca0520bb7c551e8027c47ecb7c8e3b13d9b106cad5c6b9",
+      "crates/zkminer-prover/src/dispatcher.rs": "db106da3f7de7144092523134a2c7c5564443019fb1e25d64c9f91858e18c1b7",
+      "crates/zkminer-prover/src/macos.rs": "23f062b4c24af4da035123f3cee59eedddd5e12a264016d0001cb65c0cae72bd",
+      "crates/zkminer-prover/src/memory.rs": "9f945a5221924fd18aa7c85d58511a1b0417113354e957f01162f48f83737b19",
+      "crates/zkminer-prover/tests/macos_worker.rs": "6b7ad95a31a9a8410d02faa7223f5f900bce43f57a751f20e705d1ad8f691908",
+      "scripts/macos/test-native-worker.py": "bc20b491e0d2b1a79913b22dca5e54db045a128a10b5af20f6a479b6596b2412",
+      "scripts/macos/phase2-host-snapshot.py": "9885208d3ed53587b9f9d9c54d1d77d520325de414384ab726f00ad077c82330"
+    },
+    "guard_rule": "Continue when owned worker/helper footprint is readable and <=32 GiB and kernel pressure is normal (1) or warning (2); critical (4), unreadable pressure, unreadable footprint, or excess footprint kills the owned group. The VM estimate is logged and sampled but is not an in-proof kill condition.",
+    "held_memory": {
+      "held_60": {
+        "run": "target/macos/native-wrap/worker-runs/d1af97c05fca493e8fecfe890497737c",
+        "result_sha256": "df95fe45e1385799e12d87c4439004c3eb35710e3c9dfbfcc568c7a5ef66eb08",
+        "details": {
+          "admission": {
+            "bytes_written": 64424509440,
+            "estimated_available_bytes_at_admission": 26204815360,
+            "held_gib": 60,
+            "pressure_level_at_admission": 1,
+            "sibling_pid": 26924,
+            "time_to_ready_ms": 13689.685375
+          },
+          "guard_min_estimated_available_bytes": 10316038144,
+          "guard_pressure_levels_seen": [
+            1
+          ],
+          "minimum_periodic_estimated_available_bytes": 10249420800,
+          "proof_verified": true,
+          "sibling_held_through_verification": true,
+          "tamper_rejections": 3,
+          "worker_peak_footprint_bytes": 15788755512,
+          "worker_pid": 26919
+        },
+        "verified_proofs": 1,
+        "unchanged_verifier_tamper_rejections": 3
+      },
+      "held_64": {
+        "run": "target/macos/native-wrap/worker-runs/f8f231e013664c1ebc2b072c5a242a8c",
+        "result_sha256": "29d1cdbd82ca94dc1dd22ff13b6ff11ffa500a0d1cb1f78c18b83a8decf76d42",
+        "details": {
+          "admission": {
+            "bytes_written": 68719476736,
+            "estimated_available_bytes_at_admission": 21652684800,
+            "held_gib": 64,
+            "pressure_level_at_admission": 1,
+            "sibling_pid": 27731,
+            "time_to_ready_ms": 14950.087542000001
+          },
+          "guard_min_estimated_available_bytes": 8634040320,
+          "guard_pressure_levels_seen": [
+            1,
+            2
+          ],
+          "minimum_periodic_estimated_available_bytes": 8634138624,
+          "proof_verified": true,
+          "sibling_held_through_verification": true,
+          "tamper_rejections": 3,
+          "worker_peak_footprint_bytes": 15936277000,
+          "worker_pid": 27727
+        },
+        "verified_proofs": 1,
+        "unchanged_verifier_tamper_rejections": 3
+      }
+    },
+    "held_80_prerequisite": {
+      "run": "target/macos/native-wrap/worker-runs/50751744883e42f183a7370ea141d06e",
+      "result_status": "failed",
+      "admission": {
+        "bytes_written": 85899345920,
+        "estimated_available_bytes_at_admission": 9037299712,
+        "held_gib": 80,
+        "pressure_level_at_admission": 2,
+        "sibling_pid": 26776,
+        "time_to_ready_ms": 23392.882084
+      },
+      "interpretation": "Stopped before proof because warning pressure and an 8.4 GiB estimate failed the 20..30 GiB normal-pressure prerequisite; sibling exited."
+    },
+    "desktop": {
+      "run": "target/macos/native-wrap/worker-runs/31c36c6f1a544ce8817c4043548d317e",
+      "result_sha256": "376fa8b83ed1c94760717b3e4b013a972376eb1b7e34d65637c778fd2bb8452b",
+      "host_before": {
+        "observed_utc": "2026-11-06T21:33:46.565149+00:00",
+        "estimated_available_bytes": 91422064640,
+        "estimated_available_method": "free pages plus half of the lesser of file-backed and inactive pages",
+        "kernel_memory_free_percent": 91,
+        "kernel_memory_free_percent_method": "memory_pressure -Q; a pressure metric, not free physical pages",
+        "thermal": {
+          "low_power_false_may_mean_unknown": true,
+          "low_power_mode_enabled": false,
+          "schema_version": 1,
+          "thermal_nominal_may_mean_unknown": true,
+          "thermal_state": 0,
+          "thermal_state_name": "nominal"
+        },
+        "background_process_present": {
+          "brave": true,
+          "chatgpt_codex": true,
+          "claude": true,
+          "colima": true,
+          "vscode": false,
+          "xcode": false,
+          "zed": true
+        },
+        "scope": "instantaneous host observation; process changes are recorded by the campaign driver"
+      },
+      "host_after": {
+        "observed_utc": "2026-11-06T21:53:21.604805+00:00",
+        "estimated_available_bytes": 87086309376,
+        "estimated_available_method": "free pages plus half of the lesser of file-backed and inactive pages",
+        "kernel_memory_free_percent": 92,
+        "kernel_memory_free_percent_method": "memory_pressure -Q; a pressure metric, not free physical pages",
+        "thermal": {
+          "low_power_false_may_mean_unknown": true,
+          "low_power_mode_enabled": false,
+          "schema_version": 1,
+          "thermal_nominal_may_mean_unknown": true,
+          "thermal_state": 0,
+          "thermal_state_name": "nominal"
+        },
+        "background_process_present": {
+          "brave": true,
+          "chatgpt_codex": true,
+          "claude": true,
+          "colima": true,
+          "vscode": false,
+          "xcode": false,
+          "zed": true
+        },
+        "scope": "instantaneous host observation; process changes are recorded by the campaign driver"
+      },
+      "proofs_verified": 1,
+      "tamper_rejections": 3,
+      "admission_wait_upper_bound_ms": 212.03083299999707,
+      "logical_reservation": {
+        "attempted": false,
+        "error": "host RAM is short for risc0:generic: needs ~24.0 GiB, 97.0 GiB already reserved by proofs in flight, 85.3 GiB available",
+        "helper_count_after": 0,
+        "host_available_at_refusal_bytes": 91638644736,
+        "host_available_bytes": 91638956032,
+        "host_reserve_bytes": 8589934592,
+        "host_total_bytes": 137438953472,
+        "kind": "in_flight_reservation_admission",
+        "needed_bytes": 25769803776,
+        "physical_memory_pressure": false,
+        "reservation_count": 97,
+        "reserved_after_bytes": 0,
+        "reserved_before_bytes": 0,
+        "reserved_held_bytes": 104152956928,
+        "sidecar_count_after": 0,
+        "sidecar_count_before": 0,
+        "step_bytes": 1073741824,
+        "worker_pid_after": 28720,
+        "worker_pid_before": 28720
+      },
+      "kernel_warning": {
+        "allocator_command": "memory_pressure -l warn -s 30",
+        "attempted": false,
+        "error": "kernel memory pressure is warning (level 2); refused before dispatch: host RAM is short for risc0:generic: needs ~24.0 GiB, 0.0 GiB already reserved by proofs in flight, 8.1 GiB available",
+        "helper_count_after": 0,
+        "host_reserve_bytes": 8589934592,
+        "kind": "real_allocation_kernel_pressure",
+        "recovered_level": 1,
+        "recovery_ms": 27.172416000000002,
+        "refusal_ms": 0.384833,
+        "sidecar_count_after": 0,
+        "sidecar_count_before": 0,
+        "time_to_warning_ms": 26242.093584,
+        "warning_level": 2
+      }
+    },
+    "lifecycle": {
+      "run": "target/macos/native-wrap/worker-runs/9029e35081b84b77a75315de274d9c33",
+      "result_sha256": "9728d5cfaf04e5a331c30d061d2e0007763c2d3bb2fde60634467ffdc32c15c6",
+      "verified_proofs": 21,
+      "tamper_rejections": 63,
+      "request_1_idle_rss_bytes": 4657971200,
+      "request_20_idle_rss_bytes": 3901210624,
+      "idle_change_percent": -16.24657052409426,
+      "helper_cancel": true,
+      "worker_timeout": true,
+      "restart": true,
+      "shutdown": true
+    },
+    "limit_controls": {
+      "run": "target/macos/native-wrap/worker-runs/698264c88c0c420d966f19901bcd6985",
+      "result_sha256": "c34b7ecea4ddcbe8d4c9c651ac23b7ac9bc7ca3a858bcd678af535ae60502abb",
+      "cases_passed": 9
+    },
+    "real_witness_cpu_differentials": {
+      "14": {
+        "run": "target/macos/native-wrap/worker-runs/3eccd7ac21ec421ab4e331ac4b04ee47",
+        "verified_proofs": 1,
+        "cpu_differential_checks": 22,
+        "tamper_rejections": 3,
+        "result_sha256": "c437ac98bf34b240da981ce88c04a618c3c2f0e9d2c91f1ba7750713b78d10f3"
+      },
+      "18": {
+        "run": "target/macos/native-wrap/worker-runs/d96441ee8a5a459dafc19cff263e7c3a",
+        "verified_proofs": 1,
+        "cpu_differential_checks": 1,
+        "tamper_rejections": 3,
+        "result_sha256": "de5ea82aa3bd30d03b4448f68fa442c25452b0c24b5d8b103a95a3bb02b14288"
+      },
+      "20": {
+        "run": "target/macos/native-wrap/worker-runs/7e9de7b24b5d4e73bcd124b8eae3fde9",
+        "verified_proofs": 1,
+        "cpu_differential_checks": 1,
+        "tamper_rejections": 3,
+        "result_sha256": "eff09d926020e10c7997b436aaa21be8e072690959b9cb9f31cb99f89410ee2a"
+      }
+    },
+    "feature_and_unit_checks": {
+      "macos_cpu_only": {
+        "status": "passed",
+        "log": "target/macos/phase2/wp7-conditions-cpu-only-macos.log",
+        "sha256": "16822622aacd96389571a34db3fb8056979fd145d598e3d59784c8bbe0998d93"
+      },
+      "linux_cpu_only": {
+        "status": "passed",
+        "log": "target/macos/phase2/wp7-conditions-linux/check.log",
+        "sha256": "def6dc7845437f07218361b4d3ecd1503a095ca43de6035b13d1dd030b33009e"
+      },
+      "macos_policy_tests": {
+        "status": "passed",
+        "log": "target/macos/phase2/wp7-conditions-unit.log",
+        "sha256": "adda4b2859822bd40afd72b5ee282f0f3893852da20d2a167e78f05da2fc431b"
+      },
+      "memory_ledger_tests": {
+        "status": "passed",
+        "log": "target/macos/phase2/wp7-conditions-memory-tests.log",
+        "sha256": "1856180a2a66db580043b2acb4ee8e8fa74b42a8059b097843674bf0214fb13d"
+      }
+    }
+  }
+}

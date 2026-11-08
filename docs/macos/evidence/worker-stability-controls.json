@@ -1,0 +1,229 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "generated_at_utc": "2026-10-31T20:48:18.849205+00:00",
+  "command": [
+    "/opt/homebrew/opt/python@3.15/bin/python3.15",
+    "/Users/dbur/dev/zk-miner/scripts/macos/test-worker-summary-controls.py",
+    "--output",
+    "docs/macos/evidence/worker-stability-controls.json"
+  ],
+  "scope": "collector binding controls on in-memory copies of archived evidence; no proving or cryptographic verification executed",
+  "proofs_generated_or_verified": 0,
+  "control_cases_passed": 12,
+  "control_cases_failed": 0,
+  "artifacts": {
+    "control_script": {
+      "path": "/Users/dbur/dev/zk-miner/scripts/macos/test-worker-summary-controls.py",
+      "sha256": "21bcdb978b9e8810397885990b37f419fb78e9e2bc16ddc89ee60d2fda75f5fd",
+      "bytes": 7696
+    },
+    "collector_script": {
+      "path": "/Users/dbur/dev/zk-miner/scripts/macos/summarize-worker.py",
+      "sha256": "cc4eb9f507e8342d629dd28ae5f292421b3d53e1edd6d29f9297d64107658a28",
+      "bytes": 28967
+    },
+    "fixture_worker": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/71387ac25ac74d4395278a3459680152/acceptance/proof-0/worker.json",
+      "sha256": "2e8109643b0c33043d91131d05c41008a4dc48d2097b0da30c130a7ed0b84566",
+      "bytes": 1932
+    },
+    "fixture_seal": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/71387ac25ac74d4395278a3459680152/acceptance/proof-0/seal.bin",
+      "sha256": "12ef0f6dca1b3de6cc889545c787f0ebfda54e341ec85e725f3a248ad61d2c87",
+      "bytes": 256
+    },
+    "fixture_journal": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/71387ac25ac74d4395278a3459680152/acceptance/proof-0/journal.bin",
+      "sha256": "4cd16d6f3feb4d6a96bc4d4145fbb3dc87817ed74b4afdf9f2d1e193d4b17f9b",
+      "bytes": 32
+    }
+  },
+  "cases": [
+    {
+      "case": "identical actual worker evidence",
+      "expected": "accept",
+      "observed": "accept",
+      "outcome": "passed",
+      "diagnostic_differences": []
+    },
+    {
+      "case": "one ULP in total_ms",
+      "expected": "accept",
+      "observed": "accept",
+      "outcome": "passed",
+      "diagnostic_differences": [
+        {
+          "field": "total_ms",
+          "left_source": "saved_real_worker",
+          "right_source": "controlled_copy",
+          "left_value": 171638.804792,
+          "right_value": 171638.80479200004,
+          "left_float_hex": "0x1.4f3b67036c9c1p+17",
+          "right_float_hex": "0x1.4f3b67036c9c2p+17",
+          "absolute_difference": 2.9103830456733704e-11,
+          "ulp_distance": 1
+        }
+      ]
+    },
+    {
+      "case": "two ULPs in total_ms",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "diagnostic timing differs by more than one ULP at total_ms"
+    },
+    {
+      "case": "one ULP in stage_ms.verification",
+      "expected": "accept",
+      "observed": "accept",
+      "outcome": "passed",
+      "diagnostic_differences": [
+        {
+          "field": "stage_ms.verification",
+          "left_source": "saved_real_worker",
+          "right_source": "controlled_copy",
+          "left_value": 1.793792,
+          "right_value": 1.7937920000000003,
+          "left_float_hex": "0x1.cb35f3d7d3911p+0",
+          "right_float_hex": "0x1.cb35f3d7d3912p+0",
+          "absolute_difference": 2.220446049250313e-16,
+          "ulp_distance": 1
+        }
+      ]
+    },
+    {
+      "case": "two ULPs in stage_ms.verification",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "diagnostic timing differs by more than one ULP at stage_ms.verification"
+    },
+    {
+      "case": "modified raw seal hash",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "worker evidence differs at seal_sha256"
+    },
+    {
+      "case": "modified request identity",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "worker evidence differs at request_id"
+    },
+    {
+      "case": "modified segment counter",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "worker evidence differs at stats.segments"
+    },
+    {
+      "case": "one ULP outside allowed timing fields",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "worker evidence differs at observed_stages.diagnostic"
+    },
+    {
+      "case": "negative timing even when both copies contain it",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "invalid nonnegative finite diagnostic timing at total_ms"
+    },
+    {
+      "case": "infinite timing even when both copies contain it",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "invalid nonnegative finite diagnostic timing at total_ms"
+    },
+    {
+      "case": "NaN timing even when both copies contain it",
+      "expected": "reject",
+      "observed": "reject",
+      "outcome": "passed",
+      "diagnostic": "invalid nonnegative finite diagnostic timing at total_ms"
+    }
+  ],
+  "earlier_collector_refusals": [
+    {
+      "category": "outer RSS observation",
+      "diagnostic_observed_before_fix": "evidence summary refused: invalid outer RSS sample",
+      "run_id": "71387ac25ac74d4395278a3459680152",
+      "proof_failure": false,
+      "raw_artifact": {
+        "path": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/71387ac25ac74d4395278a3459680152/rss-samples.jsonl",
+        "sha256": "15306f96ef561caa05d1b68ab9f1c2df5225ce05df5c6c973334784c51cbd15a",
+        "bytes": 21470
+      },
+      "raw_zero_observations": [
+        {
+          "line": 173,
+          "observation": {
+            "elapsed_seconds": 188.5714494176209,
+            "worker_pid": 22269,
+            "request_id": 1,
+            "phase": "complete",
+            "rss_bytes": 0
+          }
+        },
+        {
+          "line": 174,
+          "observation": {
+            "elapsed_seconds": 189.584590498358,
+            "worker_pid": 22269,
+            "request_id": 1,
+            "phase": "complete",
+            "rss_bytes": 0
+          }
+        }
+      ],
+      "resolution": "retain zeros as unavailable_nonpositive_rss; exclude them from positive sample counts and peaks; cause remains unknown"
+    },
+    {
+      "category": "diagnostic timing serialization",
+      "diagnostic_observed_before_fix": "evidence summary refused: terminal sidecar differs from accepted request",
+      "run_id": "3c0b5d8179934bafb482174615a05d22",
+      "proof_failure": false,
+      "raw_worker_artifact": {
+        "path": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/3c0b5d8179934bafb482174615a05d22/acceptance/proof-0/worker.json",
+        "sha256": "104356fb941f112b68d9a1fc5e08b40e0f409fa74fea046f882e552734d9908a",
+        "bytes": 3052
+      },
+      "raw_sidecar_artifact": {
+        "path": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/3c0b5d8179934bafb482174615a05d22/requests/24754-1.json",
+        "sha256": "72075dc954861de5ed2bb513f7294a90faedd7798845e03eb18b752be771a7d8",
+        "bytes": 3067
+      },
+      "example_original_differences": [
+        {
+          "field": "stage_ms.verification",
+          "left_source": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/3c0b5d8179934bafb482174615a05d22/acceptance/proof-0/worker.json",
+          "right_source": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/3c0b5d8179934bafb482174615a05d22/requests/24754-1.json",
+          "left_value": 1.867709,
+          "right_value": 1.8677089999999998,
+          "left_float_hex": "0x1.de222d5171e2ap+0",
+          "right_float_hex": "0x1.de222d5171e29p+0",
+          "absolute_difference": 2.220446049250313e-16,
+          "ulp_distance": 1
+        },
+        {
+          "field": "total_ms",
+          "left_source": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/3c0b5d8179934bafb482174615a05d22/acceptance/proof-0/worker.json",
+          "right_source": "/Users/dbur/dev/zk-miner/target/macos/worker-runs/3c0b5d8179934bafb482174615a05d22/requests/24754-1.json",
+          "left_value": 237595.898333,
+          "right_value": 237595.89833300002,
+          "left_float_hex": "0x1.d00df2fc9363fp+17",
+          "right_float_hex": "0x1.d00df2fc93640p+17",
+          "absolute_difference": 2.9103830456733704e-11,
+          "ulp_distance": 1
+        }
+      ],
+      "resolution": "permit at most one adjacent finite nonnegative float step only in total_ms/direct stage_ms values; preserve originals and exact non-timing bindings"
+    }
+  ]
+}

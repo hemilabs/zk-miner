@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "status": "checks_passed",
+  "engine_commit": "09c2f4d2836cbcd88cd29e65b6a6bdd8db262416",
+  "worker_sha256": "9b7ab90957fefe60232e871a2823056d8683c8852476666483a8721b08cce545",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "collector_sha256": "44a404833fa80c23516afc7f542991680417dcd1ff7c5bdc6d2cf106572236d5",
+  "smoke_binary_unchanged_after_engine_commit": true,
+  "checks": {
+    "native_worker_unit_tests": {
+      "passed": 5,
+      "build_log_sha256": "e7b3cd3245798c5f424770be5a68123fd50fa01fa91c121135bdee184f03befc"
+    },
+    "cpu_worker_unit_tests": {
+      "passed": 5,
+      "build_log_sha256": "e1bd56b7bab00aae9ad61c14ab15883f2fccba6a065ca13e46e086b6dcc56034"
+    },
+    "smoke_cpu_differential": 5,
+    "workload_limit_rejections": 9,
+    "lifecycle_verified_proofs": 21,
+    "lifecycle_negative_checks": 63,
+    "helper_cancellation": true,
+    "helper_timeout_expected_failure": true,
+    "worker_timeout": true,
+    "restart_proof_verified": true,
+    "shutdown": true,
+    "idle_first_bytes": 4525821960,
+    "idle_last_bytes": 4729245728,
+    "idle_drift_fraction": 0.04494736421315171,
+    "idle_min_bytes": 4516728840,
+    "idle_max_bytes": 4729245728,
+    "pressure_levels_observed": [
+      1
+    ]
+  },
+  "runs": {
+    "smoke": {
+      "path": "target/macos/native-wrap/worker-runs/deb5d01ce8ab4a08a94d6849e7ee2fa9",
+      "result_sha256": "0c764f5db898355b1a9ab8362e1cb1c32fd52a1a2cd8a54dffed3a6b94f5bbf7",
+      "request_ledger_sha256": "b09e07e0468527ed47dfd9857938146dd901d089127acc327968cca575dc44ec"
+    },
+    "limits": {
+      "path": "target/macos/native-wrap/worker-runs/7cec19787337430cbb978543f38669a5",
+      "result_sha256": "bcc86837e2f99df992588d6501fadef621e2285368196e7f0cc426072025f110",
+      "request_ledger_sha256": null
+    },
+    "lifecycle": {
+      "path": "target/macos/native-wrap/worker-runs/dd1228bdff6c472297ee78cf49cf1c67",
+      "result_sha256": "0238348495510a2d69c4a26ba81b305d2d599dd9e638b239273b2caaa69629b3",
+      "request_ledger_sha256": "bcb0f9167661419b1be7fcc90c39c6ca23847c5c683411e2d6a15047348c744e"
+    }
+  },
+  "linux_feature_compile": "not run: only aarch64-apple-darwin is installed in the local pinned Rust toolchain",
+  "new_dependencies_or_version_bumps": [],
+  "lifecycle_csv_sha256": "82ce268e24ee593c52f7d385ba1323998efa95cf42ba9cf08b77ba1cdbdc81a6"
+}

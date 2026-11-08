@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "status": "blocked_before_measured_pairs",
+  "cause": "Default host admission refused the resident warm-up while the baseline stayed resident: 39.3 GiB available versus 24 GiB initial proof budget plus 16 GiB reserve.",
+  "measured_pairs": 0,
+  "baseline_warmup_verified": true,
+  "baseline_complete_seconds": 422.263819167,
+  "baseline_binary_sha256": "d157305ba0e0830671c6b8f6238dc68e59ae8a68dc3454865c2084c21bc347b9",
+  "negative_checks": 3,
+  "warmup_included_in_gate": false,
+  "host_reserve_gib": 16,
+  "raw_campaign": "/Users/dbur/dev/zk-miner/target/macos/review-rv32im/ce17c0dfa9a442e4b24e22defe32a603",
+  "raw_campaign_sha256": "902adb8eae555393142be7726182ffea283c4f4fbe347bd4f0a35347cfe52ebc",
+  "warmup_verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+  "warmup_worker_sha256": "53391b27356a319399d59a8d34fa48e0fa33bab10d5bc103b31d5005290084f6",
+  "test_log_sha256": "6de88719cb4b5e0741e238bf78bc611fe2039b292792d585a899dd572c070f45",
+  "frozen_acceptance_binary_sha256": "4362469d9d5dd51ee1906f0dfe29117c99c0018c61bf42c025c93fb81302a0ea"
+}

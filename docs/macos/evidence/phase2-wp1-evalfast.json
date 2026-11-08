@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "status": "measured",
+  "scope": "isolated exact CPU differentials plus single verified 10M diagnostics; not a warm median",
+  "engine_commit": "d194533fa5138a8d9a352c977ae622d59cca4d41",
+  "worker_sha256": "64f66d2b9458fe05de27f1219320fc66643e9992fe90847efbf0d495164e2bb1",
+  "shader_sha256": "b36f8be41fa39d91c243760f41b9b0589956beb61f50d8f50a5fefb43a8e3f47",
+  "shader_metadata_sha256": "7b74564757047c35473cc189c3942a6fb1b7b28564d5078af45263454abb9cb1",
+  "worker_embedded_shader_path": "/Users/dbur/dev/zk-miner/target/macos/worker-native-rv32im-metal/release/build/risc0-circuit-rv32im-33d213f4248b78db/out/rv32im-evalfast.metal",
+  "generator_sha256": "98b0a2f414e2239394b8d9d1f57247e12139dd9650588d88f982873b44d9dffd",
+  "acceptance_runner_sha256": "714054e4727a8978f51025b5ba4a1c8484ace3536c4da6f6f50f38d183e8b0dd",
+  "prototype_source_sha256": "8bd3a585f71100699a393c8b51e57abf33515a5481f4d8cdf443c3a52aaf4b53",
+  "prototype_binary_sha256": "f4195651fbb6660a92278b6af90054197b89cd85560104a7149e60c9723cab7c",
+  "collector_sha256": "f61fb19e31359ad30e9edcea036541fef2d8c2f78a141da4a18cad5a4ad2a24f",
+  "synthetic": [
+    {
+      "po2": 12,
+      "seed": 1,
+      "threads": 256,
+      "gpu_seconds": 0.007753416895866394,
+      "output_sha256": "ea9782c624a535183aafacc66f23fdcc475acf6dd73763c33cfdc42a8153ff8f",
+      "raw_log_sha256": "9e259e7902835c7b88c97abe64c2b91711495c8f508930b7abe96ad9403f0d0d"
+    },
+    {
+      "po2": 20,
+      "seed": 1,
+      "threads": 256,
+      "gpu_seconds": 1.6941767893731594,
+      "output_sha256": "338cf7d57f198004555759da78012191c4861fa579f737a97d1243daa04d978e",
+      "raw_log_sha256": "b374cc320c77b87e0382c7c190af650f186f6b4f3045a5257e8af6a21136c6bc"
+    },
+    {
+      "po2": 20,
+      "seed": 2,
+      "threads": 512,
+      "gpu_seconds": 1.7405687477439642,
+      "output_sha256": "14be2824e8032f96622ee0dd336895a90811949d84a2b0807945924bd57d667a",
+      "raw_log_sha256": "e2bb782c215834190478d860b5a3f386a4f3ab0a1f965a39bb31c8dc5f292a7f"
+    }
+  ],
+  "real_witness_differentials": [
+    {
+      "po2": 14,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/978fe95e9a144170ac7bb860166e940b",
+      "segments": 22,
+      "cpu_differential_checks": 22,
+      "result_sha256": "9d8749fa0219e6f82a0c70912adc8b21c0b84d8db6ddf3db915c881432dc6edb",
+      "worker_sidecar_sha256": "d7760f48bb5937dc978f0ff44e442893e2239c56ac75d5a2d9680944e2e9ca2f",
+      "verification_sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1"
+    },
+    {
+      "po2": 18,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/ea4297cc17bd42daafd0e5a2c09c0fba",
+      "segments": 1,
+      "cpu_differential_checks": 1,
+      "result_sha256": "c7f798cd9a14fb488be2ec71e16985eba48e56feb111b83c203895bdb4c938f1",
+      "worker_sidecar_sha256": "ec61e920836951f5fa41a25f3986b29680ec158d08603fbe955748072a2eee0c",
+      "verification_sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1"
+    },
+    {
+      "po2": 20,
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/c3afd48c3064446695297d9d7732fc9f",
+      "segments": 1,
+      "cpu_differential_checks": 1,
+      "result_sha256": "d06574063bf6a4026e2ff725978ebb2bb19308e4fd35677c3ff20b1062b37f41",
+      "worker_sidecar_sha256": "76b037135ce3286d290d1019c670798187e97d138bab955e42c134faad0fd0a6",
+      "verification_sha256": "c7f1568f4e2ac01c4c66c1a7b8ae16fc0ddc3383cd2023d9151cd83d78e71fd1"
+    }
+  ],
+  "diagnostic_profiles": [
+    {
+      "fixture": "arithmetic-10m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/f6c7e139e9ec4146bf367f15f06177bc",
+      "result_sha256": "9c8f9cdbfec43801c707660df7db708d7ba4a23899c924266f2ff5b00230a9a8",
+      "worker_sidecar_sha256": "2944a7afd0e7f7e62d6f0c8ded8e7acf21e99f304198b35d16dffce0bd0e6ffd",
+      "constraint_wall_seconds": 16.8985,
+      "constraint_gpu_seconds": 16.316308999999997,
+      "evalfast_segment_gpu_median_seconds": 1.6237789999999999,
+      "evalfast_segment_gpu_min_seconds": 1.621736,
+      "evalfast_segment_gpu_max_seconds": 1.662266,
+      "complete_seconds": 86.494201958,
+      "tail_split_constraint_wall_seconds": 47.8129,
+      "tail_split_complete_seconds": 118.59322016700001,
+      "constraint_wall_saved_seconds": 30.9144,
+      "complete_saved_seconds": 32.09901820900001
+    },
+    {
+      "fixture": "hash-10m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/4c2e66d315264cc7bfc14ef75d039413",
+      "result_sha256": "f300a34dd4e5d070891b3300153bcd292eceb5330d89cbf69c204dccea7fd7e7",
+      "worker_sidecar_sha256": "38eacb88139d9d78a3e4213c874e3f7b91664cfa06e7d2ed003a42a53ad7a2c5",
+      "constraint_wall_seconds": 16.9479,
+      "constraint_gpu_seconds": 16.287137,
+      "evalfast_segment_gpu_median_seconds": 1.6234225,
+      "evalfast_segment_gpu_min_seconds": 1.616051,
+      "evalfast_segment_gpu_max_seconds": 1.666731,
+      "complete_seconds": 88.576808375,
+      "tail_split_constraint_wall_seconds": 51.058699999999995,
+      "tail_split_complete_seconds": 124.648348292,
+      "constraint_wall_saved_seconds": 34.1108,
+      "complete_saved_seconds": 36.071539916999996
+    }
+  ],
+  "lifecycle": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/b16275c590f040d79b773d2aa05cef40",
+    "result_sha256": "f692988ede0ff947efc947879902655166ae0be0e49ab4ca465bf442a38133dc",
+    "verified_proofs": 21,
+    "negative_checks": 63,
+    "idle_first_bytes": 4570337384,
+    "idle_last_bytes": 4004106032,
+    "idle_min_bytes": 3987689264,
+    "idle_max_bytes": 4656369816,
+    "first_to_last_drift_fraction": -0.1238926810922718,
+    "post_settle_max_to_min_fraction": 0.002517517858352525,
+    "pressure_levels_observed": [
+      1
+    ],
+    "helper_cancel": true,
+    "helper_timeout": false,
+    "helper_timeout_control_observed": true,
+    "worker_timeout": true,
+    "restart": true,
+    "shutdown": true,
+    "timeout_calibration": {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/2bf19392b38d49c0b8d895ca274da967",
+      "result_sha256": "12b4fbf1ae140abae6ee9be8f6dc580b07b241f4d3e69ff5c6ba06418e80a5b4",
+      "verified_proofs": 4
+    },
+    "initial_control_failure": {
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/aceb5b344b514e838417f45d6075b69d",
+      "result_sha256": "3b842a3eb9371a60040a0fe82af316dba2ca41a83d968e44b0ef83ce13739490",
+      "steady_verified_proofs": 20,
+      "cause": "10-second watchdog captured a segments_complete sidecar before RV32IM counters were populated; the harness validation panicked"
+    }
+  },
+  "limit_controls": {
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/c44c46b25df643f5aff299c1aa1d2e28",
+    "result_sha256": "ddfb1751fafc4d8bb659bf99248791e3beb929a7be2137391a30a89695e4504d",
+    "rejections": 9
+  },
+  "profile_result_sha256": "bac2b029f8f1162827156873c1fe05e2c2b2544bc0deebef3a93e9b4725b9417",
+  "gate": {
+    "po2_20_synthetic_under_2_seconds": true,
+    "both_10m_savings_over_25_seconds": true,
+    "real_witness_differential": true,
+    "lifecycle": true
+  },
+  "fallback": {
+    "selector": "leave RISC0_RV32IM_EVALFAST unset",
+    "shader_sha256": "2f61db29536c7cb473ff5d1d69203cd58bd048c4372fc94a61b13ed8ba5961c8",
+    "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/9d46fa14e1e24164b4e423b305216e1e",
+    "result_sha256": "8adb634d1bbdc1d7272e390f9024139b35f993dd9cdf2aaf091d7f68b186f137",
+    "worker_sidecar_sha256": "c428852673a2c20a475bb345e48853327460391b2555b8c5150e63f04082c07f",
+    "cpu_differential_checks": 8
+  }
+}

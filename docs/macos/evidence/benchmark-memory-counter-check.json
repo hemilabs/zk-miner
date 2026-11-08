@@ -1,0 +1,37 @@
+{
+  "checked_at_utc": "2026-11-01T16:48:43.910008+00:00",
+  "method": "SDK host_statistics64 counters before and after vm_stat; observations are sequential, not atomic",
+  "source": "#include <mach/mach.h>\n#include <mach/vm_statistics.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <unistd.h>\n\nint main(void) {\n    vm_statistics64_data_t stats = {0};\n    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;\n    mach_port_t host = mach_host_self();\n    kern_return_t status = host_statistics64(host, HOST_VM_INFO64,\n        (host_info64_t)&stats, &count);\n    mach_port_deallocate(mach_task_self(), host);\n    long page_size = sysconf(_SC_PAGESIZE);\n    if (status != KERN_SUCCESS || count != HOST_VM_INFO64_COUNT || page_size <= 0) return 1;\n    uint64_t credit = (stats.external_page_count < stats.inactive_count ?\n        stats.external_page_count : stats.inactive_count) / 2;\n    uint64_t available = ((uint64_t)stats.free_count + credit) * (uint64_t)page_size;\n    printf(\"{\\\"page_size\\\":%ld,\\\"free_count\\\":%u,\\\"speculative_count\\\":%u,\"\n           \"\\\"inactive_count\\\":%u,\\\"external_page_count\\\":%u,\\\"policy_available_bytes\\\":%llu}\\n\",\n           page_size, stats.free_count, stats.speculative_count, stats.inactive_count,\n           stats.external_page_count, (unsigned long long)available);\n    return 0;\n}\n",
+  "source_sha256": "30f0c84d7396348523d1a4ac4f149df954157820cc6648fa96cdd408f5d0c059",
+  "compile_command": [
+    "xcrun",
+    "clang",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "/private/tmp/hemi-memory-check.c",
+    "-o",
+    "/private/tmp/hemi-memory-check"
+  ],
+  "native_before": {
+    "page_size": 16384,
+    "free_count": 1122239,
+    "speculative_count": 111657,
+    "inactive_count": 3369552,
+    "external_page_count": 3051851,
+    "policy_available_bytes": 43387518976
+  },
+  "vm_stat_raw": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                             1010871.\nPages active:                           2791411.\nPages inactive:                         3369552.\nPages speculative:                       111657.\nPages throttled:                              0.\nPages wired down:                        306668.\nPages purgeable:                          58391.\n\"Translation faults\":               19728983895.\nPages copy-on-write:                  511769592.\nPages zero filled:                  30432093440.\nPages reactivated:                   1281943308.\nPages purged:                         277621542.\nFile-backed pages:                      3051851.\nAnonymous pages:                        3220769.\nPages stored in compressor:             1179551.\nPages occupied by compressor:            735488.\nDecompressions:                      3901136762.\nCompressions:                        3928802124.\nPageins:                              644130982.\nPageouts:                              13695602.\nSwapins:                              249800594.\nSwapouts:                             253976007.\n",
+  "native_after": {
+    "page_size": 16384,
+    "free_count": 1122553,
+    "speculative_count": 111657,
+    "inactive_count": 3369552,
+    "external_page_count": 3051851,
+    "policy_available_bytes": 43392663552
+  },
+  "old_ad_hoc_proxy_bytes": 41562865664,
+  "corrected_vm_stat_proxy_bytes": 43392253952,
+  "sdk_reference": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_statistics.h:158",
+  "correction": "Mach free_count already includes speculative pages. The earlier ad hoc vm_stat proxy omitted its separately printed speculative pages, so it underestimated the production policy reading. Original observations remain unmodified; production guard and benchmark resource records are unchanged."
+}

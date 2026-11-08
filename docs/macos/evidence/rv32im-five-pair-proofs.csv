@@ -1,0 +1,13 @@
+round,case,segment_hal,warmup,complete_seconds,prove_call_ms,independent_verifier_ms,admission_wait_ms,worker_pid,worker_start_time_us,guard_peak_footprint_bytes,artifact_directory
+0,0,cpu,True,419.247973209,419213.125209,34.848,0.0,49533,1793735268243890,14109287496,target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-0-case-0
+0,1,metal,True,124.236499708,124200.490833,36.008875,0.0,49545,1793735272917620,16552445344,target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-0-case-1
+1,1,metal,False,117.17693304100001,117140.68608300001,36.246958,0.0,49545,1793735272917620,20719112536,target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-1-case-1
+1,0,cpu,False,420.82885270800006,420808.16650000005,20.686208,0.0,49533,1793735268243890,17452234408,target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-1-case-0
+2,0,cpu,False,427.191923166,427157.514958,34.408208,0.0,49533,1793735268243890,17452234408,target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-2-case-0
+2,1,metal,False,117.179767126,117144.055959,35.711167,0.0,49545,1793735272917620,20823478688,target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-2-case-1
+3,1,metal,False,117.191532125,117154.7935,36.738625,0.0,49545,1793735272917620,20865487360,target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-3-case-1
+3,0,cpu,False,423.426033792,423391.84745799995,34.186334,0.0,49533,1793735268243890,17452234408,target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-3-case-0
+4,0,cpu,False,428.801669167,428772.605125,29.064041999999997,0.0,49533,1793735268243890,17452234408,target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-4-case-0
+4,1,metal,False,117.691307541,117655.465833,35.841708,0.0,49545,1793735272917620,20883919360,target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-4-case-1
+5,1,metal,False,117.99981241699999,117974.307875,25.504542,0.0,49545,1793735272917620,20900794928,target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-5-case-1
+5,0,cpu,False,432.259616083,432224.52550000005,35.090583,0.0,49533,1793735268243890,17557649112,target/macos/native-wrap/worker-runs/ad9ce734c5cb4519a9d2d1666bebd275/acceptance/round-5-case-0

@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "scope": "upstream merge acceptance before controlled reading",
+  "engine_commit": "881513e022d98ac7c07460ba090a5f6a5657334a",
+  "miner_merge_commit": "d359e0102b6f66862a0bf92257e32253c3e77ed2",
+  "worker_sha256": "c3428c3717c331c452e3621736e779ae1f06311003dfd65b50f292d39877e5f9",
+  "worker_build_manifest_sha256": "b70d06a699b42bf7d2d7e7ea6c57d49ecf71062c620fe8a631e0c6af10dbbae4",
+  "cpu_worker_sha256": "79631a91ba2b9b5435aaee8ff5389a7174c6bd5ed639cb2f73251ae24f9fce09",
+  "cpu_build_log_sha256": "9926fa5bbe8072838a62203d3f657d7fddedda350c4a6e9c3a418b062b022d05",
+  "engine_execute_test_log_sha256": "5a01a3159a434282c601bbde470f37db3765fcee47636d815a6345866dccc787",
+  "root_cargo_lock_sha256": "ca5059bf28fee596cb11b0a2c841ec49c4cba7c75b2fd281733fc6b841849a95",
+  "runs": {
+    "lifecycle": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/4ea0f5b0ea374b20ae5982898cb07c39",
+      "result_sha256": "707bade4b8fc3bc8b59c61aa034168a35aabd73bea1a6d85bcac050be0be8c9f",
+      "status": "passed",
+      "verified_proofs": 21,
+      "tamper_rejections": 63,
+      "request_ledger_sha256": "e8a79795040e95d5f9ead30c53806d1719621a8aaf784dc600ddbf79d53a6ed5"
+    },
+    "cpu_diff_po2_14": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/7f8946bbd5aa4b798e2a182cc03c180c",
+      "result_sha256": "0204b427d0a91b0ad4187e85f3e1edee91ddaf538bbf48bc55b898fe38d11f50",
+      "status": "passed",
+      "verified_proofs": 1,
+      "tamper_rejections": 3,
+      "request_ledger_sha256": "9fcd7c1a26c039de82c3968138768534a0c0436e28d6a428e129dcc5c2769c5a",
+      "segment_cpu_differential_checks": 8,
+      "recursion_cpu_differential_checks": 15
+    },
+    "cpu_diff_po2_18": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/2ca1471c44244432b7e0d37807afc04a",
+      "result_sha256": "99ff0f4e04eb55458d80c42e3242ce95806b02e0029fa2ef42b5e0b73a22fe57",
+      "status": "passed",
+      "verified_proofs": 1,
+      "tamper_rejections": 3,
+      "request_ledger_sha256": "0dfdaccbb0165983d1ca284f5d01794b75c53c27f74139d269641b1305125353",
+      "segment_cpu_differential_checks": 1,
+      "recursion_cpu_differential_checks": 1
+    },
+    "cpu_diff_po2_20": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/c21e959740cc4e57b2081fe7a0d4769d",
+      "result_sha256": "3bd6822c849541b014a05d617d298d9a801ba6469b29639d5b9d950c39f8ba92",
+      "status": "passed",
+      "verified_proofs": 1,
+      "tamper_rejections": 3,
+      "request_ledger_sha256": "ba4785180252b891432aaeed879163316186e31d5b6d03cdd31531a963971a9d",
+      "segment_cpu_differential_checks": 1,
+      "recursion_cpu_differential_checks": 1
+    },
+    "limit_controls": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/23168bc22b754229986891d2fc80f002",
+      "result_sha256": "7429b6a1e98e8f03c283f286139cf50f3598f3b2819b9f0eff121ca6a37eb207",
+      "status": "passed",
+      "verified_proofs": 0,
+      "tamper_rejections": 0,
+      "cases": [
+        {
+          "limit": "0",
+          "outcome": "startup_rejected"
+        },
+        {
+          "limit": "67108865",
+          "outcome": "startup_rejected"
+        },
+        {
+          "limit": "-1",
+          "outcome": "startup_rejected"
+        },
+        {
+          "limit": "invalid",
+          "outcome": "startup_rejected"
+        },
+        {
+          "limit": "18446744073709551615",
+          "outcome": "startup_rejected"
+        },
+        {
+          "operation": "execute",
+          "outcome": "guest_cycle_limit_rejected"
+        },
+        {
+          "operation": "prove",
+          "outcome": "input_rejected",
+          "po2": 13
+        },
+        {
+          "operation": "prove",
+          "outcome": "input_rejected",
+          "po2": 22
+        },
+        {
+          "operation": "prove",
+          "outcome": "input_rejected",
+          "po2": 20
+        }
+      ]
+    },
+    "pipeline_cancel": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/8b21851ac27f411f9430a86b14c31422",
+      "result_sha256": "61eefa6adef174656dd118b2615ba1220ff99b0dc04a2db12ef6d248b27f4832",
+      "status": "passed",
+      "verified_proofs": 3,
+      "tamper_rejections": 9,
+      "request_ledger_sha256": "b9ed6b0ec5bca1febdff589b4834582cd062d1a65ac40e7ba9c4049757f2754e",
+      "overlap_cancelled": true
+    }
+  },
+  "linux_feature_paths": {
+    "recursion": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/phase2/upstream-merge-linux/recursion.log",
+      "sha256": "f612f4b68a998081dfc5d03887a0df95480678b4d893ee0e77e0500d09f311fb",
+      "passed": true
+    },
+    "rv32im": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/phase2/upstream-merge-linux/rv32im.log",
+      "sha256": "a1de732628658cbc9f14acc2193709eaf67817101a6e12461ea40a4012d2f9dc",
+      "passed": true
+    },
+    "zkvm": {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/phase2/upstream-merge-linux/zkvm.log",
+      "sha256": "ed6cf679581f0f16211feb62bde103561d32b29ea35bc2e8cc8eb32eb1e0010a",
+      "passed": true
+    }
+  },
+  "cpu_build_log_path": "/Users/dbur/dev/zk-miner/target/macos/phase2/upstream-merge-acceptance/cpu-build.log",
+  "engine_execute_test_log_path": "/Users/dbur/dev/zk-miner/target/macos/phase2/upstream-merge-acceptance/engine-execute-tests.log",
+  "pipeline_cancel_log_path": "/Users/dbur/dev/zk-miner/target/macos/phase2/upstream-merge-acceptance/pipeline-cancel.log",
+  "lifecycle_log_path": "/Users/dbur/dev/zk-miner/target/macos/phase2/upstream-merge-acceptance/lifecycle.log"
+}

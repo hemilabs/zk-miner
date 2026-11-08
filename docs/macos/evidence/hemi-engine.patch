@@ -1,0 +1,134 @@
+diff --git a/risc0/groth16/src/prove/docker.rs b/risc0/groth16/src/prove/docker.rs
+index 755158357..990855e46 100644
+--- a/risc0/groth16/src/prove/docker.rs
++++ b/risc0/groth16/src/prove/docker.rs
+@@ -60,12 +60,39 @@ pub(crate) fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
+     std::fs::write(seal_path, seal_json)?;
+ 
+     tracing::debug!("risc0-groth16-prover");
+-    let output = Command::new("docker")
+-        .arg("run")
++    let mut command = Command::new("docker");
++    command.arg("run");
++    // A native Mac supervisor owns this exact container and removes it if the
++    // worker is killed. Other platforms retain their existing invocation.
++    #[cfg(target_os = "macos")]
++    if let Ok(name) = std::env::var("RISC0_GROTH16_CONTAINER_NAME") {
++        command.args([
++            "--name",
++            &name,
++            "--platform",
++            "linux/amd64",
++            "--pull",
++            "never",
++            "--network",
++            "none",
++            "--memory",
++            "24g",
++            "--cpus",
++            "6",
++            "--entrypoint",
++            "timeout",
++        ]);
++    }
++    command
+         .arg("--rm")
+         .arg("-v")
+         .arg(format!("{}:/mnt", work_dir.to_string_lossy()))
+-        .arg(IMAGE)
++        .arg(IMAGE);
++    #[cfg(target_os = "macos")]
++    if std::env::var_os("RISC0_GROTH16_CONTAINER_NAME").is_some() {
++        command.args(["1800", "/app/prover.sh"]);
++    }
++    let output = command
+         .stdout(Stdio::piped())
+         .stderr(Stdio::piped())
+         .output()?;
+diff --git a/risc0/sys/build.rs b/risc0/sys/build.rs
+index f42727c91..75eeb752e 100644
+--- a/risc0/sys/build.rs
++++ b/risc0/sys/build.rs
+@@ -53,7 +53,10 @@ fn main() {
+         build_intel_kernels();
+     }
+ 
+-    if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos" || os == "ios") {
++    // CPU proving on Apple platforms must not require the Metal compiler.
++    if env::var("CARGO_FEATURE_METAL").is_ok()
++        && env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos" || os == "ios")
++    {
+         println!(
+             "cargo:metal_root={}",
+             manifest_dir.join("kernels/zkp/metal").to_string_lossy()
+diff --git a/risc0/zkp/Cargo.toml b/risc0/zkp/Cargo.toml
+index e01aa5673..0efe5c3fb 100644
+--- a/risc0/zkp/Cargo.toml
++++ b/risc0/zkp/Cargo.toml
+@@ -34,7 +34,7 @@ tracing = { version = "0.1", default-features = false, features = [
+ ] }
+ 
+ [target.'cfg(any(target_os="macos", target_os="ios"))'.dependencies]
+-metal = { workspace = true }
++metal = { workspace = true, optional = true }
+ 
+ [target.'cfg(not(target_os = "zkvm"))'.dependencies]
+ ndarray = { version = "0.16", features = ["rayon"], optional = true }
+@@ -60,8 +60,8 @@ cuda = ["dep:cust", "prove", "risc0-sys/cuda"]
+ rocm = ["prove", "risc0-sys/rocm"]
+ intel = ["prove", "risc0-sys/intel"]
+ default = []
+-metal = ["prove"]
+-metal_prefix_products = []
++metal = ["prove", "dep:metal", "risc0-sys/metal"]
++metal_prefix_products = ["metal"]
+ prove = [
+   "dep:ff",
+   "dep:ndarray",
+diff --git a/risc0/zkp/build.rs b/risc0/zkp/build.rs
+index c76462d9c..7377d8894 100644
+--- a/risc0/zkp/build.rs
++++ b/risc0/zkp/build.rs
+@@ -15,11 +15,11 @@
+ use std::env;
+ 
+ fn main() {
+-    if env::var("CARGO_FEATURE_PROVE").is_ok()
++    if env::var("CARGO_FEATURE_METAL").is_ok()
+         && env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos" || os == "ios")
+     {
+         let metal_bin =
+-            env::var("DEP_RISC0_SYS_METAL_KERNELS_ZKP").expect("attempting to build risc0-zkp using the `prove` feature flag. This requires building the metal kernels but DEP_RISC0_SYS_METAL_KERNELS_ZKP is not defined.");
++            env::var("DEP_RISC0_SYS_METAL_KERNELS_ZKP").expect("attempting to build risc0-zkp using the `metal` feature flag. This requires building the metal kernels but DEP_RISC0_SYS_METAL_KERNELS_ZKP is not defined.");
+         println!("cargo:rustc-env=ZKP_METAL_PATH={metal_bin}");
+     }
+ }
+diff --git a/risc0/zkp/src/hal/mod.rs b/risc0/zkp/src/hal/mod.rs
+index df4d9f10c..7ef721a1b 100644
+--- a/risc0/zkp/src/hal/mod.rs
++++ b/risc0/zkp/src/hal/mod.rs
+@@ -22,7 +22,10 @@ pub mod dual;
+ pub mod hip;
+ #[cfg(feature = "intel")]
+ pub mod intel;
+-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))]
++#[cfg(all(
++    feature = "metal",
++    any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios")
++))]
+ pub mod metal;
+ 
+ use std::{
+diff --git a/risc0/zkvm/Cargo.toml b/risc0/zkvm/Cargo.toml
+index 3952474d4..2f49f251e 100644
+--- a/risc0/zkvm/Cargo.toml
++++ b/risc0/zkvm/Cargo.toml
+@@ -212,7 +212,7 @@ getrandom = ["risc0-zkvm-platform/getrandom"]
+ # The zkVM uses a bump-pointer heap allocator by default which does not free
+ # memory. This will use a slower linked-list heap allocator to reclaim memory.
+ heap-embedded-alloc = ["risc0-zkvm-platform/heap-embedded-alloc"]
+-metal = ["prove"]
++metal = ["prove", "risc0-zkp/metal"]
+ prove = [
+   "client",
+   "dep:addr2line",

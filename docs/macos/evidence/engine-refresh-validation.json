@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "scope": "Post-merge regression on c6b67b15e; README-only descendant 3747d12ff is a separate checkpoint to validate next.",
+  "engine_revision": "c6b67b15e9932f2144bafdd5cecde5b751e82a9d",
+  "parent_revision": "8007a99720c4890d8fdfd808cec556b8cbb5db1f",
+  "recorded_at": "2026-11-02T19:24:22.816198+00:00",
+  "worker_binaries": {
+    "native": "7dcdfe871ce462d6dbb30f34b6d7ddf46b50901143b838c12182f1067ed9a98b",
+    "native-rv32im-metal": "821c590f76d8cd46e4e56e4f90de70ff6cc137167424e8416c9b11322535236c"
+  },
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "verified_proofs": 8,
+  "negative_checks": 24,
+  "host_reserve_gib": 12,
+  "default_host_reserve_gib": 16,
+  "process_group_limit_gib": 32,
+  "admission_refusal": {
+    "path": "/Users/dbur/dev/zk-miner/target/macos/upstream-refresh/20261102T173847Z/proof-regressions-default-reserve-refused.json",
+    "sha256": "4c87c36338cbaf4bd3ce9e44d60d4ae6cccafd0e56eaf528d882928384b75b35",
+    "scope": "Default 16 GiB reserve refused before proof dispatch; supported 12 GiB reserve used for final serial runs."
+  },
+  "cases": [
+    {
+      "name": "tiny-tail",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/b7bf7ae5e91043c799680d1a0477af79",
+      "result_sha256": "893f488c7b6c1ec1fb4ff5fedb87d1ad74d728823eb409a3ce67b7460fd2ddf4",
+      "verified_proofs": 1,
+      "negative_checks": 3,
+      "summary": {
+        "admission_pressure": false,
+        "expected_journal_hex": "f0debc9a78563412",
+        "helper_cancel": false,
+        "helper_timeout": false,
+        "min_segments": 1,
+        "observed_mode": "metal",
+        "po2": 14,
+        "requested_mode": "cpu",
+        "restart": false,
+        "shutdown": true,
+        "status": "complete_independently_verified",
+        "unique_completed_requests": 1,
+        "verified_proofs": 1,
+        "worker_timeout": false,
+        "workload": "segment-boundary"
+      }
+    },
+    {
+      "name": "valid-witness-full-domain",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/840d83d875f04fd98694608aaaf31efa",
+      "result_sha256": "13223723be95272285c4559aa54ce5174c9977976e4736cafc5d8e812b546336",
+      "verified_proofs": 1,
+      "negative_checks": 3,
+      "summary": {
+        "admission_pressure": false,
+        "expected_journal_hex": "401f8225952d516c",
+        "helper_cancel": false,
+        "helper_timeout": false,
+        "min_segments": 1,
+        "observed_mode": "metal",
+        "po2": 20,
+        "requested_mode": "cpu",
+        "restart": false,
+        "shutdown": true,
+        "status": "complete_independently_verified",
+        "unique_completed_requests": 1,
+        "verified_proofs": 1,
+        "worker_timeout": false,
+        "workload": "fibonacci"
+      }
+    },
+    {
+      "name": "cpu-native-control",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/85839ce2a8e1495188e03ba2475ebd5c",
+      "result_sha256": "dfa45b7b46be4189e0d860b5112f210af5132560a154a987cd853a68f148a6a5",
+      "verified_proofs": 1,
+      "negative_checks": 3,
+      "summary": {
+        "admission_pressure": false,
+        "expected_journal_hex": "6d1a000000000000",
+        "helper_cancel": false,
+        "helper_timeout": false,
+        "min_segments": 1,
+        "observed_mode": "cpu",
+        "po2": 20,
+        "requested_mode": "cpu",
+        "restart": false,
+        "shutdown": true,
+        "status": "complete_independently_verified",
+        "unique_completed_requests": 1,
+        "verified_proofs": 1,
+        "worker_timeout": false,
+        "workload": "fibonacci"
+      }
+    },
+    {
+      "name": "hash-10m",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/f8073f1af2264c76b5edffaf78351e21",
+      "result_sha256": "6b4c6ccaa39cf2db5dcde302693de6f47e343c9598583ec805f006a0f54985af",
+      "verified_proofs": 1,
+      "negative_checks": 3,
+      "summary": {
+        "admission_pressure": false,
+        "expected_journal_hex": "7b3b9da440ac877e14646d0dbff269ec24926a37a504819bae0e7b2f6226b5b4",
+        "helper_cancel": false,
+        "helper_timeout": false,
+        "min_segments": 1,
+        "observed_mode": "metal",
+        "po2": 20,
+        "requested_mode": "cpu",
+        "restart": false,
+        "shutdown": true,
+        "status": "complete_independently_verified",
+        "unique_completed_requests": 1,
+        "verified_proofs": 1,
+        "worker_timeout": false,
+        "workload": "sha256-chain"
+      }
+    },
+    {
+      "name": "worker-lifecycle",
+      "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/7909473f427748c6830ea89444675672",
+      "result_sha256": "4d7111ab438368ff732965971e0728ef63c00b640dacafe6e50689391fb1e297",
+      "verified_proofs": 4,
+      "negative_checks": 12,
+      "summary": {
+        "admission_pressure": false,
+        "expected_journal_hex": "6d1a000000000000",
+        "helper_cancel": true,
+        "helper_timeout": false,
+        "min_segments": 1,
+        "observed_mode": "metal",
+        "po2": 20,
+        "requested_mode": "cpu",
+        "restart": true,
+        "shutdown": true,
+        "status": "complete_independently_verified",
+        "unique_completed_requests": 4,
+        "verified_proofs": 4,
+        "worker_timeout": true,
+        "workload": "fibonacci"
+      }
+    }
+  ],
+  "unit_and_differential_tests": {
+    "worker_cpu": 5,
+    "worker_resident_metal": 5,
+    "metal_primitives": 18,
+    "recursion_evaluator": 1
+  },
+  "raw_record": "/Users/dbur/dev/zk-miner/target/macos/upstream-refresh/20261102T173847Z/proof-regressions.json",
+  "raw_record_sha256": "f3a03b727f15380d12f3f7360c558aacb9cb7ad04ebaae8471e1d6e3e73abd71"
+}

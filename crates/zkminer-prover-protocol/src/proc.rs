@@ -138,9 +138,12 @@ pub fn is_transient_spawn_error(err: &io::Error) -> bool {
     #[cfg(unix)]
     {
         // Spelled numerically so this crate needs no libc dependency. These values are fixed
-        // by the Linux ABI and identical on x86_64 and aarch64 (asm-generic/errno-base.h).
+        // by the Linux ABI except EAGAIN on Darwin (35, not Linux's 11).
         const EINTR: i32 = 4;
+        #[cfg(not(target_os = "macos"))]
         const EAGAIN: i32 = 11;
+        #[cfg(target_os = "macos")]
+        const EAGAIN: i32 = 35;
         const ENOMEM: i32 = 12;
         const ENFILE: i32 = 23;
         const EMFILE: i32 = 24;
@@ -678,9 +681,12 @@ mod tests {
     #[test]
     fn a_healthy_child_is_fast_and_successful() {
         let _g = test_lock().lock().unwrap();
-        let sh = Script::new("ok", "echo hi; exit 0");
+        // Use the installed shell: first execution of a newly written script
+        // can pay macOS security/filesystem latency unrelated to pipe draining.
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "echo hi; exit 0"]);
         let t0 = Instant::now();
-        let got = run(&sh, Duration::from_secs(5));
+        let got = output_with_timeout(&mut command, Duration::from_secs(5), 64 * 1024);
         assert!(
             matches!(got, Outcome::Ran { success: true, .. }),
             "got {}",
@@ -756,7 +762,7 @@ mod tests {
     fn transient_and_permanent_spawn_errors_are_separated() {
         for errno in [
             26, /*ETXTBSY*/
-            11, /*EAGAIN*/
+            if cfg!(target_os = "macos") { 35 } else { 11 }, /*EAGAIN*/
             12, /*ENOMEM*/
             4,  /*EINTR*/
         ] {
@@ -779,6 +785,8 @@ mod tests {
         // ECHILD is deliberately absent: it cannot occur at SPAWN time. It occurs at WAIT
         // time, and is reported as `Unsettled` precisely so it cannot reach a decline.
         assert!(!is_transient_spawn_error(&io::Error::from_raw_os_error(10)));
+        #[cfg(target_os = "macos")]
+        assert!(!is_transient_spawn_error(&io::Error::from_raw_os_error(11))); // EDEADLK
     }
 
     /// `describe` is what assertion and log messages carry, so it must name the variant
@@ -873,6 +881,7 @@ mod capture_tests {
     /// AND the classification that keeps a transient failure from permanently declining a
     /// backend.
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_persistently_busy_executable_is_reported_transient() {
         let dir = std::env::temp_dir().join(format!(
             "zkproc-etxtbsy-{}-{}",

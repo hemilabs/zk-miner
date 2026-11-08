@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-04",
+  "scope": "Two sequential single-worker 10M arithmetic spot checks on the 128 GiB Apple M5 Max with Brave open. Ordinary background load varied; no pressure was induced and no applications or VM state were changed. Neither a matched refusal test nor a smaller-Mac or pressure-only qualification.",
+  "engine_revision": "dcbe9f4b9140a48d4792ffcd3a3eba19897be175",
+  "worker_sha256": "f876cf8e7591e7f9ea98085ccb259ad22f767d54715023b79c5b9caf2e74fc08",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+  "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+  "settings": {
+    "po2": 20,
+    "rayon_threads": 18,
+    "go_threads": 18,
+    "initial_proof_budget_gib": 24
+  },
+  "cases": [
+    {
+      "reserve_gib": 16,
+      "host_available_before_prove_bytes": 43413389312,
+      "worker_footprint_before_prove_bytes": 39977440,
+      "pressure_before_prove": 1,
+      "pressure_levels": [
+        1
+      ],
+      "min_sampled_host_available_bytes": 25473712128,
+      "guard_peak_footprint_bytes": 16553477464,
+      "guest_cycles": 10003116,
+      "segments": 10,
+      "complete_seconds": 129.635653709,
+      "verification": "passed",
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "run": "target/macos/native-wrap/worker-runs/394fe430c3fa40f6857d209d5d70bbed",
+      "artifact_sha256": {
+        "result.json": "04bd694bef28ff3b3568d5ebb3c72bebf1d97fc29b5104fd93eb3b9da28b68db",
+        "acceptance/proof-0/worker.json": "246bbe8826d4d488c924a1656258f78a291246e39c71890f6b56ed1e5d4ce276",
+        "acceptance/proof-0/resource.json": "17c7360bf0bef9dd15d3e6bf63b12f175766973a1cad252336b7057828e7c190",
+        "acceptance/proof-0/timing.json": "07a19c1cdbbeff9f1ea0ab7f6955f0b8b228f0aedabe29e8ef0d613320c8e095",
+        "acceptance/proof-0/verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e"
+      }
+    },
+    {
+      "reserve_gib": 12,
+      "host_available_before_prove_bytes": 42181246976,
+      "worker_footprint_before_prove_bytes": 40010232,
+      "pressure_before_prove": 1,
+      "pressure_levels": [
+        1
+      ],
+      "min_sampled_host_available_bytes": 25467535360,
+      "guard_peak_footprint_bytes": 16553526664,
+      "guest_cycles": 10003116,
+      "segments": 10,
+      "complete_seconds": 129.63989966699998,
+      "verification": "passed",
+      "negative_tests": [
+        "wrong_image",
+        "modified_journal",
+        "corrupt_seal"
+      ],
+      "run": "target/macos/native-wrap/worker-runs/e7c571e276ab4df587711137595f2f39",
+      "artifact_sha256": {
+        "result.json": "04bd694bef28ff3b3568d5ebb3c72bebf1d97fc29b5104fd93eb3b9da28b68db",
+        "acceptance/proof-0/worker.json": "3892dbced75aa8f48f42a54a47a386d22d9012394f252af9e3f9e148879336e6",
+        "acceptance/proof-0/resource.json": "a255b954147725fcb9eaa233ff9b7c11d25237bb068b9945f3ff81e8e0e27423",
+        "acceptance/proof-0/timing.json": "8cbedebbd23731762e954afe503be35ec323f573a57f8e50cfb9ed86fcb30425",
+        "acceptance/proof-0/verification.json": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e"
+      }
+    }
+  ],
+  "next_step": "Before changing the default, test 12 GiB at cold startup, repeated warm requests and a 46M proof under ordinary desktop load; record pressure, swap deltas, guard outcomes and verification. Keep the incremental byte check and the in-flight limits."
+}

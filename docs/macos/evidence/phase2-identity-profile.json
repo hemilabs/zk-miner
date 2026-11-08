@@ -1,0 +1,382 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "scope": "three complete arithmetic 10M proofs on a source-bound timer-only diagnostic worker; published checkpoint untouched",
+  "spec_sha256": "9a0e052f6c1e72a1a8a31d3081fe3a3604bbfe11cb9fd661e30109c21c12f6f1",
+  "published_worker_sha256": "c3428c3717c331c452e3621736e779ae1f06311003dfd65b50f292d39877e5f9",
+  "profile_worker_sha256": "5832edb772968101731a192d0cde232ff2eaf4d1a203098fc1362a95541743c5",
+  "engine_base_commit": "881513e022d98ac7c07460ba090a5f6a5657334a",
+  "profile_engine_commit": "6cfd014fcdb5fe035b950a6b35e53ed1192359bd",
+  "miner_commit_at_profile": "9ec2086e4b369180aa6eb04b690d7e366332d00d",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "helper_manifest_sha256": "cab3b912750594cefb8b8da8b300f0b100ed6ccfaf81ee4a041503b966dca830",
+  "wp0_gpu_profile_sha256": "2cbc0d778ed84a4385d74846e532d7a75a5457a1834ec9b15a2874c8356f296f",
+  "wp0_attribution": "WP0 attributes segment and lift/join Metal work; identity_p254 uses the CPU Poseidon254 HAL, with no Metal identity kernels",
+  "campaign_path": "/Users/dbur/dev/zk-miner/target/macos/phase2/identity-profile/run-21aa9fd3c2224695a25a15fff68ec52f",
+  "campaign_result_sha256": "f0b2c764d91378933576e105c47e6112e0166af6a4157247464e400b00574422",
+  "raw_run_path": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/9380a7a09d1141bab7f0df6465b8f390",
+  "raw_test_log_sha256": "d2d87b60e765c2b8aed1b59983b79fd157a6ed7ce715bc8b34bb092f810f8356",
+  "raw_result_sha256": "52f76f533513ddd7292e4221e1c0b241f462bcc455d023f9c8c721fef3d0787a",
+  "validation": {
+    "verified_proofs": 3,
+    "tamper_rejections": 9,
+    "workload": "fibonacci",
+    "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+    "input_sha256": "cee19cda5a705d63da91e2090a5ebb792a8ea1040f92b95717823e8aa9299830",
+    "user_cycles_per_proof": [
+      10003116,
+      10003116,
+      10003116
+    ]
+  },
+  "failed_preflight_attempts": [
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/phase2/identity-profile/run-75c940101f4f49ef81ef816f1e72e4b2/result.json",
+      "sha256": "4c4996178030c4577667e4fa7bc96f76d370a201aa717c9532786f9ba39d7ab3"
+    },
+    {
+      "path": "/Users/dbur/dev/zk-miner/target/macos/phase2/identity-profile/run-55e02c804c1e459c8d8e4017e0e8f810/result.json",
+      "sha256": "8e1402aeb8eeb36c2d5796d93ece6b267f413f3fdda3ea08d4e037e98811581d"
+    }
+  ],
+  "conditions": {
+    "browser_closed": true,
+    "host_reserve_gib": 8,
+    "reserve_override": false,
+    "initial_thermal": "nominal",
+    "rayon_threads": 18,
+    "go_threads": 18,
+    "po2": 20,
+    "segment_pipeline": true,
+    "measured_proofs": 3,
+    "extra_warmup": false
+  },
+  "idle_gap_seconds": 2002.3107047080994,
+  "host_start_sha256": "d337f453136d9bd1a470d50bb52d63ce7b039a9aba374bebbed12545d3ba3749",
+  "host_end_sha256": "0507fd5c9edd84f054a158df49cf3045f92c42de3d451e8ba64560f84af39fd1",
+  "host_end": {
+    "browser_closed": true,
+    "thermal": "nominal"
+  },
+  "preflight_note": "Two start gates stopped before proof when Brave was open. The final run began 2002.3 s after the last build with browsers closed and nominal thermal; Brave was closed again shortly before that start, so a continuously browser-closed final 15-minute interval was not established.",
+  "timer_sources": {
+    "identity_boundary": "RISC0_VERBOSE identity_profile begin/end in risc0/zkvm/src/host/server/prove/mod.rs; begin excludes overlapped helper prestart",
+    "hashing": "RISC0_VERBOSE CpuHal poseidon254 hash_rows + hash_fold wall timers; includes Merkle and FRI trees but excludes small scalar transcript hashes",
+    "transforms": "RISC0_VERBOSE CpuHal expand/evaluate NTT, interpolate NTT, bit reversal, point evaluation, zk_shift, mix_poly_coeffs and FRI fold wall timers",
+    "evaluator": "existing [start_finalize] eval_check_launch; synchronous CPU eval_check for identity_p254",
+    "cross_check": "existing [recursion_prove], [poly_group] and [finalize] stage timers",
+    "wrap": "existing [succinct_to_groth16] and native.rs witness_ms; RISC0_VERBOSE forwards unchanged Go helper debug timers to worker stderr",
+    "go_units": "Go zerolog took durations are milliseconds, confirmed against helper wall time; loadWitness starts before identity completes, so its timer includes waiting for stdin and is not the witness compute cost"
+  },
+  "medians_min_max_seconds": {
+    "identity_prove_s": {
+      "median": 14.044002,
+      "min": 13.742865,
+      "max": 14.976063
+    },
+    "identity_prestart_s": {
+      "median": 0.000452,
+      "min": 0.000445,
+      "max": 0.000488
+    },
+    "poseidon254_hash_s": {
+      "median": 11.967597,
+      "min": 11.664902,
+      "max": 12.974527
+    },
+    "hash_rows_s": {
+      "median": 9.368423,
+      "min": 9.087754,
+      "max": 9.860059
+    },
+    "hash_fold_s": {
+      "median": 2.599174,
+      "min": 2.577148,
+      "max": 3.114468
+    },
+    "transform_s": {
+      "median": 0.819966,
+      "min": 0.79869,
+      "max": 0.842951
+    },
+    "eval_check_s": {
+      "median": 1.1268,
+      "min": 1.0438,
+      "max": 1.157
+    },
+    "transform_eval_s": {
+      "median": 1.969751,
+      "min": 1.84249,
+      "max": 1.976966
+    },
+    "other_identity_s": {
+      "median": 0.106654,
+      "min": 0.100997,
+      "max": 0.159046
+    },
+    "identity_plus_prestart_s": {
+      "median": 14.0445,
+      "min": 13.7433,
+      "max": 14.9765
+    },
+    "wrap_wall_s": {
+      "median": 4.926,
+      "min": 4.8253,
+      "max": 9.2231
+    },
+    "rust_witness_write_s": {
+      "median": 0.33934,
+      "min": 0.320143,
+      "max": 4.978261
+    },
+    "go_constraint_system_load_s": {
+      "median": 0.293727,
+      "min": 0.274539,
+      "max": 0.343303
+    },
+    "go_proving_key_load_s": {
+      "median": 0.322059,
+      "min": 0.320087,
+      "max": 0.333711
+    },
+    "go_key_load_total_s": {
+      "median": 0.613814,
+      "min": 0.596597,
+      "max": 0.677014
+    },
+    "go_witness_wait_and_decode_s": {
+      "median": 13.783879,
+      "min": 13.563297,
+      "max": 19.453212
+    },
+    "go_proving_s": {
+      "median": 4.23977,
+      "min": 4.014262,
+      "max": 4.371347
+    },
+    "wrap_other_s": {
+      "median": 0.23451,
+      "min": 0.230577,
+      "max": 0.24619
+    },
+    "identity_and_wrap_s": {
+      "median": 18.9705,
+      "min": 18.5686,
+      "max": 24.1996
+    },
+    "complete_proof_s": {
+      "median": 51.257527,
+      "min": 50.234352,
+      "max": 55.302074
+    }
+  },
+  "poseidon254_hash_share_of_identity": {
+    "median": 0.85215,
+    "min": 0.848797,
+    "max": 0.866351
+  },
+  "proofs": [
+    {
+      "log_begin_line": 442,
+      "prestart_ms": 0.445,
+      "cpu_ops_ms": {
+        "interpolate_ntt": 84.847,
+        "zk_shift": 139.49,
+        "expand_evaluate_ntt": 323.15599999999995,
+        "bit_reverse": 9.754000000000001,
+        "hash_rows": 9860.059,
+        "hash_fold": 3114.468,
+        "evaluate_any": 163.563,
+        "mix_poly_coeffs": 69.032,
+        "fri_fold": 8.848
+      },
+      "go_ms": {
+        "constraint_system_load": 274.538792,
+        "proving_key_load": 322.058625,
+        "witness_wait_and_decode": 19453.211958,
+        "proving": 4014.262042,
+        "key_load_total": 596.597417
+      },
+      "poly_groups": [
+        {
+          "group": "ctrl",
+          "ntt_ms": 52.5,
+          "merkle_ms": 2399.3
+        },
+        {
+          "group": "data",
+          "ntt_ms": 224.0,
+          "merkle_ms": 7171.8
+        },
+        {
+          "group": "accum",
+          "ntt_ms": 29.0,
+          "merkle_ms": 1565.4
+        },
+        {
+          "group": "check",
+          "ntt_ms": 30.4,
+          "merkle_ms": 1581.0
+        }
+      ],
+      "eval_check_ms": 1043.8,
+      "identity_prove_ms": 14976.063,
+      "log_identity_end_line": 612,
+      "rust_witness_write_ms": 4978.261375,
+      "prestart_and_wrap_ms": 24199.338708,
+      "top_level_ms": {
+        "identity_p254": 14976.5,
+        "get_seal": 0.0,
+        "shrink_wrap": 9223.1,
+        "total": 24199.6
+      },
+      "log_finish_line": 619,
+      "components_ms": {
+        "poseidon254_hash_ms": 12974.526999999998,
+        "merkle_hash_rows_ms": 9860.059,
+        "merkle_hash_fold_ms": 3114.468,
+        "transform_ms": 798.6899999999999,
+        "eval_check_ms": 1043.8,
+        "transform_eval_ms": 1842.4899999999998,
+        "other_identity_ms": 159.0460000000021
+      },
+      "wrap_other_ms": 230.57658300000048,
+      "acceptance_proof_dir": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/9380a7a09d1141bab7f0df6465b8f390/acceptance/proof-0",
+      "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+      "complete_proof_ms": 55302.074292,
+      "timing_sha256": "179c79547048b18bb388d94bcaaf2b7b51426f0d6da0221d41e7ad3b09539c6a"
+    },
+    {
+      "log_begin_line": 1031,
+      "prestart_ms": 0.452,
+      "cpu_ops_ms": {
+        "interpolate_ntt": 83.836,
+        "zk_shift": 140.32299999999998,
+        "expand_evaluate_ntt": 331.70200000000006,
+        "bit_reverse": 8.506,
+        "hash_rows": 9087.753999999999,
+        "hash_fold": 2577.1480000000006,
+        "evaluate_any": 170.054,
+        "mix_poly_coeffs": 74.48,
+        "fri_fold": 11.065
+      },
+      "go_ms": {
+        "constraint_system_load": 293.727166,
+        "proving_key_load": 320.087208,
+        "witness_wait_and_decode": 13563.296875,
+        "proving": 4239.770125,
+        "key_load_total": 613.814374
+      },
+      "poly_groups": [
+        {
+          "group": "data",
+          "ntt_ms": 259.0,
+          "merkle_ms": 7953.8
+        },
+        {
+          "group": "accum",
+          "ntt_ms": 27.8,
+          "merkle_ms": 1728.6
+        },
+        {
+          "group": "check",
+          "ntt_ms": 28.4,
+          "merkle_ms": 1703.7
+        }
+      ],
+      "eval_check_ms": 1157.0,
+      "identity_prove_ms": 13742.865,
+      "log_identity_end_line": 1173,
+      "rust_witness_write_ms": 339.339916,
+      "prestart_and_wrap_ms": 18568.290875,
+      "top_level_ms": {
+        "identity_p254": 13743.3,
+        "get_seal": 0.0,
+        "shrink_wrap": 4825.3,
+        "total": 18568.6
+      },
+      "log_finish_line": 1179,
+      "components_ms": {
+        "poseidon254_hash_ms": 11664.902,
+        "merkle_hash_rows_ms": 9087.753999999999,
+        "merkle_hash_fold_ms": 2577.1480000000006,
+        "transform_ms": 819.966,
+        "eval_check_ms": 1157.0,
+        "transform_eval_ms": 1976.966,
+        "other_identity_ms": 100.99699999999984
+      },
+      "wrap_other_ms": 246.18995900000027,
+      "acceptance_proof_dir": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/9380a7a09d1141bab7f0df6465b8f390/acceptance/proof-1",
+      "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+      "complete_proof_ms": 50234.351875,
+      "timing_sha256": "40c4e43a819d892853818ca20ecf2987e6a27f89b84283ccfafda0738ca01232"
+    },
+    {
+      "log_begin_line": 1591,
+      "prestart_ms": 0.488,
+      "cpu_ops_ms": {
+        "interpolate_ntt": 81.699,
+        "zk_shift": 138.31300000000002,
+        "expand_evaluate_ntt": 349.15799999999996,
+        "bit_reverse": 8.685,
+        "hash_rows": 9368.423000000003,
+        "hash_fold": 2599.174000000001,
+        "evaluate_any": 174.543,
+        "mix_poly_coeffs": 79.795,
+        "fri_fold": 10.758000000000001
+      },
+      "go_ms": {
+        "constraint_system_load": 343.302833,
+        "proving_key_load": 333.711292,
+        "witness_wait_and_decode": 13783.879291,
+        "proving": 4371.347167,
+        "key_load_total": 677.014125
+      },
+      "poly_groups": [
+        {
+          "group": "data",
+          "ntt_ms": 275.2,
+          "merkle_ms": 8201.3
+        },
+        {
+          "group": "accum",
+          "ntt_ms": 28.4,
+          "merkle_ms": 1739.3
+        },
+        {
+          "group": "check",
+          "ntt_ms": 30.8,
+          "merkle_ms": 1740.2
+        }
+      ],
+      "eval_check_ms": 1126.8,
+      "identity_prove_ms": 14044.002,
+      "log_identity_end_line": 1733,
+      "rust_witness_write_ms": 320.14300000000003,
+      "prestart_and_wrap_ms": 18970.165334,
+      "top_level_ms": {
+        "identity_p254": 14044.5,
+        "get_seal": 0.0,
+        "shrink_wrap": 4926.0,
+        "total": 18970.5
+      },
+      "log_finish_line": 1739,
+      "components_ms": {
+        "poseidon254_hash_ms": 11967.597000000003,
+        "merkle_hash_rows_ms": 9368.423000000003,
+        "merkle_hash_fold_ms": 2599.174000000001,
+        "transform_ms": 842.951,
+        "eval_check_ms": 1126.8,
+        "transform_eval_ms": 1969.751,
+        "other_identity_ms": 106.65399999999704
+      },
+      "wrap_other_ms": 234.50983300000007,
+      "acceptance_proof_dir": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/9380a7a09d1141bab7f0df6465b8f390/acceptance/proof-2",
+      "verification_sha256": "0631e8f936e42fd3f311af142371e063c79274b6da1e345dc508ca53cc7c201e",
+      "complete_proof_ms": 51257.527167,
+      "timing_sha256": "fb5057192b05e3a886d25133aa55d48a57d1bb184586c031131bd7365b476f95"
+    }
+  ],
+  "overlap_note": "Go CS/key loading starts during identity and is not added to wrap wall time. Go loadWitness includes its blocked wait for identity and Rust streaming, so its 13-19 s span is not counted as witness computation. Rust witness writing and Go proving are the comparable wrap components; independent durations must not be summed as serial wall time.",
+  "collector_sha256": "bf195d72c4dca67c15227fbd522c81a0c6129c770b79d952be6b7d546219888a"
+}

@@ -1,0 +1,2598 @@
+{
+  "milestone": "Native WorkerPool one-stage Metal proving with independent Groth16 verification and recovery",
+  "date": "2026-10-31",
+  "miner": {
+    "path": "/Users/dbur/dev/zk-miner",
+    "parent_commit": "3b2720110c1721a53d19c09a6ff2a16235aeb9be",
+    "milestone_commit": "containing commit",
+    "implementation_built_from_uncommitted_working_tree": true,
+    "build_source_identity": "Archived source-input hashes bind the worker and acceptance executables before the containing local commit.",
+    "branch": "codex/hemi-macos-metal"
+  },
+  "engine": {
+    "path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+    "head": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+    "pinned_base": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+    "changed_this_milestone": false,
+    "working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "unchanged_verifier_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+  "hardware_baseline": {
+    "reference": {
+      "path": "docs/macos/evidence/baseline.json",
+      "sha256": "bddc7ebe0bc75acbd8ceb8d934cf58e3546da8d7b91680672eb5e660e07e77a9",
+      "bytes": 3136
+    },
+    "observed_hardware": {
+      "physical_memory_bytes": 137438953472,
+      "logical_cpus": 18,
+      "metal_devices": [
+        {
+          "max_buffer_bytes": 86586540032,
+          "supported_family_ids": [
+            1001,
+            1002,
+            1003,
+            1004,
+            1005,
+            1006,
+            1007,
+            1008,
+            1009,
+            1010,
+            2002,
+            5001,
+            5002
+          ],
+          "unified_memory": true,
+          "name": "Apple M5 Max",
+          "recommended_max_working_set_bytes": 115448725504,
+          "currently_allocated_bytes": 65536
+        }
+      ],
+      "active_cpus": 18
+    }
+  },
+  "root_lock": {
+    "artifact": {
+      "path": "Cargo.lock",
+      "sha256": "75d710409c3107e465ca0520bb7c551e8027c47ecb7c8e3b13d9b106cad5c6b9",
+      "bytes": 284247
+    },
+    "external_package_versions_and_sources_unchanged": true,
+    "workspace_dependency_changes": [
+      {
+        "package": "zkminer-prove-risc0",
+        "version": "0.1.0",
+        "added_dependencies": [
+          "metal",
+          "risc0-zkp",
+          "serde_json",
+          "sha2"
+        ],
+        "removed_dependencies": []
+      }
+    ]
+  },
+  "summary": {
+    "finalized_runs": 4,
+    "explicitly_executed_acceptance_tests": 8,
+    "ignored_tests_skipped": 0,
+    "all_selected_runs_passed": true,
+    "complete_independently_verified_proofs": 7,
+    "negative_verification_rejections": 21,
+    "complete_metal_proofs": 5,
+    "complete_cpu_proofs": 2,
+    "deliberately_incomplete_requests": 2,
+    "unexpected_failed_runs": [],
+    "completed_metal_commands_in_successful_proofs": 970,
+    "completed_metal_commands_in_deliberately_incomplete_requests": 388
+  },
+  "public_output_comparison": {
+    "matched": true,
+    "fields": [
+      "image_id",
+      "elf_sha256",
+      "input_sha256",
+      "journal_hex",
+      "po2",
+      "stats"
+    ],
+    "proof_bytes_compared": false,
+    "expected": {
+      "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+      "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+      "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+      "journal_hex": "6d1a000000000000",
+      "po2": 18,
+      "stats": {
+        "paging_cycles": 16300,
+        "reserved_cycles": 13152,
+        "segments": 1,
+        "total_cycles": 32768,
+        "user_cycles": 3316
+      }
+    }
+  },
+  "startup_and_mode_checks": {
+    "test": "native_worker_mode_preflight",
+    "evidence": "Each finalized passing run executed both ignored tests explicitly; source-bound test inputs and test.log are archived.",
+    "common_cases": [
+      "explicit CPU warmup",
+      "invalid mode rejection",
+      "development mode rejection",
+      "skip-verification rejection",
+      "malformed staging budget rejection",
+      "4095-byte budget rejection",
+      "16777217-byte budget rejection"
+    ],
+    "build_specific_cases": {
+      "cpu": [
+        "auto reports CPU fallback",
+        "CPU-only build rejects forced Metal"
+      ],
+      "metal": [
+        "auto selects Metal"
+      ]
+    },
+    "additional_real_pool_checks": [
+      "selected capabilities",
+      "protocol version mismatch",
+      "missing helper context",
+      "valid guest execution",
+      "invalid guest rejection",
+      "one risc0:generic slot"
+    ]
+  },
+  "build_seals_by_artifact_sha256": {
+    "aba024a8849aa91e3b3c70e15362f4d32acd5b48f002304c44471e5a32ae90c6": {
+      "kind": "worker",
+      "contents": {
+        "source": {
+          "kind": "metal",
+          "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+          "engine_path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+          "engine_head": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+          "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "config_path": "/Users/dbur/dev/zk-miner/target/macos/local-engine.toml",
+          "inputs": {
+            "Cargo.lock": "75d710409c3107e465ca0520bb7c551e8027c47ecb7c8e3b13d9b106cad5c6b9",
+            "Cargo.toml": "6d62c06c33b867de1177afe1b4f220f70557e87e9175e3bd7574e56d0d66fed2",
+            "crates/zkminer-prove-risc0/Cargo.toml": "5815dcb5a50523ffd4c17b0ab9858e7eb75d85d95049d459e07b600bce62d7b2",
+            "crates/zkminer-prove-risc0/build.rs": "a6311821df1d5d69671acb372ca5c6a6608df3789d7cd9113975ba6d99ea1ac6",
+            "crates/zkminer-prove-risc0/src/macos.rs": "1869c4409bea90d0dde1de1610e9a60b31bb1ba8436cb96ee7a27aea44fa7bac",
+            "crates/zkminer-prove-risc0/src/macos_metal.rs": "0362e42524cdb32b269019ec99965308bf5f4812d4b8576fec138d16c1b47f05",
+            "crates/zkminer-prove-risc0/src/main.rs": "f8c0f568959c888b551ca1156d58e9ea329b0d0c02a9ca35e913545f1376ecdc",
+            "crates/zkminer-prover-protocol/Cargo.toml": "a646a1d0024007d0172aa8a1b4efb5ebc1b5df2364950d5475279ee6250dbdcd",
+            "crates/zkminer-prover-protocol/src/codec.rs": "70543a49b7d6c4df969ec05033bbcf934c450d8cdfcf261ced7536b3e0145f86",
+            "crates/zkminer-prover-protocol/src/lib.rs": "540d80cbfc01cb62c5e0c6ad2c6309088c22dbef52f309417dd745ec44225b6b",
+            "crates/zkminer-prover-protocol/src/proc.rs": "5b1bba5de4b31c09eb07510f2480e57b82b5d65ac4d480142e0e7d4c4c06af10",
+            "crates/zkminer-prover-protocol/src/types.rs": "684640701892d81adc2f3d717d5c61bd4f1f434d2ef3e8bc72165f19dd6fea89",
+            "rust-toolchain.toml": "f0815f7685d7aff345137c830314cf78d4d0dc7bc71328561fc6823b7fbb23cb",
+            "scripts/macos/build-worker.py": "4e88a75998440e33f65ebee0f7b51c310e1e33bb9a8990c58878686b4d57fedb",
+            "scripts/macos/check-source.py": "74984a609430d8f1f03c2720cd775a308b50455f0ba79a421d3d421595143605",
+            "scripts/macos/env.sh": "7f6f9a87ba5b1915d427ca59de1a2930cb23f24af6c39b273f44350902a1afe4",
+            "scripts/macos/local-engine.py": "b3045c21b11c7a0aa32b9cc9909bccb587bf5ab30f06539f3cf09a4a015244c4",
+            "scripts/macos/worker_provenance.py": "8c82109dd115ed12a6f0685630462f9c034245784cff65d468009f0e665995d0",
+            "target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/sha256-chain.bin": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+            "target/macos/local-engine.toml": "4ceec928b625b49cb87d71dd9300c145468afd84fdf570b4f96b34e64bb1e881"
+          }
+        },
+        "build_environment": {
+          "RUSTFLAGS": null,
+          "CARGO_ENCODED_RUSTFLAGS": null,
+          "DEVELOPER_DIR": null,
+          "TOOLCHAINS": null,
+          "SDKROOT": null,
+          "CC": null,
+          "CXX": null,
+          "CFLAGS": null,
+          "CXXFLAGS": null,
+          "AR": null,
+          "RUSTC": null,
+          "RUSTC_WRAPPER": null,
+          "RUSTC_WORKSPACE_WRAPPER": null,
+          "CARGO_BUILD_JOBS": "6",
+          "CARGO_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/cargo",
+          "RUSTUP_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/rustup",
+          "RISC0_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/risc0",
+          "ZKMINER_RISC0_GUEST_DIR": "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release"
+        },
+        "binary_sha256": "2c3bf297141cdf9623a8d997d0fcdf560ef0e547fd51531c5a179f3de97329f4",
+        "metadata_sha256": "29b0ceb48fb00b263d4bb90ec6553bb6152a4336a82cae029e2eaa27bf8a1308",
+        "local_lock_sha256": "64b6b7b23485b9494f941ef552701301ca14024aa45d2d403c67c43d5a30720e",
+        "host_toolchain": "1.93.0"
+      }
+    },
+    "1ab288cd09cf291d78a9478220f81ac8150f617aef72539269fb6666152b60ca": {
+      "kind": "verifier",
+      "contents": {
+        "source": {
+          "kind": "verifier",
+          "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+          "inputs": {
+            "scripts/macos/proof_provenance.py": "5e6b2950433da2c24ed8166e46c22f3f4b7ebcc198cbc2a9141a9bae704c4f59",
+            "scripts/macos/env.sh": "7f6f9a87ba5b1915d427ca59de1a2930cb23f24af6c39b273f44350902a1afe4",
+            "scripts/macos/check-source.py": "74984a609430d8f1f03c2720cd775a308b50455f0ba79a421d3d421595143605",
+            "target/macos/unchanged-verifier/Cargo.toml": "9445d02008b6349ac9f1832acc00ac1a68b70b200d0a2382c05e5d361f20a29a",
+            "target/macos/unchanged-verifier/Cargo.lock": "8c494780d49a95aaeec068d2c516aea1743c4f14ceb31dff00625deee97cc17e",
+            "target/macos/unchanged-verifier/src/main.rs": "b520205c2582fad43555ae443eb6c636f03bd5a3fd642b4f5f1b004a33bb91e0",
+            "tools/macos-proof/Verifier.Cargo.lock": "8c494780d49a95aaeec068d2c516aea1743c4f14ceb31dff00625deee97cc17e",
+            "scripts/macos/build-verifier.sh": "3cd88f4b460084926cde536c737fe3b2e9ebd3a85f93e8121b15252b47f21530"
+          }
+        },
+        "build_environment": {
+          "RUSTFLAGS": null,
+          "CARGO_ENCODED_RUSTFLAGS": null,
+          "DEVELOPER_DIR": null,
+          "TOOLCHAINS": null,
+          "SDKROOT": null
+        },
+        "binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+        "metadata_sha256": "0f87d4511d814f6ee25b2a33a391792fa541412789761600c67678e535b6c5bd",
+        "host_toolchain": "1.93.0"
+      }
+    },
+    "00f42fbeb8a306150a0263de1ee176233d854f9cf57b4f00a1e3a75b4325254a": {
+      "kind": "acceptance",
+      "contents": {
+        "source_inputs": {
+          "Cargo.lock": "75d710409c3107e465ca0520bb7c551e8027c47ecb7c8e3b13d9b106cad5c6b9",
+          "Cargo.toml": "6d62c06c33b867de1177afe1b4f220f70557e87e9175e3bd7574e56d0d66fed2",
+          "crates/zkminer-config/Cargo.toml": "17b097097a9837b87d2eeb2caf943d24c30ca72c7d67041a60d4bcabca9bc958",
+          "crates/zkminer-config/src/config.rs": "4ba88192cc5734f198d3b5b325ade825bf481a0b1a0beb377750fca03b854aa1",
+          "crates/zkminer-config/src/lib.rs": "a8541f79fdf60bec1640500402b8ed60120f338835634463e85af14d2c06fd0e",
+          "crates/zkminer-config/src/wallet.rs": "92a27b38933ca168d312019433c42fda84a4beb16be465553fa89f9a011916ec",
+          "crates/zkminer-prover/Cargo.toml": "d6d07731e7f0bacd47536bc910f23e4499e4a424ac7e7b7bc863eff359655f7c",
+          "crates/zkminer-prover/build.rs": "199b21e7fdf3d8ab730a5c767e20b1b65ef2aeaf32cc6dcbba962caf4d6c0ec2",
+          "crates/zkminer-prover/guests/openvm/bigint-mul/Cargo.toml": "9faa0332214318fd18f7f56dc921f3aa083171385719eef1d61d6f70a839058e",
+          "crates/zkminer-prover/guests/openvm/bigint-mul/src/main.rs": "21aacf29aba0d1195d58b26c8459fbbf17cbb5a4e3adb682e42ae4ff316ba5ad",
+          "crates/zkminer-prover/guests/openvm/chacha-mix/Cargo.toml": "bea96340598bbcfd78a5a1d10349479238ff0c8a1241b542eca0f0aafeb0f191",
+          "crates/zkminer-prover/guests/openvm/chacha-mix/src/main.rs": "06c885f05c1901fc670987a63e3c979dd689ae2d255b2d6ecacb10e9cec89d5d",
+          "crates/zkminer-prover/guests/openvm/ecdsa-verify/Cargo.toml": "b6120b321883044e374f53f556cc033340e3212d93d24e382fe55101f0d35ae3",
+          "crates/zkminer-prover/guests/openvm/ecdsa-verify/src/main.rs": "f2e9c2e4157bc3fe10cea11c0b797a16cbf3e9ff05ab694f3570fa165e302ded",
+          "crates/zkminer-prover/guests/openvm/fibonacci/Cargo.lock": "486b912298ba0bae2bd85b3cd4338f71de14c221e97b043b1e8a6d9e27a052d4",
+          "crates/zkminer-prover/guests/openvm/fibonacci/Cargo.toml": "1d38f8e4444fcaa1109581257d75f9ab57253ff1647521f95d40a81f5d587bd8",
+          "crates/zkminer-prover/guests/openvm/fibonacci/src/main.rs": "387045e7b11e19bed25e5f73d311aae8ac9bf78bf337a60016844651369a239b",
+          "crates/zkminer-prover/guests/openvm/memory-merkle/Cargo.toml": "cd43ff7d690ca9aeab646616828ff23cd26df7a35ce641a7fd4940a1fb848c2f",
+          "crates/zkminer-prover/guests/openvm/memory-merkle/src/main.rs": "4459c0f8fbe558571f500a58d4ab02e4da804f95816b14c92449b765a588fb0c",
+          "crates/zkminer-prover/guests/openvm/sha256-chain/Cargo.toml": "ebb6b7a3825b7edbcdd1b784dfb6f2c4aca08aa555e595bb5dd614f773b49cc8",
+          "crates/zkminer-prover/guests/openvm/sha256-chain/src/main.rs": "3adc8ce21f80f74b5b484786b5bc1cd9b8254e48e2c6855d23b79e472552cf5e",
+          "crates/zkminer-prover/guests/openvm/sha256-merkle/Cargo.lock": "bdf5bad508bda152c9a6c9703c03ffa2b44569a25d0b0120238b008e17892333",
+          "crates/zkminer-prover/guests/openvm/sha256-merkle/Cargo.toml": "d4ef3465c9180255303a051431f5894f43ed57f3f7200d3e1954f0fc6068fc55",
+          "crates/zkminer-prover/guests/openvm/sha256-merkle/src/main.rs": "48d25a058075d4582d27c79b95f1292ae9a9dd168b90f68152aa94b1c3a30159",
+          "crates/zkminer-prover/guests/risc0/babybear-stress/Cargo.lock": "1de23568c2fb6910ecf0717741bfe137e5b49097c4514fd44c62f7cec657250d",
+          "crates/zkminer-prover/guests/risc0/babybear-stress/Cargo.toml": "49e1557dcf9d62c0ac6fe300e7dd48823f7ba34280a61ffe3400f25d8288acce",
+          "crates/zkminer-prover/guests/risc0/babybear-stress/src/main.rs": "be066a4766644f837c784012b93e7baeaca9286dd69426af3c44dcb1ecf2e3ff",
+          "crates/zkminer-prover/guests/risc0/bigint-mul/Cargo.lock": "59472874edc8b54189cc940e89ad6aff20a054147afcce5794a35261ddef5ab3",
+          "crates/zkminer-prover/guests/risc0/bigint-mul/Cargo.toml": "d881bb198db26d32a3b2fa7ba2d7bbca2c040e976ddce8a60c4ea1017141a681",
+          "crates/zkminer-prover/guests/risc0/bigint-mul/src/main.rs": "220733b8e68c7708b588cc506d2303a75c9715b6a358a1957695a29300d5b50f",
+          "crates/zkminer-prover/guests/risc0/chacha-mix/Cargo.lock": "a71cf953bdbbaea974dc6a6d8795fc0a791b9fbee88552e28cc69dc250edf635",
+          "crates/zkminer-prover/guests/risc0/chacha-mix/Cargo.toml": "0813dca917d1ff2fec1c5652e78a40f878493ce1de5aea5b24c809398bb7b891",
+          "crates/zkminer-prover/guests/risc0/chacha-mix/src/main.rs": "44d99e59a773ba1ac3e09f8c9eff0065bacadaf383bed20f604ccb1116898e70",
+          "crates/zkminer-prover/guests/risc0/ecdsa-verify/Cargo.lock": "a1bc35973ddd3bc6ab704b3f428c8653c687c64e08bf40b4e92b6baaff9b4e97",
+          "crates/zkminer-prover/guests/risc0/ecdsa-verify/Cargo.toml": "28c1d834be2516529cee0e0a52dd75afc3e80619e0dba66202e8bd0792157e2b",
+          "crates/zkminer-prover/guests/risc0/ecdsa-verify/src/main.rs": "6733c7eb597c364a42de0fb7890dab89520f49252c78d50894f759e70df2d128",
+          "crates/zkminer-prover/guests/risc0/edge-case-arith/Cargo.lock": "ac7b761b23a0cc8247edcf8dc97eff4fff00493d0d543df8d1b9f3422453d531",
+          "crates/zkminer-prover/guests/risc0/edge-case-arith/Cargo.toml": "bf65dc146b84fad021619a6e4a664a6870f197cfa52e5aae9bf8580a73eac767",
+          "crates/zkminer-prover/guests/risc0/edge-case-arith/src/main.rs": "1b418066f8260ff66068f6cd9056b5f1db9bab203faa718bdd4028a24bbc2eb7",
+          "crates/zkminer-prover/guests/risc0/fibonacci/Cargo.lock": "b40e81865bfb9c8fad24819b4792665454d779ec86797ecc0440b4842769d11c",
+          "crates/zkminer-prover/guests/risc0/fibonacci/Cargo.toml": "1e0c7898b3d484d59fe26367979d76882308a12b730a09e5bf6fc87ff1bbac2f",
+          "crates/zkminer-prover/guests/risc0/fibonacci/src/main.rs": "6752e729c1b54d846d2e295e4736ea6d4d6729421e86c13b993dfb62b6741a34",
+          "crates/zkminer-prover/guests/risc0/memory-merkle/Cargo.lock": "ecac1684326d3b4e4b67652bdb78d31c4568f1e6f098957aa473eeaa30ffbf9e",
+          "crates/zkminer-prover/guests/risc0/memory-merkle/Cargo.toml": "9ff6fd138e2cde69de3e8af89b569102e231d63e2e52ded96b2461445877d6c0",
+          "crates/zkminer-prover/guests/risc0/memory-merkle/src/main.rs": "0bd9819edb1ed8793f88b7a41419dd1e9193575a70615e57af173292917ef16d",
+          "crates/zkminer-prover/guests/risc0/memory-stress/Cargo.lock": "0fee7401f9ba1d72cc468530b6a011f557009ea7ddb1df8978ca1bb242af28b6",
+          "crates/zkminer-prover/guests/risc0/memory-stress/Cargo.toml": "bcf6fd1773273b62bb074346d758720d5fc558c7b1503aafe7a969ab03c7f43e",
+          "crates/zkminer-prover/guests/risc0/memory-stress/src/main.rs": "4f0e75ec0306e658decc54d952608f93f23e07cec6fbb21d5187b1aca205181c",
+          "crates/zkminer-prover/guests/risc0/minimal-proof/Cargo.lock": "a4531e603cfeb598f016ca1d542686fd36ebf3561cd9e44c50cf1a76b536de92",
+          "crates/zkminer-prover/guests/risc0/minimal-proof/Cargo.toml": "6a053502e9b0a09351a47f7de9e068d23ae1243acefd8bdb8dfd06c9428c0c29",
+          "crates/zkminer-prover/guests/risc0/minimal-proof/src/main.rs": "15ad6cf4134b167f65b0ca29f8aa717a405bda61377614c3e9985c3094ef1ed7",
+          "crates/zkminer-prover/guests/risc0/precompile-interleave/Cargo.lock": "c28e07b4ebd8b21f155c5273d9baa7afe1b6ff66b796ac72cde1faa25e0f691e",
+          "crates/zkminer-prover/guests/risc0/precompile-interleave/Cargo.toml": "daa3978a0187ba09f6df3291e82b21930eaaae1f44b511f524644da5dbb6300c",
+          "crates/zkminer-prover/guests/risc0/precompile-interleave/src/main.rs": "58ed99db1f51040c8934e836f3e5888ca0c366b553e00c9312724d2aaf9a9707",
+          "crates/zkminer-prover/guests/risc0/rv32im-torture/Cargo.lock": "51f2856a35a36b8910a74b9ca435fc32786cc98b85730da88b316ebd71afa888",
+          "crates/zkminer-prover/guests/risc0/rv32im-torture/Cargo.toml": "126045162f6900cc6b8db6baf093dfc125413c46f4987ca426a19ec09e6fe29e",
+          "crates/zkminer-prover/guests/risc0/rv32im-torture/src/main.rs": "63723230237c3c64e4d0ef83b4adf8dbe4a0235af2114cc3d2de3e9ebc6fac00",
+          "crates/zkminer-prover/guests/risc0/segment-boundary/Cargo.lock": "20d2ef2a2f3e4d62bdc40b76bc3e3dfe7ed378e458f492418b40a2c92885fde0",
+          "crates/zkminer-prover/guests/risc0/segment-boundary/Cargo.toml": "5adcc0b03b3eafb8d0342f6069b9f5ae13e6b6fb0bcabfb202ed7bea0ce04a6a",
+          "crates/zkminer-prover/guests/risc0/segment-boundary/src/main.rs": "cde4b9571111160e4a3aefe7258d0c482a9102fbb099e0a20d069904668b5e57",
+          "crates/zkminer-prover/guests/risc0/sha256-chain/Cargo.lock": "7b0ea8a9588a03eb37b98178a99efc1e53f00a2e07159828d5ca9dd74baa18d7",
+          "crates/zkminer-prover/guests/risc0/sha256-chain/Cargo.toml": "eb904012ac6f0c82d37a175d8680d56e1e6596e948b433ef67626b5fabf28118",
+          "crates/zkminer-prover/guests/risc0/sha256-chain/src/main.rs": "afacd42ea25c94ead76dc88a364785801b9d094bc58a4c54f378f764112f6c3d",
+          "crates/zkminer-prover/guests/sp1/bigint-mul/Cargo.lock": "a300151829ce04a2a1f2156cb108db2de4e568e5067cbae0b39a4a8015ff6e59",
+          "crates/zkminer-prover/guests/sp1/bigint-mul/Cargo.toml": "773b816417b1ba465d44f8d855b193faaaf42052924bd3e47916f7eddf03aaaa",
+          "crates/zkminer-prover/guests/sp1/bigint-mul/src/main.rs": "169e9f5322a26f1eabe6717c851e734d119e40f863421122e7659b149b96b441",
+          "crates/zkminer-prover/guests/sp1/chacha-mix/Cargo.lock": "864259a51bb1cd79b3e71b673cc86352b85405aaf8868d9f7d3357f37f1ff22b",
+          "crates/zkminer-prover/guests/sp1/chacha-mix/Cargo.toml": "6a36d39e036f2e8940b0202ed145851c7428ef84a056e11b1fdec9effaa7c3b6",
+          "crates/zkminer-prover/guests/sp1/chacha-mix/src/main.rs": "044d819535d699df882c3916e26c17f50499fd8b385c1548bb86f8945c29ab38",
+          "crates/zkminer-prover/guests/sp1/ecdsa-verify/Cargo.lock": "dfdc89108c54be54b67a1a97cab1e06074ee5b7f94e004f032bdebe714dc903c",
+          "crates/zkminer-prover/guests/sp1/ecdsa-verify/Cargo.toml": "dc9445e364289941c43eceb3f9b8b0fb34baf69415ef33e987ccf1c15d8c3dd2",
+          "crates/zkminer-prover/guests/sp1/ecdsa-verify/src/main.rs": "3916c9ddd4989566c385acc3c168ee01b97290fb784f18c7714523637cc0fcbf",
+          "crates/zkminer-prover/guests/sp1/edge-case-arith/Cargo.lock": "24c49568eb0a63a4f50eb8781d0f8fbdef9efa1e2b1c50bb01fd38225f1a09df",
+          "crates/zkminer-prover/guests/sp1/edge-case-arith/Cargo.toml": "5e9467c6f873f2168e2f9766672a3e92fd914e8246aa860045a94d505c2eeb28",
+          "crates/zkminer-prover/guests/sp1/edge-case-arith/src/main.rs": "367fce463098cf5794ebf414666362fdd6941061743c027836fbe4199002be1f",
+          "crates/zkminer-prover/guests/sp1/fibonacci/Cargo.lock": "50263dc9cd15dc1530660a59b2e658ce2fd9f8b857e019cd0900a48dd3609d35",
+          "crates/zkminer-prover/guests/sp1/fibonacci/Cargo.toml": "a9a6f5a3d8889d011247adf2f05e25789e7dd01f7c6f441eb189c62c71d656dd",
+          "crates/zkminer-prover/guests/sp1/fibonacci/src/main.rs": "ef9c485048aadb2ae17decd756ebec482e56d7aa81132b2d92e245f5fdc5369a",
+          "crates/zkminer-prover/guests/sp1/memory-merkle/Cargo.lock": "40c8a65c0f64a090d314a530c852c10210ef46016637026118be8cac3730ff8d",
+          "crates/zkminer-prover/guests/sp1/memory-merkle/Cargo.toml": "cc5850d4b27650d58c79306c753c2d8d4afffa279d1b183aa56ba5be0902406b",
+          "crates/zkminer-prover/guests/sp1/memory-merkle/src/main.rs": "75531151765bd65da2ffdcbd6e9c35dd767a96097bc0de61293bfd8fa05f14e1",
+          "crates/zkminer-prover/guests/sp1/memory-stress/Cargo.lock": "70e74fc5ea7e8255c1956e960c01e9d0a1dc706aebd9a7337f471f8490f75ea0",
+          "crates/zkminer-prover/guests/sp1/memory-stress/Cargo.toml": "172bf970964325a2c6b32df9a166b239aa672cf6eff267a4660763e84958b4dd",
+          "crates/zkminer-prover/guests/sp1/memory-stress/src/main.rs": "0db849f5c6f97708c6e170e52cbc1bba919c60a88f1264dbce7710db62acab98",
+          "crates/zkminer-prover/guests/sp1/minimal-proof/Cargo.lock": "ba2f6c7731ccbf184c86e5401f4881229be5b317871b6c3e9291a479632c8951",
+          "crates/zkminer-prover/guests/sp1/minimal-proof/Cargo.toml": "0d181a89b56b41321967b37cad26e548487cfd16e676bc29058d3b141cde916b",
+          "crates/zkminer-prover/guests/sp1/minimal-proof/src/main.rs": "c952f9ea3a3908acdcbe8dd8a99a7e740aac80887f228a4b18630b11e2e073ea",
+          "crates/zkminer-prover/guests/sp1/precompile-interleave/Cargo.lock": "54e5fd37c6c41374fe954e5a2c7dd3e1de0111d1cdaa2f07610a235fa98daab7",
+          "crates/zkminer-prover/guests/sp1/precompile-interleave/Cargo.toml": "26c5b98dd11270fec2f01e363a66275934ad7ce347f2623c3e8a59b2851d850f",
+          "crates/zkminer-prover/guests/sp1/precompile-interleave/src/main.rs": "8a8cac99ca204a3401175e07a807fe6270f551bb67d9832d2b45c0189ad34a6e",
+          "crates/zkminer-prover/guests/sp1/rv32im-torture/Cargo.lock": "158145d53218212aebb620d0d87ffd475b15ab2ce7950d70f96e581c16706a36",
+          "crates/zkminer-prover/guests/sp1/rv32im-torture/Cargo.toml": "cb869ef56f27a6f8a3ed2be5c28589474ecb3212a9887ab5a62d6a25de478484",
+          "crates/zkminer-prover/guests/sp1/rv32im-torture/src/main.rs": "392c645f45d5110d80b3ef9f367db55741115016550e5c5fc04913148b4b6fcf",
+          "crates/zkminer-prover/guests/sp1/segment-boundary/Cargo.lock": "2493f2c862fdfac5d4d92d3110f37eec6c48b544bf3d704a228dc488527dc036",
+          "crates/zkminer-prover/guests/sp1/segment-boundary/Cargo.toml": "693b4e33949e724b34c96a521f25c68220af7fb4ef8e4127d7ef7c9c2c7db849",
+          "crates/zkminer-prover/guests/sp1/segment-boundary/src/main.rs": "e0e8bab0149de2a1cebdbc03feb6220e0a33d17cdcec72a64cbab1f1975a434a",
+          "crates/zkminer-prover/guests/sp1/sha256-chain/Cargo.lock": "b7a25760ea668556ba0c0a9cd6b71a3b38c8d504a211c2572eadaac648d43297",
+          "crates/zkminer-prover/guests/sp1/sha256-chain/Cargo.toml": "b95b88325ac1eecc5018ce29ab18944ebee9a41edc663b8988ee301746daa1b0",
+          "crates/zkminer-prover/guests/sp1/sha256-chain/src/main.rs": "c474afdce4efa3a66c4114e93e7f49adbb13ea8de5c17227cbc0acecdf2f7bea",
+          "crates/zkminer-prover/src/benchmark.rs": "329c098dc6f691eb105471fc6c1e8f90e61c479f5cf16028ace3742d525ef3fc",
+          "crates/zkminer-prover/src/bin/mock_worker.rs": "fc388d58ba5a08712f7e084dea50cf4dcf04d74b44f3a50a0fae9fe0866d951b",
+          "crates/zkminer-prover/src/descriptor.rs": "197a0e7cb46746082c5d1f94f43c7783fed55726931a31117d30d3c30e0c9f1e",
+          "crates/zkminer-prover/src/discovery.rs": "505f7f93239e176566ff920d1c2bbef7f31a901e1bd5afd373ce89a9b9f6591b",
+          "crates/zkminer-prover/src/dispatcher.rs": "25c5afddee639207f7555e29f553beefe648b18167ee6e0f845eb851ddbae0eb",
+          "crates/zkminer-prover/src/engine.rs": "9a17cc27972bed2980ff2311f914b3380a8d99c6fdbeeaf9bbbdbb91bb07efaa",
+          "crates/zkminer-prover/src/gpu_code.rs": "26e0db67bfddaa9769d1d7e54fc95339cab78d7e5fa3c7d044e007c6ee047bfc",
+          "crates/zkminer-prover/src/lib.rs": "d72b5fc0866a029f0116094e4c37ca102b294da221cb74ed1c6e4e66ac787f76",
+          "crates/zkminer-prover/src/macos.rs": "3fa22b3da69f36fa7ef024398be75c78930383ece253de4147bce4d57b1a0eac",
+          "crates/zkminer-prover/src/memory.rs": "8a6db9267b6cb129e0de3ae02e9d6524c636f3a8a0df8b9d9d12672f351d3891",
+          "crates/zkminer-prover/src/openvm.rs": "533f0d6ec6641579be0c935aefbeb08e2fe35d9f898561957e7bc6c2950bfdfc",
+          "crates/zkminer-prover/src/registry.rs": "6f8a32ecec7f1dd6cdbba8f1ceee7845ba9ef6ab15b5493cb335a07546d4907a",
+          "crates/zkminer-prover/src/risc0.rs": "af5ea20336b588f2c7f3e2ce4e808338659e0ec59a901a950117936d06d44f37",
+          "crates/zkminer-prover/src/sp1.rs": "b605f366e11138222478cfd4b8cf0288b5c240bb8058b710bd01367e8ff3e6d4",
+          "crates/zkminer-prover/src/worker.rs": "4c304e35b0ae843bdf0ed2e264b25b51bea1161e612bbd228b0d3722c7470011",
+          "crates/zkminer-prover/tests/backoff_dispatch.rs": "76f2eb4c6d6b3613f55eee4f2e47b0d6247006abb49de0f4f2f023e6a51b3347",
+          "crates/zkminer-prover/tests/comprehensive_zkvm_test.rs": "c7d391d2cd3b43ec8909c2c803a748b30d5b1be49d47b6ee82371cb67289b2e9",
+          "crates/zkminer-prover/tests/cross_backend_host_ram.rs": "462eb20060209f3d1de3ba2a81b786121095f5444e5b078c4a94e6b1f284876a",
+          "crates/zkminer-prover/tests/cross_backend_vram.rs": "9bb3445570fb46811e53e123c48956618abbab43bb0535c85a0f26b406e8e1c4",
+          "crates/zkminer-prover/tests/macos_worker.rs": "ec53e82d04e1afa13ff237be44cd3bf9599dd930feeca0a9d6b5b8e7f3ce4a3a",
+          "crates/zkminer-prover/tests/oom_routing.rs": "a1783defedaee456711311d7c43b0fbda297f796f9e442257f52434c59de6feb",
+          "crates/zkminer-prover/tests/orphan_reaping.rs": "4399619b46f6326522127af583427dde5cde3cb35878fbbbf7b04876c52f4c93",
+          "crates/zkminer-prover/tests/proof_format_test.rs": "e25f0a75ce7550295255001990185f888dfe40f379dcb6b09776b71acb0d9fa9",
+          "crates/zkminer-prover/tests/risc0_groth16_vram.rs": "5b0c9235cd054f0c1bc20c1e09a9b424d4459caf97b72af9f107e34dac7024f6",
+          "crates/zkminer-prover/tests/rocm_sha256_regression.rs": "46e2fc12dc7d4aa545a8c07d7aff4a9e692a00a83e21d38b58e3105b3b75a2f4",
+          "crates/zkminer-prover/tests/sha_bisect.rs": "ba8f09c086346c88782e5e0df5d498bc9cbdd7a586570e156b8ab26f0597d9cc",
+          "crates/zkminer-prover/tests/sp1_large_proof.rs": "b5e295c70375aad310339c0685a9ba328b1b8ac12422868e474a1d195a46ec0c",
+          "crates/zkminer-prover/tests/sp1_proof_test.rs": "8d8c897726665c8e7511dfa7f32ffd2fd112e6e61532cfb61a29b2a0ecb1256f",
+          "crates/zkminer-prover/tests/sp1_warm_slot_vram.rs": "64b294202a2ae116a0375dc09d2d81e8fe54468f93b46e1cf75ecf7f5d154080",
+          "crates/zkminer-prover/tests/sp1_warmup_live.rs": "ed35739b40ecb365dc84b13e6636f51a5d2e7e72858ad12402139eee40d73934",
+          "crates/zkminer-prover/tests/worker_lifecycle.rs": "ced2cc33280b97b81c785a3b22aeb1aecc63b8409dd4f1710411979cd261c694",
+          "crates/zkminer-prover-protocol/Cargo.toml": "a646a1d0024007d0172aa8a1b4efb5ebc1b5df2364950d5475279ee6250dbdcd",
+          "crates/zkminer-prover-protocol/src/codec.rs": "70543a49b7d6c4df969ec05033bbcf934c450d8cdfcf261ced7536b3e0145f86",
+          "crates/zkminer-prover-protocol/src/lib.rs": "540d80cbfc01cb62c5e0c6ad2c6309088c22dbef52f309417dd745ec44225b6b",
+          "crates/zkminer-prover-protocol/src/proc.rs": "5b1bba5de4b31c09eb07510f2480e57b82b5d65ac4d480142e0e7d4c4c06af10",
+          "crates/zkminer-prover-protocol/src/types.rs": "684640701892d81adc2f3d717d5c61bd4f1f434d2ef3e8bc72165f19dd6fea89",
+          "scripts/macos/test-worker.py": "b095e62ea2b0ca273c0cf779bfdd216d33d8c6d8535178c55c462319565d7a71"
+        },
+        "binary_path": "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build/debug/deps/macos_worker-9116c14936aff687",
+        "binary_sha256": "837d9093d2c2e8af94b79a1cd4f41219c6199372b16844e8c09c97ab8a65f649",
+        "command": [
+          "cargo",
+          "+1.93.0",
+          "test",
+          "--locked",
+          "-p",
+          "zkminer-prover",
+          "--test",
+          "macos_worker",
+          "--no-run",
+          "--message-format=json",
+          "--target-dir",
+          "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build"
+        ]
+      }
+    },
+    "9f8da6486bbf7fb8c0790093b57433381b2bbd5fe5f06e712a3c66a5f39b666c": {
+      "kind": "worker",
+      "contents": {
+        "source": {
+          "kind": "cpu",
+          "pinned_engine_revision": "f8dcbdf8124a3f1528146bb01d539c55545cbb3d",
+          "engine_path": "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+          "engine_head": "0d5b41e8e44876c1e8b5a8a671aabc154e33106c",
+          "engine_working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "config_path": "/Users/dbur/dev/zk-miner/target/macos/local-engine.toml",
+          "inputs": {
+            "Cargo.lock": "75d710409c3107e465ca0520bb7c551e8027c47ecb7c8e3b13d9b106cad5c6b9",
+            "Cargo.toml": "6d62c06c33b867de1177afe1b4f220f70557e87e9175e3bd7574e56d0d66fed2",
+            "crates/zkminer-prove-risc0/Cargo.toml": "5815dcb5a50523ffd4c17b0ab9858e7eb75d85d95049d459e07b600bce62d7b2",
+            "crates/zkminer-prove-risc0/build.rs": "a6311821df1d5d69671acb372ca5c6a6608df3789d7cd9113975ba6d99ea1ac6",
+            "crates/zkminer-prove-risc0/src/macos.rs": "1869c4409bea90d0dde1de1610e9a60b31bb1ba8436cb96ee7a27aea44fa7bac",
+            "crates/zkminer-prove-risc0/src/macos_metal.rs": "0362e42524cdb32b269019ec99965308bf5f4812d4b8576fec138d16c1b47f05",
+            "crates/zkminer-prove-risc0/src/main.rs": "f8c0f568959c888b551ca1156d58e9ea329b0d0c02a9ca35e913545f1376ecdc",
+            "crates/zkminer-prover-protocol/Cargo.toml": "a646a1d0024007d0172aa8a1b4efb5ebc1b5df2364950d5475279ee6250dbdcd",
+            "crates/zkminer-prover-protocol/src/codec.rs": "70543a49b7d6c4df969ec05033bbcf934c450d8cdfcf261ced7536b3e0145f86",
+            "crates/zkminer-prover-protocol/src/lib.rs": "540d80cbfc01cb62c5e0c6ad2c6309088c22dbef52f309417dd745ec44225b6b",
+            "crates/zkminer-prover-protocol/src/proc.rs": "5b1bba5de4b31c09eb07510f2480e57b82b5d65ac4d480142e0e7d4c4c06af10",
+            "crates/zkminer-prover-protocol/src/types.rs": "684640701892d81adc2f3d717d5c61bd4f1f434d2ef3e8bc72165f19dd6fea89",
+            "rust-toolchain.toml": "f0815f7685d7aff345137c830314cf78d4d0dc7bc71328561fc6823b7fbb23cb",
+            "scripts/macos/build-worker.py": "4e88a75998440e33f65ebee0f7b51c310e1e33bb9a8990c58878686b4d57fedb",
+            "scripts/macos/check-source.py": "74984a609430d8f1f03c2720cd775a308b50455f0ba79a421d3d421595143605",
+            "scripts/macos/env.sh": "7f6f9a87ba5b1915d427ca59de1a2930cb23f24af6c39b273f44350902a1afe4",
+            "scripts/macos/local-engine.py": "b3045c21b11c7a0aa32b9cc9909bccb587bf5ab30f06539f3cf09a4a015244c4",
+            "scripts/macos/worker_provenance.py": "8c82109dd115ed12a6f0685630462f9c034245784cff65d468009f0e665995d0",
+            "target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/sha256-chain.bin": "bdb516605c01f9dce3f4a7103246f8ebff6e0e8d064783ea206c2335d1761573",
+            "target/macos/local-engine.toml": "4ceec928b625b49cb87d71dd9300c145468afd84fdf570b4f96b34e64bb1e881"
+          }
+        },
+        "build_environment": {
+          "RUSTFLAGS": null,
+          "CARGO_ENCODED_RUSTFLAGS": null,
+          "DEVELOPER_DIR": null,
+          "TOOLCHAINS": null,
+          "SDKROOT": null,
+          "CC": null,
+          "CXX": null,
+          "CFLAGS": null,
+          "CXXFLAGS": null,
+          "AR": null,
+          "RUSTC": null,
+          "RUSTC_WRAPPER": null,
+          "RUSTC_WORKSPACE_WRAPPER": null,
+          "CARGO_BUILD_JOBS": "6",
+          "CARGO_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/cargo",
+          "RUSTUP_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/rustup",
+          "RISC0_HOME": "/Users/dbur/dev/zk-miner/target/macos/toolchain/risc0",
+          "ZKMINER_RISC0_GUEST_DIR": "/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release"
+        },
+        "binary_sha256": "97588b915f1c27c953644b4b20582156cf7c297e00abb4eb2943430404cc15b9",
+        "metadata_sha256": "548459965a3c6581f931acbbab4225f0a719dfb80086a53e3c9f88ab12e07e09",
+        "local_lock_sha256": "64b6b7b23485b9494f941ef552701301ca14024aa45d2d403c67c43d5a30720e",
+        "host_toolchain": "1.93.0"
+      }
+    }
+  },
+  "runs": [
+    {
+      "run_report": {
+        "id": "f8ff5abb2cef4a19bb02e24fbcb318d0",
+        "status": "complete_independently_verified",
+        "requested_mode": "metal",
+        "expected_mode": "metal",
+        "worker_kind": "metal",
+        "repeat": 3,
+        "lifecycle": true,
+        "helper_arch": "linux/amd64",
+        "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+        "helper_context": "colima-hemi-macos-cpu",
+        "helper_endpoint": "unix:///Users/dbur/.colima/hemi-macos-cpu/docker.sock",
+        "worker_peak_rss_bytes": {
+          "8653": 2013675520,
+          "12543": 1975042048,
+          "13430": 1975107584
+        },
+        "rss_method": "owned native worker RSS sampled once per second; excludes helper VM",
+        "worker_binary_sha256": "2c3bf297141cdf9623a8d997d0fcdf560ef0e547fd51531c5a179f3de97329f4",
+        "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+        "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "command": [
+          "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build/debug/deps/macos_worker-9116c14936aff687",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "test_exit_code": 0,
+        "results": {
+          "helper_cancel": true,
+          "helper_timeout": true,
+          "observed_mode": "metal",
+          "requested_mode": "metal",
+          "restart": true,
+          "shutdown": true,
+          "status": "complete_independently_verified",
+          "verified_proofs": 4
+        },
+        "elapsed_seconds": 778.4621887076646
+      },
+      "build_seal_references": {
+        "worker": {
+          "sha256": "aba024a8849aa91e3b3c70e15362f4d32acd5b48f002304c44471e5a32ae90c6",
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/worker-build.json"
+        },
+        "verifier": {
+          "sha256": "1ab288cd09cf291d78a9478220f81ac8150f617aef72539269fb6666152b60ca",
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/verifier-build.json"
+        },
+        "acceptance": {
+          "sha256": "00f42fbeb8a306150a0263de1ee176233d854f9cf57b4f00a1e3a75b4325254a",
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance-build.json"
+        }
+      },
+      "complete_proofs": [
+        {
+          "case": "proof-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-8513-1793471733602840000-10",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "metal",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "metal_stage": {
+                "completed_dispatches": 194,
+                "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+                "name": "segment_poseidon2_merkle_fold",
+                "segments": [
+                  {
+                    "completed_dispatches": 194,
+                    "fold_calls": 90,
+                    "input_digests": 1065972,
+                    "output_digests": 532986,
+                    "peak_staging_bytes": 524288,
+                    "po2": 15,
+                    "segment_index": 0,
+                    "staging_limit_bytes": 524288
+                  }
+                ]
+              },
+              "other_segment_operations": "cpu",
+              "recursion": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "request_id": 1,
+            "requested_mode": "metal",
+            "schema_version": 1,
+            "seal_sha256": "0f552cf6b57524c23b4105f74730b7e21ffbdf487c32a34671ce084efdc08803",
+            "stage_ms": {
+              "execution_and_segment": 2729.715792,
+              "identity_and_wrap": 153867.542583,
+              "recursion": 7369.510667,
+              "verification": 1.766
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 163997.123541,
+            "worker_pid": 8653
+          },
+          "independent_verification": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "journal_hex": "6d1a000000000000",
+            "negative_tests": [
+              "wrong_image",
+              "modified_journal",
+              "corrupt_seal"
+            ],
+            "verification": "passed"
+          },
+          "artifacts": [
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-0/journal.bin",
+              "sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+              "bytes": 8
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-0/receipt.bin",
+              "sha256": "44c6fcb1d189e0852cd314adbdcfb10f79bf8bc6e0c829c3493dae0a68eeb4ab",
+              "bytes": 502
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-0/seal.bin",
+              "sha256": "0f552cf6b57524c23b4105f74730b7e21ffbdf487c32a34671ce084efdc08803",
+              "bytes": 256
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-0/verification.json",
+              "sha256": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+              "bytes": 322
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-0/verifier.stderr",
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "bytes": 0
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-0/verifier.stdout",
+              "sha256": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+              "bytes": 284
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-0/worker.json",
+              "sha256": "960cba731f8805271a5db78b4c39fc5cd32c7c0803ce8ea4c9f78f690bffb1ab",
+              "bytes": 1875
+            }
+          ]
+        },
+        {
+          "case": "proof-1",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-8513-1793471733602840000-10",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "metal",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "metal_stage": {
+                "completed_dispatches": 194,
+                "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+                "name": "segment_poseidon2_merkle_fold",
+                "segments": [
+                  {
+                    "completed_dispatches": 194,
+                    "fold_calls": 90,
+                    "input_digests": 1065972,
+                    "output_digests": 532986,
+                    "peak_staging_bytes": 524288,
+                    "po2": 15,
+                    "segment_index": 0,
+                    "staging_limit_bytes": 524288
+                  }
+                ]
+              },
+              "other_segment_operations": "cpu",
+              "recursion": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "request_id": 2,
+            "requested_mode": "metal",
+            "schema_version": 1,
+            "seal_sha256": "8203d25c465c696b3e77dcc278d079403b53e253534b4f71bae5d22e6fcd5edf",
+            "stage_ms": {
+              "execution_and_segment": 2685.369,
+              "identity_and_wrap": 150222.086417,
+              "recursion": 6656.929875000001,
+              "verification": 1.767042
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 159590.494625,
+            "worker_pid": 8653
+          },
+          "independent_verification": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "journal_hex": "6d1a000000000000",
+            "negative_tests": [
+              "wrong_image",
+              "modified_journal",
+              "corrupt_seal"
+            ],
+            "verification": "passed"
+          },
+          "artifacts": [
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-1/journal.bin",
+              "sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+              "bytes": 8
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-1/receipt.bin",
+              "sha256": "cf9dcb77873a65d1953858720894132fc0bef4fe27e3c1aeb9119bb581c73474",
+              "bytes": 502
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-1/seal.bin",
+              "sha256": "8203d25c465c696b3e77dcc278d079403b53e253534b4f71bae5d22e6fcd5edf",
+              "bytes": 256
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-1/verification.json",
+              "sha256": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+              "bytes": 322
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-1/verifier.stderr",
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "bytes": 0
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-1/verifier.stdout",
+              "sha256": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+              "bytes": 284
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-1/worker.json",
+              "sha256": "a1d739168e85539377d952c49f540b2b7c069885f9e2faa0ab5ddc77a7cf92ed",
+              "bytes": 1881
+            }
+          ]
+        },
+        {
+          "case": "proof-2",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-8513-1793471733602840000-10",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "metal",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "metal_stage": {
+                "completed_dispatches": 194,
+                "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+                "name": "segment_poseidon2_merkle_fold",
+                "segments": [
+                  {
+                    "completed_dispatches": 194,
+                    "fold_calls": 90,
+                    "input_digests": 1065972,
+                    "output_digests": 532986,
+                    "peak_staging_bytes": 524288,
+                    "po2": 15,
+                    "segment_index": 0,
+                    "staging_limit_bytes": 524288
+                  }
+                ]
+              },
+              "other_segment_operations": "cpu",
+              "recursion": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "request_id": 3,
+            "requested_mode": "metal",
+            "schema_version": 1,
+            "seal_sha256": "7fbeab5c8f459950bb22634d1f7c41a860862fbb422b100d05b816d9306b5a84",
+            "stage_ms": {
+              "execution_and_segment": 2711.0593750000003,
+              "identity_and_wrap": 150028.615666,
+              "recursion": 6374.513583,
+              "verification": 1.816833
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 159140.17,
+            "worker_pid": 8653
+          },
+          "independent_verification": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "journal_hex": "6d1a000000000000",
+            "negative_tests": [
+              "wrong_image",
+              "modified_journal",
+              "corrupt_seal"
+            ],
+            "verification": "passed"
+          },
+          "artifacts": [
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-2/journal.bin",
+              "sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+              "bytes": 8
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-2/receipt.bin",
+              "sha256": "39d880035621f10ce0c0a8f9da5958dbe5bc07567a4bcafb114bdf9417fa2ced",
+              "bytes": 502
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-2/seal.bin",
+              "sha256": "7fbeab5c8f459950bb22634d1f7c41a860862fbb422b100d05b816d9306b5a84",
+              "bytes": 256
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-2/verification.json",
+              "sha256": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+              "bytes": 322
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-2/verifier.stderr",
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "bytes": 0
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-2/verifier.stdout",
+              "sha256": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+              "bytes": 284
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-2/worker.json",
+              "sha256": "834e5f8c8742207369613cbd71269d035ab3073ef9eb754715f343d3de98a0bf",
+              "bytes": 1881
+            }
+          ]
+        },
+        {
+          "case": "proof-after-restart",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-8513-1793472331740590000-12",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "metal",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "metal_stage": {
+                "completed_dispatches": 194,
+                "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+                "name": "segment_poseidon2_merkle_fold",
+                "segments": [
+                  {
+                    "completed_dispatches": 194,
+                    "fold_calls": 90,
+                    "input_digests": 1065972,
+                    "output_digests": 532986,
+                    "peak_staging_bytes": 524288,
+                    "po2": 15,
+                    "segment_index": 0,
+                    "staging_limit_bytes": 524288
+                  }
+                ]
+              },
+              "other_segment_operations": "cpu",
+              "recursion": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "request_id": 6,
+            "requested_mode": "metal",
+            "schema_version": 1,
+            "seal_sha256": "003f33e5a8651cc45dc35e7df699f27c6ef589431bd8841afeb01aa99aa37b55",
+            "stage_ms": {
+              "execution_and_segment": 2692.726542,
+              "identity_and_wrap": 154300.260917,
+              "recursion": 7447.0,
+              "verification": 1.785166
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 164464.86166599998,
+            "worker_pid": 13430
+          },
+          "independent_verification": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "journal_hex": "6d1a000000000000",
+            "negative_tests": [
+              "wrong_image",
+              "modified_journal",
+              "corrupt_seal"
+            ],
+            "verification": "passed"
+          },
+          "artifacts": [
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-after-restart/journal.bin",
+              "sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+              "bytes": 8
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-after-restart/receipt.bin",
+              "sha256": "2a8d23eef45adde02ad47b7090f44e5b99ece5180a85c9b182bf79517ba935ec",
+              "bytes": 502
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-after-restart/seal.bin",
+              "sha256": "003f33e5a8651cc45dc35e7df699f27c6ef589431bd8841afeb01aa99aa37b55",
+              "bytes": 256
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-after-restart/verification.json",
+              "sha256": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+              "bytes": 322
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-after-restart/verifier.stderr",
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "bytes": 0
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-after-restart/verifier.stdout",
+              "sha256": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+              "bytes": 284
+            },
+            {
+              "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/proof-after-restart/worker.json",
+              "sha256": "2d8e8f7ed934ab821ba714ede3ae27bbb323184304dec7e6b5704c66ee4ff91a",
+              "bytes": 1879
+            }
+          ]
+        }
+      ],
+      "commands_executed_and_recorded": {
+        "acceptance_test": [
+          "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build/debug/deps/macos_worker-9116c14936aff687",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "acceptance_compile": [
+          "cargo",
+          "+1.93.0",
+          "test",
+          "--locked",
+          "-p",
+          "zkminer-prover",
+          "--test",
+          "macos_worker",
+          "--no-run",
+          "--message-format=json",
+          "--target-dir",
+          "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build"
+        ]
+      },
+      "runner_reproduction_command": [
+        "python3",
+        "scripts/macos/test-worker.py",
+        "--engine",
+        "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "--worker-kind",
+        "metal",
+        "--mode",
+        "metal",
+        "--context",
+        "colima-hemi-macos-cpu",
+        "--repeat",
+        "3"
+      ],
+      "failure_recovery_cases": [
+        {
+          "request_ledger_entry": {
+            "case": "helper-cancel",
+            "error": "Worker risc0 process died (EOF)",
+            "observed_running_helper": {
+              "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+              "error": null,
+              "fallback_reason": null,
+              "helper_arch": "linux/amd64 (emulated)",
+              "helper_container": "zkminer-macos-8513-1793471733602840000-10",
+              "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+              "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+              "observed_mode": "metal",
+              "observed_stages": {
+                "groth16": "local_linux_amd64_helper",
+                "identity": "cpu",
+                "metal_stage": {
+                  "completed_dispatches": 194,
+                  "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+                  "name": "segment_poseidon2_merkle_fold",
+                  "segments": [
+                    {
+                      "completed_dispatches": 194,
+                      "fold_calls": 90,
+                      "input_digests": 1065972,
+                      "output_digests": 532986,
+                      "peak_staging_bytes": 524288,
+                      "po2": 15,
+                      "segment_index": 0,
+                      "staging_limit_bytes": 524288
+                    }
+                  ]
+                },
+                "other_segment_operations": "cpu",
+                "recursion": "cpu"
+              },
+              "operation": "prove",
+              "phase": "wrapping",
+              "po2": 18,
+              "proof_kind": "succinct",
+              "request_id": 4,
+              "requested_mode": "metal",
+              "schema_version": 1,
+              "stage_ms": {
+                "execution_and_segment": 2705.516666,
+                "recursion": 6396.608332999999
+              },
+              "staging_limit_bytes": 524288,
+              "stats": {
+                "paging_cycles": 16300,
+                "reserved_cycles": 13152,
+                "segments": 1,
+                "total_cycles": 32768,
+                "user_cycles": 3316
+              },
+              "total_ms": 9126.589625,
+              "worker_pid": 8653
+            },
+            "status": "expected_failure"
+          },
+          "production_log_evidence": [
+            "2026-10-31T18:44:19.136218Z  WARN zkminer_prover::dispatcher: Cancelling proof on risc0:generic by killing worker PID 8653"
+          ],
+          "not_a_completed_proof": true
+        },
+        {
+          "request_ledger_entry": {
+            "case": "helper-timeout",
+            "elapsed_seconds": 71.722672333,
+            "error": "Worker risc0 process died (EOF)",
+            "observed_running_helper": {
+              "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+              "error": null,
+              "fallback_reason": null,
+              "helper_arch": "linux/amd64 (emulated)",
+              "helper_container": "zkminer-macos-8513-1793472259894135000-11",
+              "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+              "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+              "observed_mode": "metal",
+              "observed_stages": {
+                "groth16": "local_linux_amd64_helper",
+                "identity": "cpu",
+                "metal_stage": {
+                  "completed_dispatches": 194,
+                  "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+                  "name": "segment_poseidon2_merkle_fold",
+                  "segments": [
+                    {
+                      "completed_dispatches": 194,
+                      "fold_calls": 90,
+                      "input_digests": 1065972,
+                      "output_digests": 532986,
+                      "peak_staging_bytes": 524288,
+                      "po2": 15,
+                      "segment_index": 0,
+                      "staging_limit_bytes": 524288
+                    }
+                  ]
+                },
+                "other_segment_operations": "cpu",
+                "recursion": "cpu"
+              },
+              "operation": "prove",
+              "phase": "wrapping",
+              "po2": 18,
+              "proof_kind": "succinct",
+              "request_id": 5,
+              "requested_mode": "metal",
+              "schema_version": 1,
+              "stage_ms": {
+                "execution_and_segment": 2723.468625,
+                "recursion": 7437.6605
+              },
+              "staging_limit_bytes": 524288,
+              "stats": {
+                "paging_cycles": 16300,
+                "reserved_cycles": 13152,
+                "segments": 1,
+                "total_cycles": 32768,
+                "user_cycles": 3316
+              },
+              "total_ms": 10187.454000000002,
+              "worker_pid": 12543
+            },
+            "status": "expected_failure",
+            "timeout_seconds": 70
+          },
+          "production_log_evidence": [
+            "2026-10-31T18:45:30.753817Z ERROR zkminer_prover::dispatcher: Proving timeout (70s) exceeded for risc0:generic, killing worker PID 12543"
+          ],
+          "not_a_completed_proof": true
+        }
+      ],
+      "request_ledger": [
+        {
+          "case": "proof-0",
+          "status": "started"
+        },
+        {
+          "case": "proof-0",
+          "status": "complete_independently_verified",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-8513-1793471733602840000-10",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "metal",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "metal_stage": {
+                "completed_dispatches": 194,
+                "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+                "name": "segment_poseidon2_merkle_fold",
+                "segments": [
+                  {
+                    "completed_dispatches": 194,
+                    "fold_calls": 90,
+                    "input_digests": 1065972,
+                    "output_digests": 532986,
+                    "peak_staging_bytes": 524288,
+                    "po2": 15,
+                    "segment_index": 0,
+                    "staging_limit_bytes": 524288
+                  }
+                ]
+              },
+              "other_segment_operations": "cpu",
+              "recursion": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "request_id": 1,
+            "requested_mode": "metal",
+            "schema_version": 1,
+            "seal_sha256": "0f552cf6b57524c23b4105f74730b7e21ffbdf487c32a34671ce084efdc08803",
+            "stage_ms": {
+              "execution_and_segment": 2729.715792,
+              "identity_and_wrap": 153867.542583,
+              "recursion": 7369.510667,
+              "verification": 1.766
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 163997.123541,
+            "worker_pid": 8653
+          }
+        },
+        {
+          "case": "proof-1",
+          "status": "started"
+        },
+        {
+          "case": "proof-1",
+          "status": "complete_independently_verified",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-8513-1793471733602840000-10",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "metal",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "metal_stage": {
+                "completed_dispatches": 194,
+                "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+                "name": "segment_poseidon2_merkle_fold",
+                "segments": [
+                  {
+                    "completed_dispatches": 194,
+                    "fold_calls": 90,
+                    "input_digests": 1065972,
+                    "output_digests": 532986,
+                    "peak_staging_bytes": 524288,
+                    "po2": 15,
+                    "segment_index": 0,
+                    "staging_limit_bytes": 524288
+                  }
+                ]
+              },
+              "other_segment_operations": "cpu",
+              "recursion": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "request_id": 2,
+            "requested_mode": "metal",
+            "schema_version": 1,
+            "seal_sha256": "8203d25c465c696b3e77dcc278d079403b53e253534b4f71bae5d22e6fcd5edf",
+            "stage_ms": {
+              "execution_and_segment": 2685.369,
+              "identity_and_wrap": 150222.086417,
+              "recursion": 6656.929875000001,
+              "verification": 1.767042
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 159590.494625,
+            "worker_pid": 8653
+          }
+        },
+        {
+          "case": "proof-2",
+          "status": "started"
+        },
+        {
+          "case": "proof-2",
+          "status": "complete_independently_verified",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-8513-1793471733602840000-10",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "metal",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "metal_stage": {
+                "completed_dispatches": 194,
+                "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+                "name": "segment_poseidon2_merkle_fold",
+                "segments": [
+                  {
+                    "completed_dispatches": 194,
+                    "fold_calls": 90,
+                    "input_digests": 1065972,
+                    "output_digests": 532986,
+                    "peak_staging_bytes": 524288,
+                    "po2": 15,
+                    "segment_index": 0,
+                    "staging_limit_bytes": 524288
+                  }
+                ]
+              },
+              "other_segment_operations": "cpu",
+              "recursion": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "request_id": 3,
+            "requested_mode": "metal",
+            "schema_version": 1,
+            "seal_sha256": "7fbeab5c8f459950bb22634d1f7c41a860862fbb422b100d05b816d9306b5a84",
+            "stage_ms": {
+              "execution_and_segment": 2711.0593750000003,
+              "identity_and_wrap": 150028.615666,
+              "recursion": 6374.513583,
+              "verification": 1.816833
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 159140.17,
+            "worker_pid": 8653
+          }
+        },
+        {
+          "case": "helper-cancel",
+          "status": "started"
+        },
+        {
+          "case": "helper-cancel",
+          "error": "Worker risc0 process died (EOF)",
+          "observed_running_helper": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-8513-1793471733602840000-10",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "observed_mode": "metal",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "metal_stage": {
+                "completed_dispatches": 194,
+                "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+                "name": "segment_poseidon2_merkle_fold",
+                "segments": [
+                  {
+                    "completed_dispatches": 194,
+                    "fold_calls": 90,
+                    "input_digests": 1065972,
+                    "output_digests": 532986,
+                    "peak_staging_bytes": 524288,
+                    "po2": 15,
+                    "segment_index": 0,
+                    "staging_limit_bytes": 524288
+                  }
+                ]
+              },
+              "other_segment_operations": "cpu",
+              "recursion": "cpu"
+            },
+            "operation": "prove",
+            "phase": "wrapping",
+            "po2": 18,
+            "proof_kind": "succinct",
+            "request_id": 4,
+            "requested_mode": "metal",
+            "schema_version": 1,
+            "stage_ms": {
+              "execution_and_segment": 2705.516666,
+              "recursion": 6396.608332999999
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 9126.589625,
+            "worker_pid": 8653
+          },
+          "status": "expected_failure"
+        },
+        {
+          "case": "helper-timeout",
+          "status": "started",
+          "timeout_seconds": 70
+        },
+        {
+          "case": "helper-timeout",
+          "elapsed_seconds": 71.722672333,
+          "error": "Worker risc0 process died (EOF)",
+          "observed_running_helper": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-8513-1793472259894135000-11",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "observed_mode": "metal",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "metal_stage": {
+                "completed_dispatches": 194,
+                "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+                "name": "segment_poseidon2_merkle_fold",
+                "segments": [
+                  {
+                    "completed_dispatches": 194,
+                    "fold_calls": 90,
+                    "input_digests": 1065972,
+                    "output_digests": 532986,
+                    "peak_staging_bytes": 524288,
+                    "po2": 15,
+                    "segment_index": 0,
+                    "staging_limit_bytes": 524288
+                  }
+                ]
+              },
+              "other_segment_operations": "cpu",
+              "recursion": "cpu"
+            },
+            "operation": "prove",
+            "phase": "wrapping",
+            "po2": 18,
+            "proof_kind": "succinct",
+            "request_id": 5,
+            "requested_mode": "metal",
+            "schema_version": 1,
+            "stage_ms": {
+              "execution_and_segment": 2723.468625,
+              "recursion": 7437.6605
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 10187.454000000002,
+            "worker_pid": 12543
+          },
+          "status": "expected_failure",
+          "timeout_seconds": 70
+        },
+        {
+          "case": "proof-after-restart",
+          "status": "started"
+        },
+        {
+          "case": "proof-after-restart",
+          "status": "complete_independently_verified",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-8513-1793472331740590000-12",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "metal",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "metal_stage": {
+                "completed_dispatches": 194,
+                "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+                "name": "segment_poseidon2_merkle_fold",
+                "segments": [
+                  {
+                    "completed_dispatches": 194,
+                    "fold_calls": 90,
+                    "input_digests": 1065972,
+                    "output_digests": 532986,
+                    "peak_staging_bytes": 524288,
+                    "po2": 15,
+                    "segment_index": 0,
+                    "staging_limit_bytes": 524288
+                  }
+                ]
+              },
+              "other_segment_operations": "cpu",
+              "recursion": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "request_id": 6,
+            "requested_mode": "metal",
+            "schema_version": 1,
+            "seal_sha256": "003f33e5a8651cc45dc35e7df699f27c6ef589431bd8841afeb01aa99aa37b55",
+            "stage_ms": {
+              "execution_and_segment": 2692.726542,
+              "identity_and_wrap": 154300.260917,
+              "recursion": 7447.0,
+              "verification": 1.785166
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 164464.86166599998,
+            "worker_pid": 13430
+          }
+        }
+      ],
+      "artifacts": [
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/result.json",
+          "sha256": "8ae1c9240087f58fedeb1a9b5ecde254aca9e7226e5ce1e5d00b4f7970d82a9f",
+          "bytes": 1438
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/worker-build.json",
+          "sha256": "aba024a8849aa91e3b3c70e15362f4d32acd5b48f002304c44471e5a32ae90c6",
+          "bytes": 3855
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/verifier-build.json",
+          "sha256": "1ab288cd09cf291d78a9478220f81ac8150f617aef72539269fb6666152b60ca",
+          "bytes": 1409
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance-build.json",
+          "sha256": "00f42fbeb8a306150a0263de1ee176233d854f9cf57b4f00a1e3a75b4325254a",
+          "bytes": 17939
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/test.log",
+          "sha256": "50392c3aea8f7607b77925021b6a1af8ad0ca88b67f223c9a313f36ca9bcde00",
+          "bytes": 6964
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/test-build.jsonl",
+          "sha256": "459468c68ee8e25aaf4530fdbc51c2ad30b6d3b8d7c1e285af1b98a801cf9d8e",
+          "bytes": 336774
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/test-build.stderr",
+          "sha256": "a6d01b95b8b6c2c0b72d99a8f69c68a4c5569449d582008845e552c36e7131c5",
+          "bytes": 391
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/input.bin",
+          "sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+          "bytes": 4
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/complete.json",
+          "sha256": "4e514282ced7b95d2ce7ce83bc31fdeff62bff034f7498e629598e644da95619",
+          "bytes": 220
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/acceptance/requests.jsonl",
+          "sha256": "48f7fa49c518a706fa44767709d1fcdc1076d60828848d7e077f26a3a3fc4ae0",
+          "bytes": 9553
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/requests/12543-5.json",
+          "sha256": "9cdb3b931a6a964af92dec0a9ddaeefc74ab1f331ca0884b1fb916ad7f4c2861",
+          "bytes": 1603
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/requests/13430-6.json",
+          "sha256": "2d8e8f7ed934ab821ba714ede3ae27bbb323184304dec7e6b5704c66ee4ff91a",
+          "bytes": 1879
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/requests/8653-1.json",
+          "sha256": "0f4216e2eb6ed8b4570e9556226b561bbbbf9c104a44af6009b7143c64f683c0",
+          "bytes": 1882
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/requests/8653-2.json",
+          "sha256": "a1d739168e85539377d952c49f540b2b7c069885f9e2faa0ab5ddc77a7cf92ed",
+          "bytes": 1881
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/requests/8653-3.json",
+          "sha256": "834e5f8c8742207369613cbd71269d035ab3073ef9eb754715f343d3de98a0bf",
+          "bytes": 1881
+        },
+        {
+          "path": "target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/requests/8653-4.json",
+          "sha256": "e8f8b1e84e16fc4d5bde27b6c39061b810754fe048cd79db26757b61c198a576",
+          "bytes": 1609
+        }
+      ],
+      "executed_test_summary": {
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 0
+      }
+    },
+    {
+      "run_report": {
+        "id": "2b17330c44b84da099de8089a72032aa",
+        "status": "complete_independently_verified",
+        "requested_mode": "auto",
+        "expected_mode": "cpu",
+        "worker_kind": "cpu",
+        "repeat": 1,
+        "lifecycle": false,
+        "helper_arch": "linux/amd64",
+        "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+        "helper_context": "colima-hemi-macos-cpu",
+        "helper_endpoint": "unix:///Users/dbur/.colima/hemi-macos-cpu/docker.sock",
+        "worker_peak_rss_bytes": {
+          "15120": 1961787392
+        },
+        "rss_method": "owned native worker RSS sampled once per second; excludes helper VM",
+        "worker_binary_sha256": "97588b915f1c27c953644b4b20582156cf7c297e00abb4eb2943430404cc15b9",
+        "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+        "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "command": [
+          "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build/debug/deps/macos_worker-9116c14936aff687",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "test_exit_code": 0,
+        "results": {
+          "helper_cancel": false,
+          "helper_timeout": false,
+          "observed_mode": "cpu",
+          "requested_mode": "auto",
+          "restart": false,
+          "shutdown": true,
+          "status": "complete_independently_verified",
+          "verified_proofs": 1
+        },
+        "elapsed_seconds": 184.43170779198408
+      },
+      "build_seal_references": {
+        "worker": {
+          "sha256": "9f8da6486bbf7fb8c0790093b57433381b2bbd5fe5f06e712a3c66a5f39b666c",
+          "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/worker-build.json"
+        },
+        "verifier": {
+          "sha256": "1ab288cd09cf291d78a9478220f81ac8150f617aef72539269fb6666152b60ca",
+          "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/verifier-build.json"
+        },
+        "acceptance": {
+          "sha256": "00f42fbeb8a306150a0263de1ee176233d854f9cf57b4f00a1e3a75b4325254a",
+          "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/acceptance-build.json"
+        }
+      },
+      "complete_proofs": [
+        {
+          "case": "proof-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": "worker was compiled without the macos-metal feature",
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-14995-1793472537449976000-11",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "request_id": 1,
+            "requested_mode": "auto",
+            "schema_version": 1,
+            "seal_sha256": "5f8096c45aec4d31eb1be4910a25befed8d2afbe273be9fc740e4641346ace8e",
+            "stage_ms": {
+              "execution_and_segment": 2709.928875,
+              "identity_and_wrap": 154337.078791,
+              "recursion": 7416.499,
+              "verification": 1.740958
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 164496.79529100002,
+            "worker_pid": 15120
+          },
+          "independent_verification": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "journal_hex": "6d1a000000000000",
+            "negative_tests": [
+              "wrong_image",
+              "modified_journal",
+              "corrupt_seal"
+            ],
+            "verification": "passed"
+          },
+          "artifacts": [
+            {
+              "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/acceptance/proof-0/journal.bin",
+              "sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+              "bytes": 8
+            },
+            {
+              "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/acceptance/proof-0/receipt.bin",
+              "sha256": "e8dd466512f5664b8300243775dbeb816a7a4ece9b1dec96f80e0a0d705cf034",
+              "bytes": 502
+            },
+            {
+              "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/acceptance/proof-0/seal.bin",
+              "sha256": "5f8096c45aec4d31eb1be4910a25befed8d2afbe273be9fc740e4641346ace8e",
+              "bytes": 256
+            },
+            {
+              "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/acceptance/proof-0/verification.json",
+              "sha256": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+              "bytes": 322
+            },
+            {
+              "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/acceptance/proof-0/verifier.stderr",
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "bytes": 0
+            },
+            {
+              "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/acceptance/proof-0/verifier.stdout",
+              "sha256": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+              "bytes": 284
+            },
+            {
+              "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/acceptance/proof-0/worker.json",
+              "sha256": "b6dc68c262ce57def91cc7584827fa6b834e4fd57d3a01309cc2cddcde8924ad",
+              "bytes": 1424
+            }
+          ]
+        }
+      ],
+      "commands_executed_and_recorded": {
+        "acceptance_test": [
+          "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build/debug/deps/macos_worker-9116c14936aff687",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "acceptance_compile": [
+          "cargo",
+          "+1.93.0",
+          "test",
+          "--locked",
+          "-p",
+          "zkminer-prover",
+          "--test",
+          "macos_worker",
+          "--no-run",
+          "--message-format=json",
+          "--target-dir",
+          "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build"
+        ]
+      },
+      "runner_reproduction_command": [
+        "python3",
+        "scripts/macos/test-worker.py",
+        "--engine",
+        "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "--worker-kind",
+        "cpu",
+        "--mode",
+        "auto",
+        "--context",
+        "colima-hemi-macos-cpu",
+        "--repeat",
+        "1",
+        "--proof-only"
+      ],
+      "failure_recovery_cases": [],
+      "request_ledger": [
+        {
+          "case": "proof-0",
+          "status": "started"
+        },
+        {
+          "case": "proof-0",
+          "status": "complete_independently_verified",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": "worker was compiled without the macos-metal feature",
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-14995-1793472537449976000-11",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "request_id": 1,
+            "requested_mode": "auto",
+            "schema_version": 1,
+            "seal_sha256": "5f8096c45aec4d31eb1be4910a25befed8d2afbe273be9fc740e4641346ace8e",
+            "stage_ms": {
+              "execution_and_segment": 2709.928875,
+              "identity_and_wrap": 154337.078791,
+              "recursion": 7416.499,
+              "verification": 1.740958
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 164496.79529100002,
+            "worker_pid": 15120
+          }
+        }
+      ],
+      "artifacts": [
+        {
+          "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/result.json",
+          "sha256": "8391a3823eadfff050ed8a64ab4496d02f5cacacf16a450558a2225b04db4c3d",
+          "bytes": 1386
+        },
+        {
+          "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/worker-build.json",
+          "sha256": "9f8da6486bbf7fb8c0790093b57433381b2bbd5fe5f06e712a3c66a5f39b666c",
+          "bytes": 3853
+        },
+        {
+          "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/verifier-build.json",
+          "sha256": "1ab288cd09cf291d78a9478220f81ac8150f617aef72539269fb6666152b60ca",
+          "bytes": 1409
+        },
+        {
+          "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/acceptance-build.json",
+          "sha256": "00f42fbeb8a306150a0263de1ee176233d854f9cf57b4f00a1e3a75b4325254a",
+          "bytes": 17939
+        },
+        {
+          "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/test.log",
+          "sha256": "427167736396e2b9ef032b92be49840c0211b96b29528678e3c0e317d9d39161",
+          "bytes": 2649
+        },
+        {
+          "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/test-build.jsonl",
+          "sha256": "9d8a717342079c8d4d1b326d5ff826f7668aeae63bc3df898b7be394a9bf3aad",
+          "bytes": 336774
+        },
+        {
+          "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/test-build.stderr",
+          "sha256": "92c6c0e6382b6fa244860e3d4c13123cdde3233983067457c25cb4f135521e82",
+          "bytes": 391
+        },
+        {
+          "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/acceptance/input.bin",
+          "sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+          "bytes": 4
+        },
+        {
+          "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/acceptance/complete.json",
+          "sha256": "c44c0fd381cf8598863ca6cb1c4ff8fdd48a39dfe92d22ee99bfcc06abe68bf3",
+          "bytes": 220
+        },
+        {
+          "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/acceptance/requests.jsonl",
+          "sha256": "1fb7fdb3350737bc8d4ef150bc34b50c7f5eeda46e45e3b405dcdb3b75a3e2e5",
+          "bytes": 1344
+        },
+        {
+          "path": "target/macos/worker-runs/2b17330c44b84da099de8089a72032aa/requests/15120-1.json",
+          "sha256": "b6dc68c262ce57def91cc7584827fa6b834e4fd57d3a01309cc2cddcde8924ad",
+          "bytes": 1424
+        }
+      ],
+      "executed_test_summary": {
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 0
+      }
+    },
+    {
+      "run_report": {
+        "id": "0a20964eec5f4643b0805f52e49a4d44",
+        "status": "complete_independently_verified",
+        "requested_mode": "cpu",
+        "expected_mode": "cpu",
+        "worker_kind": "metal",
+        "repeat": 1,
+        "lifecycle": false,
+        "helper_arch": "linux/amd64",
+        "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+        "helper_context": "colima-hemi-macos-cpu",
+        "helper_endpoint": "unix:///Users/dbur/.colima/hemi-macos-cpu/docker.sock",
+        "worker_peak_rss_bytes": {
+          "16020": 1966292992
+        },
+        "rss_method": "owned native worker RSS sampled once per second; excludes helper VM",
+        "worker_binary_sha256": "2c3bf297141cdf9623a8d997d0fcdf560ef0e547fd51531c5a179f3de97329f4",
+        "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+        "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "command": [
+          "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build/debug/deps/macos_worker-9116c14936aff687",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "test_exit_code": 0,
+        "results": {
+          "helper_cancel": false,
+          "helper_timeout": false,
+          "observed_mode": "cpu",
+          "requested_mode": "cpu",
+          "restart": false,
+          "shutdown": true,
+          "status": "complete_independently_verified",
+          "verified_proofs": 1
+        },
+        "elapsed_seconds": 184.28219075128436
+      },
+      "build_seal_references": {
+        "worker": {
+          "sha256": "aba024a8849aa91e3b3c70e15362f4d32acd5b48f002304c44471e5a32ae90c6",
+          "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/worker-build.json"
+        },
+        "verifier": {
+          "sha256": "1ab288cd09cf291d78a9478220f81ac8150f617aef72539269fb6666152b60ca",
+          "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/verifier-build.json"
+        },
+        "acceptance": {
+          "sha256": "00f42fbeb8a306150a0263de1ee176233d854f9cf57b4f00a1e3a75b4325254a",
+          "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/acceptance-build.json"
+        }
+      },
+      "complete_proofs": [
+        {
+          "case": "proof-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-15896-1793472720838662000-10",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "request_id": 1,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "f2611c4cd96f5ca521a59cdf5534f4f4c5fb00cbb7a777d6a50018d8edf77702",
+            "stage_ms": {
+              "execution_and_segment": 2709.6901249999996,
+              "identity_and_wrap": 154543.855125,
+              "recursion": 7433.528499999999,
+              "verification": 1.750583
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 164717.609042,
+            "worker_pid": 16020
+          },
+          "independent_verification": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "journal_hex": "6d1a000000000000",
+            "negative_tests": [
+              "wrong_image",
+              "modified_journal",
+              "corrupt_seal"
+            ],
+            "verification": "passed"
+          },
+          "artifacts": [
+            {
+              "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/acceptance/proof-0/journal.bin",
+              "sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+              "bytes": 8
+            },
+            {
+              "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/acceptance/proof-0/receipt.bin",
+              "sha256": "cac827d5209a7643a680b7c2a9f11b93ffcaba73a940b67b07fda676cc950a65",
+              "bytes": 502
+            },
+            {
+              "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/acceptance/proof-0/seal.bin",
+              "sha256": "f2611c4cd96f5ca521a59cdf5534f4f4c5fb00cbb7a777d6a50018d8edf77702",
+              "bytes": 256
+            },
+            {
+              "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/acceptance/proof-0/verification.json",
+              "sha256": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+              "bytes": 322
+            },
+            {
+              "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/acceptance/proof-0/verifier.stderr",
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "bytes": 0
+            },
+            {
+              "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/acceptance/proof-0/verifier.stdout",
+              "sha256": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+              "bytes": 284
+            },
+            {
+              "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/acceptance/proof-0/worker.json",
+              "sha256": "916aaae982f7112b31178b9bb334ef5896f0f6fa8abd29ac4f058f8f6142012e",
+              "bytes": 1385
+            }
+          ]
+        }
+      ],
+      "commands_executed_and_recorded": {
+        "acceptance_test": [
+          "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build/debug/deps/macos_worker-9116c14936aff687",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "acceptance_compile": [
+          "cargo",
+          "+1.93.0",
+          "test",
+          "--locked",
+          "-p",
+          "zkminer-prover",
+          "--test",
+          "macos_worker",
+          "--no-run",
+          "--message-format=json",
+          "--target-dir",
+          "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build"
+        ]
+      },
+      "runner_reproduction_command": [
+        "python3",
+        "scripts/macos/test-worker.py",
+        "--engine",
+        "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "--worker-kind",
+        "metal",
+        "--mode",
+        "cpu",
+        "--context",
+        "colima-hemi-macos-cpu",
+        "--repeat",
+        "1",
+        "--proof-only"
+      ],
+      "failure_recovery_cases": [],
+      "request_ledger": [
+        {
+          "case": "proof-0",
+          "status": "started"
+        },
+        {
+          "case": "proof-0",
+          "status": "complete_independently_verified",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-15896-1793472720838662000-10",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "cpu",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "other_segment_operations": "cpu",
+              "recursion": "cpu",
+              "segment": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "request_id": 1,
+            "requested_mode": "cpu",
+            "schema_version": 1,
+            "seal_sha256": "f2611c4cd96f5ca521a59cdf5534f4f4c5fb00cbb7a777d6a50018d8edf77702",
+            "stage_ms": {
+              "execution_and_segment": 2709.6901249999996,
+              "identity_and_wrap": 154543.855125,
+              "recursion": 7433.528499999999,
+              "verification": 1.750583
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 164717.609042,
+            "worker_pid": 16020
+          }
+        }
+      ],
+      "artifacts": [
+        {
+          "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/result.json",
+          "sha256": "334433b5f54aa9dd0cf7cb3a96a1bfdc3d88e201a0fc105bf2646026de0c2a32",
+          "bytes": 1386
+        },
+        {
+          "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/worker-build.json",
+          "sha256": "aba024a8849aa91e3b3c70e15362f4d32acd5b48f002304c44471e5a32ae90c6",
+          "bytes": 3855
+        },
+        {
+          "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/verifier-build.json",
+          "sha256": "1ab288cd09cf291d78a9478220f81ac8150f617aef72539269fb6666152b60ca",
+          "bytes": 1409
+        },
+        {
+          "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/acceptance-build.json",
+          "sha256": "00f42fbeb8a306150a0263de1ee176233d854f9cf57b4f00a1e3a75b4325254a",
+          "bytes": 17939
+        },
+        {
+          "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/test.log",
+          "sha256": "2fb5daccbed5a4be4595035e9da2ddc2198ca9e58c099ecac80b8930cb946716",
+          "bytes": 2673
+        },
+        {
+          "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/test-build.jsonl",
+          "sha256": "c8d104460b74e36987b9b1ff5c133ba2759e219ef60e1a813eeac7060f19943b",
+          "bytes": 336774
+        },
+        {
+          "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/test-build.stderr",
+          "sha256": "27ee979082f2ddb24376da437168b7cde1ddf278c42a36415169c4adb8dade67",
+          "bytes": 391
+        },
+        {
+          "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/acceptance/input.bin",
+          "sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+          "bytes": 4
+        },
+        {
+          "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/acceptance/complete.json",
+          "sha256": "5951d12c32386ec546054cc56a93b138a537610812bc6164e2739d81e4bc3a41",
+          "bytes": 219
+        },
+        {
+          "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/acceptance/requests.jsonl",
+          "sha256": "63c496ee1c0bcff27bf4f7d6e9d016d08ca6eadee9800f26588e4ac5f96d2344",
+          "bytes": 1305
+        },
+        {
+          "path": "target/macos/worker-runs/0a20964eec5f4643b0805f52e49a4d44/requests/16020-1.json",
+          "sha256": "916aaae982f7112b31178b9bb334ef5896f0f6fa8abd29ac4f058f8f6142012e",
+          "bytes": 1385
+        }
+      ],
+      "executed_test_summary": {
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 0
+      }
+    },
+    {
+      "run_report": {
+        "id": "ac9cf5773bf34427925ab5f29ce18ac5",
+        "status": "complete_independently_verified",
+        "requested_mode": "auto",
+        "expected_mode": "metal",
+        "worker_kind": "metal",
+        "repeat": 1,
+        "lifecycle": false,
+        "helper_arch": "linux/amd64",
+        "helper_image": "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee",
+        "helper_context": "colima-hemi-macos-cpu",
+        "helper_endpoint": "unix:///Users/dbur/.colima/hemi-macos-cpu/docker.sock",
+        "worker_peak_rss_bytes": {
+          "16739": 1975173120
+        },
+        "rss_method": "owned native worker RSS sampled once per second; excludes helper VM",
+        "worker_binary_sha256": "2c3bf297141cdf9623a8d997d0fcdf560ef0e547fd51531c5a179f3de97329f4",
+        "verifier_binary_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+        "program_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+        "command": [
+          "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build/debug/deps/macos_worker-9116c14936aff687",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "test_exit_code": 0,
+        "results": {
+          "helper_cancel": false,
+          "helper_timeout": false,
+          "observed_mode": "metal",
+          "requested_mode": "auto",
+          "restart": false,
+          "shutdown": true,
+          "status": "complete_independently_verified",
+          "verified_proofs": 1
+        },
+        "elapsed_seconds": 184.4123400002718
+      },
+      "build_seal_references": {
+        "worker": {
+          "sha256": "aba024a8849aa91e3b3c70e15362f4d32acd5b48f002304c44471e5a32ae90c6",
+          "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/worker-build.json"
+        },
+        "verifier": {
+          "sha256": "1ab288cd09cf291d78a9478220f81ac8150f617aef72539269fb6666152b60ca",
+          "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/verifier-build.json"
+        },
+        "acceptance": {
+          "sha256": "00f42fbeb8a306150a0263de1ee176233d854f9cf57b4f00a1e3a75b4325254a",
+          "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/acceptance-build.json"
+        }
+      },
+      "complete_proofs": [
+        {
+          "case": "proof-0",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-16641-1793472905088828000-10",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "metal",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "metal_stage": {
+                "completed_dispatches": 194,
+                "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+                "name": "segment_poseidon2_merkle_fold",
+                "segments": [
+                  {
+                    "completed_dispatches": 194,
+                    "fold_calls": 90,
+                    "input_digests": 1065972,
+                    "output_digests": 532986,
+                    "peak_staging_bytes": 524288,
+                    "po2": 15,
+                    "segment_index": 0,
+                    "staging_limit_bytes": 524288
+                  }
+                ]
+              },
+              "other_segment_operations": "cpu",
+              "recursion": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "request_id": 1,
+            "requested_mode": "auto",
+            "schema_version": 1,
+            "seal_sha256": "7f46fa9ee5dc0a1e109aebb96464eefc097c48472e2e906ad4e1f3b08a5278de",
+            "stage_ms": {
+              "execution_and_segment": 2721.264333,
+              "identity_and_wrap": 154656.590375,
+              "recursion": 7389.714292,
+              "verification": 1.829167
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 164797.924167,
+            "worker_pid": 16739
+          },
+          "independent_verification": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "journal_hex": "6d1a000000000000",
+            "negative_tests": [
+              "wrong_image",
+              "modified_journal",
+              "corrupt_seal"
+            ],
+            "verification": "passed"
+          },
+          "artifacts": [
+            {
+              "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/acceptance/proof-0/journal.bin",
+              "sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+              "bytes": 8
+            },
+            {
+              "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/acceptance/proof-0/receipt.bin",
+              "sha256": "2f2910b04396fcebf45c30b7e7c131d273c42aa89f19612f0a0bc262115c46a6",
+              "bytes": 502
+            },
+            {
+              "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/acceptance/proof-0/seal.bin",
+              "sha256": "7f46fa9ee5dc0a1e109aebb96464eefc097c48472e2e906ad4e1f3b08a5278de",
+              "bytes": 256
+            },
+            {
+              "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/acceptance/proof-0/verification.json",
+              "sha256": "fe26a57647ceea1d066ef91bc76bb524d3affec05c1ec8f9fba6f6599336b7d2",
+              "bytes": 322
+            },
+            {
+              "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/acceptance/proof-0/verifier.stderr",
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "bytes": 0
+            },
+            {
+              "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/acceptance/proof-0/verifier.stdout",
+              "sha256": "95227c4928ccb980acbc24fd4507f44da22949c4a4b88424262fead4b19f01e7",
+              "bytes": 284
+            },
+            {
+              "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/acceptance/proof-0/worker.json",
+              "sha256": "c1191435c1beacd93cd03b3975dc76577e786e14ad9c2b8016af37ec7a81046a",
+              "bytes": 1879
+            }
+          ]
+        }
+      ],
+      "commands_executed_and_recorded": {
+        "acceptance_test": [
+          "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build/debug/deps/macos_worker-9116c14936aff687",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "acceptance_compile": [
+          "cargo",
+          "+1.93.0",
+          "test",
+          "--locked",
+          "-p",
+          "zkminer-prover",
+          "--test",
+          "macos_worker",
+          "--no-run",
+          "--message-format=json",
+          "--target-dir",
+          "/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-build"
+        ]
+      },
+      "runner_reproduction_command": [
+        "python3",
+        "scripts/macos/test-worker.py",
+        "--engine",
+        "/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0",
+        "--worker-kind",
+        "metal",
+        "--mode",
+        "auto",
+        "--context",
+        "colima-hemi-macos-cpu",
+        "--repeat",
+        "1",
+        "--proof-only"
+      ],
+      "failure_recovery_cases": [],
+      "request_ledger": [
+        {
+          "case": "proof-0",
+          "status": "started"
+        },
+        {
+          "case": "proof-0",
+          "status": "complete_independently_verified",
+          "worker": {
+            "elf_sha256": "27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793",
+            "error": null,
+            "fallback_reason": null,
+            "helper_arch": "linux/amd64 (emulated)",
+            "helper_container": "zkminer-macos-16641-1793472905088828000-10",
+            "image_id": "6f8159836d1511443408b77a590c2920fce31042249e71551bf998e7c7ea1466",
+            "input_sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "journal_hex": "6d1a000000000000",
+            "journal_sha256": "e7516a5975a45d1e431bc219a413cc9a180138a6020f04dbb646ee6147b18ee1",
+            "observed_mode": "metal",
+            "observed_stages": {
+              "groth16": "local_linux_amd64_helper",
+              "identity": "cpu",
+              "metal_stage": {
+                "completed_dispatches": 194,
+                "kernel_source_sha256": "2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0",
+                "name": "segment_poseidon2_merkle_fold",
+                "segments": [
+                  {
+                    "completed_dispatches": 194,
+                    "fold_calls": 90,
+                    "input_digests": 1065972,
+                    "output_digests": 532986,
+                    "peak_staging_bytes": 524288,
+                    "po2": 15,
+                    "segment_index": 0,
+                    "staging_limit_bytes": 524288
+                  }
+                ]
+              },
+              "other_segment_operations": "cpu",
+              "recursion": "cpu"
+            },
+            "operation": "prove",
+            "phase": "complete",
+            "po2": 18,
+            "proof_kind": "groth16",
+            "request_id": 1,
+            "requested_mode": "auto",
+            "schema_version": 1,
+            "seal_sha256": "7f46fa9ee5dc0a1e109aebb96464eefc097c48472e2e906ad4e1f3b08a5278de",
+            "stage_ms": {
+              "execution_and_segment": 2721.264333,
+              "identity_and_wrap": 154656.590375,
+              "recursion": 7389.714292,
+              "verification": 1.829167
+            },
+            "staging_limit_bytes": 524288,
+            "stats": {
+              "paging_cycles": 16300,
+              "reserved_cycles": 13152,
+              "segments": 1,
+              "total_cycles": 32768,
+              "user_cycles": 3316
+            },
+            "total_ms": 164797.924167,
+            "worker_pid": 16739
+          }
+        }
+      ],
+      "artifacts": [
+        {
+          "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/result.json",
+          "sha256": "1c98bda1ccf019791117726cdeba34aa239830ac04fa0848e80d4aa2fb8868eb",
+          "bytes": 1391
+        },
+        {
+          "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/worker-build.json",
+          "sha256": "aba024a8849aa91e3b3c70e15362f4d32acd5b48f002304c44471e5a32ae90c6",
+          "bytes": 3855
+        },
+        {
+          "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/verifier-build.json",
+          "sha256": "1ab288cd09cf291d78a9478220f81ac8150f617aef72539269fb6666152b60ca",
+          "bytes": 1409
+        },
+        {
+          "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/acceptance-build.json",
+          "sha256": "00f42fbeb8a306150a0263de1ee176233d854f9cf57b4f00a1e3a75b4325254a",
+          "bytes": 17939
+        },
+        {
+          "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/test.log",
+          "sha256": "949693043098e3e4eaa8a7017cf09809926cc65f29afc7801c40cb4674ce40c0",
+          "bytes": 2675
+        },
+        {
+          "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/test-build.jsonl",
+          "sha256": "cd578c5d04c17fab0a4a797738db5e34d5c4ee5c6c865f6e29a574ca7713984f",
+          "bytes": 336774
+        },
+        {
+          "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/test-build.stderr",
+          "sha256": "b4f0601f4df0ce119ea944c7fddd9881ede3781b53e4c9801446715431dfc7b1",
+          "bytes": 391
+        },
+        {
+          "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/acceptance/input.bin",
+          "sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+          "bytes": 4
+        },
+        {
+          "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/acceptance/complete.json",
+          "sha256": "dcd42931a14d00cc6fdabdf31a1b9a1bf2235a1ba36974aff5b8b2739420bf9b",
+          "bytes": 222
+        },
+        {
+          "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/acceptance/requests.jsonl",
+          "sha256": "155d35a1fc8a45f1a4865e03905f4a944aca121304d9ec1a088ae07d024980e2",
+          "bytes": 1641
+        },
+        {
+          "path": "target/macos/worker-runs/ac9cf5773bf34427925ab5f29ce18ac5/requests/16739-1.json",
+          "sha256": "c1191435c1beacd93cd03b3975dc76577e786e14ad9c2b8016af37ec7a81046a",
+          "bytes": 1879
+        }
+      ],
+      "executed_test_summary": {
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 0
+      }
+    }
+  ],
+  "optional_non_mac_check": {
+    "status": "failed_offline_metadata_resolution",
+    "passed": false,
+    "limitation": "Linux CUDA metadata could not resolve an uncached approx 0.5.1 in offline mode; no Linux/CUDA/ROCm runtime validation is claimed.",
+    "log": {
+      "path": "target/macos/native-worker-linux-cuda-metadata.log",
+      "sha256": "994c068d47290ff9aea0b1af92fa3e56a4f94e52b1fd5ff4e2928fa6b992b0b7",
+      "bytes": 120
+    },
+    "message": "error: failed to download `approx v0.5.1`\n\nCaused by:\n  attempting to make an HTTP request, but --offline was specified\n"
+  },
+  "measurement_limits": [
+    "These are correctness and lifecycle runs, not controlled comparative performance benchmarks.",
+    "Worker total_ms excludes external unchanged verification and some WorkerPool/test-runner overhead.",
+    "RSS is sampled by worker PID over an entire run; a repeated PID peak cannot be assigned to a particular proof. Helper VM memory is excluded.",
+    "Metal staging peak is allocated temporary buffer data, not total driver/GPU/host memory.",
+    "Only segment Poseidon2 Merkle folds use Metal. Other native stages remain CPU; Groth16 wrapping is the pinned local emulated Linux/amd64 helper.",
+    "Cancelled and timed-out requests retain partial stage observations and never count as complete proofs.",
+    "No twenty-request stability recommendation, GPU hardware fault injection, speedup claim, or network acceptance is established."
+  ],
+  "authorization": {
+    "push": false,
+    "wallet_access": false,
+    "network_jobs": false,
+    "transactions": false,
+    "privileged_installation": false
+  },
+  "collector": {
+    "path": "/private/tmp/collect-native-worker-evidence.py",
+    "sha256": "3b77a30f71e5c64a30ee98983864d3bc1837fcfb45c0f29f07a4b823f0dc671b"
+  },
+  "measurements": {
+    "path": "docs/macos/evidence/native-worker-measurements.csv",
+    "sha256": "a2c69c6631f3def3abce6596ce629b79fc27a42000c3478e07271ebd8cd8436e",
+    "bytes": 6223
+  }
+}

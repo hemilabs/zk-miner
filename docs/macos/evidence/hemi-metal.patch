@@ -1,0 +1,491 @@
+diff --git a/risc0/build_kernel/src/lib.rs b/risc0/build_kernel/src/lib.rs
+index 394ed93b3..6feca10c6 100644
+--- a/risc0/build_kernel/src/lib.rs
++++ b/risc0/build_kernel/src/lib.rs
+@@ -27,6 +27,14 @@ const METAL_INCS: &[(&str, &str)] = &[
+     ("fpext.h", include_str!("../kernels/metal/fpext.h")),
+ ];
+ 
++/// Shared field headers used by the retained Metal kernels.
++///
++/// Exposing the embedded sources lets runtime-compiled libraries use the same
++/// headers as offline builds without depending on sibling crate source paths.
++pub fn metal_headers() -> &'static [(&'static str, &'static str)] {
++    METAL_INCS
++}
++
+ #[derive(Eq, PartialEq, Hash)]
+ #[non_exhaustive]
+ pub enum KernelType {
+diff --git a/risc0/sys/Cargo.toml b/risc0/sys/Cargo.toml
+index 57b0b41d9..919e458a5 100644
+--- a/risc0/sys/Cargo.toml
++++ b/risc0/sys/Cargo.toml
+@@ -24,3 +24,6 @@ cuda = ["dep:blst", "dep:cust", "dep:sppark"]
+ rocm = ["dep:blst", "dep:sppark"]
+ intel = []
+ metal = []
++# Explicit opt-in: embed source for the system Metal runtime compiler instead
++# of invoking the separately installed offline metal/metallib tools.
++metal-runtime = ["metal"]
+diff --git a/risc0/sys/build.rs b/risc0/sys/build.rs
+index 75eeb752e..3a44a5a41 100644
+--- a/risc0/sys/build.rs
++++ b/risc0/sys/build.rs
+@@ -61,7 +61,11 @@ fn main() {
+             "cargo:metal_root={}",
+             manifest_dir.join("kernels/zkp/metal").to_string_lossy()
+         );
+-        build_metal_kernels();
++        if env::var_os("CARGO_FEATURE_METAL_RUNTIME").is_some() {
++            embed_metal_sources();
++        } else {
++            build_metal_kernels();
++        }
+     }
+ }
+ 
+@@ -259,3 +263,49 @@ fn build_metal_kernels() {
+             .compile(&out);
+     }
+ }
++
++fn embed_metal_sources() {
++    // Same source files and field headers as build_metal_kernels. This only
++    // expands the known local includes; kernel arithmetic remains unchanged.
++    // There is no implicit runtime fallback when an offline compiler fails.
++    const SOURCES: &[&str] = &[
++        "sha256.h",
++        "eltwise.metal",
++        "fri.metal",
++        "mix.metal",
++        "ntt.metal",
++        "poseidon2.metal",
++        "sha.metal",
++        "zk.metal",
++    ];
++    fn append(source: &mut String, name: &str, contents: &str) {
++        source.push_str(&format!("\n#line 1 \"{name}\"\n"));
++        for line in contents.lines() {
++            match line.trim() {
++                "#pragma once"
++                | "#include \"fp.h\""
++                | "#include \"fpext.h\""
++                | "#include \"sha256.h\"" => source.push('\n'),
++                directive if directive.starts_with("#include \"") => {
++                    panic!("unhandled runtime Metal include in {name}: {directive}");
++                }
++                _ => {
++                    source.push_str(line);
++                    source.push('\n');
++                }
++            }
++        }
++    }
++    let mut source = String::new();
++    for (name, contents) in risc0_build_kernel::metal_headers() {
++        append(&mut source, name, contents);
++    }
++    for name in SOURCES {
++        let path = Path::new("kernels/zkp/metal").join(name);
++        println!("cargo:rerun-if-changed={}", path.display());
++        append(&mut source, name, &std::fs::read_to_string(path).unwrap());
++    }
++    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("metal_kernels_zkp.metal");
++    std::fs::write(&output, source).unwrap();
++    println!("cargo:metal_source_zkp={}", output.display());
++}
+diff --git a/risc0/sys/kernels/zkp/metal/poseidon2.metal b/risc0/sys/kernels/zkp/metal/poseidon2.metal
+index cc89e9e7c..24d1b39fc 100644
+--- a/risc0/sys/kernels/zkp/metal/poseidon2.metal
++++ b/risc0/sys/kernels/zkp/metal/poseidon2.metal
+@@ -180,7 +180,9 @@ kernel void poseidon2_rows(const device Fp* ROUND_CONSTANTS,
+       used = 0;
+     }
+   }
+-  if (used != 0 || count == 0) {
++  // Match unpadded_hash: an empty row still permutes the zero state once.
++  // count is the number of rows; col_size is the number of elements hashed.
++  if (used != 0 || col_size == 0) {
+     // Zero pad to get a CELLS_RATE-aligned number of inputs
+     for (uint i = used; i < CELLS_RATE; i++)  {
+         cells[i] = 0;
+diff --git a/risc0/zkp/Cargo.toml b/risc0/zkp/Cargo.toml
+index 0efe5c3fb..d6eb1e6fc 100644
+--- a/risc0/zkp/Cargo.toml
++++ b/risc0/zkp/Cargo.toml
+@@ -61,6 +61,7 @@ rocm = ["prove", "risc0-sys/rocm"]
+ intel = ["prove", "risc0-sys/intel"]
+ default = []
+ metal = ["prove", "dep:metal", "risc0-sys/metal"]
++metal-runtime = ["metal", "risc0-sys/metal-runtime"]
+ metal_prefix_products = ["metal"]
+ prove = [
+   "dep:ff",
+diff --git a/risc0/zkp/build.rs b/risc0/zkp/build.rs
+index 7377d8894..e7fbb6605 100644
+--- a/risc0/zkp/build.rs
++++ b/risc0/zkp/build.rs
+@@ -18,8 +18,14 @@ fn main() {
+     if env::var("CARGO_FEATURE_METAL").is_ok()
+         && env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos" || os == "ios")
+     {
+-        let metal_bin =
+-            env::var("DEP_RISC0_SYS_METAL_KERNELS_ZKP").expect("attempting to build risc0-zkp using the `metal` feature flag. This requires building the metal kernels but DEP_RISC0_SYS_METAL_KERNELS_ZKP is not defined.");
+-        println!("cargo:rustc-env=ZKP_METAL_PATH={metal_bin}");
++        if env::var_os("CARGO_FEATURE_METAL_RUNTIME").is_some() {
++            let source = env::var("DEP_RISC0_SYS_METAL_SOURCE_ZKP")
++                .expect("metal-runtime requires the retained kernel source from risc0-sys");
++            println!("cargo:rustc-env=ZKP_METAL_SOURCE_PATH={source}");
++        } else {
++            let metal_bin =
++                env::var("DEP_RISC0_SYS_METAL_KERNELS_ZKP").expect("attempting to build risc0-zkp using the `metal` feature flag. This requires building the metal kernels but DEP_RISC0_SYS_METAL_KERNELS_ZKP is not defined.");
++            println!("cargo:rustc-env=ZKP_METAL_PATH={metal_bin}");
++        }
+     }
+ }
+diff --git a/risc0/zkp/src/hal/metal.rs b/risc0/zkp/src/hal/metal.rs
+index 764401d73..0d033d9df 100644
+--- a/risc0/zkp/src/hal/metal.rs
++++ b/risc0/zkp/src/hal/metal.rs
+@@ -13,12 +13,18 @@
+ // limitations under the License.
+ 
+ use std::{
+-    collections::HashMap, ffi::c_void, fmt::Debug, marker::PhantomData, mem, slice, sync::OnceLock,
++    cell::Cell,
++    collections::HashMap,
++    ffi::c_void,
++    fmt::Debug,
++    marker::PhantomData,
++    mem, slice,
++    sync::{Arc, OnceLock},
+ };
+ 
+ use metal::{
+     Buffer as MetalBuffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineDescriptor,
+-    Device, MTLArgumentBuffersTier, MTLResourceOptions, MTLSize,
++    Device, MTLArgumentBuffersTier, MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
+ };
+ use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
+ use rayon::prelude::*;
+@@ -44,8 +50,18 @@ use crate::{
+     FRI_FOLD,
+ };
+ 
++#[cfg(not(feature = "metal-runtime"))]
+ const METAL_LIB: &[u8] = include_bytes!(env!("ZKP_METAL_PATH"));
+ 
++#[cfg(feature = "metal-runtime")]
++const METAL_SOURCE: &str = include_str!(env!("ZKP_METAL_SOURCE_PATH"));
++
++/// The exact retained source compiled by `metal-runtime`, for provenance.
++#[cfg(feature = "metal-runtime")]
++pub fn runtime_kernel_source() -> &'static str {
++    METAL_SOURCE
++}
++
+ const KERNEL_NAMES: &[&str] = &[
+     "batch_expand",
+     "eltwise_add_fp",
+@@ -194,13 +210,14 @@ pub struct MetalHal<Hash: MetalHash + ?Sized> {
+     pub cmd_queue: CommandQueue,
+     kernels: HashMap<String, ComputePipelineDescriptor>,
+     hash: Option<Box<Hash>>,
++    completed_dispatches: Cell<u64>,
+     _lock: ReentrantMutexGuard<'static, ()>,
+ }
+ 
+ pub type MetalHalSha256 = MetalHal<MetalHashSha256>;
+ pub type MetalHalPoseidon2 = MetalHal<MetalHashPoseidon2>;
+ 
+-#[derive(Clone, Debug)]
++#[derive(Debug)]
+ struct TrackedBuffer(MetalBuffer);
+ 
+ impl TrackedBuffer {
+@@ -220,7 +237,9 @@ impl Drop for TrackedBuffer {
+ pub struct BufferImpl<T> {
+     name: &'static str,
+     cmd_queue: CommandQueue,
+-    buffer: TrackedBuffer,
++    // Slices and clones retain one tracked allocation; only its last owner
++    // releases the allocation from the tracker.
++    buffer: Arc<TrackedBuffer>,
+     offset: usize,
+     size: usize,
+     marker: PhantomData<T>,
+@@ -236,15 +255,54 @@ pub enum KernelArg<'a> {
+ }
+ 
+ impl<T> BufferImpl<T> {
++    fn allocation_bytes(size: usize) -> usize {
++        let element_bytes = mem::size_of::<T>();
++        assert!(
++            element_bytes != 0,
++            "zero-sized Metal elements are unsupported"
++        );
++        let bytes = size
++            .checked_mul(element_bytes)
++            .expect("Metal buffer size overflow");
++        assert!(
++            bytes <= isize::MAX as usize,
++            "Metal buffer exceeds host slice bounds"
++        );
++        // Keep a real, aligned, non-null allocation for logically empty buffers.
++        // No kernel is dispatched for a zero-length element operation.
++        bytes.max(element_bytes)
++    }
++
++    fn byte_offset(&self, offset: usize) -> usize {
++        assert!(
++            offset <= self.size,
++            "Metal buffer offset exceeds logical slice"
++        );
++        let bytes = self
++            .offset
++            .checked_add(offset)
++            .and_then(|offset| offset.checked_mul(mem::size_of::<T>()))
++            .expect("Metal buffer offset overflow");
++        assert!(
++            bytes <= self.buffer.0.length() as usize,
++            "Metal buffer offset exceeds allocation"
++        );
++        bytes
++    }
++
+     pub fn new(name: &'static str, device: &Device, cmd_queue: CommandQueue, size: usize) -> Self {
+-        let bytes_len = size * mem::size_of::<T>();
++        let bytes_len = Self::allocation_bytes(size);
++        assert!(
++            bytes_len as u64 <= device.max_buffer_length(),
++            "Metal buffer exceeds device limit"
++        );
+         // TODO: detect if device supports shared mode
+         let options = MTLResourceOptions::StorageModeShared;
+         let buffer = device.new_buffer(bytes_len as u64, options);
+         Self {
+             name,
+             cmd_queue,
+-            buffer: TrackedBuffer::new(buffer),
++            buffer: Arc::new(TrackedBuffer::new(buffer)),
+             offset: 0,
+             size,
+             marker: PhantomData,
+@@ -257,7 +315,14 @@ impl<T> BufferImpl<T> {
+         cmd_queue: CommandQueue,
+         slice: &[T],
+     ) -> Self {
+-        let bytes_len = mem::size_of_val(slice);
++        if slice.is_empty() {
++            return Self::new(name, device, cmd_queue, 0);
++        }
++        let bytes_len = Self::allocation_bytes(slice.len());
++        assert!(
++            bytes_len as u64 <= device.max_buffer_length(),
++            "Metal buffer exceeds device limit"
++        );
+         // TODO: detect if device supports shared mode
+         let options = MTLResourceOptions::StorageModeShared;
+         let buffer =
+@@ -265,7 +330,7 @@ impl<T> BufferImpl<T> {
+         Self {
+             name,
+             cmd_queue,
+-            buffer: TrackedBuffer::new(buffer),
++            buffer: Arc::new(TrackedBuffer::new(buffer)),
+             offset: 0,
+             size: slice.len(),
+             marker: PhantomData,
+@@ -273,7 +338,7 @@ impl<T> BufferImpl<T> {
+     }
+ 
+     pub fn as_arg(&self) -> KernelArg<'_> {
+-        let offset = self.offset * mem::size_of::<T>();
++        let offset = self.byte_offset(0);
+         KernelArg::Buffer {
+             buffer: &self.buffer.0,
+             offset: offset as u64,
+@@ -281,7 +346,7 @@ impl<T> BufferImpl<T> {
+     }
+ 
+     pub fn as_arg_with_offset(&self, offset: usize) -> KernelArg<'_> {
+-        let offset = (self.offset + offset) * mem::size_of::<T>();
++        let offset = self.byte_offset(offset);
+         KernelArg::Buffer {
+             buffer: &self.buffer.0,
+             offset: offset as u64,
+@@ -298,11 +363,23 @@ impl<T> BufferImpl<T> {
+     // }
+ 
+     pub fn as_device_ptr(&self) -> *mut c_void {
+-        self.buffer.0.gpu_address() as *mut c_void
++        self.buffer
++            .0
++            .gpu_address()
++            .checked_add(self.byte_offset(0) as u64)
++            .expect("Metal device pointer overflow") as *mut c_void
+     }
+ 
+     pub fn as_ptr(&self) -> *mut c_void {
+-        self.buffer.0.contents()
++        // byte_offset validates the logical range against the shared allocation.
++        unsafe {
++            self.buffer
++                .0
++                .contents()
++                .cast::<u8>()
++                .add(self.byte_offset(0))
++                .cast()
++        }
+     }
+ 
+     pub fn as_buf(&self) -> MetalBuffer {
+@@ -320,42 +397,43 @@ impl<T: Clone> Buffer<T> for BufferImpl<T> {
+     }
+ 
+     fn slice(&self, offset: usize, size: usize) -> BufferImpl<T> {
+-        assert!(offset + size <= self.size());
++        assert!(
++            offset <= self.size && size <= self.size - offset,
++            "Metal buffer slice exceeds logical range"
++        );
+         BufferImpl {
+             name: self.name,
+             cmd_queue: self.cmd_queue.clone(),
+             buffer: self.buffer.clone(),
+-            offset: self.offset + offset,
++            offset: self
++                .offset
++                .checked_add(offset)
++                .expect("Metal slice offset overflow"),
+             size,
+             marker: PhantomData,
+         }
+     }
+ 
+     fn get_at(&self, idx: usize) -> T {
++        assert!(idx < self.size, "Metal buffer index exceeds logical slice");
+         // TODO: detect if device supports synchronize_resource
+         // self.sync();
+-        let ptr = self.buffer.0.contents() as *const T;
+-        let len = self.buffer.0.length() as usize / mem::size_of::<T>();
+-        let slice = unsafe { slice::from_raw_parts(ptr, len) };
+-        slice[self.offset + idx].clone()
++        let slice = unsafe { slice::from_raw_parts(self.as_ptr().cast::<T>(), self.size) };
++        slice[idx].clone()
+     }
+ 
+     fn view<F: FnOnce(&[T])>(&self, f: F) {
+         // TODO: detect if device supports synchronize_resource
+         // self.sync();
+-        let ptr = self.buffer.0.contents() as *const T;
+-        let len = self.buffer.0.length() as usize / mem::size_of::<T>();
+-        let slice = unsafe { slice::from_raw_parts(ptr, len) };
+-        f(&slice[self.offset..self.offset + self.size]);
++        let slice = unsafe { slice::from_raw_parts(self.as_ptr().cast::<T>(), self.size) };
++        f(slice);
+     }
+ 
+     fn view_mut<F: FnOnce(&mut [T])>(&self, f: F) {
+         // TODO: detect if device supports synchronize_resource
+         // self.sync();
+-        let ptr = self.buffer.0.contents() as *mut T;
+-        let len = self.buffer.0.length() as usize / mem::size_of::<T>();
+-        let slice = unsafe { slice::from_raw_parts_mut(ptr, len) };
+-        f(&mut slice[self.offset..self.offset + self.size]);
++        let slice = unsafe { slice::from_raw_parts_mut(self.as_ptr().cast::<T>(), self.size) };
++        f(slice);
+         // TODO: detect if device supports did_modify_range
+         // let offset = self.offset * mem::size_of::<T>();
+         // let size = self.size * mem::size_of::<T>();
+@@ -365,10 +443,8 @@ impl<T: Clone> Buffer<T> for BufferImpl<T> {
+     }
+ 
+     fn to_vec(&self) -> Vec<T> {
+-        let ptr = self.buffer.0.contents() as *const T;
+-        let len = self.buffer.0.length() as usize / mem::size_of::<T>();
+-        let slice = unsafe { slice::from_raw_parts(ptr, len) };
+-        Vec::from(slice)
++        let slice = unsafe { slice::from_raw_parts(self.as_ptr().cast::<T>(), self.size) };
++        slice.to_vec()
+     }
+ }
+ 
+@@ -386,7 +462,16 @@ impl<MH: MetalHash> MetalHal<MH> {
+             device.argument_buffers_support(),
+             MTLArgumentBuffersTier::Tier2
+         );
++        #[cfg(not(feature = "metal-runtime"))]
+         let library = device.new_library_with_data(METAL_LIB).unwrap();
++        #[cfg(feature = "metal-runtime")]
++        let library = {
++            let options = metal::CompileOptions::new();
++            options.set_fast_math_enabled(false);
++            device
++                .new_library_with_source(METAL_SOURCE, &options)
++                .expect("system Metal runtime compiler rejected the retained kernel source")
++        };
+         let cmd_queue = device.new_command_queue();
+         let mut kernels = HashMap::new();
+         for name in KERNEL_NAMES {
+@@ -400,12 +485,19 @@ impl<MH: MetalHash> MetalHal<MH> {
+             cmd_queue,
+             kernels,
+             hash: None,
++            completed_dispatches: Cell::new(0),
+             _lock: lock,
+         };
+         hal.hash = Some(Box::new(MH::new(&hal)));
+         hal
+     }
+ 
++    /// Successful GPU command completions observed by this HAL instance.
++    /// CPU fallback operations do not increment this count.
++    pub fn completed_dispatches(&self) -> u64 {
++        self.completed_dispatches.get()
++    }
++
+     pub fn dispatch_by_name(&self, name: &str, args: &[KernelArg], count: u64) {
+         let kernel = self.kernels.get(name).unwrap();
+         self.dispatch(kernel, args, count, None);
+@@ -429,7 +521,23 @@ impl<MH: MetalHash> MetalHal<MH> {
+         opts: Option<(MTLSize, MTLSize)>,
+         callback: F,
+     ) {
++        let empty_grid = match opts {
++            Some((groups, threads)) => {
++                groups.width == 0
++                    || groups.height == 0
++                    || groups.depth == 0
++                    || threads.width == 0
++                    || threads.height == 0
++                    || threads.depth == 0
++            }
++            None => count == 0,
++        };
++        if empty_grid {
++            return;
++        }
+         let cmd_buffer = self.cmd_queue.new_command_buffer();
++        let kernel_name = kernel.compute_function().unwrap().name();
++        cmd_buffer.set_label(kernel_name);
+         let cmd_encoder = cmd_buffer.new_compute_command_encoder();
+ 
+         callback(cmd_encoder);
+@@ -474,6 +582,15 @@ impl<MH: MetalHash> MetalHal<MH> {
+ 
+         cmd_buffer.commit();
+         cmd_buffer.wait_until_completed();
++        let status = cmd_buffer.status();
++        assert_eq!(
++            status,
++            MTLCommandBufferStatus::Completed,
++            "Metal kernel {kernel_name} failed (command status {status:?})"
++        );
++        self.completed_dispatches
++            .set(self.completed_dispatches.get() + 1);
++        tracing::debug!(kernel = kernel_name, count, "Metal dispatch completed");
+     }
+ }
+ 

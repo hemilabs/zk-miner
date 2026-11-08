@@ -1,0 +1,11 @@
+[package]
+name = "macos-wp3-merkle-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+risc0-core = { path = "/Users/dbur/dev/risc0/risc0/core" }
+risc0-zkp = { path = "/Users/dbur/dev/risc0/risc0/zkp", features = ["metal-runtime"] }

@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "status": "three_draft_prs_open",
+  "branches": [
+    {
+      "branch": "codex/upstream-final-segment-padding",
+      "base": "8007a99720c4890d8fdfd808cec556b8cbb5db1f",
+      "commit": "f9455a5181cb733e45085ee0daf25afe7737eb66",
+      "files": [
+        "risc0/circuit/rv32im/src/execute/executor.rs",
+        "risc0/circuit/rv32im/src/execute/mod.rs",
+        "risc0/circuit/rv32im/src/execute/tests.rs"
+      ],
+      "title": "fix(rv32im): pad final segments for recursion-compatible caps",
+      "published": true,
+      "pr_url": "https://github.com/hemilabs/risc0/pull/30",
+      "draft": true,
+      "validation": {
+        "test_count": 2,
+        "log": "/Users/dbur/dev/zk-miner/target/macos/review-followup/20261102T192422Z/upstream-padding-tests.log",
+        "log_sha256": "a03fb06be2fbb5910282044f882ecf2e7246de91836d8af7ba6338fc21827707",
+        "scope": "execution-only tests on the isolated parent-based branch"
+      }
+    },
+    {
+      "branch": "codex/upstream-locked-circom",
+      "base": "8007a99720c4890d8fdfd808cec556b8cbb5db1f",
+      "commit": "1d363933d0b95b2ecc58f9ccc1f401a499c0e518",
+      "files": [
+        "groth16_proof/docker/prover.Dockerfile"
+      ],
+      "title": "build(groth16): use the Circom lockfile during installation",
+      "published": true,
+      "pr_url": "https://github.com/hemilabs/risc0/pull/31",
+      "draft": true,
+      "validation": {
+        "dockerfile_sha256": "47a7268758d18ed345d372832d85d092d1304b1eb29a8ff65b27b945ac49bb12",
+        "source_evidence": "docs/macos/evidence/arm64-wrap-feasibility.json",
+        "scope": "same complete Dockerfile as the previously successful ARM64 build; no new Docker build claimed"
+      }
+    },
+    {
+      "branch": "codex/upstream-native-helper-lifetime",
+      "base": "8007a99720c4890d8fdfd808cec556b8cbb5db1f",
+      "commit": "6b4e43dd53cc58d769549d53571f1eb393249d3c",
+      "files": [
+        "groth16_proof/circom-compat/cmd/prover/main.go"
+      ],
+      "title": "feat(groth16): add opt-in native helper lifetime bounds",
+      "published": true,
+      "pr_url": "https://github.com/hemilabs/risc0/pull/32",
+      "draft": true,
+      "validation": {
+        "log": "/Users/dbur/dev/zk-miner/target/macos/review-followup/20261102T192422Z/upstream-native-build.log",
+        "log_sha256": "b30fb11c7319e589c6039a7a67febf6dbf301eb66540f2566c33c906fa0a4c01",
+        "controls": {
+          "status": "passed",
+          "cases": [
+            {
+              "case": "timeout",
+              "exit_code": 124
+            },
+            {
+              "case": "wrong-parent",
+              "exit_code": 125
+            },
+            {
+              "case": "default-positional-invocation",
+              "status": "still_running_without_bounds"
+            },
+            {
+              "case": "parent-death",
+              "status": "exited"
+            }
+          ],
+          "scope": "real newly built helper blocked before constraint-file loading; no setup/artifact conversion"
+        }
+      }
+    }
+  ]
+}
