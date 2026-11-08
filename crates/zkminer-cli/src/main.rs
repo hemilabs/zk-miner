@@ -96,6 +96,37 @@ enum Commands {
         #[arg(long, requires = "watch_only")]
         address: Option<alloy::primitives::Address>,
     },
+    /// Measure jobs as the miner sizes them before a claim, whatever their state, and print one JSON
+    /// line per job: cycles, or why not. Signs and sends nothing; starts measure workers only.
+    Simulate {
+        /// A job to measure (repeatable).
+        #[arg(long = "job", value_name = "JOB_ID")]
+        jobs: Vec<alloy::primitives::B256>,
+        /// Then read requests from stdin until EOF, one per line: a job id, or
+        /// {"jobId": "0x…", "submitTx": "0x…"} (the submitting tx saves the descriptor's log scan).
+        #[arg(long)]
+        stdin: bool,
+        /// The risc0 segment size to measure at (risc0 cycle counts are padded per segment).
+        #[arg(long, default_value_t = zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2)]
+        po2: u8,
+        /// Bound on one execution, in seconds.
+        #[arg(long, default_value_t = 600)]
+        execute_timeout_secs: u64,
+        /// Bound on deriving one program's id, in seconds (SP1's setup on the CPU: seconds for a small
+        /// guest, minutes for a large one). Requests are served one at a time, so this also bounds how
+        /// long one new program can hold the queue.
+        #[arg(long, default_value_t = 900)]
+        program_id_timeout_secs: u64,
+        /// The risc0 worker binary (e.g. zkminer-prove-risc0-cpu); overrides the config.
+        #[arg(long)]
+        risc0_worker: Option<std::path::PathBuf>,
+        /// The SP1 worker binary (zkminer-prove-sp1); overrides the config.
+        #[arg(long)]
+        sp1_worker: Option<std::path::PathBuf>,
+        /// Where to keep the ELF and program-id caches (default ~/.zkminer/simulate).
+        #[arg(long)]
+        cache_dir: Option<std::path::PathBuf>,
+    },
     /// Register fibonacci-sp1-guest and submit a test job (SP1 demo)
     #[cfg(feature = "sp1-demo")]
     Sp1Demo {
@@ -214,6 +245,33 @@ async fn main() -> Result<()> {
             let watch = watch_only.then_some(commands::run::WatchOnly { address });
             commands::run::run(config_path, headless || watch_only, watch).await
         }
+        Commands::Simulate {
+            jobs,
+            stdin,
+            po2,
+            execute_timeout_secs,
+            program_id_timeout_secs,
+            risc0_worker,
+            sp1_worker,
+            cache_dir,
+        } => {
+            commands::simulate::run(
+                config_path,
+                commands::simulate::SimulateOptions {
+                    jobs,
+                    stdin,
+                    po2,
+                    execute_timeout: std::time::Duration::from_secs(execute_timeout_secs.max(1)),
+                    program_id_timeout: std::time::Duration::from_secs(
+                        program_id_timeout_secs.max(1),
+                    ),
+                    risc0_worker,
+                    sp1_worker,
+                    cache_dir,
+                },
+            )
+            .await
+        }
         #[cfg(feature = "sp1-demo")]
         Commands::Sp1Demo { input } => commands::sp1_demo::run(config_path, input).await,
         Commands::Init {
@@ -250,5 +308,37 @@ mod tests {
         assert!(
             Cli::try_parse_from(["zkminer", "run", "--watch-only", "--address", "0x12"]).is_err()
         );
+    }
+
+    #[test]
+    fn simulate_flags_parse() {
+        let a = format!("0x{}", "ab".repeat(32));
+        let b = format!("0x{}", "cd".repeat(32));
+        let cli = Cli::try_parse_from([
+            "zkminer", "simulate", "--job", &a, "--job", &b, "--stdin", "--po2", "21",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Simulate {
+                jobs,
+                stdin,
+                po2,
+                execute_timeout_secs,
+                ..
+            } => {
+                assert_eq!(
+                    jobs,
+                    vec![
+                        a.parse::<alloy::primitives::B256>().unwrap(),
+                        b.parse::<alloy::primitives::B256>().unwrap()
+                    ]
+                );
+                assert!(stdin);
+                assert_eq!(po2, 21);
+                assert_eq!(execute_timeout_secs, 600);
+            }
+            _ => panic!("not a simulate command"),
+        }
+        assert!(Cli::try_parse_from(["zkminer", "simulate", "--job", "0x12"]).is_err());
     }
 }

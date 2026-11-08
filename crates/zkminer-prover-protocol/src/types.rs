@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 /// 10: `Execute` gained `po2`: the host measures a risc0 job at the segment size of each card that
 /// may prove it, and a job proof runs at its card's size, within [`RISC0_JOB_PO2_MIN`]..=
 /// [`RISC0_JOB_PO2_MAX`]. A v9 worker would measure every job at 20 whatever the host asked.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// 11: `ProgramId` / `ProgramIdResult`: the program id a chain binds a proof of an ELF to (the risc0
+/// image id, the SP1 verifying-key hash), derived without executing it. A v10 worker cannot decode the
+/// command, so the handshake refuses it.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -128,6 +131,13 @@ pub enum WorkerCommand {
     /// its `sp1-gpu-server` supports it, building the stripped circuit its Groth16 helper reads.
     /// Answered with `WarmupDone`, or `Error`. A backend with nothing to set up answers at once.
     Warmup { request_id: u64 },
+    /// Derive the program id the chain binds a proof of `elf` to, without executing it: the risc0
+    /// image id (`compute_image_id`, milliseconds), or the SP1 verifying-key hash (`vk.bytes32()`,
+    /// SP1's `setup` on the CPU, minutes). For a caller that must know a served ELF IS a job's program
+    /// before it trusts a measurement of it: SP1's `Execute` does not check that (see its `program_id`).
+    /// Answered with `ProgramIdResult`, or `Error` (`InvalidInput` for an ELF the SDK refuses).
+    /// Appended last, so every earlier variant keeps its bincode index.
+    ProgramId { request_id: u64, elf: Vec<u8> },
 }
 
 /// Responses sent from worker to host via stdout.
@@ -240,6 +250,17 @@ pub enum WorkerResponse {
         /// (`sp1-gpu-server --sp1-groth16-cpu-helper`), whose memory a peak read from the live
         /// processes alone would miss once it has exited.
         groth16_helper: bool,
+    },
+    /// Response to `ProgramId`.
+    ProgramIdResult {
+        request_id: u64,
+        /// risc0: the image id (`Digest::as_bytes`, the order the deployed adapter verifies against).
+        /// SP1: the verifying-key hash as `vk.bytes32()` writes it. The on-chain order of an SP1
+        /// programId is deployment-defined, so a caller compares it in either order, as the SP1
+        /// worker's prove-path gate does.
+        program_id: [u8; 32],
+        /// How long the derivation took.
+        duration_secs: f64,
     },
 }
 
@@ -626,6 +647,24 @@ impl std::fmt::Display for MeasureSlotsBusy {
 }
 
 impl std::error::Error for MeasureSlotsBusy {}
+
+/// A worker answered a `ProgramId` request with `InvalidInput`: its SDK refused to derive a program
+/// id from these bytes (risc0: not an ELF it can compute an image id for; SP1: `setup` failed on it).
+/// Typed so a caller can tell the worker's verdict on the ELF from everything else that can fail
+/// around it (no worker, a dead or OOM-killed one, an internal error) — those say nothing about the
+/// program. The message carries SDK text derived from the ELF: never match on it.
+#[derive(Debug, Clone)]
+pub struct ProgramIdRefused {
+    pub message: String,
+}
+
+impl std::fmt::Display for ProgramIdRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the worker refused to derive a program id: {}", self.message)
+    }
+}
+
+impl std::error::Error for ProgramIdRefused {}
 
 /// A cycle measurement's wall-clock watchdog SIGKILLed the worker because the guest did not finish
 /// within the measure budget.

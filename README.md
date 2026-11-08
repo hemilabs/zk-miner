@@ -313,11 +313,42 @@ a size, the job waits for one (switch a card back on, or give one a po2 under Se
 Advanced; a config size or a calibration applies only after a restart, which releases it) and
 is released before its deadline.
 
+## Simulate (measure jobs without mining)
+
+`zkminer simulate` runs the miner's own pre-claim measurement on any job, whatever its state, and
+prints one JSON line per job on stdout: the cycle count proving would report, or why there is none.
+It is for an indexer or a dashboard that wants the work a job took: the chain records none
+(`JobFulfilled.actualCycles` is 0 for every adapter but PoVW).
+
+```bash
+zkminer --config simulate.toml simulate --job 0x… --job 0x…
+zkminer --config simulate.toml simulate --stdin   # one request per line: a job id, or
+                                                  # {"jobId":"0x…","submitTx":"0x…"}
+```
+
+Each job goes through the steps a claim depends on: its descriptor rebuilt from the submit
+transaction and checked against its on-chain hash (a `submitTx` hint saves the log scan), the
+program's ELF from the ProgramRegistry, those bytes bound to the job's `programId`, and one execution
+on a measure worker at `--po2` (risc0, default 20). The binding is derived, never trusted: the risc0
+image id, or the SP1 verifying-key hash from SP1's `setup` on the CPU (minutes per program, cached on
+disk per ELF under `--cache-dir`, default `~/.zkminer/simulate`). A report's `outcome` is `measured`
+(with `cycles`, a decimal string), `not_served`, `undecodable`, `no_program`, `program_mismatch`,
+`too_heavy`, `failed`, `timeout` or `unavailable`; `retryable` says whether asking again can change it.
+
+It signs and sends nothing (the watch-only client), and starts measure workers only, never a prover,
+so it runs on a host without a GPU: build the CPU worker and name it.
+
+```bash
+cargo build --release -p zkminer-prove-risc0 --features cpu --bin zkminer-prove-risc0-cpu
+zkminer --config simulate.toml simulate --stdin \
+    --risc0-worker target/release/zkminer-prove-risc0-cpu --sp1-worker target/release/zkminer-prove-sp1
+```
+
 ## Layout
 
 | crate | role |
 |---|---|
-| `zkminer-cli` | binary entry point: `status`, `benchmark`, `run`, `init` |
+| `zkminer-cli` | binary entry point: `status`, `benchmark`, `run`, `simulate`, `init` |
 | `zkminer-chain` | chain client, auction math, staking, monitor, tx/nonce layer, RPC metering |
 | `zkminer-contracts` | `sol!()` bindings — the source of truth for the on-chain ABI |
 | `zkminer-prover` | worker dispatcher, ELF registry, benchmarks, guest programs |

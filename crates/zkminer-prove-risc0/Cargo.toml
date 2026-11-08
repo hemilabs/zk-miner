@@ -18,12 +18,21 @@ name = "zkminer-prove-risc0-intel"
 path = "src/main.rs"
 required-features = ["intel"]
 
+# No GPU toolkit: measures (executes) guests and derives image ids on the CPU, for a host with no GPU
+# that only sizes jobs (`zkminer simulate`, `zkminer run --watch-only`). It can prove, but on the CPU,
+# far too slowly for a lock's deadline, so never name it as a mining worker.
+[[bin]]
+name = "zkminer-prove-risc0-cpu"
+path = "src/main.rs"
+required-features = ["cpu"]
+
 [features]
 cuda = ["risc0-zkvm/cuda", "risc0-groth16/cuda"]
 rocm = ["risc0-zkvm/rocm", "risc0-groth16/rocm"]
 # Intel Arc / Data Center GPUs through SYCL on Level Zero. Built with oneAPI's `icpx` (see the README's
 # Intel section); the kernels' shared libraries are found next to the binary (`$ORIGIN`, set in build.rs).
 intel = ["risc0-zkvm/intel", "risc0-groth16/intel"]
+cpu = []
 
 [dependencies]
 zkminer-prover-protocol = { workspace = true }

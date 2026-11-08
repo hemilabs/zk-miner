@@ -179,6 +179,70 @@ mod tests {
         const _: () = assert!(PROTOCOL_VERSION >= 5);
     }
 
+    /// v11 added `ProgramId` / `ProgramIdResult`, appended so no older variant's bincode index moved:
+    /// a co-built host and worker agree either way, but the indices below are what a v10 frame used.
+    #[test]
+    fn program_id_round_trips_and_moves_no_older_variant() {
+        let mut buf = Vec::new();
+        let elf = vec![0x7f, b'E', b'L', b'F', 1, 2, 3];
+        write_message(
+            &mut buf,
+            &WorkerCommand::ProgramId {
+                request_id: 9,
+                elf: elf.clone(),
+            },
+        )
+        .unwrap();
+        // Frame: 4-byte big-endian length, then bincode's u32 little-endian variant index.
+        assert_eq!(&buf[4..8], &9u32.to_le_bytes(), "ProgramId is the 10th command");
+        match read_message::<_, WorkerCommand>(&mut Cursor::new(buf)).unwrap() {
+            WorkerCommand::ProgramId { request_id, elf: e } => {
+                assert_eq!((request_id, e), (9, elf));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let id: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let mut buf = Vec::new();
+        write_message(
+            &mut buf,
+            &WorkerResponse::ProgramIdResult {
+                request_id: 9,
+                program_id: id,
+                duration_secs: 1.5,
+            },
+        )
+        .unwrap();
+        assert_eq!(&buf[4..8], &11u32.to_le_bytes(), "ProgramIdResult is the 12th response");
+        match read_message::<_, WorkerResponse>(&mut Cursor::new(buf)).unwrap() {
+            WorkerResponse::ProgramIdResult {
+                request_id,
+                program_id,
+                duration_secs,
+            } => assert_eq!((request_id, program_id, duration_secs), (9, id, 1.5)),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // The variants a v10 peer knew keep their indices.
+        let index = |cmd: &WorkerCommand| {
+            let mut b = Vec::new();
+            write_message(&mut b, cmd).unwrap();
+            u32::from_le_bytes(b[4..8].try_into().unwrap())
+        };
+        assert_eq!(
+            index(&WorkerCommand::Execute {
+                request_id: 1,
+                elf: vec![],
+                input_data: vec![],
+                program_id: None,
+                po2: None,
+            }),
+            4
+        );
+        assert_eq!(index(&WorkerCommand::Warmup { request_id: 1 }), 8);
+        const _: () = assert!(PROTOCOL_VERSION >= 11);
+    }
+
     #[test]
     fn round_trip_response() {
         let resp = WorkerResponse::HelloAck {

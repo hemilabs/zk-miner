@@ -419,6 +419,34 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
+            WorkerCommand::ProgramId { request_id, elf } => {
+                // The image id alone: no execution. The ELF is submitter-controlled and reaches
+                // risc0's parser here, which can panic on a malformed one (see the Execute arm), so a
+                // panic is contained and reported as a property of the ELF.
+                let started = std::time::Instant::now();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    verify_program_id(&elf, None)
+                }));
+                let resp = match outcome {
+                    Ok(Ok(program_id)) => WorkerResponse::ProgramIdResult {
+                        request_id,
+                        program_id,
+                        duration_secs: started.elapsed().as_secs_f64(),
+                    },
+                    Ok(Err(e)) => WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::InvalidInput,
+                        message: format!("{e:#}"),
+                    },
+                    Err(_) => WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::InvalidInput,
+                        message: "deriving the image id panicked on this ELF".to_string(),
+                    },
+                };
+                write_message(&mut stdout, &resp)?;
+            }
+
             WorkerCommand::Shutdown => {
                 tracing::info!("Shutdown requested, exiting");
                 break;

@@ -79,6 +79,15 @@ pub struct ExecuteMeasurement {
     pub duration_secs: f64,
 }
 
+/// What a `ProgramId` request derived (see [`WorkerPool::derive_program_id`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProgramIdDerivation {
+    /// The risc0 image id, or the SP1 verifying-key hash as `vk.bytes32()` writes it.
+    pub program_id: [u8; 32],
+    /// How long the derivation took, in seconds.
+    pub duration_secs: f64,
+}
+
 /// A job's segment size (po2) on each slot, by slot key, or `None` for a slot that must not prove it
 /// (see `WorkerPool::prove_min_vram`).
 pub type SlotPo2<'a> = &'a dyn Fn(&str) -> Option<u8>;
@@ -1762,6 +1771,9 @@ pub struct WorkerPool {
     /// When set, `discover_and_spawn` starts workers for these backends only (see
     /// [`Self::only_backends`]).
     only_backends: Option<HashSet<String>>,
+    /// When set, `discover_and_spawn` starts the dedicated measure pools only, and no prove worker
+    /// (see [`Self::measure_only`]).
+    measure_only: bool,
 }
 
 /// Round-robin counter for load balancing across multiple GPU workers.
@@ -1791,7 +1803,19 @@ impl WorkerPool {
             shm_ledger: crate::memory::MemoryLedger::default(),
             inflight_measures: Mutex::new(HashMap::new()),
             only_backends: None,
+            measure_only: false,
         }
+    }
+
+    /// Start the dedicated measure pools only: no prove worker at all. For a process that sizes jobs
+    /// and never proves (`zkminer simulate`): a prove worker would hold a process per card for
+    /// nothing, and SP1's has host-wide startup side effects (it installs its bundled
+    /// `sp1-gpu-server` and reaps orphaned servers' sockets) beside any miner on this host. The
+    /// measure workers never build a prover (risc0's `default_prover()` is touched only by `Prove`;
+    /// SP1's run with `SP1_MEASURE_ONLY_ENV`), so a GPU worker binary serves here on a host without
+    /// its GPU, and so does `zkminer-prove-risc0-cpu`.
+    pub fn measure_only(&mut self) {
+        self.measure_only = true;
     }
 
     /// Start workers (prove and measure) for these backends only; the others are not spawned at
@@ -2057,6 +2081,10 @@ impl WorkerPool {
             }
             if backend == zkminer_prover_protocol::BACKEND_RISC0 && risc0_measure_path.is_none() {
                 risc0_measure_path = Some(path.clone());
+            }
+            if self.measure_only {
+                // Only the binary path is wanted: the measure pools below are spawned from it.
+                continue;
             }
             let key = slot_key(&backend, &gpu_tag, device_index);
             let env = Self::gpu_env(&backend, &gpu_tag, pci_bus_id.as_deref(), device_index);
@@ -2643,6 +2671,34 @@ impl WorkerPool {
     /// exceeded the pool on >=3-GPU rigs (over-spawning into the "all slots busy" race).
     pub fn measure_worker_count(&self, backend: &str) -> Option<usize> {
         self.measure_workers.get(backend).map(|p| p.len())
+    }
+
+    /// How many of `backend`'s measure workers are running now (a busy one counts). 0 when it has
+    /// no measure pool, or every slot failed to start: a caller that only measures can refuse to
+    /// start on that instead of failing every job.
+    pub fn measure_workers_live(&self, backend: &str) -> usize {
+        self.measure_workers.get(backend).map_or(0, |pool| {
+            pool.iter()
+                .filter(|e| match e.slot.try_lock() {
+                    Ok(slot) => slot.handle.is_some(),
+                    // Busy: running a request, so live. Poisoned: a panic held it; not live.
+                    Err(std::sync::TryLockError::WouldBlock) => true,
+                    Err(std::sync::TryLockError::Poisoned(_)) => false,
+                })
+                .count()
+        })
+    }
+
+    /// The SDK version a live measure worker of `backend` reported at its handshake (e.g.
+    /// "risc0-zkvm 3.0.6"), if one is idle to ask. A program id is a function of the ELF AND the SDK
+    /// (an SP1 vkey depends on its circuit version), so a cache of derived ids keys on it.
+    pub fn measure_worker_sdk_version(&self, backend: &str) -> Option<String> {
+        self.measure_workers.get(backend)?.iter().find_map(|e| {
+            e.slot
+                .try_lock()
+                .ok()
+                .and_then(|slot| slot.handle.as_ref().and_then(|h| h.sdk_version.clone()))
+        })
     }
 
     /// Measure-pool LIVENESS for `backend` (distinct from idleness): `None` if the backend has no
@@ -3944,31 +4000,14 @@ impl WorkerPool {
         })
     }
 
-    /// Measure a job's TRUE cycle count by executing the guest, without proving it.
-    ///
-    /// Every scheduling decision is sized from `expectedCycles` on the job descriptor, which
-    /// is submitter-declared and — on the observed market — always zero, leaving a hardcoded
-    /// 34e6 fallback that is ~8x below the measured median. This is the only way to learn the
-    /// real number before committing collateral.
-    ///
-    /// Runs on any live worker for `backend` WITHOUT taking that worker's GPU lock: execution
-    /// is CPU work in the default executor, so it must not block or contend with the proofs it
-    /// exists to schedule. `timeout` bounds it — an unexpectedly enormous guest must not stall
-    /// the brain loop.
-    pub fn execute_cycles(
-        &self,
+    /// The slot one sizing request for `backend` runs on (`Execute`, `ProgramId`), locked: a live
+    /// idle one, else a down one revived. Shared by [`Self::execute_cycles`] and
+    /// [`Self::derive_program_id`]. `MeasureSlotsBusy` (typed, transient) when every slot is busy or
+    /// down and not revivable.
+    fn measure_slot<'a>(
+        &'a self,
         backend: &str,
-        elf: &[u8],
-        input_data: &[u8],
-        timeout: Option<Duration>,
-        // The job's on-chain programId; the risc0 worker refuses to size (execute) an ELF whose
-        // image id does not match, so the zero-cost pre-claim measurement path cannot be driven with
-        // an ELF unrelated to the registered program.
-        program_id: Option<[u8; 32]>,
-        // The segment size to execute at (risc0): the size of a card that may prove the job, since a
-        // guest can tell the size it runs at. `None` = the worker's default.
-        po2: Option<u8>,
-    ) -> anyhow::Result<ExecuteMeasurement> {
+    ) -> anyhow::Result<(String, &'a WorkerEntry, std::sync::MutexGuard<'a, WorkerSlot>)> {
         // Measure on the DEDICATED measure worker when one exists for this backend (SP1), NEVER on a
         // prove worker — so a measure wall-clock-watchdog SIGKILL (which group-kills the chosen
         // worker, dispatcher.rs watchdog) can only hit this server-less process, never a prove
@@ -3996,7 +4035,7 @@ impl WorkerPool {
         // proving and a sizing measurement must never queue behind one — but taking only the first
         // meant a rig whose first GPU was busy never measured at all, even with the second one idle.
         // (With a dedicated measure worker there is one candidate; the scan still applies cleanly.)
-        let (key, entry, mut slot) = {
+        let (key, entry, slot) = {
             let mut found = None;
             for (k, e) in &candidates {
                 let e = *e;
@@ -4064,6 +4103,36 @@ impl WorkerPool {
                 }
             }
         };
+        Ok((key, entry, slot))
+    }
+
+    /// Measure a job's TRUE cycle count by executing the guest, without proving it.
+    ///
+    /// Every scheduling decision is sized from `expectedCycles` on the job descriptor, which
+    /// is submitter-declared and — on the observed market — always zero, leaving a hardcoded
+    /// 34e6 fallback that is ~8x below the measured median. This is the only way to learn the
+    /// real number before committing collateral.
+    ///
+    /// Runs on any live worker for `backend` WITHOUT taking that worker's GPU lock: execution
+    /// is CPU work in the default executor, so it must not block or contend with the proofs it
+    /// exists to schedule. `timeout` bounds it — an unexpectedly enormous guest must not stall
+    /// the brain loop.
+    pub fn execute_cycles(
+        &self,
+        backend: &str,
+        elf: &[u8],
+        input_data: &[u8],
+        timeout: Option<Duration>,
+        // The job's on-chain programId; the risc0 worker refuses to size (execute) an ELF whose
+        // image id does not match, so the zero-cost pre-claim measurement path cannot be driven with
+        // an ELF unrelated to the registered program.
+        program_id: Option<[u8; 32]>,
+        // The segment size to execute at (risc0): the size of a card that may prove the job, since a
+        // guest can tell the size it runs at. `None` = the worker's default.
+        po2: Option<u8>,
+    ) -> anyhow::Result<ExecuteMeasurement> {
+        // A free measure slot (see `measure_slot`): typed `MeasureSlotsBusy` when none is.
+        let (key, entry, mut slot) = self.measure_slot(backend)?;
         let key = key.as_str();
         let handle = slot
             .handle
@@ -4382,6 +4451,124 @@ impl WorkerPool {
                 anyhow::bail!("cycle measurement failed: {message}")
             }
             other => anyhow::bail!("unexpected response to Execute: {other:?}"),
+        }
+    }
+
+    /// Derive the program id the chain binds a proof of `elf` to, on a measure worker, without
+    /// executing it: the risc0 image id (milliseconds) or the SP1 verifying-key hash (SP1's `setup` on
+    /// the CPU, minutes; see `WorkerCommand::ProgramId`). For `zkminer simulate`, which must know a
+    /// served SP1 ELF IS the job's program before it reports a measurement of it: SP1's `Execute` does
+    /// not check that, and the registry's `elf_hash` binds the bytes to the registrant's word only.
+    ///
+    /// Runs on the same slots as [`Self::execute_cycles`], charged to the host-RAM ledger the same
+    /// way, and bounded by `timeout` the same way (a watchdog SIGKILL comes back as the typed
+    /// `MeasureWallClockTimeout`). Not registered as preemptible: only a process that proves nothing
+    /// calls it, so no committed proof can need its memory.
+    pub fn derive_program_id(
+        &self,
+        backend: &str,
+        elf: &[u8],
+        timeout: Option<Duration>,
+    ) -> anyhow::Result<ProgramIdDerivation> {
+        let (key, entry, mut slot) = self.measure_slot(backend)?;
+        let key = key.as_str();
+        let handle = slot
+            .handle
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("worker '{key}' has no live handle"))?;
+
+        static PROGRAM_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+        // Disjoint from prove ids and from execute ids (which set the top bit).
+        let request_id = PROGRAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed) | 0x4000_0000_0000_0000;
+        entry.intentional_kill.store(false, Ordering::Release);
+
+        // The same charge as a measurement on this slot: SP1's setup traces the program on the CPU
+        // much as its executor does, and risc0's image id is far below its execute ceiling.
+        let _mem = if self.measure_workers.contains_key(backend) {
+            let total = crate::memory::mem_total_bytes().unwrap_or(u64::MAX);
+            let want = if backend == zkminer_prover_protocol::BACKEND_SP1 {
+                crate::memory::sp1_measure_cap_bytes(total)
+            } else {
+                crate::memory::RISC0_EXECUTE_PEAK_BYTES
+                    .min(crate::memory::max_admissible_budget(total))
+            };
+            match self.reserve_host_memory(want, key) {
+                Some(r) => Some(r),
+                None => {
+                    return Err(anyhow::Error::new(
+                        zkminer_prover_protocol::types::HostMemoryShortage {
+                            attempted: false,
+                            slot_key: key.to_string(),
+                            needed: want,
+                            reserved: self.reserved_host_memory(),
+                            available: crate::memory::mem_available_bytes().unwrap_or(0),
+                        },
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Err(e) = handle.send(&WorkerCommand::ProgramId {
+            request_id,
+            elf: elf.to_vec(),
+        }) {
+            // A closed pipe: the worker died while idle. Clear the slot so the next request revives
+            // it (see the same arm in `execute_cycles`).
+            Self::mark_slot_dead(&mut slot, entry);
+            return Err(e);
+        }
+        let _watchdog = timeout.map(|t| {
+            ProvingWatchdog::new(
+                entry.pid.clone(),
+                entry.pid_starttime.clone(),
+                t,
+                key.to_string(),
+                entry.intentional_kill.clone(),
+            )
+        });
+        let response = match handle.recv_proof(request_id, &None) {
+            Ok(r) => r,
+            Err(e) => {
+                if entry.intentional_kill.load(Ordering::Acquire) {
+                    // Our own watchdog: a wall-clock timeout, not a crash.
+                    Self::mark_slot_dead(&mut slot, entry);
+                    return Err(anyhow::Error::new(
+                        zkminer_prover_protocol::types::MeasureWallClockTimeout {
+                            slot_key: key.to_string(),
+                        },
+                    ));
+                }
+                Self::mark_slot_failed(&mut slot, entry);
+                return Err(e);
+            }
+        };
+        match response {
+            WorkerResponse::ProgramIdResult {
+                program_id,
+                duration_secs,
+                ..
+            } => {
+                tracing::debug!("program id on {key}: derived in {duration_secs:.1}s");
+                Ok(ProgramIdDerivation {
+                    program_id,
+                    duration_secs,
+                })
+            }
+            // The worker's verdict on the ELF, typed; any other kind (Internal: it could not even
+            // build its prover) is not about the program.
+            WorkerResponse::Error {
+                kind: ErrorKind::InvalidInput,
+                message,
+                ..
+            } => Err(anyhow::Error::new(
+                zkminer_prover_protocol::types::ProgramIdRefused { message },
+            )),
+            WorkerResponse::Error { message, .. } => {
+                anyhow::bail!("program id derivation failed: {message}")
+            }
+            other => anyhow::bail!("unexpected response to ProgramId: {other:?}"),
         }
     }
 

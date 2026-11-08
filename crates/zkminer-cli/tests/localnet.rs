@@ -2067,6 +2067,267 @@ async fn watch_only_reports_every_job() {
     dir.finish();
 }
 
+/// `zkminer simulate` over every job: the RISC Zero program's cases, and with
+/// `ZKMINER_LOCALNET_SP1_WORKER` set the SP1 program's too (its vkey derived on the CPU, minutes).
+/// Each measurable job must come back `measured` with its program bound (image id / vkey), a risc0
+/// count a power of two (one segment), and the binding verdict its case implies; the decoy ELF must
+/// come back `program_mismatch` and the unreachable one `unavailable`; an unknown job id
+/// `unavailable`; and the same reports through `--stdin` with submit-tx hints. Nothing is sent.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs anvil, the release risc0 worker (a CPU one serves) and the 743111 RPC; see the module docs"]
+async fn simulate_reports_every_job() {
+    let dir = RunDir::new("simulate");
+    let risc0 = risc0_worker();
+    let sp1 = std::env::var("ZKMINER_LOCALNET_SP1_WORKER")
+        .ok()
+        .map(PathBuf::from);
+    let mut programs = vec![Program::fibonacci(&risc0, &dir.0)];
+    if let Some(w) = &sp1 {
+        programs.push(Program::sp1_fibonacci(w, &dir.0));
+    }
+    let n_programs = programs.len();
+    let mut world = World::with_programs(&dir.0, programs, &Case::ALL, Clock::Wall, vec![1]).await;
+    world.submit_held_back().await;
+    let config = world.write_config(&dir.0, &risc0, false);
+    let mut args: Vec<String> = vec![
+        "--risc0-worker".into(),
+        risc0.display().to_string(),
+        "--cache-dir".into(),
+        dir.0.join("simulate-cache").display().to_string(),
+    ];
+    if let Some(w) = &sp1 {
+        args.extend(["--sp1-worker".into(), w.display().to_string()]);
+    }
+    let unknown = keccak256(b"zkminer localnet: no such job");
+    let mut run_args = args.clone();
+    for job in &world.jobs {
+        run_args.extend(["--job".into(), job.id.to_string()]);
+    }
+    run_args.extend(["--job".into(), unknown.to_string()]);
+    let argv: Vec<&str> = run_args.iter().map(String::as_str).collect();
+    let out = Miner::command(&dir.0, &config, &[], "simulate", &argv, &[])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run zkminer simulate");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    std::fs::write(dir.0.join("simulate.log"), &stderr).ok();
+    let mut failures: Vec<String> = Vec::new();
+    if !out.status.success() {
+        failures.push(format!("zkminer simulate exited {}", out.status));
+    }
+    let reports: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not a JSON report ({e}): {l}")))
+        .collect();
+    if reports.len() != world.jobs.len() + 1 {
+        failures.push(format!(
+            "{} reports for {} requests",
+            reports.len(),
+            world.jobs.len() + 1
+        ));
+    }
+    let report_of = |id: B256| {
+        reports
+            .iter()
+            .find(|r| r["jobId"].as_str() == Some(&id.to_string()))
+            .cloned()
+    };
+    let mut sp1_derivations = 0;
+    for job in &world.jobs {
+        let program = world.program_of(job);
+        let sp1_job = is_sp1_id(program.proof_system);
+        let Some(r) = report_of(job.id) else {
+            failures.push(format!("{:?} ({}): no report", job.case, program.name));
+            continue;
+        };
+        let what = format!("{:?} ({})", job.case, program.name);
+        let outcome = r["outcome"].as_str().unwrap_or_default();
+        match job.case {
+            Case::DecoyElf => {
+                // The decoy serves the risc0 guest. Its image id is not the job's: a mismatch. Under
+                // SP1, setup either derives a vkey that is not the job's (a mismatch) or refuses the
+                // bytes, which SP1 reports as a retryable failure (setup can fail for the host too).
+                let ok = outcome == "program_mismatch" || (sp1_job && outcome == "failed" && r["retryable"] == true);
+                if !ok {
+                    failures.push(format!("{what}: {outcome}, not program_mismatch: {r}"));
+                }
+            }
+            Case::ElfUnreachable => {
+                if outcome != "unavailable" || r["retryable"] != true {
+                    failures.push(format!("{what}: {outcome}, not a retryable unavailable: {r}"));
+                }
+            }
+            case => {
+                if outcome != "measured" {
+                    failures.push(format!("{what}: {outcome}, not measured: {r}"));
+                    continue;
+                }
+                let cycles: u64 = r["cycles"].as_str().and_then(|c| c.parse().ok()).unwrap_or(0);
+                let check = r["programCheck"].as_str().unwrap_or_default();
+                if sp1_job {
+                    if check != "vkey" || cycles == 0 || !r["po2"].is_null() {
+                        failures.push(format!("{what}: an SP1 measurement must be vkey-bound, nonzero and have no po2: {r}"));
+                    }
+                    if r["programCheckSecs"].as_f64().unwrap_or(0.0) > 0.0 {
+                        sp1_derivations += 1;
+                    }
+                } else if check != "image_id" || !cycles.is_power_of_two() || r["po2"] != 20 {
+                    failures.push(format!("{what}: a risc0 measurement must be image-id-bound, a power of two at po2 20: {r}"));
+                }
+                let binding = r["binding"].as_str().unwrap_or_default();
+                let want = match case {
+                    Case::Full | Case::Fields | Case::FullForAnother | Case::FullExclusiveForAnother | Case::HighCollateral => Some("satisfied"),
+                    Case::FullWrongJournal | Case::FieldsWrongJournal => Some("fails"),
+                    Case::NoneForUs | Case::NoneForAnother => Some("none"),
+                    _ => None,
+                };
+                if want.is_some_and(|w| w != binding) {
+                    failures.push(format!("{what}: binding {binding}, expected {want:?}: {r}"));
+                }
+                if r["inputBytes"] != program.input.len() as u64 {
+                    failures.push(format!("{what}: inputBytes {} for a {}-byte input", r["inputBytes"], program.input.len()));
+                }
+            }
+        }
+    }
+    if sp1.is_some() && sp1_derivations != 1 {
+        failures.push(format!("the SP1 vkey was derived {sp1_derivations} times, not once and then cached"));
+    }
+    match report_of(unknown) {
+        Some(r) if r["outcome"] == "unavailable" => {}
+        other => failures.push(format!("an unknown job id: {other:?}")),
+    }
+
+    // The same through --stdin, with the submitting tx as a hint, a garbage line skipped, and a
+    // bare id; and now every SP1 vkey comes from the cache.
+    let submitted = world.logs::<IHemiProveCore::JobSubmitted>().await;
+    let first = &world.jobs[0];
+    let tx = submitted
+        .iter()
+        .find(|(id, _)| *id == first.id)
+        .map(|(_, l)| l.tx)
+        .expect("the first job's JobSubmitted");
+    let input = format!(
+        "{{\"jobId\":\"{}\",\"submitTx\":\"{tx}\"}}\nnot a request\n{}\n",
+        first.id,
+        world.jobs[1].id
+    );
+    let argv: Vec<&str> = args.iter().map(String::as_str).chain(["--stdin"]).collect();
+    let mut child = Miner::command(&dir.0, &config, &[], "simulate", &argv, &[])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zkminer simulate --stdin");
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let out = child.wait_with_output().expect("wait for zkminer simulate --stdin");
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let ids: Vec<&str> = lines.iter().filter_map(|r| r["jobId"].as_str()).collect();
+    if ids != [first.id.to_string(), world.jobs[1].id.to_string()] {
+        failures.push(format!("--stdin reported {ids:?}"));
+    }
+    // One line out per line in: the garbage line is answered, in its place.
+    let shape: Vec<&str> = lines
+        .iter()
+        .map(|r| if r["error"] == "invalid_request" { "invalid" } else { "report" })
+        .collect();
+    if shape != ["report", "invalid", "report"] {
+        failures.push(format!("--stdin answered {shape:?}"));
+    }
+    if !String::from_utf8_lossy(&out.stderr).contains("skipping a request line") {
+        failures.push("--stdin did not say it skipped the garbage line".into());
+    }
+    for r in &lines {
+        if r["programCheckSecs"].as_f64().unwrap_or(0.0) > 0.0 && r["programCheck"] == "vkey" {
+            failures.push(format!("--stdin derived an SP1 vkey the cache holds: {r}"));
+        }
+    }
+
+    // Simulating sends nothing.
+    let anvil_log = std::fs::read_to_string(dir.0.join("anvil.log")).unwrap_or_default();
+    if anvil_log.matches("eth_sendRawTransaction").count() > 0 {
+        failures.push("the node received a raw transaction".into());
+    }
+    eprintln!(
+        "localnet: simulate covered {} jobs over {n_programs} program(s)",
+        world.jobs.len()
+    );
+    if !failures.is_empty() {
+        let tail: Vec<String> = stderr.lines().rev().take(60).map(str::to_string).collect();
+        dump_tail(&dir.0, &tail.into_iter().rev().collect::<Vec<_>>());
+        panic!(
+            "simulate localnet run failed (run directory {}):\n  {}",
+            dir.0.display(),
+            failures.join("\n  ")
+        );
+    }
+    dir.finish();
+}
+
+/// Serves a fork set up as [`simulate_reports_every_job`]'s (the risc0 program's cases, and the SP1
+/// program's with `ZKMINER_LOCALNET_SP1_WORKER`) to a `zkminer simulate` consumer run by hand, such
+/// as an indexer's runner: writes `simulate-jobs.json` (each job's id, submit tx, case and program)
+/// and the miner config into the run directory, says READY, and keeps the fork up until a `stop`
+/// file appears there (or `ZKMINER_LOCALNET_SERVE_SECS`, default 3600). CPU only.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "serves a localnet to a simulate consumer run by hand; set ZKMINER_LOCALNET_SERVE=1"]
+async fn serves_jobs_to_simulate() {
+    if !env_flag("ZKMINER_LOCALNET_SERVE") {
+        eprintln!("localnet: SKIPPED; set ZKMINER_LOCALNET_SERVE=1 to serve one");
+        return;
+    }
+    let dir = RunDir::new("serve-simulate");
+    let risc0 = risc0_worker();
+    let mut programs = vec![Program::fibonacci(&risc0, &dir.0)];
+    if let Ok(w) = std::env::var("ZKMINER_LOCALNET_SP1_WORKER") {
+        programs.push(Program::sp1_fibonacci(Path::new(&w), &dir.0));
+    }
+    let mut world = World::with_programs(&dir.0, programs, &Case::ALL, Clock::Wall, vec![1]).await;
+    world.submit_held_back().await;
+    let config = world.write_config(&dir.0, &risc0, false);
+    let submitted = world.logs::<IHemiProveCore::JobSubmitted>().await;
+    let jobs: Vec<serde_json::Value> = world
+        .jobs
+        .iter()
+        .map(|j| {
+            let tx = submitted
+                .iter()
+                .find(|(id, _)| *id == j.id)
+                .map(|(_, l)| l.tx.to_string());
+            serde_json::json!({
+                "jobId": j.id.to_string(),
+                "submitTx": tx,
+                "case": format!("{:?}", j.case),
+                "program": world.program_of(j).name,
+                "proofSystem": world.program_of(j).proof_system.to_string(),
+            })
+        })
+        .collect();
+    let list = dir.0.join("simulate-jobs.json");
+    std::fs::write(&list, serde_json::to_string_pretty(&jobs).unwrap()).unwrap();
+    let stop = dir.0.join("stop");
+    let secs: u64 = std::env::var("ZKMINER_LOCALNET_SERVE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3_600);
+    eprintln!(
+        "localnet: READY. {} jobs on the fork at {}; jobs in {}, miner config {}; stop with: touch {}",
+        jobs.len(),
+        world.rpc_url,
+        list.display(),
+        config.display(),
+        stop.display()
+    );
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(secs) && !stop.exists() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    dir.finish();
+}
+
 /// The environment for a miner on the replayed receipt fixture.
 fn replay_env() -> Vec<(&'static str, String)> {
     vec![
