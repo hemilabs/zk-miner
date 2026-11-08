@@ -27,6 +27,33 @@ pub(crate) fn apply_cuda_groth16_helper() {
     unsafe { std::env::set_var(VAR, &helper) };
 }
 
+/// Fewer and cheaper device-to-host readbacks for the HIP server (AMD cards).
+///
+/// On Windows each small readback costs several times what it does on Linux: on an RX 9070 XT the
+/// ~14,000 readbacks of a 144M-cycle proof took 7-8x their time on an RTX 4090, 18-26% of the AMD
+/// card's GPU time. Two `sp1-gpu-server` switches cut that:
+/// - `SP1_GPU_GKR_DEVICE_ROUNDS=1`: a LogUp-GKR layer's later sumcheck rounds finish and sample their
+///   challenge on the device; the host replays them and checks every message and challenge;
+/// - `SP1_HIP_PINNED_READBACK=1`: the remaining small readbacks go through a pinned staging buffer
+///   (off by default on Windows since an RX 9060 XT read back wrong GKR values with it in 18 of 156
+///   proofs, each caught by shard verification and proved again).
+///
+/// RX 9070 XT (SP1's node bench, 4 proofs each): fibonacci 144M-cycle core 2.82-2.86 -> 2.59-2.61 s,
+/// sha2 compressed 3.58-3.60 -> 3.18-3.19 s; 150 of 150 proofs verified with no shard retried. A value
+/// the operator set wins.
+pub(crate) fn apply_hip_readbacks() {
+    if crate::warmup::server_name() != "sp1-gpu-server-hip" {
+        return;
+    }
+    for var in ["SP1_GPU_GKR_DEVICE_ROUNDS", "SP1_HIP_PINNED_READBACK"] {
+        if std::env::var_os(var).is_none() {
+            tracing::info!("SP1 tuning: {var}=1 (AMD card on Windows: fewer, cheaper readbacks)");
+            // SAFETY: single-threaded startup, before any prover, server or thread exists.
+            unsafe { std::env::set_var(var, "1") };
+        }
+    }
+}
+
 /// The wrap prover's persistent proving key (`SP1_WRAP_PERSISTENT_PK`) on a 16 GB Intel card.
 ///
 /// `sp1-gpu-server` keeps the Groth16/PLONK key between proofs only on cards with 24 GB or more,
