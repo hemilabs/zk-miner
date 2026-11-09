@@ -42,6 +42,8 @@ pub const MEMORY_MERKLE_ELF: &[u8] = &[];
 pub const MEMORY_MERKLE_ID: [u32; 8] = [0u32; 8];
 pub const CHACHA_MIX_ELF: &[u8] = &[];
 pub const CHACHA_MIX_ID: [u32; 8] = [0u32; 8];
+pub const ZKOP_MIX_ELF: &[u8] = &[];
+pub const ZKOP_MIX_ID: [u32; 8] = [0u32; 8];
 pub const RV32IM_TORTURE_ELF: &[u8] = &[];
 pub const RV32IM_TORTURE_ID: [u32; 8] = [0u32; 8];
 pub const EDGE_CASE_ARITH_ELF: &[u8] = &[];
@@ -73,6 +75,7 @@ pub const MINIMAL_PROOF_ID: [u32; 8] = [0u32; 8];
     guests.insert("bigint-mul", opts.clone());
     guests.insert("memory-merkle", opts.clone());
     guests.insert("chacha-mix", opts.clone());
+    guests.insert("zkop-mix", opts.clone());
     guests.insert("rv32im-torture", opts.clone());
     guests.insert("edge-case-arith", opts.clone());
     guests.insert("memory-stress", opts.clone());
@@ -105,6 +108,14 @@ pub const MINIMAL_PROOF_ID: [u32; 8] = [0u32; 8];
     println!(
         "cargo:rerun-if-changed={}",
         guest_dir.join("chacha-mix/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("../common/zkop_mix.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("zkop-mix/src/main.rs").display()
     );
     println!(
         "cargo:rerun-if-changed={}",

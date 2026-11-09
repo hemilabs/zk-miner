@@ -400,7 +400,6 @@ async fn run_device_benchmark(state: SharedState, device_id: &str) {
             existing.results = suite.results;
             existing.cpu_info = suite.cpu_info;
             existing.timestamp = suite.timestamp;
-            existing.zkops = suite.zkops;
             existing.cpu_power_watts = suite.cpu_power_watts;
 
             // Replace CPU device benchmarks
@@ -412,12 +411,8 @@ async fn run_device_benchmark(state: SharedState, device_id: &str) {
                     .filter(|d| d.device_id == "cpu"),
             );
 
-            let zkops = existing.zkops;
             benchmark::save_benchmark(existing);
-            s.add_log(
-                LogLevel::Success,
-                format!("CPU benchmark complete (zkOP/s: {zkops:.0})"),
-            );
+            s.add_log(LogLevel::Success, "CPU benchmark complete");
         }
         s.benchmark_device_in_progress = None;
     } else {
@@ -525,6 +520,7 @@ async fn run_streaming_gpu_benchmark(state: SharedState) {
             .device_benchmarks
             .retain(|d| !d.device_id.starts_with("gpu"));
         existing.device_benchmarks.extend(suite.device_benchmarks);
+        existing.zkops = benchmark::machine_zkops(&existing.device_benchmarks);
         existing.gpu_power_watts = suite.gpu_power_watts;
         existing.timestamp = suite.timestamp;
         benchmark::save_benchmark(existing);

@@ -527,8 +527,8 @@ pub struct DeviceProgress {
     pub complete: bool,
     /// The slot finished without producing results.
     pub failed: bool,
-    /// Partial zkOP/s score computed from completed programs.
-    pub partial_zkops: Option<f64>,
+    /// This row's zkOP/s, once its scoring program has finished.
+    pub zkops: Option<f64>,
 }
 
 /// Shorten a driver-reported GPU name for places that have to fit several of them on one line.
@@ -660,8 +660,10 @@ impl BenchmarkTracker {
         };
         let programs = zkminer_prover::benchmark::BENCHMARK_PROGRAMS
             .iter()
-            .map(|program| ProgramProgress {
-                name: program.name.into(),
+            .map(|program| program.name)
+            .chain([zkminer_prover_protocol::BENCH_ZKOP_MIX])
+            .map(|name| ProgramProgress {
+                name: name.into(),
                 phase: ProgramPhase::Pending,
                 throughput: None,
                 duration_secs: None,
@@ -683,7 +685,7 @@ impl BenchmarkTracker {
             programs,
             complete: false,
             failed: false,
-            partial_zkops: None,
+            zkops: None,
         });
         self.devices.len() - 1
     }
@@ -740,25 +742,10 @@ impl BenchmarkTracker {
             prog.precompile = Some(entry.precompile);
         }
 
-        // Compute partial zkOP/s from completed programs
-        let partial_results: Vec<zkminer_prover::benchmark::BenchmarkResult> = dev
-            .programs
-            .iter()
-            .filter(|p| p.phase == ProgramPhase::Done)
-            .filter_map(|p| {
-                Some(zkminer_prover::benchmark::BenchmarkResult {
-                    program_name: p.name.clone(),
-                    prover_backend: p.prover_backend.clone().unwrap_or_default(),
-                    cycles: p.cycles.unwrap_or(0),
-                    duration: std::time::Duration::from_secs_f64(p.duration_secs.unwrap_or(0.0)),
-                    throughput: p.throughput.unwrap_or(0.0),
-                    weight: p.weight.unwrap_or(0.0),
-                    precompile: p.precompile.unwrap_or(false),
-                })
-            })
-            .collect();
-        if !partial_results.is_empty() {
-            dev.partial_zkops = Some(zkminer_prover::benchmark::compute_zkops(&partial_results));
+        if entry.program_name == zkminer_prover_protocol::BENCH_ZKOP_MIX {
+            dev.zkops = Some(zkminer_prover_protocol::zkops_from_stark_secs(
+                entry.duration_secs,
+            ));
         }
 
         // Mark the next pending program as Running
@@ -960,7 +947,7 @@ mod benchmark_tracker_tests {
         ));
 
         assert_eq!(tracker.devices.len(), 3);
-        assert_eq!(tracker.total_count(), 18);
+        assert_eq!(tracker.total_count(), 21);
         let active = tracker.active_device().expect("a card is running");
         assert_eq!(tracker.display_name(active), "RTX 4090 RISC Zero");
         assert_eq!(active.programs[0].phase, ProgramPhase::Running);
@@ -1029,6 +1016,18 @@ mod benchmark_tracker_tests {
 
         assert!(!tracker.devices[0].failed);
         assert_eq!(tracker.devices[0].programs[0].phase, ProgramPhase::Pending);
+    }
+
+    #[test]
+    fn the_score_comes_from_the_scoring_program_only() {
+        let key = "sp1:cuda:0";
+        let mut tracker = BenchmarkTracker::default();
+        tracker.apply(&event(key, RTX, 0, program_done("chacha-mix", 6)));
+        assert_eq!(tracker.devices[0].zkops, None);
+
+        tracker.apply(&event(key, RTX, 0, program_done(zkminer_prover_protocol::BENCH_ZKOP_MIX, 7)));
+        let expected = zkminer_prover_protocol::zkops_from_stark_secs(1.0);
+        assert_eq!(tracker.devices[0].zkops, Some(expected));
     }
 
     #[test]

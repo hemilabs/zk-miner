@@ -428,26 +428,20 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
         // AMD GPU the two are off by one, and this column showed each card its
         // neighbour's score. `None` = no row for this card; render "--", never a
         // positional guess.
-        let best_gpu_tp = gpu
+        // This card's own SP1 score. A card with no row or no score shows "--", never a guess.
+        let card_zkops = gpu
             .benchmark_device_id(suite)
             .map(|device_id| {
                 suite
                     .device_benchmarks
                     .iter()
-                    .filter(|d| d.device_id == device_id)
-                    .map(|d| d.throughput)
+                    .filter(|d| d.device_id == device_id && d.prover_backend == "sp1")
+                    .map(|d| d.zkops())
                     .fold(0.0_f64, f64::max)
             })
             .unwrap_or(0.0);
-        let best_cpu_tp = suite
-            .device_benchmarks
-            .iter()
-            .filter(|d| d.device_id == "cpu")
-            .map(|d| d.throughput)
-            .fold(0.0_f64, f64::max);
-        if best_gpu_tp > 0.0 && best_cpu_tp > 0.0 && suite.zkops > 0.0 {
-            let gpu_zkops = best_gpu_tp / best_cpu_tp * suite.zkops;
-            format_compact(gpu_zkops)
+        if card_zkops > 0.0 {
+            format_compact(card_zkops)
         } else {
             "--".to_string()
         }

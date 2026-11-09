@@ -2500,13 +2500,7 @@ pub async fn run(
     let state = new_shared_state();
 
     // Initialize worker pool (before TUI, after config load)
-    let benchmark_timeout = if config.prover.benchmark_timeout_secs > 0 {
-        Some(std::time::Duration::from_secs(
-            config.prover.benchmark_timeout_secs,
-        ))
-    } else {
-        None
-    };
+    let benchmark_timeout = config.prover.benchmark_timeout();
     let mut pool = WorkerPool::new(
         config
             .prover

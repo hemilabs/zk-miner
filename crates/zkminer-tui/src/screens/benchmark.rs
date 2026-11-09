@@ -10,6 +10,7 @@ use crate::hardware::GpuVendor;
 use crate::state::{BenchmarkTracker, MinerState, ProgramPhase};
 use crate::theme;
 use zkminer_prover::benchmark::BENCHMARK_PROGRAMS;
+use zkminer_prover_protocol::{zkops_from_stark_secs, BENCH_ZKOP_MIX};
 
 /// Build the ordered list of unique device IDs from benchmark data + hardware.
 /// CPU is always first, then gpu0, gpu1, etc.
@@ -85,34 +86,16 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
 
     // CPU info + zkOP/s
     let cpu_info = if let Some(bench) = &state.benchmark_results {
-        let (zkops_color, zkops_label) = if bench.zkops >= 100_000.0 {
-            (theme::green(), "Excellent")
-        } else if bench.zkops >= 50_000.0 {
-            (theme::yellow(), "Good")
-        } else if bench.zkops > 0.0 {
-            (theme::red(), "Low")
-        } else {
-            (theme::subtext(), "N/A")
-        };
-
         vec![
             Line::from(vec![
-                Span::styled(format!(" zkOP/s: {:.0} ", bench.zkops), theme::metric()),
                 Span::styled(
-                    format!("  ({})", zkops_label),
-                    Style::default().fg(zkops_color),
+                    format!(" zkOP/s: {} ", format_zkops(bench.zkops)),
+                    theme::metric(),
                 ),
-                if bench.precompile_score > 0.0 || bench.compute_score > 0.0 {
-                    Span::styled(
-                        format!(
-                            "   Precompile: {:.1}x  Compute: {:.1}x",
-                            bench.precompile_score, bench.compute_score
-                        ),
-                        theme::dim(),
-                    )
-                } else {
-                    Span::raw("")
-                },
+                Span::styled(
+                    "  SP1 cycles per second on a 50M-cycle program, all GPUs",
+                    theme::dim(),
+                ),
             ]),
             Line::from(""),
             Line::from(vec![
@@ -287,7 +270,15 @@ fn render_device_benchmarks(f: &mut Frame, area: Rect, state: &MinerState) {
     let dev_count = ids.len();
 
     if let Some(bench) = &state.benchmark_results {
-        let dev_header = Row::new(["", "Backend", "po2", "Segment", "Memory", "Throughput"])
+        let dev_header = Row::new([
+            "",
+            "Backend",
+            "po2",
+            "Segment",
+            "Memory",
+            "Throughput",
+            "zkOP/s",
+        ])
             .style(theme::table_header());
 
         let mut dev_rows: Vec<Row> = Vec::new();
@@ -367,6 +358,7 @@ fn render_device_benchmarks(f: &mut Frame, area: Rect, state: &MinerState) {
                         Cell::from(segment_str),
                         Cell::from(mem_str),
                         Cell::from(format_throughput(d.throughput)),
+                        Cell::from(format_zkops(d.zkops())).style(theme::metric()),
                     ])
                     .style(theme::bold()),
                 );
@@ -405,6 +397,7 @@ fn render_device_benchmarks(f: &mut Frame, area: Rect, state: &MinerState) {
                 Constraint::Length(10),
                 Constraint::Length(10),
                 Constraint::Length(14),
+                Constraint::Length(10),
             ],
         )
         .header(dev_header)
@@ -617,172 +610,105 @@ fn render_program_table(f: &mut Frame, area: Rect, state: &MinerState, tracker: 
         })
         .unwrap_or_else(|| " Programs ".to_string());
 
-    let header = Row::new(vec![
-        Cell::from("").style(theme::table_header()),
-        Cell::from("Program").style(theme::table_header()),
-        Cell::from("Weight").style(theme::table_header()),
-        Cell::from("Cycles").style(theme::table_header()),
-        Cell::from("STARK").style(theme::table_header()),
-        Cell::from("Groth16").style(theme::table_header()),
-        Cell::from("Throughput").style(theme::table_header()),
-        Cell::from("Reference").style(theme::table_header()),
-        Cell::from("Delta").style(theme::table_header()),
-    ]);
+    let header = Row::new(
+        [
+            "", "Program", "Weight", "Cycles", "STARK", "Groth16", "Result",
+        ]
+        .map(|title| Cell::from(title).style(theme::table_header())),
+    );
 
-    let rows: Vec<Row> = if let Some(dev) = active_dev {
-        dev.programs
-            .iter()
-            .enumerate()
-            .map(|(i, prog)| {
-                let ref_tp = BENCHMARK_PROGRAMS
-                    .iter()
-                    .find(|p| p.name == prog.name)
-                    .map(|p| p.reference_throughput)
-                    .unwrap_or(0.0);
-
-                match &prog.phase {
-                    ProgramPhase::Pending => Row::new(vec![
-                        Cell::from(Span::styled(" \u{00B7}", theme::dim())),
-                        Cell::from(Span::styled(&prog.name, theme::dim())),
-                        Cell::from(Span::styled(
-                            prog.weight
-                                .map(|w| format!("{:.0}%", w * 100.0))
-                                .unwrap_or_else(|| {
-                                    format!(
-                                        "{:.0}%",
-                                        BENCHMARK_PROGRAMS
-                                            .iter()
-                                            .find(|p| p.name == prog.name)
-                                            .map(|p| p.weight * 100.0)
-                                            .unwrap_or(0.0)
-                                    )
-                                }),
-                            theme::dim(),
-                        )),
-                        Cell::from(Span::styled("\u{2014}", theme::dim())),
-                        Cell::from(Span::styled("\u{2014}", theme::dim())),
-                        Cell::from(Span::styled("\u{2014}", theme::dim())),
-                        Cell::from(Span::styled("\u{2014}", theme::dim())),
-                        Cell::from(Span::styled(
-                            format_throughput(ref_tp),
-                            Style::default().fg(theme::subtext()),
-                        )),
-                        Cell::from(Span::styled("\u{2014}", theme::dim())),
-                    ])
-                    .style(theme::striped(i)),
-
-                    ProgramPhase::Running => {
-                        let dots = ".".repeat((state.tick_count as usize % 3) + 1);
-                        let indicator_style = if state.tick_count.is_multiple_of(2) {
-                            Style::default()
-                                .fg(theme::yellow())
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(theme::yellow())
-                        };
-                        Row::new(vec![
-                            Cell::from(Span::styled(" \u{25B6}", indicator_style)),
-                            Cell::from(Span::styled(
-                                &prog.name,
-                                Style::default().add_modifier(Modifier::BOLD),
-                            )),
-                            Cell::from(Span::styled(
-                                format!(
-                                    "{:.0}%",
-                                    BENCHMARK_PROGRAMS
-                                        .iter()
-                                        .find(|p| p.name == prog.name)
-                                        .map(|p| p.weight * 100.0)
-                                        .unwrap_or(0.0)
-                                ),
-                                Style::default().fg(theme::text()),
-                            )),
-                            Cell::from(Span::styled("\u{2014}", theme::dim())),
-                            Cell::from(Span::styled(
-                                format!("proving{dots}"),
-                                Style::default().fg(theme::yellow()),
-                            )),
-                            Cell::from(Span::styled("\u{2014}", theme::dim())),
-                            Cell::from(Span::styled("\u{2014}", theme::dim())),
-                            Cell::from(Span::styled(
-                                format_throughput(ref_tp),
-                                Style::default().fg(theme::subtext()),
-                            )),
-                            Cell::from(Span::styled("\u{2014}", theme::dim())),
-                        ])
-                        .style(theme::striped(i))
-                    }
-
-                    ProgramPhase::Done => {
-                        let tp = prog.throughput.unwrap_or(0.0);
-                        let dur = prog.duration_secs.unwrap_or(0.0);
-                        let cycles = prog.cycles.unwrap_or(0);
-
-                        let delta = if ref_tp > 0.0 && tp > 0.0 {
-                            let pct = ((tp / ref_tp) - 1.0) * 100.0;
-                            let color = if pct > 2.0 {
-                                theme::green()
-                            } else if pct < -2.0 {
-                                theme::red()
+    let dash = || Cell::from(Span::styled("\u{2014}", theme::dim()));
+    let rows: Vec<Row> = active_dev
+        .map(|dev| {
+            dev.programs
+                .iter()
+                .enumerate()
+                .map(|(i, prog)| {
+                    let row = match &prog.phase {
+                        ProgramPhase::Pending => Row::new(vec![
+                            Cell::from(Span::styled(" \u{00B7}", theme::dim())),
+                            Cell::from(Span::styled(&prog.name, theme::dim())),
+                            Cell::from(Span::styled(weight_label(&prog.name), theme::dim())),
+                            dash(),
+                            dash(),
+                            dash(),
+                            dash(),
+                        ]),
+                        ProgramPhase::Running => {
+                            let dots = ".".repeat((state.tick_count as usize % 3) + 1);
+                            let indicator_style = if state.tick_count.is_multiple_of(2) {
+                                Style::default()
+                                    .fg(theme::yellow())
+                                    .add_modifier(Modifier::BOLD)
                             } else {
-                                theme::subtext()
+                                Style::default().fg(theme::yellow())
                             };
+                            Row::new(vec![
+                                Cell::from(Span::styled(" \u{25B6}", indicator_style)),
+                                Cell::from(Span::styled(
+                                    &prog.name,
+                                    Style::default().add_modifier(Modifier::BOLD),
+                                )),
+                                Cell::from(Span::styled(
+                                    weight_label(&prog.name),
+                                    Style::default().fg(theme::text()),
+                                )),
+                                dash(),
+                                Cell::from(Span::styled(
+                                    format!("proving{dots}"),
+                                    Style::default().fg(theme::yellow()),
+                                )),
+                                dash(),
+                                dash(),
+                            ])
+                        }
+                        ProgramPhase::Done => {
+                            let duration = prog.duration_secs.unwrap_or(0.0);
+                            let result = if prog.name == BENCH_ZKOP_MIX {
+                                format!(
+                                    "{} zkOP/s",
+                                    format_zkops(zkops_from_stark_secs(duration))
+                                )
+                            } else {
+                                format_throughput(prog.throughput.unwrap_or(0.0))
+                            };
+                            Row::new(vec![
+                                Cell::from(Span::styled(
+                                    " \u{2713}",
+                                    Style::default().fg(theme::green()),
+                                )),
+                                Cell::from(prog.name.clone()),
+                                Cell::from(weight_label(&prog.name)),
+                                Cell::from(format_cycles(prog.cycles.unwrap_or(0))),
+                                Cell::from(format!("{duration:.1}s")),
+                                // SP1 measures the wrap on one program per card, so a dash here means
+                                // "not measured for this program", not "no wrap".
+                                Cell::from(
+                                    prog.wrap_secs
+                                        .map(|w| format!("{w:.1}s"))
+                                        .unwrap_or_else(|| "\u{2014}".to_string()),
+                                ),
+                                Cell::from(Span::styled(result, theme::metric())),
+                            ])
+                        }
+                        ProgramPhase::Failed => Row::new(vec![
                             Cell::from(Span::styled(
-                                format!("{:+.1}%", pct),
-                                Style::default().fg(color),
-                            ))
-                        } else {
-                            Cell::from(Span::styled("\u{2014}", theme::dim()))
-                        };
-
-                        Row::new(vec![
-                            Cell::from(Span::styled(
-                                " \u{2713}",
-                                Style::default().fg(theme::green()),
+                                " \u{2717}",
+                                Style::default().fg(theme::red()),
                             )),
-                            Cell::from(prog.name.clone()),
-                            Cell::from(
-                                prog.weight
-                                    .map(|w| format!("{:.0}%", w * 100.0))
-                                    .unwrap_or_default(),
-                            ),
-                            Cell::from(format_cycles(cycles)),
-                            Cell::from(format!("{dur:.1}s")),
-                            // SP1 measures the wrap on one program per card, so a dash here means
-                            // "not measured for this program", not "no wrap".
-                            Cell::from(
-                                prog.wrap_secs
-                                    .map(|w| format!("{w:.1}s"))
-                                    .unwrap_or_else(|| "\u{2014}".to_string()),
-                            ),
-                            Cell::from(Span::styled(format_throughput(tp), theme::metric())),
-                            Cell::from(Span::styled(
-                                format_throughput(ref_tp),
-                                Style::default().fg(theme::subtext()),
-                            )),
-                            delta,
-                        ])
-                        .style(theme::striped(i))
-                    }
-
-                    ProgramPhase::Failed => Row::new(vec![
-                        Cell::from(Span::styled(" \u{2717}", Style::default().fg(theme::red()))),
-                        Cell::from(Span::styled(&prog.name, theme::error())),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(Span::styled("FAILED", theme::error())),
-                        Cell::from(""),
-                        Cell::from(""),
-                    ])
-                    .style(theme::striped(i)),
-                }
-            })
-            .collect()
-    } else {
-        vec![]
-    };
+                            Cell::from(Span::styled(&prog.name, theme::error())),
+                            Cell::from(""),
+                            Cell::from(""),
+                            Cell::from(""),
+                            Cell::from(""),
+                            Cell::from(Span::styled("FAILED", theme::error())),
+                        ]),
+                    };
+                    row.style(theme::striped(i))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let widths = [
         Constraint::Length(3),  // status icon
@@ -791,9 +717,7 @@ fn render_program_table(f: &mut Frame, area: Rect, state: &MinerState, tracker: 
         Constraint::Length(10), // cycles
         Constraint::Length(10), // STARK time
         Constraint::Length(9),  // Groth16 wrap
-        Constraint::Length(14), // throughput
-        Constraint::Length(14), // reference
-        Constraint::Length(10), // delta
+        Constraint::Length(18), // throughput, or the score
     ];
 
     let table = Table::new(rows, widths).header(header).block(
@@ -903,58 +827,32 @@ fn render_score_and_controls(
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
-    // Score panel
-    let active_dev = tracker.devices.get(tracker.active_device_index);
-    let mut score_lines: Vec<Line> = Vec::new();
-
-    // Active device partial score detail, first so a long list of cards cannot push it off the panel
-    if let Some(dev) = active_dev.filter(|d| !d.complete) {
-        let done = dev
-            .programs
-            .iter()
-            .filter(|p| p.phase == ProgramPhase::Done)
-            .count();
-        if let Some(score) = dev.partial_zkops {
-            score_lines.push(Line::from(vec![
-                Span::styled(" Partial: ", theme::dim()),
-                Span::styled(format!("{score:.0} zkOP/s"), theme::metric()),
-                Span::styled(
-                    format!(" ({done}/{} programs)", dev.programs.len()),
-                    theme::dim(),
-                ),
-            ]));
-        } else {
-            score_lines.push(Line::from(Span::styled(
-                " Waiting for first result...",
-                theme::placeholder(),
-            )));
-        }
-    }
-
-    // Per-device scores. Cards still waiting are on the tabs and have no score to show.
-    let scores = tracker
+    // Score panel: each row's score appears when its scoring program, the last one, finishes.
+    let scores: Vec<Span> = tracker
         .devices
         .iter()
         .filter_map(|dev| {
             let name = tracker.display_name(dev);
             if dev.failed {
                 Some(Span::styled(format!("{name} failed"), theme::error()))
-            } else if dev.complete {
-                dev.partial_zkops.map(|score| {
+            } else {
+                dev.zkops.map(|score| {
                     Span::styled(
-                        format!("{name} {score:.0} \u{2713}"),
+                        format!("{name} {} \u{2713}", format_zkops(score)),
                         Style::default().fg(theme::green()),
                     )
                 })
-            } else {
-                dev.partial_zkops
-                    .map(|score| Span::styled(format!("{name} ~{score:.0}"), theme::metric()))
             }
         })
-        .collect::<Vec<_>>();
-    if !scores.is_empty() {
-        score_lines.extend(wrap_items(scores, cols[0].width.saturating_sub(2) as usize));
-    }
+        .collect();
+    let score_lines: Vec<Line> = if scores.is_empty() {
+        vec![Line::from(Span::styled(
+            " Scored by the last program on each zkVM",
+            theme::placeholder(),
+        ))]
+    } else {
+        wrap_items(scores, cols[0].width.saturating_sub(2) as usize)
+    };
 
     let score = Paragraph::new(score_lines).block(
         Block::default()
@@ -996,6 +894,31 @@ fn format_throughput(tp: f64) -> String {
     } else {
         format!("{:.0} c/s", tp)
     }
+}
+
+/// A zkOP/s figure, or "N/A" when there is no score.
+fn format_zkops(zkops: f64) -> String {
+    if zkops >= 1_000_000.0 {
+        format!("{:.2}M", zkops / 1_000_000.0)
+    } else if zkops >= 1_000.0 {
+        format!("{:.0}K", zkops / 1_000.0)
+    } else if zkops > 0.0 {
+        format!("{zkops:.0}")
+    } else {
+        "N/A".to_string()
+    }
+}
+
+/// The Weight column: a program's share, or what the scoring program is for.
+fn weight_label(name: &str) -> String {
+    if name == BENCH_ZKOP_MIX {
+        return "score".to_string();
+    }
+    BENCHMARK_PROGRAMS
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| format!("{:.0}%", p.weight * 100.0))
+        .unwrap_or_default()
 }
 
 fn format_cycles(cycles: u64) -> String {
@@ -1083,6 +1006,9 @@ mod tests {
             .collect();
         println!("{}", rows.join("\n"));
 
+        let screen = rows.join("\n");
+        assert!(!screen.contains("Reference") && !screen.contains("Delta"));
+        assert!(screen.contains("zkop-mix"), "the scoring program is listed");
         assert!(
             rows[1].contains("Benchmarking RTX 4090 SP1"),
             "{}",
@@ -1091,7 +1017,7 @@ mod tests {
         let tabs = &rows[4];
         for tab in [
             "RTX 4090 RISC Zero",
-            "RTX 4090 SP1 [0/6]",
+            "RTX 4090 SP1 [0/7]",
             "Arc A770 RISC Zero",
             "Arc A770 SP1",
         ] {
