@@ -6,6 +6,8 @@
 use std::io::{self, BufReader, BufWriter};
 use std::time::Instant;
 
+mod groth16_component;
+
 use anyhow::{Context, Result};
 use risc0_zkvm::Prover as _;
 use zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV;
@@ -39,7 +41,31 @@ fn dup_cloexec(fd: std::os::unix::io::RawFd) -> std::io::Result<std::os::unix::i
     Ok(new)
 }
 
+/// The release's Intel worker ships Intel's Level Zero driver beside it (`zkminer-intel/lib`, from
+/// `Dockerfile.build`'s intel-gpu-runtime). The Level Zero loader (shipped there too) would also open
+/// any other driver it finds on the host by its usual names, such as a distribution's
+/// `libze_intel_gpu_legacy1.so.1`, which adds its devices to the ones `ZE_AFFINITY_MASK` indexes;
+/// `ZE_ENABLE_ALT_DRIVERS` makes the shipped driver the only one. An operator's own setting wins.
+#[cfg(feature = "intel")]
+fn use_shipped_level_zero_driver() {
+    if std::env::var_os("ZE_ENABLE_ALT_DRIVERS").is_some() {
+        return;
+    }
+    let Some(driver) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("zkminer-intel/lib/libze_intel_gpu.so.1")))
+        .filter(|driver| driver.is_file())
+    else {
+        return;
+    };
+    // Before anything starts a thread or initialises Level Zero.
+    std::env::set_var("ZE_ENABLE_ALT_DRIVERS", driver);
+}
+
 fn main() {
+    #[cfg(feature = "intel")]
+    use_shipped_level_zero_driver();
+
     // Direct benchmark mode runs the operator's own guests and prints a human table to the REAL
     // stdout, so it must come before the fd-1 redirect below. It speaks no IPC.
     if std::env::args().any(|a| a == "--benchmark") {
@@ -1626,14 +1652,17 @@ fn benchmark_stages(
 /// why calibration is opt-in (`zkminer benchmark --calibrate`), never a default run.
 const CALIBRATION_ITERS: u32 = 6_000_000;
 
-/// The one-time setup before a first proof (`WorkerCommand::Warmup`). Nothing on CUDA or ROCm, whose
-/// kernels are compiled in. On Intel, SYCL compiles the kernels shipped as SPIR-V (the zkp and Groth16
-/// ones) for the device on first use, which took ~8 minutes on an Arc B580, longer than a benchmark's
-/// whole budget; the driver caches the result on disk (`~/.cache/libsycl_cache`,
-/// `~/.cache/neo_compiler_cache`), so one small proof through the full Groth16 pipeline compiles
-/// everything once for every later process. It is verified, so a broken card fails here, not on a job.
+/// The one-time setup before a first proof (`WorkerCommand::Warmup`), which the miner runs before it
+/// claims any risc0 job. Every backend: the `risc0-groth16` component every proof's Groth16 wrap
+/// needs, installed if it is missing (`groth16_component`). On Intel, also the kernels: SYCL compiles
+/// those shipped as SPIR-V (the zkp and Groth16 ones) for the device on first use, which took ~8
+/// minutes on an Arc B580, longer than a benchmark's whole budget; the driver caches the result on
+/// disk (`~/.cache/libsycl_cache`, `~/.cache/neo_compiler_cache`), so one small proof through the
+/// full Groth16 pipeline compiles everything once for every later process. It is verified, so a
+/// broken card fails here, not on a job.
 #[cfg(feature = "intel")]
 fn warm_up() -> Result<String> {
+    let component = groth16_component::ensure_installed()?;
     let start = Instant::now();
     let env = risc0_zkvm::ExecutorEnv::builder()
         .write_slice(&1000u32.to_le_bytes())
@@ -1647,14 +1676,15 @@ fn warm_up() -> Result<String> {
         .verify(FIBONACCI_ID)
         .context("the warm-up proof does not verify")?;
     Ok(format!(
-        "compiled and cached the Intel GPU kernels with a verified Groth16 proof in {:.0} s",
+        "{component}; compiled and cached the Intel GPU kernels with a verified Groth16 proof in \
+         {:.0} s",
         start.elapsed().as_secs_f64()
     ))
 }
 
 #[cfg(not(feature = "intel"))]
 fn warm_up() -> Result<String> {
-    Ok("nothing to warm up".to_string())
+    groth16_component::ensure_installed()
 }
 
 /// Run a po2 calibration: prove fibonacci at the specified segment po2 and measure throughput.

@@ -44,6 +44,11 @@ risc0-circuit-keccak = { version = "4.0", features = ["prove"] }
 # Directly, for `prove::release_srs`: the Groth16 SRS cache on the GPU has to be freed after each proof
 # on a card too small to hold it beside the next STARK. See `release_groth16_cache_if_tight`.
 risc0-groth16 = { version = "3.0" }
+# Installing the risc0-groth16 component on a host without rzup (`groth16_component`): the download
+# (rustls with its own roots, so neither OpenSSL nor the host's CA store is needed) and the tar.xz.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+liblzma = { version = "0.4", features = ["parallel"] }
+tar = "0.4"
 
 [package.metadata.risc0]
 methods = [

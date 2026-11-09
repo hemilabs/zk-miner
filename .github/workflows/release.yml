@@ -14,6 +14,10 @@ on:
         description: 'Assemble assets but do not publish a release'
         type: boolean
         default: true
+      gpu_validation:
+        description: 'Mine with the release on every GPU of the self-hosted runner first'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -57,6 +61,10 @@ jobs:
   linux:
     needs: check-version
     uses: ./.github/workflows/build-docker.yml
+    # The builds keep their layer cache in this repository's container registry.
+    permissions:
+      contents: read
+      packages: write
     with:
       retention_days: 30
 
@@ -65,13 +73,14 @@ jobs:
   # the CUDA toolkit), which is the whole reason this job exists.
   # ---------------------------------------------------------------------------
   # ---------------------------------------------------------------------------
-  # Collect every artifact, checksum the set, publish.
+  # Collect every artifact into the release: the CLI and NVIDIA provers as
+  # single files, the AMD and Intel provers as tarballs with the runtimes they
+  # load (scripts/ci/assemble-release.sh). Then check, with no GPU, that every
+  # binary and library loads in stock Ubuntu 22.04, 24.04 and Fedora images.
   # ---------------------------------------------------------------------------
-  publish:
+  assemble:
     needs: [check-version, linux]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write   # required to create a release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
@@ -83,54 +92,23 @@ jobs:
         with:
           path: staging
 
+      # NOTE on Windows coverage. `build-windows.yml` builds a native Windows
+      # CUDA prover, but it needs `dtolnay/rust-toolchain` and
+      # `Jimver/cuda-toolkit`, NEITHER of which is on this repo's
+      # allowed-actions list -- so a release cannot call it without a policy
+      # change, and doing so would fail the whole run at startup. The
+      # Windows CLI here is the Dockerfile's cargo-xwin cross-build, which is
+      # policy-clean and statically linked. Add those two actions to the
+      # allowlist (or install CUDA manually) to ship the Windows prover too.
+      #
+      # The script fails if any expected file is missing: without that, a job
+      # that silently produced nothing would yield a release quietly missing a
+      # platform, which is how a half-published release happens.
       - name: "Assemble release assets"
-        run: |
-          set -euo pipefail
-          mkdir -p release
-          # Artifacts arrive as staging/<artifact-name>/<files>. Flatten, dropping
-          # the per-artifact .sha256 files -- a single SHA256SUMS replaces them so
-          # a user has one file to verify against.
-          #
-          # NOTE on Windows coverage. `build-windows.yml` builds a native Windows
-          # CUDA prover, but it needs `dtolnay/rust-toolchain` and
-          # `Jimver/cuda-toolkit`, NEITHER of which is on this repo's
-          # allowed-actions list -- so a release cannot call it without a policy
-          # change, and doing so would fail the whole run at startup. The
-          # Windows CLI here is the Dockerfile's cargo-xwin cross-build, which is
-          # policy-clean and statically linked. Add those two actions to the
-          # allowlist (or install CUDA manually) to ship the Windows prover too.
-          # Any OTHER duplicate basename is unintended -- fail rather than let one
-          # artifact silently overwrite another in the release.
-          dupes=$(find staging -type f ! -name '*.sha256' -printf '%f\n' | sort | uniq -d)
-          if [ -n "$dupes" ]; then
-            echo "::error::two artifacts provide the same filename: $dupes"
-            exit 1
-          fi
-          find staging -type f ! -name '*.sha256' -exec cp -v {} release/ \;
-          cd release
-          test -n "$(ls -A)" || { echo "::error::no assets were assembled"; exit 1; }
-          sha256sum * > SHA256SUMS
-          echo "--- release contents ---"
-          ls -la
-          cat SHA256SUMS
+        run: scripts/ci/assemble-release.sh staging release kit
 
-      # Every expected user-facing binary must be present. Without this a job
-      # that silently produced nothing would yield a release that is quietly
-      # missing a platform, which is how a half-published release happens.
-      - name: "Verify the asset set is complete"
-        run: |
-          set -euo pipefail
-          cd release
-          missing=0
-          for f in zkminer zkminer.exe \
-                   zkminer-prove-risc0-cuda \
-                   zkminer-prove-risc0-rocm zkminer-prove-sp1 sp1-gpu-server \
-                   libcudart.so.12 libcudart.so.12.LICENSE.txt \
-                   zkminer-prove-openvm; do
-            if [ ! -s "$f" ]; then echo "::error::missing release asset: $f"; missing=1; fi
-          done
-          [ "$missing" -eq 0 ] || exit 1
-          echo "all expected assets present"
+      - name: "Every binary and library loads with only the GPU driver to come"
+        run: scripts/ci/check-release-libs.sh release
 
       - name: "Upload the assembled set as a run artifact"
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -140,10 +118,78 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: "Upload the GPU validation kit"
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gpu-validation-kit-${{ needs.check-version.outputs.version }}
+          path: kit/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Mine with the release on real GPUs: the self-hosted runner labelled
+  # zkminer-gpu (scripts/ci/setup-gpu-runner.sh; an RTX 5060 Ti, RTX 4070,
+  # RX 7900 XTX and Arc B580 at the time of writing). The localnet fork of
+  # 743111 with risc0 and SP1 jobs, proved on every card and verified on chain,
+  # in a stock Ubuntu 22.04 image given only the GPUs and the NVIDIA driver's
+  # libraries (scripts/ci/gpu-validate.sh). A tag waits for the runner; a manual
+  # run can skip it.
+  #
+  # Only this job may run there, and only from a tag or a manual run; the
+  # repository requires approval before any outside contributor's workflow
+  # runs, and the runner's user holds nothing but its cache.
+  # ---------------------------------------------------------------------------
+  validate:
+    needs: [check-version, assemble]
+    if: ${{ github.ref_type == 'tag' || inputs.gpu_validation }}
+    runs-on: zkminer-gpu
+    timeout-minutes: 240
+    # One validation at a time: it uses every GPU of the host.
+    concurrency:
+      group: zkminer-gpu-validation
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+
+      - name: "Download the release"
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-${{ needs.check-version.outputs.version }}
+          path: release
+
+      - name: "Download the validation kit"
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: gpu-validation-kit-${{ needs.check-version.outputs.version }}
+          path: kit
+
+      - name: "Mine on every GPU"
+        run: scripts/ci/gpu-validate.sh release kit
+
+  # ---------------------------------------------------------------------------
+  # Publish the assembled set, once the GPU validation passed (or a manual run
+  # skipped it).
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [check-version, assemble, validate]
+    if: ${{ !cancelled() && needs.assemble.result == 'success' && (needs.validate.result == 'success' || (needs.validate.result == 'skipped' && github.ref_type != 'tag')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to create a release
+    steps:
+      - name: "Download the assembled set"
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-${{ needs.check-version.outputs.version }}
+          path: release
+
       - name: "Publish GitHub Release"
         if: ${{ github.ref_type == 'tag' && !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         # `softprops/action-gh-release` is NOT on this repo's allowed-actions list
         # (the policy is `allowed_actions: selected` with `sha_pinning_required`),
         # so the release is cut with the gh CLI, which is preinstalled on the
@@ -153,16 +199,19 @@ jobs:
           cat > notes.md <<'NOTES'
           ## zkminer ${{ github.ref_name }}
 
+          Each prover needs only its GPU's driver: no CUDA toolkit, ROCm or oneAPI install.
+
           ### Linux (glibc 2.35+, x86-64-v3)
           | file | what it is |
           |---|---|
           | `zkminer` | the miner CLI - start here |
-          | `zkminer-prove-risc0-cuda` | RISC Zero prover, NVIDIA |
-          | `zkminer-prove-risc0-rocm` | RISC Zero prover, AMD |
-          | `zkminer-prove-sp1` | SP1 prover (NVIDIA) |
-          | `sp1-gpu-server` | the GPU server `zkminer-prove-sp1` drives, built from the pinned hemilabs/sp1; keep it beside `zkminer-prove-sp1`, which installs it into `~/.sp1/bin` |
+          | `zkminer-prove-risc0-cuda` | RISC Zero prover, NVIDIA (RTX 20 series and later) |
+          | `zkminer-prove-sp1` | SP1 prover, every GPU vendor: it runs the server for the card it is given |
+          | `sp1-gpu-server` | the NVIDIA GPU server `zkminer-prove-sp1` drives, built from the pinned hemilabs/sp1; keep it beside `zkminer-prove-sp1`, which installs it into `~/.sp1/bin` |
           | `libcudart.so.12` | NVIDIA's CUDA 12 runtime, which `sp1-gpu-server` links; keep it beside `zkminer-prove-sp1`, so a host needs only the NVIDIA driver. NVIDIA's software under NVIDIA's CUDA EULA, not zkminer's MIT license: see `libcudart.so.12.LICENSE.txt` |
           | `libcudart.so.12.LICENSE.txt` | the notice and NVIDIA's license for `libcudart.so.12` |
+          | `zkminer-provers-amd-linux-x86_64.tar.zst` | AMD (Radeon RX 7000 and 9000 series): the RISC Zero prover with AMD's ROCm 7.1 HIP runtime (`zkminer-rocm/`), and SP1's HIP server with ROCm 10.1's (`sp1-gpu-server-hip-lib/`); licenses in each `LICENSES/` |
+          | `zkminer-provers-intel-linux-x86_64.tar.zst` | Intel (Arc A and B series): the RISC Zero prover, SP1's SYCL server, and the oneAPI SYCL runtime and Intel compute runtime they load (`zkminer-intel/`; licenses in `zkminer-intel/LICENSES`) |
           | `zkminer-prove-openvm` | OpenVM prover |
 
           ### Windows (x86-64)
@@ -172,9 +221,11 @@ jobs:
 
           Verify with `sha256sum -c SHA256SUMS`.
 
-          On Linux, put the prover binaries (and `sp1-gpu-server`, `libcudart.so.12` and its
-          license) in `~/.zkminer/provers/` and `chmod +x` the binaries; the CLI discovers
-          them there.
+          On Linux, put the prover files (and `sp1-gpu-server`, `libcudart.so.12` and its
+          license) in `~/.zkminer/provers/`, `chmod +x` the binaries, and unpack the AMD or Intel
+          tarball there too (`tar --zstd -xf <tarball> -C ~/.zkminer/provers`); the CLI discovers
+          them there. AMD and Intel cards need the user in the `render` group when the miner runs
+          outside a desktop session (`sudo usermod -aG render $USER`).
 
           The native Windows CUDA prover is not included - see the release workflow
           for why.
@@ -188,5 +239,5 @@ jobs:
       - name: "Dry run — nothing published"
         if: ${{ !(github.ref_type == 'tag' && !inputs.dry_run) }}
         run: |
-          echo "Assets assembled and uploaded as a run artifact; no release published."
+          echo "Assets assembled, checked and uploaded as a run artifact; no release published."
           echo "ref_type=${{ github.ref_type }} dry_run=${{ inputs.dry_run }}"

@@ -365,69 +365,18 @@ fn handle_key(state: &mut MinerState, key: crossterm::event::KeyEvent) -> PostKe
     PostKeyAction::None
 }
 
-/// Re-benchmark a single device asynchronously.
-async fn run_device_benchmark(state: SharedState, device_id: &str) {
-    use zkminer_prover::benchmark;
-
-    if device_id == "cpu" {
-        // CPU re-benchmark: re-run the full benchmark suite, replace CPU entries
-        let suite = tokio::task::spawn_blocking(benchmark::run_benchmark)
-            .await
-            .unwrap_or_default();
-
-        let mut s = state.write().await;
-
-        // A run that produced NO GPU rows must not overwrite one that had them, and must never be
-        // saved. The suite arrives from `spawn_blocking(..).await.unwrap_or_default()`, so a
-        // panicked task yields `BenchmarkSuite::default()` — and a wedged driver or VRAM
-        // starvation yields a real suite with zero device rows. Persisting either one prices every
-        // card at 0 W (the cost model's own doc: "which on a GPU box would price every job as if
-        // the cards were switched off"), reverts the cost/throughput pairing to the optimistic
-        // suite average, and on a cold start leaves `average_throughput() == 0` so every job is
-        // skipped as infeasible — reproduced from the cache on every restart until the file is
-        // deleted by hand.
-        if suite.device_benchmarks.is_empty() {
-            tracing::warn!(
-                "the CPU re-benchmark produced no device rows at all — keeping the previous \
-                 results and NOT saving, rather than persisting a suite that prices every card \
-                 at 0W"
-            );
-            return;
-        }
-        if let Some(existing) = s.benchmark_results.as_mut() {
-            // Update CPU-specific data; leave the real (worker-measured) GPU
-            // benchmarks intact — GPU throughput is measured, not derived from CPU.
-            existing.results = suite.results;
-            existing.cpu_info = suite.cpu_info;
-            existing.timestamp = suite.timestamp;
-            existing.cpu_power_watts = suite.cpu_power_watts;
-
-            // Replace CPU device benchmarks
-            existing.device_benchmarks.retain(|d| d.device_id != "cpu");
-            existing.device_benchmarks.extend(
-                suite
-                    .device_benchmarks
-                    .into_iter()
-                    .filter(|d| d.device_id == "cpu"),
-            );
-
-            benchmark::save_benchmark(existing);
-            s.add_log(LogLevel::Success, "CPU benchmark complete");
-        }
-        s.benchmark_device_in_progress = None;
-    } else {
-        // GPU: run the real streaming benchmark (actual proving). The worker pool
-        // can't isolate a single GPU, so all GPUs are re-measured — but identity
-        // and throughput come from real measurement, matching how the miner records
-        // them, so the selected GPU's name/order stays stable (the old path used a
-        // CPU-extrapolation model that was instant and used a different id/name
-        // scheme, which flipped names and never actually proved).
-        run_streaming_gpu_benchmark(state).await;
-    }
+/// Re-benchmark the selected device. The worker pool can't isolate a single GPU, so all GPUs are
+/// re-measured by the real streaming benchmark (actual proving) -- identity and throughput come from
+/// real measurement, matching how the miner records them, so the selected GPU's name/order stays
+/// stable (the old path used a CPU-extrapolation model that was instant and used a different
+/// id/name scheme, which flipped names and never actually proved). There is no CPU entry to pick:
+/// the benchmark has no CPU rows.
+async fn run_device_benchmark(state: SharedState, _device_id: &str) {
+    run_streaming_gpu_benchmark(state).await;
 }
 
 /// Run the REAL GPU streaming benchmark (actual proving on each GPU worker) and
-/// merge the fresh per-GPU results into `benchmark_results`, preserving CPU data.
+/// merge the fresh per-GPU results into `benchmark_results`.
 /// Mirrors the miner's own startup benchmark so device identity (worker index +
 /// name, one row per GPU) stays consistent. Reports a GPU-tuning before/after delta
 /// if one was requested.

@@ -1,0 +1,30 @@
+ROCm 7.1.0's LLVM (ROCm/llvm-project 1b0eada6): CodeGenPrepare compile time, from upstream LLVM
+e80f32fd20bf, "[CodeGenPrepare] Use Instruction::comesBefore instead of manual ordering" (#190485).
+
+tryToSinkFreeOperands numbered every instruction of its basic block, in a DenseMap built anew for each
+instruction it looked at, which is quadratic in the length of the block. Instruction::comesBefore
+gives the same order (upstream: "the exact same ordering"), so the generated code does not change.
+ROCm 7.1 predates upstream's other change to this loop (the side-effect and memory checks beside
+isa<PHINode>), which this backport leaves out.
+
+--- a/llvm/lib/CodeGen/CodeGenPrepare.cpp
++++ b/llvm/lib/CodeGen/CodeGenPrepare.cpp
+@@ -7648,17 +7648,12 @@ bool CodeGenPrepare::tryToSinkFreeOperands(Instruction *I) {
+   bool Changed = false;
+   SmallVector<Use *, 4> ToReplace;
+   Instruction *InsertPoint = I;
+-  DenseMap<const Instruction *, unsigned long> InstOrdering;
+-  unsigned long InstNumber = 0;
+-  for (const auto &I : *TargetBB)
+-    InstOrdering[&I] = InstNumber++;
+-
+   for (Use *U : reverse(OpsToSink)) {
+     auto *UI = cast<Instruction>(U->get());
+     if (isa<PHINode>(UI))
+       continue;
+     if (UI->getParent() == TargetBB) {
+-      if (InstOrdering[UI] < InstOrdering[InsertPoint])
++      if (UI->comesBefore(InsertPoint))
+         InsertPoint = UI;
+       continue;
+     }

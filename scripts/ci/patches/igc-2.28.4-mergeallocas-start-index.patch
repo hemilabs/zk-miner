@@ -1,0 +1,25 @@
+IGC v2.28.4: MergeAllocas compile time. Still present on intel-graphics-compiler master (2026-11).
+
+For each allocation, AllocationLivenessAnalyzer::LivenessData walks the block where its lifetime
+starts up to the allocation's first user, and built a LivenessInstruction for every instruction on the
+way, whose constructor finds the instruction's index by scanning the block from its start
+(getInstructionIndex): quadratic in the distance walked. The index is now counted along the walk; the
+lifetime start it records, and so the merging, are the same.
+
+--- a/IGC/AdaptorCommon/LivenessUtils/AllocationLivenessAnalyzer.cpp
++++ b/IGC/AdaptorCommon/LivenessUtils/AllocationLivenessAnalyzer.cpp
+@@ -285,8 +285,13 @@
+   auto *lifetimeStartBB = *bbOutOnly.begin();
+ 
+   // fill out the lifetime start/ends instruction
++  // (the index is counted along the walk; LivenessInstruction(&I) finds it by scanning the
++  // block from its start, which made this loop quadratic in the block's length)
++  size_t lifetimeStartIndex = 0;
+   for (auto &I : *lifetimeStartBB) {
+-    lifetimeStart = LivenessInstruction(&I, bbToIndexMap);
++    lifetimeStart.inst = &I;
++    lifetimeStart.instIndexInBB = lifetimeStartIndex++;
++    lifetimeStart.parentBBIndex = bbToIndexMap.lookup(lifetimeStartBB);
+     if (usersOfAllocation.contains(&I))
+       break;
+   }

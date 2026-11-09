@@ -56,6 +56,9 @@
 //!   `target/release/zkminer-prove-risc0-cuda`).
 //! - `ZKMINER_LOCALNET_MOCK_WORKER`: the mock worker (default: `target/debug/mock-worker`).
 //! - `ANVIL`: the anvil binary (default: `anvil` on `PATH`).
+//! - `ZKMINER_LOCALNET_ZKMINER`: the zkminer binary to test (default: the one cargo built with this
+//!   test), and `ZKMINER_LOCALNET_TMPDIR`: where run directories go (default: `target/tmp`). The
+//!   release's GPU validation uses both to run a separately built copy of this test.
 //! - `ZKMINER_LOCALNET_ECHO=1`: echo zkminer's log while it runs.
 //! - `ZKMINER_LOCALNET_KEEP=1`: keep the run directory (under `target/tmp`) after a pass; a failed
 //!   run always keeps it.
@@ -432,6 +435,16 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// The miner under test: `ZKMINER_LOCALNET_ZKMINER`, or the one cargo built with this test. The
+/// release's GPU validation (scripts/ci/gpu-validate.sh) runs this test, built on its own, against
+/// the release's binaries.
+fn zkminer_exe() -> PathBuf {
+    std::env::var_os("ZKMINER_LOCALNET_ZKMINER").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_zkminer")),
+        PathBuf::from,
+    )
+}
+
 fn env_flag(name: &str) -> bool {
     matches!(std::env::var(name).as_deref(), Ok("1") | Ok("true"))
 }
@@ -482,8 +495,9 @@ struct RunDir(PathBuf);
 
 impl RunDir {
     fn new(name: &str) -> Self {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("zkminer-localnet-{name}-{}", std::process::id()));
+        let root = std::env::var_os("ZKMINER_LOCALNET_TMPDIR")
+            .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from);
+        let dir = root.join(format!("zkminer-localnet-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".zkminer")).expect("create the run directory");
         Self(dir)
@@ -1658,8 +1672,9 @@ impl Miner {
     ) -> Command {
         let exe = dir.join("zkminer");
         let _ = std::fs::remove_file(&exe);
-        if std::fs::hard_link(env!("CARGO_BIN_EXE_zkminer"), &exe).is_err() {
-            std::fs::copy(env!("CARGO_BIN_EXE_zkminer"), &exe).expect("copy the zkminer binary");
+        let zkminer = zkminer_exe();
+        if std::fs::hard_link(&zkminer, &exe).is_err() {
+            std::fs::copy(&zkminer, &exe).expect("copy the zkminer binary");
         }
         let mut cmd = Command::new(&exe);
         cmd.args(global)

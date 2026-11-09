@@ -27,3 +27,15 @@ sp1-prover = "6.0"
 
 [build-dependencies]
 sp1-build = "6.0"
+
+[dev-dependencies]
+# For the error and socket path the SDK does not re-export, which this worker reads the text of and
+# mirrors: the tests hold those to the pinned SDK. sp1-sdk depends on it already.
+sp1-cuda = "6.0"
+# For the version a stand-in server must report. Also through sp1-sdk.
+sp1-primitives = "6.0"
+
+[[test]]
+name = "server_faults"
+# Its own `main`, as the same binary also plays the server the worker starts.
+harness = false

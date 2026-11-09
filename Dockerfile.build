@@ -3,7 +3,11 @@
 # Multi-stage portable Linux build for zkminer binaries.
 # Usage: docker build -f Dockerfile.build --target dist-cli --output type=local,dest=dist/ .
 #
-# All binaries link against glibc 2.35 (Ubuntu 22.04) for broad compatibility.
+# All binaries link against glibc 2.35 (Ubuntu 22.04) for broad compatibility. What a host needs
+# beyond that is its GPU's driver and nothing else: the NVIDIA workers link the CUDA runtime
+# statically or ship it (libcudart.so.12); the AMD workers ship AMD's HIP runtime they were built with;
+# the Intel workers ship oneAPI's SYCL runtime and Intel's compute stack, built here from source
+# (dist-intel). .github/workflows/release.yml checks that on real GPUs, in stock distribution images.
 
 # ---------------------------------------------------------------------------
 # Build args (all overridable)
@@ -12,9 +16,34 @@ ARG RUST_VERSION=1.97.1
 ARG CUDA_VERSION=12.8.0
 # sp1-gpu-server alone: see the sp1-server-cuda-rust-base stage.
 ARG SP1_SERVER_CUDA_VERSION=12.9.2
-ARG ROCM_IMAGE=rocm/dev-ubuntu-22.04:6.4
 ARG UBUNTU_VERSION=22.04
 ARG FOUNDRY_VERSION=v1.3.5
+# nvcc compiles each kernel file for this many GPU targets at once (see build-cuda). CI raises it on a
+# runner with the memory for it.
+ARG NVCC_THREADS=2
+# cargo-chef: the risc0 workers build their dependencies, the GPU kernels among them, in a layer of
+# their own, keyed on Cargo.lock and the manifests (see the planner stage).
+ARG CARGO_CHEF_VERSION=0.1.78
+# AMD: AMD's ROCm 10.1 for Ubuntu 22.04 (earlier ROCm gives invalid SP1 proofs, hemilabs/sp1 #19 needs
+# 7.2 or later), and the GPUs compiled for: gfx1100 (RX 7900), gfx1101 (RX 7800/7700), gfx1102
+# (RX 7600), gfx1200 (RX 9060), gfx1201 (RX 9070).
+ARG ROCM_VERSION=10.1
+ARG ROCM_PKG_VERSION=10.1.0-3
+ARG AMD_GPU_TARGETS=gfx1100,gfx1101,gfx1102,gfx1200,gfx1201
+# The risc0 prover, compiled with ROCm 7.1, for the same five exact targets. Not gfx11-generic, the one
+# code object every RX 7000 could run: built for it, the prover's proofs fail verification on an RX
+# 7900 XTX (all six benchmarks, "check != result"), where the same build for gfx1100 proves them all.
+ARG RISC0_AMD_GPU_TARGETS=gfx1100,gfx1101,gfx1102,gfx1200,gfx1201
+# hipcc compiles a file's GPU targets this many at a time (clang's -parallel-jobs), which multiplies
+# the compiler's memory by as much. CI raises it on a runner with the memory for it.
+ARG HIP_PARALLEL_JOBS=1
+# Intel: oneAPI DPC++ 2026.0, and the GPUs the risc0 kernels are compiled for ahead of time: Battlemage
+# (bmg_g21: Arc B580/B570; bmg_g31: B-series Pro) and Alchemist (acm_g10: Arc A770/A750/A580), plus
+# SPIR-V, which the shipped compiler builds on first use for any other Intel GPU (A380, A310). SP1's
+# SYCL build compiles the same set by default.
+ARG ONEAPI_VERSION=2026.0
+ARG ONEAPI_PKG_VERSION=2026.0.0-947
+ARG RISC0_INTEL_SYCL_TARGETS=intel_gpu_bmg_g21,intel_gpu_bmg_g31,intel_gpu_acm_g10,spir64
 
 # ===========================================================================
 # Stage: rust-base — Ubuntu 22.04 + Rust toolchain
@@ -39,6 +68,21 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
 
 WORKDIR /build
+
+# ===========================================================================
+# Stage: planner — the dependency recipe the risc0 worker builds cook first
+# ===========================================================================
+# `cargo chef prepare` reduces the workspace to its manifests and Cargo.lock. The worker stages copy
+# only that recipe before `cargo chef cook`, which compiles every dependency, the risc0 GPU kernels
+# among them (hours, for every target). So that layer is rebuilt only when a dependency changes, and
+# is reused from the build cache otherwise; a source change rebuilds zkminer's own crates alone. No
+# cache mounts in those layers: the dependency sources and target dir have to be in the layer for
+# the next one to reuse them.
+FROM rust-base AS planner
+ARG CARGO_CHEF_VERSION
+RUN cargo install cargo-chef --locked --version ${CARGO_CHEF_VERSION}
+COPY . .
+RUN cargo chef prepare --recipe-path /recipe.json
 
 # ===========================================================================
 # Stage: build-cli — the main zkminer CLI binary
@@ -201,9 +245,15 @@ RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN rzup install -f
 WORKDIR /build
 
 # ===========================================================================
-# Stage: build-cuda — RISC Zero CUDA prover (multi-arch portable)
+# Stages: cook-cuda, build-cuda — RISC Zero CUDA prover (multi-arch portable)
 # ===========================================================================
-FROM cuda-base AS build-cuda
+# cook-cuda compiles the dependencies, the GPU kernels among them; build-cuda the prover on top. The
+# first is a stage of its own so that CI can save it to the build cache before building on
+# (build-docker.yml, `checkpoints`): the kernels take hours on a standard runner, and a build that
+# fails later would otherwise save none of it. The same goes for cook-rocm and cook-intel.
+FROM cuda-base AS cook-cuda
+ARG CARGO_CHEF_VERSION
+ARG NVCC_THREADS
 
 # GPU targets: native code for every family from Turing up — sm_75 (RTX 20, T4), sm_80 (A100),
 # sm_86 (RTX 30, A10, A40, A6000), sm_89 (RTX 40, L4, L40), sm_90 (H100, H200), sm_100 (B200, and B300
@@ -216,19 +266,24 @@ FROM cuda-base AS build-cuda
 # of this image is risc0-circuit-rv32im-sys's 3 MB steps.cu, a single nvcc call that took ~24 minutes
 # for one target and one PTX on the 4-core runner; serially, eight targets would take it past two hours.
 # Not four at a time: beside cargo's four jobs that peaked at 16.8 GB of compiler memory, more than the
-# runner's 16 GB. Two at a time built under a 14 GiB cap with no swap, peaking at 10.6 GB (2026-10-10).
-ENV NVCC_APPEND_FLAGS="--threads 2 \
+# runner's 16 GB. Two at a time built under a 14 GiB cap with no swap, peaking at 10.6 GB (2026-10-10),
+# but the kernels of the current risc0 pin ran the 16 GB runner out of memory at two (2026-11-03), so
+# CI passes NVCC_THREADS=1 there, and 4 on a larger runner.
+ENV NVCC_APPEND_FLAGS="--threads ${NVCC_THREADS} \
     -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 \
     -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
     -gencode arch=compute_90,code=sm_90 -gencode arch=compute_100,code=sm_100 \
     -gencode arch=compute_120,code=[sm_120,compute_120]"
 
+RUN cargo install cargo-chef --locked --version ${CARGO_CHEF_VERSION}
+COPY --from=planner /recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json \
+        -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda
+
+FROM cook-cuda AS build-cuda
 COPY . .
 
-RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=target-cuda,target=/build/target \
-    cargo build --release -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda \
+RUN cargo build --release -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda \
     && cp target/release/zkminer-prove-risc0-cuda /zkminer-prove-risc0-cuda
 
 # ===========================================================================
@@ -357,21 +412,82 @@ NOTICE
 EOF
 
 # ===========================================================================
-# Stage: rocm-base — AMD ROCm + Rust toolchain
+# Stage: rocm-toolchain — Ubuntu 22.04 + Rust + AMD's ROCm 10.1, for SP1's HIP server
 # ===========================================================================
-# rocm/dev-ubuntu-22.04:6.4 — pinned 2026-03-05
-FROM ${ROCM_IMAGE}@sha256:79aa43981a4296ca45f6827a0d0bcdc8239824c8e97643a7a86c1ce2c9dddc8b AS rocm-base
+# ROCm from AMD's own Ubuntu 22.04 repository rather than a ROCm image: the image is the same Ubuntu
+# 22.04 as every other binary here, and only what the build uses is installed: the HIP runtime and
+# compiler (amdrocm-runtime-dev pulls in amdrocm-llvm-dev), and hipcub/rocprim/rocthrust
+# (amdrocm-ccl-dev). The repository key is checked against its hash. (The risc0 prover is built with
+# ROCm 7.1: see rocm71-toolchain.)
+FROM rust-base AS rocm-toolchain
+ARG ROCM_VERSION
+ARG ROCM_PKG_VERSION
+ARG ROCM_KEY_SHA256=090a4bf906822c5eb450ae8024b728b9281f2fccb0304641eb75018e4ec6a6dd
+
+RUN install -d /etc/apt/keyrings \
+    && curl -fsSL -o /etc/apt/keyrings/amdrocm.asc https://stable.repo.amd.com/rocm/gpg/packages.gpg \
+    && echo "${ROCM_KEY_SHA256}  /etc/apt/keyrings/amdrocm.asc" | sha256sum -c - \
+    && printf '%s\n' 'Types: deb' 'URIs: https://stable.repo.amd.com/rocm/core/packages/ubuntu2204/' \
+        'Suites: stable' 'Components: main' 'Architectures: amd64' \
+        'Signed-By: /etc/apt/keyrings/amdrocm.asc' > /etc/apt/sources.list.d/amdrocm.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends libclang-dev file \
+        amdrocm-runtime-dev${ROCM_VERSION}=${ROCM_PKG_VERSION} \
+        amdrocm-runtime${ROCM_VERSION}=${ROCM_PKG_VERSION} \
+        amdrocm-llvm-dev${ROCM_VERSION}=${ROCM_PKG_VERSION} \
+        amdrocm-llvm${ROCM_VERSION}=${ROCM_PKG_VERSION} \
+        amdrocm-sysdeps${ROCM_VERSION}=${ROCM_PKG_VERSION} \
+        amdrocm-ccl-dev${ROCM_VERSION}=${ROCM_PKG_VERSION} \
+    && rm -rf /var/lib/apt/lists/* \
+    && /opt/rocm/core-${ROCM_VERSION}/bin/hipcc --version | head -n 3
+
+ENV ROCM_PATH=/opt/rocm/core-${ROCM_VERSION} \
+    HIP_PATH=/opt/rocm/core-${ROCM_VERSION} \
+    PATH="${PATH}:/opt/rocm/core-${ROCM_VERSION}/bin"
+
+# ===========================================================================
+# Stage: rocm71-toolchain — AMD's ROCm 7.1 image + Rust + the RISC Zero toolchain
+# ===========================================================================
+# The risc0 ROCm prover's kernels are compiled with ROCm 7.1, the compiler they were validated with
+# on an RX 7900 XTX, not 10.1: ROCm 10.1's compiler gives the witness kernel par_stepExecW2 every
+# implicit kernel argument, the hostcall buffer among them (it can no longer prove the kernel uses
+# none), and a kernel with a hostcall buffer cannot launch on a card without PCIe atomics
+# ("hostcall not supported", "AQL dispatch failed"), even with asserts compiled out and printf
+# buffered. ROCm 7.1's leaves it out. The prover ships with ROCm 7.1's runtime (build-rocm), and
+# SP1's HIP server, which needs 7.2 or later, with ROCm 10.1's (build-sp1-server-hip): each runs on
+# the runtime of the toolchain it was compiled and validated with.
+#
+# Its clang is ROCm 7.1's own, rebuilt with one compile-time fix (rocm71-clang below).
+# rocm/dev-ubuntu-22.04:7.1 — ROCm 7.1.0, pinned 2026-11-03
+FROM rocm/dev-ubuntu-22.04:7.1@sha256:f55ecea640588a014b9a0fcaba596ed9f79656bffea23644e73f9928280103a5 AS rocm71-clang
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates cmake ninja-build patch zlib1g-dev libzstd-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/ci/build-rocm71-clang.sh /usr/local/bin/
+COPY scripts/ci/patches/llvm-rocm-7.1-codegenprepare-comesbefore.patch /usr/local/bin/patches/
+RUN build-rocm71-clang.sh /out
+
+FROM rocm/dev-ubuntu-22.04:7.1@sha256:f55ecea640588a014b9a0fcaba596ed9f79656bffea23644e73f9928280103a5 AS rocm71-toolchain
 ARG RUST_VERSION
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential git curl ca-certificates cmake pkg-config \
-        protobuf-compiler libclang-dev \
-        hipcub-dev rocthrust-dev \
+        build-essential git curl ca-certificates cmake pkg-config libssl-dev \
+        protobuf-compiler libclang-dev file \
+        hipcub-dev rocthrust-dev rocprim-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# ROCm 7.1's clang with upstream LLVM's fix for a quadratic loop in CodeGenPrepare
+# (scripts/ci/build-rocm71-clang.sh). It generates the same code, and compiles risc0's RDNA4
+# (gfx1200, gfx1201) eval_check in minutes rather than hours per target.
+COPY --from=rocm71-clang /out/bin/clang-20 /opt/rocm-7.1.0/lib/llvm/bin/clang-20
+RUN /opt/rocm/lib/llvm/bin/clang --version | head -n 1 | grep -q 'zkminer-codegenprepare' \
+    && /opt/rocm/bin/hipcc --version | head -n 3
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
-    PATH="/usr/local/cargo/bin:${PATH}"
+    PATH="/usr/local/cargo/bin:${PATH}:/root/.risc0/bin" \
+    ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
@@ -379,96 +495,234 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
 
-RUN apt update
-RUN apt install -y curl 
-RUN curl -L https://risczero.com/install | bash
-RUN cat "/root/.bashrc"
-ENV PATH="$PATH:/root/.risc0/bin"
-RUN echo blah
-RUN rzup --help
-RUN rzup install --help
-# GITHUB_TOKEN: see cuda-base.
-RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN rzup install -f
+# rzup: see cuda-base (GITHUB_TOKEN).
+RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
+    curl -fsSL https://risczero.com/install | bash && rzup install -f
 
 WORKDIR /build
 
 # ===========================================================================
-# Stage: build-rocm — RISC Zero ROCm prover (multi-arch portable)
+# Stages: cook-rocm, build-rocm — RISC Zero ROCm prover
 # ===========================================================================
-FROM rocm-base AS build-rocm
+# RISC0_HIP_ARCH names the GPUs compiled for; every risc0 HIP build script honours it. The release
+# build has device asserts compiled out and device printf buffered (-DNDEBUG -mprintf-kind=buffered),
+# which is the build validated on an RX 7900 XTX, and which needs no PCIe atomics: an assert or a
+# printf otherwise makes a kernel use hostcall, which cannot launch on a card without them (some
+# platforms, VMs, eGPU enclosures). The binary's RPATH finds the HIP runtime shipped beside it
+# (crates/zkminer-prove-risc0/build.rs, staged below).
+FROM rocm71-toolchain AS cook-rocm
+ARG CARGO_CHEF_VERSION
+ARG RISC0_AMD_GPU_TARGETS
+ARG HIP_PARALLEL_JOBS
+ENV HIPCC=/opt/rocm/bin/hipcc \
+    NVCC=off \
+    RISC0_HIP_ARCH=${RISC0_AMD_GPU_TARGETS} \
+    HIPCC_COMPILE_FLAGS_APPEND="-DNDEBUG -mprintf-kind=buffered -parallel-jobs=${HIP_PARALLEL_JOBS}"
 
-# Full list: gfx900,gfx906,gfx908,gfx90a,gfx942,gfx1030,gfx1031,gfx1032,gfx1100,gfx1101,gfx1200,gfx1201
-# Testing subset: 7900 XTX (gfx1100) + 9070 XT (gfx1201)
-ENV RISC0_HIP_ARCH="gfx1100,gfx1201"
-ENV HIPCC_COMPILE_FLAGS_APPEND="--offload-arch=gfx1100 --offload-arch=gfx1201"
-RUN printf '%s\n' \
-'#!/bin/sh' \
-'for a; do shift' \
-'  case "$a" in --offload-arch=native) set -- "$@" "--offload-arch=$RISC0_HIP_ARCH";;' \
-'                *) set -- "$@" "$a";; esac' \
-'done' \
-'exec /opt/rocm/bin/hipcc "$@"' > /usr/local/bin/hipcc-arch && \
-chmod +x /usr/local/bin/hipcc-arch
-ENV HIPCC=/usr/local/bin/hipcc-arch
-ENV NVCC=off
+RUN cargo install cargo-chef --locked --version ${CARGO_CHEF_VERSION}
+COPY --from=planner /recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json \
+        -p zkminer-prove-risc0 --features rocm --bin zkminer-prove-risc0-rocm
+
+# See cook-cuda.
+FROM cook-rocm AS build-rocm
+COPY . .
+
+# With the HIP runtime it was compiled against, ROCm 7.1's, in zkminer-rocm/ (lib/, LICENSES/), which
+# the binary's RPATH names: scripts/ci/stage-rocm-runtime.sh.
+RUN cargo build --release -p zkminer-prove-risc0 --features rocm --bin zkminer-prove-risc0-rocm \
+    && mkdir -p /stage \
+    && cp target/release/zkminer-prove-risc0-rocm /stage/ \
+    && readelf -d /stage/zkminer-prove-risc0-rocm | grep -q 'RPATH.*\$ORIGIN/zkminer-rocm/lib' \
+    && scripts/ci/stage-rocm-runtime.sh /opt/rocm /stage/zkminer-rocm
+
+# ===========================================================================
+# Stage: build-sp1-server-hip — hemilabs/sp1's sp1-gpu-server, HIP build
+# ===========================================================================
+# The same commit as build-sp1-server (Cargo.lock's), built for AMD GPUs (#19) with ROCm 10.1 (it needs
+# 7.2 or later). Shipped as sp1-gpu-server-hip; the dispatcher has the SP1 worker run it for an AMD
+# card. Device printf buffered,
+# as for build-rocm (Release builds already compile asserts out). CMake is told the ROCm root, which
+# it does not find from the compiler path in ROCm 10's layout.
+FROM rocm-toolchain AS build-sp1-server-hip
+ARG ROCM_VERSION
+ARG AMD_GPU_TARGETS
+COPY scripts/ci/install-sp1-server-tools.sh /usr/local/bin/
+RUN install-sp1-server-tools.sh
+# GOPROXY: see build-sp1-server.
+ENV PATH="/usr/local/go/bin:${PATH}" \
+    GOPROXY="https://proxy.golang.org,https://goproxy.cn,direct"
+RUN printf 'set(CMAKE_HIP_COMPILER_ROCM_ROOT "/opt/rocm/core-%s")\n' "${ROCM_VERSION}" \
+        > /usr/local/share/hip-rocm-root.cmake
+ENV SP1_GPU_BACKEND=hip \
+    HIP_ARCHS=${AMD_GPU_TARGETS} \
+    HIPCXX=/opt/rocm/core-${ROCM_VERSION}/lib/llvm/bin/clang++ \
+    HIPFLAGS="-mprintf-kind=buffered" \
+    CMAKE_TOOLCHAIN_FILE=/usr/local/share/hip-rocm-root.cmake
+
+COPY Cargo.lock /build/Cargo.lock
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-sp1-server-hip,target=/build/target-sp1-server \
+    REV=$(grep -o 'git+https://github.com/hemilabs/sp1?[^#"]*#[0-9a-f]\{40\}' /build/Cargo.lock | head -1 | cut -d'#' -f2) \
+    && test -n "$REV" \
+    && echo "building sp1-gpu-server (HIP: ${HIP_ARCHS}) at hemilabs/sp1 $REV" \
+    && CARGO_TARGET_DIR=/build/target-sp1-server \
+       cargo install --locked --root /sp1-server --git https://github.com/hemilabs/sp1 --rev "$REV" sp1-gpu-server \
+    && mkdir -p /stage \
+    && cp /sp1-server/bin/sp1-gpu-server /stage/sp1-gpu-server-hip \
+    && readelf -d /stage/sp1-gpu-server-hip | grep -q 'NEEDED.*\[libamdhip64\.so\.7\]'
+
+# With the HIP runtime it was compiled against, ROCm 10.1's, as sp1-gpu-server-hip-lib/ (the
+# libraries, and their licenses in LICENSES/), which the SP1 worker puts on the server's library path.
+COPY scripts/ci/stage-rocm-runtime.sh /usr/local/bin/
+RUN stage-rocm-runtime.sh /opt/rocm/core-${ROCM_VERSION} /tmp/hip-runtime \
+    && mv /tmp/hip-runtime/lib /stage/sp1-gpu-server-hip-lib \
+    && mv /tmp/hip-runtime/LICENSES /stage/sp1-gpu-server-hip-lib/LICENSES
+
+# ===========================================================================
+# Stages: intel-igc, intel-gpu-runtime — Intel's GPU compute stack, built from source for glibc 2.35
+# ===========================================================================
+# IGC and gmmlib, then the compute runtime (with ocloc) and the Level Zero loader, at the versions the
+# Intel workers were validated with (scripts/ci/build-intel-igc.sh, build-intel-gpu-runtime.sh).
+# Intel's packages of them need glibc 2.38. IGC builds LLVM 16 (over an hour on a standard runner),
+# so it is a stage of its own, which depends only on its script and the shared one: the build cache
+# keeps it while the rest changes, and CI saves it before building on (build-docker.yml,
+# `checkpoints`).
+FROM ubuntu:${UBUNTU_VERSION}@sha256:3ba65aa20f86a0fad9df2b2c259c613df006b2e6d0bfcc8a146afb8c525a9751 AS intel-igc
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build git ca-certificates python3 python3-mako python3-yaml \
+        bison flex pkg-config zlib1g-dev libzstd-dev patchelf file \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/ci/intel-gpu-build-lib.sh scripts/ci/build-intel-igc.sh /usr/local/bin/
+COPY scripts/ci/patches/igc-2.28.4-mergeallocas-start-index.patch /usr/local/bin/patches/
+RUN build-intel-igc.sh /opt/zkminer-intel-gpu && rm -rf /tmp/intel-gpu-src
+
+FROM intel-igc AS intel-gpu-runtime
+COPY scripts/ci/build-intel-gpu-runtime.sh /usr/local/bin/
+RUN build-intel-gpu-runtime.sh /opt/zkminer-intel-gpu && rm -rf /tmp/intel-gpu-src
+
+# ===========================================================================
+# Stage: intel-toolchain — Ubuntu 22.04 + Rust + oneAPI DPC++ + the Intel GPU stack + RISC Zero
+# ===========================================================================
+# oneAPI from Intel's apt repository (key checked against its hash), the compiler alone, and Python,
+# which the risc0 Intel kernels' build scripts run (standard library only). The kernels
+# are compiled ahead of time with the ocloc built above, the same version the release ships, which
+# icpx finds on PATH; the Level Zero headers and loader come from there too.
+FROM rust-base AS intel-toolchain
+ARG ONEAPI_VERSION
+ARG ONEAPI_PKG_VERSION
+ARG ONEAPI_KEY_SHA256=db932ba032a71f732dc415eef5f4f185fc7ae768487d7a357bc2772746b6c48c
+
+RUN install -d /etc/apt/keyrings \
+    && curl -fsSL -o /etc/apt/keyrings/intel-oneapi.asc \
+        https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+    && echo "${ONEAPI_KEY_SHA256}  /etc/apt/keyrings/intel-oneapi.asc" | sha256sum -c - \
+    && echo "deb [signed-by=/etc/apt/keyrings/intel-oneapi.asc] https://apt.repos.intel.com/oneapi all main" \
+        > /etc/apt/sources.list.d/oneapi.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends libclang-dev file python3 \
+        intel-oneapi-compiler-dpcpp-cpp-${ONEAPI_VERSION}=${ONEAPI_PKG_VERSION} \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=intel-gpu-runtime /opt/zkminer-intel-gpu /opt/zkminer-intel-gpu
+
+ENV ONEAPI_ROOT=/opt/intel/oneapi \
+    RISC0_ICPX=/opt/intel/oneapi/compiler/${ONEAPI_VERSION}/bin/icpx \
+    PATH="/opt/intel/oneapi/compiler/${ONEAPI_VERSION}/bin:/opt/zkminer-intel-gpu/bin:${PATH}:/root/.risc0/bin" \
+    LD_LIBRARY_PATH="/opt/intel/oneapi/compiler/${ONEAPI_VERSION}/lib:/opt/intel/oneapi/umf/latest/lib:/opt/intel/oneapi/tcm/latest/lib:/opt/intel/oneapi/tbb/latest/lib/intel64/gcc4.8:/opt/zkminer-intel-gpu/lib" \
+    LIBRARY_PATH="/opt/intel/oneapi/compiler/${ONEAPI_VERSION}/lib:/opt/zkminer-intel-gpu/lib" \
+    CPATH="/opt/zkminer-intel-gpu/include"
+
+RUN icpx --version | head -n 1 && ocloc -version 2>/dev/null | head -n 2 || true
+
+# rzup: see cuda-base (GITHUB_TOKEN).
+RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
+    curl -fsSL https://risczero.com/install | bash && rzup install -f
+
+# ===========================================================================
+# Stages: cook-intel, build-intel — RISC Zero Intel prover, and the libraries it ships with
+# ===========================================================================
+# The risc0 -sys crates build their SYCL kernels as shared libraries; stage-intel-worker-libs.sh
+# copies them, oneAPI's SYCL runtime and (INTEL_GPU_RUNTIME) Intel's compute stack into
+# zkminer-intel/lib, which the binary's RPATH names, and their licenses into zkminer-intel/LICENSES.
+FROM intel-toolchain AS cook-intel
+ARG CARGO_CHEF_VERSION
+ARG RISC0_INTEL_SYCL_TARGETS
+ENV NVCC=off HIPCC=off RISC0_INTEL_SYCL_TARGETS=${RISC0_INTEL_SYCL_TARGETS}
+
+RUN cargo install cargo-chef --locked --version ${CARGO_CHEF_VERSION}
+COPY --from=planner /recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json \
+        -p zkminer-prove-risc0 --features intel --bin zkminer-prove-risc0-intel
+
+# See cook-cuda.
+FROM cook-intel AS build-intel
+COPY . .
+
+RUN cargo build --release -p zkminer-prove-risc0 --features intel --bin zkminer-prove-risc0-intel \
+    && mkdir -p /stage \
+    && cp target/release/zkminer-prove-risc0-intel /stage/ \
+    && INTEL_GPU_RUNTIME=/opt/zkminer-intel-gpu \
+       scripts/stage-intel-worker-libs.sh /stage/zkminer-prove-risc0-intel /build/target
+
+# ===========================================================================
+# Stage: build-sp1-server-sycl — hemilabs/sp1's sp1-gpu-server, SYCL build
+# ===========================================================================
+# The same commit as build-sp1-server, built for Intel GPUs (#19) with its default targets (Battlemage
+# and Alchemist ahead of time, plus SPIR-V). Shipped as sp1-gpu-server-sycl, with its own library
+# (libsp1_gpu_sycl.so) staged with the rest into zkminer-intel/lib. No cache mount for the target dir:
+# that library is built there.
+FROM intel-toolchain AS build-sp1-server-sycl
+COPY scripts/ci/install-sp1-server-tools.sh /usr/local/bin/
+RUN install-sp1-server-tools.sh
+# GOPROXY: see build-sp1-server.
+ENV PATH="/usr/local/go/bin:${PATH}" \
+    GOPROXY="https://proxy.golang.org,https://goproxy.cn,direct" \
+    SP1_GPU_BACKEND=sycl
+
+COPY Cargo.lock /build/Cargo.lock
+COPY scripts/stage-intel-worker-libs.sh /usr/local/bin/
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    REV=$(grep -o 'git+https://github.com/hemilabs/sp1?[^#"]*#[0-9a-f]\{40\}' /build/Cargo.lock | head -1 | cut -d'#' -f2) \
+    && test -n "$REV" \
+    && echo "building sp1-gpu-server (SYCL) at hemilabs/sp1 $REV" \
+    && CARGO_TARGET_DIR=/build/target-sp1-server \
+       cargo install --locked --root /sp1-server --git https://github.com/hemilabs/sp1 --rev "$REV" sp1-gpu-server \
+    && mkdir -p /stage \
+    && cp /sp1-server/bin/sp1-gpu-server /stage/sp1-gpu-server-sycl \
+    && INTEL_GPU_RUNTIME=/opt/zkminer-intel-gpu \
+       stage-intel-worker-libs.sh /stage/sp1-gpu-server-sycl /build/target-sp1-server \
+    && rm -rf /build/target-sp1-server
+
+# ===========================================================================
+# Stage: build-localnet-test — the localnet test, for the release's GPU validation
+# ===========================================================================
+# The every-GPU localnet test (crates/zkminer-cli/tests/localnet.rs) built on its own, with anvil, so
+# the self-hosted GPU runner can run it against the release's binaries in stock distribution images
+# (scripts/ci/gpu-validate.sh). Not part of the release.
+FROM rust-base AS build-localnet-test
+ARG FOUNDRY_VERSION
+ENV FOUNDRY_DIR=/usr/local/foundry \
+    PATH="/usr/local/foundry/bin:${PATH}"
+RUN curl -L https://foundry.paradigm.xyz | bash \
+    && foundryup --install ${FOUNDRY_VERSION} \
+    && anvil --version
 
 COPY . .
 
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=target-rocm,target=/build/target \
-    cargo build --release -p zkminer-prove-risc0 --features rocm --bin zkminer-prove-risc0-rocm \
-    && cp target/release/zkminer-prove-risc0-rocm /zkminer-prove-risc0-rocm
-
-# ===========================================================================
-# Stage: intel-base — Intel oneAPI + Rust toolchain
-# ===========================================================================
-# Intel oneAPI base toolkit for SYCL/Level Zero GPU compute.
-# Used for future Intel GPU prover builds (Arc, Data Center Max).
-FROM intel/oneapi-basekit:2025.1.1-0-devel-ubuntu22.04 AS intel-base
-ARG RUST_VERSION
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential git curl ca-certificates cmake pkg-config \
-        protobuf-compiler libclang-dev \
-        level-zero-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH="/usr/local/cargo/bin:${PATH}"
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
-    && rustup show
-
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
-
-RUN apt update
-RUN apt install -y curl 
-RUN curl -L https://risczero.com/install | bash
-RUN cat "/root/.bashrc"
-ENV PATH="$PATH:/root/.risc0/bin"
-RUN echo blah
-RUN rzup --help
-RUN rzup install --help
-# GITHUB_TOKEN: see cuda-base.
-RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN rzup install -f
-
-WORKDIR /build
-
-# ===========================================================================
-# Stage: build-intel — Intel GPU prover (placeholder, requires sppark SYCL port)
-# ===========================================================================
-# FROM intel-base AS build-intel
-#
-# COPY . .
-#
-# RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-#     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
-#     --mount=type=cache,id=target-intel,target=/build/target \
-#     cargo build --release -p zkminer-prove-risc0 --features intel --bin zkminer-prove-risc0-intel \
-#     && cp target/release/zkminer-prove-risc0-intel /zkminer-prove-risc0-intel
+    --mount=type=cache,id=target-localnet,target=/build/target \
+    cargo test --release -p zkminer-cli --test localnet --no-run 2>&1 | tee /tmp/build.log \
+    && exe=$(sed -n 's/.*Executable .*(\(.*\/localnet-[0-9a-f]*\)).*/\1/p' /tmp/build.log | tail -n 1) \
+    && test -x "$exe" \
+    && mkdir -p /localnet-test \
+    && cp "$exe" /localnet-test/localnet \
+    && cp /usr/local/foundry/bin/anvil /localnet-test/anvil
 
 # ===========================================================================
 # Dist stages — scratch containers for --output extraction
@@ -492,5 +746,26 @@ FROM scratch AS dist-sp1-server
 COPY --from=build-sp1-server /sp1-gpu-server /sp1-gpu-server
 COPY --from=build-sp1-server /cudart/ /
 
+# zkminer-prove-risc0-rocm and zkminer-rocm/ (ROCm 7.1's HIP runtime)
 FROM scratch AS dist-rocm
-COPY --from=build-rocm /zkminer-prove-risc0-rocm /zkminer-prove-risc0-rocm
+COPY --from=build-rocm /stage/ /
+
+# sp1-gpu-server-hip and sp1-gpu-server-hip-lib/ (ROCm 10.1's HIP runtime)
+FROM scratch AS dist-sp1-server-hip
+COPY --from=build-sp1-server-hip /stage/ /
+
+# Intel's compute stack alone, as built for the release: its own CI job, so that the stage is built
+# once and its layers are in the build cache for the two jobs below.
+FROM scratch AS dist-intel-gpu-runtime
+COPY --from=intel-gpu-runtime /opt/zkminer-intel-gpu /zkminer-intel-gpu
+
+# zkminer-prove-risc0-intel and zkminer-intel/ (lib/, LICENSES/)
+FROM scratch AS dist-intel
+COPY --from=build-intel /stage/ /
+
+# sp1-gpu-server-sycl and zkminer-intel/ (its libraries; the release merges both zkminer-intel/)
+FROM scratch AS dist-sp1-server-sycl
+COPY --from=build-sp1-server-sycl /stage/ /
+
+FROM scratch AS dist-localnet-test
+COPY --from=build-localnet-test /localnet-test/ /

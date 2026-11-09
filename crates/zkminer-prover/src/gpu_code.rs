@@ -122,6 +122,141 @@ impl EmbeddedGpuCode {
     }
 }
 
+/// Which AMD GPUs a HIP binary can run on, read from the device code it carries.
+///
+/// hipcc embeds device code in clang offload bundles in `.hip_fatbin`, one per compiled module:
+/// `__CLANG_OFFLOAD_BUNDLE__`, a `u64` count, then per entry a `u64` offset, `u64` size, `u64` id
+/// length and the id, such as `hipv4-amdgcn-amd-amdhsa--gfx1100` (a code object for that GPU) or
+/// `host-x86_64-unknown-linux-gnu` (empty). A card runs a module only with a code object for its own
+/// target or a generic target that covers it (`gfx11-generic`); there is no JIT fallback, and a
+/// launch without one fails with "invalid device function". Every module must be runnable, as for
+/// CUDA.
+///
+/// As for CUDA, anything not understood (compressed bundles, an unknown generic target, no
+/// `.hip_fatbin`) is unknown, never "cannot run".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedHipCode {
+    /// Per bundle, the targets of its code objects (`gfx1100`, `gfx11-generic`), features dropped.
+    bundles: Vec<Vec<String>>,
+}
+
+const HIP_SECTION: &[u8] = b".hip_fatbin";
+const BUNDLE_MAGIC: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";
+/// A bundle's header is far smaller than this; it bounds what one read takes.
+const MAX_BUNDLE_HEADER: usize = 64 << 10;
+
+impl EmbeddedHipCode {
+    /// The HIP device code in the ELF at `path`, or `None` if there is none it can read.
+    pub fn read(path: &Path) -> io::Result<Option<Self>> {
+        Self::from_reader(&mut File::open(path)?)
+    }
+
+    fn from_reader<R: Read + Seek>(r: &mut R) -> io::Result<Option<Self>> {
+        let Some((offset, size)) = find_section(r, HIP_SECTION)? else {
+            return Ok(None);
+        };
+        let end = offset.saturating_add(size);
+        let mut bundles = Vec::new();
+        let mut at = offset;
+        // Bundles sit one after another, padded to an alignment; between them is nothing but
+        // padding, so a scan from one's end finds the next's magic within a window.
+        let mut window = vec![0u8; MAX_BUNDLE_HEADER];
+        while at < end {
+            let len = ((end - at) as usize).min(window.len());
+            if !read_at(r, at, &mut window[..len])? {
+                return Ok(None);
+            }
+            let Some(found) = window[..len]
+                .windows(BUNDLE_MAGIC.len())
+                .position(|w| w == BUNDLE_MAGIC)
+            else {
+                // Compressed bundles ("CCOB") or another layout: not understood.
+                if window[..len].iter().any(|&b| b != 0) {
+                    return Ok(None);
+                }
+                at += len as u64;
+                continue;
+            };
+            let start = at + found as u64;
+            let hlen = ((end - start) as usize).min(window.len());
+            if !read_at(r, start, &mut window[..hlen])? {
+                return Ok(None);
+            }
+            let Some((targets, bundle_len)) = parse_bundle(&window[..hlen]) else {
+                return Ok(None);
+            };
+            bundles.push(targets);
+            at = start + bundle_len.max(1);
+        }
+        Ok((!bundles.is_empty()).then_some(Self { bundles }))
+    }
+
+    /// Whether an AMD GPU of target `gfx` (`gfx1100`) can run every module. A module whose targets
+    /// include one this does not know counts as runnable.
+    pub fn runs_on(&self, gfx: &str) -> bool {
+        self.bundles.iter().all(|targets| {
+            targets
+                .iter()
+                .any(|t| hip_target_covers(t, gfx).unwrap_or(true))
+        })
+    }
+
+    /// The targets, for a log line: `gfx1100, gfx1201`.
+    pub fn describe(&self) -> String {
+        let mut all: Vec<&str> = self.bundles.iter().flatten().map(String::as_str).collect();
+        all.sort_unstable();
+        all.dedup();
+        all.join(", ")
+    }
+}
+
+/// The targets of one bundle's code objects, and the bundle's length, from its header.
+fn parse_bundle(b: &[u8]) -> Option<(Vec<String>, u64)> {
+    let mut at = BUNDLE_MAGIC.len();
+    let count = u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?);
+    at += 8;
+    if count == 0 || count > 1024 {
+        return None;
+    }
+    let mut targets = Vec::new();
+    let mut len = 0u64;
+    for _ in 0..count {
+        let field = |i: usize| -> Option<u64> {
+            Some(u64::from_le_bytes(
+                b.get(at + 8 * i..at + 8 * i + 8)?.try_into().ok()?,
+            ))
+        };
+        let (offset, size, id_len) = (field(0)?, field(1)?, field(2)? as usize);
+        at += 24;
+        let id = std::str::from_utf8(b.get(at..at + id_len)?).ok()?;
+        at += id_len;
+        len = len.max(offset.checked_add(size)?);
+        if id.contains("amdgcn") {
+            let target = &id[id.find("gfx")?..];
+            // `gfx90a:xnack+`: the processor alone decides which card runs it.
+            targets.push(target.split(':').next()?.to_string());
+        }
+    }
+    (!targets.is_empty()).then_some((targets, len))
+}
+
+/// Whether code for `target` runs on a card of target `card`: the same target, or a generic one
+/// that covers it. `None` for a generic target this does not know.
+fn hip_target_covers(target: &str, card: &str) -> Option<bool> {
+    let covered: &[&str] = match target {
+        t if !t.contains("generic") => return Some(t == card),
+        "gfx10-3-generic" => &[
+            "gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036",
+        ],
+        "gfx11-generic" => &[
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153",
+        ],
+        "gfx12-generic" => &["gfx1200", "gfx1201"],
+        _ => return None,
+    };
+    Some(covered.contains(&card))
+}
+
 fn read_at<R: Read + Seek>(r: &mut R, offset: u64, buf: &mut [u8]) -> io::Result<bool> {
     r.seek(SeekFrom::Start(offset))?;
     match r.read_exact(buf) {
@@ -294,6 +429,132 @@ fn read_containers<R: Read + Seek>(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// A minimal 64-bit LE ELF with one section, `name`, holding `data`.
+    fn elf_with_section(name: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut names = vec![0u8];
+        let name_at = names.len() as u32;
+        names.extend_from_slice(name);
+        names.push(0);
+        let shstrtab_at = names.len() as u32;
+        names.extend_from_slice(b".shstrtab\0");
+        let data_off = 64u64;
+        let names_off = data_off + data.len() as u64;
+        let shoff = (names_off + names.len() as u64 + 7) & !7;
+        let mut f = vec![0u8; shoff as usize];
+        f[..4].copy_from_slice(b"\x7fELF");
+        f[4] = 2;
+        f[5] = 1;
+        f[0x28..0x30].copy_from_slice(&shoff.to_le_bytes());
+        f[0x3A..0x3C].copy_from_slice(&64u16.to_le_bytes());
+        f[0x3C..0x3E].copy_from_slice(&3u16.to_le_bytes());
+        f[0x3E..0x40].copy_from_slice(&2u16.to_le_bytes());
+        f[64..64 + data.len()].copy_from_slice(data);
+        f[names_off as usize..names_off as usize + names.len()].copy_from_slice(&names);
+        let section = |name: u32, kind: u32, off: u64, size: u64| {
+            let mut h = vec![0u8; 64];
+            h[..4].copy_from_slice(&name.to_le_bytes());
+            h[4..8].copy_from_slice(&kind.to_le_bytes());
+            h[24..32].copy_from_slice(&off.to_le_bytes());
+            h[32..40].copy_from_slice(&size.to_le_bytes());
+            h
+        };
+        f.extend(vec![0u8; 64]);
+        f.extend(section(name_at, 1, data_off, data.len() as u64));
+        f.extend(section(shstrtab_at, 3, names_off, names.len() as u64));
+        f
+    }
+
+    /// A clang offload bundle with a host entry and a code object per target, padded to 64 bytes.
+    fn bundle(targets: &[&str]) -> Vec<u8> {
+        let mut ids = vec!["host-x86_64-unknown-linux-gnu".to_string()];
+        ids.extend(
+            targets
+                .iter()
+                .map(|t| format!("hipv4-amdgcn-amd-amdhsa--{t}")),
+        );
+        let header_len: usize =
+            BUNDLE_MAGIC.len() + 8 + ids.iter().map(|id| 24 + id.len()).sum::<usize>();
+        let mut b = BUNDLE_MAGIC.to_vec();
+        b.extend((ids.len() as u64).to_le_bytes());
+        let mut at = header_len as u64;
+        for (i, id) in ids.iter().enumerate() {
+            let size = if i == 0 { 0u64 } else { 100 };
+            b.extend(at.to_le_bytes());
+            b.extend(size.to_le_bytes());
+            b.extend((id.len() as u64).to_le_bytes());
+            b.extend(id.as_bytes());
+            at += size;
+        }
+        b.resize(at as usize, 0xAB);
+        b.resize(b.len().next_multiple_of(64), 0);
+        b
+    }
+
+    #[test]
+    fn hip_code_runs_only_on_the_targets_every_module_has() {
+        let both = [
+            bundle(&["gfx1100", "gfx1201"]),
+            bundle(&["gfx1100", "gfx1201"]),
+        ]
+        .concat();
+        let code =
+            EmbeddedHipCode::from_reader(&mut Cursor::new(elf_with_section(b".hip_fatbin", &both)))
+                .unwrap()
+                .unwrap();
+        assert_eq!(code.describe(), "gfx1100, gfx1201");
+        assert!(code.runs_on("gfx1100"));
+        assert!(code.runs_on("gfx1201"));
+        assert!(!code.runs_on("gfx1030"), "an RX 6000 card has no code here");
+        assert!(
+            !code.runs_on("gfx1101"),
+            "nor does an RX 7800, without a generic target"
+        );
+
+        // A module without the card's target fails it, however many others have it.
+        let one_short = [bundle(&["gfx1100", "gfx1201"]), bundle(&["gfx1201"])].concat();
+        let code = EmbeddedHipCode::from_reader(&mut Cursor::new(elf_with_section(
+            b".hip_fatbin",
+            &one_short,
+        )))
+        .unwrap()
+        .unwrap();
+        assert!(!code.runs_on("gfx1100"));
+        assert!(code.runs_on("gfx1201"));
+
+        // Generic targets cover their family; one this does not know is not held against a card.
+        let generic = bundle(&["gfx11-generic", "gfx12-generic"]);
+        let code = EmbeddedHipCode::from_reader(&mut Cursor::new(elf_with_section(
+            b".hip_fatbin",
+            &generic,
+        )))
+        .unwrap()
+        .unwrap();
+        assert!(code.runs_on("gfx1101") && code.runs_on("gfx1200"));
+        assert!(!code.runs_on("gfx1030"));
+        let unknown = bundle(&["gfx13-generic"]);
+        let code = EmbeddedHipCode::from_reader(&mut Cursor::new(elf_with_section(
+            b".hip_fatbin",
+            &unknown,
+        )))
+        .unwrap()
+        .unwrap();
+        assert!(code.runs_on("gfx1030"));
+    }
+
+    #[test]
+    fn hip_code_it_cannot_read_is_unknown() {
+        let read = |elf: Vec<u8>| EmbeddedHipCode::from_reader(&mut Cursor::new(elf)).unwrap();
+        assert_eq!(
+            read(elf_with_section(b".text", &bundle(&["gfx1100"]))),
+            None
+        );
+        assert_eq!(
+            read(elf_with_section(b".hip_fatbin", b"CCOB compressed bytes")),
+            None
+        );
+        assert_eq!(read(b"#!/bin/sh\n".to_vec()), None);
+    }
 
     /// One fatbin entry: a 64-byte header and `payload` bytes of stand-in code.
     fn entry(kind: u16, arch: u32, payload: usize) -> Vec<u8> {
@@ -598,6 +859,19 @@ mod tests {
             (12, 1),
         ];
         for path in paths.split(':') {
+            if let Some(code) = EmbeddedHipCode::read(Path::new(path)).unwrap() {
+                let gfx = [
+                    "gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201",
+                ];
+                let ok: Vec<&str> = gfx.iter().copied().filter(|g| code.runs_on(g)).collect();
+                println!(
+                    "{path}: {} HIP module(s), {}; runs on {}",
+                    code.bundles.len(),
+                    code.describe(),
+                    ok.join(" ")
+                );
+                continue;
+            }
             match EmbeddedGpuCode::read(Path::new(path)).unwrap() {
                 None => println!("{path}: no loaded device code found"),
                 Some(code) => {

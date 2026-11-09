@@ -420,7 +420,7 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
         GpuVendor::Unknown => (" GPU ", theme::overlay()),
     };
 
-    // Per-GPU zkOP/s: scale from best GPU throughput relative to best CPU throughput
+    // Per-GPU zkOP/s: the suite's score, scaled by this card's best throughput over the suite's mean
     let zkops_str = if let Some(suite) = &state.benchmark_results {
         // Join on physical identity, NOT on `gpu.index`. `gpu.index` is a display
         // ordinal over all DRM cards; benchmark rows are keyed in the prover's

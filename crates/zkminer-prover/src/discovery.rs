@@ -112,6 +112,7 @@ fn detect_all_gpus_with(
             .map(|g| format!("[{}] {} ({})", g.device_index, g.name, g.pci_bus_id))
             .collect();
         tracing::info!("Detected {} AMD GPU(s): {}", amd.len(), names.join(", "));
+        warn_if_inaccessible(&[Path::new("/dev/kfd")], "AMD");
         gpus.extend(amd);
     }
 
@@ -126,11 +127,52 @@ fn detect_all_gpus_with(
             intel.len(),
             names.join(", ")
         );
+        let render_nodes: Vec<PathBuf> = std::fs::read_dir("/dev/dri")
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("renderD"))
+            .map(|e| e.path())
+            .collect();
+        let render_nodes: Vec<&Path> = render_nodes.iter().map(PathBuf::as_path).collect();
+        warn_if_inaccessible(&render_nodes, "Intel");
         gpus.extend(intel);
     }
 
     gpus
 }
+
+/// Says so, once, when this user cannot open the device nodes an AMD (`/dev/kfd`) or Intel
+/// (`/dev/dri/renderD*`) worker needs. They are `root:render`, mode 0660: a desktop session's user
+/// is let in by its seat, but a service, a cron job or an SSH session needs the user in `render`,
+/// and without it every worker on those cards fails to start, with only the runtime's own error.
+#[cfg(unix)]
+fn warn_if_inaccessible(nodes: &[&Path], vendor: &str) {
+    use std::os::unix::ffi::OsStrExt;
+    let denied: Vec<String> = nodes
+        .iter()
+        .filter(|node| {
+            let Ok(path) = std::ffi::CString::new(node.as_os_str().as_bytes()) else {
+                return false;
+            };
+            // access(2) checks the real user and all its groups, as opening the node would.
+            let status = unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK) };
+            status != 0
+        })
+        .map(|node| node.display().to_string())
+        .collect();
+    if !denied.is_empty() && denied.len() == nodes.len() {
+        tracing::warn!(
+            "{vendor} GPU(s) found, but this user cannot open {}: their workers will fail to \
+             start. Add the user to the `render` group (`sudo usermod -aG render $USER`, then log \
+             in again): a desktop session is let in, a service or SSH session is not.",
+            denied.join(", ")
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_inaccessible(_nodes: &[&Path], _vendor: &str) {}
 
 /// Detect NVIDIA GPUs via nvidia-smi, falling back to /proc/driver/nvidia/gpus/.
 fn detect_nvidia_gpus() -> Vec<DetectedGpu> {
@@ -855,7 +897,9 @@ fn detect_amd_gpus() -> Vec<DetectedGpu> {
         return Vec::new();
     }
 
-    // Query rocm-smi for proper product names AND the authoritative HIP device index.
+    // HIP device indices from the kernel's KFD topology, which needs no ROCm install; rocm-smi's
+    // where that cannot be read (and product names, where rocm-smi is installed).
+    let kfd_index = kfd_hip_indices(Path::new("/sys/class/kfd/kfd/topology"));
     let rocm_info = query_rocm_smi_info();
 
     let mut entries: Vec<_> = match std::fs::read_dir(drm_base) {
@@ -923,15 +967,15 @@ fn detect_amd_gpus() -> Vec<DetectedGpu> {
             .cloned()
             .unwrap_or_else(|| read_amd_gpu_name(&device_dir));
 
-        // HIP_VISIBLE_DEVICES must use the ROCm/HIP device index, which is what
-        // rocm-smi's GPU[N] reports. The DRM cardN walk order need not match it
+        // HIP_VISIBLE_DEVICES must use the ROCm/HIP device index: KFD's GPU order, which
+        // rocm-smi's GPU[N] also reports. The DRM cardN walk order need not match it
         // (an skipped iGPU or non-PCI ordering would shift the index and mis-pin
         // the worker onto the wrong AMD GPU — the same failure class as the CUDA
-        // PCI-bus-id bug). Fall back to a positional counter only if rocm-smi
-        // didn't give us an index for this bus.
-        let device_index = rocm_info
-            .index_by_bus
+        // PCI-bus-id bug). Fall back to a positional counter only if neither
+        // gave us an index for this bus.
+        let device_index = kfd_index
             .get(&pci_bus_id)
+            .or_else(|| rocm_info.index_by_bus.get(&pci_bus_id))
             .copied()
             .unwrap_or_else(|| {
                 let i = fallback_index;
@@ -950,6 +994,85 @@ fn detect_amd_gpus() -> Vec<DetectedGpu> {
     }
 
     gpus
+}
+
+/// The GPU nodes of the kernel's KFD topology (`<topology>/nodes/<n>/properties`), which a host
+/// with only the amdgpu driver has, in node order: each one's PCI bus id and target (`gfx1100`).
+/// CPU nodes, which have no SIMDs, are left out. A node's `location_id` is its PCI address,
+/// `bus << 8 | device << 3 | function`, in PCI domain `domain`; its `gfx_target_version` is
+/// `major * 10000 + minor * 100 + stepping`, the target named `gfx<major><minor:x><stepping:x>`.
+///
+/// `None` when the topology cannot be read whole: a GPU node missing from the list would shift
+/// every later HIP index, and pin a worker onto the wrong card.
+fn kfd_gpu_nodes(topology: &Path) -> Option<Vec<(String, Option<String>)>> {
+    let mut nodes: Vec<(u32, PathBuf)> = std::fs::read_dir(topology.join("nodes"))
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| Some((e.file_name().to_str()?.parse().ok()?, e.path())))
+        .collect();
+    nodes.sort();
+    let mut gpus = Vec::new();
+    for (_, dir) in nodes {
+        let properties = std::fs::read_to_string(dir.join("properties")).ok()?;
+        let value = |key: &str| {
+            properties.lines().find_map(|line| {
+                let (k, v) = line.split_once(' ')?;
+                (k == key).then(|| v.trim().parse::<u64>().ok()).flatten()
+            })
+        };
+        if value("simd_count").unwrap_or(0) == 0 {
+            continue;
+        }
+        let (location, domain) = (value("location_id")?, value("domain")?);
+        let bus = format!(
+            "{domain:04x}:{:02x}:{:02x}.{:x}",
+            (location >> 8) & 0xff,
+            (location >> 3) & 0x1f,
+            location & 0x7
+        );
+        let gfx = value("gfx_target_version")
+            .filter(|v| *v > 0)
+            .map(|v| format!("gfx{}{:x}{:x}", v / 10_000, (v / 100) % 100, v % 100));
+        gpus.push((normalize_pci_bus_id(&bus), gfx));
+    }
+    Some(gpus)
+}
+
+/// Each AMD GPU's HIP device index, by PCI bus id: HIP numbers the GPUs in the order of their KFD
+/// nodes, counting every GPU node (an APU's too). Empty when the topology cannot be read whole.
+fn kfd_hip_indices(topology: &Path) -> HashMap<String, u32> {
+    kfd_gpu_nodes(topology)
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(index, (bus, _))| (bus, index as u32))
+        .collect()
+}
+
+/// The target of the AMD GPU at `pci_bus_id` (`gfx1100` for an RX 7900 XTX), from the KFD topology,
+/// for checking a HIP binary carries code for it (`gpu_code::EmbeddedHipCode`).
+pub fn amd_gfx_target(pci_bus_id: &str) -> Option<String> {
+    let bus = normalize_pci_bus_id(pci_bus_id);
+    kfd_gpu_nodes(Path::new("/sys/class/kfd/kfd/topology"))?
+        .into_iter()
+        .find(|(b, _)| *b == bus)?
+        .1
+}
+
+/// The binary holding a backend's HIP device code, for `gpu_code::EmbeddedHipCode` to read: the
+/// risc0 worker itself, or the SP1 HIP server the SP1 worker will run.
+pub fn hip_code_binary(backend: &str, worker: &Path) -> Option<PathBuf> {
+    if backend != "sp1" {
+        return Some(worker.to_path_buf());
+    }
+    let install = std::env::var(zkminer_prover_protocol::types::SP1_SERVER_INSTALL_ENV)
+        .map_or(true, |v| v.trim() != "0");
+    sp1_named_server_for(
+        sp1_server_name("rocm")?,
+        worker,
+        install,
+        dirs::home_dir().as_deref(),
+    )
 }
 
 /// Parse the numeric suffix of a DRM node name like "card10" -> 10.
@@ -1005,14 +1128,41 @@ fn read_amd_gpu_name(device_dir: &Path) -> String {
             return name;
         }
     }
+    let read = |file: &str| {
+        std::fs::read_to_string(device_dir.join(file))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    let (device_id, revision) = (read("device"), read("revision"));
+    // The marketing name from libdrm's table, which Mesa installs (libdrm-common): a host with only
+    // the GPU driver has no rocm-smi to ask.
+    if let Some(name) = [
+        "/usr/share/libdrm/amdgpu.ids",
+        "/usr/local/share/libdrm/amdgpu.ids",
+    ]
+    .iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .find_map(|ids| amdgpu_ids_name(&ids, &device_id, &revision))
+    {
+        return name;
+    }
     // Fallback: device ID
-    if let Ok(device_id) = std::fs::read_to_string(device_dir.join("device")) {
-        let device_id = device_id.trim().to_string();
-        if !device_id.is_empty() {
-            return format!("AMD GPU ({})", device_id);
-        }
+    if !device_id.is_empty() {
+        return format!("AMD GPU ({})", device_id);
     }
     "AMD GPU".to_string()
+}
+
+/// The product name libdrm's `amdgpu.ids` gives a device id and revision (sysfs's `0x744c` and
+/// `0xc8`), from its `744C,\tC8,\tAMD Radeon RX 7900 XTX` lines.
+fn amdgpu_ids_name(ids: &str, device_id: &str, revision: &str) -> Option<String> {
+    let hex = |s: &str| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    let (device, revision) = (hex(device_id)?, hex(revision)?);
+    ids.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ',');
+        let (d, r, name) = (fields.next()?, fields.next()?, fields.next()?);
+        (hex(d)? == device && hex(r)? == revision).then(|| name.trim().to_string())
+    })
 }
 
 /// rocm-smi enumeration info, keyed by lowercase PCI bus id.
@@ -1663,6 +1813,91 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amd_names_come_from_libdrm_without_rocm() {
+        let ids = "# comment\n1.0.0\n744C,\tC8,\tAMD Radeon RX 7900 XTX\n744C,\tCC,\tAMD Radeon RX 7900 XT\n7550,\tC0,\tAMD Radeon RX 9070 XT\n";
+        assert_eq!(
+            amdgpu_ids_name(ids, "0x744c", "0xc8").as_deref(),
+            Some("AMD Radeon RX 7900 XTX")
+        );
+        assert_eq!(
+            amdgpu_ids_name(ids, "0x7550", "0xc0").as_deref(),
+            Some("AMD Radeon RX 9070 XT")
+        );
+        assert_eq!(amdgpu_ids_name(ids, "0x744c", "0xff"), None);
+        assert_eq!(amdgpu_ids_name(ids, "", "0xc8"), None);
+    }
+
+    #[test]
+    fn gfx_targets_are_named_from_their_version() {
+        let root = std::env::temp_dir().join(format!("zkminer-kfd-gfx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (n, version) in [(1, 110001), (2, 120001), (3, 90010), (4, 90402)] {
+            let dir = root.join(format!("nodes/{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("properties"),
+                format!(
+                    "simd_count 64\nlocation_id {}\ndomain 0\ngfx_target_version {version}\n",
+                    n << 8
+                ),
+            )
+            .unwrap();
+        }
+        let gfx: Vec<String> = kfd_gpu_nodes(&root)
+            .unwrap()
+            .into_iter()
+            .filter_map(|g| g.1)
+            .collect();
+        assert_eq!(gfx, ["gfx1101", "gfx1201", "gfx90a", "gfx942"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hip_indices_follow_the_kfd_topology_without_rocm() {
+        let root = std::env::temp_dir().join(format!("zkminer-kfd-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let node = |n: u32, properties: &str| {
+            let dir = root.join(format!("nodes/{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("properties"), properties).unwrap();
+        };
+        // A CPU node, an APU, then two discrete cards, listed out of order (node 10 after 2).
+        node(
+            0,
+            "cpu_cores_count 16\nsimd_count 0\nlocation_id 0\ndomain 0\n",
+        );
+        node(1, "simd_count 24\nlocation_id 1280\ndomain 0\n");
+        node(10, "simd_count 128\nlocation_id 49152\ndomain 1\n");
+        node(
+            2,
+            "simd_count 192\nlocation_id 2168\ndomain 0\ngfx_target_version 110000\n",
+        );
+
+        let gpus = kfd_gpu_nodes(&root).unwrap();
+        assert_eq!(
+            gpus[1],
+            ("0000:08:0f.0".to_string(), Some("gfx1100".to_string()))
+        );
+        assert_eq!(gpus[0].1, None, "a node without its target version");
+        let indices = kfd_hip_indices(&root);
+        // 1280 = 0x500: 05:00.0; 2168 = 0x878: 08:0f.0; 49152 = 0xc000: c0:00.0.
+        assert_eq!(indices.get("0000:05:00.0"), Some(&0), "the APU counts");
+        assert_eq!(indices.get("0000:08:0f.0"), Some(&1));
+        assert_eq!(
+            indices.get("0001:c0:00.0"),
+            Some(&2),
+            "node 10 sorts after node 2"
+        );
+        assert_eq!(indices.len(), 3);
+
+        // A GPU node without its address: no index is trusted.
+        node(11, "simd_count 64\n");
+        assert!(kfd_hip_indices(&root).is_empty());
+        assert!(kfd_hip_indices(&root.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// The layout an Arc B580 returned on xe (kernel 7.0): system memory, then one VRAM region.
     #[test]

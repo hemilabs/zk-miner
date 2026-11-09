@@ -56,7 +56,8 @@ fn elf_fetch_timeout() -> Duration {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(60);
-    Duration::from_secs(secs)
+    // Bounded: this is added to an `Instant`, which panics past what it can hold.
+    Duration::from_secs(secs.min(24 * 60 * 60))
 }
 
 /// Cap on concurrent blocking DNS resolutions of submitter-controlled ELF hosts, node-wide.
@@ -109,6 +110,10 @@ fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     if seg[0..6].iter().all(|&s| s == 0) && !(seg[6] == 0 && (seg[7] == 0 || seg[7] == 1)) {
         return Some(v4_from(seg[6], seg[7]));
     }
+    // IPv4-translated `::ffff:0:a.b.c.d` (SIIT), which neither of the two forms above matches.
+    if seg[0..4].iter().all(|&s| s == 0) && seg[4] == 0xffff && seg[5] == 0 {
+        return Some(v4_from(seg[6], seg[7]));
+    }
     // NAT64 well-known prefix `64:ff9b::/96` — `64:ff9b::a.b.c.d`.
     if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6].iter().all(|&s| s == 0) {
         return Some(v4_from(seg[6], seg[7]));
@@ -126,8 +131,8 @@ fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
 
 /// True for an address a submitter must not be able to make the miner reach: loopback, RFC1918
 /// private, link-local (incl. the 169.254.169.254 metadata endpoint), CGNAT, unspecified, broadcast,
-/// documentation, multicast, IPv6 ULA/link-local, and every IPv6 form that embeds an IPv4 address
-/// (IPv4-mapped, IPv4-compatible, NAT64, 6to4, Teredo — see [`embedded_ipv4`]).
+/// documentation, multicast, IPv6 ULA/link-local, every IPv6 form that embeds a blocked IPv4 address
+/// (see [`embedded_ipv4`]), and the 6to4 and Teredo prefixes whatever they embed.
 fn ip_is_blocked(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -136,6 +141,7 @@ fn ip_is_blocked(ip: &IpAddr) -> bool {
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_broadcast()
+                || v4.is_multicast()
                 || v4.is_documentation()
                 || v4.is_unspecified()
                 || o[0] == 0
@@ -144,13 +150,14 @@ fn ip_is_blocked(ip: &IpAddr) -> bool {
                 || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18.0.0/15 benchmarking
                 || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF protocol assignments
                 || (o[0] == 192 && o[1] == 88 && o[2] == 99) // 192.88.99.0/24 6to4 relay anycast
+                || o == [168, 63, 129, 16] // Azure's platform endpoint
         }
         IpAddr::V6(v6) => {
             // Normalise every IPv6 form that EMBEDS an IPv4 address back to that IPv4 and re-test it,
             // so a blocked v4 target cannot be smuggled through as a v6 literal the submitter's DNS
             // returns. `to_ipv4_mapped()` alone (the previous guard) covered only `::ffff:a.b.c.d`.
-            if let Some(v4) = embedded_ipv4(*v6) {
-                return ip_is_blocked(&IpAddr::V4(v4));
+            if embedded_ipv4(*v6).is_some_and(|v4| ip_is_blocked(&IpAddr::V4(v4))) {
+                return true;
             }
             let seg = v6.segments();
             v6.is_loopback()
@@ -158,10 +165,12 @@ fn ip_is_blocked(ip: &IpAddr) -> bool {
                 || v6.is_multicast()
                 || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
                 || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
-                // Block the translation/relay prefixes themselves too, so a form of them that carries
-                // no routable embedded v4 (or one `embedded_ipv4` declines) still cannot be reached —
-                // no legitimate program store serves from a NAT64/6to4/Teredo address.
-                || (seg[0] == 0x0064 && seg[1] == 0xff9b) // NAT64 well-known 64:ff9b::/96
+                || (seg[0] & 0xffc0) == 0xfec0 // fec0::/10 site-local, deprecated
+                // Block the relay prefixes outright, whatever they embed: both are deprecated, and no
+                // program store serves from one. Not the well-known NAT64 /96 with a public address in
+                // it, tested above, which is how a host on an IPv6-only network with DNS64 reaches a
+                // store that only has IPv4. Any other `64:ff9b:` is a local translator (RFC 8215).
+                || (seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6].iter().any(|&s| s != 0))
                 || seg[0] == 0x2002 // 6to4 2002::/16
                 || (seg[0] == 0x2001 && seg[1] == 0x0000) // Teredo 2001:0::/32
                 || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
@@ -244,72 +253,19 @@ fn reject_blocked_addrs(host: &str, addrs: &[std::net::SocketAddr]) -> Result<()
     Ok(())
 }
 
-/// Non-blocking redirect-hop validation (no DNS). reqwest runs the redirect policy
-/// synchronously on its connection task, so it must NOT resolve DNS (that would stall a runtime worker) —
-/// but that is exactly why a redirect to an unvalidated HOSTNAME must now be REFUSED rather than
-/// followed: we cannot IP-check it here, and only the ORIGINAL host was resolved+vetted+pinned
-/// off-runtime. The previous policy followed hostname redirects, so a `302 Location:
-/// http://name.attacker.com/` whose A record is 169.254.169.254 / 127.0.0.1 / RFC1918 defeated the
-/// whole SSRF guard. Now: reject a non-http(s) scheme; allow a redirect back to the SAME (pinned)
-/// host — reqwest connects it to the pinned address, so http→https and path redirects still work;
-/// IP-check an IP-literal target; and refuse any OTHER hostname.
-fn validate_redirect_target(url: &reqwest::Url, pinned_host: &str) -> Result<()> {
-    match url.scheme() {
-        "http" | "https" => {}
-        other => bail!("non-http(s) redirect scheme '{other}'"),
-    }
-    if allow_private_elf_hosts() {
-        return Ok(());
-    }
-    let Some(host) = url.host_str() else {
-        bail!("redirect target has no host");
-    };
-    // Same host as the vetted+pinned original: safe to follow — the client's resolve override pins
-    // this host to the addresses we already IP-checked, so no fresh (rebindable) lookup happens.
-    if host.eq_ignore_ascii_case(pinned_host) {
-        return Ok(());
-    }
-    // host_str() returns an IPv6 literal bracketed ("[::1]"); strip for IpAddr parsing.
-    let h = host
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(host);
-    match h.parse::<IpAddr>() {
-        Ok(ip) => {
-            if ip_is_blocked(&ip) {
-                bail!("redirect to private/reserved address {ip}");
-            }
-            Ok(())
-        }
-        // A different hostname we cannot resolve+check on the runtime task: refuse.
-        Err(_) => bail!(
-            "redirect to unvalidated host '{host}' (differs from the vetted ELF host); refusing \
-             to follow a redirect whose address cannot be re-checked"
-        ),
-    }
-}
-
-/// Build a download client pinned to `host` → `addrs` (the addresses `validate_fetch_url_async`
-/// already IP-checked), with bounded connect/total timeouts and an SSRF-checked redirect policy.
-/// Pinning resolves the host ONCE (here) and connects to those exact addresses,
-/// closing DNS rebinding; the policy refuses redirects to any other hostname (see
-/// `validate_redirect_target`). An empty `addrs` (private hosts allowed by config) builds an
-/// unpinned client — there is nothing to guard in that mode.
+/// Build a download client for one hop, pinned to `host` → `addrs` (the addresses
+/// `validate_fetch_url_async` already IP-checked), with bounded timeouts and no redirects of its own:
+/// [`get_following_redirects`] follows those, vetting each. Pinning resolves the host ONCE (there) and
+/// connects to those exact addresses, closing DNS rebinding. An empty `addrs` (private hosts allowed by
+/// config) builds an unpinned client — there is nothing to guard in that mode.
 fn build_elf_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result<reqwest::Client> {
-    let pinned_host = host.to_string();
-    let policy = reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= 5 {
-            return attempt.error("too many redirects while fetching ELF");
-        }
-        match validate_redirect_target(attempt.url(), &pinned_host) {
-            Ok(()) => attempt.follow(),
-            Err(e) => attempt.error(format!("blocked redirect target: {e}")),
-        }
-    });
     let mut builder = reqwest::Client::builder()
         .connect_timeout(elf_fetch_timeout())
         .timeout(elf_fetch_timeout())
-        .redirect(policy);
+        .redirect(reqwest::redirect::Policy::none())
+        // reqwest sends none by default, and Arweave's gateways answer a request without one with a
+        // 403 (the subdomain `arweave.net` redirects to, measured).
+        .user_agent(concat!("zkminer/", env!("CARGO_PKG_VERSION")));
     if !addrs.is_empty() {
         // Pin only the vetted IP, NOT the port. The connector (hyper-util `set_port`)
         // fills a resolved addr's port iff it is 0 OR the URI carries an explicit port, so a pinned
@@ -318,11 +274,78 @@ fn build_elf_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result<reqwes
         // for an http:// URL) instead breaks a legitimate same-host http->https redirect: the
         // connector keeps 80 and attempts TLS against the plaintext port. See `pin_addrs`.
         let pinned = pin_addrs(addrs);
-        builder = builder.resolve_to_addrs(host, &pinned);
+        // And no proxy, which reqwest otherwise takes from `HTTP_PROXY` and friends. A proxy resolves
+        // the host itself, so it would ignore the pin and let a submitter's URL reach whatever the
+        // proxy can. A host that only has egress through a proxy can set
+        // `ZKMINER_ELF_ALLOW_PRIVATE_URLS=1`, the unpinned mode above, giving up the checks on every hop.
+        builder = builder.resolve_to_addrs(host, &pinned).no_proxy();
     }
     builder
         .build()
         .context("building hardened ELF download client")
+}
+
+/// How many redirects one ELF fetch follows.
+const MAX_ELF_REDIRECTS: usize = 5;
+
+/// GET `start`, following redirects by hand so that each hop goes through `vet` before anything
+/// connects to it.
+///
+/// reqwest runs a redirect policy synchronously on its connection task, where it cannot resolve DNS,
+/// and with a client pinned to one host. So a policy can only refuse a redirect to another hostname or
+/// follow it unchecked, and following it would let a `302 Location: http://name.attacker.com/` whose A
+/// record is 169.254.169.254 defeat the SSRF guard. Refusing it breaks real program stores:
+/// `arweave.net/<tx>` answers with a redirect to a subdomain of its own, and a GitHub release URL with
+/// one to `release-assets.githubusercontent.com`. Out here each hop can be resolved, IP-checked and
+/// pinned as the first was, with a client of its own.
+///
+/// `budget` bounds the whole chain and the body read after it, as the single request it replaces did.
+/// A response that is not a redirect is returned whatever its status.
+async fn get_following_redirects<V, F>(
+    start: reqwest::Url,
+    budget: Duration,
+    vet: V,
+) -> Result<reqwest::Response>
+where
+    V: Fn(reqwest::Url) -> F,
+    F: std::future::Future<Output = Result<Vec<std::net::SocketAddr>>>,
+{
+    let deadline = std::time::Instant::now() + budget;
+    let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+    let mut url = start;
+    for _ in 0..=MAX_ELF_REDIRECTS {
+        let addrs = tokio::time::timeout(remaining(), vet(url.clone()))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out vetting {}", sanitize_log(url.as_str())))??;
+        let client = build_elf_client(url.host_str().unwrap_or(""), &addrs)?;
+        let response = client
+            .get(url.clone())
+            .timeout(remaining())
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", sanitize_log(&e.to_string())))?;
+        use reqwest::StatusCode as S;
+        if !matches!(
+            response.status(),
+            S::MOVED_PERMANENTLY
+                | S::FOUND
+                | S::SEE_OTHER
+                | S::TEMPORARY_REDIRECT
+                | S::PERMANENT_REDIRECT
+        ) {
+            return Ok(response);
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| anyhow::anyhow!("redirect with no usable Location"))?;
+        url = url
+            .join(location)
+            .map_err(|e| anyhow::anyhow!("redirect to an invalid Location: {e}"))?;
+        tracing::debug!("ELF fetch redirected to {}", sanitize_log(url.as_str()));
+    }
+    bail!("too many redirects while fetching ELF")
 }
 
 /// Strip the port from each vetted address so the pin binds the IP only. The connector
@@ -781,30 +804,17 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                 continue;
             }
         };
-        let vetted_addrs = match validate_fetch_url_async(&parsed).await {
-            Ok(addrs) => addrs,
-            Err(e) => {
-                tracing::warn!("Skipping storage URI {}: {e:#}", sanitize_log(&url));
-                continue;
-            }
-        };
-        // Build the client pinned to the host we just resolved+IP-checked, so the
-        // connection uses those exact addresses (no rebindable re-resolution) and redirects to any
-        // other hostname are refused. Per-URI because each may target a different host.
-        let host = parsed.host_str().unwrap_or("").to_string();
-        let client = match build_elf_client(&host, &vetted_addrs) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("Skipping storage URI {}: client build failed: {e:#}", sanitize_log(&url));
-                continue;
-            }
-        };
 
         // The URL string is submitter-controlled (built from a registered URI); sanitize it in
         // every log line so embedded ANSI/OSC/CRLF cannot forge or corrupt operator console output.
         let url_log = sanitize_log(&url);
         tracing::info!("Downloading ELF from {}...", url_log);
-        match client.get(parsed).send().await {
+        // Every hop is resolved, IP-checked and pinned before anything connects to it.
+        let fetched = get_following_redirects(parsed, elf_fetch_timeout(), |hop| async move {
+            validate_fetch_url_async(&hop).await
+        })
+        .await;
+        match fetched {
             Ok(mut response) => {
                 if !response.status().is_success() {
                     tracing::warn!("HTTP {} from {}", response.status(), url_log);
@@ -905,7 +915,11 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                 return Ok(elf);
             }
             Err(e) => {
-                tracing::warn!("Failed to download from {}: {}", url_log, sanitize_log(&e.to_string()));
+                tracing::warn!(
+                    "Failed to download from {}: {}",
+                    url_log,
+                    sanitize_log(&format!("{e:#}"))
+                );
                 continue;
             }
         }
@@ -1091,6 +1105,33 @@ mod security_tests {
         assert_eq!(super::sanitize_log("café-π"), "café-π");
     }
 
+    /// What the guard's doc says it blocks and it used to let through.
+    #[test]
+    fn blocks_the_forms_the_early_return_let_through() {
+        for s in [
+            "224.0.0.1",          // IPv4 multicast
+            "239.255.255.250",    // IPv4 multicast
+            "::ffff:0:a9fe:a9fe", // IPv4-translated 169.254.169.254
+            "::ffff:0:a00:1",     // IPv4-translated 10.0.0.1
+            "2002:0808:0808::",   // 6to4, whatever it embeds
+            "2001:0:808:808::1",  // Teredo, whatever it embeds
+            "64:ff9b:1::808:808", // a local NAT64 translator (RFC 8215)
+            "fec0::1",            // deprecated site-local
+            "168.63.129.16",      // Azure's platform endpoint
+        ] {
+            assert!(ip_is_blocked(&ip(s)), "{s} should be blocked");
+        }
+        // How an IPv6-only host with DNS64 reaches a store with only IPv4, and the same public
+        // address in the other embedding forms, which reach nothing internal.
+        for s in ["64:ff9b::808:808", "::ffff:8.8.8.8", "::ffff:0:808:808"] {
+            assert!(!ip_is_blocked(&ip(s)), "{s} should be allowed");
+        }
+        assert_eq!(
+            embedded_ipv4("::ffff:0:a9fe:a9fe".parse().unwrap()),
+            Some(std::net::Ipv4Addr::new(169, 254, 169, 254))
+        );
+    }
+
     #[test]
     fn blocks_ipv4_embedding_ipv6_forms() {
         use std::net::Ipv4Addr;
@@ -1121,28 +1162,284 @@ mod security_tests {
         assert_eq!(embedded_ipv4("2606:4700:4700::1111".parse().unwrap()), None);
     }
 
-    #[test]
-    fn validate_rejects_bad_scheme_and_private_ip_literals() {
-        // The redirect-hop validator (non-blocking) rejects bad schemes and private IP LITERALS. The
-        // pinned host here is "elf.example.com" — the vetted ELF host the download started from.
-        let pin = "elf.example.com";
-        let v = |u: &str| validate_redirect_target(&reqwest::Url::parse(u).unwrap(), pin);
-        assert!(v("ftp://example.com/x").is_err());
-        assert!(v("file:///etc/passwd").is_err());
-        assert!(v("http://127.0.0.1/x").is_err());
-        assert!(v("http://169.254.169.254/latest/meta-data/").is_err());
-        assert!(v("http://[::1]:8545/").is_err());
-        // Public IP literal is allowed.
-        assert!(v("https://1.1.1.1/elf").is_ok());
-        // A redirect back to the SAME (pinned) host is allowed — the client pins it to
-        // the already-vetted address, so http→https and path redirects still work.
-        assert!(v("https://elf.example.com/elf").is_ok());
-        assert!(v("https://ELF.EXAMPLE.COM/elf").is_ok()); // case-insensitive
-        // A redirect to a DIFFERENT hostname is refused: it cannot be resolved+checked
-        // on reqwest's runtime task, and only the original host was vetted+pinned. This closes
-        // the redirect-to-internal-hostname / DNS-rebind SSRF bypass.
-        assert!(v("http://name.attacker.com/").is_err());
-        assert!(v("https://metadata.google.internal/").is_err());
+    /// A server on localhost that answers each connection with the next canned reply (`{port}` in one
+    /// becomes its port) and records the Host header each request carried. `STALL` reads the request
+    /// and then says nothing, with the connection held open; see [`SLOW`] and [`BODY_STALLS`] for the
+    /// other ways it misbehaves.
+    struct CannedServer {
+        port: u16,
+        hosts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    fn canned_server(replies: &[&str]) -> CannedServer {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hosts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let replies: Vec<String> = replies
+            .iter()
+            .map(|r| r.replace("{port}", &port.to_string()))
+            .collect();
+        let seen = hosts.clone();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                if let Some(host) = text.lines().find_map(|l| l.strip_prefix("host: ")) {
+                    seen.lock()
+                        .unwrap()
+                        .push(host.split(':').next().unwrap().to_string());
+                }
+                if reply == STALL {
+                    std::thread::sleep(Duration::from_secs(60));
+                    return;
+                }
+                let reply = match reply.strip_prefix(SLOW) {
+                    Some(rest) => {
+                        std::thread::sleep(SLOW_BY);
+                        rest.to_string()
+                    }
+                    None => reply,
+                };
+                let _ = stream.write_all(reply.as_bytes());
+                if reply.ends_with(BODY_STALLS) {
+                    std::thread::sleep(Duration::from_secs(60));
+                    return;
+                }
+            }
+        });
+        CannedServer { port, hosts }
+    }
+
+    fn redirect_to(location: &str) -> String {
+        format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    const STALL: &str = "stall";
+    /// A reply starting with this comes after [`SLOW_BY`].
+    const SLOW: &str = "slow:";
+    const SLOW_BY: Duration = Duration::from_millis(1500);
+    /// A reply ending with this is left open: its headers promise more than it sends.
+    const BODY_STALLS: &str = "part of";
+
+    const OK_ELF: &str = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nelf";
+
+    type Vetted = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A vetter that takes names no resolver knows to localhost, recording what it was asked about.
+    /// That the fetch connects at all shows it used the pin. Refuses `refused`.
+    fn vet_to_localhost(
+        refused: &'static str,
+    ) -> (
+        Vetted,
+        impl Fn(reqwest::Url) -> std::future::Ready<Result<Vec<std::net::SocketAddr>>>,
+    ) {
+        let asked: Vetted = Default::default();
+        let log = asked.clone();
+        let vet = move |url: reqwest::Url| {
+            let host = url.host_str().unwrap_or("").to_string();
+            log.lock().unwrap().push(host.clone());
+            std::future::ready(if host == refused {
+                Err(anyhow::anyhow!("refused {host}"))
+            } else {
+                Ok(vec!["127.0.0.1:0".parse().unwrap()])
+            })
+        };
+        (asked, vet)
+    }
+
+    fn start_url(server: &CannedServer) -> reqwest::Url {
+        reqwest::Url::parse(&format!("http://store.invalid:{}/elf", server.port)).unwrap()
+    }
+
+    const BUDGET: Duration = Duration::from_secs(20);
+
+    /// What `arweave.net/<tx>` and a GitHub release URL do, and what the guard used to refuse.
+    #[tokio::test]
+    async fn a_redirect_to_another_host_is_vetted_and_followed() {
+        let server = canned_server(&[&redirect_to("http://cdn.invalid:{port}/real"), OK_ELF]);
+        let (asked, vet) = vet_to_localhost("");
+        let response = get_following_redirects(start_url(&server), BUDGET, vet)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "elf");
+        assert_eq!(*asked.lock().unwrap(), ["store.invalid", "cdn.invalid"]);
+        assert_eq!(
+            *server.hosts.lock().unwrap(),
+            ["store.invalid", "cdn.invalid"]
+        );
+    }
+
+    /// The point of the whole guard: nothing connects to a hop that fails vetting.
+    #[tokio::test]
+    async fn a_hop_that_fails_vetting_is_never_connected_to() {
+        let server = canned_server(&[&redirect_to("http://internal.invalid:{port}/"), OK_ELF]);
+        let (_, vet) = vet_to_localhost("internal.invalid");
+        let e = get_following_redirects(start_url(&server), BUDGET, vet)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("refused internal.invalid"),
+            "{e:#}"
+        );
+        assert_eq!(*server.hosts.lock().unwrap(), ["store.invalid"]);
+    }
+
+    /// With the real vetter: a name that resolves to a blocked address, an IP literal, and a scheme.
+    #[tokio::test]
+    async fn the_real_vetter_refuses_internal_redirect_targets() {
+        for target in [
+            "http://localhost:{port}/",
+            "http://127.0.0.1:{port}/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:{port}/",
+            "http://[::ffff:0:a9fe:a9fe]/",
+            "ftp://store.invalid/elf",
+            "file:///etc/passwd",
+        ] {
+            let server = canned_server(&[&redirect_to(target), OK_ELF]);
+            let first = start_url(&server);
+            let origin = first.clone();
+            let vet = move |hop: reqwest::Url| {
+                let is_first = hop == origin;
+                async move {
+                    if is_first {
+                        Ok(vec!["127.0.0.1:0".parse().unwrap()])
+                    } else {
+                        validate_fetch_url_async(&hop).await
+                    }
+                }
+            };
+            let result = get_following_redirects(first, BUDGET, vet).await;
+            let e = result
+                .err()
+                .unwrap_or_else(|| panic!("{target} was followed"));
+            // The guard's own words: a target that merely cannot be reached from here is no pass.
+            assert!(
+                format!("{e:#}").contains("refusing ELF fetch"),
+                "{target}: {e:#}"
+            );
+            assert_eq!(
+                server.hosts.lock().unwrap().len(),
+                1,
+                "{target} was connected to"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relative_location_stays_on_the_host_and_is_vetted_again() {
+        let server = canned_server(&[&redirect_to("/moved/elf"), OK_ELF]);
+        let (asked, vet) = vet_to_localhost("");
+        let response = get_following_redirects(start_url(&server), BUDGET, vet)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(*asked.lock().unwrap(), ["store.invalid", "store.invalid"]);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_chain_is_bounded() {
+        let hop = redirect_to("http://store.invalid:{port}/again");
+        let replies = vec![hop.as_str(); MAX_ELF_REDIRECTS + 3];
+        let server = canned_server(&replies);
+        let (asked, vet) = vet_to_localhost("");
+        let e = get_following_redirects(start_url(&server), BUDGET, vet)
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("too many redirects"), "{e:#}");
+        assert_eq!(asked.lock().unwrap().len(), MAX_ELF_REDIRECTS + 1);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_without_a_location_fails_and_other_statuses_are_returned() {
+        let server = canned_server(&[
+            "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]);
+        let (_, vet) = vet_to_localhost("");
+        assert!(get_following_redirects(start_url(&server), BUDGET, vet)
+            .await
+            .is_err());
+
+        let server = canned_server(&[
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]);
+        let (_, vet) = vet_to_localhost("");
+        let response = get_following_redirects(start_url(&server), BUDGET, vet)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+    }
+
+    /// The budget covers the whole chain, as the single request it replaces did: a host that stalls
+    /// must not get a fresh allowance for each hop. The first hop spends most of it, so a fresh one
+    /// for the second would take over 3.5 s rather than the 2 s of the budget.
+    #[tokio::test]
+    async fn the_budget_covers_the_whole_chain() {
+        let hop = format!("{SLOW}{}", redirect_to("http://store.invalid:{port}/stall"));
+        let server = canned_server(&[&hop, STALL]);
+        let (_, vet) = vet_to_localhost("");
+        let started = std::time::Instant::now();
+        let e = get_following_redirects(start_url(&server), Duration::from_secs(2), vet)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            server.hosts.lock().unwrap().len(),
+            2,
+            "the stalled hop was reached: {e:#}"
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(1900) && took < Duration::from_secs(3),
+            "{took:?}"
+        );
+    }
+
+    /// And the body, which the caller reads after this returns.
+    #[tokio::test]
+    async fn the_budget_covers_the_body_read() {
+        let reply = format!("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{BODY_STALLS}");
+        let server = canned_server(&[&reply]);
+        let (_, vet) = vet_to_localhost("");
+        let started = std::time::Instant::now();
+        let response = get_following_redirects(start_url(&server), Duration::from_secs(1), vet)
+            .await
+            .unwrap();
+        assert!(response.text().await.is_err(), "the body never finishes");
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(900) && took < Duration::from_secs(4),
+            "{took:?}"
+        );
+    }
+
+    /// The stores this was written for, for real: neither redirect stays on the host asked for.
+    #[tokio::test]
+    #[ignore = "needs the network"]
+    async fn real_stores_that_redirect_across_hosts_are_followed() {
+        for url in [
+            "https://arweave.net/bNbA3TEQVL60xlgCcqdz4ZPHFZ711cZ3hmkpGttDt_U",
+            "https://github.com/risc0/risc0/releases/download/v1.0.0/cargo-risczero-x86_64-unknown-linux-gnu.tgz",
+        ] {
+            let vet = |hop: reqwest::Url| async move { validate_fetch_url_async(&hop).await };
+            let start = reqwest::Url::parse(url).unwrap();
+            let response = get_following_redirects(start.clone(), Duration::from_secs(60), vet)
+                .await
+                .unwrap_or_else(|e| panic!("{url}: {e:#}"));
+            assert!(response.status().is_success(), "{url}: {}", response.status());
+            assert_ne!(response.url().host_str(), start.host_str(), "{url} no longer redirects");
+        }
     }
 
     #[test]

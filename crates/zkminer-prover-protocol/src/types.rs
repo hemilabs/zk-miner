@@ -320,6 +320,15 @@ pub enum ErrorKind {
     /// Catch-all for internal errors.
     Internal,
 }
+/// The exit code of a worker whose proving server is gone, or whose connection to it is unusable.
+///
+/// The SP1 SDK keeps one connection to the `sp1-gpu-server` it starts and never reconnects, so a
+/// worker that loses it can prove nothing more, and it exits for the dispatcher to replace it. Its
+/// server may have been killed by the host running out of memory, which the worker cannot tell, so
+/// the dispatcher reads this code as it reads a worker's own SIGKILL (see
+/// `WorkerHandle::died_of_host_oom`). 75 is `EX_TEMPFAIL`: another worker may well succeed.
+pub const WORKER_EXIT_SERVER_LOST: i32 = 75;
+
 /// Bytes of HOST memory a worker is allowed to use, as the dispatcher sees it.
 ///
 /// A worker cannot work this out for itself: the ceiling is the host's RAM minus the slice reserved

@@ -1505,55 +1505,16 @@ pub fn run_benchmark() -> BenchmarkSuite {
         }
     };
 
-    // Generate CPU device benchmarks (per-backend throughput)
-    let priced: Vec<_> = results
-        .iter()
-        .filter(|r| r.program_name != zkminer_prover_protocol::BENCH_ZKOP_MIX)
-        .collect();
-    let cpu_avg = if priced.is_empty() {
-        0.0
-    } else {
-        priced.iter().map(|r| r.throughput).sum::<f64>() / priced.len() as f64
-    };
-    let cpu_power = cpu_power_watts.unwrap_or(200.0);
-    let cpu_memory = get_total_memory_bytes();
-    let mut device_benchmarks: Vec<DeviceBenchmark> = BACKEND_PROFILES
-        .iter()
-        .map(|profile| {
-            let (optimal_po2, memory_usage_bytes) =
-                find_optimal_po2(cpu_memory, profile.name, false);
-            let po2_factor = if profile.name == "risc0" {
-                po2_throughput_factor(optimal_po2)
-            } else {
-                1.0
-            };
-            DeviceBenchmark {
-                program_stages: Vec::new(),
-                device_id: CPU_DEVICE_ID.to_string(),
-                device_label: cpu_info.clone(),
-                prover_backend: profile.name.to_string(),
-                throughput: cpu_avg * profile.cpu_factor * po2_factor,
-                power_watts: cpu_power,
-                optimal_po2,
-                memory_usage_bytes,
-                max_feasible_po2: optimal_po2,
-                program_throughputs: std::collections::HashMap::new(),
-                pci_bus_id: String::new(),
-                po2_samples: Vec::new(),
-                // A CPU row's host cost is the CPU benchmark itself, which the admission gate does
-                // not govern (there is no worker to cap); left unmeasured rather than guessed.
-                host_peak_bytes: None,
-            }
-        })
-        .collect();
-
-    // Build GPU device benchmarks from real worker results.
+    // Device rows are the GPU workers' own measurements only. A CPU row used to be made up here
+    // from the GPU results (their mean throughput times a per-backend factor), which showed the CPU
+    // proving faster than the cards without a single CPU proof behind it; the cost model already
+    // skipped it. Cached suites drop theirs on load (`drop_cpu_device_rows`).
+    //
     // Workers are keyed like "risc0:cuda:0", "risc0:rocm:1", etc.
     // Each worker ran the full benchmark suite on its assigned GPU — use
     // the measured average throughput directly.
-    let mut gpu_device_benchmarks =
+    let device_benchmarks =
         build_gpu_device_benchmarks_from_workers(&worker_device_results, &per_card);
-    device_benchmarks.append(&mut gpu_device_benchmarks);
 
     let zkops = machine_zkops(&device_benchmarks);
     BenchmarkSuite {
@@ -2719,7 +2680,16 @@ pub(crate) fn load_cached_benchmark_from(
     let mut suite = saved.suite;
     migrate_device_identity(&mut suite);
     floor_implausible_gpu_power(&mut suite);
+    drop_cpu_device_rows(&mut suite);
     Some(suite)
+}
+
+/// Removes the CPU device rows a suite cached before they were dropped: they were derived from the
+/// GPU results, not measured (see `run_benchmark`).
+fn drop_cpu_device_rows(suite: &mut BenchmarkSuite) {
+    suite
+        .device_benchmarks
+        .retain(|d| d.device_id != CPU_DEVICE_ID);
 }
 
 /// The lowest GPU draw that can plausibly be a PROVING measurement.
@@ -3097,27 +3067,26 @@ mod tests {
     }
 
     #[test]
-    fn device_benchmarks_populated_by_run_benchmark() {
-        // run_benchmark() should generate CPU device benchmarks for all 3 backends.
+    fn run_benchmark_makes_no_device_rows_without_gpu_workers() {
+        // Device rows come only from GPU workers' measurements; there are none here. It used to
+        // add a CPU row per backend, derived from the GPU results rather than measured.
         let suite = run_benchmark();
-        assert_eq!(
-            suite.device_benchmarks.len(),
-            3,
-            "expected 3 CPU device benchmarks (risc0, sp1, openvm)"
+        assert!(
+            suite.device_benchmarks.is_empty(),
+            "expected no device rows, got {:?}",
+            suite
+                .device_benchmarks
+                .iter()
+                .map(|d| (&d.device_id, &d.prover_backend))
+                .collect::<Vec<_>>()
         );
-        for db in &suite.device_benchmarks {
-            assert_eq!(db.device_id, "cpu");
-            assert!(
-                db.throughput > 0.0,
-                "throughput for {} should be > 0",
-                db.prover_backend
-            );
-            assert!(
-                PROVER_BACKENDS.contains(&db.prover_backend.as_str()),
-                "unexpected backend: {}",
-                db.prover_backend
-            );
-        }
+        assert!(
+            !suite
+                .device_benchmarks
+                .iter()
+                .any(|d| d.device_id == CPU_DEVICE_ID),
+            "no CPU row, ever"
+        );
     }
 
     #[test]
@@ -3131,8 +3100,8 @@ mod tests {
         }];
         add_gpu_device_benchmarks(&mut suite, &gpus);
 
-        // Should now have 3 CPU + 2 GPU entries (risc0+sp1, no openvm GPU)
-        assert_eq!(suite.device_benchmarks.len(), 5);
+        // 2 GPU entries (risc0+sp1, no openvm GPU), and no CPU rows
+        assert_eq!(suite.device_benchmarks.len(), 2);
 
         let gpu_entries: Vec<_> = suite
             .device_benchmarks
@@ -3141,19 +3110,19 @@ mod tests {
             .collect();
         assert_eq!(gpu_entries.len(), 2);
 
-        // GPU entries should be faster than CPU entries for backends with GPU support
+        // GPU estimates should beat the baseline they scale, for backends with GPU support
+        let base = suite.average_throughput();
         for profile in &BACKEND_PROFILES {
             let Some(_) = profile.gpu_acceleration else {
                 continue;
             };
-            let cpu_tp = suite.throughput_for("cpu", profile.name).unwrap();
             let gpu_tp = suite.throughput_for("gpu0", profile.name).unwrap();
             assert!(
-                gpu_tp > cpu_tp,
-                "GPU should be faster than CPU for {}: gpu={:.0} cpu={:.0}",
+                gpu_tp > base,
+                "GPU estimate should beat the baseline for {}: gpu={:.0} base={:.0}",
                 profile.name,
                 gpu_tp,
-                cpu_tp
+                base
             );
         }
     }
@@ -3206,7 +3175,7 @@ mod tests {
         add_gpu_device_benchmarks(&mut suite, &gpus);
 
         let risc0_devices = suite.devices_for_backend("risc0");
-        assert_eq!(risc0_devices.len(), 3); // cpu + gpu0 + gpu1
+        assert_eq!(risc0_devices.len(), 2); // gpu0 + gpu1
 
         let unknown_devices = suite.devices_for_backend("nonexistent");
         assert!(unknown_devices.is_empty());
@@ -4527,7 +4496,8 @@ mod cache_power_tests {
     }
 
     /// The WIRING, not the helper: a cache file on disk must come back with its implausible
-    /// power already floored. Deleting the `floor_implausible_gpu_power` call from
+    /// power already floored, and without the CPU row older versions derived from the GPU results.
+    /// Deleting the `floor_implausible_gpu_power` or `drop_cpu_device_rows` call from
     /// `load_cached_benchmark_from` makes this fail; the two helper tests above do not.
     #[test]
     fn a_loaded_cache_has_its_implausible_power_floored() {
@@ -4551,6 +4521,12 @@ mod cache_power_tests {
                 "results": [],
                 "device_benchmarks": [
                     {
+                        "device_id": "cpu", "device_label": "CPU", "prover_backend": "risc0",
+                        "throughput": 9000000.0, "power_watts": 200.0, "optimal_po2": 21,
+                        "memory_usage_bytes": 0, "max_feasible_po2": 21,
+                        "program_throughputs": {}, "pci_bus_id": "", "po2_samples": []
+                    },
+                    {
                         "device_id": "gpu0", "device_label": "GPU0", "prover_backend": "risc0",
                         "throughput": 1000000.0, "power_watts": 8.5, "optimal_po2": 21,
                         "memory_usage_bytes": 0, "max_feasible_po2": 21,
@@ -4566,6 +4542,12 @@ mod cache_power_tests {
 
         let loaded = super::load_cached_benchmark_from(&path, "v-test", "fp-test")
             .expect("version and fingerprint match, so it must load");
+        let ids: Vec<&str> = loaded
+            .device_benchmarks
+            .iter()
+            .map(|d| d.device_id.as_str())
+            .collect();
+        assert_eq!(ids, ["gpu0"], "the derived CPU row must not survive a load");
         assert_eq!(
             loaded.device_benchmarks[0].power_watts, FALLBACK_GPU_WATTS,
             "a cache written by the old power bug must not reach the cost model as measured"

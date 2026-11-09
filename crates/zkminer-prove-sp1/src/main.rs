@@ -54,50 +54,161 @@ fn pk_cache_capacity() -> usize {
         .unwrap_or(4)
 }
 
-/// Drop a GPU-resident proving key safely. Dropping a `CudaPk` performs async teardown of the
-/// `sp1-gpu-server` that needs a tokio runtime context (see the shutdown path); without one the Drop
-/// impl panics. Evictions are rare, so a short-lived runtime per eviction is acceptable.
-#[cfg(not(windows))]
-fn drop_pk(pk: CudaPk) {
+/// Drop something holding the SP1 client: a proving key, the prover, or several of them.
+///
+/// Their `Drop` impls call `tokio::spawn`, which panics outside a runtime (`there is no reactor
+/// running`), so they are dropped inside one. The last one dropped also ends the `sp1-gpu-server`
+/// (the SDK starts it `kill_on_drop`). Building a runtime is rare enough to do each time.
+///
+/// Only for what is not going to use the client again, as this cancels whatever those drops spawned.
+/// See `evict_key` for a key on a server that lives on.
+///
+/// If no runtime can be built the value is leaked rather than panicking in `Drop`, so a server it
+/// held outlives this worker and is left to the next worker's `reap_orphaned_gpu_servers`.
+fn drop_on_runtime<T>(held: T) {
     match tokio::runtime::Runtime::new() {
         Ok(rt) => rt.block_on(async move {
-            drop(pk);
+            drop(held);
         }),
         Err(e) => {
-            tracing::warn!("No tokio runtime to free an evicted SP1 proving key ({e}); leaking it");
-            std::mem::forget(pk);
+            tracing::warn!("No tokio runtime to release the SP1 client ({e}); leaking it");
+            std::mem::forget(held);
         }
     }
 }
 
-/// Windows: the drop's teardown is a request the key's `Drop` spawns on the current runtime, and a
-/// short-lived runtime cancelled it mid-write. Windows completes a named-pipe write asynchronously,
-/// so the cancel could land between the request's length and its body, leaving half a frame on the
-/// server's pipe: its next request failed to decode ("invalid value: integer `92`") and the server
-/// closed the connection, failing that proof and the next. Seen proving the six benchmark programs
-/// in turn on an RTX 5090, at the fifth (the first eviction). The runtime here lives as long as the
-/// worker, so the request runs to completion; it holds the client's lock while it does, so it is
-/// never interleaved with another.
-#[cfg(windows)]
-fn drop_pk(pk: CudaPk) {
-    static RUNTIME: std::sync::LazyLock<Option<tokio::runtime::Runtime>> =
-        std::sync::LazyLock::new(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()
-                .map_err(|e| tracing::warn!("cannot start a runtime to free SP1 proving keys: {e}"))
-                .ok()
-        });
-    match RUNTIME.as_ref() {
-        Some(rt) => {
-            let _context = rt.enter();
-            drop(pk);
-        }
-        None => {
-            tracing::warn!("No tokio runtime to free an evicted SP1 proving key; leaking it");
+/// How long the server may take to answer a key's Destroy, which only removes it from a map, before
+/// the connection is given up on.
+const KEY_DESTROY_WAIT: Duration = Duration::from_secs(30);
+
+/// Free a key evicted from `PkCache`, on a server this worker goes on using, and return once its
+/// Destroy is over. One that failed is only logged, by the SDK, and the next request finds that out.
+///
+/// `drop_on_runtime` is not enough here. Dropping a key spawns its Destroy, on one connection shared
+/// with every later request, and that function ends its runtime at once, which can cancel the Destroy
+/// before it is sent, or between the request and its reply. That leaves the key on the server, or the
+/// stream out of step with its requests.
+fn evict_key(pk: CudaPk) -> Result<()> {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::warn!("No tokio runtime to free an evicted SP1 proving key ({e}); leaking it");
             std::mem::forget(pk);
+            return Ok(());
         }
+    };
+    let answered = rt.block_on(async move {
+        drop(pk);
+        let started = Instant::now();
+        while tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+            > 0
+        {
+            if started.elapsed() >= KEY_DESTROY_WAIT {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        true
+    });
+    if answered {
+        Ok(())
+    } else {
+        // Ending the runtime cancels it, so the stream can no longer be trusted.
+        Err(anyhow::Error::new(ServerLost {
+            detail: format!("no answer to a key's Destroy in {KEY_DESTROY_WAIT:?}"),
+        }))
+    }
+}
+
+/// Everything that holds the SP1 client, and through it `sp1-gpu-server`, released when this goes
+/// out of scope, however that happens.
+///
+/// A drop is only safe inside a runtime (`drop_on_runtime`), and a block of code at the end of a
+/// function does not run on every way out of it. An answer that cannot be written, because the miner
+/// died while this worker proved, used to leave through `?` and panic in `Drop`: measured on a real
+/// server with a key held, three panics and SIGABRT.
+struct ServerHolders {
+    prover: Option<sp1_sdk::blocking::CudaProver>,
+    pk_cache: PkCache,
+    /// Keys from benchmarks, held rather than leaked; see `run_benchmarks`.
+    benchmark_keys: Vec<CudaPk>,
+}
+
+impl ServerHolders {
+    fn new() -> Self {
+        Self {
+            prover: None,
+            pk_cache: PkCache::new(pk_cache_capacity()),
+            benchmark_keys: Vec::new(),
+        }
+    }
+}
+
+impl Drop for ServerHolders {
+    fn drop(&mut self) {
+        if self.prover.is_some() || !self.pk_cache.is_empty() || !self.benchmark_keys.is_empty() {
+            drop_on_runtime((
+                std::mem::take(&mut self.benchmark_keys),
+                std::mem::replace(&mut self.pk_cache, PkCache::new(1)),
+                self.prover.take(),
+            ));
+        }
+    }
+}
+
+/// The error type of the SDK's calls to `sp1-gpu-server`.
+type SdkError = <sp1_sdk::blocking::CudaProver as sp1_sdk::blocking::Prover>::Error;
+
+/// `sp1-gpu-server` is gone, or the connection to it can no longer be used.
+///
+/// The SDK makes one connection when the prover is built and never another, so every later call
+/// fails too: measured, killing only the server made the next four proofs fail with `early eof`
+/// and `Broken pipe` while the worker stayed up and answered each with an ordinary error. Nothing
+/// but a new process recovers from that, so a worker that sees this exits (see
+/// `WORKER_EXIT_SERVER_LOST`), and the dispatcher handles it as it does any worker that died.
+#[derive(Debug)]
+struct ServerLost {
+    /// The SDK's error.
+    detail: String,
+}
+
+impl std::fmt::Display for ServerLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "lost the connection to sp1-gpu-server: {}", self.detail)
+    }
+}
+
+impl std::error::Error for ServerLost {}
+
+/// Whether the text of a [`SdkError`] says the client can no longer be used: a read or a write on
+/// its one connection failed, which also leaves a part-read reply in the stream, or a reply was
+/// not one its request can have, so replies no longer line up with requests.
+///
+/// `CudaClientError` does not expose its variant, so this reads the start of its `Display`, which
+/// each variant fixes and no message can change: a guest's text, which can reach the server's own
+/// errors, only ever comes after the variant's fixed words. So this must only be given an
+/// [`SdkError`]'s own text (`sdk_error` is why), and it is an anchored match, never `contains`.
+/// `the_server_lost_check_agrees_with_the_real_error_type` holds it to the pinned SDK's wording.
+fn says_server_lost(sdk_error_text: &str) -> bool {
+    [
+        "CudaClientError: Failed to read the response:",
+        "CudaClientError: Failed to write the request:",
+        "CudaClientError: The server returned an unexpected response:",
+    ]
+    .iter()
+    .any(|fixed| sdk_error_text.starts_with(fixed))
+}
+
+/// An SDK error as this worker reports it: [`ServerLost`] if it is that, so callers can tell by
+/// type, and otherwise its text.
+fn sdk_error(e: SdkError) -> anyhow::Error {
+    let detail = e.to_string();
+    if says_server_lost(&detail) {
+        anyhow::Error::new(ServerLost { detail })
+    } else {
+        anyhow::anyhow!("{detail}")
     }
 }
 
@@ -141,7 +252,7 @@ impl<V> LruCache<V> {
 
     /// Insert `value`, evicting least-recently-used entries until under capacity. Returns evicted
     /// values (usually zero or one).
-    #[must_use = "evicted proving keys must be dropped in a runtime context via drop_pk"]
+    #[must_use = "evicted proving keys must be dropped in a runtime context via evict_key"]
     fn insert(&mut self, key: [u8; 32], value: V) -> Vec<V> {
         let mut evicted = Vec::new();
         while self.map.len() >= self.cap {
@@ -162,6 +273,8 @@ impl<V> LruCache<V> {
 
 type PkCache = LruCache<CudaPk>;
 use zkminer_prover_protocol::proc::{self, Outcome};
+#[cfg(any(target_os = "linux", test))]
+use zkminer_prover_protocol::sp1_shm::{is_sp1_shm_basename, sp1_shm_mapped_in};
 use zkminer_prover_protocol::types::{
     CUDA_DEVICE_ID_ENV, CUDA_VRAM_AVAILABLE_BYTES_ENV, CUDA_VRAM_BYTES_ENV, HOST_MEM_BUDGET_ENV,
 };
@@ -223,13 +336,18 @@ fn main() {
         use sp1_sdk::blocking::{Elf, Prover};
         use sp1_sdk::{HashableKey, ProvingKey};
         let (Some(name), Some(path)) = (args.get(i + 1), args.get(i + 2)) else {
-            eprintln!("usage: --export-guest fibonacci <path>");
+            eprintln!("usage: --export-guest <benchmark program> <path>");
             std::process::exit(2);
         };
         let elf = match name.as_str() {
-            "fibonacci" => FIBONACCI_SP1_GUEST_ELF,
+            BENCH_FIBONACCI => FIBONACCI_SP1_GUEST_ELF,
+            BENCH_SHA256_CHAIN => SHA256_CHAIN_SP1_GUEST_ELF,
+            BENCH_ECDSA_VERIFY => ECDSA_VERIFY_SP1_GUEST_ELF,
+            BENCH_BIGINT_MUL => BIGINT_MUL_SP1_GUEST_ELF,
+            BENCH_MEMORY_MERKLE => MEMORY_MERKLE_SP1_GUEST_ELF,
+            BENCH_CHACHA_MIX => CHACHA_MIX_SP1_GUEST_ELF,
             other => {
-                eprintln!("unknown guest {other:?} (known: fibonacci)");
+                eprintln!("unknown guest {other:?} (known: the benchmark programs)");
                 std::process::exit(2);
             }
         };
@@ -257,7 +375,7 @@ fn main() {
     // which would corrupt the bincode IPC stream. We dup stdout for IPC,
     // then redirect FD 1 to stderr so any stray prints go to the log.
     #[cfg(unix)]
-    let ipc_stdout = {
+    let mut ipc_stdout = {
         use std::os::unix::io::{AsRawFd, FromRawFd};
         let stdout_fd = io::stdout().as_raw_fd(); // FD 1
         let ipc_fd = dup_cloexec(stdout_fd).expect("dup(stdout) failed");
@@ -266,7 +384,7 @@ fn main() {
         unsafe { std::fs::File::from_raw_fd(ipc_fd) }
     };
     #[cfg(windows)]
-    let ipc_stdout = zkminer_prover_protocol::ipc::take_ipc_stdout();
+    let mut ipc_stdout = zkminer_prover_protocol::ipc::take_ipc_stdout();
 
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
@@ -278,15 +396,14 @@ fn main() {
     // Which card this worker drives, set by the dispatcher. Read here as well as in the worker loop
     // because the orphan reaping below must be scoped to it: there is one SP1 worker per card now,
     // and each must leave its siblings' servers and sockets alone.
-    #[cfg(target_os = "linux")]
     let our_cuda_device: Option<u32> = std::env::var(CUDA_DEVICE_ID_ENV)
         .ok()
         .and_then(|v| v.trim().parse().ok());
 
-    // Direct benchmark mode: run benchmarks and print results to stderr (stdout is redirected)
-    // Before constructing any CudaProver: never adopt a server whose owner is gone.
-    #[cfg(target_os = "linux")]
-    reap_orphaned_gpu_servers(our_cuda_device);
+    // Before constructing any CudaProver: never adopt a server whose owner is gone. Without waiting
+    // for it to finish exiting: this spends the handshake's budget (`HANDSHAKE_TIMEOUT`), and most
+    // workers prove minutes later if at all. `build_prover` waits, when a server is about to start.
+    reap_orphaned_gpu_servers(our_cuda_device, Duration::ZERO);
     // On Windows no server outlives its worker to be adopted.
     #[cfg(windows)]
     windows_job::end_children_with_this_process();
@@ -307,16 +424,19 @@ fn main() {
     if warmup::drives_cuda() {
         ensure_cuda12_on_library_path();
     } else {
-        // The HIP or SYCL build's own libraries, installed beside it (see `bundled_server`): put
-        // them on the library path the server inherits from this process.
-        if let Ok(server) = warmup::server_path() {
-            let lib = server.with_file_name(format!("{}-lib", warmup::server_name()));
-            if lib.is_dir() {
-                let path = match std::env::var("LD_LIBRARY_PATH") {
-                    Ok(p) if !p.is_empty() => format!("{}:{p}", lib.display()),
-                    _ => lib.display().to_string(),
-                };
-                std::env::set_var("LD_LIBRARY_PATH", path);
+        // The HIP or SYCL build's own libraries (`bundled_server::server_lib_dir`): put them first
+        // on the library path the server inherits from this process.
+        if let Some(lib) = bundled_server::server_lib_dir() {
+            let path = match std::env::var("LD_LIBRARY_PATH") {
+                Ok(p) if !p.is_empty() => format!("{}:{p}", lib.display()),
+                _ => lib.display().to_string(),
+            };
+            std::env::set_var("LD_LIBRARY_PATH", path);
+            // The SYCL build's Level Zero driver, shipped there: the only one its loader opens, not
+            // also a distribution's (see zkminer-prove-risc0's `use_shipped_level_zero_driver`).
+            let driver = lib.join("libze_intel_gpu.so.1");
+            if driver.is_file() && std::env::var_os("ZE_ENABLE_ALT_DRIVERS").is_none() {
+                std::env::set_var("ZE_ENABLE_ALT_DRIVERS", driver);
             }
         }
     }
@@ -336,33 +456,114 @@ fn main() {
         }
     }
 
+    // Direct benchmark mode: run benchmarks and print results to stderr (stdout is redirected).
     if std::env::args().any(|a| a == "--benchmark") {
         // Honour the assigned device here too. Without this, benchmarking card 1 by hand silently
         // measured card 0 — a figure that is then persisted as that card's.
-        let prover = {
-            let builder = sp1_sdk::blocking::ProverClient::builder().cuda();
-            match std::env::var(CUDA_DEVICE_ID_ENV)
-                .ok()
-                .and_then(|v| v.trim().parse::<u32>().ok())
-            {
-                Some(id) => builder.with_device_id(id).build(),
-                None => builder.build(),
-            }
-        };
-        let results = run_benchmarks(&prover, &mut |_, _, _| {});
-        for r in &results {
-            eprintln!(
-                "{:<16} {:>12} cycles  {:>8.2}s  {:>12.0} c/s  weight={:.2}  precompile={}",
-                r.program_name, r.cycles, r.duration_secs, r.throughput, r.weight, r.precompile,
-            );
-        }
-        return;
+        std::process::exit(run_benchmarks_by_hand(our_cuda_device));
     }
 
-    if let Err(e) = run_worker_loop(ipc_stdout) {
+    // By reference, so the descriptor closes with the process and not before. The host reads the EOF
+    // as this worker having died and asks at once how it died (`died_of_host_oom`), so a descriptor
+    // closed while it is still exiting gets the answer "still running".
+    if let Err(e) = run_worker_loop(&mut ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
-        std::process::exit(1);
+        std::process::exit(if e.is::<ServerLost>() {
+            zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST
+        } else {
+            1
+        });
     }
+}
+
+/// `--benchmark`: run every benchmark and print a row per program to stderr. Returns the exit code,
+/// which is non-zero unless every program produced its row, so a script can tell.
+fn run_benchmarks_by_hand(device: Option<u32>) -> i32 {
+    // Dropped before returning. That also ends the server, which must not outlive this process: with
+    // no dispatcher to sweep its process group, nothing else would.
+    let mut held = ServerHolders::new();
+    let prover = match build_prover(device) {
+        Ok(prover) => held.prover.insert(prover),
+        Err(message) => {
+            tracing::error!("{message}");
+            return 1;
+        }
+    };
+    let run = run_benchmarks(prover, &mut held.benchmark_keys, &mut |_, _, _| {});
+    for r in &run.results {
+        eprintln!(
+            "{:<16} {:>12} cycles  {:>8.2}s  {:>12.0} c/s  weight={:.2}  precompile={}",
+            r.program_name, r.cycles, r.duration_secs, r.throughput, r.weight, r.precompile,
+        );
+    }
+    for failure in &run.failed {
+        eprintln!("FAILED {failure}");
+    }
+    drop(held);
+    if let Some(lost) = run.server_lost {
+        eprintln!("FAILED: {lost}");
+        return zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST;
+    }
+    if run.failed.is_empty() && !run.results.is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+/// How long `build_prover` waits for an orphaned server it killed to finish exiting.
+///
+/// Well past what was measured, 1.35 s at 29 GB, which is ~20 GB/s. It only runs out on a server
+/// stuck in the kernel, typically in a GPU driver, and then the socket is already unlinked, so the
+/// new server is still the one reached. This runs ahead of the first proof, not in the handshake.
+const ORPHAN_EXIT_WAIT: Duration = Duration::from_secs(10);
+
+/// Build the prover, turning a PANIC into a decline.
+///
+/// The SDK ends `build()` with `.expect("Failed to create the CUDA prover impl")`, so anything that
+/// stops `sp1-gpu-server` coming up kills this process outright. The dispatcher then sees only EOF
+/// and reads it as worker ill-health: it excludes a slot, burns a retry, respawns, and does it all
+/// again on the next job. But the commonest cause is categorical, not transient — the server
+/// refuses a card below its hard VRAM floor — upstream's reads "Unsupported GPU memory: 20, must be
+/// at least 24GB"; the fork this repo pins lowers it to 16 — which will be just as true next time.
+///
+/// Catching it lets us answer the protocol properly. `WORKER_DECLINED` is the dispatcher's existing
+/// signal for "I spoke to you, and I cannot prove here": at the handshake or a respawn it stops the
+/// backend being advertised on this slot. In the answer to a Prove or a Benchmark, where this is
+/// called, nothing reads it yet, and it is a plain error.
+///
+/// `AssertUnwindSafe` is sound here because the panic path leaves nothing of ours half-written: the
+/// prover slot is still `None` (we only assign on success), and the SDK's own state dies with the
+/// server it failed to reach.
+fn build_prover(
+    cuda_device_id: Option<u32>,
+) -> std::result::Result<sp1_sdk::blocking::CudaProver, String> {
+    reap_orphaned_gpu_servers(cuda_device_id, ORPHAN_EXIT_WAIT);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tracing::info!("Initializing SP1 CUDA prover...");
+        let builder = sp1_sdk::blocking::ProverClient::builder().cuda();
+        let builder = match cuda_device_id {
+            Some(id) => builder.with_device_id(id),
+            None => builder,
+        };
+        builder.build()
+    }))
+    .map_err(|e| {
+        let detail = e
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| e.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic with no message".to_string());
+        format!(
+            "{}: could not initialise the SP1 CUDA prover on device {}: {detail}. The most \
+             likely cause is a card below sp1-gpu-server's hard VRAM floor (16 GB in the pinned \
+             fork, 24 GB upstream), which no proving option can change.",
+            zkminer_prover_protocol::types::WORKER_DECLINED,
+            cuda_device_id
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "default".to_string()),
+        )
+    })
 }
 
 /// Parse the parent pid out of a `/proc/<pid>/stat` line.
@@ -376,8 +577,106 @@ fn ppid_from_proc_stat(stat: &str) -> Option<i32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// Kill any ORPHANED `sp1-gpu-server` before this worker starts its own, and remove the
-/// socket it was holding.
+/// True once a process has finished exiting, so that its socket is closed, whether or not anything
+/// ever reaps it.
+///
+/// `Z` alone does not say that. A thread group's leader turns `Z` at once while its other threads
+/// are still releasing what they share: measured on a 24 GB process, `Z` within 0.2 ms, still
+/// accepting connections until 909 ms. Those threads leave the count only after that, so `Z` with
+/// one thread left is the end of it (`Z`, 1 thread, connections refused, 924 ms). Watching for
+/// `/proc/<pid>` to vanish instead would wait out the whole bound wherever nothing reaps zombies,
+/// such as a container whose PID 1 is not an init.
+///
+/// It does not promise the host's memory is back. Whatever is reading the process's `/proc` entry
+/// when it dies holds its address space for that moment, and then frees it itself: measured with a
+/// reader on a 12 GB process, `Z` with one thread and connections refused at 0.3 ms, and the reader
+/// held 580 ms. What this wait is for, the socket, is settled either way, and the dispatcher waits
+/// for memory itself where that matters (`wait_for_reclaim`).
+#[cfg(target_os = "linux")]
+fn has_finished_exiting(stat: &str) -> bool {
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    let mut fields = rest.split_whitespace();
+    // Field 3 is the state and field 20 `num_threads`; `nth` here counts from field 4.
+    let exited = matches!(fields.next(), Some("Z" | "X" | "x"));
+    let threads = fields.nth(16).and_then(|n| n.parse::<i64>().ok());
+    exited && threads.is_some_and(|n| n <= 1)
+}
+
+/// The socket a server named `server_name` listens on for `device`, as the SDK's own `socket_path`
+/// names it (`the_socket_name_is_the_sdks` holds the two together). The SDK's reads this process's
+/// environment, which says nothing about an orphan started by another worker.
+///
+/// `None` for a name no socket could have: this comes from a process's environment and ends up
+/// being unlinked.
+#[cfg(target_os = "linux")]
+fn server_socket_path(server_name: &str, device: u32) -> Option<std::path::PathBuf> {
+    if server_name.contains('/') {
+        return None;
+    }
+    let base = match server_name {
+        "" | "sp1-gpu-server" => "sp1-cuda",
+        name => name,
+    };
+    Some(format!("/tmp/{base}-{device}.sock").into())
+}
+
+/// The socket a running server listens on, read from its own environment (`/proc/<pid>/environ`).
+///
+/// The SDK sets `CUDA_VISIBLE_DEVICES=<id>` on the child it starts, for every build of the server,
+/// and the child inherits `SP1_GPU_SERVER_NAME` from the worker, so this is more reliable than
+/// guessing, and right for a server of another vendor's build. An `environ` is empty once its
+/// process has started exiting, which yields `None`.
+#[cfg(target_os = "linux")]
+fn server_socket_of_environ(environ: &[u8]) -> Option<std::path::PathBuf> {
+    let mut device = None;
+    let mut name = "";
+    for entry in environ.split(|b| *b == 0) {
+        // `continue`, NOT `?`. An `environ` blob is arbitrary bytes, and one non-UTF8 entry
+        // anywhere before ours — a path, LS_COLORS, anything inherited from an operator's shell —
+        // must not abort the whole scan and answer "cannot tell".
+        let Ok(text) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        if let Some(v) = text.strip_prefix("CUDA_VISIBLE_DEVICES=") {
+            device = v.trim().parse::<u32>().ok();
+        } else if let Some(v) = text.strip_prefix("SP1_GPU_SERVER_NAME=") {
+            name = v;
+        }
+    }
+    server_socket_path(name, device?)
+}
+
+/// Whether a server whose parent has this `comm` has outlived its owner, given its `ppid`.
+///
+/// `ppid == 1` is the discriminator: a server owned by a LIVE worker (this one, or a sibling miner
+/// on the same box) has that worker as its parent, so it is never touched. Only a server whose owner
+/// is already gone gets killed.
+///
+/// An orphan goes to its nearest subreaper rather than to PID 1, and `systemd --user` is one: what a
+/// terminal on a desktop, or a user unit, descends from. Measured, an orphan from a user unit had
+/// ppid 3198, comm `systemd`, so a test of `ppid == 1` alone never reaps there. No worker is called
+/// that, and the SDK starts the server as its own child, so such a parent is no worker that lives
+/// on. An operator's own `sp1-gpu-server` unit is killed here too, as one under PID 1 always was.
+#[cfg(target_os = "linux")]
+fn parent_means_orphan(ppid: i32, parent_comm: Option<&str>) -> bool {
+    ppid == 1 || parent_comm.is_some_and(|comm| comm.trim() == "systemd")
+}
+
+/// Whether `pid` is an `sp1-gpu-server` that is still exiting. A pid no longer naming one (it is
+/// gone, or was reused) is not.
+#[cfg(target_os = "linux")]
+fn server_still_exiting(pid: i32) -> bool {
+    let is_server = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .is_ok_and(|comm| comm.trim().starts_with("sp1-gpu-server"));
+    is_server
+        && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|stat| !has_finished_exiting(&stat))
+}
+
+/// Kill any ORPHANED `sp1-gpu-server` before this worker starts its own, remove the socket it was
+/// holding, and wait up to `wait` for it to finish exiting.
 ///
 /// WHY THIS EXISTS. The SDK forks `sp1-gpu-server` as a child of this worker and relies on
 /// `kill_on_drop(true)` to reap it. That only works on a graceful teardown. If the worker
@@ -389,24 +688,29 @@ fn ppid_from_proc_stat(stat: &str) -> Option<i32> {
 /// The result is not a clean failure, which is what makes it hard to spot. Measured
 /// behaviour: SIGKILLing the worker left the server alive at 7.6GB RSS, still listening on
 /// `/tmp/sp1-cuda-0.sock`. The NEXT worker's `CudaClient::connect` unconditionally calls
-/// `start_server`, whose new server cannot bind the in-use socket and dies -- so the client
-/// silently CONNECTS TO THE ORPHAN and proves against it. The proof succeeds, and the
-/// orphan's RSS grew 8.5GB -> 19.5GB across one adoption. Nothing ever reaps it, so on a
-/// 28GB host an adopted server drifts upward run after run until the box is out of memory.
+/// `start_server`, whose new server takes hundreds of milliseconds to replace the socket, while
+/// the client connects at once -- so it silently CONNECTS TO THE ORPHAN and proves against it. The
+/// proof succeeds, and the orphan's RSS grew 8.5GB -> 19.5GB across one adoption. Nothing ever reaps
+/// it, so on a 28GB host an adopted server drifts upward run after run until the box is out of memory.
 ///
-/// `ppid == 1` is the discriminator: a server owned by a LIVE worker (this one, or a
-/// sibling miner on the same box) has that worker as its parent, so it is never touched.
-/// Only a server whose owner is already gone gets killed.
-#[cfg(target_os = "linux")]
-fn reap_orphaned_gpu_servers(our_device: Option<u32>) {
+/// WHY KILLING IS NOT ENOUGH. A SIGKILLed server frees its memory before it closes its descriptors,
+/// so its socket goes on accepting connections for as long as that takes: 98 ms at 2.3 GB, 1,070 ms
+/// at 29.6 GB. The SDK connects before its own new server has bound, within ~400 ms of a worker
+/// starting, so past roughly 10 GB it connected to the dying server, the connection then broke, and
+/// as the SDK never reconnects the worker failed (HIP 6 of 6, SYCL 3 of 3), with a healthy new
+/// server running unused. Waiting for the orphan to finish exiting fixed it, 4 of 4.
+///
+/// `wait` is zero at startup, inside the handshake's budget, and [`ORPHAN_EXIT_WAIT`] just before a
+/// server starts, where the scan finds again whatever is still exiting.
+fn reap_orphaned_gpu_servers(our_device: Option<u32>, wait: Duration) {
+    #[cfg(not(target_os = "linux"))]
+    let _ = (our_device, wait);
     #[cfg(target_os = "linux")]
     {
         let Ok(entries) = std::fs::read_dir("/proc") else {
             return;
         };
-        let mut killed = 0usize;
-        // Devices whose orphaned server we actually killed, so only their sockets are removed.
-        let mut reaped_devices: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut killed: Vec<i32> = Vec::new();
         for e in entries.flatten() {
             let name = e.file_name();
             let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
@@ -430,13 +734,19 @@ fn reap_orphaned_gpu_servers(our_device: Option<u32>) {
                 Some(v) => v,
                 None => continue,
             };
-            if ppid != 1 {
+            let parent_comm = std::fs::read_to_string(format!("/proc/{ppid}/comm")).ok();
+            if !parent_means_orphan(ppid, parent_comm.as_deref()) {
                 continue; // still owned by a live worker -- not ours to kill
+            }
+            // Nothing to do or to wait for: a zombie that nothing is reaping, in a container whose
+            // PID 1 is not an init. It would stay and raise the alarm below on every worker's start.
+            if has_finished_exiting(&stat) {
+                continue;
             }
             // Deliberately NOT scoped to our own device.
             //
-            // The `ppid != 1` test above already spares every server a live worker owns — this one's,
-            // a sibling's, another miner's — because such a server has that worker as its parent. So
+            // The check above already spares every server a live worker owns — this one's, a
+            // sibling's, another miner's — because such a server has that worker as its parent. So
             // anything reaching this line is owned by nobody, and killing it is right whichever card
             // it sat on. Scoping the kill by device was a mistake in the other direction: the next
             // thing this process does is `CudaClient::connect`, which ADOPTS a reachable orphan
@@ -444,12 +754,12 @@ fn reap_orphaned_gpu_servers(our_device: Option<u32>) {
             // re-opens the exact bug this function exists to prevent. It is only the SOCKET cleanup
             // that has to be narrowed, because that is the part that can harm a live sibling.
             //
-            // Note the device anyway, so the cleanup below can unlink precisely what was freed.
-            if let Some(d) = server_device_of_pid(pid) {
-                reaped_devices.insert(d);
-            }
+            // Read before the kill: its environment is gone as soon as it starts exiting.
+            let socket = std::fs::read(format!("/proc/{pid}/environ"))
+                .ok()
+                .and_then(|environ| server_socket_of_environ(&environ));
             tracing::warn!(
-                "reaping orphaned sp1-gpu-server pid {pid} (ppid 1) left by an abruptly \
+                "reaping orphaned sp1-gpu-server pid {pid} (ppid {ppid}) left by an abruptly \
                  killed worker; adopting it instead would reuse a server nothing can reap"
             );
             // Count only an ACTUAL kill. Ignoring the return counted an EPERM (a server owned by
@@ -460,66 +770,69 @@ fn reap_orphaned_gpu_servers(our_device: Option<u32>) {
             if rc != 0 {
                 tracing::warn!(
                     "could not SIGKILL orphaned sp1-gpu-server pid {pid}: {}. It may belong to \
-                     another user, or already be a zombie.",
+                     another user, or already be gone.",
                     std::io::Error::last_os_error()
                 );
                 continue;
             }
-            killed += 1;
-        }
-        if killed > 0 {
-            // The orphan held the socket; remove it so our fresh server binds cleanly rather than
-            // racing a dying one. The SDK never unlinks it (CudaClientInner's Drop only shuts the
-            // stream down), and the path is machine-global.
+            killed.push(pid);
+            // The orphan held the socket; remove it so that nothing connects into a dying server.
+            // The SDK never unlinks it (CudaClientInner's Drop only shuts the stream down), and the
+            // path is machine-global. At once, not after the scan, while no new server for that
+            // card should have bound it: `build_prover` starts one only after this wait.
             //
-            // ONLY OUR OWN. This used to sweep `/tmp/sp1-cuda-{0..7}.sock` unconditionally, which
-            // contradicted the `ppid != 1` check a few lines above: that check exists to spare a
-            // server owned by a live worker, and then the cleanup pulled the socket out from under
-            // it, breaking the sibling's reconnect path. With one SP1 worker per card that is no
-            // longer a corner case — it is what happens every time two workers start.
-            // ONLY the sockets whose server we just killed, plus our own.
+            // One way that can still be wrong: an orphan stuck in a driver past `ORPHAN_EXIT_WAIT`
+            // has its card's worker start a new server at this path, and a later scan by another
+            // worker unlinks that. It only matters within the second the SDK takes to connect, and
+            // then costs one proof attempt.
             //
-            // This used to sweep `/tmp/sp1-cuda-{0..7}.sock` unconditionally, which contradicted the
-            // `ppid != 1` check above: that check spares a server a live worker owns, and then the
-            // sweep pulled the socket out from under it, breaking the sibling's reconnect. With one
-            // SP1 worker per card that stopped being a corner case and became what happens on every
-            // startup. (The server also unlinks a stale socket itself before binding, so this is
-            // hygiene rather than the thing that makes a bind succeed.)
-            let mut to_unlink = reaped_devices.clone();
-            to_unlink.insert(our_device.unwrap_or(0));
-            for id in to_unlink {
-                let p = format!("/tmp/sp1-cuda-{id}.sock");
-                if std::path::Path::new(&p).exists() {
-                    let _ = std::fs::remove_file(&p);
-                }
+            // ONLY the socket of the server just killed, and below our own. This used to sweep
+            // `/tmp/sp1-cuda-{0..7}.sock` unconditionally, which contradicted the check above: that
+            // check spares a server a live worker owns, and then the sweep pulled the socket out
+            // from under it, breaking the sibling's reconnect. With one SP1 worker per card that
+            // stopped being a corner case and became what happens on every startup.
+            if let Some(socket) = socket {
+                let _ = std::fs::remove_file(socket);
             }
-            tracing::warn!("reaped {killed} orphaned sp1-gpu-server process(es)");
+        }
+        if killed.is_empty() {
+            return;
+        }
+        // Our own as well: the orphan on our card may have been past telling us its name. A
+        // measure-only worker has none. It starts no server, and it has no device of its own: its
+        // default of 0 would name the live socket of whichever worker proves on card 0.
+        if !sp1_measure_only() {
+            if let Some(own) = server_socket_path(&warmup::server_name(), our_device.unwrap_or(0)) {
+                let _ = std::fs::remove_file(own);
+            }
+        }
+        tracing::warn!(
+            "reaped {} orphaned sp1-gpu-server process(es)",
+            killed.len()
+        );
+        if wait.is_zero() {
+            return;
+        }
+        let started = Instant::now();
+        loop {
+            killed.retain(|pid| server_still_exiting(*pid));
+            if killed.is_empty() {
+                tracing::info!(
+                    "orphaned sp1-gpu-server finished exiting after {:.2?}",
+                    started.elapsed()
+                );
+                return;
+            }
+            if started.elapsed() >= wait {
+                tracing::warn!(
+                    "orphaned sp1-gpu-server pid(s) {killed:?} still exiting after {wait:?}, \
+                     probably stuck in a GPU driver; going ahead, as their sockets are removed"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
-}
-
-/// Which CUDA device a running `sp1-gpu-server` was started for, read from its own environment.
-///
-/// The SDK sets `CUDA_VISIBLE_DEVICES=<id>` on the child it spawns, so the child's `environ` is the
-/// authoritative record of which card it owns — more reliable than guessing from its socket, which we
-/// cannot see from `/proc`. Unreadable `environ` (a server owned by another user, or one that exited
-/// between the two reads) yields `None`, which the caller treats as "cannot tell", and it then leaves
-/// the process alone rather than killing something that may not be ours.
-#[cfg(target_os = "linux")]
-fn server_device_of_pid(pid: i32) -> Option<u32> {
-    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-    for entry in raw.split(|b| *b == 0) {
-        // `continue`, NOT `?`. An `environ` blob is arbitrary bytes, and one non-UTF8 entry
-        // anywhere before ours — a path, LS_COLORS, anything inherited from an operator's shell —
-        // used to abort the whole scan and answer "cannot tell".
-        let Ok(text) = std::str::from_utf8(entry) else {
-            continue;
-        };
-        if let Some(v) = text.strip_prefix("CUDA_VISIBLE_DEVICES=") {
-            return v.trim().parse().ok();
-        }
-    }
-    None
 }
 
 /// How old an UNmapped `/dev/shm/sp1_*` segment must be before the reaper unlinks it. The
@@ -528,37 +841,6 @@ fn server_device_of_pid(pid: i32) -> Option<u32> {
 /// in `maps` — when a genuinely-live segment is momentarily in neither place.
 #[cfg(target_os = "linux")]
 const SP1_SHM_ORPHAN_MIN_AGE: Duration = Duration::from_secs(30);
-
-/// True for a `/dev/shm` basename the SP1 native executor creates: the memory image
-/// (`sp1_<uuid>_m`), the trace ring (`sp1_<uuid>_t`) and the ring's POSIX semaphores
-/// (`sem.sp1_<uuid>_t_filled` / `_empty`). Both prefixes are matched on purpose — glibc backs a
-/// named semaphore with a `sem.`-prefixed file in the same tmpfs (see sp1-jit `shm.rs`). The name
-/// carries a random uuid, not a pid, so it cannot be the discriminator; liveness is (see reaper).
-fn is_sp1_shm_basename(name: &str) -> bool {
-    name.starts_with("sp1_") || name.starts_with("sem.sp1_")
-}
-
-/// Record into `out` every SP1 `/dev/shm` basename a `/proc/<pid>/maps` blob currently maps. A
-/// segment that ANY live process maps is in use and must never be unlinked, whichever worker owns
-/// it. Reads `maps` not `fd` deliberately: SP1 `mmap`s a segment then CLOSES the fd, so the fd is
-/// usually gone while the mapping — and the segment's use — persists; keying on fds would unlink a
-/// live prover's ring.
-fn sp1_shm_mapped_in(maps: &str, out: &mut std::collections::HashSet<String>) {
-    for line in maps.lines() {
-        let Some(idx) = line.find("/dev/shm/") else {
-            continue;
-        };
-        // SP1's names are `sp1_` + base64url(uuid) + suffix; the base64url alphabet has no spaces,
-        // so the basename is the first whitespace-delimited token after the prefix. Taking that
-        // token also drops a trailing " (deleted)" annotation on an already-unlinked mapping.
-        let Some(name) = line[idx + "/dev/shm/".len()..].split_whitespace().next() else {
-            continue;
-        };
-        if is_sp1_shm_basename(name) {
-            out.insert(name.to_string());
-        }
-    }
-}
 
 /// Unlink `/dev/shm/sp1_*` segments (memory image, trace ring) and their `sem.sp1_*` semaphores
 /// left behind by a native executor that died WITHOUT running its `Drop` — a SIGBUS when /dev/shm
@@ -574,6 +856,8 @@ fn sp1_shm_mapped_in(maps: &str, out: &mut std::collections::HashSet<String>) {
 /// segments over time. The age floor defers the segment THIS respawn's death just leaked to a later
 /// pass (it is younger than the floor now); that is fine, because one stale ring does not fill a
 /// correctly-sized tmpfs, and the next pass reaps it once it has aged out of the create→mmap window.
+/// What the dispatcher kills itself it unlinks as it does so (`unlink_group_sp1_shm`), so this is for
+/// deaths it did not cause, and for a dispatcher that died too.
 ///
 /// The discriminator is LIVENESS, not a pid (the names are random uuids): a segment that any live
 /// process still maps (`/proc/*/maps`) is spared. The age floor is a second guard for the create→mmap
@@ -1154,17 +1438,19 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     // Lazy-init the CUDA prover on first Prove/Benchmark command, not at startup.
     // CudaProver initialization is expensive (spawns sp1-gpu-server, CUDA context)
     // and would block the handshake response if done before the message loop.
-    let mut prover: Option<sp1_sdk::blocking::CudaProver> = None;
+    //
+    // `held.pk_cache` keeps one proving key per unique ELF. The key depends only on the program, so
+    // reusing it across proofs of the same ELF avoids a costly setup() every call AND stops leaking a
+    // fresh GPU-resident key per proof (the old code mem::forget'd the key each time). VRAM is now
+    // bounded to O(unique ELFs) instead of O(proofs).
+    let mut held = ServerHolders::new();
     // Lazy CPU prover used ONLY for the pre-claim EXECUTE (cycle-measurement) path. SP1 execution is
     // pure CPU emulation, so measuring on a `CpuProver` yields the identical cycle count the CUDA
     // prover would while never spinning up `sp1-gpu-server` — keeping the sizing path as cheap as
     // risc0's. See `run_execute_sp1`.
     let mut cpu_executor: Option<sp1_sdk::blocking::CpuProver> = None;
-    // Cache one proving key per unique ELF. The key depends only on the program, so
-    // reusing it across proofs of the same ELF avoids a costly setup() every call AND
-    // stops leaking a fresh GPU-resident key per proof (the old code mem::forget'd the
-    // key each time). VRAM is now bounded to O(unique ELFs) instead of O(proofs).
-    let mut pk_cache = PkCache::new(pk_cache_capacity());
+    // Set when the connection to the server is lost, which ends the loop. See `ServerLost`.
+    let mut server_lost: Option<anyhow::Error> = None;
     // Which card this worker drives, chosen by the dispatcher.
     //
     // NOT `CUDA_VISIBLE_DEVICES`. The SDK sets that itself on the `sp1-gpu-server` child from the id
@@ -1347,52 +1633,6 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
         }
     }
 
-    // Build the prover, turning a PANIC into a decline.
-    //
-    // The SDK ends `build()` with `.expect("Failed to create the CUDA prover impl")`, so anything that
-    // stops `sp1-gpu-server` coming up kills this process outright. The dispatcher then sees only EOF
-    // and reads it as worker ill-health: it excludes a slot, burns a retry, respawns, and does it all
-    // again on the next job. But the commonest cause is categorical, not transient — the server
-    // refuses a card below its hard VRAM floor — upstream's reads "Unsupported GPU memory: 20, must be
-    // at least 24GB"; the fork this repo pins lowers it to 16 — which will be just as true next time.
-    //
-    // Catching it lets us answer the protocol properly. `WORKER_DECLINED` is the dispatcher's existing
-    // signal for "I spoke to you, and I cannot prove here": it stops the backend being advertised on
-    // this slot instead of being rediscovered job after job.
-    //
-    // `AssertUnwindSafe` is sound here because the panic path leaves nothing of ours half-written: the
-    // prover slot is still `None` (we only assign on success), and the SDK's own state dies with the
-    // server it failed to reach.
-    fn build_prover(
-        cuda_device_id: Option<u32>,
-    ) -> std::result::Result<sp1_sdk::blocking::CudaProver, String> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tracing::info!("Initializing SP1 CUDA prover...");
-            let builder = sp1_sdk::blocking::ProverClient::builder().cuda();
-            let builder = match cuda_device_id {
-                Some(id) => builder.with_device_id(id),
-                None => builder,
-            };
-            builder.build()
-        }))
-        .map_err(|e| {
-            let detail = e
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| e.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "panic with no message".to_string());
-            format!(
-                "{}: could not initialise the SP1 CUDA prover on device {}: {detail}. The most \
-                 likely cause is a card below sp1-gpu-server's hard VRAM floor (16 GB in the pinned \
-                 fork, 24 GB upstream), which no proving option can change.",
-                zkminer_prover_protocol::types::WORKER_DECLINED,
-                cuda_device_id
-                    .map(|d| d.to_string())
-                    .unwrap_or_else(|| "default".to_string()),
-            )
-        })
-    }
-
     macro_rules! get_prover {
         ($p:expr) => {
             match $p {
@@ -1490,21 +1730,49 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     write_message(&mut stdout, &resp)?;
                     continue;
                 }
-                match get_prover!(prover) {
+                match get_prover!(held.prover) {
                     Ok(p) => {
-                        let results = run_benchmarks(p, &mut |entry, program_index, total| {
-                            // A closed pipe is reported by the final result's write below.
-                            let _ = write_message(
-                                &mut stdout,
-                                &WorkerResponse::BenchmarkProgress {
-                                    entry: entry.clone(),
-                                    program_index,
-                                    total_programs: total,
-                                },
-                            );
-                        });
-                        let resp = WorkerResponse::BenchmarkResult { results };
+                        let run = run_benchmarks(
+                            p,
+                            &mut held.benchmark_keys,
+                            &mut |entry, program_index, total| {
+                                // A closed pipe is reported by the final result's write below.
+                                let _ = write_message(
+                                    &mut stdout,
+                                    &WorkerResponse::BenchmarkProgress {
+                                        entry: entry.clone(),
+                                        program_index,
+                                        total_programs: total,
+                                    },
+                                );
+                            },
+                        );
+                        // Answered even when the server is gone. What completed stands, and the host
+                        // then recycles this slot as after any benchmark, waiting for its memory to
+                        // come back before the next card's turn. A worker that just exited would
+                        // skip both.
+                        //
+                        // Zero rows is a failure, and an answer of zero rows hides it: the host
+                        // skips an empty result without a word.
+                        let resp = if run.results.is_empty() {
+                            let message =
+                                format!("no SP1 benchmark completed: {}", run.failed.join("; "));
+                            tracing::error!("{message}");
+                            WorkerResponse::Error {
+                                request_id: 0,
+                                kind: ErrorKind::Internal,
+                                message,
+                            }
+                        } else {
+                            WorkerResponse::BenchmarkResult {
+                                results: run.results,
+                            }
+                        };
                         write_message(&mut stdout, &resp)?;
+                        if let Some(lost) = run.server_lost {
+                            server_lost = Some(lost);
+                            break;
+                        }
                     }
                     Err(message) => {
                         tracing::error!("{message}");
@@ -1547,7 +1815,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     segments: None,
                 };
                 write_message(&mut stdout, &started)?;
-                let prover_for_proof = match get_prover!(prover) {
+                let prover_for_proof = match get_prover!(held.prover) {
                     Ok(p) => p,
                     Err(message) => {
                         // A DECLINE, answered on the protocol, rather than a panic the dispatcher can
@@ -1570,7 +1838,13 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // worker dies on a CLAIMED job, the dispatcher charges a healthy slot, the retry loop
                 // crashes every GPU, and the program is never classed bad. A caught panic is a bad job.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_proof(prover_for_proof, &mut pk_cache, &elf, &input_data, program_id)
+                    run_proof(
+                        prover_for_proof,
+                        &mut held.pk_cache,
+                        &elf,
+                        &input_data,
+                        program_id,
+                    )
                 }));
                 match outcome {
                     Ok(Ok((journal, seal, duration_secs, cycles))) => {
@@ -1591,6 +1865,14 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                                 .to_string(),
                         };
                         write_message(&mut stdout, &resp)?;
+                    }
+                    Ok(Err(e)) if e.is::<ServerLost>() => {
+                        // No answer: the host reads the EOF as this worker dying, which it is, and
+                        // retries on a new one. The job is not at fault unless it does this to every
+                        // server it is retried on, which the host's count of failed attempts sees as
+                        // for any other failure.
+                        server_lost = Some(e);
+                        break;
                     }
                     Ok(Err(e)) => {
                         let msg = format!("{e:#}");
@@ -1769,28 +2051,13 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
         }
     }
 
-    // Cleanly release GPU resources before exit. Dropping the CudaProver / proving
-    // keys performs async teardown of the sp1-gpu-server, which needs a tokio runtime
-    // context — without one the drops panic and the gpu-server is only reaped by the
-    // parent's process-group kill (and NOT at all on a clean graceful shutdown, where
-    // it would otherwise orphan and leak ~18.6 GB of VRAM). Drop them inside a runtime.
-    if prover.is_some() || !pk_cache.is_empty() {
-        match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt.block_on(async move {
-                drop(pk_cache);
-                drop(prover);
-            }),
-            Err(e) => {
-                // Couldn't build a runtime — forget rather than panic in Drop; the
-                // dispatcher's process-group kill will reap the gpu-server.
-                tracing::warn!("No tokio runtime for GPU teardown ({e}); leaking to parent kill");
-                std::mem::forget(pk_cache);
-                std::mem::forget(prover);
-            }
-        }
+    // `held` is dropped on the way out, which releases the GPU, and ends the server: without that,
+    // a clean exit would leave it running, holding ~18.6 GB of VRAM. After a lost connection too,
+    // as a server can close its connection and live on.
+    match server_lost {
+        Some(lost) => Err(lost),
+        None => Ok(()),
     }
-
-    Ok(())
 }
 
 fn detect_gpu() -> (bool, Option<String>) {
@@ -2073,7 +2340,7 @@ fn run_proof(
     if let Some(limit) = sp1_execute_cycle_limit() {
         exec = exec.cycle_limit(limit);
     }
-    let (_, report) = exec.run().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (public_values, report) = exec.run().map_err(|e| anyhow::anyhow!("{e}"))?;
     let cycles = report.total_instruction_count();
 
     // Get-or-create the proving key for this ELF. The key depends only on the
@@ -2083,13 +2350,14 @@ fn run_proof(
     if pk_cache.contains(&key) {
         pk_cache.touch(&key);
     } else {
-        let pk = prover
-            .setup(Elf::from(elf))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pk = prover.setup(Elf::from(elf)).map_err(sdk_error)?;
         // LRU-evict to bound host RAM + VRAM; free each evicted key's GPU memory in a runtime.
         for evicted in pk_cache.insert(key, pk) {
-            tracing::info!("Evicting a cached SP1 proving key (cap {})", pk_cache_capacity());
-            drop_pk(evicted);
+            tracing::info!(
+                "Evicting a cached SP1 proving key (cap {})",
+                pk_cache_capacity()
+            );
+            evict_key(evicted)?;
         }
     }
     let pk = pk_cache.get(&key).expect("pk was just inserted or touched");
@@ -2136,12 +2404,19 @@ fn run_proof(
     // Generate Groth16 proof for on-chain verification.
     // The SP1 on-chain verifier expects: vkey_hash[0..4] || encoded_groth16_proof
     let start = Instant::now();
-    let proof = prover
-        .prove(pk, stdin)
-        .groth16()
-        .run()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let proof = prover.prove(pk, stdin).groth16().run().map_err(sdk_error)?;
     let duration_secs = start.elapsed().as_secs_f64();
+
+    // The proof must be of THIS job's input, which `verify` below cannot say: a valid proof of another
+    // input passes it, and the SDK's requests carry no id. Execution above saw what this input commits.
+    // Before `verify`, because a proof of another program would otherwise read as an invalid one. A
+    // guest that commits differently from run to run fails this too, and its job then fails its
+    // attempts like any other.
+    if proof.public_values.to_vec() != public_values.to_vec() {
+        return Err(anyhow::Error::new(ServerLost {
+            detail: "the proof it returned is not of this job's input".to_string(),
+        }));
+    }
 
     // Verify proof locally before returning — catches GPU output corruption.
     if let Err(e) = prover.verify(&proof, pk.verifying_key(), None) {
@@ -2157,12 +2432,85 @@ fn run_proof(
     Ok((journal, seal, duration_secs, cycles))
 }
 
-/// Run the suite, calling `on_done(entry, 1-based program index, total)` after each program.
+/// What a benchmark run came to.
+struct BenchmarkRun {
+    /// A row per program that completed.
+    results: Vec<BenchmarkEntry>,
+    /// "program: why", per program that did not.
+    failed: Vec<String>,
+    /// A [`ServerLost`], which ended the run where it happened. `results` still holds what came
+    /// before, and a row whose wrap alone was lost.
+    server_lost: Option<anyhow::Error>,
+}
+
+/// Run the zkOP/s scoring proofs, adding their row to `run`.
+fn score_zkop_mix(
+    prover: &sp1_sdk::blocking::CudaProver,
+    keys: &mut Vec<CudaPk>,
+    run: &mut BenchmarkRun,
+    total: u32,
+    on_done: &mut dyn FnMut(&BenchmarkEntry, u32, u32),
+) {
+    use zkminer_prover_protocol::{measure_zkop_mix, BENCH_ZKOP_MIX, ZKOP_MIX_SP1_CYCLES};
+    let mut failure = None;
+    let scored = measure_zkop_mix(|iterations| {
+        match benchmark_program(
+            prover,
+            BENCH_ZKOP_MIX,
+            ZKOP_MIX_SP1_GUEST_ELF,
+            &iterations.to_le_bytes(),
+            0.0,
+            false,
+            false,
+            keys,
+            &mut run.server_lost,
+        ) {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                failure = Some(e);
+                None
+            }
+        }
+    });
+    match (scored, failure) {
+        (Some(entry), _) if entry.cycles == ZKOP_MIX_SP1_CYCLES => {
+            on_done(&entry, total, total);
+            run.results.push(entry);
+        }
+        // The score divides a fixed cycle count by this proof's time, so it only means anything
+        // for the program that count was measured on.
+        (Some(entry), _) => {
+            let message = format!(
+                "{BENCH_ZKOP_MIX}: {} cycles where {ZKOP_MIX_SP1_CYCLES} were expected",
+                entry.cycles
+            );
+            tracing::error!("{message}; not reporting a zkOP/s score");
+            run.failed.push(message);
+        }
+        (None, Some(e)) => {
+            tracing::error!("{BENCH_ZKOP_MIX}: {e:#}");
+            run.failed.push(format!("{BENCH_ZKOP_MIX}: {e:#}"));
+            if e.is::<ServerLost>() {
+                run.server_lost = Some(e);
+            }
+        }
+        (None, None) => {}
+    }
+}
+
+/// Prove every benchmark program, calling `on_done(entry, 1-based program index, total)` after each.
+/// The keys it sets up go into `keys` and stay resident: each holds the client, and through it the
+/// server, so they belong with whatever releases those.
 fn run_benchmarks(
     prover: &sp1_sdk::blocking::CudaProver,
+    keys: &mut Vec<CudaPk>,
     on_done: &mut dyn FnMut(&BenchmarkEntry, u32, u32),
-) -> Vec<BenchmarkEntry> {
-    let mut results = Vec::new();
+) -> BenchmarkRun {
+    let mut run = BenchmarkRun {
+        results: Vec::new(),
+        failed: Vec::new(),
+        server_lost: None,
+    };
 
     let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
         (
@@ -2223,46 +2571,44 @@ fn run_benchmarks(
         }
         program_index += 1;
         let measure_wrap = Some(idx) == last_runnable;
-        if let Some(entry) =
-            benchmark_program(prover, name, elf, input, weight, precompile, measure_wrap)
-        {
-            on_done(&entry, program_index, total);
-            results.push(entry);
-        }
-    }
-
-    use zkminer_prover_protocol::{measure_zkop_mix, BENCH_ZKOP_MIX, ZKOP_MIX_SP1_CYCLES};
-    let scored = measure_zkop_mix(|iterations| {
-        benchmark_program(
+        match benchmark_program(
             prover,
-            BENCH_ZKOP_MIX,
-            ZKOP_MIX_SP1_GUEST_ELF,
-            &iterations.to_le_bytes(),
-            0.0,
-            false,
-            false,
-        )
-    });
-    match scored {
-        Some(entry) if entry.cycles == ZKOP_MIX_SP1_CYCLES => {
-            on_done(&entry, total, total);
-            results.push(entry);
+            name,
+            elf,
+            input,
+            weight,
+            precompile,
+            measure_wrap,
+            keys,
+            &mut run.server_lost,
+        ) {
+            Ok(entry) => {
+                on_done(&entry, program_index, total);
+                run.results.push(entry);
+            }
+            Err(e) => {
+                tracing::error!("{name}: {e:#}");
+                run.failed.push(format!("{name}: {e:#}"));
+                if e.is::<ServerLost>() {
+                    run.server_lost = Some(e);
+                }
+            }
         }
-        // The score divides a fixed cycle count by this proof's time, so it only means anything
-        // for the program that count was measured on.
-        Some(entry) => tracing::error!(
-            "{BENCH_ZKOP_MIX}: {} cycles where {ZKOP_MIX_SP1_CYCLES} were expected; not reporting \
-             a zkOP/s score",
-            entry.cycles
-        ),
-        None => tracing::error!("{BENCH_ZKOP_MIX}: proving failed; not reporting a zkOP/s score"),
+        if run.server_lost.is_some() {
+            break;
+        }
     }
 
-    results
+    if run.server_lost.is_none() {
+        score_zkop_mix(prover, keys, &mut run, total, on_done);
+    }
+
+    run
 }
 
+#[allow(clippy::too_many_arguments)]
 fn benchmark_program(
-    prover: &impl sp1_sdk::blocking::Prover,
+    prover: &sp1_sdk::blocking::CudaProver,
     name: &str,
     elf: &[u8],
     input: &[u8],
@@ -2270,17 +2616,21 @@ fn benchmark_program(
     precompile: bool,
     // Also prove this program in Groth16 mode and report the wrap. See `run_benchmarks`.
     measure_wrap: bool,
-) -> Option<BenchmarkEntry> {
-    use sp1_sdk::blocking::{Elf, ProveRequest, SP1Stdin};
-    // The blocking Prover's `type ProvingKey: ProvingKey` is bound by this trait;
-    // it must be in scope for `pk.verifying_key()` on the generic associated type.
-    use sp1_sdk::ProvingKey;
+    // Where the key goes, as soon as there is one; see `run_benchmarks`.
+    keys: &mut Vec<CudaPk>,
+    // Set if the server is lost in the wrap, when the row itself is still good.
+    server_lost: &mut Option<anyhow::Error>,
+) -> Result<BenchmarkEntry> {
+    use sp1_sdk::blocking::{Elf, ProveRequest, Prover, SP1Stdin};
 
     let mut stdin = SP1Stdin::new();
     stdin.write_slice(input);
 
     // Execute to get real cycle count
-    let (_, report) = prover.execute(Elf::from(elf), stdin.clone()).run().ok()?;
+    let (_, report) = prover
+        .execute(Elf::from(elf), stdin.clone())
+        .run()
+        .map_err(|e| anyhow::anyhow!("execute failed: {e}"))?;
     let cycles = report.total_instruction_count();
 
     // Key setup OUTSIDE the timed region. It is not proving, and production caches the key per ELF
@@ -2289,31 +2639,29 @@ fn benchmark_program(
     // first program on each card, then 0.02-0.03 s for every one after. Inside the stopwatch it was
     // most of why a 9,966-cycle fibonacci "took" 6 s, and it landed on whichever program ran first.
     let started = Instant::now();
-    let pk = prover.setup(Elf::from(elf)).ok()?;
+    // At once into `keys`, which is released in a runtime however this ends. A local here would be
+    // dropped outside one by a panic, panicking again while unwinding, which aborts.
+    keys.push(prover.setup(Elf::from(elf)).map_err(sdk_error)?);
+    let pk = keys.last().expect("just pushed");
     let setup_secs = started.elapsed().as_secs_f64();
 
     // STARK: the core shard proofs and the recursion that compresses them into one constant-size
     // proof. This used to run in the SDK's default Core mode, which stops before the recursion — and
     // the recursion scales with shard count, so it belongs here rather than with the wrap.
     let started = Instant::now();
-    let proof = match prover.prove(&pk, stdin.clone()).compressed().run() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("{name}: prove failed: {e}");
-            std::mem::forget(pk);
-            return None;
-        }
-    };
+    let proof = prover
+        .prove(pk, stdin.clone())
+        .compressed()
+        .run()
+        .map_err(|e| sdk_error(e).context("prove failed"))?;
     let duration_secs = started.elapsed().as_secs_f64();
 
     // Verify the proof locally — catches GPU output corruption before polluting
     // the benchmark cache with invalid throughput numbers.
     if let Err(e) = prover.verify(&proof, pk.verifying_key(), None) {
-        tracing::error!(
-            "{name}: proof verification FAILED — benchmark proof is invalid, skipping entry: {e}"
+        anyhow::bail!(
+            "proof verification FAILED — benchmark proof is invalid, skipping entry: {e}"
         );
-        std::mem::forget(pk);
-        return None;
     }
 
     // The Groth16 wrap, by DIFFERENCE. `sp1-gpu-server` runs the whole pipeline as one request —
@@ -2324,7 +2672,7 @@ fn benchmark_program(
     // fixed key (`~/.sp1/circuits/groth16/*/groth16_pk.bin`), so one measurement stands for all.
     let wrap_secs = if measure_wrap {
         let started = Instant::now();
-        match prover.prove(&pk, stdin).groth16().run() {
+        match prover.prove(pk, stdin).groth16().run() {
             Ok(g) => {
                 let total = started.elapsed().as_secs_f64();
                 if let Err(e) = prover.verify(&g, pk.verifying_key(), None) {
@@ -2345,16 +2693,17 @@ fn benchmark_program(
                 }
             }
             Err(e) => {
+                let e = sdk_error(e);
                 tracing::error!("{name}: Groth16 prove failed — not reporting a wrap time: {e}");
+                if e.is::<ServerLost>() {
+                    *server_lost = Some(e);
+                }
                 None
             }
         }
     } else {
         None
     };
-
-    // Leak the proving key to avoid drop panic (SP1 CUDA PK drops require tokio runtime context)
-    std::mem::forget(pk);
 
     let throughput = cycles as f64 / duration_secs;
 
@@ -2369,7 +2718,7 @@ fn benchmark_program(
         ),
     }
 
-    Some(BenchmarkEntry {
+    Ok(BenchmarkEntry {
         program_name: name.to_string(),
         prover_backend: BACKEND_SP1.to_string(),
         cycles,
@@ -2428,6 +2777,286 @@ mod orphan_reap_tests {
         let parsed = ppid_from_proc_stat(&stat).expect("parse");
         let expected = unsafe { libc::getppid() };
         assert_eq!(parsed, expected, "parsed ppid must match getppid()");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod orphan_exit_tests {
+    use super::{
+        has_finished_exiting, parent_means_orphan, server_socket_of_environ, server_socket_path,
+    };
+    use std::path::PathBuf;
+
+    /// A `/proc/<pid>/stat` line with this state and thread count.
+    fn stat(comm: &str, state: &str, threads: u32) -> String {
+        format!(
+            "4242 ({comm}) {state} 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 {threads} 0 99 0 0"
+        )
+    }
+
+    /// The rule the wait depends on, from the trace of a real 24 GB process: a leader is `Z` while
+    /// its threads still hold the socket, which it goes on accepting on until they are done.
+    #[test]
+    fn a_zombie_leader_with_threads_left_is_still_exiting() {
+        assert!(!has_finished_exiting(&stat("sp1-gpu-server", "Z", 8)));
+        assert!(!has_finished_exiting(&stat("sp1-gpu-server", "Z", 2)));
+        assert!(has_finished_exiting(&stat("sp1-gpu-server", "Z", 1)));
+        // The kernel reports 0 threads for a task already being released.
+        assert!(has_finished_exiting(&stat("sp1-gpu-server", "Z", 0)));
+        assert!(has_finished_exiting(&stat("sp1-gpu-server", "X", 1)));
+        // Running, sleeping, or stuck in a driver.
+        for state in ["R", "S", "D"] {
+            assert!(
+                !has_finished_exiting(&stat("sp1-gpu-server", state, 1)),
+                "{state}"
+            );
+        }
+    }
+
+    /// `comm` can contain anything, including what looks like the rest of the line.
+    #[test]
+    fn the_exit_check_is_not_fooled_by_a_hostile_comm() {
+        assert!(!has_finished_exiting(&stat("a) Z 1 1 1", "S", 3)));
+        assert!(has_finished_exiting(&stat("a) S 1 1 1", "Z", 1)));
+    }
+
+    /// What it cannot read it must not call finished: that would skip the wait.
+    #[test]
+    fn a_malformed_stat_is_not_finished() {
+        assert!(!has_finished_exiting(""));
+        assert!(!has_finished_exiting("no parenthesis Z 1"));
+        assert!(!has_finished_exiting("4242 (x) Z"));
+        assert!(!has_finished_exiting(
+            "4242 (x) Z 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 many"
+        ));
+    }
+
+    /// Against the kernel, on a real child that stays a zombie because this test has not reaped it.
+    #[test]
+    fn a_real_zombie_reads_as_finished_and_a_live_process_does_not() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let path = format!("/proc/{}/stat", child.id());
+        assert!(!has_finished_exiting(
+            &std::fs::read_to_string(&path).unwrap()
+        ));
+        unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !has_finished_exiting(&std::fs::read_to_string(&path).unwrap()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never read as finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child.wait().unwrap();
+        // And this multi-threaded process, the test harness, is plainly alive.
+        assert!(!has_finished_exiting(
+            &std::fs::read_to_string("/proc/self/stat").unwrap()
+        ));
+    }
+
+    #[test]
+    fn the_socket_name_is_the_sdks() {
+        let _env = crate::usability_tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("SP1_GPU_SERVER_NAME").ok();
+        for name in [
+            "",
+            "sp1-gpu-server",
+            "sp1-gpu-server-hip",
+            "sp1-gpu-server-sycl",
+        ] {
+            std::env::set_var("SP1_GPU_SERVER_NAME", name);
+            for device in [0, 1, 7] {
+                assert_eq!(
+                    server_socket_path(name, device).unwrap(),
+                    sp1_cuda::client::socket_path(device),
+                    "{name:?} {device}"
+                );
+            }
+        }
+        std::env::remove_var("SP1_GPU_SERVER_NAME");
+        assert_eq!(
+            server_socket_path("sp1-gpu-server", 0).unwrap(),
+            sp1_cuda::client::socket_path(0)
+        );
+        match saved {
+            Some(v) => std::env::set_var("SP1_GPU_SERVER_NAME", v),
+            None => std::env::remove_var("SP1_GPU_SERVER_NAME"),
+        }
+    }
+
+    /// The path this makes is then unlinked, and the name came out of a process's environment.
+    #[test]
+    fn a_name_cannot_point_the_unlink_elsewhere() {
+        assert_eq!(server_socket_path("../../home/user/x", 0), None);
+        assert_eq!(server_socket_path("/etc/x", 0), None);
+    }
+
+    #[test]
+    fn an_orphans_socket_is_read_from_its_environment() {
+        let path =
+            |env: &[u8]| server_socket_of_environ(env).map(|p: PathBuf| p.display().to_string());
+        // The bug this replaces: only the CUDA name was ever removed, so the HIP and SYCL servers'
+        // sockets stayed for the next client to connect into.
+        assert_eq!(
+            path(b"A=1\0SP1_GPU_SERVER_NAME=sp1-gpu-server-hip\0CUDA_VISIBLE_DEVICES=2\0B=2\0")
+                .as_deref(),
+            Some("/tmp/sp1-gpu-server-hip-2.sock")
+        );
+        assert_eq!(
+            path(b"CUDA_VISIBLE_DEVICES=0\0SP1_GPU_SERVER_NAME=sp1-gpu-server-sycl\0").as_deref(),
+            Some("/tmp/sp1-gpu-server-sycl-0.sock")
+        );
+        assert_eq!(
+            path(b"CUDA_VISIBLE_DEVICES=1\0").as_deref(),
+            Some("/tmp/sp1-cuda-1.sock")
+        );
+        // One non-UTF-8 entry does not stop the scan.
+        assert_eq!(
+            path(b"LS_COLORS=\xff\xfe\0CUDA_VISIBLE_DEVICES=3\0").as_deref(),
+            Some("/tmp/sp1-cuda-3.sock")
+        );
+        // Cannot tell: nothing is removed. Empty is what an exiting process reads as.
+        assert_eq!(path(b""), None);
+        assert_eq!(path(b"A=1\0"), None);
+        assert_eq!(path(b"CUDA_VISIBLE_DEVICES=GPU-abc\0"), None);
+        assert_eq!(path(b"CUDA_VISIBLE_DEVICES=0,1\0"), None);
+        assert_eq!(
+            path(b"SP1_GPU_SERVER_NAME=a/b\0CUDA_VISIBLE_DEVICES=0\0"),
+            None
+        );
+    }
+
+    /// Spares a server with a live owner, however that owner is named.
+    #[test]
+    fn only_a_gone_owner_makes_an_orphan() {
+        assert!(parent_means_orphan(1, Some("systemd\n")));
+        assert!(parent_means_orphan(1, Some("docker-init\n")));
+        assert!(parent_means_orphan(1, None));
+        // The user manager, which an orphan goes to on a desktop or from a user unit.
+        assert!(parent_means_orphan(3198, Some("systemd\n")));
+        assert!(!parent_means_orphan(4242, Some("zkminer-prove-s\n")));
+        assert!(!parent_means_orphan(4242, Some("my-sp1-app\n")));
+        assert!(!parent_means_orphan(4242, Some("systemd-run\n")));
+        // A parent that exited between the two reads: next time round it reads as an orphan.
+        assert!(!parent_means_orphan(4242, None));
+    }
+
+    /// A worker that waits at startup is SIGKILLed by the host when the wait outlasts what remains
+    /// of `HANDSHAKE_TIMEOUT`, and only by a host with a large enough orphan, so this is easily
+    /// missed. And one that never waits connects to the dying server again.
+    #[test]
+    fn the_wait_is_ahead_of_the_server_and_outside_the_handshake() {
+        let source = include_str!("main.rs");
+        let main_fn = source.split_once("\nfn main() {").unwrap().1;
+        let main_fn = &main_fn[..main_fn.find("\nfn ").unwrap()];
+        assert!(main_fn.contains("reap_orphaned_gpu_servers(our_cuda_device, Duration::ZERO)"));
+        assert!(!main_fn.contains("ORPHAN_EXIT_WAIT"));
+
+        let build = source.split_once("\nfn build_prover(").unwrap().1;
+        let build = &build[..build.find("\nfn ").unwrap()];
+        let wait = build
+            .find("reap_orphaned_gpu_servers(cuda_device_id, ORPHAN_EXIT_WAIT)")
+            .expect("build_prover must wait for orphans");
+        let start = build
+            .find(".build()")
+            .expect("build_prover builds the prover");
+        assert!(
+            wait < start,
+            "the wait must come before the SDK starts a server"
+        );
+    }
+}
+
+#[cfg(test)]
+mod server_lost_tests {
+    use super::{says_server_lost, sdk_error, ServerLost};
+    use sp1_cuda::CudaClientError;
+    use std::io::{Error, ErrorKind};
+
+    /// `CudaClientError` hides its variant, so `says_server_lost` reads its text. This holds that
+    /// reading to the type itself: if an SDK bump rewords a variant, this fails, rather than a dead
+    /// connection going back to being an ordinary error that wedges the worker.
+    #[test]
+    fn the_server_lost_check_agrees_with_the_real_error_type() {
+        let lost = [
+            CudaClientError::Read(Error::new(ErrorKind::UnexpectedEof, "early eof")),
+            CudaClientError::Read(Error::from(ErrorKind::ConnectionReset)),
+            CudaClientError::Write(Error::from(ErrorKind::BrokenPipe)),
+            CudaClientError::UnexpectedResponse("Ok"),
+            CudaClientError::new_read(Error::from(ErrorKind::BrokenPipe), "with a context"),
+        ];
+        for e in lost {
+            let text = e.to_string();
+            assert!(says_server_lost(&text), "{text}");
+            assert!(sdk_error(e).is::<ServerLost>(), "{text}");
+        }
+
+        let not_lost = [
+            CudaClientError::ServerError("proving failed".to_string()),
+            CudaClientError::ProverError("proving failed".to_string()),
+            CudaClientError::Unexpected("something".to_string()),
+            CudaClientError::Connect(Error::from(ErrorKind::NotFound)),
+            CudaClientError::DownloadIO(Error::from(ErrorKind::BrokenPipe)),
+            CudaClientError::Deserialize(Box::new(bincode::ErrorKind::SizeLimit)),
+            CudaClientError::Serialize(Box::new(bincode::ErrorKind::SizeLimit)),
+        ];
+        for e in not_lost {
+            let text = e.to_string();
+            assert!(!says_server_lost(&text), "{text}");
+            assert!(!sdk_error(e).is::<ServerLost>(), "{text}");
+        }
+    }
+
+    /// A guest's text can reach the server's errors. Exiting on it would let a submitter have this
+    /// worker torn down at will, and be charged to the slot, with no failed proof to show for it.
+    #[test]
+    fn a_guests_text_cannot_claim_the_server_is_lost() {
+        let forged = "CudaClientError: Failed to read the response: Custom { kind: UnexpectedEof }";
+        for text in [
+            forged.to_string(),
+            format!("\n{forged}"),
+            format!("guest says {forged}"),
+            "Failed to write the request: Broken pipe".to_string(),
+            "early eof".to_string(),
+            "Broken pipe".to_string(),
+        ] {
+            for e in [
+                CudaClientError::ServerError(text.clone()),
+                CudaClientError::ProverError(text.clone()),
+                CudaClientError::Unexpected(text.clone()),
+            ] {
+                let shown = e.to_string();
+                assert!(!sdk_error(e).is::<ServerLost>(), "{shown}");
+            }
+        }
+    }
+
+    /// The benchmark path adds context, and the worker loop asks by type.
+    #[test]
+    fn the_type_survives_context() {
+        let e = sdk_error(CudaClientError::Write(Error::from(ErrorKind::BrokenPipe)))
+            .context("prove failed");
+        assert!(e.is::<ServerLost>());
+        assert!(format!("{e:#}").contains("lost the connection to sp1-gpu-server"));
+    }
+
+    /// Other errors must read as they did before this: the Prove arm's classification below reads
+    /// them (`is_gpu_oom`, the vkey binding), and so do people.
+    #[test]
+    fn other_errors_keep_their_text() {
+        let e = CudaClientError::ServerError("CUDA_ERROR_OUT_OF_MEMORY".to_string());
+        let text = e.to_string();
+        let reported = sdk_error(e);
+        assert_eq!(format!("{reported:#}"), text);
+        assert!(zkminer_prover_protocol::types::is_gpu_oom(&format!(
+            "{reported:#}"
+        )));
     }
 }
 

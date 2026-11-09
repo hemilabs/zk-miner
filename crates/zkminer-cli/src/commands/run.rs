@@ -369,10 +369,14 @@ pub(crate) fn hold_instance_lock() -> Result<()> {
     // profile directory is already private to its user.)
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
             .create(&dir)
             .with_context(|| format!("create {}", dir.display()))?;
     }
@@ -381,12 +385,14 @@ pub(crate) fn hold_instance_lock() -> Result<()> {
     let path = dir.join("miner.lock");
     #[cfg(unix)]
     let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?
     };
@@ -4706,41 +4712,47 @@ fn risc0_job_device(backend: &str, cards: &[Risc0Card], device: &str) -> bool {
     backend != zkminer_prover_protocol::BACKEND_RISC0 || cards.iter().any(|c| c.device == device)
 }
 
-/// Warms SP1 up in the background until it succeeds (see `WorkerPool::warm_up`): installs its
-/// Groth16 circuit artifacts and, where its server supports it, builds the stripped circuit, before
-/// its first proof rather than inside it. A failure (a network error, the host short of memory just
-/// then) is retried, more patiently each time.
+/// Warms SP1 and risc0 up in the background, each until it succeeds (see `WorkerPool::warm_up`), so
+/// that their one-time setup happens before their first proof rather than inside it: SP1 installs
+/// its Groth16 circuit artifacts and, where its server supports it, builds the stripped circuit;
+/// risc0 installs its `risc0-groth16` component where it is missing (a host with only its GPU driver
+/// has no rzup to install it with). A failure (a network error, the host short of memory just then)
+/// is retried, more patiently each time.
 fn spawn_sp1_warmup() {
-    use zkminer_prover_protocol::BACKEND_SP1;
+    use zkminer_prover_protocol::{BACKEND_RISC0, BACKEND_SP1};
     let Some(pool) = zkminer_prover::engine::worker_pool() else {
         return;
     };
-    if !pool.has_slots(BACKEND_SP1) || pool.backend_warmed(BACKEND_SP1) {
-        return;
-    }
-    let spawned = std::thread::Builder::new()
-        .name("sp1-warmup".into())
-        .spawn(move || {
-            let mut delay = Duration::from_secs(60);
-            loop {
-                match pool.warm_up(BACKEND_SP1, zkminer_prover::dispatcher::WARMUP_TIMEOUT) {
-                    Ok(summary) => {
-                        tracing::info!("SP1 is ready: {summary}");
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                        "SP1's one-time setup failed, so SP1 jobs are not claimed yet; retrying in \
-                         {delay:?}: {e:#}"
-                    );
-                        std::thread::sleep(delay);
-                        delay = (delay * 2).min(Duration::from_secs(15 * 60));
+    for (backend, name) in [(BACKEND_SP1, "SP1"), (BACKEND_RISC0, "risc0")] {
+        if !pool.has_slots(backend) || pool.backend_warmed(backend) {
+            continue;
+        }
+        let spawned = std::thread::Builder::new()
+            .name(format!("{backend}-warmup"))
+            .spawn(move || {
+                let mut delay = Duration::from_secs(60);
+                loop {
+                    match pool.warm_up(backend, zkminer_prover::dispatcher::WARMUP_TIMEOUT) {
+                        Ok(summary) => {
+                            tracing::info!("{name} is ready: {summary}");
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "{name}'s one-time setup failed, so {name} jobs are not claimed \
+                                 yet; retrying in {delay:?}: {e:#}"
+                            );
+                            std::thread::sleep(delay);
+                            delay = (delay * 2).min(Duration::from_secs(15 * 60));
+                        }
                     }
                 }
-            }
-        });
-    if let Err(e) = spawned {
-        tracing::error!("could not start SP1's warm-up ({e}); SP1 jobs will not be claimed");
+            });
+        if let Err(e) = spawned {
+            tracing::error!(
+                "could not start {name}'s warm-up ({e}); {name} jobs will not be claimed"
+            );
+        }
     }
 }
 
@@ -6757,9 +6769,9 @@ async fn miner_brain(
                 if let Some(pool) = zkminer_prover::engine::worker_pool() {
                     let peak = measured_peak_for_job.unwrap_or(0);
                     if !pool.sp1_execute_provable_beside_server(peak) {
-                        if memory_skips_this_tick
-                            .insert(format!("sp1:provable:{:x}", job.info.program_id))
-                        {
+                        // Once a tick for all of them, not per program: the id is the submitter's
+                        // choice, so a program each would be one warning each, every tick.
+                        if memory_skips_this_tick.insert("sp1:provable".to_string()) {
                             tracing::warn!(
                                 "Not claiming SP1 job {}: its measured execute peak (~{:.1} GiB) plus \
                                  a warm sp1-gpu-server would exceed host RAM at prove time, so it is \

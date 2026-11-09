@@ -12,10 +12,10 @@ use crate::theme;
 use zkminer_prover::benchmark::BENCHMARK_PROGRAMS;
 use zkminer_prover_protocol::{zkops_from_stark_secs, BENCH_ZKOP_MIX};
 
-/// Build the ordered list of unique device IDs from benchmark data + hardware.
-/// CPU is always first, then gpu0, gpu1, etc.
+/// Build the ordered list of unique device IDs from benchmark data + hardware: gpu0, gpu1, etc.
+/// The CPU has no row: the benchmark measures only the cards.
 fn device_ids(state: &MinerState) -> Vec<String> {
-    let mut ids = vec!["cpu".to_string()];
+    let mut ids = Vec::new();
     // Resolve each physical card to the benchmark id that actually belongs to it.
     // Building these from `gpu.index` produced ids for cards that have no
     // benchmark row at all (a non-proving AMD card) while omitting the id of a
@@ -294,26 +294,21 @@ fn render_device_benchmarks(f: &mut Frame, area: Rect, state: &MinerState) {
                 .filter(|d| &d.device_id == device_id)
                 .collect();
 
-            let label = if device_id == "cpu" {
-                bench.cpu_info.clone()
-            } else {
-                dev_entries
-                    .first()
-                    .map(|d| d.device_label.clone())
-                    .unwrap_or_else(|| {
-                        state
-                            .benchmark_results
-                            .as_ref()
-                            .and_then(|suite| {
-                                state.hardware.gpus.iter().find(|g| {
-                                    g.benchmark_device_id(suite).as_deref()
-                                        == Some(device_id.as_str())
-                                })
+            let label = dev_entries
+                .first()
+                .map(|d| d.device_label.clone())
+                .unwrap_or_else(|| {
+                    state
+                        .benchmark_results
+                        .as_ref()
+                        .and_then(|suite| {
+                            state.hardware.gpus.iter().find(|g| {
+                                g.benchmark_device_id(suite).as_deref() == Some(device_id.as_str())
                             })
-                            .map(|g| format!("GPU{} {}", g.index, g.name))
-                            .unwrap_or_else(|| device_id.clone())
-                    })
-            };
+                        })
+                        .map(|g| format!("GPU{} {}", g.index, g.name))
+                        .unwrap_or_else(|| device_id.clone())
+                });
 
             let total_tp: f64 = dev_entries.iter().map(|d| d.throughput).sum();
             let cursor = if is_selected { "> " } else { "  " };

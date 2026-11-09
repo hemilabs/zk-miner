@@ -9,6 +9,13 @@
 //!   empty = respond normally. `"execute"` holds a measurement in flight until it is SIGKILLed.
 //! - `MOCK_CRASH_ON`: `"benchmark"`, `"prove"`, `"execute"`, `"both"` or `"warmup"` — exits
 //!   immediately with code 1 on the specified command type, simulating a worker crash.
+//! - `MOCK_CRASH_CODE`: the exit code for `MOCK_CRASH_ON` on `"prove"` and `"benchmark"`. Default: 1.
+//! - `MOCK_SERVER_OOM`: set to anything to have a child, standing in for a prover's server, allocate
+//!   until the kernel kills it, before `MOCK_CRASH_ON` applies on `"prove"`: a host OOM killing a
+//!   server and not the worker. First lowers this worker's own cgroup limit to 256 MiB, and exits 99
+//!   if it cannot, so the child can never eat the host.
+//! - `MOCK_HOLD_SHM`: a `/dev/shm` name to create and map before hanging on an Execute, as SP1's native
+//!   executor stages a guest there, and leaves it behind if killed.
 //! - `MOCK_BACKEND`: backend name for the HelloAck response. Default: `"mock"`.
 //! - `MOCK_JOURNAL_HEX` / `MOCK_SEAL_HEX`: replay a fixed receipt. Execute reports the journal, and
 //!   Prove returns the journal and the seal, whatever the ELF and input. With a real receipt (the
@@ -26,8 +33,18 @@ use zkminer_prover_protocol::{
 };
 
 fn main() {
+    if std::env::var_os("MOCK_BE_MEMORY_HOG").is_some() {
+        let mut held: Vec<Vec<u8>> = Vec::new();
+        loop {
+            held.push(vec![1u8; 16 * 1024 * 1024]);
+        }
+    }
     let hang_on = std::env::var("MOCK_HANG_ON").unwrap_or_default();
     let crash_on = std::env::var("MOCK_CRASH_ON").unwrap_or_default();
+    let crash_code: i32 = std::env::var("MOCK_CRASH_CODE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     let backend = std::env::var("MOCK_BACKEND").unwrap_or_else(|_| "mock".to_string());
     let journal = hex_env("MOCK_JOURNAL_HEX");
     let seal = hex_env("MOCK_SEAL_HEX");
@@ -74,7 +91,7 @@ fn main() {
 
             WorkerCommand::Benchmark => {
                 if crash_on == "benchmark" || crash_on == "both" {
-                    std::process::exit(1);
+                    std::process::exit(crash_code);
                 }
                 if hang_on == "benchmark" || hang_on == "both" {
                     // Hang forever — the watchdog will SIGKILL us
@@ -93,8 +110,17 @@ fn main() {
                 po2,
                 program_id: _,
             } => {
+                if std::env::var_os("MOCK_SERVER_OOM").is_some() {
+                    if limit_own_cgroup_memory(256 * 1024 * 1024).is_err() {
+                        std::process::exit(99);
+                    }
+                    let _ = std::process::Command::new(std::env::current_exe().unwrap())
+                        .env("MOCK_BE_MEMORY_HOG", "1")
+                        .stdout(std::process::Stdio::null())
+                        .status();
+                }
                 if crash_on == "prove" || crash_on == "both" {
-                    std::process::exit(1);
+                    std::process::exit(crash_code);
                 }
                 if hang_on == "prove" || hang_on == "both" {
                     loop {
@@ -121,6 +147,10 @@ fn main() {
             } => {
                 if crash_on == "execute" || crash_on == "both" {
                     std::process::exit(1);
+                }
+                #[cfg(unix)]
+                if let Ok(name) = std::env::var("MOCK_HOLD_SHM") {
+                    hold_shm(&name);
                 }
                 if hang_on == "execute" || hang_on == "both" {
                     // Hang forever — simulating an in-flight measurement that holds its slot and its
@@ -180,6 +210,54 @@ fn main() {
             WorkerCommand::Shutdown => break,
         }
     }
+}
+
+/// Map a new `/dev/shm/<name>` shared, touch it, and keep it mapped for good. Named only once it is
+/// mapped, so that a test that sees the name knows a kill will find the mapping.
+#[cfg(unix)]
+fn hold_shm(name: &str) {
+    use std::os::fd::AsRawFd;
+    const LEN: usize = 1024 * 1024;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(format!("/dev/shm/{name}.partial"))
+        .expect("create the /dev/shm file");
+    file.set_len(LEN as u64).expect("size the /dev/shm file");
+    let mapped = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            LEN,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(mapped, libc::MAP_FAILED, "map the /dev/shm file");
+    unsafe { std::ptr::write_bytes(mapped as *mut u8, 1, LEN) };
+    std::fs::rename(
+        format!("/dev/shm/{name}.partial"),
+        format!("/dev/shm/{name}"),
+    )
+    .expect("name the /dev/shm file");
+}
+
+/// Lower `memory.max` of the cgroup this process is in, and read it back.
+fn limit_own_cgroup_memory(bytes: u64) -> io::Result<()> {
+    let own = std::fs::read_to_string("/proc/self/cgroup")?;
+    let relative = own
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or(io::ErrorKind::NotFound)?;
+    let file = format!("/sys/fs/cgroup{}/memory.max", relative.trim());
+    std::fs::write(&file, bytes.to_string())?;
+    if std::fs::read_to_string(&file)?.trim() != bytes.to_string() {
+        return Err(io::ErrorKind::Other.into());
+    }
+    Ok(())
 }
 
 /// The bytes of a hex environment variable (an optional `0x` prefix allowed); empty when unset.
