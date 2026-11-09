@@ -24,6 +24,8 @@
 //!   and seal.
 //! - `MOCK_PROVE_DELAY_SECS`: how long a Prove takes (default 0), so a test can act while a lock
 //!   is held.
+//! - `MOCK_HOST_ENTROPY_READS`: what an Execute reports as `host_entropy_reads`: a number, or
+//!   `unknown` for `None`. Default: 0.
 
 use std::io::{self, BufReader, BufWriter};
 use std::time::Duration;
@@ -168,6 +170,11 @@ fn main() {
                     journal_len: journal.len() as u64,
                     peak_host_bytes: 0,
                     journal: Some(journal.clone()),
+                    host_entropy_reads: match std::env::var("MOCK_HOST_ENTROPY_READS") {
+                        Ok(v) if v == "unknown" => None,
+                        Ok(v) => Some(v.trim().parse().expect("MOCK_HOST_ENTROPY_READS")),
+                        Err(_) => Some(0),
+                    },
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }
@@ -203,6 +210,34 @@ fn main() {
                     request_id,
                     summary: "nothing to warm up".to_string(),
                     groth16_helper: false,
+                };
+                write_message(&mut stdout, &resp).unwrap();
+            }
+
+            // Derives nothing: answers keccak256 of the ELF, so a test can tell ELFs apart and serve a
+            // matching (or deliberately mismatching) programId. `MOCK_PROGRAM_ID_FAIL=1` refuses the
+            // ELF, as a worker does one its SDK cannot parse.
+            WorkerCommand::ProgramId { request_id, elf } => {
+                if crash_on == "program_id" {
+                    std::process::exit(1);
+                }
+                if hang_on == "program_id" {
+                    loop {
+                        std::thread::sleep(Duration::from_secs(3600));
+                    }
+                }
+                let resp = if std::env::var_os("MOCK_PROGRAM_ID_FAIL").is_some() {
+                    WorkerResponse::Error {
+                        request_id,
+                        kind: zkminer_prover_protocol::types::ErrorKind::InvalidInput,
+                        message: "mock: this ELF does not parse".to_string(),
+                    }
+                } else {
+                    WorkerResponse::ProgramIdResult {
+                        request_id,
+                        program_id: alloy_primitives::keccak256(&elf).0,
+                        duration_secs: 0.01,
+                    }
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }
