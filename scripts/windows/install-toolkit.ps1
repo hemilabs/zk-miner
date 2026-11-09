@@ -21,7 +21,8 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'  # Invoke-WebRequest is far slower with it
 
 function Get-Verified([string]$Url, [string]$Sha256, [string]$Out) {
-    Invoke-WebRequest $Url -OutFile $Out
+    # Vendors' download servers answer 504 often enough to fail a build.
+    Invoke-WebRequest $Url -OutFile $Out -MaximumRetryCount 5 -RetryIntervalSec 30
     $actual = (Get-FileHash $Out -Algorithm SHA256).Hash
     if ($actual -ne $Sha256) { throw "$Url`: SHA-256 $actual, expected $Sha256" }
 }

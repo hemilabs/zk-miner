@@ -231,7 +231,12 @@ jobs:
           curl -fsSL "https://raw.githubusercontent.com/succinctlabs/sp1/$SP1UP_SCRIPT_REV/sp1up/sp1up" -o ~/.sp1/bin/sp1up
           echo "$SP1UP_SCRIPT_SHA256  $HOME/.sp1/bin/sp1up" | sha256sum -c -
           chmod +x ~/.sp1/bin/sp1up
-          ~/.sp1/bin/sp1up --version 6.0.1
+          # Its downloads have failed with a bad archive that a retry gets past.
+          for attempt in 1 2 3; do
+            ~/.sp1/bin/sp1up --version 6.0.1 && break
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep 30
+          done
 
       # What sp1_build does from the worker's build script on Linux: each guest is its own
       # workspace, and its ELF lands in its target/elf-compilation.
