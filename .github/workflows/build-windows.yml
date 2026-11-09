@@ -233,7 +233,7 @@ jobs:
           set -euo pipefail
           export PATH="$HOME/.sp1/bin:$PATH"
           mkdir -p sp1-guests
-          for guest in fibonacci sha256-chain ecdsa-verify bigint-mul memory-merkle chacha-mix; do
+          for guest in fibonacci sha256-chain ecdsa-verify bigint-mul memory-merkle chacha-mix zkop-mix; do
             (cd "crates/zkminer-prover/guests/sp1/$guest" && cargo prove build)
             cp "crates/zkminer-prover/guests/sp1/$guest/target/elf-compilation/riscv64im-succinct-zkvm-elf/release/$guest-sp1-guest" sp1-guests/
           done

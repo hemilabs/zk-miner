@@ -53,6 +53,7 @@ methods = [
     "../zkminer-prover/guests/risc0/bigint-mul",
     "../zkminer-prover/guests/risc0/memory-merkle",
     "../zkminer-prover/guests/risc0/chacha-mix",
+    "../zkminer-prover/guests/risc0/zkop-mix",
     "../zkminer-prover/guests/risc0/rv32im-torture",
     "../zkminer-prover/guests/risc0/edge-case-arith",
     "../zkminer-prover/guests/risc0/memory-stress",
