@@ -2397,6 +2397,8 @@ pub async fn run(
     if watch.is_none() {
         hold_instance_lock()?;
     }
+    let splash = zkminer_tui::splash::Splash::start(!headless);
+    splash.status("Connecting to the chain");
     let queue_horizon_secs = config.prover.queue_horizon_secs;
     let client = match watch {
         Some(w) => {
@@ -2432,6 +2434,7 @@ pub async fn run(
         None => ChainClient::new(&config, load_signer(&config.wallet)?).await?,
     };
 
+    splash.status("Verifying the on-chain contracts");
     // Before ANY transaction (handoff §13 tests 1-2): the configured stack must be the live
     // deployment for this chain, wired to itself (router.staking/registry/hemiToken), and running the
     // AUDITED code; and every proof system zkminer serves must be registered and wrap the audited
@@ -2497,13 +2500,7 @@ pub async fn run(
     let state = new_shared_state();
 
     // Initialize worker pool (before TUI, after config load)
-    let benchmark_timeout = if config.prover.benchmark_timeout_secs > 0 {
-        Some(std::time::Duration::from_secs(
-            config.prover.benchmark_timeout_secs,
-        ))
-    } else {
-        None
-    };
+    let benchmark_timeout = config.prover.benchmark_timeout();
     let mut pool = WorkerPool::new(
         config
             .prover
@@ -2539,6 +2536,9 @@ pub async fn run(
     if watch_only() {
         pool.only_backends(served_backends());
     }
+    splash.status("Looking for GPUs and prover workers");
+    let status = splash.status_line();
+    pool.set_progress(move |text| status.set(text));
     // On a BLOCKING thread, like the hardware probe just below it and for the same reason.
     //
     // Per slot this blocks on `nvidia-smi` (up to VRAM_QUERY_TIMEOUT), then the serialised spawner
@@ -2562,6 +2562,7 @@ pub async fn run(
         spawn_sp1_warmup();
     }
 
+    splash.status("Reading GPU details");
     // Hardware probe — runs on a blocking thread to avoid freezing the system.
     // NVML init + device queries + sysfs reads can take seconds on idle GPUs.
     let (hw, tuning) = tokio::task::spawn_blocking(|| {
@@ -2650,6 +2651,7 @@ pub async fn run(
         // on a TOTAL failure, stake_info stays None → the collateral gate reads it as 0 and
         // blocks claims (never over-commits), and the +7s refresh loop re-hydrates before the
         // brain's first claim eval.
+        splash.status("Reading your balance and stake");
         let hydrated;
         match client.get_refresh_batch().await {
             Ok(data) => {
@@ -3066,14 +3068,10 @@ pub async fn run(
         }
     });
 
-    // Benchmarks are user-triggered via [b] on the Benchmark screen.
-    // Auto-benchmark at startup is disabled because GPU proving in VMs with
-    // passthrough GPUs causes kernel time spikes that freeze the system.
-    {
-        let s = state.read().await;
-        if s.benchmark_results.is_none() {
-            tracing::info!("No cached benchmarks — press [b] on Benchmark screen to run");
-        }
+    // Before the brain starts, so it sees the claim hold. Not when watching: a watch-only run
+    // proves nothing.
+    if !watch_only() {
+        zkminer_tui::start_benchmark_if_incomplete(&state, !headless).await;
     }
 
     // The journal is the AUTHORITATIVE record of what we hold on-chain: a breadcrumb is
@@ -3307,6 +3305,7 @@ pub async fn run(
         // `run()`, leaving held jobs Locked on-chain with nothing alive to release them (they
         // then ride past the lock deadline, after which releaseJob reverts permanently) and
         // the SP1 gpu-server grandchild holding its VRAM. Log and fall through instead.
+        drop(splash);
         let tui_result = zkminer_tui::run_tui(state.clone(), Some(client.clone())).await;
         // Terminal is restored (raw mode off) and the TUI no longer owns the keyboard —
         // release the signal handler so the drain below still has the abandon/force ladder.
@@ -5979,6 +5978,11 @@ async fn miner_brain(
                 }
                 continue;
             }
+        }
+
+        // The startup benchmark has the cards. Held-lock recovery is not behind this.
+        if state.read().await.startup_benchmark_pending {
+            continue;
         }
 
         let benchmarks = match benchmarks {
@@ -12672,26 +12676,23 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
             while let Some(event) = bridge_rx.recv().await {
                 let mut s = bridge_state.write().await;
                 if let Some(tracker) = s.benchmark_tracker.as_mut() {
-                    tracker.on_progress(
-                        &event.slot_key,
-                        event.gpu_name.as_deref(),
-                        event.device_index,
-                        event.pci_bus_id.as_deref(),
-                        &event.gpu_tag,
-                        &event.entry,
-                        event.program_index,
-                        event.total_programs,
+                    tracker.apply(&event);
+                }
+                if let zkminer_prover::dispatcher::BenchmarkProgressKind::ProgramDone {
+                    entry,
+                    ..
+                } = &event.kind
+                {
+                    s.add_log(
+                        LogLevel::Info,
+                        format!(
+                            "{}: {} done ({:.1}M c/s)",
+                            event.slot_key,
+                            entry.program_name,
+                            entry.throughput / 1_000_000.0
+                        ),
                     );
                 }
-                s.add_log(
-                    LogLevel::Info,
-                    format!(
-                        "{}: {} done ({:.1}M c/s)",
-                        event.slot_key,
-                        event.entry.program_name,
-                        event.entry.throughput / 1_000_000.0
-                    ),
-                );
             }
         });
 

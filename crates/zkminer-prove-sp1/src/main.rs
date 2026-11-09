@@ -188,6 +188,7 @@ const ECDSA_VERIFY_SP1_GUEST_ELF: &[u8] = include_bytes!(env!("SP1_ELF_ecdsa-ver
 const BIGINT_MUL_SP1_GUEST_ELF: &[u8] = include_bytes!(env!("SP1_ELF_bigint-mul-sp1-guest"));
 const MEMORY_MERKLE_SP1_GUEST_ELF: &[u8] = include_bytes!(env!("SP1_ELF_memory-merkle-sp1-guest"));
 const CHACHA_MIX_SP1_GUEST_ELF: &[u8] = include_bytes!(env!("SP1_ELF_chacha-mix-sp1-guest"));
+const ZKOP_MIX_SP1_GUEST_ELF: &[u8] = include_bytes!(env!("SP1_ELF_zkop-mix-sp1-guest"));
 
 /// Duplicate `fd` with close-on-exec set.
 ///
@@ -348,7 +349,7 @@ fn main() {
                 None => builder.build(),
             }
         };
-        let results = run_benchmarks(&prover);
+        let results = run_benchmarks(&prover, &mut |_, _, _| {});
         for r in &results {
             eprintln!(
                 "{:<16} {:>12} cycles  {:>8.2}s  {:>12.0} c/s  weight={:.2}  precompile={}",
@@ -1467,6 +1468,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         BENCH_BIGINT_MUL.to_string(),
                         BENCH_MEMORY_MERKLE.to_string(),
                         BENCH_CHACHA_MIX.to_string(),
+                        zkminer_prover_protocol::BENCH_ZKOP_MIX.to_string(),
                     ],
                     gpu_available,
                     gpu_name,
@@ -1490,7 +1492,17 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 }
                 match get_prover!(prover) {
                     Ok(p) => {
-                        let results = run_benchmarks(p);
+                        let results = run_benchmarks(p, &mut |entry, program_index, total| {
+                            // A closed pipe is reported by the final result's write below.
+                            let _ = write_message(
+                                &mut stdout,
+                                &WorkerResponse::BenchmarkProgress {
+                                    entry: entry.clone(),
+                                    program_index,
+                                    total_programs: total,
+                                },
+                            );
+                        });
                         let resp = WorkerResponse::BenchmarkResult { results };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -2145,7 +2157,11 @@ fn run_proof(
     Ok((journal, seal, duration_secs, cycles))
 }
 
-fn run_benchmarks(prover: &sp1_sdk::blocking::CudaProver) -> Vec<BenchmarkEntry> {
+/// Run the suite, calling `on_done(entry, 1-based program index, total)` after each program.
+fn run_benchmarks(
+    prover: &sp1_sdk::blocking::CudaProver,
+    on_done: &mut dyn FnMut(&BenchmarkEntry, u32, u32),
+) -> Vec<BenchmarkEntry> {
     let mut results = Vec::new();
 
     let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
@@ -2198,16 +2214,48 @@ fn run_benchmarks(prover: &sp1_sdk::blocking::CudaProver) -> Vec<BenchmarkEntry>
     // compressed run's speed, and the first proof in a fresh worker also pays GPU warm-up, which would
     // land in one run and not the other. By the last program that has long been paid.
     let last_runnable = benchmarks.iter().rposition(|&(_, elf, ..)| !elf.is_empty());
+    // The scoring program runs after these.
+    let total = benchmarks.iter().filter(|b| !b.1.is_empty()).count() as u32 + 1;
+    let mut program_index = 0;
     for (idx, &(name, elf, input, weight, precompile)) in benchmarks.iter().enumerate() {
         if elf.is_empty() {
             continue;
         }
+        program_index += 1;
         let measure_wrap = Some(idx) == last_runnable;
         if let Some(entry) =
             benchmark_program(prover, name, elf, input, weight, precompile, measure_wrap)
         {
+            on_done(&entry, program_index, total);
             results.push(entry);
         }
+    }
+
+    use zkminer_prover_protocol::{measure_zkop_mix, BENCH_ZKOP_MIX, ZKOP_MIX_SP1_CYCLES};
+    let scored = measure_zkop_mix(|iterations| {
+        benchmark_program(
+            prover,
+            BENCH_ZKOP_MIX,
+            ZKOP_MIX_SP1_GUEST_ELF,
+            &iterations.to_le_bytes(),
+            0.0,
+            false,
+            false,
+        )
+    });
+    match scored {
+        Some(entry) if entry.cycles == ZKOP_MIX_SP1_CYCLES => {
+            on_done(&entry, total, total);
+            results.push(entry);
+        }
+        // The score divides a fixed cycle count by this proof's time, so it only means anything
+        // for the program that count was measured on.
+        Some(entry) => tracing::error!(
+            "{BENCH_ZKOP_MIX}: {} cycles where {ZKOP_MIX_SP1_CYCLES} were expected; not reporting \
+             a zkOP/s score",
+            entry.cycles
+        ),
+        None => tracing::error!("{BENCH_ZKOP_MIX}: proving failed; not reporting a zkOP/s score"),
     }
 
     results

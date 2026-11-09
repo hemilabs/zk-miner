@@ -1,11 +1,12 @@
 /// The guests `main.rs` embeds, each as `SP1_ELF_<name>-sp1-guest`.
-const EMBEDDED_GUESTS: [&str; 6] = [
+const EMBEDDED_GUESTS: [&str; 7] = [
     "fibonacci",
     "sha256-chain",
     "ecdsa-verify",
     "bigint-mul",
     "memory-merkle",
     "chacha-mix",
+    "zkop-mix",
 ];
 
 fn main() {
@@ -52,6 +53,11 @@ fn main() {
         sp1_build::build_program(&chacha_dir.to_string_lossy());
     }
 
+    let zkop_dir = guest_dir.join("zkop-mix");
+    if zkop_dir.exists() {
+        sp1_build::build_program(&zkop_dir.to_string_lossy());
+    }
+
     let torture_dir = guest_dir.join("rv32im-torture");
     if torture_dir.exists() {
         sp1_build::build_program(&torture_dir.to_string_lossy());
@@ -95,6 +101,14 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         guest_dir.join("chacha-mix/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("../common/zkop_mix.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("zkop-mix/src/main.rs").display()
     );
     println!(
         "cargo:rerun-if-changed={}",

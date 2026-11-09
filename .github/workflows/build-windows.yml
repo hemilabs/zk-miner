@@ -218,12 +218,19 @@ jobs:
           rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
           rustup default ${{ env.RUST_VERSION }}
 
-      # The version Dockerfile.build's build-sp1 installs.
+      # The version Dockerfile.build's build-sp1 installs. sp1up comes straight from Succinct's
+      # repository, pinned: sp1up.succinct.xyz, which only installed this same script, is gone.
       - name: Install the SP1 toolchain
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SP1UP_SCRIPT_REV: 749b0c63f226063c471a6238a94101f930c14a13
+          SP1UP_SCRIPT_SHA256: 55d4f6ef8e79e04a7ccd064f75c6a6b44a1694b21cd41aa8e7d0d53eb880a71d
         run: |
-          curl -L https://sp1up.succinct.xyz | bash
+          set -euo pipefail
+          mkdir -p ~/.sp1/bin
+          curl -fsSL "https://raw.githubusercontent.com/succinctlabs/sp1/$SP1UP_SCRIPT_REV/sp1up/sp1up" -o ~/.sp1/bin/sp1up
+          echo "$SP1UP_SCRIPT_SHA256  $HOME/.sp1/bin/sp1up" | sha256sum -c -
+          chmod +x ~/.sp1/bin/sp1up
           ~/.sp1/bin/sp1up --version 6.0.1
 
       # What sp1_build does from the worker's build script on Linux: each guest is its own
@@ -233,7 +240,7 @@ jobs:
           set -euo pipefail
           export PATH="$HOME/.sp1/bin:$PATH"
           mkdir -p sp1-guests
-          for guest in fibonacci sha256-chain ecdsa-verify bigint-mul memory-merkle chacha-mix; do
+          for guest in fibonacci sha256-chain ecdsa-verify bigint-mul memory-merkle chacha-mix zkop-mix; do
             (cd "crates/zkminer-prover/guests/sp1/$guest" && cargo prove build)
             cp "crates/zkminer-prover/guests/sp1/$guest/target/elf-compilation/riscv64im-succinct-zkvm-elf/release/$guest-sp1-guest" sp1-guests/
           done

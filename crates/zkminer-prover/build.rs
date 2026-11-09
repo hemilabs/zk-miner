@@ -17,6 +17,7 @@ fn main() {
         sp1_build::build_program("guests/sp1/segment-boundary");
         sp1_build::build_program("guests/sp1/minimal-proof");
         sp1_build::build_program("guests/sp1/chacha-mix");
+        sp1_build::build_program("guests/sp1/zkop-mix");
         sp1_build::build_program("guests/sp1/bigint-mul");
         sp1_build::build_program("guests/sp1/ecdsa-verify");
         sp1_build::build_program("guests/sp1/memory-merkle");

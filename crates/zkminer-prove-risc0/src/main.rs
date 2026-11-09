@@ -176,6 +176,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         BENCH_BIGINT_MUL.to_string(),
                         BENCH_MEMORY_MERKLE.to_string(),
                         BENCH_CHACHA_MIX.to_string(),
+                        zkminer_prover_protocol::BENCH_ZKOP_MIX.to_string(),
                     ],
                     gpu_available,
                     gpu_name,
@@ -1322,7 +1323,13 @@ fn run_benchmarks_streaming<W: std::io::Write>(
                     .map_or(true, |only| name.eq_ignore_ascii_case(only))
         })
         .collect();
-    let total = active.len() as u32;
+    use zkminer_prover_protocol::{measure_zkop_mix, BENCH_ZKOP_MIX};
+    // The scoring program runs after these.
+    let score = !ZKOP_MIX_ELF.is_empty()
+        && bench_only
+            .as_ref()
+            .map_or(true, |only| BENCH_ZKOP_MIX.eq_ignore_ascii_case(only));
+    let total = active.len() as u32 + u32::from(score);
 
     for (idx, &&(name, elf, input, weight, precompile)) in active.iter().enumerate() {
         if let Some(entry) = benchmark_program(name, elf, input, weight, precompile) {
@@ -1333,6 +1340,31 @@ fn run_benchmarks_streaming<W: std::io::Write>(
             };
             write_message(stdout, &progress)?;
             results.push(entry);
+        }
+    }
+
+    if score {
+        let scored = measure_zkop_mix(|iterations| {
+            benchmark_stages(
+                BENCH_ZKOP_MIX,
+                ZKOP_MIX_ELF,
+                &iterations.to_le_bytes(),
+                0.0,
+                false,
+                false,
+            )
+        });
+        match scored {
+            Some(entry) => {
+                let progress = WorkerResponse::BenchmarkProgress {
+                    entry: entry.clone(),
+                    program_index: total,
+                    total_programs: total,
+                };
+                write_message(stdout, &progress)?;
+                results.push(entry);
+            }
+            None => tracing::error!("{BENCH_ZKOP_MIX}: proving failed; not reporting a zkOP/s score"),
         }
     }
 
@@ -1417,6 +1449,19 @@ fn benchmark_program(
     weight: f64,
     precompile: bool,
 ) -> Option<BenchmarkEntry> {
+    benchmark_stages(name, elf, input, weight, precompile, true)
+}
+
+/// Prove `elf`, timing each stage. Without `measure_wrap` it stops at the constant-size STARK, whose
+/// receipt it verifies instead of a Groth16 one.
+fn benchmark_stages(
+    name: &str,
+    elf: &[u8],
+    input: &[u8],
+    weight: f64,
+    precompile: bool,
+    measure_wrap: bool,
+) -> Option<BenchmarkEntry> {
     // At the size an uncalibrated card proves jobs at, so its throughput and host peak describe them.
     // (Its first stage is a composite proof, for which the SDK never picks a size of its own, so this
     // only says what the executor default already was.)
@@ -1465,6 +1510,33 @@ fn benchmark_program(
         }
     };
     let recursion_secs = started.elapsed().as_secs_f64();
+
+    if !measure_wrap {
+        let image_id = match risc0_zkvm::compute_image_id(elf) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!("{name}: failed to compute image id for verification: {e:#}");
+                return None;
+            }
+        };
+        if let Err(e) = succinct.verify(image_id) {
+            tracing::error!("{name}: succinct receipt.verify() FAILED: {e:#}");
+            return None;
+        }
+        let cycles = prove_info.stats.total_cycles;
+        let duration_secs = composite_secs + recursion_secs;
+        tracing::info!("{name}: {cycles} cycles, STARK {duration_secs:.2}s, verified");
+        return Some(BenchmarkEntry {
+            program_name: name.to_string(),
+            prover_backend: BACKEND_RISC0.to_string(),
+            cycles,
+            duration_secs,
+            throughput: cycles as f64 / duration_secs,
+            weight,
+            precompile,
+            wrap_secs: None,
+        });
+    }
 
     // Stage 3: STARK-to-SNARK. Proves the fixed `stark_verify` circuit with a fixed proving key
     // (`~/.risc0/extensions/*-risc0-groth16/stark_verify_final.zkey`), so it does not depend on the
