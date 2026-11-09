@@ -270,9 +270,13 @@ Worth knowing:
 - **`PAGE:` lines need a human.** They say claiming has stopped (the deployment or proof
   system failed its check, the protocol is paused, the clock is off, funds are short) or a
   lock is at risk. The dashboard shows them; headless, they go to stderr.
-- **Keep `~/.zkminer/risc0-sys-rand.key`.** It seeds guests' randomness, so a measurement
-  and the proof after it agree; a lock re-proved after a restart needs the same key. Don't
-  copy it off the host.
+- **Drain before an upgrade that changes the `sys_rand` rule.** risc0 guests' randomness is a
+  public function of the program and input (`crates/zkminer-prover-protocol/src/sys_rand.rs`), so
+  a measurement and the proof after it agree on any host, and no key needs keeping (an old
+  `~/.zkminer/risc0-sys-rand.key` is unused and can be deleted). A new rule re-seeds whatever a lock
+  was measured under: a guest whose journal or path follows its random bytes may then fail or commit
+  something else, and that lock is released at the job's release penalty (5% by default). So for such a release let the locks finish first
+  (SIGINT, and wait), not SIGINT then SIGKILL. A restart that finds such a lock says so on a `PAGE:` line.
 - **Escape hatches, for after you've checked by hand:** `ZKMINER_SKIP_CODE_PINS=1` skips
   the audited-code checks (router, Staking, Registry, facets, and the risc0 adapter and
   verifier), `ZKMINER_ALLOW_UNKNOWN_DEPLOYMENT=1` accepts contract addresses that aren't
@@ -333,8 +337,8 @@ decoded. Any other field, or a malformed one, is an `invalid_request`.
 
 Each job goes through the steps a claim depends on: its descriptor rebuilt from the submit
 transaction and checked against its on-chain hash, the program's ELF from the ProgramRegistry, those
-bytes bound to the job's `programId`, and one execution on a measure worker at `--po2` (risc0,
-default 20). A `submitTx` hint whose receipt holds the job's `JobSubmitted` log is the submit
+bytes bound to the job's `programId`, and execution on a measure worker: at all seven segment sizes
+for risc0 (below), once for SP1. A `submitTx` hint whose receipt holds the job's `JobSubmitted` log is the submit
 transaction, so its calldata decides alone: calldata that does not decode is `undecodable` at once,
 with no log scan (any other hint is only tried first). The ELF is the bytes that bound before, else
 the bytes the registry's `elf_hash` names from any URI that serves them, else what the first URI that
@@ -367,14 +371,14 @@ A `measured` report also says whether its count is evidence of the proven run:
   `differs`, or `unknown` (none sent, or no whole journal came back: over 32 KiB). The router's fulfil
   takes the journal as `publicValues` for both risc0 (the receipt's journal) and SP1 (its public
   values).
-- `hostInput`: whether the guest read host-supplied nondeterministic input, and `hostInputReads` how
-  often, when counted. risc0: its `sys_rand` calls past the one 4-word draw its guest runtime makes
-  before `main` (the only syscall the host answers from entropy; environment and arguments are
-  empty). SP1: never (`false`, 0): its `sys_rand` is an in-guest PRNG with a fixed seed. `true` also
-  when the worker could not count (a guest without risc0's runtime). A guest whose path followed
-  such input may have run another one when proven. Note that std's `HashMap` seeds itself from
-  `sys_rand`, so a risc0 guest that builds one reads it. What no count can show: a guest that
-  branches on the bytes of its runtime's own draw.
+- `hostInput` and `hostInputReads`: whether the guest called `sys_rand` past the one 4-word draw its
+  runtime makes before `main`, and how often. risc0 only: an SP1 guest's generator runs inside the
+  guest from a fixed seed, so it is `false`, 0 (and the proof covers it). `hostInputReads` is absent
+  when nothing could be counted: a guest without risc0's runtime, or a keccak request the guest never
+  assumes, which costs its prover nothing. std's `HashMap` seeds itself from `sys_rand`, so a risc0
+  guest that builds one reads it once. Reading is not a fault: see below.
+- `sysRandRule`: the rule that seeded a risc0 run (also on the READY line); absent for SP1.
+- `sizeCheck` (risc0 only): `same`, `differs` or `skipped`; see below.
 - `binding`: the job's journal binding against the measured journal, as the router checks it:
   `satisfied`, `fails`, `none` (nothing binds the journal; an SP1 proof-nonce job with no statement
   included), `unchecked` (no whole journal). For a proof-nonce job the statement is checked with the
@@ -382,15 +386,31 @@ A `measured` report also says whether its count is evidence of the proven run:
 - `sdkVersion`: the measure worker's SDK, as its handshake names it (on every report once the job's
   backend is known to have a worker).
 
-A count is evidence when `proven` is `matches`, `hostInput` is `false` and `binding` is not `fails`.
-That catches an honest mismatch and a nondeterministic guest. It does not bind the run to the proven
-one: the chain never checks the input, so a requester who is also the prover can prove another
-input with the same journal and choose a count up to `--max-cycles`. A keccak request the guest
-never assumes costs its prover nothing, so a run with one reports `hostInput: true`.
+A count is evidence when `proven` is `matches`, `binding` is not `fails`, `hostInputReads` is
+present and `sizeCheck` is not `differs`. risc0 guests' `sys_rand` is seeded by a public rule (`SYS_RAND_RULE`) that zkminer's proofs
+use from protocol 12: a function of the image id and every byte the guest reads, so a guest's random
+bytes, and the path it takes on them, are the same here as in a proof zkminer makes under that rule.
+The figure is the cost of that run at the size the report names (a miner proves at its own card's).
 
-risc0 guests' `sys_rand` is seeded from a key made for each run, never this host's
-`~/.zkminer/risc0-sys-rand.key` (neither read nor created, so a HOME it cannot write is fine), and
-the journal comes back for it: in simulate it backs no proof.
+What this does not show: the proof binds neither the seed nor the input. A job proven before the
+rule, by an older zkminer, was seeded by its miner's key, so when `hostInputReads` is above 0 its
+count is the public-seed run, not necessarily the proven one. A prover on other software
+can answer `sys_rand` with anything, and a requester who is also the prover can prove another input
+with the same journal and choose a count up to `--max-cycles`.
+
+**The segment-size check.** A guest can read the segment size it runs at, and a miner proves at its
+own card's size, so a guest could cost one thing here and another there. `simulate` therefore runs a
+risc0 job at all seven sizes a miner can prove at (2^16 to 2^22) and compares the journal, the guest's
+own cycles, its keccak charges and its random reads. Any difference reports `sizeCheck: differs`. If
+none differs it reports `same`, and `cycles` and `po2` are those of the LOWEST of the seven: a guest
+can keep every compared value equal and still read more memory at one size, inflating that size
+through paging alone, but a miner paid at least the lowest figure at whichever size it proved at. A
+request with `singleRun: true` is measured once at `--po2` and reports `skipped`, for a program the
+caller trusts, and only the caller decides that. A guest failure at another size is `differs` too; a
+timeout or a host problem there is reported as it would be for any execution. `--max-cycles` applies
+to the `--po2` run. Seven executions bound one request by `7·E`, and small segments are slower, so a
+job takes about 8 to 21 times as long as one run at 2^20 (measured).
+`RISC0_KECCAK_PO2`, which a guest can also see, is pinned to the SDK's default here.
 
 **The failure memory.** A program whose ELF did not bind (refused, another id, a derivation past its
 bound, or for a shorter 15 minutes a worker that died deriving it, which may be the host's doing) is remembered under `<cache-dir>/program-failures` for
@@ -411,7 +431,7 @@ READY, and again before the next SP1 request when its worker was respawned, boun
 other wait is bounded too, so the longest one request can take, in seconds, is
 
 ```text
-4·R + 2·F + 4·W + 2·S + P + E  =  584 + P + E      (+ local work)
+4·R + 2·F + 4·W + 2·S + P + 7·E  =  584 + P + 7·E      (+ local work)
 R = 30   each chain read outside the two fetches: the status view, the head refresh,
          the registry entry, its re-read after a derivation that did not bind
 F = 90   the descriptor fetch, and the ELF fetch (every URI, twice when elf_hash is set)
@@ -450,13 +470,13 @@ zkminer --config simulate.toml simulate --stdin \
 Reading the counts:
 
 - **Units differ by backend.** risc0's count is cycles with every segment padded to its power of two
-  at `--po2`, plus a charge of 2^20 for each keccak proof request (a price, not cycles: about a 2^20
+  at the report's `po2`, plus a charge of 2^20 for each keccak proof request (a price, not cycles: about a 2^20
   segment's proving time; doubled per step of a larger keccak po2). SP1's is
   the RV64 instruction count, where a precompile (keccak, sha, ...) counts once. Never add or compare
   the two.
 - **po2.** risc0 counts depend on the segment size: a job proven on a small card (po2 16) has about
-  1.8 times the po2-20 count. A report carries the `po2` it was measured at; changing `--po2` mixes
-  sizes in what was already stored.
+  1.8 times the po2-20 count. A report carries the `po2` of its figure, which is the lowest of the
+  seven sizes unless the request was `singleRun`.
 - **`--max-cycles`.** Every count up to it is the guest's to choose (a keccak request costs a few
   hundred cycles of guest work and is charged 2^20), so it bounds what one job adds to a sum. The
   default, 1e9, is ten times the largest proof seen on this market.

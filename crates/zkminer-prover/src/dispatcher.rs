@@ -80,6 +80,30 @@ pub struct ExecuteMeasurement {
     /// How many times the guest read host-supplied nondeterministic input (risc0: `sys_rand` past its
     /// runtime's own draw), `None` = not counted; see `WorkerResponse::ExecuteResult`.
     pub host_entropy_reads: Option<u64>,
+    /// The cycles the guest itself executed, before paging and padding; `None` when the worker has no
+    /// such figure (SP1).
+    pub user_cycles: Option<u64>,
+    /// The keccak proof charges inside `cycles`; `None` as for `user_cycles`.
+    pub keccak_cycles: Option<u64>,
+}
+
+impl ExecuteMeasurement {
+    /// Whether `other`, the same (program, input) at another segment size, ran the same as far as a
+    /// measurement can see: the same journal, the same cycles of the guest's own, the same keccak
+    /// charges and the same random reads. `cycles` is left out on purpose, because padding and paging
+    /// legitimately move it with the size.
+    ///
+    /// Not a proof of one path: a guest can sense the size and keep all of these equal while changing
+    /// only which memory it reads, which moves `cycles` through paging alone. A figure a reader adds up
+    /// must therefore not come from one size on the strength of this check.
+    pub fn same_path(&self, other: &Self) -> bool {
+        self.user_cycles.is_some()
+            && self.user_cycles == other.user_cycles
+            && self.keccak_cycles == other.keccak_cycles
+            && self.host_entropy_reads == other.host_entropy_reads
+            && self.journal_len == other.journal_len
+            && self.journal == other.journal
+    }
 }
 
 /// What a `ProgramId` request derived (see [`WorkerPool::derive_program_id`]).
@@ -2390,6 +2414,15 @@ impl WorkerPool {
                     "ZKMINER_RISC0_EXECUTE_MAX_RSS_BYTES".to_string(),
                     risc0_measure_rss.to_string(),
                 );
+                // A guest can see the keccak proof size (`sys_keccak` reports full by it), and the SDK
+                // reads it from the environment. A simulation measures the one run every reader can
+                // reproduce, whatever this host's environment says; a miner keeps its own setting.
+                if self.measure_only {
+                    menv.insert(
+                        zkminer_prover_protocol::sys_rand::RISC0_KECCAK_PO2_ENV.to_string(),
+                        zkminer_prover_protocol::sys_rand::RISC0_CANONICAL_KECCAK_PO2.to_string(),
+                    );
+                }
                 let mkey = format!("{backend}:measure:{i}");
                 let (handle, pid, starttime, failures, last_failure) =
                     match WorkerHandle::spawn(&backend, &path, &menv) {
@@ -4537,6 +4570,8 @@ impl WorkerPool {
                 peak_host_bytes,
                 journal,
                 host_entropy_reads,
+                user_cycles,
+                keccak_cycles,
                 ..
             } => {
                 tracing::debug!(
@@ -4568,6 +4603,8 @@ impl WorkerPool {
                     peak_host_bytes,
                     duration_secs,
                     host_entropy_reads,
+                    user_cycles,
+                    keccak_cycles,
                 })
             }
             WorkerResponse::Error { message, .. } => {

@@ -1933,6 +1933,9 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             // HINT_READ), the run itself, or a hook, which is a fixed function of what
                             // the guest wrote to it. The proof nonce is not visible to the guest.
                             host_entropy_reads: Some(0),
+                            // SP1 runs once: it has no segment size for a guest to steer on.
+                            user_cycles: None,
+                            keccak_cycles: None,
                         };
                         write_message(&mut stdout, &resp)?;
                     }

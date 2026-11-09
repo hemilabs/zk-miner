@@ -436,6 +436,147 @@ fn export(worker: &Path, name: &str, dir: &Path) -> (Vec<u8>, [u8; 32]) {
     )
 }
 
+/// What the `sys-rand-echo` guest must commit under the public rule: everything from public data.
+fn echo_journal_by_the_rule(image_id: &[u8; 32], input: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let seed: [u8; 32] = Sha256::new()
+        .chain_update(zkminer_prover_protocol::sys_rand::SYS_RAND_DOMAIN)
+        .chain_update(image_id)
+        .chain_update(Sha256::digest(input))
+        .finalize()
+        .into();
+    let block = |i: u64| {
+        Sha256::new()
+            .chain_update(b"risc0-zkvm/sys_rand/v1")
+            .chain_update(seed)
+            .chain_update(i.to_le_bytes())
+            .finalize()
+    };
+    let stream: Vec<u8> = (0..2).flat_map(|i| block(i).to_vec()).collect();
+    // The guest's runtime takes the first 16 bytes before `main`.
+    stream[16..48].to_vec()
+}
+
+/// A guest that commits its `sys_rand` bytes: the journal is exactly what the public rule predicts,
+/// in separate worker processes and at different segment sizes. This is what a change to the seed
+/// function, the input it hashes, the image id's byte order or the fork's stream would break.
+#[test]
+#[ignore = "needs ZKMINER_TEST_RISC0_WORKER"]
+fn the_risc0_worker_seeds_a_guest_by_the_public_rule_in_every_process() {
+    let worker = PathBuf::from(
+        std::env::var("ZKMINER_TEST_RISC0_WORKER").expect("ZKMINER_TEST_RISC0_WORKER"),
+    );
+    let dir = temp_dir("sys-rand-rule");
+    let (echo, echo_id) = export(&worker, "sys-rand-echo", &dir);
+    let input = b"zkminer".to_vec();
+    let want = echo_journal_by_the_rule(&echo_id, &input);
+    for po2 in [18u8, 20] {
+        let pool = real_pool("risc0", worker.clone());
+        let m = pool
+            .execute_cycles(
+                "risc0",
+                &echo,
+                &input,
+                Some(Duration::from_secs(120)),
+                Some(echo_id),
+                Some(po2),
+            )
+            .expect("execute");
+        assert_eq!(
+            m.journal.as_deref(),
+            Some(&want[..]),
+            "the bytes the rule predicts, at po2 {po2}"
+        );
+        assert_eq!(m.host_entropy_reads, Some(1), "its one draw is counted");
+        pool.shutdown_all();
+    }
+    // Another input is another seed.
+    let pool = real_pool("risc0", worker);
+    let other = pool
+        .execute_cycles(
+            "risc0",
+            &echo,
+            b"zkminer!",
+            Some(Duration::from_secs(120)),
+            Some(echo_id),
+            Some(20),
+        )
+        .expect("execute");
+    assert_ne!(other.journal.as_deref(), Some(&want[..]));
+    assert_eq!(
+        other.journal.as_deref(),
+        Some(&echo_journal_by_the_rule(&echo_id, b"zkminer!")[..])
+    );
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `same_path` against the real worker: a plain guest runs the same at every size, in the guest's own
+/// cycles, though its padded count moves; one that reads the size does not.
+#[test]
+#[ignore = "needs ZKMINER_TEST_RISC0_WORKER"]
+fn the_risc0_worker_shows_which_guests_steer_on_the_segment_size() {
+    let worker = PathBuf::from(
+        std::env::var("ZKMINER_TEST_RISC0_WORKER").expect("ZKMINER_TEST_RISC0_WORKER"),
+    );
+    let dir = temp_dir("segment-size");
+    let (fib, fib_id) = export(&worker, "fibonacci", &dir);
+    let (steer, steer_id) = export(&worker, "segment-size-steer", &dir);
+    let pool = real_pool("risc0", worker);
+    let at = |elf: &[u8], id: [u8; 32], input: &[u8], po2: u8| {
+        pool.execute_cycles("risc0", elf, input, Some(Duration::from_secs(300)), Some(id), Some(po2))
+            .expect("execute")
+    };
+    let input = 10u32.to_le_bytes();
+    let base = at(&fib, fib_id, &input, 20);
+    assert!(base.user_cycles.is_some_and(|c| c > 0));
+    assert_eq!(base.keccak_cycles, Some(0));
+    for po2 in [16u8, 18, 22] {
+        assert!(base.same_path(&at(&fib, fib_id, &input, po2)), "fibonacci at po2 {po2}");
+    }
+    let at20 = at(&steer, steer_id, &[], 20);
+    let at19 = at(&steer, steer_id, &[], 19);
+    assert_eq!(at20.journal, at19.journal, "one journal, so the journal alone cannot tell");
+    assert_eq!(at20.host_entropy_reads, Some(0), "and it reads no randomness");
+    assert!(!at20.same_path(&at19), "its own cycles differ");
+    assert!(at20.cycles > at19.cycles * 4, "{} against {}", at20.cycles, at19.cycles);
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The keccak proof size is a host setting a guest can see, so a simulation fixes it: every measure
+/// worker gets the SDK's default whatever this host's environment says.
+#[test]
+fn a_measure_only_pool_pins_the_keccak_size_a_guest_can_see() {
+    use zkminer_prover_protocol::sys_rand::{RISC0_CANONICAL_KECCAK_PO2, RISC0_KECCAK_PO2_ENV};
+    let dir = temp_dir("keccak-pin");
+    let log = dir.join("env.log");
+    let path = dir.join("risc0-logs-env");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nenv >> {}\nexec env MOCK_BACKEND=risc0 {}\n",
+            log.display(),
+            mock_worker_path().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var(RISC0_KECCAK_PO2_ENV, "15");
+    let (pool, _) = measure_only_pool(HashMap::from([("risc0".to_string(), path)]));
+    std::env::remove_var(RISC0_KECCAK_PO2_ENV);
+    assert!(pool.measure_workers_live("risc0") > 0);
+    let seen = std::fs::read_to_string(&log).unwrap();
+    let want = format!("{RISC0_KECCAK_PO2_ENV}={RISC0_CANONICAL_KECCAK_PO2}");
+    assert!(seen.lines().any(|l| l == want), "pinned: {seen}");
+    assert!(
+        !seen.lines().any(|l| l == format!("{RISC0_KECCAK_PO2_ENV}=15")),
+        "not the host's"
+    );
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn real_pool(backend: &str, worker: PathBuf) -> WorkerPool {
     let (pool, connected) = measure_only_pool(HashMap::from([(backend.to_string(), worker)]));
     assert!(connected.is_empty());
@@ -455,14 +596,12 @@ fn the_risc0_worker_derives_its_guests_image_id_and_measures_it() {
     let dir = temp_dir("risc0-real");
     // The risc0 worker exports its fibonacci guest only.
     let (fib, fib_id) = export(&worker, "fibonacci", &dir);
-    // As `zkminer simulate` runs it under the indexer's unit: a HOME it cannot write (so no key file
-    // can be read or made there) and a `sys_rand` key for this run only, passed as not ephemeral. The
-    // worker must still return the journal, or every binding reads `unchecked`.
+    // As `zkminer simulate` runs it under the indexer's unit: a HOME it cannot write. The worker must
+    // still return the journal, or every binding reads `unchecked`.
     let home = dir.join("read-only-home");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
     std::env::set_var("HOME", &home);
-    zkminer_prover::worker::set_risc0_sys_rand_key([0x5a; 32], false);
     let pool = real_pool("risc0", worker);
     let d = pool
         .derive_program_id("risc0", &fib, Some(Duration::from_secs(60)))
@@ -500,7 +639,7 @@ fn the_risc0_worker_derives_its_guests_image_id_and_measures_it() {
     assert_eq!(
         m.journal.as_deref(),
         Some(&55u64.to_le_bytes()[..]),
-        "fibonacci(10) = 55, returned under the per-run key"
+        "fibonacci(10) = 55"
     );
     // It reads no host entropy past its runtime's own draw; and this build's count works (else None).
     assert_eq!(m.host_entropy_reads, Some(0));

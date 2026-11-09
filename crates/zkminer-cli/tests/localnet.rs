@@ -2291,6 +2291,7 @@ async fn simulate_reports_every_job() {
         "backends": backends,
         "zkminerVersion": env!("CARGO_PKG_VERSION"),
         "protocolVersion": zkminer_prover_protocol::PROTOCOL_VERSION,
+        "sysRandRule": zkminer_prover_protocol::sys_rand::SYS_RAND_RULE,
     });
     if lines.first() != Some(&ready) {
         failures.push(format!("--stdin's first line is {:?}, not {ready}", lines.first()));
@@ -2320,6 +2321,17 @@ async fn simulate_reports_every_job() {
         failures.push(format!("--stdin answered {shape:?}"));
     }
     let reports: Vec<&serde_json::Value> = lines.iter().filter(|r| r["jobId"].is_string()).collect();
+    // A measured risc0 run names the seed rule the indexer requires; SP1, with no host seed, names none.
+    for r in reports.iter().filter(|r| r["outcome"] == "measured") {
+        let want = (r["backend"] == "risc0").then_some(zkminer_prover_protocol::sys_rand::SYS_RAND_RULE);
+        if r["sysRandRule"].as_str() != want {
+            failures.push(format!("--stdin: a measured report should name rule {want:?}: {r}"));
+        }
+        let size = (r["backend"] == "risc0").then_some("same");
+        if r["sizeCheck"].as_str() != size {
+            failures.push(format!("--stdin: a measured report should say sizeCheck {size:?}: {r}"));
+        }
+    }
     // The indexer's own path gives what `--job` gave for the measurable ones, and says whether the
     // count is of the proven run: the honest journal matches, another differs, none is unknown.
     for (r, proven) in reports.iter().take(3).zip(["matches", "unknown", "differs"]) {

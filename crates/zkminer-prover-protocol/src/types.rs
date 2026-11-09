@@ -27,7 +27,11 @@ use serde::{Deserialize, Serialize};
 /// image id, the SP1 verifying-key hash), derived without executing it. A v10 worker cannot decode the
 /// command, so the handshake refuses it. And `ExecuteResult` gained `host_entropy_reads`, whether the
 /// guest read host-supplied nondeterministic input (both in the same unreleased version).
-pub const PROTOCOL_VERSION: u32 = 11;
+/// 12: no new field, a new meaning: the risc0 `sys_rand` seed is the public rule of `sys_rand.rs`, no key.
+/// A v11 worker would seed guests by its host's key, unlike a v12 one proving the same job. And
+/// `ExecuteResult` gained `user_cycles` and `keccak_cycles`, which `zkminer simulate` compares across
+/// segment sizes (both in the same unreleased version).
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -221,8 +225,8 @@ pub enum WorkerResponse {
         /// have run another path, and committed another journal, when its prover ran it, so a
         /// measurement with any is no evidence of the proven run.
         ///
-        /// risc0: the guest's `sys_rand` calls (the only syscall the host answers from entropy rather
-        /// than from the job's input or the run itself), less the one 4-word draw risc0's guest
+        /// risc0: the guest's `sys_rand` calls (the one syscall not answered from the job's input or
+        /// the run itself; the public seed answers it), less the one 4-word draw risc0's guest
         /// runtime makes before `main` for its memory-image entropy. A guest that reads that draw's
         /// bytes cannot be told from one that does not. `None` when the run drew nothing at all: a
         /// guest without risc0's runtime, or a count that does not work in this build.
@@ -231,6 +235,13 @@ pub enum WorkerResponse {
         /// `None` from any other worker: not counted.
         #[serde(default)]
         host_entropy_reads: Option<u64>,
+        /// The cycles the guest itself executed: no paging, no padding, so the same at every segment
+        /// size unless the guest steers on the size. `None` from a worker that has no such figure.
+        #[serde(default)]
+        user_cycles: Option<u64>,
+        /// The part of `cycles` that is keccak proof charges. `None` as for `user_cycles`.
+        #[serde(default)]
+        keccak_cycles: Option<u64>,
     },
     /// Progress update during proving.
     Progress {
