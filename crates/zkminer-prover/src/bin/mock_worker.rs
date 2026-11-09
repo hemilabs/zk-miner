@@ -175,6 +175,8 @@ fn main() {
                         Ok(v) => Some(v.trim().parse().expect("MOCK_HOST_ENTROPY_READS")),
                         Err(_) => Some(0),
                     },
+                    user_cycles: Some(1000),
+                    keccak_cycles: Some(0),
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }

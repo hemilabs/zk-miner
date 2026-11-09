@@ -580,9 +580,8 @@ pub(crate) type MeasuredJournal = Option<(alloy::primitives::B256, std::sync::Ar
 /// ~3 GiB of them; past this bound other entries are evicted, and an evicted pair is re-measured.
 const MEASURED_JOURNAL_BYTES_CAP: usize = 64 * 1024 * 1024;
 
-/// How long a real measurement that came back without its journal (a worker that could not vouch
-/// for it, such as one seeding `sys_rand` with a key for its process alone) sizes jobs before the
-/// pair is re-measured. It never makes a journal-bound job claimable; this only bounds how long those
+/// How long a real measurement that came back without its journal sizes jobs before the pair is
+/// re-measured (defensive: a worker reports every journal within the size a fulfil could carry). It never makes a journal-bound job claimable; this only bounds how long those
 /// jobs wait for a measurement that does. Not submitter-reachable: an over-cap journal is a permanent
 /// infeasible verdict instead.
 const MEASURED_NO_JOURNAL_TTL: Duration = Duration::from_secs(10 * 60);
@@ -1379,7 +1378,7 @@ fn note_claim_retry_after(job_id: alloy::primitives::B256, class: zkminer_chain:
 /// Post-claim FAILURE breaker. A claimed job whose (program, input) measured clean and then failed
 /// after the lock — ANY terminal prove failure (a guest fault, a watchdog kill, a health failure, a
 /// budget run-out) or an over-cap journal — pays the release penalty, and a submitter can assign NONE
-/// jobs to us without our consent. The risc0 worker seeds the guest's `sys_rand` per (ELF, input), so
+/// jobs to us without our consent. The risc0 worker seeds the guest's `sys_rand` per (image id, input), so
 /// a guest's randomness no longer splits its measurement from its proof; but proving still runs paths
 /// a measurement doesn't (the GPU, another segment size, more memory). Worker error text can carry
 /// guest-chosen strings, so this is deliberately class-agnostic: it cannot be evaded by choosing how
@@ -1923,7 +1922,7 @@ fn descriptor_carries_revert_lever(d: &zkminer_contracts::bindings::JobDescripto
 /// The pre-claim verdict on a job's journal binding: does the journal its (program, input) measured
 /// satisfy it, for `prover`? `None` when no whole journal measured on exactly this descriptor's input
 /// is in hand — never a reason to claim. The journal is a deterministic function of (ELF, input) (the
-/// risc0 worker seeds `sys_rand` per (ELF, input)), so a mismatch here is the `JournalMismatch` the
+/// risc0 worker seeds `sys_rand` per (image id, input)), so a mismatch here is the `JournalMismatch` the
 /// fulfil would revert after the lock.
 pub(crate) fn measured_binding_verdict(
     d: &zkminer_contracts::bindings::JobDescriptor,
@@ -2513,20 +2512,6 @@ pub async fn run(
             .collect(),
         benchmark_timeout,
     );
-    // One `sys_rand` key for every risc0 worker this miner spawns, loaded once: a measured journal is
-    // only worth checking a binding against if the proof that follows, on whichever worker, seeds the
-    // guest alike — and the measurements live in this process, as long as the key does.
-    {
-        let (key, err) = zkminer_prover_protocol::sys_rand::host_key(dirs::home_dir().as_deref());
-        if let Some(e) = &err {
-            tracing::warn!(
-                "risc0 sys_rand key file unusable ({e}): using a key for this run only, so no \
-                 journal-bound job is claimed (its journal could change when a lock is re-proved \
-                 after a restart)"
-            );
-        }
-        zkminer_prover::worker::set_risc0_sys_rand_key(key, err.is_some());
-    }
     // Watch-only proves nothing, and only measures what this build serves: no worker for another
     // backend (SP1's has host-wide startup effects: it installs its bundled `sp1-gpu-server` and
     // reaps orphaned servers' sockets, beside whatever miner runs on this host).
@@ -4774,6 +4759,27 @@ async fn miner_brain(
             .len();
         if n > 0 {
             tracing::info!("Loaded job journal with {n} claimed entries");
+        }
+    }
+    // A lock measured under another `sys_rand` rule re-proves under this one, and a guest whose journal
+    // or path follows its random bytes may then fail or commit something else: the binding check before
+    // the fulfil releases it rather than publish a proof that would revert. A held lock is the one
+    // thing that spans the rule, so say so while there is still time to look at it. (Run before
+    // recovery reconciles the journal, so an entry may turn out to be gone already.)
+    {
+        let stale = journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .measured_under_another_sys_rand_rule(zkminer_prover_protocol::sys_rand::SYS_RAND_RULE);
+        if !stale.is_empty() {
+            let ids: Vec<String> = stale.iter().map(|id| short_id(*id)).collect();
+            tracing::error!(
+                "PAGE: {} risc0 job(s) in the journal were measured under an older sys_rand rule ({}): a \
+                 guest whose journal or path depends on its random bytes may fail or commit something \
+                 else when re-proved, and is then released at the job's release penalty.",
+                stale.len(),
+                ids.join(", ")
+            );
         }
     }
     // Concurrency: run one job per detected GPU (bounded by max_concurrent_proofs).
@@ -11097,8 +11103,10 @@ async fn measure_cycles(
                     peak_host_bytes,
                     duration_secs,
                     // Simulate's evidence rule; the miner's own measure-matches-prove guarantee is the
-                    // shared seed key, not this count.
+                    // public seed, not this count.
                     host_entropy_reads: _,
+                    user_cycles: _,
+                    keccak_cycles: _,
                 } = measurement;
                 if paces_claims {
                     clear_preclaim_strikes(job_id);

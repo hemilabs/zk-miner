@@ -57,46 +57,17 @@ fn sanitize_worker_line(line: &str) -> String {
     out
 }
 
-/// The `sys_rand` key the miner hands every risc0 worker it spawns (see
-/// `zkminer_prover_protocol::sys_rand`), and whether it is for this run only. Unset (a benchmark, the
-/// tests): each worker reads the file.
-static RISC0_SYS_RAND_KEY: std::sync::OnceLock<([u8; 32], bool)> = std::sync::OnceLock::new();
-
-/// Set the key passed to risc0 workers spawned from now on (`ephemeral`: not the host's key file).
-/// Once per process.
-pub fn set_risc0_sys_rand_key(key: [u8; 32], ephemeral: bool) {
-    let _ = RISC0_SYS_RAND_KEY.set((key, ephemeral));
-}
-
-/// The environment a worker for `backend` starts with: `inherited` minus secret-named variables
-/// (and any inherited `sys_rand` key), then the dispatcher's `overrides`, then — for a risc0 worker
-/// only — the miner's `sys_rand` key (see [`set_risc0_sys_rand_key`]). Later entries win.
+/// The environment a worker starts with: `inherited` minus secret-named variables, then the
+/// dispatcher's `overrides`. Later entries win.
 fn worker_env(
-    backend: &str,
     inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     overrides: &HashMap<String, String>,
-    sys_rand_key: Option<&([u8; 32], bool)>,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    use zkminer_prover_protocol::sys_rand::{
-        encode_key, SYS_RAND_KEY_ENV, SYS_RAND_KEY_EPHEMERAL_ENV,
-    };
     let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = inherited
         .into_iter()
-        .filter(|(k, _)| {
-            !k.to_str().is_some_and(|n| {
-                is_secret_env_name(n) || n == SYS_RAND_KEY_ENV || n == SYS_RAND_KEY_EPHEMERAL_ENV
-            })
-        })
+        .filter(|(k, _)| !k.to_str().is_some_and(is_secret_env_name))
         .collect();
     env.extend(overrides.iter().map(|(k, v)| (k.into(), v.into())));
-    if backend.starts_with("risc0") {
-        if let Some((key, ephemeral)) = sys_rand_key {
-            env.push((SYS_RAND_KEY_ENV.into(), encode_key(key).into()));
-            if *ephemeral {
-                env.push((SYS_RAND_KEY_EPHEMERAL_ENV.into(), "1".into()));
-            }
-        }
-    }
     env
 }
 
@@ -671,12 +642,7 @@ impl WorkerHandle {
         // `env_clear()` alone, so PATH / HOME / LD_LIBRARY_PATH / CUDA_* and everything the worker
         // genuinely needs are preserved. The dispatcher's explicit overrides are applied last.
         cmd.env_clear();
-        cmd.envs(worker_env(
-            backend,
-            std::env::vars_os(),
-            env_overrides,
-            RISC0_SYS_RAND_KEY.get(),
-        ));
+        cmd.envs(worker_env(std::env::vars_os(), env_overrides));
 
         // Kill worker if parent process dies (prevents orphan GPU processes after host crash).
         // PR_SET_PDEATHSIG is Linux-specific.
@@ -1864,65 +1830,6 @@ mod tests {
         let huge = "A".repeat(10_000);
         let out = sanitize_worker_line(&huge);
         assert!(out.len() < 10_000 && out.ends_with("…[truncated]"));
-    }
-
-    #[test]
-    fn only_a_risc0_worker_gets_the_miners_sys_rand_key() {
-        use zkminer_prover_protocol::sys_rand::{
-            encode_key, SYS_RAND_KEY_ENV, SYS_RAND_KEY_EPHEMERAL_ENV,
-        };
-        let inherited = || {
-            [
-                ("PATH", "/usr/bin"),
-                ("ZKMINER_PRIVATE_KEY", "0xdead"),
-                (SYS_RAND_KEY_ENV, "00"),
-                (SYS_RAND_KEY_EPHEMERAL_ENV, "1"),
-            ]
-            .map(|(k, v)| (k.into(), v.into()))
-        };
-        let overrides = std::collections::HashMap::from([(
-            "CUDA_VISIBLE_DEVICES".to_string(),
-            "1".to_string(),
-        )]);
-        let get = |env: &[(std::ffi::OsString, std::ffi::OsString)], k: &str| {
-            env.iter()
-                .rev()
-                .find(|(n, _)| n == k)
-                .map(|(_, v)| v.to_str().unwrap().to_string())
-        };
-        let key = [7u8; 32];
-        let risc0 = super::worker_env("risc0", inherited(), &overrides, Some(&(key, false)));
-        assert_eq!(get(&risc0, "PATH").as_deref(), Some("/usr/bin"));
-        assert_eq!(get(&risc0, "CUDA_VISIBLE_DEVICES").as_deref(), Some("1"));
-        assert_eq!(
-            get(&risc0, "ZKMINER_PRIVATE_KEY"),
-            None,
-            "the signing key never reaches a worker"
-        );
-        assert_eq!(
-            get(&risc0, SYS_RAND_KEY_ENV),
-            Some(encode_key(&key)),
-            "the miner's, not an inherited one"
-        );
-        assert_eq!(
-            get(&risc0, SYS_RAND_KEY_EPHEMERAL_ENV),
-            None,
-            "nor an inherited flag"
-        );
-        let ephemeral = super::worker_env("risc0", inherited(), &overrides, Some(&(key, true)));
-        assert_eq!(
-            get(&ephemeral, SYS_RAND_KEY_EPHEMERAL_ENV).as_deref(),
-            Some("1")
-        );
-        let sp1 = super::worker_env("sp1", inherited(), &overrides, Some(&(key, false)));
-        assert_eq!(get(&sp1, SYS_RAND_KEY_ENV), None, "no other worker gets it");
-        assert_eq!(get(&sp1, SYS_RAND_KEY_EPHEMERAL_ENV), None);
-        let unset = super::worker_env("risc0", inherited(), &overrides, None);
-        assert_eq!(
-            get(&unset, SYS_RAND_KEY_ENV),
-            None,
-            "no miner key: the worker reads the file"
-        );
     }
 
     #[test]
