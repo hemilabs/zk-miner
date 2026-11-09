@@ -348,7 +348,7 @@ fn main() {
                 None => builder.build(),
             }
         };
-        let results = run_benchmarks(&prover);
+        let results = run_benchmarks(&prover, &mut |_, _, _| {});
         for r in &results {
             eprintln!(
                 "{:<16} {:>12} cycles  {:>8.2}s  {:>12.0} c/s  weight={:.2}  precompile={}",
@@ -1490,7 +1490,17 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 }
                 match get_prover!(prover) {
                     Ok(p) => {
-                        let results = run_benchmarks(p);
+                        let results = run_benchmarks(p, &mut |entry, program_index, total| {
+                            // A closed pipe is reported by the final result's write below.
+                            let _ = write_message(
+                                &mut stdout,
+                                &WorkerResponse::BenchmarkProgress {
+                                    entry: entry.clone(),
+                                    program_index,
+                                    total_programs: total,
+                                },
+                            );
+                        });
                         let resp = WorkerResponse::BenchmarkResult { results };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -2145,7 +2155,11 @@ fn run_proof(
     Ok((journal, seal, duration_secs, cycles))
 }
 
-fn run_benchmarks(prover: &sp1_sdk::blocking::CudaProver) -> Vec<BenchmarkEntry> {
+/// Run the suite, calling `on_done(entry, 1-based program index, total)` after each program.
+fn run_benchmarks(
+    prover: &sp1_sdk::blocking::CudaProver,
+    on_done: &mut dyn FnMut(&BenchmarkEntry, u32, u32),
+) -> Vec<BenchmarkEntry> {
     let mut results = Vec::new();
 
     let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
@@ -2198,14 +2212,18 @@ fn run_benchmarks(prover: &sp1_sdk::blocking::CudaProver) -> Vec<BenchmarkEntry>
     // compressed run's speed, and the first proof in a fresh worker also pays GPU warm-up, which would
     // land in one run and not the other. By the last program that has long been paid.
     let last_runnable = benchmarks.iter().rposition(|&(_, elf, ..)| !elf.is_empty());
+    let total = benchmarks.iter().filter(|b| !b.1.is_empty()).count() as u32;
+    let mut program_index = 0;
     for (idx, &(name, elf, input, weight, precompile)) in benchmarks.iter().enumerate() {
         if elf.is_empty() {
             continue;
         }
+        program_index += 1;
         let measure_wrap = Some(idx) == last_runnable;
         if let Some(entry) =
             benchmark_program(prover, name, elf, input, weight, precompile, measure_wrap)
         {
+            on_done(&entry, program_index, total);
             results.push(entry);
         }
     }

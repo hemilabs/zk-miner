@@ -56,12 +56,29 @@ pub struct BenchmarkProgressEvent {
     pub pci_bus_id: Option<String>,
     /// GPU tag: "cuda", "rocm", "generic"
     pub gpu_tag: String,
-    /// The benchmark entry that just completed
-    pub entry: zkminer_prover_protocol::BenchmarkEntry,
-    /// 1-based program index
-    pub program_index: u32,
-    /// Total programs in suite
-    pub total_programs: u32,
+    /// What just happened on this slot.
+    pub kind: BenchmarkProgressKind,
+}
+
+/// The stages of one slot's benchmark, in the order they are reported.
+#[derive(Debug, Clone)]
+pub enum BenchmarkProgressKind {
+    /// This slot will run. Every slot is announced before the first one starts, so a progress view
+    /// knows the whole queue rather than discovering cards as their first results arrive.
+    Queued,
+    /// This slot is now running. Sent before its setup, which on SP1 is a long wait.
+    Started,
+    /// One program finished on this slot.
+    ProgramDone {
+        /// The benchmark entry that just completed
+        entry: zkminer_prover_protocol::BenchmarkEntry,
+        /// 1-based program index
+        program_index: u32,
+        /// Total programs in suite
+        total_programs: u32,
+    },
+    /// This slot is finished. `succeeded` is false when it produced no results.
+    Finished { succeeded: bool },
 }
 
 /// What a pre-claim `Execute` measured (see [`WorkerPool::execute_cycles`]).
@@ -1769,6 +1786,8 @@ pub struct WorkerPool {
     /// When set, `discover_and_spawn` starts workers for these backends only (see
     /// [`Self::only_backends`]).
     only_backends: Option<HashSet<String>>,
+    /// Told what `discover_and_spawn` is doing, for a startup display.
+    progress: Option<Box<dyn Fn(String) + Send + Sync>>,
 }
 
 /// Round-robin counter for load balancing across multiple GPU workers.
@@ -1798,6 +1817,18 @@ impl WorkerPool {
             shm_ledger: crate::memory::MemoryLedger::default(),
             inflight_measures: Mutex::new(HashMap::new()),
             only_backends: None,
+            progress: None,
+        }
+    }
+
+    /// Calls `report` with a short description of each step `discover_and_spawn` starts.
+    pub fn set_progress(&mut self, report: impl Fn(String) + Send + Sync + 'static) {
+        self.progress = Some(Box::new(report));
+    }
+
+    fn report_progress(&self, text: String) {
+        if let Some(report) = &self.progress {
+            report(text);
         }
     }
 
@@ -2069,6 +2100,10 @@ impl WorkerPool {
             path,
         } in discovered
         {
+            self.report_progress(match &gpu_name {
+                Some(gpu) => format!("Starting the {backend} prover on {gpu}"),
+                None => format!("Starting the {backend} prover"),
+            });
             if backend == zkminer_prover_protocol::BACKEND_SP1 && sp1_measure_path.is_none() {
                 sp1_measure_path = Some(path.clone());
             }
@@ -2309,6 +2344,7 @@ impl WorkerPool {
         // /dev/shm — must NOT be collateral-skipped by that, or risc0 would silently fall back to the
         // measure-kills-warm-prover in-process path on small-/dev/shm hosts.
         if let Some(path) = risc0_measure_path {
+            self.report_progress("Starting the risc0 cycle-measuring workers".to_string());
             let backend = zkminer_prover_protocol::BACKEND_RISC0.to_string();
             // Default 2 (like SP1): a single measure worker lets one slow/stuck ~120 s measurement
             // serialize ALL risc0 sizing until its watchdog fires. A POOL keeps a second measurement
@@ -2397,6 +2433,7 @@ impl WorkerPool {
         // multi-threaded tokio runtime), and they run concurrent CPU executions alongside GPU proofs;
         // host-RAM admission on the measure path (added separately) bounds the aggregate.
         if let Some(path) = sp1_measure_path {
+            self.report_progress("Starting the sp1 cycle-measuring workers".to_string());
             // Layer-B /dev/shm guard (locked #3). The SP1 native executor stages its trace ring and
             // memory image in /dev/shm; a tmpfs too small to hold even the (now 2-slot, ~4 GiB) ring
             // makes every measure SIGBUS the instant it is touched — the 64 MiB Docker default being
@@ -2625,6 +2662,19 @@ impl WorkerPool {
     /// exceeded the pool on >=3-GPU rigs (over-spawning into the "all slots busy" race).
     pub fn measure_worker_count(&self, backend: &str) -> Option<usize> {
         self.measure_workers.get(backend).map(|p| p.len())
+    }
+
+    /// The (benchmark device id, backend) pair of every GPU prove worker: the rows a complete
+    /// benchmark suite has. Reads only the slot keys, so it never waits on a running proof.
+    pub fn benchmark_targets(&self) -> Vec<(String, String)> {
+        self.workers
+            .keys()
+            .filter_map(|key| {
+                let parts: Vec<&str> = key.split(':').collect();
+                (parts.len() == 3 && matches!(parts[1], "cuda" | "rocm" | "intel"))
+                    .then(|| (Self::benchmark_device_id(key), parts[0].to_string()))
+            })
+            .collect()
     }
 
     /// Measure-pool LIVENESS for `backend` (distinct from idleness): `None` if the backend has no
@@ -3598,9 +3648,11 @@ impl WorkerPool {
                 device_index,
                 pci_bus_id: slot_pci_bus_id.clone(),
                 gpu_tag: gpu_tag.clone(),
-                entry: entry.clone(),
-                program_index: idx,
-                total_programs: total,
+                kind: BenchmarkProgressKind::ProgramDone {
+                    entry: entry.clone(),
+                    program_index: idx,
+                    total_programs: total,
+                },
             });
         };
 
@@ -3623,10 +3675,33 @@ impl WorkerPool {
         }
     }
 
+    /// A progress event for `key`, carrying that slot's card details.
+    fn benchmark_event(
+        &self,
+        key: &str,
+        kind: BenchmarkProgressKind,
+    ) -> Option<BenchmarkProgressEvent> {
+        let slot = self
+            .workers
+            .get(key)?
+            .slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Some(BenchmarkProgressEvent {
+            slot_key: key.to_string(),
+            gpu_name: slot.gpu_name.clone(),
+            device_index: slot.device_index,
+            pci_bus_id: slot.pci_bus_id.clone(),
+            gpu_tag: slot.gpu_tag.clone(),
+            kind,
+        })
+    }
+
     /// Run benchmarks on all connected workers with per-program streaming progress.
     ///
     /// Same as `benchmark_all_with_device_info` but sends `BenchmarkProgressEvent`
-    /// through the callback as each benchmark program completes on each GPU.
+    /// through the callback as each slot is queued, starts and finishes, and as each
+    /// benchmark program completes on each GPU.
     pub fn benchmark_all_streaming(
         &self,
         on_progress: &dyn Fn(BenchmarkProgressEvent),
@@ -3666,6 +3741,19 @@ impl WorkerPool {
             })
             .collect();
 
+        // Announce the whole queue first, applying the same skip as the loop below.
+        for key in &keys {
+            let skipped = self.workers.get(key).is_some_and(|entry| {
+                let slot = entry.slot.lock().unwrap_or_else(|e| e.into_inner());
+                slot.gpu_tag == "generic" && gpu_backends.contains(&slot.backend)
+            });
+            if !skipped {
+                if let Some(event) = self.benchmark_event(key, BenchmarkProgressKind::Queued) {
+                    on_progress(event);
+                }
+            }
+        }
+
         let mut recycled_keys: Vec<String> = Vec::new();
 
         for key in keys {
@@ -3693,7 +3781,16 @@ impl WorkerPool {
                 continue;
             }
 
+            if let Some(event) = self.benchmark_event(&key, BenchmarkProgressKind::Started) {
+                on_progress(event);
+            }
             let outcome = self.benchmark_slot_streaming(&key, on_progress);
+            let succeeded = matches!(&outcome, Ok(entries) if !entries.is_empty());
+            if let Some(event) =
+                self.benchmark_event(&key, BenchmarkProgressKind::Finished { succeeded })
+            {
+                on_progress(event);
+            }
             // See `benchmark_all_with_device_info`.
             let card_was_busy = outcome.as_ref().err().is_some_and(|e| {
                 e.downcast_ref::<zkminer_prover_protocol::types::ProofDeadlineReached>()

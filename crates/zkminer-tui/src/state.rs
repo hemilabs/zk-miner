@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 use zkminer_chain::jobs::JobInfo;
 use zkminer_chain::staking::{ProverStatistics, StakeInfo};
 use zkminer_prover::benchmark::BenchmarkSuite;
+use zkminer_prover::dispatcher::{BenchmarkProgressEvent, BenchmarkProgressKind};
 use zkminer_prover::engine::BackendSource;
 
 use crate::gpu_tuning::GpuTuningState;
@@ -401,6 +402,10 @@ pub struct MinerState {
     /// Published by the brain; empty until it runs.
     pub risc0_job_po2s: Vec<(String, Option<u8>)>,
     pub benchmark_running: bool,
+    /// The benchmark started at launch is still running. It has the cards, so no job is claimed.
+    pub startup_benchmark_pending: bool,
+    /// The launch benchmark took the screen from the Setup wizard; a key returns there afterwards.
+    pub return_to_setup_after_benchmark: bool,
     /// Which device is selected in the benchmark screen (0 = CPU, 1+ = GPUs).
     pub benchmark_selected_device: usize,
     /// Device currently being re-benchmarked (None = idle, Some = device_id).
@@ -509,6 +514,10 @@ pub struct DeviceProgress {
     pub slot_key: String,
     pub device_id: String,
     pub device_label: String,
+    /// The card's model without vendor names and trademarks, e.g. "RTX 4090" or "Arc A770".
+    pub short_name: String,
+    /// The prover's per-vendor index of this card. Tells apart cards of the same model.
+    pub ordinal: u32,
     /// Canonical PCI bus id of the card this row is measuring, when known.
     /// Join on this to find the physical card -- see `GpuInfo::benchmark_device_id`.
     pub pci_bus_id: Option<String>,
@@ -516,11 +525,38 @@ pub struct DeviceProgress {
     pub gpu_tag: String,
     pub programs: Vec<ProgramProgress>,
     pub complete: bool,
+    /// The slot finished without producing results.
+    pub failed: bool,
     /// Partial zkOP/s score computed from completed programs.
     pub partial_zkops: Option<f64>,
 }
 
+/// Shorten a driver-reported GPU name for places that have to fit several of them on one line.
+fn short_gpu_name(name: &str) -> String {
+    let cleaned = name.replace("(R)", "").replace("(TM)", "");
+    let cleaned = cleaned.trim();
+    let cleaned = cleaned.strip_suffix(" Graphics").unwrap_or(cleaned);
+    let cleaned = ["NVIDIA ", "Intel ", "AMD "]
+        .iter()
+        .find_map(|vendor| cleaned.strip_prefix(vendor))
+        .unwrap_or(cleaned);
+    cleaned
+        .strip_prefix("GeForce ")
+        .unwrap_or(cleaned)
+        .to_string()
+}
+
 impl DeviceProgress {
+    /// The zkVM this row is measuring, from the slot key (`"risc0:cuda:0"` -> `"RISC Zero"`).
+    pub fn backend_label(&self) -> &str {
+        match self.slot_key.split(':').next().unwrap_or_default() {
+            "risc0" => "RISC Zero",
+            "sp1" => "SP1",
+            "openvm" => "OpenVM",
+            other => other,
+        }
+    }
+
     /// Extract the prover-side device index from the device_id (`"gpu0"` -> 0).
     ///
     /// This is the PROVER's per-vendor index. It is NOT `GpuInfo.index`, which is
@@ -558,34 +594,74 @@ pub struct BenchmarkTracker {
 }
 
 impl BenchmarkTracker {
-    /// Update progress when a program completes on a device.
-    pub fn on_progress(
-        &mut self,
-        slot_key: &str,
-        gpu_name: Option<&str>,
-        device_index: Option<u32>,
-        pci_bus_id: Option<&str>,
-        gpu_tag: &str,
-        entry: &zkminer_prover_protocol::BenchmarkEntry,
-        program_index: u32,
-        total_programs: u32,
-    ) {
-        let idx = device_index.unwrap_or(0);
+    /// Record one benchmark event.
+    pub fn apply(&mut self, event: &BenchmarkProgressEvent) {
+        tracing::debug!("benchmark progress on {}: {:?}", event.slot_key, event.kind);
+        let pos = self.device_position(event);
+        match &event.kind {
+            BenchmarkProgressKind::Queued => {}
+            BenchmarkProgressKind::Started => {
+                self.active_device_index = pos;
+                if let Some(first) = self.devices[pos].programs.first_mut() {
+                    if first.phase == ProgramPhase::Pending {
+                        first.phase = ProgramPhase::Running;
+                    }
+                }
+            }
+            BenchmarkProgressKind::ProgramDone {
+                entry,
+                program_index,
+                total_programs,
+            } => self.on_program_done(pos, entry, *program_index, *total_programs),
+            BenchmarkProgressKind::Finished { succeeded } => {
+                let dev = &mut self.devices[pos];
+                // A worker that never streams still succeeds with nothing reported per program, so
+                // its running row is not a failure. After streamed results, it is one.
+                let streamed = dev.programs.iter().any(|p| p.phase == ProgramPhase::Done);
+                let unfinished = if *succeeded && !streamed {
+                    ProgramPhase::Pending
+                } else {
+                    ProgramPhase::Failed
+                };
+                for prog in &mut dev.programs {
+                    if prog.phase == ProgramPhase::Running {
+                        prog.phase = unfinished.clone();
+                    }
+                }
+                dev.complete = true;
+                dev.failed = !*succeeded;
+            }
+        }
+        self.all_complete = !self.devices.is_empty() && self.devices.iter().all(|d| d.complete);
+    }
+
+    /// The tracker row for this event's slot, creating it if this is the first event for the slot.
+    fn device_position(&mut self, event: &BenchmarkProgressEvent) -> usize {
+        if let Some(pos) = self
+            .devices
+            .iter()
+            .position(|d| d.slot_key == event.slot_key)
+        {
+            return pos;
+        }
+        let idx = event.device_index.unwrap_or(0);
         // Must match `WorkerPool::benchmark_device_id` / the benchmark writer:
         // tag-qualified so a cuda and a rocm card at index 0 do not collide.
         let device_id =
-            zkminer_prover::dispatcher::WorkerPool::gpu_device_id(gpu_tag, &idx.to_string());
-        let device_label = match gpu_name {
+            zkminer_prover::dispatcher::WorkerPool::gpu_device_id(&event.gpu_tag, &idx.to_string());
+        let device_label = match event.gpu_name.as_deref() {
             Some(name) => format!("GPU{idx} {name}"),
             None => format!("GPU{idx}"),
         };
-
-        // Find or create device entry
-        let dev = if let Some(pos) = self.devices.iter().position(|d| d.slot_key == slot_key) {
-            &mut self.devices[pos]
-        } else {
-            let make_prog = |name: &str| ProgramProgress {
-                name: name.into(),
+        let short_name = match event.gpu_name.as_deref() {
+            Some(name) => short_gpu_name(name),
+            None if event.gpu_tag == "generic" => "CPU".to_string(),
+            None => format!("GPU{idx}"),
+        };
+        let programs = zkminer_prover::benchmark::BENCHMARK_PROGRAMS
+            .iter()
+            .map(|program| ProgramProgress {
+                name: program.name.into(),
                 phase: ProgramPhase::Pending,
                 throughput: None,
                 duration_secs: None,
@@ -594,28 +670,59 @@ impl BenchmarkTracker {
                 prover_backend: None,
                 weight: None,
                 precompile: None,
-            };
-            let programs = vec![
-                make_prog("fibonacci"),
-                make_prog("sha256-chain"),
-                make_prog("ecdsa-verify"),
-                make_prog("bigint-mul"),
-                make_prog("memory-merkle"),
-                make_prog("chacha-mix"),
-            ];
-            self.active_device_index = self.devices.len();
-            self.devices.push(DeviceProgress {
-                slot_key: slot_key.to_string(),
-                device_id,
-                device_label,
-                pci_bus_id: pci_bus_id.map(str::to_string),
-                gpu_tag: gpu_tag.to_string(),
-                programs,
-                complete: false,
-                partial_zkops: None,
-            });
-            self.devices.last_mut().unwrap()
-        };
+            })
+            .collect();
+        self.devices.push(DeviceProgress {
+            slot_key: event.slot_key.clone(),
+            device_id,
+            device_label,
+            short_name,
+            ordinal: idx,
+            pci_bus_id: event.pci_bus_id.clone(),
+            gpu_tag: event.gpu_tag.clone(),
+            programs,
+            complete: false,
+            failed: false,
+            partial_zkops: None,
+        });
+        self.devices.len() - 1
+    }
+
+    /// A compact name for this row: the card and the zkVM, numbered only when two rows would
+    /// otherwise read the same (two RTX 4090s in one machine).
+    pub fn display_name(&self, dev: &DeviceProgress) -> String {
+        let same_model_elsewhere = self
+            .devices
+            .iter()
+            .any(|d| d.short_name == dev.short_name && d.ordinal != dev.ordinal);
+        if same_model_elsewhere {
+            format!(
+                "{} #{} {}",
+                dev.short_name,
+                dev.ordinal,
+                dev.backend_label()
+            )
+        } else {
+            format!("{} {}", dev.short_name, dev.backend_label())
+        }
+    }
+
+    /// The row being benchmarked right now, if any.
+    pub fn active_device(&self) -> Option<&DeviceProgress> {
+        self.devices
+            .get(self.active_device_index)
+            .filter(|d| !d.complete)
+    }
+
+    /// Update progress when a program completes on a device.
+    fn on_program_done(
+        &mut self,
+        pos: usize,
+        entry: &zkminer_prover_protocol::BenchmarkEntry,
+        program_index: u32,
+        total_programs: u32,
+    ) {
+        let dev = &mut self.devices[pos];
 
         // Mark the completed program
         if let Some(prog) = dev
@@ -665,9 +772,6 @@ impl BenchmarkTracker {
 
         // Check if device is complete
         dev.complete = program_index >= total_programs;
-
-        // Check if all devices are complete
-        self.all_complete = !self.devices.is_empty() && self.devices.iter().all(|d| d.complete);
     }
 
     /// Total completed programs across all devices.
@@ -701,6 +805,8 @@ impl Default for MinerState {
             benchmark_results: None,
             risc0_job_po2s: Vec::new(),
             benchmark_running: false,
+            startup_benchmark_pending: false,
+            return_to_setup_after_benchmark: false,
             benchmark_selected_device: 0,
             benchmark_device_in_progress: None,
             hardware: HardwareInfo::default(),
@@ -789,4 +895,162 @@ pub type SharedState = Arc<RwLock<MinerState>>;
 
 pub fn new_shared_state() -> SharedState {
     Arc::new(RwLock::new(MinerState::default()))
+}
+
+#[cfg(test)]
+mod benchmark_tracker_tests {
+    use super::*;
+
+    fn event(
+        slot_key: &str,
+        name: &str,
+        index: u32,
+        kind: BenchmarkProgressKind,
+    ) -> BenchmarkProgressEvent {
+        BenchmarkProgressEvent {
+            slot_key: slot_key.to_string(),
+            gpu_name: Some(name.to_string()),
+            device_index: Some(index),
+            pci_bus_id: None,
+            gpu_tag: slot_key.split(':').nth(1).unwrap().to_string(),
+            kind,
+        }
+    }
+
+    fn program_done(name: &str, program_index: u32) -> BenchmarkProgressKind {
+        BenchmarkProgressKind::ProgramDone {
+            entry: zkminer_prover_protocol::BenchmarkEntry {
+                program_name: name.to_string(),
+                prover_backend: "risc0".to_string(),
+                cycles: 1_000,
+                duration_secs: 1.0,
+                throughput: 1_000.0,
+                weight: 0.1,
+                precompile: false,
+                wrap_secs: None,
+            },
+            program_index,
+            total_programs: 6,
+        }
+    }
+
+    const RTX: &str = "NVIDIA GeForce RTX 4090";
+    const ARC: &str = "Intel(R) Arc(TM) A770 Graphics";
+
+    fn queued() -> BenchmarkTracker {
+        let mut tracker = BenchmarkTracker::default();
+        for (key, name) in [
+            ("risc0:cuda:0", RTX),
+            ("sp1:cuda:0", RTX),
+            ("risc0:intel:0", ARC),
+        ] {
+            tracker.apply(&event(key, name, 0, BenchmarkProgressKind::Queued));
+        }
+        tracker
+    }
+
+    #[test]
+    fn the_whole_queue_is_known_before_the_first_result() {
+        let mut tracker = queued();
+        tracker.apply(&event(
+            "risc0:cuda:0",
+            RTX,
+            0,
+            BenchmarkProgressKind::Started,
+        ));
+
+        assert_eq!(tracker.devices.len(), 3);
+        assert_eq!(tracker.total_count(), 18);
+        let active = tracker.active_device().expect("a card is running");
+        assert_eq!(tracker.display_name(active), "RTX 4090 RISC Zero");
+        assert_eq!(active.programs[0].phase, ProgramPhase::Running);
+    }
+
+    #[test]
+    fn finishing_one_card_does_not_end_the_progress_view() {
+        let mut tracker = queued();
+        tracker.apply(&event(
+            "risc0:cuda:0",
+            RTX,
+            0,
+            BenchmarkProgressKind::Started,
+        ));
+        tracker.apply(&event(
+            "risc0:cuda:0",
+            RTX,
+            0,
+            program_done("chacha-mix", 6),
+        ));
+        tracker.apply(&event(
+            "risc0:cuda:0",
+            RTX,
+            0,
+            BenchmarkProgressKind::Finished { succeeded: true },
+        ));
+
+        assert!(tracker.devices[0].complete);
+        assert!(!tracker.all_complete);
+        assert!(tracker.active_device().is_none(), "between cards");
+
+        tracker.apply(&event("sp1:cuda:0", RTX, 0, BenchmarkProgressKind::Started));
+        let active = tracker.active_device().expect("the next card is running");
+        assert_eq!(tracker.display_name(active), "RTX 4090 SP1");
+    }
+
+    #[test]
+    fn a_failed_slot_is_marked_and_does_not_stall_the_run() {
+        let mut tracker = BenchmarkTracker::default();
+        let key = "sp1:cuda:0";
+        tracker.apply(&event(key, RTX, 0, BenchmarkProgressKind::Queued));
+        tracker.apply(&event(key, RTX, 0, BenchmarkProgressKind::Started));
+        tracker.apply(&event(
+            key,
+            RTX,
+            0,
+            BenchmarkProgressKind::Finished { succeeded: false },
+        ));
+
+        assert!(tracker.devices[0].failed);
+        assert_eq!(tracker.devices[0].programs[0].phase, ProgramPhase::Failed);
+        assert!(tracker.all_complete);
+    }
+
+    #[test]
+    fn a_worker_that_does_not_stream_is_not_shown_as_failed() {
+        let mut tracker = BenchmarkTracker::default();
+        let key = "openvm:cuda:0";
+        tracker.apply(&event(key, RTX, 0, BenchmarkProgressKind::Started));
+        tracker.apply(&event(
+            key,
+            RTX,
+            0,
+            BenchmarkProgressKind::Finished { succeeded: true },
+        ));
+
+        assert!(!tracker.devices[0].failed);
+        assert_eq!(tracker.devices[0].programs[0].phase, ProgramPhase::Pending);
+    }
+
+    #[test]
+    fn identical_cards_are_numbered_and_different_ones_are_not() {
+        let mut tracker = BenchmarkTracker::default();
+        tracker.apply(&event("sp1:cuda:0", RTX, 0, BenchmarkProgressKind::Queued));
+        tracker.apply(&event("sp1:cuda:1", RTX, 1, BenchmarkProgressKind::Queued));
+        tracker.apply(&event("sp1:intel:0", ARC, 0, BenchmarkProgressKind::Queued));
+
+        assert_eq!(tracker.display_name(&tracker.devices[0]), "RTX 4090 #0 SP1");
+        assert_eq!(tracker.display_name(&tracker.devices[1]), "RTX 4090 #1 SP1");
+        assert_eq!(tracker.display_name(&tracker.devices[2]), "Arc A770 SP1");
+    }
+
+    #[test]
+    fn gpu_names_are_shortened_without_losing_the_model() {
+        assert_eq!(short_gpu_name(RTX), "RTX 4090");
+        assert_eq!(short_gpu_name(ARC), "Arc A770");
+        assert_eq!(
+            short_gpu_name("Intel(R) Arc(TM) Pro B70 Graphics"),
+            "Arc Pro B70"
+        );
+        assert_eq!(short_gpu_name("AMD Radeon RX 9070 XT"), "Radeon RX 9070 XT");
+    }
 }

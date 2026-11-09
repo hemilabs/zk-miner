@@ -173,9 +173,14 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
         ]
     };
 
+    let title = if state.return_to_setup_after_benchmark && !state.startup_benchmark_pending {
+        " Benchmark - press any key to continue to setup "
+    } else {
+        " Benchmark "
+    };
     let cpu = Paragraph::new(cpu_info).block(
         Block::default()
-            .title(Span::styled(" Benchmark ", theme::title()))
+            .title(Span::styled(title, theme::title()))
             .borders(Borders::ALL)
             .border_style(theme::border())
             .border_type(theme::border_type()),
@@ -435,20 +440,47 @@ fn render_device_benchmarks(f: &mut Frame, area: Rect, state: &MinerState) {
 // Progress view — redesigned with per-device focus, live telemetry, and scores
 // ---------------------------------------------------------------------------
 
+/// Lay `items` out left to right, starting a new line rather than splitting an item.
+fn wrap_items(items: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
+    const GAP: &str = "   ";
+    let mut lines = Vec::new();
+    let mut current: Vec<Span<'static>> = vec![Span::raw(" ")];
+    let mut used = 1;
+    for item in items {
+        let len = item.content.chars().count();
+        if current.len() > 1 && used + GAP.len() + len > width {
+            lines.push(Line::from(std::mem::replace(
+                &mut current,
+                vec![Span::raw(" ")],
+            )));
+            used = 1;
+        }
+        if current.len() > 1 {
+            current.push(Span::raw(GAP));
+            used += GAP.len();
+        }
+        used += len;
+        current.push(item);
+    }
+    lines.push(Line::from(current));
+    lines
+}
+
 fn render_progress_view(f: &mut Frame, area: Rect, state: &MinerState, tracker: &BenchmarkTracker) {
+    let tabs = device_tab_lines(tracker, area.width.saturating_sub(2) as usize);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header with progress bar
-            Constraint::Length(3), // Device tabs
-            Constraint::Min(10),   // Program table (main content)
-            Constraint::Length(5), // GPU telemetry
-            Constraint::Length(5), // Score + controls
+            Constraint::Length(3),                     // Header with progress bar
+            Constraint::Length(tabs.len() as u16 + 2), // Device tabs
+            Constraint::Min(10),                       // Program table (main content)
+            Constraint::Length(5),                     // GPU telemetry
+            Constraint::Length(5),                     // Score + controls
         ])
         .split(area);
 
     render_progress_header(f, chunks[0], state, tracker);
-    render_device_tabs(f, chunks[1], tracker);
+    render_device_tabs(f, chunks[1], tabs);
     render_program_table(f, chunks[2], state, tracker);
     render_gpu_telemetry(f, chunks[3], state, tracker);
     render_score_and_controls(f, chunks[4], state, tracker);
@@ -466,8 +498,16 @@ fn render_progress_header(
         .unwrap_or(0);
     let done = tracker.completed_count();
     let total = tracker.total_count().max(1);
-    let completed_gpus = tracker.devices.iter().filter(|d| d.complete).count();
-    let total_gpus = tracker.devices.len();
+    // Between two cards the finished worker is shut down and its memory reclaimed.
+    let current = tracker
+        .active_device()
+        .map(|d| tracker.display_name(d))
+        .unwrap_or_else(|| "next GPU".to_string());
+    let verb = if tracker.active_device().is_some() {
+        "Benchmarking"
+    } else {
+        "Preparing"
+    };
 
     let spinners = ['|', '/', '-', '\\'];
     let spinner = spinners[state.tick_count as usize % spinners.len()];
@@ -494,16 +534,12 @@ fn render_progress_header(
 
     let line = Line::from(vec![
         Span::styled(
-            format!(" {spinner} Benchmarking "),
+            format!(" {spinner} {verb} {current}  "),
             Style::default()
                 .fg(theme::yellow())
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("{done}/{total} programs"), theme::metric()),
-        Span::styled(
-            format!("  GPU {}/{total_gpus}", completed_gpus + 1),
-            theme::dim(),
-        ),
         Span::styled("  ", theme::dim()),
         Span::styled(bar_filled, Style::default().fg(theme::green())),
         Span::styled(bar_empty, Style::default().fg(theme::overlay())),
@@ -522,49 +558,43 @@ fn render_progress_header(
     f.render_widget(header, area);
 }
 
-fn render_device_tabs(f: &mut Frame, area: Rect, tracker: &BenchmarkTracker) {
-    let mut spans: Vec<Span> = vec![Span::raw("  ")];
+/// One tab per queued card and zkVM, wrapped to `width`.
+fn device_tab_lines(tracker: &BenchmarkTracker, width: usize) -> Vec<Line<'static>> {
+    let items = tracker
+        .devices
+        .iter()
+        .enumerate()
+        .map(|(i, dev)| {
+            let name = tracker.display_name(dev);
+            if dev.failed {
+                Span::styled(format!("\u{2717} {name}"), theme::error())
+            } else if dev.complete {
+                Span::styled(
+                    format!("\u{2713} {name}"),
+                    Style::default().fg(theme::green()),
+                )
+            } else if i == tracker.active_device_index {
+                let done = dev
+                    .programs
+                    .iter()
+                    .filter(|p| p.phase == ProgramPhase::Done)
+                    .count();
+                Span::styled(
+                    format!("\u{25B6} {name} [{done}/{}]", dev.programs.len()),
+                    Style::default()
+                        .fg(theme::yellow())
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(format!("\u{00B7} {name}"), theme::dim())
+            }
+        })
+        .collect();
+    wrap_items(items, width)
+}
 
-    for (i, dev) in tracker.devices.iter().enumerate() {
-        let is_active = i == tracker.active_device_index;
-        let done_count = dev
-            .programs
-            .iter()
-            .filter(|p| p.phase == ProgramPhase::Done)
-            .count();
-
-        if dev.complete {
-            let score_str = dev
-                .partial_zkops
-                .map(|s| format!("{:.0} zkOP/s", s))
-                .unwrap_or_else(|| "done".to_string());
-            spans.push(Span::styled(
-                format!("\u{2713} {} [{}]", dev.device_label, score_str),
-                Style::default().fg(theme::green()),
-            ));
-        } else if is_active {
-            spans.push(Span::styled(
-                format!("\u{25B6} {} [{}/6]", dev.device_label, done_count),
-                Style::default()
-                    .fg(theme::yellow())
-                    .add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            spans.push(Span::styled(
-                format!(
-                    "  {} [\u{00B7}\u{00B7}\u{00B7}\u{00B7}\u{00B7}\u{00B7}]",
-                    dev.device_label
-                ),
-                theme::dim(),
-            ));
-        }
-
-        if i < tracker.devices.len() - 1 {
-            spans.push(Span::styled("    ", theme::dim()));
-        }
-    }
-
-    let tabs = Paragraph::new(vec![Line::from(spans)]).block(
+fn render_device_tabs(f: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+    let tabs = Paragraph::new(lines).block(
         Block::default()
             .title(Span::styled(" Devices ", theme::title()))
             .borders(Borders::ALL)
@@ -578,7 +608,13 @@ fn render_program_table(f: &mut Frame, area: Rect, state: &MinerState, tracker: 
     let active_dev = tracker.devices.get(tracker.active_device_index);
 
     let title = active_dev
-        .map(|d| format!(" Programs \u{2014} {} ", d.device_label))
+        .map(|d| {
+            format!(
+                " Programs \u{2014} {} / {} ",
+                d.device_label,
+                d.backend_label()
+            )
+        })
         .unwrap_or_else(|| " Programs ".to_string());
 
     let header = Row::new(vec![
@@ -871,31 +907,8 @@ fn render_score_and_controls(
     let active_dev = tracker.devices.get(tracker.active_device_index);
     let mut score_lines: Vec<Line> = Vec::new();
 
-    // Per-device scores
-    let mut score_spans: Vec<Span> = vec![Span::styled("  ", theme::dim())];
-    for dev in &tracker.devices {
-        if dev.complete {
-            let score = dev.partial_zkops.unwrap_or(0.0);
-            score_spans.push(Span::styled(
-                format!("{}: {:.0} zkOP/s \u{2713}  ", dev.device_label, score),
-                Style::default().fg(theme::green()),
-            ));
-        } else if let Some(score) = dev.partial_zkops {
-            score_spans.push(Span::styled(
-                format!("{}: ~{:.0} zkOP/s  ", dev.device_label, score),
-                theme::metric(),
-            ));
-        } else {
-            score_spans.push(Span::styled(
-                format!("{}: \u{2014}  ", dev.device_label),
-                theme::dim(),
-            ));
-        }
-    }
-    score_lines.push(Line::from(score_spans));
-
-    // Active device partial score detail
-    if let Some(dev) = active_dev {
+    // Active device partial score detail, first so a long list of cards cannot push it off the panel
+    if let Some(dev) = active_dev.filter(|d| !d.complete) {
         let done = dev
             .programs
             .iter()
@@ -903,21 +916,49 @@ fn render_score_and_controls(
             .count();
         if let Some(score) = dev.partial_zkops {
             score_lines.push(Line::from(vec![
-                Span::styled("  Partial: ", theme::dim()),
+                Span::styled(" Partial: ", theme::dim()),
                 Span::styled(format!("{score:.0} zkOP/s"), theme::metric()),
-                Span::styled(format!(" ({done}/6 programs)"), theme::dim()),
+                Span::styled(
+                    format!(" ({done}/{} programs)", dev.programs.len()),
+                    theme::dim(),
+                ),
             ]));
         } else {
             score_lines.push(Line::from(Span::styled(
-                "  Waiting for first result...",
+                " Waiting for first result...",
                 theme::placeholder(),
             )));
         }
     }
 
+    // Per-device scores. Cards still waiting are on the tabs and have no score to show.
+    let scores = tracker
+        .devices
+        .iter()
+        .filter_map(|dev| {
+            let name = tracker.display_name(dev);
+            if dev.failed {
+                Some(Span::styled(format!("{name} failed"), theme::error()))
+            } else if dev.complete {
+                dev.partial_zkops.map(|score| {
+                    Span::styled(
+                        format!("{name} {score:.0} \u{2713}"),
+                        Style::default().fg(theme::green()),
+                    )
+                })
+            } else {
+                dev.partial_zkops
+                    .map(|score| Span::styled(format!("{name} ~{score:.0}"), theme::metric()))
+            }
+        })
+        .collect::<Vec<_>>();
+    if !scores.is_empty() {
+        score_lines.extend(wrap_items(scores, cols[0].width.saturating_sub(2) as usize));
+    }
+
     let score = Paragraph::new(score_lines).block(
         Block::default()
-            .title(Span::styled(" Score ", theme::title()))
+            .title(Span::styled(" Score (zkOP/s) ", theme::title()))
             .borders(Borders::ALL)
             .border_style(theme::border())
             .border_type(theme::border_type()),
@@ -964,5 +1005,97 @@ fn format_cycles(cycles: u64) -> String {
         format!("{:.1}K", cycles as f64 / 1_000.0)
     } else {
         format!("{}", cycles)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn items_wrap_between_tabs_and_never_inside_one() {
+        let items = ["RTX 4090 RISC Zero", "RTX 4090 SP1", "Arc A770 RISC Zero"]
+            .map(|s| Span::raw(s.to_string()))
+            .to_vec();
+
+        let lines = wrap_items(items, 36);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(text(&lines[0]), " RTX 4090 RISC Zero   RTX 4090 SP1");
+        assert_eq!(text(&lines[1]), " Arc A770 RISC Zero");
+    }
+
+    #[test]
+    fn an_item_wider_than_the_panel_still_gets_its_own_line() {
+        let lines = wrap_items(vec![Span::raw("a very long card name".to_string())], 5);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(text(&lines[0]), " a very long card name");
+    }
+
+    #[test]
+    fn the_progress_screen_names_the_card_and_zkvm_being_benchmarked() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use zkminer_prover::dispatcher::{BenchmarkProgressEvent, BenchmarkProgressKind as Kind};
+
+        const RTX: &str = "NVIDIA GeForce RTX 4090";
+        const ARC: &str = "Intel(R) Arc(TM) A770 Graphics";
+        let event = |slot_key: &str, name: &str, kind| BenchmarkProgressEvent {
+            slot_key: slot_key.to_string(),
+            gpu_name: Some(name.to_string()),
+            device_index: Some(0),
+            pci_bus_id: None,
+            gpu_tag: slot_key.split(':').nth(1).unwrap().to_string(),
+            kind,
+        };
+
+        let mut tracker = BenchmarkTracker::default();
+        let queue = [
+            ("risc0:cuda:0", RTX),
+            ("sp1:cuda:0", RTX),
+            ("risc0:intel:0", ARC),
+            ("sp1:intel:0", ARC),
+        ];
+        for (key, name) in queue {
+            tracker.apply(&event(key, name, Kind::Queued));
+        }
+        tracker.apply(&event("risc0:cuda:0", RTX, Kind::Started));
+        tracker.apply(&event(
+            "risc0:cuda:0",
+            RTX,
+            Kind::Finished { succeeded: true },
+        ));
+        tracker.apply(&event("sp1:cuda:0", RTX, Kind::Started));
+
+        let state = MinerState::default();
+        let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+        term.draw(|f| render_progress_view(f, f.area(), &state, &tracker))
+            .unwrap();
+        let buffer = term.backend().buffer();
+        let rows: Vec<String> = buffer
+            .content
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        println!("{}", rows.join("\n"));
+
+        assert!(
+            rows[1].contains("Benchmarking RTX 4090 SP1"),
+            "{}",
+            rows[1]
+        );
+        let tabs = &rows[4];
+        for tab in [
+            "RTX 4090 RISC Zero",
+            "RTX 4090 SP1 [0/6]",
+            "Arc A770 RISC Zero",
+            "Arc A770 SP1",
+        ] {
+            assert!(tabs.contains(tab), "missing {tab}: {tabs}");
+        }
     }
 }

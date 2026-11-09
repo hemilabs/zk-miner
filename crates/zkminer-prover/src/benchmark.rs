@@ -2727,6 +2727,22 @@ pub fn benchmark_cache_path() -> PathBuf {
     zkminer_config::ZkMinerConfig::default_dir().join("benchmarks.json")
 }
 
+/// The (device id, backend) pairs in `targets` that `suite` has no measured throughput for.
+pub fn missing_device_benchmarks(
+    suite: Option<&BenchmarkSuite>,
+    targets: &[(String, String)],
+) -> Vec<(String, String)> {
+    targets
+        .iter()
+        .filter(|(device, backend)| {
+            !suite
+                .and_then(|s| s.throughput_for(device, backend))
+                .is_some_and(|throughput| throughput > 0.0)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Load cached benchmarks from disk, verifying the hardware fingerprint.
 ///
 /// Returns `None` if the file is missing, corrupt, or the hardware has changed.
@@ -3014,6 +3030,57 @@ mod tests {
         assert!(
             (sum - 1.0).abs() < 1e-9,
             "weights sum to {sum}, expected 1.0"
+        );
+    }
+
+    #[test]
+    fn missing_device_benchmarks_finds_what_the_suite_lacks() {
+        let row = |device: &str, backend: &str, throughput: f64| DeviceBenchmark {
+            program_stages: Vec::new(),
+            device_id: device.to_string(),
+            device_label: device.to_string(),
+            prover_backend: backend.to_string(),
+            throughput,
+            power_watts: 300.0,
+            optimal_po2: 21,
+            memory_usage_bytes: 0,
+            max_feasible_po2: 21,
+            program_throughputs: std::collections::HashMap::new(),
+            pci_bus_id: String::new(),
+            po2_samples: Vec::new(),
+            host_peak_bytes: None,
+        };
+        let target = |device: &str, backend: &str| (device.to_string(), backend.to_string());
+        let targets = [
+            target("gpu0", "risc0"),
+            target("gpu0", "sp1"),
+            target("gpu-rocm0", "sp1"),
+        ];
+
+        assert_eq!(missing_device_benchmarks(None, &targets), targets.to_vec());
+
+        let suite = BenchmarkSuite {
+            device_benchmarks: vec![
+                row("gpu0", "risc0", 1e6),
+                row("gpu0", "sp1", 0.0),
+                row("gpu1", "sp1", 1e6),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            missing_device_benchmarks(Some(&suite), &targets),
+            vec![target("gpu0", "sp1"), target("gpu-rocm0", "sp1")],
+            "a zero row and another card's row are not coverage"
+        );
+
+        let full = BenchmarkSuite {
+            device_benchmarks: targets.iter().map(|(d, b)| row(d, b, 1e6)).collect(),
+            ..Default::default()
+        };
+        assert!(missing_device_benchmarks(Some(&full), &targets).is_empty());
+        assert!(
+            missing_device_benchmarks(None, &[]).is_empty(),
+            "no GPU workers: nothing to run"
         );
     }
 

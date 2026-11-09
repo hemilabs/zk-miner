@@ -88,6 +88,8 @@ fn seed_state(state: &mut zkminer_tui::state::MinerState) {
 }
 
 pub async fn run(headless: bool) -> Result<()> {
+    let splash = zkminer_tui::splash::Splash::start(!headless);
+    splash.status("Looking for GPUs and prover workers");
     let state = new_shared_state();
 
     // Spawn worker pool so GPU provers are available for real benchmarks.
@@ -98,6 +100,8 @@ pub async fn run(headless: bool) -> Result<()> {
             Vec::new(),                                // default search paths
             Some(std::time::Duration::from_secs(600)), // 10 min benchmark timeout
         );
+        let status = splash.status_line();
+        pool.set_progress(move |text| status.set(text));
         let connected = pool.discover_and_spawn();
         if !connected.is_empty() {
             tracing::info!("Connected subprocess workers: {}", connected.join(", "));
@@ -111,6 +115,7 @@ pub async fn run(headless: bool) -> Result<()> {
         seed_state(&mut s);
     }
 
+    splash.status("Reading GPU details");
     // Hardware probe — runs on a blocking thread to avoid freezing the system.
     // NVML init + device queries + sysfs reads can take seconds on idle GPUs.
     let (hw, tuning) = tokio::task::spawn_blocking(|| {
@@ -164,15 +169,7 @@ pub async fn run(headless: bool) -> Result<()> {
         }
     }
 
-    // Load cached benchmarks or skip — auto-benchmark is triggered by user
-    // pressing [b] in the Benchmark screen, not at startup. GPU proving in
-    // this VM causes kernel time spikes that freeze the system during benchmarks.
-    {
-        let s = state.read().await;
-        if s.benchmark_results.is_none() {
-            tracing::info!("No cached benchmarks — press [b] on Benchmark screen to run");
-        }
-    }
+    zkminer_tui::start_benchmark_if_incomplete(&state, !headless).await;
 
     // Spawn background tasks
     let block_handle = tokio::spawn(block_ticker(state.clone()));
@@ -229,6 +226,7 @@ pub async fn run(headless: bool) -> Result<()> {
         println!("\nShutting down...");
         log_handle.abort();
     } else {
+        drop(splash);
         zkminer_tui::run_tui(state.clone(), None).await?;
     }
 
@@ -907,26 +905,23 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
             while let Some(event) = bridge_rx.recv().await {
                 let mut s = bridge_state.write().await;
                 if let Some(tracker) = s.benchmark_tracker.as_mut() {
-                    tracker.on_progress(
-                        &event.slot_key,
-                        event.gpu_name.as_deref(),
-                        event.device_index,
-                        event.pci_bus_id.as_deref(),
-                        &event.gpu_tag,
-                        &event.entry,
-                        event.program_index,
-                        event.total_programs,
+                    tracker.apply(&event);
+                }
+                if let zkminer_prover::dispatcher::BenchmarkProgressKind::ProgramDone {
+                    entry,
+                    ..
+                } = &event.kind
+                {
+                    s.add_log(
+                        LogLevel::Info,
+                        format!(
+                            "{}: {} done ({:.1}M c/s)",
+                            event.slot_key,
+                            entry.program_name,
+                            entry.throughput / 1_000_000.0
+                        ),
                     );
                 }
-                s.add_log(
-                    LogLevel::Info,
-                    format!(
-                        "{}: {} done ({:.1}M c/s)",
-                        event.slot_key,
-                        event.entry.program_name,
-                        event.entry.throughput / 1_000_000.0
-                    ),
-                );
             }
         });
 
