@@ -1942,27 +1942,14 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // submitter-declared `expectedCycles`. Runs on a lazily-built CPU executor (no
                 // gpu-server), so it is as cheap as risc0's sizing path.
                 tracing::info!("Execute (sizing) request {request_id} ({} bytes ELF)", elf.len());
-                let cpu = match cpu_executor {
-                    Some(ref c) => c,
-                    None => {
-                        // Build the CPU executor defensively: a panic here must answer the protocol
-                        // (Internal), not vanish and have the dispatcher kill a healthy proving slot.
-                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            sp1_sdk::blocking::ProverClient::builder().cpu().build()
-                        })) {
-                            Ok(built) => cpu_executor.insert(built),
-                            Err(_) => {
-                                let resp = WorkerResponse::Error {
-                                    request_id,
-                                    kind: ErrorKind::Internal,
-                                    message: "failed to initialise the SP1 CPU executor for sizing"
-                                        .to_string(),
-                                };
-                                write_message(&mut stdout, &resp)?;
-                                continue;
-                            }
-                        }
-                    }
+                let Some(cpu) = cpu_prover(&mut cpu_executor) else {
+                    let resp = WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::Internal,
+                        message: "failed to initialise the SP1 CPU executor for sizing".to_string(),
+                    };
+                    write_message(&mut stdout, &resp)?;
+                    continue;
                 };
                 // The ELF bytes are fully attacker-controlled, and SP1's parser/executor
                 // (`Elf::from` / `setup` / `execute().run()`) CAN panic on a malformed registered ELF
@@ -1988,6 +1975,12 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             peak_host_bytes,
                             // One no fulfil could carry is reported by its length alone.
                             journal: (journal.len() <= EXECUTE_JOURNAL_MAX_BYTES).then_some(journal),
+                            // Nothing the guest reads is host entropy: an SP1 guest's `sys_rand` is an
+                            // in-guest PRNG with a fixed seed (sp1-zkvm `syscalls/sys.rs`, PRNG_SEED),
+                            // and the executor answers every syscall from the stdin (HINT_LEN /
+                            // HINT_READ), the run itself, or a hook, which is a fixed function of what
+                            // the guest wrote to it. The proof nonce is not visible to the guest.
+                            host_entropy_reads: Some(0),
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -2018,6 +2011,79 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         write_message(&mut stdout, &resp)?;
                     }
                 }
+            }
+
+            WorkerCommand::ProgramId { request_id, elf } => {
+                // The verifying-key hash, from SP1's `setup` on the same lazily built CPU prover the
+                // sizing path uses: no `sp1-gpu-server`, no CUDA. Minutes of CPU, which is why
+                // `Execute` does not do it; a caller that needs the binding asks for it once per ELF.
+                tracing::info!(
+                    "ProgramId request {request_id} ({} bytes ELF): SP1 setup on the CPU",
+                    elf.len()
+                );
+                let Some(cpu) = cpu_prover(&mut cpu_executor) else {
+                    let resp = WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::Internal,
+                        message: "failed to initialise the SP1 CPU prover for setup".to_string(),
+                    };
+                    write_message(&mut stdout, &resp)?;
+                    continue;
+                };
+                let started = Instant::now();
+                // Submitter-controlled bytes reach `setup`, which can panic on a malformed ELF: a
+                // caught panic is a property of the ELF (InvalidInput), as on the Execute arm.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    sp1_program_id(cpu, &elf)
+                }));
+                let resp = match outcome {
+                    Ok(Ok(program_id)) => {
+                        let duration_secs = started.elapsed().as_secs_f64();
+                        tracing::info!("ProgramId {request_id}: setup took {duration_secs:.1}s");
+                        WorkerResponse::ProgramIdResult {
+                            request_id,
+                            program_id,
+                            duration_secs,
+                        }
+                    }
+                    Ok(Err(e)) => WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::InvalidInput,
+                        message: format!("{e:#}"),
+                    },
+                    Err(_) => WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::InvalidInput,
+                        message: "SP1 setup panicked on this ELF (malformed or hostile program)"
+                            .to_string(),
+                    },
+                };
+                write_message(&mut stdout, &resp)?;
+            }
+
+            WorkerCommand::Warmup { request_id } if sp1_measure_only() => {
+                // A measure-only worker proves nothing, so it needs no Groth16 artifacts: its one
+                // setup is the CPU prover its `Execute` and `ProgramId` run on (~15 s on first use),
+                // built here, outside any request's watchdog, when the host asks (`zkminer simulate`
+                // does before READY and after a respawn).
+                let started = Instant::now();
+                let resp = if cpu_prover(&mut cpu_executor).is_some() {
+                    WorkerResponse::WarmupDone {
+                        request_id,
+                        summary: format!(
+                            "CPU prover ready in {:.1}s",
+                            started.elapsed().as_secs_f64()
+                        ),
+                        groth16_helper: false,
+                    }
+                } else {
+                    WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::Internal,
+                        message: "failed to initialise the SP1 CPU executor for sizing".to_string(),
+                    }
+                };
+                write_message(&mut stdout, &resp)?;
             }
 
             WorkerCommand::Warmup { request_id } => {
@@ -2248,6 +2314,36 @@ fn with_peak_rss_sampling<T>(f: impl FnOnce() -> T) -> (T, u64) {
 #[cfg(not(target_os = "linux"))]
 fn with_peak_rss_sampling<T>(f: impl FnOnce() -> T) -> (T, u64) {
     (f(), 0)
+}
+
+/// The CPU prover the sizing paths (`Execute`, `ProgramId`) run on, built on first use: never the
+/// CUDA prover, so neither path starts `sp1-gpu-server`. Built defensively: a panic yields `None`, which
+/// the caller answers as `Internal` rather than letting it unwind out of the loop and have the
+/// dispatcher score a healthy slot as failed.
+fn cpu_prover(
+    slot: &mut Option<sp1_sdk::blocking::CpuProver>,
+) -> Option<&sp1_sdk::blocking::CpuProver> {
+    if slot.is_none() {
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sp1_sdk::blocking::ProverClient::builder().cpu().build()
+        }))
+        .ok()?;
+        *slot = Some(built);
+    }
+    slot.as_ref()
+}
+
+/// The SP1 program id of `elf`: its verifying-key hash, in the order `vk.bytes32()` writes it (the
+/// order the prove path's binding gate decodes). Through `bytes32()`, never `bytes32_raw()`, which
+/// panics on a digest that is not exactly 31 big-endian bytes (see `decode_hex32`).
+fn sp1_program_id(cpu: &sp1_sdk::blocking::CpuProver, elf: &[u8]) -> anyhow::Result<[u8; 32]> {
+    use sp1_sdk::blocking::{Elf, Prover};
+    use sp1_sdk::{HashableKey, ProvingKey};
+    let pk = cpu
+        .setup(Elf::from(elf))
+        .map_err(|e| anyhow::anyhow!("SP1 setup: {e}"))?;
+    decode_hex32(&pk.verifying_key().bytes32())
+        .ok_or_else(|| anyhow::anyhow!("could not parse the SP1 vkey hash of this ELF"))
 }
 
 fn run_execute_sp1(

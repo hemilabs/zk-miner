@@ -316,11 +316,163 @@ a size, the job waits for one (switch a card back on, or give one a po2 under Se
 Advanced; a config size or a calibration applies only after a restart, which releases it) and
 is released before its deadline.
 
+## Simulate (measure jobs without mining)
+
+`zkminer simulate` runs the miner's own pre-claim measurement on any job, whatever its state, and
+prints one JSON line per job on stdout: the cycle count proving would report, or why there is none.
+It is for an indexer or a dashboard that wants the work a job took: the chain records none
+(`JobFulfilled.actualCycles` is 0 under every governance adapter; only a custom verifier, chosen by
+the job's caller, reports one).
+
+```bash
+zkminer --config simulate.toml simulate --job 0x… --job 0x…
+zkminer --config simulate.toml simulate --stdin   # one request per line: a job id, or
+                       # {"jobId":"0x…","submitTx":"0x…","publicValues":"0x…"} (both optional)
+```
+
+A request line is at most 132,096 bytes; `publicValues` (the fulfil's on-chain public values, to
+compare the measured journal with) is `0x` and an even number of hex digits, at most 65,536 bytes
+decoded. Any other field, or a malformed one, is an `invalid_request`.
+
+Each job goes through the steps a claim depends on: its descriptor rebuilt from the submit
+transaction and checked against its on-chain hash, the program's ELF from the ProgramRegistry, those
+bytes bound to the job's `programId`, and one execution on a measure worker at `--po2` (risc0,
+default 20). A `submitTx` hint whose receipt holds the job's `JobSubmitted` log is the submit
+transaction, so its calldata decides alone: calldata that does not decode is `undecodable` at once,
+with no log scan (any other hint is only tried first). The ELF is the bytes that bound before, else
+the bytes the registry's `elf_hash` names from any URI that serves them, else what the first URI that
+answers serves. The binding is derived, never trusted: the risc0 image id, or the SP1 verifying-key
+hash from SP1's `setup` on the CPU (minutes per program, cached on disk per ELF under `--cache-dir`,
+default `~/.zkminer/simulate`). SP1 PLONK jobs are measured by the SP1 worker (the same ELF and vkey
+hash as Groth16), though the miner does not claim them. A journal-prefix job runs on its prover's
+input, `abi.encode(jobId, prover)` and then `inputData` (risc0; an SP1 one is `not_served`, since its
+prefix is a stdin buffer of its own, which one execution input cannot reproduce).
+
+A report's `outcome` is one of:
+
+| outcome | meaning | `retryable` |
+|---|---|---|
+| `measured` | executed; `cycles` is the count (a decimal string) | no |
+| `not_served` | this build can never measure it: its proof system is not one it measures (OpenVM, a custom verifier, unknown), or it is an SP1 journal-prefix job | no |
+| `no_worker` | no measure worker for its backend runs here | yes |
+| `undecodable` | its descriptor can never be rebuilt | no |
+| `no_program` | the program is not in the registry, or has no storage URIs | yes |
+| `program_mismatch` | the risc0 ELF the registry declares (its keccak256 is the registry `elf_hash` or a URI's content hash) is not the job's program (an image id depends on the bytes alone) | no |
+| `too_heavy` | past the executor's cycle cap, or above `--max-cycles` (default 1e9, risc0's keccak charge included) | no |
+| `failed` | the guest or the worker failed; bytes the registry does not vouch for did not bind; or a declared SP1 ELF derived another vkey (a vkey depends on the SDK's circuit version too: the reason names `sdkVersion`) | yes, a few times |
+| `timeout` | the execution or the program-id derivation hit its bound | yes, a few times |
+| `unavailable` | nothing conclusive: the RPC, the registry or the ELF host failed (no URI served usable bytes, or none could be fetched, its URI unparseable or of a kind not fetched included: the registrant can change them), a worker was busy or found dead, or the program's last failure is remembered (the reason begins `remembered from`) | yes |
+
+A `measured` report also says whether its count is evidence of the proven run:
+
+- `proven`: the measured journal against the request's `publicValues`, byte for byte, an SP1
+  proof-nonce job's included (the nonce is in the seal; the guest cannot read it): `matches`,
+  `differs`, or `unknown` (none sent, or no whole journal came back: over 32 KiB). The router's fulfil
+  takes the journal as `publicValues` for both risc0 (the receipt's journal) and SP1 (its public
+  values).
+- `hostInput`: whether the guest read host-supplied nondeterministic input, and `hostInputReads` how
+  often, when counted. risc0: its `sys_rand` calls past the one 4-word draw its guest runtime makes
+  before `main` (the only syscall the host answers from entropy; environment and arguments are
+  empty). SP1: never (`false`, 0): its `sys_rand` is an in-guest PRNG with a fixed seed. `true` also
+  when the worker could not count (a guest without risc0's runtime). A guest whose path followed
+  such input may have run another one when proven. Note that std's `HashMap` seeds itself from
+  `sys_rand`, so a risc0 guest that builds one reads it. What no count can show: a guest that
+  branches on the bytes of its runtime's own draw.
+- `binding`: the job's journal binding against the measured journal, as the router checks it:
+  `satisfied`, `fails`, `none` (nothing binds the journal; an SP1 proof-nonce job with no statement
+  included), `unchecked` (no whole journal). For a proof-nonce job the statement is checked with the
+  marker cleared, as the router does.
+- `sdkVersion`: the measure worker's SDK, as its handshake names it (on every report once the job's
+  backend is known to have a worker).
+
+A count is evidence when `proven` is `matches`, `hostInput` is `false` and `binding` is not `fails`.
+That catches an honest mismatch and a nondeterministic guest. It does not bind the run to the proven
+one: the chain never checks the input, so a requester who is also the prover can prove another
+input with the same journal and choose a count up to `--max-cycles`. A keccak request the guest
+never assumes costs its prover nothing, so a run with one reports `hostInput: true`.
+
+risc0 guests' `sys_rand` is seeded from a key made for each run, never this host's
+`~/.zkminer/risc0-sys-rand.key` (neither read nor created, so a HOME it cannot write is fine), and
+the journal comes back for it: in simulate it backs no proof.
+
+**The failure memory.** A program whose ELF did not bind (refused, another id, a derivation past its
+bound, or for a shorter 15 minutes a worker that died deriving it, which may be the host's doing) is remembered under `<cache-dir>/program-failures` for
+`--program-failure-ttl-secs` (default 6 h, 0 = off), and one whose ELF could not be fetched for
+15 minutes (at most that TTL). Its other jobs are answered from the memory, `unavailable` (or
+`program_mismatch` when that was the verdict), instead of each paying a download and a derivation, or
+the fetch budget. An entry holds only while the program's registry entry reads as it did (its
+`elf_hash`, its URIs and their content hashes; a final verdict only while the registry still vouches
+for the very bytes it judged), and only for the zkminer build that wrote it (its version and binary),
+backend and worker SDK; an entry dated more than 60 s ahead of the clock is dropped. Bytes that bind
+clear it. **Re-queuing jobs after a fix outside the registry (an upgraded worker, a host problem)
+includes deleting `<cache-dir>/program-failures`**, or the new run may answer from it.
+
+**Bounds.** `--execute-timeout-secs` (default 600) and `--program-id-timeout-secs` (default 900)
+bound one execution and one derivation: at least 60 (a lower value is raised to it) and at most
+86400. An SP1 measure worker's one-time setup (its CPU prover, ~15 s) is not in them: it runs before
+READY, and again before the next SP1 request when its worker was respawned, bounded at 120 s. Every
+other wait is bounded too, so the longest one request can take, in seconds, is
+
+```text
+4·R + 2·F + 4·W + 2·S + P + E  =  584 + P + E      (+ local work)
+R = 30   each chain read outside the two fetches: the status view, the head refresh,
+         the registry entry, its re-read after a derivation that did not bind
+F = 90   the descriptor fetch, and the ELF fetch (every URI, twice when elf_hash is set)
+W = 11   one worker (re)start: process and handshake (10 s), before each worker request
+S = 120  the SP1 set-up, before the derivation and the execution (0 for risc0)
+P = --program-id-timeout-secs     E = --execute-timeout-secs
+```
+
+where local work is a keccak, a cache read and a cache write of an ELF of at most 248 MiB, and a
+few small files: seconds on a working disk. With the defaults that is 2084 s. (risc0 requests stay
+under `3·R + 2·F + 2·W + P + E`.)
+
+With `--stdin`, a READY line comes first, once the measure workers run (an SP1 one set up) and before
+any request is read; a reader should send nothing before it:
+
+```json
+{"schema":1,"ready":true,"backends":["risc0","sp1"],"zkminerVersion":"0.1.0","protocolVersion":11}
+```
+
+(`backends`: those with a live measure worker, sorted.) A line that is not a request is answered
+`{"error":"invalid_request","reason":"…","schema":1}` in its place. Reasons are sanitized and carry
+no URL path, query or userinfo.
+
+It signs and sends nothing (the watch-only client), and starts measure workers only, never a prover,
+so it runs on a host without a GPU: build the CPU risc0 worker and, for SP1 jobs, the SP1 worker
+(not a default workspace member; it needs the SP1 toolchain, installed with `sp1up`), and name them.
+
+```bash
+cargo build --release -p zkminer-prove-risc0 --features cpu --bin zkminer-prove-risc0-cpu
+CARGO_TARGET_DIR=target-sp1 cargo build --release -p zkminer-prove-sp1
+zkminer --config simulate.toml simulate --stdin \
+    --risc0-worker target/release/zkminer-prove-risc0-cpu \
+    --sp1-worker target-sp1/release/zkminer-prove-sp1
+```
+
+Reading the counts:
+
+- **Units differ by backend.** risc0's count is cycles with every segment padded to its power of two
+  at `--po2`, plus a charge of 2^20 for each keccak proof request (a price, not cycles: about a 2^20
+  segment's proving time; doubled per step of a larger keccak po2). SP1's is
+  the RV64 instruction count, where a precompile (keccak, sha, ...) counts once. Never add or compare
+  the two.
+- **po2.** risc0 counts depend on the segment size: a job proven on a small card (po2 16) has about
+  1.8 times the po2-20 count. A report carries the `po2` it was measured at; changing `--po2` mixes
+  sizes in what was already stored.
+- **`--max-cycles`.** Every count up to it is the guest's to choose (a keccak request costs a few
+  hundred cycles of guest work and is charged 2^20), so it bounds what one job adds to a sum. The
+  default, 1e9, is ten times the largest proof seen on this market.
+
+**Never run `simulate` on a host that runs a miner.** The miner's host-RAM and `/dev/shm` ledgers are
+per process: a simulate measurement (an SP1 one stages gigabytes in `/dev/shm` and may hold up to
+24 GiB) is invisible to a miner beside it, and the two can together OOM or SIGBUS its proofs.
+
 ## Layout
 
 | crate | role |
 |---|---|
-| `zkminer-cli` | binary entry point: `status`, `benchmark`, `run`, `init` |
+| `zkminer-cli` | binary entry point: `status`, `benchmark`, `run`, `simulate`, `init` |
 | `zkminer-chain` | chain client, auction math, staking, monitor, tx/nonce layer, RPC metering |
 | `zkminer-contracts` | `sol!()` bindings — the source of truth for the on-chain ABI |
 | `zkminer-prover` | worker dispatcher, ELF registry, benchmarks, guest programs |

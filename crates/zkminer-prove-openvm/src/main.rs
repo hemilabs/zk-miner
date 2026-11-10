@@ -155,6 +155,19 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
+            WorkerCommand::ProgramId { request_id, .. } => {
+                // Not implemented for openvm, which measures nothing either (see Execute): decline
+                // rather than answer an id the chain would not bind a proof to. `Internal`, not
+                // `InvalidInput`: a missing capability, not this worker's verdict on the bytes (the
+                // dispatcher types `InvalidInput` as `ProgramIdRefused`).
+                let resp = WorkerResponse::Error {
+                    request_id,
+                    kind: ErrorKind::Internal,
+                    message: "program id derivation not supported by the openvm backend".to_string(),
+                };
+                write_message(&mut stdout, &resp)?;
+            }
+
             WorkerCommand::Warmup { request_id } => {
                 // Nothing to set up before a first proof.
                 let resp = WorkerResponse::WarmupDone {

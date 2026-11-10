@@ -1129,6 +1129,7 @@ impl WorkerHandle {
                 }
                 WorkerResponse::ProofResult { request_id, .. }
                 | WorkerResponse::ExecuteResult { request_id, .. }
+                | WorkerResponse::ProgramIdResult { request_id, .. }
                 | WorkerResponse::Error { request_id, .. }
                 | WorkerResponse::Cancelled { request_id, .. } => {
                     if *request_id == expected_request_id {

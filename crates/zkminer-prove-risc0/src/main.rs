@@ -144,12 +144,21 @@ fn main() {
     #[cfg(not(any(unix, windows)))]
     let ipc_stdout = io::stdout();
 
-    tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(io::stderr)
+                    .with_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| "info".into()),
+                    ),
+            )
+            // Whatever RUST_LOG says: an Execute reports how often its guest read host entropy.
+            .with(sys_rand_draws::Counter.with_filter(sys_rand_draws::filter()))
+            .init();
+    }
 
     // Load (or create) the `sys_rand` key now, outside any job: a failure inside a job's panic
     // containment would be blamed on that job's program.
@@ -358,7 +367,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     run_execute(&elf, &input_data, program_id, po2)
                 }));
                 match outcome {
-                    Ok(Ok((cycles, journal, duration_secs))) => {
+                    Ok(Ok((cycles, journal, duration_secs, host_entropy_reads))) => {
                         tracing::info!(
                             "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s"
                         );
@@ -379,6 +388,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             // reports no peak: 0 = "unknown", which leaves `sp1_execute_provable_beside_
                             // server` ungated for risc0 (it is only consulted for SP1 anyway).
                             peak_host_bytes: 0,
+                            host_entropy_reads,
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -429,6 +439,39 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         request_id,
                         kind: ErrorKind::Internal,
                         message: format!("warm-up failed: {e:#}"),
+                    },
+                };
+                write_message(&mut stdout, &resp)?;
+            }
+
+            WorkerCommand::ProgramId { request_id, elf } => {
+                // The image id alone: no execution. The ELF is submitter-controlled and reaches
+                // risc0's parser here, which can panic on a malformed one (see the Execute arm), so a
+                // panic is contained and reported as a property of the ELF. Under the same RSS
+                // self-guard as Execute: the image id maps every loadable word up to a segment's
+                // `p_memsz`, so a tiny crafted ELF can ask for gigabytes, and the worker exits rather
+                // than let it OOM the host.
+                let started = std::time::Instant::now();
+                let outcome = with_rss_self_guard(execute_max_rss_bytes(), || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        verify_program_id(&elf, None)
+                    }))
+                });
+                let resp = match outcome {
+                    Ok(Ok(program_id)) => WorkerResponse::ProgramIdResult {
+                        request_id,
+                        program_id,
+                        duration_secs: started.elapsed().as_secs_f64(),
+                    },
+                    Ok(Err(e)) => WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::InvalidInput,
+                        message: format!("{e:#}"),
+                    },
+                    Err(_) => WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::InvalidInput,
+                        message: "deriving the image id panicked on this ELF".to_string(),
                     },
                 };
                 write_message(&mut stdout, &resp)?;
@@ -911,12 +954,130 @@ fn job_segment_po2(po2: Option<u8>) -> anyhow::Result<u8> {
     Ok(po2)
 }
 
+/// A keccak request the guest never assumes is charged in the cycle count but binds nothing in the
+/// receipt, so a prover need not prove it: that part of the count is free to inflate. Reports the
+/// evidence as unknown (`None` fails closed in `simulate`); the miner's own sizing ignores the field.
+fn reads_given_keccak(reads: Option<u64>, keccak_cycles: u64, assumptions: usize) -> Option<u64> {
+    if keccak_cycles > 0 && assumptions == 0 {
+        None
+    } else {
+        reads
+    }
+}
+
+/// Counts the guest's `sys_rand` calls during an execution, for `ExecuteResult.host_entropy_reads`.
+///
+/// `sys_rand` is the one syscall risc0's executor answers from host entropy (seeded here, see
+/// [`sys_rand_seed`], but by a key the job's prover does not share): `sys_getenv` and `sys_argv` read
+/// an environment and arguments this worker leaves empty, `sys_read` the job's input, `sys_cycle_count`
+/// the run itself, and the keccak and verify calls are checked functions of what the guest passes.
+/// So reading none beyond its runtime's own draw rules out a guest whose path depends on host
+/// entropy. It does not bind the run to the proven one: the chain never checks the input, so a
+/// requester who is also the prover can prove another input with the same journal.
+///
+/// The executor exposes no count, so this counts the line the pinned fork's handler logs at DEBUG
+/// for each call (`risc0/zkvm/src/host/server/exec/syscall/random.rs`: `SYS_RANDOM: <words>`), with a
+/// layer that sees that target only, whatever `RUST_LOG` filters. On the thread that logs it, which
+/// is the one that runs the guest (risc0 runs the emulator on the caller's thread and only builds
+/// segments on others). A fork that stops logging it reads as no draw at all, which reports `None`
+/// (unknown), never 0: the real-worker test (`measure_only.rs`, the risc0 one) pins the count.
+mod sys_rand_draws {
+    use std::cell::Cell;
+
+    /// The module of the fork's `sys_rand` handler.
+    pub(super) const TARGET: &str = "risc0_zkvm::host::server::exec::syscall::random";
+    /// Its DEBUG line for one call, before the number of words drawn.
+    const PREFIX: &str = "SYS_RANDOM: ";
+    /// What risc0's guest runtime draws before `main`, once: four words of memory-image entropy
+    /// (`risc0_zkvm::guest::env::init`, `MEMORY_IMAGE_ENTROPY`).
+    pub(super) const RUNTIME_DRAW_WORDS: u64 = 4;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) struct Draws {
+        pub calls: u64,
+        /// The words the first call drew.
+        pub first_words: Option<u64>,
+    }
+
+    thread_local! {
+        static DRAWS: Cell<Draws> = const { Cell::new(Draws { calls: 0, first_words: None }) };
+    }
+
+    pub(super) fn reset() {
+        DRAWS.with(|d| d.set(Draws::default()));
+    }
+
+    pub(super) fn take() -> Draws {
+        DRAWS.with(|d| d.replace(Draws::default()))
+    }
+
+    fn note(words: u64) {
+        DRAWS.with(|d| {
+            let mut v = d.get();
+            v.calls = v.calls.saturating_add(1);
+            v.first_words.get_or_insert(words);
+            d.set(v);
+        });
+    }
+
+    /// The draws past the runtime's own: `None` when there was no draw at all (a guest without
+    /// risc0's runtime, or a fork whose handler no longer logs the line this counts).
+    pub(super) fn host_entropy_reads(d: Draws) -> Option<u64> {
+        match d.first_words? {
+            RUNTIME_DRAW_WORDS => Some(d.calls - 1),
+            _ => Some(d.calls),
+        }
+    }
+
+    pub(super) fn filter() -> tracing_subscriber::filter::Targets {
+        tracing_subscriber::filter::Targets::new().with_target(TARGET, tracing::Level::DEBUG)
+    }
+
+    pub(super) struct Counter;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Counter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != TARGET {
+                return;
+            }
+            struct Message(Option<String>);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut m = Message(None);
+            event.record(&mut m);
+            if let Some(words) = m
+                .0
+                .as_deref()
+                .and_then(|t| t.strip_prefix(PREFIX))
+                .and_then(|w| w.trim().parse::<u64>().ok())
+            {
+                note(words);
+            }
+        }
+    }
+}
+
+/// Execute the guest as a proof of it would, without proving: its proving cycle count, its journal,
+/// how long it took, and its host-entropy reads (see [`sys_rand_draws`]).
 fn run_execute(
     elf: &[u8],
     input_data: &[u8],
     program_id: Option<[u8; 32]>,
     po2: Option<u8>,
-) -> anyhow::Result<(u64, Vec<u8>, f64)> {
+) -> anyhow::Result<(u64, Vec<u8>, f64, Option<u64>)> {
     use std::time::Instant;
     let po2 = job_segment_po2(po2)?;
     // Bind the ELF to the job's programId before spending any execution on it (the pre-claim
@@ -943,11 +1104,13 @@ fn run_execute(
         .map_err(|e| anyhow::anyhow!("execute: env build failed: {e}"))?;
 
     // In-process RSS self-guard (finding H4): contain a ballooning guest before it OOMs the host.
+    sys_rand_draws::reset();
     let session = with_rss_self_guard(execute_max_rss_bytes(), || {
         // The in-process executor, never one chosen by RISC0_EXECUTOR (an external r0vm).
         risc0_zkvm::local_executor().execute(env, elf)
     })
     .map_err(|e| anyhow::anyhow!("execute: {e}"))?;
+    let host_entropy_reads = sys_rand_draws::host_entropy_reads(sys_rand_draws::take());
 
     // A guest that does not halt with exit code 0 can NEVER produce a receipt that
     // `receipt.verify(image_id)` accepts (verify builds the expected claim as Halted(0)), so this
@@ -1005,6 +1168,8 @@ fn run_execute(
     // Measured at `po2`, the size the job proves at on its card. Each keccak request is a further
     // proof of its own (a 2^17-row keccak STARK, its lift and a join), priced here as a 2^20 segment.
     let cycles: u64 = session.segments.iter().map(|s| 1u64 << s.po2).sum::<u64>() + keccak.cycles;
+    let host_entropy_reads =
+        reads_given_keccak(host_entropy_reads, keccak.cycles, assumptions.0.len());
     // The journal the guest committed here is byte-identical to the one the later proof
     // would carry at this segment size (both are a deterministic function of (ELF, input) at the size
     // both run at, which a guest can tell — `sys_rand` included, via the shared seed — and the image-id
@@ -1015,6 +1180,7 @@ fn run_execute(
         cycles,
         session.journal.bytes,
         started.elapsed().as_secs_f64(),
+        host_entropy_reads,
     ))
 }
 
@@ -1866,6 +2032,68 @@ mod sys_rand_tests {
             verify_program_id(FIBONACCI_ELF, Some(image)).unwrap(),
             image
         );
+    }
+}
+
+#[cfg(test)]
+mod sys_rand_draw_tests {
+    use super::sys_rand_draws::{self, Draws};
+    use super::*;
+
+    #[test]
+    fn a_keccak_charge_the_guest_never_assumes_is_no_evidence() {
+        assert_eq!(reads_given_keccak(Some(0), 1 << 20, 0), None, "charged, assumed by nothing");
+        assert_eq!(reads_given_keccak(Some(0), 1 << 20, 1), Some(0), "assumed: bound in the receipt");
+        assert_eq!(reads_given_keccak(Some(0), 0, 0), Some(0), "no keccak at all");
+        assert_eq!(reads_given_keccak(Some(3), 1 << 20, 1), Some(3));
+    }
+
+    #[test]
+    fn only_draws_past_the_runtimes_own_count() {
+        let reads = |calls, first_words| sys_rand_draws::host_entropy_reads(Draws { calls, first_words });
+        assert_eq!(reads(0, None), None, "no draw at all is unknown, never 0");
+        assert_eq!(reads(1, Some(4)), Some(0), "the runtime's own memory-image draw");
+        assert_eq!(reads(2, Some(4)), Some(1));
+        assert_eq!(reads(1, Some(2)), Some(1), "a first draw of another size is the guest's");
+        assert_eq!(reads(3, Some(8)), Some(3));
+    }
+
+    /// The layer counts the handler's line by its target and text, on the thread that logs it.
+    #[test]
+    fn the_layer_counts_the_handlers_line_only() {
+        use tracing_subscriber::prelude::*;
+        let subscriber = tracing_subscriber::registry()
+            .with(sys_rand_draws::Counter.with_filter(sys_rand_draws::filter()));
+        tracing::subscriber::with_default(subscriber, || {
+            sys_rand_draws::reset();
+            tracing::debug!(target: "risc0_zkvm::host::server::exec::syscall::random", "SYS_RANDOM: {}", 4);
+            tracing::debug!(target: "risc0_zkvm::host::server::exec::syscall::random", "SYS_RANDOM: {}", 2);
+            // Not the handler: another module, or another line of it.
+            tracing::debug!(target: "risc0_zkvm::host::server::exec::syscall::read", "SYS_RANDOM: {}", 9);
+            tracing::debug!(target: "risc0_zkvm::host::server::exec::syscall::random", "SYS_READ: {}", 9);
+            let d = sys_rand_draws::take();
+            assert_eq!(d, Draws { calls: 2, first_words: Some(4) });
+            assert_eq!(sys_rand_draws::host_entropy_reads(d), Some(1));
+            assert_eq!(sys_rand_draws::take(), Draws::default(), "taken");
+        });
+    }
+
+    /// The fibonacci guest draws nothing but its runtime's entropy: 0, which also proves this build's
+    /// fork still logs the line the count reads (else `None`).
+    #[test]
+    fn a_guest_that_reads_no_entropy_counts_zero() {
+        use tracing_subscriber::prelude::*;
+        if FIBONACCI_ELF.is_empty() {
+            return; // stubbed guests; nothing to validate
+        }
+        let image = verify_program_id(FIBONACCI_ELF, None).unwrap();
+        let subscriber = tracing_subscriber::registry()
+            .with(sys_rand_draws::Counter.with_filter(sys_rand_draws::filter()));
+        let (_, journal, _, reads) = tracing::subscriber::with_default(subscriber, || {
+            run_execute(FIBONACCI_ELF, &10u32.to_le_bytes(), Some(image), Some(20)).unwrap()
+        });
+        assert_eq!(journal, 55u64.to_le_bytes());
+        assert_eq!(reads, Some(0));
     }
 }
 

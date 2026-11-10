@@ -116,6 +116,65 @@ pub async fn fetch_job_descriptor_checked(
     Ok(d)
 }
 
+/// The descriptor of `job_id` from `tx_hash`, a transaction a caller names as the job's submit tx
+/// (an indexer that saw the job's `JobSubmitted` log), checked first: the tx's receipt must hold the
+/// router's `JobSubmitted` for `job_id`. One JobSubmitted is ever emitted per jobId, so that tx IS the
+/// submit tx, and the descriptor is its calldata or nothing: calldata that does not decode, or whose
+/// descriptor does not hash to `expected_hash`, is final ([`UndecodableDescriptor`]), with no log
+/// scan behind it (the scan would find this same tx, after up to 500k blocks of `eth_getLogs`).
+///
+/// `Ok(None)`: the node knows no such tx, or its receipt holds no such log, so the hint says nothing
+/// and the caller scans as usual. Any other `Err` is the RPC's.
+pub async fn fetch_job_descriptor_from_submit_tx(
+    client: &ChainClient,
+    job_id: B256,
+    tx_hash: B256,
+    expected_hash: B256,
+) -> Result<Option<JobDescriptor>> {
+    // Raw JSON, as `decode_descriptor_from_tx` reads the tx: an L1 deposit (type 0x7E) does not
+    // deserialize as an Ethereum receipt.
+    let receipt: Option<serde_json::Value> = client
+        .provider
+        .raw_request("eth_getTransactionReceipt".into(), (tx_hash,))
+        .await
+        .context("Failed to fetch the submit tx's receipt")?;
+    let Some(receipt) = receipt else {
+        return Ok(None);
+    };
+    if !receipt_emits_job_submitted(&receipt, client.hemi_prove, job_id) {
+        return Ok(None);
+    }
+    let d = decode_descriptor_from_tx(client, job_id, tx_hash, Some(expected_hash)).await?;
+    verify_descriptor_hash(&d, expected_hash).map_err(|e| undecodable(format!("{e:#}")))?;
+    Ok(Some(d))
+}
+
+/// Whether a receipt (as the node's JSON) holds `router`'s `JobSubmitted` log for `job_id`.
+fn receipt_emits_job_submitted(receipt: &serde_json::Value, router: Address, job_id: B256) -> bool {
+    let topic0 = job_submitted_topic();
+    receipt
+        .get("logs")
+        .and_then(|l| l.as_array())
+        .is_some_and(|logs| {
+            logs.iter().any(|log| {
+                let from_router = log
+                    .get("address")
+                    .and_then(|a| a.as_str())
+                    .and_then(|a| a.parse::<Address>().ok())
+                    == Some(router);
+                let removed = log.get("removed").and_then(|r| r.as_bool()) == Some(true);
+                let topic = |i: usize| {
+                    log.get("topics")
+                        .and_then(|t| t.as_array())
+                        .and_then(|t| t.get(i))
+                        .and_then(|t| t.as_str())
+                        .and_then(|t| t.parse::<B256>().ok())
+                };
+                from_router && !removed && topic(0) == Some(topic0) && topic(1) == Some(job_id)
+            })
+        })
+}
+
 /// A permanent decode verdict (see [`UndecodableDescriptor`]) as an `anyhow::Error`.
 fn undecodable(msg: String) -> anyhow::Error {
     UndecodableDescriptor(msg).into()
@@ -399,6 +458,46 @@ mod tests {
             transient.downcast_ref::<UndecodableDescriptor>().is_none(),
             "a transient fetch error must not be treated as permanently undecodable"
         );
+    }
+
+    /// A submit-tx hint is taken as the submit tx only when its receipt holds the router's
+    /// JobSubmitted for this very job: another job's, another contract's, another event's, or a
+    /// removed log says nothing.
+    #[test]
+    fn only_the_routers_job_submitted_for_the_job_makes_a_hint_the_submit_tx() {
+        let router: Address = "0x00000000000000000000000000000000000000a1".parse().unwrap();
+        let job = B256::repeat_byte(0x22);
+        let log = |address: Address, topic0: B256, topic1: B256, removed: bool| {
+            serde_json::json!({
+                "address": address.to_string(),
+                "topics": [topic0.to_string(), topic1.to_string(), B256::ZERO.to_string()],
+                "removed": removed,
+            })
+        };
+        let receipt = |logs: Vec<serde_json::Value>| serde_json::json!({ "status": "0x1", "logs": logs });
+        let t = job_submitted_topic();
+        let other: Address = "0x00000000000000000000000000000000000000b2".parse().unwrap();
+        assert!(receipt_emits_job_submitted(&receipt(vec![log(router, t, job, false)]), router, job));
+        // Beside other logs, in any position.
+        assert!(receipt_emits_job_submitted(
+            &receipt(vec![log(other, t, job, false), log(router, t, job, false)]),
+            router,
+            job
+        ));
+        for wrong in [
+            log(other, t, job, false),
+            log(router, keccak256("Other()"), job, false),
+            log(router, t, B256::repeat_byte(0x33), false),
+            log(router, t, job, true),
+        ] {
+            assert!(!receipt_emits_job_submitted(&receipt(vec![wrong.clone()]), router, job), "{wrong}");
+        }
+        assert!(!receipt_emits_job_submitted(&receipt(vec![]), router, job));
+        assert!(!receipt_emits_job_submitted(&serde_json::json!({}), router, job));
+        // Address case does not matter (nodes answer lower case; a checksum parses the same).
+        let mut upper = log(router, t, job, false);
+        upper["address"] = serde_json::json!("0x00000000000000000000000000000000000000A1");
+        assert!(receipt_emits_job_submitted(&receipt(vec![upper]), router, job));
     }
 
     #[test]

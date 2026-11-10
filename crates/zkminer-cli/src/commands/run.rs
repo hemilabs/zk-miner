@@ -585,7 +585,7 @@ struct Measured {
 }
 
 /// A resolved measurement's journal, with the keccak of the input it was executed on.
-type MeasuredJournal = Option<(alloy::primitives::B256, std::sync::Arc<[u8]>)>;
+pub(crate) type MeasuredJournal = Option<(alloy::primitives::B256, std::sync::Arc<[u8]>)>;
 
 /// Bound on the journal bytes the measured cache holds. A cached journal is at most
 /// `MAX_JOURNAL_BYTES` (longer ones are infeasible verdicts), so the entry cap alone would allow
@@ -1937,7 +1937,7 @@ fn descriptor_carries_revert_lever(d: &zkminer_contracts::bindings::JobDescripto
 /// is in hand — never a reason to claim. The journal is a deterministic function of (ELF, input) (the
 /// risc0 worker seeds `sys_rand` per (ELF, input)), so a mismatch here is the `JournalMismatch` the
 /// fulfil would revert after the lock.
-fn measured_binding_verdict(
+pub(crate) fn measured_binding_verdict(
     d: &zkminer_contracts::bindings::JobDescriptor,
     measured: &MeasuredJournal,
     job_id: alloy::primitives::B256,
@@ -2293,7 +2293,7 @@ const MEASURE_TIMEOUT: Duration = Duration::from_secs(120);
 /// guest-controlled bytes a hostile guest could set to "wall-clock watchdog" to forge the TTL and
 /// re-open the perpetual re-measurement DoS. Extracted as a free fn so the classification is unit-
 /// testable without driving a worker.
-fn is_measure_wall_clock_timeout(e: &anyhow::Error) -> bool {
+pub(crate) fn is_measure_wall_clock_timeout(e: &anyhow::Error) -> bool {
     e.downcast_ref::<zkminer_prover_protocol::types::MeasureWallClockTimeout>()
         .is_some()
 }
@@ -2305,7 +2305,7 @@ fn is_measure_wall_clock_timeout(e: &anyhow::Error) -> bool {
 /// purely transient scheduling (the measurement was healthy and yielded to a bonded job), so the
 /// caller must treat it exactly like `MeasureSlotsBusy`: no strike, no negative-cache, no retry TTL —
 /// just re-measure next tick. Extracted as a free fn so the classification is unit-testable.
-fn is_measure_preempted(e: &anyhow::Error) -> bool {
+pub(crate) fn is_measure_preempted(e: &anyhow::Error) -> bool {
     e.downcast_ref::<zkminer_prover_protocol::types::MeasurePreempted>()
         .is_some()
 }
@@ -2324,7 +2324,7 @@ fn prove_sizing_cycles(declared: u64, measured: Option<u64>) -> u64 {
 /// `num_uris × per-URI-timeout` (minutes), and because a claim now REQUIRES a measurement, a frozen
 /// budget halts all claiming. A real descriptor read / few-MB ELF download completes in seconds; this
 /// is generous for that while cutting a staller off. `download_elf` also caps the URI count.
-const MEASURE_FETCH_BUDGET: Duration = Duration::from_secs(90);
+pub(crate) const MEASURE_FETCH_BUDGET: Duration = Duration::from_secs(90);
 
 /// Fallback fee rate (5%) used only if the adapter query fails.
 const FALLBACK_FEE_RATE_BPS: u16 = 500;
@@ -10372,7 +10372,7 @@ fn planner_throughputs_for_backend(
     }
 }
 
-fn resolve_backend(proof_system_id: alloy::primitives::B256) -> Option<&'static str> {
+pub(crate) fn resolve_backend(proof_system_id: alloy::primitives::B256) -> Option<&'static str> {
     use zkminer_chain::auction::ProofSystem;
     match ProofSystem::from_id(proof_system_id)? {
         // The one system this build can prove AND verify end-to-end against the deployed verifier:
@@ -11112,6 +11112,9 @@ async fn measure_cycles(
                     journal,
                     peak_host_bytes,
                     duration_secs,
+                    // Simulate's evidence rule; the miner's own measure-matches-prove guarantee is the
+                    // shared seed key, not this count.
+                    host_entropy_reads: _,
                 } = measurement;
                 if paces_claims {
                     clear_preclaim_strikes(job_id);
@@ -11425,7 +11428,7 @@ async fn measure_cycles(
     }
 }
 
-async fn fetch_or_download_elf(
+pub(crate) async fn fetch_or_download_elf(
     client: &ChainClient,
     state: &zkminer_tui::state::SharedState,
     program_id: alloy::primitives::B256,
@@ -11573,7 +11576,7 @@ async fn fetch_or_download_elf(
 /// The ProgramRegistry could not be read (and no cached ELF stood in): an RPC failure, which says
 /// nothing about the program — a back-off, never a measure strike.
 #[derive(Debug)]
-struct RegistryUnavailable(String);
+pub(crate) struct RegistryUnavailable(String);
 
 impl std::fmt::Display for RegistryUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

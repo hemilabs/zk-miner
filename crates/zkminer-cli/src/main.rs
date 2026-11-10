@@ -96,6 +96,49 @@ enum Commands {
         #[arg(long, requires = "watch_only")]
         address: Option<alloy::primitives::Address>,
     },
+    /// Measure jobs as the miner sizes them before a claim, whatever their state, and print one JSON
+    /// line per job: cycles, or why not. Signs and sends nothing; starts measure workers only.
+    Simulate {
+        /// A job to measure (repeatable).
+        #[arg(long = "job", value_name = "JOB_ID")]
+        jobs: Vec<alloy::primitives::B256>,
+        /// Then read requests from stdin until EOF, one per line: a job id, or
+        /// {"jobId": "0x…", "submitTx": "0x…", "publicValues": "0x…"} (the submitting tx saves the
+        /// descriptor's log scan; the fulfil's public values let the report say whether the measured
+        /// journal is the proven one).
+        #[arg(long)]
+        stdin: bool,
+        /// The risc0 segment size to measure at (risc0 cycle counts are padded per segment).
+        #[arg(long, default_value_t = zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2)]
+        po2: u8,
+        /// Bound on one execution, in seconds: at least 60 (a lower value is raised to it), at most
+        /// 86400. An SP1 worker's one-time setup is not part of it.
+        #[arg(long, default_value_t = 600)]
+        execute_timeout_secs: u64,
+        /// Bound on deriving one program's id, in seconds: at least 60, at most 86400 (SP1's setup on
+        /// the CPU: seconds for a small guest, minutes for a large one). Requests are served one at a
+        /// time, so this also bounds how long one new program can hold the queue.
+        #[arg(long, default_value_t = 900)]
+        program_id_timeout_secs: u64,
+        /// The largest cycle count reported as `measured`; a measurement above it (risc0's keccak
+        /// charge included) is reported `too_heavy`, with the count in its reason.
+        #[arg(long, default_value_t = commands::simulate::DEFAULT_MAX_CYCLES)]
+        max_cycles: u64,
+        /// How long, in seconds, a program whose ELF did not bind (refused, a different id, or a
+        /// derivation that timed out) is answered from memory instead of downloaded and derived
+        /// again; 0 = never remembered.
+        #[arg(long, default_value_t = commands::simulate::DEFAULT_PROGRAM_FAILURE_TTL_SECS)]
+        program_failure_ttl_secs: u64,
+        /// The risc0 worker binary (e.g. zkminer-prove-risc0-cpu); overrides the config.
+        #[arg(long)]
+        risc0_worker: Option<std::path::PathBuf>,
+        /// The SP1 worker binary (zkminer-prove-sp1); overrides the config.
+        #[arg(long)]
+        sp1_worker: Option<std::path::PathBuf>,
+        /// Where to keep the ELF and program-id caches (default ~/.zkminer/simulate).
+        #[arg(long)]
+        cache_dir: Option<std::path::PathBuf>,
+    },
     /// Register fibonacci-sp1-guest and submit a test job (SP1 demo)
     #[cfg(feature = "sp1-demo")]
     Sp1Demo {
@@ -214,6 +257,38 @@ async fn main() -> Result<()> {
             let watch = watch_only.then_some(commands::run::WatchOnly { address });
             commands::run::run(config_path, headless || watch_only, watch).await
         }
+        Commands::Simulate {
+            jobs,
+            stdin,
+            po2,
+            execute_timeout_secs,
+            program_id_timeout_secs,
+            max_cycles,
+            program_failure_ttl_secs,
+            risc0_worker,
+            sp1_worker,
+            cache_dir,
+        } => {
+            commands::simulate::run(
+                config_path,
+                commands::simulate::SimulateOptions {
+                    jobs,
+                    stdin,
+                    po2,
+                    execute_timeout: simulate_bound("--execute-timeout-secs", execute_timeout_secs),
+                    program_id_timeout: simulate_bound(
+                        "--program-id-timeout-secs",
+                        program_id_timeout_secs,
+                    ),
+                    max_cycles,
+                    program_failure_ttl: std::time::Duration::from_secs(program_failure_ttl_secs),
+                    risc0_worker,
+                    sp1_worker,
+                    cache_dir,
+                },
+            )
+            .await
+        }
         #[cfg(feature = "sp1-demo")]
         Commands::Sp1Demo { input } => commands::sp1_demo::run(config_path, input).await,
         Commands::Init {
@@ -224,9 +299,53 @@ async fn main() -> Result<()> {
     }
 }
 
+/// A `simulate` bound in seconds, clamped to `MIN_BOUND_SECS..=86400`: below the minimum a request's
+/// own overhead would fail every request; far above it, the watchdog's deadline arithmetic overflows.
+fn simulate_bound(flag: &str, secs: u64) -> std::time::Duration {
+    const MAX_BOUND_SECS: u64 = 86_400;
+    let min = commands::simulate::MIN_BOUND_SECS;
+    let clamped = secs.clamp(min, MAX_BOUND_SECS);
+    if clamped != secs {
+        tracing::warn!("{flag} {secs} is outside {min}..={MAX_BOUND_SECS}: using {clamped}");
+    }
+    std::time::Duration::from_secs(clamped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simulate_bounds_are_clamped_to_their_minimum() {
+        let cli = Cli::try_parse_from([
+            "zkminer",
+            "simulate",
+            "--stdin",
+            "--max-cycles",
+            "12345",
+            "--execute-timeout-secs",
+            "5",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Simulate {
+                max_cycles,
+                execute_timeout_secs,
+                program_id_timeout_secs,
+                ..
+            } => {
+                assert_eq!(max_cycles, 12_345);
+                assert_eq!(execute_timeout_secs, 5);
+                assert_eq!(program_id_timeout_secs, 900);
+            }
+            _ => panic!("not a simulate command"),
+        }
+        let min = commands::simulate::MIN_BOUND_SECS;
+        assert_eq!(simulate_bound("x", 5).as_secs(), min);
+        assert_eq!(simulate_bound("x", 0).as_secs(), min);
+        assert_eq!(simulate_bound("x", 600).as_secs(), 600);
+        assert_eq!(simulate_bound("x", u64::MAX).as_secs(), 86_400);
+    }
 
     #[test]
     fn watch_only_flags_parse_and_conflict_as_documented() {
@@ -250,5 +369,62 @@ mod tests {
         assert!(
             Cli::try_parse_from(["zkminer", "run", "--watch-only", "--address", "0x12"]).is_err()
         );
+    }
+
+    #[test]
+    fn simulate_flags_parse() {
+        let a = format!("0x{}", "ab".repeat(32));
+        let b = format!("0x{}", "cd".repeat(32));
+        let cli = Cli::try_parse_from([
+            "zkminer", "simulate", "--job", &a, "--job", &b, "--stdin", "--po2", "21",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Simulate {
+                jobs,
+                stdin,
+                po2,
+                execute_timeout_secs,
+                max_cycles,
+                program_failure_ttl_secs,
+                ..
+            } => {
+                assert_eq!(
+                    jobs,
+                    vec![
+                        a.parse::<alloy::primitives::B256>().unwrap(),
+                        b.parse::<alloy::primitives::B256>().unwrap()
+                    ]
+                );
+                assert!(stdin);
+                assert_eq!(po2, 21);
+                assert_eq!(execute_timeout_secs, 600);
+                assert_eq!(max_cycles, 1_000_000_000);
+                assert_eq!(program_failure_ttl_secs, 6 * 3600);
+            }
+            _ => panic!("not a simulate command"),
+        }
+        let cli = Cli::try_parse_from([
+            "zkminer",
+            "simulate",
+            "--stdin",
+            "--max-cycles",
+            "1000",
+            "--program-failure-ttl-secs",
+            "0",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Simulate {
+                max_cycles,
+                program_failure_ttl_secs,
+                ..
+            } => {
+                assert_eq!(max_cycles, 1000);
+                assert_eq!(program_failure_ttl_secs, 0);
+            }
+            _ => panic!("not a simulate command"),
+        }
+        assert!(Cli::try_parse_from(["zkminer", "simulate", "--job", "0x12"]).is_err());
     }
 }
