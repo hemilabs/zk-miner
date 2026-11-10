@@ -947,7 +947,7 @@ mod benchmark_tracker_tests {
         ));
 
         assert_eq!(tracker.devices.len(), 3);
-        assert_eq!(tracker.total_count(), 21);
+        assert_eq!(tracker.total_count(), 18);
         let active = tracker.active_device().expect("a card is running");
         assert_eq!(tracker.display_name(active), "RTX 4090 RISC Zero");
         assert_eq!(active.programs[0].phase, ProgramPhase::Running);

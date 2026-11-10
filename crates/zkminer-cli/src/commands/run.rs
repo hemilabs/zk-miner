@@ -4133,10 +4133,9 @@ fn synthetic_conservative_benchmark(
 
     BenchmarkSuite {
         results: vec![
-            program("fibonacci", 500_000, 0.10, false),
             program("sha256-chain", 2_000_000, 0.20, true),
             program("ecdsa-verify", 5_000_000, 0.25, true),
-            program("bigint-mul", 1_000_000, 0.10, false),
+            program("bigint-mul", 1_000_000, 0.20, false),
             program("memory-merkle", 3_000_000, 0.15, true),
             program("chacha-mix", 34_000_000, 0.20, false),
         ],

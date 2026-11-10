@@ -1012,7 +1012,7 @@ mod tests {
         let tabs = &rows[4];
         for tab in [
             "RTX 4090 RISC Zero",
-            "RTX 4090 SP1 [0/7]",
+            "RTX 4090 SP1 [0/6]",
             "Arc A770 RISC Zero",
             "Arc A770 SP1",
         ] {
