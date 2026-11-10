@@ -21,20 +21,13 @@ pub struct BenchmarkProgram {
     pub weight: f64,
 }
 
-/// The 6 canonical benchmark programs.
+/// The 5 canonical benchmark programs.
 ///
 /// Weight distribution:
-///   40% pure compute (fibonacci 0.10, chacha-mix 0.20, bigint-mul 0.10)
+///   40% pure compute (chacha-mix 0.20, bigint-mul 0.20)
 ///   45% precompile   (sha256-chain 0.20, ecdsa-verify 0.25)
 ///   15% mixed        (memory-merkle 0.15)
-pub const BENCHMARK_PROGRAMS: [BenchmarkProgram; 6] = [
-    BenchmarkProgram {
-        name: "fibonacci",
-        description: "Tight integer loop with wrapping arithmetic",
-        precompile: false,
-        simulated_cycles: 500_000,
-        weight: 0.10,
-    },
+pub const BENCHMARK_PROGRAMS: [BenchmarkProgram; 5] = [
     BenchmarkProgram {
         name: "sha256-chain",
         description: "Sequential SHA-256 hashing (precompile-accelerated)",
@@ -54,7 +47,7 @@ pub const BENCHMARK_PROGRAMS: [BenchmarkProgram; 6] = [
         description: "4096-bit integer schoolbook multiplication",
         precompile: false,
         simulated_cycles: 1_000_000,
-        weight: 0.10,
+        weight: 0.20,
     },
     BenchmarkProgram {
         name: "memory-merkle",
@@ -1435,13 +1428,11 @@ pub fn run_benchmark() -> BenchmarkSuite {
 
     #[cfg(feature = "risc0")]
     {
-        results.push(crate::risc0::benchmark_fibonacci(1000));
         results.push(crate::risc0::benchmark_sha256_chain(10_000));
     }
 
     #[cfg(feature = "sp1")]
     {
-        results.push(crate::sp1::benchmark_fibonacci(1000));
         results.push(crate::sp1::benchmark_sha256_chain(10_000));
     }
 
@@ -2146,7 +2137,6 @@ fn run_simulated_benchmarks() -> Vec<BenchmarkResult> {
         let start = Instant::now();
 
         match program.name {
-            "fibonacci" => simulate_fibonacci(),
             "sha256-chain" => simulate_sha256_chain(),
             "ecdsa-verify" => simulate_ecdsa_verify(),
             "bigint-mul" => simulate_bigint_mul(),
@@ -2189,24 +2179,6 @@ fn run_simulated_benchmarks() -> Vec<BenchmarkResult> {
 // Simulation workloads — each exercises a distinct CPU pattern.
 // All use black_box() to prevent dead-code elimination.
 // ---------------------------------------------------------------------------
-
-/// Fibonacci: tight integer loop with wrapping arithmetic (500 iterations of LCG).
-fn simulate_fibonacci() {
-    let mut a = 0u64;
-    let mut b = 1u64;
-    for _ in 0..500 {
-        let next = a.wrapping_add(b);
-        a = b;
-        b = next;
-        // Inner LCG churn — black_box on each iteration prevents unrolling/vectorization
-        for _ in 0..200 {
-            b = std::hint::black_box(b)
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-        }
-    }
-    std::hint::black_box(b);
-}
 
 /// SHA-256 chain: simulates 1000 SHA-256 block compressions (64 rounds each, 2000 total blocks).
 fn simulate_sha256_chain() {
@@ -3048,8 +3020,8 @@ mod tests {
     }
 
     #[test]
-    fn six_programs_defined() {
-        assert_eq!(BENCHMARK_PROGRAMS.len(), 6);
+    fn five_programs_defined() {
+        assert_eq!(BENCHMARK_PROGRAMS.len(), 5);
     }
 
     #[test]

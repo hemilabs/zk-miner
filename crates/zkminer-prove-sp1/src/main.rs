@@ -281,8 +281,7 @@ use zkminer_prover_protocol::types::{
 use zkminer_prover_protocol::{
     is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
     WorkerResponse, BACKEND_SP1, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
-    BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
-    PROTOCOL_VERSION,
+    BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES, PROTOCOL_VERSION,
 };
 
 mod bundled_server;
@@ -340,7 +339,7 @@ fn main() {
             std::process::exit(2);
         };
         let elf = match name.as_str() {
-            BENCH_FIBONACCI => FIBONACCI_SP1_GUEST_ELF,
+            "fibonacci" => FIBONACCI_SP1_GUEST_ELF,
             BENCH_SHA256_CHAIN => SHA256_CHAIN_SP1_GUEST_ELF,
             BENCH_ECDSA_VERIFY => ECDSA_VERIFY_SP1_GUEST_ELF,
             BENCH_BIGINT_MUL => BIGINT_MUL_SP1_GUEST_ELF,
@@ -1702,7 +1701,6 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     backend: BACKEND_SP1.to_string(),
                     version: sp1_sdk::SP1_CIRCUIT_VERSION.to_string(),
                     supported_benchmarks: vec![
-                        BENCH_FIBONACCI.to_string(),
                         BENCH_SHA256_CHAIN.to_string(),
                         BENCH_ECDSA_VERIFY.to_string(),
                         BENCH_BIGINT_MUL.to_string(),
@@ -2514,13 +2512,6 @@ fn run_benchmarks(
 
     let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
         (
-            BENCH_FIBONACCI,
-            FIBONACCI_SP1_GUEST_ELF,
-            &1000u32.to_le_bytes(),
-            0.10,
-            false,
-        ),
-        (
             BENCH_SHA256_CHAIN,
             SHA256_CHAIN_SP1_GUEST_ELF,
             &50_000u32.to_le_bytes(),
@@ -2538,7 +2529,7 @@ fn run_benchmarks(
             BENCH_BIGINT_MUL,
             BIGINT_MUL_SP1_GUEST_ELF,
             &100u32.to_le_bytes(),
-            0.10,
+            0.20,
             false,
         ),
         (

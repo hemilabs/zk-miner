@@ -14,8 +14,8 @@ use zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV;
 use zkminer_prover_protocol::{
     is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
     WorkerResponse, BACKEND_RISC0, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
-    BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
-    PROTOCOL_VERSION, RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN,
+    BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES, PROTOCOL_VERSION,
+    RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN,
 };
 
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
@@ -196,7 +196,6 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     backend: BACKEND_RISC0.to_string(),
                     version: risc0_zkvm::VERSION.to_string(),
                     supported_benchmarks: vec![
-                        BENCH_FIBONACCI.to_string(),
                         BENCH_SHA256_CHAIN.to_string(),
                         BENCH_ECDSA_VERIFY.to_string(),
                         BENCH_BIGINT_MUL.to_string(),
@@ -1292,17 +1291,10 @@ fn run_benchmarks_streaming<W: std::io::Write>(
     let mut results = Vec::new();
     let bench_only = std::env::var("BENCH_ONLY").ok();
 
-    // All 6 canonical programs matching BENCHMARK_PROGRAMS weights.
+    // The canonical programs, matching BENCHMARK_PROGRAMS weights.
     // Input sizes tuned so each completes in 5-30s on a mid-range GPU,
     // keeping total benchmark time under 2 minutes on a 4090.
     let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
-        (
-            BENCH_FIBONACCI,
-            FIBONACCI_ELF,
-            &1000u32.to_le_bytes(),
-            0.10,
-            false,
-        ),
         (
             BENCH_SHA256_CHAIN,
             SHA256_CHAIN_ELF,
@@ -1321,7 +1313,7 @@ fn run_benchmarks_streaming<W: std::io::Write>(
             BENCH_BIGINT_MUL,
             BIGINT_MUL_ELF,
             &100u32.to_le_bytes(),
-            0.10,
+            0.20,
             false,
         ),
         (
@@ -1403,17 +1395,10 @@ fn run_benchmarks() -> Vec<BenchmarkEntry> {
     // Check for single-benchmark mode via env var (e.g., BENCH_ONLY=fibonacci)
     let bench_only = std::env::var("BENCH_ONLY").ok();
 
-    // All 6 canonical programs matching BENCHMARK_PROGRAMS weights.
+    // The canonical programs, matching BENCHMARK_PROGRAMS weights.
     // Input sizes tuned so each completes in 5-30s on a mid-range GPU,
     // keeping total benchmark time under 2 minutes on a 4090.
     let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
-        (
-            BENCH_FIBONACCI,
-            FIBONACCI_ELF,
-            &1000u32.to_le_bytes(),
-            0.10,
-            false,
-        ),
         (
             BENCH_SHA256_CHAIN,
             SHA256_CHAIN_ELF,
@@ -1432,7 +1417,7 @@ fn run_benchmarks() -> Vec<BenchmarkEntry> {
             BENCH_BIGINT_MUL,
             BIGINT_MUL_ELF,
             &100u32.to_le_bytes(),
-            0.10,
+            0.20,
             false,
         ),
         (

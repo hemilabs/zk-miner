@@ -59,7 +59,6 @@ pub const BACKEND_SP1: &str = "sp1";
 pub const BACKEND_OPENVM: &str = "openvm";
 
 // Canonical benchmark program names — must match BENCHMARK_PROGRAMS in benchmark.rs.
-pub const BENCH_FIBONACCI: &str = "fibonacci";
 pub const BENCH_SHA256_CHAIN: &str = "sha256-chain";
 pub const BENCH_ECDSA_VERIFY: &str = "ecdsa-verify";
 pub const BENCH_BIGINT_MUL: &str = "bigint-mul";

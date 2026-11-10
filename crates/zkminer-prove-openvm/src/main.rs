@@ -8,8 +8,8 @@ use std::time::Instant;
 use anyhow::Result;
 use zkminer_prover_protocol::{
     read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand, WorkerResponse,
-    BACKEND_OPENVM, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY, BENCH_FIBONACCI,
-    BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, PROTOCOL_VERSION,
+    BACKEND_OPENVM, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY, BENCH_MEMORY_MERKLE,
+    BENCH_SHA256_CHAIN, PROTOCOL_VERSION,
 };
 
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -86,7 +86,6 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     backend: BACKEND_OPENVM.to_string(),
                     version: "1.5.0-rc.1".to_string(),
                     supported_benchmarks: vec![
-                        BENCH_FIBONACCI.to_string(),
                         BENCH_SHA256_CHAIN.to_string(),
                         BENCH_ECDSA_VERIFY.to_string(),
                         BENCH_BIGINT_MUL.to_string(),
@@ -180,10 +179,9 @@ fn run_benchmarks() -> Vec<BenchmarkEntry> {
     // but report the real backend name.
     // Weights and precompile flags must match the host's BENCHMARK_PROGRAMS.
     vec![
-        simulated_benchmark(BENCH_FIBONACCI, 500_000, 0.10, false),
         simulated_benchmark(BENCH_SHA256_CHAIN, 2_000_000, 0.20, true),
         simulated_benchmark(BENCH_ECDSA_VERIFY, 5_000_000, 0.25, true),
-        simulated_benchmark(BENCH_BIGINT_MUL, 1_000_000, 0.10, false),
+        simulated_benchmark(BENCH_BIGINT_MUL, 1_000_000, 0.20, false),
         simulated_benchmark(BENCH_MEMORY_MERKLE, 3_000_000, 0.15, true),
         simulated_benchmark(BENCH_CHACHA_MIX, 34_000_000, 0.20, false),
     ]
