@@ -1,69 +1,16 @@
 //! Benchmarking for zkVM proving performance.
 //!
-//! Provides 6 diverse benchmark programs, which size and price jobs, and the **zkOP/s** score:
-//! SP1 cycles per second on one fixed 50M-cycle program. See
+//! Measures GPUs on the benchmark suite (`BENCHMARK_PROGRAMS`), which sizes and prices jobs, and
+//! for the **zkOP/s** score: SP1 cycles per second on one fixed 50M-cycle program. See
 //! `zkminer_prover_protocol::zkops_from_stark_secs`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// Descriptor for a benchmark program.
-#[derive(Debug, Clone)]
-pub struct BenchmarkProgram {
-    pub name: &'static str,
-    pub description: &'static str,
-    /// Uses zkVM precompile acceleration (SHA-256, ECDSA).
-    pub precompile: bool,
-    /// Representative cycle count for this workload.
-    pub simulated_cycles: u64,
-    /// Weight among these programs (all weights sum to 1.0).
-    pub weight: f64,
-}
-
-/// The 5 canonical benchmark programs.
-///
-/// Weight distribution:
-///   40% pure compute (chacha-mix 0.20, bigint-mul 0.20)
-///   45% precompile   (sha256-chain 0.20, ecdsa-verify 0.25)
-///   15% mixed        (memory-merkle 0.15)
-pub const BENCHMARK_PROGRAMS: [BenchmarkProgram; 5] = [
-    BenchmarkProgram {
-        name: "sha256-chain",
-        description: "Sequential SHA-256 hashing (precompile-accelerated)",
-        precompile: true,
-        simulated_cycles: 2_000_000,
-        weight: 0.20,
-    },
-    BenchmarkProgram {
-        name: "ecdsa-verify",
-        description: "Elliptic curve signature verification (precompile-accelerated)",
-        precompile: true,
-        simulated_cycles: 5_000_000,
-        weight: 0.25,
-    },
-    BenchmarkProgram {
-        name: "bigint-mul",
-        description: "4096-bit integer schoolbook multiplication",
-        precompile: false,
-        simulated_cycles: 1_000_000,
-        weight: 0.20,
-    },
-    BenchmarkProgram {
-        name: "memory-merkle",
-        description: "Build 1024-leaf Merkle tree with repeated hashing",
-        precompile: true, // Uses sha2 crate which triggers SHA-256 precompile
-        simulated_cycles: 3_000_000,
-        weight: 0.15,
-    },
-    BenchmarkProgram {
-        name: "chacha-mix",
-        description: "Pure ARX computation (Add-Rotate-XOR), no precompiles",
-        precompile: false,
-        simulated_cycles: 34_000_000,
-        weight: 0.20,
-    },
-];
+/// The suite is the protocol crate's: the miner sends it to the workers, which prove what they are
+/// sent. See `zkminer_prover_protocol::suite`.
+pub use zkminer_prover_protocol::{BenchmarkProgram, BENCHMARK_PROGRAMS};
 
 /// Single benchmark result (per-program).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2365,8 +2312,8 @@ fn quarter_round_sim(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) 
 // ---------------------------------------------------------------------------
 
 /// Benchmark suite version, derived from the benchmark program definitions.
-/// Automatically invalidates cached results when programs, weights, or
-/// reference throughputs change — no manual version bumps needed.
+/// Automatically invalidates cached results when programs, weights or
+/// inputs change — no manual version bumps needed.
 ///
 /// Uses a hand-rolled FNV-1a hash instead of `DefaultHasher` because
 /// `DefaultHasher` is explicitly not guaranteed to be stable across Rust
@@ -2390,6 +2337,11 @@ pub fn suite_version() -> String {
         h ^= pre as u64;
         h = h.wrapping_mul(FNV_PRIME);
         for b in p.simulated_cycles.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        // A different input is a different measurement.
+        for b in p.input.to_le_bytes().into_iter().chain(p.sp1_input.to_le_bytes()) {
             h ^= b as u64;
             h = h.wrapping_mul(FNV_PRIME);
         }

@@ -62,7 +62,7 @@ pub const BACKEND_RISC0: &str = "risc0";
 pub const BACKEND_SP1: &str = "sp1";
 pub const BACKEND_OPENVM: &str = "openvm";
 
-// Canonical benchmark program names — must match BENCHMARK_PROGRAMS in benchmark.rs.
+// Benchmark program names. The suite itself is `crate::suite::BENCHMARK_PROGRAMS`.
 pub const BENCH_SHA256_CHAIN: &str = "sha256-chain";
 pub const BENCH_ECDSA_VERIFY: &str = "ecdsa-verify";
 pub const BENCH_BIGINT_MUL: &str = "bigint-mul";
@@ -1069,6 +1069,22 @@ pub fn is_gpu_oom(message: &str) -> bool {
         // UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ("Native API returns: 39"), and SYCL's own wording.
         || m.contains("out_of_device_memory")
         || m.contains("out of device memory")
+}
+
+/// One program of a benchmark request: the worker proves its own build of the guest `name` on
+/// `input`. The suite these come from is the miner's; see `crate::suite`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchmarkProgramSpec {
+    /// One of the BENCH_* names.
+    pub name: String,
+    /// The guest's input, as it reads it.
+    pub input: Vec<u8>,
+    /// Copied into the result row.
+    pub weight: f64,
+    /// Copied into the result row.
+    pub precompile: bool,
+    /// Also time the Groth16 wrap on this program (`BenchmarkEntry::wrap_secs`).
+    pub measure_wrap: bool,
 }
 
 /// A single benchmark measurement from a worker.
