@@ -141,7 +141,10 @@ mod tests {
     #[test]
     fn each_zkvm_gets_its_own_inputs() {
         let input = |backend: &str, name: &str| {
-            let spec = benchmark_suite(backend).into_iter().find(|s| s.name == name).unwrap();
+            let spec = benchmark_suite(backend)
+                .into_iter()
+                .find(|s| s.name == name)
+                .unwrap();
             u32::from_le_bytes(spec.input.try_into().unwrap())
         };
         assert_eq!(input(BACKEND_RISC0, BENCH_SHA256_CHAIN), 10_000);
@@ -153,9 +156,15 @@ mod tests {
     #[test]
     fn sp1_times_the_wrap_once_and_on_the_last_program() {
         let sp1 = benchmark_suite(BACKEND_SP1);
-        let wrapped: Vec<_> = sp1.iter().filter(|s| s.measure_wrap).map(|s| &s.name).collect();
+        let wrapped: Vec<_> = sp1
+            .iter()
+            .filter(|s| s.measure_wrap)
+            .map(|s| &s.name)
+            .collect();
         assert_eq!(wrapped, [BENCH_CHACHA_MIX]);
-        assert!(benchmark_suite(BACKEND_RISC0).iter().all(|s| s.measure_wrap));
+        assert!(benchmark_suite(BACKEND_RISC0)
+            .iter()
+            .all(|s| s.measure_wrap));
     }
 
     #[test]

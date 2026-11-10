@@ -279,9 +279,10 @@ use zkminer_prover_protocol::types::{
     CUDA_DEVICE_ID_ENV, CUDA_VRAM_AVAILABLE_BYTES_ENV, CUDA_VRAM_BYTES_ENV, HOST_MEM_BUDGET_ENV,
 };
 use zkminer_prover_protocol::{
-    is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
-    WorkerResponse, BACKEND_SP1, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
-    BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES, PROTOCOL_VERSION,
+    is_gpu_oom, read_message, write_message, BenchmarkEntry, BenchmarkProgramSpec, ErrorKind,
+    WorkerCommand, WorkerResponse, BACKEND_SP1, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX,
+    BENCH_ECDSA_VERIFY, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, BENCH_ZKOP_MIX,
+    EXECUTE_JOURNAL_MAX_BYTES, PROTOCOL_VERSION,
 };
 
 mod bundled_server;
@@ -340,15 +341,10 @@ fn main() {
         };
         let elf = match name.as_str() {
             "fibonacci" => FIBONACCI_SP1_GUEST_ELF,
-            BENCH_SHA256_CHAIN => SHA256_CHAIN_SP1_GUEST_ELF,
-            BENCH_ECDSA_VERIFY => ECDSA_VERIFY_SP1_GUEST_ELF,
-            BENCH_BIGINT_MUL => BIGINT_MUL_SP1_GUEST_ELF,
-            BENCH_MEMORY_MERKLE => MEMORY_MERKLE_SP1_GUEST_ELF,
-            BENCH_CHACHA_MIX => CHACHA_MIX_SP1_GUEST_ELF,
-            other => {
+            other => benchmark_guest(other).unwrap_or_else(|| {
                 eprintln!("unknown guest {other:?} (known: the benchmark programs)");
                 std::process::exit(2);
-            }
+            }),
         };
         let pk = match sp1_sdk::blocking::ProverClient::builder()
             .cpu()
@@ -475,7 +471,8 @@ fn main() {
     }
 }
 
-/// `--benchmark`: run every benchmark and print a row per program to stderr. Returns the exit code,
+/// `--benchmark`: the suite the miner would send, then the zkOP/s score, printing a row per program
+/// to stderr. Returns the exit code,
 /// which is non-zero unless every program produced its row, so a script can tell.
 fn run_benchmarks_by_hand(device: Option<u32>) -> i32 {
     // Dropped before returning. That also ends the server, which must not outlive this process: with
@@ -488,7 +485,16 @@ fn run_benchmarks_by_hand(device: Option<u32>) -> i32 {
             return 1;
         }
     };
-    let run = run_benchmarks(prover, &mut held.benchmark_keys, &mut |_, _, _| {});
+    let programs = zkminer_prover_protocol::benchmark_suite(BACKEND_SP1);
+    let mut run = run_benchmarks(
+        prover,
+        &mut held.benchmark_keys,
+        &programs,
+        &mut |_, _, _| {},
+    );
+    if run.server_lost.is_none() {
+        score_zkop_mix(prover, &mut held.benchmark_keys, &mut run);
+    }
     for r in &run.results {
         eprintln!(
             "{:<16} {:>12} cycles  {:>8.2}s  {:>12.0} c/s  weight={:.2}  precompile={}",
@@ -1714,7 +1720,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Benchmark => {
+            WorkerCommand::Benchmark { programs } => {
                 tracing::info!("Running benchmarks...");
                 if sp1_measure_only() {
                     // Benchmarking builds the CudaProver (forks sp1-gpu-server) — exactly what a
@@ -1733,6 +1739,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         let run = run_benchmarks(
                             p,
                             &mut held.benchmark_keys,
+                            &programs,
                             &mut |entry, program_index, total| {
                                 // A closed pipe is reported by the final result's write below.
                                 let _ = write_message(
@@ -2537,15 +2544,14 @@ struct BenchmarkRun {
     server_lost: Option<anyhow::Error>,
 }
 
-/// Run the zkOP/s scoring proofs, adding their row to `run`.
+/// Run the zkOP/s scoring proofs, adding their row to `run`. For `--benchmark`: under a host, the
+/// host asks for each scoring proof itself.
 fn score_zkop_mix(
     prover: &sp1_sdk::blocking::CudaProver,
     keys: &mut Vec<CudaPk>,
     run: &mut BenchmarkRun,
-    total: u32,
-    on_done: &mut dyn FnMut(&BenchmarkEntry, u32, u32),
 ) {
-    use zkminer_prover_protocol::{measure_zkop_mix, BENCH_ZKOP_MIX, ZKOP_MIX_SP1_CYCLES};
+    use zkminer_prover_protocol::{measure_zkop_mix, ZKOP_MIX_SP1_CYCLES};
     let mut failure = None;
     let scored = measure_zkop_mix(|iterations| {
         match benchmark_program(
@@ -2567,10 +2573,7 @@ fn score_zkop_mix(
         }
     });
     match (scored, failure) {
-        (Some(entry), _) if entry.cycles == ZKOP_MIX_SP1_CYCLES => {
-            on_done(&entry, total, total);
-            run.results.push(entry);
-        }
+        (Some(entry), _) if entry.cycles == ZKOP_MIX_SP1_CYCLES => run.results.push(entry),
         // The score divides a fixed cycle count by this proof's time, so it only means anything
         // for the program that count was measured on.
         (Some(entry), _) => {
@@ -2592,12 +2595,28 @@ fn score_zkop_mix(
     }
 }
 
-/// Prove every benchmark program, calling `on_done(entry, 1-based program index, total)` after each.
-/// The keys it sets up go into `keys` and stay resident: each holds the client, and through it the
-/// server, so they belong with whatever releases those.
+/// The embedded guest a benchmark request names, or `None` for a name this build has no guest for.
+fn benchmark_guest(name: &str) -> Option<&'static [u8]> {
+    let elf = match name {
+        BENCH_SHA256_CHAIN => SHA256_CHAIN_SP1_GUEST_ELF,
+        BENCH_ECDSA_VERIFY => ECDSA_VERIFY_SP1_GUEST_ELF,
+        BENCH_BIGINT_MUL => BIGINT_MUL_SP1_GUEST_ELF,
+        BENCH_MEMORY_MERKLE => MEMORY_MERKLE_SP1_GUEST_ELF,
+        BENCH_CHACHA_MIX => CHACHA_MIX_SP1_GUEST_ELF,
+        BENCH_ZKOP_MIX => ZKOP_MIX_SP1_GUEST_ELF,
+        _ => return None,
+    };
+    (!elf.is_empty()).then_some(elf)
+}
+
+/// Prove each of `programs`, calling `on_done(entry, 1-based program index, total)` after each that
+/// proved. The suite is the host's; see `zkminer_prover_protocol::suite`. The keys it sets up go into
+/// `keys` and stay resident: each holds the client, and through it the server, so they belong with
+/// whatever releases those.
 fn run_benchmarks(
     prover: &sp1_sdk::blocking::CudaProver,
     keys: &mut Vec<CudaPk>,
+    programs: &[BenchmarkProgramSpec],
     on_done: &mut dyn FnMut(&BenchmarkEntry, u32, u32),
 ) -> BenchmarkRun {
     let mut run = BenchmarkRun {
@@ -2605,72 +2624,26 @@ fn run_benchmarks(
         failed: Vec::new(),
         server_lost: None,
     };
-
-    let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
-        (
-            BENCH_SHA256_CHAIN,
-            SHA256_CHAIN_SP1_GUEST_ELF,
-            &50_000u32.to_le_bytes(),
-            0.20,
-            true,
-        ),
-        (
-            BENCH_ECDSA_VERIFY,
-            ECDSA_VERIFY_SP1_GUEST_ELF,
-            &10u32.to_le_bytes(),
-            0.25,
-            true,
-        ),
-        (
-            BENCH_BIGINT_MUL,
-            BIGINT_MUL_SP1_GUEST_ELF,
-            &100u32.to_le_bytes(),
-            0.20,
-            false,
-        ),
-        (
-            BENCH_MEMORY_MERKLE,
-            MEMORY_MERKLE_SP1_GUEST_ELF,
-            &1024u32.to_le_bytes(),
-            0.15,
-            true,
-        ),
-        (
-            BENCH_CHACHA_MIX,
-            CHACHA_MIX_SP1_GUEST_ELF,
-            &20_000u32.to_le_bytes(),
-            0.20,
-            false,
-        ),
-    ];
-
-    // The Groth16 wrap is measured on ONE program per slot, by difference — see `benchmark_program`.
-    // The LAST one, not the first: the difference assumes the Groth16 run's STARK repeats at the
-    // compressed run's speed, and the first proof in a fresh worker also pays GPU warm-up, which would
-    // land in one run and not the other. By the last program that has long been paid.
-    let last_runnable = benchmarks.iter().rposition(|&(_, elf, ..)| !elf.is_empty());
-    // The scoring program runs after these.
-    let total = benchmarks.iter().filter(|b| !b.1.is_empty()).count() as u32 + 1;
-    let mut program_index = 0;
-    for (idx, &(name, elf, input, weight, precompile)) in benchmarks.iter().enumerate() {
-        if elf.is_empty() {
+    let total = programs.len() as u32;
+    for (idx, spec) in programs.iter().enumerate() {
+        let name = spec.name.as_str();
+        let Some(elf) = benchmark_guest(name) else {
+            tracing::warn!("{name}: no guest for it in this build; skipped");
             continue;
-        }
-        program_index += 1;
-        let measure_wrap = Some(idx) == last_runnable;
+        };
         match benchmark_program(
             prover,
             name,
             elf,
-            input,
-            weight,
-            precompile,
-            measure_wrap,
+            &spec.input,
+            spec.weight,
+            spec.precompile,
+            spec.measure_wrap,
             keys,
             &mut run.server_lost,
         ) {
             Ok(entry) => {
-                on_done(&entry, program_index, total);
+                on_done(&entry, idx as u32 + 1, total);
                 run.results.push(entry);
             }
             Err(e) => {
@@ -2685,11 +2658,6 @@ fn run_benchmarks(
             break;
         }
     }
-
-    if run.server_lost.is_none() {
-        score_zkop_mix(prover, keys, &mut run, total, on_done);
-    }
-
     run
 }
 
@@ -2701,7 +2669,8 @@ fn benchmark_program(
     input: &[u8],
     weight: f64,
     precompile: bool,
-    // Also prove this program in Groth16 mode and report the wrap. See `run_benchmarks`.
+    // Also prove this program in Groth16 mode and report the wrap; the suite asks for it on one
+    // program. See `zkminer_prover_protocol::benchmark_suite`.
     measure_wrap: bool,
     // Where the key goes, as soon as there is one; see `run_benchmarks`.
     keys: &mut Vec<CudaPk>,

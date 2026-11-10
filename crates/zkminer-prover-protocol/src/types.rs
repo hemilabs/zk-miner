@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 /// image id, the SP1 verifying-key hash), derived without executing it. A v10 worker cannot decode the
 /// command, so the handshake refuses it. And `ExecuteResult` gained `host_entropy_reads`, whether the
 /// guest read host-supplied nondeterministic input (both in the same unreleased version).
-pub const PROTOCOL_VERSION: u32 = 11;
+/// 12: `Benchmark` carries the programs to run (`BenchmarkProgramSpec`): the suite is the host's, and
+/// the zkOP/s scoring proofs are requests of their own. A v11 worker ran its own list.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -131,8 +133,10 @@ pub enum WorkerCommand {
     Hello { protocol_version: u32 },
     /// Request worker capabilities.
     Capabilities,
-    /// Run the full benchmark suite. Worker runs all programs it supports.
-    Benchmark,
+    /// Prove each of `programs`, in order, sending a `BenchmarkProgress` after each and then one
+    /// `BenchmarkResult` with a row per program that proved. A program this worker has no guest for
+    /// is skipped with a warning.
+    Benchmark { programs: Vec<BenchmarkProgramSpec> },
     /// Generate a proof for the given ELF and input data.
     Prove {
         request_id: u64,

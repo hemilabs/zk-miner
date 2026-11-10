@@ -98,9 +98,9 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Benchmark => {
+            WorkerCommand::Benchmark { programs } => {
                 tracing::info!("Running benchmarks...");
-                let results = run_benchmarks();
+                let results = run_benchmarks(&programs);
                 let resp = WorkerResponse::BenchmarkResult { results };
                 write_message(&mut stdout, &resp)?;
             }
@@ -187,17 +187,25 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     Ok(())
 }
 
-fn run_benchmarks() -> Vec<BenchmarkEntry> {
-    // OpenVM compiles guests at runtime; for benchmarks we use simulated workloads
-    // but report the real backend name.
-    // Weights and precompile flags must match the host's BENCHMARK_PROGRAMS.
-    vec![
-        simulated_benchmark(BENCH_SHA256_CHAIN, 2_000_000, 0.20, true),
-        simulated_benchmark(BENCH_ECDSA_VERIFY, 5_000_000, 0.25, true),
-        simulated_benchmark(BENCH_BIGINT_MUL, 1_000_000, 0.20, false),
-        simulated_benchmark(BENCH_MEMORY_MERKLE, 3_000_000, 0.15, true),
-        simulated_benchmark(BENCH_CHACHA_MIX, 34_000_000, 0.20, false),
-    ]
+fn run_benchmarks(
+    programs: &[zkminer_prover_protocol::BenchmarkProgramSpec],
+) -> Vec<BenchmarkEntry> {
+    // OpenVM compiles guests at runtime; for benchmarks we use simulated workloads, sized by the
+    // suite's representative cycle counts, but report the real backend name.
+    programs
+        .iter()
+        .filter_map(|spec| {
+            let program = zkminer_prover_protocol::BENCHMARK_PROGRAMS
+                .iter()
+                .find(|p| p.name == spec.name)?;
+            Some(simulated_benchmark(
+                program.name,
+                program.simulated_cycles,
+                spec.weight,
+                spec.precompile,
+            ))
+        })
+        .collect()
 }
 
 fn simulated_benchmark(name: &str, cycles: u64, weight: f64, precompile: bool) -> BenchmarkEntry {

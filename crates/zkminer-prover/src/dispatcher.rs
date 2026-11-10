@@ -1836,6 +1836,14 @@ pub struct WorkerPool {
     measure_only: bool,
 }
 
+/// What `WorkerPool::run_benchmark_requests` got from a worker.
+struct BenchmarkRequests {
+    results: Result<Vec<BenchmarkEntry>>,
+    /// The worker stopped answering (its pipe broke, or the watchdog killed it), so its slot must
+    /// be marked. `results` can still hold the programs' rows, when it was the scoring that broke.
+    broken: bool,
+}
+
 /// Round-robin counter for load balancing across multiple GPU workers.
 static ROUND_ROBIN: AtomicUsize = AtomicUsize::new(0);
 
@@ -3325,6 +3333,107 @@ impl WorkerPool {
         }
     }
 
+    /// Benchmarks the worker behind `handle` on the miner's suite for its zkVM
+    /// (`zkminer_prover_protocol::benchmark_suite`): the programs in one request, then the zkOP/s
+    /// scoring proofs one request each (`measure_zkop_mix`), the score's row after the programs'.
+    /// The worker proves what it is sent, so the suite changes with the miner alone.
+    ///
+    /// `on_done(row, 1-based program index, total)` counts the score as the last program. A scoring
+    /// proof that fails leaves the score out and keeps the rows.
+    fn run_benchmark_requests(
+        handle: &mut WorkerHandle,
+        key: &str,
+        on_done: &dyn Fn(&BenchmarkEntry, u32, u32),
+    ) -> BenchmarkRequests {
+        use zkminer_prover_protocol::{
+            benchmark_suite, measure_zkop_mix, zkop_mix_spec, BACKEND_SP1, BENCH_ZKOP_MIX,
+            ZKOP_MIX_SP1_CYCLES,
+        };
+        let backend = handle.backend.clone();
+        let programs = benchmark_suite(&backend);
+        let total = programs.len() as u32 + 1;
+        let mut results = match Self::benchmark_request(handle, programs, &|row, index, _| {
+            on_done(row, index, total)
+        }) {
+            Err(e) => {
+                return BenchmarkRequests {
+                    results: Err(e),
+                    broken: true,
+                }
+            }
+            Ok(Err(message)) => {
+                return BenchmarkRequests {
+                    results: Err(anyhow::anyhow!("Benchmark error from {key}: {message}")),
+                    broken: false,
+                }
+            }
+            Ok(Ok(results)) => results,
+        };
+        // A worker that proved none of the programs (or one with no guests, like the mock) has
+        // nothing to score with.
+        if results.is_empty() {
+            return BenchmarkRequests {
+                results: Ok(results),
+                broken: false,
+            };
+        }
+
+        let mut lost: Option<anyhow::Error> = None;
+        let scored = measure_zkop_mix(|iterations| {
+            let rows = vec![zkop_mix_spec(iterations)];
+            match Self::benchmark_request(handle, rows, &|_, _, _| {}) {
+                Ok(Ok(mut rows)) => rows.pop().filter(|r| r.program_name == BENCH_ZKOP_MIX),
+                Ok(Err(message)) => {
+                    tracing::error!("{key}: {BENCH_ZKOP_MIX}: {message}");
+                    None
+                }
+                Err(e) => {
+                    lost = Some(e);
+                    None
+                }
+            }
+        });
+        match scored {
+            // The score divides SP1's cycle count for this program by the proof's time, so on SP1
+            // it only means anything for the program that count was measured on.
+            Some(row) if backend == BACKEND_SP1 && row.cycles != ZKOP_MIX_SP1_CYCLES => {
+                tracing::error!(
+                    "{key}: {BENCH_ZKOP_MIX}: {} cycles where {ZKOP_MIX_SP1_CYCLES} were expected;                      not reporting a zkOP/s score",
+                    row.cycles
+                );
+            }
+            Some(row) => {
+                on_done(&row, total, total);
+                results.push(row);
+            }
+            None => match &lost {
+                Some(e) => tracing::error!(
+                    "{key}: the worker stopped answering while scoring: {e:#}; no zkOP/s score"
+                ),
+                None => tracing::error!("{key}: {BENCH_ZKOP_MIX} did not prove; no zkOP/s score"),
+            },
+        }
+        BenchmarkRequests {
+            results: Ok(results),
+            broken: lost.is_some(),
+        }
+    }
+
+    /// Sends one `Benchmark` request and waits for its answer: `Err` when the worker stopped
+    /// answering, `Ok(Err)` with its message when it answered with an error.
+    fn benchmark_request(
+        handle: &mut WorkerHandle,
+        programs: Vec<zkminer_prover_protocol::BenchmarkProgramSpec>,
+        on_progress: &dyn Fn(&BenchmarkEntry, u32, u32),
+    ) -> Result<std::result::Result<Vec<BenchmarkEntry>, String>> {
+        handle.send(&WorkerCommand::Benchmark { programs })?;
+        Ok(match handle.recv_benchmark(on_progress)? {
+            WorkerResponse::BenchmarkResult { results } => Ok(results),
+            WorkerResponse::Error { message, .. } => Err(message),
+            other => Err(format!("unexpected response {other:?}")),
+        })
+    }
+
     fn benchmark_slot(&self, key: &str) -> Result<Vec<BenchmarkEntry>> {
         // A benchmark proves Groth16 on SP1: set it up first, outside this benchmark's watchdog.
         self.ensure_warmed(key)?;
@@ -3447,11 +3556,6 @@ impl WorkerPool {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Worker not available for {key}"))?;
 
-        if let Err(e) = handle.send(&WorkerCommand::Benchmark) {
-            Self::mark_slot_failed(&mut slot, entry);
-            return Err(e);
-        }
-
         // Start benchmark timeout watchdog if configured.
         let _watchdog = self.benchmark_timeout.map(|t| {
             ProvingWatchdog::new(
@@ -3463,23 +3567,15 @@ impl WorkerPool {
             )
         });
 
-        let bench_response = handle.recv_benchmark(&|_, _, _| {});
-
-        if let Err(ref _e) = bench_response {
+        let requests = Self::run_benchmark_requests(handle, key, &|_, _, _| {});
+        if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);
             } else {
                 Self::mark_slot_failed(&mut slot, entry);
             }
         }
-
-        match bench_response? {
-            WorkerResponse::BenchmarkResult { results } => Ok(results),
-            WorkerResponse::Error { message, .. } => {
-                bail!("Benchmark error from {key}: {message}")
-            }
-            other => bail!("Unexpected response from {key}: {other:?}"),
-        }
+        requests.results
     }
 
     /// Run benchmarks on a backend. Accepts logical name, vendor-level, or full compound key.
@@ -3861,11 +3957,6 @@ impl WorkerPool {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Worker not available for {key}"))?;
 
-        if let Err(e) = handle.send(&WorkerCommand::Benchmark) {
-            Self::mark_slot_failed(&mut slot, entry);
-            return Err(e);
-        }
-
         // Start benchmark timeout watchdog if configured.
         let _watchdog = self.benchmark_timeout.map(|t| {
             ProvingWatchdog::new(
@@ -3893,23 +3984,15 @@ impl WorkerPool {
             });
         };
 
-        let bench_response = handle.recv_benchmark(&cb);
-
-        if let Err(ref _e) = bench_response {
+        let requests = Self::run_benchmark_requests(handle, key, &cb);
+        if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);
             } else {
                 Self::mark_slot_failed(&mut slot, entry);
             }
         }
-
-        match bench_response? {
-            WorkerResponse::BenchmarkResult { results } => Ok(results),
-            WorkerResponse::Error { message, .. } => {
-                bail!("Benchmark error from {key}: {message}")
-            }
-            other => bail!("Unexpected response from {key}: {other:?}"),
-        }
+        requests.results
     }
 
     /// A progress event for `key`, carrying that slot's card details.

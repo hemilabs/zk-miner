@@ -12,10 +12,10 @@ use anyhow::{Context, Result};
 use risc0_zkvm::Prover as _;
 use zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV;
 use zkminer_prover_protocol::{
-    is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
-    WorkerResponse, BACKEND_RISC0, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
-    BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES, PROTOCOL_VERSION,
-    RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN,
+    is_gpu_oom, read_message, write_message, BenchmarkEntry, BenchmarkProgramSpec, ErrorKind,
+    WorkerCommand, WorkerResponse, BACKEND_RISC0, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX,
+    BENCH_ECDSA_VERIFY, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
+    PROTOCOL_VERSION, RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN,
 };
 
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
@@ -218,9 +218,9 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Benchmark => {
+            WorkerCommand::Benchmark { programs } => {
                 tracing::info!("Running benchmarks...");
-                let results = run_benchmarks_streaming(&mut stdout)?;
+                let results = run_benchmarks_streaming(&mut stdout, &programs)?;
                 let resp = WorkerResponse::BenchmarkResult { results };
                 write_message(&mut stdout, &resp)?;
             }
@@ -1450,183 +1450,79 @@ fn run_proof_once(
     Ok((journal, seal, duration_secs, cycles))
 }
 
-/// Run benchmarks, sending a BenchmarkProgress message after each program completes.
+/// The embedded guest a benchmark request names, or `None` for a name this build has no guest for
+/// (or a guest stubbed out of the build).
+fn benchmark_guest(name: &str) -> Option<&'static [u8]> {
+    let elf = match name {
+        BENCH_SHA256_CHAIN => SHA256_CHAIN_ELF,
+        BENCH_ECDSA_VERIFY => ECDSA_VERIFY_ELF,
+        BENCH_BIGINT_MUL => BIGINT_MUL_ELF,
+        BENCH_MEMORY_MERKLE => MEMORY_MERKLE_ELF,
+        BENCH_CHACHA_MIX => CHACHA_MIX_ELF,
+        zkminer_prover_protocol::BENCH_ZKOP_MIX => ZKOP_MIX_ELF,
+        _ => return None,
+    };
+    (!elf.is_empty()).then_some(elf)
+}
+
+/// Prove each of `programs`, sending a `BenchmarkProgress` after each one that proved. The suite is
+/// the host's; see `zkminer_prover_protocol::suite`.
 fn run_benchmarks_streaming<W: std::io::Write>(
     stdout: &mut W,
+    programs: &[BenchmarkProgramSpec],
 ) -> anyhow::Result<Vec<BenchmarkEntry>> {
     let mut results = Vec::new();
-    let bench_only = std::env::var("BENCH_ONLY").ok();
-
-    // The canonical programs, matching BENCHMARK_PROGRAMS weights.
-    // Input sizes tuned so each completes in 5-30s on a mid-range GPU,
-    // keeping total benchmark time under 2 minutes on a 4090.
-    let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
-        (
-            BENCH_SHA256_CHAIN,
-            SHA256_CHAIN_ELF,
-            &10_000u32.to_le_bytes(),
-            0.20,
-            true,
-        ),
-        (
-            BENCH_ECDSA_VERIFY,
-            ECDSA_VERIFY_ELF,
-            &10u32.to_le_bytes(),
-            0.25,
-            true,
-        ),
-        (
-            BENCH_BIGINT_MUL,
-            BIGINT_MUL_ELF,
-            &100u32.to_le_bytes(),
-            0.20,
-            false,
-        ),
-        (
-            BENCH_MEMORY_MERKLE,
-            MEMORY_MERKLE_ELF,
-            &512u32.to_le_bytes(),
-            0.15,
-            true,
-        ),
-        (
-            BENCH_CHACHA_MIX,
-            CHACHA_MIX_ELF,
-            &5_000u32.to_le_bytes(),
-            0.20,
-            false,
-        ),
-    ];
-
-    let active: Vec<_> = benchmarks
-        .iter()
-        .filter(|&&(name, elf, _, _, _)| {
-            !elf.is_empty()
-                && bench_only
-                    .as_ref()
-                    .map_or(true, |only| name.eq_ignore_ascii_case(only))
-        })
-        .collect();
-    use zkminer_prover_protocol::{measure_zkop_mix, BENCH_ZKOP_MIX};
-    // The scoring program runs after these.
-    let score = !ZKOP_MIX_ELF.is_empty()
-        && bench_only
-            .as_ref()
-            .map_or(true, |only| BENCH_ZKOP_MIX.eq_ignore_ascii_case(only));
-    let total = active.len() as u32 + u32::from(score);
-
-    for (idx, &&(name, elf, input, weight, precompile)) in active.iter().enumerate() {
-        if let Some(entry) = benchmark_program(name, elf, input, weight, precompile) {
+    let total = programs.len() as u32;
+    for (idx, spec) in programs.iter().enumerate() {
+        if let Some(entry) = benchmark_spec(spec) {
             let progress = WorkerResponse::BenchmarkProgress {
                 entry: entry.clone(),
-                program_index: (idx + 1) as u32,
+                program_index: idx as u32 + 1,
                 total_programs: total,
             };
             write_message(stdout, &progress)?;
             results.push(entry);
         }
     }
-
-    if score {
-        let scored = measure_zkop_mix(|iterations| {
-            benchmark_stages(
-                BENCH_ZKOP_MIX,
-                ZKOP_MIX_ELF,
-                &iterations.to_le_bytes(),
-                0.0,
-                false,
-                false,
-            )
-        });
-        match scored {
-            Some(entry) => {
-                let progress = WorkerResponse::BenchmarkProgress {
-                    entry: entry.clone(),
-                    program_index: total,
-                    total_programs: total,
-                };
-                write_message(stdout, &progress)?;
-                results.push(entry);
-            }
-            None => tracing::error!("{BENCH_ZKOP_MIX}: proving failed; not reporting a zkOP/s score"),
-        }
-    }
-
     Ok(results)
 }
 
-fn run_benchmarks() -> Vec<BenchmarkEntry> {
-    let mut results = Vec::new();
-
-    // Check for single-benchmark mode via env var (e.g., BENCH_ONLY=fibonacci)
-    let bench_only = std::env::var("BENCH_ONLY").ok();
-
-    // The canonical programs, matching BENCHMARK_PROGRAMS weights.
-    // Input sizes tuned so each completes in 5-30s on a mid-range GPU,
-    // keeping total benchmark time under 2 minutes on a 4090.
-    let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
-        (
-            BENCH_SHA256_CHAIN,
-            SHA256_CHAIN_ELF,
-            &10_000u32.to_le_bytes(),
-            0.20,
-            true,
-        ),
-        (
-            BENCH_ECDSA_VERIFY,
-            ECDSA_VERIFY_ELF,
-            &10u32.to_le_bytes(),
-            0.25,
-            true,
-        ),
-        (
-            BENCH_BIGINT_MUL,
-            BIGINT_MUL_ELF,
-            &100u32.to_le_bytes(),
-            0.20,
-            false,
-        ),
-        (
-            BENCH_MEMORY_MERKLE,
-            MEMORY_MERKLE_ELF,
-            &512u32.to_le_bytes(),
-            0.15,
-            true,
-        ),
-        (
-            BENCH_CHACHA_MIX,
-            CHACHA_MIX_ELF,
-            &5_000u32.to_le_bytes(),
-            0.20,
-            false,
-        ),
-    ];
-
-    for &(name, elf, input, weight, precompile) in benchmarks {
-        if elf.is_empty() {
-            continue;
-        }
-        if let Some(ref only) = bench_only {
-            if !name.eq_ignore_ascii_case(only) {
-                continue;
-            }
-        }
-        if let Some(entry) = benchmark_program(name, elf, input, weight, precompile) {
-            results.push(entry);
-        }
-    }
-
-    results
+/// Prove one requested program, if this build has its guest.
+fn benchmark_spec(spec: &BenchmarkProgramSpec) -> Option<BenchmarkEntry> {
+    let Some(elf) = benchmark_guest(&spec.name) else {
+        tracing::warn!("{}: no guest for it in this build; skipped", spec.name);
+        return None;
+    };
+    benchmark_stages(
+        &spec.name,
+        elf,
+        &spec.input,
+        spec.weight,
+        spec.precompile,
+        spec.measure_wrap,
+    )
 }
 
-fn benchmark_program(
-    name: &str,
-    elf: &[u8],
-    input: &[u8],
-    weight: f64,
-    precompile: bool,
-) -> Option<BenchmarkEntry> {
-    benchmark_stages(name, elf, input, weight, precompile, true)
+/// `--benchmark`: the suite the miner would send, then the zkOP/s score. `BENCH_ONLY=<name>` runs one
+/// program of it (or only the score, for `zkop-mix`).
+fn run_benchmarks() -> Vec<BenchmarkEntry> {
+    use zkminer_prover_protocol::{
+        benchmark_suite, measure_zkop_mix, zkop_mix_spec, BENCH_ZKOP_MIX,
+    };
+    let only = std::env::var("BENCH_ONLY").ok();
+    let wanted = |name: &str| only.as_ref().map_or(true, |o| name.eq_ignore_ascii_case(o));
+    let mut results: Vec<BenchmarkEntry> = benchmark_suite(BACKEND_RISC0)
+        .iter()
+        .filter(|spec| wanted(&spec.name))
+        .filter_map(benchmark_spec)
+        .collect();
+    if wanted(BENCH_ZKOP_MIX) {
+        match measure_zkop_mix(|iterations| benchmark_spec(&zkop_mix_spec(iterations))) {
+            Some(entry) => results.push(entry),
+            None => tracing::error!("{BENCH_ZKOP_MIX}: proving failed; no zkOP/s score"),
+        }
+    }
+    results
 }
 
 /// Prove `elf`, timing each stage. Without `measure_wrap` it stops at the constant-size STARK, whose

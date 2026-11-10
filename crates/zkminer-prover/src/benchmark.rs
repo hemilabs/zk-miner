@@ -2341,7 +2341,12 @@ pub fn suite_version() -> String {
             h = h.wrapping_mul(FNV_PRIME);
         }
         // A different input is a different measurement.
-        for b in p.input.to_le_bytes().into_iter().chain(p.sp1_input.to_le_bytes()) {
+        for b in p
+            .input
+            .to_le_bytes()
+            .into_iter()
+            .chain(p.sp1_input.to_le_bytes())
+        {
             h ^= b as u64;
             h = h.wrapping_mul(FNV_PRIME);
         }

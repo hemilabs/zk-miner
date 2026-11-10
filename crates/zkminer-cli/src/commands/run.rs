@@ -4132,13 +4132,10 @@ fn synthetic_conservative_benchmark(
         .collect();
 
     BenchmarkSuite {
-        results: vec![
-            program("sha256-chain", 2_000_000, 0.20, true),
-            program("ecdsa-verify", 5_000_000, 0.25, true),
-            program("bigint-mul", 1_000_000, 0.20, false),
-            program("memory-merkle", 3_000_000, 0.15, true),
-            program("chacha-mix", 34_000_000, 0.20, false),
-        ],
+        results: zkminer_prover::benchmark::BENCHMARK_PROGRAMS
+            .iter()
+            .map(|p| program(p.name, p.simulated_cycles, p.weight, p.precompile))
+            .collect(),
         device_benchmarks,
         zkops: throughput_cps,
         cpu_info: SYNTHETIC_SUITE_CPU.to_string(),
