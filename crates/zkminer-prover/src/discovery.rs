@@ -10,6 +10,8 @@
 //! For each backend, GPU-suffixed variants are searched first:
 //!   `zkminer-prove-{backend}-cuda`  → gpu_tag = "cuda"
 //!   `zkminer-prove-{backend}-rocm`  → gpu_tag = "rocm"
+//!   `zkminer-prove-{backend}-intel` → gpu_tag = "intel"
+//!   `zkminer-prove-{backend}-metal` → gpu_tag = "metal" (macOS, Apple silicon)
 //!   `zkminer-prove-{backend}`       → gpu_tag = "generic"
 //!
 //! GPU binaries are auto-expanded: one worker entry per detected physical GPU of that vendor.
@@ -25,16 +27,17 @@ use zkminer_prover_protocol::{BACKEND_OPENVM, BACKEND_RISC0, BACKEND_SP1};
 const ALL_BACKENDS: &[&str] = &[BACKEND_RISC0, BACKEND_SP1, BACKEND_OPENVM];
 
 /// GPU variant suffixes to search, in order. "generic" means no suffix.
-const GPU_TAGS: &[&str] = &["cuda", "rocm", "intel", "generic"];
+const GPU_TAGS: &[&str] = &["cuda", "rocm", "intel", "metal", "generic"];
 
 /// A detected physical GPU.
 #[derive(Debug, Clone)]
 pub struct DetectedGpu {
-    /// "cuda" or "rocm"
+    /// "cuda", "rocm", "intel" or "metal"
     pub gpu_tag: String,
     /// Sequential index within vendor (0, 1, ...)
     pub device_index: u32,
-    /// PCI bus ID, e.g. "0000:01:00.0" — used for *_VISIBLE_DEVICES
+    /// PCI bus ID, e.g. "0000:01:00.0" — used for *_VISIBLE_DEVICES. An Apple GPU is not on PCI
+    /// and gets the stable pseudo id [`APPLE_GPU_PSEUDO_BUS_ID`].
     pub pci_bus_id: String,
     /// Human-readable GPU name
     pub name: String,
@@ -48,7 +51,7 @@ pub struct DetectedGpu {
 #[derive(Debug, Clone)]
 pub struct DiscoveredWorker {
     pub backend: String,
-    /// GPU variant: "cuda", "rocm", or "generic".
+    /// GPU variant: "cuda", "rocm", "intel", "metal", or "generic".
     pub gpu_tag: String,
     /// Device index within vendor (None for "generic" or explicit binaries).
     pub device_index: Option<u32>,
@@ -72,7 +75,7 @@ fn worker_binary_name(backend: &str, gpu_tag: &str) -> String {
     }
 }
 
-/// Detect all physical GPUs (NVIDIA + AMD + Intel).
+/// Detect all physical GPUs (NVIDIA + AMD + Intel, and Apple on macOS).
 pub fn detect_all_gpus() -> Vec<DetectedGpu> {
     let mut gpus = Vec::new();
 
@@ -124,7 +127,103 @@ pub fn detect_all_gpus() -> Vec<DetectedGpu> {
         gpus.extend(intel);
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        let apple = detect_apple_gpus();
+        if !apple.is_empty() {
+            let names: Vec<_> = apple
+                .iter()
+                .map(|g| format!("[{}] {} ({})", g.device_index, g.name, g.pci_bus_id))
+                .collect();
+            tracing::info!(
+                "Detected {} Apple GPU(s): {}",
+                apple.len(),
+                names.join(", ")
+            );
+            gpus.extend(apple);
+        }
+    }
+
     gpus
+}
+
+/// The pseudo PCI bus id of the Apple GPU. Apple silicon's GPU sits on the SoC, not on PCI, but
+/// everything downstream (benchmark rows' `pci_bus_id`, cache migration, the dashboard) keys a card
+/// by this string, so it must be non-empty and stable across runs. It contains no `:`, so
+/// `normalize_pci_bus_id` leaves it alone and it can never equal a real bus id.
+pub const APPLE_GPU_PSEUDO_BUS_ID: &str = "apple-gpu0";
+
+/// Detect the Apple silicon GPU on macOS: exactly one, device index 0, which is the device
+/// `MTLCreateSystemDefaultDevice` returns and the only one the risc0 Metal HAL drives.
+///
+/// `system_profiler SPDisplaysDataType -json` names it (bounded by `GPU_TOOL_TIMEOUT` like
+/// `nvidia-smi` and `rocm-smi`; it took 0.16 s on an M5 Max). If that does not answer, the SoC's
+/// brand string (`sysctl machdep.cpu.brand_string`, e.g. "Apple M5 Max") is the same name, since the
+/// GPU is part of the chip. An Intel Mac reports neither as Apple and gets no entry: the Metal port
+/// targets Apple silicon only. No compute capability: that is a CUDA notion.
+#[cfg(target_os = "macos")]
+fn detect_apple_gpus() -> Vec<DetectedGpu> {
+    let (outcome, stdout) = zkminer_prover_protocol::proc::output_with_timeout_capturing_stdout(
+        std::process::Command::new("system_profiler").args(["SPDisplaysDataType", "-json"]),
+        GPU_TOOL_TIMEOUT,
+        1024 * 1024,
+    );
+    let from_profiler = if matches!(
+        outcome,
+        zkminer_prover_protocol::proc::Outcome::Ran { success: true, .. }
+    ) {
+        apple_gpu_name_from_profiler_json(&stdout)
+    } else {
+        tracing::warn!(
+            "system_profiler did not answer ({}); naming the Apple GPU after the chip",
+            outcome.describe()
+        );
+        None
+    };
+    let name = from_profiler.or_else(|| {
+        crate::memory::sysctl_string("machdep.cpu.brand_string").filter(|b| b.starts_with("Apple"))
+    });
+    match name {
+        Some(name) => vec![apple_gpu(name)],
+        None => Vec::new(),
+    }
+}
+
+/// The single Apple GPU entry, given its name.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn apple_gpu(name: String) -> DetectedGpu {
+    DetectedGpu {
+        gpu_tag: "metal".to_string(),
+        device_index: 0,
+        pci_bus_id: APPLE_GPU_PSEUDO_BUS_ID.to_string(),
+        name,
+        compute_cap: None,
+    }
+}
+
+/// The name of the first Apple-made GPU in `system_profiler SPDisplaysDataType -json` output, or
+/// `None` when there is none (an Intel Mac's AMD or Intel GPU is skipped) or the JSON is not the
+/// expected shape. Split out so the parse is testable without a Mac.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn apple_gpu_name_from_profiler_json(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get("SPDisplaysDataType")?
+        .as_array()?
+        .iter()
+        .filter(|gpu| {
+            let vendor = gpu.get("spdisplays_vendor").and_then(|x| x.as_str());
+            let model = gpu.get("sppci_model").and_then(|x| x.as_str());
+            vendor.is_some_and(|v| v.to_ascii_lowercase().contains("apple"))
+                || model.is_some_and(|m| m.starts_with("Apple"))
+        })
+        .find_map(|gpu| {
+            ["sppci_model", "_name"]
+                .iter()
+                .filter_map(|k| gpu.get(*k).and_then(|x| x.as_str()))
+                .map(str::trim)
+                .find(|n| !n.is_empty())
+                .map(str::to_string)
+        })
 }
 
 /// Says so, once, when this user cannot open the device nodes an AMD (`/dev/kfd`) or Intel
@@ -1434,6 +1533,9 @@ fn infer_gpu_tag(path: &Path) -> String {
         if name.ends_with("-intel") {
             return "intel".to_string();
         }
+        if name.ends_with("-metal") {
+            return "metal".to_string();
+        }
     }
     "generic".to_string()
 }
@@ -1631,7 +1733,11 @@ mod tests {
     /// whatever is installed now.
     #[test]
     fn the_sp1_server_checked_is_the_one_the_worker_will_run() {
-        let root = std::env::temp_dir().join(format!(
+        // Canonical, because `sp1_named_server_for` canonicalizes the worker's path: on macOS the
+        // temp dir is `/var/folders/...`, a symlink into `/private/var/folders/...`.
+        let tmp =
+            std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+        let root = tmp.join(format!(
             "zk-sp1-server-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1853,5 +1959,94 @@ mod tests {
         assert_eq!(gpus[0].pci_bus_id, "0000:01:00.0");
         // And the canonical form must match what the TUI produces from sysfs.
         assert_eq!(normalize_pci_bus_id("0000:41:00.0"), gpus[1].pci_bus_id);
+    }
+
+    #[test]
+    fn metal_is_a_gpu_tag_with_a_suffixed_binary() {
+        assert!(GPU_TAGS.contains(&"metal"));
+        // Searched before the generic name, like every other vendor suffix.
+        let metal = GPU_TAGS.iter().position(|t| *t == "metal").unwrap();
+        let generic = GPU_TAGS.iter().position(|t| *t == "generic").unwrap();
+        assert!(metal < generic);
+        assert_eq!(
+            worker_binary_name("risc0", "metal"),
+            "zkminer-prove-risc0-metal"
+        );
+        assert_eq!(
+            infer_gpu_tag(Path::new(
+                "/Users/x/.zkminer/provers/zkminer-prove-risc0-metal"
+            )),
+            "metal"
+        );
+        // Only a suffix counts.
+        assert_eq!(
+            infer_gpu_tag(Path::new("/x/zkminer-prove-risc0-metal-old")),
+            "generic"
+        );
+        // No SP1 build drives an Apple GPU, so SP1 is never expanded onto one.
+        assert_eq!(sp1_server_name("metal"), None);
+        assert!(!sp1_serves_card(
+            "metal",
+            Path::new("/nonexistent/zkminer-prove-sp1")
+        ));
+    }
+
+    #[test]
+    fn apple_gpu_is_named_from_system_profiler() {
+        // Trimmed from `system_profiler SPDisplaysDataType -json` on an M5 Max (macOS 27.2).
+        let m5 = r#"{
+          "SPDisplaysDataType" : [
+            {
+              "_name" : "Apple M5 Max",
+              "spdisplays_mtlgpufamilysupport" : "spdisplays_metal4",
+              "spdisplays_ndrvs" : [ { "_name" : "Some Display" } ],
+              "spdisplays_vendor" : "sppci_vendor_Apple",
+              "sppci_bus" : "spdisplays_builtin",
+              "sppci_cores" : "32",
+              "sppci_device_type" : "spdisplays_gpu",
+              "sppci_model" : "Apple M5 Max"
+            }
+          ]
+        }"#;
+        assert_eq!(
+            apple_gpu_name_from_profiler_json(m5).as_deref(),
+            Some("Apple M5 Max")
+        );
+        // An Intel Mac's discrete AMD GPU is not an Apple GPU: no entry.
+        let intel_mac = r#"{"SPDisplaysDataType":[{"_name":"AMD Radeon Pro 5500M",
+            "spdisplays_vendor":"sppci_vendor_amd","sppci_model":"AMD Radeon Pro 5500M"}]}"#;
+        assert_eq!(apple_gpu_name_from_profiler_json(intel_mac), None);
+        // Falls back to `_name` when the model is missing.
+        let no_model = r#"{"SPDisplaysDataType":[{"_name":"Apple M1",
+            "spdisplays_vendor":"sppci_vendor_Apple"}]}"#;
+        assert_eq!(
+            apple_gpu_name_from_profiler_json(no_model).as_deref(),
+            Some("Apple M1")
+        );
+        assert_eq!(apple_gpu_name_from_profiler_json(""), None);
+        assert_eq!(apple_gpu_name_from_profiler_json("{}"), None);
+        assert_eq!(apple_gpu_name_from_profiler_json("not json"), None);
+
+        let gpu = apple_gpu("Apple M5 Max".into());
+        assert_eq!(gpu.gpu_tag, "metal");
+        assert_eq!(gpu.device_index, 0);
+        assert_eq!(gpu.pci_bus_id, APPLE_GPU_PSEUDO_BUS_ID);
+        assert_eq!(gpu.compute_cap, None);
+        // The pseudo id must survive normalisation unchanged, or rows keyed by it would not join.
+        assert_eq!(normalize_pci_bus_id(APPLE_GPU_PSEUDO_BUS_ID), "apple-gpu0");
+    }
+
+    /// On an Apple silicon Mac, discovery reports exactly one Apple GPU.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn this_mac_reports_one_apple_gpu() {
+        let apple = detect_apple_gpus();
+        assert_eq!(apple.len(), 1, "{apple:?}");
+        assert!(apple[0].name.starts_with("Apple"), "{apple:?}");
+        assert_eq!(apple[0].gpu_tag, "metal");
+        assert_eq!(apple[0].device_index, 0);
+        assert_eq!(apple[0].pci_bus_id, "apple-gpu0");
+        let all = detect_all_gpus();
+        assert_eq!(all.iter().filter(|g| g.gpu_tag == "metal").count(), 1);
     }
 }

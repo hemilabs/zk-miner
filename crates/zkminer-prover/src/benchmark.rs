@@ -867,6 +867,14 @@ pub fn get_cpu_info() -> String {
             }
         }
     }
+    // macOS has no `/proc/cpuinfo`; the kernel's own brand string ("Apple M5 Max") is the same
+    // fact. It feeds `hardware_fingerprint`, so it must be stable across runs, which it is.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(name) = crate::memory::sysctl_string("machdep.cpu.brand_string") {
+            return name;
+        }
+    }
     "Unknown CPU".to_string()
 }
 
@@ -2565,10 +2573,16 @@ fn gpu_fingerprint() -> String {
     }
 }
 
-/// Read total physical memory in bytes from `/proc/meminfo`.
+/// Read total physical memory in bytes from `/proc/meminfo` (on macOS, `sysctl hw.memsize`).
 ///
-/// Returns 0 on non-Linux or if the file can't be parsed.
+/// Returns 0 on other platforms or if the figure can't be read.
 pub fn get_total_memory_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(bytes) = crate::memory::mem_total_bytes() {
+            return bytes;
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
@@ -4720,5 +4734,22 @@ mod host_peak_tests {
             crate::memory::unmeasured_peak_for("risc0"),
             "one unmeasured card must not inherit another card's measurement"
         );
+    }
+
+    /// macOS has no `/proc`: the CPU name and RAM size, both part of the hardware fingerprint, come
+    /// from `sysctl` instead of reading as "Unknown CPU" and 0 bytes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cpu_and_memory_are_known() {
+        let cpu = get_cpu_info();
+        assert_ne!(cpu, "Unknown CPU");
+        assert_eq!(
+            Some(cpu),
+            crate::memory::sysctl_string("machdep.cpu.brand_string")
+        );
+        let total = get_total_memory_bytes();
+        assert!(total > 1 << 30, "{total}");
+        assert_eq!(Some(total), crate::memory::mem_total_bytes());
+        assert!(!hardware_fingerprint().contains("|0GiB|"));
     }
 }
