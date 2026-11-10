@@ -96,9 +96,9 @@ pub async fn run(headless: bool) -> Result<()> {
     // This discovers binaries in ~/.zkminer/provers/, $PATH, etc.
     {
         let mut pool = zkminer_prover::dispatcher::WorkerPool::new(
-            HashMap::new(),                            // no explicit binaries in mock mode
-            Vec::new(),                                // default search paths
-            Some(std::time::Duration::from_secs(600)), // 10 min benchmark timeout
+            HashMap::new(), // no explicit binaries in mock mode
+            Vec::new(),     // default search paths
+            zkminer_config::config::ProverConfig::default().benchmark_timeout(),
         );
         let status = splash.status_line();
         pool.set_progress(move |text| status.set(text));
