@@ -17,3 +17,7 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 alloy-primitives = { workspace = true }
 nvml-wrapper = { workspace = true }
+
+# Loads the GPU vendors' telemetry libraries, which ship with their drivers.
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8"

@@ -9,6 +9,8 @@ pub mod state;
 pub mod theme;
 #[cfg(windows)]
 mod windows_gpus;
+#[cfg(windows)]
+mod windows_telemetry;
 
 pub use app::{run_tui, start_benchmark_if_incomplete};
 pub use state::{new_shared_state, MinerState, SharedState, TuiContext};

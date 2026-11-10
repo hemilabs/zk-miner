@@ -10169,6 +10169,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "crossterm",
+ "libloading",
  "nvml-wrapper",
  "ratatui",
  "tokio",
