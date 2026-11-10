@@ -583,7 +583,7 @@ fn slot_key(backend: &str, gpu_tag: &str, device_index: Option<u32>) -> String {
 /// workers and for explicit binaries without a device index (a 2-part key): we
 /// can't know which physical GPU those target, so they are left unguarded and keep
 /// their prior behavior. The guarded gpu_tags MUST match the set counted as a
-/// physical GPU by `proving_gpu_count` (`cuda`/`rocm`/`intel`) — otherwise a card
+/// physical GPU by `proving_gpu_count` (`cuda`/`rocm`/`intel`/`metal`) — otherwise a card
 /// that inflates auto `max_concurrent` could go unguarded and double-book VRAM.
 /// Mirrors the `slot_key` format — keep the two in sync.
 fn physical_gpu_id(key: &str) -> Option<String> {
@@ -591,7 +591,7 @@ fn physical_gpu_id(key: &str) -> Option<String> {
     let _backend = parts.next()?;
     let gpu_tag = parts.next()?;
     let device_index = parts.next()?; // absent ⇒ 2-part key (generic/explicit) ⇒ unguarded
-    if matches!(gpu_tag, "cuda" | "rocm" | "intel") {
+    if matches!(gpu_tag, "cuda" | "rocm" | "intel" | "metal") {
         Some(format!("{gpu_tag}:{device_index}"))
     } else {
         None
@@ -624,6 +624,10 @@ fn gpu_vram_bytes(
         // The xe driver's own count of the card's device memory (sysfs has none): see
         // `discovery::intel_vram`. Unknown on i915, which keeps the unsized behaviour.
         return crate::discovery::intel_vram(pci_bus_id?).map(|(total, _)| total);
+    }
+    if gpu_tag == "metal" {
+        // Unified memory: the GPU's "VRAM" is host RAM less what the host keeps for itself.
+        return metal_vram_budget_bytes(crate::memory::mem_total_bytes()?);
     }
     if gpu_tag != "cuda" {
         return None;
@@ -658,6 +662,27 @@ fn gpu_vram_bytes(
     }
     let mib: u64 = stdout.trim().parse().ok()?;
     Some(mib * 1024 * 1024)
+}
+
+/// Host RAM withheld from an Apple GPU's "VRAM" figure (see [`metal_vram_budget_bytes`]).
+///
+/// Apple silicon has unified memory: every byte the Metal prover allocates comes out of the same RAM
+/// as the miner, the OS, WindowServer and the prover's own host-side state (the executor, segments,
+/// witness generation), so the GPU cannot be sized as if it had all of `hw.memsize`. 8 GiB is
+/// chosen to agree with Metal's own ceiling: on the 36 GiB M5 Max this was written on,
+/// `MTLDevice.recommendedMaxWorkingSetSize` is 30.15 GB, i.e. macOS itself keeps ~8.5 GB of the
+/// 38.65 GB back, and 36 GiB − 8 GiB = 30.06 GB. It is larger than `DEFAULT_HOST_RESERVE_BYTES`
+/// (3 GiB, the reserve for a host whose provers' big buffers live on a discrete card) because here
+/// the GPU working set and the host-side proving state compete for the same pages.
+pub const METAL_HOST_RESERVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The "VRAM" of an Apple GPU, as reported to routing, benchmark rows and the worker's
+/// `ZKMINER_CUDA_VRAM_BYTES`: `hw.memsize` (`mem_total`) minus [`METAL_HOST_RESERVE_BYTES`].
+/// `None` on a host too small to leave anything, which reads as "unknown" downstream.
+fn metal_vram_budget_bytes(mem_total: u64) -> Option<u64> {
+    mem_total
+        .checked_sub(METAL_HOST_RESERVE_BYTES)
+        .filter(|b| *b > 0)
 }
 
 /// `HSA_SCRATCH_SINGLE_LIMIT` for a ROCm worker whose card's memory cannot be read: above the ~7.6 GB
@@ -1841,6 +1866,7 @@ impl WorkerPool {
     /// CUDA uses PCI bus IDs with CUDA_DEVICE_ORDER=PCI_BUS_ID.
     /// ROCm uses numeric device indices for HIP_VISIBLE_DEVICES.
     /// Intel uses device index for ZE_AFFINITY_MASK (Level Zero) and ONEAPI_DEVICE_SELECTOR.
+    /// Metal has one device and no visibility variable; it gets only the unified-memory budget.
     fn gpu_env(
         backend: &str,
         gpu_tag: &str,
@@ -2005,6 +2031,21 @@ impl WorkerPool {
                     if std::env::var_os("ONEAPI_DEVICE_SELECTOR").is_none() {
                         env.insert("ONEAPI_DEVICE_SELECTOR".into(), "level_zero:*".into());
                     }
+                }
+            }
+            "metal" => {
+                // Apple silicon has exactly one GPU, the default Metal device, so there is nothing to
+                // pin and no `*_VISIBLE_DEVICES` analogue to set. What the worker cannot work out for
+                // itself is how much of the unified memory it may treat as its card: the risc0 worker
+                // reads `ZKMINER_CUDA_VRAM_BYTES` (`release_groth16_cache_if_tight`), so it is given
+                // `hw.memsize` less `METAL_HOST_RESERVE_BYTES`. Only for an enumerated device, as for
+                // CUDA: an explicitly configured binary keeps whatever its own environment says
+                // (`gpu_vram_bytes` is `None` without a device index).
+                if let Some(vram) = gpu_vram_bytes(gpu_tag, device_index, pci_bus_id) {
+                    env.insert(
+                        zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
+                        vram.to_string(),
+                    );
                 }
             }
             _ => {}
@@ -2662,7 +2703,7 @@ impl WorkerPool {
         for key in self.workers.keys() {
             let parts: Vec<&str> = key.split(':').collect();
             // "backend:gpu_tag:device_index" with a real GPU tag = a pinned physical GPU.
-            if parts.len() == 3 && matches!(parts[1], "cuda" | "rocm" | "intel") {
+            if parts.len() == 3 && matches!(parts[1], "cuda" | "rocm" | "intel" | "metal") {
                 gpus.insert((parts[1].to_string(), parts[2].to_string()));
             }
         }
@@ -3507,10 +3548,10 @@ impl WorkerPool {
                 }
             }
 
-            // After benchmarking a GPU-specific worker (cuda/rocm/intel), shut it down
+            // After benchmarking a GPU-specific worker (cuda/rocm/intel/metal), shut it down
             // to free VRAM. GPU prover processes hold buffer pools that prevent
-            // other backends from using the same GPU.
-            if !card_was_busy && matches!(gpu_tag.as_str(), "cuda" | "rocm" | "intel") {
+            // other backends from using the same GPU (on Metal, the same unified memory).
+            if !card_was_busy && matches!(gpu_tag.as_str(), "cuda" | "rocm" | "intel" | "metal") {
                 if let Some(entry) = self.workers.get(&key) {
                     // Under the card's guard. Without it — `benchmark_slot*` has already released it —
                     // a proof waiting for this card could take it in between and start beside the
@@ -3910,7 +3951,7 @@ impl WorkerPool {
                 }
             }
 
-            if !card_was_busy && matches!(gpu_tag.as_str(), "cuda" | "rocm" | "intel") {
+            if !card_was_busy && matches!(gpu_tag.as_str(), "cuda" | "rocm" | "intel" | "metal") {
                 if let Some(entry) = self.workers.get(&key) {
                     // Under the card's guard. Without it — `benchmark_slot*` has already released it —
                     // a proof waiting for this card could take it in between and start beside the
@@ -10215,6 +10256,92 @@ mod tests {
         // No GPU-pinned workers -> at least 1.
         let cpu_only = pool_with_keys(&["sp1:generic", "openvm"]);
         assert_eq!(cpu_only.proving_gpu_count(), 1);
+    }
+
+    // ---- metal (Apple silicon, unified memory) ----
+
+    #[test]
+    fn metal_slot_keys_device_ids_and_locks() {
+        assert_eq!(slot_key("risc0", "metal", Some(0)), "risc0:metal:0");
+        // One card: the per-GPU lock and the capacity count must cover it like any other GPU.
+        assert_eq!(physical_gpu_id("risc0:metal:0").as_deref(), Some("metal:0"));
+        // An explicit binary (no device index) is unguarded, as for every vendor.
+        assert_eq!(physical_gpu_id("risc0:metal"), None);
+        // Tag-qualified, so it can never collide with CUDA's bare `gpu0`.
+        assert_eq!(WorkerPool::gpu_device_id("metal", "0"), "gpu-metal0");
+        assert_eq!(
+            WorkerPool::benchmark_device_id("risc0:metal:0"),
+            "gpu-metal0"
+        );
+        assert_eq!(WorkerPool::benchmark_device_id("risc0:metal"), "gpu-metal0");
+        let pool = pool_with_keys(&["risc0:metal:0", "risc0"]);
+        assert_eq!(pool.proving_gpu_count(), 1);
+        let mixed = pool_with_keys(&["risc0:metal:0", "risc0:cuda:0"]);
+        assert_eq!(mixed.proving_gpu_count(), 2);
+    }
+
+    #[test]
+    fn metal_vram_budget_is_host_ram_less_the_reserve() {
+        let gib = 1024 * 1024 * 1024u64;
+        assert_eq!(metal_vram_budget_bytes(36 * gib), Some(28 * gib));
+        // The M5 Max this was written on: within 0.2 GB of Metal's own recommendedMaxWorkingSetSize.
+        assert_eq!(
+            metal_vram_budget_bytes(38_654_705_664),
+            Some(38_654_705_664 - METAL_HOST_RESERVE_BYTES)
+        );
+        assert_eq!(metal_vram_budget_bytes(METAL_HOST_RESERVE_BYTES), None);
+        assert_eq!(metal_vram_budget_bytes(4 * gib), None);
+        // `gpu_vram_bytes` reports exactly that budget for an enumerated Apple GPU, and nothing for
+        // an explicit binary (no index), as for every other vendor.
+        assert_eq!(
+            gpu_vram_bytes("metal", Some(0), Some("apple-gpu0")),
+            crate::memory::mem_total_bytes().and_then(metal_vram_budget_bytes)
+        );
+        assert_eq!(gpu_vram_bytes("metal", None, Some("apple-gpu0")), None);
+    }
+
+    #[test]
+    fn gpu_env_metal() {
+        let env = WorkerPool::gpu_env("risc0", "metal", Some("apple-gpu0"), Some(0));
+        // No device pin of any vendor: there is one GPU and Metal has no visibility variable.
+        for k in env.keys() {
+            assert!(
+                !k.ends_with("_VISIBLE_DEVICES"),
+                "metal worker env must not carry {k}"
+            );
+        }
+        for k in [
+            "CUDA_DEVICE_ORDER",
+            "ZE_AFFINITY_MASK",
+            "ONEAPI_DEVICE_SELECTOR",
+            "NVCC",
+            "HSA_SCRATCH_SINGLE_LIMIT",
+            zkminer_prover_protocol::types::CUDA_DEVICE_ID_ENV,
+        ] {
+            assert!(!env.contains_key(k), "metal worker env must not carry {k}");
+        }
+        // The unified-memory budget, which the risc0 worker reads as its card's capacity.
+        // (A host with 8 GiB or less has no budget and gets no figure, which the worker reads as
+        // "unknown"; every host this runs on in practice has more.)
+        let total = crate::memory::mem_total_bytes().expect("this host reports its memory size");
+        let want = metal_vram_budget_bytes(total).map(|b| b.to_string());
+        assert_eq!(
+            env.get(zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV),
+            want.as_ref()
+        );
+        assert_eq!(
+            zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV,
+            "ZKMINER_CUDA_VRAM_BYTES"
+        );
+        assert_eq!(
+            env.len(),
+            usize::from(want.is_some()),
+            "unexpected metal worker env: {env:?}"
+        );
+
+        // An explicitly configured binary (no device index) gets nothing: its own env stands.
+        let explicit = WorkerPool::gpu_env("risc0", "metal", None, None);
+        assert!(explicit.is_empty(), "{explicit:?}");
     }
 
     #[test]

@@ -139,16 +139,127 @@ const CAP_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// The kernel's own estimate of what can be allocated without swapping — NOT `MemFree`, which
 /// excludes reclaimable page cache and on this box reads ~9 GB while 26 GB is actually available.
+///
+/// On macOS there is no `/proc`; see [`macos_mem_available_bytes`] for the equivalent estimate.
 pub fn mem_available_bytes() -> Option<u64> {
-    parse_meminfo_kb(
-        &std::fs::read_to_string("/proc/meminfo").ok()?,
-        "MemAvailable",
-    )
+    #[cfg(target_os = "macos")]
+    {
+        macos_mem_available_bytes()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        parse_meminfo_kb(
+            &std::fs::read_to_string("/proc/meminfo").ok()?,
+            "MemAvailable",
+        )
+    }
 }
 
-/// `MemTotal` from `/proc/meminfo`, in bytes.
+/// `MemTotal` from `/proc/meminfo`, in bytes. On macOS, `sysctl hw.memsize`.
+///
+/// Known on macOS so the host-memory ledger's committed term (`can_admit`, `host_side_refusal`,
+/// `sp1_concurrent_capacity`, `worker_memory_ceiling_bytes`) works there as it does on Linux,
+/// instead of every caller's `unwrap_or(u64::MAX)` fail-open path.
 pub fn mem_total_bytes() -> Option<u64> {
-    parse_meminfo_kb(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal")
+    #[cfg(target_os = "macos")]
+    {
+        sysctl_u64("hw.memsize").filter(|&b| b > 0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        parse_meminfo_kb(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal")
+    }
+}
+
+/// macOS's nearest equivalent of Linux's `MemAvailable`: pages that can be handed out without
+/// compressing or swapping anyone's anonymous memory, i.e. free pages, file-backed pageable pages
+/// (page cache, which the kernel drops on demand) and purgeable (volatile) pages, all read with
+/// `sysctlbyname` and multiplied by `vm.pagesize`. Capped at `hw.memsize`.
+///
+/// Deliberately NOT `kern.memorystatus_level`, the kernel's own "percent available": that counts
+/// anonymous memory the compressor could squeeze, and read 90% on a 36 GiB M5 Max whose
+/// anonymous pages held 16 GB — the ledger would have admitted proofs into the compressor.
+/// Anonymous memory is excluded here exactly as `MemAvailable` excludes it (without swap).
+#[cfg(target_os = "macos")]
+fn macos_mem_available_bytes() -> Option<u64> {
+    let page = sysctl_u64("vm.pagesize").filter(|&p| p > 0)?;
+    let pages = sysctl_u64("vm.page_free_count")?
+        .saturating_add(sysctl_u64("vm.page_pageable_external_count")?)
+        .saturating_add(sysctl_u64("vm.page_purgeable_count").unwrap_or(0));
+    let bytes = pages.saturating_mul(page);
+    Some(match mem_total_bytes() {
+        Some(total) => bytes.min(total),
+        None => bytes,
+    })
+}
+
+/// An integer `sysctl` by name (`hw.memsize`, `vm.page_free_count`, ...), whether the kernel stores
+/// it as 32 or 64 bits. `None` when the name does not exist or the value is not an integer.
+#[cfg(target_os = "macos")]
+pub(crate) fn sysctl_u64(name: &str) -> Option<u64> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut buf = [0u8; 8];
+    let mut len: libc::size_t = buf.len();
+    // SAFETY: `cname` is NUL-terminated; `buf` is writable for `len` bytes and the kernel writes at
+    // most `len` bytes and stores the written size back into `len`. No new value is set.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    match len {
+        4 => Some(u32::from_ne_bytes(buf[..4].try_into().ok()?) as u64),
+        8 => Some(u64::from_ne_bytes(buf)),
+        _ => None,
+    }
+}
+
+/// A string `sysctl` by name (`machdep.cpu.brand_string`, ...), trimmed of its NUL and whitespace.
+/// `None` when the name does not exist or the value is empty.
+#[cfg(target_os = "macos")]
+pub(crate) fn sysctl_string(name: &str) -> Option<String> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut len: libc::size_t = 0;
+    // SAFETY: a NULL `oldp` asks only for the size, which the kernel stores into `len`.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    // SAFETY: `buf` is writable for `len` bytes; the kernel writes at most that and updates `len`.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    let s = String::from_utf8_lossy(&buf)
+        .trim_end_matches('\0')
+        .trim()
+        .to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 /// Total capacity of the `/dev/shm` tmpfs, in bytes, or `None` if it cannot be stat'd.
@@ -182,6 +293,7 @@ pub fn dev_shm_capacity_bytes() -> Option<u64> {
 ///
 /// Split out so the parse is testable without a particular host: the field order and the presence
 /// of `MemAvailable` both vary by kernel version.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn parse_meminfo_kb(text: &str, key: &str) -> Option<u64> {
     for line in text.lines() {
         let Some((name, rest)) = line.split_once(':') else {
@@ -1511,6 +1623,50 @@ pub(crate) fn volunteer_as_oom_victim() {
 }
 
 /// Does the protection actually reach the kernel? These spawn real processes and read `/proc`.
+
+/// The macOS figures the host-memory ledger runs on (`sysctl`, since there is no `/proc`).
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    #[test]
+    fn sysctl_reads_integers_and_strings() {
+        let total = sysctl_u64("hw.memsize").expect("hw.memsize");
+        assert!(total > 1 << 30, "implausible hw.memsize: {total}");
+        let page = sysctl_u64("vm.pagesize").expect("vm.pagesize");
+        assert!(page.is_power_of_two() && page >= 4096, "{page}");
+        // A 32-bit sysctl (`unsigned int` in the kernel) reads as well as the 64-bit `hw.memsize`.
+        let free = sysctl_u64("vm.page_free_count").expect("vm.page_free_count");
+        assert!(free.saturating_mul(page) <= total);
+        assert!(sysctl_string("machdep.cpu.brand_string").is_some_and(|b| !b.is_empty()));
+        assert_eq!(sysctl_u64("no.such.sysctl"), None);
+        assert_eq!(sysctl_string("no.such.sysctl"), None);
+    }
+
+    #[test]
+    fn memory_is_known_and_the_ledger_is_active() {
+        let total = mem_total_bytes().expect("hw.memsize");
+        assert_eq!(Some(total), sysctl_u64("hw.memsize"));
+        let avail = mem_available_bytes().expect("available estimate");
+        assert!(avail > 0 && avail <= total, "{avail} of {total}");
+        // The per-worker ceiling follows from a known total, as on Linux.
+        assert_eq!(
+            worker_memory_ceiling_bytes(DEFAULT_HOST_RESERVE_BYTES),
+            Some(total - DEFAULT_HOST_RESERVE_BYTES)
+        );
+        // With both figures known, the ledger admits a small proof and refuses one larger than the
+        // machine, instead of failing open on an unreadable host.
+        let ledger = MemoryLedger::default();
+        assert!(ledger
+            .try_reserve(1 << 20, 0, avail, total, DEFAULT_HOST_RESERVE_BYTES)
+            .is_some());
+        let ledger = MemoryLedger::default();
+        assert!(ledger
+            .try_reserve(total, 0, avail, total, DEFAULT_HOST_RESERVE_BYTES)
+            .is_none());
+    }
+}
+
 #[cfg(all(test, unix))]
 mod live_tests {
     use super::*;
