@@ -1460,6 +1460,7 @@ fn benchmark_guest(name: &str) -> Option<&'static [u8]> {
         BENCH_MEMORY_MERKLE => MEMORY_MERKLE_ELF,
         BENCH_CHACHA_MIX => CHACHA_MIX_ELF,
         zkminer_prover_protocol::BENCH_ZKOP_MIX => ZKOP_MIX_ELF,
+        zkminer_prover_protocol::BENCH_WARMUP => FIBONACCI_ELF,
         _ => return None,
     };
     (!elf.is_empty()).then_some(elf)
@@ -1503,12 +1504,14 @@ fn benchmark_spec(spec: &BenchmarkProgramSpec) -> Option<BenchmarkEntry> {
     )
 }
 
-/// `--benchmark`: the suite the miner would send, then the zkOP/s score. `BENCH_ONLY=<name>` runs one
+/// `--benchmark`: the warm-up and suite the miner would send, then the zkOP/s score. `BENCH_ONLY=<name>` runs one
 /// program of it (or only the score, for `zkop-mix`).
 fn run_benchmarks() -> Vec<BenchmarkEntry> {
     use zkminer_prover_protocol::{
-        benchmark_suite, measure_zkop_mix, zkop_mix_spec, BENCH_ZKOP_MIX,
+        benchmark_suite, measure_zkop_mix, warmup_spec, zkop_mix_spec, BENCH_ZKOP_MIX,
     };
+    // Discarded, as under a host: see `warmup_spec`.
+    benchmark_spec(&warmup_spec(BACKEND_RISC0));
     let only = std::env::var("BENCH_ONLY").ok();
     let wanted = |name: &str| only.as_ref().map_or(true, |o| name.eq_ignore_ascii_case(o));
     let mut results: Vec<BenchmarkEntry> = benchmark_suite(BACKEND_RISC0)

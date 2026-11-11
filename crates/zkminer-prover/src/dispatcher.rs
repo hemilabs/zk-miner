@@ -66,8 +66,12 @@ pub enum BenchmarkProgressKind {
     /// This slot will run. Every slot is announced before the first one starts, so a progress view
     /// knows the whole queue rather than discovering cards as their first results arrive.
     Queued,
-    /// This slot is now running. Sent before its setup, which on SP1 is a long wait.
+    /// This slot is now running. Sent before its setup, which on SP1 is a long wait, and its warm-up
+    /// proof: the slot is warming up until `WarmedUp`.
     Started,
+    /// The slot's warm-up proof is done (whether or not it proved; its result is never reported) and
+    /// the suite's first program is starting.
+    WarmedUp,
     /// One program finished on this slot.
     ProgramDone {
         /// The benchmark entry that just completed
@@ -3338,18 +3342,33 @@ impl WorkerPool {
     /// scoring proofs one request each (`measure_zkop_mix`), the score's row after the programs'.
     /// The worker proves what it is sent, so the suite changes with the miner alone.
     ///
+    /// First a warm-up proof whose result is thrown away (`warmup_spec`), then `on_warmed`.
     /// `on_done(row, 1-based program index, total)` counts the score as the last program. A scoring
     /// proof that fails leaves the score out and keeps the rows.
     fn run_benchmark_requests(
         handle: &mut WorkerHandle,
         key: &str,
         on_done: &dyn Fn(&BenchmarkEntry, u32, u32),
+        on_warmed: &dyn Fn(),
     ) -> BenchmarkRequests {
         use zkminer_prover_protocol::{
-            benchmark_suite, measure_zkop_mix, zkop_mix_spec, BACKEND_SP1, BENCH_ZKOP_MIX,
-            ZKOP_MIX_SP1_CYCLES,
+            benchmark_suite, measure_zkop_mix, warmup_spec, zkop_mix_spec, BACKEND_SP1,
+            BENCH_ZKOP_MIX, ZKOP_MIX_SP1_CYCLES,
         };
         let backend = handle.backend.clone();
+        // The worker's one-off first-proof costs land here, not on the first program's row. A
+        // warm-up that fails costs only that; the suite still runs.
+        match Self::benchmark_request(handle, vec![warmup_spec(&backend)], &|_, _, _| {}) {
+            Err(e) => {
+                return BenchmarkRequests {
+                    results: Err(e),
+                    broken: true,
+                }
+            }
+            Ok(Err(message)) => tracing::warn!("{key}: the warm-up proof failed: {message}"),
+            Ok(Ok(_)) => {}
+        }
+        on_warmed();
         let programs = benchmark_suite(&backend);
         let total = programs.len() as u32 + 1;
         let mut results = match Self::benchmark_request(handle, programs, &|row, index, _| {
@@ -3567,7 +3586,7 @@ impl WorkerPool {
             )
         });
 
-        let requests = Self::run_benchmark_requests(handle, key, &|_, _, _| {});
+        let requests = Self::run_benchmark_requests(handle, key, &|_, _, _| {}, &|| {});
         if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);
@@ -3969,22 +3988,24 @@ impl WorkerPool {
         });
 
         let key_owned = key.to_string();
-        let cb = |entry: &zkminer_prover_protocol::BenchmarkEntry, idx: u32, total: u32| {
-            on_progress(BenchmarkProgressEvent {
-                slot_key: key_owned.clone(),
-                gpu_name: gpu_name.clone(),
-                device_index,
-                pci_bus_id: slot_pci_bus_id.clone(),
-                gpu_tag: gpu_tag.clone(),
-                kind: BenchmarkProgressKind::ProgramDone {
-                    entry: entry.clone(),
-                    program_index: idx,
-                    total_programs: total,
-                },
-            });
+        let event = |kind: BenchmarkProgressKind| BenchmarkProgressEvent {
+            slot_key: key_owned.clone(),
+            gpu_name: gpu_name.clone(),
+            device_index,
+            pci_bus_id: slot_pci_bus_id.clone(),
+            gpu_tag: gpu_tag.clone(),
+            kind,
         };
+        let cb = |entry: &zkminer_prover_protocol::BenchmarkEntry, idx: u32, total: u32| {
+            on_progress(event(BenchmarkProgressKind::ProgramDone {
+                entry: entry.clone(),
+                program_index: idx,
+                total_programs: total,
+            }));
+        };
+        let warmed = || on_progress(event(BenchmarkProgressKind::WarmedUp));
 
-        let requests = Self::run_benchmark_requests(handle, key, &cb);
+        let requests = Self::run_benchmark_requests(handle, key, &cb, &warmed);
         if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);

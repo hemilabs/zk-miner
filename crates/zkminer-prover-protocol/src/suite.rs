@@ -7,7 +7,7 @@
 
 use crate::types::{
     BenchmarkProgramSpec, BACKEND_SP1, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
-    BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, BENCH_ZKOP_MIX,
+    BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, BENCH_WARMUP, BENCH_ZKOP_MIX,
 };
 
 /// A program of the suite.
@@ -115,6 +115,23 @@ pub fn benchmark_suite(backend: &str) -> Vec<BenchmarkProgramSpec> {
         .collect()
 }
 
+/// The proof a `backend` worker runs before the suite, whose result is thrown away.
+///
+/// A worker's first proof pays one-off costs: kernels loaded, memory pools grown, and on RISC Zero
+/// the Groth16 prover's first use. Measured on an RTX 5090, RISC Zero's first suite program ran at
+/// 3.0M c/s with a 4.7 s wrap, against 5.1M c/s and 0.37 s for every later one. A small fibonacci
+/// proof, through the wrap where the suite times it on every program, takes those costs instead.
+/// SP1 times its wrap only on the last program, by when that is warm anyway.
+pub fn warmup_spec(backend: &str) -> BenchmarkProgramSpec {
+    BenchmarkProgramSpec {
+        name: BENCH_WARMUP.to_string(),
+        input: 1000u32.to_le_bytes().to_vec(),
+        weight: 0.0,
+        precompile: false,
+        measure_wrap: backend != BACKEND_SP1,
+    }
+}
+
 /// One `zkop-mix` proof at `iterations`, for the zkOP/s score (see `measure_zkop_mix`). It has no
 /// weight among the programs and its wrap is not measured.
 pub fn zkop_mix_spec(iterations: u32) -> BenchmarkProgramSpec {
@@ -165,6 +182,14 @@ mod tests {
         assert!(benchmark_suite(BACKEND_RISC0)
             .iter()
             .all(|s| s.measure_wrap));
+    }
+
+    #[test]
+    fn the_warm_up_is_no_suite_program_and_wraps_where_the_suite_does() {
+        assert!(BENCHMARK_PROGRAMS.iter().all(|p| p.name != BENCH_WARMUP));
+        assert!(warmup_spec(BACKEND_RISC0).measure_wrap);
+        assert!(!warmup_spec(BACKEND_SP1).measure_wrap);
+        assert_eq!(warmup_spec(BACKEND_SP1).weight, 0.0);
     }
 
     #[test]

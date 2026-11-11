@@ -491,10 +491,10 @@ fn render_progress_header(
         .active_device()
         .map(|d| tracker.display_name(d))
         .unwrap_or_else(|| "next GPU".to_string());
-    let verb = if tracker.active_device().is_some() {
-        "Benchmarking"
-    } else {
-        "Preparing"
+    let verb = match tracker.active_device() {
+        Some(d) if d.warming_up => "Warming up",
+        Some(_) => "Benchmarking",
+        None => "Preparing",
     };
 
     let spinners = ['|', '/', '-', '\\'];
@@ -990,15 +990,28 @@ mod tests {
         tracker.apply(&event("sp1:cuda:0", RTX, Kind::Started));
 
         let state = MinerState::default();
-        let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
-        term.draw(|f| render_progress_view(f, f.area(), &state, &tracker))
-            .unwrap();
-        let buffer = term.backend().buffer();
-        let rows: Vec<String> = buffer
-            .content
-            .chunks(buffer.area.width as usize)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
-            .collect();
+        let draw = |tracker: &BenchmarkTracker| -> Vec<String> {
+            let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+            term.draw(|f| render_progress_view(f, f.area(), &state, tracker))
+                .unwrap();
+            let buffer = term.backend().buffer();
+            buffer
+                .content
+                .chunks(buffer.area.width as usize)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+                .collect()
+        };
+
+        let warming = draw(&tracker);
+        assert!(
+            warming[1].contains("Warming up RTX 4090 SP1"),
+            "{}",
+            warming[1]
+        );
+        assert!(!warming.join("\n").contains("fibonacci"));
+
+        tracker.apply(&event("sp1:cuda:0", RTX, Kind::WarmedUp));
+        let rows = draw(&tracker);
         println!("{}", rows.join("\n"));
 
         let screen = rows.join("\n");

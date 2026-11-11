@@ -70,6 +70,9 @@ pub const BENCH_ECDSA_VERIFY: &str = "ecdsa-verify";
 pub const BENCH_BIGINT_MUL: &str = "bigint-mul";
 pub const BENCH_MEMORY_MERKLE: &str = "memory-merkle";
 pub const BENCH_CHACHA_MIX: &str = "chacha-mix";
+/// The discarded proof each card runs before the suite (see `crate::suite::warmup_spec`). Not one
+/// of the suite's programs, and never reported.
+pub const BENCH_WARMUP: &str = "fibonacci";
 /// The program behind zkOP/s: one source file, built for every zkVM, so proofs on any of them do
 /// the same work. Mixed arithmetic, bit mixing, multiplication, branching and memory access, with
 /// no precompiles.

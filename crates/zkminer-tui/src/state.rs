@@ -529,6 +529,8 @@ pub struct DeviceProgress {
     pub failed: bool,
     /// This row's zkOP/s, once its scoring program has finished.
     pub zkops: Option<f64>,
+    /// Setting up and running the discarded warm-up proof, before the first program.
+    pub warming_up: bool,
 }
 
 /// Shorten a driver-reported GPU name for places that have to fit several of them on one line.
@@ -602,7 +604,12 @@ impl BenchmarkTracker {
             BenchmarkProgressKind::Queued => {}
             BenchmarkProgressKind::Started => {
                 self.active_device_index = pos;
-                if let Some(first) = self.devices[pos].programs.first_mut() {
+                self.devices[pos].warming_up = true;
+            }
+            BenchmarkProgressKind::WarmedUp => {
+                let dev = &mut self.devices[pos];
+                dev.warming_up = false;
+                if let Some(first) = dev.programs.first_mut() {
                     if first.phase == ProgramPhase::Pending {
                         first.phase = ProgramPhase::Running;
                     }
@@ -630,6 +637,7 @@ impl BenchmarkTracker {
                 }
                 dev.complete = true;
                 dev.failed = !*succeeded;
+                dev.warming_up = false;
             }
         }
         self.all_complete = !self.devices.is_empty() && self.devices.iter().all(|d| d.complete);
@@ -686,6 +694,7 @@ impl BenchmarkTracker {
             complete: false,
             failed: false,
             zkops: None,
+            warming_up: false,
         });
         self.devices.len() - 1
     }
@@ -725,6 +734,7 @@ impl BenchmarkTracker {
         total_programs: u32,
     ) {
         let dev = &mut self.devices[pos];
+        dev.warming_up = false;
 
         // Mark the completed program
         if let Some(prog) = dev
@@ -950,7 +960,24 @@ mod benchmark_tracker_tests {
         assert_eq!(tracker.total_count(), 18);
         let active = tracker.active_device().expect("a card is running");
         assert_eq!(tracker.display_name(active), "RTX 4090 RISC Zero");
+        // Warming up: no program has started.
+        assert!(active.warming_up);
+        assert_eq!(active.programs[0].phase, ProgramPhase::Pending);
+
+        tracker.apply(&event(
+            "risc0:cuda:0",
+            RTX,
+            0,
+            BenchmarkProgressKind::WarmedUp,
+        ));
+        let active = tracker.active_device().expect("a card is running");
+        assert!(!active.warming_up);
         assert_eq!(active.programs[0].phase, ProgramPhase::Running);
+        // The warm-up is never one of the rows.
+        assert!(active
+            .programs
+            .iter()
+            .all(|p| p.name != zkminer_prover_protocol::BENCH_WARMUP));
     }
 
     #[test]
@@ -990,6 +1017,7 @@ mod benchmark_tracker_tests {
         let key = "sp1:cuda:0";
         tracker.apply(&event(key, RTX, 0, BenchmarkProgressKind::Queued));
         tracker.apply(&event(key, RTX, 0, BenchmarkProgressKind::Started));
+        tracker.apply(&event(key, RTX, 0, BenchmarkProgressKind::WarmedUp));
         tracker.apply(&event(
             key,
             RTX,
@@ -1000,6 +1028,26 @@ mod benchmark_tracker_tests {
         assert!(tracker.devices[0].failed);
         assert_eq!(tracker.devices[0].programs[0].phase, ProgramPhase::Failed);
         assert!(tracker.all_complete);
+    }
+
+    #[test]
+    fn a_slot_that_fails_while_warming_up_is_failed_with_no_program_blamed() {
+        let mut tracker = BenchmarkTracker::default();
+        let key = "sp1:cuda:0";
+        tracker.apply(&event(key, RTX, 0, BenchmarkProgressKind::Started));
+        tracker.apply(&event(
+            key,
+            RTX,
+            0,
+            BenchmarkProgressKind::Finished { succeeded: false },
+        ));
+
+        let dev = &tracker.devices[0];
+        assert!(dev.failed && !dev.warming_up);
+        assert!(dev
+            .programs
+            .iter()
+            .all(|p| p.phase == ProgramPhase::Pending));
     }
 
     #[test]

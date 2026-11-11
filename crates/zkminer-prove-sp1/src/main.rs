@@ -339,13 +339,10 @@ fn main() {
             eprintln!("usage: --export-guest <benchmark program> <path>");
             std::process::exit(2);
         };
-        let elf = match name.as_str() {
-            "fibonacci" => FIBONACCI_SP1_GUEST_ELF,
-            other => benchmark_guest(other).unwrap_or_else(|| {
-                eprintln!("unknown guest {other:?} (known: the benchmark programs)");
-                std::process::exit(2);
-            }),
-        };
+        let elf = benchmark_guest(name).unwrap_or_else(|| {
+            eprintln!("unknown guest {name:?} (known: the benchmark programs)");
+            std::process::exit(2);
+        });
         let pk = match sp1_sdk::blocking::ProverClient::builder()
             .cpu()
             .build()
@@ -471,7 +468,7 @@ fn main() {
     }
 }
 
-/// `--benchmark`: the suite the miner would send, then the zkOP/s score, printing a row per program
+/// `--benchmark`: the warm-up and suite the miner would send, then the zkOP/s score, printing a row per program
 /// to stderr. Returns the exit code,
 /// which is non-zero unless every program produced its row, so a script can tell.
 fn run_benchmarks_by_hand(device: Option<u32>) -> i32 {
@@ -485,6 +482,9 @@ fn run_benchmarks_by_hand(device: Option<u32>) -> i32 {
             return 1;
         }
     };
+    // Discarded, as under a host: see `warmup_spec`.
+    let warmup = [zkminer_prover_protocol::warmup_spec(BACKEND_SP1)];
+    run_benchmarks(prover, &mut held.benchmark_keys, &warmup, &mut |_, _, _| {});
     let programs = zkminer_prover_protocol::benchmark_suite(BACKEND_SP1);
     let mut run = run_benchmarks(
         prover,
@@ -2604,6 +2604,7 @@ fn benchmark_guest(name: &str) -> Option<&'static [u8]> {
         BENCH_MEMORY_MERKLE => MEMORY_MERKLE_SP1_GUEST_ELF,
         BENCH_CHACHA_MIX => CHACHA_MIX_SP1_GUEST_ELF,
         BENCH_ZKOP_MIX => ZKOP_MIX_SP1_GUEST_ELF,
+        zkminer_prover_protocol::BENCH_WARMUP => FIBONACCI_SP1_GUEST_ELF,
         _ => return None,
     };
     (!elf.is_empty()).then_some(elf)
