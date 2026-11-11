@@ -2402,7 +2402,12 @@ mod mac_footprint {
     /// The ceiling from the environment: `None` if unset, `0` or malformed (a malformed value is
     /// reported, not guessed at).
     pub fn ceiling() -> Option<u64> {
-        let text = std::env::var(WORKER_MAX_FOOTPRINT_ENV).ok()?;
+        parse_ceiling(std::env::var(WORKER_MAX_FOOTPRINT_ENV).ok().as_deref())
+    }
+
+    /// [`ceiling`] without the environment: `None` for unset, `0` or malformed text.
+    pub fn parse_ceiling(text: Option<&str>) -> Option<u64> {
+        let text = text?;
         match text.trim().parse::<u64>() {
             Ok(0) => None,
             Ok(n) => Some(n),
@@ -2411,6 +2416,42 @@ mod mac_footprint {
                 None
             }
         }
+    }
+
+    /// Why the guard ends the process on one poll.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Verdict {
+        /// The footprint `now` passed the ceiling `limit`.
+        OverCeiling { now: u64, limit: u64 },
+        /// The worker was reparented: the dispatcher that spawned it (`parent`) is gone.
+        Orphaned { parent: i32 },
+    }
+
+    impl Verdict {
+        pub fn exit_code(&self) -> i32 {
+            match self {
+                Verdict::OverCeiling { .. } => FOOTPRINT_EXIT_CODE,
+                Verdict::Orphaned { .. } => 1,
+            }
+        }
+    }
+
+    /// One poll's decision, free of side effects so it can be tested: `now` is the current
+    /// footprint (`None` if it could not be read), `parent` the parent PID at start and `ppid` the
+    /// current one. A `parent` of 0/1 (started under launchd) is never treated as orphaned.
+    pub fn guard_verdict(
+        now: Option<u64>,
+        limit: Option<u64>,
+        parent: i32,
+        ppid: i32,
+        watch_parent: bool,
+    ) -> Option<Verdict> {
+        if let (Some(now), Some(limit)) = (now, limit) {
+            if now > limit {
+                return Some(Verdict::OverCeiling { now, limit });
+            }
+        }
+        (watch_parent && parent > 1 && ppid != parent).then_some(Verdict::Orphaned { parent })
     }
 
     /// Start the guard thread once: tracks [`PHASE_PEAK`], exits at the ceiling, and (when
@@ -2430,9 +2471,14 @@ mod mac_footprint {
             let spawned = std::thread::Builder::new()
                 .name("footprint-guard".into())
                 .spawn(move || loop {
-                    if let Some((now, _)) = self_footprint() {
+                    let now = self_footprint().map(|f| f.0);
+                    if let Some(now) = now {
                         PHASE_PEAK.fetch_max(now, Ordering::Relaxed);
-                        if let Some(limit) = limit.filter(|&l| now > l) {
+                    }
+                    // SAFETY: getppid has no preconditions.
+                    let ppid = unsafe { libc::getppid() };
+                    match guard_verdict(now, limit, parent, ppid, watch_parent) {
+                        Some(v @ Verdict::OverCeiling { now, limit }) => {
                             tracing::error!(
                                 "process footprint {} MiB passed the {} MiB ceiling \
                                  ({WORKER_MAX_FOOTPRINT_ENV}); exiting so the proof fails here \
@@ -2440,17 +2486,18 @@ mod mac_footprint {
                                 now >> 20,
                                 limit >> 20
                             );
-                            std::process::exit(FOOTPRINT_EXIT_CODE);
+                            std::process::exit(v.exit_code());
                         }
-                    }
-                    // Reparented (to launchd) means the dispatcher died: nothing will read this
-                    // proof, and its memory is the owner's.
-                    if watch_parent && parent > 1 && unsafe { libc::getppid() } != parent {
-                        tracing::error!(
-                            "the dispatcher (PID {parent}) is gone; exiting instead of proving \
-                             for nobody"
-                        );
-                        std::process::exit(1);
+                        // Reparented (to launchd) means the dispatcher died: nothing will read
+                        // this proof, and its memory is the owner's.
+                        Some(v @ Verdict::Orphaned { parent }) => {
+                            tracing::error!(
+                                "the dispatcher (PID {parent}) is gone; exiting instead of \
+                                 proving for nobody"
+                            );
+                            std::process::exit(v.exit_code());
+                        }
+                        None => {}
                     }
                     std::thread::sleep(POLL);
                 });
@@ -2460,8 +2507,10 @@ mod mac_footprint {
         });
     }
 
-    /// `task_vm_info` (`<mach/task_info.h>`, through rev 7), which libc does not bind.
-    #[repr(C)]
+    /// `task_vm_info` (`<mach/task_info.h>`, through rev 7), which libc does not bind. The C struct
+    /// is declared under `#pragma pack(4)`, hence `packed(4)` (without it Rust pads after
+    /// `decompressions` and every later field is misplaced).
+    #[repr(C, packed(4))]
     #[derive(Default)]
     struct TaskVmInfo {
         virtual_size: u64,
@@ -2516,7 +2565,8 @@ mod mac_footprint {
             return None;
         }
         // ledger[0] = phys_footprint_peak; graphics_footprint is ledger index 13.
-        let graphics = info.ledger[13].max(0) as u64;
+        let ledger = info.ledger; // copied out: no references into a packed struct
+        let graphics = ledger[13].max(0) as u64;
         Some((info.internal, info.compressed, graphics, info.resident_size))
     }
 
@@ -2604,5 +2654,107 @@ mod m6_tests {
             crate::metal_sizing::DEFAULT_JOB_PO2_CAP,
             zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
         );
+    }
+}
+
+/// M6 round 1: the footprint guard's decisions (ceiling and orphan exit) and the ceiling's parsing,
+/// plus one end-to-end check that a process over the ceiling really exits with 137. None of these
+/// exist on base 7469b2a (no guard at all), so they fail to compile there.
+#[cfg(all(test, target_os = "macos"))]
+mod mac_footprint_tests {
+    use super::mac_footprint::{guard_verdict, parse_ceiling, Verdict};
+    use crate::metal_sizing::{FOOTPRINT_EXIT_CODE, WORKER_MAX_FOOTPRINT_ENV};
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn the_ceiling_parses_only_a_positive_byte_count() {
+        assert_eq!(parse_ceiling(None), None);
+        assert_eq!(parse_ceiling(Some("0")), None, "0 disables the guard");
+        assert_eq!(parse_ceiling(Some("")), None);
+        assert_eq!(parse_ceiling(Some("13G")), None, "no unit suffixes");
+        assert_eq!(parse_ceiling(Some("-5")), None);
+        assert_eq!(parse_ceiling(Some("13958643712")), Some(13 * GIB));
+        assert_eq!(parse_ceiling(Some(" 4096\n")), Some(4096));
+    }
+
+    #[test]
+    fn over_the_ceiling_exits_137() {
+        let v = guard_verdict(Some(9 * GIB), Some(8 * GIB), 100, 100, true);
+        assert_eq!(
+            v,
+            Some(Verdict::OverCeiling {
+                now: 9 * GIB,
+                limit: 8 * GIB
+            })
+        );
+        assert_eq!(v.unwrap().exit_code(), FOOTPRINT_EXIT_CODE);
+        assert_eq!(FOOTPRINT_EXIT_CODE, 137);
+        // The ceiling wins over the orphan check when both apply.
+        let both = guard_verdict(Some(9 * GIB), Some(8 * GIB), 100, 1, true).unwrap();
+        assert_eq!(both.exit_code(), 137);
+    }
+
+    #[test]
+    fn at_or_under_the_ceiling_or_without_one_the_guard_stays_quiet() {
+        assert_eq!(
+            guard_verdict(Some(8 * GIB), Some(8 * GIB), 100, 100, true),
+            None
+        );
+        assert_eq!(
+            guard_verdict(Some(GIB), Some(8 * GIB), 100, 100, true),
+            None
+        );
+        assert_eq!(guard_verdict(Some(64 * GIB), None, 100, 100, true), None);
+        assert_eq!(
+            guard_verdict(None, Some(1), 100, 100, true),
+            None,
+            "unreadable footprint"
+        );
+    }
+
+    #[test]
+    fn a_reparented_worker_exits_1_only_when_watching_a_real_parent() {
+        let v = guard_verdict(Some(GIB), Some(8 * GIB), 4242, 1, true);
+        assert_eq!(v, Some(Verdict::Orphaned { parent: 4242 }));
+        assert_eq!(v.unwrap().exit_code(), 1);
+        // --benchmark (watch_parent = false) runs from a shell that may exit.
+        assert_eq!(guard_verdict(Some(GIB), None, 4242, 1, false), None);
+        // Started directly under launchd: there is no dispatcher to lose.
+        assert_eq!(guard_verdict(Some(GIB), None, 1, 1, true), None);
+        assert_eq!(guard_verdict(Some(GIB), None, 0, 1, true), None);
+        assert_eq!(guard_verdict(Some(GIB), None, 4242, 4242, true), None);
+    }
+
+    /// Child half of [`a_process_over_the_ceiling_exits_137`]: inert unless the parent test set
+    /// `M6_FOOTPRINT_GUARD_CHILD`.
+    #[test]
+    fn footprint_guard_child() {
+        if std::env::var_os("M6_FOOTPRINT_GUARD_CHILD").is_none() {
+            return;
+        }
+        super::mac_footprint::start_guard(false);
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        // Still alive: the guard did not fire. Exit with a status the parent can tell apart.
+        std::process::exit(3);
+    }
+
+    #[test]
+    fn a_process_over_the_ceiling_exits_137() {
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "mac_footprint_tests::footprint_guard_child",
+                "--nocapture",
+            ])
+            .env("M6_FOOTPRINT_GUARD_CHILD", "1")
+            // Any process's footprint is above 1 MiB.
+            .env(WORKER_MAX_FOOTPRINT_ENV, (1u64 << 20).to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(FOOTPRINT_EXIT_CODE), "{status:?}");
     }
 }

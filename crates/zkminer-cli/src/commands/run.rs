@@ -4497,8 +4497,7 @@ fn risc0_slot_sizes(
                     .find(|d| d.device_id == *device && d.prover_backend == risc0)
             });
             let over = overrides.get(device).copied();
-            // Per device: an Apple GPU is sized from the Metal worker's own table (M6).
-            let po2 = zkminer_prover::benchmark::risc0_slot_job_po2(device, over, row, *vram);
+            let po2 = zkminer_prover::benchmark::risc0_job_po2(over, row, *vram);
             (slot.clone(), device.clone(), po2)
         })
         .collect()

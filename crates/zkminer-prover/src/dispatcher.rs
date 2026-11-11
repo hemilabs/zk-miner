@@ -6558,8 +6558,6 @@ impl WorkerPool {
         }
     }
 
-    /// Get-or-create the per-physical-GPU proving lock for a slot key (see
-    /// `gpu_locks`). Returns `None` for unguarded slots (CPU/generic/explicit).
     /// The benchmark deadline for one slot: the configured `benchmark_timeout`, except on an Apple
     /// GPU, whose risc0 suite takes ~19 minutes on a 32-core M5 Max and longer on smaller Macs, so it
     /// gets `metal_benchmark_timeout` (M6).
@@ -6585,6 +6583,8 @@ impl WorkerPool {
         scaled
     }
 
+    /// Get-or-create the per-physical-GPU proving lock for a slot key (see
+    /// `gpu_locks`). Returns `None` for unguarded slots (CPU/generic/explicit).
     fn gpu_lock_for(&self, key: &str) -> Option<Arc<Mutex<()>>> {
         let id = physical_gpu_id(key)?;
         let mut map = self.gpu_locks.lock().unwrap_or_else(|e| e.into_inner());
