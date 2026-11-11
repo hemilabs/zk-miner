@@ -113,7 +113,9 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
                         s.benchmark_tracker.as_mut(),
                         zkminer_prover::engine::worker_pool(),
                     ) {
-                        tracker.refresh_setup_status(|key| pool.setup_status(key));
+                        tracker.refresh_setup_status(|key| {
+                            pool.setup_status(key).map(|step| step.describe())
+                        });
                     }
                     PostKeyAction::None
                 }

@@ -345,9 +345,47 @@ pub enum WorkerResponse {
     /// Appended last, so every earlier variant keeps its bincode index.
     SetupProgress {
         request_id: u64,
-        /// For the operator, e.g. "Downloading SP1's Groth16 circuit (first run, about 8 GB)".
+        /// The step, for the operator, e.g. "Downloading the Groth16 circuit (first run)".
         status: String,
+        /// Bytes of a download or an unpack done so far, for a step that has them.
+        done_bytes: Option<u64>,
+        /// What `done_bytes` is heading for, where it is known.
+        total_bytes: Option<u64>,
     },
+}
+
+/// What a worker's one-time setup is doing (`WorkerResponse::SetupProgress`), for display.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetupStep {
+    pub status: String,
+    pub done_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+}
+
+impl SetupStep {
+    /// How far through the step, 0 to 1, where both byte counts are known.
+    pub fn fraction(&self) -> Option<f64> {
+        let total = self.total_bytes.filter(|&t| t > 0)?;
+        Some((self.done_bytes? as f64 / total as f64).clamp(0.0, 1.0))
+    }
+
+    /// The bytes so far, "2.6 of 6.2 GB" or "2.6 GB so far", for a step that counts them.
+    pub fn amount(&self) -> Option<String> {
+        let done = self.done_bytes? as f64 / 1e9;
+        Some(match self.total_bytes.filter(|&t| t > 0) {
+            Some(total) => format!("{done:.1} of {:.1} GB", total as f64 / 1e9),
+            None => format!("{done:.1} GB so far"),
+        })
+    }
+
+    /// One line: the step, then its bytes and how far through.
+    pub fn describe(&self) -> String {
+        match (self.amount(), self.fraction()) {
+            (Some(amount), Some(f)) => format!("{}: {amount} ({:.0}%)", self.status, f * 100.0),
+            (Some(amount), None) => format!("{}: {amount}", self.status),
+            _ => self.status.clone(),
+        }
+    }
 }
 
 /// Classification of worker errors.
@@ -1166,6 +1204,26 @@ mod zkop_mix_tests {
             times.next().map(|secs| entry(*secs))
         });
         (result, calls)
+    }
+
+    #[test]
+    fn a_setup_step_describes_its_bytes() {
+        let step = |done, total| SetupStep {
+            status: "Downloading".to_string(),
+            done_bytes: done,
+            total_bytes: total,
+        };
+        assert_eq!(
+            step(Some(2_600_000_000), Some(6_200_000_000)).describe(),
+            "Downloading: 2.6 of 6.2 GB (42%)"
+        );
+        assert_eq!(
+            step(Some(2_600_000_000), None).describe(),
+            "Downloading: 2.6 GB so far"
+        );
+        assert_eq!(step(None, None).describe(), "Downloading");
+        assert_eq!(step(Some(7), Some(5)).fraction(), Some(1.0));
+        assert_eq!(step(Some(1), Some(0)).fraction(), None);
     }
 
     #[test]

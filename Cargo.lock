@@ -10096,6 +10096,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "libc",
+ "reqwest",
  "serde",
  "sha2",
  "sp1-build",
