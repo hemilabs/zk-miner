@@ -306,9 +306,17 @@ const MIB: u64 = 1024 * 1024;
 
 /// Measured `(element threshold, peak VRAM)` for SP1, largest first.
 ///
-/// Both figures measured on this box with a 1,912,954,963-cycle `sha256-chain` proof
-/// through to a compact Groth16 seal: 17,766 MiB of a 24,564 MiB RTX 4090 at the 268M threshold, and
-/// 15,092 MiB of a 16,303 MiB RTX 5080 at 134M.
+/// Measured with a 1,912,954,985-cycle `sha256-chain` proof through to a compact Groth16 seal on SP1
+/// circuit **v6.1.0**: 11,542 MiB of a 16,311 MiB RTX 5060 Ti at the 268M threshold, and 8,884–8,957
+/// MiB at 134M (the same 5060 Ti, and a 12,282 MiB RTX 4070). Recorded conservatively above every
+/// observation (200 ms sampling). The peak is flat across job size — it is the shard working set plus
+/// the fixed Groth16-wrap recursion, not shard count — and the wrap itself is on the CPU (gnark) here,
+/// so it costs host RAM, not VRAM.
+///
+/// v6.1.0 is markedly more memory-efficient than v6.0.0, where this same 134M proof peaked at 15,092
+/// MiB and 268M at 17,766 MiB. The consequence that matters: **134M now fits a 12 GiB card** (~9 GiB
+/// peak), so 12 GiB cards run the standard tier rather than needing a smaller one; and a 16 GiB card
+/// can now run 268M (11,542 MiB fits) where before it was held to 134M.
 ///
 /// `402_653_184` — the fork's own default — is deliberately ABSENT. Nothing here has measured its peak
 /// VRAM, and this table is used to decide what will fit. Its omission makes a roomy card slightly
@@ -316,7 +324,7 @@ const MIB: u64 = 1024 * 1024;
 /// trade `sp1_element_threshold_for_host_scale` already makes for host memory: only ever a value
 /// measured to complete a proof.
 const SP1_MEASURED_TIERS: &[(u64, u64)] =
-    &[(268_435_456, 17_766 * MIB), (134_217_728, 15_092 * MIB)];
+    &[(268_435_456, 12_000 * MIB), (134_217_728, 9_500 * MIB)];
 
 /// Headroom required on top of a measured peak before that configuration is considered to fit.
 ///
@@ -954,25 +962,29 @@ mod tests {
         const GIB: u64 = 1024 * 1024 * 1024;
         const FULL_DEFAULT: u64 = 402_653_184;
 
-        // An empty 4090 has room for the 268M configuration (17,766 MiB + margin).
+        // An empty 4090 has room for the 268M configuration (v6.1.0: 11,542 MiB + margin = 12,512).
         assert_eq!(tier(24 * GIB), Some(268_435_456));
-        // 16 GiB free steps down to 134M, whose 15,092 MiB peak fits.
-        assert_eq!(tier(16 * GIB), Some(134_217_728));
+        // 16 GiB free now also fits 268M — v6.1.0 shrank it to fit a 16 GiB card, where v6.0.0's
+        // 17,766 MiB did not.
+        assert_eq!(tier(16 * GIB), Some(268_435_456));
 
-        // THE REGRESSION THIS GUARDS. SP1's own rule — `ceil(gib) + 4 > 20` — takes the 268M tier from
-        // 16.4 GiB upward, but that tier peaks at 17,766 MiB. Everything in that band must step down,
-        // or we commit to a configuration that cannot fit and fail part-way through a claimed job.
-        for mib in [16_500u64, 17_000, 17_500, 18_000, 18_277] {
+        // THE REGRESSION THIS GUARDS: a card with room for 134M but not 268M must step down, not
+        // commit to a configuration that cannot fit and fail part-way through a claimed job. On
+        // v6.1.0 that band is [134M's 10,012 MiB, 268M's 12,512 MiB).
+        for mib in [10_100u64, 11_000, 12_000, 12_511] {
             assert_eq!(
                 tier(mib * MIB),
                 Some(134_217_728),
-                "{mib} MiB free must take the 134M tier: 268M peaks at 17,766 MiB and will not fit"
+                "{mib} MiB free must take the 134M tier: 268M needs 12,512 MiB and will not fit"
             );
         }
-        // Just above the 268M peak plus margin, it may step back up.
-        assert_eq!(tier(18_278 * MIB), Some(268_435_456));
+        // At the 268M requirement it steps back up.
+        assert_eq!(tier(12_512 * MIB), Some(268_435_456));
 
-        // Below the smallest measured configuration there is nothing to offer.
+        // 134M now fits a 12 GiB card; one MiB below its 10,012 requirement there is nothing to offer.
+        assert_eq!(tier(12 * GIB), Some(134_217_728));
+        assert_eq!(tier(10_012 * MIB), Some(134_217_728));
+        assert_eq!(tier(10_011 * MIB), None);
         assert_eq!(tier(8 * GIB), None);
         assert_eq!(tier(0), None);
 
@@ -1062,7 +1074,9 @@ mod tests {
         // The two bounds combine as the smaller; neither present means the fork decides.
         assert_eq!(cap(1.0, Some(24 * GIB)), Some(268_435_456));
         assert_eq!(cap(0.6, Some(24 * GIB)), Some(134_217_728));
-        assert_eq!(cap(0.8, Some(16 * GIB)), Some(134_217_728));
+        // 16 GiB free fits 268M on v6.1.0, and the 0.8 host scale also allows 268M, so neither bound
+        // lowers it.
+        assert_eq!(cap(0.8, Some(16 * GIB)), Some(268_435_456));
         // Too little free for any measured tier still bounds it — to the smallest, never to nothing,
         // which would hand a 24 GB card back to the fork's 402M.
         assert_eq!(cap(1.0, Some(8 * GIB)), Some(134_217_728));
