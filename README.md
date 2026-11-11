@@ -8,16 +8,17 @@ worth taking, claims the ones that are, generates the proof on a local GPU, and 
 it on-chain. Proving runs in separate worker processes — one per GPU — so a wedged or
 OOM-killed prover can't take the miner down with it.
 
-Backends: **RISC Zero** (CUDA, ROCm and Intel), **SP1**, **OpenVM**.
+Backends: **RISC Zero** (CUDA, ROCm, Intel, and Metal on Apple Silicon Macs), **SP1**, **OpenVM**.
 
 ## Requirements
 
 | | |
 |---|---|
-| Rust | 1.93.0 (pinned in `rust-toolchain.toml`) |
+| Rust | 1.97.1 (pinned in `rust-toolchain.toml`) |
 | RISC Zero toolchain | `rzup`, see below — **required to build, and to prove** |
 | CUDA | toolkit with `nvcc` (12.8–13.x tested) for NVIDIA workers |
 | ROCm | 6.4+ with `hipcc` for AMD workers |
+| Metal | macOS on Apple Silicon: the Metal shader compiler (`xcrun --sdk macosx metal`), see [macOS](#macos-apple-silicon-metal) |
 | oneAPI | DPC++/C++ compiler `icpx` (2026.0 tested) and `ocloc` (the `intel-ocloc` package, the same version as the installed compute runtime) for Intel workers; at run time the Level Zero loader, the compute runtime and `intel-ocloc` |
 | Build deps | `build-essential cmake pkg-config protobuf-compiler libclang-dev` (+ `libhipcub-dev librocthrust-dev` for ROCm) |
 | Foundry | `cast` — only for the example job submitters under `examples/` |
@@ -85,6 +86,8 @@ Never set `RISC0_SKIP_BUILD=1` — it produces empty guest ELF stubs, and every
 benchmark then silently reports zero work.
 
 `make` wraps portable Docker builds: `make cli | cuda | rocm | sp1 | openvm | all | test`.
+On a Mac, `make -f Makefile.mac` builds, tests and installs the Metal worker natively, see
+[macOS](#macos-apple-silicon-metal).
 
 ## Install the workers
 
@@ -98,6 +101,7 @@ no error.**
 ├── zkminer-prove-risc0-rocm
 ├── zkminer-rocm/               (ROCm 7.1's HIP runtime, which the risc0 AMD prover loads)
 ├── zkminer-prove-risc0-intel
+├── zkminer-prove-risc0-metal    (macOS, Apple Silicon)
 ├── zkminer-intel/              (the Intel provers' libraries and Intel's compute runtime)
 ├── zkminer-prove-sp1
 ├── sp1-gpu-server
@@ -177,6 +181,172 @@ If a worker needs environment the miner's own process won't have (a systemd unit
 job does *not* source `~/.bashrc`), install a small wrapper script under the expected
 name that sets it up and then `exec`s the real binary — `exec` preserves the PID and
 process group the dispatcher relies on.
+
+## macOS (Apple Silicon, Metal)
+
+The RISC Zero worker also runs on Apple Silicon Macs, on the GPU through Metal:
+`zkminer-prove-risc0-metal`. It is built from the Metal port of the risc0 fork, which
+`Cargo.toml`'s `[patch.crates-io]` takes from `../deps/risc0` (branch `zkminer/metal`). The
+segment proofs, the recursion and the Groth16 wrap run on the GPU (two steps still run on the CPU
+for now: the rv32im witness generation and the last recursion step before the wrap), and neither
+Docker nor a CUDA/ROCm toolkit is involved. SP1 and OpenVM have no Mac worker; the miner never gives an Apple
+GPU an SP1 slot.
+
+### Supported Macs
+
+| Tier | Hardware | What to expect |
+|---|---|---|
+| Not supported | Intel Macs; any Mac with 8 GB (including the A18 Pro MacBook Neo); an x86_64 build or a shell under Rosetta | The worker refuses, with the reason in its log: Capabilities reports no GPU, Prove, Warmup and Benchmark answer with the refusal, and `--benchmark` exits 2. Executing guests (job measurement) still works. |
+| Minimum | M1–M6 base chip with 16 GB (7–10 GPU cores) | Small segments (po2 17–18). Not practical yet, see the footprint limitation below. |
+| Primary target | M4/M5 base (10 cores) with 24 GB; M4/M5 Pro with 24–48 GB | po2 19–20 |
+| High end | Max (36–128 GB), Ultra | po2 20 |
+
+The worker's check: an aarch64 build, not translated by Rosetta (`sysctl.proc_translated`), a Metal
+device with unified memory, and `hw.memsize` of at least 12 GiB (so 8 GB Macs are refused, and a
+16 GB Mac is never refused over rounding). It never assumes a core count or a share of RAM: it
+sizes everything from the device's `recommendedMaxWorkingSetSize` (about 75% of RAM; 28.1 GiB on a
+36 GB M5 Max), lowered by `RISC0_METAL_MAX_WORKING_SET_BYTES` if set and by the miner's own figure
+(`hw.memsize` minus an 8 GiB host reserve). Only a 36 GB M5 Max has been measured so far; the rows
+for smaller Macs come from budget runs on it.
+
+Default segment size (po2) when the job names none, and the peak GPU memory measured at that size
+for the STARK (segments / recursion) on the M5 Max:
+
+| Working-set limit | po2 | Peak GPU memory, MiB | Typical Mac |
+|---|---|---|---|
+| < 6 GiB | 17 | 2082 / 3971 | 16 GB under a ~4 GB budget |
+| 6 to < 12 GiB | 18 | 2700 / 4390 | 16 GB |
+| 12 to < 20 GiB | 19 | 4976 / 6668 | 24 GB |
+| ≥ 20 GiB | 20 | 9473 / 11169 (up to ~12 000) | 32 GB and up |
+
+The Groth16 wrap needs about 7.4 GB of GPU memory on its own (the 5.7 GB proving key plus the
+last recursion step). A po2 larger than the limit allows is refused as ResourceExhausted instead of
+being swapped through (`ZKMINER_METAL_NO_PO2_CEILING=1` disables that, for diagnostics only).
+
+### Prerequisites
+
+- Rust from `rust-toolchain.toml`, and RISC Zero's guest toolchain (`rzup install rust`, see
+  [above](#risc-zero-toolchain-easy-to-miss)). The fork's own `risc0-zkvm` tests also need the C++
+  guest toolchain: `rzup install cpp` (`env.sh` below then points cargo at its archiver).
+- The **Metal shader compiler**. The Command Line Tools do not include it. With Xcode 26 or later,
+  download it as a component: `xcodebuild -downloadComponent MetalToolchain`. Check with
+  `xcrun --sdk macosx metal --version`; the fork's build scripts call exactly that, and stop with a
+  hint if it is missing.
+- Without Xcode (no admin rights, Command Line Tools only), the toolchain can be fetched the way
+  Xcode does it; this is how the development machine got it. Apple's downloadable index
+  (`index2.dvtdownloadableindex`) maps an Xcode build to its Metal Toolchain build (Xcode 27.2 →
+  27B47); Apple's asset server answers a `com.apple.MobileAsset.MetalToolchain` query for that build
+  with an encrypted archive and its key (no Apple ID); `aea decrypt` and `aa extract` give
+  `MetalToolchain-<build>.dmg`, and a user-level `hdiutil attach -nobrowse -readonly` mounts
+  `Metal.xctoolchain`. With its `usr/bin` on `PATH`, `xcrun --sdk macosx metal` finds it (if xcrun
+  keeps resolving an old path, `xcrun --kill-cache`). The exact requests are in
+  `deps/metal-toolchain/README.md` beside the fork on that machine.
+- No Docker, no CUDA, no ROCm. Builds set `NVCC=off HIPCC=off` so sppark looks for neither.
+
+### env.sh
+
+Source one small script before any cargo command. `Makefile.mac` sources it for you, from
+`ENV_SH` (default: `env.sh` in the directory that holds `zk-miner/` and `deps/`). On the
+development machine it is:
+
+```bash
+# ~/zkminer/env.sh
+export PATH="$HOME/.cargo/bin:$HOME/.risc0/bin:$PATH"
+# Metal shader compiler mounted from the toolchain dmg (skip this block if Xcode's component is installed).
+METAL_TC="$HOME/zkminer/deps/metal-toolchain/mnt/Metal.xctoolchain"
+if [ ! -x "$METAL_TC/usr/bin/metal" ]; then          # remount after a reboot
+  hdiutil attach -nobrowse -readonly -mountpoint "$HOME/zkminer/deps/metal-toolchain/mnt" \
+      "$HOME/zkminer/deps/metal-toolchain/MetalToolchain-27B47.dmg" >/dev/null || echo "WARN: could not mount Metal toolchain dmg" >&2
+fi
+export PATH="$METAL_TC/usr/bin:$PATH"
+# The C++ guest crates (the fork's risc0-zkvm tests) need RISC Zero's riscv32 archiver; without it
+# their link fails with undefined blst_* symbols.
+_R0_AR="$(ls -d "$HOME"/.risc0/toolchains/*-cpp-aarch64-apple-darwin/riscv32im-osx-arm64/bin/riscv32-unknown-elf-ar 2>/dev/null | tail -1)"
+[ -n "$_R0_AR" ] && export AR_riscv32im_risc0_zkvm_elf="$_R0_AR"
+```
+
+Never set `RISC0_SKIP_BUILD` (the Makefile refuses to run with it).
+
+### Build, test, install: `Makefile.mac`
+
+```bash
+make -f Makefile.mac mac-check            # this Mac and its toolchains, then cargo check
+make -f Makefile.mac mac-build-worker     # target/release/zkminer-prove-risc0-metal and zkminer
+make -f Makefile.mac mac-install-worker   # into ~/.zkminer/provers, then warm the GPU pipelines
+make -f Makefile.mac mac-test-miner       # zk-miner's macOS tests
+make -f Makefile.mac mac-test-risc0       # the fork's Metal conformance suites
+make -f Makefile.mac mac-bench BENCH_ONLY=fibonacci
+```
+
+| Target | What it runs | Time on a 36 GB M5 Max (warm caches, other work running) |
+|---|---|---|
+| `mac-check` | prerequisite checks (the worker's own refusal rules, the Metal compiler, rzup toolchains, the Groth16 component, the fork), then `cargo check` of the Metal worker and the CLI | ~4.5 min from an empty target dir |
+| `mac-build-worker` | `cargo build --release` of `zkminer-prove-risc0-metal` (`--features metal`) and `zkminer-cli` | ~6 min from an empty target dir (with the compiled Metal libraries already in the risc0 build cache, `~/Library/Caches/com.risczero.RISC-Zero.risc0`; a machine's first build also compiles those); ~35 s with nothing changed (the worker's build script always reruns) |
+| `mac-install-worker` | copies the worker into `PROVERS_DIR` (default `~/.zkminer/provers`; copy then rename, so a running worker is never modified in place), then proves fibonacci once with it to warm the pipelines (`WARM=0` skips) | ~1 min warm; add the cold warm-up below on a new machine |
+| `mac-test-miner` | the worker's unit tests (20), `zkminer-prover` `discovery::`/`dispatcher::` (114), and the real worker over its IPC protocol: Capabilities, Warmup (pipelines + a verified Groth16 proof), one Prove (`MINER_IPC=0` skips this one) | ~4 min |
+| `mac-test-risc0` | in `RISC0_DIR`: `risc0-zkp` `hal::metal` (138), `risc0-circuit-rv32im` `prove::` (74), `risc0-circuit-recursion` (42), `risc0-circuit-keccak` (23), `risc0-groth16-sys` (46) and `risc0-groth16` (9); each also alone as `mac-test-risc0-{zkp,rv32im,recursion,keccak,groth16}` | ~5 min once built |
+| `mac-bench` | builds, then `zkminer-prove-risc0-metal --benchmark` (all six programs, ~19 min at po2 20; `BENCH_ONLY=<program>` for one) | ~1 min for fibonacci |
+
+Every target sources `env.sh`, sets `NVCC=off HIPCC=off`, passes `--locked` (never `cargo update`,
+see [Layout](#layout)), and builds with `-j` = `CARGO_BUILD_JOBS` if set, else the number of
+performance cores, never below 4. Override `ENV_SH`, `RISC0_DIR`, `PROVERS_DIR` or `JOBS` on the
+make command line. `zkminer benchmark` drives the installed worker the way the miner does.
+
+### First start: building the GPU pipelines
+
+Metal compiles each kernel for the GPU the first time a process creates its pipeline, and the
+translated circuits are large. With no cache at all (`MTL_SHADER_CACHE_SIZE=0 RISC0_METAL_ARCHIVE=0`)
+the worker's warm-up took **242 s** on the M5 Max while other builds ran (four circuits in parallel:
+rv32im+zkp 242 s, groth16 188 s, recursion 108 s, keccak 59 s); with the caches warm it takes 0.1 s.
+The compile runs on the CPU, so a base chip with fewer cores takes longer (not yet measured).
+
+The results are kept in the OS Metal shader cache (per user, shared with every app, can be
+evicted) and, for keccak, in a binary archive of the worker's own under
+`~/Library/Caches/com.risczero.RISC-Zero.risc0/metal-archives` (`RISC0_METAL_ARCHIVE_DIR` moves it).
+A new build of the worker only recompiles what changed. The worker builds every pipeline in its
+Warmup, which the miner sends once, before the worker's first benchmark or proof and outside any
+job's deadline (it allows the warm-up an hour); `mac-install-worker` does the same at install time.
+
+### Groth16 without Docker
+
+The Metal worker wraps STARKs in Groth16 natively on the GPU (no Docker, no x86 emulation). It needs
+RISC Zero's `risc0-groth16` component, which it downloads in its one-time setup like the other
+workers (`~/.risc0/extensions/v0.1.0-risc0-groth16`, or `RISC0_GROTH16_DIR`). A wrap takes
+about 16 s on the M5 Max and peaks at ~7.4 GB of GPU memory; the worker keeps the 5.7 GB proving key
+loaded between proofs only when the working-set limit has room for it beside a full STARK and the
+host's own state. `RISC0_GROTH16_METAL_PROVER=docker` switches to RISC Zero's Docker prover. The
+CPU-only worker (`--features cpu`) has no native wrap and needs Docker for it.
+
+### Environment knobs
+
+Read at run time by the worker (they pass through the miner's environment):
+
+| Variable | Effect |
+|---|---|
+| `RISC0_METAL_MAX_WORKING_SET_BYTES` | A GPU memory budget below `recommendedMaxWorkingSetSize`, in bytes or with a `K`/`M`/`G`/`T` suffix (`8G`, `4GiB`). The worker picks its default po2 and its po2 ceiling from it, and every Metal allocation that would exceed it fails early with "Metal working-set budget exceeded" (a Prove then answers ResourceExhausted) instead of pushing the Mac into swap. Use it to leave the owner room on a shared Mac. Under 4 GiB no Groth16 wrap fits. |
+| `RISC0_METAL_RV32IM_GPU_PHASES=witgen` | Run the rv32im witness generation on the GPU. **Off by default**: the generated GPU witgen kernel is not deterministic on real segments (a proof made with it can fail verification); the default runs that phase's CPU kernel over the GPU buffers and the rest (accum, eval_check, NTTs, hashing) on the GPU. For debugging that issue only. |
+| `RISC0_METAL_RV32IM_CPU_PHASES` | Comma list of `witgen`, `accum`, `eval`: run those rv32im phases' CPU kernels over the GPU buffers (wins over `..._GPU_PHASES`). Diagnostics. |
+| `RISC0_METAL=0`, `RISC0_METAL_SKIP=<units>` | Disable Metal entirely, or for some of `zkp`, `rv32im`, `recursion`, `keccak`, `groth16` (comma list); those fall back to the CPU prover (groth16: Docker). Diagnostics. |
+| `RISC0_GROTH16_METAL_PROVER=docker` | Use the Docker Groth16 prover. |
+| `RISC0_GROTH16_DIR` | Directory holding the `risc0-groth16` component. |
+| `RISC0_KECCAK_METAL_WITGEN` | `auto` (default: GPU from po2 13), `gpu`, or `host` (the CPU's witness generator). |
+| `RISC0_METAL_REC_KERNELS` | `monolith` (default) or `split`: which recursion eval_check kernels to use. |
+| `RISC0_METAL_ARCHIVE=0`, `RISC0_METAL_ARCHIVE_DIR` | Disable or move the keccak pipeline archive. |
+| `RISC0_METAL_DEBUG=1` (with `MTL_DEBUG_LAYER=1`) | Metal API validation and extra checks; slow, for debugging. |
+| `ZKMINER_METAL_NO_PO2_CEILING=1` | Let a po2 above what the working-set limit allows run anyway. Diagnostics. |
+| `ZKMINER_CUDA_VRAM_BYTES` | Set by the miner for each Mac worker (`hw.memsize` − 8 GiB); also caps the worker's limit. |
+
+### Known limitations
+
+- **Memory footprint on 16 GB Macs.** Besides the GPU allocations the budget counts, the worker's
+  process carries several GB of driver and host memory (measured: about 16 GB of process footprint
+  for a small proof at po2 18 under an 8 GiB budget). Until that is reduced, a 16 GB Mac does not
+  have the room to prove; 24 GB and up do.
+- Under a 4 GiB budget the STARK proves but the Groth16 wrap is refused (the key alone is 5.7 GB),
+  so the worker's warm-up fails and it takes no jobs.
+- The rv32im GPU witness generation is disabled by default (see the knob above).
+- The six-program benchmark takes ~19 minutes at po2 20 on an M5 Max, longer on smaller Macs.
+- GPU power is not read on macOS; the miner's cost model assumes its 300 W default.
 
 ## Configure
 
@@ -494,6 +664,9 @@ ZKVM_ALLOW_SKIP=1 cargo test                  # skip tests needing GPUs/guest EL
 cargo test -p zkminer-prover --features risc0,sp1 --test comprehensive_zkvm_test \
     -- --test-threads=1 --nocapture
 ```
+
+On a Mac, `make -f Makefile.mac mac-test-miner mac-test-risc0` runs the macOS and Metal suites
+(see [macOS](#macos-apple-silicon-metal)).
 
 The zkVM suite is **fail-closed**: a missing worker or guest ELF fails the test rather
 than skipping, so a half-installed box can't look green. Set `ZKVM_ALLOW_SKIP=1` to skip

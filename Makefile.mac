@@ -1,0 +1,171 @@
+# Apple Silicon (Metal) builds and tests, run natively on the Mac (no Docker).
+#
+# Usage:  make -f Makefile.mac <target>        (make -f Makefile.mac help lists them)
+#
+#   mac-check           Check this Mac and its toolchains, then `cargo check` the Metal worker and the CLI
+#   mac-test-risc0      The risc0 fork's Metal conformance suites (zkp, rv32im, recursion, keccak, groth16);
+#                       each also runs alone as mac-test-risc0-<unit>
+#   mac-test-miner      zk-miner's macOS tests: the Metal worker's unit tests, discovery/dispatcher,
+#                       and one Warmup + Prove of the real worker over its IPC protocol
+#   mac-build-worker    Build zkminer-prove-risc0-metal and the zkminer CLI (release)
+#   mac-install-worker  Install the worker into $(PROVERS_DIR) and warm its GPU pipelines once
+#   mac-bench           Run the worker's own benchmark (BENCH_ONLY=fibonacci for one program)
+#
+# Every target sources $(ENV_SH) (Metal compiler on PATH, the RISC Zero C++ guest archiver), sets
+# NVCC=off HIPCC=off (sppark must not look for CUDA/HIP) and builds with -j $(JOBS) (at least 4).
+# The layout it expects is the one Cargo.toml's [patch.crates-io] expects:
+#   <root>/zk-miner (this repo)   <root>/deps/risc0 (the Metal-port fork)   <root>/env.sh
+# Override any of ZKMINER_ROOT, ENV_SH, RISC0_DIR, PROVERS_DIR, JOBS on the command line.
+
+SHELL := /bin/bash
+.DEFAULT_GOAL := help
+
+MAKEFILE_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+ZKMINER_ROOT ?= $(abspath $(MAKEFILE_DIR)/..)
+ENV_SH       ?= $(ZKMINER_ROOT)/env.sh
+RISC0_DIR    ?= $(ZKMINER_ROOT)/deps/risc0
+PROVERS_DIR  ?= $(HOME)/.zkminer/provers
+
+# Parallel jobs: $CARGO_BUILD_JOBS if set, else the performance-core count, never below 4
+# (no core count is assumed: a base M1 has 4 performance cores, an M5 Max 6).
+JOBS ?= $(shell n=$${CARGO_BUILD_JOBS:-$$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.physicalcpu)}; \
+          [ "$$n" -ge 4 ] 2>/dev/null && echo $$n || echo 4)
+
+WORKER     := zkminer-prove-risc0-metal
+WORKER_BIN := $(MAKEFILE_DIR)/target/release/$(WORKER)
+CLI_BIN    := $(MAKEFILE_DIR)/target/release/zkminer
+
+# Warm the installed worker's pipelines at install (1) or not (0); see mac-install-worker.
+WARM ?= 1
+# Run the real worker over IPC in mac-test-miner (1) or skip it (0).
+MINER_IPC ?= 1
+
+# Prefix of every recipe that runs cargo or the worker. env.sh is sourced before `set -e`
+# (its last line is a conditional export that may return 1).
+CARGO_ENV = test -f "$(ENV_SH)" || { echo "Makefile.mac: $(ENV_SH) not found (see the README's macOS section, or pass ENV_SH=...)" >&2; exit 1; }; \
+	source "$(ENV_SH)"; set -eo pipefail; \
+	if [ -n "$${RISC0_SKIP_BUILD:-}" ]; then echo "Makefile.mac: unset RISC0_SKIP_BUILD (it builds empty guest ELFs)" >&2; exit 1; fi; \
+	export NVCC=off HIPCC=off CARGO_BUILD_JOBS=$(JOBS);
+CARGO = cargo
+MINER = cd "$(MAKEFILE_DIR)" &&
+FORK  = cd "$(RISC0_DIR)" &&
+
+.PHONY: help mac-check mac-prereqs mac-test-risc0 mac-test-risc0-zkp mac-test-risc0-rv32im \
+	mac-test-risc0-recursion mac-test-risc0-keccak mac-test-risc0-groth16 mac-test-miner \
+	mac-build-worker mac-install-worker mac-bench
+
+help:
+	@echo "Apple Silicon (Metal) targets (make -f Makefile.mac <target>):"
+	@echo "  mac-check           - check this Mac and its toolchains, cargo check the Metal worker and CLI"
+	@echo "  mac-test-risc0      - the risc0 fork's Metal suites (also mac-test-risc0-{zkp,rv32im,recursion,keccak,groth16})"
+	@echo "  mac-test-miner      - zk-miner macOS tests (worker unit tests, discovery/dispatcher, IPC prove; MINER_IPC=0 skips the last)"
+	@echo "  mac-build-worker    - release build of $(WORKER) and zkminer"
+	@echo "  mac-install-worker  - install $(WORKER) into $(PROVERS_DIR) and warm its pipelines (WARM=0 skips)"
+	@echo "  mac-bench           - the worker's own benchmark (BENCH_ONLY=fibonacci for one program)"
+	@echo ""
+	@echo "Settings: ENV_SH=$(ENV_SH)"
+	@echo "          RISC0_DIR=$(RISC0_DIR)"
+	@echo "          PROVERS_DIR=$(PROVERS_DIR)  JOBS=$(JOBS)"
+
+# ---------------------------------------------------------------------------------------------
+# mac-check: what the worker itself requires (PLAN 9.1: Apple Silicon, >= 16 GB; refused: Intel
+# Macs, Rosetta, 8 GB Macs incl. the A18 Pro MacBook Neo), the Metal compiler, the RISC Zero
+# toolchains, the fork; then a cargo check of the Metal worker and the CLI.
+mac-prereqs:
+	@set -eo pipefail; fail=0; \
+	ok()  { printf '  ok    %s\n' "$$*"; }; \
+	bad() { printf '  FAIL  %s\n' "$$*"; fail=1; }; \
+	warn(){ printf '  warn  %s\n' "$$*"; }; \
+	echo "Mac:"; \
+	[ "$$(uname -s)" = Darwin ] && ok "macOS $$(sw_vers -productVersion 2>/dev/null)" || bad "not macOS ($$(uname -s))"; \
+	[ "$$(uname -m)" = arm64 ] && ok "arm64" || bad "not Apple Silicon ($$(uname -m)): Intel Macs are not supported"; \
+	[ "$$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = 0 ] && ok "native (not under Rosetta)" || bad "this shell runs under Rosetta: use a native arm64 terminal"; \
+	mem=$$(sysctl -n hw.memsize); gib=$$((mem >> 30)); \
+	[ "$$mem" -ge $$((12 << 30)) ] && ok "$$gib GiB RAM ($$(sysctl -n machdep.cpu.brand_string))" \
+	  || bad "$$gib GiB RAM: Macs with 8 GB are not supported (the worker refuses them)"; \
+	echo "Toolchains:"; \
+	if [ -f "$(ENV_SH)" ]; then ok "env.sh: $(ENV_SH)"; source "$(ENV_SH)" || true; else bad "env.sh not found: $(ENV_SH)"; fi; \
+	if [ -n "$${RISC0_SKIP_BUILD:-}" ]; then bad "RISC0_SKIP_BUILD is set: unset it (it builds empty guest ELFs)"; fi; \
+	if v=$$(xcrun --sdk macosx metal --version 2>/dev/null | head -1) && [ -n "$$v" ]; then ok "Metal compiler: $$v ($$(command -v metal || echo via xcrun))"; \
+	  else bad "no Metal shader compiler (xcrun --sdk macosx metal): install Xcode's Metal Toolchain, see the README"; fi; \
+	command -v cargo >/dev/null && ok "$$(cd "$(MAKEFILE_DIR)" && cargo --version)" || bad "cargo not on PATH"; \
+	ls -d "$$HOME"/.risc0/toolchains/*-rust-aarch64-apple-darwin >/dev/null 2>&1 && ok "RISC Zero Rust toolchain (rzup install rust)" \
+	  || bad "no RISC Zero Rust toolchain: rzup install rust"; \
+	if [ -n "$${AR_riscv32im_risc0_zkvm_elf:-}" ]; then ok "RISC Zero C++ toolchain archiver (AR_riscv32im_risc0_zkvm_elf)"; \
+	  else warn "no AR_riscv32im_risc0_zkvm_elf (rzup install cpp): only the fork's risc0-zkvm tests need it"; fi; \
+	ls "$$HOME"/.risc0/extensions/*-risc0-groth16/stark_verify_final.zkey >/dev/null 2>&1 || [ -n "$${RISC0_GROTH16_DIR:-}" ] \
+	  && ok "risc0-groth16 component" || warn "no risc0-groth16 component yet: the worker downloads it (2.3 GB) at its first Warmup"; \
+	command -v docker >/dev/null && warn "docker found: not needed, the Groth16 wrap runs natively on Metal" || ok "no Docker needed (native Metal Groth16)"; \
+	echo "Fork:"; \
+	if [ -f "$(RISC0_DIR)/risc0/zkvm/Cargo.toml" ]; then ok "$(RISC0_DIR) ($$(git -C "$(RISC0_DIR)" rev-parse --abbrev-ref HEAD 2>/dev/null) $$(git -C "$(RISC0_DIR)" rev-parse --short HEAD 2>/dev/null))"; \
+	  else bad "risc0 fork not found at $(RISC0_DIR) (Cargo.toml patches ../deps/risc0)"; fi; \
+	echo "Build: -j $(JOBS), NVCC=off HIPCC=off"; \
+	exit $$fail
+
+mac-check: mac-prereqs
+	@$(CARGO_ENV) $(MINER) \
+	$(CARGO) check --locked -p zkminer-prove-risc0 --features metal --bin $(WORKER) && \
+	$(CARGO) check --locked -p zkminer-cli
+
+# ---------------------------------------------------------------------------------------------
+# The fork's Metal suites (PLAN 2.10), run in $(RISC0_DIR) under the default parallel harness.
+# Each compares the Metal backend with the CPU backend (bit-exact) or verifies Metal proofs.
+mac-test-risc0: mac-test-risc0-zkp mac-test-risc0-rv32im mac-test-risc0-recursion mac-test-risc0-keccak mac-test-risc0-groth16
+
+mac-test-risc0-zkp:
+	@$(CARGO_ENV) $(FORK) $(CARGO) test --locked -p risc0-zkp --features metal --lib -- hal::metal
+
+mac-test-risc0-rv32im:
+	@$(CARGO_ENV) $(FORK) $(CARGO) test --locked -p risc0-circuit-rv32im --features metal --lib -- prove::
+
+mac-test-risc0-recursion:
+	@$(CARGO_ENV) $(FORK) $(CARGO) test --locked -p risc0-circuit-recursion --features metal --lib
+
+mac-test-risc0-keccak:
+	@$(CARGO_ENV) $(FORK) $(CARGO) test --locked -p risc0-circuit-keccak --release --features metal --lib
+
+# groth16-sys: bn254, NTT, MSM and the prover vs arkworks; groth16: native wraps verified
+# (needs the risc0-groth16 component, ~/.risc0/extensions or RISC0_GROTH16_DIR).
+mac-test-risc0-groth16:
+	@$(CARGO_ENV) $(FORK) \
+	$(CARGO) test --locked -p risc0-groth16-sys --features metal --lib && \
+	$(CARGO) test --locked -p risc0-groth16 --features metal --lib
+
+# ---------------------------------------------------------------------------------------------
+mac-test-miner:
+	@$(CARGO_ENV) $(MINER) \
+	$(CARGO) test --locked --release -p zkminer-prove-risc0 --features metal --bin $(WORKER) && \
+	$(CARGO) test --locked -p zkminer-prover --lib -- discovery:: dispatcher:: && \
+	if [ "$(MINER_IPC)" = 1 ]; then \
+	  $(CARGO) test --locked --release -p zkminer-prove-risc0 --features metal --test metal_worker -- --ignored --nocapture; \
+	else echo "MINER_IPC=0: skipped the worker IPC test"; fi
+
+# ---------------------------------------------------------------------------------------------
+mac-build-worker:
+	@$(CARGO_ENV) $(MINER) \
+	$(CARGO) build --locked --release -j $(JOBS) -p zkminer-prove-risc0 --features metal --bin $(WORKER) && \
+	$(CARGO) build --locked --release -j $(JOBS) -p zkminer-cli && \
+	ls -l "$(WORKER_BIN)" "$(CLI_BIN)"
+
+# Copy, then rename over the old binary: a running worker keeps its (now unlinked) file, and
+# macOS never sees a signed binary modified in place (which gets the process killed).
+# With WARM=1 the installed worker then proves fibonacci once (`--benchmark`, which first builds
+# every circuit's GPU pipelines): minutes on a cold machine, seconds once the OS shader cache
+# and the keccak binary archive hold them, so the first real job does not pay for it.
+mac-install-worker: mac-build-worker
+	@set -eo pipefail; mkdir -p "$(PROVERS_DIR)"; \
+	tmp="$(PROVERS_DIR)/.$(WORKER).tmp.$$$$"; \
+	cp "$(WORKER_BIN)" "$$tmp" && chmod 755 "$$tmp" && mv -f "$$tmp" "$(PROVERS_DIR)/$(WORKER)"; \
+	echo "installed $(PROVERS_DIR)/$(WORKER)"
+	@if [ "$(WARM)" = 1 ]; then \
+	  $(CARGO_ENV) echo "warming the GPU pipelines (BENCH_ONLY=fibonacci $(PROVERS_DIR)/$(WORKER) --benchmark)"; \
+	  t0=$$(date +%s); BENCH_ONLY=fibonacci "$(PROVERS_DIR)/$(WORKER)" --benchmark; \
+	  echo "warm-up done in $$(( $$(date +%s) - t0 )) s"; \
+	else echo "WARM=0: pipelines not warmed (the first Warmup or job builds them)"; fi
+
+# The worker's own benchmark (six programs, ~20 min at po2 20 on an M5 Max; BENCH_ONLY=<name> for one).
+mac-bench: mac-build-worker
+	@$(CARGO_ENV) \
+	$(if $(BENCH_ONLY),export BENCH_ONLY="$(BENCH_ONLY)";) \
+	echo "running $(WORKER_BIN) --benchmark$(if $(BENCH_ONLY), (BENCH_ONLY=$(BENCH_ONLY)))"; \
+	"$(WORKER_BIN)" --benchmark
