@@ -380,6 +380,12 @@ fn may_signal_group(pid: u32) -> bool {
 /// `proc_root` is a parameter so the discriminator can be tested against a synthetic tree.
 #[cfg(unix)]
 fn live_group_members(proc_root: &Path, pgid: i32) -> Option<Vec<(i32, String)>> {
+    // macOS has no `/proc`: the real tree is asked of libproc instead. A synthetic root (tests)
+    // still goes through the parser below on every platform.
+    #[cfg(target_os = "macos")]
+    if proc_root == Path::new("/proc") {
+        return macos_live_group_members(pgid);
+    }
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(proc_root) {
         Ok(e) => e,
@@ -417,6 +423,83 @@ fn live_group_members(proc_root: &Path, pgid: i32) -> Option<Vec<(i32, String)>>
             continue;
         }
         out.push((pid, comm_from_stat(&stat).unwrap_or_default()));
+    }
+    out.sort();
+    Some(out)
+}
+
+/// `live_group_members` against the real kernel on macOS: `proc_listpids(PROC_PGRP_ONLY)` names the group's
+/// members and `proc_pidinfo(PROC_PIDTBSDINFO)` gives each one's state and `comm`.
+///
+/// Before this, `/proc` was unreadable on macOS, so every sweep of a worker's group logged "cannot
+/// read /proc" and killed blind (M6). Killing blind is safe here (the caller holds the unreaped
+/// leader), but the warning fired on every worker exit and the leftover alarm could never fire.
+/// `None` only if the list call itself fails, which keeps the caller's "kill blind" fallback.
+#[cfg(target_os = "macos")]
+fn macos_live_group_members(pgid: i32) -> Option<Vec<(i32, String)>> {
+    if pgid <= 0 {
+        return Some(Vec::new());
+    }
+    // Grow until the kernel's answer fits: it returns the number of BYTES written, and a full
+    // buffer may mean it was truncated.
+    let mut cap = 64usize;
+    let pids = loop {
+        let mut buf = vec![0 as libc::pid_t; cap];
+        let bytes = (cap * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        // `proc_listpids(PROC_PGRP_ONLY)` rather than `proc_listpgrppids`: the latter answers a
+        // pid COUNT, the former BYTES, and only bytes say whether the buffer was big enough
+        // (measured on macOS 27.2: 2 vs 8 for a two-member group).
+        const PROC_PGRP_ONLY: u32 = 2; // <sys/proc_info.h>
+                                       // SAFETY: the buffer holds `bytes` bytes; the call writes at most that many.
+        let n = unsafe {
+            libc::proc_listpids(PROC_PGRP_ONLY, pgid as u32, buf.as_mut_ptr().cast(), bytes)
+        };
+        if n < 0 {
+            tracing::warn!(
+                "proc_listpids(PGRP_ONLY, {pgid}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        let count = n as usize / std::mem::size_of::<libc::pid_t>();
+        if count < cap || cap >= 1 << 16 {
+            buf.truncate(count);
+            break buf;
+        }
+        cap *= 4;
+    };
+    let mut out = Vec::new();
+    for pid in pids {
+        if pid <= 0 || pid == pgid {
+            continue;
+        }
+        // SAFETY: as in `memory::proc_identity`.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        if n != size {
+            continue; // raced exit
+        }
+        // SZOMB (5): a zombie holds no memory and is not a leftover.
+        const SZOMB: u32 = 5;
+        if info.pbi_pgid as i32 != pgid || info.pbi_status == SZOMB {
+            continue;
+        }
+        let comm: Vec<u8> = info
+            .pbi_comm
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        out.push((pid, String::from_utf8_lossy(&comm).into_owned()));
     }
     out.sort();
     Some(out)
@@ -719,6 +802,32 @@ impl WorkerHandle {
             });
         }
 
+        // macOS: the per-worker memory ceiling, enforced by the worker on itself (no cgroups here;
+        // see `metal_sizing::WORKER_MAX_FOOTPRINT_ENV`). Same figure as the Linux `MemoryMax` cap.
+        #[cfg(target_os = "macos")]
+        {
+            let key = crate::metal_sizing::WORKER_MAX_FOOTPRINT_ENV;
+            if !env_overrides.contains_key(key) && std::env::var_os(key).is_none() {
+                if let Some(ceiling) = crate::memory::worker_memory_ceiling_bytes(
+                    crate::memory::DEFAULT_HOST_RESERVE_BYTES,
+                ) {
+                    cmd.env(key, ceiling.to_string());
+                }
+            }
+        }
+
+        // Elsewhere (macOS): the same process group, which every identity check and group kill
+        // relies on (`memory::pid_is_our_worker` requires pgid == pid). Without it a Mac worker
+        // shared the miner's group, so no watchdog, preemption or shutdown could ever signal it,
+        // and a timed-out worker ran on (M6). There is no PR_SET_PDEATHSIG here; the risc0 worker
+        // watches its parent itself (`zkminer-prove-risc0`, `exit_when_orphaned`), and the oom
+        // score is a Linux knob.
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
         let child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn worker {backend} at {}", path.display()))?;
@@ -890,6 +999,16 @@ impl WorkerHandle {
         // NOT a wrapper process — see `memory::cap_process_memory` for why that distinction is
         // load-bearing for every pid-keyed path in this file.
         let pid_for_cap = spawn_guard.get().id();
+        // macOS: no systemd, so no `busctl` to try (every spawn used to warn that the cap failed and
+        // that `oom_score_adj` would cover it, which does not exist there either). The ceiling went
+        // to the worker in its environment instead, above.
+        #[cfg(target_os = "macos")]
+        tracing::info!(
+            "worker {backend} (PID {pid_for_cap}): memory ceiling is the worker's own footprint \
+             guard ({}), macOS has no cgroups",
+            crate::metal_sizing::WORKER_MAX_FOOTPRINT_ENV
+        );
+        #[cfg(not(target_os = "macos"))]
         match crate::memory::worker_memory_ceiling_bytes(crate::memory::DEFAULT_HOST_RESERVE_BYTES)
         {
             Some(ceiling) => {
@@ -2241,8 +2360,12 @@ mod tests {
         let pid = child.id();
         wait_for_zombie(pid);
 
-        // The old guard: a zombie keeps its own group non-empty.
+        // The old guard: a zombie keeps its own group non-empty. Linux only: XNU answers ESRCH
+        // for a group whose only member is a zombie (measured, macOS 27.2), so there the old guard
+        // never misfired; the new predicate below is what matters on both.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
         let old_guard_fires = unsafe { libc::kill(-(pid as i32), 0) } == 0;
+        #[cfg(target_os = "linux")]
         assert!(
             old_guard_fires,
             "precondition: the old kill(-pgid, 0) guard must still succeed for a zombie \
@@ -2331,7 +2454,9 @@ mod tests {
                 }
                 other => panic!("probe {i} lost the zombie: {other:?}"),
             }
-            // Still signallable, i.e. the group number is still ours.
+            // Still signallable, i.e. the group number is still ours. (Linux: XNU answers ESRCH for
+            // a group whose only member is a zombie, though the zombie still pins the number.)
+            #[cfg(target_os = "linux")]
             assert_eq!(unsafe { libc::kill(-(pid as i32), 0) }, 0);
         }
         let _ = child.wait();

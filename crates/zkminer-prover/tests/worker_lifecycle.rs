@@ -298,6 +298,10 @@ fn a_worker_that_lost_its_server_is_replaced_and_the_next_proof_succeeds() {
 /// the room is about to be given to the proof, so left there the two add up to a full tmpfs and a
 /// SIGBUS.
 #[test]
+// Linux only: there is no `/dev/shm` tmpfs on macOS (POSIX shm is not a directory there), SP1's native
+// executor does not stage that way off Linux, and `worker::unlink_group_sp1_shm` is compiled only for
+// Linux. On macOS the mock cannot stage, so the test failed with "the mock never staged" (M6).
+#[cfg(target_os = "linux")]
 fn preempting_an_sp1_measurement_unlinks_what_it_staged() {
     let shm_name = format!("sp1_mocktest{}_t", std::process::id());
     let shm_file = format!("/dev/shm/{shm_name}");

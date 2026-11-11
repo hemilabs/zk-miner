@@ -172,6 +172,9 @@ fn detect_apple_gpus() -> Vec<DetectedGpu> {
         outcome,
         zkminer_prover_protocol::proc::Outcome::Ran { success: true, .. }
     ) {
+        if let Some(cores) = apple_gpu_cores_from_profiler_json(&stdout) {
+            let _ = APPLE_GPU_CORES.set(cores);
+        }
         apple_gpu_name_from_profiler_json(&stdout)
     } else {
         tracing::warn!(
@@ -187,6 +190,37 @@ fn detect_apple_gpus() -> Vec<DetectedGpu> {
         Some(name) => vec![apple_gpu(name)],
         None => Vec::new(),
     }
+}
+
+/// The Apple GPU's core count (`sppci_cores`), recorded when discovery ran `system_profiler`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+static APPLE_GPU_CORES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// This Mac's GPU core count, if discovery read it (macOS only; `None` elsewhere or before
+/// discovery). Read at runtime, never assumed: the dev machine reports 32, the minimum tier 7-10
+/// (PLAN 9.1). Used to scale the Metal benchmark's deadline (`dispatcher::metal_benchmark_timeout`).
+pub fn apple_gpu_cores() -> Option<u32> {
+    APPLE_GPU_CORES.get().copied()
+}
+
+/// `sppci_cores` of the first Apple GPU in `system_profiler SPDisplaysDataType -json` output.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn apple_gpu_cores_from_profiler_json(json: &str) -> Option<u32> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get("SPDisplaysDataType")?
+        .as_array()?
+        .iter()
+        .filter(|gpu| {
+            gpu.get("spdisplays_vendor")
+                .and_then(|x| x.as_str())
+                .is_some_and(|v| v.to_ascii_lowercase().contains("apple"))
+                || gpu
+                    .get("sppci_model")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|m| m.starts_with("Apple"))
+        })
+        .find_map(|gpu| gpu.get("sppci_cores")?.as_str()?.trim().parse::<u32>().ok())
+        .filter(|&c| c > 0)
 }
 
 /// The single Apple GPU entry, given its name.
@@ -2026,6 +2060,10 @@ mod tests {
         assert_eq!(apple_gpu_name_from_profiler_json(""), None);
         assert_eq!(apple_gpu_name_from_profiler_json("{}"), None);
         assert_eq!(apple_gpu_name_from_profiler_json("not json"), None);
+        // The core count, for the Metal benchmark deadline (M6).
+        assert_eq!(apple_gpu_cores_from_profiler_json(m5), Some(32));
+        assert_eq!(apple_gpu_cores_from_profiler_json(intel_mac), None);
+        assert_eq!(apple_gpu_cores_from_profiler_json(no_model), None);
 
         let gpu = apple_gpu("Apple M5 Max".into());
         assert_eq!(gpu.gpu_tag, "metal");

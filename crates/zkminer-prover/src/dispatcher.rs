@@ -685,6 +685,47 @@ fn metal_vram_budget_bytes(mem_total: u64) -> Option<u64> {
         .filter(|b| *b > 0)
 }
 
+/// GPU-core-seconds the risc0 benchmark suite may take on an Apple GPU at the protocol's default
+/// segment size, safety margin included.
+///
+/// Measured (M1, M5 Max reporting 32 GPU cores, po2 20, warm pipelines, GPU otherwise idle): 1136 s
+/// for the six programs, STARK plus wraps, i.e. ~36,400 core-seconds. Three times that is the budget:
+/// the owner's own GPU work slows the run (measured in M6 with other GPU jobs on the same Mac:
+/// sha256-chain 697 s against 313 s idle, x2.2), and a deadline here only exists to stop a HUNG
+/// worker, so being generous costs little while being tight kills a healthy benchmark, which is what
+/// the CUDA-sized 600 s default did, 10 minutes into the 19-minute run (M6).
+pub const METAL_BENCHMARK_CORE_SECS: u64 = 109_200;
+
+/// GPU cores assumed when discovery could not read the count: the bottom of PLAN 9.1's minimum tier
+/// (7-10 cores), so an unknown Mac gets the longest deadline, never a shorter one.
+const METAL_FALLBACK_GPU_CORES: u32 = 7;
+
+/// The deadline for a risc0 benchmark (or calibration proof) on an Apple GPU: the configured one, or
+/// longer when the Mac needs longer. Scales with the GPU's core count and with the segment size the
+/// worker will use: each step below po2 20 costs x1.5 (recursion per segment; a 62M-cycle proof on a
+/// 4090 took 44.0 / 57.6 / 87.2 s at po2 20 / 19 / 18, x1.31 then x1.51). `None` (no deadline
+/// configured) stays `None`. Real job deadlines are not touched: callers pass them to `prove`.
+pub fn metal_benchmark_timeout(
+    configured: Option<Duration>,
+    gpu_cores: Option<u32>,
+    job_po2: u8,
+) -> Option<Duration> {
+    let configured = configured?;
+    let cores = u64::from(
+        gpu_cores
+            .filter(|&c| c > 0)
+            .unwrap_or(METAL_FALLBACK_GPU_CORES),
+    );
+    let steps_down = u32::from(
+        zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
+            .saturating_sub(job_po2)
+            .min(6),
+    );
+    let secs = (METAL_BENCHMARK_CORE_SECS / cores).saturating_mul(3u64.pow(steps_down))
+        / 2u64.pow(steps_down);
+    Some(configured.max(Duration::from_secs(secs)))
+}
+
 /// `HSA_SCRATCH_SINGLE_LIMIT` for a ROCm worker whose card's memory cannot be read: above the ~7.6 GB
 /// the keccak eval_check asks for on a 96-CU card (see `gpu_env`).
 const ROCM_SCRATCH_LIMIT_FALLBACK: u64 = 16 * 1024 * 1024 * 1024;
@@ -2959,8 +3000,12 @@ impl WorkerPool {
         // the same card is the worst case of the double-booking the lock prevents. Bounded by
         // `benchmark_timeout`. See `acquire_gpu_guard`.
         let gpu_lock = self.gpu_lock_for(key);
-        let _gpu_guard =
-            Self::acquire_gpu_guard(gpu_lock.as_ref(), key, None, self.benchmark_timeout)?;
+        let _gpu_guard = Self::acquire_gpu_guard(
+            gpu_lock.as_ref(),
+            key,
+            None,
+            self.benchmark_timeout_for(key),
+        )?;
 
         // Size the segment to what is actually free, rather than refusing the card.
         //
@@ -3063,7 +3108,7 @@ impl WorkerPool {
         }
 
         // A calibration run is a full proof — reuse the benchmark timeout budget.
-        let _watchdog = self.benchmark_timeout.map(|t| {
+        let _watchdog = self.benchmark_timeout_for(key).map(|t| {
             ProvingWatchdog::new(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
@@ -3281,8 +3326,12 @@ impl WorkerPool {
         // lock exists to prevent. Bounded by `benchmark_timeout` so a wedged holder cannot park the
         // benchmark forever. See `acquire_gpu_guard`.
         let gpu_lock = self.gpu_lock_for(key);
-        let _gpu_guard =
-            Self::acquire_gpu_guard(gpu_lock.as_ref(), key, None, self.benchmark_timeout)?;
+        let _gpu_guard = Self::acquire_gpu_guard(
+            gpu_lock.as_ref(),
+            key,
+            None,
+            self.benchmark_timeout_for(key),
+        )?;
 
         // Enough of this card free for this backend? A benchmark is a proof as far as the card is
         // concerned, and an OOM here poisons the throughput row that prices every later job on it.
@@ -3399,7 +3448,7 @@ impl WorkerPool {
         }
 
         // Start benchmark timeout watchdog if configured.
-        let _watchdog = self.benchmark_timeout.map(|t| {
+        let _watchdog = self.benchmark_timeout_for(key).map(|t| {
             ProvingWatchdog::new(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
@@ -3564,7 +3613,7 @@ impl WorkerPool {
                         gpu_lock.as_ref(),
                         &key,
                         None,
-                        self.benchmark_timeout,
+                        self.benchmark_timeout_for(&key),
                     ) {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -3689,8 +3738,12 @@ impl WorkerPool {
         // lock exists to prevent. Bounded by `benchmark_timeout` so a wedged holder cannot park the
         // benchmark forever. See `acquire_gpu_guard`.
         let gpu_lock = self.gpu_lock_for(key);
-        let _gpu_guard =
-            Self::acquire_gpu_guard(gpu_lock.as_ref(), key, None, self.benchmark_timeout)?;
+        let _gpu_guard = Self::acquire_gpu_guard(
+            gpu_lock.as_ref(),
+            key,
+            None,
+            self.benchmark_timeout_for(key),
+        )?;
 
         // Enough of this card free for this backend? A benchmark is a proof as far as the card is
         // concerned, and an OOM here poisons the throughput row that prices every later job on it.
@@ -3813,7 +3866,7 @@ impl WorkerPool {
         }
 
         // Start benchmark timeout watchdog if configured.
-        let _watchdog = self.benchmark_timeout.map(|t| {
+        let _watchdog = self.benchmark_timeout_for(key).map(|t| {
             ProvingWatchdog::new(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
@@ -3964,7 +4017,7 @@ impl WorkerPool {
                         gpu_lock.as_ref(),
                         &key,
                         None,
-                        self.benchmark_timeout,
+                        self.benchmark_timeout_for(&key),
                     ) {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -6503,6 +6556,31 @@ impl WorkerPool {
         } else {
             format!("gpu-{gpu_tag}{idx}")
         }
+    }
+
+    /// The benchmark deadline for one slot: the configured `benchmark_timeout`, except on an Apple
+    /// GPU, whose risc0 suite takes ~19 minutes on a 32-core M5 Max and longer on smaller Macs, so it
+    /// gets `metal_benchmark_timeout` (M6).
+    fn benchmark_timeout_for(&self, key: &str) -> Option<Duration> {
+        let mut parts = key.split(':');
+        let (backend, tag) = (parts.next(), parts.next());
+        if backend != Some(zkminer_prover_protocol::BACKEND_RISC0) || tag != Some("metal") {
+            return self.benchmark_timeout;
+        }
+        let vram = self.workers.get(key).and_then(|e| e.vram_bytes);
+        let (cores, po2) = (
+            crate::discovery::apple_gpu_cores(),
+            crate::benchmark::metal_job_po2(vram),
+        );
+        let scaled = metal_benchmark_timeout(self.benchmark_timeout, cores, po2);
+        if scaled != self.benchmark_timeout {
+            tracing::debug!(
+                "{key}: benchmark deadline {scaled:?} (configured {:?}; {} GPU cores, po2 {po2})",
+                self.benchmark_timeout,
+                cores.map_or("unknown".to_string(), |c| c.to_string()),
+            );
+        }
+        scaled
     }
 
     /// Get-or-create the per-physical-GPU proving lock for a slot key (see
@@ -10278,6 +10356,34 @@ mod tests {
         assert_eq!(pool.proving_gpu_count(), 1);
         let mixed = pool_with_keys(&["risc0:metal:0", "risc0:cuda:0"]);
         assert_eq!(mixed.proving_gpu_count(), 2);
+    }
+
+    /// M6: the CUDA-sized 600 s benchmark deadline fired 10 minutes into the Metal worker's
+    /// 19-minute benchmark on a 32-core M5 Max. On a Mac it scales with the GPU and segment size;
+    /// everything else, and "no deadline", is unchanged.
+    #[test]
+    fn a_metal_benchmark_gets_a_deadline_it_can_meet() {
+        let configured = Some(Duration::from_secs(600));
+        // The measured run: 1136 s on 32 cores at po2 20. It must fit, with room.
+        let m5 = metal_benchmark_timeout(configured, Some(32), 20).unwrap();
+        assert!(m5 >= Duration::from_secs(3 * 1136), "{m5:?}");
+        // Fewer cores and a smaller segment: longer, never shorter (4x the cores, two steps down).
+        let base = metal_benchmark_timeout(configured, Some(8), 18).unwrap();
+        assert!(base >= m5 * 4 * 2, "{base:?} vs {m5:?}");
+        // Unknown cores: as long as the smallest supported Mac's.
+        let unknown = metal_benchmark_timeout(configured, None, 18).unwrap();
+        assert!(unknown >= base, "{unknown:?} vs {base:?}");
+        // A longer configured deadline is kept, and none stays none.
+        let long = Some(Duration::from_secs(100_000));
+        assert_eq!(metal_benchmark_timeout(long, Some(32), 20), long);
+        assert_eq!(metal_benchmark_timeout(None, Some(32), 20), None);
+
+        // Per slot: only a risc0 Metal slot is scaled.
+        let pool = WorkerPool::new(HashMap::new(), Vec::new(), configured);
+        assert_eq!(pool.benchmark_timeout_for("risc0:cuda:0"), configured);
+        assert_eq!(pool.benchmark_timeout_for("sp1:cuda:0"), configured);
+        assert_eq!(pool.benchmark_timeout_for("risc0:cpu"), configured);
+        assert!(pool.benchmark_timeout_for("risc0:metal:0").unwrap() > Duration::from_secs(600));
     }
 
     #[test]
