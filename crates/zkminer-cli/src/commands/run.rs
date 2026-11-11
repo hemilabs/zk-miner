@@ -2563,12 +2563,27 @@ pub async fn run(
         tracing::info!("Connected subprocess workers: {}", connected.join(", "));
     }
     let found = zkminer_tui::splash::found_summary(&pool.started_provers());
-    let startup_problems = pool.startup_problems().to_vec();
+    let mut startup_problems = pool.startup_problems().to_vec();
     init_worker_pool(pool);
     // SP1's one-time setup, in the background: SP1 jobs are not claimed until it is done (see the
     // pre-claim gate), and everything else proceeds meanwhile. Not when watching: it proves on the
     // GPU, and a watch-only run proves nothing.
     if !watch_only() {
+        // On the splash, where a first run's downloads can be watched; headless, the background
+        // warm-up below does it while mining starts. It also retries what fails here.
+        if !headless {
+            let status = splash.status_line();
+            let backends = [
+                zkminer_prover_protocol::BACKEND_SP1,
+                zkminer_prover_protocol::BACKEND_RISC0,
+            ];
+            let failed = tokio::task::spawn_blocking(move || {
+                zkminer_tui::splash::run_setup(&status, &backends)
+            })
+            .await
+            .unwrap_or_default();
+            startup_problems.extend(failed);
+        }
         spawn_sp1_warmup();
     }
 

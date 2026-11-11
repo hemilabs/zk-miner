@@ -57,8 +57,9 @@ pub(crate) fn warm_up(report: &mut dyn FnMut(&str)) -> Result<WarmupReport> {
         .context("cannot locate the Groth16 circuit artifacts directory")?;
     let started = Instant::now();
     let installed = ensure_installed(&dir, |staging| {
-        report("Downloading SP1's Groth16 circuit (first run, about 8 GB)");
-        download(staging)
+        let label = "Downloading SP1's Groth16 circuit (first run, about 8 GB)";
+        report(label);
+        with_size_progress(staging, label, report, || download(staging))
     })?;
     let mut summary = format!(
         "Groth16 circuit artifacts {} ({}, {:.0?})",
@@ -206,6 +207,50 @@ pub(crate) fn ensure_installed(
         return Err(e).with_context(|| format!("cannot move the artifacts to {}", dir.display()));
     }
     Ok(Installed::Downloaded)
+}
+
+/// How often a long step's size is reported.
+const PROGRESS_EVERY: Duration = Duration::from_secs(2);
+
+/// Runs `step` on a thread of its own, telling `report` every few seconds how much `path` holds,
+/// as "<label>: 3.1 GB so far". For a download or an unpack whose library reports nothing itself.
+fn with_size_progress<T: Send>(
+    path: &Path,
+    label: &str,
+    report: &mut dyn FnMut(&str),
+    step: impl FnOnce() -> T + Send,
+) -> T {
+    std::thread::scope(|scope| {
+        let running = scope.spawn(step);
+        let mut reported = Instant::now();
+        while !running.is_finished() {
+            std::thread::sleep(Duration::from_millis(250));
+            if reported.elapsed() >= PROGRESS_EVERY {
+                reported = Instant::now();
+                let gb = size_on_disk(path) as f64 / 1e9;
+                report(&format!("{label}: {gb:.1} GB so far"));
+            }
+        }
+        running
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// Bytes in `path`, a file or a directory tree; what cannot be read counts as nothing.
+fn size_on_disk(path: &Path) -> u64 {
+    let Ok(meta) = fs::metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| size_on_disk(&entry.path()))
+        .sum()
 }
 
 /// The SDK's download and extraction, into `staging`.

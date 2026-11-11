@@ -120,6 +120,63 @@ impl Drop for Splash {
     }
 }
 
+/// Runs the one-time setup of each of `backends` (`WorkerPool::warm_up`) before the TUI opens, on
+/// `status`: a first run downloads several GB, better watched here, step by step, than behind a
+/// dashboard that cannot prove yet. They run at once. Every later start finds everything in place
+/// in milliseconds. Returns a problem line for each whose setup failed; the caller retries those
+/// in the background as before.
+pub fn run_setup(status: &StatusLine, backends: &[&str]) -> Vec<String> {
+    use zkminer_prover::dispatcher::WARMUP_TIMEOUT;
+    let Some(pool) = zkminer_prover::engine::worker_pool() else {
+        return Vec::new();
+    };
+    let backends: Vec<&str> = backends
+        .iter()
+        .copied()
+        .filter(|b| pool.has_slots(b) && !pool.backend_warmed(b))
+        .collect();
+    std::thread::scope(|scope| {
+        let running: Vec<_> = backends
+            .iter()
+            .map(|&backend| {
+                (
+                    backend,
+                    scope.spawn(move || pool.warm_up(backend, WARMUP_TIMEOUT)),
+                )
+            })
+            .collect();
+        while running.iter().any(|(_, setup)| !setup.is_finished()) {
+            let steps: Vec<String> = running
+                .iter()
+                .filter(|(_, setup)| !setup.is_finished())
+                .map(|(backend, _)| {
+                    pool.setup_status(backend).unwrap_or_else(|| {
+                        format!("Checking {}'s setup", crate::state::zkvm_label(backend))
+                    })
+                })
+                .collect();
+            status.set(steps.join("; "));
+            thread::sleep(FRAME);
+        }
+        running
+            .into_iter()
+            .filter_map(|(backend, setup)| {
+                let zkvm = crate::state::zkvm_label(backend);
+                match setup.join() {
+                    Ok(Ok(summary)) => {
+                        tracing::info!("{zkvm} is ready: {summary}");
+                        None
+                    }
+                    Ok(Err(e)) => Some(format!(
+                        "{zkvm} setup failed, retrying in the background: {e:#}"
+                    )),
+                    Err(_) => Some(format!("{zkvm} setup panicked")),
+                }
+            })
+            .collect()
+    })
+}
+
 /// What startup found, for the status line: each card and the zkVMs running on it, from
 /// `WorkerPool::started_provers`.
 pub fn found_summary(provers: &[(String, Option<String>)]) -> String {

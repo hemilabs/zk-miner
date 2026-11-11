@@ -94,7 +94,7 @@ pub async fn run(headless: bool) -> Result<()> {
 
     // Spawn worker pool so GPU provers are available for real benchmarks.
     // This discovers binaries in ~/.zkminer/provers/, $PATH, etc.
-    let (found, startup_problems) = {
+    let (found, mut startup_problems) = {
         let mut pool = zkminer_prover::dispatcher::WorkerPool::new(
             HashMap::new(), // no explicit binaries in mock mode
             Vec::new(),     // default search paths
@@ -116,6 +116,20 @@ pub async fn run(headless: bool) -> Result<()> {
     {
         let mut s = state.write().await;
         seed_state(&mut s);
+    }
+
+    // A first run's downloads, on the splash where they can be watched.
+    if !headless {
+        let status = splash.status_line();
+        let backends = [
+            zkminer_prover_protocol::BACKEND_SP1,
+            zkminer_prover_protocol::BACKEND_RISC0,
+        ];
+        let failed =
+            tokio::task::spawn_blocking(move || zkminer_tui::splash::run_setup(&status, &backends))
+                .await
+                .unwrap_or_default();
+        startup_problems.extend(failed);
     }
 
     // Long enough to read: once the TUI opens the splash is gone.

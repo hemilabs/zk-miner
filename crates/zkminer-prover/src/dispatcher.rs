@@ -3394,10 +3394,17 @@ impl WorkerPool {
             key.to_string(),
             entry.intentional_kill.clone(),
         );
+        let mut logged_step: Option<String> = None;
         let response = loop {
             match handle.recv() {
                 Ok(WorkerResponse::SetupProgress { status, .. }) => {
-                    tracing::info!("{key}: {status}");
+                    // A download repeats its step with a growing byte count: the log takes each
+                    // step once.
+                    let step = status.split(": ").next().unwrap_or(&status);
+                    if logged_step.as_deref() != Some(step) {
+                        tracing::info!("{key}: {status}");
+                        logged_step = Some(step.to_string());
+                    }
                     self.set_setup_status(key, Some(status));
                 }
                 other => break other,
