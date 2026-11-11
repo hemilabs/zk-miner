@@ -9,6 +9,8 @@ use std::time::Instant;
 mod groth16_component;
 #[cfg(feature = "metal")]
 mod metal_host;
+#[cfg(all(feature = "metal", not(target_os = "macos")))]
+compile_error!("feature `metal` builds the Apple Silicon worker: build it on macOS (aarch64-apple-darwin)");
 
 use anyhow::{Context, Result};
 use risc0_zkvm::Prover as _;
@@ -299,7 +301,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             .map(String::as_str)
                             .or_else(|| panic.downcast_ref::<&str>().copied())
                             .unwrap_or("");
-                        let kind = if is_gpu_oom(detail) || detail.contains("allocation failed") {
+                        let kind = if is_gpu_oom(detail)
+                            || detail.contains("allocation failed")
+                            || is_metal_oom(detail)
+                        {
                             ErrorKind::ResourceExhausted
                         } else {
                             ErrorKind::Internal
@@ -310,6 +315,21 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             message: format!("risc0 prover panicked: {detail}"),
                         };
                         write_message(&mut stdout, &resp)?;
+                        // On Metal a prove panic leaves this thread's provers unusable: a mutex the
+                        // panic unwound through stays poisoned (every later proof failed with
+                        // `PoisonError`), and the zkvm's cached segment prover keeps its pool, which
+                        // the worker cannot drop. Exit after answering, so the dispatcher starts a
+                        // clean worker (it kills one on ResourceExhausted, and respawns one that died
+                        // idle) instead of sending the next job to this one.
+                        #[cfg(feature = "metal")]
+                        {
+                            use std::io::Write as _;
+                            let _ = stdout.flush();
+                            tracing::error!(
+                                "exiting after a Metal prove panic so a clean worker replaces this one"
+                            );
+                            std::process::exit(METAL_PANIC_EXIT_CODE);
+                        }
                     }
                     Ok(Err(e)) => {
                         let msg = format!("{e:#}");
@@ -336,7 +356,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             // The served ELF's image id is not this job's programId — permanent for the
                             // program. Report ProgramMismatch so the host stops claiming its jobs.
                             ErrorKind::ProgramMismatch
-                        } else if is_gpu_oom(&msg) {
+                        } else if is_gpu_oom(&msg) || is_metal_oom(&msg) {
                             // GPU OOM — host/driver text (guest faults are handled above): tag
                             // ResourceExhausted so the dispatcher kills + respawns this worker with a
                             // clean GPU context (a wedged/leaked context would fail every later proof).
@@ -608,13 +628,44 @@ fn detect_gpu() -> (bool, Option<String>) {
 }
 
 /// Why this worker refuses to use the GPU on this machine, or `None`. Only the Metal worker refuses
-/// (Intel Macs, Macs under 16 GB and x86_64 builds under Rosetta; PLAN 9.1).
+/// (Intel Macs, 8 GB Macs (`hw.memsize` under 12 GiB) and x86_64 builds under Rosetta; PLAN 9.1).
 fn gpu_refusal() -> Option<String> {
     #[cfg(feature = "metal")]
     if let Err(msg) = metal_host::support() {
         return Some(msg.clone());
     }
     None
+}
+
+/// Whether host-generated text is a Metal out-of-memory (`metal_host::is_metal_oom`); always false
+/// without the `metal` feature. Classified like `is_gpu_oom`, after any guest-fault text.
+fn is_metal_oom(text: &str) -> bool {
+    #[cfg(feature = "metal")]
+    {
+        metal_host::is_metal_oom(text)
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = text;
+        false
+    }
+}
+
+/// Exit status of a Metal worker that ends itself after a prove panic (see the Prove handler).
+#[cfg(feature = "metal")]
+const METAL_PANIC_EXIT_CODE: i32 = 70;
+
+/// Why a proof at segment `po2` must not start here (`metal_host::po2_refusal`), or `None`.
+fn po2_refusal(po2: u8) -> Option<String> {
+    #[cfg(feature = "metal")]
+    {
+        metal_host::po2_refusal(po2)
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = po2;
+        None
+    }
 }
 
 /// The segment size used when the host names none: [`zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2`], or on a Mac the size its
@@ -1320,6 +1371,18 @@ fn local_prover() -> risc0_zkvm::LocalProver {
     risc0_zkvm::LocalProver::new("local")
 }
 
+/// Calls [`release_after_proof`] when dropped, so it also runs while a panic unwinds.
+struct ReleaseOnDrop;
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::warn!("prove panicked: releasing this thread's cached provers");
+        }
+        release_after_proof();
+    }
+}
+
 fn run_proof(
     elf: &[u8],
     input_data: &[u8],
@@ -1332,6 +1395,12 @@ fn run_proof(
     // job range; other sizes are for benchmarks and calibration.
     if program_id.is_some() {
         job_segment_po2(po2)?;
+    }
+    // Refused before any work: on a Mac a segment size whose STARK cannot fit in the working set does
+    // not fail, it thrashes swap for as long as it is left to run. Typed ResourceExhausted (the text
+    // is the fork's out-of-memory wording), so the job goes to a bigger card.
+    if let Some(refusal) = po2_refusal(po2.unwrap_or_else(default_job_po2)) {
+        anyhow::bail!("{refusal}");
     }
     // The seed the pre-claim measurement used, so every attempt runs the guest exactly as it did.
     let seed = sys_rand_seed(&sys_rand_key(), &image_id, input_data);
@@ -1462,10 +1531,10 @@ fn run_proof_once(
     let opts = ProverOpts::groth16().with_dev_mode(false);
     #[cfg(feature = "metal")]
     if let Some(limit) = metal_host::working_set_limit() {
+        // Above the default but under the hard ceiling `run_proof` enforces (`po2_refusal`).
         if po2 > metal_host::job_po2_for_limit(limit) {
             tracing::warn!(
-                "segment po2 {po2} is above the {} this Mac's {:.1} GiB Metal working set is sized \
-                 for: the proof may run out of GPU memory",
+                "segment po2 {po2} is above the default {} for this Mac's {:.1} GiB Metal working set",
                 metal_host::job_po2_for_limit(limit),
                 limit as f64 / (1u64 << 30) as f64
             );
@@ -1474,10 +1543,14 @@ fn run_proof_once(
     #[cfg(feature = "metal")]
     let sampler = metal_host::PeakSampler::start();
     let start = Instant::now();
-    let proved = prover.prove_with_opts(env, elf, &opts);
+    let proved = {
+        // Releases on unwind too: a prove-path panic (a Metal budget panic mid-STARK) must not skip
+        // returning the recursion provers' memory. The normal path releases when this scope ends.
+        let _release = ReleaseOnDrop;
+        prover.prove_with_opts(env, elf, &opts)
+    };
     #[cfg(feature = "metal")]
     sampler.phase("proof");
-    release_after_proof();
     #[cfg(feature = "metal")]
     {
         sampler.held("held after release");
@@ -1928,6 +2001,9 @@ fn warm_up() -> Result<String> {
 
 /// Run a po2 calibration: prove fibonacci at the specified segment po2 and measure throughput.
 fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
+    if let Some(refusal) = po2_refusal(po2) {
+        anyhow::bail!("{refusal}");
+    }
     let input = CALIBRATION_ITERS.to_le_bytes();
     let env = risc0_zkvm::ExecutorEnv::builder()
         .write_slice(&input)

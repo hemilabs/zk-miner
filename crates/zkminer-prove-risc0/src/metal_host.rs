@@ -200,6 +200,53 @@ pub fn stark_peak_bytes(po2: u8) -> u64 {
     }
 }
 
+/// The largest segment po2 whose STARK peak ([`stark_peak_bytes`]) fits in `limit`, or `None` when
+/// not even po2 17's does. This is a hard ceiling, not the default ([`job_po2_for_limit`] is): on the
+/// 36 GB dev machine (28.1 GiB) it is 21, and po2 22 is refused. Without it a po2 22 Prove there
+/// did not fail but thrashed swap for 40 minutes (18 GB of swap, the whole machine starved), because
+/// with no `RISC0_METAL_MAX_WORKING_SET_BYTES` Metal over-commits past
+/// `recommendedMaxWorkingSetSize` instead of failing the allocation (M1 note, fix round 1).
+pub fn max_po2_for_limit(limit: u64) -> Option<u8> {
+    (13..=24u8).rev().find(|&p| stark_peak_bytes(p) <= limit)
+}
+
+/// Lets an operator (or a test of the out-of-memory path) prove above [`max_po2_for_limit`].
+pub const NO_PO2_CEILING_ENV: &str = "ZKMINER_METAL_NO_PO2_CEILING";
+
+/// Why a proof at segment `po2` must not start on this Mac, or `None`. The text starts with the
+/// fork's own out-of-memory wording so [`is_metal_oom`] types it `ResourceExhausted`, which sends
+/// the job to a bigger card instead of failing it here.
+pub fn po2_refusal(po2: u8) -> Option<String> {
+    if std::env::var(NO_PO2_CEILING_ENV).is_ok_and(|v| v.trim() == "1") {
+        return None;
+    }
+    let limit = working_set_limit()?;
+    let max = max_po2_for_limit(limit);
+    if max.is_some_and(|m| po2 <= m) {
+        return None;
+    }
+    Some(format!(
+        "Metal working-set budget exceeded: segment po2 {po2} needs about {:.1} GiB of GPU memory, \
+         above this Mac's {:.1} GiB working-set limit ({})",
+        stark_peak_bytes(po2) as f64 / GIB as f64,
+        limit as f64 / GIB as f64,
+        match max {
+            Some(m) => format!("largest po2 here: {m}"),
+            None => "no segment size fits".to_string(),
+        }
+    ))
+}
+
+/// Whether host-generated error or panic text is a Metal out-of-memory: the fork's working-set budget
+/// check (`hal/metal/runtime.rs`, also behind the Groth16 key load), a failed `newBuffer`, or
+/// [`po2_refusal`]. `is_gpu_oom` (CUDA/HIP/Level Zero wording) matches none of these. Callers must
+/// classify guest-fault text first, as they do for `is_gpu_oom`.
+pub fn is_metal_oom(text: &str) -> bool {
+    text.contains("Metal working-set budget exceeded")
+        || text.contains("Metal allocation failed")
+        || text.contains("Metal private allocation failed")
+}
+
 /// Whether the Groth16 proving key may stay cached on the GPU between proofs: only when it fits
 /// beside the next proof's largest STARK phase with headroom. On unified memory a kept key is 5.6 GB
 /// of the owner's RAM held while idle, so this is the high-end tier only.
@@ -370,6 +417,33 @@ mod tests {
         // The 36 GB dev machine: min(30.15 GB, 28 GiB).
         assert_eq!(job_po2_for_limit(28 * GIB), 20);
         assert_eq!(job_po2_for_limit(180 * GIB), 20);
+    }
+
+    #[test]
+    fn the_po2_ceiling_follows_the_stark_peak() {
+        assert_eq!(max_po2_for_limit(3 * GIB), None);
+        assert_eq!(max_po2_for_limit(4 * GIB), Some(17));
+        assert_eq!(max_po2_for_limit(8 * GIB), Some(19));
+        assert_eq!(max_po2_for_limit(16 * GIB), Some(20));
+        // The 36 GB dev machine: po2 21 proved there (M1 review), po2 22 thrashed swap.
+        assert_eq!(max_po2_for_limit(28 * GIB), Some(21));
+        assert_eq!(max_po2_for_limit(180 * GIB), Some(23));
+        // Never below the default for the same limit.
+        for limit in [4 * GIB, 8 * GIB, 10_700_000_000, 16 * GIB, 28 * GIB] {
+            assert!(max_po2_for_limit(limit).unwrap() >= job_po2_for_limit(limit));
+        }
+    }
+
+    #[test]
+    fn metal_oom_text_is_recognised() {
+        assert!(is_metal_oom(
+            "risc0 prover panicked: Metal working-set budget exceeded: allocating 3152 bytes"
+        ));
+        assert!(is_metal_oom(
+            "failed to load the groth16 proving key: Metal working-set budget exceeded: x"
+        ));
+        assert!(is_metal_oom("Metal allocation failed on evaluated: 7 bytes"));
+        assert!(!is_metal_oom("called `Result::unwrap()` on an `Err` value: PoisonError"));
     }
 
     #[test]

@@ -27,7 +27,8 @@ path = "src/main.rs"
 required-features = ["cpu"]
 
 # Apple Silicon Macs through Metal (the risc0 fork's `metal` backend). macOS on aarch64 only; the worker
-# refuses Intel Macs and Macs with less than 16 GB at runtime (see `metal_host.rs`).
+# refuses Intel Macs and 8 GB Macs at runtime (it requires 16 GB; the check is `hw.memsize` >= 12 GiB,
+# so rounding never refuses a 16 GB Mac; see `metal_host.rs`).
 [[bin]]
 name = "zkminer-prove-risc0-metal"
 path = "src/main.rs"
