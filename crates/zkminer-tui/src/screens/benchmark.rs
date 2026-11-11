@@ -546,6 +546,32 @@ fn render_progress_header(
 
     let elapsed_str = format!("{}:{:02}", elapsed / 60, elapsed % 60);
 
+    // A first run's setup can take many minutes: say what it is doing, in place of the bar.
+    let setup = tracker
+        .active_device()
+        .and_then(|d| d.setup_status.as_deref());
+    if let Some(status) = setup {
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {spinner} {verb} {current}: "),
+                Style::default()
+                    .fg(theme::yellow())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(status.to_string(), theme::metric()),
+            Span::styled(format!("  {elapsed_str}"), theme::dim()),
+        ]);
+        let header = Paragraph::new(vec![line]).block(
+            Block::default()
+                .title(Span::styled(" Benchmark ", theme::title()))
+                .borders(Borders::ALL)
+                .border_style(theme::border_focused())
+                .border_type(theme::border_type()),
+        );
+        f.render_widget(header, area);
+        return;
+    }
+
     let line = Line::from(vec![
         Span::styled(
             format!(" {spinner} {verb} {current}  "),
@@ -1063,6 +1089,13 @@ mod tests {
             warming[1]
         );
         assert!(!warming.join("\n").contains("fibonacci"));
+
+        // A first run's setup says what it is doing.
+        let download = "Downloading SP1's Groth16 circuit (first run, about 8 GB)";
+        tracker.refresh_setup_status(|_| Some(download.to_string()));
+        let setup = draw(&tracker);
+        assert!(setup[1].contains(download), "{}", setup[1]);
+        assert!(setup[1].contains("Warming up RTX 4090 SP1"), "{}", setup[1]);
 
         tracker.apply(&event("sp1:cuda:0", RTX, Kind::WarmedUp));
         let rows = draw(&tracker);

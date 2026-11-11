@@ -34,8 +34,8 @@ const FILES: [&str; 4] = [
 ];
 
 /// Makes sure the component is where risc0 will look for it, installing it if it is not. What was
-/// done, for the log.
-pub fn ensure_installed() -> Result<String> {
+/// done, for the log. `report` is told before each long step.
+pub fn ensure_installed(report: &mut dyn FnMut(&str)) -> Result<String> {
     if let Some(dir) = std::env::var_os("RISC0_GROTH16_DIR") {
         let dir = PathBuf::from(dir);
         ensure!(
@@ -73,7 +73,9 @@ pub fn ensure_installed() -> Result<String> {
         dir.display()
     );
     let archive = tmp.join(format!("risc0-groth16-{VERSION}.tar.xz"));
+    report("Downloading RISC Zero's Groth16 files (first run, 2.3 GB)");
     download(&archive)?;
+    report("Unpacking RISC Zero's Groth16 files (first run, 5 GB)");
     let staging = tmp.join(format!("risc0-groth16-{VERSION}.{}", std::process::id()));
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging)?;

@@ -1840,6 +1840,8 @@ pub struct WorkerPool {
     measure_only: bool,
     /// Why workers could not start, in words for the operator. See [`Self::startup_problems`].
     startup_problems: Vec<String>,
+    /// What each slot's one-time setup is doing now, by slot key. See [`Self::setup_status`].
+    setup_status: Mutex<HashMap<String, String>>,
 }
 
 /// What `WorkerPool::run_benchmark_requests` got from a worker.
@@ -1891,6 +1893,7 @@ impl WorkerPool {
             progress: None,
             measure_only: false,
             startup_problems: Vec::new(),
+            setup_status: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1903,6 +1906,28 @@ impl WorkerPool {
     /// this a card missing a zkVM has no explanation outside the log file.
     pub fn startup_problems(&self) -> &[String] {
         &self.startup_problems
+    }
+
+    /// What `key`'s one-time setup is doing now, if it is in one. Falls back to any slot of the same
+    /// backend: the setup is per host, so one slot does it while the others wait for it, and it may
+    /// be running on a background thread rather than for the caller.
+    pub fn setup_status(&self, key: &str) -> Option<String> {
+        let statuses = self.setup_status.lock().unwrap_or_else(|e| e.into_inner());
+        let backend = key.split(':').next().unwrap_or(key);
+        statuses.get(key).cloned().or_else(|| {
+            statuses
+                .iter()
+                .find(|(k, _)| k.split(':').next() == Some(backend))
+                .map(|(_, status)| status.clone())
+        })
+    }
+
+    fn set_setup_status(&self, key: &str, status: Option<String>) {
+        let mut statuses = self.setup_status.lock().unwrap_or_else(|e| e.into_inner());
+        match status {
+            Some(status) => statuses.insert(key.to_string(), status),
+            None => statuses.remove(key),
+        };
     }
 
     /// The (backend, card name) of each prove worker that is running, sorted.
@@ -3369,7 +3394,16 @@ impl WorkerPool {
             key.to_string(),
             entry.intentional_kill.clone(),
         );
-        let response = handle.recv();
+        let response = loop {
+            match handle.recv() {
+                Ok(WorkerResponse::SetupProgress { status, .. }) => {
+                    tracing::info!("{key}: {status}");
+                    self.set_setup_status(key, Some(status));
+                }
+                other => break other,
+            }
+        };
+        self.set_setup_status(key, None);
         if response.is_err() {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);

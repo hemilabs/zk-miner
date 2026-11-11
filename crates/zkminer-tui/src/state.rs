@@ -533,6 +533,8 @@ pub struct DeviceProgress {
     pub zkops: Option<f64>,
     /// Setting up and running the discarded warm-up proof, before the first program.
     pub warming_up: bool,
+    /// What the card's one-time setup is doing now, while it is warming up.
+    pub setup_status: Option<String>,
 }
 
 /// A zkVM's name as an operator knows it.
@@ -616,6 +618,7 @@ impl BenchmarkTracker {
             BenchmarkProgressKind::WarmedUp => {
                 let dev = &mut self.devices[pos];
                 dev.warming_up = false;
+                dev.setup_status = None;
                 if let Some(first) = dev.programs.first_mut() {
                     if first.phase == ProgramPhase::Pending {
                         first.phase = ProgramPhase::Running;
@@ -645,6 +648,7 @@ impl BenchmarkTracker {
                 dev.complete = true;
                 dev.failed = !*succeeded;
                 dev.warming_up = false;
+                dev.setup_status = None;
             }
         }
         self.all_complete = !self.devices.is_empty() && self.devices.iter().all(|d| d.complete);
@@ -702,6 +706,7 @@ impl BenchmarkTracker {
             failed: false,
             zkops: None,
             warming_up: false,
+            setup_status: None,
         });
         self.devices.len() - 1
     }
@@ -725,6 +730,13 @@ impl BenchmarkTracker {
         }
     }
 
+    /// Updates what each warming-up card's setup is doing, from `status(slot key)`.
+    pub fn refresh_setup_status(&mut self, status: impl Fn(&str) -> Option<String>) {
+        for dev in self.devices.iter_mut().filter(|d| d.warming_up) {
+            dev.setup_status = status(&dev.slot_key);
+        }
+    }
+
     /// The row being benchmarked right now, if any.
     pub fn active_device(&self) -> Option<&DeviceProgress> {
         self.devices
@@ -742,6 +754,7 @@ impl BenchmarkTracker {
     ) {
         let dev = &mut self.devices[pos];
         dev.warming_up = false;
+        dev.setup_status = None;
 
         // Mark the completed program
         if let Some(prog) = dev
@@ -989,6 +1002,9 @@ mod benchmark_tracker_tests {
         let active = tracker.active_device().expect("a card is running");
         assert!(!active.warming_up);
         assert_eq!(active.programs[0].phase, ProgramPhase::Running);
+        tracker.refresh_setup_status(|_| Some("not warming up any more".to_string()));
+        let active = tracker.active_device().expect("a card is running");
+        assert_eq!(active.setup_status, None);
         // The warm-up is never one of the rows.
         assert!(active
             .programs

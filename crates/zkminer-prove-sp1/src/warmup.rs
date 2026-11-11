@@ -51,12 +51,15 @@ pub(crate) struct WarmupReport {
 }
 
 /// Installs the Groth16 circuit artifacts if they are not installed, and builds the stripped
-/// circuit where the server supports it.
-pub(crate) fn warm_up() -> Result<WarmupReport> {
+/// circuit where the server supports it. `report` is told before each long step.
+pub(crate) fn warm_up(report: &mut dyn FnMut(&str)) -> Result<WarmupReport> {
     let dir = sp1_prover::build::groth16_circuit_artifacts_dir()
         .context("cannot locate the Groth16 circuit artifacts directory")?;
     let started = Instant::now();
-    let installed = ensure_installed(&dir, download)?;
+    let installed = ensure_installed(&dir, |staging| {
+        report("Downloading SP1's Groth16 circuit (first run, about 8 GB)");
+        download(staging)
+    })?;
     let mut summary = format!(
         "Groth16 circuit artifacts {} ({}, {:.0?})",
         installed.describe(),
@@ -68,6 +71,7 @@ pub(crate) fn warm_up() -> Result<WarmupReport> {
     let groth16_helper = server.exists() && server_hosts_groth16_helper(&server);
     if groth16_helper {
         let started = Instant::now();
+        report("Preparing SP1's Groth16 circuit (about 30 s on a first run)");
         prepare_stripped_circuit(&server, &dir)?;
         summary.push_str(&format!(
             "; stripped circuit ready ({:.0?})",

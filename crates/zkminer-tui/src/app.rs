@@ -109,6 +109,12 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
                     let mut s = state.write().await;
                     s.tick_count = s.tick_count.wrapping_add(1);
                     s.block_just_updated = false;
+                    if let (Some(tracker), Some(pool)) = (
+                        s.benchmark_tracker.as_mut(),
+                        zkminer_prover::engine::worker_pool(),
+                    ) {
+                        tracker.refresh_setup_status(|key| pool.setup_status(key));
+                    }
                     PostKeyAction::None
                 }
                 AppEvent::Resize(_, _) => PostKeyAction::None,

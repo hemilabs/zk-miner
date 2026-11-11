@@ -2094,7 +2094,16 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             WorkerCommand::Warmup { request_id } => {
                 // Outside any proof's watchdog: the artifact download alone can take minutes.
                 tracing::info!("warming up: Groth16 circuit artifacts and helper setup");
-                let resp = match warmup::warm_up() {
+                let resp = match warmup::warm_up(&mut |status| {
+                    // A closed pipe is reported by the final answer's write below.
+                    let _ = write_message(
+                        &mut stdout,
+                        &WorkerResponse::SetupProgress {
+                            request_id,
+                            status: status.to_string(),
+                        },
+                    );
+                }) {
                     Ok(report) => {
                         tracing::info!("warm-up done: {}", report.summary);
                         WorkerResponse::WarmupDone {

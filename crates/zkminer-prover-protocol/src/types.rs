@@ -28,7 +28,8 @@ use serde::{Deserialize, Serialize};
 /// command, so the handshake refuses it. And `ExecuteResult` gained `host_entropy_reads`, whether the
 /// guest read host-supplied nondeterministic input (both in the same unreleased version).
 /// 12: `Benchmark` carries the programs to run (`BenchmarkProgramSpec`): the suite is the host's, and
-/// the zkOP/s scoring proofs are requests of their own. A v11 worker ran its own list.
+/// the zkOP/s scoring proofs are requests of their own. A v11 worker ran its own list. And
+/// `SetupProgress`, what a `Warmup` is doing (both in the same unreleased version).
 pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
@@ -338,6 +339,14 @@ pub enum WorkerResponse {
         program_id: [u8; 32],
         /// How long the derivation took.
         duration_secs: f64,
+    },
+    /// What a `Warmup` is doing now, sent before each long step: a first run can spend many minutes
+    /// downloading or compiling. Any number of these come before its `WarmupDone` or `Error`.
+    /// Appended last, so every earlier variant keeps its bincode index.
+    SetupProgress {
+        request_id: u64,
+        /// For the operator, e.g. "Downloading SP1's Groth16 circuit (first run, about 8 GB)".
+        status: String,
     },
 }
 
