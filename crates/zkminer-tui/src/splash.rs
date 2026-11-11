@@ -120,6 +120,30 @@ impl Drop for Splash {
     }
 }
 
+/// What startup found, for the status line: each card and the zkVMs running on it, from
+/// `WorkerPool::started_provers`.
+pub fn found_summary(provers: &[(String, Option<String>)]) -> String {
+    let mut cards: Vec<(String, Vec<&str>)> = Vec::new();
+    for (backend, gpu) in provers {
+        let card = gpu
+            .as_deref()
+            .map_or("CPU".to_string(), crate::state::short_gpu_name);
+        let zkvm = crate::state::zkvm_label(backend);
+        match cards.iter_mut().find(|(name, _)| *name == card) {
+            Some((_, zkvms)) => zkvms.push(zkvm),
+            None => cards.push((card, vec![zkvm])),
+        }
+    }
+    if cards.is_empty() {
+        return "no GPU provers".to_string();
+    }
+    cards
+        .iter()
+        .map(|(card, zkvms)| format!("{card}: {}", zkvms.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// The status line's text, cut to `max` characters: a wrapped line would break the erase.
 fn status_text(status: &str, elapsed: Duration, max: usize) -> String {
     let spinner = SPINNER[(elapsed.as_millis() / FRAME.as_millis()) as usize % SPINNER.len()];
@@ -179,6 +203,22 @@ fn erase(lines_above: u16) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_summary_lists_each_card_and_its_zkvms() {
+        let prover = |backend: &str, gpu: &str| (backend.to_string(), Some(gpu.to_string()));
+        let rtx = "NVIDIA GeForce RTX 5090";
+        let arc = "Intel(R) Arc(TM) Pro B70 Graphics";
+        assert_eq!(
+            found_summary(&[prover("risc0", rtx), prover("sp1", rtx)]),
+            "RTX 5090: RISC Zero, SP1"
+        );
+        assert_eq!(
+            found_summary(&[prover("risc0", rtx), prover("sp1", arc)]),
+            "RTX 5090: RISC Zero; Arc Pro B70: SP1"
+        );
+        assert_eq!(found_summary(&[]), "no GPU provers");
+    }
 
     #[test]
     fn art_fits_its_declared_width() {

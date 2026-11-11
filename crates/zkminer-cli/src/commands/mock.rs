@@ -94,7 +94,7 @@ pub async fn run(headless: bool) -> Result<()> {
 
     // Spawn worker pool so GPU provers are available for real benchmarks.
     // This discovers binaries in ~/.zkminer/provers/, $PATH, etc.
-    {
+    let (found, startup_problems) = {
         let mut pool = zkminer_prover::dispatcher::WorkerPool::new(
             HashMap::new(), // no explicit binaries in mock mode
             Vec::new(),     // default search paths
@@ -106,8 +106,11 @@ pub async fn run(headless: bool) -> Result<()> {
         if !connected.is_empty() {
             tracing::info!("Connected subprocess workers: {}", connected.join(", "));
         }
+        let found = zkminer_tui::splash::found_summary(&pool.started_provers());
+        let startup_problems = pool.startup_problems().to_vec();
         zkminer_prover::engine::init_worker_pool(pool);
-    }
+        (found, startup_problems)
+    };
 
     // Seed initial state
     {
@@ -115,7 +118,14 @@ pub async fn run(headless: bool) -> Result<()> {
         seed_state(&mut s);
     }
 
-    splash.status("Reading GPU details");
+    // Long enough to read: once the TUI opens the splash is gone.
+    if !headless {
+        for problem in &startup_problems {
+            splash.status(format!("Problem: {problem}"));
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    }
+    splash.status(format!("Reading GPU details (found {found})"));
     // Hardware probe — runs on a blocking thread to avoid freezing the system.
     // NVML init + device queries + sysfs reads can take seconds on idle GPUs.
     let (hw, tuning) = tokio::task::spawn_blocking(|| {
@@ -157,6 +167,8 @@ pub async fn run(headless: bool) -> Result<()> {
                 }
             })
             .collect();
+
+        s.note_startup_problems(&startup_problems);
 
         // Load cached benchmarks if available.
         // If no cache, benchmarks will run in the background after TUI starts.

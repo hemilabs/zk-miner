@@ -1838,6 +1838,8 @@ pub struct WorkerPool {
     /// When set, `discover_and_spawn` starts the dedicated measure pools only, and no prove worker
     /// (see [`Self::measure_only`]).
     measure_only: bool,
+    /// Why workers could not start, in words for the operator. See [`Self::startup_problems`].
+    startup_problems: Vec<String>,
 }
 
 /// What `WorkerPool::run_benchmark_requests` got from a worker.
@@ -1846,6 +1848,16 @@ struct BenchmarkRequests {
     /// The worker stopped answering (its pipe broke, or the watchdog killed it), so its slot must
     /// be marked. `results` can still hold the programs' rows, when it was the scoring that broke.
     broken: bool,
+}
+
+/// A zkVM's name as an operator knows it.
+fn zkvm_label(backend: &str) -> &str {
+    match backend {
+        zkminer_prover_protocol::BACKEND_RISC0 => "RISC Zero",
+        zkminer_prover_protocol::BACKEND_SP1 => "SP1",
+        zkminer_prover_protocol::BACKEND_OPENVM => "OpenVM",
+        other => other,
+    }
 }
 
 /// Round-robin counter for load balancing across multiple GPU workers.
@@ -1878,12 +1890,46 @@ impl WorkerPool {
             only_backends: None,
             progress: None,
             measure_only: false,
+            startup_problems: Vec::new(),
         }
     }
 
     /// Calls `report` with a short description of each step `discover_and_spawn` starts.
     pub fn set_progress(&mut self, report: impl Fn(String) + Send + Sync + 'static) {
         self.progress = Some(Box::new(report));
+    }
+
+    /// Why workers could not start in `discover_and_spawn`, in words for the operator: without
+    /// this a card missing a zkVM has no explanation outside the log file.
+    pub fn startup_problems(&self) -> &[String] {
+        &self.startup_problems
+    }
+
+    /// The (backend, card name) of each prove worker that is running, sorted.
+    pub fn started_provers(&self) -> Vec<(String, Option<String>)> {
+        let mut provers: Vec<_> = self
+            .workers
+            .iter()
+            .filter_map(|(key, entry)| {
+                let slot = entry.slot.try_lock().ok()?;
+                slot.handle.as_ref()?;
+                let backend = key.split(':').next().unwrap_or(key).to_string();
+                Some((backend, slot.gpu_name.clone()))
+            })
+            .collect();
+        provers.sort();
+        provers
+    }
+
+    /// Records that a `backend` measure worker did not start, unless that zkVM's prove worker
+    /// already explains it: both fail for the same reasons.
+    fn note_measure_problem(&mut self, backend: &str, e: &anyhow::Error) {
+        let zkvm = zkvm_label(backend);
+        if !self.startup_problems.iter().any(|p| p.starts_with(zkvm)) {
+            self.startup_problems.push(format!(
+                "{zkvm} cycle-measuring worker could not start: {e:#}"
+            ));
+        }
     }
 
     fn report_progress(&self, text: String) {
@@ -2409,6 +2455,12 @@ impl WorkerPool {
                     } else {
                         tracing::error!("Failed to start worker {key}{device_desc}: {msg}");
                     }
+                    self.startup_problems.push(format!(
+                        "{} could not start on {}: {}",
+                        zkvm_label(&backend),
+                        gpu_name.as_deref().unwrap_or("this machine"),
+                        msg.lines().next().unwrap_or_default(),
+                    ));
                     let vram_bytes = gpu_vram_bytes(&gpu_tag, device_index, pci_bus_id.as_deref());
                     let entry_bus_id = pci_bus_id.clone().filter(|b| !b.is_empty());
                     self.workers.insert(
@@ -2505,6 +2557,7 @@ impl WorkerPool {
                             // keep risc0 on the dedicated pool and let `ensure_alive` revive it, exactly
                             // like the SP1 spawn-failure path.
                             tracing::error!("Failed to start risc0 measure worker {mkey}: {e:#}");
+                            self.note_measure_problem(zkminer_prover_protocol::BACKEND_RISC0, &e);
                             (None, 0u32, 0u64, 1u32, Some(Instant::now()))
                         }
                     };
@@ -2659,6 +2712,7 @@ impl WorkerPool {
                             // re-open the server-teardown DoS). Register a DOWN entry so `ensure_alive`
                             // can revive it later, mirroring the prove-slot spawn-failure path.
                             tracing::error!("Failed to start SP1 measure worker {mkey}: {e:#}");
+                            self.note_measure_problem(zkminer_prover_protocol::BACKEND_SP1, &e);
                             (None, 0u32, 0u64, 1u32, Some(Instant::now()))
                         }
                     };

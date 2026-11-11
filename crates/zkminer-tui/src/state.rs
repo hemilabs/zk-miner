@@ -404,6 +404,8 @@ pub struct MinerState {
     pub benchmark_running: bool,
     /// The benchmark started at launch is still running. It has the cards, so no job is claimed.
     pub startup_benchmark_pending: bool,
+    /// Why workers could not start, for the operator. Empty when all did.
+    pub startup_problems: Vec<String>,
     /// The launch benchmark took the screen from the Setup wizard; a key returns there afterwards.
     pub return_to_setup_after_benchmark: bool,
     /// Which device is selected in the benchmark screen (0 = CPU, 1+ = GPUs).
@@ -533,8 +535,18 @@ pub struct DeviceProgress {
     pub warming_up: bool,
 }
 
+/// A zkVM's name as an operator knows it.
+pub(crate) fn zkvm_label(backend: &str) -> &str {
+    match backend {
+        "risc0" => "RISC Zero",
+        "sp1" => "SP1",
+        "openvm" => "OpenVM",
+        other => other,
+    }
+}
+
 /// Shorten a driver-reported GPU name for places that have to fit several of them on one line.
-fn short_gpu_name(name: &str) -> String {
+pub(crate) fn short_gpu_name(name: &str) -> String {
     let cleaned = name.replace("(R)", "").replace("(TM)", "");
     let cleaned = cleaned.trim();
     let cleaned = cleaned.strip_suffix(" Graphics").unwrap_or(cleaned);
@@ -551,12 +563,7 @@ fn short_gpu_name(name: &str) -> String {
 impl DeviceProgress {
     /// The zkVM this row is measuring, from the slot key (`"risc0:cuda:0"` -> `"RISC Zero"`).
     pub fn backend_label(&self) -> &str {
-        match self.slot_key.split(':').next().unwrap_or_default() {
-            "risc0" => "RISC Zero",
-            "sp1" => "SP1",
-            "openvm" => "OpenVM",
-            other => other,
-        }
+        zkvm_label(self.slot_key.split(':').next().unwrap_or_default())
     }
 
     /// Extract the prover-side device index from the device_id (`"gpu0"` -> 0).
@@ -803,6 +810,7 @@ impl Default for MinerState {
             risc0_job_po2s: Vec::new(),
             benchmark_running: false,
             startup_benchmark_pending: false,
+            startup_problems: Vec::new(),
             return_to_setup_after_benchmark: false,
             benchmark_selected_device: 0,
             benchmark_device_in_progress: None,
@@ -872,6 +880,14 @@ impl MinerState {
         let suite = self.benchmark_results.as_ref()?;
         let gpu = crate::gpu_tuning::find_gpu_by_tuning_id(&self.hardware.gpus, tuning_id)?;
         gpu.benchmark_device_id(suite)
+    }
+
+    /// Records why workers could not start, where the operator will see it.
+    pub fn note_startup_problems(&mut self, problems: &[String]) {
+        for problem in problems {
+            self.add_log(LogLevel::Error, problem.clone());
+        }
+        self.startup_problems = problems.to_vec();
     }
 
     pub fn add_log(&mut self, level: LogLevel, message: impl Into<String>) {

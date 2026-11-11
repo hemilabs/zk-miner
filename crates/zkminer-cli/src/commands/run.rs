@@ -2562,6 +2562,8 @@ pub async fn run(
     if !connected.is_empty() {
         tracing::info!("Connected subprocess workers: {}", connected.join(", "));
     }
+    let found = zkminer_tui::splash::found_summary(&pool.started_provers());
+    let startup_problems = pool.startup_problems().to_vec();
     init_worker_pool(pool);
     // SP1's one-time setup, in the background: SP1 jobs are not claimed until it is done (see the
     // pre-claim gate), and everything else proceeds meanwhile. Not when watching: it proves on the
@@ -2570,7 +2572,14 @@ pub async fn run(
         spawn_sp1_warmup();
     }
 
-    splash.status("Reading GPU details");
+    // Long enough to read: once the TUI opens the splash is gone.
+    if !headless {
+        for problem in &startup_problems {
+            splash.status(format!("Problem: {problem}"));
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+    splash.status(format!("Reading GPU details (found {found})"));
     // Hardware probe — runs on a blocking thread to avoid freezing the system.
     // NVML init + device queries + sysfs reads can take seconds on idle GPUs.
     let (hw, tuning) = tokio::task::spawn_blocking(|| {
@@ -2612,6 +2621,8 @@ pub async fn run(
                 }
             })
             .collect();
+
+        s.note_startup_problems(&startup_problems);
 
         // Load cached benchmarks if available.
         // If no cache, benchmarks will run in the background after TUI starts.
@@ -2659,7 +2670,7 @@ pub async fn run(
         // on a TOTAL failure, stake_info stays None → the collateral gate reads it as 0 and
         // blocks claims (never over-commits), and the +7s refresh loop re-hydrates before the
         // brain's first claim eval.
-        splash.status("Reading your balance and stake");
+        splash.status(format!("Reading your balance and stake (found {found})"));
         let hydrated;
         match client.get_refresh_batch().await {
             Ok(data) => {

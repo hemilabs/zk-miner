@@ -456,11 +456,18 @@ fn wrap_items(items: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
 
 fn render_progress_view(f: &mut Frame, area: Rect, state: &MinerState, tracker: &BenchmarkTracker) {
     let tabs = device_tab_lines(tracker, area.width.saturating_sub(2) as usize);
+    let problems = &state.startup_problems;
+    let problems_height = if problems.is_empty() {
+        0
+    } else {
+        problems.len() as u16 + 2
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),                     // Header with progress bar
             Constraint::Length(tabs.len() as u16 + 2), // Device tabs
+            Constraint::Length(problems_height),       // Workers that did not start (0 if none)
             Constraint::Min(10),                       // Program table (main content)
             Constraint::Length(5),                     // GPU telemetry
             Constraint::Length(5),                     // Score + controls
@@ -469,9 +476,28 @@ fn render_progress_view(f: &mut Frame, area: Rect, state: &MinerState, tracker: 
 
     render_progress_header(f, chunks[0], state, tracker);
     render_device_tabs(f, chunks[1], tabs);
-    render_program_table(f, chunks[2], state, tracker);
-    render_gpu_telemetry(f, chunks[3], state, tracker);
-    render_score_and_controls(f, chunks[4], state, tracker);
+    if !problems.is_empty() {
+        render_startup_problems(f, chunks[2], problems);
+    }
+    render_program_table(f, chunks[3], state, tracker);
+    render_gpu_telemetry(f, chunks[4], state, tracker);
+    render_score_and_controls(f, chunks[5], state, tracker);
+}
+
+/// Why a card may be missing a zkVM below: the workers that did not start.
+fn render_startup_problems(f: &mut Frame, area: Rect, problems: &[String]) {
+    let lines: Vec<Line<'_>> = problems
+        .iter()
+        .map(|p| Line::from(Span::styled(format!(" {p}"), theme::error())))
+        .collect();
+    let panel = Paragraph::new(lines).block(
+        Block::default()
+            .title(Span::styled(" Did not start ", theme::title()))
+            .borders(Borders::ALL)
+            .border_style(theme::border())
+            .border_type(theme::border_type()),
+    );
+    f.render_widget(panel, area);
 }
 
 fn render_progress_header(
@@ -945,6 +971,34 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(text(&lines[0]), " RTX 4090 RISC Zero   RTX 4090 SP1");
         assert_eq!(text(&lines[1]), " Arc A770 RISC Zero");
+    }
+
+    #[test]
+    fn workers_that_did_not_start_are_named_on_the_progress_screen() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use zkminer_prover::dispatcher::{BenchmarkProgressEvent, BenchmarkProgressKind};
+        let mut tracker = BenchmarkTracker::default();
+        tracker.apply(&BenchmarkProgressEvent {
+            slot_key: "sp1:cuda:0".to_string(),
+            gpu_name: Some("NVIDIA GeForce RTX 5090".to_string()),
+            device_index: Some(0),
+            pci_bus_id: None,
+            gpu_tag: "cuda".to_string(),
+            kind: BenchmarkProgressKind::Started,
+        });
+        let mut state = MinerState::default();
+        let problem = "RISC Zero could not start on RX 9060 XT: version mismatch".to_string();
+        state.note_startup_problems(std::slice::from_ref(&problem));
+
+        let mut term = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        term.draw(|f| render_progress_view(f, f.area(), &state, &tracker))
+            .unwrap();
+        let buffer = term.backend().buffer();
+        let screen: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+
+        assert!(screen.contains("Did not start"), "{screen}");
+        assert!(screen.contains(&problem), "{screen}");
+        assert_eq!(state.activity_log.back().unwrap().message, problem);
     }
 
     #[test]
