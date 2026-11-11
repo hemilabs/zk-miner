@@ -2440,7 +2440,7 @@ pub async fn run(
         None => ChainClient::new(&config, load_signer(&config.wallet)?).await?,
     };
 
-    splash.status("Verifying the on-chain contracts");
+    splash.status("Verifying the deployment contracts");
     // Before ANY transaction (handoff §13 tests 1-2): the configured stack must be the live
     // deployment for this chain, wired to itself (router.staking/registry/hemiToken), and running the
     // AUDITED code; and every proof system zkminer serves must be registered and wrap the audited
@@ -2469,6 +2469,7 @@ pub async fn run(
         None => RISC0_GROTH16_SELECTOR,
     };
     let _ = SEAL_SELECTOR.set(sel);
+    splash.status("Verifying the RISC Zero verifier contract");
     // NOT fatal: a held lock must still be recovered (fulfilled, kept through a Disabled window, or
     // released) when the adapter is disabled, swapped, or fails a pin. Exiting here would leave every
     // lock to a 100% slash. Claims for the proof system stay off until a re-check passes.
@@ -2487,6 +2488,7 @@ pub async fn run(
              already held are still recovered and driven. Re-checked every few minutes."
         ),
     }
+    splash.status("Verifying the SP1 verifier contract");
     // Not a PAGE: a deployment need not register SP1 at all.
     match reverify_sp1(&client).await {
         Ok(adapter) => tracing::info!(

@@ -128,7 +128,7 @@ fn whole_journal(journal: Option<Vec<u8>>, journal_len: u64) -> Option<Vec<u8>> 
 use anyhow::{bail, Result};
 use zkminer_prover_protocol::{BenchmarkEntry, ErrorKind, WorkerCommand, WorkerResponse};
 
-use crate::discovery::{discover_workers, DiscoveredWorker};
+use crate::discovery::{discover_workers_reporting, DiscoveredWorker};
 use crate::engine::ProofOutput;
 use crate::worker::{WorkerDied, WorkerHandle};
 
@@ -2148,7 +2148,10 @@ impl WorkerPool {
     /// Discover and spawn all available worker binaries.
     /// Returns the list of compound keys that were successfully connected.
     pub fn discover_and_spawn(&mut self) -> Vec<String> {
-        let mut discovered = discover_workers(&self.explicit_binaries, &self.search_dirs);
+        let mut discovered =
+            discover_workers_reporting(&self.explicit_binaries, &self.search_dirs, &|text| {
+                self.report_progress(text.to_string())
+            });
         if let Some(only) = &self.only_backends {
             discovered.retain(|w| only.contains(&w.backend));
         }

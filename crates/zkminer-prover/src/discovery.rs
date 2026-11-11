@@ -74,17 +74,20 @@ fn worker_binary_name(backend: &str, gpu_tag: &str) -> String {
 
 /// Detect all physical GPUs (NVIDIA + AMD + Intel).
 pub fn detect_all_gpus() -> Vec<DetectedGpu> {
-    detect_all_gpus_with(&HashMap::new(), &[])
+    detect_all_gpus_with(&HashMap::new(), &[], &|_| {})
 }
 
 /// `detect_all_gpus`, also looking for the HIP probe (see `detect_amd_gpus_windows`) where
-/// `discover_workers` looks for worker binaries: `explicit_binaries` and `search_dirs`.
+/// `discover_workers` looks for worker binaries: `explicit_binaries` and `search_dirs`. `report` is
+/// told which vendor it is checking.
 fn detect_all_gpus_with(
     explicit_binaries: &HashMap<String, PathBuf>,
     search_dirs: &[PathBuf],
+    report: &dyn Fn(&str),
 ) -> Vec<DetectedGpu> {
     let mut gpus = Vec::new();
 
+    report("Looking for NVIDIA GPUs");
     let nvidia = detect_nvidia_gpus();
     if !nvidia.is_empty() {
         let names: Vec<_> = nvidia
@@ -99,6 +102,7 @@ fn detect_all_gpus_with(
         gpus.extend(nvidia);
     }
 
+    report("Looking for AMD GPUs");
     #[cfg(windows)]
     let amd = detect_amd_gpus_windows(explicit_binaries, search_dirs);
     #[cfg(not(windows))]
@@ -116,6 +120,7 @@ fn detect_all_gpus_with(
         gpus.extend(amd);
     }
 
+    report("Looking for Intel GPUs");
     let intel = detect_intel_gpus();
     if !intel.is_empty() {
         let names: Vec<_> = intel
@@ -1243,7 +1248,16 @@ pub fn discover_workers(
     explicit_binaries: &HashMap<String, PathBuf>,
     search_dirs: &[PathBuf],
 ) -> Vec<DiscoveredWorker> {
-    let gpus = detect_all_gpus_with(explicit_binaries, search_dirs);
+    discover_workers_reporting(explicit_binaries, search_dirs, &|_| {})
+}
+
+/// `discover_workers`, telling `report` which GPU vendor it is checking, for a startup display.
+pub fn discover_workers_reporting(
+    explicit_binaries: &HashMap<String, PathBuf>,
+    search_dirs: &[PathBuf],
+    report: &dyn Fn(&str),
+) -> Vec<DiscoveredWorker> {
+    let gpus = detect_all_gpus_with(explicit_binaries, search_dirs, report);
     let mut found: Vec<DiscoveredWorker> = Vec::new();
 
     for backend in ALL_BACKENDS {
