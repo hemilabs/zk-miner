@@ -9,6 +9,14 @@ use std::time::Instant;
 mod groth16_component;
 #[cfg(feature = "metal")]
 mod metal_host;
+/// The Metal sizing table and the macOS footprint ceiling, shared with the host (single source of
+/// truth, M6). The worker does not depend on `zkminer-prover`, so it compiles that crate's
+/// dependency-free file into itself.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[path = "../../zkminer-prover/src/metal_sizing.rs"]
+mod metal_sizing;
+// `mac_footprint`: inline at the end of this file.
 #[cfg(all(feature = "metal", not(target_os = "macos")))]
 compile_error!("feature `metal` builds the Apple Silicon worker: build it on macOS (aarch64-apple-darwin)");
 
@@ -81,6 +89,9 @@ fn main() {
             eprintln!("{refusal}");
             std::process::exit(2);
         }
+        // Not orphan-watched: run by hand, its parent is a shell.
+        #[cfg(target_os = "macos")]
+        mac_footprint::start_guard(false);
         #[cfg(feature = "metal")]
         {
             let host = metal_host::support()
@@ -173,6 +184,12 @@ fn main() {
     // Load (or create) the `sys_rand` key now, outside any job: a failure inside a job's panic
     // containment would be blamed on that job's program.
     sys_rand_key();
+
+    // macOS: the footprint ceiling the dispatcher hands every worker (there are no cgroups), and an
+    // exit when the dispatcher dies (there is no PR_SET_PDEATHSIG): without it a worker orphaned
+    // mid-proof proved on to the end, holding up to tens of GB of the owner's unified memory (M6).
+    #[cfg(target_os = "macos")]
+    mac_footprint::start_guard(true);
 
     if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
@@ -669,11 +686,30 @@ fn po2_refusal(po2: u8) -> Option<String> {
 }
 
 /// The segment size used when the host names none: [`zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2`], or on a Mac the size its
-/// Metal working-set limit allows (`metal_host::job_po2_for_limit`, PLAN 9.1).
+/// Metal working-set limit allows (`metal_sizing::job_po2_for_limit`, PLAN 9.1: the table the host
+/// sizes this Mac's jobs and benchmark row with, M6).
 fn default_job_po2() -> u8 {
     #[cfg(feature = "metal")]
     {
-        metal_host::default_job_po2()
+        static PO2: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *PO2.get_or_init(|| {
+            // `metal_host` (M1) still has its own copy of the table; the shared one wins, and a
+            // disagreement (pinned by `m6_tests`) is logged rather than silently followed.
+            let local = metal_host::default_job_po2();
+            match metal_host::working_set_limit() {
+                Some(limit) => {
+                    let shared = metal_sizing::job_po2_for_limit(limit);
+                    if shared != local {
+                        tracing::warn!(
+                            "metal_host's table says po2 {local}, the shared table {shared}: using \
+                             {shared}, which is what the host sizes this Mac's jobs with"
+                        );
+                    }
+                    shared
+                }
+                None => local,
+            }
+        })
     }
     #[cfg(not(feature = "metal"))]
     {
@@ -1532,16 +1568,18 @@ fn run_proof_once(
     #[cfg(feature = "metal")]
     if let Some(limit) = metal_host::working_set_limit() {
         // Above the default but under the hard ceiling `run_proof` enforces (`po2_refusal`).
-        if po2 > metal_host::job_po2_for_limit(limit) {
+        if po2 > default_job_po2() {
             tracing::warn!(
                 "segment po2 {po2} is above the default {} for this Mac's {:.1} GiB Metal working set",
-                metal_host::job_po2_for_limit(limit),
+                default_job_po2(),
                 limit as f64 / (1u64 << 30) as f64
             );
         }
     }
     #[cfg(feature = "metal")]
     let sampler = metal_host::PeakSampler::start();
+    #[cfg(target_os = "macos")]
+    let footprint = mac_footprint::Phases::start();
     let start = Instant::now();
     let proved = {
         // Releases on unwind too: a prove-path panic (a Metal budget panic mid-STARK) must not skip
@@ -1555,6 +1593,14 @@ fn run_proof_once(
     {
         sampler.held("held after release");
         tracing::info!("Metal peak GPU memory: {}", sampler.summary());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        footprint.phase("proof");
+        tracing::info!(
+            "peak process footprint (host + GPU): {}",
+            footprint.summary()
+        );
     }
     let prove_info = proved?;
     let duration_secs = start.elapsed().as_secs_f64();
@@ -1792,6 +1838,8 @@ fn benchmark_program(
     let prover = local_prover();
     #[cfg(feature = "metal")]
     let sampler = metal_host::PeakSampler::start();
+    #[cfg(target_os = "macos")]
+    let footprint = mac_footprint::Phases::start();
 
     // Stage 1: execution and the segment proofs.
     let started = Instant::now();
@@ -1809,6 +1857,8 @@ fn benchmark_program(
     let composite_secs = started.elapsed().as_secs_f64();
     #[cfg(feature = "metal")]
     sampler.phase("segments");
+    #[cfg(target_os = "macos")]
+    footprint.phase("segments");
 
     // Stage 2: lift every segment receipt and join them into one constant-size STARK. Scales with
     // segment count, so it is STARK proving and belongs on the variable side of the split.
@@ -1826,6 +1876,8 @@ fn benchmark_program(
     let recursion_secs = started.elapsed().as_secs_f64();
     #[cfg(feature = "metal")]
     sampler.phase("recursion");
+    #[cfg(target_os = "macos")]
+    footprint.phase("recursion");
 
     // Stage 3: STARK-to-SNARK. Proves the fixed `stark_verify` circuit with a fixed proving key
     // (`~/.risc0/extensions/*-risc0-groth16/stark_verify_final.zkey`), so it does not depend on the
@@ -1838,6 +1890,8 @@ fn benchmark_program(
     let wrap_secs = started.elapsed().as_secs_f64();
     #[cfg(feature = "metal")]
     sampler.phase("wrap");
+    #[cfg(target_os = "macos")]
+    footprint.phase("wrap");
     // Outside the stopwatch: the release is not part of the wrap, and on a card that releases, the NEXT
     // wrap pays the reload — which is that card's honest per-proof cost.
     release_after_proof();
@@ -1848,6 +1902,15 @@ fn benchmark_program(
             "{name}: Metal peak GPU memory at po2 {}: {}",
             default_job_po2(),
             sampler.summary()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        footprint.phase("held after release");
+        tracing::info!(
+            "{name}: peak process footprint (host + GPU) at po2 {}: {}",
+            default_job_po2(),
+            footprint.summary()
         );
     }
     let groth16 = match wrapped {
@@ -2296,5 +2359,250 @@ mod retry_tests {
         assert!(format!("{err:#}").contains("po2 value"), "{err:#}");
         let err = run_execute(FIBONACCI_ELF, &[], Some(image), Some(po2)).unwrap_err();
         assert!(format!("{err:#}").contains("po2 value"), "{err:#}");
+    }
+}
+
+/// macOS: the worker's own memory ceiling and orphan exit, and per-phase peaks of its process
+/// footprint (M6).
+///
+/// Linux bounds a worker from outside (a systemd `MemoryMax` cgroup cap, `oom_score_adj`,
+/// `PR_SET_PDEATHSIG`); macOS has none of those, so the worker does it itself. `phys_footprint` is
+/// the kernel's own accounting of what a process costs the machine (Activity Monitor's "Memory",
+/// what jetsam acts on): dirty anonymous memory, compressed pages, and on a Mac the GPU allocations
+/// the process made, which is what makes it the right figure on unified memory.
+#[cfg(target_os = "macos")]
+mod mac_footprint {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, Once};
+    use std::time::Duration;
+
+    use crate::metal_sizing::{FOOTPRINT_EXIT_CODE, WORKER_MAX_FOOTPRINT_ENV};
+
+    /// How often the guard looks. A prover allocates GiBs per second at worst, so the ceiling can be
+    /// overshot by about that much before the exit; the host reserve (3 GiB) absorbs it.
+    const POLL: Duration = Duration::from_millis(50);
+
+    /// Highest footprint seen since the last [`Phases`] boundary.
+    static PHASE_PEAK: AtomicU64 = AtomicU64::new(0);
+
+    /// `(phys_footprint, lifetime max phys_footprint)` of this process.
+    pub fn self_footprint() -> Option<(u64, u64)> {
+        // SAFETY: plain old data; the call fills at most one `rusage_info_v4`.
+        let mut ri: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V4,
+                (&mut ri as *mut libc::rusage_info_v4).cast(),
+            )
+        };
+        (rc == 0).then_some((ri.ri_phys_footprint, ri.ri_lifetime_max_phys_footprint))
+    }
+
+    /// The ceiling from the environment: `None` if unset, `0` or malformed (a malformed value is
+    /// reported, not guessed at).
+    pub fn ceiling() -> Option<u64> {
+        let text = std::env::var(WORKER_MAX_FOOTPRINT_ENV).ok()?;
+        match text.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => {
+                tracing::error!("{WORKER_MAX_FOOTPRINT_ENV}={text:?} is not a byte count; ignored");
+                None
+            }
+        }
+    }
+
+    /// Start the guard thread once: tracks [`PHASE_PEAK`], exits at the ceiling, and (when
+    /// `watch_parent`) exits when the dispatcher that spawned this worker is gone.
+    pub fn start_guard(watch_parent: bool) {
+        static STARTED: Once = Once::new();
+        STARTED.call_once(|| {
+            let limit = ceiling();
+            // SAFETY: getppid has no preconditions.
+            let parent = unsafe { libc::getppid() };
+            if let Some(limit) = limit {
+                tracing::info!(
+                    "process footprint ceiling {:.1} GiB ({WORKER_MAX_FOOTPRINT_ENV})",
+                    limit as f64 / (1u64 << 30) as f64
+                );
+            }
+            let spawned = std::thread::Builder::new()
+                .name("footprint-guard".into())
+                .spawn(move || loop {
+                    if let Some((now, _)) = self_footprint() {
+                        PHASE_PEAK.fetch_max(now, Ordering::Relaxed);
+                        if let Some(limit) = limit.filter(|&l| now > l) {
+                            tracing::error!(
+                                "process footprint {} MiB passed the {} MiB ceiling \
+                                 ({WORKER_MAX_FOOTPRINT_ENV}); exiting so the proof fails here \
+                                 instead of pushing the Mac into swap",
+                                now >> 20,
+                                limit >> 20
+                            );
+                            std::process::exit(FOOTPRINT_EXIT_CODE);
+                        }
+                    }
+                    // Reparented (to launchd) means the dispatcher died: nothing will read this
+                    // proof, and its memory is the owner's.
+                    if watch_parent && parent > 1 && unsafe { libc::getppid() } != parent {
+                        tracing::error!(
+                            "the dispatcher (PID {parent}) is gone; exiting instead of proving \
+                             for nobody"
+                        );
+                        std::process::exit(1);
+                    }
+                    std::thread::sleep(POLL);
+                });
+            if let Err(e) = spawned {
+                tracing::warn!("could not start the footprint guard: {e}");
+            }
+        });
+    }
+
+    /// `task_vm_info` (`<mach/task_info.h>`, through rev 7), which libc does not bind.
+    #[repr(C)]
+    #[derive(Default)]
+    struct TaskVmInfo {
+        virtual_size: u64,
+        region_count: i32,
+        page_size: i32,
+        resident_size: u64,
+        resident_size_peak: u64,
+        device: u64,
+        device_peak: u64,
+        internal: u64,
+        internal_peak: u64,
+        external: u64,
+        external_peak: u64,
+        reusable: u64,
+        reusable_peak: u64,
+        purgeable_volatile_pmap: u64,
+        purgeable_volatile_resident: u64,
+        purgeable_volatile_virtual: u64,
+        compressed: u64,
+        compressed_peak: u64,
+        compressed_lifetime: u64,
+        phys_footprint: u64,
+        min_address: u64,
+        max_address: u64,
+        ledger: [i64; 23],
+        limit_bytes_remaining: u64,
+        decompressions: i32,
+        ledger_swapins: i64,
+        neural_nofootprint_total: i64,
+        neural_nofootprint_peak: i64,
+    }
+
+    /// Where the footprint is right now: `(internal, compressed, graphics, resident)` in bytes.
+    /// `internal` is the process's dirty anonymous memory (heap, Rust vectors); `graphics` is memory
+    /// the GPU driver charges to the process (`ledger_tag_graphics_footprint`, Metal buffers and
+    /// the driver's own allocations); `compressed` is what the compressor holds of either.
+    pub fn breakdown() -> Option<(u64, u64, u64, u64)> {
+        const TASK_VM_INFO: u32 = 22;
+        let mut info = TaskVmInfo::default();
+        let mut count = (std::mem::size_of::<TaskVmInfo>() / 4) as libc::mach_msg_type_number_t;
+        // SAFETY: `info` is `count` natural_t words long and the kernel writes at most `count`.
+        #[allow(deprecated)]
+        let kr = unsafe {
+            libc::task_info(
+                libc::mach_task_self(),
+                TASK_VM_INFO,
+                (&mut info as *mut TaskVmInfo).cast(),
+                &mut count,
+            )
+        };
+        if kr != libc::KERN_SUCCESS {
+            return None;
+        }
+        // ledger[0] = phys_footprint_peak; graphics_footprint is ledger index 13.
+        let graphics = info.ledger[13].max(0) as u64;
+        Some((info.internal, info.compressed, graphics, info.resident_size))
+    }
+
+    fn mib(b: u64) -> u64 {
+        b >> 20
+    }
+
+    /// Peak footprint per named phase, like `metal_host::PeakSampler` for GPU memory.
+    pub struct Phases {
+        phases: Mutex<Vec<(String, u64)>>,
+    }
+
+    impl Phases {
+        pub fn start() -> Self {
+            let now = self_footprint().map_or(0, |f| f.0);
+            PHASE_PEAK.store(now, Ordering::Relaxed);
+            // The baseline: what the worker already holds before this proof (pipelines, the
+            // executor's and the provers' caches), so a phase's own cost is the difference.
+            Self {
+                phases: Mutex::new(vec![("start".to_string(), now)]),
+            }
+        }
+
+        /// Close the current phase: record its peak (including the current figure, in case the
+        /// guard thread is not running) and start the next from the current figure.
+        pub fn phase(&self, name: &str) {
+            let now = self_footprint().map_or(0, |f| f.0);
+            let peak = PHASE_PEAK.swap(now, Ordering::Relaxed).max(now);
+            self.phases
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((name.to_string(), peak));
+            if let Some((internal, compressed, graphics, resident)) = breakdown() {
+                tracing::info!(
+                    "footprint after {name}: {} MiB = internal {} + compressed {} + graphics {} \
+                     MiB (+ other); resident {} MiB",
+                    mib(now),
+                    mib(internal),
+                    mib(compressed),
+                    mib(graphics),
+                    mib(resident)
+                );
+            }
+        }
+
+        pub fn summary(&self) -> String {
+            let lifetime = self_footprint().map_or(0, |f| f.1);
+            let phases = self.phases.lock().unwrap_or_else(|e| e.into_inner());
+            let mut out: Vec<String> = phases
+                .iter()
+                .map(|(n, b)| format!("{n} {:.0} MiB", *b as f64 / (1u64 << 20) as f64))
+                .collect();
+            out.push(format!(
+                "process lifetime peak {:.0} MiB",
+                lifetime as f64 / (1u64 << 20) as f64
+            ));
+            out.join(", ")
+        }
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod m6_tests {
+    /// M6: the host and this worker size a Mac from ONE table. `metal_host` (M1) still carries its
+    /// own copy for `keep_groth16_cache` / the po2 ceiling; this pins the two together until that
+    /// copy is removed.
+    #[test]
+    fn the_worker_and_the_host_share_the_metal_table() {
+        for mib in (256..=256 * 1024u64).step_by(256) {
+            let limit = mib << 20;
+            assert_eq!(
+                crate::metal_sizing::job_po2_for_limit(limit),
+                crate::metal_host::job_po2_for_limit(limit),
+                "{mib} MiB"
+            );
+        }
+        for po2 in 13..=24 {
+            assert_eq!(
+                crate::metal_sizing::stark_peak_bytes(po2),
+                crate::metal_host::stark_peak_bytes(po2),
+                "po2 {po2}"
+            );
+        }
+        assert_eq!(
+            crate::metal_sizing::DEFAULT_JOB_PO2_CAP,
+            zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
+        );
     }
 }

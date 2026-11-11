@@ -381,6 +381,58 @@ pub fn risc0_job_po2(
     }
 }
 
+/// [`risc0_job_po2`] for one risc0 slot, by its benchmark device id (`WorkerPool::risc0_slots`).
+///
+/// An Apple GPU (`gpu-metal<N>`) is sized from the shared Metal table
+/// ([`crate::metal_sizing::job_po2_for_limit`]), the same one the Metal worker uses for its own
+/// default and ceiling, rather than from the discrete-card rule: that rule gave po2 20 to any figure of
+/// at least [`RISC0_JOB_MIN_VRAM_BYTES`] (a 24 GB Mac's 16 GiB, where the worker's table says 19) and
+/// NO job size to a 16 GB Mac's 8 GiB (M6). A calibrated Metal row is honoured as for any card, and
+/// raised only to the table's size. An operator override still wins. Every other device: unchanged.
+pub fn risc0_slot_job_po2(
+    device_id: &str,
+    override_po2: Option<u8>,
+    row: Option<&DeviceBenchmark>,
+    vram_bytes: Option<u64>,
+) -> Option<u8> {
+    use zkminer_prover_protocol::{RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
+    if !is_metal_device_id(device_id) {
+        return risc0_job_po2(override_po2, row, vram_bytes);
+    }
+    let in_range = |p: u8| p.clamp(RISC0_JOB_PO2_MIN, RISC0_JOB_PO2_MAX);
+    if let Some(p) = override_po2 {
+        return Some(in_range(p));
+    }
+    let default = metal_job_po2(vram_bytes);
+    match row.filter(|db| db.prover_backend == "risc0" && !db.po2_samples.is_empty()) {
+        Some(db) => {
+            let calibrated = in_range(db.optimal_po2.min(db.max_feasible_po2));
+            let proved_default = db.max_feasible_po2.saturating_add(1) >= default;
+            Some(if proved_default {
+                calibrated.max(default)
+            } else {
+                calibrated
+            })
+        }
+        None => Some(default),
+    }
+}
+
+/// Whether a benchmark device id names an Apple GPU (`WorkerPool::gpu_device_id("metal", ..)`).
+pub fn is_metal_device_id(device_id: &str) -> bool {
+    device_id.starts_with("gpu-metal")
+}
+
+/// The Metal table's segment size for the host's figure for an Apple GPU (`hw.memsize` less the host
+/// reserve) and `RISC0_METAL_MAX_WORKING_SET_BYTES`. With neither known, the protocol default: the
+/// worker then sizes itself, and refuses what does not fit.
+pub fn metal_job_po2(vram_bytes: Option<u64>) -> u8 {
+    match crate::metal_sizing::host_working_set_limit(vram_bytes) {
+        Some(limit) => crate::metal_sizing::job_po2_for_limit(limit),
+        None => zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2,
+    }
+}
+
 /// Throughput factor per segment-size step below the smallest size a row was measured at.
 ///
 /// Recursion (lift/join) costs per segment, so it doubles per step down while the segments themselves
@@ -1778,6 +1830,12 @@ fn build_gpu_device_benchmarks_from_workers(
         // "not VRAM-derived — do NOT trust max_feasible_po2". Any future po2
         // calibration must gate on that before raising a device's segment size.
         let (optimal_po2, memory_usage_bytes) = match vram_bytes {
+            // An Apple GPU: the Metal worker's own table, not the discrete-card estimate, which
+            // showed "po2 24 / 16.0 GB" for an uncalibrated Mac whose worker proves at 20 (M6).
+            _ if r.gpu_tag == "metal" && backend == "risc0" => {
+                let po2 = metal_job_po2(vram_bytes);
+                (po2, crate::metal_sizing::stark_peak_bytes(po2))
+            }
             Some(vram) if vram > 0 => find_optimal_po2(vram, backend, true),
             _ => {
                 tracing::warn!(
@@ -4290,6 +4348,82 @@ mod tests {
             po2_samples: samples,
             host_peak_bytes: None,
         }
+    }
+
+    /// M6: an Apple GPU is sized from the Metal worker's own table, not the discrete-card rule that
+    /// gave a 24 GB Mac po2 20 (the worker says 19) and a 16 GB Mac no job size at all.
+    #[test]
+    fn a_mac_proves_risc0_jobs_at_the_metal_tables_size() {
+        use crate::metal_sizing::{job_po2_for_limit, working_set_limit_of};
+        const GIB: u64 = 1 << 30;
+        let mac16 = Some(8 * GIB); // hw.memsize less the 8 GiB reserve
+        let mac24 = Some(16 * GIB);
+        let mac36 = Some(28 * GIB);
+        // The rule the host used before: wrong for both small Macs.
+        assert_eq!(risc0_job_po2(None, None, mac24), Some(20));
+        assert_eq!(risc0_job_po2(None, None, mac16), None);
+        // Per slot: what the table says for the host figure and this process's budget, if any
+        // (the budget runs set RISC0_METAL_MAX_WORKING_SET_BYTES for the whole process).
+        for vram in [mac16, mac24, mac36] {
+            assert_eq!(
+                risc0_slot_job_po2("gpu-metal0", None, None, vram),
+                Some(metal_job_po2(vram))
+            );
+        }
+        // Without a budget: 18 / 19 / 20.
+        let table = |v: Option<u64>| job_po2_for_limit(working_set_limit_of(v, None).unwrap());
+        assert_eq!((table(mac16), table(mac24), table(mac36)), (18, 19, 20));
+        // An override still wins; a discrete card is unchanged.
+        assert_eq!(
+            risc0_slot_job_po2("gpu-metal0", Some(17), None, mac36),
+            Some(17)
+        );
+        assert_eq!(risc0_slot_job_po2("gpu0", None, None, mac24), Some(20));
+        assert_eq!(risc0_slot_job_po2("gpu-rocm0", None, None, mac16), None);
+        // A calibrated Mac: its measured size stands below the table's (the table's size failed
+        // there), and is raised to the table's when the calibration proved it.
+        let calibrated = |ceiling: u8| {
+            let samples = (16..=ceiling)
+                .map(|p| sample(p, 64 >> (p - 16), 1e6))
+                .collect();
+            risc0_row(samples, ceiling, ceiling)
+        };
+        // Under a 4 GiB budget run the table says 17, and a ceiling two below it is outside the
+        // job range; the cases need the unbudgeted 36 GB size or a budget of at least 6 GiB.
+        let d = metal_job_po2(mac36);
+        if d < 18 {
+            return;
+        }
+        assert_eq!(
+            risc0_slot_job_po2("gpu-metal0", None, Some(&calibrated(d - 2)), mac36),
+            Some(d - 2)
+        );
+        assert_eq!(
+            risc0_slot_job_po2("gpu-metal0", None, Some(&calibrated(d - 1)), mac36),
+            Some(d)
+        );
+    }
+
+    /// M6: the device row of a Mac shows the Metal worker's size and peak, not the discrete-card
+    /// estimate ("po2 24 / 16M rows / 16.0 GB" for an uncalibrated M5 Max).
+    #[test]
+    fn a_macs_device_row_shows_the_metal_size() {
+        let mut r = gpu_slot(Some(28 << 30));
+        r.slot_key = "risc0:metal:0".to_string();
+        r.gpu_tag = "metal".to_string();
+        r.gpu_name = Some("Apple M5 Max".to_string());
+        r.pci_bus_id = Some("apple-gpu0".to_string());
+        let rows = build_gpu_device_benchmarks_from_workers(&[r], &BTreeMap::new());
+        assert_eq!(rows.len(), 1);
+        let po2 = metal_job_po2(Some(28 << 30));
+        assert_eq!(rows[0].device_id, "gpu-metal0");
+        assert_eq!(rows[0].optimal_po2, po2);
+        assert!(rows[0].optimal_po2 <= 20, "{}", rows[0].optimal_po2);
+        assert_eq!(rows[0].max_feasible_po2, po2);
+        assert_eq!(
+            rows[0].memory_usage_bytes,
+            crate::metal_sizing::stark_peak_bytes(po2)
+        );
     }
 
     #[test]

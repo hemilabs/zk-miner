@@ -5,6 +5,7 @@ pub mod dispatcher;
 pub mod engine;
 pub mod gpu_code;
 pub mod memory;
+pub mod metal_sizing;
 pub mod registry;
 pub mod worker;
 

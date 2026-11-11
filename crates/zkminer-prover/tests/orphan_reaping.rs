@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 /// `kill(pid, 0)` alone returns 0 for a zombie, which is precisely the bug that made the
 /// first version of this fix sleep 2s on every drop. A test that used it would be blind
 /// in the same way, so read the process state from /proc instead.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn alive(pid: i32) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         // field 3 is the state char; Z = zombie.
@@ -32,6 +32,25 @@ fn alive(pid: i32) -> bool {
             .unwrap_or(false),
         Err(_) => false,
     }
+}
+
+/// macOS has no `/proc` (these two tests failed there, M6): the state comes from
+/// `proc_pidinfo(PROC_PIDTBSDINFO)`, which fails for a zombie or a reaped pid, or reports SZOMB.
+#[cfg(target_os = "macos")]
+fn alive(pid: i32) -> bool {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    const SZOMB: u32 = 5;
+    n == size && info.pbi_status != SZOMB
 }
 
 /// Spawn a parent in its own process group that forks a grandchild and exits at once,
