@@ -26,12 +26,37 @@ name = "zkminer-prove-risc0-cpu"
 path = "src/main.rs"
 required-features = ["cpu"]
 
+# Apple Silicon Macs through Metal (the risc0 fork's `metal` backend). macOS on aarch64 only; the worker
+# refuses Intel Macs and 8 GB Macs at runtime (it requires 16 GB; the check is `hw.memsize` >= 12 GiB,
+# so rounding never refuses a 16 GB Mac; see `metal_host.rs`).
+[[bin]]
+name = "zkminer-prove-risc0-metal"
+path = "src/main.rs"
+required-features = ["metal"]
+
 [features]
 cuda = ["risc0-zkvm/cuda", "risc0-groth16/cuda"]
 rocm = ["risc0-zkvm/rocm", "risc0-groth16/rocm"]
 # Intel Arc / Data Center GPUs through SYCL on Level Zero. Built with oneAPI's `icpx` (see the README's
 # Intel section); the kernels' shared libraries are found next to the binary (`$ORIGIN`, set in build.rs).
 intel = ["risc0-zkvm/intel", "risc0-groth16/intel"]
+# The first three are the fan-out of PLAN 8.1. The rest are what the worker calls directly: the
+# per-circuit Metal pipeline warm-ups (rv32im, recursion, keccak, groth16-sys), the device name
+# (risc0-zkp) and the device's working-set limit and allocation (metal).
+metal = [
+    "risc0-zkvm/metal",
+    "risc0-groth16/metal",
+    "risc0-circuit-keccak/metal",
+    "dep:risc0-zkp",
+    "risc0-zkp/metal",
+    "dep:risc0-circuit-rv32im",
+    "risc0-circuit-rv32im/metal",
+    "dep:risc0-circuit-recursion",
+    "risc0-circuit-recursion/metal",
+    "dep:risc0-groth16-sys",
+    "risc0-groth16-sys/metal",
+    "dep:metal",
+]
 cpu = []
 
 [dependencies]
@@ -58,6 +83,14 @@ risc0-groth16 = { version = "3.0" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 liblzma = { version = "0.4", features = ["parallel"] }
 tar = "0.4"
+# Metal only (feature `metal`): see the feature's comment.
+risc0-zkp = { version = "3.0", optional = true }
+risc0-circuit-rv32im = { version = "4.0", optional = true }
+risc0-circuit-recursion = { version = "4.0", optional = true }
+risc0-groth16-sys = { version = "0.1", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.29", optional = true }
 
 [package.metadata.risc0]
 methods = [
