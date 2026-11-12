@@ -12694,7 +12694,7 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
         s.benchmark_tracker = Some(BenchmarkTracker {
             devices: Vec::new(),
             all_complete: false,
-            started_at: Some(chrono::Utc::now()),
+            started_at: Some(std::time::Instant::now()),
             active_device_index: 0,
         });
         s.add_log(LogLevel::Info, "Starting GPU benchmarks...");

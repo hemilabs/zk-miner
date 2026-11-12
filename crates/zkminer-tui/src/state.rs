@@ -599,7 +599,9 @@ impl DeviceProgress {
 pub struct BenchmarkTracker {
     pub devices: Vec<DeviceProgress>,
     pub all_complete: bool,
-    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the benchmark started, on the monotonic clock: the wall clock can be set back during a
+    /// run (a time sync correcting it), which made the elapsed time and ETA negative.
+    pub started_at: Option<std::time::Instant>,
     /// Index of the currently active (benchmarking) device in the tabs.
     pub active_device_index: usize,
 }

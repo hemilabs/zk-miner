@@ -508,8 +508,7 @@ fn render_progress_header(
 ) {
     let elapsed = tracker
         .started_at
-        .map(|t| chrono::Utc::now().signed_duration_since(t).num_seconds())
-        .unwrap_or(0);
+        .map_or(0, |t| t.elapsed().as_secs() as i64);
     let done = tracker.completed_count();
     let total = tracker.total_count().max(1);
     // Between two cards the finished worker is shut down and its memory reclaimed.

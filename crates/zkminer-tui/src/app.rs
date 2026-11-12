@@ -397,7 +397,7 @@ async fn run_streaming_gpu_benchmark(state: SharedState) {
         s.benchmark_tracker = Some(crate::state::BenchmarkTracker {
             devices: Vec::new(),
             all_complete: false,
-            started_at: Some(chrono::Utc::now()),
+            started_at: Some(std::time::Instant::now()),
             active_device_index: 0,
         });
         s.add_log(LogLevel::Info, "Running GPU benchmarks (real proving)...");
