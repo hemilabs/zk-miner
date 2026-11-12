@@ -599,8 +599,8 @@ impl DeviceProgress {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CardScore {
     pub name: String,
-    gpu_tag: String,
-    ordinal: u32,
+    pub gpu_tag: String,
+    pub ordinal: u32,
     /// zkOP/s, blended over the zkVMs that have scored so far.
     pub zkops: Option<f64>,
     /// Every zkVM on it has finished.

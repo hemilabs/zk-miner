@@ -75,369 +75,347 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
         }
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8), // CPU info + zkOP/s + power
-            Constraint::Min(6),    // Results table
-            Constraint::Min(5),    // Device benchmarks (selectable)
-            Constraint::Length(3), // Controls
-        ])
-        .split(area);
-
-    // CPU info + zkOP/s
-    let cpu_info = if let Some(bench) = &state.benchmark_results {
-        vec![
-            Line::from(vec![
-                Span::styled(format!(" {} ", format_mzkops(bench.zkops)), theme::metric()),
-                Span::styled(
-                    "  each GPU's SP1 and RISC Zero scores blended, all GPUs",
-                    theme::dim(),
-                ),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("CPU: ", theme::dim()),
-                Span::styled(&bench.cpu_info, theme::identifier()),
-            ]),
-            Line::from(vec![
-                Span::styled("Last Run: ", theme::dim()),
-                Span::raw(&bench.timestamp),
-            ]),
-            Line::from(vec![
-                Span::styled("Avg Throughput: ", theme::dim()),
-                Span::styled(
-                    format!("{:.0} cycles/sec", bench.average_throughput()),
-                    theme::dim(),
-                ),
-            ]),
-            Line::from({
-                // Figures from the last benchmark run, not live: the CPU's average, and the sum of
-                // each card's peak (the cards run one after another, so an average would count
-                // their idle time). Live draw is on the dashboard.
-                let mut spans = vec![Span::styled("Draw while benchmarking: ", theme::dim())];
-                match bench.cpu_power_watts {
-                    Some(w) => spans.push(Span::styled(
-                        format!("CPU {w:.0}W average"),
-                        theme::warning(),
-                    )),
-                    None => spans.push(Span::styled("CPU N/A", theme::dim())),
-                }
-                spans.push(Span::styled("  ", theme::dim()));
-                match bench.gpu_power_watts {
-                    Some(w) => {
-                        spans.push(Span::styled(format!("GPU {w:.0}W peak"), theme::warning()))
-                    }
-                    None => spans.push(Span::styled("GPU N/A", theme::dim())),
-                }
-                if let (Some(cpu_w), Some(gpu_w)) = (bench.cpu_power_watts, bench.gpu_power_watts) {
-                    let total_w = cpu_w + gpu_w;
-                    spans.push(Span::styled("  |  ", theme::separator()));
-                    spans.push(Span::styled(
-                        format!("Total {:.0}W", total_w),
-                        theme::bold(),
-                    ));
-                    if total_w > 0.0 && bench.zkops > 0.0 {
-                        let efficiency = bench.zkops / total_w;
-                        spans.push(Span::styled("  |  ", theme::separator()));
-                        spans.push(Span::styled(
-                            format!("{:.0} zkOP/W", efficiency),
-                            theme::dim(),
-                        ));
-                    }
-                }
-                spans
-            }),
-        ]
-    } else {
-        vec![
+    let Some(bench) = &state.benchmark_results else {
+        let placeholder = Paragraph::new(vec![
             Line::from(Span::styled(
-                "No benchmark results yet.",
+                if state.benchmark_running {
+                    "Benchmark running..."
+                } else {
+                    "No benchmark results yet."
+                },
                 theme::placeholder(),
             )),
             Line::from(Span::styled(
                 "Press 'b' to run benchmarks.",
                 theme::placeholder(),
             )),
-        ]
+        ])
+        .block(summary_block(state));
+        f.render_widget(placeholder, area);
+        return;
     };
 
+    // One row per GPU, and the selected GPU's programs below: eight GPUs fit a 30-line terminal.
+    // The programs panel gives up its lines first when the window is shorter.
+    let ids = device_ids(state);
+    let gpus = gpu_summaries(bench, &ids);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),                     // Machine score and power
+            Constraint::Length(gpus.len() as u16 + 3), // One row per GPU
+            Constraint::Min(0),                        // The selected GPU's programs
+        ])
+        .split(area);
+
+    render_summary(f, chunks[0], state, bench);
+    render_gpu_table(f, chunks[1], state, bench, &gpus);
+    render_gpu_programs(f, chunks[2], state, &gpus);
+}
+
+fn summary_block(state: &MinerState) -> Block<'static> {
     let title = if state.return_to_setup_after_benchmark && !state.startup_benchmark_pending {
         " Benchmark - press any key to continue to setup "
     } else {
         " Benchmark "
     };
-    let cpu = Paragraph::new(cpu_info).block(
-        Block::default()
-            .title(Span::styled(title, theme::title()))
-            .borders(Borders::ALL)
-            .border_style(theme::border())
-            .border_type(theme::border_type()),
-    );
-    f.render_widget(cpu, chunks[0]);
-
-    // Results table
-    if let Some(bench) = &state.benchmark_results {
-        let header = Row::new([
-            "Program",
-            "Backend",
-            "Precompile",
-            "Weight",
-            "Cycles",
-            "Time",
-            "Throughput",
-        ])
-        .style(theme::table_header());
-
-        let rows: Vec<Row> = bench
-            .results
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let precompile_str = if r.precompile { "\u{2713}" } else { "-" };
-                let weight_str = if r.weight > 0.0 {
-                    format!("{:.0}%", r.weight * 100.0)
-                } else {
-                    "-".to_string()
-                };
-                Row::new(vec![
-                    Cell::from(r.program_name.clone()),
-                    Cell::from(r.prover_backend.clone()).style(theme::accent()),
-                    Cell::from(precompile_str),
-                    Cell::from(weight_str),
-                    Cell::from(format!("{}", r.cycles)),
-                    Cell::from(format!("{:.2}s", r.duration.as_secs_f64())),
-                    Cell::from(format!("{:.0} c/s", r.throughput)),
-                ])
-                .style(theme::striped(i))
-            })
-            .collect();
-
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(18),
-                Constraint::Length(12),
-                Constraint::Length(11),
-                Constraint::Length(8),
-                Constraint::Length(12),
-                Constraint::Length(10),
-                Constraint::Length(15),
-            ],
-        )
-        .header(header)
-        .block(
-            Block::default()
-                .title(Span::styled(" Results ", theme::title()))
-                .borders(Borders::ALL)
-                .border_style(theme::border())
-                .border_type(theme::border_type()),
-        );
-
-        f.render_widget(table, chunks[1]);
-    } else {
-        let placeholder = Paragraph::new(Span::styled(
-            if state.benchmark_running {
-                "Benchmark running..."
-            } else {
-                "No results"
-            },
-            theme::placeholder(),
-        ))
-        .block(
-            Block::default()
-                .title(Span::styled(" Results ", theme::title()))
-                .borders(Borders::ALL)
-                .border_style(theme::border())
-                .border_type(theme::border_type()),
-        );
-        f.render_widget(placeholder, chunks[1]);
-    }
-
-    // Device Benchmarks — selectable, grouped by device with per-backend breakdown
-    render_device_benchmarks(f, chunks[2], state);
-
-    // Controls
-    let mut ctrl_spans: Vec<Span> = Vec::new();
-    ctrl_spans.extend(theme::keybind("[b]", " Run All  "));
-    ctrl_spans.extend(theme::keybind("[r]", " Re-benchmark Device  "));
-    ctrl_spans.extend(theme::keybind("[j/k]", " Select Device"));
-    let controls = Paragraph::new(Line::from(ctrl_spans)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(theme::border())
-            .border_type(theme::border_type()),
-    );
-    f.render_widget(controls, chunks[3]);
+    Block::default()
+        .title(Span::styled(title, theme::title()))
+        .borders(Borders::ALL)
+        .border_style(theme::border())
+        .border_type(theme::border_type())
 }
 
-fn render_device_benchmarks(f: &mut Frame, area: Rect, state: &MinerState) {
-    let ids = device_ids(state);
-    let dev_count = ids.len();
+/// The machine's score, the last run's power, and when it ran, on one line.
+fn render_summary(
+    f: &mut Frame,
+    area: Rect,
+    state: &MinerState,
+    bench: &zkminer_prover::benchmark::BenchmarkSuite,
+) {
+    let mut spans = vec![Span::styled(
+        format!(" Machine {} ", format_mzkops(bench.zkops)),
+        theme::metric(),
+    )];
+    // Figures from the last benchmark run, not live: the CPU's average, and the sum of each card's
+    // peak (the cards run one after another, so an average would count their idle time). Live
+    // draw is on the dashboard.
+    spans.push(Span::styled("  Draw while benchmarking: ", theme::dim()));
+    if let Some(w) = bench.cpu_power_watts {
+        spans.push(Span::styled(
+            format!("CPU {w:.0}W average  "),
+            theme::warning(),
+        ));
+    }
+    match bench.gpu_power_watts {
+        Some(w) => {
+            spans.push(Span::styled(format!("GPU {w:.0}W peak"), theme::warning()));
+            let total = w + bench.cpu_power_watts.unwrap_or(0.0);
+            if total > 0.0 && bench.zkops > 0.0 {
+                spans.push(Span::styled(
+                    format!("  {:.1}K zkOP/W", bench.zkops / total / 1e3),
+                    theme::dim(),
+                ));
+            }
+        }
+        None => spans.push(Span::styled("GPU not measured", theme::dim())),
+    }
+    spans.push(Span::styled(
+        format!("   Last run {}", local_time(&bench.timestamp)),
+        theme::dim(),
+    ));
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).block(summary_block(state)),
+        area,
+    );
+}
 
-    if let Some(bench) = &state.benchmark_results {
-        let dev_header = Row::new([
-            "",
-            "Backend",
-            "po2",
-            "Segment",
-            "Memory",
-            "Throughput",
-            "Score",
-        ])
-            .style(theme::table_header());
+/// An RFC 3339 timestamp as local "2026-11-12 12:41", or as it came if it does not parse.
+fn local_time(timestamp: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| timestamp.to_string())
+}
 
-        let mut dev_rows: Vec<Row> = Vec::new();
+/// One GPU of the results: its rows for each zkVM.
+struct GpuSummary<'a> {
+    device_id: &'a str,
+    name: String,
+    sp1: Option<&'a zkminer_prover::benchmark::DeviceBenchmark>,
+    risc0: Option<&'a zkminer_prover::benchmark::DeviceBenchmark>,
+    rows: Vec<&'a zkminer_prover::benchmark::DeviceBenchmark>,
+}
 
-        for (dev_idx, device_id) in ids.iter().enumerate() {
-            let is_selected = dev_idx == state.benchmark_selected_device;
-            let is_running =
-                state.benchmark_device_in_progress.as_deref() == Some(device_id.as_str());
-
-            let dev_entries: Vec<_> = bench
+/// The GPUs in `ids`' order, each named by its model, numbered where two are the same model.
+fn gpu_summaries<'a>(
+    bench: &'a zkminer_prover::benchmark::BenchmarkSuite,
+    ids: &'a [String],
+) -> Vec<GpuSummary<'a>> {
+    let model = |rows: &[&zkminer_prover::benchmark::DeviceBenchmark], id: &str| {
+        rows.first().map_or(id.to_string(), |d| {
+            // "GPU0 NVIDIA GeForce RTX 5090" -> "RTX 5090"
+            let name = d
+                .device_label
+                .split_once(' ')
+                .filter(|(first, _)| first.starts_with("GPU"))
+                .map_or(d.device_label.as_str(), |(_, rest)| rest);
+            crate::state::short_gpu_name(name)
+        })
+    };
+    let mut gpus: Vec<GpuSummary> = ids
+        .iter()
+        .map(|id| {
+            let rows: Vec<_> = bench
                 .device_benchmarks
                 .iter()
-                .filter(|d| &d.device_id == device_id)
+                .filter(|d| &d.device_id == id)
                 .collect();
+            let backend = |b: &str| rows.iter().copied().find(|d| d.prover_backend == b);
+            GpuSummary {
+                device_id: id,
+                name: model(&rows, id),
+                sp1: backend("sp1"),
+                risc0: backend("risc0"),
+                rows,
+            }
+        })
+        .collect();
+    let names: Vec<String> = gpus.iter().map(|g| g.name.clone()).collect();
+    for gpu in &mut gpus {
+        if names.iter().filter(|n| **n == gpu.name).count() > 1 {
+            let ordinal: String = gpu
+                .device_id
+                .chars()
+                .rev()
+                .take_while(char::is_ascii_digit)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            gpu.name = format!("{} #{ordinal}", gpu.name);
+        }
+    }
+    gpus
+}
 
-            let label = dev_entries
-                .first()
-                .map(|d| d.device_label.clone())
-                .unwrap_or_else(|| {
-                    state
-                        .benchmark_results
-                        .as_ref()
-                        .and_then(|suite| {
-                            state.hardware.gpus.iter().find(|g| {
-                                g.benchmark_device_id(suite).as_deref() == Some(device_id.as_str())
-                            })
-                        })
-                        .map(|g| format!("GPU{} {}", g.index, g.name))
-                        .unwrap_or_else(|| device_id.clone())
-                });
-
-            let total_tp: f64 = dev_entries.iter().map(|d| d.throughput).sum();
-            let cursor = if is_selected { "> " } else { "  " };
-            let status = if is_running { " [benchmarking...]" } else { "" };
-            let device_label = format!("{cursor}{label}{status}");
-
-            let device_style = if is_selected {
+/// One row per GPU: its score, each zkVM's score and job rate, its wraps and its peak power.
+fn render_gpu_table(
+    f: &mut Frame,
+    area: Rect,
+    state: &MinerState,
+    bench: &zkminer_prover::benchmark::BenchmarkSuite,
+    gpus: &[GpuSummary],
+) {
+    let dash = || "\u{2014}".to_string();
+    let rate =
+        |d: Option<&zkminer_prover::benchmark::DeviceBenchmark>,
+         pick: fn(&zkminer_prover::benchmark::DeviceBenchmark) -> Option<f64>| {
+            d.and_then(pick).map_or_else(dash, format_throughput)
+        };
+    let wrap = |d: Option<&zkminer_prover::benchmark::DeviceBenchmark>| {
+        d.and_then(|d| d.wrap_secs())
+            .map_or_else(dash, |s| format!("{s:.1}s"))
+    };
+    let header = Row::new([
+        "GPU",
+        "MzkOP/s",
+        "SP1 score",
+        "RISC Zero score",
+        "SP1 job rate",
+        "RISC Zero job rate",
+        "Groth16 SP1/R0",
+        "Peak W",
+    ])
+    .style(theme::table_header());
+    let rows: Vec<Row> = gpus
+        .iter()
+        .enumerate()
+        .map(|(i, gpu)| {
+            let selected = i == state.benchmark_selected_device;
+            let running = state.benchmark_device_in_progress.as_deref() == Some(gpu.device_id);
+            let cursor = if selected { "> " } else { "  " };
+            let running = if running { " [benchmarking...]" } else { "" };
+            let name_style = if selected {
                 Style::default()
                     .fg(theme::peach())
                     .add_modifier(Modifier::BOLD)
             } else {
                 theme::bold()
             };
-
-            dev_rows.push(Row::new(vec![
-                Cell::from(device_label).style(device_style),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(format_throughput(total_tp)).style(theme::metric()),
+            // A row without a measurement holds the fallback, which is no reading.
+            let peak = gpu
+                .rows
+                .iter()
+                .map(|d| d.power_watts)
+                .filter(|&w| w > 0.0 && w != zkminer_prover::benchmark::FALLBACK_GPU_WATTS)
+                .fold(None, |max: Option<f64>, w| {
+                    Some(max.map_or(w, |m| m.max(w)))
+                });
+            Row::new(vec![
+                Cell::from(format!("{cursor}{}{running}", gpu.name)).style(name_style),
                 Cell::from(
-                    gpu_zkops(&bench.device_benchmarks, device_id)
-                        .map_or(String::new(), format_mzkops),
+                    gpu_zkops(&bench.device_benchmarks, gpu.device_id)
+                        .map_or_else(dash, |z| format!("{:.2}", z / 1e6)),
                 )
                 .style(theme::metric()),
-            ]));
+                Cell::from(rate(gpu.sp1, |d| d.scoring_cycles_per_sec())),
+                Cell::from(rate(gpu.risc0, |d| d.scoring_cycles_per_sec())),
+                Cell::from(rate(gpu.sp1, |d| d.stark_rate())),
+                Cell::from(rate(gpu.risc0, |d| d.stark_rate())),
+                Cell::from(format!("{} / {}", wrap(gpu.sp1), wrap(gpu.risc0))),
+                Cell::from(peak.map_or_else(dash, |w| format!("{w:.0}"))),
+            ])
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(22),
+            Constraint::Length(8),
+            Constraint::Length(11),
+            Constraint::Length(15),
+            Constraint::Length(12),
+            Constraint::Length(18),
+            Constraint::Length(15),
+            Constraint::Length(7),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .title(Span::styled(
+                format!(" GPUs ({}) ", gpus.len()),
+                theme::title(),
+            ))
+            .borders(Borders::ALL)
+            .border_style(theme::border())
+            .border_type(theme::border_type()),
+    );
+    f.render_widget(table, area);
+}
 
-            for d in dev_entries {
-                let rows_count = 1u64 << d.optimal_po2;
-                let segment_str = if rows_count >= 1_000_000 {
-                    format!("{}M rows", rows_count / 1_000_000)
-                } else {
-                    format!("{}K rows", rows_count / 1_000)
-                };
-                let mem_gb = d.memory_usage_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                let mem_str = if mem_gb >= 1.0 {
-                    format!("{:.1} GB", mem_gb)
-                } else {
-                    format!("{:.0} MB", mem_gb * 1024.0)
-                };
-                dev_rows.push(
-                    Row::new(vec![
-                        Cell::from(format!("  {}", d.prover_backend)).style(theme::accent()),
-                        Cell::from("po2"),
-                        Cell::from(format!("{}", d.optimal_po2)),
-                        Cell::from(segment_str),
-                        Cell::from(mem_str),
-                        Cell::from(format_throughput(d.throughput)),
-                        // Each zkVM's score in its own cycles per second.
-                        Cell::from(
-                            d.scoring_cycles_per_sec()
-                                .map_or(String::new(), format_throughput),
-                        )
-                        .style(theme::metric()),
-                    ])
-                    .style(theme::bold()),
-                );
+/// The selected GPU's programs, SP1 and RISC Zero side by side, with the keys in the border.
+fn render_gpu_programs(f: &mut Frame, area: Rect, state: &MinerState, gpus: &[GpuSummary]) {
+    let selected = gpus.get(state.benchmark_selected_device);
+    let mut title = vec![Span::styled(
+        format!(
+            " {}: programs   ",
+            selected.map_or("No GPU", |g| g.name.as_str())
+        ),
+        theme::title(),
+    )];
+    title.extend(theme::keybind("[j/k]", " select GPU  "));
+    title.extend(theme::keybind("[r]", " re-benchmark  "));
+    title.extend(theme::keybind("[b]", " run all "));
+    let block = Block::default()
+        .title(Line::from(title))
+        .borders(Borders::ALL)
+        .border_style(theme::border())
+        .border_type(theme::border_type());
 
-                // Per-program breakdown for this device (real measured throughputs),
-                // grouped under the device so results read per-device rather than flat.
-                for program in BENCHMARK_PROGRAMS {
-                    if let Some(tp) = d.program_throughputs.get(program.name) {
-                        let kind = if program.precompile {
-                            "precompile"
-                        } else {
-                            "compute"
-                        };
-                        dev_rows.push(
-                            Row::new(vec![
-                                Cell::from(format!("      {}", program.name)),
-                                Cell::from(kind),
-                                Cell::from(""),
-                                Cell::from(""),
-                                Cell::from(""),
-                                Cell::from(format_throughput(*tp)),
-                            ])
-                            .style(theme::dim()),
-                        );
-                    }
-                }
-            }
-        }
-
-        let dev_table = Table::new(
-            dev_rows,
-            [
-                Constraint::Length(30),
-                Constraint::Length(10),
-                Constraint::Length(5),
-                Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(14),
-                Constraint::Length(10),
-            ],
-        )
-        .header(dev_header)
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    format!(" Device Benchmarks ({}) ", dev_count),
-                    theme::title(),
-                ))
-                .borders(Borders::ALL)
-                .border_style(theme::border())
-                .border_type(theme::border_type()),
-        );
-
-        f.render_widget(dev_table, area);
-    } else {
-        let placeholder = Paragraph::new(Span::styled(
-            "No benchmarks — press [b] to run",
-            theme::placeholder(),
-        ))
-        .block(
-            Block::default()
-                .title(Span::styled(" Device Benchmarks ", theme::title()))
-                .borders(Borders::ALL)
-                .border_style(theme::border())
-                .border_type(theme::border_type()),
-        );
-        f.render_widget(placeholder, area);
-    }
+    let Some(gpu) = selected else {
+        f.render_widget(Paragraph::new("").block(block), area);
+        return;
+    };
+    let stage = |d: Option<&'_ zkminer_prover::benchmark::DeviceBenchmark>, name: &str| {
+        d.and_then(|d| {
+            d.program_stages
+                .iter()
+                .find(|p| p.program_name == name && p.stark_secs > 0.0)
+                .map(|p| (p.cycles, p.cycles as f64 / p.stark_secs))
+        })
+    };
+    let cells = |s: Option<(u64, f64)>| match s {
+        Some((cycles, rate)) => (format_cycles(cycles), format_throughput(rate)),
+        None => ("\u{2014}".to_string(), "\u{2014}".to_string()),
+    };
+    let names = BENCHMARK_PROGRAMS
+        .iter()
+        .map(|p| p.name)
+        .chain([BENCH_ZKOP_MIX]);
+    let rows: Vec<Row> = names
+        .enumerate()
+        .map(|(i, name)| {
+            let (sp1_cycles, sp1_rate) = cells(stage(gpu.sp1, name));
+            let (r0_cycles, r0_rate) = cells(stage(gpu.risc0, name));
+            Row::new(vec![
+                Cell::from(name),
+                Cell::from(weight_label(name)),
+                Cell::from(sp1_cycles),
+                Cell::from(sp1_rate),
+                Cell::from(r0_cycles),
+                Cell::from(r0_rate),
+            ])
+            .style(theme::striped(i))
+        })
+        .collect();
+    let header = Row::new([
+        "Program",
+        "Weight",
+        "SP1 cycles",
+        "SP1 rate",
+        "RISC Zero cycles",
+        "RISC Zero rate",
+    ])
+    .style(theme::table_header());
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(16),
+            Constraint::Length(8),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(17),
+            Constraint::Length(15),
+        ],
+    )
+    .header(header)
+    .block(block);
+    f.render_widget(table, area);
 }
 
 // ---------------------------------------------------------------------------
@@ -613,36 +591,58 @@ fn render_progress_header(
     f.render_widget(header, area);
 }
 
-/// One tab per queued card and zkVM, wrapped to `width`.
+/// One entry per GPU, wrapped to `width`, with a marker per zkVM: \u{2713} done, \u{2717} failed,
+/// \u{25B6} running (with its programs done so far), \u{00B7} waiting. Sixteen card-and-zkVM tabs
+/// took several lines for eight GPUs; four GPUs fit a line.
 fn device_tab_lines(tracker: &BenchmarkTracker, width: usize) -> Vec<Line<'static>> {
     let items = tracker
-        .devices
-        .iter()
-        .enumerate()
-        .map(|(i, dev)| {
-            let name = tracker.display_name(dev);
-            if dev.failed {
-                Span::styled(format!("\u{2717} {name}"), theme::error())
-            } else if dev.complete {
-                Span::styled(
-                    format!("\u{2713} {name}"),
-                    Style::default().fg(theme::green()),
-                )
-            } else if i == tracker.active_device_index {
-                let done = dev
-                    .programs
-                    .iter()
-                    .filter(|p| p.phase == ProgramPhase::Done)
-                    .count();
-                Span::styled(
-                    format!("\u{25B6} {name} [{done}/{}]", dev.programs.len()),
-                    Style::default()
-                        .fg(theme::yellow())
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::styled(format!("\u{00B7} {name}"), theme::dim())
+        .card_scores()
+        .into_iter()
+        .map(|card| {
+            let mut text = card.name.clone();
+            let mut running = false;
+            for (i, dev) in tracker.devices.iter().enumerate() {
+                if dev.gpu_tag != card.gpu_tag || dev.ordinal != card.ordinal {
+                    continue;
+                }
+                let zkvm = match dev.slot_key.split(':').next() {
+                    Some("risc0") => "R0",
+                    Some("sp1") => "SP1",
+                    _ => dev.backend_label(),
+                };
+                let marker = if dev.failed {
+                    "\u{2717}".to_string()
+                } else if dev.complete {
+                    "\u{2713}".to_string()
+                } else if i == tracker.active_device_index {
+                    running = true;
+                    if dev.warming_up {
+                        "\u{25B6}warm-up".to_string()
+                    } else {
+                        let done = dev
+                            .programs
+                            .iter()
+                            .filter(|p| p.phase == ProgramPhase::Done)
+                            .count();
+                        format!("\u{25B6}{done}/{}", dev.programs.len())
+                    }
+                } else {
+                    "\u{00B7}".to_string()
+                };
+                text.push_str(&format!("  {zkvm} {marker}"));
             }
+            let style = if running {
+                Style::default()
+                    .fg(theme::yellow())
+                    .add_modifier(Modifier::BOLD)
+            } else if card.failed {
+                theme::error()
+            } else if card.complete {
+                Style::default().fg(theme::green())
+            } else {
+                theme::dim()
+            };
+            Span::styled(text, style)
         })
         .collect();
     wrap_items(items, width)
@@ -651,7 +651,7 @@ fn device_tab_lines(tracker: &BenchmarkTracker, width: usize) -> Vec<Line<'stati
 fn render_device_tabs(f: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
     let tabs = Paragraph::new(lines).block(
         Block::default()
-            .title(Span::styled(" Devices ", theme::title()))
+            .title(Span::styled(" GPUs ", theme::title()))
             .borders(Borders::ALL)
             .border_style(theme::border())
             .border_type(theme::border_type()),
@@ -1111,12 +1111,76 @@ mod tests {
         );
         let tabs = &rows[4];
         for tab in [
-            "RTX 4090 RISC Zero",
-            "RTX 4090 SP1 [0/6]",
-            "Arc A770 RISC Zero",
-            "Arc A770 SP1",
+            "RTX 4090  R0 \u{2713}  SP1 \u{25B6}0/6",
+            "Arc A770  R0 \u{00B7}  SP1 \u{00B7}",
         ] {
             assert!(tabs.contains(tab), "missing {tab}: {tabs}");
         }
+    }
+
+    /// Eight GPUs' results in a standard 120 x 30 terminal (28 lines below the tab and status
+    /// bars): every GPU's row, and the selected one's programs.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // two of MinerState's many fields
+    fn eight_gpus_fit_a_standard_terminal() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use zkminer_prover::benchmark::{BenchmarkSuite, DeviceBenchmark, ProgramStage};
+        let row = |i: usize, backend: &str| DeviceBenchmark {
+            program_stages: BENCHMARK_PROGRAMS
+                .iter()
+                .map(|p| p.name)
+                .chain([BENCH_ZKOP_MIX])
+                .map(|name| ProgramStage {
+                    program_name: name.to_string(),
+                    cycles: 50_000_000,
+                    stark_secs: 5.0 + i as f64,
+                    wrap_secs: Some(1.0),
+                })
+                .collect(),
+            device_id: format!("gpu{i}"),
+            device_label: format!("GPU{i} NVIDIA GeForce RTX 5090"),
+            prover_backend: backend.to_string(),
+            throughput: 1e7,
+            power_watts: 600.0,
+            optimal_po2: 24,
+            memory_usage_bytes: 0,
+            max_feasible_po2: 24,
+            program_throughputs: Default::default(),
+            pci_bus_id: format!("0000:0{i}:00.0"),
+            po2_samples: Vec::new(),
+            host_peak_bytes: None,
+        };
+        let mut state = MinerState::default();
+        state.benchmark_selected_device = 7;
+        state.benchmark_results = Some(BenchmarkSuite {
+            device_benchmarks: (0..8)
+                .flat_map(|i| [row(i, "sp1"), row(i, "risc0")])
+                .collect(),
+            zkops: 1e8,
+            ..Default::default()
+        });
+
+        let mut term = Terminal::new(TestBackend::new(120, 28)).unwrap();
+        term.draw(|f| render(f, f.area(), &state)).unwrap();
+        let buffer = term.backend().buffer();
+        let screen: String = buffer
+            .content
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>() + "\n")
+            .collect();
+        println!("{screen}");
+        for i in 0..8 {
+            assert!(
+                screen.contains(&format!("RTX 5090 #{i}")),
+                "GPU {i} missing:\n{screen}"
+            );
+        }
+        assert!(screen.contains("> RTX 5090 #7"), "{screen}");
+        assert!(screen.contains("RTX 5090 #7: programs"), "{screen}");
+        assert!(
+            screen.contains("zkop-mix"),
+            "the last program row fits:\n{screen}"
+        );
+        assert!(screen.contains("100.00 MzkOP/s"), "{screen}");
     }
 }
