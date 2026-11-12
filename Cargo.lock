@@ -6213,6 +6213,7 @@ dependencies = [
  "metal",
  "risc0-build-kernel",
  "risc0-sys",
+ "risc0-zkp",
  "sppark",
 ]
 
