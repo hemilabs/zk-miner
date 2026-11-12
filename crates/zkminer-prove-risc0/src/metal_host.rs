@@ -356,6 +356,68 @@ impl Drop for PeakSampler {
     }
 }
 
+/// Revert knob for the worker-start Groth16 witness-graph preload (M7): `0`, `off` or `false` leaves
+/// the graph to the zkvm, which starts building it only when a proof begins (`prove_with_opts` with
+/// a Groth16 receipt) or, for a staged proof such as `--benchmark`'s, when the wrap begins, so that
+/// wrap waits for it.
+pub const G16_PRELOAD_ENV: &str = "ZKMINER_G16_PRELOAD";
+
+static G16_PRELOAD_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Why the worker-start graph preload must not run, or `None` when it should: the knob is off, or the
+/// `risc0-groth16` component is not installed yet. The second matters: risc0 keeps a failed graph
+/// load for the life of the process (`OnceLock`), so a preload that ran before `Warmup` installed the
+/// component would fail every wrap of this worker.
+fn graph_preload_refusal(knob: Option<&str>, component_installed: bool) -> Option<&'static str> {
+    if knob.is_some_and(|v| matches!(v.trim(), "0" | "off" | "false")) {
+        return Some("disabled by ZKMINER_G16_PRELOAD");
+    }
+    if !component_installed {
+        return Some("the risc0-groth16 component is not installed yet");
+    }
+    None
+}
+
+/// Start building the Groth16 witness graph (`risc0_groth16::prove::preload_graph`) on a background
+/// thread, once per process, so the first wrap does not wait for it. The build is CPU only (~5 s on
+/// one core, ~2 GB of host memory that risc0 keeps for the life of the process) and touches no GPU
+/// memory, so it overlaps pipeline warm-up and the first STARK. Later callers (the zkvm's own
+/// preload at proof start, `prestart_prover` before the wrap, the wrap itself) share the one build
+/// (risc0 caches it in a `OnceLock`), so nothing is built twice. The proving key is deliberately not
+/// loaded here (M7 note: its load, 0.13-0.55 s, already runs beside the witness and was on the wrap's
+/// critical path for at most 87 ms in 5 of 49 measured wraps, while loading it early would put
+/// 3.9 GB of device memory beside the STARK pools). Returns whether it started a build.
+pub fn start_groth16_graph_preload(at: &str) -> bool {
+    let knob = std::env::var(G16_PRELOAD_ENV).ok();
+    let installed = crate::groth16_component::installed();
+    if let Some(why) = graph_preload_refusal(knob.as_deref(), installed) {
+        tracing::info!("not preloading the Groth16 witness graph at {at}: {why}");
+        return false;
+    }
+    if G16_PRELOAD_STARTED.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let at = at.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("g16-graph-preload".into())
+        .spawn(move || {
+            let t = Instant::now();
+            match risc0_groth16::prove::preload_graph() {
+                Ok(()) => tracing::info!(
+                    "Groth16 witness graph ready {:.2} s after the preload started at {at}",
+                    t.elapsed().as_secs_f64()
+                ),
+                Err(e) => tracing::warn!("Groth16 witness graph preload failed: {e:#}"),
+            }
+        });
+    if let Err(e) = spawned {
+        G16_PRELOAD_STARTED.store(false, Ordering::SeqCst);
+        tracing::warn!("could not start the Groth16 witness graph preload: {e}");
+        return false;
+    }
+    true
+}
+
 /// Build every circuit's Metal pipeline states once per process: rv32im (with the zkp kernels),
 /// recursion, keccak (through its binary archive, K5) and the Groth16 prover, each on its own thread
 /// so the compiler service builds them in parallel. None of them takes the GPU lock for long, and
@@ -453,6 +515,17 @@ mod tests {
         // The 36 GB dev machine (28.1 GiB) releases it; a 48 GB Mac (~36 GiB) keeps it.
         assert!(!keep_groth16_cache(28 * GIB, 20));
         assert!(keep_groth16_cache(36 * GIB, 20));
+    }
+
+    #[test]
+    fn the_graph_preload_needs_the_component_and_honours_its_knob() {
+        assert_eq!(graph_preload_refusal(None, true), None);
+        assert_eq!(graph_preload_refusal(Some("1"), true), None);
+        for off in ["0", "off", "false", " 0 "] {
+            assert!(graph_preload_refusal(Some(off), true).is_some(), "{off:?}");
+        }
+        // Never before the component is installed: risc0 would cache the failure.
+        assert!(graph_preload_refusal(None, false).is_some());
     }
 
     #[test]
