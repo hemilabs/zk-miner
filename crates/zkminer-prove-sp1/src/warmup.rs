@@ -51,8 +51,8 @@ pub(crate) struct WarmupReport {
 }
 
 /// Installs the Groth16 circuit artifacts if they are not installed, and builds the stripped
-/// circuit where the server supports it. `report(step, done bytes, total bytes)` is told before each
-/// long step, and every second during a download or an unpack.
+/// circuit where the server supports it. `report(step, done bytes, total bytes)` is told before
+/// each long step, and every second during a download or an unpack.
 pub(crate) fn warm_up(
     report: &mut dyn FnMut(&str, Option<u64>, Option<u64>),
 ) -> Result<WarmupReport> {
@@ -304,7 +304,13 @@ fn archive_size() -> Option<u64> {
             .timeout(Duration::from_secs(20))
             .build()
             .ok()?;
-        let response = client.head(&url).send().await.ok()?.error_for_status().ok()?;
+        let response = client
+            .head(&url)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?;
         // The header, not `content_length()`: for a HEAD reply that is the empty body's size, 0.
         response
             .headers()
