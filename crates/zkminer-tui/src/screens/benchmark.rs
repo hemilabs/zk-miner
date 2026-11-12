@@ -114,14 +114,22 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
                 ),
             ]),
             Line::from({
-                let mut spans = vec![Span::styled("Power: ", theme::dim())];
+                // Figures from the last benchmark run, not live: the CPU's average, and the sum of
+                // each card's peak (the cards run one after another, so an average would count
+                // their idle time). Live draw is on the dashboard.
+                let mut spans = vec![Span::styled("Draw while benchmarking: ", theme::dim())];
                 match bench.cpu_power_watts {
-                    Some(w) => spans.push(Span::styled(format!("CPU {w:.0}W"), theme::warning())),
+                    Some(w) => spans.push(Span::styled(
+                        format!("CPU {w:.0}W average"),
+                        theme::warning(),
+                    )),
                     None => spans.push(Span::styled("CPU N/A", theme::dim())),
                 }
                 spans.push(Span::styled("  ", theme::dim()));
                 match bench.gpu_power_watts {
-                    Some(w) => spans.push(Span::styled(format!("GPU {w:.0}W"), theme::warning())),
+                    Some(w) => {
+                        spans.push(Span::styled(format!("GPU {w:.0}W peak"), theme::warning()))
+                    }
                     None => spans.push(Span::styled("GPU N/A", theme::dim())),
                 }
                 if let (Some(cpu_w), Some(gpu_w)) = (bench.cpu_power_watts, bench.gpu_power_watts) {
