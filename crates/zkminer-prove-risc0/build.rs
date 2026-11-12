@@ -57,6 +57,10 @@ pub const BABYBEAR_STRESS_ELF: &[u8] = &[];
 pub const BABYBEAR_STRESS_ID: [u32; 8] = [0u32; 8];
 pub const MINIMAL_PROOF_ELF: &[u8] = &[];
 pub const MINIMAL_PROOF_ID: [u32; 8] = [0u32; 8];
+pub const SYS_RAND_ECHO_ELF: &[u8] = &[];
+pub const SYS_RAND_ECHO_ID: [u32; 8] = [0u32; 8];
+pub const SEGMENT_SIZE_STEER_ELF: &[u8] = &[];
+pub const SEGMENT_SIZE_STEER_ID: [u32; 8] = [0u32; 8];
 "#,
         )
         .expect("failed to write method stubs");
@@ -80,7 +84,9 @@ pub const MINIMAL_PROOF_ID: [u32; 8] = [0u32; 8];
     guests.insert("precompile-interleave", opts.clone());
     guests.insert("segment-boundary", opts.clone());
     guests.insert("babybear-stress", opts.clone());
-    guests.insert("minimal-proof", opts);
+    guests.insert("minimal-proof", opts.clone());
+    guests.insert("sys-rand-echo", opts.clone());
+    guests.insert("segment-size-steer", opts);
     risc0_build::embed_methods_with_options(guests);
     // Tell cargo to watch the guest source directories.
     println!(
@@ -136,5 +142,13 @@ pub const MINIMAL_PROOF_ID: [u32; 8] = [0u32; 8];
     println!(
         "cargo:rerun-if-changed={}",
         guest_dir.join("minimal-proof/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("sys-rand-echo/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("segment-size-steer/src/main.rs").display()
     );
 }

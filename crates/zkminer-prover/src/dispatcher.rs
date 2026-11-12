@@ -80,6 +80,30 @@ pub struct ExecuteMeasurement {
     /// How many times the guest read host-supplied nondeterministic input (risc0: `sys_rand` past its
     /// runtime's own draw), `None` = not counted; see `WorkerResponse::ExecuteResult`.
     pub host_entropy_reads: Option<u64>,
+    /// The cycles the guest itself executed, before paging and padding; `None` when the worker has no
+    /// such figure (SP1).
+    pub user_cycles: Option<u64>,
+    /// The keccak proof charges inside `cycles`; `None` as for `user_cycles`.
+    pub keccak_cycles: Option<u64>,
+}
+
+impl ExecuteMeasurement {
+    /// Whether `other`, the same (program, input) at another segment size, ran the same as far as a
+    /// measurement can see: the same journal, the same cycles of the guest's own, the same keccak
+    /// charges and the same random reads. `cycles` is left out on purpose, because padding and paging
+    /// legitimately move it with the size.
+    ///
+    /// Not a proof of one path: a guest can sense the size and keep all of these equal while changing
+    /// only which memory it reads, which moves `cycles` through paging alone. A figure a reader adds up
+    /// must therefore not come from one size on the strength of this check.
+    pub fn same_path(&self, other: &Self) -> bool {
+        self.user_cycles.is_some()
+            && self.user_cycles == other.user_cycles
+            && self.keccak_cycles == other.keccak_cycles
+            && self.host_entropy_reads == other.host_entropy_reads
+            && self.journal_len == other.journal_len
+            && self.journal == other.journal
+    }
 }
 
 /// What a `ProgramId` request derived (see [`WorkerPool::derive_program_id`]).
@@ -1696,6 +1720,15 @@ const SP1_GPU_SERVER_NAME_ENV: &str = "SP1_GPU_SERVER_NAME";
 /// Groth16 component 2.3 GB.
 pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
+/// The default bound on setting an SP1 measure worker up before a sizing request runs on it (see
+/// `set_up_measure_slot`): building the CPU prover its `Execute` and `ProgramId` run on, about 170
+/// CPU-seconds and a 7.4 GB peak (measured at sp1 9a0de74: 38 s with five free cores, 92 s with
+/// two, 160-173 s with one). The setup is the same for every program (no guest has run), so a long
+/// bound opens no lever to a submitter; it only bounds a wedged worker, while a bound below a slow
+/// host's setup would kill every setup there and never measure SP1 at all. `zkminer simulate` turns
+/// this off and sets its workers up itself (`WorkerPool::measure_setup_bound`).
+pub const SP1_MEASURE_SETUP_BOUND: Duration = Duration::from_secs(600);
+
 /// `~/.zkminer/locks`: on disk, owned by the miner, and the same for every worker it starts.
 fn sp1_queue_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".zkminer").join("locks"))
@@ -1715,8 +1748,11 @@ pub struct WorkerPool {
     /// Backends whose one-time setup has completed on this host; see `warm_up`.
     warmed: Mutex<HashSet<String>>,
     /// Measure slot key -> the pid of the worker in it whose setup has run; see
-    /// `warm_measure_worker`. A respawned worker has another pid, so it is set up again.
+    /// `set_up_measure_slot`. A respawned worker has another pid, so it is set up again.
     measure_warm_pids: Mutex<HashMap<String, u32>>,
+    /// The bound on that setup inside a sizing request, or `None` for no setup there; see
+    /// [`Self::measure_setup_bound`].
+    measure_setup_bound: Option<Duration>,
     /// Whether SP1's server proves Groth16 in a helper process, as its warm-up reported. A peak read
     /// from live processes must then add the helper's; see `host_peak_for_slot`.
     sp1_groth16_helper: AtomicBool,
@@ -1785,6 +1821,31 @@ pub struct WorkerPool {
 /// Round-robin counter for load balancing across multiple GPU workers.
 static ROUND_ROBIN: AtomicUsize = AtomicUsize::new(0);
 
+/// Why `WorkerPool::set_up_measure_slot` left a measure worker not set up. `gone`: the worker was
+/// already dead when asked, so nothing was attempted (a request maps that to `MeasureWorkerGone`,
+/// as a failed send of its own would be); otherwise `MeasureSetupFailed`.
+struct MeasureSetupError {
+    gone: bool,
+    message: String,
+}
+
+impl MeasureSetupError {
+    /// The typed error a sizing request on `slot_key` returns for it.
+    fn into_request_error(self, slot_key: &str) -> anyhow::Error {
+        if self.gone {
+            anyhow::Error::new(zkminer_prover_protocol::types::MeasureWorkerGone {
+                slot_key: slot_key.to_string(),
+                message: self.message,
+            })
+        } else {
+            anyhow::Error::new(zkminer_prover_protocol::types::MeasureSetupFailed {
+                slot_key: slot_key.to_string(),
+                message: self.message,
+            })
+        }
+    }
+}
+
 impl WorkerPool {
     /// Create a new pool. Does NOT discover or spawn workers yet.
     /// `benchmark_timeout` sets the per-suite benchmark deadline (None = no timeout).
@@ -1798,6 +1859,7 @@ impl WorkerPool {
             memory_ledger: crate::memory::MemoryLedger::default(),
             warmed: Mutex::new(HashSet::new()),
             measure_warm_pids: Mutex::new(HashMap::new()),
+            measure_setup_bound: Some(SP1_MEASURE_SETUP_BOUND),
             sp1_groth16_helper: AtomicBool::new(false),
             workers: HashMap::new(),
             measure_workers: HashMap::new(),
@@ -1823,6 +1885,16 @@ impl WorkerPool {
     /// its GPU, and so does `zkminer-prove-risc0-cpu`.
     pub fn measure_only(&mut self) {
         self.measure_only = true;
+    }
+
+    /// The bound on setting a measure worker up inside a sizing request (`execute_cycles`,
+    /// `derive_program_id`; see `set_up_measure_slot`), outside the request's own bound. Default
+    /// [`SP1_MEASURE_SETUP_BOUND`]. `None`: a request does not set its worker up, and on a worker
+    /// that is not set up pays the setup inside its own bound; for a caller that sets workers up
+    /// itself (`warm_measure_worker`) and whose request bounds are long enough to hold the setup
+    /// when that fails (`zkminer simulate`: minutes, against the miner's 120 s measure bound).
+    pub fn measure_setup_bound(&mut self, bound: Option<Duration>) {
+        self.measure_setup_bound = bound;
     }
 
     /// Start workers (prove and measure) for these backends only; the others are not spawned at
@@ -1863,18 +1935,21 @@ impl WorkerPool {
                 // index is the PCI-bus rank, which matches how we enumerate them.
                 let _ = pci_bus_id;
                 env.insert("CUDA_DEVICE_ORDER".into(), "PCI_BUS_ID".into());
-                // SP1 execute-memory cap + trace ring, set for EVERY SP1 prove worker INDEPENDENT of
-                // the device-index pin. These MUST equal the measure worker's values, or a guest that
-                // declines at measure would succeed at prove — finding F, and worse as claim-then-fail
-                // (collateral already bonded). `MEMORY_LIMIT` bounds the prove-phase execute CHILD's RSS
-                // exactly as on the measure worker; `TRACE_CHUNK_SLOTS=2` makes the prove /dev/shm trace
-                // ring the SAME ~4 GiB as measure, so equal `MEMORY_LIMIT` leaves equal guest-IMAGE
-                // headroom (asymmetric rings would otherwise pass a mid-size guest at measure and SIGKILL
-                // it at prove) and keeps the prove ring inside a modest /dev/shm. A worker pinned to an
-                // explicit `-cuda` binary has `device_index=None` but still proves on device 0, so this
-                // cannot live inside the `device_index` pin block below. SP1-only (`drives_cuda_…`), so
-                // risc0 and other cuda backends are untouched. A claimed job was measured under this
-                // cap, so its prove-phase execute never trips it — a pure safety backstop, not a limit.
+                // SP1 execute-memory cap + trace rings, set for EVERY SP1 prove worker INDEPENDENT
+                // of the device-index pin. These MUST equal the measure worker's values, or a guest
+                // that declines at measure would succeed at prove — finding F, and worse as
+                // claim-then-fail (collateral already bonded). `MEMORY_LIMIT` bounds the
+                // prove-phase execute CHILD's RSS exactly as on the measure worker;
+                // `GAS_TRACE_CHUNK_SLOTS=2` gives that execute (which `run_proof` runs before
+                // proving) the SAME ~4.4 GiB /dev/shm ring as the measure worker's `Execute`, so
+                // equal `MEMORY_LIMIT` leaves equal guest-IMAGE headroom (asymmetric rings would
+                // otherwise pass a mid-size guest at measure and SIGKILL it at prove).
+                // `TRACE_CHUNK_SLOTS=2` keeps the proving phase's own ring (~0.28 GiB slots) small
+                // inside a modest /dev/shm. A worker pinned to an explicit `-cuda` binary has
+                // `device_index=None` but still proves on device 0, so this cannot live inside the
+                // `device_index` pin block below. SP1-only (`drives_cuda_…`), so risc0 and other
+                // cuda backends are untouched. A claimed job was measured under this cap, so its
+                // prove-phase execute never trips it — a pure safety backstop, not a limit.
                 if crate::discovery::drives_cuda_without_visibility_pin(backend) {
                     env.insert(
                         "MEMORY_LIMIT".into(),
@@ -1883,6 +1958,7 @@ impl WorkerPool {
                         )
                         .to_string(),
                     );
+                    env.insert("GAS_TRACE_CHUNK_SLOTS".into(), "2".into());
                     env.insert("TRACE_CHUNK_SLOTS".into(), "2".into());
                 }
                 if let Some(i) = device_index {
@@ -2027,6 +2103,7 @@ impl WorkerPool {
                 )
                 .to_string(),
             );
+            env.insert("GAS_TRACE_CHUNK_SLOTS".into(), "2".into());
             env.insert("TRACE_CHUNK_SLOTS".into(), "2".into());
             if let Some(i) = device_index {
                 env.insert(
@@ -2390,6 +2467,15 @@ impl WorkerPool {
                     "ZKMINER_RISC0_EXECUTE_MAX_RSS_BYTES".to_string(),
                     risc0_measure_rss.to_string(),
                 );
+                // A guest can see the keccak proof size (`sys_keccak` reports full by it), and the SDK
+                // reads it from the environment. A simulation measures the one run every reader can
+                // reproduce, whatever this host's environment says; a miner keeps its own setting.
+                if self.measure_only {
+                    menv.insert(
+                        zkminer_prover_protocol::sys_rand::RISC0_KECCAK_PO2_ENV.to_string(),
+                        zkminer_prover_protocol::sys_rand::RISC0_CANONICAL_KECCAK_PO2.to_string(),
+                    );
+                }
                 let mkey = format!("{backend}:measure:{i}");
                 let (handle, pid, starttime, failures, last_failure) =
                     match WorkerHandle::spawn(&backend, &path, &menv) {
@@ -2451,26 +2537,31 @@ impl WorkerPool {
         // host-RAM admission on the measure path (added separately) bounds the aggregate.
         if let Some(path) = sp1_measure_path {
             // Layer-B /dev/shm guard (locked #3). The SP1 native executor stages its trace ring and
-            // memory image in /dev/shm; a tmpfs too small to hold even the (now 2-slot, ~4 GiB) ring
-            // makes every measure SIGBUS the instant it is touched — the 64 MiB Docker default being
-            // the usual culprit. On too-small /dev/shm, register an EMPTY measure pool (below) instead
-            // of spawning workers that only SIGBUS-loop: that blocks SP1 claiming cleanly while leaving
-            // the already-registered prove workers up for jobs that were claimed before this point.
-            // Gated to x86-64 Linux, where the native executor exists; the portable executor elsewhere
-            // runs in-process and never touches /dev/shm. An unreadable probe (`None`) does NOT disable
-            // SP1 — spawn and let a real failure speak.
+            // memory image in /dev/shm; a tmpfs too small to hold even the 2-slot (~4.4 GiB) ring
+            // an `Execute` uses makes every measure SIGBUS the instant it is touched — the 64 MiB
+            // Docker default being the usual culprit. On too-small /dev/shm, register an EMPTY
+            // measure pool (below) instead of spawning workers that only SIGBUS-loop: that blocks
+            // SP1 claiming cleanly while leaving the already-registered prove workers up for jobs
+            // that were claimed before this point. Gated to x86-64 Linux, where the native executor
+            // exists; the portable executor elsewhere runs in-process and never touches /dev/shm.
+            // An unreadable probe (`None`) does NOT disable SP1 — spawn and let a real failure
+            // speak.
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             let shm_ok = {
-                // ~4 GiB ring (TRACE_CHUNK_SLOTS=2 × 2 GiB) plus a little image headroom. Below this
-                // the ring cannot even be created and the first execute SIGBUSes.
-                // A measure execute and a concurrent prove execute each stage their own ~5 GiB,
-                // 2-slot trace ring in this SAME tmpfs, so the floor is TWO rings (~10 GiB), not one:
-                // sizing for one ring lets a measure and a prove coexist and overflow /dev/shm →
-                // SIGBUS. (This static floor does NOT cover a misconfigured container that gives a
-                // large `--memory` but a modest `--shm-size`, where the RAM ledger can admit several
-                // concurrent MEASURES the tmpfs still cannot back; a /dev/shm-sized execute semaphore
-                // is the complete fix and is tracked separately.) The ~5 GiB-per-ring figure is
-                // `TRACE_CHUNK_SLOTS=2 × ~2.4 GiB`, both workers pinned to 2 slots.
+                // ~4.4 GiB ring (GAS_TRACE_CHUNK_SLOTS=2 × ~2.2 GiB, the ring every SP1 `Execute`
+                // stages) plus a little image headroom. Below this the ring cannot even be created
+                // and the first execute SIGBUSes. A measure execute and a concurrent prove's
+                // execute phase (`run_proof` executes before it proves) each stage their own such
+                // ring in this SAME tmpfs, so the floor is TWO rings (~10 GiB with headroom), not
+                // one: sizing for one ring lets a measure and a prove coexist and overflow /dev/shm
+                // → SIGBUS. (This static floor does NOT cover a misconfigured container that gives
+                // a large `--memory` but a modest `--shm-size`, where the RAM ledger can admit
+                // several concurrent MEASURES the tmpfs still cannot back; a /dev/shm-sized execute
+                // semaphore is the complete fix and is tracked separately.) The per-ring figure is
+                // `GAS_TRACE_CHUNK_SLOTS=2 × ~2.2 GiB` (sp1 9a0de74,
+                // `DEFAULT_GAS_TRACE_CHUNK_SLOTS`), both workers pinned to 2 slots. The proving
+                // phase's own ring is smaller (`TRACE_CHUNK_SLOTS` × ~0.28 GiB) and follows the
+                // execute, so it adds nothing here.
                 // Floor below which /dev/shm is too small to stage even the executor's irreducible
                 // working set (anon floor + a 2-slot trace ring), so the H3 cap clamp would drive
                 // `MEMORY_LIMIT` below what any measure needs and every measure would fail. Above this,
@@ -2534,12 +2625,16 @@ impl WorkerPool {
                     "1".to_string(),
                 );
                 // Layer-B ring cap (locked #3). Pin the native executor's /dev/shm trace ring to 2
-                // slots (~4 GiB) on the measure worker instead of SP1's default 5 (~10 GiB), which
-                // alone nearly fills a typical half-of-RAM tmpfs and leaves a hostile guest little
-                // room to drive the image balloon into a SIGBUS. Applied last by `WorkerHandle::spawn`
-                // (overrides any inherited value) and carried in `spawn_env` across respawns. Inert on
-                // the portable executor.
-                menv.insert("TRACE_CHUNK_SLOTS".to_string(), "2".to_string());
+                // slots (~4.4 GiB) on the measure worker. An `Execute` stages the gas-estimation
+                // ring, sized by `GAS_TRACE_CHUNK_SLOTS` (slots of ~2.2 GiB; sp1 9a0de74
+                // `execute.rs`), not `TRACE_CHUNK_SLOTS`, which sizes only the proving phase's ring
+                // and is inert here (measured: at 1 and at 8 slots every Execute reported the
+                // same). 2 is SP1's default; pinning it means an inherited value cannot grow the
+                // ring past the /dev/shm floor above, and it equals the prove workers' pin
+                // (`gpu_env`), so a guest measures in the ring its prove-phase execute will have.
+                // Applied last by `WorkerHandle::spawn` (overrides any inherited value) and carried
+                // in `spawn_env` across respawns. Inert on the portable executor.
+                menv.insert("GAS_TRACE_CHUNK_SLOTS".to_string(), "2".to_string());
                 // Layer-A enforced cap (locked #1/#2). SP1 reads `MEMORY_LIMIT` (bytes) and SIGKILLs the
                 // guest at that RSS via a 100 ms monitor, surfacing an in-band `TooMuchMemory` — the
                 // IMAGE balloon that is the real SIGBUS/OOM driver is bounded HERE. Explicit and
@@ -2681,16 +2776,17 @@ impl WorkerPool {
     }
 
     /// Runs the one-time setup of the measure worker `backend`'s next request will run on, now,
-    /// outside any request's watchdog, unless that worker has run it since it was (re)spawned:
-    /// for SP1, building the CPU prover its `Execute` and `ProgramId` run on (~15 s, and the memory it
-    /// then keeps). Without it the first request after each spawn pays that inside its own bound, so
-    /// a tight bound fails every request (each kill respawns a cold worker). The worker is the one
-    /// `measure_slot` picks: the first live one, else the first it would revive, revived (or
+    /// unless that worker has run it since it was (re)spawned: for SP1, building the CPU prover its
+    /// `Execute` and `ProgramId` run on (see [`SP1_MEASURE_SETUP_BOUND`] for what that costs),
+    /// outside any request's watchdog. A miner's sizing request sets its own worker up first anyway
+    /// (`set_up_measure_slot`); a pool with that off (`measure_setup_bound(None)`) relies on this,
+    /// or its first request after each spawn pays the setup inside its own bound. The worker is the
+    /// one `measure_slot` picks: the first live one, else the first it would revive, revived (or
     /// respawned, if it died idle) here. Only that one, so an idle second worker never holds a CPU
     /// prover it does not use. Charged to the host-RAM ledger as a measurement is, and bounded by
     /// `timeout` (a watchdog kill). Only SP1 has such a setup (risc0: true while one runs). For
-    /// `zkminer simulate`, which calls it before its READY line and before each SP1 request; the
-    /// miner keeps its SP1 measure worker lazy. Whether that worker is now set up.
+    /// `zkminer simulate`, which calls it before its READY line and before each SP1 request.
+    /// Whether that worker is now set up.
     pub fn warm_measure_worker(&self, backend: &str, timeout: Duration) -> bool {
         if backend != zkminer_prover_protocol::BACKEND_SP1 {
             return self.measure_workers_live(backend) > 0;
@@ -2726,13 +2822,7 @@ impl WorkerPool {
             return false;
         };
         entry.publish_pid(pid);
-        let warmed_pid = self
-            .measure_warm_pids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .copied();
-        if warmed_pid == Some(pid) {
+        if self.measure_slot_set_up(&key, pid) {
             return true;
         }
         let total = crate::memory::mem_total_bytes().unwrap_or(u64::MAX);
@@ -2741,23 +2831,73 @@ impl WorkerPool {
             tracing::debug!("{key}: no host memory to set it up in now; its first request will");
             return false;
         };
+        self.set_up_measure_slot(&key, &mut slot, entry, timeout, None)
+            .is_ok()
+    }
+
+    /// Whether the worker `pid` in measure slot `key` has run its setup (`set_up_measure_slot`).
+    fn measure_slot_set_up(&self, key: &str, pid: u32) -> bool {
+        self.measure_warm_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            == Some(&pid)
+    }
+
+    /// Runs the one-time setup of the SP1 measure worker in `slot` (`WorkerCommand::Warmup`, which
+    /// a measure-only SP1 worker answers by building its CPU prover), unless it has run since the
+    /// worker was (re)spawned; bounded by `timeout`, a watchdog kill. Without it the first request
+    /// after each spawn pays the setup inside its own bound, and on a host with one or two free
+    /// cores that is longer than the miner's 120 s measure bound: every first measurement timed
+    /// out, struck an honest job, and respawned a cold worker for the next one to fail on the same
+    /// way.
+    ///
+    /// The caller holds the slot and has charged the host memory the setup needs (a measurement's
+    /// charge covers it). On failure the slot is cleared if the worker died: `mark_slot_dead` when
+    /// the bound killed it (the setup's length is the host's, not the slot's ill-health) or a
+    /// claimed proof preempted it (`preempted`, the request's flag when it is registered as
+    /// preemptible), and `mark_slot_failed` when it died otherwise; the error says whether the
+    /// worker was already gone when asked.
+    fn set_up_measure_slot(
+        &self,
+        key: &str,
+        slot: &mut WorkerSlot,
+        entry: &WorkerEntry,
+        timeout: Duration,
+        preempted: Option<&AtomicBool>,
+    ) -> Result<(), MeasureSetupError> {
+        let Some(pid) = slot.handle.as_ref().map(|h| h.pid()) else {
+            return Err(MeasureSetupError {
+                gone: true,
+                message: "no live worker".to_string(),
+            });
+        };
+        if self.measure_slot_set_up(key, pid) {
+            return Ok(());
+        }
         static MEASURE_WARMUP_REQUEST: AtomicU64 = AtomicU64::new(1);
         // Disjoint from the other request ids (execute ids set the top bit, program-id ones the next).
         let request_id =
             MEASURE_WARMUP_REQUEST.fetch_add(1, Ordering::Relaxed) | 0x2000_0000_0000_0000;
         entry.intentional_kill.store(false, Ordering::Release);
         let Some(handle) = slot.handle.as_mut() else {
-            return false;
+            return Err(MeasureSetupError {
+                gone: true,
+                message: "no live worker".to_string(),
+            });
         };
-        if handle.send(&WorkerCommand::Warmup { request_id }).is_err() {
-            Self::mark_slot_dead(&mut slot, entry);
-            return false;
+        if let Err(e) = handle.send(&WorkerCommand::Warmup { request_id }) {
+            Self::mark_slot_dead(slot, entry);
+            return Err(MeasureSetupError {
+                gone: true,
+                message: format!("{e:#}"),
+            });
         }
         let watchdog = ProvingWatchdog::new(
             entry.pid.clone(),
             entry.pid_starttime.clone(),
             timeout,
-            key.clone(),
+            key.to_string(),
             entry.intentional_kill.clone(),
         );
         let response = handle.recv();
@@ -2768,21 +2908,32 @@ impl WorkerPool {
                 self.measure_warm_pids
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(key, pid);
-                true
+                    .insert(key.to_string(), pid);
+                Ok(())
             }
             Ok(other) => {
                 tracing::warn!("{key}: its set-up answered {other:?}");
-                false
+                Err(MeasureSetupError {
+                    gone: false,
+                    message: "the worker refused to set up".to_string(),
+                })
             }
             Err(e) => {
-                tracing::warn!("{key} died setting up: {e:#}");
-                if entry.intentional_kill.load(Ordering::Acquire) {
-                    Self::mark_slot_dead(&mut slot, entry);
+                let message = if preempted.is_some_and(|p| p.load(Ordering::Acquire)) {
+                    Self::mark_slot_dead(slot, entry);
+                    "killed to free its memory for a claimed proof".to_string()
+                } else if entry.intentional_kill.load(Ordering::Acquire) {
+                    Self::mark_slot_dead(slot, entry);
+                    format!("not set up within {} s", timeout.as_secs())
                 } else {
-                    Self::mark_slot_failed(&mut slot, entry);
-                }
-                false
+                    Self::mark_slot_failed(slot, entry);
+                    format!("died setting up: {e:#}")
+                };
+                tracing::warn!("{key}: {message}");
+                Err(MeasureSetupError {
+                    gone: false,
+                    message,
+                })
             }
         }
     }
@@ -4248,10 +4399,9 @@ impl WorkerPool {
         // A free measure slot (see `measure_slot`): typed `MeasureSlotsBusy` when none is.
         let (key, entry, mut slot) = self.measure_slot(backend)?;
         let key = key.as_str();
-        let handle = slot
-            .handle
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("worker '{key}' has no live handle"))?;
+        if slot.handle.is_none() {
+            anyhow::bail!("worker '{key}' has no live handle");
+        }
 
         static EXEC_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request_id =
@@ -4411,6 +4561,31 @@ impl WorkerPool {
             }
         };
 
+        // SP1's measure worker builds its CPU prover once per spawn: here, under its own bound,
+        // before this request's watchdog starts (see `set_up_measure_slot`). Inside the preemptible
+        // window, so a claimed proof that needs this memory can still kill it. A setup that fails
+        // says nothing about the program: typed transients only, never a strike.
+        if let Some(bound) = self
+            .measure_setup_bound
+            .filter(|_| backend == zkminer_prover_protocol::BACKEND_SP1)
+            .filter(|_| self.measure_workers.contains_key(backend))
+        {
+            if let Err(e) = self.set_up_measure_slot(key, &mut slot, entry, bound, Some(&preempt)) {
+                if preempt.load(Ordering::Acquire) {
+                    return Err(anyhow::Error::new(
+                        zkminer_prover_protocol::types::MeasurePreempted {
+                            slot_key: key.to_string(),
+                        },
+                    ));
+                }
+                return Err(e.into_request_error(key));
+            }
+            // The setup's watchdog is gone; this request's own starts below.
+            entry.intentional_kill.store(false, Ordering::Release);
+        }
+        let Some(handle) = slot.handle.as_mut() else {
+            anyhow::bail!("worker '{key}' has no live handle");
+        };
         if let Err(e) = handle.send(&WorkerCommand::Execute {
             request_id,
             elf: elf.to_vec(),
@@ -4537,6 +4712,8 @@ impl WorkerPool {
                 peak_host_bytes,
                 journal,
                 host_entropy_reads,
+                user_cycles,
+                keccak_cycles,
                 ..
             } => {
                 tracing::debug!(
@@ -4568,6 +4745,8 @@ impl WorkerPool {
                     peak_host_bytes,
                     duration_secs,
                     host_entropy_reads,
+                    user_cycles,
+                    keccak_cycles,
                 })
             }
             WorkerResponse::Error { message, .. } => {
@@ -4601,10 +4780,9 @@ impl WorkerPool {
     ) -> anyhow::Result<ProgramIdDerivation> {
         let (key, entry, mut slot) = self.measure_slot(backend)?;
         let key = key.as_str();
-        let handle = slot
-            .handle
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("worker '{key}' has no live handle"))?;
+        if slot.handle.is_none() {
+            anyhow::bail!("worker '{key}' has no live handle");
+        }
 
         static PROGRAM_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
         // Disjoint from prove ids and from execute ids (which set the top bit).
@@ -4639,6 +4817,20 @@ impl WorkerPool {
             None
         };
 
+        // The setup the derivation runs on, first and under its own bound, as in `execute_cycles`.
+        if let Some(bound) = self
+            .measure_setup_bound
+            .filter(|_| backend == zkminer_prover_protocol::BACKEND_SP1)
+            .filter(|_| self.measure_workers.contains_key(backend))
+        {
+            if let Err(e) = self.set_up_measure_slot(key, &mut slot, entry, bound, None) {
+                return Err(e.into_request_error(key));
+            }
+            entry.intentional_kill.store(false, Ordering::Release);
+        }
+        let Some(handle) = slot.handle.as_mut() else {
+            anyhow::bail!("worker '{key}' has no live handle");
+        };
         if let Err(e) = handle.send(&WorkerCommand::ProgramId {
             request_id,
             elf: elf.to_vec(),

@@ -436,6 +436,147 @@ fn export(worker: &Path, name: &str, dir: &Path) -> (Vec<u8>, [u8; 32]) {
     )
 }
 
+/// What the `sys-rand-echo` guest must commit under the public rule: everything from public data.
+fn echo_journal_by_the_rule(image_id: &[u8; 32], input: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let seed: [u8; 32] = Sha256::new()
+        .chain_update(zkminer_prover_protocol::sys_rand::SYS_RAND_DOMAIN)
+        .chain_update(image_id)
+        .chain_update(Sha256::digest(input))
+        .finalize()
+        .into();
+    let block = |i: u64| {
+        Sha256::new()
+            .chain_update(b"risc0-zkvm/sys_rand/v1")
+            .chain_update(seed)
+            .chain_update(i.to_le_bytes())
+            .finalize()
+    };
+    let stream: Vec<u8> = (0..2).flat_map(|i| block(i).to_vec()).collect();
+    // The guest's runtime takes the first 16 bytes before `main`.
+    stream[16..48].to_vec()
+}
+
+/// A guest that commits its `sys_rand` bytes: the journal is exactly what the public rule predicts,
+/// in separate worker processes and at different segment sizes. This is what a change to the seed
+/// function, the input it hashes, the image id's byte order or the fork's stream would break.
+#[test]
+#[ignore = "needs ZKMINER_TEST_RISC0_WORKER"]
+fn the_risc0_worker_seeds_a_guest_by_the_public_rule_in_every_process() {
+    let worker = PathBuf::from(
+        std::env::var("ZKMINER_TEST_RISC0_WORKER").expect("ZKMINER_TEST_RISC0_WORKER"),
+    );
+    let dir = temp_dir("sys-rand-rule");
+    let (echo, echo_id) = export(&worker, "sys-rand-echo", &dir);
+    let input = b"zkminer".to_vec();
+    let want = echo_journal_by_the_rule(&echo_id, &input);
+    for po2 in [18u8, 20] {
+        let pool = real_pool("risc0", worker.clone());
+        let m = pool
+            .execute_cycles(
+                "risc0",
+                &echo,
+                &input,
+                Some(Duration::from_secs(120)),
+                Some(echo_id),
+                Some(po2),
+            )
+            .expect("execute");
+        assert_eq!(
+            m.journal.as_deref(),
+            Some(&want[..]),
+            "the bytes the rule predicts, at po2 {po2}"
+        );
+        assert_eq!(m.host_entropy_reads, Some(1), "its one draw is counted");
+        pool.shutdown_all();
+    }
+    // Another input is another seed.
+    let pool = real_pool("risc0", worker);
+    let other = pool
+        .execute_cycles(
+            "risc0",
+            &echo,
+            b"zkminer!",
+            Some(Duration::from_secs(120)),
+            Some(echo_id),
+            Some(20),
+        )
+        .expect("execute");
+    assert_ne!(other.journal.as_deref(), Some(&want[..]));
+    assert_eq!(
+        other.journal.as_deref(),
+        Some(&echo_journal_by_the_rule(&echo_id, b"zkminer!")[..])
+    );
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `same_path` against the real worker: a plain guest runs the same at every size, in the guest's own
+/// cycles, though its padded count moves; one that reads the size does not.
+#[test]
+#[ignore = "needs ZKMINER_TEST_RISC0_WORKER"]
+fn the_risc0_worker_shows_which_guests_steer_on_the_segment_size() {
+    let worker = PathBuf::from(
+        std::env::var("ZKMINER_TEST_RISC0_WORKER").expect("ZKMINER_TEST_RISC0_WORKER"),
+    );
+    let dir = temp_dir("segment-size");
+    let (fib, fib_id) = export(&worker, "fibonacci", &dir);
+    let (steer, steer_id) = export(&worker, "segment-size-steer", &dir);
+    let pool = real_pool("risc0", worker);
+    let at = |elf: &[u8], id: [u8; 32], input: &[u8], po2: u8| {
+        pool.execute_cycles("risc0", elf, input, Some(Duration::from_secs(300)), Some(id), Some(po2))
+            .expect("execute")
+    };
+    let input = 10u32.to_le_bytes();
+    let base = at(&fib, fib_id, &input, 20);
+    assert!(base.user_cycles.is_some_and(|c| c > 0));
+    assert_eq!(base.keccak_cycles, Some(0));
+    for po2 in [16u8, 18, 22] {
+        assert!(base.same_path(&at(&fib, fib_id, &input, po2)), "fibonacci at po2 {po2}");
+    }
+    let at20 = at(&steer, steer_id, &[], 20);
+    let at19 = at(&steer, steer_id, &[], 19);
+    assert_eq!(at20.journal, at19.journal, "one journal, so the journal alone cannot tell");
+    assert_eq!(at20.host_entropy_reads, Some(0), "and it reads no randomness");
+    assert!(!at20.same_path(&at19), "its own cycles differ");
+    assert!(at20.cycles > at19.cycles * 4, "{} against {}", at20.cycles, at19.cycles);
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The keccak proof size is a host setting a guest can see, so a simulation fixes it: every measure
+/// worker gets the SDK's default whatever this host's environment says.
+#[test]
+fn a_measure_only_pool_pins_the_keccak_size_a_guest_can_see() {
+    use zkminer_prover_protocol::sys_rand::{RISC0_CANONICAL_KECCAK_PO2, RISC0_KECCAK_PO2_ENV};
+    let dir = temp_dir("keccak-pin");
+    let log = dir.join("env.log");
+    let path = dir.join("risc0-logs-env");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nenv >> {}\nexec env MOCK_BACKEND=risc0 {}\n",
+            log.display(),
+            mock_worker_path().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var(RISC0_KECCAK_PO2_ENV, "15");
+    let (pool, _) = measure_only_pool(HashMap::from([("risc0".to_string(), path)]));
+    std::env::remove_var(RISC0_KECCAK_PO2_ENV);
+    assert!(pool.measure_workers_live("risc0") > 0);
+    let seen = std::fs::read_to_string(&log).unwrap();
+    let want = format!("{RISC0_KECCAK_PO2_ENV}={RISC0_CANONICAL_KECCAK_PO2}");
+    assert!(seen.lines().any(|l| l == want), "pinned: {seen}");
+    assert!(
+        !seen.lines().any(|l| l == format!("{RISC0_KECCAK_PO2_ENV}=15")),
+        "not the host's"
+    );
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn real_pool(backend: &str, worker: PathBuf) -> WorkerPool {
     let (pool, connected) = measure_only_pool(HashMap::from([(backend.to_string(), worker)]));
     assert!(connected.is_empty());
@@ -455,14 +596,12 @@ fn the_risc0_worker_derives_its_guests_image_id_and_measures_it() {
     let dir = temp_dir("risc0-real");
     // The risc0 worker exports its fibonacci guest only.
     let (fib, fib_id) = export(&worker, "fibonacci", &dir);
-    // As `zkminer simulate` runs it under the indexer's unit: a HOME it cannot write (so no key file
-    // can be read or made there) and a `sys_rand` key for this run only, passed as not ephemeral. The
-    // worker must still return the journal, or every binding reads `unchecked`.
+    // As `zkminer simulate` runs it under the indexer's unit: a HOME it cannot write. The worker must
+    // still return the journal, or every binding reads `unchecked`.
     let home = dir.join("read-only-home");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
     std::env::set_var("HOME", &home);
-    zkminer_prover::worker::set_risc0_sys_rand_key([0x5a; 32], false);
     let pool = real_pool("risc0", worker);
     let d = pool
         .derive_program_id("risc0", &fib, Some(Duration::from_secs(60)))
@@ -500,7 +639,7 @@ fn the_risc0_worker_derives_its_guests_image_id_and_measures_it() {
     assert_eq!(
         m.journal.as_deref(),
         Some(&55u64.to_le_bytes()[..]),
-        "fibonacci(10) = 55, returned under the per-run key"
+        "fibonacci(10) = 55"
     );
     // It reads no host entropy past its runtime's own draw; and this build's count works (else None).
     assert_eq!(m.host_entropy_reads, Some(0));
@@ -539,6 +678,225 @@ fn the_sp1_worker_derives_its_guests_vkey_on_the_cpu() {
         )
         .expect("execute");
     assert!(m.cycles > 0);
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The pids that set up, one line per `Warmup` the mock answered (`MOCK_WARMUP_LOG`).
+fn warmups(log: &Path) -> Vec<u32> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect()
+}
+
+/// `measure_only_pool`, with `bound` on a request's measure-worker setup.
+fn measure_only_pool_bounded(binaries: HashMap<String, PathBuf>, bound: Duration) -> WorkerPool {
+    let mut pool = WorkerPool::new(binaries, Vec::new(), None);
+    pool.only_backends(["sp1"]);
+    pool.measure_only();
+    pool.measure_setup_bound(Some(bound));
+    pool.discover_and_spawn();
+    pool
+}
+
+/// SP1's measure worker pays a one-time setup on first use (its CPU prover; minutes on a host with
+/// one free core). A request sets its worker up FIRST, under the setup bound, so the request's own
+/// bound covers only the request: here a 4 s setup and a 2 s bound, which timed every first
+/// measurement out when the setup ran inside it. Once per spawn: a respawned worker is set up again
+/// by the request that revives it.
+#[test]
+fn a_request_sets_its_sp1_measure_worker_up_outside_its_own_bound() {
+    let dir = temp_dir("lazy-setup");
+    let log = dir.join("warmups");
+    let log_s = log.display().to_string();
+    let binaries = HashMap::from([(
+        "sp1".to_string(),
+        wrapper(
+            &dir,
+            "sp1",
+            &[("MOCK_SETUP_SECS", "4"), ("MOCK_WARMUP_LOG", &log_s)],
+        ),
+    )]);
+    let pool = measure_only_pool_bounded(binaries, Duration::from_secs(60));
+    if !pool.measure_worker_count("sp1").is_some_and(|n| n > 0) {
+        // This host's /dev/shm is too small for an SP1 measure pool (see the first test).
+        pool.shutdown_all();
+        return;
+    }
+    let bound = Some(Duration::from_secs(2));
+    let execute = || pool.execute_cycles("sp1", b"elf", &[], bound, None, None);
+
+    execute().expect("the setup is not inside the request's bound");
+    assert_eq!(warmups(&log).len(), 1, "set up once");
+    execute().expect("a set-up worker measures");
+    assert_eq!(warmups(&log).len(), 1, "and not again for the same worker");
+    pool.derive_program_id("sp1", b"elf", bound)
+        .expect("a derivation runs on the same set-up worker");
+    assert_eq!(warmups(&log).len(), 1);
+
+    // Every worker dies idle. The requests that find one gone say so (typed, nothing ran) until one
+    // revives a worker, which it sets up before measuring, again outside its bound.
+    let first = warmups(&log)[0];
+    for i in 0..pool.measure_worker_count("sp1").unwrap() {
+        let (live, pid, _) = pool.test_measure_slot_state("sp1", i).unwrap();
+        if live && pid != 0 {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+            wait_exited(pid);
+        }
+    }
+    let mut measured = false;
+    for _ in 0..10 {
+        match execute() {
+            Ok(_) => {
+                measured = true;
+                break;
+            }
+            Err(e) => {
+                assert!(
+                    e.downcast_ref::<zkminer_prover_protocol::types::MeasureWorkerGone>()
+                        .is_some()
+                        || e.downcast_ref::<zkminer_prover_protocol::types::MeasureSlotsBusy>()
+                            .is_some(),
+                    "only a typed 'nothing ran': {e:#}"
+                );
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+    assert!(measured, "a revived worker measures");
+    let set_up = warmups(&log);
+    assert_eq!(set_up.len(), 2, "the revived worker was set up: {set_up:?}");
+    assert_ne!(set_up[1], first, "by its own process");
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A derivation sets a cold worker up first, outside its own bound, as an execution does.
+#[test]
+fn a_derivation_sets_its_sp1_measure_worker_up_outside_its_own_bound() {
+    let dir = temp_dir("lazy-setup-derive");
+    let binaries = HashMap::from([(
+        "sp1".to_string(),
+        wrapper(&dir, "sp1", &[("MOCK_SETUP_SECS", "4")]),
+    )]);
+    let pool = measure_only_pool_bounded(binaries, Duration::from_secs(60));
+    if !pool.measure_worker_count("sp1").is_some_and(|n| n > 0) {
+        pool.shutdown_all();
+        return;
+    }
+    let d = pool
+        .derive_program_id("sp1", b"elf", Some(Duration::from_secs(2)))
+        .expect("the setup is not inside the derivation's bound");
+    assert_eq!(d.program_id, keccak256(b"elf").0);
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A setup past its bound is killed and fails the request as the typed transient
+/// `MeasureSetupFailed`: no guest ran, so it is neither a wall-clock timeout (which strikes the
+/// job) nor scored against the slot.
+#[test]
+fn a_setup_past_its_bound_fails_the_request_as_a_typed_transient() {
+    let dir = temp_dir("setup-hang");
+    let binaries = HashMap::from([(
+        "sp1".to_string(),
+        wrapper(&dir, "sp1", &[("MOCK_HANG_ON", "warmup")]),
+    )]);
+    let pool = measure_only_pool_bounded(binaries, Duration::from_secs(2));
+    if !pool.measure_worker_count("sp1").is_some_and(|n| n > 0) {
+        pool.shutdown_all();
+        return;
+    }
+    let started = std::time::Instant::now();
+    let e = pool
+        .execute_cycles(
+            "sp1",
+            b"elf",
+            &[],
+            Some(Duration::from_secs(60)),
+            None,
+            None,
+        )
+        .expect_err("the setup never finishes");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "bounded by the setup bound"
+    );
+    assert!(
+        e.downcast_ref::<zkminer_prover_protocol::types::MeasureSetupFailed>()
+            .is_some(),
+        "typed: {e:#}"
+    );
+    assert!(
+        e.downcast_ref::<MeasureWallClockTimeout>().is_none(),
+        "{e:#}"
+    );
+    let (live, _, failures) = pool.test_measure_slot_state("sp1", 0).unwrap();
+    assert!(!live, "the setup's watchdog killed it");
+    assert_eq!(
+        failures, 0,
+        "its own bound's kill is not scored against the slot"
+    );
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A claimed proof may preempt a measurement while its worker is still being set up: the request is
+/// the typed `MeasurePreempted` (no strike), and the kill is not scored against the slot.
+#[test]
+fn a_setup_preempted_by_a_claimed_proof_is_a_preemption() {
+    let dir = temp_dir("setup-preempt");
+    let log = dir.join("warmups");
+    let log_s = log.display().to_string();
+    let binaries = HashMap::from([(
+        "sp1".to_string(),
+        wrapper(
+            &dir,
+            "sp1",
+            &[("MOCK_HANG_ON", "warmup"), ("MOCK_WARMUP_LOG", &log_s)],
+        ),
+    )]);
+    let pool = std::sync::Arc::new(measure_only_pool_bounded(binaries, Duration::from_secs(60)));
+    if !pool.measure_worker_count("sp1").is_some_and(|n| n > 0) {
+        pool.shutdown_all();
+        return;
+    }
+    let measurer = {
+        let pool = std::sync::Arc::clone(&pool);
+        std::thread::spawn(move || {
+            pool.execute_cycles(
+                "sp1",
+                b"elf",
+                &[],
+                Some(Duration::from_secs(60)),
+                None,
+                None,
+            )
+        })
+    };
+    // The mock logs the Warmup before it hangs in it.
+    let started = std::time::Instant::now();
+    while warmups(&log).is_empty() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the setup never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    pool.test_preempt_all_inflight_measures();
+    let e = measurer.join().unwrap().expect_err("it was preempted");
+    assert!(
+        e.downcast_ref::<zkminer_prover_protocol::types::MeasurePreempted>()
+            .is_some(),
+        "{e:#}"
+    );
+    let (live, _, failures) = pool.test_measure_slot_state("sp1", 0).unwrap();
+    assert!(!live, "the preemption killed it");
+    assert_eq!(failures, 0, "a preemption is not scored against the slot");
     pool.shutdown_all();
     let _ = std::fs::remove_dir_all(&dir);
 }

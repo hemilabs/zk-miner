@@ -42,10 +42,8 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 bincode = "1"
 libc = "0.2"
-# The host key and per-(ELF, input) seed for the guest's `sys_rand`: see `sys_rand_seed`.
+# `dirs`: the risc0-groth16 component's install path. `sha2`: the guest's `sys_rand` seed (`sys_rand_seed`).
 dirs = { workspace = true }
-getrandom = "0.3"
-hmac = "0.12"
 sha2 = "0.10"
 risc0-zkvm = { version = "3.0", default-features = false, features = ["prove"] }
 # Directly, to check a measured guest's keccak proof requests as the prover will (`KeccakAudit`).
@@ -74,6 +72,8 @@ methods = [
     "../zkminer-prover/guests/risc0/segment-boundary",
     "../zkminer-prover/guests/risc0/babybear-stress",
     "../zkminer-prover/guests/risc0/minimal-proof",
+    "../zkminer-prover/guests/risc0/sys-rand-echo",
+    "../zkminer-prover/guests/risc0/segment-size-steer",
 ]
 
 [dev-dependencies]

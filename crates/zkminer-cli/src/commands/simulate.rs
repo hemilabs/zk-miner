@@ -19,17 +19,20 @@
 //!    (`WorkerPool::derive_program_id`): the risc0 image id, or the SP1 verifying-key hash. SP1's
 //!    takes minutes of CPU, so it is cached per ELF on disk. A measurement of an ELF that is not the
 //!    job's program says nothing about the job, so it is never reported;
-//! 5. one `Execute` on a dedicated measure worker (`WorkerPool::execute_cycles`, with its watchdog
-//!    and host-RAM ledger), at the segment size given (risc0), on the input its prover ran: the
+//! 5. `Execute` on a dedicated measure worker (`WorkerPool::execute_cycles`, with its watchdog
+//!    and host-RAM ledger), at every segment size a miner can prove at (risc0; once at `--po2` for a
+//!    `singleRun` request, and once for SP1), on the input its prover ran: the
 //!    job's `inputData`, after `abi.encode(jobId, prover)` for a journal-prefix job (risc0 only);
 //! 6. the measured journal against the job's binding, and against the fulfil's `publicValues` when
-//!    the request carries them (`proven`), and whether the guest read host entropy (`hostInput`).
-//!    These catch an honest mismatch and a nondeterministic guest. They do not bind the run to the
-//!    proven one: the chain never checks the input, so a requester who is also the prover can
+//!    the request carries them (`proven`), and how often the guest read `sys_rand` (`hostInputReads`).
+//!    These catch an honest mismatch and a run nothing could be counted for. They do not bind the
+//!    run to the proven one: the chain never checks the input, so a requester who is also the prover can
 //!    prove another input with the same journal, and choose a count up to `--max-cycles`.
 //!
-//! risc0 guests' `sys_rand` is seeded from a key of this run's own (never `~/.zkminer`'s, which is
-//! neither read nor created), and the journal comes back for it: here it backs no proof.
+//! risc0 guests' `sys_rand` is seeded by the public rule zkminer's proofs use from protocol 12
+//! (`zkminer_prover_protocol::sys_rand`), so this run takes the path such a proof took, up to the
+//! segment size: the count is the cost of that run at the size the report names. A prover on other software, or a job
+//! proven before the rule, was seeded otherwise; the proof does not bind it.
 //!
 //! A program whose ELF did not bind (refused, another id, a derivation past its bound, or a worker
 //! that died deriving it), or could not be fetched, is remembered on disk (`<cache-dir>/program-
@@ -46,7 +49,7 @@
 //!
 //! In `--stdin` mode a READY line comes first, once the measure workers run (an SP1 one with its CPU
 //! prover built) and before any request is read:
-//! `{"schema":1,"ready":true,"backends":[…],"zkminerVersion":"…","protocolVersion":…}`.
+//! `{"schema":1,"ready":true,"backends":[…],"zkminerVersion":"…","protocolVersion":…,"sysRandRule":"…"}`.
 //!
 //! The pool starts measure workers only (`WorkerPool::measure_only`): no prove worker, no GPU
 //! context, no `sp1-gpu-server`. A host with no GPU names `zkminer-prove-risc0-cpu` (and an SP1
@@ -115,8 +118,10 @@ pub const FETCH_FAILURE_TTL: Duration = Duration::from_secs(15 * 60);
 /// each is well under a second.
 pub const RPC_READ_BUDGET: Duration = Duration::from_secs(30);
 
-/// The bound on setting an SP1 measure worker up (building its CPU prover, ~15 s), outside any
-/// request's own bound: before READY, and before an SP1 request whose worker was respawned.
+/// The bound on setting an SP1 measure worker up (building its CPU prover: about 170 CPU-seconds,
+/// so 38 s with five free cores and nearly three minutes with one), outside any request's own
+/// bound: before READY, and before an SP1 request whose worker was respawned. A setup past it is
+/// stopped, and the request's derivation or execution then builds the prover within its own bound.
 pub const SP1_SETUP_BOUND: Duration = Duration::from_secs(120);
 
 /// The least `--execute-timeout-secs` and `--program-id-timeout-secs` (a lower value is raised to
@@ -167,7 +172,21 @@ pub struct Request {
     /// The fulfil's on-chain `publicValues`, which the measured journal is compared with
     /// (`proven`).
     pub public_values: Option<Vec<u8>>,
+    /// Measure a risc0 job at `--po2` only: the caller trusts this program not to steer on the segment
+    /// size. Otherwise every size a miner can prove at is run (see [`SIZE_CHECK_SAME`]).
+    pub single_run: bool,
 }
+
+/// `sizeCheck` on a risc0 report: every segment size a miner can prove at gave the same journal, guest
+/// cycles, keccak charges and random reads. The figure is then the LOWEST of them, not the `--po2` one:
+/// a guest can sense the size and keep all of those equal while reading more memory at one size, which
+/// inflates that size's count through paging alone. A miner paid at least the lowest figure at whichever
+/// size it proved at, so no size can be inflated past what a proof cost.
+const SIZE_CHECK_SAME: &str = "same";
+/// `sizeCheck`: some size ran differently. The guest steers on the size, so no count is evidence.
+const SIZE_CHECK_DIFFERS: &str = "differs";
+/// `sizeCheck`: the request asked for one run (`singleRun`).
+const SIZE_CHECK_SKIPPED: &str = "skipped";
 
 /// Parse one stdin line: a bare `0x…` job id, or
 /// `{"jobId": "0x…", "submitTx": "0x…", "publicValues": "0x…"}` (both optional; any other field is
@@ -184,6 +203,8 @@ pub fn parse_request(line: &str) -> Result<Request> {
             submit_tx: Option<B256>,
             #[serde(default)]
             public_values: Option<String>,
+            #[serde(default)]
+            single_run: bool,
         }
         let j: Json = serde_json::from_str(line).context("not a simulate request")?;
         Ok(Request {
@@ -194,12 +215,14 @@ pub fn parse_request(line: &str) -> Result<Request> {
                 .as_deref()
                 .map(parse_public_values)
                 .transpose()?,
+            single_run: j.single_run,
         })
     } else {
         Ok(Request {
             job_id: line.parse().context("not a 32-byte job id")?,
             submit_tx: None,
             public_values: None,
+            single_run: false,
         })
     }
 }
@@ -309,7 +332,7 @@ pub struct Report {
     /// precompile counts once). Not one unit: never add the two. At most `--max-cycles`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cycles: Option<String>,
-    /// The risc0 segment size measured at; absent for SP1.
+    /// The risc0 segment size `cycles` is at (the lowest of the seven, when all were run); absent for SP1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub po2: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -323,8 +346,7 @@ pub struct Report {
     pub journal_hash: Option<B256>,
     /// The job's journal binding against the measured journal: `none` (the journal is bound by
     /// nothing; an SP1 proof-nonce job with no statement included, as the nonce binds the seal),
-    /// `satisfied`, `fails`, or `unchecked` (no whole journal came back). Advice: a guest that reads
-    /// host entropy commits what its seed gives, and this run's seed is not the prover's.
+    /// `satisfied`, `fails`, or `unchecked` (no whole journal came back).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<&'static str>,
     /// The measured journal against the `publicValues` the request carried (the fulfil's, as
@@ -332,15 +354,24 @@ pub struct Report {
     /// journal came back). On every `measured` report.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proven: Option<&'static str>,
-    /// Whether the guest read host-supplied nondeterministic input during the run: risc0, a
-    /// `sys_rand` call past its runtime's own start-up draw; never for SP1, whose executor serves
-    /// none. True too when the worker could not count. A guest that branched on such input may
-    /// have run another path when proven, so its count is no evidence. On every `measured` report.
+    /// Whether the guest read `sys_rand` past its runtime's own start-up draw (risc0; never SP1, whose
+    /// generator runs inside the guest), or nothing could be counted. On every `measured` report. The
+    /// meaning is unchanged from protocol v11, so an older reader stays correct; a new reader goes
+    /// by `host_input_reads` and `sys_rand_rule`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_input: Option<bool>,
-    /// How many such reads, when counted.
+    /// How many such reads, when counted. Absent when not: a guest without risc0's runtime, or a keccak
+    /// charge the guest never assumed. No count without this is evidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_input_reads: Option<u64>,
+    /// The rule that seeded this risc0 run's `sys_rand`, on every risc0 `measured` report; the same
+    /// value as the READY line's. Absent for SP1, which has no host seed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sys_rand_rule: Option<&'static str>,
+    /// How the segment sizes compared on a risc0 `measured` report: `same`, `differs` or `skipped`.
+    /// Absent for SP1, which has no segment size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_check: Option<&'static str>,
     /// The measure worker's SDK, as its handshake names it (sanitized, bounded): a program id is a
     /// function of the SDK too (an SP1 vkey of its circuit version). On every report from the point
     /// the job's backend is known to have a worker here.
@@ -378,6 +409,8 @@ impl Report {
             proven: None,
             host_input: None,
             host_input_reads: None,
+            sys_rand_rule: None,
+            size_check: None,
             sdk_version: None,
             zkminer_version: env!("CARGO_PKG_VERSION"),
             protocol_version: zkminer_prover_protocol::PROTOCOL_VERSION,
@@ -894,7 +927,98 @@ fn bounded_sdk_version(sdk: &str) -> String {
     sanitize_log(sdk).chars().take(MAX_SDK_VERSION_CHARS).collect()
 }
 
+/// What running a job at every segment size found.
+struct SizeCheck {
+    label: &'static str,
+    cycles: u64,
+    po2: u8,
+    total_secs: f64,
+    peak_host_bytes: u64,
+}
+
+/// The figure and size to report, given the `--po2` run and the others: the lowest count, `primary`
+/// on a tie, so a job that costs the same at every size keeps its usual label.
+fn lowest_figure(primary: (u8, u64), others: &[(u8, u64)]) -> (u8, u64) {
+    others.iter().fold(primary, |best, &(po2, cycles)| {
+        if cycles < best.1 {
+            (po2, cycles)
+        } else {
+            best
+        }
+    })
+}
+
+/// Whether a failed execution at another size is the guest's doing: the worker ran it and reported
+/// an error, as it does for a panic, a trap or a non-zero exit. The guest halted cleanly at the first
+/// size, so failing at this one is a difference between sizes, not a job to retry. A timeout, a busy
+/// or lost worker or a shortage of host memory says nothing about the guest.
+fn is_guest_failure(e: &anyhow::Error) -> bool {
+    classify_execute_error(e) == Outcome::Failed
+        && format!("{e:#}").contains("cycle measurement failed")
+}
+
+/// Run a job at every other size a miner can prove at through `run`, and compare each with `first`,
+/// the `primary` run. Stops at the first difference.
+async fn compare_sizes<F, Fut>(
+    primary: u8,
+    first: &zkminer_prover::dispatcher::ExecuteMeasurement,
+    mut run: F,
+) -> Result<SizeCheck>
+where
+    F: FnMut(u8) -> Fut,
+    Fut: std::future::Future<Output = Result<zkminer_prover::dispatcher::ExecuteMeasurement>>,
+{
+    let mut total_secs = first.duration_secs;
+    let mut peak_host_bytes = first.peak_host_bytes;
+    let differs = |total_secs, peak_host_bytes| SizeCheck {
+        label: SIZE_CHECK_DIFFERS,
+        cycles: first.cycles,
+        po2: primary,
+        total_secs,
+        peak_host_bytes,
+    };
+    let mut others = Vec::new();
+    for po2 in
+        zkminer_prover_protocol::RISC0_JOB_PO2_MIN..=zkminer_prover_protocol::RISC0_JOB_PO2_MAX
+    {
+        if po2 == primary {
+            continue;
+        }
+        let m = match run(po2).await {
+            Ok(m) => m,
+            Err(e) if is_guest_failure(&e) => return Ok(differs(total_secs, peak_host_bytes)),
+            Err(e) => return Err(e.context(format!("at segment size {po2}"))),
+        };
+        total_secs += m.duration_secs;
+        peak_host_bytes = peak_host_bytes.max(m.peak_host_bytes);
+        if !first.same_path(&m) {
+            return Ok(differs(total_secs, peak_host_bytes));
+        }
+        others.push((po2, m.cycles));
+    }
+    let (po2, cycles) = lowest_figure((primary, first.cycles), &others);
+    Ok(SizeCheck {
+        label: SIZE_CHECK_SAME,
+        cycles,
+        po2,
+        total_secs,
+        peak_host_bytes,
+    })
+}
+
+impl SizeCheck {
+    /// Put what the check found on the report: the figure, its size, and the cost of all the runs.
+    fn apply_to(&self, r: &mut Report) {
+        r.size_check = Some(self.label);
+        r.execute_secs = Some(self.total_secs);
+        r.peak_host_bytes = Some(self.peak_host_bytes);
+        r.po2 = Some(self.po2);
+        r.cycles = Some(self.cycles.to_string());
+    }
+}
+
 impl Simulator {
+
     /// The program's registry entry, within [`RPC_READ_BUDGET`] (usually from the client's
     /// 10-minute cache); `Err` says why not.
     async fn registry_info(&self, program_id: B256) -> Result<ProgramInfo, String> {
@@ -1276,14 +1400,50 @@ impl Simulator {
         if let Some(why) = over_cycle_cap(m.cycles, self.max_cycles) {
             return r.end(Outcome::TooHeavy, why);
         }
-        r.cycles = Some(m.cycles.to_string());
+        if let Some(primary) = size {
+            if req.single_run {
+                r.size_check = Some(SIZE_CHECK_SKIPPED);
+            } else {
+                let backend_owned = backend.to_string();
+                let check = compare_sizes(primary, &m, |po2| {
+                    let (pool, elf2, input2, timeout) =
+                        (self.pool, elf.clone(), input.clone(), self.execute_timeout);
+                    let backend_owned = backend_owned.clone();
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            pool.execute_cycles(
+                                &backend_owned,
+                                &elf2,
+                                &input2,
+                                Some(timeout),
+                                Some(program_id.0),
+                                Some(po2),
+                            )
+                        })
+                        .await
+                        .map_err(|join| anyhow::anyhow!("execute task: {join}"))?
+                    }
+                })
+                .await;
+                match check {
+                    Ok(check) => check.apply_to(&mut r),
+                    Err(e) => return r.end(classify_execute_error(&e), format!("execute: {e:#}")),
+                }
+            }
+        }
+        if r.cycles.is_none() {
+            r.cycles = Some(m.cycles.to_string());
+        }
         r.journal_bytes = Some(m.journal_len);
         r.journal_hash = m.journal.as_ref().map(keccak256);
         let journal = m.journal.as_deref();
         r.proven = Some(proven_label(journal, req.public_values.as_deref()));
         r.host_input_reads = m.host_entropy_reads;
-        // Uncounted reads as read: a count is evidence only when the guest provably read none.
+        // Uncounted reads as read: an older reader takes a count as evidence only when this is false.
         r.host_input = Some(m.host_entropy_reads != Some(0));
+        if r.po2.is_some() {
+            r.sys_rand_rule = Some(zkminer_prover_protocol::sys_rand::SYS_RAND_RULE);
+        }
         // On this descriptor's input (after its prefix, for a journal-prefix job, which the binding
         // check expects the journal to begin with).
         r.binding = Some(binding_label(&d, journal, job_id, view.prover));
@@ -1351,16 +1511,6 @@ impl Simulator {
         }
         r.end(outcome, reason)
     }
-}
-
-/// The risc0 guests' `sys_rand` seed key for one `simulate` run: fresh, never this host's lasting key
-/// (`~/.zkminer/risc0-sys-rand.key`, which is neither read nor created). No key simulate could hold
-/// is the job's prover's, and a miner on this host must not have its guests' randomness served back
-/// by simulation output (a guest's count, time and journal follow its seed). Passed as NOT ephemeral,
-/// so the workers return the journal: in this measure-only pool it backs no proof, it is advice a
-/// reader compares with the journal that was proven (`proven`).
-fn per_run_sys_rand_key() -> [u8; 32] {
-    rand::random()
 }
 
 /// The directory this command keeps its caches in: `--cache-dir`, else `~/.zkminer/simulate`.
@@ -1433,6 +1583,7 @@ struct Ready<'a> {
     backends: &'a [&'a str],
     zkminer_version: &'static str,
     protocol_version: u32,
+    sys_rand_rule: &'static str,
 }
 
 fn emit_ready(out: &mut impl Write, backends: &[&str]) -> Result<()> {
@@ -1444,6 +1595,7 @@ fn emit_ready(out: &mut impl Write, backends: &[&str]) -> Result<()> {
             backends,
             zkminer_version: env!("CARGO_PKG_VERSION"),
             protocol_version: zkminer_prover_protocol::PROTOCOL_VERSION,
+            sys_rand_rule: zkminer_prover_protocol::sys_rand::SYS_RAND_RULE,
         },
     )?;
     out.write_all(b"\n")?;
@@ -1508,8 +1660,10 @@ pub async fn run(config_path: Option<&Path>, opts: SimulateOptions) -> Result<()
     );
     pool.only_backends([BACKEND_RISC0, BACKEND_SP1]);
     pool.measure_only();
-    // The risc0 guests' `sys_rand` seed key: this run's own (see `per_run_sys_rand_key`).
-    zkminer_prover::worker::set_risc0_sys_rand_key(per_run_sys_rand_key(), false);
+    // This process sets its SP1 worker up itself (`set_up_worker`, under `SP1_SETUP_BOUND`), and a
+    // request's own bound (minutes) can hold the setup when that is stopped; a miner's 120 s
+    // measure bound cannot, so its requests set up first.
+    pool.measure_setup_bound(None);
     let pool = tokio::task::spawn_blocking(move || {
         pool.discover_and_spawn();
         pool
@@ -1533,10 +1687,10 @@ pub async fn run(config_path: Option<&Path>, opts: SimulateOptions) -> Result<()
              --sp1-worker, or [prover.worker_binaries])"
         );
     }
-    // SP1's measure worker builds its CPU prover on first use (~15 s): before READY, and outside
-    // any request's bound, so a request's bound is the request's alone. After `served` is built: a
-    // warm-up that fails must not drop SP1 for this process's whole life (the worker is revived by
-    // the next SP1 request).
+    // SP1's measure worker builds its CPU prover once per spawn (see `SP1_SETUP_BOUND`): before
+    // READY, and outside any request's bound, so a request's bound is the request's alone. After
+    // `served` is built: a warm-up that fails must not drop SP1 for this process's whole life (the
+    // worker is revived by the next SP1 request).
     if served.contains_key(BACKEND_SP1) {
         let ok = tokio::task::spawn_blocking(move || {
             pool.warm_measure_worker(BACKEND_SP1, SP1_SETUP_BOUND)
@@ -1581,6 +1735,7 @@ pub async fn run(config_path: Option<&Path>, opts: SimulateOptions) -> Result<()
                 job_id: *job_id,
                 submit_tx: None,
                 public_values: None,
+                single_run: false,
             })
             .await;
         emit(&mut out, &report)?;
@@ -1652,6 +1807,7 @@ mod tests {
                 job_id: id(0xab),
                 submit_tx: None,
                 public_values: None,
+                single_run: false,
             }
         );
         let json = format!(r#"{{"jobId":"{}","submitTx":"{}"}}"#, id(1), id(2));
@@ -1661,6 +1817,7 @@ mod tests {
                 job_id: id(1),
                 submit_tx: Some(id(2)),
                 public_values: None,
+                single_run: false,
             }
         );
         let no_tx = format!(r#"{{"jobId":"{}"}}"#, id(3));
@@ -2061,6 +2218,92 @@ mod tests {
     }
 
     #[test]
+    fn the_figure_is_the_lowest_size_and_the_usual_one_on_a_tie() {
+        assert_eq!(lowest_figure((20, 500), &[(16, 900), (19, 600), (21, 400), (22, 450)]), (21, 400));
+        assert_eq!(lowest_figure((20, 500), &[(16, 500), (21, 500)]), (20, 500), "a tie keeps --po2");
+        assert_eq!(lowest_figure((20, 500), &[]), (20, 500));
+        // A size inflated by paging alone never sets the figure: 2^20 here is the crafted one.
+        assert_eq!(lowest_figure((20, 23_068_672), &[(19, 9_568_256), (21, 9_437_184)]), (21, 9_437_184));
+    }
+
+    fn run_of(cycles: u64, user: u64) -> zkminer_prover::dispatcher::ExecuteMeasurement {
+        zkminer_prover::dispatcher::ExecuteMeasurement {
+            cycles,
+            journal_len: 1,
+            journal: Some(vec![7]),
+            peak_host_bytes: 0,
+            duration_secs: 1.0,
+            host_entropy_reads: Some(0),
+            user_cycles: Some(user),
+            keccak_cycles: Some(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_size_is_run_and_the_lowest_figure_is_reported() {
+        let first = run_of(1 << 20, 900);
+        let seen = std::cell::RefCell::new(Vec::new());
+        let c = compare_sizes(20, &first, |po2| {
+            seen.borrow_mut().push(po2);
+            let m = run_of(if po2 == 22 { 700 } else { 1 << 21 }, 900);
+            async move { Ok(m) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*seen.borrow(), vec![16, 17, 18, 19, 21, 22], "every other size, once");
+        assert_eq!((c.label, c.po2, c.cycles), (SIZE_CHECK_SAME, 22, 700));
+        assert_eq!(c.total_secs, 7.0, "the time of all seven");
+        let mut r = Report::new(id(7));
+        r.po2 = Some(20);
+        r.cycles = Some("1048576".into());
+        c.apply_to(&mut r);
+        assert_eq!((r.cycles.as_deref(), r.po2, r.size_check), (Some("700"), Some(22), Some(SIZE_CHECK_SAME)));
+    }
+
+    #[tokio::test]
+    async fn a_difference_stops_the_runs_and_keeps_the_first_figure() {
+        let first = run_of(1 << 20, 900);
+        let seen = std::cell::RefCell::new(0);
+        let c = compare_sizes(20, &first, |po2| {
+            *seen.borrow_mut() += 1;
+            let m = run_of(5, if po2 == 17 { 901 } else { 900 });
+            async move { Ok(m) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*seen.borrow(), 2, "2^16, then 2^17, which differs");
+        assert_eq!((c.label, c.po2, c.cycles), (SIZE_CHECK_DIFFERS, 20, 1 << 20));
+    }
+
+    #[tokio::test]
+    async fn a_guest_failure_at_another_size_is_a_difference_and_a_host_problem_is_not() {
+        let first = run_of(1 << 20, 900);
+        let c = compare_sizes(20, &first, |_| async {
+            Err(anyhow::anyhow!("cycle measurement failed: guest panicked at segment size"))
+        })
+        .await
+        .unwrap();
+        assert_eq!(c.label, SIZE_CHECK_DIFFERS);
+        let err = compare_sizes(20, &first, |_| async {
+            Err(anyhow::Error::new(zkminer_prover_protocol::types::MeasureSlotsBusy { backend: "risc0".into(), slots: 1 }))
+        })
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(classify_execute_error(&err), Outcome::Unavailable, "through the context: {err:#}");
+        assert!(format!("{err:#}").contains("at segment size 16"), "{err:#}");
+    }
+
+    #[test]
+    fn a_request_asks_for_one_run_only_by_saying_so() {
+        let id = format!("0x{}", "11".repeat(32));
+        assert!(!parse_request(&id).unwrap().single_run);
+        assert!(!parse_request(&format!("{{\"jobId\":\"{id}\"}}")).unwrap().single_run);
+        assert!(parse_request(&format!("{{\"jobId\":\"{id}\",\"singleRun\":true}}")).unwrap().single_run);
+        assert!(parse_request(&format!("{{\"jobId\":\"{id}\",\"singleRun\":1}}")).is_err());
+    }
+
+    #[test]
     fn the_ready_line_is_exact() {
         let mut out = Vec::new();
         emit_ready(&mut out, &["risc0", "sp1"]).unwrap();
@@ -2068,9 +2311,10 @@ mod tests {
             String::from_utf8(out).unwrap(),
             format!(
                 "{{\"schema\":1,\"ready\":true,\"backends\":[\"risc0\",\"sp1\"],\
-                 \"zkminerVersion\":\"{}\",\"protocolVersion\":{}}}\n",
+                 \"zkminerVersion\":\"{}\",\"protocolVersion\":{},\"sysRandRule\":\"{}\"}}\n",
                 env!("CARGO_PKG_VERSION"),
-                zkminer_prover_protocol::PROTOCOL_VERSION
+                zkminer_prover_protocol::PROTOCOL_VERSION,
+                zkminer_prover_protocol::sys_rand::SYS_RAND_RULE
             )
         );
     }
@@ -2247,13 +2491,6 @@ mod tests {
     }
 
     #[test]
-    fn each_run_seeds_with_its_own_key() {
-        let (a, b) = (per_run_sys_rand_key(), per_run_sys_rand_key());
-        assert_ne!(a, b);
-        assert_ne!(a, [0u8; 32]);
-    }
-
-    #[test]
     fn a_measured_report_says_whether_it_is_evidence() {
         let mut r = Report::new(id(7));
         r.cycles = Some("32768".into());
@@ -2270,7 +2507,7 @@ mod tests {
         // An unmeasured report carries none of the evidence fields.
         let v: serde_json::Value =
             serde_json::to_value(Report::new(id(7)).end(Outcome::Failed, "no")).unwrap();
-        for f in ["proven", "hostInput", "hostInputReads", "sdkVersion"] {
+        for f in ["proven", "hostInput", "hostInputReads", "sysRandRule", "sizeCheck", "sdkVersion"] {
             assert!(v.get(f).is_none(), "{f}");
         }
     }

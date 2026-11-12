@@ -89,13 +89,15 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--export-guest") {
         let (Some(name), Some(path)) = (args.get(i + 1), args.get(i + 2)) else {
-            eprintln!("usage: --export-guest fibonacci <path>");
+            eprintln!("usage: --export-guest fibonacci|sys-rand-echo|segment-size-steer <path>");
             std::process::exit(2);
         };
         let elf = match name.as_str() {
             "fibonacci" => FIBONACCI_ELF,
+            "sys-rand-echo" => SYS_RAND_ECHO_ELF,
+            "segment-size-steer" => SEGMENT_SIZE_STEER_ELF,
             other => {
-                eprintln!("unknown guest {other:?} (known: fibonacci)");
+                eprintln!("unknown guest {other:?} (known: fibonacci, sys-rand-echo, segment-size-steer)");
                 std::process::exit(2);
             }
         };
@@ -145,10 +147,6 @@ fn main() {
             .with(sys_rand_draws::Counter.with_filter(sys_rand_draws::filter()))
             .init();
     }
-
-    // Load (or create) the `sys_rand` key now, outside any job: a failure inside a job's panic
-    // containment would be blamed on that job's program.
-    sys_rand_key();
 
     if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
@@ -352,7 +350,14 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     run_execute(&elf, &input_data, program_id, po2)
                 }));
                 match outcome {
-                    Ok(Ok((cycles, journal, duration_secs, host_entropy_reads))) => {
+                    Ok(Ok(ExecuteOutcome {
+                        cycles,
+                        journal,
+                        duration_secs,
+                        host_entropy_reads,
+                        user_cycles,
+                        keccak_cycles,
+                    })) => {
                         tracing::info!(
                             "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s"
                         );
@@ -363,17 +368,16 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             duration_secs,
                             journal_len,
                             // The host checks the job's journal binding against these bytes. One no
-                            // fulfil could carry is reported by its length alone, and so is one a
-                            // proof on another worker may not reproduce (a process-only seed key).
-                            journal: (journal.len() <= EXECUTE_JOURNAL_MAX_BYTES
-                                && sys_rand_key_is_shared())
-                            .then_some(journal),
+                            // fulfil could carry is reported by its length alone.
+                            journal: (journal.len() <= EXECUTE_JOURNAL_MAX_BYTES).then_some(journal),
                             // risc0 is bounded by its own in-process RSS self-guard + the ledger charge
                             // (finding H4), not by the SP1-only prove-stacking claim gate (H1), so it
                             // reports no peak: 0 = "unknown", which leaves `sp1_execute_provable_beside_
                             // server` ungated for risc0 (it is only consulted for SP1 anyway).
                             peak_host_bytes: 0,
                             host_entropy_reads,
+                            user_cycles: Some(user_cycles),
+                            keccak_cycles: Some(keccak_cycles),
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -753,85 +757,47 @@ fn with_rss_self_guard<T>(limit_bytes: Option<u64>, f: impl FnOnce() -> T) -> T 
     out
 }
 
-/// The seed for the guest's `sys_rand` on one (program, input).
+/// The seed for the guest's `sys_rand` on one (program, input): the public rule
+/// `zkminer_prover_protocol::sys_rand::SYS_RAND_RULE`, `SHA-256(domain || image id || SHA-256(stdin))`.
 ///
 /// Unseeded, risc0 answers `sys_rand` with fresh host entropy on every execution, so a guest can
-/// branch on its random bytes: measure clean before the claim and fail the proof after it, which
-/// costs us the release penalty. The pre-claim measurement and every proving attempt use this seed
-/// instead, so they run the guest identically, even in different workers. It is keyed with this
-/// host's secret key, so the bytes stay unpredictable to everyone else, as the guest's randomness
-/// should be: risc0 also draws the entropy that keeps a receipt's post-state digest from revealing
-/// private inputs from it. It hashes the program's IMAGE ID, not its ELF bytes: two ELFs with one
-/// image id (one stripped, say) are the same program, and a lock re-driven after a restart may fetch
-/// the other one.
-fn sys_rand_seed(key: &[u8; 32], image_id: &[u8; 32], input_data: &[u8]) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
+/// branch on its random bytes: measure clean before the claim and fail the proof after it. The
+/// pre-claim measurement, every proving attempt and `zkminer simulate` all use this one function.
+/// It hashes the program's IMAGE ID, not its ELF bytes (two ELFs with one image id are the same
+/// program), and the exact bytes the guest reads, which for a journal-prefix job begin with the prefix.
+fn sys_rand_seed(image_id: &[u8; 32], input_data: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
 
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(b"zkminer/risc0/sys_rand/v2");
-    mac.update(image_id);
-    mac.update(&Sha256::digest(input_data));
-    mac.finalize().into_bytes().into()
+    let mut h = Sha256::new();
+    h.update(zkminer_prover_protocol::sys_rand::SYS_RAND_DOMAIN);
+    h.update(image_id);
+    h.update(Sha256::digest(input_data));
+    h.finalize().into()
 }
 
-/// This host's `sys_rand` key, loaded once per process: the one the miner passed in
-/// [`SYS_RAND_KEY_ENV`] (it hands the same key to every risc0 worker it spawns), else
-/// `~/.zkminer/risc0-sys-rand.key` (created there on first use) for a worker started on its own.
-///
-/// If neither can be used, the worker keys its seeds for this process alone: its measurements and
-/// proofs still agree with each other, but a job measured by another worker can diverge again, so its
-/// measurements then report no journal (see [`sys_rand_key_is_shared`]).
-fn sys_rand_key() -> [u8; 32] {
-    sys_rand_key_state().0
+/// The environment every run of a job starts from: its input and its `sys_rand` seed, together, so a
+/// measurement and a proof can differ in neither (a run that forgot the seed would have to forget
+/// the guest's input too).
+fn job_env_builder<'a>(input_data: &[u8], seed: [u8; 32]) -> risc0_zkvm::ExecutorEnvBuilder<'a> {
+    let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
+    if !input_data.is_empty() {
+        env_builder.write_slice(input_data);
+    }
+    env_builder.random_seed(seed);
+    env_builder
 }
 
-/// Whether the seed key is the host's lasting key (its file's, read here or passed by the miner)
-/// rather than one for this process or this miner run alone.
-fn sys_rand_key_is_shared() -> bool {
-    sys_rand_key_state().1
-}
-
-fn sys_rand_key_state() -> &'static ([u8; 32], bool) {
-    use zkminer_prover_protocol::sys_rand;
-    static KEY: std::sync::OnceLock<([u8; 32], bool)> = std::sync::OnceLock::new();
-    KEY.get_or_init(|| {
-        if let Ok(v) = std::env::var(sys_rand::SYS_RAND_KEY_ENV) {
-            // Out of this process's environment once read, so nothing it starts (nvidia-smi,
-            // rocm-smi, docker) inherits it. `main` reads the key before any other thread exists.
-            std::env::remove_var(sys_rand::SYS_RAND_KEY_ENV);
-            let ephemeral =
-                std::env::var(sys_rand::SYS_RAND_KEY_EPHEMERAL_ENV).is_ok_and(|v| v == "1");
-            match sys_rand::decode_key(v.trim()) {
-                // A key for the miner's run alone keeps this run's workers in step, but a lock
-                // re-proved after a restart would not be: report no journal, as for a
-                // process-only key.
-                Some(key) => return (key, !ephemeral),
-                None => tracing::warn!(
-                    "{} is not 64 hex digits — ignoring it",
-                    sys_rand::SYS_RAND_KEY_ENV
-                ),
-            }
-        }
-        let loaded = match dirs::home_dir() {
-            Some(home) => sys_rand::load_or_create_key(&sys_rand::key_path(&home))
-                .map_err(anyhow::Error::from),
-            None => Err(anyhow::anyhow!("no home directory")),
-        };
-        match loaded {
-            Ok(key) => (key, true),
-            Err(e) => {
-                tracing::warn!(
-                    "sys_rand key unavailable ({e:#}): seeding with a key for this process only, so \
-                     a job measured here may be proved by another worker with other randomness; \
-                     measurements report no journal, and no journal-bound job is claimed on them"
-                );
-                let mut key = [0u8; 32];
-                getrandom::fill(&mut key).expect("no OS randomness for the sys_rand key");
-                (key, false)
-            }
-        }
-    })
+/// What one execution of a job measured.
+#[derive(Debug)]
+struct ExecuteOutcome {
+    cycles: u64,
+    journal: Vec<u8>,
+    duration_secs: f64,
+    host_entropy_reads: Option<u64>,
+    /// The cycles the guest itself executed, before paging and padding.
+    user_cycles: u64,
+    /// The keccak proof charges inside `cycles`.
+    keccak_cycles: u64,
 }
 
 /// What one keccak proof request at the default keccak po2 (17) is charged in a measurement (see
@@ -932,13 +898,15 @@ fn reads_given_keccak(reads: Option<u64>, keccak_cycles: u64, assumptions: usize
 
 /// Counts the guest's `sys_rand` calls during an execution, for `ExecuteResult.host_entropy_reads`.
 ///
-/// `sys_rand` is the one syscall risc0's executor answers from host entropy (seeded here, see
-/// [`sys_rand_seed`], but by a key the job's prover does not share): `sys_getenv` and `sys_argv` read
-/// an environment and arguments this worker leaves empty, `sys_read` the job's input, `sys_cycle_count`
-/// the run itself, and the keccak and verify calls are checked functions of what the guest passes.
-/// So reading none beyond its runtime's own draw rules out a guest whose path depends on host
-/// entropy. It does not bind the run to the proven one: the chain never checks the input, so a
-/// requester who is also the prover can prove another input with the same journal.
+/// `sys_rand` is the one syscall risc0's executor would answer from host entropy; here the public
+/// seed answers it (see [`sys_rand_seed`]). `sys_getenv` and `sys_argv` read an environment and
+/// arguments this worker leaves empty, `sys_read` the job's input, and `sys_cycle_count` the run itself.
+///
+/// The count is a fact to report, not a test of a run: reading none does not show the path ignores
+/// the seed (a guest can read its runtime's own draw straight from memory), and reading some does not
+/// show it follows it. What the seed gives is reproducibility: a zkminer run of the same input takes
+/// the same path. `None` keeps its meaning (nothing was counted: a guest without risc0's runtime, or a
+/// keccak charge the guest never assumed), and no count there is evidence.
 ///
 /// The executor exposes no count, so this counts the line the pinned fork's handler logs at DEBUG
 /// for each call (`risc0/zkvm/src/host/server/exec/syscall/random.rs`: `SYS_RANDOM: <words>`), with a
@@ -1042,7 +1010,7 @@ fn run_execute(
     input_data: &[u8],
     program_id: Option<[u8; 32]>,
     po2: Option<u8>,
-) -> anyhow::Result<(u64, Vec<u8>, f64, Option<u64>)> {
+) -> anyhow::Result<ExecuteOutcome> {
     use std::time::Instant;
     let po2 = job_segment_po2(po2)?;
     // Bind the ELF to the job's programId before spending any execution on it (the pre-claim
@@ -1050,11 +1018,7 @@ fn run_execute(
     let image_id = verify_program_id(elf, program_id)?;
     let started = Instant::now();
 
-    let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
-    if !input_data.is_empty() {
-        env_builder.write_slice(input_data);
-    }
-    env_builder.random_seed(sys_rand_seed(&sys_rand_key(), &image_id, input_data));
+    let mut env_builder = job_env_builder(input_data, sys_rand_seed(&image_id, input_data));
     // At the size the job will be proven at, on the card the host asked for: the guest can tell (see
     // `RISC0_DEFAULT_JOB_PO2`).
     env_builder.segment_limit_po2(po2 as u32);
@@ -1141,12 +1105,15 @@ fn run_execute(
     // check makes measure-ELF == prove-ELF). The host checks the job's journal binding against it,
     // and screens a journal that would blow the fulfillJob payload cap, before committing
     // collateral and a full proof to it.
-    Ok((
+    let user_cycles = session.cycles();
+    Ok(ExecuteOutcome {
         cycles,
-        session.journal.bytes,
-        started.elapsed().as_secs_f64(),
+        journal: session.journal.bytes,
+        duration_secs: started.elapsed().as_secs_f64(),
         host_entropy_reads,
-    ))
+        user_cycles,
+        keccak_cycles: keccak.cycles,
+    })
 }
 
 /// Cards with less VRAM than this release the Groth16 SRS cache after every proof.
@@ -1222,7 +1189,7 @@ fn run_proof(
         job_segment_po2(po2)?;
     }
     // The seed the pre-claim measurement used, so every attempt runs the guest exactly as it did.
-    let seed = sys_rand_seed(&sys_rand_key(), &image_id, input_data);
+    let seed = sys_rand_seed(&image_id, input_data);
     // Retry-on-invalid mitigation for the rare (~1.5%) nondeterministic GPU
     // timing race on RTX 5090 / Blackwell (sm_120) — an intra-kernel race
     // produces an internally-invalid segment STARK, surfaced as
@@ -1325,9 +1292,7 @@ fn run_proof_once(
         }
     }
 
-    let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
-    env_builder.write_slice(input_data);
-    env_builder.random_seed(seed);
+    let mut env_builder = job_env_builder(input_data, seed);
     // Never left to the SDK, which picks 21 on a 32 GB card: a job is measured at the size the host
     // names here, and the guest can tell the size it runs at.
     let po2 = po2.unwrap_or(RISC0_DEFAULT_JOB_PO2);
@@ -1888,14 +1853,22 @@ mod sys_rand_tests {
     use super::*;
 
     #[test]
-    fn seed_is_fixed_by_key_image_id_and_input() {
-        let key = [1u8; 32];
+    fn seed_is_fixed_by_image_id_and_input() {
         let image = [7u8; 32];
-        let seed = sys_rand_seed(&key, &image, b"input");
-        assert_eq!(sys_rand_seed(&key, &image, b"input"), seed);
-        assert_ne!(sys_rand_seed(&[2u8; 32], &image, b"input"), seed);
-        assert_ne!(sys_rand_seed(&key, &[8u8; 32], b"input"), seed);
-        assert_ne!(sys_rand_seed(&key, &image, b"input2"), seed);
+        let seed = sys_rand_seed(&image, b"input");
+        assert_eq!(sys_rand_seed(&image, b"input"), seed);
+        assert_ne!(sys_rand_seed(&[8u8; 32], b"input"), seed);
+        assert_ne!(sys_rand_seed(&image, b"input2"), seed);
+    }
+
+    /// A rule change is a compatibility break with every miner that seeded by the old one: this must
+    /// only change together with SYS_RAND_RULE. From Python's hashlib.
+    #[test]
+    fn the_seed_rule_known_answer() {
+        assert_eq!(
+            sys_rand_seed(&[7u8; 32], b"input").map(|b| format!("{b:02x}")).concat(),
+            "ba157a4c0fd9382ff3e51b1f758c75061651e6374ca1dfd38a5d648a4a37bce8"
+        );
     }
 
     #[test]
@@ -1975,11 +1948,13 @@ mod sys_rand_draw_tests {
         let image = verify_program_id(FIBONACCI_ELF, None).unwrap();
         let subscriber = tracing_subscriber::registry()
             .with(sys_rand_draws::Counter.with_filter(sys_rand_draws::filter()));
-        let (_, journal, _, reads) = tracing::subscriber::with_default(subscriber, || {
+        let outcome = tracing::subscriber::with_default(subscriber, || {
             run_execute(FIBONACCI_ELF, &10u32.to_le_bytes(), Some(image), Some(20)).unwrap()
         });
-        assert_eq!(journal, 55u64.to_le_bytes());
-        assert_eq!(reads, Some(0));
+        assert_eq!(outcome.journal, 55u64.to_le_bytes());
+        assert_eq!(outcome.host_entropy_reads, Some(0));
+        assert!(outcome.user_cycles > 0);
+        assert_eq!(outcome.keccak_cycles, 0);
     }
 }
 
