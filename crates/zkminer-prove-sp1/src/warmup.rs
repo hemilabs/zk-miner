@@ -304,8 +304,15 @@ fn archive_size() -> Option<u64> {
             .timeout(Duration::from_secs(20))
             .build()
             .ok()?;
-        let response = client.head(&url).send().await.ok()?;
-        response.error_for_status().ok()?.content_length()
+        let response = client.head(&url).send().await.ok()?.error_for_status().ok()?;
+        // The header, not `content_length()`: for a HEAD reply that is the empty body's size, 0.
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()
     })
 }
 
@@ -432,6 +439,15 @@ impl Drop for TestDir {
 
 #[cfg(test)]
 mod tests {
+    /// The size the progress bar divides by, from the real server. Run by hand:
+    /// `cargo test -p zkminer-prove-sp1 archive_size -- --ignored`.
+    #[test]
+    #[ignore = "asks SP1's download server"]
+    fn the_archive_size_comes_from_the_server() {
+        let bytes = super::archive_size().expect("the server gives the archive's size");
+        assert!(bytes > 1_000_000_000, "{bytes} bytes");
+    }
+
     use super::*;
     use std::cell::Cell;
 
