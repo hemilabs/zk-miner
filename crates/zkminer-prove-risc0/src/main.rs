@@ -92,6 +92,10 @@ fn main() {
         // Not orphan-watched: run by hand, its parent is a shell.
         #[cfg(target_os = "macos")]
         mac_footprint::start_guard(false);
+        // The witness graph builds on the CPU while the pipelines warm up and the first program
+        // proves, so the first wrap does not wait for it (M7).
+        #[cfg(feature = "metal")]
+        metal_host::start_groth16_graph_preload("benchmark start");
         #[cfg(feature = "metal")]
         {
             let host = metal_host::support()
@@ -190,6 +194,14 @@ fn main() {
     // mid-proof proved on to the end, holding up to tens of GB of the owner's unified memory (M6).
     #[cfg(target_os = "macos")]
     mac_footprint::start_guard(true);
+
+    // Metal: build the Groth16 witness graph in the background from the start, so the first wrap
+    // of this process does not wait ~3-5 s for it (M7). Not on an unsupported Mac, and not in a
+    // measure-only worker, which never wraps.
+    #[cfg(feature = "metal")]
+    if gpu_refusal().is_none() && !measure_only_worker() {
+        metal_host::start_groth16_graph_preload("worker start");
+    }
 
     if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
@@ -2019,6 +2031,14 @@ fn warm_up() -> Result<String> {
     ))
 }
 
+/// A dedicated measure worker: it only executes guests on the CPU (the dispatcher gives it an RSS
+/// cap and no GPU figure), so it never proves or wraps.
+#[cfg(feature = "metal")]
+fn measure_only_worker() -> bool {
+    std::env::var_os("ZKMINER_RISC0_EXECUTE_MAX_RSS_BYTES").is_some()
+        && std::env::var_os(CUDA_VRAM_BYTES_ENV).is_none()
+}
+
 /// The Metal worker's one-time setup: the `risc0-groth16` component, then every circuit's Metal
 /// pipeline states (`metal_host::warm_up_pipelines`; minutes cold on a newly built binary, PLAN 9.1),
 /// then one small verified Groth16 proof at this Mac's default segment size, so a broken GPU fails
@@ -2030,11 +2050,11 @@ fn warm_up() -> Result<String> {
         anyhow::bail!("{refusal}");
     }
     let component = groth16_component::ensure_installed()?;
-    let measure_only = std::env::var_os("ZKMINER_RISC0_EXECUTE_MAX_RSS_BYTES").is_some()
-        && std::env::var_os(CUDA_VRAM_BYTES_ENV).is_none();
-    if measure_only {
+    if measure_only_worker() {
         return Ok(component);
     }
+    // A no-op if worker start already began it; starts it if this call just installed the component.
+    metal_host::start_groth16_graph_preload("warm-up");
     let pipelines = metal_host::warm_up_pipelines();
     let start = Instant::now();
     let env = risc0_zkvm::ExecutorEnv::builder()

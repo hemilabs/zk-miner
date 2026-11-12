@@ -106,6 +106,24 @@ pub fn ensure_installed() -> Result<String> {
     ))
 }
 
+/// Whether the component is already complete where [ensure_installed] would look for it, without
+/// installing anything. The Metal worker starts its witness-graph preload only then (`metal_host`,
+/// M7): risc0 caches a failed graph load for the life of the process, so a preload that raced the
+/// install would fail every later wrap.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+pub fn installed() -> bool {
+    match std::env::var_os("RISC0_GROTH16_DIR") {
+        Some(dir) => complete(Path::new(&dir)),
+        None => risc0_home().is_ok_and(|home| {
+            complete(
+                &home
+                    .join("extensions")
+                    .join(format!("v{VERSION}-risc0-groth16")),
+            )
+        }),
+    }
+}
+
 /// Whether `dir` holds every file of the component.
 fn complete(dir: &Path) -> bool {
     FILES
