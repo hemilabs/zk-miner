@@ -50,6 +50,10 @@ chrono = { workspace = true }
 dirs = { workspace = true }
 bincode = "1"
 
+# Loads the GPU vendors' telemetry libraries, which ship with their drivers.
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

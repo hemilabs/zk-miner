@@ -1012,9 +1012,11 @@ where
 /// a two-card box each row claimed the whole machine's GPU power), while the suite-level
 /// figure wants the sum.
 ///
-/// Both vendors are read:
+/// Every vendor is read:
 ///
-/// * AMD through hwmon `power1_average`.
+/// * AMD through hwmon `power1_average` on Linux.
+/// * Intel and AMD on Windows through their drivers' libraries (`windows_telemetry`). Without
+///   them those cards were never measured, so their rows took `FALLBACK_GPU_WATTS`.
 /// * NVIDIA through `nvidia-smi --query-gpu=power.draw`. This was missing entirely, and
 ///   this box is all NVIDIA — so every reading failed, every device row took the 300 W
 ///   fallback, and the suite recorded `gpu_power_watts: None` while two cards drew a
@@ -1033,7 +1035,13 @@ fn read_gpu_power_by_card(proving_bus_ids: &[String]) -> PowerSample {
     // Windows, where leaving it out made every card take FALLBACK_GPU_WATTS.
     #[cfg(target_os = "linux")]
     read_amd_power_by_card(proving_bus_ids, &mut out);
-    let probe_failed = !read_nvidia_power_by_card(proving_bus_ids, &mut out);
+    #[cfg(windows)]
+    read_windows_power_by_card(proving_bus_ids, &mut out);
+    // Asked only for cards the others did not read: on a machine without NVIDIA cards the query
+    // fails every time, and the sampler gives up after a few failures in a row, which would end
+    // the Intel and AMD readings with it.
+    let unread = proving_bus_ids.iter().any(|bus| !out.contains_key(bus));
+    let probe_failed = unread && !read_nvidia_power_by_card(proving_bus_ids, &mut out);
     PowerSample {
         per_card: out,
         probe_failed,
@@ -1108,6 +1116,30 @@ fn parse_nvidia_power_csv(csv: &str, proving_bus_ids: &[String]) -> Vec<(String,
         }
     }
     found
+}
+
+/// Intel and AMD per-card draw on Windows, through their drivers' libraries. Intel's comes from an
+/// energy counter, so a card has no reading until its second sample.
+#[cfg(windows)]
+fn read_windows_power_by_card(proving_bus_ids: &[String], out: &mut BTreeMap<String, f64>) {
+    use crate::windows_telemetry::{GpuTelemetry, WindowsTelemetry};
+    use std::sync::{Mutex, OnceLock};
+    // One for the process: the counters' previous readings live in it.
+    static TELEMETRY: OnceLock<Mutex<WindowsTelemetry>> = OnceLock::new();
+    let telemetry = TELEMETRY.get_or_init(|| Mutex::new(WindowsTelemetry::new(true, true)));
+    let Ok(mut telemetry) = telemetry.lock() else {
+        return;
+    };
+    for bus in proving_bus_ids {
+        let mut reading = GpuTelemetry {
+            pci_bus_id: bus.clone(),
+            ..Default::default()
+        };
+        telemetry.refresh(&mut reading);
+        if reading.power_watts.is_finite() && reading.power_watts > 0.0 {
+            fold_peak(out, [(bus.clone(), reading.power_watts)]);
+        }
+    }
 }
 
 /// AMD per-card draw via hwmon.

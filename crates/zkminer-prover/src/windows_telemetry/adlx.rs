@@ -8,8 +8,8 @@
 //! ADLX is started once per process and never stopped: it crashes when started again after
 //! `ADLXTerminate`, so the one instance lives for the life of the process.
 
+use super::GpuTelemetry;
 use super::{bdf_key, pcie_speed_label};
-use crate::hardware::GpuInfo;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
@@ -197,7 +197,7 @@ impl Adlx {
         }
     }
 
-    pub(super) fn refresh(&mut self, gpu: &mut GpuInfo) {
+    pub(super) fn refresh(&mut self, gpu: &mut GpuTelemetry) {
         let Some(card) = self.gpus.get(&gpu.pci_bus_id) else {
             return;
         };
