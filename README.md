@@ -396,7 +396,9 @@ What this does not show: the proof binds neither the seed nor the input. A job p
 rule, by an older zkminer, was seeded by its miner's key, so when `hostInputReads` is above 0 its
 count is the public-seed run, not necessarily the proven one. A prover on other software
 can answer `sys_rand` with anything, and a requester who is also the prover can prove another input
-with the same journal and choose a count up to `--max-cycles`.
+with the same journal and choose a count up to `--max-cycles`. An SP1 proof binds the ELF image and
+address 0, but not the first value of any other register or memory word: this run starts them at
+zero, as an honest prover does, and another prover can start them at anything.
 
 **The segment-size check.** A guest can read the segment size it runs at, and a miner proves at its
 own card's size, so a guest could cost one thing here and another there. `simulate` therefore runs a
@@ -426,8 +428,11 @@ includes deleting `<cache-dir>/program-failures`**, or the new run may answer fr
 
 **Bounds.** `--execute-timeout-secs` (default 600) and `--program-id-timeout-secs` (default 900)
 bound one execution and one derivation: at least 60 (a lower value is raised to it) and at most
-86400. An SP1 measure worker's one-time setup (its CPU prover, ~15 s) is not in them: it runs before
-READY, and again before the next SP1 request when its worker was respawned, bounded at 120 s. Every
+86400. An SP1 measure worker's one-time setup (its CPU prover: about 170 CPU-seconds, so 38 s with
+five free cores and nearly three minutes with one) is not in them: it runs before READY, and again
+before the next SP1 request when its worker was respawned, bounded at 120 s. A host with fewer than
+two free cores can need longer: the setup is then stopped, and the request's derivation or execution
+builds the prover within its own bound. Every
 other wait is bounded too, so the longest one request can take, in seconds, is
 
 ```text

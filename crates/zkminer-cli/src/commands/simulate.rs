@@ -118,8 +118,10 @@ pub const FETCH_FAILURE_TTL: Duration = Duration::from_secs(15 * 60);
 /// each is well under a second.
 pub const RPC_READ_BUDGET: Duration = Duration::from_secs(30);
 
-/// The bound on setting an SP1 measure worker up (building its CPU prover, ~15 s), outside any
-/// request's own bound: before READY, and before an SP1 request whose worker was respawned.
+/// The bound on setting an SP1 measure worker up (building its CPU prover: about 170 CPU-seconds,
+/// so 38 s with five free cores and nearly three minutes with one), outside any request's own
+/// bound: before READY, and before an SP1 request whose worker was respawned. A setup past it is
+/// stopped, and the request's derivation or execution then builds the prover within its own bound.
 pub const SP1_SETUP_BOUND: Duration = Duration::from_secs(120);
 
 /// The least `--execute-timeout-secs` and `--program-id-timeout-secs` (a lower value is raised to
@@ -1658,6 +1660,10 @@ pub async fn run(config_path: Option<&Path>, opts: SimulateOptions) -> Result<()
     );
     pool.only_backends([BACKEND_RISC0, BACKEND_SP1]);
     pool.measure_only();
+    // This process sets its SP1 worker up itself (`set_up_worker`, under `SP1_SETUP_BOUND`), and a
+    // request's own bound (minutes) can hold the setup when that is stopped; a miner's 120 s
+    // measure bound cannot, so its requests set up first.
+    pool.measure_setup_bound(None);
     let pool = tokio::task::spawn_blocking(move || {
         pool.discover_and_spawn();
         pool
@@ -1681,10 +1687,10 @@ pub async fn run(config_path: Option<&Path>, opts: SimulateOptions) -> Result<()
              --sp1-worker, or [prover.worker_binaries])"
         );
     }
-    // SP1's measure worker builds its CPU prover on first use (~15 s): before READY, and outside
-    // any request's bound, so a request's bound is the request's alone. After `served` is built: a
-    // warm-up that fails must not drop SP1 for this process's whole life (the worker is revived by
-    // the next SP1 request).
+    // SP1's measure worker builds its CPU prover once per spawn (see `SP1_SETUP_BOUND`): before
+    // READY, and outside any request's bound, so a request's bound is the request's alone. After
+    // `served` is built: a warm-up that fails must not drop SP1 for this process's whole life (the
+    // worker is revived by the next SP1 request).
     if served.contains_key(BACKEND_SP1) {
         let ok = tokio::task::spawn_blocking(move || {
             pool.warm_measure_worker(BACKEND_SP1, SP1_SETUP_BOUND)

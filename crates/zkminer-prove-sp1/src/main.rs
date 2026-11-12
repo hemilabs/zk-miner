@@ -1546,10 +1546,14 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             // settles it.
             //
             // The theory: `TRACE_CHUNK_SLOTS` slots of a fixed 2 GiB each
-            // (`MINIMAL_TRACE_CHUNK_THRESHOLD = 2147483648 / size_of::<MemValue>()`, so slots × that ×
-            // size_of is exactly 2 GiB per slot), i.e. 10 GiB at the default 5. It survives the GPU
-            // override, unlike `SHARD_SIZE` — `local_gpu_opts` rewrites only `shard_size`,
-            // `sharding_threshold.element_threshold` and `global_dependencies_opt`.
+            // (`MINIMAL_TRACE_CHUNK_THRESHOLD = 2147483648 / size_of::<MemValue>()`, so slots ×
+            // that × size_of is exactly 2 GiB per slot), i.e. 10 GiB at the default 5. It survives
+            // the GPU override, unlike `SHARD_SIZE` — `local_gpu_opts` rewrites only `shard_size`,
+            // `sharding_threshold.element_threshold` and `global_dependencies_opt`. (That was an
+            // older SP1. At sp1 9a0de74 a proving slot is 256 MiB, `MINIMAL_TRACE_CHUNK_THRESHOLD`
+            // = 16,777,216 entries of 16 B, so about 1.4 GiB at the default 5; and the execute
+            // before the proof stages the gas-estimation ring, `GAS_TRACE_CHUNK_SLOTS` slots of
+            // ~2.2 GiB, which this knob does not reach.)
             //
             // The measurement, on the 4090 across three runs: `shmem-rss` in the OOM record was
             // 7,329,476 kB at slots=5, at slots=4, and at an explicit slots=2 — byte-identical every
@@ -1889,10 +1893,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // risc0's segment size; SP1 shards on its own.
                 po2: _,
             } => {
-                // Real cycle measurement for SP1, matching risc0's Execute
-                // arm, so the miner sizes SP1 jobs on a measured count rather than the
-                // submitter-declared `expectedCycles`. Runs on a lazily-built CPU executor (no
-                // gpu-server), so it is as cheap as risc0's sizing path.
+                // Real cycle measurement for SP1, matching risc0's Execute arm, so the miner sizes
+                // SP1 jobs on a measured count rather than the submitter-declared `expectedCycles`.
+                // Runs on the CPU executor (no gpu-server), built once per worker: by the host's
+                // `Warmup` before the first request (below), else here.
                 tracing::info!("Execute (sizing) request {request_id} ({} bytes ELF)", elf.len());
                 let Some(cpu) = cpu_prover(&mut cpu_executor) else {
                     let resp = WorkerResponse::Error {
@@ -2018,9 +2022,11 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
 
             WorkerCommand::Warmup { request_id } if sp1_measure_only() => {
                 // A measure-only worker proves nothing, so it needs no Groth16 artifacts: its one
-                // setup is the CPU prover its `Execute` and `ProgramId` run on (~15 s on first use),
-                // built here, outside any request's watchdog, when the host asks (`zkminer simulate`
-                // does before READY and after a respawn).
+                // setup is the CPU prover its `Execute` and `ProgramId` run on, about 170
+                // CPU-seconds and a 7.4 GB peak (38 s with five free cores, 92 s with two, nearly
+                // three minutes with one), built here, outside any request's watchdog. The miner
+                // asks before the first sizing request of each spawn (`set_up_measure_slot`);
+                // `zkminer simulate` before READY and before a request whose worker was respawned.
                 let started = Instant::now();
                 let resp = if cpu_prover(&mut cpu_executor).is_some() {
                     WorkerResponse::WarmupDone {
@@ -2271,8 +2277,9 @@ fn with_peak_rss_sampling<T>(f: impl FnOnce() -> T) -> (T, u64) {
     (f(), 0)
 }
 
-/// The CPU prover the sizing paths (`Execute`, `ProgramId`) run on, built on first use: never the
-/// CUDA prover, so neither path starts `sp1-gpu-server`. Built defensively: a panic yields `None`, which
+/// The CPU prover the sizing paths (`Execute`, `ProgramId`) run on, built on first use (the measure
+/// worker's `Warmup`, which the host sends before a spawn's first sizing request): never the CUDA
+/// prover, so neither path starts `sp1-gpu-server`. Built defensively: a panic yields `None`, which
 /// the caller answers as `Internal` rather than letting it unwind out of the loop and have the
 /// dispatcher score a healthy slot as failed.
 fn cpu_prover(

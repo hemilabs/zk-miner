@@ -2297,6 +2297,15 @@ pub(crate) fn is_measure_preempted(e: &anyhow::Error) -> bool {
         .is_some()
 }
 
+/// Could the measure worker not be SET UP before the request ran (SP1's per-spawn CPU prover, built
+/// under its own bound; see the dispatcher's `set_up_measure_slot`)? No guest ran and the setup is
+/// the same for every program, so, like a preemption, it is transient: no strike, no
+/// negative-cache, no retry TTL. By the dispatcher-only TYPE, never by message.
+pub(crate) fn is_measure_setup_failed(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<zkminer_prover_protocol::types::MeasureSetupFailed>()
+        .is_some()
+}
+
 fn prove_sizing_cycles(declared: u64, measured: Option<u64>) -> u64 {
     match measured {
         Some(m) => declared.max(m),
@@ -8050,9 +8059,14 @@ async fn watch_inspector(
     const PASS_EVERY: Duration = Duration::from_secs(5);
     const SUMMARY_EVERY: Duration = Duration::from_secs(600);
     // How long a job may stay inconclusive (waiting on a measurement the brain runs, a busy measure
-    // pool, a slow source) before it is reported as such: a measurement's whole budget, and some.
-    const GIVE_UP_AFTER: Duration =
-        Duration::from_secs(MEASURE_TIMEOUT.as_secs() + 2 * MEASURE_FETCH_BUDGET.as_secs() + 60);
+    // pool, a slow source) before it is reported as such: a measurement's whole budget, and some. A
+    // spawn's first SP1 measurement first sets its worker up, under its own bound.
+    const GIVE_UP_AFTER: Duration = Duration::from_secs(
+        MEASURE_TIMEOUT.as_secs()
+            + 2 * MEASURE_FETCH_BUDGET.as_secs()
+            + zkminer_prover::dispatcher::SP1_MEASURE_SETUP_BOUND.as_secs()
+            + 60,
+    );
     const MAX_RETRY_GAP: Duration = Duration::from_secs(60);
     let started = std::time::Instant::now();
     let mut last_summary = started;
@@ -11295,6 +11309,15 @@ async fn measure_cycles(
                 if is_measure_preempted(&e) {
                     tracing::debug!(
                         "measure {}: preempted by a claimed proof, not sizing now (transient)",
+                        short_id(program_id)
+                    );
+                    continue;
+                }
+                // The worker could not be set up (its SP1 CPU prover) before the execute: nothing
+                // ran, and nothing about the program is known. The dispatcher has logged why.
+                if is_measure_setup_failed(&e) {
+                    tracing::debug!(
+                        "measure {}: the measure worker is not set up, not sizing now (transient)",
                         short_id(program_id)
                     );
                     continue;
@@ -14633,6 +14656,23 @@ mod r2_sizing_tests {
         // A guest-forged message does not win the transient treatment.
         let forged = anyhow::anyhow!("cycle measurement failed: Guest panicked: preempted (transient)");
         assert!(!is_measure_preempted(&forged));
+    }
+
+    /// A measure worker that could not be set up is its own typed transient: not a timeout (no
+    /// retry TTL, no strike), not a preemption, and not forgeable from guest text.
+    #[test]
+    fn a_setup_failure_is_classified_by_type_and_is_not_a_timeout() {
+        let real: anyhow::Error =
+            anyhow::Error::new(zkminer_prover_protocol::types::MeasureSetupFailed {
+                slot_key: "sp1:measure:0".to_string(),
+                message: "not set up within 600 s".to_string(),
+            });
+        assert!(is_measure_setup_failed(&real));
+        assert!(!is_measure_wall_clock_timeout(&real));
+        assert!(!is_measure_preempted(&real));
+        let forged =
+            anyhow::anyhow!("Guest panicked: measure worker could not be set up (transient)");
+        assert!(!is_measure_setup_failed(&forged));
     }
 
     /// A measured entry: `cycles`, a journal, the verified ELF keccak and the execute's seconds.

@@ -814,6 +814,35 @@ impl std::fmt::Display for MeasurePreempted {
 
 impl std::error::Error for MeasurePreempted {}
 
+/// A measure worker could not be SET UP before a sizing request (`Execute`, `ProgramId`) ran on it:
+/// SP1's measure worker builds its CPU prover once per spawn, and the dispatcher runs that setup
+/// first, under its own bound, so the request's bound is the request's alone. The setup is the same
+/// work whatever the program (no guest has run), so this is TRANSIENT like `MeasureSlotsBusy`: no
+/// strike, no negative-cache, no retry TTL. The dispatcher has cleared the slot when the worker
+/// died or was killed at the bound, so the next request revives it.
+///
+/// Dispatcher-only: only its setup path constructs it, never from a `WorkerResponse::Error`
+/// carrying guest-controlled text, so a guest cannot forge it to win the lenient treatment.
+#[derive(Debug, Clone)]
+pub struct MeasureSetupFailed {
+    /// The measure slot whose worker could not be set up, e.g. `sp1:measure:0`.
+    pub slot_key: String,
+    /// Why: past the bound, died, or the worker's own answer.
+    pub message: String,
+}
+
+impl std::fmt::Display for MeasureSetupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "measure worker {} could not be set up ({}); nothing ran (transient)",
+            self.slot_key, self.message
+        )
+    }
+}
+
+impl std::error::Error for MeasureSetupFailed {}
+
 /// Not enough of this card's VRAM is free for this backend to be given work on it.
 ///
 /// Distinct from `HostMemoryShortage` (that is system RAM) and from a GPU OOM (that is the proof
@@ -1439,6 +1468,25 @@ mod tests {
         });
         assert!(boxed.downcast_ref::<MeasurePreempted>().is_some());
         assert!(boxed.downcast_ref::<MeasureSlotsBusy>().is_none());
+        assert!(boxed.downcast_ref::<MeasureWallClockTimeout>().is_none());
+    }
+
+    /// `MeasureSetupFailed` names its slot and the cause, says "transient", and is its own type:
+    /// the measure path downcasts it to skip a strike, so it must not read as a timeout or a
+    /// preemption.
+    #[test]
+    fn measure_setup_failed_is_a_typed_transient() {
+        let e = MeasureSetupFailed {
+            slot_key: "sp1:measure:1".to_string(),
+            message: "not set up within 600 s".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("sp1:measure:1"), "names the slot: {msg}");
+        assert!(msg.contains("within 600 s"), "says why: {msg}");
+        assert!(msg.contains("transient"), "flagged transient: {msg}");
+        let boxed: Box<dyn std::error::Error> = Box::new(e);
+        assert!(boxed.downcast_ref::<MeasureSetupFailed>().is_some());
+        assert!(boxed.downcast_ref::<MeasurePreempted>().is_none());
         assert!(boxed.downcast_ref::<MeasureWallClockTimeout>().is_none());
     }
 }

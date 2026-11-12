@@ -681,3 +681,222 @@ fn the_sp1_worker_derives_its_guests_vkey_on_the_cpu() {
     pool.shutdown_all();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The pids that set up, one line per `Warmup` the mock answered (`MOCK_WARMUP_LOG`).
+fn warmups(log: &Path) -> Vec<u32> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect()
+}
+
+/// `measure_only_pool`, with `bound` on a request's measure-worker setup.
+fn measure_only_pool_bounded(binaries: HashMap<String, PathBuf>, bound: Duration) -> WorkerPool {
+    let mut pool = WorkerPool::new(binaries, Vec::new(), None);
+    pool.only_backends(["sp1"]);
+    pool.measure_only();
+    pool.measure_setup_bound(Some(bound));
+    pool.discover_and_spawn();
+    pool
+}
+
+/// SP1's measure worker pays a one-time setup on first use (its CPU prover; minutes on a host with
+/// one free core). A request sets its worker up FIRST, under the setup bound, so the request's own
+/// bound covers only the request: here a 4 s setup and a 2 s bound, which timed every first
+/// measurement out when the setup ran inside it. Once per spawn: a respawned worker is set up again
+/// by the request that revives it.
+#[test]
+fn a_request_sets_its_sp1_measure_worker_up_outside_its_own_bound() {
+    let dir = temp_dir("lazy-setup");
+    let log = dir.join("warmups");
+    let log_s = log.display().to_string();
+    let binaries = HashMap::from([(
+        "sp1".to_string(),
+        wrapper(
+            &dir,
+            "sp1",
+            &[("MOCK_SETUP_SECS", "4"), ("MOCK_WARMUP_LOG", &log_s)],
+        ),
+    )]);
+    let pool = measure_only_pool_bounded(binaries, Duration::from_secs(60));
+    if !pool.measure_worker_count("sp1").is_some_and(|n| n > 0) {
+        // This host's /dev/shm is too small for an SP1 measure pool (see the first test).
+        pool.shutdown_all();
+        return;
+    }
+    let bound = Some(Duration::from_secs(2));
+    let execute = || pool.execute_cycles("sp1", b"elf", &[], bound, None, None);
+
+    execute().expect("the setup is not inside the request's bound");
+    assert_eq!(warmups(&log).len(), 1, "set up once");
+    execute().expect("a set-up worker measures");
+    assert_eq!(warmups(&log).len(), 1, "and not again for the same worker");
+    pool.derive_program_id("sp1", b"elf", bound)
+        .expect("a derivation runs on the same set-up worker");
+    assert_eq!(warmups(&log).len(), 1);
+
+    // Every worker dies idle. The requests that find one gone say so (typed, nothing ran) until one
+    // revives a worker, which it sets up before measuring, again outside its bound.
+    let first = warmups(&log)[0];
+    for i in 0..pool.measure_worker_count("sp1").unwrap() {
+        let (live, pid, _) = pool.test_measure_slot_state("sp1", i).unwrap();
+        if live && pid != 0 {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+            wait_exited(pid);
+        }
+    }
+    let mut measured = false;
+    for _ in 0..10 {
+        match execute() {
+            Ok(_) => {
+                measured = true;
+                break;
+            }
+            Err(e) => {
+                assert!(
+                    e.downcast_ref::<zkminer_prover_protocol::types::MeasureWorkerGone>()
+                        .is_some()
+                        || e.downcast_ref::<zkminer_prover_protocol::types::MeasureSlotsBusy>()
+                            .is_some(),
+                    "only a typed 'nothing ran': {e:#}"
+                );
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+    assert!(measured, "a revived worker measures");
+    let set_up = warmups(&log);
+    assert_eq!(set_up.len(), 2, "the revived worker was set up: {set_up:?}");
+    assert_ne!(set_up[1], first, "by its own process");
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A derivation sets a cold worker up first, outside its own bound, as an execution does.
+#[test]
+fn a_derivation_sets_its_sp1_measure_worker_up_outside_its_own_bound() {
+    let dir = temp_dir("lazy-setup-derive");
+    let binaries = HashMap::from([(
+        "sp1".to_string(),
+        wrapper(&dir, "sp1", &[("MOCK_SETUP_SECS", "4")]),
+    )]);
+    let pool = measure_only_pool_bounded(binaries, Duration::from_secs(60));
+    if !pool.measure_worker_count("sp1").is_some_and(|n| n > 0) {
+        pool.shutdown_all();
+        return;
+    }
+    let d = pool
+        .derive_program_id("sp1", b"elf", Some(Duration::from_secs(2)))
+        .expect("the setup is not inside the derivation's bound");
+    assert_eq!(d.program_id, keccak256(b"elf").0);
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A setup past its bound is killed and fails the request as the typed transient
+/// `MeasureSetupFailed`: no guest ran, so it is neither a wall-clock timeout (which strikes the
+/// job) nor scored against the slot.
+#[test]
+fn a_setup_past_its_bound_fails_the_request_as_a_typed_transient() {
+    let dir = temp_dir("setup-hang");
+    let binaries = HashMap::from([(
+        "sp1".to_string(),
+        wrapper(&dir, "sp1", &[("MOCK_HANG_ON", "warmup")]),
+    )]);
+    let pool = measure_only_pool_bounded(binaries, Duration::from_secs(2));
+    if !pool.measure_worker_count("sp1").is_some_and(|n| n > 0) {
+        pool.shutdown_all();
+        return;
+    }
+    let started = std::time::Instant::now();
+    let e = pool
+        .execute_cycles(
+            "sp1",
+            b"elf",
+            &[],
+            Some(Duration::from_secs(60)),
+            None,
+            None,
+        )
+        .expect_err("the setup never finishes");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "bounded by the setup bound"
+    );
+    assert!(
+        e.downcast_ref::<zkminer_prover_protocol::types::MeasureSetupFailed>()
+            .is_some(),
+        "typed: {e:#}"
+    );
+    assert!(
+        e.downcast_ref::<MeasureWallClockTimeout>().is_none(),
+        "{e:#}"
+    );
+    let (live, _, failures) = pool.test_measure_slot_state("sp1", 0).unwrap();
+    assert!(!live, "the setup's watchdog killed it");
+    assert_eq!(
+        failures, 0,
+        "its own bound's kill is not scored against the slot"
+    );
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A claimed proof may preempt a measurement while its worker is still being set up: the request is
+/// the typed `MeasurePreempted` (no strike), and the kill is not scored against the slot.
+#[test]
+fn a_setup_preempted_by_a_claimed_proof_is_a_preemption() {
+    let dir = temp_dir("setup-preempt");
+    let log = dir.join("warmups");
+    let log_s = log.display().to_string();
+    let binaries = HashMap::from([(
+        "sp1".to_string(),
+        wrapper(
+            &dir,
+            "sp1",
+            &[("MOCK_HANG_ON", "warmup"), ("MOCK_WARMUP_LOG", &log_s)],
+        ),
+    )]);
+    let pool = std::sync::Arc::new(measure_only_pool_bounded(binaries, Duration::from_secs(60)));
+    if !pool.measure_worker_count("sp1").is_some_and(|n| n > 0) {
+        pool.shutdown_all();
+        return;
+    }
+    let measurer = {
+        let pool = std::sync::Arc::clone(&pool);
+        std::thread::spawn(move || {
+            pool.execute_cycles(
+                "sp1",
+                b"elf",
+                &[],
+                Some(Duration::from_secs(60)),
+                None,
+                None,
+            )
+        })
+    };
+    // The mock logs the Warmup before it hangs in it.
+    let started = std::time::Instant::now();
+    while warmups(&log).is_empty() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the setup never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    pool.test_preempt_all_inflight_measures();
+    let e = measurer.join().unwrap().expect_err("it was preempted");
+    assert!(
+        e.downcast_ref::<zkminer_prover_protocol::types::MeasurePreempted>()
+            .is_some(),
+        "{e:#}"
+    );
+    let (live, _, failures) = pool.test_measure_slot_state("sp1", 0).unwrap();
+    assert!(!live, "the preemption killed it");
+    assert_eq!(failures, 0, "a preemption is not scored against the slot");
+    pool.shutdown_all();
+    let _ = std::fs::remove_dir_all(&dir);
+}
