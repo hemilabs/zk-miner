@@ -2642,10 +2642,11 @@ pub async fn run(
         // Load cached benchmarks if available.
         // If no cache, benchmarks will run in the background after TUI starts.
         if let Some(suite) = load_cached_benchmark() {
-            tracing::info!("Loaded cached benchmarks (zkOP/s: {:.0})", suite.zkops);
+            let score = zkminer_prover::benchmark::format_mzkops(suite.zkops);
+            tracing::info!("Loaded cached benchmarks ({score})");
             s.add_log(
                 LogLevel::Info,
-                format!("Loaded cached benchmarks (zkOP/s: {:.0})", suite.zkops),
+                format!("Loaded cached benchmarks ({score})"),
             );
             s.benchmark_results = Some(suite);
         }

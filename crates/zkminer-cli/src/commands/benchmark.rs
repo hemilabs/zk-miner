@@ -212,15 +212,33 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
     println!("{}", "─".repeat(86));
     println!();
     println!(
-        "  zkOP/s: {:.0}  (SP1 cycles per second on a 50M-cycle program, all GPUs)",
-        results.zkops
+        "  {}  (all GPUs: each GPU's SP1 and RISC Zero scores blended, added up)",
+        zkminer_prover::benchmark::format_mzkops(results.zkops)
     );
-    for d in results.device_benchmarks.iter().filter(|d| d.zkops() > 0.0) {
+    let devices = &results.device_benchmarks;
+    let mut seen: Vec<&str> = Vec::new();
+    for d in devices {
+        if seen.contains(&d.device_id.as_str()) {
+            continue;
+        }
+        seen.push(&d.device_id);
+        let Some(score) = zkminer_prover::benchmark::gpu_zkops(devices, &d.device_id) else {
+            continue;
+        };
+        // Each zkVM in its own cycles per second: the scoring program's rate.
+        let per_zkvm: Vec<String> = devices
+            .iter()
+            .filter(|r| r.device_id == d.device_id)
+            .filter_map(|r| {
+                let rate = r.scoring_cycles_per_sec()?;
+                Some(format!("{} {:.2}M c/s", r.prover_backend, rate / 1e6))
+            })
+            .collect();
         println!(
-            "    {} / {}: {:.0}",
+            "    {}: {}  ({})",
             d.device_label,
-            d.prover_backend,
-            d.zkops()
+            zkminer_prover::benchmark::format_mzkops(score),
+            per_zkvm.join(", ")
         );
     }
     println!();

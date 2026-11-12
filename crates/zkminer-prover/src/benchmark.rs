@@ -360,14 +360,25 @@ impl DeviceBenchmark {
         (cycles > 0 && secs > 0.0).then(|| cycles as f64 / secs)
     }
 
-    /// This device's zkOP/s on this backend, or 0 if the scoring program did not run on it.
-    pub fn zkops(&self) -> f64 {
+    /// The scoring program's proof on this backend, if it ran.
+    fn scoring_stage(&self) -> Option<&ProgramStage> {
         self.program_stages
             .iter()
             .find(|p| p.program_name == zkminer_prover_protocol::BENCH_ZKOP_MIX)
-            .map_or(0.0, |p| {
-                zkminer_prover_protocol::zkops_from_stark_secs(p.stark_secs)
-            })
+            .filter(|p| p.stark_secs > 0.0)
+    }
+
+    /// The scoring program's rate in this zkVM's own cycles per second. This zkVM's score as shown;
+    /// cycles of different zkVMs are not comparable, so it is no part of a GPU's MzkOP/s as such.
+    pub fn scoring_cycles_per_sec(&self) -> Option<f64> {
+        self.scoring_stage().map(|p| p.cycles as f64 / p.stark_secs)
+    }
+
+    /// The scoring proof's speed in zkOP/s (SP1 cycles of the program per second), what
+    /// `gpu_zkops` blends.
+    pub fn zkop_mix_rate(&self) -> Option<f64> {
+        self.scoring_stage()
+            .map(|p| zkminer_prover_protocol::zkops_from_stark_secs(p.stark_secs))
     }
 
     /// This device's steady-state Groth16 wrap time: the MEDIAN over the programs it was measured on,
@@ -714,13 +725,34 @@ pub fn add_gpu_device_benchmarks(suite: &mut BenchmarkSuite, gpus: &[GpuDesc]) {
     }
 }
 
-/// The machine's zkOP/s: the SP1 score of every GPU, added up, as they prove side by side.
+/// The GPU `device_id`'s score in zkOP/s: its SP1 and RISC Zero scoring proofs blended
+/// (`zkminer_prover_protocol::blended_zkops`), over whichever it ran. `None` when it ran neither.
+pub fn gpu_zkops(devices: &[DeviceBenchmark], device_id: &str) -> Option<f64> {
+    let rate = |backend: &str| {
+        devices
+            .iter()
+            .filter(|d| d.device_id == device_id && d.prover_backend == backend)
+            .find_map(DeviceBenchmark::zkop_mix_rate)
+    };
+    zkminer_prover_protocol::blended_zkops(rate("sp1"), rate("risc0"))
+}
+
+/// The machine's zkOP/s: every GPU's score, added up, as they prove side by side.
 pub fn machine_zkops(devices: &[DeviceBenchmark]) -> f64 {
-    devices
-        .iter()
-        .filter(|d| d.prover_backend == "sp1")
-        .map(DeviceBenchmark::zkops)
+    let mut ids: Vec<&str> = Vec::new();
+    for d in devices {
+        if !ids.contains(&d.device_id.as_str()) {
+            ids.push(&d.device_id);
+        }
+    }
+    ids.into_iter()
+        .filter_map(|id| gpu_zkops(devices, id))
         .sum()
+}
+
+/// A GPU's or machine's score for display, e.g. "13.83 MzkOP/s".
+pub fn format_mzkops(zkops: f64) -> String {
+    format!("{:.2} MzkOP/s", zkops / 1e6)
 }
 
 /// Get CPU info string.
@@ -2642,6 +2674,8 @@ pub(crate) fn load_cached_benchmark_from(
     migrate_device_identity(&mut suite);
     floor_implausible_gpu_power(&mut suite);
     drop_cpu_device_rows(&mut suite);
+    // From the saved proofs, so a change to how GPUs are scored needs no new benchmark.
+    suite.zkops = machine_zkops(&suite.device_benchmarks);
     Some(suite)
 }
 
@@ -2896,7 +2930,7 @@ mod zkop_score_tests {
     }
 
     #[test]
-    fn the_machine_score_adds_up_each_gpus_sp1_score() {
+    fn the_machine_score_adds_up_each_gpus_blended_score() {
         let devices = build_gpu_device_benchmarks_from_workers(
             &[
                 slot("sp1:cuda:0", 0, "sp1", 5.0),
@@ -2906,9 +2940,22 @@ mod zkop_score_tests {
             &Default::default(),
         );
         let c = ZKOP_MIX_SP1_CYCLES as f64;
-        assert_eq!(devices[0].zkops(), c / 5.0);
-        assert_eq!(devices[2].zkops(), c / 20.0, "RISC Zero is scored in the same unit");
-        assert_eq!(machine_zkops(&devices), c / 5.0 + c / 10.0);
+        let id = |i: usize| devices[i].device_id.clone();
+        assert_eq!(devices[0].zkop_mix_rate(), Some(c / 5.0));
+        assert_eq!(
+            devices[2].zkop_mix_rate(),
+            Some(c / 20.0),
+            "RISC Zero in the same unit"
+        );
+        // Card 0 ran both zkVMs; card 1 only SP1, which is all it is scored on.
+        let card0 = zkminer_prover_protocol::blended_zkops(Some(c / 5.0), Some(c / 20.0)).unwrap();
+        let gpu = |device_id: String| gpu_zkops(&devices, &device_id).unwrap();
+        assert_eq!(gpu(id(0)), card0);
+        assert_eq!(gpu(id(1)), c / 10.0);
+        assert_eq!(machine_zkops(&devices), card0 + c / 10.0);
+        // Shown per zkVM in its own cycles per second.
+        assert_eq!(devices[0].scoring_cycles_per_sec(), Some(c / 5.0));
+        assert_eq!(format_mzkops(13_830_000.0), "13.83 MzkOP/s");
     }
 
     #[test]
@@ -2926,7 +2973,8 @@ mod zkop_score_tests {
         let mut only_suite = slot("sp1:cuda:0", 0, "sp1", 5.0);
         only_suite.entries.pop();
         let devices = build_gpu_device_benchmarks_from_workers(&[only_suite], &Default::default());
-        assert_eq!(devices[0].zkops(), 0.0);
+        assert_eq!(devices[0].zkop_mix_rate(), None);
+        assert_eq!(gpu_zkops(&devices, &devices[0].device_id), None);
         assert_eq!(machine_zkops(&devices), 0.0);
     }
 }

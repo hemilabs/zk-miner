@@ -589,7 +589,10 @@ async fn run_full_benchmark(state: SharedState) {
         benchmark::save_benchmark(&suite);
         s.add_log(
             LogLevel::Success,
-            format!("CPU benchmark complete (zkOP/s: {:.0})", suite.zkops),
+            format!(
+                "CPU benchmark complete ({})",
+                benchmark::format_mzkops(suite.zkops)
+            ),
         );
         s.benchmark_results = Some(suite);
     }

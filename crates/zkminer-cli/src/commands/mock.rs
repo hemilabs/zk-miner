@@ -189,7 +189,10 @@ pub async fn run(headless: bool) -> Result<()> {
         if let Some(suite) = load_cached_benchmark() {
             s.add_log(
                 LogLevel::Info,
-                format!("Loaded cached benchmarks (zkOP/s: {:.0})", suite.zkops),
+                format!(
+                    "Loaded cached benchmarks ({})",
+                    zkminer_prover::benchmark::format_mzkops(suite.zkops)
+                ),
             );
             s.benchmark_results = Some(suite);
         }

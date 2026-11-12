@@ -529,7 +529,8 @@ pub struct DeviceProgress {
     pub complete: bool,
     /// The slot finished without producing results.
     pub failed: bool,
-    /// This row's zkOP/s, once its scoring program has finished.
+    /// This row's scoring proof in zkOP/s (SP1 terms), once it has finished: what the card's score
+    /// blends (`BenchmarkTracker::card_scores`).
     pub zkops: Option<f64>,
     /// Setting up and running the discarded warm-up proof, before the first program.
     pub warming_up: bool,
@@ -592,6 +593,20 @@ impl DeviceProgress {
         let bus = self.pci_bus_id.as_deref().filter(|b| !b.is_empty())?;
         gpus.iter().find(|g| g.pci_bus_id == bus)
     }
+}
+
+/// One GPU's score on the benchmark screen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CardScore {
+    pub name: String,
+    gpu_tag: String,
+    ordinal: u32,
+    /// zkOP/s, blended over the zkVMs that have scored so far.
+    pub zkops: Option<f64>,
+    /// Every zkVM on it has finished.
+    pub complete: bool,
+    /// Every zkVM on it failed.
+    pub failed: bool,
 }
 
 /// Tracks real-time benchmark progress across all GPUs.
@@ -730,6 +745,53 @@ impl BenchmarkTracker {
         } else {
             format!("{} {}", dev.short_name, dev.backend_label())
         }
+    }
+
+    /// Each GPU's score so far, in the order its rows were queued: its zkVMs' scoring proofs
+    /// blended (`zkminer_prover_protocol::blended_zkops`).
+    pub fn card_scores(&self) -> Vec<CardScore> {
+        let mut cards: Vec<CardScore> = Vec::new();
+        let mut rates: Vec<(Option<f64>, Option<f64>)> = Vec::new();
+        for dev in &self.devices {
+            let pos = match cards
+                .iter()
+                .position(|c| c.gpu_tag == dev.gpu_tag && c.ordinal == dev.ordinal)
+            {
+                Some(pos) => pos,
+                None => {
+                    let same_model_elsewhere = self
+                        .devices
+                        .iter()
+                        .any(|d| d.short_name == dev.short_name && d.ordinal != dev.ordinal);
+                    cards.push(CardScore {
+                        name: if same_model_elsewhere {
+                            format!("{} #{}", dev.short_name, dev.ordinal)
+                        } else {
+                            dev.short_name.clone()
+                        },
+                        gpu_tag: dev.gpu_tag.clone(),
+                        ordinal: dev.ordinal,
+                        zkops: None,
+                        complete: true,
+                        failed: true,
+                    });
+                    rates.push((None, None));
+                    cards.len() - 1
+                }
+            };
+            let card = &mut cards[pos];
+            card.complete &= dev.complete;
+            card.failed &= dev.failed;
+            match dev.slot_key.split(':').next() {
+                Some("sp1") => rates[pos].0 = rates[pos].0.or(dev.zkops),
+                Some("risc0") => rates[pos].1 = rates[pos].1.or(dev.zkops),
+                _ => {}
+            }
+        }
+        for (card, (sp1, risc0)) in cards.iter_mut().zip(rates) {
+            card.zkops = zkminer_prover_protocol::blended_zkops(sp1, risc0);
+        }
+        cards
     }
 
     /// Updates what each warming-up card's setup is doing, from `status(slot key)`.
@@ -1110,6 +1172,47 @@ mod benchmark_tracker_tests {
         tracker.apply(&event(key, RTX, 0, program_done(zkminer_prover_protocol::BENCH_ZKOP_MIX, 7)));
         let expected = zkminer_prover_protocol::zkops_from_stark_secs(1.0);
         assert_eq!(tracker.devices[0].zkops, Some(expected));
+    }
+
+    #[test]
+    fn a_card_scores_its_zkvms_blended() {
+        use zkminer_prover_protocol::{blended_zkops, zkops_from_stark_secs, BENCH_ZKOP_MIX};
+        let mut tracker = BenchmarkTracker::default();
+        tracker.apply(&event(
+            "risc0:cuda:0",
+            RTX,
+            0,
+            BenchmarkProgressKind::Queued,
+        ));
+        tracker.apply(&event("sp1:cuda:0", RTX, 0, BenchmarkProgressKind::Queued));
+        tracker.apply(&event("sp1:intel:0", ARC, 0, BenchmarkProgressKind::Queued));
+        let rate = zkops_from_stark_secs(1.0);
+
+        // One zkVM scored: the card's score is that one alone, not yet ticked.
+        tracker.apply(&event(
+            "risc0:cuda:0",
+            RTX,
+            0,
+            program_done(BENCH_ZKOP_MIX, 6),
+        ));
+        let cards = tracker.card_scores();
+        assert_eq!(cards.len(), 2, "one per GPU, not per zkVM");
+        assert_eq!(cards[0].name, "RTX 4090");
+        assert_eq!(cards[0].zkops, blended_zkops(None, Some(rate)));
+        assert!(!cards[0].complete);
+
+        // Both scored: blended, and complete.
+        tracker.apply(&event(
+            "sp1:cuda:0",
+            RTX,
+            0,
+            program_done(BENCH_ZKOP_MIX, 6),
+        ));
+        let cards = tracker.card_scores();
+        assert_eq!(cards[0].zkops, blended_zkops(Some(rate), Some(rate)));
+        assert!(cards[0].complete && !cards[0].failed);
+        assert_eq!(cards[1].name, "Arc A770");
+        assert_eq!(cards[1].zkops, None);
     }
 
     #[test]

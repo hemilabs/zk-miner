@@ -10,7 +10,8 @@ use crate::hardware::GpuVendor;
 use crate::state::{BenchmarkTracker, MinerState, ProgramPhase};
 use crate::theme;
 use zkminer_prover::benchmark::BENCHMARK_PROGRAMS;
-use zkminer_prover_protocol::{zkops_from_stark_secs, BENCH_ZKOP_MIX};
+use zkminer_prover::benchmark::{format_mzkops, gpu_zkops};
+use zkminer_prover_protocol::BENCH_ZKOP_MIX;
 
 /// Build the ordered list of unique device IDs from benchmark data + hardware: gpu0, gpu1, etc.
 /// The CPU has no row: the benchmark measures only the cards.
@@ -88,12 +89,9 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
     let cpu_info = if let Some(bench) = &state.benchmark_results {
         vec![
             Line::from(vec![
+                Span::styled(format!(" {} ", format_mzkops(bench.zkops)), theme::metric()),
                 Span::styled(
-                    format!(" zkOP/s: {} ", format_zkops(bench.zkops)),
-                    theme::metric(),
-                ),
-                Span::styled(
-                    "  SP1 cycles per second on a 50M-cycle program, all GPUs",
+                    "  each GPU's SP1 and RISC Zero scores blended, all GPUs",
                     theme::dim(),
                 ),
             ]),
@@ -285,7 +283,7 @@ fn render_device_benchmarks(f: &mut Frame, area: Rect, state: &MinerState) {
             "Segment",
             "Memory",
             "Throughput",
-            "zkOP/s",
+            "Score",
         ])
             .style(theme::table_header());
 
@@ -338,6 +336,11 @@ fn render_device_benchmarks(f: &mut Frame, area: Rect, state: &MinerState) {
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(format_throughput(total_tp)).style(theme::metric()),
+                Cell::from(
+                    gpu_zkops(&bench.device_benchmarks, device_id)
+                        .map_or(String::new(), format_mzkops),
+                )
+                .style(theme::metric()),
             ]));
 
             for d in dev_entries {
@@ -361,7 +364,12 @@ fn render_device_benchmarks(f: &mut Frame, area: Rect, state: &MinerState) {
                         Cell::from(segment_str),
                         Cell::from(mem_str),
                         Cell::from(format_throughput(d.throughput)),
-                        Cell::from(format_zkops(d.zkops())).style(theme::metric()),
+                        // Each zkVM's score in its own cycles per second.
+                        Cell::from(
+                            d.scoring_cycles_per_sec()
+                                .map_or(String::new(), format_throughput),
+                        )
+                        .style(theme::metric()),
                     ])
                     .style(theme::bold()),
                 );
@@ -718,14 +726,7 @@ fn render_program_table(f: &mut Frame, area: Rect, state: &MinerState, tracker: 
                         }
                         ProgramPhase::Done => {
                             let duration = prog.duration_secs.unwrap_or(0.0);
-                            let result = if prog.name == BENCH_ZKOP_MIX {
-                                format!(
-                                    "{} zkOP/s",
-                                    format_zkops(zkops_from_stark_secs(duration))
-                                )
-                            } else {
-                                format_throughput(prog.throughput.unwrap_or(0.0))
-                            };
+                            let result = format_throughput(prog.throughput.unwrap_or(0.0));
                             Row::new(vec![
                                 Cell::from(Span::styled(
                                     " \u{2713}",
@@ -881,22 +882,26 @@ fn render_score_and_controls(
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
-    // Score panel: each row's score appears when its scoring program, the last one, finishes.
+    // Score panel: each GPU's blended score, once a zkVM on it has scored; ticked when every
+    // zkVM on it has finished.
     let scores: Vec<Span> = tracker
-        .devices
-        .iter()
-        .filter_map(|dev| {
-            let name = tracker.display_name(dev);
-            if dev.failed {
-                Some(Span::styled(format!("{name} failed"), theme::error()))
-            } else {
-                dev.zkops.map(|score| {
-                    Span::styled(
-                        format!("{name} {} \u{2713}", format_zkops(score)),
-                        Style::default().fg(theme::green()),
-                    )
-                })
-            }
+        .card_scores()
+        .into_iter()
+        .filter_map(|card| match card.zkops {
+            Some(score) => Some(Span::styled(
+                format!(
+                    "{} {}{}",
+                    card.name,
+                    format_mzkops(score),
+                    if card.complete { " \u{2713}" } else { "" }
+                ),
+                Style::default().fg(theme::green()),
+            )),
+            None if card.failed => Some(Span::styled(
+                format!("{} failed", card.name),
+                theme::error(),
+            )),
+            None => None,
         })
         .collect();
     let score_lines: Vec<Line> = if scores.is_empty() {
@@ -910,7 +915,7 @@ fn render_score_and_controls(
 
     let score = Paragraph::new(score_lines).block(
         Block::default()
-            .title(Span::styled(" Score (zkOP/s) ", theme::title()))
+            .title(Span::styled(" Score per GPU ", theme::title()))
             .borders(Borders::ALL)
             .border_style(theme::border())
             .border_type(theme::border_type()),
@@ -951,18 +956,6 @@ fn format_throughput(tp: f64) -> String {
 }
 
 /// A zkOP/s figure, or "N/A" when there is no score.
-fn format_zkops(zkops: f64) -> String {
-    if zkops >= 1_000_000.0 {
-        format!("{:.2}M", zkops / 1_000_000.0)
-    } else if zkops >= 1_000.0 {
-        format!("{:.0}K", zkops / 1_000.0)
-    } else if zkops > 0.0 {
-        format!("{zkops:.0}")
-    } else {
-        "N/A".to_string()
-    }
-}
-
 /// The Weight column: a program's share, or what the scoring program is for.
 fn weight_label(name: &str) -> String {
     if name == BENCH_ZKOP_MIX {
