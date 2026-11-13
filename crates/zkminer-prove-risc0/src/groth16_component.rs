@@ -1,6 +1,6 @@
-//! RISC Zero's `risc0-groth16` component: the Groth16 proving key and witness generator (~5 GB)
+//! RISC Zero's `risc0-groth16` component: the Groth16 proving key and witness generator (~5.8 GB)
 //! that the final wrap of every proof needs. risc0 looks for it (`risc0_groth16::prove::component`)
-//! in `RISC0_GROTH16_DIR`, else in rzup's install, `~/.risc0/extensions/v0.1.0-risc0-groth16`
+//! in `RISC0_GROTH16_DIR`, else in rzup's install, `~/.risc0/extensions/v0.2.0-risc0-groth16`
 //! (`$RISC0_HOME` in place of `~/.risc0`), and fails every proof without it.
 //!
 //! A host with only its GPU driver has no `rzup` to install it with, so the worker installs it
@@ -19,13 +19,14 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
 
-/// The version risc0-groth16 3.0 asks for.
-const VERSION: &str = "0.1.0";
+/// The version risc0-groth16 3.1 asks for: 0.2.0, the ceremony of the v3.1.0 Groth16 fix
+/// (GHSA-g6qg-9j8p-7j87). Proofs from the 0.1.0 key do not verify against 3.1's verifier.
+const VERSION: &str = "0.2.0";
 /// The archive of that version, as rzup's distribution manifest lists it
 /// (`rzup/components/risc0-groth16/distribution_manifest.json`).
-const ARCHIVE_SHA256: &str = "4b4f2b2fb8380369ed14f0dc48380a1bbcbc82c7d553f1888b47d0a9f8e72e4d";
+const ARCHIVE_SHA256: &str = "173354ab0bd18417ba1080a0094b4398098a62b9c7460ba1dc34988b2baa57e5";
 const ARCHIVE_URL: &str = "https://risc0-artifacts.s3.us-west-2.amazonaws.com/rzup/components/\
-                           risc0-groth16/sha256/4b4f2b2fb8380369ed14f0dc48380a1bbcbc82c7d553f1888b47d0a9f8e72e4d";
+                           risc0-groth16/sha256/173354ab0bd18417ba1080a0094b4398098a62b9c7460ba1dc34988b2baa57e5";
 /// The files a complete install holds.
 const FILES: [&str; 4] = [
     "stark_verify_graph.bin",
@@ -71,7 +72,7 @@ pub fn ensure_installed(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) 
 
     let start = Instant::now();
     tracing::info!(
-        "installing the risc0-groth16 component (a 2.3 GB download, 5 GB installed) into {}",
+        "installing the risc0-groth16 component (a 2.4 GB download, 5.8 GB installed) into {}",
         dir.display()
     );
     let archive = tmp.join(format!("risc0-groth16-{VERSION}.tar.xz"));
@@ -200,7 +201,7 @@ fn download(to: &Path, total: &AtomicU64) -> Result<()> {
 const DOWNLOADING: &str = "Downloading the Groth16 files (first run)";
 const UNPACKING: &str = "Unpacking the Groth16 files (first run)";
 /// What the pinned component unpacks to, for the unpack's progress bar.
-const UNPACKED_BYTES: u64 = 5_314_631_872;
+const UNPACKED_BYTES: u64 = 5_812_781_917;
 /// How often a long step's progress is reported.
 const PROGRESS_EVERY: Duration = Duration::from_secs(1);
 

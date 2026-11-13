@@ -160,23 +160,23 @@ zkminer-config = { path = "crates/zkminer-config" }
 # A rev and not a branch for the reason given on `sppark` below: a branch pin follows a moved head on
 # the next `cargo update` without anyone choosing to.
 [patch.crates-io]
-risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
-risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
 # Pinned by immutable REV, not a branch: a branch head can silently move the build
 # off a validated commit (which is why the risc0/sp1 patches below carry a
 # do-not-cargo-update warning). 5f68eb3 = hemilabs/risc0-sppark `zkminer/windows-amd`
@@ -263,3 +263,11 @@ codegen-units = 1
 codegen-units = 1
 [profile.release.package.zkminer-prove-sp1]
 codegen-units = 1
+
+# risc0 3.1's recursion programs (`risc0-circuit-recursion-zkrs`, `-control-zkrs`) ship as a tarball
+# stored in git-lfs, which a cargo git checkout of the fork does not fetch (its build script then stops
+# with "zkrs.tar.xz is a git-lfs pointer"). The crates.io releases hold the same tarballs (SHA-256
+# 53388c58... and 202fd7e7..., the fork's LFS object ids at f6f6f8f9), so they are taken from there.
+[patch."https://github.com/hemilabs/risc0"]
+risc0-circuit-recursion-zkrs = { version = "=4.1.0", registry = "crates-io" }
+risc0-circuit-recursion-control-zkrs = { version = "=4.1.0", registry = "crates-io" }
