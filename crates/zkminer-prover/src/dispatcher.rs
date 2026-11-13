@@ -1841,7 +1841,7 @@ pub struct WorkerPool {
     /// Why workers could not start, in words for the operator. See [`Self::startup_problems`].
     startup_problems: Vec<String>,
     /// What each slot's one-time setup is doing now, by slot key. See [`Self::setup_status`].
-    setup_status: Mutex<HashMap<String, String>>,
+    setup_status: Mutex<HashMap<String, zkminer_prover_protocol::SetupStep>>,
 }
 
 /// What `WorkerPool::run_benchmark_requests` got from a worker.
@@ -1911,7 +1911,7 @@ impl WorkerPool {
     /// What `key`'s one-time setup is doing now, if it is in one. Falls back to any slot of the same
     /// backend: the setup is per host, so one slot does it while the others wait for it, and it may
     /// be running on a background thread rather than for the caller.
-    pub fn setup_status(&self, key: &str) -> Option<String> {
+    pub fn setup_status(&self, key: &str) -> Option<zkminer_prover_protocol::SetupStep> {
         let statuses = self.setup_status.lock().unwrap_or_else(|e| e.into_inner());
         let backend = key.split(':').next().unwrap_or(key);
         statuses.get(key).cloned().or_else(|| {
@@ -1922,7 +1922,7 @@ impl WorkerPool {
         })
     }
 
-    fn set_setup_status(&self, key: &str, status: Option<String>) {
+    fn set_setup_status(&self, key: &str, status: Option<zkminer_prover_protocol::SetupStep>) {
         let mut statuses = self.setup_status.lock().unwrap_or_else(|e| e.into_inner());
         match status {
             Some(status) => statuses.insert(key.to_string(), status),
@@ -3397,15 +3397,26 @@ impl WorkerPool {
         let mut logged_step: Option<String> = None;
         let response = loop {
             match handle.recv() {
-                Ok(WorkerResponse::SetupProgress { status, .. }) => {
-                    // A download repeats its step with a growing byte count: the log takes each
-                    // step once.
-                    let step = status.split(": ").next().unwrap_or(&status);
-                    if logged_step.as_deref() != Some(step) {
+                Ok(WorkerResponse::SetupProgress {
+                    status,
+                    done_bytes,
+                    total_bytes,
+                    ..
+                }) => {
+                    // A download repeats its step every second with its bytes so far: the log
+                    // takes each step once.
+                    if logged_step.as_deref() != Some(status.as_str()) {
                         tracing::info!("{key}: {status}");
-                        logged_step = Some(step.to_string());
+                        logged_step = Some(status.clone());
                     }
-                    self.set_setup_status(key, Some(status));
+                    self.set_setup_status(
+                        key,
+                        Some(zkminer_prover_protocol::SetupStep {
+                            status,
+                            done_bytes,
+                            total_bytes,
+                        }),
+                    );
                 }
                 other => break other,
             }

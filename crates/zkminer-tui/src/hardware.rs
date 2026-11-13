@@ -295,8 +295,13 @@ impl HwMonitor {
         let nvml_devices = cache_nvml_devices(&state.hardware);
         // Intel and AMD have no sysfs here: their drivers' libraries report instead.
         #[cfg(windows)]
-        let mut windows_telemetry =
-            crate::windows_telemetry::WindowsTelemetry::new(&state.hardware.gpus);
+        let mut windows_telemetry = {
+            let has = |vendor| state.hardware.gpus.iter().any(|g| g.vendor == vendor);
+            zkminer_prover::windows_telemetry::WindowsTelemetry::new(
+                has(GpuVendor::Intel),
+                has(GpuVendor::Amd),
+            )
+        };
         let has_nvidia = state
             .hardware
             .gpus
@@ -351,7 +356,7 @@ impl HwMonitor {
                 } else {
                     refresh_gpu(gpu, energy_snap);
                     #[cfg(windows)]
-                    windows_telemetry.refresh(gpu);
+                    refresh_from_windows_telemetry(&mut windows_telemetry, gpu);
                 }
             }
 
@@ -392,6 +397,47 @@ impl HwMonitor {
             }
         }
     }
+}
+
+/// Reads an Intel or AMD card on Windows through its vendor's library (see
+/// `zkminer_prover::windows_telemetry`).
+#[cfg(windows)]
+fn refresh_from_windows_telemetry(
+    telemetry: &mut zkminer_prover::windows_telemetry::WindowsTelemetry,
+    gpu: &mut GpuInfo,
+) {
+    let mut reading = zkminer_prover::windows_telemetry::GpuTelemetry {
+        pci_bus_id: gpu.pci_bus_id.clone(),
+        gpu_clock_mhz: gpu.gpu_clock_mhz,
+        mem_clock_mhz: gpu.mem_clock_mhz,
+        gpu_usage_percent: gpu.gpu_usage_percent,
+        vram_used_bytes: gpu.vram_used_bytes,
+        vram_total_bytes: gpu.vram_total_bytes,
+        temp_edge_c: gpu.temp_edge_c,
+        temp_junction_c: gpu.temp_junction_c,
+        temp_mem_c: gpu.temp_mem_c,
+        fan_rpm: gpu.fan_rpm,
+        power_watts: gpu.power_watts,
+        voltage_mv: gpu.voltage_mv,
+        pcie_speed: std::mem::take(&mut gpu.pcie_speed),
+        pcie_width: gpu.pcie_width,
+        throttle_reasons: std::mem::take(&mut gpu.throttle_reasons),
+    };
+    telemetry.refresh(&mut reading);
+    gpu.gpu_clock_mhz = reading.gpu_clock_mhz;
+    gpu.mem_clock_mhz = reading.mem_clock_mhz;
+    gpu.gpu_usage_percent = reading.gpu_usage_percent;
+    gpu.vram_used_bytes = reading.vram_used_bytes;
+    gpu.vram_total_bytes = reading.vram_total_bytes;
+    gpu.temp_edge_c = reading.temp_edge_c;
+    gpu.temp_junction_c = reading.temp_junction_c;
+    gpu.temp_mem_c = reading.temp_mem_c;
+    gpu.fan_rpm = reading.fan_rpm;
+    gpu.power_watts = reading.power_watts;
+    gpu.voltage_mv = reading.voltage_mv;
+    gpu.pcie_speed = reading.pcie_speed;
+    gpu.pcie_width = reading.pcie_width;
+    gpu.throttle_reasons = reading.throttle_reasons;
 }
 
 /// Cache NVML Device objects keyed by global GPU index.
@@ -449,7 +495,7 @@ fn refresh_nvidia_gpu_cached(gpu: &mut GpuInfo, device: &nvml_wrapper::Device) {
     #[cfg(windows)]
     {
         if let Ok(generation) = device.current_pcie_link_gen() {
-            gpu.pcie_speed = crate::windows_telemetry::pcie_speed_label(generation);
+            gpu.pcie_speed = zkminer_prover::windows_telemetry::pcie_speed_label(generation);
         }
         if let Ok(width) = device.current_pcie_link_width() {
             gpu.pcie_width = width;

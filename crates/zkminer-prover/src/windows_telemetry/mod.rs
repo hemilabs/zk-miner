@@ -2,36 +2,57 @@
 //! (`ControlLib.dll`) and AMD's ADLX (`amdadlx64.dll`). Both ship with the regular display
 //! driver, so nothing extra is installed.
 //!
-//! Windows has no sysfs, so without these the hardware panel only knew each card's name and VRAM.
-//! They also report the PCIe link the card actually negotiated with the slot: Windows' own device
-//! properties describe the link between the GPU and the switch on its own board, which on Arc and
-//! Radeon cards is not the slot's.
+//! Windows has no sysfs, so without these the hardware panel only knew each card's name and VRAM,
+//! and the benchmark could not measure their power. They also report the PCIe link the card
+//! actually negotiated with the slot: Windows' own device properties describe the link between the
+//! GPU and the switch on its own board, which on Arc and Radeon cards is not the slot's.
 //!
-//! Cards are matched on their PCI address, the key the rest of the TUI joins on. A library that
-//! is missing or fails to start leaves its cards' figures empty, as before.
+//! Cards are matched on their PCI address, the key the rest of the miner joins on. A library that
+//! is missing or fails to start leaves its cards' figures as they were.
 
 mod adlx;
 mod igcl;
 
-use crate::hardware::{GpuInfo, GpuVendor};
+/// One card's figures, read into by [`WindowsTelemetry::refresh`]. A field the card's library
+/// does not report keeps the value it had.
+#[derive(Debug, Clone, Default)]
+pub struct GpuTelemetry {
+    /// Canonical lowercase PCI address, e.g. `0000:03:00.0`: which card to read.
+    pub pci_bus_id: String,
+    pub gpu_clock_mhz: u32,
+    pub mem_clock_mhz: u32,
+    pub gpu_usage_percent: u32,
+    pub vram_used_bytes: u64,
+    pub vram_total_bytes: u64,
+    pub temp_edge_c: Option<f64>,
+    pub temp_junction_c: Option<f64>,
+    pub temp_mem_c: Option<f64>,
+    pub fan_rpm: u32,
+    /// Watts. 0 until known: Intel's comes from two readings of an energy counter.
+    pub power_watts: f64,
+    pub voltage_mv: u32,
+    /// sysfs `current_link_speed` form, e.g. "32.0 GT/s PCIe".
+    pub pcie_speed: String,
+    pub pcie_width: u32,
+    pub throttle_reasons: Vec<String>,
+}
 
-pub(crate) struct WindowsTelemetry {
+pub struct WindowsTelemetry {
     intel: Option<igcl::Igcl>,
     amd: Option<&'static std::sync::Mutex<adlx::Adlx>>,
 }
 
 impl WindowsTelemetry {
-    /// Load the libraries for the vendors present in `gpus`.
-    pub(crate) fn new(gpus: &[GpuInfo]) -> Self {
-        let has = |vendor| gpus.iter().any(|g| g.vendor == vendor);
-        let intel = if has(GpuVendor::Intel) {
+    /// Load the libraries of the vendors asked for.
+    pub fn new(intel: bool, amd: bool) -> Self {
+        let intel = if intel {
             igcl::Igcl::load()
                 .inspect_err(|e| tracing::info!("Intel GPU telemetry unavailable: {e}"))
                 .ok()
         } else {
             None
         };
-        let amd = if has(GpuVendor::Amd) {
+        let amd = if amd {
             adlx::Adlx::shared()
                 .inspect_err(|e| tracing::info!("AMD GPU telemetry unavailable: {e}"))
                 .ok()
@@ -41,21 +62,18 @@ impl WindowsTelemetry {
         Self { intel, amd }
     }
 
-    pub(crate) fn refresh(&mut self, gpu: &mut GpuInfo) {
-        match gpu.vendor {
-            GpuVendor::Intel => {
-                if let Some(intel) = self.intel.as_mut() {
-                    intel.refresh(gpu);
-                }
+    /// Reads the card at `gpu.pci_bus_id` into `gpu`, if a loaded library knows it.
+    pub fn refresh(&mut self, gpu: &mut GpuTelemetry) {
+        if let Some(intel) = self.intel.as_mut() {
+            if intel.knows(&gpu.pci_bus_id) {
+                intel.refresh(gpu);
+                return;
             }
-            GpuVendor::Amd => {
-                if let Some(amd) = self.amd {
-                    if let Ok(mut amd) = amd.lock() {
-                        amd.refresh(gpu);
-                    }
-                }
+        }
+        if let Some(amd) = self.amd {
+            if let Ok(mut amd) = amd.lock() {
+                amd.refresh(gpu);
             }
-            _ => {}
         }
     }
 }
@@ -66,7 +84,7 @@ fn bdf_key(bus: u32, device: u32, function: u32) -> String {
 }
 
 /// A PCIe generation in sysfs' `current_link_speed` form, which `pcie_gen_label` reads.
-pub(crate) fn pcie_speed_label(generation: u32) -> String {
+pub fn pcie_speed_label(generation: u32) -> String {
     match generation {
         1 => "2.5 GT/s PCIe",
         2 => "5.0 GT/s PCIe",
@@ -122,11 +140,9 @@ mod tests {
     }
 
     #[test]
-    fn link_speeds_read_back_as_their_generation() {
-        for generation in 1..=5 {
-            let label = crate::hardware::pcie_gen_label(&pcie_speed_label(generation)).to_string();
-            assert_eq!(label, format!("Gen{generation}"));
-        }
+    fn link_speeds_are_in_sysfs_form() {
+        assert_eq!(pcie_speed_label(1), "2.5 GT/s PCIe");
+        assert_eq!(pcie_speed_label(5), "32.0 GT/s PCIe");
         assert_eq!(pcie_speed_label(0), "");
     }
 
@@ -154,18 +170,24 @@ mod tests {
         assert_eq!(then.rates_since(&then), (None, None));
     }
 
-    /// Reads this machine's GPUs through the same path as the hardware panel. Run by hand:
-    /// `cargo test -p zkminer-tui --lib live_telemetry -- --ignored --nocapture`.
+    /// Reads this machine's GPUs through the libraries, twice a second apart (Intel's power needs
+    /// two). Run by hand: `cargo test -p zkminer-prover --lib live_telemetry -- --ignored --nocapture`.
     #[test]
     #[ignore = "reads the GPUs of the machine it runs on"]
     fn live_telemetry() {
-        let mut gpus = crate::hardware::probe_static().gpus;
-        let mut telemetry = WindowsTelemetry::new(&gpus);
+        let mut telemetry = WindowsTelemetry::new(true, true);
+        let mut cards: Vec<GpuTelemetry> = crate::discovery::detect_all_gpus()
+            .into_iter()
+            .map(|gpu| GpuTelemetry {
+                pci_bus_id: gpu.pci_bus_id,
+                ..Default::default()
+            })
+            .collect();
         for round in 0..2 {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            for gpu in &mut gpus {
-                telemetry.refresh(gpu);
-                println!("round {round}: {gpu:#?}");
+            for card in &mut cards {
+                telemetry.refresh(card);
+                println!("round {round}: {card:?}");
             }
         }
     }
