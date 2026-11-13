@@ -102,7 +102,6 @@ pub(super) struct Adlx {
     performance: Object,
     /// Keyed by `pci_bus_id`. Discrete GPUs only.
     gpus: HashMap<String, Gpu>,
-    _library: libloading::Library,
 }
 
 // SAFETY: ADLX's objects may be used from any thread; the Mutex around the one instance keeps
@@ -122,6 +121,10 @@ impl Adlx {
         type Initialize2Fn = unsafe extern "C" fn(u64, *mut Object, *mut Object) -> AdlxResult;
         // SAFETY: loading the driver's own library, whose initialization has no preconditions.
         let library = unsafe { libloading::Library::new("amdadlx64.dll") }?;
+        // Never unloaded, as `ControlLib.dll` (igcl.rs): a driver library may leave work on the
+        // process's thread pool that outlives a failed initialization, and the objects below
+        // point into it.
+        let library: &'static libloading::Library = Box::leak(Box::new(library));
         // SAFETY: `ADLXInitialize2_Fn` from ADLX.h. Version 1.1 and later export it.
         let initialize = unsafe { *library.get::<Initialize2Fn>(b"ADLXInitialize2\0")? };
         let mut system: Object = std::ptr::null_mut();
@@ -192,7 +195,6 @@ impl Adlx {
             Ok(Adlx {
                 performance,
                 gpus,
-                _library: library,
             })
         }
     }
