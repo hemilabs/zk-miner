@@ -160,23 +160,23 @@ zkminer-config = { path = "crates/zkminer-config" }
 # A rev and not a branch for the reason given on `sppark` below: a branch pin follows a moved head on
 # the next `cargo update` without anyone choosing to.
 [patch.crates-io]
-risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
-risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "49f42eb11658ab608509113f3073366aa4d4edd2" }
+risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
+risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "58dfae8982439db6d3e0a95ab5c2d670b21d0107" }
 # Pinned by immutable REV, not a branch: a branch head can silently move the build
 # off a validated commit (which is why the risc0/sp1 patches below carry a
 # do-not-cargo-update warning). 5f68eb3 = hemilabs/risc0-sppark `zkminer/windows-amd`
