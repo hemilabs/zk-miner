@@ -14832,6 +14832,31 @@ mod r2_sizing_tests {
         }
     }
 
+    /// M8: a Mac's risc0 slot is sized by the shared Metal table: 19 for a 16 GB or 18 GB Mac (8 /
+    /// 10 GiB host figure) and 20 for a 24 GB Mac (16 GiB), where M1's table gave 18 / 18 / 19.
+    #[test]
+    fn a_macs_risc0_slot_takes_the_m8_tier() {
+        use zkminer_prover::metal_sizing as ms;
+        const GIB: u64 = 1 << 30;
+        let vrams = [8 * GIB, 10 * GIB, 16 * GIB, 28 * GIB];
+        let slots: Vec<_> = vrams
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (format!("risc0:metal:{i}"), format!("gpu-metal{i}"), Some(*v)))
+            .collect();
+        let sizes = risc0_slot_sizes(&slots, None, &HashMap::new());
+        let got: Vec<Option<u8>> = sizes.iter().map(|(_, _, p)| *p).collect();
+        // Whatever this process's budget and knob: the table row of the smaller figure.
+        let want: Vec<Option<u8>> = vrams
+            .iter()
+            .map(|&v| Some(ms::job_po2_for_limit(ms::host_working_set_limit(Some(v)).unwrap())))
+            .collect();
+        assert_eq!(got, want);
+        if ms::env_working_set_budget().is_none() && ms::env_po2_table() == ms::Po2Table::M8 {
+            assert_eq!(got, vec![Some(19), Some(19), Some(20), Some(20)]);
+        }
+    }
+
     #[test]
     fn each_card_measures_and_proves_risc0_jobs_at_its_own_size() {
         const GIB: u64 = 1 << 30;
