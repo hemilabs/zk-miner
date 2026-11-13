@@ -218,8 +218,6 @@ pub(super) struct Igcl {
     telemetry: TelemetryFn,
     /// Keyed by `pci_bus_id`.
     devices: HashMap<String, Device>,
-    // Last: the function pointers above point into it.
-    _library: libloading::Library,
 }
 
 // SAFETY: the handles are only used from the thread that owns this value; IGCL documents its calls
@@ -230,6 +228,11 @@ impl Igcl {
     pub(super) fn load() -> anyhow::Result<Self> {
         // SAFETY: loading the driver's own library, whose initialization has no preconditions.
         let library = unsafe { libloading::Library::new("ControlLib.dll") }?;
+        // Never unloaded (the function pointers below point into it). ctlInit leaves work on the
+        // process's thread pool that runs after it returns, failed or not: unloading the library
+        // when it failed (as on a machine whose only GPUs are not Intel's: 0x40000001) made that
+        // work jump into unmapped code and crash the miner, seconds later and only now and then.
+        let library: &'static libloading::Library = Box::leak(Box::new(library));
         // SAFETY: the signatures are `igcl_api.h`'s; the pointers are kept with the library.
         let (init, close, enumerate, properties, pci_state, telemetry) = unsafe {
             (
@@ -259,7 +262,6 @@ impl Igcl {
             pci_state,
             telemetry,
             devices: HashMap::new(),
-            _library: library,
         };
 
         let mut count = 0u32;
@@ -383,7 +385,7 @@ impl Igcl {
 
 impl Drop for Igcl {
     fn drop(&mut self) {
-        // SAFETY: `api` came from ctlInit and the library is still loaded.
+        // SAFETY: `api` came from ctlInit, and the library is never unloaded.
         unsafe { (self.close)(self.api) };
     }
 }
