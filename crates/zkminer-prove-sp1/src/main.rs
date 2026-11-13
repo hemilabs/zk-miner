@@ -279,14 +279,18 @@ use zkminer_prover_protocol::types::{
     CUDA_DEVICE_ID_ENV, CUDA_VRAM_AVAILABLE_BYTES_ENV, CUDA_VRAM_BYTES_ENV, HOST_MEM_BUDGET_ENV,
 };
 use zkminer_prover_protocol::{
-    is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
-    WorkerResponse, BACKEND_SP1, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
-    BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
-    PROTOCOL_VERSION,
+    is_gpu_oom, read_message, write_message, BenchmarkEntry, BenchmarkProgramSpec, ErrorKind,
+    WorkerCommand, WorkerResponse, BACKEND_SP1, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX,
+    BENCH_ECDSA_VERIFY, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, BENCH_ZKOP_MIX,
+    EXECUTE_JOURNAL_MAX_BYTES, PROTOCOL_VERSION,
 };
 
 mod bundled_server;
 mod warmup;
+#[cfg(windows)]
+mod windows_job;
+#[cfg(windows)]
+mod windows_tuning;
 
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -297,6 +301,7 @@ const ECDSA_VERIFY_SP1_GUEST_ELF: &[u8] = include_bytes!(env!("SP1_ELF_ecdsa-ver
 const BIGINT_MUL_SP1_GUEST_ELF: &[u8] = include_bytes!(env!("SP1_ELF_bigint-mul-sp1-guest"));
 const MEMORY_MERKLE_SP1_GUEST_ELF: &[u8] = include_bytes!(env!("SP1_ELF_memory-merkle-sp1-guest"));
 const CHACHA_MIX_SP1_GUEST_ELF: &[u8] = include_bytes!(env!("SP1_ELF_chacha-mix-sp1-guest"));
+const ZKOP_MIX_SP1_GUEST_ELF: &[u8] = include_bytes!(env!("SP1_ELF_zkop-mix-sp1-guest"));
 
 /// Duplicate `fd` with close-on-exec set.
 ///
@@ -334,18 +339,10 @@ fn main() {
             eprintln!("usage: --export-guest <benchmark program> <path>");
             std::process::exit(2);
         };
-        let elf = match name.as_str() {
-            BENCH_FIBONACCI => FIBONACCI_SP1_GUEST_ELF,
-            BENCH_SHA256_CHAIN => SHA256_CHAIN_SP1_GUEST_ELF,
-            BENCH_ECDSA_VERIFY => ECDSA_VERIFY_SP1_GUEST_ELF,
-            BENCH_BIGINT_MUL => BIGINT_MUL_SP1_GUEST_ELF,
-            BENCH_MEMORY_MERKLE => MEMORY_MERKLE_SP1_GUEST_ELF,
-            BENCH_CHACHA_MIX => CHACHA_MIX_SP1_GUEST_ELF,
-            other => {
-                eprintln!("unknown guest {other:?} (known: the benchmark programs)");
-                std::process::exit(2);
-            }
-        };
+        let elf = benchmark_guest(name).unwrap_or_else(|| {
+            eprintln!("unknown guest {name:?} (known: the benchmark programs)");
+            std::process::exit(2);
+        });
         let pk = match sp1_sdk::blocking::ProverClient::builder()
             .cpu()
             .build()
@@ -378,8 +375,8 @@ fn main() {
         unsafe { libc::dup2(io::stderr().as_raw_fd(), stdout_fd) };
         unsafe { std::fs::File::from_raw_fd(ipc_fd) }
     };
-    #[cfg(not(unix))]
-    let mut ipc_stdout = io::stdout();
+    #[cfg(windows)]
+    let mut ipc_stdout = zkminer_prover_protocol::ipc::take_ipc_stdout();
 
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
@@ -399,6 +396,9 @@ fn main() {
     // for it to finish exiting: this spends the handshake's budget (`HANDSHAKE_TIMEOUT`), and most
     // workers prove minutes later if at all. `build_prover` waits, when a server is about to start.
     reap_orphaned_gpu_servers(our_cuda_device, Duration::ZERO);
+    // On Windows no server outlives its worker to be adopted.
+    #[cfg(windows)]
+    windows_job::end_children_with_this_process();
 
     // Likewise before any execute: sweep SP1 native-executor /dev/shm trace rings and memory images
     // orphaned by a worker that died without unlinking (SIGBUS/OOM-kill). Left behind they fill the
@@ -433,6 +433,21 @@ fn main() {
         }
     }
 
+    // Windows: every build's own DLLs (the MSVC runtime; HIP's or SYCL's runtime) are installed in
+    // `<name>-lib/` beside it, which goes on the PATH the server inherits: Windows looks there for
+    // a DLL that is not beside the executable.
+    #[cfg(windows)]
+    if let Ok(server) = warmup::server_path() {
+        let lib = server.with_file_name(format!("{}-lib", warmup::server_name()));
+        if lib.is_dir() {
+            let mut dirs = vec![lib];
+            dirs.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+            if let Ok(path) = std::env::join_paths(dirs) {
+                std::env::set_var("PATH", path);
+            }
+        }
+    }
+
     // Direct benchmark mode: run benchmarks and print results to stderr (stdout is redirected).
     if std::env::args().any(|a| a == "--benchmark") {
         // Honour the assigned device here too. Without this, benchmarking card 1 by hand silently
@@ -453,7 +468,8 @@ fn main() {
     }
 }
 
-/// `--benchmark`: run every benchmark and print a row per program to stderr. Returns the exit code,
+/// `--benchmark`: the warm-up and suite the miner would send, then the zkOP/s score, printing a row per program
+/// to stderr. Returns the exit code,
 /// which is non-zero unless every program produced its row, so a script can tell.
 fn run_benchmarks_by_hand(device: Option<u32>) -> i32 {
     // Dropped before returning. That also ends the server, which must not outlive this process: with
@@ -466,7 +482,19 @@ fn run_benchmarks_by_hand(device: Option<u32>) -> i32 {
             return 1;
         }
     };
-    let run = run_benchmarks(prover, &mut held.benchmark_keys);
+    // Discarded, as under a host: see `warmup_spec`.
+    let warmup = [zkminer_prover_protocol::warmup_spec(BACKEND_SP1)];
+    run_benchmarks(prover, &mut held.benchmark_keys, &warmup, &mut |_, _, _| {});
+    let programs = zkminer_prover_protocol::benchmark_suite(BACKEND_SP1);
+    let mut run = run_benchmarks(
+        prover,
+        &mut held.benchmark_keys,
+        &programs,
+        &mut |_, _, _| {},
+    );
+    if run.server_lost.is_none() {
+        score_zkop_mix(prover, &mut held.benchmark_keys, &mut run);
+    }
     for r in &run.results {
         eprintln!(
             "{:<16} {:>12} cycles  {:>8.2}s  {:>12.0} c/s  weight={:.2}  precompile={}",
@@ -548,6 +576,7 @@ fn build_prover(
 /// Field 4 is ppid, but field 2 (`comm`) is wrapped in parentheses and may itself contain
 /// spaces AND parentheses, so counting from the left is wrong. Split after the LAST ')'
 /// and take the second field from there (field 3 is the state char).
+#[cfg(target_os = "linux")]
 fn ppid_from_proc_stat(stat: &str) -> Option<i32> {
     let rest = stat.rsplit_once(')').map(|(_, r)| r)?;
     rest.split_whitespace().nth(1)?.parse().ok()
@@ -962,6 +991,11 @@ const CUDA_DIR_OVERRIDE: &str = "ZKMINER_SP1_CUDA_RUNTIME_DIR";
 /// has the final say, so a failed or wrong resolution degrades to "SP1 cleanly
 /// unavailable, here is why" instead of claiming jobs it cannot prove.
 fn ensure_cuda12_on_library_path() {
+    // Windows' sp1-gpu-server links the CUDA runtime statically (cudart_static, see hemilabs/sp1's
+    // sp1-gpu-sys), so it needs only the driver.
+    if !cfg!(target_os = "linux") {
+        return;
+    }
     // Already reachable? Then do nothing -- including the case where the operator's own
     // LD_LIBRARY_PATH already provides it.
     if existing_path_has_cudart() {
@@ -1121,11 +1155,12 @@ fn sp1_measure_only() -> bool {
 }
 
 fn sp1_usability() -> Result<(), String> {
-    // The SDK does `env::var("HOME").expect(...)` to locate the server, so an unset HOME
-    // is a panic rather than an error. Systemd units routinely have no HOME.
-    let home = match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => h,
-        _ => {
+    // The SDK does `env::var("HOME").expect(...)` to locate the server (hemilabs/sp1 falls back to
+    // USERPROFILE, which is all Windows sets), so an unset HOME is a panic rather than an error.
+    // Systemd units routinely have no HOME.
+    let server = match warmup::server_path() {
+        Ok(server) => server,
+        Err(_) => {
             return Err(
                 "$HOME is not set, and the SP1 SDK requires it to locate ~/.sp1/bin/sp1-gpu-server (it panics without it)"
                     .to_string(),
@@ -1164,9 +1199,6 @@ fn sp1_usability() -> Result<(), String> {
     //   "error while loading shared libraries: libcudart.so.12: cannot open shared
     //    object file"
     // `--version` is what the SDK itself runs, costs milliseconds, and touches no GPU.
-    let server = std::path::PathBuf::from(&home)
-        .join(".sp1/bin")
-        .join(warmup::server_name());
     if !server.exists() {
         // Absent: the SDK downloads it on first use. We cannot verify a binary that does
         // not exist yet, and refusing here would disable SP1 on a host where it works.
@@ -1464,6 +1496,12 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             .unwrap_or_else(|| "unknown".into()),
     );
     apply_sp1_worker_tuning(sp1_scale, available_vram);
+    #[cfg(windows)]
+    windows_tuning::apply_sycl_wrap_persistent_pk(vram_bytes);
+    #[cfg(windows)]
+    windows_tuning::apply_cuda_groth16_helper();
+    #[cfg(windows)]
+    windows_tuning::apply_hip_readbacks();
     match cuda_device_id {
         Some(id) => tracing::info!("SP1 worker will drive CUDA device {id}"),
         None => tracing::info!(
@@ -1669,12 +1707,12 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     backend: BACKEND_SP1.to_string(),
                     version: sp1_sdk::SP1_CIRCUIT_VERSION.to_string(),
                     supported_benchmarks: vec![
-                        BENCH_FIBONACCI.to_string(),
                         BENCH_SHA256_CHAIN.to_string(),
                         BENCH_ECDSA_VERIFY.to_string(),
                         BENCH_BIGINT_MUL.to_string(),
                         BENCH_MEMORY_MERKLE.to_string(),
                         BENCH_CHACHA_MIX.to_string(),
+                        zkminer_prover_protocol::BENCH_ZKOP_MIX.to_string(),
                     ],
                     gpu_available,
                     gpu_name,
@@ -1682,7 +1720,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Benchmark => {
+            WorkerCommand::Benchmark { programs } => {
                 tracing::info!("Running benchmarks...");
                 if sp1_measure_only() {
                     // Benchmarking builds the CudaProver (forks sp1-gpu-server) — exactly what a
@@ -1698,7 +1736,22 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 }
                 match get_prover!(held.prover) {
                     Ok(p) => {
-                        let run = run_benchmarks(p, &mut held.benchmark_keys);
+                        let run = run_benchmarks(
+                            p,
+                            &mut held.benchmark_keys,
+                            &programs,
+                            &mut |entry, program_index, total| {
+                                // A closed pipe is reported by the final result's write below.
+                                let _ = write_message(
+                                    &mut stdout,
+                                    &WorkerResponse::BenchmarkProgress {
+                                        entry: entry.clone(),
+                                        program_index,
+                                        total_programs: total,
+                                    },
+                                );
+                            },
+                        );
                         // Answered even when the server is gone. What completed stands, and the host
                         // then recycles this slot as after any benchmark, waiting for its memory to
                         // come back before the next card's turn. A worker that just exited would
@@ -2041,7 +2094,16 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             WorkerCommand::Warmup { request_id } => {
                 // Outside any proof's watchdog: the artifact download alone can take minutes.
                 tracing::info!("warming up: Groth16 circuit artifacts and helper setup");
-                let resp = match warmup::warm_up() {
+                let resp = match warmup::warm_up(&mut |status| {
+                    // A closed pipe is reported by the final answer's write below.
+                    let _ = write_message(
+                        &mut stdout,
+                        &WorkerResponse::SetupProgress {
+                            request_id,
+                            status: status.to_string(),
+                        },
+                    );
+                }) {
                     Ok(report) => {
                         tracing::info!("warm-up done: {}", report.summary);
                         WorkerResponse::WarmupDone {
@@ -2491,82 +2553,109 @@ struct BenchmarkRun {
     server_lost: Option<anyhow::Error>,
 }
 
-/// Prove every benchmark program. The keys it sets up go into `keys` and stay resident: each holds
-/// the client, and through it the server, so they belong with whatever releases those.
-fn run_benchmarks(prover: &sp1_sdk::blocking::CudaProver, keys: &mut Vec<CudaPk>) -> BenchmarkRun {
+/// Run the zkOP/s scoring proofs, adding their row to `run`. For `--benchmark`: under a host, the
+/// host asks for each scoring proof itself.
+fn score_zkop_mix(
+    prover: &sp1_sdk::blocking::CudaProver,
+    keys: &mut Vec<CudaPk>,
+    run: &mut BenchmarkRun,
+) {
+    use zkminer_prover_protocol::{measure_zkop_mix, ZKOP_MIX_SP1_CYCLES};
+    let mut failure = None;
+    let scored = measure_zkop_mix(|iterations| {
+        match benchmark_program(
+            prover,
+            BENCH_ZKOP_MIX,
+            ZKOP_MIX_SP1_GUEST_ELF,
+            &iterations.to_le_bytes(),
+            0.0,
+            false,
+            false,
+            keys,
+            &mut run.server_lost,
+        ) {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                failure = Some(e);
+                None
+            }
+        }
+    });
+    match (scored, failure) {
+        (Some(entry), _) if entry.cycles == ZKOP_MIX_SP1_CYCLES => run.results.push(entry),
+        // The score divides a fixed cycle count by this proof's time, so it only means anything
+        // for the program that count was measured on.
+        (Some(entry), _) => {
+            let message = format!(
+                "{BENCH_ZKOP_MIX}: {} cycles where {ZKOP_MIX_SP1_CYCLES} were expected",
+                entry.cycles
+            );
+            tracing::error!("{message}; not reporting a zkOP/s score");
+            run.failed.push(message);
+        }
+        (None, Some(e)) => {
+            tracing::error!("{BENCH_ZKOP_MIX}: {e:#}");
+            run.failed.push(format!("{BENCH_ZKOP_MIX}: {e:#}"));
+            if e.is::<ServerLost>() {
+                run.server_lost = Some(e);
+            }
+        }
+        (None, None) => {}
+    }
+}
+
+/// The embedded guest a benchmark request names, or `None` for a name this build has no guest for.
+fn benchmark_guest(name: &str) -> Option<&'static [u8]> {
+    let elf = match name {
+        BENCH_SHA256_CHAIN => SHA256_CHAIN_SP1_GUEST_ELF,
+        BENCH_ECDSA_VERIFY => ECDSA_VERIFY_SP1_GUEST_ELF,
+        BENCH_BIGINT_MUL => BIGINT_MUL_SP1_GUEST_ELF,
+        BENCH_MEMORY_MERKLE => MEMORY_MERKLE_SP1_GUEST_ELF,
+        BENCH_CHACHA_MIX => CHACHA_MIX_SP1_GUEST_ELF,
+        BENCH_ZKOP_MIX => ZKOP_MIX_SP1_GUEST_ELF,
+        zkminer_prover_protocol::BENCH_WARMUP => FIBONACCI_SP1_GUEST_ELF,
+        _ => return None,
+    };
+    (!elf.is_empty()).then_some(elf)
+}
+
+/// Prove each of `programs`, calling `on_done(entry, 1-based program index, total)` after each that
+/// proved. The suite is the host's; see `zkminer_prover_protocol::suite`. The keys it sets up go into
+/// `keys` and stay resident: each holds the client, and through it the server, so they belong with
+/// whatever releases those.
+fn run_benchmarks(
+    prover: &sp1_sdk::blocking::CudaProver,
+    keys: &mut Vec<CudaPk>,
+    programs: &[BenchmarkProgramSpec],
+    on_done: &mut dyn FnMut(&BenchmarkEntry, u32, u32),
+) -> BenchmarkRun {
     let mut run = BenchmarkRun {
         results: Vec::new(),
         failed: Vec::new(),
         server_lost: None,
     };
-
-    let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
-        (
-            BENCH_FIBONACCI,
-            FIBONACCI_SP1_GUEST_ELF,
-            &1000u32.to_le_bytes(),
-            0.10,
-            false,
-        ),
-        (
-            BENCH_SHA256_CHAIN,
-            SHA256_CHAIN_SP1_GUEST_ELF,
-            &50_000u32.to_le_bytes(),
-            0.20,
-            true,
-        ),
-        (
-            BENCH_ECDSA_VERIFY,
-            ECDSA_VERIFY_SP1_GUEST_ELF,
-            &10u32.to_le_bytes(),
-            0.25,
-            true,
-        ),
-        (
-            BENCH_BIGINT_MUL,
-            BIGINT_MUL_SP1_GUEST_ELF,
-            &100u32.to_le_bytes(),
-            0.10,
-            false,
-        ),
-        (
-            BENCH_MEMORY_MERKLE,
-            MEMORY_MERKLE_SP1_GUEST_ELF,
-            &1024u32.to_le_bytes(),
-            0.15,
-            true,
-        ),
-        (
-            BENCH_CHACHA_MIX,
-            CHACHA_MIX_SP1_GUEST_ELF,
-            &20_000u32.to_le_bytes(),
-            0.20,
-            false,
-        ),
-    ];
-
-    // The Groth16 wrap is measured on ONE program per slot, by difference — see `benchmark_program`.
-    // The LAST one, not the first: the difference assumes the Groth16 run's STARK repeats at the
-    // compressed run's speed, and the first proof in a fresh worker also pays GPU warm-up, which would
-    // land in one run and not the other. By the last program that has long been paid.
-    let last_runnable = benchmarks.iter().rposition(|&(_, elf, ..)| !elf.is_empty());
-    for (idx, &(name, elf, input, weight, precompile)) in benchmarks.iter().enumerate() {
-        if elf.is_empty() {
+    let total = programs.len() as u32;
+    for (idx, spec) in programs.iter().enumerate() {
+        let name = spec.name.as_str();
+        let Some(elf) = benchmark_guest(name) else {
+            tracing::warn!("{name}: no guest for it in this build; skipped");
             continue;
-        }
-        let measure_wrap = Some(idx) == last_runnable;
+        };
         match benchmark_program(
             prover,
             name,
             elf,
-            input,
-            weight,
-            precompile,
-            measure_wrap,
+            &spec.input,
+            spec.weight,
+            spec.precompile,
+            spec.measure_wrap,
             keys,
             &mut run.server_lost,
         ) {
-            Ok(entry) => run.results.push(entry),
+            Ok(entry) => {
+                on_done(&entry, idx as u32 + 1, total);
+                run.results.push(entry);
+            }
             Err(e) => {
                 tracing::error!("{name}: {e:#}");
                 run.failed.push(format!("{name}: {e:#}"));
@@ -2579,7 +2668,6 @@ fn run_benchmarks(prover: &sp1_sdk::blocking::CudaProver, keys: &mut Vec<CudaPk>
             break;
         }
     }
-
     run
 }
 
@@ -2591,7 +2679,8 @@ fn benchmark_program(
     input: &[u8],
     weight: f64,
     precompile: bool,
-    // Also prove this program in Groth16 mode and report the wrap. See `run_benchmarks`.
+    // Also prove this program in Groth16 mode and report the wrap; the suite asks for it on one
+    // program. See `zkminer_prover_protocol::benchmark_suite`.
     measure_wrap: bool,
     // Where the key goes, as soon as there is one; see `run_benchmarks`.
     keys: &mut Vec<CudaPk>,
@@ -2707,7 +2796,7 @@ fn benchmark_program(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod orphan_reap_tests {
     use super::ppid_from_proc_stat;
 
@@ -3037,7 +3126,8 @@ mod server_lost_tests {
     }
 }
 
-#[cfg(test)]
+// Linux semantics throughout: shell scripts standing in for the server, sonames, /proc.
+#[cfg(all(test, target_os = "linux"))]
 mod usability_tests {
     use super::sp1_usability;
 

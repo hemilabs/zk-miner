@@ -899,6 +899,10 @@ impl WorkerHandle {
                          ({unit})",
                         ceiling as f64 / (1024.0 * 1024.0 * 1024.0)
                     ),
+                    // Windows has neither layer; the dispatcher's memory admission still applies.
+                    Err(why) if cfg!(windows) => tracing::info!(
+                        "worker {backend} (PID {pid_for_cap}) runs without a memory ceiling ({why})"
+                    ),
                     // No cap is survivable: `oom_score_adj` still points the kernel at the prover.
                     Err(why) => tracing::warn!(
                         "worker {backend} (PID {pid_for_cap}) could NOT be memory-capped ({why}); \
@@ -987,12 +991,35 @@ impl WorkerHandle {
                 }
             })
             .ok();
+        // Windows: the same watchdog, terminating the worker by its pid and creation time. Its
+        // children (SP1's server) are in its kill-on-close job and end with it.
+        #[cfg(windows)]
+        let watchdog = crate::memory::pid_starttime(child_pid).and_then(|start| {
+            std::thread::Builder::new()
+                .name(format!("handshake-watchdog-{backend}"))
+                .spawn(move || {
+                    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+                    while Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(100));
+                        if cancel_clone.load(Ordering::Relaxed) {
+                            return;
+                        }
+                    }
+                    if !cancel_clone.load(Ordering::Relaxed) {
+                        tracing::error!(
+                            "Handshake watchdog: worker {backend} (PID {child_pid}) did not                              respond within {HANDSHAKE_TIMEOUT:?}, killing"
+                        );
+                        crate::memory::terminate_if_our_worker(child_pid, Some(start));
+                    }
+                })
+                .ok()
+        });
 
         let result = self.recv();
 
         // Cancel the watchdog regardless of outcome
         cancel.store(true, Ordering::Relaxed);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(handle) = watchdog {
             let _ = handle.join();
         }
@@ -1831,7 +1858,8 @@ mod exit_classification_tests {
     }
 }
 
-#[cfg(test)]
+// Unix-only, as the `/proc` helpers it tests are.
+#[cfg(all(test, unix))]
 mod tests {
     #[test]
     fn sanitize_worker_line_strips_control_and_bidi_and_separators() {

@@ -292,7 +292,28 @@ fn default_proving_timeout() -> u64 {
     600
 }
 fn default_benchmark_timeout() -> u64 {
-    600 // 10 minutes
+    // The suite plus the zkOP/s proofs is about 10 minutes on an Arc A770's RISC Zero worker.
+    BENCHMARK_TIMEOUT_DEFAULT_SECS
+}
+
+const BENCHMARK_TIMEOUT_DEFAULT_SECS: u64 = 1800;
+/// The default before the zkOP/s proofs were added, which `zkminer init` wrote into config files.
+const BENCHMARK_TIMEOUT_OLD_DEFAULT_SECS: u64 = 600;
+
+impl ProverConfig {
+    /// The per-worker benchmark deadline, or `None` for no deadline.
+    ///
+    /// A config still carrying the old default gets the new one: that value was never a choice, and
+    /// the worker would be killed partway through scoring a slower card.
+    pub fn benchmark_timeout(&self) -> Option<std::time::Duration> {
+        match self.benchmark_timeout_secs {
+            0 => None,
+            BENCHMARK_TIMEOUT_OLD_DEFAULT_SECS => Some(std::time::Duration::from_secs(
+                BENCHMARK_TIMEOUT_DEFAULT_SECS,
+            )),
+            secs => Some(std::time::Duration::from_secs(secs)),
+        }
+    }
 }
 fn default_token_price() -> f64 {
     0.80

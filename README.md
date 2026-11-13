@@ -248,6 +248,9 @@ stderr, so `zkminer benchmark --json` on stdout stays machine-readable.
 
 Worth knowing:
 
+- **The miner benchmarks itself at startup when it has to.** If the saved results don't cover
+  every card and prover it started, `zkminer run` benchmarks the GPUs, shows the results on the
+  Benchmark screen, and claims no jobs until that finishes. `--watch-only` skips it.
 - **Don't run `benchmark` while the miner is running.** Both spawn a worker per GPU and
   the GPU lock is per-process, so they will double-book VRAM.
 - **If the miner sits idle with jobs available, suspect collateral.** Available

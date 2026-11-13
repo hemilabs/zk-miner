@@ -74,8 +74,20 @@ fn worker_binary_name(backend: &str, gpu_tag: &str) -> String {
 
 /// Detect all physical GPUs (NVIDIA + AMD + Intel).
 pub fn detect_all_gpus() -> Vec<DetectedGpu> {
+    detect_all_gpus_with(&HashMap::new(), &[], &|_| {})
+}
+
+/// `detect_all_gpus`, also looking for the HIP probe (see `detect_amd_gpus_windows`) where
+/// `discover_workers` looks for worker binaries: `explicit_binaries` and `search_dirs`. `report` is
+/// told which vendor it is checking.
+fn detect_all_gpus_with(
+    explicit_binaries: &HashMap<String, PathBuf>,
+    search_dirs: &[PathBuf],
+    report: &dyn Fn(&str),
+) -> Vec<DetectedGpu> {
     let mut gpus = Vec::new();
 
+    report("Looking for NVIDIA GPUs");
     let nvidia = detect_nvidia_gpus();
     if !nvidia.is_empty() {
         let names: Vec<_> = nvidia
@@ -90,7 +102,14 @@ pub fn detect_all_gpus() -> Vec<DetectedGpu> {
         gpus.extend(nvidia);
     }
 
-    let amd = detect_amd_gpus();
+    report("Looking for AMD GPUs");
+    #[cfg(windows)]
+    let amd = detect_amd_gpus_windows(explicit_binaries, search_dirs);
+    #[cfg(not(windows))]
+    let amd = {
+        let _ = (explicit_binaries, search_dirs);
+        detect_amd_gpus()
+    };
     if !amd.is_empty() {
         let names: Vec<_> = amd
             .iter()
@@ -101,6 +120,7 @@ pub fn detect_all_gpus() -> Vec<DetectedGpu> {
         gpus.extend(amd);
     }
 
+    report("Looking for Intel GPUs");
     let intel = detect_intel_gpus();
     if !intel.is_empty() {
         let names: Vec<_> = intel
@@ -339,9 +359,162 @@ fn detect_nvidia_via_proc() -> Vec<DetectedGpu> {
     gpus
 }
 
+/// Detect Intel discrete GPUs: from sysfs on Linux, from the PnP display devices on Windows.
+fn detect_intel_gpus() -> Vec<DetectedGpu> {
+    #[cfg(windows)]
+    {
+        detect_intel_gpus_windows()
+    }
+    #[cfg(not(windows))]
+    {
+        detect_intel_gpus_sysfs()
+    }
+}
+
+/// PowerShell that lists the PnP display devices as `name|PNPDeviceID|location|memory` lines:
+/// the location is `DEVPKEY_Device_LocationInfo` ("PCI bus 3, device 0, function 0"), the memory
+/// the adapter's `HardwareInformation.qwMemorySize` from its driver key (bytes; empty if absent).
+/// (WMI's `AdapterRAM` is a 32-bit field, capped at 4 GiB.)
+#[cfg(any(windows, test))]
+const WINDOWS_DISPLAY_DEVICES_PS: &str = r#"Get-CimInstance Win32_PnPEntity -Filter "PNPClass='Display'" | ForEach-Object { $loc = (Get-PnpDeviceProperty -InstanceId $_.PNPDeviceID -KeyName DEVPKEY_Device_LocationInfo -ErrorAction SilentlyContinue).Data; $drv = (Get-PnpDeviceProperty -InstanceId $_.PNPDeviceID -KeyName DEVPKEY_Device_Driver -ErrorAction SilentlyContinue).Data; $mem = ''; if ($drv) { $mem = (Get-ItemProperty ('HKLM:\SYSTEM\CurrentControlSet\Control\Class\' + $drv) -ErrorAction SilentlyContinue).'HardwareInformation.qwMemorySize' }; '{0}|{1}|{2}|{3}' -f $_.Name, $_.PNPDeviceID, $loc, $mem }"#;
+
+/// Detect Intel discrete GPUs on Windows, which has no sysfs: list the PnP display devices
+/// through PowerShell and keep Intel's discrete parts (see `parse_windows_intel_gpus`).
+#[cfg(windows)]
+fn detect_intel_gpus_windows() -> Vec<DetectedGpu> {
+    query_windows_intel_gpus()
+        .into_iter()
+        .map(|(gpu, _)| gpu)
+        .collect()
+}
+
+/// The VRAM of Intel GPU `device_index` (as numbered by `detect_intel_gpus`), where the platform
+/// reports it: on Windows, from the adapter's driver key. `None` elsewhere or if unknown.
+pub fn intel_vram_bytes(device_index: u32) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        query_windows_intel_gpus()
+            .into_iter()
+            .find(|(gpu, _)| gpu.device_index == device_index)
+            .and_then(|(_, vram)| vram)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = device_index;
+        None
+    }
+}
+
+/// The Intel discrete GPUs on Windows with their VRAM (see `WINDOWS_DISPLAY_DEVICES_PS`).
+#[cfg(windows)]
+fn query_windows_intel_gpus() -> Vec<(DetectedGpu, Option<u64>)> {
+    // PowerShell's own start-up takes a second or so: allow it more than a GPU tool.
+    let (outcome, stdout) = zkminer_prover_protocol::proc::output_with_timeout_capturing_stdout(
+        std::process::Command::new("powershell").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_DISPLAY_DEVICES_PS,
+        ]),
+        GPU_TOOL_TIMEOUT * 4,
+        256 * 1024,
+    );
+    if !matches!(
+        outcome,
+        zkminer_prover_protocol::proc::Outcome::Ran { success: true, .. }
+    ) {
+        tracing::warn!(
+            "listing display devices for Intel GPUs failed ({})",
+            outcome.describe()
+        );
+        return Vec::new();
+    }
+    parse_windows_intel_gpus_with_vram(&stdout)
+}
+
+/// Whether an Intel PCI device ID is a discrete GPU: Arc Alchemist / Flex (DG2, 0x56xx), Arc
+/// Battlemage (BMG, 0xe2xx) and Data Center GPU Max (PVC, 0x0bd5-0x0bdb). Integrated GPUs share
+/// the vendor ID, and on Windows there is no local-memory attribute to tell them apart by.
+#[cfg(any(windows, test))]
+fn is_discrete_intel_device_id(device_id: u16) -> bool {
+    matches!(device_id >> 8, 0x56 | 0xe2) || (0x0bd5..=0x0bdb).contains(&device_id)
+}
+
+/// Parse `name|PNPDeviceID|location[|memory]` lines (`WINDOWS_DISPLAY_DEVICES_PS`) into Intel
+/// discrete GPUs, ordered by PCI bus ID. `device_index` follows that order, which is the order
+/// Level Zero enumerates them in (the index `ZE_AFFINITY_MASK` selects by).
+#[cfg(test)]
+fn parse_windows_intel_gpus(output: &str) -> Vec<DetectedGpu> {
+    parse_windows_intel_gpus_with_vram(output)
+        .into_iter()
+        .map(|(gpu, _)| gpu)
+        .collect()
+}
+
+/// `parse_windows_intel_gpus`, with each GPU's VRAM in bytes where the line reports it.
+#[cfg(any(windows, test))]
+fn parse_windows_intel_gpus_with_vram(output: &str) -> Vec<(DetectedGpu, Option<u64>)> {
+    let mut gpus: Vec<(DetectedGpu, Option<u64>)> = output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.trim().splitn(4, '|');
+            let name = parts.next()?.trim();
+            let pnp_id = parts.next()?.trim().to_uppercase();
+            let location = parts.next().unwrap_or("").trim();
+            let vram = parts
+                .next()
+                .and_then(|m| m.trim().parse::<u64>().ok())
+                .filter(|&m| m > 0);
+            let ids = pnp_id.strip_prefix("PCI\\VEN_8086&DEV_")?;
+            let device_id = u16::from_str_radix(ids.get(..4)?, 16).ok()?;
+            if !is_discrete_intel_device_id(device_id) {
+                return None;
+            }
+            let pci_bus_id = pci_bus_id_from_location_info(location)?;
+            let name = if name.is_empty() {
+                intel_gpu_name_from_id(&format!("0x{device_id:04x}"))
+            } else {
+                name.to_string()
+            };
+            Some((
+                DetectedGpu {
+                    gpu_tag: "intel".to_string(),
+                    device_index: 0,
+                    pci_bus_id,
+                    name,
+                    // Not a CUDA device; CUDA compute capability does not apply.
+                    compute_cap: None,
+                },
+                vram,
+            ))
+        })
+        .collect();
+    gpus.sort_by(|a, b| a.0.pci_bus_id.cmp(&b.0.pci_bus_id));
+    for (i, (gpu, _)) in gpus.iter_mut().enumerate() {
+        gpu.device_index = i as u32;
+    }
+    gpus
+}
+
+/// "PCI bus 3, device 0, function 0" (Windows' `DEVPKEY_Device_LocationInfo`, decimal) ->
+/// "0000:03:00.0".
+#[cfg(any(windows, test))]
+fn pci_bus_id_from_location_info(location: &str) -> Option<String> {
+    let mut nums = location
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u32>());
+    let (bus, device, function) = (nums.next()?.ok()?, nums.next()?.ok()?, nums.next()?.ok()?);
+    if !location.to_ascii_lowercase().starts_with("pci bus") || device > 31 || function > 7 {
+        return None;
+    }
+    Some(format!("0000:{bus:02x}:{device:02x}.{function:x}"))
+}
+
 /// Detect Intel discrete GPUs via /sys/class/drm/card*/device/.
 /// Filters out integrated GPUs by requiring local memory (tile0 or BAR2).
-fn detect_intel_gpus() -> Vec<DetectedGpu> {
+#[cfg_attr(windows, allow(dead_code))]
+fn detect_intel_gpus_sysfs() -> Vec<DetectedGpu> {
     let drm_base = Path::new("/sys/class/drm");
     if !drm_base.is_dir() {
         return Vec::new();
@@ -588,7 +761,141 @@ fn intel_gpu_name_from_id(device_id: &str) -> String {
     }
 }
 
+/// Detect AMD discrete GPUs on Windows, which has neither sysfs nor rocm-smi, from the HIP runtime
+/// itself: run a ROCm worker binary's `--list-hip-devices` (see `parse_hip_device_list`). Only
+/// the runtime knows its own device order, which is what `HIP_VISIBLE_DEVICES` selects by (an
+/// integrated GPU, which it lists too, can sit anywhere in it), and which devices are integrated.
+/// No ROCm worker binary, no AMD GPU: there would be nothing to run on it.
+#[cfg(windows)]
+fn detect_amd_gpus_windows(
+    explicit_binaries: &HashMap<String, PathBuf>,
+    search_dirs: &[PathBuf],
+) -> Vec<DetectedGpu> {
+    let Some(probe) = find_hip_probe(explicit_binaries, search_dirs) else {
+        return Vec::new();
+    };
+    // The probe must see every device, whatever this process was started with.
+    let mut cmd = std::process::Command::new(&probe);
+    cmd.arg("--list-hip-devices")
+        .env_remove("HIP_VISIBLE_DEVICES")
+        .env_remove("ROCR_VISIBLE_DEVICES")
+        .env_remove("CUDA_VISIBLE_DEVICES")
+        .env("RUST_LOG", "error");
+    // A worker's start-up (a large binary, the HIP runtime) takes longer than a GPU tool's.
+    let (outcome, stdout) = zkminer_prover_protocol::proc::output_with_timeout_capturing_stdout(
+        &mut cmd,
+        GPU_TOOL_TIMEOUT * 4,
+        256 * 1024,
+    );
+    if !matches!(
+        outcome,
+        zkminer_prover_protocol::proc::Outcome::Ran { success: true, .. }
+    ) {
+        tracing::warn!(
+            "listing HIP devices with {} failed ({})",
+            probe.display(),
+            outcome.describe()
+        );
+        return Vec::new();
+    }
+    let gpus = parse_hip_device_list_with_vram(&stdout);
+    if let Ok(mut known) = AMD_HIP_VRAM.lock() {
+        let known = known.get_or_insert_with(HashMap::new);
+        for (gpu, vram) in &gpus {
+            if let Some(vram) = vram {
+                known.insert(gpu.pci_bus_id.clone(), *vram);
+            }
+        }
+    }
+    gpus.into_iter().map(|(gpu, _)| gpu).collect()
+}
+
+/// Each discrete AMD GPU's memory as the HIP runtime reported it to the last
+/// `detect_amd_gpus_windows`, by PCI bus id. Windows has no amdgpu sysfs to read it from.
+#[cfg(windows)]
+static AMD_HIP_VRAM: std::sync::Mutex<Option<HashMap<String, u64>>> = std::sync::Mutex::new(None);
+
+/// The memory of the AMD GPU at `pci_bus_id`, where the platform reports it without sysfs: on
+/// Windows, what the HIP runtime said at discovery (`--list-hip-devices`). `None` elsewhere, before
+/// discovery, or if unknown.
+pub fn amd_hip_vram_bytes(pci_bus_id: &str) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let key = normalize_pci_bus_id(pci_bus_id);
+        AMD_HIP_VRAM.lock().ok()?.as_ref()?.get(&key).copied()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pci_bus_id;
+        None
+    }
+}
+
+/// The ROCm worker binary to list HIP devices with: an explicitly configured one, else the first
+/// `zkminer-prove-<backend>-rocm` where `discover_workers` searches.
+#[cfg(windows)]
+fn find_hip_probe(
+    explicit_binaries: &HashMap<String, PathBuf>,
+    search_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    for backend in ALL_BACKENDS {
+        if let Some(path) = explicit_binaries.get(*backend) {
+            if path.is_file() && infer_gpu_tag(path) == "rocm" {
+                return Some(path.clone());
+            }
+        }
+    }
+    let dirs = worker_search_dirs(search_dirs);
+    ALL_BACKENDS.iter().find_map(|backend| {
+        let bin_name = worker_binary_name(backend, "rocm");
+        search_in_dirs(&bin_name, &dirs).or_else(|| search_in_path(&bin_name))
+    })
+}
+
+/// Parse `index|pci_bus_id|integrated|total_mem|name` lines (a ROCm worker's
+/// `--list-hip-devices`) into the discrete AMD GPUs, keeping HIP's own index.
+#[cfg(test)]
+fn parse_hip_device_list(output: &str) -> Vec<DetectedGpu> {
+    parse_hip_device_list_with_vram(output)
+        .into_iter()
+        .map(|(gpu, _)| gpu)
+        .collect()
+}
+
+/// [`parse_hip_device_list`], with each GPU's memory in bytes as HIP reports it (`total_mem`).
+#[cfg(any(windows, test))]
+fn parse_hip_device_list_with_vram(output: &str) -> Vec<(DetectedGpu, Option<u64>)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.trim().splitn(5, '|');
+            let device_index = parts.next()?.trim().parse::<u32>().ok()?;
+            let pci_bus_id = normalize_pci_bus_id(parts.next()?);
+            let integrated = parts.next()?.trim() != "0";
+            let total_mem = parts.next()?.trim().parse::<u64>().ok().filter(|b| *b > 0);
+            let name = parts.next()?.trim().to_string();
+            if integrated {
+                tracing::debug!("Skipping integrated AMD GPU [{device_index}] {name}");
+                return None;
+            }
+            if pci_bus_id.is_empty() {
+                return None;
+            }
+            let gpu = DetectedGpu {
+                gpu_tag: "rocm".to_string(),
+                device_index,
+                pci_bus_id,
+                name,
+                // Not a CUDA device; CUDA compute capability does not apply.
+                compute_cap: None,
+            };
+            Some((gpu, total_mem))
+        })
+        .collect()
+}
+
 /// Detect AMD GPUs via /sys/class/drm/card*/device/.
+#[cfg_attr(windows, allow(dead_code))]
 fn detect_amd_gpus() -> Vec<DetectedGpu> {
     let drm_base = Path::new("/sys/class/drm");
     if !drm_base.is_dir() {
@@ -941,7 +1248,16 @@ pub fn discover_workers(
     explicit_binaries: &HashMap<String, PathBuf>,
     search_dirs: &[PathBuf],
 ) -> Vec<DiscoveredWorker> {
-    let gpus = detect_all_gpus();
+    discover_workers_reporting(explicit_binaries, search_dirs, &|_| {})
+}
+
+/// `discover_workers`, telling `report` which GPU vendor it is checking, for a startup display.
+pub fn discover_workers_reporting(
+    explicit_binaries: &HashMap<String, PathBuf>,
+    search_dirs: &[PathBuf],
+    report: &dyn Fn(&str),
+) -> Vec<DiscoveredWorker> {
+    let gpus = detect_all_gpus_with(explicit_binaries, search_dirs, report);
     let mut found: Vec<DiscoveredWorker> = Vec::new();
 
     for backend in ALL_BACKENDS {
@@ -1272,21 +1588,32 @@ fn sp1_named_server_for(
     install: bool,
     home: Option<&Path>,
 ) -> Option<PathBuf> {
+    // `.exe` on Windows.
+    let server = worker_file_name(server);
     if install {
         // The worker looks beside its own executable, which for a symlinked worker is the target's
         // directory; a wrapper script sits beside the binary it runs, so its own directory works too.
-        let real = std::fs::canonicalize(worker).ok();
+        let real = std::fs::canonicalize(worker).ok().map(strip_verbatim);
         let shipped = [real.as_deref().and_then(Path::parent), worker.parent()]
             .into_iter()
             .flatten()
-            .map(|dir| dir.join(server))
+            .map(|dir| dir.join(&server))
             .find(|path| path.is_file());
         if shipped.is_some() {
             return shipped;
         }
     }
-    let installed = home?.join(".sp1").join("bin").join(server);
+    let installed = home?.join(".sp1").join("bin").join(&server);
     installed.is_file().then_some(installed)
+}
+
+/// `path` without the `\\?\` that `canonicalize` puts before a Windows drive path, so a canonical
+/// path compares and prints as the ordinary spelling of the same file. Anything else is unchanged.
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
 }
 
 /// Minimum VRAM a card must have for a backend to run on it at all, or `None` for no floor.
@@ -1425,6 +1752,9 @@ pub fn vram_required_for_tier(backend: &str, tier: u64) -> Option<u64> {
 /// Infer GPU tag from binary filename.
 fn infer_gpu_tag(path: &Path) -> String {
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        let name = name
+            .strip_suffix(std::env::consts::EXE_SUFFIX)
+            .unwrap_or(name);
         if name.ends_with("-cuda") {
             return "cuda".to_string();
         }
@@ -1438,9 +1768,31 @@ fn infer_gpu_tag(path: &Path) -> String {
     "generic".to_string()
 }
 
+/// The file a worker binary is installed as: `bin_name` plus the platform's
+/// executable suffix (`.exe` on Windows, nothing elsewhere).
+fn worker_file_name(bin_name: &str) -> String {
+    format!("{bin_name}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Where worker binaries are searched for: the configured directories, then ~/.zkminer/provers/,
+/// then the directory of this executable (as in `discover_workers`).
+#[cfg(windows)]
+fn worker_search_dirs(search_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut all_dirs: Vec<PathBuf> = search_dirs.to_vec();
+    if let Some(home_dir) = dirs::home_dir() {
+        all_dirs.push(home_dir.join(".zkminer").join("provers"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            all_dirs.push(parent.to_path_buf());
+        }
+    }
+    all_dirs
+}
+
 fn search_in_dirs(bin_name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     for dir in dirs {
-        let candidate = dir.join(bin_name);
+        let candidate = dir.join(worker_file_name(bin_name));
         if candidate.is_file() && is_executable(&candidate) {
             return Some(candidate);
         }
@@ -1451,7 +1803,7 @@ fn search_in_dirs(bin_name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 fn search_in_path(bin_name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(bin_name);
+        let candidate = dir.join(worker_file_name(bin_name));
         if candidate.is_file() && is_executable(&candidate) {
             return Some(candidate);
         }
@@ -1592,6 +1944,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_hip_device_list_keeps_discrete_gpus_with_hip_index() {
+        // A Ryzen host with an RX 9070 XT: the iGPU is HIP device 1 here, but could be any index.
+        let out = "0|0000:03:00.0|0|17095983104|AMD Radeon RX 9070 XT
+                   1|0000:16:00.0|1|62477336576|AMD Radeon(TM) Graphics
+                   2|00000000:2d:00.0|0|25753026560|AMD Radeon RX 7900 XTX
+                   garbage line
+";
+        let gpus = parse_hip_device_list(out);
+        assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[0].device_index, 0);
+        assert_eq!(gpus[0].pci_bus_id, "0000:03:00.0");
+        assert_eq!(gpus[0].name, "AMD Radeon RX 9070 XT");
+        assert_eq!(gpus[0].gpu_tag, "rocm");
+        // The index is HIP's, not the position among discrete GPUs.
+        assert_eq!(gpus[1].device_index, 2);
+        assert_eq!(gpus[1].pci_bus_id, "0000:2d:00.0");
+        let with_vram = parse_hip_device_list_with_vram(out);
+        assert_eq!(with_vram[0].1, Some(17_095_983_104));
+        assert_eq!(with_vram[1].1, Some(25_753_026_560));
+        // An unreadable or zero size is unknown, not zero.
+        let odd = parse_hip_device_list_with_vram("0|0000:03:00.0|0|?|X\n1|0000:04:00.0|0|0|Y");
+        assert_eq!(
+            odd.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+            [None, None]
+        );
+    }
+
+    #[test]
     fn worker_binary_names() {
         assert_eq!(
             worker_binary_name("risc0", "generic"),
@@ -1639,12 +2019,17 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        // In its canonical spelling, as `sp1_server_for` returns paths: a temp dir can be spelled
+        // otherwise (a Windows runner's TEMP is `C:\Users\RUNNER~1\...`, 8.3 for `runneradmin`).
+        std::fs::create_dir_all(&root).unwrap();
+        let root = strip_verbatim(std::fs::canonicalize(&root).unwrap());
         let (release, home) = (root.join("provers"), root.join("home"));
-        let installed = home.join(".sp1").join("bin").join("sp1-gpu-server");
+        let server = worker_file_name("sp1-gpu-server");
+        let installed = home.join(".sp1").join("bin").join(&server);
         std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&release).unwrap();
-        let worker = release.join("zkminer-prove-sp1");
-        let shipped = release.join("sp1-gpu-server");
+        let worker = release.join(worker_file_name("zkminer-prove-sp1"));
+        let shipped = release.join(&server);
         for file in [&worker, &shipped, &installed] {
             std::fs::write(file, b"x").unwrap();
         }
@@ -1787,6 +2172,27 @@ mod tests {
         );
     }
 
+    /// Windows installs workers as `<name>.exe`: discovery must find them under that
+    /// name, and an explicitly configured `...-cuda.exe` is still a CUDA worker.
+    #[test]
+    #[cfg(windows)]
+    fn windows_worker_names_carry_exe() {
+        assert_eq!(
+            worker_file_name("zkminer-prove-risc0-cuda"),
+            "zkminer-prove-risc0-cuda.exe"
+        );
+        assert_eq!(
+            infer_gpu_tag(Path::new(r"C:\zk\zkminer-prove-risc0-cuda.exe")),
+            "cuda"
+        );
+        let dir = std::env::temp_dir().join(format!("zkminer-disc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("zkminer-prove-risc0-cuda.exe"), b"").unwrap();
+        let found = search_in_dirs("zkminer-prove-risc0-cuda", std::slice::from_ref(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, Some(dir.join("zkminer-prove-risc0-cuda.exe")));
+    }
+
     #[test]
     fn detected_gpu_struct() {
         let gpu = DetectedGpu {
@@ -1853,5 +2259,54 @@ mod tests {
         assert_eq!(gpus[0].pci_bus_id, "0000:01:00.0");
         // And the canonical form must match what the TUI produces from sysfs.
         assert_eq!(normalize_pci_bus_id("0000:41:00.0"), gpus[1].pci_bus_id);
+    }
+
+    #[test]
+    fn parses_windows_intel_display_devices() {
+        // As listed on a Windows box with an Arc Pro B70 and a Ryzen iGPU, plus an Intel iGPU
+        // (Meteor Lake, 0x7d55) and a second B70 on a lower bus, to check filtering and order.
+        let out = [
+            r"AMD Radeon(TM) Graphics|PCI\VEN_1002&DEV_13C0&SUBSYS_D0001458&REV_C9\4&16012499&0&0041|PCI bus 19, device 0, function 0",
+            r"Intel(R) Arc(TM) Pro B70 Graphics|PCI\VEN_8086&DEV_E223&SUBSYS_60251849&REV_00\6&81E8C03&0&00080009|PCI bus 3, device 0, function 0|34359738368",
+            r"Intel(R) Graphics|PCI\VEN_8086&DEV_7D55&SUBSYS_00000000&REV_08\3&11583659&0&10|PCI bus 0, device 2, function 0",
+            r"|PCI\VEN_8086&DEV_E223&SUBSYS_60251849&REV_00\6&1&0&0|PCI bus 2, device 0, function 0",
+            // No location: dropped, as it couldn't be matched to a device.
+            r"Intel(R) Arc(TM) A770|PCI\VEN_8086&DEV_56A0&SUBSYS_1020172F&REV_08\6&2&0&0|",
+        ]
+        .join("\r\n");
+        let out = out.as_str();
+        let gpus = parse_windows_intel_gpus(out);
+        assert_eq!(gpus.len(), 2, "{gpus:?}");
+        assert_eq!(gpus[0].pci_bus_id, "0000:02:00.0");
+        assert_eq!(gpus[0].name, "Arc Pro B70");
+        assert_eq!(gpus[0].device_index, 0);
+        assert_eq!(gpus[1].pci_bus_id, "0000:03:00.0");
+        assert_eq!(gpus[1].name, "Intel(R) Arc(TM) Pro B70 Graphics");
+        assert_eq!(gpus[1].device_index, 1);
+        assert!(gpus.iter().all(|g| g.gpu_tag == "intel" && g.compute_cap.is_none()));
+        let vram: Vec<Option<u64>> = parse_windows_intel_gpus_with_vram(out)
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(vram, vec![None, Some(34359738368)]);
+    }
+
+    #[test]
+    fn pci_location_info_to_bus_id() {
+        assert_eq!(
+            pci_bus_id_from_location_info("PCI bus 3, device 0, function 0").as_deref(),
+            Some("0000:03:00.0")
+        );
+        assert_eq!(
+            pci_bus_id_from_location_info("PCI bus 129, device 31, function 7").as_deref(),
+            Some("0000:81:1f.7")
+        );
+        assert_eq!(pci_bus_id_from_location_info(""), None);
+        assert_eq!(pci_bus_id_from_location_info("Internal"), None);
+        assert!(is_discrete_intel_device_id(0xe223));
+        assert!(is_discrete_intel_device_id(0x56a0));
+        assert!(is_discrete_intel_device_id(0x0bd5));
+        assert!(!is_discrete_intel_device_id(0x7d55));
+        assert!(!is_discrete_intel_device_id(0xa7a0));
     }
 }

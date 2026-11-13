@@ -88,7 +88,32 @@ zkminer-config = { path = "crates/zkminer-config" }
 
 # Patch risc0 crates to use hemilabs fork (AMD + NVIDIA GPU support)
 #
-# Pinned by REV to branch `zkminer/intel-aot` @ 68b3eacbb: two Intel commits on top of branch
+# Pinned by REV to branch `zkminer/windows-intel-keepalive` @ c98b3f269, one Windows Intel commit on
+# top of `zkminer/windows-rocm-init` @ 73a665792 (below). On an Arc A770 about one proof in three
+# stalled once for 71 s, the waiting thread in the driver's fence wait with the CPU and GPU idle (a
+# completion it missed, noticed only at a driver timeout). c98b3f269 has a thread fill 4 bytes on
+# its own queue every 50 ms (RISC0_INTEL_KEEPALIVE_MS, 0 = off), so the engine keeps completing
+# work: no stall in 8 runs of the six benchmark programs against 5 in 8, and the A770's risc0 rate
+# in `zkminer benchmark` 285 -> 389 K c/s.
+# `zkminer/windows-rocm-init` @ 73a665792 is a merge of two lines:
+# - b35b0acc0, one Windows ROCm fix on top of `zkminer/windows-a770-perf` @ ce41408c5 (below). On
+#   Windows, HIP deadlocks when a process's first pinned host allocation races its first kernel
+#   launch and stream sync on another thread, and every proof hung at its first segment on an RX
+#   9070 XT (the warmup thread against segment 0's witgen slots); b35b0acc0 makes one pinned
+#   allocation before the warmup threads start.
+# - `zkminer/windows-a770-perf` @ 7f6350f64 (hemilabs/risc0 #34): e92fbebb2 makes the Poseidon-254
+#   kernels unnamed lambdas again, so a card's first proof compiles 2 of them instead of 4 (A770: the
+#   first Groth16 wrap from cold caches 130 s -> 59 s; warm runs unchanged), and 7f6350f64 rounds
+#   their thread counts to 16 so SYCL never launches the range-rounding wrapper, whose image the
+#   driver fails to link for these ESIMD kernels.
+# `zkminer/windows-a770-perf` @ ce41408c5 is two Arc A770 fixes on top of branch
+# `zkminer/intel-aot` @ 68b3eacbb (below):
+# - af9efc88f gives the ESIMD Poseidon-254 kernels 256 GRF on Alchemist: at 128 they spill, and after
+#   a kernel with a larger spill has run (the recursion eval_check) the driver's shared scratch space
+#   made them 7.5x slower for the rest of the process (identity_p254 17 s instead of 2.5 s);
+# - ce41408c5 compiles the Groth16 prover's acm_g10 image with 256 GRF: without it the G2 bucket sums
+#   came out SIMD16 with 30 KB of private memory per work item (shrink_wrap 22 s instead of 3 s).
+# `zkminer/intel-aot` @ 68b3eacbb is two Intel commits on top of branch
 # `zkminer/release-3.0-8007a99` @ 8b16ef0c8 (tag `zkminer-pin-2026-11-02b`), so that an Intel card the
 # build targets compiles almost nothing at its first proof:
 # - 0bb393f6e (branch `zkminer/witgen-scan-width`) sizes the rv32im witgen scans from the card's
@@ -135,23 +160,23 @@ zkminer-config = { path = "crates/zkminer-config" }
 # A rev and not a branch for the reason given on `sppark` below: a branch pin follows a moved head on
 # the next `cargo update` without anyone choosing to.
 [patch.crates-io]
-risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
-risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
+risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "c98b3f269237000c13ee24e22f81c1b8480e29e7" }
 # Pinned by immutable REV, not a branch: a branch head can silently move the build
 # off a validated commit (which is why the risc0/sp1 patches below carry a
 # do-not-cargo-update warning). 5f68eb3 = hemilabs/risc0-sppark `zkminer/windows-amd`
@@ -168,7 +193,11 @@ sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "5f68eb3eb9e4
 
 # Patch SP1 crates to use hemilabs fork (AMD GPU + PLONK optimizations)
 #
-# Pinned by commit: hemilabs/sp1 `zkminer/sycl-record-events` @ 9a0de7462, one SYCL fix on top of
+# Pinned by commit: hemilabs/sp1 `zkminer/windows-server-connect` @ a4df7c8f7, which waits for a
+# starting `sp1-gpu-server` while it runs instead of for one second: the HIP build on Windows takes
+# 0.7-1.3 s to open its socket on an RX 9070 XT, and a fresh worker's first proofs failed with "Could
+# not connect to `sp1-gpu-server` socket". Client side only (no server change). It sits on
+# `zkminer/sycl-record-events` @ 9a0de7462, one SYCL fix on top of
 # #19 (`perf/windows-gpu-cpu`) @ 23a275ccd (tagged `zkminer-pin-2026-11-02`, so a rebased or deleted
 # branch cannot orphan it). The fix: on Linux the Intel server aborted about every other benchmark
 # run on an Arc B580 ("ur_die: urEventWait must not be called for an internal event"), from Level
@@ -184,24 +213,24 @@ sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "5f68eb3eb9e4
 # which installs it. A commit rather than a branch, so that a moved branch can never pair an SDK with
 # a different server. Keep `crates/zkminer-cli/Cargo.toml`, which names the commit directly, in step
 # with this.
-sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-build = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-cuda = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-prover = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-prover-types = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-core-executor = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-core-machine = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-curves = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-derive = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-hypercube = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-jit = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-primitives = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
-sp1-verifier = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-build = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-cuda = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-prover = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-prover-types = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-core-executor = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-core-machine = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-curves = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-derive = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-hypercube = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-jit = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-primitives = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-verifier = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
 
 [profile.release]
 opt-level = 3

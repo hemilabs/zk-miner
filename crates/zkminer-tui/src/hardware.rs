@@ -158,6 +158,19 @@ pub fn probe_static() -> HardwareInfo {
             core_ids.len() as u32
         };
     }
+    // Windows has no /proc/cpuinfo.
+    #[cfg(windows)]
+    {
+        let name = zkminer_prover::benchmark::get_cpu_info();
+        if name != "Unknown CPU" {
+            info.cpu.model = shorten_cpu_name(&name);
+        }
+        info.cpu.threads = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1);
+        info.cpu.cores =
+            zkminer_prover::benchmark::physical_core_count().unwrap_or(info.cpu.threads);
+    }
 
     // Detect GPUs
     info.gpus = detect_gpus();
@@ -280,6 +293,10 @@ impl HwMonitor {
     ) {
         // Cache NVML device handles — avoids a device_by_index() ioctl per refresh.
         let nvml_devices = cache_nvml_devices(&state.hardware);
+        // Intel and AMD have no sysfs here: their drivers' libraries report instead.
+        #[cfg(windows)]
+        let mut windows_telemetry =
+            crate::windows_telemetry::WindowsTelemetry::new(&state.hardware.gpus);
         let has_nvidia = state
             .hardware
             .gpus
@@ -333,6 +350,8 @@ impl HwMonitor {
                     }
                 } else {
                     refresh_gpu(gpu, energy_snap);
+                    #[cfg(windows)]
+                    windows_telemetry.refresh(gpu);
                 }
             }
 
@@ -426,6 +445,16 @@ fn refresh_nvidia_gpu_cached(gpu: &mut GpuInfo, device: &nvml_wrapper::Device) {
     use nvml_wrapper::enum_wrappers::device::Clock;
     gpu.gpu_clock_mhz = device.clock_info(Clock::Graphics).unwrap_or(0);
     gpu.mem_clock_mhz = device.clock_info(Clock::Memory).unwrap_or(0);
+    // Linux reads the negotiated link from sysfs; Windows has none, but NVML reports it.
+    #[cfg(windows)]
+    {
+        if let Ok(generation) = device.current_pcie_link_gen() {
+            gpu.pcie_speed = crate::windows_telemetry::pcie_speed_label(generation);
+        }
+        if let Ok(width) = device.current_pcie_link_width() {
+            gpu.pcie_width = width;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -826,6 +855,10 @@ fn detect_gpus() -> Vec<GpuInfo> {
             idx += 1;
         }
     }
+
+    // Windows has no DRM cards to scan: Intel and AMD GPUs come from the prover's discovery.
+    #[cfg(windows)]
+    gpus.extend(crate::windows_gpus::intel_and_amd_gpus(idx));
 
     gpus
 }
@@ -1580,7 +1613,10 @@ pub fn fmt_bytes(bytes: u64) -> String {
 
 /// Parse PCIe speed string like "32.0 GT/s PCIe" into a Gen label.
 pub fn pcie_gen_label(speed: &str) -> &str {
-    if speed.contains("32.0") || speed.contains("32 GT") {
+    // 2.5 first: "2.5 GT/s" also contains "5 GT".
+    if speed.contains("2.5") {
+        "Gen1"
+    } else if speed.contains("32.0") || speed.contains("32 GT") {
         "Gen5"
     } else if speed.contains("16.0") || speed.contains("16 GT") {
         "Gen4"
@@ -1588,8 +1624,6 @@ pub fn pcie_gen_label(speed: &str) -> &str {
         "Gen3"
     } else if speed.contains("5.0") || speed.contains("5 GT") {
         "Gen2"
-    } else if speed.contains("2.5") {
-        "Gen1"
     } else {
         speed.split_whitespace().next().unwrap_or("?")
     }

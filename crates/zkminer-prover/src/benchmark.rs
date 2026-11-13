@@ -1,88 +1,16 @@
 //! Benchmarking for zkVM proving performance.
 //!
-//! Provides 6 diverse benchmark programs with a blended **zkOP/s** metric
-//! normalized so that an AMD Threadripper 3970X baseline = 100,000 zkOP/s.
+//! Measures GPUs on the benchmark suite (`BENCHMARK_PROGRAMS`), which sizes and prices jobs, and
+//! for the **zkOP/s** score: SP1 cycles per second on one fixed 50M-cycle program. See
+//! `zkminer_prover_protocol::zkops_from_stark_secs`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// Descriptor for a benchmark program.
-#[derive(Debug, Clone)]
-pub struct BenchmarkProgram {
-    pub name: &'static str,
-    pub description: &'static str,
-    /// Uses zkVM precompile acceleration (SHA-256, ECDSA).
-    pub precompile: bool,
-    /// Representative cycle count for this workload.
-    pub simulated_cycles: u64,
-    /// Weight in the zkOP/s blend (all weights sum to 1.0).
-    pub weight: f64,
-    /// Reference throughput (cycles/sec) on the 3970X baseline machine.
-    pub reference_throughput: f64,
-}
-
-/// The 6 canonical benchmark programs with their reference calibration constants.
-///
-/// Reference throughputs are calibrated so that the AMD Threadripper 3970X
-/// scores approximately 100,000 zkOP/s.  These are placeholder values that
-/// should be replaced after running on the actual reference hardware.
-///
-/// Weight distribution:
-///   40% pure compute (fibonacci 0.10, chacha-mix 0.20, bigint-mul 0.10)
-///   45% precompile   (sha256-chain 0.20, ecdsa-verify 0.25)
-///   15% mixed        (memory-merkle 0.15)
-pub const BENCHMARK_PROGRAMS: [BenchmarkProgram; 6] = [
-    BenchmarkProgram {
-        name: "fibonacci",
-        description: "Tight integer loop with wrapping arithmetic",
-        precompile: false,
-        simulated_cycles: 500_000,
-        weight: 0.10,
-        // Calibrated on AMD Threadripper 3970X (release mode)
-        reference_throughput: 5_100_000_000.0,
-    },
-    BenchmarkProgram {
-        name: "sha256-chain",
-        description: "Sequential SHA-256 hashing (precompile-accelerated)",
-        precompile: true,
-        simulated_cycles: 2_000_000,
-        weight: 0.20,
-        reference_throughput: 825_000_000.0,
-    },
-    BenchmarkProgram {
-        name: "ecdsa-verify",
-        description: "Elliptic curve signature verification (precompile-accelerated)",
-        precompile: true,
-        simulated_cycles: 5_000_000,
-        weight: 0.25,
-        reference_throughput: 824_000_000.0,
-    },
-    BenchmarkProgram {
-        name: "bigint-mul",
-        description: "4096-bit integer schoolbook multiplication",
-        precompile: false,
-        simulated_cycles: 1_000_000,
-        weight: 0.10,
-        reference_throughput: 255_000_000.0,
-    },
-    BenchmarkProgram {
-        name: "memory-merkle",
-        description: "Build 1024-leaf Merkle tree with repeated hashing",
-        precompile: true, // Uses sha2 crate which triggers SHA-256 precompile
-        simulated_cycles: 3_000_000,
-        weight: 0.15,
-        reference_throughput: 545_000_000.0,
-    },
-    BenchmarkProgram {
-        name: "chacha-mix",
-        description: "Pure ARX computation (Add-Rotate-XOR), no precompiles",
-        precompile: false,
-        simulated_cycles: 34_000_000,
-        weight: 0.20,
-        reference_throughput: 340_000_000.0,
-    },
-];
+/// The suite is the protocol crate's: the miner sends it to the workers, which prove what they are
+/// sent. See `zkminer_prover_protocol::suite`.
+pub use zkminer_prover_protocol::{BenchmarkProgram, BENCHMARK_PROGRAMS};
 
 /// Single benchmark result (per-program).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -421,9 +349,25 @@ impl DeviceBenchmark {
     /// unweighted mean lets it drag the device figure down by ~20%. For the `wrap + cycles / rate`
     /// model the rate that matters is the one large jobs see, which is what weighting by cycles gives.
     pub fn stark_rate(&self) -> Option<f64> {
-        let cycles: u64 = self.program_stages.iter().map(|p| p.cycles).sum();
-        let secs: f64 = self.program_stages.iter().map(|p| p.stark_secs).sum();
+        // The scoring program has its own use (`zkops`) and does not take part in job sizing.
+        let priced = || {
+            self.program_stages
+                .iter()
+                .filter(|p| p.program_name != zkminer_prover_protocol::BENCH_ZKOP_MIX)
+        };
+        let cycles: u64 = priced().map(|p| p.cycles).sum();
+        let secs: f64 = priced().map(|p| p.stark_secs).sum();
         (cycles > 0 && secs > 0.0).then(|| cycles as f64 / secs)
+    }
+
+    /// This device's zkOP/s on this backend, or 0 if the scoring program did not run on it.
+    pub fn zkops(&self) -> f64 {
+        self.program_stages
+            .iter()
+            .find(|p| p.program_name == zkminer_prover_protocol::BENCH_ZKOP_MIX)
+            .map_or(0.0, |p| {
+                zkminer_prover_protocol::zkops_from_stark_secs(p.stark_secs)
+            })
     }
 
     /// This device's steady-state Groth16 wrap time: the MEDIAN over the programs it was measured on,
@@ -500,14 +444,8 @@ pub struct BenchmarkSuite {
     pub host_peaks: std::collections::HashMap<String, u64>,
     pub cpu_info: String,
     pub timestamp: String,
-    /// Blended zkOP/s score (3970X baseline = 100,000).
+    /// zkOP/s of the whole machine; see [`machine_zkops`]. 0 when no GPU has a score.
     pub zkops: f64,
-    /// Precompile sub-score (sha256-chain + ecdsa-verify + memory-merkle), normalized.
-    #[serde(default)]
-    pub precompile_score: f64,
-    /// Pure compute sub-score (fibonacci + bigint-mul), normalized.
-    #[serde(default)]
-    pub compute_score: f64,
     /// Average CPU package power draw during benchmarks (watts), via RAPL.
     #[serde(default)]
     pub cpu_power_watts: Option<f64>,
@@ -776,81 +714,13 @@ pub fn add_gpu_device_benchmarks(suite: &mut BenchmarkSuite, gpus: &[GpuDesc]) {
     }
 }
 
-/// Compute the blended zkOP/s score from benchmark results.
-///
-/// Formula: `Σ(weight_i × throughput_i / reference_throughput_i) × 100,000`
-/// with weights renormalized over the programs that have results.
-///
-/// Returns 0.0 if no programs have results.
-pub fn compute_zkops(results: &[BenchmarkResult]) -> f64 {
-    let mut weighted_sum = 0.0;
-    let mut total_weight = 0.0;
-
-    for program in &BENCHMARK_PROGRAMS {
-        let result = results
-            .iter()
-            .find(|r| r.program_name.starts_with(program.name));
-        let Some(result) = result else {
-            continue; // Skip missing programs, renormalize over available ones
-        };
-        if program.reference_throughput <= 0.0 || result.throughput <= 0.0 {
-            continue;
-        }
-        let ratio = result.throughput / program.reference_throughput;
-        weighted_sum += program.weight * ratio;
-        total_weight += program.weight;
-    }
-
-    if total_weight <= 0.0 {
-        return 0.0;
-    }
-
-    // Renormalize: scale as if available weights summed to 1.0
-    (weighted_sum / total_weight) * 100_000.0
-}
-
-/// Compute per-category sub-scores (precompile, compute).
-///
-/// Each sub-score is the normalized ratio averaged across programs in that category.
-/// Precompile: programs with `precompile=true` (sha256-chain, ecdsa-verify, memory-merkle).
-/// Compute: programs with `precompile=false` (fibonacci, bigint-mul, chacha-mix).
-///
-/// Returns `(precompile_score, compute_score)` as multipliers (1.0 = baseline).
-pub fn compute_category_scores(results: &[BenchmarkResult]) -> (f64, f64) {
-    let mut precompile_sum = 0.0;
-    let mut precompile_count = 0;
-    let mut compute_sum = 0.0;
-    let mut compute_count = 0;
-
-    for program in &BENCHMARK_PROGRAMS {
-        let result = results
-            .iter()
-            .find(|r| r.program_name.starts_with(program.name));
-        let Some(result) = result else { continue };
-        if program.reference_throughput <= 0.0 {
-            continue;
-        }
-        let ratio = result.throughput / program.reference_throughput;
-        if program.precompile {
-            precompile_sum += ratio;
-            precompile_count += 1;
-        } else {
-            compute_sum += ratio;
-            compute_count += 1;
-        }
-    }
-
-    let precompile = if precompile_count > 0 {
-        precompile_sum / precompile_count as f64
-    } else {
-        0.0
-    };
-    let compute = if compute_count > 0 {
-        compute_sum / compute_count as f64
-    } else {
-        0.0
-    };
-    (precompile, compute)
+/// The machine's zkOP/s: the SP1 score of every GPU, added up, as they prove side by side.
+pub fn machine_zkops(devices: &[DeviceBenchmark]) -> f64 {
+    devices
+        .iter()
+        .filter(|d| d.prover_backend == "sp1")
+        .map(DeviceBenchmark::zkops)
+        .sum()
 }
 
 /// Get CPU info string.
@@ -867,7 +737,110 @@ pub fn get_cpu_info() -> String {
             }
         }
     }
+    #[cfg(windows)]
+    if let Some(name) = windows_cpu::processor_name() {
+        return name;
+    }
     "Unknown CPU".to_string()
+}
+
+/// Physical CPU cores, on Windows. (On Linux the TUI counts them from `/proc/cpuinfo`.)
+#[cfg(windows)]
+pub fn physical_core_count() -> Option<u32> {
+    windows_cpu::physical_cores()
+}
+
+/// The CPU's name and core count from Windows, which has no `/proc/cpuinfo`.
+#[cfg(windows)]
+mod windows_cpu {
+    use std::ffi::c_void;
+
+    const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
+    const RRF_RT_REG_SZ: u32 = 0x2;
+    const RELATION_PROCESSOR_CORE: u32 = 0;
+
+    /// SYSTEM_LOGICAL_PROCESSOR_INFORMATION: mask, relationship, then a 16-byte union.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct LogicalProcessorInfo {
+        mask: usize,
+        relationship: u32,
+        _union: [u64; 2],
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            key: isize,
+            sub_key: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut c_void,
+            len: *mut u32,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLogicalProcessorInformation(buf: *mut LogicalProcessorInfo, len: *mut u32) -> i32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// The marketing name Windows shows (as `/proc/cpuinfo`'s `model name` is on Linux).
+    pub fn processor_name() -> Option<String> {
+        let key = wide(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0");
+        let value = wide("ProcessorNameString");
+        let mut buf = [0u16; 256];
+        let mut len = std::mem::size_of_val(&buf) as u32;
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let chars = (len as usize / 2).min(buf.len());
+        let name = String::from_utf16_lossy(&buf[..chars]);
+        let name = name.trim_end_matches('\0').trim();
+        (!name.is_empty()).then(|| name.to_string())
+    }
+
+    pub fn physical_cores() -> Option<u32> {
+        let mut len = 0u32;
+        unsafe { GetLogicalProcessorInformation(std::ptr::null_mut(), &mut len) };
+        let count = len as usize / std::mem::size_of::<LogicalProcessorInfo>();
+        if count == 0 {
+            return None;
+        }
+        let mut infos = vec![
+            LogicalProcessorInfo {
+                mask: 0,
+                relationship: 0,
+                _union: [0; 2]
+            };
+            count
+        ];
+        if unsafe { GetLogicalProcessorInformation(infos.as_mut_ptr(), &mut len) } == 0 {
+            return None;
+        }
+        let cores = infos
+            .iter()
+            .take(len as usize / std::mem::size_of::<LogicalProcessorInfo>())
+            .filter(|info| info.relationship == RELATION_PROCESSOR_CORE)
+            .count() as u32;
+        (cores > 0).then_some(cores)
+    }
 }
 
 /// Get number of available CPU cores.
@@ -1056,16 +1029,11 @@ where
 /// than reporting a confidently wrong number for it.
 fn read_gpu_power_by_card(proving_bus_ids: &[String]) -> PowerSample {
     let mut out: BTreeMap<String, f64> = BTreeMap::new();
+    // AMD's reader is sysfs hwmon, so Linux only; nvidia-smi answers the same query on
+    // Windows, where leaving it out made every card take FALLBACK_GPU_WATTS.
     #[cfg(target_os = "linux")]
-    let probe_failed = {
-        read_amd_power_by_card(proving_bus_ids, &mut out);
-        !read_nvidia_power_by_card(proving_bus_ids, &mut out)
-    };
-    #[cfg(not(target_os = "linux"))]
-    let probe_failed = {
-        let _ = proving_bus_ids;
-        true
-    };
+    read_amd_power_by_card(proving_bus_ids, &mut out);
+    let probe_failed = !read_nvidia_power_by_card(proving_bus_ids, &mut out);
     PowerSample {
         per_card: out,
         probe_failed,
@@ -1076,7 +1044,6 @@ fn read_gpu_power_by_card(proving_bus_ids: &[String]) -> PowerSample {
 /// Returns false when the QUERY itself did not answer — which is the leak signal the sampler's
 /// give-up cap counts. A successful query that reports no usable row for some card returns true:
 /// that is a fact about the card, not a failure of the probe.
-#[cfg(target_os = "linux")]
 fn read_nvidia_power_by_card(proving_bus_ids: &[String], out: &mut BTreeMap<String, f64>) -> bool {
     // Bounded. `nvidia-smi` blocks in the driver after an Xid, a bus fall-off or an ECC remap,
     // and the sampler calls this every couple of seconds for the whole benchmark window. The
@@ -1408,13 +1375,11 @@ pub fn run_benchmark() -> BenchmarkSuite {
 
     #[cfg(feature = "risc0")]
     {
-        results.push(crate::risc0::benchmark_fibonacci(1000));
         results.push(crate::risc0::benchmark_sha256_chain(10_000));
     }
 
     #[cfg(feature = "sp1")]
     {
-        results.push(crate::sp1::benchmark_fibonacci(1000));
         results.push(crate::sp1::benchmark_sha256_chain(10_000));
     }
 
@@ -1478,9 +1443,6 @@ pub fn run_benchmark() -> BenchmarkSuite {
         }
     };
 
-    let zkops = compute_zkops(&results);
-    let (precompile_score, compute_score) = compute_category_scores(&results);
-
     // Device rows are the GPU workers' own measurements only. A CPU row used to be made up here
     // from the GPU results (their mean throughput times a per-backend factor), which showed the CPU
     // proving faster than the cards without a single CPU proof behind it; the cost model already
@@ -1492,14 +1454,13 @@ pub fn run_benchmark() -> BenchmarkSuite {
     let device_benchmarks =
         build_gpu_device_benchmarks_from_workers(&worker_device_results, &per_card);
 
+    let zkops = machine_zkops(&device_benchmarks);
     BenchmarkSuite {
         results,
         device_benchmarks,
         cpu_info,
         timestamp,
         zkops,
-        precompile_score,
-        compute_score,
         cpu_power_watts,
         gpu_power_watts,
         host_peaks: host_peaks_from_workers(&worker_device_results),
@@ -1550,21 +1511,13 @@ pub fn run_benchmark_gpu_only() -> BenchmarkSuite {
             results.push(benchmark_entry_to_result(entry));
         }
     }
-    let zkops = if results.is_empty() {
-        0.0
-    } else {
-        compute_zkops(&results)
-    };
-    let (precompile_score, compute_score) = compute_category_scores(&results);
-
+    let zkops = machine_zkops(&device_benchmarks);
     BenchmarkSuite {
         results,
         device_benchmarks,
         cpu_info,
         timestamp,
         zkops,
-        precompile_score,
-        compute_score,
         cpu_power_watts: None, // see the note in the streaming path below
         gpu_power_watts,
         host_peaks: host_peaks_from_workers(&worker_device_results),
@@ -1609,21 +1562,13 @@ pub fn run_benchmark_gpu_only_streaming(
             results.push(benchmark_entry_to_result(entry));
         }
     }
-    let zkops = if results.is_empty() {
-        0.0
-    } else {
-        compute_zkops(&results)
-    };
-    let (precompile_score, compute_score) = compute_category_scores(&results);
-
+    let zkops = machine_zkops(&device_benchmarks);
     BenchmarkSuite {
         results,
         device_benchmarks,
         cpu_info,
         timestamp,
         zkops,
-        precompile_score,
-        compute_score,
         cpu_power_watts: cpu_power_over(rapl_before, cpu_window.elapsed()),
         gpu_power_watts,
         host_peaks: host_peaks_from_workers(&worker_device_results),
@@ -1733,7 +1678,10 @@ fn build_gpu_device_benchmarks_from_workers(
 
         // Build per-program throughput map for workload-specific predictions
         let mut program_throughputs = std::collections::HashMap::new();
-        for entry in entries {
+        for entry in entries
+            .iter()
+            .filter(|e| e.program_name != zkminer_prover_protocol::BENCH_ZKOP_MIX)
+        {
             program_throughputs.insert(entry.program_name.clone(), entry.throughput);
         }
         // And the STARK/wrap split behind those rates, per program. `duration_secs` is the STARK
@@ -2136,7 +2084,6 @@ fn run_simulated_benchmarks() -> Vec<BenchmarkResult> {
         let start = Instant::now();
 
         match program.name {
-            "fibonacci" => simulate_fibonacci(),
             "sha256-chain" => simulate_sha256_chain(),
             "ecdsa-verify" => simulate_ecdsa_verify(),
             "bigint-mul" => simulate_bigint_mul(),
@@ -2179,24 +2126,6 @@ fn run_simulated_benchmarks() -> Vec<BenchmarkResult> {
 // Simulation workloads — each exercises a distinct CPU pattern.
 // All use black_box() to prevent dead-code elimination.
 // ---------------------------------------------------------------------------
-
-/// Fibonacci: tight integer loop with wrapping arithmetic (500 iterations of LCG).
-fn simulate_fibonacci() {
-    let mut a = 0u64;
-    let mut b = 1u64;
-    for _ in 0..500 {
-        let next = a.wrapping_add(b);
-        a = b;
-        b = next;
-        // Inner LCG churn — black_box on each iteration prevents unrolling/vectorization
-        for _ in 0..200 {
-            b = std::hint::black_box(b)
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-        }
-    }
-    std::hint::black_box(b);
-}
 
 /// SHA-256 chain: simulates 1000 SHA-256 block compressions (64 rounds each, 2000 total blocks).
 fn simulate_sha256_chain() {
@@ -2383,8 +2312,8 @@ fn quarter_round_sim(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) 
 // ---------------------------------------------------------------------------
 
 /// Benchmark suite version, derived from the benchmark program definitions.
-/// Automatically invalidates cached results when programs, weights, or
-/// reference throughputs change — no manual version bumps needed.
+/// Automatically invalidates cached results when programs, weights or
+/// inputs change — no manual version bumps needed.
 ///
 /// Uses a hand-rolled FNV-1a hash instead of `DefaultHasher` because
 /// `DefaultHasher` is explicitly not guaranteed to be stable across Rust
@@ -2404,10 +2333,6 @@ pub fn suite_version() -> String {
             h ^= b as u64;
             h = h.wrapping_mul(FNV_PRIME);
         }
-        for b in p.reference_throughput.to_bits().to_le_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
         let pre = if p.precompile { 1u8 } else { 0u8 };
         h ^= pre as u64;
         h = h.wrapping_mul(FNV_PRIME);
@@ -2415,8 +2340,23 @@ pub fn suite_version() -> String {
             h ^= b as u64;
             h = h.wrapping_mul(FNV_PRIME);
         }
+        // A different input is a different measurement.
+        for b in p
+            .input
+            .to_le_bytes()
+            .into_iter()
+            .chain(p.sp1_input.to_le_bytes())
+        {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
     }
-    format!("v2-{h:016x}")
+    // The zkOP/s definition: a change to it makes every saved score incomparable.
+    for b in zkminer_prover_protocol::ZKOP_MIX_SP1_CYCLES.to_le_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    format!("v3-{h:016x}")
 }
 
 /// On-disk benchmark cache with hardware fingerprint for staleness detection.
@@ -2593,6 +2533,22 @@ pub fn get_total_memory_bytes() -> u64 {
 /// Returns the path to the benchmark cache file: `~/.zkminer/benchmarks.json`.
 pub fn benchmark_cache_path() -> PathBuf {
     zkminer_config::ZkMinerConfig::default_dir().join("benchmarks.json")
+}
+
+/// The (device id, backend) pairs in `targets` that `suite` has no measured throughput for.
+pub fn missing_device_benchmarks(
+    suite: Option<&BenchmarkSuite>,
+    targets: &[(String, String)],
+) -> Vec<(String, String)> {
+    targets
+        .iter()
+        .filter(|(device, backend)| {
+            !suite
+                .and_then(|s| s.throughput_for(device, backend))
+                .is_some_and(|throughput| throughput > 0.0)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Load cached benchmarks from disk, verifying the hardware fingerprint.
@@ -2869,6 +2825,81 @@ pub fn save_benchmark(suite: &BenchmarkSuite) {
 }
 
 #[cfg(test)]
+mod zkop_score_tests {
+    use super::*;
+    use crate::dispatcher::SlotBenchmarkResult;
+    use zkminer_prover_protocol::{BenchmarkEntry, BENCH_CHACHA_MIX, BENCH_ZKOP_MIX, ZKOP_MIX_SP1_CYCLES};
+
+    fn entry(name: &str, cycles: u64, secs: f64, weight: f64) -> BenchmarkEntry {
+        BenchmarkEntry {
+            program_name: name.to_string(),
+            prover_backend: "sp1".to_string(),
+            cycles,
+            duration_secs: secs,
+            throughput: cycles as f64 / secs,
+            weight,
+            precompile: false,
+            wrap_secs: None,
+        }
+    }
+
+    fn slot(key: &str, index: u32, backend: &str, score_secs: f64) -> SlotBenchmarkResult {
+        let mut entries = vec![
+            entry(BENCH_CHACHA_MIX, 8_000_000, 2.0, 0.2),
+            entry(BENCH_ZKOP_MIX, ZKOP_MIX_SP1_CYCLES, score_secs, 0.0),
+        ];
+        for e in &mut entries {
+            e.prover_backend = backend.to_string();
+        }
+        SlotBenchmarkResult {
+            slot_key: key.to_string(),
+            gpu_name: Some("Test".to_string()),
+            device_index: Some(index),
+            pci_bus_id: Some(format!("0000:0{index}:00.0")),
+            gpu_tag: "cuda".to_string(),
+            entries,
+            vram_bytes: None,
+            host_peak_bytes: None,
+        }
+    }
+
+    #[test]
+    fn the_machine_score_adds_up_each_gpus_sp1_score() {
+        let devices = build_gpu_device_benchmarks_from_workers(
+            &[
+                slot("sp1:cuda:0", 0, "sp1", 5.0),
+                slot("sp1:cuda:1", 1, "sp1", 10.0),
+                slot("risc0:cuda:0", 0, "risc0", 20.0),
+            ],
+            &Default::default(),
+        );
+        let c = ZKOP_MIX_SP1_CYCLES as f64;
+        assert_eq!(devices[0].zkops(), c / 5.0);
+        assert_eq!(devices[2].zkops(), c / 20.0, "RISC Zero is scored in the same unit");
+        assert_eq!(machine_zkops(&devices), c / 5.0 + c / 10.0);
+    }
+
+    #[test]
+    fn the_scoring_program_stays_out_of_job_pricing() {
+        let devices =
+            build_gpu_device_benchmarks_from_workers(&[slot("sp1:cuda:0", 0, "sp1", 5.0)], &Default::default());
+        let device = &devices[0];
+        assert_eq!(device.throughput, 4_000_000.0);
+        assert_eq!(device.stark_rate(), Some(4_000_000.0));
+        assert!(!device.program_throughputs.contains_key(BENCH_ZKOP_MIX));
+    }
+
+    #[test]
+    fn a_device_without_the_scoring_program_has_no_score() {
+        let mut only_suite = slot("sp1:cuda:0", 0, "sp1", 5.0);
+        only_suite.entries.pop();
+        let devices = build_gpu_device_benchmarks_from_workers(&[only_suite], &Default::default());
+        assert_eq!(devices[0].zkops(), 0.0);
+        assert_eq!(machine_zkops(&devices), 0.0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2895,76 +2926,59 @@ mod tests {
     }
 
     #[test]
-    fn six_programs_defined() {
-        assert_eq!(BENCHMARK_PROGRAMS.len(), 6);
-    }
+    fn missing_device_benchmarks_finds_what_the_suite_lacks() {
+        let row = |device: &str, backend: &str, throughput: f64| DeviceBenchmark {
+            program_stages: Vec::new(),
+            device_id: device.to_string(),
+            device_label: device.to_string(),
+            prover_backend: backend.to_string(),
+            throughput,
+            power_watts: 300.0,
+            optimal_po2: 21,
+            memory_usage_bytes: 0,
+            max_feasible_po2: 21,
+            program_throughputs: std::collections::HashMap::new(),
+            pci_bus_id: String::new(),
+            po2_samples: Vec::new(),
+            host_peak_bytes: None,
+        };
+        let target = |device: &str, backend: &str| (device.to_string(), backend.to_string());
+        let targets = [
+            target("gpu0", "risc0"),
+            target("gpu0", "sp1"),
+            target("gpu-rocm0", "sp1"),
+        ];
 
-    #[test]
-    fn compute_zkops_baseline() {
-        // If throughput == reference_throughput for all programs, score should be 100,000.
-        let results: Vec<BenchmarkResult> = BENCHMARK_PROGRAMS
-            .iter()
-            .map(|p| BenchmarkResult {
-                program_name: p.name.to_string(),
-                prover_backend: "test".to_string(),
-                cycles: p.simulated_cycles,
-                duration: Duration::from_secs(1),
-                throughput: p.reference_throughput,
-                weight: p.weight,
-                precompile: p.precompile,
-            })
-            .collect();
-        let score = compute_zkops(&results);
+        assert_eq!(missing_device_benchmarks(None, &targets), targets.to_vec());
+
+        let suite = BenchmarkSuite {
+            device_benchmarks: vec![
+                row("gpu0", "risc0", 1e6),
+                row("gpu0", "sp1", 0.0),
+                row("gpu1", "sp1", 1e6),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            missing_device_benchmarks(Some(&suite), &targets),
+            vec![target("gpu0", "sp1"), target("gpu-rocm0", "sp1")],
+            "a zero row and another card's row are not coverage"
+        );
+
+        let full = BenchmarkSuite {
+            device_benchmarks: targets.iter().map(|(d, b)| row(d, b, 1e6)).collect(),
+            ..Default::default()
+        };
+        assert!(missing_device_benchmarks(Some(&full), &targets).is_empty());
         assert!(
-            (score - 100_000.0).abs() < 1.0,
-            "expected ~100,000 but got {score}"
+            missing_device_benchmarks(None, &[]).is_empty(),
+            "no GPU workers: nothing to run"
         );
     }
 
     #[test]
-    fn compute_zkops_missing_program_renormalizes() {
-        // Missing one program should renormalize weights over the rest,
-        // not return 0.0 — this supports SP1 workers that lack chacha-mix.
-        let results: Vec<BenchmarkResult> = BENCHMARK_PROGRAMS[..5]
-            .iter()
-            .map(|p| BenchmarkResult {
-                program_name: p.name.to_string(),
-                prover_backend: "test".to_string(),
-                cycles: p.simulated_cycles,
-                duration: Duration::from_secs(1),
-                throughput: p.reference_throughput,
-                weight: p.weight,
-                precompile: p.precompile,
-            })
-            .collect();
-        // With 5 of 6 programs at baseline, renormalized score should still be ~100K
-        let score = compute_zkops(&results);
-        assert!(
-            (score - 100_000.0).abs() < 1.0,
-            "expected ~100,000 but got {score}"
-        );
-    }
-
-    #[test]
-    fn compute_zkops_double_speed() {
-        // 2× throughput on all programs → 200,000 zkOP/s.
-        let results: Vec<BenchmarkResult> = BENCHMARK_PROGRAMS
-            .iter()
-            .map(|p| BenchmarkResult {
-                program_name: p.name.to_string(),
-                prover_backend: "test".to_string(),
-                cycles: p.simulated_cycles,
-                duration: Duration::from_secs(1),
-                throughput: p.reference_throughput * 2.0,
-                weight: p.weight,
-                precompile: p.precompile,
-            })
-            .collect();
-        let score = compute_zkops(&results);
-        assert!(
-            (score - 200_000.0).abs() < 1.0,
-            "expected ~200,000 but got {score}"
-        );
+    fn five_programs_defined() {
+        assert_eq!(BENCHMARK_PROGRAMS.len(), 5);
     }
 
     #[test]
@@ -3331,95 +3345,13 @@ mod tests {
         let v2 = suite_version();
         assert_eq!(v1, v2, "suite_version should be deterministic");
         assert!(
-            v1.starts_with("v2-"),
-            "suite_version should start with 'v2-'"
+            v1.starts_with("v3-"),
+            "suite_version should start with 'v3-'"
         );
         assert!(v1.len() > 10, "suite_version should include a hash");
     }
 
     // ---- category sub-scores ----
-
-    #[test]
-    fn category_scores_at_baseline() {
-        let results: Vec<BenchmarkResult> = BENCHMARK_PROGRAMS
-            .iter()
-            .map(|p| BenchmarkResult {
-                program_name: p.name.to_string(),
-                prover_backend: "risc0".to_string(),
-                cycles: p.simulated_cycles,
-                duration: Duration::from_secs(1),
-                throughput: p.reference_throughput, // exactly baseline
-                weight: p.weight,
-                precompile: p.precompile,
-            })
-            .collect();
-        let (pre, comp) = compute_category_scores(&results);
-        assert!(
-            (pre - 1.0).abs() < 0.01,
-            "precompile at baseline should be 1.0, got {pre}"
-        );
-        assert!(
-            (comp - 1.0).abs() < 0.01,
-            "compute at baseline should be 1.0, got {comp}"
-        );
-    }
-
-    #[test]
-    fn category_scores_double_precompile() {
-        // 2x precompile throughput, 1x compute
-        let results: Vec<BenchmarkResult> = BENCHMARK_PROGRAMS
-            .iter()
-            .map(|p| BenchmarkResult {
-                program_name: p.name.to_string(),
-                prover_backend: "risc0".to_string(),
-                cycles: p.simulated_cycles,
-                duration: Duration::from_secs(1),
-                throughput: if p.precompile {
-                    p.reference_throughput * 2.0
-                } else {
-                    p.reference_throughput
-                },
-                weight: p.weight,
-                precompile: p.precompile,
-            })
-            .collect();
-        let (pre, comp) = compute_category_scores(&results);
-        assert!(
-            (pre - 2.0).abs() < 0.01,
-            "precompile should be 2.0x, got {pre}"
-        );
-        assert!(
-            (comp - 1.0).abs() < 0.01,
-            "compute should be 1.0x, got {comp}"
-        );
-    }
-
-    // ---- compute_zkops renormalization ----
-
-    #[test]
-    fn compute_zkops_empty_returns_zero() {
-        assert_eq!(compute_zkops(&[]), 0.0);
-    }
-
-    #[test]
-    fn compute_zkops_single_program_renormalizes() {
-        // A single program at baseline should still produce 100K after renormalization.
-        let p = &BENCHMARK_PROGRAMS[0]; // fibonacci
-        let results = vec![BenchmarkResult {
-            program_name: p.name.to_string(),
-            prover_backend: "test".to_string(),
-            cycles: p.simulated_cycles,
-            duration: Duration::from_secs(1),
-            throughput: p.reference_throughput,
-            weight: p.weight,
-            precompile: p.precompile,
-        }];
-        let score = compute_zkops(&results);
-        assert!(
-            (score - 100_000.0).abs() < 1.0,
-            "single program at baseline should renormalize to ~100K, got {score}"
-        );
-    }
 
     // ---- throughput_cov tests ----
 

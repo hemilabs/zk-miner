@@ -13,7 +13,7 @@
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
@@ -34,8 +34,8 @@ const FILES: [&str; 4] = [
 ];
 
 /// Makes sure the component is where risc0 will look for it, installing it if it is not. What was
-/// done, for the log.
-pub fn ensure_installed() -> Result<String> {
+/// done, for the log. `report` is told before each long step.
+pub fn ensure_installed(report: &mut dyn FnMut(&str)) -> Result<String> {
     if let Some(dir) = std::env::var_os("RISC0_GROTH16_DIR") {
         let dir = PathBuf::from(dir);
         ensure!(
@@ -73,15 +73,22 @@ pub fn ensure_installed() -> Result<String> {
         dir.display()
     );
     let archive = tmp.join(format!("risc0-groth16-{VERSION}.tar.xz"));
-    download(&archive)?;
+    let label = "Downloading RISC Zero's Groth16 files (first run, 2.3 GB)";
+    report(label);
+    let part = archive.with_extension("xz.part");
+    with_size_progress(&part, label, report, || download(&archive))?;
+    let label = "Unpacking RISC Zero's Groth16 files (first run, 5 GB)";
+    report(label);
     let staging = tmp.join(format!("risc0-groth16-{VERSION}.{}", std::process::id()));
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging)?;
-    let unpacked = File::open(&archive)
-        .map(BufReader::new)
-        .map(liblzma::bufread::XzDecoder::new_parallel)
-        .map(tar::Archive::new)
-        .and_then(|mut a| a.unpack(&staging));
+    let unpacked = with_size_progress(&staging, label, report, || {
+        File::open(&archive)
+            .map(BufReader::new)
+            .map(liblzma::bufread::XzDecoder::new_parallel)
+            .map(tar::Archive::new)
+            .and_then(|mut a| a.unpack(&staging))
+    });
     let _ = fs::remove_file(&archive);
     unpacked.with_context(|| {
         format!(
@@ -162,6 +169,50 @@ fn download(to: &Path) -> Result<()> {
     }
     fs::rename(&part, to)?;
     Ok(())
+}
+
+/// How often a long step's size is reported.
+const PROGRESS_EVERY: Duration = Duration::from_secs(2);
+
+/// Runs `step` on a thread of its own, telling `report` every few seconds how much `path` holds,
+/// as "<label>: 3.1 GB so far". For a download or an unpack whose library reports nothing itself.
+fn with_size_progress<T: Send>(
+    path: &Path,
+    label: &str,
+    report: &mut dyn FnMut(&str),
+    step: impl FnOnce() -> T + Send,
+) -> T {
+    std::thread::scope(|scope| {
+        let running = scope.spawn(step);
+        let mut reported = Instant::now();
+        while !running.is_finished() {
+            std::thread::sleep(Duration::from_millis(250));
+            if reported.elapsed() >= PROGRESS_EVERY {
+                reported = Instant::now();
+                let gb = size_on_disk(path) as f64 / 1e9;
+                report(&format!("{label}: {gb:.1} GB so far"));
+            }
+        }
+        running
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// Bytes in `path`, a file or a directory tree; what cannot be read counts as nothing.
+fn size_on_disk(path: &Path) -> u64 {
+    let Ok(meta) = fs::metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| size_on_disk(&entry.path()))
+        .sum()
 }
 
 fn hex(bytes: &[u8]) -> String {

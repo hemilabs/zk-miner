@@ -91,7 +91,7 @@ fn main() {
                 write_message(&mut stdout, &resp).unwrap();
             }
 
-            WorkerCommand::Benchmark => {
+            WorkerCommand::Benchmark { .. } => {
                 if crash_on == "benchmark" || crash_on == "both" {
                     std::process::exit(crash_code);
                 }

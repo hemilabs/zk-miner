@@ -24,11 +24,7 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
     // `ZkMinerConfig::load` returns defaults when the file is absent, so a missing
     // config degrades to the default worker search paths rather than failing.
     let config = ZkMinerConfig::load(config_path)?;
-    let benchmark_timeout = if config.prover.benchmark_timeout_secs > 0 {
-        Some(Duration::from_secs(config.prover.benchmark_timeout_secs))
-    } else {
-        None
-    };
+    let benchmark_timeout = config.prover.benchmark_timeout();
     let mut pool = WorkerPool::new(
         config
             .prover
@@ -215,7 +211,18 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
 
     println!("{}", "─".repeat(86));
     println!();
-    println!("  zkOP/s: {:.0}  (3970X baseline = 100,000)", results.zkops);
+    println!(
+        "  zkOP/s: {:.0}  (SP1 cycles per second on a 50M-cycle program, all GPUs)",
+        results.zkops
+    );
+    for d in results.device_benchmarks.iter().filter(|d| d.zkops() > 0.0) {
+        println!(
+            "    {} / {}: {:.0}",
+            d.device_label,
+            d.prover_backend,
+            d.zkops()
+        );
+    }
     println!();
 
     // Device benchmarks summary

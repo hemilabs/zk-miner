@@ -11,6 +11,7 @@ methods = [
     "guests/risc0/bigint-mul",
     "guests/risc0/memory-merkle",
     "guests/risc0/chacha-mix",
+    "guests/risc0/zkop-mix",
     "guests/risc0/rv32im-torture",
     "guests/risc0/edge-case-arith",
     "guests/risc0/memory-stress",

@@ -139,6 +139,7 @@ const CAP_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// The kernel's own estimate of what can be allocated without swapping — NOT `MemFree`, which
 /// excludes reclaimable page cache and on this box reads ~9 GB while 26 GB is actually available.
+#[cfg(not(windows))]
 pub fn mem_available_bytes() -> Option<u64> {
     parse_meminfo_kb(
         &std::fs::read_to_string("/proc/meminfo").ok()?,
@@ -147,6 +148,7 @@ pub fn mem_available_bytes() -> Option<u64> {
 }
 
 /// `MemTotal` from `/proc/meminfo`, in bytes.
+#[cfg(not(windows))]
 pub fn mem_total_bytes() -> Option<u64> {
     parse_meminfo_kb(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal")
 }
@@ -176,6 +178,19 @@ pub fn dev_shm_capacity_bytes() -> Option<u64> {
 #[cfg(not(target_os = "linux"))]
 pub fn dev_shm_capacity_bytes() -> Option<u64> {
     None
+}
+
+/// Windows: `GlobalMemoryStatusEx`'s available physical memory, which, like `MemAvailable`, counts
+/// the reclaimable standby (cache) list as available.
+#[cfg(windows)]
+pub fn mem_available_bytes() -> Option<u64> {
+    win32::physical_memory().map(|(_, available)| available)
+}
+
+/// Windows: `GlobalMemoryStatusEx`'s total physical memory.
+#[cfg(windows)]
+pub fn mem_total_bytes() -> Option<u64> {
+    win32::physical_memory().map(|(total, _)| total)
 }
 
 /// Pull one `kB` field out of `/proc/meminfo` and return it in bytes.
@@ -324,6 +339,16 @@ pub fn cap_unit_name(unit_hint: &str, pid: u32) -> String {
     )
 }
 
+/// Windows has no resident-memory ceiling that kills: a Job Object limits COMMITTED memory, which
+/// for a CUDA process is no measure of what it holds (see the module docs), so a cap sized from RAM
+/// could kill a proof that fits. Until one is measured against real provers there is none, and
+/// admission control is the layer that keeps workers from summing past RAM.
+#[cfg(windows)]
+pub fn cap_process_memory(_pid: u32, _unit_hint: &str, _max_bytes: u64) -> Result<String, String> {
+    Err("no per-worker memory ceiling on Windows".to_string())
+}
+
+#[cfg(not(windows))]
 pub fn cap_process_memory(pid: u32, unit_hint: &str, max_bytes: u64) -> Result<String, String> {
     let unit = cap_unit_name(unit_hint, pid);
     let mut cmd = std::process::Command::new("busctl");
@@ -512,6 +537,7 @@ pub fn process_group_peak_bytes(proc_root: &std::path::Path, pgid: i32) -> Optio
 ///
 /// Field 4, read past the last `)` so a `comm` containing spaces and parentheses cannot shift the
 /// offsets. Same technique as `group_of_stat`, which reads field 5 two positions further on.
+#[cfg_attr(windows, allow(dead_code))] // Windows reads parents from a snapshot: `parent_pid`
 pub(crate) fn parent_of_stat(stat: &str) -> Option<i32> {
     let rest = stat.get(stat.rfind(')')? + 1..)?;
     rest.split_whitespace().nth(1)?.parse().ok()
@@ -585,17 +611,200 @@ pub fn pid_is_our_worker(pid: u32, expected_starttime: Option<u64>) -> bool {
     }
 }
 
-/// Non-unix: there is no `/proc` to prove identity with, and no process groups to signal, so the
-/// signal sites this guards are themselves compiled out. Answering `false` keeps the surrounding
-/// `if` well-typed without pretending to a check we cannot make.
-#[cfg(not(unix))]
+/// Windows: pid plus creation time is the identity, as pid plus start time is on Linux (Windows
+/// has no process groups, and a worker's parent is not cheaply readable). Without a captured
+/// creation time the answer is `false`: the safe direction, as on Linux.
+#[cfg(windows)]
+pub fn pid_is_our_worker(pid: u32, expected_starttime: Option<u64>) -> bool {
+    match (pid, expected_starttime) {
+        (0, _) | (_, None) => false,
+        (pid, Some(expected)) => {
+            win32::open(pid, win32::PROCESS_QUERY_LIMITED_INFORMATION)
+                .and_then(|process| process.creation_time())
+                == Some(expected)
+        }
+    }
+}
+
+/// Windows: the process's creation time (a FILETIME), which a recycled pid cannot share.
+#[cfg(windows)]
+pub fn pid_starttime(pid: u32) -> Option<u64> {
+    win32::open(pid, win32::PROCESS_QUERY_LIMITED_INFORMATION)?.creation_time()
+}
+
+/// Windows: terminate `pid` if it is still our worker, which Unix does with `kill(-pid, SIGKILL)`
+/// after `pid_is_our_worker`. One handle serves both the identity check and the kill, and an open
+/// handle keeps its process's pid from being reused, so no other process can be hit in between.
+/// Returns whether it was terminated.
+#[cfg(windows)]
+pub fn terminate_if_our_worker(pid: u32, expected_starttime: Option<u64>) -> bool {
+    let Some(expected) = expected_starttime.filter(|_| pid != 0) else {
+        return false;
+    };
+    let Some(process) = win32::open(
+        pid,
+        win32::PROCESS_QUERY_LIMITED_INFORMATION | win32::PROCESS_TERMINATE,
+    ) else {
+        return false;
+    };
+    process.creation_time() == Some(expected) && process.terminate()
+}
+
+/// Windows: the process that started `pid`, which Linux reads from `/proc/<pid>/stat`.
+///
+/// Windows records the parent's pid at creation and keeps it after the parent exits, by which time
+/// the number may belong to another process. One that started after `pid` cannot be its parent, so
+/// it is not returned; nor is one whose start time cannot be read, so a walk up the tree stops there
+/// rather than guessing.
+#[cfg(windows)]
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    let parent = win32::recorded_parent(pid)?;
+    let started = pid_starttime(pid)?;
+    (parent != 0 && pid_starttime(parent)? <= started).then_some(parent)
+}
+
+#[cfg(windows)]
+mod win32 {
+    use std::ffi::c_void;
+
+    pub const PROCESS_TERMINATE: u32 = 0x0001;
+    pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    /// `(total, available)` physical memory, in bytes.
+    pub fn physical_memory() -> Option<(u64, u64)> {
+        let mut status = MemoryStatusEx {
+            length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            memory_load: 0,
+            total_phys: 0,
+            avail_phys: 0,
+            total_page_file: 0,
+            avail_page_file: 0,
+            total_virtual: 0,
+            avail_virtual: 0,
+            avail_extended_virtual: 0,
+        };
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        (ok != 0).then_some((status.total_phys, status.avail_phys))
+    }
+
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        size: u32,
+        usage: u32,
+        process_id: u32,
+        default_heap_id: usize,
+        module_id: u32,
+        threads: u32,
+        parent_process_id: u32,
+        pri_class_base: i32,
+        flags: u32,
+        exe_file: [u16; 260],
+    }
+
+    /// The parent pid Windows recorded when `pid` was created, from a process snapshot.
+    pub fn recorded_parent(pid: u32) -> Option<u32> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot.is_null() || snapshot as isize == -1 {
+            return None;
+        }
+        let snapshot = Process(snapshot); // closed on drop, like a process handle
+        let mut entry = ProcessEntry32W {
+            size: std::mem::size_of::<ProcessEntry32W>() as u32,
+            usage: 0,
+            process_id: 0,
+            default_heap_id: 0,
+            module_id: 0,
+            threads: 0,
+            parent_process_id: 0,
+            pri_class_base: 0,
+            flags: 0,
+            exe_file: [0; 260],
+        };
+        let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
+        while more {
+            if entry.process_id == pid {
+                return Some(entry.parent_process_id);
+            }
+            more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
+        }
+        None
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut c_void;
+        fn Process32FirstW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn TerminateProcess(handle: *mut c_void, exit_code: u32) -> i32;
+        fn GetProcessTimes(
+            handle: *mut c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+
+    /// An open process handle, closed on drop.
+    pub struct Process(*mut c_void);
+
+    pub fn open(pid: u32, access: u32) -> Option<Process> {
+        let handle = unsafe { OpenProcess(access, 0, pid) };
+        (!handle.is_null()).then_some(Process(handle))
+    }
+
+    impl Process {
+        pub fn creation_time(&self) -> Option<u64> {
+            let mut times: [FileTime; 4] = Default::default();
+            let [creation, exit, kernel, user] = &mut times;
+            let ok = unsafe { GetProcessTimes(self.0, creation, exit, kernel, user) };
+            (ok != 0).then(|| (u64::from(times[0].high) << 32) | u64::from(times[0].low))
+        }
+
+        pub fn terminate(&self) -> bool {
+            unsafe { TerminateProcess(self.0, 1) != 0 }
+        }
+    }
+
+    impl Drop for Process {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+/// Neither Unix nor Windows: no identity to prove, so nothing is signalled.
+#[cfg(not(any(unix, windows)))]
 pub fn pid_is_our_worker(_pid: u32, _expected_starttime: Option<u64>) -> bool {
     false
 }
 
-/// Non-unix: no `/proc` to read a start time from. `None` is "unknown", which `publish_pid` already
-/// stores as 0 and every reader treats as absent — the same thing an unreadable `/proc` means on Linux.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn pid_starttime(_pid: u32) -> Option<u64> {
     None
 }
@@ -1735,6 +1944,52 @@ mod live_tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+/// Windows' identity check and terminate, against a real process.
+#[cfg(all(test, windows))]
+mod windows_pid_tests {
+    use super::*;
+
+    #[test]
+    fn terminates_only_the_process_its_creation_time_names() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        let pid = child.id();
+        let start = pid_starttime(pid).expect("a live child has a creation time");
+
+        assert!(!pid_is_our_worker(0, Some(start)), "pid 0 is never ours");
+        assert!(
+            !pid_is_our_worker(pid, None),
+            "no creation time, no identity"
+        );
+        assert!(pid_is_our_worker(pid, Some(start)));
+
+        // A different creation time is a different process: refused, and left running.
+        assert!(!terminate_if_our_worker(pid, Some(start.wrapping_add(1))));
+        assert!(child.try_wait().unwrap().is_none(), "still running");
+        assert!(!terminate_if_our_worker(pid, None));
+
+        assert!(terminate_if_our_worker(pid, Some(start)));
+        child.wait().expect("terminated child is reaped");
+    }
+
+    /// A child's parent is us, and a pid that does not exist has none.
+    #[test]
+    fn a_child_names_its_parent() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        assert_eq!(parent_pid(child.id()), Some(std::process::id()));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(parent_pid(u32::MAX - 3), None);
     }
 }
 

@@ -27,7 +27,10 @@ use serde::{Deserialize, Serialize};
 /// image id, the SP1 verifying-key hash), derived without executing it. A v10 worker cannot decode the
 /// command, so the handshake refuses it. And `ExecuteResult` gained `host_entropy_reads`, whether the
 /// guest read host-supplied nondeterministic input (both in the same unreleased version).
-pub const PROTOCOL_VERSION: u32 = 11;
+/// 12: `Benchmark` carries the programs to run (`BenchmarkProgramSpec`): the suite is the host's, and
+/// the zkOP/s scoring proofs are requests of their own. A v11 worker ran its own list. And
+/// `SetupProgress`, what a `Warmup` is doing (both in the same unreleased version).
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -62,13 +65,70 @@ pub const BACKEND_RISC0: &str = "risc0";
 pub const BACKEND_SP1: &str = "sp1";
 pub const BACKEND_OPENVM: &str = "openvm";
 
-// Canonical benchmark program names — must match BENCHMARK_PROGRAMS in benchmark.rs.
-pub const BENCH_FIBONACCI: &str = "fibonacci";
+// Benchmark program names. The suite itself is `crate::suite::BENCHMARK_PROGRAMS`.
 pub const BENCH_SHA256_CHAIN: &str = "sha256-chain";
 pub const BENCH_ECDSA_VERIFY: &str = "ecdsa-verify";
 pub const BENCH_BIGINT_MUL: &str = "bigint-mul";
 pub const BENCH_MEMORY_MERKLE: &str = "memory-merkle";
 pub const BENCH_CHACHA_MIX: &str = "chacha-mix";
+/// The discarded proof each card runs before the suite (see `crate::suite::warmup_spec`). Not one
+/// of the suite's programs, and never reported.
+pub const BENCH_WARMUP: &str = "fibonacci";
+/// The program behind zkOP/s: one source file, built for every zkVM, so proofs on any of them do
+/// the same work. Mixed arithmetic, bit mixing, multiplication, branching and memory access, with
+/// no precompiles.
+pub const BENCH_ZKOP_MIX: &str = "zkop-mix";
+
+/// `zkop-mix` input for one scored proof.
+pub const ZKOP_MIX_ITERATIONS: u32 = 3202;
+/// What [`ZKOP_MIX_ITERATIONS`] costs in SP1 cycles. This is the numerator of zkOP/s on every zkVM.
+pub const ZKOP_MIX_SP1_CYCLES: u64 = 50_007_139;
+/// Input for the discarded proof before scoring. Small, so a slow card does not pay for a full one.
+const ZKOP_MIX_WARMUP_ITERATIONS: u32 = 200;
+/// At most this many scored proofs.
+const ZKOP_MIX_MAX_RUNS: usize = 3;
+/// No further scored proof starts once this much proving time has been spent.
+const ZKOP_MIX_BUDGET_SECS: f64 = 60.0;
+
+/// zkOP/s for a `zkop-mix` proof that took `stark_secs`: SP1 cycles of that program per second of
+/// STARK proving. One zkOP is one SP1 cycle of it, so the zkVMs share a unit even though their own
+/// cycle counts cannot be compared. 0 for a time that is not a measurement.
+pub fn zkops_from_stark_secs(stark_secs: f64) -> f64 {
+    if stark_secs.is_finite() && stark_secs > 0.0 {
+        ZKOP_MIX_SP1_CYCLES as f64 / stark_secs
+    } else {
+        0.0
+    }
+}
+
+/// Runs the scoring measurement, given a closure that proves `zkop-mix` at some iteration count:
+/// one discarded warm-up, then up to three scored proofs inside the time budget, reporting the
+/// median. Other work on the GPU shows up as slow runs, which a median ignores; a slow card stops
+/// after one proof. `None` if any proof failed.
+pub fn measure_zkop_mix(
+    mut prove: impl FnMut(u32) -> Option<BenchmarkEntry>,
+) -> Option<BenchmarkEntry> {
+    prove(ZKOP_MIX_WARMUP_ITERATIONS)?;
+    let mut runs: Vec<BenchmarkEntry> = Vec::new();
+    let mut spent = 0.0;
+    while runs.len() < ZKOP_MIX_MAX_RUNS && (runs.is_empty() || spent < ZKOP_MIX_BUDGET_SECS) {
+        let run = prove(ZKOP_MIX_ITERATIONS)?;
+        spent += run.duration_secs;
+        runs.push(run);
+    }
+    runs.sort_by(|a, b| a.duration_secs.total_cmp(&b.duration_secs));
+    let mid = runs.len() / 2;
+    let median = if runs.len() % 2 == 1 {
+        runs[mid].duration_secs
+    } else {
+        (runs[mid - 1].duration_secs + runs[mid].duration_secs) / 2.0
+    };
+    let mut entry = runs.swap_remove(mid);
+    entry.duration_secs = median;
+    entry.throughput = entry.cycles as f64 / median;
+    entry.wrap_secs = None;
+    Some(entry)
+}
 
 /// Commands sent from host to worker via stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,8 +137,10 @@ pub enum WorkerCommand {
     Hello { protocol_version: u32 },
     /// Request worker capabilities.
     Capabilities,
-    /// Run the full benchmark suite. Worker runs all programs it supports.
-    Benchmark,
+    /// Prove each of `programs`, in order, sending a `BenchmarkProgress` after each and then one
+    /// `BenchmarkResult` with a row per program that proved. A program this worker has no guest for
+    /// is skipped with a warning.
+    Benchmark { programs: Vec<BenchmarkProgramSpec> },
     /// Generate a proof for the given ELF and input data.
     Prove {
         request_id: u64,
@@ -277,6 +339,14 @@ pub enum WorkerResponse {
         program_id: [u8; 32],
         /// How long the derivation took.
         duration_secs: f64,
+    },
+    /// What a `Warmup` is doing now, sent before each long step: a first run can spend many minutes
+    /// downloading or compiling. Any number of these come before its `WarmupDone` or `Error`.
+    /// Appended last, so every earlier variant keeps its bincode index.
+    SetupProgress {
+        request_id: u64,
+        /// For the operator, e.g. "Downloading SP1's Groth16 circuit (first run, about 8 GB)".
+        status: String,
     },
 }
 
@@ -1017,6 +1087,22 @@ pub fn is_gpu_oom(message: &str) -> bool {
         || m.contains("out of device memory")
 }
 
+/// One program of a benchmark request: the worker proves its own build of the guest `name` on
+/// `input`. The suite these come from is the miner's; see `crate::suite`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchmarkProgramSpec {
+    /// One of the BENCH_* names.
+    pub name: String,
+    /// The guest's input, as it reads it.
+    pub input: Vec<u8>,
+    /// Copied into the result row.
+    pub weight: f64,
+    /// Copied into the result row.
+    pub precompile: bool,
+    /// Also time the Groth16 wrap on this program (`BenchmarkEntry::wrap_secs`).
+    pub measure_wrap: bool,
+}
+
 /// A single benchmark measurement from a worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkEntry {
@@ -1052,6 +1138,77 @@ pub struct BenchmarkEntry {
     /// per slot: the wrap is fixed, and a second full proof per program would multiply the suite's
     /// run time against a per-slot benchmark timeout.
     pub wrap_secs: Option<f64>,
+}
+
+#[cfg(test)]
+mod zkop_mix_tests {
+    use super::*;
+
+    fn entry(duration_secs: f64) -> BenchmarkEntry {
+        BenchmarkEntry {
+            program_name: BENCH_ZKOP_MIX.to_string(),
+            prover_backend: BACKEND_SP1.to_string(),
+            cycles: ZKOP_MIX_SP1_CYCLES,
+            duration_secs,
+            throughput: 0.0,
+            weight: 0.0,
+            precompile: false,
+            wrap_secs: None,
+        }
+    }
+
+    /// Plays back `times`, recording the iteration count of each call.
+    fn measure(times: &[f64]) -> (Option<BenchmarkEntry>, Vec<u32>) {
+        let mut calls = Vec::new();
+        let mut times = times.iter();
+        let result = measure_zkop_mix(|iterations| {
+            calls.push(iterations);
+            times.next().map(|secs| entry(*secs))
+        });
+        (result, calls)
+    }
+
+    #[test]
+    fn the_warm_up_is_small_and_not_scored() {
+        let (result, calls) = measure(&[1000.0, 5.0, 6.0, 7.0]);
+        assert_eq!(calls[0], ZKOP_MIX_WARMUP_ITERATIONS);
+        assert_eq!(result.unwrap().duration_secs, 6.0);
+    }
+
+    #[test]
+    fn a_fast_card_gets_three_runs_and_a_slow_outlier_is_ignored() {
+        let (result, calls) = measure(&[1.0, 18.0, 24.7, 18.1]);
+        assert_eq!(calls.len(), 4);
+        assert_eq!(result.unwrap().duration_secs, 18.1);
+    }
+
+    #[test]
+    fn a_slow_card_stops_after_one_run() {
+        let (result, calls) = measure(&[10.0, 157.0, 157.0, 157.0]);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(result.unwrap().duration_secs, 157.0);
+    }
+
+    #[test]
+    fn two_runs_report_their_midpoint() {
+        let (result, calls) = measure(&[4.0, 33.0, 35.0, 40.0]);
+        assert_eq!(calls.len(), 3);
+        let entry = result.unwrap();
+        assert_eq!(entry.duration_secs, 34.0);
+        assert_eq!(entry.throughput, ZKOP_MIX_SP1_CYCLES as f64 / 34.0);
+    }
+
+    #[test]
+    fn a_failed_proof_produces_no_score() {
+        assert!(measure(&[1.0, 18.0]).0.is_none());
+    }
+
+    #[test]
+    fn a_zkop_is_one_sp1_cycle_of_the_program() {
+        assert_eq!(zkops_from_stark_secs(10.0), ZKOP_MIX_SP1_CYCLES as f64 / 10.0);
+        assert_eq!(zkops_from_stark_secs(0.0), 0.0);
+        assert_eq!(zkops_from_stark_secs(f64::NAN), 0.0);
+    }
 }
 
 #[cfg(test)]

@@ -12,13 +12,16 @@ use anyhow::{Context, Result};
 use risc0_zkvm::Prover as _;
 use zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV;
 use zkminer_prover_protocol::{
-    is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
-    WorkerResponse, BACKEND_RISC0, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
-    BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
+    is_gpu_oom, read_message, write_message, BenchmarkEntry, BenchmarkProgramSpec, ErrorKind,
+    WorkerCommand, WorkerResponse, BACKEND_RISC0, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX,
+    BENCH_ECDSA_VERIFY, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
     PROTOCOL_VERSION, RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN,
 };
 
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
+
+#[cfg(all(feature = "rocm", windows))]
+mod hip;
 
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -83,6 +86,13 @@ fn main() {
         return;
     }
 
+    // The HIP devices, for the host's GPU discovery where there is no rocm-smi (Windows).
+    #[cfg(all(feature = "rocm", windows))]
+    if std::env::args().any(|a| a == "--list-hip-devices") {
+        hip::print_devices();
+        return;
+    }
+
     // `--export-guest <name> <path>`: write one of the embedded guests to `path` and print its image
     // id, which is the `programId` of a job for it. For harnesses that submit jobs this worker can
     // serve (crates/zkminer-cli/tests/localnet.rs). Speaks no IPC.
@@ -127,7 +137,11 @@ fn main() {
         unsafe { libc::dup2(io::stderr().as_raw_fd(), stdout_fd) };
         unsafe { std::fs::File::from_raw_fd(ipc_fd) }
     };
-    #[cfg(not(unix))]
+    // Windows: the same isolation through the C runtime (ipc.rs): circom-witnesscalc and other
+    // native code print to the process's stdout, which now goes to stderr.
+    #[cfg(windows)]
+    let ipc_stdout = zkminer_prover_protocol::ipc::take_ipc_stdout();
+    #[cfg(not(any(unix, windows)))]
     let ipc_stdout = io::stdout();
 
     {
@@ -191,12 +205,12 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     backend: BACKEND_RISC0.to_string(),
                     version: risc0_zkvm::VERSION.to_string(),
                     supported_benchmarks: vec![
-                        BENCH_FIBONACCI.to_string(),
                         BENCH_SHA256_CHAIN.to_string(),
                         BENCH_ECDSA_VERIFY.to_string(),
                         BENCH_BIGINT_MUL.to_string(),
                         BENCH_MEMORY_MERKLE.to_string(),
                         BENCH_CHACHA_MIX.to_string(),
+                        zkminer_prover_protocol::BENCH_ZKOP_MIX.to_string(),
                     ],
                     gpu_available,
                     gpu_name,
@@ -204,9 +218,9 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Benchmark => {
+            WorkerCommand::Benchmark { programs } => {
                 tracing::info!("Running benchmarks...");
-                let results = run_benchmarks_streaming(&mut stdout)?;
+                let results = run_benchmarks_streaming(&mut stdout, &programs)?;
                 let resp = WorkerResponse::BenchmarkResult { results };
                 write_message(&mut stdout, &resp)?;
             }
@@ -414,7 +428,16 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             }
 
             WorkerCommand::Warmup { request_id } => {
-                let resp = match warm_up() {
+                let resp = match warm_up(&mut |status| {
+                    // A closed pipe is reported by the final answer's write below.
+                    let _ = write_message(
+                        &mut stdout,
+                        &WorkerResponse::SetupProgress {
+                            request_id,
+                            status: status.to_string(),
+                        },
+                    );
+                }) {
                     Ok(summary) => WorkerResponse::WarmupDone {
                         request_id,
                         summary,
@@ -502,7 +525,22 @@ fn detect_gpu() -> (bool, Option<String>) {
             }
         }
     }
-    #[cfg(feature = "rocm")]
+    // Windows has neither rocm-smi nor /dev/kfd: ask HIP for the device this worker proves on
+    // (the dispatcher pins it with HIP_VISIBLE_DEVICES, so it is the first one visible).
+    #[cfg(all(feature = "rocm", windows))]
+    {
+        return match hip::devices() {
+            Ok(devices) => match devices.into_iter().next() {
+                Some(d) => (true, Some(d.name)),
+                None => (false, None),
+            },
+            Err(e) => {
+                tracing::warn!("{e}");
+                (false, None)
+            }
+        };
+    }
+    #[cfg(all(feature = "rocm", not(windows)))]
     {
         // Try rocm-smi first (more reliable than sysfs product_name)
         if let Ok(output) = std::process::Command::new("rocm-smi")
@@ -530,6 +568,11 @@ fn detect_gpu() -> (bool, Option<String>) {
     }
     #[cfg(feature = "intel")]
     {
+        // Windows has no sysfs. The dispatcher starts this worker only for an Intel GPU it detected
+        // (and pins it with ZE_AFFINITY_MASK); the prover fails loudly if no device is visible.
+        if cfg!(windows) {
+            return (true, Some("Intel GPU".to_string()));
+        }
         // The host pins this worker to one card through ZE_AFFINITY_MASK, which sysfs does not see;
         // name the card only when the box has exactly one Intel GPU, so the name is never another
         // card's. The host names its slots from its own discovery either way.
@@ -1160,7 +1203,15 @@ fn run_execute(
 /// The saving from keeping it turned out small: wraps after a release ran 2.08-2.12 s on the 5080
 /// against 2.01-2.05 s on the cache-keeping 4090, so at most ~0.1 s. The threshold is therefore cheap to
 /// get wrong in the conservative direction, which is why an unknown size releases.
+#[cfg(not(all(feature = "intel", windows)))]
 const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// On Intel under Windows the threshold is higher: risc0 proves its segments at po2 21 there, and
+/// a 23M-cycle keccak job's segments alone peaked at 23 GB of a 32 GB Arc Pro B70. With the cache
+/// kept from the previous proof, the same segments ran with the card full and up to 5.8 GB spilled
+/// into shared system memory (WDDM's spill), at 2-5x the time (2026-10-14).
+#[cfg(all(feature = "intel", windows))]
+const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 48 * 1024 * 1024 * 1024;
 
 /// Free the Groth16 prover and SRS cached on the GPU if this card cannot also hold the next STARK.
 ///
@@ -1408,164 +1459,93 @@ fn run_proof_once(
     Ok((journal, seal, duration_secs, cycles))
 }
 
-/// Run benchmarks, sending a BenchmarkProgress message after each program completes.
+/// The embedded guest a benchmark request names, or `None` for a name this build has no guest for
+/// (or a guest stubbed out of the build).
+fn benchmark_guest(name: &str) -> Option<&'static [u8]> {
+    let elf = match name {
+        BENCH_SHA256_CHAIN => SHA256_CHAIN_ELF,
+        BENCH_ECDSA_VERIFY => ECDSA_VERIFY_ELF,
+        BENCH_BIGINT_MUL => BIGINT_MUL_ELF,
+        BENCH_MEMORY_MERKLE => MEMORY_MERKLE_ELF,
+        BENCH_CHACHA_MIX => CHACHA_MIX_ELF,
+        zkminer_prover_protocol::BENCH_ZKOP_MIX => ZKOP_MIX_ELF,
+        zkminer_prover_protocol::BENCH_WARMUP => FIBONACCI_ELF,
+        _ => return None,
+    };
+    (!elf.is_empty()).then_some(elf)
+}
+
+/// Prove each of `programs`, sending a `BenchmarkProgress` after each one that proved. The suite is
+/// the host's; see `zkminer_prover_protocol::suite`.
 fn run_benchmarks_streaming<W: std::io::Write>(
     stdout: &mut W,
+    programs: &[BenchmarkProgramSpec],
 ) -> anyhow::Result<Vec<BenchmarkEntry>> {
     let mut results = Vec::new();
-    let bench_only = std::env::var("BENCH_ONLY").ok();
-
-    // All 6 canonical programs matching BENCHMARK_PROGRAMS weights.
-    // Input sizes tuned so each completes in 5-30s on a mid-range GPU,
-    // keeping total benchmark time under 2 minutes on a 4090.
-    let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
-        (
-            BENCH_FIBONACCI,
-            FIBONACCI_ELF,
-            &1000u32.to_le_bytes(),
-            0.10,
-            false,
-        ),
-        (
-            BENCH_SHA256_CHAIN,
-            SHA256_CHAIN_ELF,
-            &10_000u32.to_le_bytes(),
-            0.20,
-            true,
-        ),
-        (
-            BENCH_ECDSA_VERIFY,
-            ECDSA_VERIFY_ELF,
-            &10u32.to_le_bytes(),
-            0.25,
-            true,
-        ),
-        (
-            BENCH_BIGINT_MUL,
-            BIGINT_MUL_ELF,
-            &100u32.to_le_bytes(),
-            0.10,
-            false,
-        ),
-        (
-            BENCH_MEMORY_MERKLE,
-            MEMORY_MERKLE_ELF,
-            &512u32.to_le_bytes(),
-            0.15,
-            true,
-        ),
-        (
-            BENCH_CHACHA_MIX,
-            CHACHA_MIX_ELF,
-            &5_000u32.to_le_bytes(),
-            0.20,
-            false,
-        ),
-    ];
-
-    let active: Vec<_> = benchmarks
-        .iter()
-        .filter(|&&(name, elf, _, _, _)| {
-            !elf.is_empty()
-                && bench_only
-                    .as_ref()
-                    .map_or(true, |only| name.eq_ignore_ascii_case(only))
-        })
-        .collect();
-    let total = active.len() as u32;
-
-    for (idx, &&(name, elf, input, weight, precompile)) in active.iter().enumerate() {
-        if let Some(entry) = benchmark_program(name, elf, input, weight, precompile) {
+    let total = programs.len() as u32;
+    for (idx, spec) in programs.iter().enumerate() {
+        if let Some(entry) = benchmark_spec(spec) {
             let progress = WorkerResponse::BenchmarkProgress {
                 entry: entry.clone(),
-                program_index: (idx + 1) as u32,
+                program_index: idx as u32 + 1,
                 total_programs: total,
             };
             write_message(stdout, &progress)?;
             results.push(entry);
         }
     }
-
     Ok(results)
 }
 
+/// Prove one requested program, if this build has its guest.
+fn benchmark_spec(spec: &BenchmarkProgramSpec) -> Option<BenchmarkEntry> {
+    let Some(elf) = benchmark_guest(&spec.name) else {
+        tracing::warn!("{}: no guest for it in this build; skipped", spec.name);
+        return None;
+    };
+    benchmark_stages(
+        &spec.name,
+        elf,
+        &spec.input,
+        spec.weight,
+        spec.precompile,
+        spec.measure_wrap,
+    )
+}
+
+/// `--benchmark`: the warm-up and suite the miner would send, then the zkOP/s score. `BENCH_ONLY=<name>` runs one
+/// program of it (or only the score, for `zkop-mix`).
 fn run_benchmarks() -> Vec<BenchmarkEntry> {
-    let mut results = Vec::new();
-
-    // Check for single-benchmark mode via env var (e.g., BENCH_ONLY=fibonacci)
-    let bench_only = std::env::var("BENCH_ONLY").ok();
-
-    // All 6 canonical programs matching BENCHMARK_PROGRAMS weights.
-    // Input sizes tuned so each completes in 5-30s on a mid-range GPU,
-    // keeping total benchmark time under 2 minutes on a 4090.
-    let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
-        (
-            BENCH_FIBONACCI,
-            FIBONACCI_ELF,
-            &1000u32.to_le_bytes(),
-            0.10,
-            false,
-        ),
-        (
-            BENCH_SHA256_CHAIN,
-            SHA256_CHAIN_ELF,
-            &10_000u32.to_le_bytes(),
-            0.20,
-            true,
-        ),
-        (
-            BENCH_ECDSA_VERIFY,
-            ECDSA_VERIFY_ELF,
-            &10u32.to_le_bytes(),
-            0.25,
-            true,
-        ),
-        (
-            BENCH_BIGINT_MUL,
-            BIGINT_MUL_ELF,
-            &100u32.to_le_bytes(),
-            0.10,
-            false,
-        ),
-        (
-            BENCH_MEMORY_MERKLE,
-            MEMORY_MERKLE_ELF,
-            &512u32.to_le_bytes(),
-            0.15,
-            true,
-        ),
-        (
-            BENCH_CHACHA_MIX,
-            CHACHA_MIX_ELF,
-            &5_000u32.to_le_bytes(),
-            0.20,
-            false,
-        ),
-    ];
-
-    for &(name, elf, input, weight, precompile) in benchmarks {
-        if elf.is_empty() {
-            continue;
-        }
-        if let Some(ref only) = bench_only {
-            if !name.eq_ignore_ascii_case(only) {
-                continue;
-            }
-        }
-        if let Some(entry) = benchmark_program(name, elf, input, weight, precompile) {
-            results.push(entry);
+    use zkminer_prover_protocol::{
+        benchmark_suite, measure_zkop_mix, warmup_spec, zkop_mix_spec, BENCH_ZKOP_MIX,
+    };
+    // Discarded, as under a host: see `warmup_spec`.
+    benchmark_spec(&warmup_spec(BACKEND_RISC0));
+    let only = std::env::var("BENCH_ONLY").ok();
+    let wanted = |name: &str| only.as_ref().map_or(true, |o| name.eq_ignore_ascii_case(o));
+    let mut results: Vec<BenchmarkEntry> = benchmark_suite(BACKEND_RISC0)
+        .iter()
+        .filter(|spec| wanted(&spec.name))
+        .filter_map(benchmark_spec)
+        .collect();
+    if wanted(BENCH_ZKOP_MIX) {
+        match measure_zkop_mix(|iterations| benchmark_spec(&zkop_mix_spec(iterations))) {
+            Some(entry) => results.push(entry),
+            None => tracing::error!("{BENCH_ZKOP_MIX}: proving failed; no zkOP/s score"),
         }
     }
-
     results
 }
 
-fn benchmark_program(
+/// Prove `elf`, timing each stage. Without `measure_wrap` it stops at the constant-size STARK, whose
+/// receipt it verifies instead of a Groth16 one.
+fn benchmark_stages(
     name: &str,
     elf: &[u8],
     input: &[u8],
     weight: f64,
     precompile: bool,
+    measure_wrap: bool,
 ) -> Option<BenchmarkEntry> {
     // At the size an uncalibrated card proves jobs at, so its throughput and host peak describe them.
     // (Its first stage is a composite proof, for which the SDK never picks a size of its own, so this
@@ -1615,6 +1595,33 @@ fn benchmark_program(
         }
     };
     let recursion_secs = started.elapsed().as_secs_f64();
+
+    if !measure_wrap {
+        let image_id = match risc0_zkvm::compute_image_id(elf) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!("{name}: failed to compute image id for verification: {e:#}");
+                return None;
+            }
+        };
+        if let Err(e) = succinct.verify(image_id) {
+            tracing::error!("{name}: succinct receipt.verify() FAILED: {e:#}");
+            return None;
+        }
+        let cycles = prove_info.stats.total_cycles;
+        let duration_secs = composite_secs + recursion_secs;
+        tracing::info!("{name}: {cycles} cycles, STARK {duration_secs:.2}s, verified");
+        return Some(BenchmarkEntry {
+            program_name: name.to_string(),
+            prover_backend: BACKEND_RISC0.to_string(),
+            cycles,
+            duration_secs,
+            throughput: cycles as f64 / duration_secs,
+            weight,
+            precompile,
+            wrap_secs: None,
+        });
+    }
 
     // Stage 3: STARK-to-SNARK. Proves the fixed `stark_verify` circuit with a fixed proving key
     // (`~/.risc0/extensions/*-risc0-groth16/stark_verify_final.zkey`), so it does not depend on the
@@ -1713,8 +1720,9 @@ const CALIBRATION_ITERS: u32 = 6_000_000;
 /// full Groth16 pipeline compiles everything once for every later process. It is verified, so a
 /// broken card fails here, not on a job.
 #[cfg(feature = "intel")]
-fn warm_up() -> Result<String> {
-    let component = groth16_component::ensure_installed()?;
+fn warm_up(report: &mut dyn FnMut(&str)) -> Result<String> {
+    let component = groth16_component::ensure_installed(report)?;
+    report("Preparing GPU kernels for this card (a first run can take several minutes)");
     let start = Instant::now();
     let env = risc0_zkvm::ExecutorEnv::builder()
         .write_slice(&1000u32.to_le_bytes())
@@ -1735,8 +1743,8 @@ fn warm_up() -> Result<String> {
 }
 
 #[cfg(not(feature = "intel"))]
-fn warm_up() -> Result<String> {
-    groth16_component::ensure_installed()
+fn warm_up(report: &mut dyn FnMut(&str)) -> Result<String> {
+    groth16_component::ensure_installed(report)
 }
 
 /// Run a po2 calibration: prove fibonacci at the specified segment po2 and measure throughput.

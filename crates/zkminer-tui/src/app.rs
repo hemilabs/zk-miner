@@ -109,6 +109,12 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
                     let mut s = state.write().await;
                     s.tick_count = s.tick_count.wrapping_add(1);
                     s.block_just_updated = false;
+                    if let (Some(tracker), Some(pool)) = (
+                        s.benchmark_tracker.as_mut(),
+                        zkminer_prover::engine::worker_pool(),
+                    ) {
+                        tracker.refresh_setup_status(|key| pool.setup_status(key));
+                    }
                     PostKeyAction::None
                 }
                 AppEvent::Resize(_, _) => PostKeyAction::None,
@@ -180,6 +186,18 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
 }
 
 fn handle_key(state: &mut MinerState, key: crossterm::event::KeyEvent) -> PostKeyAction {
+    let quitting = matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+    if state.return_to_setup_after_benchmark
+        && !state.startup_benchmark_pending
+        && state.current_screen == Screen::Benchmark
+        && !quitting
+    {
+        state.return_to_setup_after_benchmark = false;
+        state.current_screen = Screen::Setup;
+        return PostKeyAction::None;
+    }
+
     // Setup screen has its own key handling — intercept before global keys
     if state.current_screen == Screen::Setup {
         // Allow quit from setup
@@ -395,16 +413,7 @@ async fn run_streaming_gpu_benchmark(state: SharedState) {
             while let Some(event) = bridge_rx.recv().await {
                 let mut s = bridge_state.write().await;
                 if let Some(tracker) = s.benchmark_tracker.as_mut() {
-                    tracker.on_progress(
-                        &event.slot_key,
-                        event.gpu_name.as_deref(),
-                        event.device_index,
-                        event.pci_bus_id.as_deref(),
-                        &event.gpu_tag,
-                        &event.entry,
-                        event.program_index,
-                        event.total_programs,
-                    );
+                    tracker.apply(&event);
                 }
             }
         });
@@ -450,6 +459,13 @@ async fn run_streaming_gpu_benchmark(state: SharedState) {
             "GPU benchmark produced no device rows — keeping the previous results and NOT saving, \
              rather than persisting a suite that prices every card at 0W"
         );
+        s.add_log(
+            LogLevel::Warn,
+            "GPU benchmark produced no results — see the log; press [b] on this screen to retry",
+        );
+        s.benchmark_running = false;
+        s.benchmark_tracker = None;
+        s.benchmark_device_in_progress = None;
         return;
     }
 
@@ -459,6 +475,7 @@ async fn run_streaming_gpu_benchmark(state: SharedState) {
             .device_benchmarks
             .retain(|d| !d.device_id.starts_with("gpu"));
         existing.device_benchmarks.extend(suite.device_benchmarks);
+        existing.zkops = benchmark::machine_zkops(&existing.device_benchmarks);
         existing.gpu_power_watts = suite.gpu_power_watts;
         existing.timestamp = suite.timestamp;
         benchmark::save_benchmark(existing);
@@ -505,6 +522,55 @@ async fn run_streaming_gpu_benchmark(state: SharedState) {
     s.benchmark_running = false;
     s.benchmark_tracker = None;
     s.benchmark_device_in_progress = None;
+}
+
+/// Benchmarks the GPUs, in the background, if the saved results don't cover every card and prover
+/// this miner started. `show` opens the Benchmark screen for it. Call before the miner can claim:
+/// `startup_benchmark_pending` holds claims back until the cards are free.
+pub async fn start_benchmark_if_incomplete(state: &SharedState, show: bool) {
+    use zkminer_prover::{benchmark, engine};
+
+    let targets = engine::worker_pool()
+        .map(|p| p.benchmark_targets())
+        .unwrap_or_default();
+    {
+        let mut s = state.write().await;
+        let missing = benchmark::missing_device_benchmarks(s.benchmark_results.as_ref(), &targets);
+        if missing.is_empty() {
+            return;
+        }
+        s.benchmark_running = true;
+        s.startup_benchmark_pending = true;
+        if show {
+            s.return_to_setup_after_benchmark = s.current_screen == Screen::Setup;
+            s.current_screen = Screen::Benchmark;
+        }
+        let missing: Vec<String> = missing.iter().map(|(d, b)| format!("{d}/{b}")).collect();
+        let message = format!("Benchmarking: no saved results for {}", missing.join(", "));
+        tracing::info!("{message}");
+        s.add_log(LogLevel::Info, message);
+    }
+
+    let state = state.clone();
+    tokio::spawn(async move {
+        run_streaming_gpu_benchmark(state.clone()).await;
+        let mut s = state.write().await;
+        s.startup_benchmark_pending = false;
+        let rows: Vec<String> = s
+            .benchmark_results
+            .iter()
+            .flat_map(|suite| &suite.device_benchmarks)
+            .filter(|d| d.device_id.starts_with("gpu"))
+            .map(|d| {
+                let rate = d.throughput / 1_000_000.0;
+                format!("{} / {}: {rate:.1}M c/s", d.device_label, d.prover_backend)
+            })
+            .collect();
+        for row in rows {
+            tracing::info!("Benchmark result: {row}");
+            s.add_log(LogLevel::Success, row);
+        }
+    });
 }
 
 /// Run a full benchmark suite asynchronously: CPU (measured) then GPUs (measured

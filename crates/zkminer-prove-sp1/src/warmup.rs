@@ -51,12 +51,16 @@ pub(crate) struct WarmupReport {
 }
 
 /// Installs the Groth16 circuit artifacts if they are not installed, and builds the stripped
-/// circuit where the server supports it.
-pub(crate) fn warm_up() -> Result<WarmupReport> {
+/// circuit where the server supports it. `report` is told before each long step.
+pub(crate) fn warm_up(report: &mut dyn FnMut(&str)) -> Result<WarmupReport> {
     let dir = sp1_prover::build::groth16_circuit_artifacts_dir()
         .context("cannot locate the Groth16 circuit artifacts directory")?;
     let started = Instant::now();
-    let installed = ensure_installed(&dir, download)?;
+    let installed = ensure_installed(&dir, |staging| {
+        let label = "Downloading SP1's Groth16 circuit (first run, about 8 GB)";
+        report(label);
+        with_size_progress(staging, label, report, || download(staging))
+    })?;
     let mut summary = format!(
         "Groth16 circuit artifacts {} ({}, {:.0?})",
         installed.describe(),
@@ -68,6 +72,7 @@ pub(crate) fn warm_up() -> Result<WarmupReport> {
     let groth16_helper = server.exists() && server_hosts_groth16_helper(&server);
     if groth16_helper {
         let started = Instant::now();
+        report("Preparing SP1's Groth16 circuit (about 30 s on a first run)");
         prepare_stripped_circuit(&server, &dir)?;
         summary.push_str(&format!(
             "; stripped circuit ready ({:.0?})",
@@ -82,12 +87,16 @@ pub(crate) fn warm_up() -> Result<WarmupReport> {
     })
 }
 
-/// `~/.sp1/bin/sp1-gpu-server`, where the SDK runs it from.
+/// `~/.sp1/bin/sp1-gpu-server` (`.exe` on Windows), where the SDK runs it from. The home directory
+/// is found as the SDK finds it: `HOME`, or on Windows, which does not set it, `USERPROFILE`.
 pub(crate) fn server_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|home| !home.is_empty()))
         .ok_or_else(|| anyhow!("$HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".sp1/bin").join(server_name()))
+    Ok(PathBuf::from(home)
+        .join(".sp1/bin")
+        .join(format!("{}{}", server_name(), std::env::consts::EXE_SUFFIX)))
 }
 
 /// The build of `sp1-gpu-server` this worker's SDK runs: `SP1_GPU_SERVER_NAME` (set by the dispatcher
@@ -200,6 +209,50 @@ pub(crate) fn ensure_installed(
     Ok(Installed::Downloaded)
 }
 
+/// How often a long step's size is reported.
+const PROGRESS_EVERY: Duration = Duration::from_secs(2);
+
+/// Runs `step` on a thread of its own, telling `report` every few seconds how much `path` holds,
+/// as "<label>: 3.1 GB so far". For a download or an unpack whose library reports nothing itself.
+fn with_size_progress<T: Send>(
+    path: &Path,
+    label: &str,
+    report: &mut dyn FnMut(&str),
+    step: impl FnOnce() -> T + Send,
+) -> T {
+    std::thread::scope(|scope| {
+        let running = scope.spawn(step);
+        let mut reported = Instant::now();
+        while !running.is_finished() {
+            std::thread::sleep(Duration::from_millis(250));
+            if reported.elapsed() >= PROGRESS_EVERY {
+                reported = Instant::now();
+                let gb = size_on_disk(path) as f64 / 1e9;
+                report(&format!("{label}: {gb:.1} GB so far"));
+            }
+        }
+        running
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// Bytes in `path`, a file or a directory tree; what cannot be read counts as nothing.
+fn size_on_disk(path: &Path) -> u64 {
+    let Ok(meta) = fs::metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| size_on_disk(&entry.path()))
+        .sum()
+}
+
 /// The SDK's download and extraction, into `staging`.
 fn download(staging: &Path) -> Result<()> {
     tracing::info!(
@@ -216,8 +269,10 @@ fn download(staging: &Path) -> Result<()> {
     ))
 }
 
-/// An exclusive `flock` on `path`, held until the file is dropped.
+/// An exclusive lock on `path`, held until the file is dropped: `flock` on Unix, `LockFileEx` on
+/// Windows (std's `File::lock`).
 fn lock(path: &Path) -> Result<File> {
+    #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
     let file = fs::OpenOptions::new()
         .create(true)
@@ -225,6 +280,7 @@ fn lock(path: &Path) -> Result<File> {
         .write(true)
         .open(path)
         .with_context(|| format!("cannot open {}", path.display()))?;
+    #[cfg(unix)]
     loop {
         // SAFETY: flock on a descriptor we own.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
@@ -234,6 +290,12 @@ fn lock(path: &Path) -> Result<File> {
         if err.kind() != std::io::ErrorKind::Interrupted {
             return Err(err).with_context(|| format!("cannot lock {}", path.display()));
         }
+    }
+    #[cfg(windows)]
+    {
+        file.lock()
+            .with_context(|| format!("cannot lock {}", path.display()))?;
+        Ok(file)
     }
 }
 
@@ -406,6 +468,7 @@ mod tests {
 
     /// The probe tells a helper-hosting server from one that rejects the argument, as the pinned
     /// v6.0.2 server does, without starting either as a server.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_helper_probe_reads_the_servers_answer() {
         // Other tests in this binary briefly point PATH elsewhere, and the scripts are written with

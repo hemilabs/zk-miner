@@ -1,6 +1,24 @@
+/// The guests `main.rs` embeds, each as `SP1_ELF_<name>-sp1-guest`.
+const EMBEDDED_GUESTS: [&str; 7] = [
+    "fibonacci",
+    "sha256-chain",
+    "ecdsa-verify",
+    "bigint-mul",
+    "memory-merkle",
+    "chacha-mix",
+    "zkop-mix",
+];
+
 fn main() {
-    // Note: sp1_build::build_program handles SP1_SKIP_PROGRAM_BUILD internally
-    // (creates dummy ELFs and sets env vars for include_elf! macro).
+    println!("cargo:rerun-if-env-changed=ZKMINER_SP1_GUESTS_DIR");
+    // Embed guests built elsewhere: Succinct's toolchain, which compiles them, has no Windows build.
+    if let Some(dir) = std::env::var_os("ZKMINER_SP1_GUESTS_DIR") {
+        import_prebuilt_guests(std::path::Path::new(&dir));
+        return;
+    }
+
+    // Note: with SP1_SKIP_PROGRAM_BUILD, sp1_build::build_program only sets the SP1_ELF_* env vars
+    // for include_elf!, to where the ELFs would be; it creates none, so they must already exist.
     let guest_dir =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../zkminer-prover/guests/sp1");
 
@@ -33,6 +51,11 @@ fn main() {
     let chacha_dir = guest_dir.join("chacha-mix");
     if chacha_dir.exists() {
         sp1_build::build_program(&chacha_dir.to_string_lossy());
+    }
+
+    let zkop_dir = guest_dir.join("zkop-mix");
+    if zkop_dir.exists() {
+        sp1_build::build_program(&zkop_dir.to_string_lossy());
     }
 
     let torture_dir = guest_dir.join("rv32im-torture");
@@ -81,6 +104,14 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
+        guest_dir.join("../common/zkop_mix.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest_dir.join("zkop-mix/src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
         guest_dir.join("rv32im-torture/src/main.rs").display()
     );
     println!(
@@ -115,4 +146,20 @@ fn main() {
         "cargo:rerun-if-changed={}",
         guest_dir.join("minimal-proof/src/main.rs").display()
     );
+}
+
+/// Points each embedded guest's `SP1_ELF_*` at `<dir>/<name>-sp1-guest`: the ELFs a build of this
+/// crate with Succinct's toolchain produced, under the names sp1_build gives them.
+fn import_prebuilt_guests(dir: &std::path::Path) {
+    for guest in EMBEDDED_GUESTS {
+        let name = format!("{guest}-sp1-guest");
+        let elf = dir.join(&name);
+        assert!(
+            elf.is_file(),
+            "ZKMINER_SP1_GUESTS_DIR: {} has no {name}",
+            dir.display()
+        );
+        println!("cargo:rerun-if-changed={}", elf.display());
+        println!("cargo:rustc-env=SP1_ELF_{name}={}", elf.display());
+    }
 }
