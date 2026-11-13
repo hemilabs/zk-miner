@@ -143,31 +143,14 @@ pub fn working_set_limit() -> Option<u64> {
     )
 }
 
-/// The default segment size for a working-set limit (PLAN 9.1). Peak GPU memory measured with this
-/// worker's benchmark (memory-merkle, M5 Max, merged fork; docs/metal-port-notes/M1.md), segments /
-/// recursion phase:
+/// The default segment size for a working-set limit (PLAN 9.1): the shared table
+/// (`metal_sizing::job_po2_for_limit`, M8 tiers; `ZKMINER_METAL_PO2_TABLE=m1` restores M1's).
 ///
-/// | limit           | po2 | STARK peak (MiB) | typical Mac                                     |
-/// |-----------------|-----|------------------|-------------------------------------------------|
-/// | < 6 GiB         | 17  | 2082 / 3971      | 16 GB base chip under a ~4 GB owner-active cap  |
-/// | 6 to < 12 GiB   | 18  | 2700 / 4390      | 16 GB Mac (~10.7 GB recommended, 8 GiB host)    |
-/// | 12 to < 20 GiB  | 19  | 4976 / 6668      | 24 GB Mac (16 GiB host figure)                  |
-/// | >= 20 GiB       | 20  | 9473 / 11169     | 32 GB and up (28.1 GiB on the 36 GB dev machine)|
-///
-/// The Groth16 wrap needs ~7.4 GB on its own (5.7 GB key + identity_p254), so below ~8 GiB a
-/// proof's STARK fits but its wrap does not (M1 note). Never above
-/// [`zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2`].
+/// The Groth16 wrap needs ~3.9 GB under an enforced budget (the key is not kept there), so the 4 GiB
+/// tier is the floor. Never above [`zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2`].
 pub fn job_po2_for_limit(limit: u64) -> u8 {
-    let po2 = if limit < 6 * GIB {
-        17
-    } else if limit < 12 * GIB {
-        18
-    } else if limit < 20 * GIB {
-        19
-    } else {
-        20
-    };
-    po2.min(zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2)
+    crate::metal_sizing::job_po2_for_limit(limit)
+        .min(zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2)
 }
 
 /// This Mac's default segment size ([`job_po2_for_limit`] of [`working_set_limit`]), or the protocol
@@ -187,27 +170,50 @@ pub fn default_job_po2() -> u8 {
     })
 }
 
-/// Peak GPU memory of the largest STARK phase at `po2`: the recursion phase, which runs beside the
-/// segment prover's cached pool. Measured with the worker's benchmark on the M5 Max (M1 note):
-/// 3971 / 4390 / 6668 / 11169-11938 MiB at po2 17 / 18 / 19 / 20, rounded up.
+/// Peak GPU memory of the largest STARK phase at `po2` with no budget enforced (the recursion phase,
+/// beside the segment prover's cached pool): the shared `metal_sizing::stark_peak_bytes`. Used for the
+/// Groth16 keep decision and the refusal text; not what sizes the job.
 pub fn stark_peak_bytes(po2: u8) -> u64 {
-    match po2 {
-        0..=17 => 4 * GIB,
-        18 => 5 * GIB,
-        19 => 7 * GIB,
-        20 => 12 * GIB,
-        p => 12 * GIB << (p - 20).min(4),
-    }
+    crate::metal_sizing::stark_peak_bytes(po2)
 }
 
-/// The largest segment po2 whose STARK peak ([`stark_peak_bytes`]) fits in `limit`, or `None` when
-/// not even po2 17's does. This is a hard ceiling, not the default ([`job_po2_for_limit`] is): on the
-/// 36 GB dev machine (28.1 GiB) it is 21, and po2 22 is refused. Without it a po2 22 Prove there
-/// did not fail but thrashed swap for 40 minutes (18 GB of swap, the whole machine starved), because
-/// with no `RISC0_METAL_MAX_WORKING_SET_BYTES` Metal over-commits past
-/// `recommendedMaxWorkingSetSize` instead of failing the allocation (M1 note, fix round 1).
+/// The largest segment po2 allowed to start under `limit`, or `None` when none is
+/// (`metal_sizing::max_po2_for_limit`). This is a hard ceiling, not the default
+/// ([`job_po2_for_limit`] is): on the 36 GB dev machine (28.1 GiB) it is 21, and po2 22 is refused.
+/// Without it a po2 22 Prove there did not fail but thrashed swap for 40 minutes (18 GB of swap,
+/// the whole machine starved), because with no `RISC0_METAL_MAX_WORKING_SET_BYTES` Metal
+/// over-commits past `recommendedMaxWorkingSetSize` instead of failing the allocation (M1 note, fix
+/// round 1). Below po2 21 the M8 table admits what proved under an enforced budget of that size
+/// (po2 18 at 4 GiB, where M1's ceiling was 17).
 pub fn max_po2_for_limit(limit: u64) -> Option<u8> {
-    (13..=24u8).rev().find(|&p| stark_peak_bytes(p) <= limit)
+    crate::metal_sizing::max_po2_for_limit(limit)
+}
+
+/// The risc0 fork's Z12 knob: `0` keeps the segment prover cached through recursion (pre-Z12), `1`
+/// always drops it before lift/join, anything else (`auto`) drops it only when the enforced
+/// working-set limit cannot hold both.
+pub const RELEASE_SEG_BEFORE_REC_ENV: &str = "RISC0_METAL_RELEASE_SEG_BEFORE_REC";
+
+/// The worker's value for [`RELEASE_SEG_BEFORE_REC_ENV`] when the operator set none: `1` (M8).
+///
+/// `auto` only sees an ENFORCED limit, and a real Mac enforces none, so there the segment prover's
+/// pool stays allocated beside recursion and the sum is real RAM. Dropping it always costs nothing
+/// in this worker: the wrap's `release_hal_buffers` drops the prover after every proof anyway, and
+/// 7 interleaved pairs each (M8 note, memory-merkle, quiet machine) put the STARK time inside the
+/// spread at 8 / 10 / 16 GiB and the default budget, while the process footprint fell 10.57 -> 8.38
+/// GB at po2 19 under a 10 GiB limit (the 16 GB Mac case: back to po2 18's 8.4 GB) and 16.15 ->
+/// 14.19 GB at po2 20 by default. Set the variable (`auto`, `0`) to override.
+pub fn release_seg_mode_default(current: Option<&std::ffi::OsStr>) -> Option<&'static str> {
+    current.is_none().then_some("1")
+}
+
+/// Applies [`release_seg_mode_default`] to this process. Call at start, before any thread proves.
+pub fn default_release_segment_prover_before_recursion() {
+    if let Some(mode) =
+        release_seg_mode_default(std::env::var_os(RELEASE_SEG_BEFORE_REC_ENV).as_deref())
+    {
+        std::env::set_var(RELEASE_SEG_BEFORE_REC_ENV, mode);
+    }
 }
 
 /// Lets an operator (or a test of the out-of-memory path) prove above [`max_po2_for_limit`].
@@ -226,9 +232,10 @@ pub fn po2_refusal(po2: u8) -> Option<String> {
         return None;
     }
     Some(format!(
-        "Metal working-set budget exceeded: segment po2 {po2} needs about {:.1} GiB of GPU memory, \
-         above this Mac's {:.1} GiB working-set limit ({})",
-        stark_peak_bytes(po2) as f64 / GIB as f64,
+        "Metal working-set budget exceeded: segment po2 {po2} needs a working-set limit of about \
+         {:.1} GiB, above this Mac's {:.1} GiB ({})",
+        crate::metal_sizing::min_limit_for_po2(po2, crate::metal_sizing::env_po2_table()) as f64
+            / GIB as f64,
         limit as f64 / GIB as f64,
         match max {
             Some(m) => format!("largest po2 here: {m}"),
@@ -469,23 +476,38 @@ pub fn warm_up_pipelines() -> &'static str {
 mod tests {
     use super::*;
 
+    /// M8 table (these tests run without `ZKMINER_METAL_PO2_TABLE`).
     #[test]
     fn po2_follows_the_working_set_limit() {
-        assert_eq!(job_po2_for_limit(4 * GIB), 17);
-        assert_eq!(job_po2_for_limit(8 * GIB), 18);
-        // A 16 GB Mac: ~10.7 GB recommended, 8 GiB host figure.
-        assert_eq!(job_po2_for_limit(10_700_000_000), 18);
-        assert_eq!(job_po2_for_limit(16 * GIB), 19);
+        if crate::metal_sizing::env_po2_table() != crate::metal_sizing::Po2Table::M8 {
+            return;
+        }
+        assert_eq!(job_po2_for_limit(4 * GIB), 18);
+        assert_eq!(job_po2_for_limit(8 * GIB), 19);
+        // A 16 GB Mac: ~10.7 GB recommended, 8 GiB host figure (the smaller wins, 19); an 18 GB
+        // Mac's 10 GiB host figure.
+        assert_eq!(job_po2_for_limit(10_700_000_000), 19);
+        assert_eq!(job_po2_for_limit(10 * GIB), 19);
+        assert_eq!(job_po2_for_limit(12 * GIB), 20);
+        assert_eq!(job_po2_for_limit(16 * GIB), 20);
         // The 36 GB dev machine: min(30.15 GB, 28 GiB).
         assert_eq!(job_po2_for_limit(28 * GIB), 20);
         assert_eq!(job_po2_for_limit(180 * GIB), 20);
     }
 
     #[test]
-    fn the_po2_ceiling_follows_the_stark_peak() {
+    fn the_po2_ceiling_follows_the_table() {
+        if crate::metal_sizing::env_po2_table() != crate::metal_sizing::Po2Table::M8 {
+            return;
+        }
         assert_eq!(max_po2_for_limit(3 * GIB), None);
-        assert_eq!(max_po2_for_limit(4 * GIB), Some(17));
+        assert_eq!(max_po2_for_limit(4 * GIB), Some(18));
         assert_eq!(max_po2_for_limit(8 * GIB), Some(19));
+        assert_eq!(
+            max_po2_for_limit(10 * GIB),
+            Some(20),
+            "proved at a 10 GiB budget (M8)"
+        );
         assert_eq!(max_po2_for_limit(16 * GIB), Some(20));
         // The 36 GB dev machine: po2 21 proved there (M1 review), po2 22 thrashed swap.
         assert_eq!(max_po2_for_limit(28 * GIB), Some(21));
@@ -493,6 +515,19 @@ mod tests {
         // Never below the default for the same limit.
         for limit in [4 * GIB, 8 * GIB, 10_700_000_000, 16 * GIB, 28 * GIB] {
             assert!(max_po2_for_limit(limit).unwrap() >= job_po2_for_limit(limit));
+        }
+    }
+
+    #[test]
+    fn the_worker_releases_the_segment_prover_unless_told_otherwise() {
+        use std::ffi::OsStr;
+        assert_eq!(release_seg_mode_default(None), Some("1"));
+        for set in ["0", "1", "auto", ""] {
+            assert_eq!(
+                release_seg_mode_default(Some(OsStr::new(set))),
+                None,
+                "{set:?}"
+            );
         }
     }
 

@@ -385,9 +385,10 @@ pub fn risc0_job_po2(
 ///
 /// An Apple GPU (`gpu-metal<N>`) is sized from the shared Metal table
 /// ([`crate::metal_sizing::job_po2_for_limit`]), the same one the Metal worker uses for its own
-/// default and ceiling, rather than from the discrete-card rule: that rule gave po2 20 to any figure of
-/// at least [`RISC0_JOB_MIN_VRAM_BYTES`] (a 24 GB Mac's 16 GiB, where the worker's table says 19) and
-/// NO job size to a 16 GB Mac's 8 GiB (M6). A calibrated Metal row is honoured as for any card, and
+/// default and ceiling, rather than from the discrete-card rule: that rule gave NO job size to a
+/// 16 GB Mac's 8 GiB (M6), where the table says 19 (M8; `ZKMINER_METAL_PO2_TABLE=m1` restores M1's
+/// 18), and 20 to any figure of at least [`RISC0_JOB_MIN_VRAM_BYTES`], which only agrees with the
+/// table since M8. A calibrated Metal row is honoured as for any card, and
 /// raised only to the table's size. An operator override still wins. Every other device: unchanged.
 pub fn risc0_slot_job_po2(
     device_id: &str,
@@ -4351,10 +4352,11 @@ mod tests {
     }
 
     /// M6: an Apple GPU is sized from the Metal worker's own table, not the discrete-card rule that
-    /// gave a 24 GB Mac po2 20 (the worker says 19) and a 16 GB Mac no job size at all.
+    /// gave a 24 GB Mac po2 20 (M1's table said 19) and a 16 GB Mac no job size at all. M8: the
+    /// table now gives a 16 GB Mac 19 and a 24 GB Mac 20.
     #[test]
     fn a_mac_proves_risc0_jobs_at_the_metal_tables_size() {
-        use crate::metal_sizing::{job_po2_for_limit, working_set_limit_of};
+        use crate::metal_sizing::{job_po2_for_limit_in, working_set_limit_of, Po2Table::*};
         const GIB: u64 = 1 << 30;
         let mac16 = Some(8 * GIB); // hw.memsize less the 8 GiB reserve
         let mac24 = Some(16 * GIB);
@@ -4370,9 +4372,17 @@ mod tests {
                 Some(metal_job_po2(vram))
             );
         }
-        // Without a budget: 18 / 19 / 20.
-        let table = |v: Option<u64>| job_po2_for_limit(working_set_limit_of(v, None).unwrap());
-        assert_eq!((table(mac16), table(mac24), table(mac36)), (18, 19, 20));
+        // Without a budget: 19 / 20 / 20 (M8; M1's table said 18 / 19 / 20).
+        let table =
+            |v: Option<u64>, t| job_po2_for_limit_in(working_set_limit_of(v, None).unwrap(), t);
+        assert_eq!(
+            (table(mac16, M8), table(mac24, M8), table(mac36, M8)),
+            (19, 20, 20)
+        );
+        assert_eq!(
+            (table(mac16, M1), table(mac24, M1), table(mac36, M1)),
+            (18, 19, 20)
+        );
         // An override still wins; a discrete card is unchanged.
         assert_eq!(
             risc0_slot_job_po2("gpu-metal0", Some(17), None, mac36),
@@ -4388,8 +4398,8 @@ mod tests {
                 .collect();
             risc0_row(samples, ceiling, ceiling)
         };
-        // Under a 4 GiB budget run the table says 17, and a ceiling two below it is outside the
-        // job range; the cases need the unbudgeted 36 GB size or a budget of at least 6 GiB.
+        // A ceiling two below the table's size must stay inside the job range (16..): true for the
+        // M8 table under every budget run (18 at 4 GiB), not for M1's (17 at 4 GiB).
         let d = metal_job_po2(mac36);
         if d < 18 {
             return;

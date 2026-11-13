@@ -74,6 +74,10 @@ fn use_shipped_level_zero_driver() {
 fn main() {
     #[cfg(feature = "intel")]
     use_shipped_level_zero_driver();
+    // M8: drop the segment prover before recursion on every proof unless the operator chose a
+    // mode (`metal_host::release_seg_mode_default`). First thing, before any thread exists.
+    #[cfg(feature = "metal")]
+    metal_host::default_release_segment_prover_before_recursion();
 
     // Direct benchmark mode runs the operator's own guests and prints a human table to the REAL
     // stdout, so it must come before the fd-1 redirect below. It speaks no IPC.

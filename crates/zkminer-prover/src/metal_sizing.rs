@@ -34,31 +34,100 @@ pub const FOOTPRINT_EXIT_CODE: i32 = 137;
 /// side pins that; this file cannot import it).
 pub const DEFAULT_JOB_PO2_CAP: u8 = 20;
 
-/// The default segment size for a GPU working-set limit (PLAN 9.1). Peak GPU memory, segments /
-/// recursion phase:
+/// Revert knob for M8's tier table: `m1` restores the M1/M6 table (one po2 lower below 20 GiB) and
+/// its po2 ceiling; unset or anything else is the M8 table. Host and worker both read it (the worker
+/// inherits the miner's environment), so setting it on the miner moves both.
+pub const PO2_TABLE_ENV: &str = "ZKMINER_METAL_PO2_TABLE";
+
+/// Which segment-size table a Mac is sized with ([`PO2_TABLE_ENV`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Po2Table {
+    /// M1's table (M6 made it the shared one): sized by the unconstrained recursion-phase peak.
+    M1,
+    /// M8's table: sized by what proves under an enforced working-set budget (risc0 Z12).
+    M8,
+}
+
+/// [`PO2_TABLE_ENV`] from this process's environment.
+pub fn env_po2_table() -> Po2Table {
+    match std::env::var(PO2_TABLE_ENV) {
+        Ok(v) if v.trim().eq_ignore_ascii_case("m1") => Po2Table::M1,
+        _ => Po2Table::M8,
+    }
+}
+
+/// The working-set limit from which [`Po2Table::M8`] gives a Mac po2 20 by default.
 ///
-/// | limit           | po2 | STARK peak (MiB) | typical Mac                                     |
-/// |-----------------|-----|------------------|-------------------------------------------------|
-/// | < 6 GiB         | 17  | 2082 / 3971      | 16 GB base chip under a ~4 GB owner-active cap  |
-/// | 6 to < 12 GiB   | 18  | 2700 / 4390      | 16 GB Mac (8 GiB host figure)                   |
-/// | 12 to < 20 GiB  | 19  | 4976 / 6668      | 24 GB Mac (16 GiB host figure)                  |
-/// | >= 20 GiB       | 20  | 9473 / 11169     | 32 GB and up                                    |
+/// po2 20 proves, wraps and verifies under a 10 GiB enforced budget (segments 9420 MiB, process
+/// footprint 13.4 GB; M8 note), which is therefore its ceiling ([`PO2_20_MIN_LIMIT`]). The default is
+/// one step more cautious because an 18 GB Mac (10 GiB host figure) enforces no budget: its proof's
+/// process footprint (13.4-13.7 GB at po2 20 against 8.4 GB at 19 with the worker's segment-prover
+/// release) would be ~70% of its RAM. From
+/// 12 GiB up (a 24 GB Mac, 16 GiB) po2 20 is the default.
+pub const PO2_20_DEFAULT_LIMIT: u64 = 12 * GIB;
+
+/// The smallest working-set limit po2 20 may start under ([`min_limit_for_po2`]): measured to prove.
+pub const PO2_20_MIN_LIMIT: u64 = 10 * GIB;
+
+/// The default segment size for a GPU working-set limit (PLAN 9.1), with the table
+/// [`PO2_TABLE_ENV`] selects.
 pub fn job_po2_for_limit(limit: u64) -> u8 {
-    let po2 = if limit < 6 * GIB {
-        17
-    } else if limit < 12 * GIB {
-        18
-    } else if limit < 20 * GIB {
-        19
-    } else {
-        20
+    job_po2_for_limit_in(limit, env_po2_table())
+}
+
+/// The default segment size for a GPU working-set limit and table.
+///
+/// [`Po2Table::M8`] (default). Measured with the worker's `--benchmark` (memory-merkle, M5 Max, risc0
+/// fork with Z12) under `RISC0_METAL_MAX_WORKING_SET_BYTES`; Metal peak MiB segments / recursion /
+/// wrap, all proofs wrapped and verified (zk-miner `docs/metal-port-notes/M8.md`, risc0 `Z12.md`):
+///
+/// | limit                  | po2 | peaks (MiB)          | next po2 up                       | typical Mac          |
+/// |------------------------|-----|----------------------|-----------------------------------|----------------------|
+/// | < 6 GiB                | 18  | 2492 / 3337 / 3942   | 19 refused in segments at 4 GiB   | 16 GB, ~4 GB cap     |
+/// | 6 GiB to < 12 GiB      | 19  | 4784 / 4788 / 5347   | 20 refused in segments at 8 GiB   | 16 / 18 GB           |
+/// | >= 12 GiB              | 20  | 9420 / 7740 / 7740   | -                                 | 24 GB and up         |
+///
+/// (po2 18 at 4 GiB: 2492 / 3337 / 3942; po2 20 also proves at 10 GiB, see [`PO2_20_DEFAULT_LIMIT`].)
+///
+/// Under an enforced budget the fork drains its pools before refusing an allocation, and Z12 drops
+/// the cached segment prover before recursion when both would not fit, so the stacked
+/// recursion-phase peak ([`stark_peak_bytes`]) is not what decides the size; the segment phase is.
+///
+/// [`Po2Table::M1`]: < 6 GiB 17, < 12 GiB 18, < 20 GiB 19, else 20 (M1 note: sized by the
+/// unconstrained recursion-phase peak, 3971 / 4390 / 6668 / 11169 MiB at 17 / 18 / 19 / 20).
+///
+/// Never above [`DEFAULT_JOB_PO2_CAP`].
+pub fn job_po2_for_limit_in(limit: u64, table: Po2Table) -> u8 {
+    let po2 = match table {
+        Po2Table::M1 => {
+            if limit < 6 * GIB {
+                17
+            } else if limit < 12 * GIB {
+                18
+            } else if limit < 20 * GIB {
+                19
+            } else {
+                20
+            }
+        }
+        Po2Table::M8 => {
+            if limit < 6 * GIB {
+                18
+            } else if limit < PO2_20_DEFAULT_LIMIT {
+                19
+            } else {
+                20
+            }
+        }
     };
     po2.min(DEFAULT_JOB_PO2_CAP)
 }
 
-/// Peak GPU memory of the largest STARK phase at `po2` (the recursion phase, beside the segment
-/// prover's cached pool): 3971 / 4390 / 6668 / 11169-11938 MiB measured at po2 17 / 18 / 19 / 20,
-/// rounded up; doubling per step above 20.
+/// Peak GPU memory of the largest STARK phase at `po2` with no budget enforced (the recursion phase,
+/// beside the segment prover's cached pool): 3971 / 4390 / 6668 / 11169-11938 MiB measured at po2 17 /
+/// 18 / 19 / 20, rounded up; doubling per step above 20. This is the real footprint on a Mac whose
+/// limit is not enforced, used for the Groth16 keep decision and the device row's memory figure; it
+/// is not what sizes the job (see [`job_po2_for_limit_in`]).
 pub fn stark_peak_bytes(po2: u8) -> u64 {
     match po2 {
         0..=17 => 4 * GIB,
@@ -67,6 +136,37 @@ pub fn stark_peak_bytes(po2: u8) -> u64 {
         20 => 12 * GIB,
         p => (12 * GIB) << (p - 20).min(4),
     }
+}
+
+/// The smallest working-set limit a proof at segment `po2` is allowed to start under (the hard
+/// ceiling, [`max_po2_for_limit_in`]).
+///
+/// [`Po2Table::M8`]: the bottom of the table row that proves it (4 GiB for 18 and below, where the
+/// Groth16 wrap's 3926 MiB is the largest phase; 6 GiB for 19; [`PO2_20_MIN_LIMIT`] for 20), and above
+/// 20, where nothing was measured under a budget, [`stark_peak_bytes`] as before.
+/// [`Po2Table::M1`]: [`stark_peak_bytes`].
+pub fn min_limit_for_po2(po2: u8, table: Po2Table) -> u64 {
+    match (table, po2) {
+        (Po2Table::M1, p) => stark_peak_bytes(p),
+        (Po2Table::M8, 0..=18) => 4 * GIB,
+        (Po2Table::M8, 19) => 6 * GIB,
+        (Po2Table::M8, 20) => PO2_20_MIN_LIMIT,
+        (Po2Table::M8, p) => stark_peak_bytes(p),
+    }
+}
+
+/// The largest segment po2 allowed to start under `limit`, or `None` when none is: the worker's hard
+/// ceiling (`zkminer-prove-risc0` `metal_host::po2_refusal`), never below [`job_po2_for_limit_in`] for
+/// a limit of at least 4 GiB.
+pub fn max_po2_for_limit_in(limit: u64, table: Po2Table) -> Option<u8> {
+    (13..=24u8)
+        .rev()
+        .find(|&p| min_limit_for_po2(p, table) <= limit)
+}
+
+/// [`max_po2_for_limit_in`] with the table [`PO2_TABLE_ENV`] selects.
+pub fn max_po2_for_limit(limit: u64) -> Option<u8> {
+    max_po2_for_limit_in(limit, env_po2_table())
 }
 
 /// A byte count with an optional binary suffix (`4294967296`, `4G`, `4GiB`, `512M`), the fork's
@@ -123,42 +223,74 @@ mod tests {
     #[test]
     fn each_mac_tier_gets_its_table_row() {
         let po2 = |ram, budget| {
-            job_po2_for_limit(working_set_limit_of(host_figure(ram), budget).unwrap())
+            job_po2_for_limit_in(
+                working_set_limit_of(host_figure(ram), budget).unwrap(),
+                Po2Table::M8,
+            )
         };
-        // PLAN 9.1 tiers: 16 GB base chip, 24 GB primary target, 36 GB and up.
-        assert_eq!(po2(16, None), 18);
+        // PLAN 9.1 tiers: 16 GB base chip, 18 GB, 24 GB primary target, 36 GB and up.
         assert_eq!(
-            po2(24, None),
+            po2(16, None),
             19,
-            "a 24 GB Mac proves at 19, not the discrete-card 20"
+            "a 16 GB Mac (8 GiB figure) proves at 19 (M8)"
         );
+        assert_eq!(
+            po2(18, None),
+            19,
+            "an 18 GB Mac (10 GiB figure): 19, for its host RAM (M8)"
+        );
+        assert_eq!(po2(24, None), 20, "a 24 GB Mac proves at 20 (M8)");
         assert_eq!(po2(32, None), 20);
         assert_eq!(po2(36, None), 20);
         assert_eq!(po2(128, None), 20, "never above the protocol default");
         // The fork's artificial budget wins when smaller (the 4 / 8 GB budget runs).
-        assert_eq!(po2(36, Some(4 * GIB)), 17);
-        assert_eq!(po2(36, Some(8 * GIB)), 18);
+        assert_eq!(po2(36, Some(4 * GIB)), 18);
+        assert_eq!(po2(36, Some(8 * GIB)), 19);
         assert_eq!(
             po2(16, Some(64 * GIB)),
-            18,
+            19,
             "a bigger budget never raises it"
         );
     }
 
     #[test]
-    fn the_stark_peak_fits_the_limit_that_chose_it() {
-        // Every row's own peak fits the bottom of the next row up, and the table is monotone.
-        let mut last = 0;
-        for limit_gib in 1..=128u64 {
-            let po2 = job_po2_for_limit(limit_gib * GIB);
-            assert!(po2 >= last);
-            last = po2;
-            if limit_gib >= 6 {
-                assert!(
-                    stark_peak_bytes(po2) <= limit_gib * GIB,
-                    "{limit_gib} GiB -> po2 {po2}"
-                );
+    fn the_m1_table_is_kept_behind_the_knob() {
+        let m1 = |gib: u64| job_po2_for_limit_in(gib * GIB, Po2Table::M1);
+        assert_eq!((m1(4), m1(8), m1(16), m1(28)), (17, 18, 19, 20));
+        let ceil = |gib: u64| max_po2_for_limit_in(gib * GIB, Po2Table::M1);
+        assert_eq!(
+            (ceil(3), ceil(4), ceil(8), ceil(16), ceil(28), ceil(180)),
+            (None, Some(17), Some(19), Some(20), Some(21), Some(23))
+        );
+    }
+
+    #[test]
+    fn the_ceiling_admits_the_default_and_stays_put_above_20() {
+        for table in [Po2Table::M1, Po2Table::M8] {
+            let mut last = 0;
+            for mib in (4096..=256 * 1024u64).step_by(128) {
+                let limit = mib << 20;
+                let po2 = job_po2_for_limit_in(limit, table);
+                assert!(po2 >= last, "{table:?} {mib} MiB");
+                last = po2;
+                let ceiling = max_po2_for_limit_in(limit, table).unwrap();
+                assert!(ceiling >= po2, "{table:?} {mib} MiB: {ceiling} < {po2}");
             }
+            assert_eq!(max_po2_for_limit_in(3 * GIB, table), None);
+        }
+        let m8 = |gib: u64| max_po2_for_limit_in(gib * GIB, Po2Table::M8);
+        assert_eq!(
+            (m8(4), m8(6), m8(8), m8(10)),
+            (Some(18), Some(19), Some(19), Some(20))
+        );
+        // Above 20 nothing was measured under a budget: the M1 ceiling, which refused po2 22 on
+        // the 36 GB dev machine after it thrashed swap (M1 note).
+        for gib in [16, 28, 64, 180] {
+            assert_eq!(
+                m8(gib),
+                max_po2_for_limit_in(gib * GIB, Po2Table::M1),
+                "{gib} GiB"
+            );
         }
     }
 
