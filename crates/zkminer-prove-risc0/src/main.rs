@@ -129,6 +129,14 @@ fn main() {
             eprintln!("{refusal}");
             std::process::exit(2);
         }
+        // W7-M10: here only, `ZKMINER_OWNER_ACTIVE=1` plans with the owner-active tier; with
+        // `ZKMINER_METAL_ENFORCE_BUDGET=1` the plan is enforced. Before any proof or HAL runtime
+        // (which read these variables); rayon's idle pool and the Metal device already exist.
+        #[cfg(feature = "metal")]
+        if let Some(plan) = metal_host::apply_planned_budget(true) {
+            tracing::info!("Metal budget: {}", plan.note);
+            eprintln!("Metal budget: {}", plan.note);
+        }
         // Not orphan-watched: run by hand, its parent is a shell.
         #[cfg(target_os = "macos")]
         mac_footprint::start_guard(false);
@@ -235,6 +243,18 @@ fn main() {
     // Load (or create) the `sys_rand` key now, outside any job: a failure inside a job's panic
     // containment would be blamed on that job's program.
     sys_rand_key();
+
+    // W7-M10: with `ZKMINER_METAL_ENFORCE_BUDGET=1` the HAL enforces the limit this worker plans
+    // with (the dispatcher's figure for this job tier); set before the first request, so before
+    // any proof or HAL runtime reads it. rayon's (idle) pool and the Metal device `gpu_refusal`
+    // opens already exist; neither reads the environment. Off by default (measured slower and
+    // larger; `metal_sizing::ENFORCE_BUDGET_ENV`).
+    #[cfg(feature = "metal")]
+    if gpu_refusal().is_none() {
+        if let Some(plan) = metal_host::apply_planned_budget(false) {
+            tracing::info!("Metal budget: {}", plan.note);
+        }
+    }
 
     // macOS: the footprint ceiling the dispatcher hands every worker (there are no cgroups), and an
     // exit when the dispatcher dies (there is no PR_SET_PDEATHSIG): without it a worker orphaned
@@ -1084,6 +1104,21 @@ fn sys_rand_key_state() -> &'static ([u8; 32], bool) {
 /// the join, so never less.
 const KECCAK_REQUEST_CYCLES: u64 = 1 << 20;
 
+/// The charge for one keccak request ([`KECCAK_REQUEST_CYCLES`]) at the request's po2.
+///
+/// The request's po2 is the po2 the request is PROVED at, not the session's keccak max po2: since
+/// risc0 K10 the executor sizes each request to the smallest circuit that holds its permutations
+/// (`request_po2`, never above the max), and the prover proves it at exactly that po2. So the charge
+/// follows the proving work. Under the default max (17) every request is charged 2^20 (a smaller one
+/// still pays for its lift and join). Under `RISC0_KECCAK_PO2=18` a partial batch that fits 17 is
+/// charged 2^20, a full one 2^21; capped to 17 (risc0 W7-V2's headroom cap below 7084 MiB) the
+/// guest makes twice the requests at 17 instead, for the same total. The charge is this build's
+/// cost estimate for pricing and the deadline (`estimated_cycles` in the miner); no receipt, journal
+/// or other host compares it, so it need not match across builds.
+fn keccak_request_charge(po2: usize) -> u64 {
+    KECCAK_REQUEST_CYCLES << po2.saturating_sub(17).min(8)
+}
+
 /// The keccak proof requests a measured guest made, checked as the prover will check them.
 #[derive(Default)]
 struct KeccakAudit {
@@ -1114,7 +1149,7 @@ impl risc0_zkvm::CoprocessorCallback for KeccakAudit {
         });
         self.cycles = self
             .cycles
-            .saturating_add(KECCAK_REQUEST_CYCLES << request.po2.saturating_sub(17).min(8));
+            .saturating_add(keccak_request_charge(request.po2));
         Ok(())
     }
 }
@@ -2331,6 +2366,22 @@ mod sys_rand_tests {
 mod sys_rand_draw_tests {
     use super::sys_rand_draws::{self, Draws};
     use super::*;
+
+    /// W7-M10 (K10 rightsizing, W7-V2 capping): pins the charge to the PROVED po2.
+    #[test]
+    fn the_keccak_charge_follows_the_proved_po2() {
+        let mib = 1u64 << 20;
+        // Rightsized requests under the default max 17 (K10: 14, 15, 16 or 17): 2^20 each.
+        for po2 in [14, 15, 16, 17] {
+            assert_eq!(keccak_request_charge(po2), mib, "po2 {po2}");
+        }
+        // Under RISC0_KECCAK_PO2=18: a full request (18) 2^21, a partial one rightsized to 17 2^20.
+        assert_eq!(keccak_request_charge(18), 2 * mib);
+        // Capped to 17 (W7-V2, below 7084 MiB): two full requests at 17 for one at 18, same total.
+        assert_eq!(2 * keccak_request_charge(17), keccak_request_charge(18));
+        // Out of range values cannot overflow.
+        assert_eq!(keccak_request_charge(usize::MAX), mib << 8);
+    }
 
     #[test]
     fn a_keccak_charge_the_guest_never_assumes_is_no_evidence() {

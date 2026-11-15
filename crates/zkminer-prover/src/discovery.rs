@@ -192,6 +192,233 @@ fn detect_apple_gpus() -> Vec<DetectedGpu> {
     }
 }
 
+/// Where the owner-activity reading comes from (W7-M10), so the tier logic can be tested with a
+/// fake one. [`MacOwnerSource`] is the real one.
+pub trait OwnerSource {
+    /// Time since the last keyboard, mouse or trackpad input.
+    fn hid_idle(&self) -> Option<std::time::Duration>;
+    /// Whether the main display is asleep.
+    fn display_asleep(&self) -> Option<bool>;
+    /// On battery power.
+    fn on_battery(&self) -> Option<bool>;
+    /// Low Power Mode.
+    fn low_power_mode(&self) -> Option<bool>;
+}
+
+/// One owner reading from `source`.
+pub fn read_owner(source: &dyn OwnerSource) -> crate::metal_sizing::OwnerReading {
+    crate::metal_sizing::OwnerReading {
+        hid_idle: source.hid_idle(),
+        display_asleep: source.display_asleep(),
+        on_battery: source.on_battery(),
+        low_power_mode: source.low_power_mode(),
+    }
+}
+
+/// The owner reading of this Mac now ([`MacOwnerSource`]); all `None` off macOS.
+pub fn owner_reading() -> crate::metal_sizing::OwnerReading {
+    read_owner(&MacOwnerSource)
+}
+
+/// The real owner-activity source. Every probe works as an ordinary user, with no entitlement and
+/// no sudo:
+/// - IOKit `IOHIDSystem`'s `HIDIdleTime` (nanoseconds since the last HID event; what `ioreg -c
+///   IOHIDSystem` prints);
+/// - CoreGraphics `CGDisplayIsAsleep(CGMainDisplayID())`;
+/// - IOKit's power-source type ("Battery Power"), as M9's worker power guard reads it;
+/// - `NSProcessInfo.isLowPowerModeEnabled` (macOS 12+), as M9's power guard reads it.
+pub struct MacOwnerSource;
+
+#[cfg(not(target_os = "macos"))]
+impl OwnerSource for MacOwnerSource {
+    fn hid_idle(&self) -> Option<std::time::Duration> {
+        None
+    }
+    fn display_asleep(&self) -> Option<bool> {
+        None
+    }
+    fn on_battery(&self) -> Option<bool> {
+        None
+    }
+    fn low_power_mode(&self) -> Option<bool> {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod mac_owner {
+    use std::ffi::{c_char, c_void, CStr};
+
+    type CFTypeRef = *const c_void;
+
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+        fn IOServiceGetMatchingService(main_port: u32, matching: *mut c_void) -> u32;
+        fn IORegistryEntryCreateCFProperty(
+            entry: u32,
+            key: CFTypeRef,
+            allocator: CFTypeRef,
+            options: u32,
+        ) -> CFTypeRef;
+        fn IOObjectRelease(object: u32) -> i32;
+        fn IOPSCopyPowerSourcesInfo() -> CFTypeRef;
+        fn IOPSGetProvidingPowerSourceType(blob: CFTypeRef) -> CFTypeRef;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringCreateWithCString(alloc: CFTypeRef, s: *const c_char, enc: u32) -> CFTypeRef;
+        fn CFStringGetCString(s: CFTypeRef, buf: *mut c_char, size: isize, enc: u32) -> u8;
+        fn CFRelease(cf: CFTypeRef);
+        fn CFGetTypeID(cf: CFTypeRef) -> usize;
+        fn CFNumberGetTypeID() -> usize;
+        fn CFDataGetTypeID() -> usize;
+        fn CFNumberGetValue(number: CFTypeRef, the_type: isize, out: *mut c_void) -> u8;
+        fn CFDataGetLength(data: CFTypeRef) -> isize;
+        fn CFDataGetBytePtr(data: CFTypeRef) -> *const u8;
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayIsAsleep(display: u32) -> u32;
+    }
+    #[link(name = "Foundation", kind = "framework")]
+    extern "C" {
+        // Referenced so Foundation (NSProcessInfo) is linked and loaded.
+        static NSFoundationVersionNumber: f64;
+    }
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    const UTF8: u32 = 0x0800_0100;
+    const K_CF_NUMBER_SINT64: isize = 4;
+
+    /// `HIDIdleTime` of IOHIDSystem, in nanoseconds.
+    pub fn hid_idle_ns() -> Option<u64> {
+        // SAFETY: IOKit registry API. `IOServiceGetMatchingService` consumes the matching dict;
+        // the service and the property are released here (Create/Copy rule).
+        unsafe {
+            let matching = IOServiceMatching(c"IOHIDSystem".as_ptr());
+            if matching.is_null() {
+                return None;
+            }
+            let service = IOServiceGetMatchingService(0, matching);
+            if service == 0 {
+                return None;
+            }
+            let key = CFStringCreateWithCString(std::ptr::null(), c"HIDIdleTime".as_ptr(), UTF8);
+            let prop = if key.is_null() {
+                std::ptr::null()
+            } else {
+                IORegistryEntryCreateCFProperty(service, key, std::ptr::null(), 0)
+            };
+            if !key.is_null() {
+                CFRelease(key);
+            }
+            IOObjectRelease(service);
+            if prop.is_null() {
+                return None;
+            }
+            let ty = CFGetTypeID(prop);
+            let mut ns: Option<u64> = None;
+            if ty == CFNumberGetTypeID() {
+                let mut v: i64 = 0;
+                if CFNumberGetValue(prop, K_CF_NUMBER_SINT64, (&mut v as *mut i64).cast()) != 0 {
+                    ns = u64::try_from(v).ok();
+                }
+            } else if ty == CFDataGetTypeID() && CFDataGetLength(prop) == 8 {
+                let p = CFDataGetBytePtr(prop);
+                if !p.is_null() {
+                    ns = Some(u64::from_ne_bytes(
+                        std::slice::from_raw_parts(p, 8).try_into().ok()?,
+                    ));
+                }
+            }
+            CFRelease(prop);
+            ns
+        }
+    }
+
+    /// Whether the main display is asleep; `None` on a Mac with no display.
+    pub fn display_asleep() -> Option<bool> {
+        // SAFETY: plain CoreGraphics queries.
+        unsafe {
+            let d = CGMainDisplayID();
+            (d != 0).then(|| CGDisplayIsAsleep(d) != 0)
+        }
+    }
+
+    /// The providing power source is the battery.
+    pub fn on_battery() -> Option<bool> {
+        // SAFETY: IOKit power-source API; the blob is released after use, and the source-type
+        // string is owned by the blob (Get rule), read before the release.
+        unsafe {
+            let blob = IOPSCopyPowerSourcesInfo();
+            if blob.is_null() {
+                return None;
+            }
+            let ty = IOPSGetProvidingPowerSourceType(blob);
+            let mut buf = [0 as c_char; 64];
+            let ok = !ty.is_null()
+                && CFStringGetCString(ty, buf.as_mut_ptr(), buf.len() as isize, UTF8) != 0;
+            let text = ok.then(|| CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned());
+            CFRelease(blob);
+            text.map(|t| t == "Battery Power")
+        }
+    }
+
+    /// `[[NSProcessInfo processInfo] isLowPowerModeEnabled]`, when the OS has it.
+    pub fn low_power_mode() -> Option<bool> {
+        type MsgId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+        type MsgBool = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
+        type MsgRespond = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool;
+        // SAFETY: `objc_msgSend` is called through the function type of each message's real
+        // signature (arm64 requires the cast); the shared NSProcessInfo instance is not owned.
+        unsafe {
+            if NSFoundationVersionNumber <= 0.0 {
+                return None;
+            }
+            let class = objc_getClass(c"NSProcessInfo".as_ptr());
+            if class.is_null() {
+                return None;
+            }
+            let send = objc_msgSend as unsafe extern "C" fn();
+            let id: MsgId = std::mem::transmute(send);
+            let boolean: MsgBool = std::mem::transmute(send);
+            let respond: MsgRespond = std::mem::transmute(send);
+            let info = id(class, sel_registerName(c"processInfo".as_ptr()));
+            if info.is_null() {
+                return None;
+            }
+            let lpm = sel_registerName(c"isLowPowerModeEnabled".as_ptr());
+            if !respond(info, sel_registerName(c"respondsToSelector:".as_ptr()), lpm) {
+                return None;
+            }
+            Some(boolean(info, lpm))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl OwnerSource for MacOwnerSource {
+    fn hid_idle(&self) -> Option<std::time::Duration> {
+        mac_owner::hid_idle_ns().map(std::time::Duration::from_nanos)
+    }
+    fn display_asleep(&self) -> Option<bool> {
+        mac_owner::display_asleep()
+    }
+    fn on_battery(&self) -> Option<bool> {
+        mac_owner::on_battery()
+    }
+    fn low_power_mode(&self) -> Option<bool> {
+        mac_owner::low_power_mode()
+    }
+}
+
 /// The Apple GPU's core count (`sppci_cores`), recorded when discovery ran `system_profiler`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 static APPLE_GPU_CORES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -2086,5 +2313,91 @@ mod tests {
         assert_eq!(apple[0].pci_bus_id, "apple-gpu0");
         let all = detect_all_gpus();
         assert_eq!(all.iter().filter(|g| g.gpu_tag == "metal").count(), 1);
+    }
+
+    /// W7-M10: a fake owner source drives the reading and, through it, the tier.
+    #[test]
+    fn a_fake_owner_source_drives_the_tier() {
+        use crate::metal_sizing::{OwnerForce, OwnerTier, OwnerTierState};
+        use std::cell::Cell;
+        use std::time::Duration;
+        struct Fake {
+            idle: Cell<Option<u64>>,
+            asleep: Cell<Option<bool>>,
+            battery: Option<bool>,
+            lpm: Option<bool>,
+        }
+        impl OwnerSource for Fake {
+            fn hid_idle(&self) -> Option<Duration> {
+                self.idle.get().map(Duration::from_secs)
+            }
+            fn display_asleep(&self) -> Option<bool> {
+                self.asleep.get()
+            }
+            fn on_battery(&self) -> Option<bool> {
+                self.battery
+            }
+            fn low_power_mode(&self) -> Option<bool> {
+                self.lpm
+            }
+        }
+        let fake = Fake {
+            idle: Cell::new(Some(4)),
+            asleep: Cell::new(Some(false)),
+            battery: Some(false),
+            lpm: None,
+        };
+        let r = read_owner(&fake);
+        assert_eq!(r.hid_idle, Some(Duration::from_secs(4)));
+        assert_eq!(
+            (r.display_asleep, r.on_battery, r.low_power_mode),
+            (Some(false), Some(false), None)
+        );
+        assert!(r.describe().contains("input idle 4 s"), "{}", r.describe());
+        let t = Duration::from_secs(300);
+        let mut s = OwnerTierState::default();
+        assert_eq!(
+            s.update(&read_owner(&fake), t, OwnerForce::Auto),
+            OwnerTier::Active
+        );
+        fake.idle.set(Some(400));
+        assert_eq!(
+            s.update(&read_owner(&fake), t, OwnerForce::Auto),
+            OwnerTier::Active
+        );
+        fake.asleep.set(Some(true));
+        assert_eq!(
+            s.update(&read_owner(&fake), t, OwnerForce::Auto),
+            OwnerTier::Idle
+        );
+        // An unreadable source (every probe None): no change.
+        let none = Fake {
+            idle: Cell::new(None),
+            asleep: Cell::new(None),
+            battery: None,
+            lpm: None,
+        };
+        assert_eq!(
+            s.update(&read_owner(&none), t, OwnerForce::Auto),
+            OwnerTier::Idle
+        );
+    }
+
+    /// The real probes answer on this Mac, as an ordinary user (no sudo).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn this_macs_owner_probes_answer() {
+        let r = owner_reading();
+        eprintln!("owner reading: {}", r.describe());
+        assert!(r.hid_idle.is_some(), "{r:?}");
+        assert!(r.low_power_mode.is_some(), "{r:?}");
+        assert!(r.on_battery.is_some(), "{r:?}");
+        // What a reading costs (the dispatcher reads at every Metal job start and claim-side
+        // sizing read).
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            assert!(owner_reading().hid_idle.is_some());
+        }
+        eprintln!("one owner reading: {:.1} us", t.elapsed().as_secs_f64() * 1e4);
     }
 }

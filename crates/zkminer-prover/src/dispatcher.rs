@@ -262,6 +262,26 @@ fn recycle_after_proofs() -> u32 {
 /// `ZKMINER_METAL_RECYCLE_AFTER_PROOFS` (20 restores the old behaviour, 0 disables the count).
 const METAL_RECYCLE_AFTER_PROOFS: u32 = 200;
 
+/// W7-M10 revert knob: `ZKMINER_METAL_RESPAWN_EARLY=0` respawns a due Metal worker before the next
+/// proof, as M9 did, instead of right after the last one.
+pub const METAL_RESPAWN_EARLY_ENV: &str = "ZKMINER_METAL_RESPAWN_EARLY";
+
+fn metal_respawn_early() -> bool {
+    !std::env::var(METAL_RESPAWN_EARLY_ENV).is_ok_and(|v| v.trim() == "0")
+}
+
+/// The tier a Metal job proves at, as [`WorkerPool::metal_job_tier`] decides it.
+#[derive(Debug, Clone)]
+struct MetalJobTier {
+    tier: crate::metal_sizing::OwnerTier,
+    /// The live worker runs at another figure: respawn it at this tier's.
+    respawn: bool,
+    /// The live worker's tier cannot hold the job's po2 (it would refuse the proof).
+    worker_refuses: bool,
+    /// For the log.
+    why: String,
+}
+
 /// The count-based recycle threshold for a slot of `gpu_tag` (see [`recycle_after_proofs`] and
 /// [`METAL_RECYCLE_AFTER_PROOFS`]). `ZKMINER_RECYCLE_AFTER_PROOFS`, when set, applies to every slot.
 fn recycle_after_proofs_for(gpu_tag: &str) -> u32 {
@@ -1249,7 +1269,7 @@ fn gpu_vram_bytes(
 /// 38.65 GB back, and 36 GiB − 8 GiB = 30.06 GB. It is larger than `DEFAULT_HOST_RESERVE_BYTES`
 /// (3 GiB, the reserve for a host whose provers' big buffers live on a discrete card) because here
 /// the GPU working set and the host-side proving state compete for the same pages.
-pub const METAL_HOST_RESERVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const METAL_HOST_RESERVE_BYTES: u64 = crate::metal_sizing::HOST_RESERVE_BYTES;
 
 /// The "VRAM" of an Apple GPU, as reported to routing, benchmark rows and the worker's
 /// `ZKMINER_CUDA_VRAM_BYTES`: `hw.memsize` (`mem_total`) minus [`METAL_HOST_RESERVE_BYTES`].
@@ -2421,6 +2441,17 @@ pub struct WorkerPool {
     /// When set, `discover_and_spawn` starts the dedicated measure pools only, and no prove worker
     /// (see [`Self::measure_only`]).
     measure_only: bool,
+    /// W7-M10: the owner tier with its hysteresis (`metal_sizing::OwnerTierState`), host-wide.
+    owner: Mutex<crate::metal_sizing::OwnerTierState>,
+    /// Tests: a forced owner tier in place of `ZKMINER_OWNER_ACTIVE` (process-wide, so tests that
+    /// run in parallel cannot use it).
+    owner_force_override: Mutex<Option<crate::metal_sizing::OwnerForce>>,
+    /// Tests: whether Metal workers enforce their figure, in place of `ZKMINER_METAL_ENFORCE_BUDGET`.
+    enforce_override: Mutex<Option<bool>>,
+    /// Tests: a per-slot count-based recycle threshold in place of the process-wide one.
+    recycle_override: Mutex<HashMap<String, u32>>,
+    /// Metal proofs completed at the idle and at the owner-active tier (W7-M10).
+    metal_tier_jobs: [AtomicU64; 2],
 }
 
 /// Round-robin counter for load balancing across multiple GPU workers.
@@ -2452,6 +2483,11 @@ impl WorkerPool {
             inflight_measures: Mutex::new(HashMap::new()),
             only_backends: None,
             measure_only: false,
+            owner: Mutex::new(crate::metal_sizing::OwnerTierState::default()),
+            owner_force_override: Mutex::new(None),
+            enforce_override: Mutex::new(None),
+            recycle_override: Mutex::new(HashMap::new()),
+            metal_tier_jobs: [AtomicU64::new(0), AtomicU64::new(0)],
         }
     }
 
@@ -3668,6 +3704,8 @@ impl WorkerPool {
             }
         };
 
+        // W7-M10: a calibration measures the Mac at its idle tier, like a benchmark.
+        Self::metal_idle_tier_for_benchmark(&mut slot, entry, key);
         self.ensure_alive(&mut slot, entry)?;
         if let Some(h) = slot.handle.as_ref() {
             entry.publish_pid(h.pid());
@@ -4006,6 +4044,8 @@ impl WorkerPool {
             (host, shm)
         };
 
+        // W7-M10: a benchmark prices the Mac at its idle tier.
+        Self::metal_idle_tier_for_benchmark(&mut slot, entry, key);
         self.ensure_alive(&mut slot, entry)?;
 
         // Update external PID after ensure_alive (may have respawned)
@@ -4425,6 +4465,8 @@ impl WorkerPool {
             (host, shm)
         };
 
+        // W7-M10: a benchmark prices the Mac at its idle tier.
+        Self::metal_idle_tier_for_benchmark(&mut slot, entry, key);
         self.ensure_alive(&mut slot, entry)?;
 
         // Update external PID after ensure_alive (may have respawned)
@@ -6911,7 +6953,17 @@ impl WorkerPool {
     /// a card's job segment size is decided from (`benchmark::risc0_job_po2`), its calibration row and
     /// its Settings override being keyed by the device id. A slot whose VRAM was not read at spawn falls
     /// back to the amdgpu driver's count for an AMD card. Takes no slot lock.
+    ///
+    /// An Apple GPU's figure is its tier's claim figure (W7-M10, `metal_sizing::claim_limit`): the
+    /// owner-active tier's while the owner uses the Mac and that tier measures claims at a smaller
+    /// po2 (16 / 18 / 24 GB Macs), else the idle figure (36 GB and up: the same po2 20). Only with
+    /// `ZKMINER_OWNER_ACTIVE=auto` or `1`; the default keeps the idle tier. Reading it may move the
+    /// tier back to idle (a larger po2, which a job measured smaller still fits), never to active:
+    /// that switch happens only as a Metal job starts ([`Self::update_owner_tier`]). A job measured
+    /// at the idle po2 and still queued when that switch happens is proved at the active po2
+    /// unmeasured (run.rs sizes its prove step from this too), which is why `auto` is opt-in.
     pub fn risc0_slots(&self) -> Vec<(String, String, Option<u64>)> {
+        let owner = self.update_owner_tier(false);
         let mut slots: Vec<_> = self
             .keys_for_prefix(zkminer_prover_protocol::BACKEND_RISC0)
             .into_iter()
@@ -6925,11 +6977,496 @@ impl WorkerPool {
                         .filter(|_| rocm)
                         .and_then(amd_vram_bytes)
                 });
+                let vram = if k.split(':').nth(1) == Some("metal") {
+                    vram.map(|v| crate::metal_sizing::claim_limit(v, owner))
+                } else {
+                    vram
+                };
                 (k, device, vram)
             })
             .collect();
         slots.sort();
         slots
+    }
+
+    // ---- W7-M10: the owner-active tier for Apple GPU slots ----
+
+    /// The tier a Metal job proves at (`metal_sizing::job_tier`), read at its start; `None` for a
+    /// slot that is not an enumerated Apple GPU. A job (a `po2`) may switch the owner tier to active
+    /// here; a benchmark-style proof (`po2` `None`) only reads it and proves at the idle tier.
+    fn metal_job_tier(
+        &self,
+        key: &str,
+        slot: &WorkerSlot,
+        entry: &WorkerEntry,
+        po2: Option<u8>,
+    ) -> Option<MetalJobTier> {
+        use crate::metal_sizing as ms;
+        let (idle, spawned) = Self::metal_figures(slot, entry)?;
+        let owner = if po2.is_some() {
+            self.update_owner_tier(true)
+        } else {
+            self.owner_tier()
+        };
+        let worker = Self::metal_worker_tier(idle, spawned);
+        let active = ms::active_limit(idle);
+        let tier = ms::job_tier(owner, worker, po2, ms::max_po2_for_limit(active));
+        let limit = ms::tier_limit(idle, tier);
+        let worker_refuses =
+            po2.is_some_and(|p| ms::max_po2_for_limit(spawned).is_none_or(|c| p > c));
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        let why = format!(
+            "owner {}, job po2 {}, {:.1} GiB instead of {:.1} GiB",
+            owner.name(),
+            po2.map_or("default".to_string(), |p| p.to_string()),
+            gib(limit),
+            gib(spawned)
+        );
+        if tier != owner && po2.is_some() {
+            tracing::info!(
+                "{key}: the owner is {} but this job proves at the {} tier ({why}): its po2 was \
+                 measured for that one",
+                owner.name(),
+                tier.name()
+            );
+        }
+        // Only when the worker would prove this job otherwise at the tier's figure: unenforced, a
+        // smaller figure that admits the po2 with the same Groth16 decision changes nothing but
+        // costs a cold worker (a 36 GB Mac's 28 -> 20 GiB at po2 20, or a 16 GB Mac's po2 18 job at
+        // 8 or 4 GiB). The proof then runs at, and is recorded at, the live worker's tier.
+        let respawn = !self.metal_same(limit, spawned, po2);
+        if !respawn && limit != spawned && po2.is_some() {
+            tracing::debug!(
+                "{key}: the {} tier would change nothing for this job ({why}): no respawn",
+                tier.name()
+            );
+        }
+        Some(MetalJobTier {
+            tier,
+            respawn,
+            worker_refuses,
+            why,
+        })
+    }
+
+    /// After a successful Metal proof: respawn the worker right away when it is due for a recycle
+    /// (the count) or for another tier (the owner tier as now read, which may only fall back to
+    /// idle here), so the new worker's first-job prewarm (M9) runs in the idle gap instead of in
+    /// the next job; and, once the footprint has settled (~2 s after the proof), make the growth
+    /// net's check and respawn the worker if it has outgrown its baseline.
+    ///
+    /// On the miner's pool (`engine::worker_pool`) all of it runs on a background thread, after this
+    /// proof has been handed back, so the proof's result never waits for a respawn. On any other
+    /// pool (tests) the count and tier checks run inline, before the proof returns, and the growth
+    /// net is left to the check before the next proof, as before. `ZKMINER_METAL_RESPAWN_EARLY=0`
+    /// turns all of this off.
+    ///
+    /// `po2`: the proof's segment po2 (`None`: a benchmark-style proof), which predicts the next
+    /// queued job's (see [`Self::idle_gap_tier`]).
+    fn after_metal_proof(
+        &self,
+        key: &str,
+        slot: &mut WorkerSlot,
+        entry: &WorkerEntry,
+        po2: Option<u8>,
+    ) {
+        if !metal_respawn_early() || slot.handle.is_none() || self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        let pid = slot.handle.as_ref().map(|h| h.pid()).unwrap_or(0);
+        let proofs = slot.proofs_since_spawn;
+        let Some(pool) = crate::engine::worker_pool().filter(|p| std::ptr::eq(*p, self)) else {
+            if let Some((why, tier)) = self.early_respawn_due(key, slot, entry, po2) {
+                self.respawn_metal_now(key, slot, entry, &why, tier);
+            }
+            return;
+        };
+        let key = key.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("metal-respawn-early".into())
+            .spawn(move || pool.respawn_early_in_background(&key, pid, proofs, po2));
+        if let Err(e) = spawned {
+            tracing::warn!("could not start the early respawn check: {e}");
+        }
+    }
+
+    /// The background half of [`Self::after_metal_proof`]: takes the slot once the proof's caller
+    /// has let it go (polling, up to [`METAL_IDLE_RECLAIM`]), and only while it still holds the same
+    /// idle worker with no proof since. A proof that starts first makes its own checks.
+    fn respawn_early_in_background(&self, key: &str, pid: u32, proofs: u32, po2: Option<u8>) {
+        let Some(entry) = self.workers.get(key) else {
+            return;
+        };
+        let unchanged = |slot: &WorkerSlot| {
+            slot.handle.as_ref().map(|h| h.pid()) == Some(pid) && slot.proofs_since_spawn == proofs
+        };
+        let started = Instant::now();
+        let mut slot = loop {
+            match entry.slot.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if started.elapsed() >= METAL_IDLE_RECLAIM {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        };
+        if !unchanged(&slot) || self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some((why, tier)) = self.early_respawn_due(key, &slot, entry, po2) {
+            self.respawn_metal_now(key, &mut slot, entry, &why, tier);
+            return;
+        }
+        if metal_net_config(&slot.spawn_env, entry.vram_bytes).margin == 0 {
+            return;
+        }
+        drop(slot);
+        self.early_growth_check(key, pid, proofs);
+    }
+
+    /// Why the slot's worker should be respawned right after its proof, with the tier to respawn it
+    /// at (`None`: the figure it has), or `None` to keep it. `last_po2`: the po2 of the proof that
+    /// just ended.
+    fn early_respawn_due(
+        &self,
+        key: &str,
+        slot: &WorkerSlot,
+        entry: &WorkerEntry,
+        last_po2: Option<u8>,
+    ) -> Option<(String, Option<crate::metal_sizing::OwnerTier>)> {
+        let retier = self.idle_gap_tier(slot, entry, last_po2);
+        let recycle_n = self.recycle_after_for_slot(key, &slot.gpu_tag);
+        if recycle_n > 0 && slot.proofs_since_spawn >= recycle_n {
+            return Some((
+                format!("{} proofs, fresh GPU state", slot.proofs_since_spawn),
+                retier,
+            ));
+        }
+        let tier = retier?;
+        let (idle, _) = Self::metal_figures(slot, entry)?;
+        Some((
+            format!(
+                "the owner tier is now {}: {:.1} GiB",
+                tier.name(),
+                Self::metal_tier_limit(idle, tier) as f64 / (1u64 << 30) as f64
+            ),
+            Some(tier),
+        ))
+    }
+
+    /// The tier to move the slot's idle worker to in the gap after a proof (the owner tier as now
+    /// read), or `None` to leave it. Only when the next job would otherwise make its own respawn,
+    /// and only once per switch, not per job (W7-M10 review findings):
+    /// - to active: only after a job whose po2 (`last_po2`, the size the jobs queued behind it were
+    ///   measured at) the active tier holds and proves otherwise ([`Self::metal_same`]). After a job
+    ///   measured at the idle po2 (19 on a 16 GB Mac, above the 4 GiB tier's 18) the worker stays:
+    ///   moving it would make the next queued po2 19 job respawn it back before its proof, two
+    ///   respawns per queued job. The first po2 18 job's start makes the one respawn instead.
+    /// - to idle: when the worker proves otherwise a job at the idle po2 (what is claimed from now)
+    ///   or at `last_po2`.
+    ///
+    /// Unenforced, the active tier never changes a job's proof (it admits the po2 or the job stays
+    /// idle, and keeps the same Groth16 decision on every Mac size measured), so no move happens.
+    fn idle_gap_tier(
+        &self,
+        slot: &WorkerSlot,
+        entry: &WorkerEntry,
+        last_po2: Option<u8>,
+    ) -> Option<crate::metal_sizing::OwnerTier> {
+        use crate::metal_sizing as ms;
+        let (idle, spawned) = Self::metal_figures(slot, entry)?;
+        let owner = self.update_owner_tier(false);
+        let target = Self::metal_tier_limit(idle, owner);
+        if target == spawned {
+            return None;
+        }
+        let differs = |p: u8| !self.metal_same(target, spawned, Some(p));
+        let due = match owner {
+            ms::OwnerTier::Active => {
+                let p = last_po2?;
+                ms::admits_po2(target, p) && differs(p)
+            }
+            ms::OwnerTier::Idle => {
+                let next = ms::job_po2_for_limit(ms::host_working_set_limit(Some(idle))?);
+                differs(next) || last_po2.is_some_and(differs)
+            }
+        };
+        due.then_some(owner)
+    }
+
+    /// Whether a worker spawned at figure `a` proves a job of `po2` as one spawned at `b` would
+    /// (`metal_sizing::same_for_job`, with this pool's enforcement setting).
+    fn metal_same(&self, a: u64, b: u64, po2: Option<u8>) -> bool {
+        let enforced = self
+            .enforce_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|| !crate::metal_sizing::enforce_budget_off());
+        crate::metal_sizing::same_for_job(a, b, po2, enforced)
+    }
+
+    /// Kills the slot's worker and spawns its replacement now, at `tier`'s figure (`None`: the
+    /// figure it has).
+    fn respawn_metal_now(
+        &self,
+        key: &str,
+        slot: &mut WorkerSlot,
+        entry: &WorkerEntry,
+        why: &str,
+        tier: Option<crate::metal_sizing::OwnerTier>,
+    ) {
+        let t = Instant::now();
+        if let Some(tier) = tier {
+            Self::set_metal_spawn_tier(slot, entry, tier);
+        }
+        entry.clear_pid();
+        if let Some(h) = slot.handle.as_mut() {
+            h.kill();
+        }
+        slot.handle = None;
+        if self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        match self.ensure_alive(slot, entry) {
+            Ok(_) => {
+                if let Some(h) = slot.handle.as_ref() {
+                    entry.publish_pid(h.pid());
+                }
+                if self.closing.load(Ordering::SeqCst) {
+                    Self::mark_slot_dead(slot, entry);
+                    return;
+                }
+                tracing::info!(
+                    "Respawned worker {key} right after its proof ({why}) in {:.2} s: it warms up \
+                     before the next job",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            // The next dispatch's `ensure_alive` tries again (with the usual backoff).
+            Err(e) => {
+                tracing::warn!("{key}: early respawn failed ({e:#}); retried at the next job")
+            }
+        }
+    }
+
+    /// The growth net's check right after a proof, on its own thread (see [`Self::after_metal_proof`]):
+    /// once the footprint has settled, if the slot is still idle with the same worker and no proof
+    /// since, the same check the next proof would make, and a respawn if it fails.
+    fn early_growth_check(&self, key: &str, pid: u32, proofs: u32) {
+        std::thread::sleep(METAL_IDLE_RECLAIM + METAL_IDLE_SETTLE_POLL);
+        let Some(entry) = self.workers.get(key) else {
+            return;
+        };
+        let Ok(mut slot) = entry.slot.try_lock() else {
+            return; // a proof (or anything else) has the slot: its own checks run
+        };
+        let same = slot.handle.as_ref().map(|h| h.pid()) == Some(pid)
+            && slot.proofs_since_spawn == proofs
+            && slot.last_use.is_some_and(|u| u.kind == UseKind::Proof);
+        if !same || self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        let outgrown = metal_idle_outgrown(
+            key,
+            pid,
+            slot.proofs_since_spawn,
+            slot.last_use,
+            metal_net_config(&slot.spawn_env, entry.vram_bytes),
+            Some(METAL_IDLE_SETTLE),
+        );
+        if let Some(why) = outgrown {
+            tracing::warn!(
+                "Recycling worker {key} after {proofs} proofs, before the next job: {why}"
+            );
+            self.respawn_metal_now(key, &mut slot, entry, &why, None);
+        }
+    }
+
+    /// The working-set figure of `tier` for an Apple GPU whose idle figure is `idle`
+    /// (`metal_sizing::tier_limit`).
+    pub fn metal_tier_limit(idle: u64, tier: crate::metal_sizing::OwnerTier) -> u64 {
+        crate::metal_sizing::tier_limit(idle, tier)
+    }
+
+    fn owner_force(&self) -> crate::metal_sizing::OwnerForce {
+        self.owner_force_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(crate::metal_sizing::owner_force)
+    }
+
+    /// Reads the owner's activity now (IOKit `HIDIdleTime`, display sleep, battery, Low Power Mode;
+    /// nothing is read when `ZKMINER_OWNER_ACTIVE` forces a tier) and moves the owner tier by it
+    /// (`metal_sizing::OwnerTierState`). `allow_active`: whether this read may switch the tier to
+    /// active (only at a job's start, see [`Self::risc0_slots`]). Returns the tier now.
+    pub fn update_owner_tier(&self, allow_active: bool) -> crate::metal_sizing::OwnerTier {
+        use crate::metal_sizing as ms;
+        let force = self.owner_force();
+        let reading = match force {
+            ms::OwnerForce::Auto => crate::discovery::owner_reading(),
+            _ => ms::OwnerReading::default(),
+        };
+        let mut state = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+        let before = state.tier;
+        let mut next = *state;
+        let tier = next.update(&reading, ms::owner_idle_after(), force);
+        if tier == ms::OwnerTier::Active
+            && before == ms::OwnerTier::Idle
+            && !allow_active
+            && force == ms::OwnerForce::Auto
+        {
+            return before;
+        }
+        *state = next;
+        if tier != before {
+            tracing::info!(
+                "Owner tier {} -> {} ({}{})",
+                before.name(),
+                tier.name(),
+                match force {
+                    ms::OwnerForce::Auto => "",
+                    _ => "forced by ZKMINER_OWNER_ACTIVE; ",
+                },
+                reading.describe()
+            );
+        }
+        tier
+    }
+
+    /// The owner tier as last read (no new reading).
+    pub fn owner_tier(&self) -> crate::metal_sizing::OwnerTier {
+        self.owner.lock().unwrap_or_else(|e| e.into_inner()).tier
+    }
+
+    /// Metal proofs completed at the idle and at the owner-active tier, as `(idle, active)`.
+    pub fn metal_tier_jobs(&self) -> (u64, u64) {
+        (
+            self.metal_tier_jobs[0].load(Ordering::Relaxed),
+            self.metal_tier_jobs[1].load(Ordering::Relaxed),
+        )
+    }
+
+    /// The Metal slot's idle figure (its `vram_bytes`) and the figure its live worker was spawned
+    /// with, or `None` for a slot that is not an enumerated Apple GPU (no figure to scale).
+    fn metal_figures(slot: &WorkerSlot, entry: &WorkerEntry) -> Option<(u64, u64)> {
+        if slot.gpu_tag != "metal" {
+            return None;
+        }
+        let idle = entry.vram_bytes?;
+        let spawned = slot
+            .spawn_env
+            .get(zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(idle);
+        Some((idle, spawned))
+    }
+
+    /// The tier the slot's worker was spawned at.
+    fn metal_worker_tier(idle: u64, spawned: u64) -> crate::metal_sizing::OwnerTier {
+        if spawned < idle {
+            crate::metal_sizing::OwnerTier::Active
+        } else {
+            crate::metal_sizing::OwnerTier::Idle
+        }
+    }
+
+    /// Points the slot's NEXT spawn at `tier`'s figure; `true` when that differs from the live
+    /// worker's (which must then be respawned for the tier to apply: the worker sizes its default
+    /// segment, its po2 ceiling and its Groth16 decisions from its figure at its start, and enforces
+    /// it as its Metal budget with `ZKMINER_METAL_ENFORCE_BUDGET=1`; W7-M10).
+    fn set_metal_spawn_tier(
+        slot: &mut WorkerSlot,
+        entry: &WorkerEntry,
+        tier: crate::metal_sizing::OwnerTier,
+    ) -> bool {
+        let Some((idle, spawned)) = Self::metal_figures(slot, entry) else {
+            return false;
+        };
+        let want = Self::metal_tier_limit(idle, tier);
+        if want == spawned {
+            return false;
+        }
+        slot.spawn_env.insert(
+            zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
+            want.to_string(),
+        );
+        true
+    }
+
+    /// Before a benchmark or a calibration on an Apple GPU: back to the idle tier, so the row
+    /// prices this Mac at its idle rate (the worker sizes the suite from its spawn figure). The live
+    /// worker is stopped when it ran at another tier, and `ensure_alive` respawns it.
+    fn metal_idle_tier_for_benchmark(slot: &mut WorkerSlot, entry: &WorkerEntry, key: &str) {
+        if Self::set_metal_spawn_tier(slot, entry, crate::metal_sizing::OwnerTier::Idle)
+            && slot.handle.is_some()
+        {
+            tracing::info!("{key}: respawning the Metal worker at the idle tier for a benchmark");
+            entry.clear_pid();
+            if let Some(h) = slot.handle.as_mut() {
+                h.kill();
+            }
+            slot.handle = None;
+        }
+    }
+
+    /// Tests: whether Metal workers count as enforcing their figure (`ZKMINER_METAL_ENFORCE_BUDGET`),
+    /// or `None` for the environment.
+    pub fn test_force_enforce(&self, enforced: Option<bool>) {
+        *self
+            .enforce_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = enforced;
+    }
+
+    /// Tests: force the owner tier (`Some(OwnerForce::Active)` etc.), or `None` for the environment.
+    pub fn test_force_owner(&self, force: Option<crate::metal_sizing::OwnerForce>) {
+        *self
+            .owner_force_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = force;
+    }
+
+    /// Tests: the count-based recycle threshold of one slot.
+    pub fn test_set_recycle_after(&self, key: &str, proofs: u32) {
+        self.recycle_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), proofs);
+    }
+
+    /// Tests: give a slot an Apple GPU figure (`vram_bytes`) and spawn it at that figure.
+    pub fn test_set_vram(&mut self, key: &str, vram: u64) {
+        if let Some(e) = self.workers.get_mut(key) {
+            e.vram_bytes = Some(vram);
+            let mut slot = e.slot.lock().unwrap_or_else(|p| p.into_inner());
+            slot.spawn_env.insert(
+                zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
+                vram.to_string(),
+            );
+        }
+    }
+
+    /// Tests: the figure a slot's worker is (re)spawned with.
+    pub fn test_spawn_vram(&self, key: &str) -> Option<u64> {
+        let e = self.workers.get(key)?;
+        let slot = e.slot.lock().unwrap_or_else(|p| p.into_inner());
+        slot.spawn_env
+            .get(zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV)?
+            .parse()
+            .ok()
+    }
+
+    /// The count-based recycle threshold for one slot.
+    fn recycle_after_for_slot(&self, key: &str, gpu_tag: &str) -> u32 {
+        self.recycle_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .copied()
+            .unwrap_or_else(|| recycle_after_proofs_for(gpu_tag))
     }
 
     /// This slot's card as the admission gate reads it, before it makes any room: what anything other
@@ -7890,7 +8427,17 @@ impl WorkerPool {
         // check first, a slot whose worker was due for recycling could be refused for the very
         // memory that recycling would have freed — the gate blocking the only action that unblocks
         // the gate, permanently, because `proofs_since_spawn` never advances past the wedge point.
-        let recycle_n = recycle_after_proofs_for(&slot.gpu_tag);
+        let recycle_n = self.recycle_after_for_slot(key, &slot.gpu_tag);
+        // W7-M10: the tier this Metal job proves at (owner active or idle), read now, at the job's
+        // start. Its po2 is already fixed; a tier that differs from the live worker's means a
+        // respawn at the tier's figure, which the new worker plans with.
+        let metal_tier = self.metal_job_tier(key, &slot, entry, po2);
+        let retier = metal_tier.as_ref().is_some_and(|t| t.respawn);
+        // A worker whose tier cannot hold this job's po2 must be respawned whatever the time left:
+        // it would refuse the proof.
+        let retier_needed = metal_tier
+            .as_ref()
+            .is_some_and(|t| t.respawn && t.worker_refuses);
         // Not this close to the deadline: the recycle and the wait for its memory would eat the time
         // the proof needs to start, and the worker can as well be recycled after its next proof.
         let give_up_at = abort_at.map(|a| a.checked_sub(MIN_ABORT_START_BUDGET).unwrap_or(a));
@@ -7928,10 +8475,10 @@ impl WorkerPool {
         // Re-checked: the growth net may have spent up to METAL_IDLE_SETTLE re-reading.
         let time_to_recycle = time_to_recycle && time_left();
         let count_due = recycle_n > 0 && slot.proofs_since_spawn >= recycle_n;
-        if time_to_recycle
+        if (time_to_recycle || retier_needed)
             && !self.closing.load(Ordering::SeqCst)
             && slot.handle.is_some()
-            && (count_due || outgrown.is_some())
+            && (count_due || outgrown.is_some() || retier)
         {
             match &outgrown {
                 Some(why) => tracing::warn!(
@@ -7939,6 +8486,13 @@ impl WorkerPool {
                     slot.backend,
                     slot.gpu_tag,
                     slot.proofs_since_spawn
+                ),
+                None if retier && !count_due => tracing::info!(
+                    "Respawning worker {}:{} at the owner-{} Metal tier ({})",
+                    slot.backend,
+                    slot.gpu_tag,
+                    metal_tier.as_ref().map_or("idle", |t| t.tier.name()),
+                    metal_tier.as_ref().map_or(String::new(), |t| t.why.clone()),
                 ),
                 None => tracing::info!(
                     "Recycling worker {}:{} after {} proofs (fresh GPU state)",
@@ -7957,6 +8511,9 @@ impl WorkerPool {
             // Read the card first, with the worker still alive and credited to this slot: that is
             // what must be back before `ensure_alive` spawns the replacement into it.
             let before = self.read_card(key).map(|c| c.available_to(key));
+            if let Some(t) = metal_tier.as_ref().filter(|t| t.respawn) {
+                Self::set_metal_spawn_tier(&mut slot, entry, t.tier);
+            }
             entry.clear_pid();
             if let Some(h) = slot.handle.as_mut() {
                 h.kill();
@@ -7969,6 +8526,13 @@ impl WorkerPool {
                 Self::set_spawn_vram(&mut slot, before);
             }
             self.await_own_vram_release(key, before, give_up_at);
+        }
+
+        // A dead worker (no handle) is respawned below by `ensure_alive`: at this job's tier.
+        if slot.handle.is_none() {
+            if let Some(t) = metal_tier.as_ref().filter(|t| t.respawn) {
+                Self::set_metal_spawn_tier(&mut slot, entry, t.tier);
+            }
         }
 
         // Host memory admission, taken AFTER the slot guard so a contender blocked on the mutex is
@@ -8177,6 +8741,17 @@ impl WorkerPool {
         // Captured now (shared borrow, before the &mut handle borrow below) for the
         // completion log so operators can see which physical GPU ran each proof.
         let gpu_name = slot.gpu_name.clone();
+        // W7-M10: the tier this proof runs at (the job's: its po2 is the tier's, and its worker
+        // either runs at the tier's figure or proves it exactly as that one would) and the live
+        // worker's figure, recorded with it.
+        let ran_tier = Self::metal_figures(&slot, entry).map(|(idle, spawned)| {
+            (
+                metal_tier
+                    .as_ref()
+                    .map_or(Self::metal_worker_tier(idle, spawned), |t| t.tier),
+                spawned,
+            )
+        });
 
         // Re-borrow handle after PID update
         let handle = slot
@@ -8339,12 +8914,27 @@ impl WorkerPool {
                 ..
             } => {
                 tracing::info!(
-                    "Proof complete on {} [{}]: {} cycles in {:.1}s",
+                    "Proof complete on {} [{}]: {} cycles in {:.1}s{}",
                     key,
                     gpu_name.as_deref().unwrap_or("cpu"),
                     cycles,
                     duration_secs,
+                    ran_tier.map_or(String::new(), |(tier, limit)| format!(
+                        " (Metal tier {}, worker figure {:.1} GiB, po2 {})",
+                        tier.name(),
+                        limit as f64 / (1u64 << 30) as f64,
+                        po2.map_or("default".to_string(), |p| p.to_string()),
+                    )),
                 );
+                if let Some((tier, _)) = ran_tier {
+                    let i = usize::from(tier == crate::metal_sizing::OwnerTier::Active);
+                    self.metal_tier_jobs[i].fetch_add(1, Ordering::Relaxed);
+                }
+                // W7-M10: a worker due for a recycle (or for another tier) is respawned now, so
+                // its first-job prewarm runs in the idle gap before the next job.
+                if slot.gpu_tag == "metal" {
+                    self.after_metal_proof(key, &mut slot, entry, po2);
+                }
                 Ok(ProofOutput {
                     journal,
                     seal,
@@ -12476,6 +13066,57 @@ mod declined_backend_tests {
             declined: declined.map(str::to_string),
             proofs_since_spawn: 0,
             last_use: None,
+        }
+    }
+
+    /// W7-M10: an Apple GPU slot's figure follows the owner tier on the claim side, per Mac size,
+    /// and a read on that side never switches the tier to active.
+    #[test]
+    fn a_macs_risc0_slot_figure_follows_the_owner_tier() {
+        use crate::metal_sizing::{OwnerForce, OwnerTier};
+        let gib = 1u64 << 30;
+        for (ram, idle_po2, active_po2) in [(16, 19, 18), (18, 19, 18), (24, 20, 19), (36, 20, 20)]
+        {
+            let idle = metal_vram_budget_bytes(ram * gib).unwrap();
+            let mut sl = slot(None, 0);
+            sl.backend = "risc0".into();
+            sl.gpu_tag = "metal".into();
+            let mut pool = pool_with(vec![("risc0:metal:0", sl)]);
+            pool.workers.get_mut("risc0:metal:0").unwrap().vram_bytes = Some(idle);
+            let figure = |pool: &WorkerPool| pool.risc0_slots()[0].2.unwrap();
+            // The table alone: the test must not depend on a budget in the environment.
+            let po2 = |v: u64| {
+                crate::metal_sizing::job_po2_for_limit_in(v, crate::metal_sizing::Po2Table::M8)
+            };
+            pool.test_force_owner(Some(OwnerForce::Idle));
+            assert_eq!(
+                (figure(&pool), po2(figure(&pool))),
+                (idle, idle_po2),
+                "{ram} GB idle"
+            );
+            pool.test_force_owner(Some(OwnerForce::Active));
+            let active = figure(&pool);
+            // An explicit budget (gpu-run's) caps both figures alike: nothing to compare then.
+            let budget = crate::metal_sizing::env_working_set_budget().is_some();
+            if !budget {
+                assert_eq!(po2(active), active_po2, "{ram} GB active");
+            // The tier's own figure where it claims at a smaller po2; else the idle one (36 GB:
+            // po2 20 at 28 and at 20 GiB), so that tier moves nothing.
+            let want = if active_po2 == idle_po2 {
+                idle
+            } else {
+                crate::metal_sizing::active_limit(idle)
+            };
+            assert_eq!(active, want, "{ram} GB active figure");
+            }
+            // The benchmark row keeps the idle figure (it reads `vram_bytes`, not this).
+            assert_eq!(pool.workers["risc0:metal:0"].vram_bytes, Some(idle));
+            // Auto: the claim-side read never moves the tier up to active by itself.
+            pool.test_force_owner(Some(OwnerForce::Idle));
+            figure(&pool);
+            pool.test_force_owner(Some(OwnerForce::Auto));
+            figure(&pool);
+            assert_eq!(pool.owner_tier(), OwnerTier::Idle);
         }
     }
 

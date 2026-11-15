@@ -14857,6 +14857,62 @@ mod r2_sizing_tests {
         }
     }
 
+    /// W7-M10 (with `ZKMINER_OWNER_ACTIVE=auto` or `1`; the default keeps the idle tier): while the
+    /// owner uses the Mac, its slot's figure is the owner-active tier's (`WorkerPool::risc0_slots`,
+    /// `metal_sizing::claim_limit`), so jobs claimed then are measured one row down (16 / 18 GB: 18,
+    /// 24 GB: 19; a 36 GB Mac keeps 20 and reports its idle figure). A job measured at the active
+    /// size still proves at that size once the owner has left (the card's size rises; the measured
+    /// one fits under it).
+    #[test]
+    fn a_macs_risc0_slot_takes_the_owner_active_tier() {
+        use zkminer_prover::dispatcher::WorkerPool;
+        use zkminer_prover::metal_sizing::{self as ms, OwnerTier};
+        const GIB: u64 = 1 << 30;
+        let idle = [8 * GIB, 10 * GIB, 16 * GIB, 28 * GIB];
+        let active: Vec<_> = idle
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let figure = WorkerPool::metal_tier_limit(*v, OwnerTier::Active);
+                (
+                    format!("risc0:metal:{i}"),
+                    format!("gpu-metal{i}"),
+                    Some(figure),
+                )
+            })
+            .collect();
+        let sizes = risc0_slot_sizes(&active, None, &HashMap::new());
+        let got: Vec<Option<u8>> = sizes.iter().map(|(_, _, p)| *p).collect();
+        let want: Vec<Option<u8>> = active
+            .iter()
+            .map(|(_, _, v)| {
+                Some(ms::job_po2_for_limit(
+                    ms::host_working_set_limit(*v).unwrap(),
+                ))
+            })
+            .collect();
+        assert_eq!(got, want);
+        if ms::env_working_set_budget().is_none() && ms::env_po2_table() == ms::Po2Table::M8 {
+            assert_eq!(got, vec![Some(18), Some(18), Some(19), Some(20)]);
+        }
+        // A job measured at 18 while the owner was active, proved after the owner left (card 19):
+        // at its measured 18.
+        let card = |po2| Risc0Card {
+            slot: "risc0:metal:0".into(),
+            device: "gpu-metal0".into(),
+            po2,
+        };
+        let (fit, measured_here) = risc0_prove_sizes(&[card(19)], &[18]);
+        assert_eq!((fit["risc0:metal:0"], measured_here), (18, true));
+        // The other direction is why `risc0_slots` never switches to the active tier on a read
+        // (only a Metal job's start does): a job measured at 19 that meets an active card (18)
+        // proves at 18 unmeasured. That remains possible for a job claimed at 19 and still queued
+        // when another job's start switches the tier, which is why `auto` is opt-in until the
+        // prove step sizes from the idle figure (W7-M10 note, open issues).
+        let (fit, measured_here) = risc0_prove_sizes(&[card(18)], &[19]);
+        assert_eq!((fit["risc0:metal:0"], measured_here), (18, false));
+    }
+
     #[test]
     fn each_card_measures_and_proves_risc0_jobs_at_its_own_size() {
         const GIB: u64 = 1 << 30;
