@@ -250,6 +250,557 @@ fn recycle_after_proofs() -> u32 {
     })
 }
 
+/// Item M9: a Metal worker's count-based recycle, when `ZKMINER_RECYCLE_AFTER_PROOFS` is not set.
+///
+/// The 20-proof recycle exists for discrete cards, where a long-lived CUDA context, buffer pool and
+/// persistent stream can wedge a flaky card mid-proof. A Mac has none of those failure modes, and
+/// its worker's warm state is worth keeping: 25 consecutive Proves in one Metal worker (M9 note) ran
+/// the first at 6.43 s and every later one at 6.05-6.14 s (no drift), while the idle footprint rose
+/// from 5.14 GB after the first proof to a plateau of ~5.65 GB by the seventh and stayed there. A
+/// recycle therefore costs one first-job penalty (~0.3 s) and buys nothing measurable. 200 keeps a
+/// backstop; the growth net below catches a real leak long before it. Overridable with
+/// `ZKMINER_METAL_RECYCLE_AFTER_PROOFS` (20 restores the old behaviour, 0 disables the count).
+const METAL_RECYCLE_AFTER_PROOFS: u32 = 200;
+
+/// The count-based recycle threshold for a slot of `gpu_tag` (see [`recycle_after_proofs`] and
+/// [`METAL_RECYCLE_AFTER_PROOFS`]). `ZKMINER_RECYCLE_AFTER_PROOFS`, when set, applies to every slot.
+fn recycle_after_proofs_for(gpu_tag: &str) -> u32 {
+    static METAL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if gpu_tag != "metal" || std::env::var_os("ZKMINER_RECYCLE_AFTER_PROOFS").is_some() {
+        return recycle_after_proofs();
+    }
+    *METAL.get_or_init(|| {
+        std::env::var("ZKMINER_METAL_RECYCLE_AFTER_PROOFS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(METAL_RECYCLE_AFTER_PROOFS)
+    })
+}
+
+/// M9's memory-growth safety net for a long-lived Metal worker. Before each proof the dispatcher
+/// reads the idle worker's `phys_footprint` and recycles the worker once its SETTLED footprint has
+/// grown more than a margin above its baseline (the settled level of its first proofs).
+///
+/// Why "settled" needs care (reclaim profile, M9 note, 8 traces at 4 and 8 GiB with 20 ms
+/// sampling): right after a proof the footprint still holds ~2.6 GB of GPU pages the worker just
+/// freed (the wrap's; 2643-2644 MiB in every trace, at both budgets). The OS takes them back in
+/// steps: about half 90-310 ms after the proof, the rest by 1.0-1.3 s. So:
+/// - a reading at least [`METAL_IDLE_RECLAIM`] after the worker's last use is settled by
+///   definition and is compared directly;
+/// - a reading taken sooner is only an upper bound of the settled level: at or under the line it
+///   passes as it is (the settled level can only be lower), and over the line it is settled first
+///   (a bounded wait, [`METAL_IDLE_SETTLE`]) before any verdict;
+/// - except for a FRESH reading (at most [`METAL_IDLE_FRESH`] after a proof, before any reclaim
+///   step; the dispatcher also reads the footprint as each Metal proof ends and judges a
+///   mid-reclaim reading on that one), where the whole transient is still there: it is judged as
+///   reading minus the transient measured at the last full settle of a fresh reading, or by the
+///   last settled-by-time reading after a proof whose end was read (the allowance), and settled
+///   before any recycle. The allowance is the latest measurement (never above the largest),
+///   capped at [`METAL_IDLE_ALLOWANCE_CAP_QUARTERS`] quarters of the working-set limit,
+///   re-measured whenever a fresh reading falls [`METAL_IDLE_TOLERANCE`] below the fresh
+///   reading it was measured on (its anchor: a smaller transient would make the estimate too low),
+///   checked against the line itself by a pass/fail settle every [`METAL_IDLE_VERIFY_EVERY`] fresh
+///   readings judged with it, and dropped with the worker. Every other regime compares a settled
+///   level.
+///
+/// The baseline is the maximum SETTLED level over the first [`METAL_IDLE_BASELINE_PROOFS`] proofs
+/// (settled by time, or by a wait whenever a reading could raise it by more than the tolerance), so
+/// ten back-to-back proofs no longer put the transient into it.
+const METAL_IDLE_BASELINE_PROOFS: u32 = 10;
+/// The margin is a quarter of the worker's working-set limit, between these bounds, and at most
+/// half the room between that limit and M6's footprint ceiling (see [`metal_growth_margin`]).
+/// `ZKMINER_METAL_RECYCLE_GROWTH_BYTES` overrides it; 0 turns the net off.
+const METAL_IDLE_GROWTH_MIN: u64 = 1 << 30;
+const METAL_IDLE_GROWTH_MAX: u64 = 2 << 30;
+/// The floor when M6's ceiling sits closer than two minimum margins above the limit.
+const METAL_IDLE_GROWTH_FLOOR: u64 = 512 << 20;
+/// After this long since the worker's last use its footprint is settled: the slowest measured
+/// reclaim finished 1.30 s after the proof (the earlier review trace: 1.6 s), plus headroom.
+const METAL_IDLE_RECLAIM: Duration = Duration::from_secs(2);
+/// A reading this soon after a proof still carries the whole transient: the first reclaim step
+/// came 90 ms after the proof at the earliest (8 traces).
+const METAL_IDLE_FRESH: Duration = Duration::from_millis(50);
+/// The longest one settle wait may take (it runs under the slot lock, before a proof): it waits
+/// until [`METAL_IDLE_RECLAIM`] after the last use, then until two readings agree.
+const METAL_IDLE_SETTLE: Duration = Duration::from_secs(3);
+const METAL_IDLE_SETTLE_POLL: Duration = Duration::from_millis(250);
+/// Two settled readings agree when this close (consecutive settled readings in the traces differed
+/// by 0-1 MiB).
+const METAL_IDLE_AGREE: u64 = 64 << 20;
+/// How far an estimate may rise above the baseline during the baseline proofs before a settle
+/// re-measures it, and how far a fresh reading may drop below the allowance's anchor (the fresh
+/// reading it was measured on) before the allowance is re-measured. The healthy caches grow by
+/// 70-150 MiB a proof over the first five to seven proofs. A healthy worker's settled level is
+/// also trimmed by 240-400 MiB about every sixth proof (36-proof 4 GiB trace); against the
+/// anchor (see [`IdleTrack::measured`]) that costs one re-measure, after which the anchor sits at
+/// a trimmed level (the trims stay within ~120 MiB of each other), where the previous per-proof
+/// comparison paid one every trim.
+const METAL_IDLE_TOLERANCE: u64 = 256 << 20;
+/// After this many fresh readings judged with the allowance, the next one over the line is
+/// checked against the line itself (a pass/fail settle: under the line as soon as any reading is,
+/// which is the first reclaim step, 0.5 s, at the 8 GiB tier and the second, 1.5 s, at 4 GiB).
+/// It bounds what a transient turning into retained memory (the fresh reading flat, the settled
+/// level rising) can hide to this many proofs' growth, and at most one allowance. 50 keeps a
+/// back-to-back 4 GiB worker's checks at 1.5 s per 50 proofs, 0.75 % of the shortest (4 s) Metal
+/// proofs; any settled-by-time reading after a proof re-measures the allowance for free.
+const METAL_IDLE_VERIFY_EVERY: u32 = 50;
+/// The allowance's cap, in quarters of the working-set limit: 3/4 of it, which clears the measured
+/// 2644 MiB transient (65 % of a 4 GiB limit) at every tier PLAN 9.1 names.
+const METAL_IDLE_ALLOWANCE_CAP_QUARTERS: u64 = 3;
+
+/// The growth margin for a worker with working-set limit `limit` and footprint ceiling `ceiling`
+/// (M6, `ZKMINER_WORKER_MAX_FOOTPRINT_BYTES`): `clamp(limit / 4, 1 GiB, 2 GiB)`, and at most half
+/// of `ceiling - limit` (never below 512 MiB), so a leak is caught while the worker's proof peak
+/// (about limit + 2 GiB of host memory, M9 note) plus the leak is still under the ceiling.
+/// `override_bytes` (`ZKMINER_METAL_RECYCLE_GROWTH_BYTES`) wins; 0 turns the net off.
+fn metal_growth_margin(
+    limit: Option<u64>,
+    ceiling: Option<u64>,
+    override_bytes: Option<u64>,
+) -> u64 {
+    if let Some(m) = override_bytes {
+        return m;
+    }
+    let Some(limit) = limit else {
+        return METAL_IDLE_GROWTH_MAX;
+    };
+    let mut m = (limit / 4).clamp(METAL_IDLE_GROWTH_MIN, METAL_IDLE_GROWTH_MAX);
+    if let Some(c) = ceiling {
+        m = m.min((c.saturating_sub(limit) / 2).max(METAL_IDLE_GROWTH_FLOOR));
+    }
+    m
+}
+
+fn metal_growth_override() -> Option<u64> {
+    static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ZKMINER_METAL_RECYCLE_GROWTH_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+/// What a worker slot last ran: a Prove (whose end leaves the ~2.6 GB transient the allowance is
+/// measured on) or anything else (benchmark, warm-up, measurement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UseKind {
+    Proof,
+    Other,
+}
+
+/// When a worker slot's last exchange ended, and what it was.
+#[derive(Debug, Clone, Copy)]
+struct LastUse {
+    at: Instant,
+    kind: UseKind,
+    /// A Metal worker's footprint read right as its proof ended (a fresh reading, with the whole
+    /// transient), so a later mid-reclaim reading can be judged on it.
+    footprint: Option<u64>,
+}
+
+/// How settled a reading is, from the time since the worker's last use (see
+/// [`METAL_IDLE_BASELINE_PROOFS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadingAge {
+    /// At least [`METAL_IDLE_RECLAIM`] after the last use: settled.
+    Settled,
+    /// At most [`METAL_IDLE_FRESH`] after a proof: the whole transient is still there.
+    Fresh,
+    /// Anything else (mid-reclaim, after a non-proof use, or no last use known): an upper bound.
+    Partial,
+}
+
+fn reading_age(since_last_use: Option<Duration>, kind: UseKind) -> ReadingAge {
+    match since_last_use {
+        Some(d) if d >= METAL_IDLE_RECLAIM => ReadingAge::Settled,
+        Some(d) if kind == UseKind::Proof && d <= METAL_IDLE_FRESH => ReadingAge::Fresh,
+        _ => ReadingAge::Partial,
+    }
+}
+
+/// The net's configuration for one slot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NetConfig {
+    /// Growth margin over the baseline (0: the net is off).
+    margin: u64,
+    /// Upper bound of the allowance ([`METAL_IDLE_ALLOWANCE_CAP_QUARTERS`] quarters of the working-set limit).
+    allowance_cap: u64,
+}
+
+/// A Metal worker's idle-footprint history (see [`METAL_IDLE_BASELINE_PROOFS`]), per slot key.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct IdleTrack {
+    pid: u32,
+    /// Maximum settled level over the first [`METAL_IDLE_BASELINE_PROOFS`] proofs.
+    baseline: Option<u64>,
+    /// Transient measured at the last settle of a fresh reading (reading minus settled level).
+    allowance: Option<u64>,
+    /// The fresh reading the allowance was measured on (the lowest one while re-measures agree).
+    anchor: u64,
+    /// Fresh readings judged with the allowance since it was measured or last verified.
+    relied: u32,
+}
+
+impl IdleTrack {
+    /// Records a measured transient: fresh reading `fresh`, settled level `settled`, after
+    /// `proofs` proofs. After the baseline proofs (while the caches still grow the anchor follows
+    /// them), a re-measure that agrees with the allowance (within [`METAL_IDLE_AGREE`]) keeps the
+    /// lower anchor, so the healthy cache trims (the settled level falling 240-400 MiB about every
+    /// sixth proof and growing back) cost one re-measure per worker rather than one per trim; a
+    /// different transient moves the anchor to its own reading.
+    fn measured(&mut self, proofs: u32, fresh: u64, settled: u64, cap: u64) {
+        let a = fresh.saturating_sub(settled).min(cap);
+        let agrees = proofs > METAL_IDLE_BASELINE_PROOFS
+            && self
+                .allowance
+                .is_some_and(|old| old.abs_diff(a) <= METAL_IDLE_AGREE);
+        self.anchor = if agrees {
+            self.anchor.min(fresh)
+        } else {
+            fresh
+        };
+        self.allowance = Some(a);
+        self.relied = 0;
+    }
+}
+
+/// Why the net waited for a reading to settle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleWhy {
+    /// A baseline proof's reading could raise the baseline.
+    Baseline,
+    /// A reading (or its estimate) is over the line.
+    OverLine,
+    /// A settled-by-time reading is over the line: confirm before recycling.
+    Confirm,
+    /// A fresh reading fell below the allowance's anchor: re-measure the allowance.
+    Shrank,
+    /// The allowance was relied on [`METAL_IDLE_VERIFY_EVERY`] times: check the line itself.
+    Verify,
+}
+
+/// What [`metal_idle_growth`] asks of its settle callback: why, and whether it may stop as soon as
+/// a reading is at most `pass_below` (a pass/fail question) or must return the settled level (to
+/// measure a baseline or an allowance).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SettleAsk {
+    why: SettleWhy,
+    pass_below: Option<u64>,
+}
+
+/// Why [`metal_idle_growth`] recycles: the baseline and the settled footprint over it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Outgrown {
+    baseline: u64,
+    settled: u64,
+}
+
+/// Records `reading`, the idle footprint of worker `pid` before its next proof after
+/// `proofs_since_spawn` completed ones, taken `since_last_use` after the slot's last exchange (of
+/// kind `kind`), and returns `Some` when the worker's settled footprint is more than the margin
+/// over its baseline. `settle(ask)` waits for the footprint to settle and returns it (or, with
+/// `ask.pass_below`, the first reading at most that); `None` means no time to wait or an
+/// unreadable footprint, and then nothing is learned and nothing recycles. A new pid starts a new
+/// history. Every judgement compares a settled level or an upper bound of one with the line; the
+/// one estimate (fresh readings minus the allowance) is described on
+/// [`METAL_IDLE_BASELINE_PROOFS`].
+#[allow(clippy::too_many_arguments)]
+fn metal_idle_growth(
+    track: &mut IdleTrack,
+    pid: u32,
+    proofs_since_spawn: u32,
+    reading: u64,
+    since_last_use: Option<Duration>,
+    kind: UseKind,
+    at_proof_end: Option<u64>,
+    cfg: NetConfig,
+    settle: impl FnOnce(SettleAsk) -> Option<u64>,
+) -> Option<Outgrown> {
+    if track.pid != pid {
+        *track = IdleTrack {
+            pid,
+            ..IdleTrack::default()
+        };
+    }
+    if cfg.margin == 0 || proofs_since_spawn == 0 {
+        return None;
+    }
+    let mut age = reading_age(since_last_use, kind);
+    let mut reading = reading;
+    // Mid-reclaim, but the footprint read as the proof ended is fresh: judge that one (the
+    // reclaim since then can only have lowered the settled level's upper bound, not the level).
+    if let (ReadingAge::Partial, UseKind::Proof, Some(end)) = (age, kind, at_proof_end) {
+        (reading, age) = (end.max(reading), ReadingAge::Fresh);
+    }
+    // A full settle of a fresh reading also measures the transient.
+    let learn = |track: &mut IdleTrack, settled: u64| {
+        if age == ReadingAge::Fresh {
+            track.measured(proofs_since_spawn, reading, settled, cfg.allowance_cap);
+        }
+    };
+    let full = |why| SettleAsk {
+        why,
+        pass_below: None,
+    };
+    // Settled by time after a proof whose end was read: the transient, measured for free.
+    if let (ReadingAge::Settled, UseKind::Proof, Some(end)) = (age, kind, at_proof_end) {
+        track.measured(proofs_since_spawn, end, reading, cfg.allowance_cap);
+    }
+    // The allowance applies to this reading: fresh, measured, and the reading has not dropped
+    // below the anchor (which a smaller transient would do). The anchor moves only when the
+    // allowance is measured, so a transient shrinking a little every proof adds up to a re-measure.
+    let allowance = match (age, track.allowance) {
+        (ReadingAge::Fresh, Some(a))
+            if reading.saturating_add(METAL_IDLE_TOLERANCE) >= track.anchor =>
+        {
+            Ok(a)
+        }
+        (ReadingAge::Fresh, Some(_)) => Err(SettleWhy::Shrank),
+        _ => Err(SettleWhy::OverLine),
+    };
+
+    let baseline = match track.baseline {
+        Some(b) if proofs_since_spawn > METAL_IDLE_BASELINE_PROOFS => b,
+        // The baseline proofs (and later ones while no baseline could be settled yet).
+        current => {
+            if age == ReadingAge::Settled {
+                track.baseline = Some(current.unwrap_or(0).max(reading));
+                return None;
+            }
+            // An upper bound that cannot raise the baseline needs no settling.
+            if current.is_some_and(|b| reading <= b) {
+                return None;
+            }
+            if let (Some(b), Ok(a)) = (current, allowance) {
+                if reading.saturating_sub(a) <= b + METAL_IDLE_TOLERANCE {
+                    return None;
+                }
+            }
+            // A fresh reading is settled in full (it measures the allowance too); any other
+            // one only until it shows it cannot raise the baseline.
+            let s = settle(SettleAsk {
+                why: SettleWhy::Baseline,
+                pass_below: if age == ReadingAge::Fresh {
+                    None
+                } else {
+                    current
+                },
+            })?;
+            learn(track, s);
+            track.baseline = Some(current.unwrap_or(0).max(s));
+            return None;
+        }
+    };
+    let line = baseline.saturating_add(cfg.margin);
+    let outgrown = |settled: u64| (settled > line).then_some(Outgrown { baseline, settled });
+
+    match age {
+        ReadingAge::Settled => {
+            if reading <= line {
+                return None;
+            }
+            // Settled by time; one more agreeing reading before a recycle.
+            let s = settle(SettleAsk {
+                why: SettleWhy::Confirm,
+                pass_below: Some(line),
+            })?;
+            outgrown(s)
+        }
+        // An upper bound at or under the line: the settled level is too. A fresh one under the
+        // anchor shows the transient may have shrunk: the next fresh reading over the line is
+        // checked against the line itself (a verification) rather than judged with the allowance.
+        _ if reading <= line => {
+            if allowance == Err(SettleWhy::Shrank) {
+                track.relied = METAL_IDLE_VERIFY_EVERY;
+            }
+            None
+        }
+        ReadingAge::Fresh => match allowance {
+            // Relied on often enough: check the line itself, which also bounds what a transient
+            // turning into retained memory can hide. Stops at the first reading under the line.
+            Ok(_) if track.relied >= METAL_IDLE_VERIFY_EVERY => {
+                let s = settle(SettleAsk {
+                    why: SettleWhy::Verify,
+                    pass_below: Some(line),
+                })?;
+                track.relied = 0;
+                outgrown(s)
+            }
+            Ok(a) if reading.saturating_sub(a) <= line => {
+                track.relied += 1;
+                None
+            }
+            Ok(_) => {
+                let s = settle(full(SettleWhy::OverLine))?;
+                learn(track, s);
+                outgrown(s)
+            }
+            Err(why) => {
+                let s = settle(full(why))?;
+                learn(track, s);
+                outgrown(s)
+            }
+        },
+        ReadingAge::Partial => {
+            let s = settle(SettleAsk {
+                why: SettleWhy::OverLine,
+                pass_below: Some(line),
+            })?;
+            outgrown(s)
+        }
+    }
+}
+
+/// Waits for an idle worker's footprint to settle: until [`METAL_IDLE_RECLAIM`] after its last use,
+/// then until two consecutive readings agree within [`METAL_IDLE_AGREE`], at most `budget`. With
+/// `pass_below`, returns as soon as a reading is at most that (the settled level can only be lower).
+/// `elapsed` is the time since the worker's last use (`None`: unknown, then the reclaim time counts
+/// from the start of this wait). Returns the settled reading; `None` when the footprint cannot be
+/// read or the budget ran out before the reclaim time (an unsettled reading must not judge).
+fn settle_footprint(
+    mut read: impl FnMut() -> Option<u64>,
+    mut elapsed: impl FnMut() -> Option<Duration>,
+    mut sleep: impl FnMut(Duration),
+    pass_below: Option<u64>,
+    budget: Duration,
+) -> Option<u64> {
+    let mut waited = Duration::ZERO;
+    let mut prev: Option<u64> = None;
+    loop {
+        let cur = read()?;
+        if pass_below.is_some_and(|l| cur <= l) {
+            return Some(cur);
+        }
+        let reclaimed = elapsed().unwrap_or(waited) >= METAL_IDLE_RECLAIM;
+        if reclaimed {
+            if prev.is_some_and(|p| p.abs_diff(cur) <= METAL_IDLE_AGREE) {
+                return Some(cur);
+            }
+            prev = Some(cur);
+        }
+        if waited + METAL_IDLE_SETTLE_POLL > budget {
+            // Past the reclaim time a reading is settled by definition, agreeing or not.
+            return reclaimed.then_some(cur);
+        }
+        sleep(METAL_IDLE_SETTLE_POLL);
+        waited += METAL_IDLE_SETTLE_POLL;
+    }
+}
+
+/// The allowance's cap for a worker with working-set limit `limit` (unknown: a 16 GiB one).
+fn metal_allowance_cap(limit: Option<u64>) -> u64 {
+    limit.unwrap_or(16 << 30) / 4 * METAL_IDLE_ALLOWANCE_CAP_QUARTERS
+}
+
+/// [`NetConfig`] for a Metal slot spawned with `spawn_env` on a GPU of `vram_bytes`: the worker's
+/// working-set limit (the host figure and `RISC0_METAL_MAX_WORKING_SET_BYTES`, from the slot's own
+/// environment first, as the worker sees them) and its footprint ceiling (M6: the slot's or the
+/// miner's `ZKMINER_WORKER_MAX_FOOTPRINT_BYTES`, else the figure the spawn hands it; 0 = none).
+fn metal_net_config(spawn_env: &HashMap<String, String>, vram_bytes: Option<u64>) -> NetConfig {
+    use crate::metal_sizing as ms;
+    let from_env = |k: &str| spawn_env.get(k).cloned().or_else(|| std::env::var(k).ok());
+    let budget = from_env(ms::MAX_WORKING_SET_ENV).and_then(|v| ms::parse_bytes(&v));
+    let limit = ms::working_set_limit_of(vram_bytes, budget);
+    let ceiling = match from_env(ms::WORKER_MAX_FOOTPRINT_ENV) {
+        Some(v) => v.trim().parse::<u64>().ok().filter(|&c| c > 0),
+        None => {
+            crate::memory::worker_memory_ceiling_bytes(crate::memory::DEFAULT_HOST_RESERVE_BYTES)
+        }
+    };
+    NetConfig {
+        margin: metal_growth_margin(limit, ceiling, metal_growth_override()),
+        allowance_cap: metal_allowance_cap(limit.or_else(crate::memory::mem_total_bytes)),
+    }
+}
+
+/// Whether the idle Metal worker `pid` of slot `key` has outgrown its baseline (and why), recording
+/// this reading. `wait_budget`: how long a settle may wait (`None`: no time, then no recycle and
+/// nothing learned). `None` off macOS or when its footprint cannot be read.
+fn metal_idle_outgrown(
+    key: &str,
+    pid: u32,
+    proofs_since_spawn: u32,
+    last_use: Option<LastUse>,
+    cfg: NetConfig,
+    wait_budget: Option<Duration>,
+) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        static TRACKS: std::sync::OnceLock<Mutex<HashMap<String, IdleTrack>>> =
+            std::sync::OnceLock::new();
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        let read = || crate::memory::macos_pid_footprint(pid).map(|f| f.current);
+        let now = read()?;
+        let tracks = || {
+            TRACKS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        };
+        // Work on a copy so a settle wait (up to METAL_IDLE_SETTLE of sleeping) does not hold the
+        // process-wide map; the caller holds this slot's lock, so no one else updates `key`.
+        let mut track = tracks().get(key).cloned().unwrap_or_default();
+        let since = last_use.map(|u| u.at.elapsed());
+        let kind = last_use.map_or(UseKind::Other, |u| u.kind);
+        let at_proof_end = last_use.and_then(|u| u.footprint);
+        let mut waited_for = None;
+        let settle = |ask: SettleAsk| {
+            let budget = wait_budget?.min(METAL_IDLE_SETTLE);
+            let t0 = Instant::now();
+            let s = settle_footprint(
+                read,
+                || last_use.map(|u| u.at.elapsed()),
+                std::thread::sleep,
+                ask.pass_below,
+                budget,
+            );
+            let took = t0.elapsed();
+            tracing::info!(
+                "Metal worker {pid} ({key}, {proofs_since_spawn} proofs): waited {:.2} s for its idle \
+                 footprint to settle ({:?}): {:.2} GiB {:.2} s after its last use -> {}",
+                took.as_secs_f64(),
+                ask.why,
+                gib(now),
+                since.unwrap_or_default().as_secs_f64(),
+                s.map_or("unreadable".to_string(), |s| format!("{:.2} GiB", gib(s)))
+            );
+            waited_for = Some(took);
+            s
+        };
+        let verdict = metal_idle_growth(
+            &mut track,
+            pid,
+            proofs_since_spawn,
+            now,
+            since,
+            kind,
+            at_proof_end,
+            cfg,
+            settle,
+        );
+        tracks().insert(key.to_string(), track);
+        verdict.map(|o| {
+            format!(
+                "its idle footprint is {:.2} GiB ({:.2} GiB settled{}), more than {:.2} GiB above its \
+                 {:.2} GiB baseline",
+                gib(now),
+                gib(o.settled),
+                waited_for.map_or(String::new(), |d| format!(
+                    " after {:.2} s of waiting",
+                    d.as_secs_f64()
+                )),
+                gib(cfg.margin),
+                gib(o.baseline)
+            )
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (key, pid, proofs_since_spawn, last_use, cfg, wait_budget);
+        None
+    }
+}
+
 struct WorkerSlot {
     handle: Option<WorkerHandle>,
     path: PathBuf,
@@ -286,6 +837,30 @@ struct WorkerSlot {
     /// the accumulated GPU context / buffer pool / persistent stream is reset to a
     /// clean slate. Reset to 0 on every (re)spawn.
     proofs_since_spawn: u32,
+    /// When this slot's last exchange with its worker (a proof, benchmark, warm-up or
+    /// measurement) ended: M9's growth net tells a settled idle footprint by it.
+    last_use: Option<LastUse>,
+}
+
+impl WorkerSlot {
+    /// Records the end of an exchange with the worker (see [`WorkerSlot::last_use`]).
+    fn note_used(&mut self, kind: UseKind) {
+        // A Metal worker's footprint as its proof ends (one `proc_pid_rusage`): the fresh reading
+        // the growth net judges a later mid-reclaim one on.
+        #[cfg(target_os = "macos")]
+        let footprint = (kind == UseKind::Proof && self.gpu_tag == "metal")
+            .then(|| self.handle.as_ref().map(|h| h.pid()))
+            .flatten()
+            .and_then(crate::memory::macos_pid_footprint)
+            .map(|f| f.current);
+        #[cfg(not(target_os = "macos"))]
+        let footprint = None;
+        self.last_use = Some(LastUse {
+            at: Instant::now(),
+            kind,
+            footprint,
+        });
+    }
 }
 
 /// Wrapper that holds a worker slot and its PID accessible without locking.
@@ -2364,6 +2939,7 @@ impl WorkerPool {
                                 last_failure: None,
                                 declined: None,
                                 proofs_since_spawn: 0,
+                                last_use: None,
                             }),
                             vram_bytes: gpu_vram_bytes(
                                 &gpu_tag,
@@ -2414,6 +2990,7 @@ impl WorkerPool {
                                 last_failure: Some(Instant::now()),
                                 declined,
                                 proofs_since_spawn: 0,
+                                last_use: None,
                             }),
                             vram_bytes,
                             pci_bus_id: entry_bus_id,
@@ -2508,6 +3085,7 @@ impl WorkerPool {
                         last_failure,
                         declined: None,
                         proofs_since_spawn: 0,
+                        last_use: None,
                     }),
                     vram_bytes: None,
                     pci_bus_id: None,
@@ -2661,6 +3239,7 @@ impl WorkerPool {
                         last_failure,
                         declined: None,
                         proofs_since_spawn: 0,
+                        last_use: None,
                     }),
                     vram_bytes: None,
                     pci_bus_id: None,
@@ -3292,6 +3871,7 @@ impl WorkerPool {
             entry.intentional_kill.clone(),
         );
         let response = handle.recv();
+        slot.note_used(UseKind::Other);
         if response.is_err() {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);
@@ -3459,6 +4039,7 @@ impl WorkerPool {
         });
 
         let bench_response = handle.recv_benchmark(&|_, _, _| {});
+        slot.note_used(UseKind::Other);
 
         if let Err(ref _e) = bench_response {
             if entry.intentional_kill.load(Ordering::Acquire) {
@@ -3891,6 +4472,7 @@ impl WorkerPool {
         };
 
         let bench_response = handle.recv_benchmark(&cb);
+        slot.note_used(UseKind::Other);
 
         if let Err(ref _e) = bench_response {
             if entry.intentional_kill.load(Ordering::Acquire) {
@@ -4623,6 +5205,7 @@ impl WorkerPool {
                 }
             }
         };
+        slot.note_used(UseKind::Other);
         match response {
             WorkerResponse::ExecuteResult {
                 cycles,
@@ -4779,6 +5362,7 @@ impl WorkerPool {
                 ));
             }
         };
+        slot.note_used(UseKind::Other);
         match response {
             WorkerResponse::ProgramIdResult {
                 program_id,
@@ -7306,26 +7890,63 @@ impl WorkerPool {
         // check first, a slot whose worker was due for recycling could be refused for the very
         // memory that recycling would have freed — the gate blocking the only action that unblocks
         // the gate, permanently, because `proofs_since_spawn` never advances past the wedge point.
-        let recycle_n = recycle_after_proofs();
+        let recycle_n = recycle_after_proofs_for(&slot.gpu_tag);
         // Not this close to the deadline: the recycle and the wait for its memory would eat the time
         // the proof needs to start, and the worker can as well be recycled after its next proof.
         let give_up_at = abort_at.map(|a| a.checked_sub(MIN_ABORT_START_BUDGET).unwrap_or(a));
-        let time_to_recycle = abort_at.is_none_or(|a| {
-            a.saturating_duration_since(Instant::now())
-                >= MIN_ABORT_START_BUDGET + VRAM_RECLAIM_WAIT
-        });
-        if recycle_n > 0
-            && time_to_recycle
+        let time_left = || {
+            abort_at.is_none_or(|a| {
+                a.saturating_duration_since(Instant::now())
+                    >= MIN_ABORT_START_BUDGET + VRAM_RECLAIM_WAIT
+            })
+        };
+        let time_to_recycle = time_left();
+        // M9: a Metal worker is also recycled when its idle footprint outgrows its baseline.
+        let outgrown = (slot.gpu_tag == "metal")
+            .then(|| slot.handle.as_ref().map(|h| h.pid()))
+            .flatten()
+            .and_then(|pid| {
+                // A settle wait must leave the start floor intact (and never runs while closing).
+                let wait_budget = (time_to_recycle && !self.closing.load(Ordering::SeqCst)).then(
+                    || match abort_at {
+                        None => METAL_IDLE_SETTLE,
+                        Some(a) => a
+                            .saturating_duration_since(Instant::now())
+                            .saturating_sub(MIN_ABORT_START_BUDGET + VRAM_RECLAIM_WAIT)
+                            .min(METAL_IDLE_SETTLE),
+                    },
+                );
+                metal_idle_outgrown(
+                    key,
+                    pid,
+                    slot.proofs_since_spawn,
+                    slot.last_use,
+                    metal_net_config(&slot.spawn_env, entry.vram_bytes),
+                    wait_budget,
+                )
+            });
+        // Re-checked: the growth net may have spent up to METAL_IDLE_SETTLE re-reading.
+        let time_to_recycle = time_to_recycle && time_left();
+        let count_due = recycle_n > 0 && slot.proofs_since_spawn >= recycle_n;
+        if time_to_recycle
             && !self.closing.load(Ordering::SeqCst)
             && slot.handle.is_some()
-            && slot.proofs_since_spawn >= recycle_n
+            && (count_due || outgrown.is_some())
         {
-            tracing::info!(
-                "Recycling worker {}:{} after {} proofs (fresh GPU state)",
-                slot.backend,
-                slot.gpu_tag,
-                slot.proofs_since_spawn
-            );
+            match &outgrown {
+                Some(why) => tracing::warn!(
+                    "Recycling worker {}:{} after {} proofs: {why}",
+                    slot.backend,
+                    slot.gpu_tag,
+                    slot.proofs_since_spawn
+                ),
+                None => tracing::info!(
+                    "Recycling worker {}:{} after {} proofs (fresh GPU state)",
+                    slot.backend,
+                    slot.gpu_tag,
+                    slot.proofs_since_spawn
+                ),
+            }
             // Zero the PID BEFORE the kill, not before the drop. `kill()` →
             // `force_kill_group()` ends with `child.wait()`, so the reap happens THERE — and
             // once reaped the OS may reuse the number, while the watchdogs that read this
@@ -7599,6 +8220,7 @@ impl WorkerPool {
         let on_progress: Option<Box<dyn Fn(f64) + Send>> = on_progress
             .map(|cb| Box::new(move |f: f64| cb(f, &key_for_cb)) as Box<dyn Fn(f64) + Send>);
         let proof_response = handle.recv_proof(request_id, &on_progress);
+        slot.note_used(UseKind::Proof);
 
         // If recv_proof failed (EOF, stream corruption, protocol desync),
         // kill the worker to prevent reusing a corrupted IPC stream.
@@ -8239,6 +8861,7 @@ impl WorkerPool {
                     last_failure: None,
                     declined: None,
                     proofs_since_spawn: 0,
+                    last_use: None,
                 }),
                 vram_bytes: None,
                 pci_bus_id: None,
@@ -8279,6 +8902,7 @@ impl WorkerPool {
                 last_failure: None,
                 declined: None,
                 proofs_since_spawn: 0,
+                last_use: None,
             }),
             vram_bytes: None,
             pci_bus_id: None,
@@ -8344,6 +8968,13 @@ impl WorkerPool {
         self.workers
             .get(key)
             .map(|e| e.intentional_kill.load(Ordering::Acquire))
+    }
+
+    /// Set a test worker's GPU tag (e.g. `metal`, whose recycle policy differs; M9).
+    pub fn test_set_gpu_tag(&self, key: &str, tag: &str) {
+        if let Some(mut s) = self.workers.get(key).and_then(|e| e.slot.lock().ok()) {
+            s.gpu_tag = tag.to_string();
+        }
     }
 
     /// Get the external PID (test inspection).
@@ -8467,6 +9098,900 @@ mod tests {
     }
     use super::*;
 
+    // ---- M9 Metal recycle policy ----
+
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+
+    /// The 8 GiB and 4 GiB tiers' configurations (margin `clamp(limit / 4, 1 GiB, 2 GiB)`, the
+    /// allowance capped at 3/4 of the limit).
+    const CFG8: NetConfig = NetConfig {
+        margin: 2 * GIB,
+        allowance_cap: 6 * GIB,
+    };
+    const CFG4: NetConfig = NetConfig {
+        margin: GIB,
+        allowance_cap: 3 * GIB,
+    };
+
+    #[test]
+    fn the_allowance_cap_is_three_quarters_of_the_limit() {
+        assert_eq!(metal_allowance_cap(Some(8 * GIB)), CFG8.allowance_cap);
+        assert_eq!(metal_allowance_cap(Some(4 * GIB)), CFG4.allowance_cap);
+        assert_eq!(metal_allowance_cap(None), 12 * GIB);
+        // It clears the measured 2644 MiB transient at the smallest tier.
+        assert!(metal_allowance_cap(Some(4 * GIB)) > 2_644 * MIB);
+    }
+
+    #[test]
+    fn the_margin_scales_with_the_working_set_limit_and_the_ceiling() {
+        let m = |l: Option<u64>, c: Option<u64>| metal_growth_margin(l, c, None);
+        assert_eq!(m(Some(4 * GIB), None), GIB, "4 GiB tier");
+        assert_eq!(m(Some(8 * GIB), Some(13 * GIB)), 2 * GIB, "16 GB Mac");
+        assert_eq!(m(Some(6 * GIB), None), 3 * GIB / 2);
+        assert_eq!(m(Some(28 * GIB), Some(33 * GIB)), 2 * GIB, "36 GB Mac");
+        assert_eq!(m(Some(2 * GIB), None), GIB, "floor");
+        assert_eq!(m(None, None), 2 * GIB, "unknown limit");
+        // M6's ceiling close above the limit: half the room, never below 512 MiB.
+        assert_eq!(m(Some(8 * GIB), Some(10 * GIB)), GIB);
+        assert_eq!(m(Some(8 * GIB), Some(8 * GIB)), 512 * MIB);
+        // ZKMINER_METAL_RECYCLE_GROWTH_BYTES wins; 0 is off.
+        assert_eq!(metal_growth_margin(Some(4 * GIB), None, Some(0)), 0);
+        assert_eq!(
+            metal_growth_margin(Some(4 * GIB), None, Some(3 * GIB)),
+            3 * GIB
+        );
+    }
+
+    #[test]
+    fn a_reading_is_settled_by_the_time_since_the_last_use() {
+        let ms = Duration::from_millis;
+        assert_eq!(reading_age(Some(ms(5)), UseKind::Proof), ReadingAge::Fresh);
+        assert_eq!(reading_age(Some(ms(50)), UseKind::Proof), ReadingAge::Fresh);
+        assert_eq!(
+            reading_age(Some(ms(51)), UseKind::Proof),
+            ReadingAge::Partial
+        );
+        assert_eq!(
+            reading_age(Some(ms(5)), UseKind::Other),
+            ReadingAge::Partial
+        );
+        assert_eq!(reading_age(None, UseKind::Proof), ReadingAge::Partial);
+        assert_eq!(
+            reading_age(Some(ms(2000)), UseKind::Other),
+            ReadingAge::Settled
+        );
+        assert_eq!(
+            reading_age(Some(ms(1999)), UseKind::Proof),
+            ReadingAge::Partial
+        );
+    }
+
+    /// The settle loop against the measured reclaim shape (8 GiB, proof 2: 4984 MiB, 3630 MiB from
+    /// ~0.3 s, 2341 MiB from ~1.3 s), on a fake clock.
+    #[test]
+    fn the_settle_wait_waits_out_the_reclaim_and_is_bounded() {
+        use std::cell::Cell;
+        let profile = |t: Duration| -> u64 {
+            match t.as_millis() {
+                0..=299 => 4_984 * MIB,
+                300..=1_299 => 3_630 * MIB,
+                _ => 2_341 * MIB,
+            }
+        };
+        let run = |g0: Option<Duration>, pass: Option<u64>, budget: Duration| {
+            let clock = Cell::new(g0.unwrap_or_default());
+            let waited = Cell::new(Duration::ZERO);
+            let s = settle_footprint(
+                || Some(profile(clock.get())),
+                || g0.map(|_| clock.get()),
+                |d| {
+                    clock.set(clock.get() + d);
+                    waited.set(waited.get() + d);
+                },
+                pass,
+                budget,
+            );
+            (s, waited.get())
+        };
+        // A full settle waits until the reclaim time, then for two agreeing readings.
+        let (s, w) = run(Some(Duration::ZERO), None, METAL_IDLE_SETTLE);
+        assert_eq!(s, Some(2_341 * MIB));
+        assert_eq!(w, Duration::from_millis(2_250));
+        // A pass/fail settle stops at the first reading under the line.
+        let (s, w) = run(Some(Duration::ZERO), Some(4_000 * MIB), METAL_IDLE_SETTLE);
+        assert_eq!((s, w), (Some(3_630 * MIB), Duration::from_millis(500)));
+        // A reading already past the reclaim time needs one more agreeing reading.
+        let (s, w) = run(Some(Duration::from_secs(5)), None, METAL_IDLE_SETTLE);
+        assert_eq!((s, w), (Some(2_341 * MIB), Duration::from_millis(250)));
+        // Too little budget to reach the reclaim time: no verdict, never an unsettled reading.
+        let (s, w) = run(Some(Duration::ZERO), None, Duration::from_secs(1));
+        assert_eq!(s, None);
+        assert!(w <= Duration::from_secs(1));
+        // No known last use: the reclaim time counts from the start of the wait.
+        let (s, w) = run(None, None, METAL_IDLE_SETTLE);
+        assert_eq!((s, w), (Some(2_341 * MIB), Duration::from_millis(2_250)));
+        // An unreadable footprint: no verdict.
+        let s = settle_footprint(|| None, || None, |_| {}, None, METAL_IDLE_SETTLE);
+        assert_eq!(s, None);
+    }
+
+    /// How a simulated proof leaves the worker before the next one.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Gap {
+        /// The next proof arrives at once: the whole transient is in the reading.
+        B2b,
+        /// After an idle gap of 3 s: settled.
+        Idle,
+        /// 0.6 s later, mid-reclaim: half the transient left.
+        Mid,
+    }
+
+    /// The measured reclaim shape (M9 note: 8 traces at 4 and 8 GiB, and the 36-proof 4 GiB trace
+    /// of the fix-round-3 review): the whole transient `tr` for up to 300 ms after a proof, about
+    /// half of it until 1.3 s, then the settled level `s`.
+    fn footprint_at(s: u64, tr: u64, t: Duration) -> u64 {
+        match t.as_millis() {
+            0..300 => s + tr,
+            300..1_300 => s + tr / 2,
+            _ => s,
+        }
+    }
+
+    /// The settle wait the dispatcher runs ([`settle_footprint`] with its real budget), on a fake
+    /// clock starting `since` after the proof, over [`footprint_at`]: the result and the time it
+    /// waited.
+    fn fake_settle(s: u64, tr: u64, since: Duration, ask: SettleAsk) -> (Option<u64>, Duration) {
+        use std::cell::Cell;
+        let clock = Cell::new(since);
+        let r = settle_footprint(
+            || Some(footprint_at(s, tr, clock.get())),
+            || Some(clock.get()),
+            |d| clock.set(clock.get() + d),
+            ask.pass_below,
+            METAL_IDLE_SETTLE,
+        );
+        (r, clock.get() - since)
+    }
+
+    /// One simulated worker life.
+    #[derive(Debug)]
+    struct SimRun {
+        /// The proof after which the net recycled the worker.
+        caught: Option<u32>,
+        /// (proof, why, time waited) of every settle wait.
+        waits: Vec<(u32, SettleWhy, Duration)>,
+        /// The net's baseline after the baseline proofs, and the true maximum settled level of
+        /// those proofs.
+        baseline: Option<u64>,
+        true_baseline: u64,
+        /// The first proof whose settled level passes the NET's baseline + margin (the net's
+        /// baseline can sit up to [`METAL_IDLE_TOLERANCE`] under the true one; see
+        /// [`check_baseline`]).
+        first_over: Option<u32>,
+    }
+
+    impl SimRun {
+        fn waited(&self) -> Duration {
+            self.waits.iter().map(|w| w.2).sum()
+        }
+    }
+
+    /// A healthy settled level that rises to a plateau and stays (8 GiB traces: 2341 MiB after
+    /// proof 2, caches growing ~70 MiB a proof to a plateau by the seventh).
+    fn plateau_level(n: u32) -> u64 {
+        2_271 * MIB + 70 * MIB * u64::from(n.min(7))
+    }
+
+    /// The settled level after each proof of the fix-round-3 review's healthy run (4 GiB budget,
+    /// `m9_proofs_in_one_worker`, fibonacci 100000, 36 proofs, read 1.4 s after each; log
+    /// `scratch/w7/W7-M9-review1/healthy4g.log`): the caches grow over five proofs, then the
+    /// level is trimmed by 240-400 MiB about every sixth proof and grows back. No drift.
+    const TRIMMED_TRACE_MIB: [u64; 36] = [
+        1936, 2082, 2214, 2349, 2465, 2475, 2476, 2472, 2474, 2474, 2473, 2191, 2291, 2340, 2374,
+        2416, 2416, 2167, 2214, 2323, 2399, 2424, 2423, 2134, 2229, 2270, 2362, 2417, 2416, 2071,
+        2164, 2269, 2364, 2410, 2410, 2169,
+    ];
+
+    /// [`TRIMMED_TRACE_MIB`], proofs past 36 repeating proofs 12-36.
+    fn trimmed_level(n: u32) -> u64 {
+        let i = if n <= 36 {
+            n as usize - 1
+        } else {
+            11 + (n as usize - 37) % 25
+        };
+        TRIMMED_TRACE_MIB[i] * MIB
+    }
+
+    /// The healthy settled-level shapes every regime runs with.
+    type Level = (&'static str, fn(u32) -> u64);
+    const LEVELS: [Level; 2] = [
+        ("plateau", plateau_level),
+        ("measured trims", trimmed_level),
+    ];
+
+    /// The measured transient (2643-2644 MiB in all 8 traces and the 36-proof one) with +-16 MiB of
+    /// deterministic jitter.
+    fn transient(n: u32) -> u64 {
+        2_628 * MIB + u64::from(n * 7_919 % 33) * MIB
+    }
+
+    /// Drives [`metal_idle_growth`] like the dispatcher would: proof `n` leaves settled level
+    /// `level(n)` and transient `trans(n)`, the next proof's reading is taken as `gap(n)` says, and
+    /// a settle runs the real wait loop on [`fake_settle`].
+    fn simulate(
+        cfg: NetConfig,
+        proofs: u32,
+        gap: impl Fn(u32) -> Gap,
+        level: impl Fn(u32) -> u64,
+        trans: impl Fn(u32) -> u64,
+    ) -> SimRun {
+        let mut t = IdleTrack::default();
+        let mut run = SimRun {
+            caught: None,
+            waits: Vec::new(),
+            baseline: None,
+            true_baseline: (1..=METAL_IDLE_BASELINE_PROOFS).map(&level).max().unwrap(),
+            first_over: None,
+        };
+        for n in 1..=proofs {
+            let (s, tr) = (level(n), trans(n));
+            let since = match gap(n) {
+                Gap::B2b => Duration::from_millis(5),
+                Gap::Idle => Duration::from_secs(3),
+                Gap::Mid => Duration::from_millis(600),
+            };
+            let reading = footprint_at(s, tr, since);
+            let mut asked = None;
+            let v = metal_idle_growth(
+                &mut t,
+                1,
+                n,
+                reading,
+                Some(since),
+                UseKind::Proof,
+                Some(s + tr),
+                cfg,
+                |a| {
+                    let (r, w) = fake_settle(s, tr, since, a);
+                    asked = Some((n, a.why, w));
+                    r
+                },
+            );
+            run.waits.extend(asked);
+            if n == METAL_IDLE_BASELINE_PROOFS {
+                run.baseline = t.baseline;
+            }
+            if n > METAL_IDLE_BASELINE_PROOFS && run.first_over.is_none() {
+                if let Some(b) = run.baseline {
+                    if s > b + cfg.margin {
+                        run.first_over = Some(n);
+                    }
+                }
+            }
+            if v.is_some() {
+                run.caught = Some(n);
+                break;
+            }
+        }
+        run
+    }
+
+    type Regime = (&'static str, fn(u32) -> Gap);
+    const REGIMES: [Regime; 8] = [
+        ("back-to-back", |_| Gap::B2b),
+        ("idle", |_| Gap::Idle),
+        ("mixed: one b2b, then idle", |n| {
+            if n == 11 {
+                Gap::B2b
+            } else {
+                Gap::Idle
+            }
+        }),
+        (
+            "alternating",
+            |n| if n % 2 == 1 { Gap::B2b } else { Gap::Idle },
+        ),
+        ("bursty: 5 b2b, 1 idle", |n| {
+            if n % 6 == 0 {
+                Gap::Idle
+            } else {
+                Gap::B2b
+            }
+        }),
+        ("10 b2b baseline, then idle", |n| {
+            if n <= 10 {
+                Gap::B2b
+            } else {
+                Gap::Idle
+            }
+        }),
+        ("bursty: 3 idle, 7 b2b", |n| {
+            if n % 10 < 3 {
+                Gap::Idle
+            } else {
+                Gap::B2b
+            }
+        }),
+        ("mid-reclaim (0.6 s gaps)", |_| Gap::Mid),
+    ];
+
+    fn check_baseline(name: &str, r: &SimRun) {
+        let b = r.baseline.unwrap_or_else(|| panic!("{name}: no baseline"));
+        assert!(
+            b <= r.true_baseline && r.true_baseline - b <= METAL_IDLE_TOLERANCE,
+            "{name}: baseline {} MiB from settled readings, true {} MiB",
+            b / MIB,
+            r.true_baseline / MIB
+        );
+    }
+
+    /// The most a healthy worker may wait per 500 proofs, after its baseline proofs: 20 s, 1 %
+    /// of 500 proofs of fibonacci 100000 at 4 GiB (~4 s each, the shortest Metal proof the
+    /// dispatcher sees; a memory-merkle-sized proof takes ~16 s).
+    const HEALTHY_WAIT_PER_500: Duration = Duration::from_secs(20);
+
+    /// A healthy worker is never recycled over 500 proofs in any regime, at either tier, on either
+    /// level shape (including the measured cache trims), with or without one huge transient that
+    /// settles back, and waits at most [`HEALTHY_WAIT_PER_500`] after its baseline proofs.
+    #[test]
+    fn the_growth_net_never_recycles_a_healthy_worker() {
+        for (tier, cfg) in [("8 GiB", CFG8), ("4 GiB", CFG4)] {
+            for (level_name, level) in LEVELS {
+                for (name, gap) in REGIMES {
+                    for huge in [false, true] {
+                        let trans = |n: u32| {
+                            if huge && n == 37 {
+                                7 * GIB
+                            } else {
+                                transient(n)
+                            }
+                        };
+                        let r = simulate(cfg, 500, gap, level, trans);
+                        let name = format!(
+                            "{tier} {level_name}, {name}{}",
+                            if huge { " + huge transient" } else { "" }
+                        );
+                        assert_eq!(r.caught, None, "{name}: recycled a healthy worker: {r:?}");
+                        check_baseline(&name, &r);
+                        let after: Duration = r
+                            .waits
+                            .iter()
+                            .filter(|w| w.0 > METAL_IDLE_BASELINE_PROOFS)
+                            .map(|w| w.2)
+                            .sum();
+                        let count = |why| r.waits.iter().filter(|w| w.1 == why).count();
+                        eprintln!(
+                            "M9 sim healthy | {name} | 500 proofs | {} waits, {:.2} s (baseline {} \
+                             {:.2} s; shrank {}, verify {}, over {}) | after the baseline {:.2} s",
+                            r.waits.len(),
+                            r.waited().as_secs_f64(),
+                            count(SettleWhy::Baseline),
+                            r.waits
+                                .iter()
+                                .filter(|w| w.1 == SettleWhy::Baseline)
+                                .map(|w| w.2)
+                                .sum::<Duration>()
+                                .as_secs_f64(),
+                            count(SettleWhy::Shrank),
+                            count(SettleWhy::Verify),
+                            count(SettleWhy::OverLine) + count(SettleWhy::Confirm),
+                            after.as_secs_f64(),
+                        );
+                        assert!(
+                            after <= HEALTHY_WAIT_PER_500,
+                            "{name}: waited {:.2} s after the baseline: {:?}",
+                            after.as_secs_f64(),
+                            r.waits
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Each leak (50, 100, 300 MiB of settled growth per proof from proof 11, or from proof 1, and
+    /// 1.5 and 3 GiB steps at proof 40), on either healthy level shape, is caught at the first proof
+    /// whose settled level passes the baseline + margin (or the next), in every regime, at either
+    /// tier, with at most 2 settle waits for the crossing.
+    #[test]
+    fn the_growth_net_catches_every_leak_at_its_crossing() {
+        type Leak = (&'static str, fn(u32) -> u64);
+        const LEAKS: [Leak; 6] = [
+            ("50 MiB/proof", |n| {
+                50 * MIB * u64::from(n.saturating_sub(10))
+            }),
+            ("100 MiB/proof", |n| {
+                100 * MIB * u64::from(n.saturating_sub(10))
+            }),
+            ("300 MiB/proof", |n| {
+                300 * MIB * u64::from(n.saturating_sub(10))
+            }),
+            ("100 MiB/proof from proof 1", |n| 100 * MIB * u64::from(n)),
+            ("1.5 GiB step at proof 40", |n| {
+                if n >= 40 {
+                    1_536 * MIB
+                } else {
+                    0
+                }
+            }),
+            (
+                "3 GiB step at proof 40",
+                |n| if n >= 40 { 3 * GIB } else { 0 },
+            ),
+        ];
+        for (tier, cfg) in [("8 GiB", CFG8), ("4 GiB", CFG4)] {
+            for (level_name, base) in LEVELS {
+                for (name, gap) in REGIMES {
+                    for (leak_name, leak) in LEAKS {
+                        let level = |n: u32| base(n) + leak(n);
+                        let r = simulate(cfg, 500, gap, level, transient);
+                        let name = format!("{tier} {level_name}, {name}, {leak_name}");
+                        check_baseline(&name, &r);
+                        let Some(first) = r.first_over else {
+                            // A 1.5 GiB step never passes the 8 GiB tier's 2 GiB margin.
+                            assert!(
+                                cfg.margin > 1_536 * MIB && leak_name.starts_with("1.5"),
+                                "{name}"
+                            );
+                            assert_eq!(r.caught, None, "{name}: recycled under the margin");
+                            continue;
+                        };
+                        let caught = r
+                            .caught
+                            .unwrap_or_else(|| panic!("{name}: never caught: {r:?}"));
+                        assert!(
+                            caught >= first && caught <= first + 1,
+                            "{name}: caught at proof {caught}, settled level over the line at \
+                             {first}: {r:?}"
+                        );
+                        let crossing = r
+                            .waits
+                            .iter()
+                            .filter(|(n, why, _)| {
+                                *n >= first
+                                    && matches!(
+                                        why,
+                                        SettleWhy::OverLine
+                                            | SettleWhy::Confirm
+                                            | SettleWhy::Verify
+                                    )
+                            })
+                            .count();
+                        assert!(
+                            crossing <= 2,
+                            "{name}: {crossing} waits for the crossing: {r:?}"
+                        );
+                        eprintln!(
+                            "M9 sim leak | {name} | over the line at {first} | caught at {caught} \
+                             | {} waits, {:.2} s ({crossing} for the crossing)",
+                            r.waits.len(),
+                            r.waited().as_secs_f64()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Transients that change under the net, every regime, both tiers, both level shapes:
+    /// - shrinking 250 MiB a proof to nothing while the worker leaks 50 MiB a proof (the fix-round-1
+    ///   review's case, where the old per-proof comparison caught it at 81 instead of ~31), and
+    ///   100 + 25: caught within 2 proofs of the crossing;
+    /// - turning into retained memory (the transient shrinks by what the settled level gains, so
+    ///   the fresh reading stays flat; 50, 100 and 200 MiB a proof, the last being the review's
+    ///   "200 + 200" case): nothing in a back-to-back reading shows it, so it is caught by the next
+    ///   verification or once the fresh reading rises past the line plus the allowance, within
+    ///   [`METAL_IDLE_VERIFY_EVERY`] + 1 proofs of the crossing (an open issue in the M9 note);
+    /// - alternating between 2644 and 1600 MiB (two job shapes) on a healthy worker: never
+    ///   recycled (its cost is printed: at the 4 GiB tier the smaller transient's estimate sits
+    ///   over the line, so it settles often).
+    #[test]
+    fn the_growth_net_handles_changing_transients() {
+        type Case = (&'static str, fn(u32) -> u64, fn(u32) -> u64, u32);
+        let cases: [Case; 5] = [
+            (
+                "transient -250 MiB/proof, leak 50 MiB/proof",
+                |n| 50 * MIB * u64::from(n.saturating_sub(10)),
+                |n| (2_644 * MIB).saturating_sub(250 * MIB * u64::from(n.saturating_sub(10))),
+                2,
+            ),
+            (
+                "transient -100 MiB/proof, leak 25 MiB/proof",
+                |n| 25 * MIB * u64::from(n.saturating_sub(10)),
+                |n| (2_644 * MIB).saturating_sub(100 * MIB * u64::from(n.saturating_sub(10))),
+                2,
+            ),
+            (
+                "transient into retained memory, 50 MiB/proof",
+                |n| (50 * MIB * u64::from(n.saturating_sub(10))).min(2_644 * MIB),
+                |n| (2_644 * MIB).saturating_sub(50 * MIB * u64::from(n.saturating_sub(10))),
+                METAL_IDLE_VERIFY_EVERY + 1,
+            ),
+            (
+                "transient into retained memory, 200 MiB/proof",
+                |n| (200 * MIB * u64::from(n.saturating_sub(10))).min(2_644 * MIB),
+                |n| (2_644 * MIB).saturating_sub(200 * MIB * u64::from(n.saturating_sub(10))),
+                METAL_IDLE_VERIFY_EVERY + 1,
+            ),
+            (
+                "transient into retained memory, 100 MiB/proof",
+                |n| (100 * MIB * u64::from(n.saturating_sub(10))).min(2_644 * MIB),
+                |n| (2_644 * MIB).saturating_sub(100 * MIB * u64::from(n.saturating_sub(10))),
+                METAL_IDLE_VERIFY_EVERY + 1,
+            ),
+        ];
+        for (tier, cfg) in [("8 GiB", CFG8), ("4 GiB", CFG4)] {
+            for (level_name, base) in LEVELS {
+                for (name, gap) in REGIMES {
+                    for (case, leak, trans, late) in cases {
+                        let r = simulate(cfg, 500, gap, |n| base(n) + leak(n), trans);
+                        let name = format!("{tier} {level_name}, {name}, {case}");
+                        check_baseline(&name, &r);
+                        let first = r.first_over.unwrap_or_else(|| panic!("{name}: {r:?}"));
+                        let caught = r
+                            .caught
+                            .unwrap_or_else(|| panic!("{name}: never caught: {r:?}"));
+                        assert!(
+                            caught >= first && caught <= first + late,
+                            "{name}: caught at {caught}, over the line at {first}: {r:?}"
+                        );
+                        eprintln!(
+                            "M9 sim changing | {name} | over the line at {first} | caught at \
+                             {caught} | {} waits, {:.2} s",
+                            r.waits.len(),
+                            r.waited().as_secs_f64()
+                        );
+                    }
+                    let two_shapes = |n: u32| {
+                        if n.is_multiple_of(2) {
+                            2_644 * MIB
+                        } else {
+                            1_600 * MIB
+                        }
+                    };
+                    let r = simulate(cfg, 500, gap, base, two_shapes);
+                    let name = format!("{tier} {level_name}, {name}, two transient sizes");
+                    assert_eq!(r.caught, None, "{name}: recycled a healthy worker: {r:?}");
+                    check_baseline(&name, &r);
+                    eprintln!(
+                        "M9 sim changing | {name} | healthy | {} waits, {:.2} s",
+                        r.waits.len(),
+                        r.waited().as_secs_f64()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The round-3 finding: after one back-to-back proof, settled readings taken after idle gaps
+    /// between the line and line + allowance were never checked. Now a settled reading is compared
+    /// with the line itself, whatever transient was learned.
+    #[test]
+    fn a_settled_reading_is_compared_with_the_line_whatever_the_allowance() {
+        let mut t = IdleTrack::default();
+        let idle = Some(Duration::from_secs(3));
+        let b2b = Some(Duration::from_millis(5));
+        let never = |_: SettleAsk| -> Option<u64> { panic!("must not settle") };
+        for n in 1..=METAL_IDLE_BASELINE_PROOFS {
+            let r = metal_idle_growth(
+                &mut t,
+                1,
+                n,
+                2_341 * MIB,
+                idle,
+                UseKind::Proof,
+                None,
+                CFG8,
+                never,
+            );
+            assert_eq!(r, None);
+        }
+        assert_eq!(t.baseline, Some(2_341 * MIB));
+        // One back-to-back proof measures the 2.6 GB transient.
+        let r = metal_idle_growth(
+            &mut t,
+            1,
+            11,
+            4_985 * MIB,
+            b2b,
+            UseKind::Proof,
+            None,
+            CFG8,
+            |a| {
+                assert_eq!((a.why, a.pass_below), (SettleWhy::OverLine, None));
+                Some(2_341 * MIB)
+            },
+        );
+        assert_eq!(r, None);
+        assert_eq!(t.allowance, Some(2_644 * MIB));
+        // A settled level 100 MiB past the line, read after an idle gap: confirmed and recycled.
+        let over = 2_341 * MIB + 2 * GIB + 100 * MIB;
+        let r = metal_idle_growth(&mut t, 1, 12, over, idle, UseKind::Proof, None, CFG8, |a| {
+            assert_eq!(a.why, SettleWhy::Confirm);
+            Some(over)
+        });
+        assert_eq!(
+            r,
+            Some(Outgrown {
+                baseline: 2_341 * MIB,
+                settled: over
+            })
+        );
+        // A respawned worker (new pid) starts over: no baseline, no allowance.
+        let r = metal_idle_growth(
+            &mut t,
+            2,
+            1,
+            9 * GIB,
+            idle,
+            UseKind::Proof,
+            None,
+            CFG8,
+            never,
+        );
+        assert_eq!(r, None);
+        assert_eq!(
+            t,
+            IdleTrack {
+                pid: 2,
+                baseline: Some(9 * GIB),
+                ..IdleTrack::default()
+            }
+        );
+        // Margin 0 turns the net off; no time to wait means no verdict and nothing learned.
+        let off = NetConfig { margin: 0, ..CFG8 };
+        assert_eq!(
+            metal_idle_growth(
+                &mut t,
+                2,
+                50,
+                99 * GIB,
+                idle,
+                UseKind::Proof,
+                None,
+                off,
+                never
+            ),
+            None
+        );
+        let before = t.clone();
+        for n in 11..15 {
+            let r = metal_idle_growth(
+                &mut t,
+                2,
+                n,
+                99 * GIB,
+                b2b,
+                UseKind::Proof,
+                None,
+                CFG8,
+                |_| None,
+            );
+            assert_eq!(r, None);
+        }
+        assert_eq!(t, before);
+    }
+
+    /// One huge transient no longer widens the margin for the worker's life: the next normal
+    /// back-to-back reading falls below it, which re-measures the allowance.
+    #[test]
+    fn one_huge_transient_does_not_widen_the_margin() {
+        let mut t = IdleTrack::default();
+        let b2b = Some(Duration::from_millis(5));
+        let s = 2_341 * MIB;
+        for n in 1..=METAL_IDLE_BASELINE_PROOFS {
+            let _ = metal_idle_growth(
+                &mut t,
+                1,
+                n,
+                s,
+                Some(Duration::from_secs(3)),
+                UseKind::Proof,
+                None,
+                CFG8,
+                |_| None,
+            );
+        }
+        let r = metal_idle_growth(
+            &mut t,
+            1,
+            11,
+            s + 7 * GIB,
+            b2b,
+            UseKind::Proof,
+            None,
+            CFG8,
+            |_| Some(s),
+        );
+        // Learned, but capped at 3/4 of the 8 GiB limit.
+        assert_eq!((r, t.allowance), (None, Some(6 * GIB)));
+        let mut why = None;
+        let r = metal_idle_growth(
+            &mut t,
+            1,
+            12,
+            s + 2_644 * MIB,
+            b2b,
+            UseKind::Proof,
+            None,
+            CFG8,
+            |a| {
+                why = Some(a.why);
+                Some(s)
+            },
+        );
+        assert_eq!(
+            (r, why, t.allowance),
+            (None, Some(SettleWhy::Shrank), Some(2_644 * MIB))
+        );
+        // Capped at 3/4 of the working-set limit.
+        let r = metal_idle_growth(
+            &mut t,
+            1,
+            13,
+            s + 20 * GIB,
+            b2b,
+            UseKind::Proof,
+            None,
+            CFG8,
+            |_| Some(s),
+        );
+        assert_eq!((r, t.allowance), (None, Some(6 * GIB)));
+    }
+
+    /// A settled-by-time reading after a proof whose end was read measures the transient without
+    /// a wait; after [`METAL_IDLE_VERIFY_EVERY`] fresh readings judged with it, the next one over
+    /// the line is checked against the line itself (pass/fail), and passing resets the count.
+    #[test]
+    fn the_allowance_is_measured_for_free_and_verified_against_the_line() {
+        let mut t = IdleTrack::default();
+        let s = 2_341 * MIB;
+        let never = |_: SettleAsk| -> Option<u64> { panic!("must not settle") };
+        for n in 1..=METAL_IDLE_BASELINE_PROOFS + 1 {
+            let r = metal_idle_growth(
+                &mut t,
+                1,
+                n,
+                s,
+                Some(Duration::from_secs(3)),
+                UseKind::Proof,
+                Some(s + 2_644 * MIB),
+                CFG4,
+                never,
+            );
+            assert_eq!(r, None);
+        }
+        assert_eq!(
+            (t.allowance, t.anchor),
+            (Some(2_644 * MIB), s + 2_644 * MIB)
+        );
+        let b2b = Some(Duration::from_millis(5));
+        let fresh = s + 2_644 * MIB;
+        for n in 0..METAL_IDLE_VERIFY_EVERY {
+            let r = metal_idle_growth(
+                &mut t,
+                1,
+                12 + n,
+                fresh,
+                b2b,
+                UseKind::Proof,
+                None,
+                CFG4,
+                never,
+            );
+            assert_eq!(r, None);
+        }
+        let mut asked = None;
+        let r = metal_idle_growth(
+            &mut t,
+            1,
+            12 + METAL_IDLE_VERIFY_EVERY,
+            fresh,
+            b2b,
+            UseKind::Proof,
+            None,
+            CFG4,
+            |a| {
+                asked = Some(a);
+                Some(s)
+            },
+        );
+        assert_eq!(r, None);
+        assert_eq!(
+            asked,
+            Some(SettleAsk {
+                why: SettleWhy::Verify,
+                pass_below: Some(s + GIB)
+            })
+        );
+        assert_eq!((t.relied, t.allowance), (0, Some(2_644 * MIB)));
+    }
+
+    /// A reading right after a benchmark or a measurement is never judged with the allowance (it
+    /// was measured on proofs): over the line, it is settled first.
+    #[test]
+    fn the_allowance_applies_only_right_after_a_proof() {
+        let mut t = IdleTrack::default();
+        let b2b = Some(Duration::from_millis(5));
+        let s = 2_341 * MIB;
+        for n in 1..=METAL_IDLE_BASELINE_PROOFS {
+            let _ = metal_idle_growth(
+                &mut t,
+                1,
+                n,
+                s,
+                Some(Duration::from_secs(3)),
+                UseKind::Proof,
+                None,
+                CFG8,
+                |_| None,
+            );
+        }
+        let _ = metal_idle_growth(
+            &mut t,
+            1,
+            11,
+            s + 2_644 * MIB,
+            b2b,
+            UseKind::Proof,
+            None,
+            CFG8,
+            |_| Some(s),
+        );
+        let over = s + 2 * GIB + 10 * MIB;
+        let mut asked = None;
+        let r = metal_idle_growth(
+            &mut t,
+            1,
+            12,
+            over + 2_644 * MIB,
+            b2b,
+            UseKind::Other,
+            None,
+            CFG8,
+            |a| {
+                asked = Some(a);
+                Some(over)
+            },
+        );
+        assert_eq!(
+            asked,
+            Some(SettleAsk {
+                why: SettleWhy::OverLine,
+                pass_below: Some(s + 2 * GIB)
+            })
+        );
+        assert_eq!(
+            r,
+            Some(Outgrown {
+                baseline: s,
+                settled: over
+            })
+        );
+    }
+
+    #[test]
+    fn only_metal_slots_get_the_long_recycle_count() {
+        if std::env::var_os("ZKMINER_RECYCLE_AFTER_PROOFS").is_some()
+            || std::env::var_os("ZKMINER_METAL_RECYCLE_AFTER_PROOFS").is_some()
+        {
+            return;
+        }
+        assert_eq!(
+            recycle_after_proofs_for("cuda"),
+            DEFAULT_RECYCLE_AFTER_PROOFS
+        );
+        assert_eq!(
+            recycle_after_proofs_for("rocm"),
+            DEFAULT_RECYCLE_AFTER_PROOFS
+        );
+        assert_eq!(
+            recycle_after_proofs_for("metal"),
+            METAL_RECYCLE_AFTER_PROOFS
+        );
+    }
+
     // ---- slot_key tests ----
 
     #[test]
@@ -8530,6 +10055,7 @@ mod tests {
                         last_failure: None,
                         declined: None,
                         proofs_since_spawn: 0,
+                        last_use: None,
                     }),
                     vram_bytes: None,
                     pci_bus_id: None,
@@ -10589,6 +12115,7 @@ mod tests {
             last_failure: last_failure_ago.map(|d| Instant::now() - d),
             declined: None,
             proofs_since_spawn: 0,
+            last_use: None,
         }
     }
 
@@ -10714,6 +12241,7 @@ mod tests {
             last_failure: Some(Instant::now()),
             declined: None,
             proofs_since_spawn: 0,
+            last_use: None,
         };
         let result = WorkerPool::respawn(&mut slot);
         assert!(result.is_err());
@@ -10739,6 +12267,7 @@ mod tests {
             last_failure: Some(Instant::now()), // just failed
             declined: None,
             proofs_since_spawn: 0,
+            last_use: None,
         };
         // With consecutive_failures=1, backoff is RESPAWN_BACKOFF[1] = 5s.
         // Since last_failure is ~now, respawn should be rejected.
@@ -10763,6 +12292,7 @@ mod tests {
             last_failure: None,
             declined: None,
             proofs_since_spawn: 0,
+            last_use: None,
         };
         let result = WorkerPool::respawn(&mut slot);
         assert!(result.is_err());
@@ -10791,6 +12321,7 @@ mod tests {
             last_failure: None,
             declined: None,
             proofs_since_spawn: 0,
+            last_use: None,
         };
         let result = pool.ensure_alive(&mut slot, &pid);
         assert!(result.is_err());
@@ -10820,6 +12351,7 @@ mod tests {
             last_failure: None,
             declined: None,
             proofs_since_spawn: 0,
+            last_use: None,
         };
         let result = pool.ensure_alive(&mut slot, &pid);
         assert!(result.is_err());
@@ -10943,6 +12475,7 @@ mod declined_backend_tests {
             last_failure: Some(Instant::now()),
             declined: declined.map(str::to_string),
             proofs_since_spawn: 0,
+            last_use: None,
         }
     }
 
@@ -11105,6 +12638,7 @@ impl WorkerSlot {
             last_failure: self.last_failure,
             declined: self.declined.clone(),
             proofs_since_spawn: self.proofs_since_spawn,
+            last_use: self.last_use,
         }
     }
 }
@@ -11140,6 +12674,7 @@ mod bus_id_locking_tests {
                     last_failure: None,
                     declined: None,
                     proofs_since_spawn: 0,
+                    last_use: None,
                 }),
                 vram_bytes: None,
                 pci_bus_id: bus.map(|b| b.to_string()),

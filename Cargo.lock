@@ -10079,6 +10079,7 @@ dependencies = [
  "libc",
  "liblzma",
  "metal",
+ "rayon",
  "reqwest",
  "risc0-build",
  "risc0-circuit-keccak",
@@ -10094,6 +10095,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber 0.3.22",
+ "zkminer-prover",
  "zkminer-prover-protocol",
 ]
 

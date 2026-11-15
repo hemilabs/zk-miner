@@ -842,3 +842,43 @@ fn a_normal_measurement_leaves_no_inflight_registration() {
     );
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
 }
+
+// ---- M9: the Metal recycle policy ----
+
+/// A worker is recycled after 20 proofs, but a Metal one is kept (its warm state is worth keeping,
+/// and its idle footprint does not grow; M9 note): 25 proofs on each, one pid for the Metal slot.
+#[test]
+fn a_metal_worker_outlives_the_20_proof_recycle() {
+    if std::env::var_os("ZKMINER_RECYCLE_AFTER_PROOFS").is_some()
+        || std::env::var_os("ZKMINER_METAL_RECYCLE_AFTER_PROOFS").is_some()
+    {
+        return;
+    }
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    let mut metal = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    metal
+        .insert_test_worker("mock:metal", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    metal.test_set_gpu_tag("mock:metal", "metal");
+    let (generic_pid, metal_pid) = (pool.test_pid("mock:generic"), metal.test_pid("mock:metal"));
+    for i in 0..25 {
+        pool.prove("mock", &[], &[], None, Some(Duration::from_secs(10)), None)
+            .unwrap_or_else(|e| panic!("generic proof {i}: {e:#}"));
+        metal
+            .prove("mock", &[], &[], None, Some(Duration::from_secs(10)), None)
+            .unwrap_or_else(|e| panic!("metal proof {i}: {e:#}"));
+    }
+    assert_ne!(
+        pool.test_pid("mock:generic"),
+        generic_pid,
+        "recycled after 20 proofs"
+    );
+    assert_eq!(
+        metal.test_pid("mock:metal"),
+        metal_pid,
+        "kept past 20 proofs"
+    );
+    assert_eq!(metal.test_consecutive_failures("mock:metal"), Some(0));
+}
