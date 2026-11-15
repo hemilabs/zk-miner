@@ -16,6 +16,8 @@ mod metal_host;
 #[allow(dead_code)]
 #[path = "../../zkminer-prover/src/metal_sizing.rs"]
 mod metal_sizing;
+#[cfg(feature = "metal")]
+mod metal_start;
 // `mac_footprint`: inline at the end of this file.
 #[cfg(all(feature = "metal", not(target_os = "macos")))]
 compile_error!("feature `metal` builds the Apple Silicon worker: build it on macOS (aarch64-apple-darwin)");
@@ -71,7 +73,39 @@ fn use_shipped_level_zero_driver() {
     std::env::set_var("ZE_ENABLE_ALT_DRIVERS", driver);
 }
 
+/// Test only (cargo feature `testing`, never in a release build's defaults): a worker that leaks
+/// `ZKMINER_TEST_LEAK_MIB_PER_PROOF` MiB of touched host memory after every successful proof, so
+/// `tests/metal_worker.rs` can drive the dispatcher's memory-growth recycle net (M9) against a real
+/// leaking Metal worker.
+#[cfg(feature = "testing")]
+mod test_leak {
+    pub(crate) const ENV: &str = "ZKMINER_TEST_LEAK_MIB_PER_PROOF";
+
+    pub(crate) fn after_proof() {
+        static LEAKED: std::sync::Mutex<Vec<Box<[u8]>>> = std::sync::Mutex::new(Vec::new());
+        let Some(mib) = std::env::var(ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&m| m > 0)
+        else {
+            return;
+        };
+        // Written, not just allocated: untouched pages are not in the footprint.
+        let block = vec![0xA5u8; mib << 20].into_boxed_slice();
+        let mut leaked = LEAKED.lock().unwrap_or_else(|e| e.into_inner());
+        leaked.push(block);
+        tracing::warn!(
+            "testing: leaked {mib} MiB after this proof ({} MiB in all, {ENV})",
+            leaked.len() * mib
+        );
+    }
+}
+
 fn main() {
+    // M9: proving threads at user-initiated QoS, and out of the Darwin background policy if started
+    // under it. First of all, so rayon's global pool is built with it before anything uses it.
+    #[cfg(feature = "metal")]
+    let qos = metal_start::apply_proving_qos();
     #[cfg(feature = "intel")]
     use_shipped_level_zero_driver();
     // M8: drop the segment prover before recursion on every proof unless the operator chose a
@@ -89,6 +123,8 @@ fn main() {
                     .unwrap_or_else(|_| "info".into()),
             )
             .init();
+        #[cfg(feature = "metal")]
+        metal_start::log_qos(&qos);
         if let Some(refusal) = gpu_refusal() {
             eprintln!("{refusal}");
             std::process::exit(2);
@@ -114,7 +150,14 @@ fn main() {
                 metal_host::working_set_limit().unwrap_or(0) as f64 / (1u64 << 30) as f64,
                 default_job_po2(),
             );
-            eprintln!("{}", metal_host::warm_up_pipelines());
+            let power = metal_start::log_power_state("benchmark start");
+            eprintln!("Power state: {}", power.describe());
+            if let Some(why) = power.reduced() {
+                eprintln!("WARNING: {why}: these results are below this Mac's full proving speed");
+            }
+            // Pipelines, then the first job's warm state (M9), so the first program is measured
+            // at the speed every later job runs at.
+            eprintln!("{}", metal_start::prewarm_first_job(default_job_po2()));
         }
         let results = run_benchmarks();
         for r in &results {
@@ -203,8 +246,16 @@ fn main() {
     // of this process does not wait ~3-5 s for it (M7). Not on an unsupported Mac, and not in a
     // measure-only worker, which never wraps.
     #[cfg(feature = "metal")]
-    if gpu_refusal().is_none() && !measure_only_worker() {
-        metal_host::start_groth16_graph_preload("worker start");
+    {
+        metal_start::log_qos(&qos);
+        if gpu_refusal().is_none() && !measure_only_worker() {
+            metal_host::start_groth16_graph_preload("worker start");
+            metal_start::log_power_state("worker start");
+            // M9: the pipelines, this Mac's specialized eval pipeline and identity_p254's ctrl
+            // group, in the background, so the first job (a respawned worker gets no Warmup)
+            // runs at warm speed.
+            metal_start::start_first_job_prewarm(default_job_po2());
+        }
     }
 
     if let Err(e) = run_worker_loop(ipc_stdout) {
@@ -268,7 +319,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     Vec::new()
                 } else {
                     #[cfg(feature = "metal")]
-                    metal_host::warm_up_pipelines();
+                    {
+                        metal_start::log_power_state("benchmark");
+                        metal_start::prewarm_first_job(default_job_po2());
+                    }
                     run_benchmarks_streaming(&mut stdout)?
                 };
                 let resp = WorkerResponse::BenchmarkResult { results };
@@ -315,6 +369,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 }));
                 match outcome {
                     Ok(Ok((journal, seal, duration_secs, cycles))) => {
+                        #[cfg(feature = "testing")]
+                        test_leak::after_proof();
                         let resp = WorkerResponse::ProofResult {
                             request_id,
                             journal,
@@ -2059,7 +2115,7 @@ fn warm_up() -> Result<String> {
     }
     // A no-op if worker start already began it; starts it if this call just installed the component.
     metal_host::start_groth16_graph_preload("warm-up");
-    let pipelines = metal_host::warm_up_pipelines();
+    let pipelines = metal_start::prewarm_first_job(default_job_po2());
     let start = Instant::now();
     let env = risc0_zkvm::ExecutorEnv::builder()
         .write_slice(&1000u32.to_le_bytes())

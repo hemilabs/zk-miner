@@ -2,7 +2,15 @@
 //! (pipelines + one verified Groth16 proof), one Prove, Shutdown. Needs an Apple Silicon Mac and the
 //! `risc0-groth16` component (Warmup installs it), so it is ignored by default:
 //!
-//!   cargo test --release -p zkminer-prove-risc0 --features metal --test metal_worker -- --ignored --nocapture
+//!   cargo test --release -p zkminer-prove-risc0 --features metal --test metal_worker --no-run
+//!   gpu-run --tag <who> -- <that test binary> --ignored --nocapture --test-threads=1
+//!
+//! MEMORY: each test spawns a full Metal worker that sizes itself to the whole GPU budget and peaks
+//! at ~13-14 GB of footprint; risc0's GPU lock only serializes within one process. Three at once
+//! would exceed a 36 GB Mac's RAM (the kernel-panic pattern seen during the port). So every GPU
+//! test here takes [`GPU_TEST_LOCK`] for its whole run (one worker at a time even under the default
+//! parallel harness), the doc lines pass `--test-threads=1` as well, and the run belongs under the
+//! exclusive (heavy) `gpu-run` lock so no other agent's prover overlaps it.
 #![cfg(feature = "metal")]
 
 use std::io::{BufReader, BufWriter, Write};
@@ -11,9 +19,18 @@ use std::time::Instant;
 
 use zkminer_prover_protocol::{read_message, write_message, WorkerCommand, WorkerResponse};
 
+/// Held by every GPU test for its whole run: at most one Metal worker alive per test process.
+static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    // A failed test poisons the lock; the next one may still run on its own.
+    GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 #[ignore = "proves on the Apple GPU; run with --ignored"]
 fn the_metal_worker_warms_up_and_proves_over_ipc() {
+    let _gpu = gpu_test_lock();
     let mut child = Command::new(env!("CARGO_BIN_EXE_zkminer-prove-risc0-metal"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -95,10 +112,11 @@ fn the_metal_worker_warms_up_and_proves_over_ipc() {
 /// (default 400000 fibonacci iterations, a few million cycles) and `ZKMINER_M7_IDLE_MS` lets the
 /// worker sit idle that long before the Prove arrives, as a worker waiting for its first job does.
 ///
-///   cargo test --release -p zkminer-prove-risc0 --features metal --test metal_worker -- --ignored --nocapture a_first_prove
+///   cargo test --release -p zkminer-prove-risc0 --features metal --test metal_worker -- --ignored --nocapture --test-threads=1 a_first_prove
 #[test]
 #[ignore = "proves on the Apple GPU; run with --ignored"]
 fn a_first_prove_without_warmup_proves() {
+    let _gpu = gpu_test_lock();
     let worker = std::env::var("ZKMINER_M7_WORKER")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_zkminer-prove-risc0-metal").to_string());
     let iters: u32 = std::env::var("ZKMINER_M7_FIB_ITERS")
@@ -163,4 +181,292 @@ fn a_first_prove_without_warmup_proves() {
     write_message(&mut to, &WorkerCommand::Shutdown).unwrap();
     to.flush().unwrap();
     assert!(child.wait().unwrap().success());
+}
+
+/// `phys_footprint` (now, lifetime peak) of a child process, in bytes.
+fn footprint(pid: u32) -> Option<(u64, u64)> {
+    // SAFETY: plain old data; `proc_pid_rusage` fills at most one `rusage_info_v4`.
+    let mut ri: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid as libc::c_int,
+            libc::RUSAGE_INFO_V4,
+            (&mut ri as *mut libc::rusage_info_v4).cast(),
+        )
+    };
+    (rc == 0).then_some((ri.ri_phys_footprint, ri.ri_lifetime_max_phys_footprint))
+}
+
+/// M9: many Proves in one worker process, as the dispatcher sends them between recycles. Prints
+/// each proof's wall time and the worker's idle footprint after it, which is what the Metal
+/// recycle policy (and its memory-growth safety net) is sized from. `ZKMINER_M9_WORKER` runs another
+/// worker binary, `ZKMINER_M9_PROOFS` (default 10) and `ZKMINER_M9_FIB_ITERS` (default 400000) size
+/// the run, `ZKMINER_M9_WARMUP=1` sends a Warmup first and `ZKMINER_M9_IDLE_MS` waits that long
+/// after the worker starts (or after the Warmup) before the first Prove. `ZKMINER_M9_GAP_MS` waits
+/// between proofs. `ZKMINER_M9_HOLD_MS` keeps the worker alive and idle that long after the last proof, for `footprint -p <pid>`.
+///
+///   cargo test --release -p zkminer-prove-risc0 --features metal --test metal_worker -- --ignored --nocapture --test-threads=1 m9_proofs
+#[test]
+#[ignore = "proves on the Apple GPU; run with --ignored"]
+fn m9_proofs_in_one_worker() {
+    let _gpu = gpu_test_lock();
+    let env_num = |k: &str, d: u64| -> u64 {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let worker = std::env::var("ZKMINER_M9_WORKER")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_zkminer-prove-risc0-metal").to_string());
+    let proofs = env_num("ZKMINER_M9_PROOFS", 10);
+    let iters = env_num("ZKMINER_M9_FIB_ITERS", 400_000) as u32;
+    let dir = tempfile::tempdir().unwrap();
+    let guest = dir.path().join("fibonacci.elf");
+    let out = Command::new(&worker)
+        .arg("--export-guest")
+        .arg("fibonacci")
+        .arg(&guest)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let elf = std::fs::read(&guest).unwrap();
+
+    let started = Instant::now();
+    let mut child = Command::new(&worker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn the worker");
+    let pid = child.id();
+    let mut to = BufWriter::new(child.stdin.take().unwrap());
+    let mut from = BufReader::new(child.stdout.take().unwrap());
+    let mut ask = |cmd: &WorkerCommand| -> WorkerResponse {
+        write_message(&mut to, cmd).unwrap();
+        to.flush().unwrap();
+        loop {
+            match read_message(&mut from).unwrap() {
+                WorkerResponse::Progress { .. } => continue,
+                other => return other,
+            }
+        }
+    };
+    let mib = |b: u64| b >> 20;
+    if std::env::var("ZKMINER_M9_WARMUP").is_ok_and(|v| v == "1") {
+        let t = Instant::now();
+        match ask(&WorkerCommand::Warmup { request_id: 1 }) {
+            WorkerResponse::WarmupDone { summary, .. } => {
+                eprintln!("M9 warm-up {:.2} s: {summary}", t.elapsed().as_secs_f64())
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let idle = env_num("ZKMINER_M9_IDLE_MS", 0);
+    if idle > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(idle));
+    }
+    if let Some((now, peak)) = footprint(pid) {
+        eprintln!(
+            "M9 before proof 1: footprint {} MiB, lifetime peak {} MiB ({:.2} s after spawn)",
+            mib(now),
+            mib(peak),
+            started.elapsed().as_secs_f64()
+        );
+    }
+    let gap = env_num("ZKMINER_M9_GAP_MS", 0);
+    for i in 1..=proofs {
+        if i > 1 && gap > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(gap));
+        }
+        let t = Instant::now();
+        match ask(&WorkerCommand::Prove {
+            request_id: 100 + i,
+            elf: elf.clone(),
+            input_data: iters.to_le_bytes().to_vec(),
+            po2: None,
+            program_id: None,
+        }) {
+            WorkerResponse::ProofResult { seal, cycles, .. } => {
+                assert!(!seal.is_empty());
+                let wall = t.elapsed().as_secs_f64();
+                let (now, peak) = footprint(pid).unwrap_or_default();
+                eprintln!(
+                    "M9 proof {i}: {cycles} cycles, {wall:.3} s, idle footprint {} MiB, lifetime \
+                     peak {} MiB",
+                    mib(now),
+                    mib(peak)
+                );
+                // The reclaim profile the growth net's settle constants are sized from: the idle
+                // footprint every 20 ms for `ZKMINER_M9_TRACE_MS` after the proof.
+                let trace = env_num("ZKMINER_M9_TRACE_MS", 0);
+                if trace > 0 {
+                    let t0 = Instant::now();
+                    let mut line = String::new();
+                    let mut last = u64::MAX;
+                    while t0.elapsed().as_millis() < trace as u128 {
+                        let (cur, _) = footprint(pid).unwrap_or_default();
+                        if mib(cur) != last {
+                            line += &format!(" {}ms:{}", t0.elapsed().as_millis(), mib(cur));
+                            last = mib(cur);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    eprintln!("M9 trace after proof {i} (MiB):{line}");
+                }
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    // Lets `footprint -p <pid>` look at the idle worker.
+    let hold = env_num("ZKMINER_M9_HOLD_MS", 0);
+    if hold > 0 {
+        eprintln!("M9 holding the idle worker (pid {pid}) for {hold} ms");
+        std::thread::sleep(std::time::Duration::from_millis(hold));
+    }
+    write_message(&mut to, &WorkerCommand::Shutdown).unwrap();
+    to.flush().unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+/// M9's memory-growth net against a REAL leaking Metal worker, driven by the dispatcher: the
+/// worker (built with the test-only `testing` feature) leaks `ZKMINER_M9_LEAK_MIB` (default 128)
+/// MiB of host memory per proof, at a 4 GiB working-set budget (margin `clamp(4 GiB / 4, 1 GiB,
+/// 2 GiB)` = 1 GiB), with the proofs arriving back to back, after a 2.5 s idle gap and 0.6 s
+/// after the previous one (mid-reclaim), in turn. The dispatcher must recycle the worker
+/// gracefully (every proof succeeds, no failure counted, one respawn) near the predicted proof.
+/// The baseline is the maximum settled level of the first 10 proofs (up to the net's 256 MiB
+/// tolerance below it), so the settled level passes baseline + margin about margin / g proofs
+/// after proof 10, where g is the settled growth per proof. g is measured here from the settled
+/// readings after the idle gaps: the leak plus the caches' own growth (~45 MiB a proof beyond a
+/// 128 MiB leak in the fix-round-3 runs), so a prediction from the leak alone came out 3 late.
+///
+///   cargo test --release -p zkminer-prove-risc0 --features metal,testing --test metal_worker --no-run
+///   gpu-run --tag <who> --budget 4G -- <that test binary> --ignored --nocapture --test-threads=1 a_leaking
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "proves on the Apple GPU; run with --ignored"]
+fn a_leaking_metal_worker_is_recycled_by_the_dispatcher() {
+    use std::collections::HashMap;
+    use std::time::Duration;
+    let _gpu = gpu_test_lock();
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .try_init();
+    let env_num = |k: &str, d: u64| -> u64 {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let leak_mib = env_num("ZKMINER_M9_LEAK_MIB", 128);
+    let iters = env_num("ZKMINER_M9_FIB_ITERS", 100_000) as u32;
+    let worker = env!("CARGO_BIN_EXE_zkminer-prove-risc0-metal");
+    let dir = tempfile::tempdir().unwrap();
+    let guest = dir.path().join("fibonacci.elf");
+    let out = Command::new(worker)
+        .arg("--export-guest")
+        .arg("fibonacci")
+        .arg(&guest)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let elf = std::fs::read(&guest).unwrap();
+
+    const GIB: u64 = 1 << 30;
+    let budget = 4 * GIB;
+    let margin_mib: u64 = 1024;
+    let mut env = HashMap::new();
+    env.insert(
+        "RISC0_METAL_MAX_WORKING_SET_BYTES".to_string(),
+        budget.to_string(),
+    );
+    env.insert(
+        "ZKMINER_TEST_LEAK_MIB_PER_PROOF".to_string(),
+        leak_mib.to_string(),
+    );
+    let key = "risc0:metal";
+    let mut pool = zkminer_prover::dispatcher::WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker(key, "risc0", worker.into(), env)
+        .expect("spawn the Metal worker");
+    pool.test_set_gpu_tag(key, "metal");
+    let first_pid = pool.test_pid(key).unwrap();
+    let predicted = 10 + margin_mib.div_ceil(leak_mib) as u32;
+    let gap = |i: u32| match i % 4 {
+        0 => Duration::from_millis(2_500),
+        2 => Duration::from_millis(600),
+        _ => Duration::ZERO,
+    };
+    let mib = |b: u64| b >> 20;
+    let mut recycled_after = None;
+    // (completed proofs, settled MiB) of the first worker, read after each idle gap.
+    let mut settled: Vec<(u32, u64)> = Vec::new();
+    let started = Instant::now();
+    for i in 1..=predicted + 8 {
+        std::thread::sleep(gap(i));
+        let pid_before = pool.test_pid(key).unwrap();
+        let fp_before = footprint(pid_before).map_or(0, |f| mib(f.0));
+        if gap(i) >= Duration::from_secs(2) && pid_before == first_pid && i > 1 {
+            settled.push((i - 1, fp_before));
+        }
+        let t = Instant::now();
+        let proof = pool
+            .prove(
+                "risc0",
+                &elf,
+                &iters.to_le_bytes(),
+                None,
+                Some(Duration::from_secs(300)),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("proof {i}: {e:#}"));
+        assert!(!proof.seal.is_empty(), "proof {i}: empty seal");
+        let pid = pool.test_pid(key).unwrap();
+        eprintln!(
+            "M9 leak proof {i}: {:.2} s after a {:?} gap, pid {pid}, footprint before {fp_before} MiB, \
+             after {} MiB ({:.0} s in)",
+            t.elapsed().as_secs_f64(),
+            gap(i),
+            footprint(pid).map_or(0, |f| mib(f.0)),
+            started.elapsed().as_secs_f64()
+        );
+        if pid != first_pid && recycled_after.is_none() {
+            // Recycled before proof i: after i - 1 completed proofs.
+            recycled_after = Some(i - 1);
+        }
+        if recycled_after.is_some_and(|n| i >= n + 2) {
+            break;
+        }
+    }
+    let n = recycled_after.unwrap_or_else(|| {
+        panic!(
+            "not recycled within {} proofs (predicted {predicted})",
+            predicted + 8
+        )
+    });
+    // The settled growth per proof, from the first and last idle-gap readings of the first worker.
+    let (&(n0, s0), &(n1, s1)) = (settled.first().unwrap(), settled.last().unwrap());
+    assert!(n1 > n0, "too few settled readings: {settled:?}");
+    let g = (s1.saturating_sub(s0) as f64 / f64::from(n1 - n0)).max(1.0);
+    assert!(
+        g >= 0.9 * leak_mib as f64,
+        "settled growth {g:.0} MiB/proof, below the {leak_mib} MiB/proof leak: {settled:?}"
+    );
+    let earliest = 10 + ((margin_mib - 256) as f64 / g).floor() as u32 - 1;
+    let latest = 10 + (margin_mib as f64 / g).ceil() as u32 + 2;
+    eprintln!(
+        "M9 leak: recycled after {n} proofs; settled growth {g:.0} MiB/proof {settled:?}, \
+         predicted {earliest}..={latest} ({leak_mib} MiB/proof leak alone: {predicted})"
+    );
+    assert!(
+        (earliest..=latest).contains(&n),
+        "recycled after {n} proofs, predicted {earliest}..={latest}"
+    );
+    assert_eq!(
+        pool.test_consecutive_failures(key),
+        Some(0),
+        "a graceful recycle"
+    );
 }

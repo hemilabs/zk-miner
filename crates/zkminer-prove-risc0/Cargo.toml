@@ -56,8 +56,13 @@ metal = [
     "dep:risc0-groth16-sys",
     "risc0-groth16-sys/metal",
     "dep:metal",
+    "dep:rayon",
 ]
 cpu = []
+# Test only: the worker leaks `ZKMINER_TEST_LEAK_MIB_PER_PROOF` MiB per proof (`main.rs`,
+# `test_leak`), for the real-worker growth-net test in `tests/metal_worker.rs`. Never in a release
+# build's defaults.
+testing = []
 
 [dependencies]
 zkminer-prover-protocol = { workspace = true }
@@ -88,6 +93,9 @@ risc0-zkp = { version = "3.0", optional = true }
 risc0-circuit-rv32im = { version = "4.0", optional = true }
 risc0-circuit-recursion = { version = "4.0", optional = true }
 risc0-groth16-sys = { version = "0.1", optional = true }
+# Metal only: the worker builds rayon's global pool (risc0's CPU work) with user-initiated QoS
+# threads (M9, `metal_start::apply_proving_qos`). The same rayon as risc0's, so it is that pool.
+rayon = { version = "1", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.29", optional = true }
@@ -111,6 +119,9 @@ methods = [
 
 [dev-dependencies]
 tempfile = "3"
+# The dispatcher (with its test hooks), so `tests/metal_worker.rs` can drive a real Metal worker
+# through it (M9's growth-net test).
+zkminer-prover = { workspace = true, features = ["testing"] }
 
 [build-dependencies]
 risc0-build = "3.0"
