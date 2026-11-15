@@ -269,6 +269,20 @@ impl PowerState {
         (!why.is_empty()).then(|| why.join(", "))
     }
 
+    /// The protocol's form of this reading (`BenchmarkEntry::power_state`, v12).
+    pub fn to_bench(&self) -> zkminer_prover_protocol::BenchPowerState {
+        zkminer_prover_protocol::BenchPowerState {
+            low_power_mode: self.low_power_mode,
+            on_battery: self.on_battery,
+            thermal: self.thermal.map(|t| match t {
+                Thermal::Nominal => 0,
+                Thermal::Fair => 1,
+                Thermal::Serious => 2,
+                Thermal::Critical => 3,
+            }),
+        }
+    }
+
     /// One line for logs and the benchmark's device line.
     pub fn describe(&self) -> String {
         let b = |v: Option<bool>| match v {
@@ -378,6 +392,109 @@ pub fn log_power_state(at: &str) -> PowerState {
     p
 }
 
+// ---- W7-M11: packaged offline (AOT) Metal binary archives ----
+
+/// Revert knob for [`apply_packaged_aot_dir`]: `0`, `off` or `false` leaves `RISC0_METAL_AOT_DIR` as
+/// the worker was started with (unset: no offline archives).
+pub const AOT_ENV: &str = "ZKMINER_METAL_AOT";
+
+/// The directory beside the installed worker that the installer copies risc0 W7-Z1's offline
+/// archives into (`make -f Makefile.mac mac-install-worker AOT_SRC=...`,
+/// `scripts/mac/install-metal-aot.sh`): `~/.zkminer/provers/metal-aot`.
+pub const AOT_DIR_NAME: &str = "metal-aot";
+
+/// risc0's variable for the offline archive directory (`risc0_zkp::hal::metal::archive::AOT_DIR_ENV`).
+pub const RISC0_AOT_DIR_ENV: &str = "RISC0_METAL_AOT_DIR";
+
+/// What [`apply_packaged_aot_dir`] decided, for the start-up log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AotDecision {
+    /// `RISC0_METAL_AOT_DIR` was set to the packaged directory.
+    Set(std::path::PathBuf),
+    /// The operator set `RISC0_METAL_AOT_DIR` already: left alone.
+    Operator(std::ffi::OsString),
+    /// [`AOT_ENV`] is off.
+    Off,
+    /// No packaged directory with archives beside the worker.
+    Absent,
+}
+
+/// The packaged directory for a worker at `exe`, when it holds at least one `.binarchive`.
+pub fn packaged_aot_dir(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = exe.parent()?.join(AOT_DIR_NAME);
+    let has_archive = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .any(|e| e.path().extension().is_some_and(|x| x == "binarchive"));
+    has_archive.then_some(dir)
+}
+
+/// [`apply_packaged_aot_dir`]'s decision as a pure function of its inputs.
+pub fn aot_decision(
+    knob: Option<&str>,
+    current: Option<std::ffi::OsString>,
+    packaged: Option<std::path::PathBuf>,
+) -> AotDecision {
+    if knob.is_some_and(value_is_off) {
+        return AotDecision::Off;
+    }
+    if let Some(cur) = current.filter(|c| !c.is_empty()) {
+        return AotDecision::Operator(cur);
+    }
+    match packaged {
+        Some(dir) => AotDecision::Set(dir),
+        None => AotDecision::Absent,
+    }
+}
+
+/// W7-M11: when the installer packaged risc0 W7-Z1's offline archives beside this binary
+/// ([`AOT_DIR_NAME`]), points `RISC0_METAL_AOT_DIR` at them, so a first install (cold OS shader
+/// cache, no runtime archives) loads its pipelines from them instead of compiling them (65-85 s,
+/// BASELINES 6.2). On a warm start risc0 opens the offline file only after its runtime archive
+/// misses (W7-Z1), so keeping it set costs nothing there. Call first thing in `main`, before any
+/// thread reads the environment or opens a Metal library. Logged by [`log_aot_decision`].
+pub fn apply_packaged_aot_dir() -> &'static AotDecision {
+    static DONE: OnceLock<AotDecision> = OnceLock::new();
+    DONE.get_or_init(|| {
+        let packaged = std::env::current_exe()
+            .ok()
+            .and_then(|exe| packaged_aot_dir(&exe));
+        let decision = aot_decision(
+            std::env::var(AOT_ENV).ok().as_deref(),
+            std::env::var_os(RISC0_AOT_DIR_ENV),
+            packaged,
+        );
+        if let AotDecision::Set(dir) = &decision {
+            std::env::set_var(RISC0_AOT_DIR_ENV, dir);
+        }
+        decision
+    })
+}
+
+/// Logs [`apply_packaged_aot_dir`]'s decision (once tracing is up).
+pub fn log_aot_decision() {
+    match apply_packaged_aot_dir() {
+        AotDecision::Set(dir) => tracing::info!(
+            "offline Metal archives: {RISC0_AOT_DIR_ENV}={} (packaged beside the worker; {AOT_ENV}=0 \
+             turns this off)",
+            dir.display()
+        ),
+        AotDecision::Operator(dir) => tracing::info!(
+            "offline Metal archives: {RISC0_AOT_DIR_ENV}={} (set by the operator)",
+            dir.to_string_lossy()
+        ),
+        AotDecision::Off => tracing::info!("offline Metal archives: off ({AOT_ENV}=0)"),
+        AotDecision::Absent => tracing::debug!("offline Metal archives: none packaged"),
+    }
+}
+
+/// This Mac's GPU architecture name (`MTLDevice.architecture.name`, e.g. `applegpu_g17s`), which
+/// names the offline archive set it can use; `--metal-arch` prints it for the installer.
+pub fn gpu_architecture() -> Option<String> {
+    let device = metal::Device::system_default()?;
+    risc0_zkp::hal::metal::archive::gpu_architecture(&device)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +524,21 @@ mod tests {
         };
         let why = all.reduced().unwrap();
         assert!(why.contains("battery") && why.contains("critical"), "{why}");
+        // The protocol form agrees about what is reduced (W7-M11).
+        assert_eq!(full.to_bench().reduced(), None);
+        assert_eq!(full.to_bench().thermal, Some(1));
+        assert!(lpm.to_bench().reduced().is_some());
+        assert_eq!(all.to_bench().thermal, Some(3));
+        assert!(all.to_bench().reduced().unwrap().contains("critical"));
+        let serious = PowerState {
+            thermal: Some(Thermal::Serious),
+            ..full
+        };
+        assert_eq!(
+            serious.reduced().is_some(),
+            serious.to_bench().reduced().is_some()
+        );
+        assert_eq!(PowerState::default().to_bench().reduced(), None);
         assert!(full.describe().contains("thermal fair"));
     }
 
@@ -428,6 +560,63 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn the_packaged_aot_dir_is_used_only_when_it_holds_archives_and_nobody_chose() {
+        let tmp = std::env::temp_dir().join(format!("w7m11-aot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join(AOT_DIR_NAME)).unwrap();
+        let exe = tmp.join("zkminer-prove-risc0-metal");
+        // An empty directory is not a packaged set.
+        assert_eq!(packaged_aot_dir(&exe), None);
+        std::fs::write(tmp.join(AOT_DIR_NAME).join("SHA256SUMS"), b"").unwrap();
+        assert_eq!(packaged_aot_dir(&exe), None);
+        std::fs::write(
+            tmp.join(AOT_DIR_NAME)
+                .join("zkp-0123-applegpu_g17s-macos27-ab.binarchive"),
+            b"x",
+        )
+        .unwrap();
+        let dir = packaged_aot_dir(&exe).unwrap();
+        assert_eq!(dir, tmp.join(AOT_DIR_NAME));
+        // Not beside another binary.
+        assert_eq!(
+            packaged_aot_dir(&std::env::temp_dir().join("nowhere/x")),
+            None
+        );
+        let p = Some(dir.clone());
+        assert_eq!(
+            aot_decision(None, None, p.clone()),
+            AotDecision::Set(dir.clone())
+        );
+        assert_eq!(
+            aot_decision(Some("1"), None, p.clone()),
+            AotDecision::Set(dir.clone())
+        );
+        assert_eq!(aot_decision(Some("0"), None, p.clone()), AotDecision::Off);
+        assert_eq!(
+            aot_decision(Some(" off "), None, p.clone()),
+            AotDecision::Off
+        );
+        let op = std::ffi::OsString::from("/elsewhere");
+        assert_eq!(
+            aot_decision(None, Some(op.clone()), p.clone()),
+            AotDecision::Operator(op)
+        );
+        // An empty variable counts as unset (risc0 reads it so too).
+        assert_eq!(
+            aot_decision(None, Some(std::ffi::OsString::new()), p),
+            AotDecision::Set(dir)
+        );
+        assert_eq!(aot_decision(None, None, None), AotDecision::Absent);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn this_macs_gpu_architecture_is_readable() {
+        let arch = gpu_architecture().expect("MTLDevice.architecture");
+        assert!(arch.starts_with("applegpu_"), "{arch}");
     }
 
     #[test]

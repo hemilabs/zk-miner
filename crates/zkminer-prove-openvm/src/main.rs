@@ -229,5 +229,6 @@ fn simulated_benchmark(name: &str, cycles: u64, weight: f64, precompile: bool) -
         precompile,
         // Simulated: there is no proof, so there is nothing to wrap.
         wrap_secs: None,
+        power_state: None,
     }
 }

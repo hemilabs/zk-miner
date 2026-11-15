@@ -239,7 +239,8 @@ pub fn keccak_po2_warning(var: Option<&str>, limit: u64) -> Option<String> {
 }
 
 /// The default segment size for a working-set limit (PLAN 9.1): the shared table
-/// (`metal_sizing::job_po2_for_limit`, M8 tiers; `ZKMINER_METAL_PO2_TABLE=m1` restores M1's).
+/// (`metal_sizing::job_po2_for_limit`: W7-M11's tiers and footprint model; `ZKMINER_METAL_TIER_TABLE=m8`
+/// restores M8's, `ZKMINER_METAL_PO2_TABLE=m1` M1's).
 ///
 /// The Groth16 wrap needs ~3.9 GB under an enforced budget (the key is not kept there), so the 4 GiB
 /// tier is the floor. Never above [`zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2`].
@@ -572,30 +573,56 @@ pub fn warm_up_pipelines() -> &'static str {
 mod tests {
     use super::*;
 
-    /// M8 table (these tests run without `ZKMINER_METAL_PO2_TABLE`).
+    /// The default table (W7-M11's W7: M8's rows plus po2 20 from 10 GiB where the footprint model
+    /// fits this Mac's RAM), and M8's behind `ZKMINER_METAL_TIER_TABLE=m8`. These tests run without
+    /// the table knobs; under one they check only that table's rows.
     #[test]
     fn po2_follows_the_working_set_limit() {
-        if crate::metal_sizing::env_po2_table() != crate::metal_sizing::Po2Table::M8 {
+        use crate::metal_sizing::{env_po2_table, job_po2_in, Po2Table};
+        let table = env_po2_table();
+        if !matches!(table, Po2Table::M8 | Po2Table::W7) {
             return;
         }
-        assert_eq!(job_po2_for_limit(4 * GIB), 18);
-        assert_eq!(job_po2_for_limit(8 * GIB), 19);
+        // The worker reads this Mac's RAM (or ZKMINER_METAL_HOST_RAM_BYTES); pin what it decides
+        // against the pure rule with that RAM.
+        let ram = crate::metal_sizing::host_ram_bytes();
+        for limit in [
+            4 * GIB,
+            8 * GIB,
+            10_700_000_000,
+            10 * GIB,
+            12 * GIB,
+            28 * GIB,
+        ] {
+            assert_eq!(job_po2_for_limit(limit), job_po2_in(limit, table, ram));
+        }
+        let m8 = |l| job_po2_in(l, Po2Table::M8, None);
+        assert_eq!(m8(4 * GIB), 18);
+        assert_eq!(m8(8 * GIB), 19);
         // A 16 GB Mac: ~10.7 GB recommended, 8 GiB host figure (the smaller wins, 19); an 18 GB
-        // Mac's 10 GiB host figure.
-        assert_eq!(job_po2_for_limit(10_700_000_000), 19);
-        assert_eq!(job_po2_for_limit(10 * GIB), 19);
-        assert_eq!(job_po2_for_limit(12 * GIB), 20);
-        assert_eq!(job_po2_for_limit(16 * GIB), 20);
+        // Mac's 10 GiB host figure: 19 in M8, and in W7 too (po2 20's footprint does not fit its
+        // RAM); R2 (opt-in) gives it 20. A 10 GiB budget on a 36 GB Mac: 20 in W7.
+        assert_eq!(m8(10_700_000_000), 19);
+        assert_eq!(m8(10 * GIB), 19);
+        assert_eq!(job_po2_in(10 * GIB, Po2Table::W7, Some(18 * GIB)), 19);
+        assert_eq!(job_po2_in(10 * GIB, Po2Table::R2, Some(18 * GIB)), 20);
+        assert_eq!(job_po2_in(10 * GIB, Po2Table::W7, Some(36 * GIB)), 20);
+        assert_eq!(job_po2_in(8 * GIB, Po2Table::W7, Some(16 * GIB)), 19);
+        assert_eq!(m8(12 * GIB), 20);
+        assert_eq!(m8(16 * GIB), 20);
         // The 36 GB dev machine: min(30.15 GB, 28 GiB).
-        assert_eq!(job_po2_for_limit(28 * GIB), 20);
-        assert_eq!(job_po2_for_limit(180 * GIB), 20);
+        assert_eq!(m8(28 * GIB), 20);
+        assert_eq!(m8(180 * GIB), 20);
+        assert_eq!(job_po2_in(180 * GIB, Po2Table::W7, Some(192 * GIB)), 20);
     }
 
     #[test]
     fn the_po2_ceiling_follows_the_table() {
-        if crate::metal_sizing::env_po2_table() != crate::metal_sizing::Po2Table::M8 {
+        use crate::metal_sizing::{env_po2_table, Po2Table};
+        if !matches!(env_po2_table(), Po2Table::M8 | Po2Table::W7) {
             return;
         }
+        // W7 keeps M8's ceiling.
         assert_eq!(max_po2_for_limit(3 * GIB), None);
         assert_eq!(max_po2_for_limit(4 * GIB), Some(18));
         assert_eq!(max_po2_for_limit(8 * GIB), Some(19));
