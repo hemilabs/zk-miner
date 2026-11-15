@@ -882,3 +882,319 @@ fn a_metal_worker_outlives_the_20_proof_recycle() {
     );
     assert_eq!(metal.test_consecutive_failures("mock:metal"), Some(0));
 }
+
+// ---- W7-M10: the owner-active tier and the respawn right after a proof ----
+
+const GIB: u64 = 1 << 30;
+
+/// A Metal slot (mock worker) with a 16 GB Mac's figure, 8 GiB.
+fn metal_16gb_pool() -> WorkerPool {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:metal", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    pool.test_set_gpu_tag("mock:metal", "metal");
+    pool.test_set_vram("mock:metal", 8 * GIB);
+    pool
+}
+
+fn prove_at(pool: &WorkerPool, po2: Option<u8>) -> u64 {
+    pool.prove("mock", &[], &[], po2, Some(Duration::from_secs(10)), None)
+        .unwrap_or_else(|e| panic!("proof at {po2:?}: {e:#}"))
+        .cycles
+}
+
+/// Whether this process has no explicit Metal budget: one (gpu-run's default) caps every figure the
+/// worker sees, so the 4 and 8 GiB tiers are the same worker and nothing respawns. The gate runs
+/// these with `gpu-run --light --no-budget` (the mock worker uses no GPU).
+fn no_budget(test: &str) -> bool {
+    let none = zkminer_prover::metal_sizing::env_working_set_budget().is_none();
+    if !none {
+        eprintln!("{test}: skipped under RISC0_METAL_MAX_WORKING_SET_BYTES (run with --no-budget)");
+    }
+    none
+}
+
+fn respawn_early_on() -> bool {
+    !std::env::var_os("ZKMINER_METAL_RESPAWN_EARLY").is_some_and(|v| v == "0")
+}
+
+/// Unenforced (the default), the tier follows the owner at each job's start, never changes a job's
+/// po2, is recorded per job, and never respawns the worker: a worker at the idle figure proves a job
+/// the active tier admits exactly as one at the active figure would (`metal_sizing::same_for_job`),
+/// so a respawn would only cost a cold worker. A count recycle while the owner is active keeps the
+/// idle figure (a worker moved to 4 GiB would refuse the next po2 19 job).
+#[test]
+fn a_metal_job_proves_at_the_owner_tier_its_po2_fits() {
+    use zkminer_prover::metal_sizing::OwnerForce;
+    let pool = metal_16gb_pool();
+    pool.test_force_enforce(Some(false));
+    let pid0 = pool.test_pid("mock:metal");
+    pool.test_force_owner(Some(OwnerForce::Active));
+    // A job measured at 19 (before the owner came back) keeps 19 and the idle tier.
+    assert_eq!(prove_at(&pool, Some(19)), 1019);
+    assert_eq!(pool.metal_tier_jobs(), (1, 0));
+    // A job measured at 18 while the owner is active: the active tier, on the same worker.
+    assert_eq!(prove_at(&pool, Some(18)), 1018);
+    assert_eq!(pool.metal_tier_jobs(), (1, 1));
+    // The owner leaves: a po2 18 job is an idle-tier job, still the same worker.
+    pool.test_force_owner(Some(OwnerForce::Idle));
+    assert_eq!(prove_at(&pool, Some(18)), 1018);
+    assert_eq!(pool.metal_tier_jobs(), (2, 1));
+    // A benchmark-style proof (no po2) always runs at the idle tier.
+    pool.test_force_owner(Some(OwnerForce::Active));
+    assert_eq!(prove_at(&pool, None), 1000);
+    assert_eq!(pool.metal_tier_jobs(), (3, 1));
+    assert_eq!(pool.test_pid("mock:metal"), pid0, "no tier respawn unenforced");
+    assert_eq!(pool.test_spawn_vram("mock:metal"), Some(8 * GIB));
+    // A count recycle while the owner is active respawns at the figure the worker had.
+    pool.test_set_recycle_after("mock:metal", 1);
+    prove_at(&pool, Some(18));
+    prove_at(&pool, Some(19));
+    assert_ne!(pool.test_pid("mock:metal"), pid0);
+    assert_eq!(pool.test_spawn_vram("mock:metal"), Some(8 * GIB));
+    assert_eq!(pool.metal_tier_jobs(), (4, 2));
+    assert_eq!(pool.test_consecutive_failures("mock:metal"), Some(0));
+}
+
+/// W7-M10 review finding: when the owner comes back with jobs measured at the idle po2 queued, the
+/// worker is not moved to the active tier in the idle gap after each of them (and back before the
+/// next): at most one respawn for the whole queue, and it happens at the first job the active tier
+/// can hold. With enforcement on, where the tier's figure is the worker's budget.
+#[test]
+fn queued_idle_po2_jobs_after_the_owner_returns_respawn_the_worker_at_most_once() {
+    if !no_budget("queued_idle_po2_jobs_after_the_owner_returns_respawn_the_worker_at_most_once") {
+        return;
+    }
+    use zkminer_prover::metal_sizing::OwnerForce;
+    let pool = metal_16gb_pool();
+    pool.test_force_enforce(Some(true));
+    pool.test_force_owner(Some(OwnerForce::Active));
+    let pid0 = pool.test_pid("mock:metal");
+    for _ in 0..3 {
+        assert_eq!(prove_at(&pool, Some(19)), 1019);
+        assert_eq!(pool.test_spawn_vram("mock:metal"), Some(8 * GIB));
+    }
+    assert_eq!(pool.metal_tier_jobs(), (3, 0));
+    assert_eq!(
+        pool.test_pid("mock:metal"),
+        pid0,
+        "no respawn for idle-po2 jobs"
+    );
+    // The first job measured at the active po2: one respawn, before it, at 4 GiB.
+    assert_eq!(prove_at(&pool, Some(18)), 1018);
+    let pid1 = pool.test_pid("mock:metal");
+    assert_ne!(pid1, pid0);
+    assert_eq!(pool.test_spawn_vram("mock:metal"), Some(4 * GIB));
+    for _ in 0..2 {
+        assert_eq!(prove_at(&pool, Some(18)), 1018);
+    }
+    assert_eq!(pool.test_pid("mock:metal"), pid1, "already at its tier");
+    assert_eq!(pool.metal_tier_jobs(), (3, 3));
+    // The owner leaves: the next po2 18 job runs on the worker as it is (active tier, no respawn
+    // before it); right after it the worker goes back to idle in the idle gap, so the po2 19 jobs
+    // claimed from now find it there.
+    pool.test_force_owner(Some(OwnerForce::Idle));
+    assert_eq!(prove_at(&pool, Some(18)), 1018);
+    assert_eq!(pool.metal_tier_jobs(), (3, 4));
+    if respawn_early_on() {
+        let pid2 = pool.test_pid("mock:metal");
+        assert_ne!(pid2, pid1, "back to idle right after the proof");
+        assert_eq!(pool.test_spawn_vram("mock:metal"), Some(8 * GIB));
+        assert_eq!(prove_at(&pool, Some(19)), 1019);
+        assert_eq!(pool.test_pid("mock:metal"), pid2);
+    } else {
+        // Without the early respawn, the po2 19 job's start makes it (the worker would refuse).
+        assert_eq!(prove_at(&pool, Some(19)), 1019);
+        assert_ne!(pool.test_pid("mock:metal"), pid1);
+        assert_eq!(pool.test_spawn_vram("mock:metal"), Some(8 * GIB));
+    }
+    assert_eq!(pool.metal_tier_jobs(), (4, 4));
+    assert_eq!(pool.test_consecutive_failures("mock:metal"), Some(0));
+}
+
+/// W7-M10 review finding: on a 36 GB Mac the active tier (20 GiB) keeps po2 20 and the Groth16 key
+/// decision of the idle one (28 GiB), so with enforcement off an owner switching back and forth
+/// never respawns the worker.
+#[test]
+fn a_36_gb_macs_owner_switches_never_respawn_the_worker() {
+    use zkminer_prover::metal_sizing::OwnerForce;
+    let mut pool = metal_16gb_pool();
+    pool.test_set_vram("mock:metal", 28 * GIB);
+    pool.test_force_enforce(Some(false));
+    let pid = pool.test_pid("mock:metal");
+    for (i, force) in [
+        OwnerForce::Active,
+        OwnerForce::Idle,
+        OwnerForce::Active,
+        OwnerForce::Active,
+        OwnerForce::Idle,
+        OwnerForce::Active,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        pool.test_force_owner(Some(force));
+        assert_eq!(prove_at(&pool, Some(20)), 1020, "proof {i}");
+        assert_eq!(pool.test_pid("mock:metal"), pid, "proof {i}");
+    }
+    assert_eq!(pool.test_spawn_vram("mock:metal"), Some(28 * GIB));
+    assert_eq!(pool.metal_tier_jobs(), (2, 4));
+}
+
+/// A benchmark prices the Mac at its idle tier: a worker left at the active tier (enforcement on)
+/// is respawned at the idle figure first.
+#[test]
+fn a_metal_benchmark_runs_at_the_idle_tier() {
+    if !no_budget("a_metal_benchmark_runs_at_the_idle_tier") {
+        return;
+    }
+    use zkminer_prover::metal_sizing::OwnerForce;
+    let pool = metal_16gb_pool();
+    pool.test_force_enforce(Some(true));
+    pool.test_force_owner(Some(OwnerForce::Active));
+    // Owner active, a job at 18: active tier (respawned before the proof).
+    assert_eq!(prove_at(&pool, Some(18)), 1018);
+    assert_eq!(pool.test_spawn_vram("mock:metal"), Some(4 * GIB));
+    let pid = pool.test_pid("mock:metal");
+    pool.benchmark("mock").expect("benchmark");
+    assert_eq!(pool.test_spawn_vram("mock:metal"), Some(8 * GIB));
+    assert_ne!(
+        pool.test_pid("mock:metal"),
+        pid,
+        "respawned at the idle tier for the benchmark"
+    );
+}
+
+/// A worker due for its count-based recycle is respawned right after the proof that made it due,
+/// not before the next one.
+#[test]
+fn a_due_metal_worker_is_respawned_right_after_its_proof() {
+    if !respawn_early_on() {
+        return;
+    }
+    let pool = metal_16gb_pool();
+    pool.test_force_owner(Some(zkminer_prover::metal_sizing::OwnerForce::Idle));
+    pool.test_set_recycle_after("mock:metal", 2);
+    let pid0 = pool.test_pid("mock:metal");
+    prove_at(&pool, Some(19));
+    assert_eq!(pool.test_pid("mock:metal"), pid0);
+    prove_at(&pool, Some(19));
+    let pid1 = pool.test_pid("mock:metal");
+    assert_ne!(pid1, pid0, "respawned as the second proof ended");
+    assert_eq!(pool.test_has_handle("mock:metal"), Some(true));
+    // The new worker proves the next job without another respawn before it.
+    prove_at(&pool, Some(19));
+    assert_eq!(pool.test_pid("mock:metal"), pid1);
+    prove_at(&pool, Some(19));
+    assert_ne!(pool.test_pid("mock:metal"), pid1);
+    assert_eq!(pool.metal_tier_jobs(), (4, 0));
+    assert_eq!(pool.test_consecutive_failures("mock:metal"), Some(0));
+}
+
+/// A slot that is not an enumerated Apple GPU (no figure) is untouched by the tier.
+#[test]
+fn a_metal_slot_without_a_figure_ignores_the_owner_tier() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:metal", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    pool.test_set_gpu_tag("mock:metal", "metal");
+    pool.test_force_owner(Some(zkminer_prover::metal_sizing::OwnerForce::Active));
+    let pid = pool.test_pid("mock:metal");
+    for _ in 0..3 {
+        assert_eq!(prove_at(&pool, Some(18)), 1018);
+    }
+    assert_eq!(pool.test_pid("mock:metal"), pid);
+    assert_eq!(pool.metal_tier_jobs(), (0, 0));
+}
+
+/// W7-M10 A/B harness (real Metal worker, ignored): proofs through the miner's own pool (the
+/// process-wide one, so the respawn right after a proof and its background growth check run as in
+/// the miner), each worker recycled after every proof (`ZKMINER_M10_RECYCLE`, default 1), with
+/// `ZKMINER_M10_GAP_MS` (default 3000) between proofs. Prints each proof's wall time as the caller
+/// sees it (respawn included) and the worker pid. Arms: `ZKMINER_METAL_RESPAWN_EARLY=0` or unset.
+///
+///   ZKMINER_M10_WORKER=<zkminer-prove-risc0-metal> cargo test --release -p zkminer-prover \
+///     --features testing --test worker_lifecycle -- --ignored --nocapture m10_recycled_first_prove
+#[test]
+#[ignore = "proves on the Apple GPU with ZKMINER_M10_WORKER; run alone under gpu-run"]
+fn m10_recycled_first_prove() {
+    let Ok(worker) = std::env::var("ZKMINER_M10_WORKER") else {
+        eprintln!("ZKMINER_M10_WORKER is not set");
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .try_init();
+    let num = |k: &str, d: u64| -> u64 {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let dir = std::env::temp_dir().join(format!("m10-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let guest = dir.join("fibonacci.elf");
+    let out = std::process::Command::new(&worker)
+        .arg("--export-guest")
+        .arg("fibonacci")
+        .arg(&guest)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let elf = std::fs::read(&guest).unwrap();
+    let iters = num("ZKMINER_M10_FIB_ITERS", 400_000) as u32;
+    let key = "risc0:metal";
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker(key, "risc0", worker.into(), HashMap::new())
+        .expect("spawn the Metal worker");
+    pool.test_set_gpu_tag(key, "metal");
+    pool.test_set_recycle_after(key, num("ZKMINER_M10_RECYCLE", 1) as u32);
+    // An Apple GPU figure (e.g. a 16 GB Mac's 8 GiB) turns the owner tier on for this slot; the
+    // tier then follows ZKMINER_OWNER_ACTIVE (or the owner's real activity).
+    let vram = num("ZKMINER_M10_VRAM", 0);
+    if vram > 0 {
+        pool.test_set_vram(key, vram);
+    }
+    let po2 = std::env::var("ZKMINER_M10_PO2")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok());
+    zkminer_prover::engine::init_worker_pool(pool);
+    let pool = zkminer_prover::engine::worker_pool().unwrap();
+    let gap = Duration::from_millis(num("ZKMINER_M10_GAP_MS", 3000));
+    let proofs = num("ZKMINER_M10_PROOFS", 3);
+    for i in 1..=proofs {
+        if i > 1 {
+            std::thread::sleep(gap);
+        }
+        let pid_before = pool.test_pid(key).unwrap_or(0);
+        let t = Instant::now();
+        let p = pool
+            .prove(
+                "risc0",
+                &elf,
+                &iters.to_le_bytes(),
+                po2,
+                Some(Duration::from_secs(300)),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("proof {i}: {e:#}"));
+        let wall = t.elapsed().as_secs_f64();
+        eprintln!(
+            "M10 tiers after proof {i}: (idle, active) = {:?}, spawn figure {:?}",
+            pool.metal_tier_jobs(),
+            pool.test_spawn_vram(key)
+        );
+        assert!(!p.seal.is_empty());
+        eprintln!(
+            "M10 proof {i}: {wall:.3} s wall, worker {:.3} s, pid {pid_before} -> {}",
+            p.duration.as_secs_f64(),
+            pool.test_pid(key).unwrap_or(0)
+        );
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    pool.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}

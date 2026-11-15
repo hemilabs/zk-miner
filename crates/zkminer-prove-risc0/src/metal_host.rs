@@ -24,16 +24,6 @@ const GIB: u64 = 1 << 30;
 /// 16, so a 16 GB machine is never refused over how the OS rounds `hw.memsize`.
 pub const MIN_HOST_MEMORY_BYTES: u64 = 12 * GIB;
 
-/// The Groth16 prover's resident footprint on the GPU while its proving key is cached
-/// (`risc0-groth16-sys` Metal prover, note G7: 5628.7 MiB measured, 5655.5 MiB planned).
-pub const GROTH16_RESIDENT_BYTES: u64 = 5_930_236_936;
-
-/// Headroom kept free beside the largest GPU phase when deciding whether to keep the Groth16 cache.
-/// Large because on unified memory the proof's host-side state (preflight traces, recursion
-/// witnesses) comes out of the same RAM: the full po2 20 benchmark on the 36 GB dev machine peaked
-/// at 17.6 GB of GPU allocations (5.7 GB of it the kept key) but at a 31 GB process footprint, so
-/// ~13 GB of host-side state.
-const KEEP_HEADROOM_BYTES: u64 = 12 * GIB;
 
 /// The Mac this worker runs on, if it is one the worker supports.
 #[derive(Debug, Clone)]
@@ -141,6 +131,111 @@ pub fn working_set_limit() -> Option<u64> {
             .min()
             .unwrap_or(host.recommended_working_set),
     )
+}
+
+/// What [`apply_planned_budget`] did, for the start-up log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetPlan {
+    /// The limit the worker plans with after this ([`working_set_limit`]).
+    pub plan: u64,
+    /// `RISC0_METAL_MAX_WORKING_SET_BYTES` as exported here, or `None` when left as it was.
+    pub exported: Option<u64>,
+    /// One line for the log.
+    pub note: String,
+}
+
+/// The keccak max po2 18 needs this much working set (risc0 W7-V2's measured minimum peak,
+/// `KECCAK_MIN_PEAK_MIB[18]` = 7084 MiB); below it only po2 17 fits.
+pub const KECCAK_PO2_18_MIN_LIMIT: u64 = 7084 << 20;
+
+/// W7-M10, at worker start, before any proof or Metal HAL runtime (the readers of the variables
+/// set here; rayon's idle pool and the Metal device [`support`] opened already exist): with
+/// `ZKMINER_METAL_ENFORCE_BUDGET=1`, makes the HAL enforce the limit the worker plans with
+/// (`metal_sizing::enforced_budget`; the HAL reads `RISC0_METAL_MAX_WORKING_SET_BYTES` when each
+/// runtime is created, the Groth16 prover at each call). Without it the plan (the host's figure,
+/// 8 GiB on a 16 GB Mac) sizes the segments while the HAL runs to `recommendedMaxWorkingSetSize`
+/// (~10.7 GiB there, pool cap 5.35 GiB). Off by default: enforcing measured slower and larger (see
+/// `metal_sizing::ENFORCE_BUDGET_ENV`). A no-op on the 36 GB dev Mac either way (plan 28.00 GiB,
+/// device 28.08 GiB) and wherever the plan is the device's limit.
+///
+/// `simulate_owner`: the `--benchmark` run only. `ZKMINER_OWNER_ACTIVE=1` there plans with the
+/// owner-active tier's figure (`metal_sizing::active_limit` of the plan), so the active tier can be
+/// measured on any Mac. An IPC worker never reads it: the dispatcher picks the tier per job and
+/// hands it the figure (`ZKMINER_CUDA_VRAM_BYTES`).
+pub fn apply_planned_budget(simulate_owner: bool) -> Option<BudgetPlan> {
+    use crate::metal_sizing as ms;
+    let host = support().as_ref().ok()?;
+    let gib = |b: u64| b as f64 / GIB as f64;
+    let mut note = String::new();
+    if simulate_owner && ms::owner_force() == ms::OwnerForce::Active {
+        let idle = working_set_limit()?;
+        let active = ms::active_limit(idle);
+        if active < idle {
+            std::env::set_var(CUDA_VRAM_BYTES_ENV, active.to_string());
+        }
+        note += &format!(
+            "owner-active tier (ZKMINER_OWNER_ACTIVE=1): {:.1} GiB instead of {:.1} GiB; ",
+            gib(active),
+            gib(idle)
+        );
+    }
+    let plan = working_set_limit()?;
+    let hal = budget_env().map_or(host.recommended_working_set, |b| {
+        b.min(host.recommended_working_set)
+    });
+    let exported = ms::enforced_budget(plan, hal, ms::enforce_budget_off());
+    match exported {
+        Some(b) => {
+            std::env::set_var(ms::MAX_WORKING_SET_ENV, b.to_string());
+            note += &format!(
+                "enforcing the planned {:.2} GiB as the Metal budget (the HAL's limit was {:.2} GiB)",
+                gib(b),
+                gib(hal)
+            );
+        }
+        None if ms::enforce_budget_off() => {
+            note += &format!(
+                "planned {:.2} GiB, not enforced ({} is not 1; the HAL's limit is {:.2} GiB)",
+                gib(plan),
+                ms::ENFORCE_BUDGET_ENV,
+                gib(hal)
+            )
+        }
+        None => {
+            note += &format!(
+                "planned {:.2} GiB, within a GiB of the HAL's {:.2} GiB limit: nothing to enforce",
+                gib(plan),
+                gib(hal)
+            )
+        }
+    }
+    if let Some(warning) =
+        keccak_po2_warning(std::env::var("RISC0_KECCAK_PO2").ok().as_deref(), plan)
+    {
+        note += "; ";
+        note += &warning;
+    }
+    Some(BudgetPlan {
+        plan,
+        exported,
+        note,
+    })
+}
+
+/// A warning when the operator's keccak max po2 (`RISC0_KECCAK_PO2`) cannot fit `limit`: po2 18
+/// needs [`KECCAK_PO2_18_MIN_LIMIT`]. The worker never sets that variable; the zkvm default (17)
+/// fits every tier, also 4 GiB (3968-4094 MiB measured there with the budget enforced, risc0
+/// W7-V2), so this is only for an override.
+pub fn keccak_po2_warning(var: Option<&str>, limit: u64) -> Option<String> {
+    let po2: u32 = var?.trim().parse().ok()?;
+    (po2 >= 18 && limit < KECCAK_PO2_18_MIN_LIMIT).then(|| {
+        format!(
+            "RISC0_KECCAK_PO2={po2} needs about {:.1} GiB of Metal working set and this worker has \
+             {:.1} GiB: a keccak proof at po2 {po2} may fail here; leave it unset (17)",
+            KECCAK_PO2_18_MIN_LIMIT as f64 / GIB as f64,
+            limit as f64 / GIB as f64
+        )
+    })
 }
 
 /// The default segment size for a working-set limit (PLAN 9.1): the shared table
@@ -256,9 +351,10 @@ pub fn is_metal_oom(text: &str) -> bool {
 
 /// Whether the Groth16 proving key may stay cached on the GPU between proofs: only when it fits
 /// beside the next proof's largest STARK phase with headroom. On unified memory a kept key is 5.6 GB
-/// of the owner's RAM held while idle, so this is the high-end tier only.
+/// of the owner's RAM held while idle, so this is the high-end tier only. The rule and its constants
+/// live in `metal_sizing` (shared with the host, which compares tiers by it).
 pub fn keep_groth16_cache(limit: u64, po2: u8) -> bool {
-    limit >= stark_peak_bytes(po2) + GROTH16_RESIDENT_BYTES + KEEP_HEADROOM_BYTES
+    crate::metal_sizing::keep_groth16_cache(limit, po2)
 }
 
 /// The device's `currentAllocatedSize` (this process's GPU allocations), or 0 without a device.
@@ -561,6 +657,50 @@ mod tests {
         }
         // Never before the component is installed: risc0 would cache the failure.
         assert!(graph_preload_refusal(None, false).is_some());
+    }
+
+    /// W7-M10: on this Mac the dispatcher's figure (RAM less 8 GiB) is within a GiB of the
+    /// device's own limit, so enforcement exports nothing; a simulated 16 GB figure, the
+    /// owner-active tier and a 4 GiB figure are enforced.
+    #[test]
+    fn enforcement_on_this_mac() {
+        use crate::metal_sizing as ms;
+        let host = support().as_ref().expect("an Apple Silicon Mac");
+        let rec = host.recommended_working_set;
+        let figure = host.host_memory - ms::HOST_RESERVE_BYTES;
+        let plan = figure.min(rec);
+        eprintln!(
+            "hw.memsize {} B, recommendedMaxWorkingSetSize {rec} B, figure {figure} B",
+            host.host_memory
+        );
+        if host.host_memory == 36 * GIB {
+            assert_eq!(
+                ms::enforced_budget(plan, rec, false),
+                None,
+                "a no-op on the 36 GB Mac"
+            );
+        }
+        if rec >= 9 * GIB {
+            assert_eq!(ms::enforced_budget(8 * GIB, rec, false), Some(8 * GIB));
+        }
+        let active = ms::active_limit(plan);
+        assert!(active <= plan);
+        assert_eq!(ms::enforced_budget(4 * GIB, rec, false), Some(4 * GIB));
+        assert_eq!(ms::enforced_budget(4 * GIB, rec, true), None, "the knob");
+    }
+
+    #[test]
+    fn a_keccak_po2_that_cannot_fit_is_warned_about() {
+        assert_eq!(
+            keccak_po2_warning(None, 4 * GIB),
+            None,
+            "unset: the default 17 fits"
+        );
+        assert_eq!(keccak_po2_warning(Some("17"), 4 * GIB), None);
+        assert!(keccak_po2_warning(Some("18"), 4 * GIB).is_some());
+        assert!(keccak_po2_warning(Some("18"), 6 * GIB).is_some());
+        assert_eq!(keccak_po2_warning(Some("18"), 8 * GIB), None);
+        assert_eq!(keccak_po2_warning(Some("x"), 4 * GIB), None);
     }
 
     #[test]
