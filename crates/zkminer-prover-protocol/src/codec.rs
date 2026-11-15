@@ -95,6 +95,7 @@ mod tests {
                 weight: 0.20,
                 precompile: false,
                 wrap_secs: wrap,
+                power_state: None,
             };
             let resp = WorkerResponse::BenchmarkResult {
                 results: vec![entry.clone(), entry],
@@ -147,6 +148,222 @@ mod tests {
         assert!(PROTOCOL_VERSION >= 4);
     }
 
+    fn v12_entry(
+        power_state: Option<crate::types::BenchPowerState>,
+    ) -> crate::types::BenchmarkEntry {
+        crate::types::BenchmarkEntry {
+            program_name: "memory-merkle".to_string(),
+            prover_backend: "risc0".to_string(),
+            cycles: 6_291_456,
+            duration_secs: 8.7,
+            throughput: 6_291_456.0 / 8.7,
+            weight: 0.15,
+            precompile: true,
+            wrap_secs: Some(1.5),
+            power_state,
+        }
+    }
+
+    /// v12: `power_state` round-trips in every shape (unread, all unknown, full, reduced), in a
+    /// progress frame and a final result, and no field before it moves.
+    #[test]
+    fn a_benchmark_entry_carries_its_power_state() {
+        use crate::types::BenchPowerState;
+        let full = BenchPowerState {
+            low_power_mode: Some(false),
+            on_battery: Some(false),
+            thermal: Some(0),
+        };
+        let lpm = BenchPowerState {
+            low_power_mode: Some(true),
+            ..full
+        };
+        for ps in [
+            None,
+            Some(BenchPowerState::default()),
+            Some(full),
+            Some(lpm),
+        ] {
+            let mut buf = Vec::new();
+            write_message(
+                &mut buf,
+                &WorkerResponse::BenchmarkProgress {
+                    entry: v12_entry(ps),
+                    program_index: 5,
+                    total_programs: 6,
+                },
+            )
+            .unwrap();
+            write_message(
+                &mut buf,
+                &WorkerResponse::BenchmarkResult {
+                    results: vec![v12_entry(ps), v12_entry(None)],
+                },
+            )
+            .unwrap();
+            let mut c = Cursor::new(buf);
+            match read_message::<_, WorkerResponse>(&mut c).unwrap() {
+                WorkerResponse::BenchmarkProgress {
+                    entry,
+                    program_index,
+                    total_programs,
+                } => {
+                    assert_eq!(entry.power_state, ps);
+                    assert_eq!(
+                        entry.wrap_secs,
+                        Some(1.5),
+                        "a field before it must not shift"
+                    );
+                    assert_eq!((program_index, total_programs), (5, 6));
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+            match read_message::<_, WorkerResponse>(&mut c).unwrap() {
+                WorkerResponse::BenchmarkResult { results } => {
+                    assert_eq!(results[0].power_state, ps);
+                    assert_eq!(results[1].power_state, None);
+                    assert_eq!(results[1].duration_secs, 8.7);
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+        assert_eq!(lpm.reduced().as_deref(), Some("Low Power Mode"));
+        assert_eq!(full.reduced(), None);
+        assert_eq!(
+            BenchPowerState::default().reduced(),
+            None,
+            "unknown is not reduced"
+        );
+        const _: () = assert!(PROTOCOL_VERSION >= 12);
+    }
+
+    /// The old-version side of v12: a v11 worker's entry (no `power_state`) does not decode as a
+    /// v12 one, alone or inside its progress frame, so it can only be refused, never misread. What
+    /// a v11 worker sends first, its `HelloAck`, still decodes, which is what lets the host read its
+    /// version and refuse it at the handshake (`worker.rs`: "Protocol version mismatch").
+    #[test]
+    fn a_v11_benchmark_entry_does_not_decode_as_v12_but_its_hello_does() {
+        #[derive(serde::Serialize)]
+        struct V11Entry {
+            program_name: String,
+            prover_backend: String,
+            cycles: u64,
+            duration_secs: f64,
+            throughput: f64,
+            weight: f64,
+            precompile: bool,
+            wrap_secs: Option<f64>,
+        }
+        #[derive(serde::Serialize)]
+        enum V11Response {
+            #[allow(dead_code)]
+            HelloAck {
+                protocol_version: u32,
+                backend: String,
+                sdk_version: String,
+                worker_version: String,
+            },
+            #[allow(dead_code)]
+            CapabilitiesReport {
+                backend: String,
+                version: String,
+                supported_benchmarks: Vec<String>,
+                gpu_available: bool,
+                gpu_name: Option<String>,
+            },
+            #[allow(dead_code)]
+            BenchmarkResult { results: Vec<V11Entry> },
+            BenchmarkProgress {
+                entry: V11Entry,
+                program_index: u32,
+                total_programs: u32,
+            },
+        }
+        let v11 = || V11Entry {
+            program_name: "fibonacci".to_string(),
+            prover_backend: "risc0".to_string(),
+            cycles: 1 << 20,
+            duration_secs: 2.0,
+            throughput: (1u64 << 20) as f64 / 2.0,
+            weight: 0.1,
+            precompile: false,
+            wrap_secs: Some(1.4),
+        };
+        let bytes = bincode::serialize(&v11()).unwrap();
+        assert!(
+            bincode::deserialize::<crate::types::BenchmarkEntry>(&bytes).is_err(),
+            "a v11 entry must NOT silently decode as v12"
+        );
+        // The last program's progress frame is the case that could have been misread: nothing
+        // follows it in the frame for the missing field to swallow.
+        let progress = bincode::serialize(&V11Response::BenchmarkProgress {
+            entry: v11(),
+            program_index: 6,
+            total_programs: 6,
+        })
+        .unwrap();
+        let mut framed = (progress.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&progress);
+        assert!(read_message::<_, WorkerResponse>(&mut Cursor::new(framed)).is_err());
+        // A v11 HelloAck is unchanged in v12.
+        let hello = bincode::serialize(&V11Response::HelloAck {
+            protocol_version: 11,
+            backend: "risc0".to_string(),
+            sdk_version: "risc0-zkvm 3.0.5".to_string(),
+            worker_version: "0.1.0".to_string(),
+        })
+        .unwrap();
+        let mut framed = (hello.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&hello);
+        match read_message::<_, WorkerResponse>(&mut Cursor::new(framed)).unwrap() {
+            WorkerResponse::HelloAck {
+                protocol_version, ..
+            } => assert_eq!(protocol_version, 11),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        assert_ne!(
+            PROTOCOL_VERSION, 11,
+            "the bump is what refuses the v11 worker"
+        );
+    }
+
+    #[test]
+    fn the_worse_power_reading_wins() {
+        use crate::types::BenchPowerState as P;
+        let full = P {
+            low_power_mode: Some(false),
+            on_battery: Some(false),
+            thermal: Some(1),
+        };
+        let hot = P {
+            thermal: Some(2),
+            ..full
+        };
+        assert_eq!(full.merge(hot), hot);
+        assert_eq!(hot.merge(full), hot);
+        assert_eq!(hot.reduced().as_deref(), Some("thermal serious"));
+        assert_eq!(full.reduced(), None, "fair is normal under load");
+        let battery = P {
+            on_battery: Some(true),
+            ..P::default()
+        };
+        let m = full.merge(battery);
+        assert_eq!(
+            (m.low_power_mode, m.on_battery, m.thermal),
+            (Some(false), Some(true), Some(1))
+        );
+        assert_eq!(P::default().merge(P::default()), P::default());
+        let crit = P {
+            thermal: Some(3),
+            low_power_mode: Some(true),
+            on_battery: Some(true),
+        };
+        assert_eq!(
+            crit.reduced().as_deref(),
+            Some("Low Power Mode, on battery, thermal critical")
+        );
+    }
+
     /// v5 added `Warmup` / `WarmupDone`, appended so no older variant's index moved.
     #[test]
     fn warmup_round_trips() {
@@ -194,7 +411,11 @@ mod tests {
         )
         .unwrap();
         // Frame: 4-byte big-endian length, then bincode's u32 little-endian variant index.
-        assert_eq!(&buf[4..8], &9u32.to_le_bytes(), "ProgramId is the 10th command");
+        assert_eq!(
+            &buf[4..8],
+            &9u32.to_le_bytes(),
+            "ProgramId is the 10th command"
+        );
         match read_message::<_, WorkerCommand>(&mut Cursor::new(buf)).unwrap() {
             WorkerCommand::ProgramId { request_id, elf: e } => {
                 assert_eq!((request_id, e), (9, elf));
@@ -213,7 +434,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(&buf[4..8], &11u32.to_le_bytes(), "ProgramIdResult is the 12th response");
+        assert_eq!(
+            &buf[4..8],
+            &11u32.to_le_bytes(),
+            "ProgramIdResult is the 12th response"
+        );
         match read_message::<_, WorkerResponse>(&mut Cursor::new(buf)).unwrap() {
             WorkerResponse::ProgramIdResult {
                 request_id,

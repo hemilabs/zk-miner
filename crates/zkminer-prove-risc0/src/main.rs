@@ -112,6 +112,24 @@ fn main() {
     // mode (`metal_host::release_seg_mode_default`). First thing, before any thread exists.
     #[cfg(feature = "metal")]
     metal_host::default_release_segment_prover_before_recursion();
+    // W7-M11: the offline Metal archives the installer packaged beside this binary, if any
+    // (`ZKMINER_METAL_AOT=0` off). Before any thread reads the environment or opens a library.
+    #[cfg(feature = "metal")]
+    metal_start::apply_packaged_aot_dir();
+
+    // `--metal-arch`: print this Mac's GPU architecture (the offline archive set it can use) for
+    // the installer, and exit. Speaks no IPC.
+    #[cfg(feature = "metal")]
+    if std::env::args().any(|a| a == "--metal-arch") {
+        match metal_start::gpu_architecture() {
+            Some(arch) => println!("{arch}"),
+            None => {
+                eprintln!("no Metal device architecture");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
 
     // Direct benchmark mode runs the operator's own guests and prints a human table to the REAL
     // stdout, so it must come before the fd-1 redirect below. It speaks no IPC.
@@ -124,7 +142,10 @@ fn main() {
             )
             .init();
         #[cfg(feature = "metal")]
-        metal_start::log_qos(&qos);
+        {
+            metal_start::log_qos(&qos);
+            metal_start::log_aot_decision();
+        }
         if let Some(refusal) = gpu_refusal() {
             eprintln!("{refusal}");
             std::process::exit(2);
@@ -268,6 +289,7 @@ fn main() {
     #[cfg(feature = "metal")]
     {
         metal_start::log_qos(&qos);
+        metal_start::log_aot_decision();
         if gpu_refusal().is_none() && !measure_only_worker() {
             metal_host::start_groth16_graph_preload("worker start");
             metal_start::log_power_state("worker start");
@@ -1565,7 +1587,7 @@ fn run_proof(
     // the host tries another card.
     let mut last_failed_segment: Option<u64> = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        match run_proof_once(elf, input_data, po2, seed) {
+        match run_proof_once(elf, input_data, po2, seed, &image_id) {
             Ok(result) => {
                 if attempt > 1 {
                     tracing::warn!(
@@ -1628,11 +1650,27 @@ fn failed_twice(segment: Option<u64>, last: Option<u64>) -> bool {
     segment.is_some() && segment == last
 }
 
+/// W7-M11 revert knob: `1` makes every proof attempt compute the image id it verifies against again
+/// (before: once per attempt, after the proof), instead of using the one [`run_proof`] computed when
+/// it bound the ELF to the job's programId.
+const RECOMPUTE_IMAGE_ID_ENV: &str = "ZKMINER_RISC0_RECOMPUTE_IMAGE_ID";
+
+/// The image id `run_proof_once` verifies the receipt against: `computed` ([`run_proof`]'s, from
+/// the same ELF bytes), or a fresh `compute_image_id` of `elf` with [`RECOMPUTE_IMAGE_ID_ENV`]`=1`.
+fn verify_image_id(elf: &[u8], computed: &[u8; 32]) -> Result<risc0_zkvm::Digest> {
+    if std::env::var(RECOMPUTE_IMAGE_ID_ENV).is_ok_and(|v| v.trim() == "1") {
+        return risc0_zkvm::compute_image_id(elf)
+            .context("Failed to compute image ID for verification");
+    }
+    Ok(risc0_zkvm::Digest::from(*computed))
+}
+
 fn run_proof_once(
     elf: &[u8],
     input_data: &[u8],
     po2: Option<u8>,
     seed: [u8; 32],
+    image_id: &[u8; 32],
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
     use risc0_zkvm::ProverOpts;
 
@@ -1714,9 +1752,10 @@ fn run_proof_once(
 
     let receipt = prove_info.receipt;
 
-    // Verify proof locally before returning — catches GPU corruption (e.g., ROCm SHA-256 bug)
-    let image_id =
-        risc0_zkvm::compute_image_id(elf).context("Failed to compute image ID for verification")?;
+    // Verify proof locally before returning — catches GPU corruption (e.g., ROCm SHA-256 bug). The
+    // image id is the one `run_proof` computed from these ELF bytes before proving (W7-M11: it was
+    // computed a second time here, per attempt).
+    let image_id = verify_image_id(elf, image_id)?;
 
     // Defense in depth against a guest that halts with a non-zero exit code: `receipt.verify` below
     // builds the expected claim as Halted(0), so a non-zero exit deterministically fails verification
@@ -1943,6 +1982,8 @@ fn benchmark_program(
     // segment count, i.e. with po2 — nor the wrap. `compress` consumes the previous receipt, so the
     // three stages below add up to the same work `prove_with_opts(groth16)` does in one call.
     let prover = local_prover();
+    // W7-M11: the power state the program is measured under, read before and after it.
+    let power_before = bench_power_state();
     #[cfg(feature = "metal")]
     let sampler = metal_host::PeakSampler::start();
     #[cfg(target_os = "macos")]
@@ -2061,6 +2102,18 @@ fn benchmark_program(
          verified"
     );
 
+    let power_state = match (power_before, bench_power_state()) {
+        (Some(a), Some(b)) => Some(a.merge(b)),
+        (a, b) => a.or(b),
+    };
+    if let Some(why) = power_state.and_then(|p| p.reduced()) {
+        tracing::warn!(
+            "{name}: measured in reduced power ({why}); the host prices it as measured and \
+             advises a re-benchmark once the Mac is back at full power (a thermal mark is \
+             informational)"
+        );
+    }
+
     Some(BenchmarkEntry {
         program_name: name.to_string(),
         prover_backend: BACKEND_RISC0.to_string(),
@@ -2070,7 +2123,24 @@ fn benchmark_program(
         weight,
         precompile,
         wrap_secs: Some(wrap_secs),
+        power_state,
     })
+}
+
+/// The power state a benchmark entry reports (protocol v12, W7-M11): on a Mac, M9's reading;
+/// elsewhere, and with `ZKMINER_POWER_STATE_IN_BENCH=0`, none.
+fn bench_power_state() -> Option<zkminer_prover_protocol::BenchPowerState> {
+    if zkminer_prover_protocol::power_state_in_bench_off() {
+        return None;
+    }
+    #[cfg(feature = "metal")]
+    {
+        Some(metal_start::power_state().to_bench())
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        None
+    }
 }
 
 /// Iteration count for the po2 calibration workload.
@@ -2252,6 +2322,46 @@ mod program_id_tests {
         // No programId supplied (benchmark/calibration/mock): nothing to match, but the image id is
         // still computed (it keys the `sys_rand` seed), so bytes that are no ELF are refused.
         assert!(verify_program_id(&[0u8; 8], None).is_err());
+    }
+
+    /// W7-M11: a Metal worker reports the power state each benchmark entry was measured under
+    /// (protocol v12); this dev Mac (mains power) reads it, at full power.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_metal_benchmark_entry_reports_its_power_state() {
+        if zkminer_prover_protocol::power_state_in_bench_off() {
+            assert_eq!(bench_power_state(), None);
+            return;
+        }
+        let p = bench_power_state().expect("a Mac reads its power state");
+        assert!(p.low_power_mode.is_some() && p.thermal.is_some(), "{p:?}");
+        assert_eq!(p, metal_start::power_state().to_bench());
+    }
+
+    /// W7-M11: `run_proof_once` verifies against the image id `run_proof` bound the ELF with; it is
+    /// the digest a recomputation gives (what it did before, per attempt). Prints what that
+    /// recomputation cost per benchmark guest.
+    #[test]
+    fn the_image_id_passed_through_is_the_recomputed_one() {
+        if FIBONACCI_ELF.is_empty() {
+            return;
+        }
+        for (name, elf) in [
+            ("fibonacci", FIBONACCI_ELF),
+            ("sha256-chain", SHA256_CHAIN_ELF),
+            ("memory-merkle", MEMORY_MERKLE_ELF),
+        ] {
+            let bound = verify_program_id(elf, None).unwrap();
+            let t = std::time::Instant::now();
+            let again = risc0_zkvm::compute_image_id(elf).unwrap();
+            let cost = t.elapsed();
+            assert_eq!(verify_image_id(elf, &bound).unwrap(), again, "{name}");
+            eprintln!(
+                "{name}: compute_image_id {:.2} ms ({} bytes ELF)",
+                cost.as_secs_f64() * 1e3,
+                elf.len()
+            );
+        }
     }
 
     // Guest-gated: only meaningful when real guests were compiled in (not RISC0_SKIP_BUILD).

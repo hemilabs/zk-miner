@@ -2704,6 +2704,8 @@ fn benchmark_program(
         weight,
         precompile,
         wrap_secs,
+        // Protocol v12 (W7-M11): only the Metal worker reads a power state.
+        power_state: None,
     })
 }
 

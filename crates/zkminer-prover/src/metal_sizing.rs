@@ -35,24 +35,58 @@ pub const FOOTPRINT_EXIT_CODE: i32 = 137;
 pub const DEFAULT_JOB_PO2_CAP: u8 = 20;
 
 /// Revert knob for M8's tier table: `m1` restores the M1/M6 table (one po2 lower below 20 GiB) and
-/// its po2 ceiling; unset or anything else is the M8 table. Host and worker both read it (the worker
+/// its po2 ceiling. It wins over [`TIER_TABLE_ENV`]. Host and worker both read it (the worker
 /// inherits the miner's environment), so setting it on the miner moves both.
 pub const PO2_TABLE_ENV: &str = "ZKMINER_METAL_PO2_TABLE";
 
-/// Which segment-size table a Mac is sized with ([`PO2_TABLE_ENV`]).
+/// W7-M11's tier knob: `m8` restores M8's table (today's before W7-M11), `r2` selects the small-Mac
+/// rows that need risc0 W7-R2 (po2 19 from 4 GiB, po2 20 from 8 GiB); unset or anything else is
+/// [`DEFAULT_TABLE`]. Same host/worker reach as [`PO2_TABLE_ENV`].
+pub const TIER_TABLE_ENV: &str = "ZKMINER_METAL_TIER_TABLE";
+
+/// Which segment-size table a Mac is sized with ([`PO2_TABLE_ENV`], [`TIER_TABLE_ENV`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Po2Table {
     /// M1's table (M6 made it the shared one): sized by the unconstrained recursion-phase peak.
     M1,
     /// M8's table: sized by what proves under an enforced working-set budget (risc0 Z12).
     M8,
+    /// W7-M11: M8's GPU rows plus po2 20 from 10 GiB, each row above M8's admitted only where the
+    /// footprint model fits the Mac's RAM ([`footprint_po2_cap`]). With today's risc0 that keeps an
+    /// 18 GB Mac at 19 (po2 20's full-suite footprint is 16.2 GiB), so on every real Mac it decides
+    /// as M8 does; only a budget run on a Mac with >= 20.75 GiB of RAM moves (10-12 GiB: 20).
+    W7,
+    /// W7-M11 with risc0 W7-R2's small-Mac rows: po2 19 from 4 GiB and po2 20 from 8 GiB, under the
+    /// same footprint rule with that risc0's footprints. Needs a risc0 with W7-A1, W7-R2 and W7-G1
+    /// (without W7-R2 these sizes are refused in the accum commit under an enforced budget; the
+    /// footprints assume W7-G1's graph release, [`spawn_without_malloc_large_cache`]), so it is
+    /// opt-in until those are merged. Per Mac: 16 GB 19 (8 GiB) / 19 (4 GiB active), 18 GB 20 / 19.
+    R2,
 }
 
-/// [`PO2_TABLE_ENV`] from this process's environment.
+/// The table used when neither knob says otherwise.
+pub const DEFAULT_TABLE: Po2Table = Po2Table::W7;
+
+/// [`PO2_TABLE_ENV`] / [`TIER_TABLE_ENV`] from this process's environment.
 pub fn env_po2_table() -> Po2Table {
-    match std::env::var(PO2_TABLE_ENV) {
-        Ok(v) if v.trim().eq_ignore_ascii_case("m1") => Po2Table::M1,
-        _ => Po2Table::M8,
+    let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_ascii_lowercase());
+    po2_table_from(
+        var(PO2_TABLE_ENV).as_deref(),
+        var(TIER_TABLE_ENV).as_deref(),
+    )
+}
+
+/// [`env_po2_table`] as a pure function of the two variables (lower-cased, trimmed).
+pub fn po2_table_from(po2_table: Option<&str>, tier_table: Option<&str>) -> Po2Table {
+    if po2_table == Some("m1") {
+        return Po2Table::M1;
+    }
+    match tier_table {
+        Some("m8") => Po2Table::M8,
+        Some("m1") => Po2Table::M1,
+        Some("r2") => Po2Table::R2,
+        Some("w7") => Po2Table::W7,
+        _ => DEFAULT_TABLE,
     }
 }
 
@@ -63,21 +97,134 @@ pub fn env_po2_table() -> Po2Table {
 /// one step more cautious because an 18 GB Mac (10 GiB host figure) enforces no budget: its proof's
 /// process footprint (13.4-13.7 GB at po2 20 against 8.4 GB at 19 with the worker's segment-prover
 /// release) would be ~70% of its RAM. From
-/// 12 GiB up (a 24 GB Mac, 16 GiB) po2 20 is the default.
+/// 12 GiB up (a 24 GB Mac, 16 GiB) po2 20 is the default. [`Po2Table::W7`] replaces this caution by
+/// the footprint model ([`footprint_po2_cap`]).
 pub const PO2_20_DEFAULT_LIMIT: u64 = 12 * GIB;
 
 /// The smallest working-set limit po2 20 may start under ([`min_limit_for_po2`]): measured to prove.
 pub const PO2_20_MIN_LIMIT: u64 = 10 * GIB;
 
+/// [`Po2Table::R2`]: po2 20 proves under an 8 GiB budget and po2 19 under 4 GiB with risc0 W7-R2
+/// (96.5 % of the budget live at the FRI mix; W7-R2 asks that these stay the tiers' own budgets,
+/// never lower).
+pub const R2_PO2_20_MIN_LIMIT: u64 = 8 * GIB;
+/// See [`R2_PO2_20_MIN_LIMIT`].
+pub const R2_PO2_19_MIN_LIMIT: u64 = 4 * GIB;
+
+// ---- W7-M11: the footprint model ----
+
+/// RAM a Mac keeps for macOS and the owner's apps beside a proof: a tier above M8's is used only
+/// when the proof's peak process footprint ([`footprint_bytes`]) leaves this much of `hw.memsize`
+/// free (18 GB Mac: po2 20 only with a footprint of at most 13.5 GiB). A fixed amount, not a RAM
+/// fraction (PLAN 9.1): what macOS and a browser need does not grow with the Mac.
+pub const FOOTPRINT_RESERVE_BYTES: u64 = 4608 << 20;
+
+/// Simulation and test override of the RAM the footprint model sees (bytes, the
+/// [`MAX_WORKING_SET_ENV`] grammar); unset, `hw.memsize`.
+pub const HOST_RAM_ENV: &str = "ZKMINER_METAL_HOST_RAM_BYTES";
+
+/// The peak process footprint (`phys_footprint`, which on a Mac includes the GPU allocations) of the
+/// worker proving the full six-program benchmark suite at segment `po2`, the worst over the budgets
+/// that size is tiered at, rounded up to a quarter GiB (W7-M11 note, "Footprint model"; M5 Max,
+/// `/usr/bin/time -l`, every program wrapped and verified):
+///
+/// | po2 | [`Po2Table::W7`] (risc0 `zkminer/metal` b5fa9a97a) | [`Po2Table::R2`] (+ W7-A1, W7-R2, W7-G1, `MallocLargeCache=0`) |
+/// |---|---|---|
+/// | <= 18 | 7.5 GiB (M8: 7.31 GiB at 4 GiB) | 6 GiB (5.94 GiB at 4 GiB) |
+/// | 19 | 10.5 GiB (10.45 GiB at 10 GiB) | 7 GiB (6.20 at 4 GiB, 6.82 at a 16 GB Mac's 10.67 GiB HAL / 8 GiB plan) |
+/// | 20 | 16.25 GiB (16.18 GiB at 10 GiB) | 12 GiB (10.63 at 8, 11.07 at 10.67 / 8, 11.86 at 10, 11.04 at 12 / 10) |
+///
+/// At po2 20 the big programs' segment phase is the peak: 9.3-9.5 GB of Metal allocations plus
+/// 2-7 GB of host state. Above 20 nothing is tiered here (only Macs whose RAM is far above these
+/// reach those sizes), so the model doubles per step. M1 and M8 do not use it.
+pub fn footprint_bytes(po2: u8, table: Po2Table) -> u64 {
+    const Q: u64 = GIB / 4;
+    let (le18, p19, p20) = match table {
+        Po2Table::R2 => (24 * Q, 28 * Q, 48 * Q),
+        _ => (30 * Q, 42 * Q, 65 * Q),
+    };
+    match po2 {
+        0..=18 => le18,
+        19 => p19,
+        20 => p20,
+        p => p20 << (p - 20).min(4),
+    }
+}
+
+/// The largest segment po2 whose [`footprint_bytes`] leaves [`FOOTPRINT_RESERVE_BYTES`] of `ram`.
+/// `None` when not even po2 16 does.
+pub fn footprint_po2_cap(ram: u64, table: Po2Table) -> Option<u8> {
+    (16..=24u8)
+        .rev()
+        .find(|&p| footprint_bytes(p, table).saturating_add(FOOTPRINT_RESERVE_BYTES) <= ram)
+}
+
+/// W7-G1 releases the Groth16 witness graph (~1.2-1.8 GiB of footprint) only in a worker spawned with
+/// `MallocLargeCache=0` (libmalloc reads it at process start) and a working-set limit below 20 GiB;
+/// [`Po2Table::R2`]'s footprint model assumes it. Whether the dispatcher spawns a Metal worker with
+/// it: with that table, below 20 GiB, unless the operator set `MallocLargeCache` (`operator_set`).
+pub fn spawn_without_malloc_large_cache(limit: u64, table: Po2Table, operator_set: bool) -> bool {
+    table == Po2Table::R2 && limit < 20 * GIB && !operator_set
+}
+
+/// The libmalloc variable [`spawn_without_malloc_large_cache`] sets to `0`.
+pub const MALLOC_LARGE_CACHE_ENV: &str = "MallocLargeCache";
+
+/// The RAM the footprint model sizes against: [`HOST_RAM_ENV`], else `hw.memsize` (macOS), else
+/// `None` (no row above M8's is then used).
+pub fn host_ram_bytes() -> Option<u64> {
+    if let Some(v) = std::env::var(HOST_RAM_ENV)
+        .ok()
+        .and_then(|v| parse_bytes(&v))
+    {
+        return Some(v);
+    }
+    hw_memsize()
+}
+
+#[cfg(target_os = "macos")]
+fn hw_memsize() -> Option<u64> {
+    use std::ffi::{c_char, c_int, c_void};
+    extern "C" {
+        // libSystem; std links it on every Apple target. Declared here so this file stays std-only.
+        fn sysctlbyname(
+            name: *const c_char,
+            oldp: *mut c_void,
+            oldlenp: *mut usize,
+            newp: *mut c_void,
+            newlen: usize,
+        ) -> c_int;
+    }
+    let mut v: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: a NUL-terminated name, an 8-byte out buffer and its length; nothing is written.
+    let rc = unsafe {
+        sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut v as *mut u64).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == 8 && v > 0).then_some(v)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hw_memsize() -> Option<u64> {
+    None
+}
+
 /// The default segment size for a GPU working-set limit (PLAN 9.1), with the table
-/// [`PO2_TABLE_ENV`] selects.
+/// [`PO2_TABLE_ENV`] / [`TIER_TABLE_ENV`] select and this Mac's RAM ([`host_ram_bytes`]).
 pub fn job_po2_for_limit(limit: u64) -> u8 {
     job_po2_for_limit_in(limit, env_po2_table())
 }
 
-/// The default segment size for a GPU working-set limit and table.
+/// The GPU rule of each table: the largest size that proves under `limit`, before the footprint
+/// model.
 ///
-/// [`Po2Table::M8`] (default). Measured with the worker's `--benchmark` (memory-merkle, M5 Max, risc0
+/// [`Po2Table::M8`]. Measured with the worker's `--benchmark` (memory-merkle, M5 Max, risc0
 /// fork with Z12) under `RISC0_METAL_MAX_WORKING_SET_BYTES`; Metal peak MiB segments / recursion /
 /// wrap, all proofs wrapped and verified (zk-miner `docs/metal-port-notes/M8.md`, risc0 `Z12.md`):
 ///
@@ -96,8 +243,8 @@ pub fn job_po2_for_limit(limit: u64) -> u8 {
 /// [`Po2Table::M1`]: < 6 GiB 17, < 12 GiB 18, < 20 GiB 19, else 20 (M1 note: sized by the
 /// unconstrained recursion-phase peak, 3971 / 4390 / 6668 / 11169 MiB at 17 / 18 / 19 / 20).
 ///
-/// Never above [`DEFAULT_JOB_PO2_CAP`].
-pub fn job_po2_for_limit_in(limit: u64, table: Po2Table) -> u8 {
+/// [`Po2Table::W7`]: < 6 GiB 18, < 10 GiB 19, else 20. [`Po2Table::R2`]: < 8 GiB 19, else 20.
+pub fn gpu_po2_for_limit_in(limit: u64, table: Po2Table) -> u8 {
     let po2 = match table {
         Po2Table::M1 => {
             if limit < 6 * GIB {
@@ -119,8 +266,52 @@ pub fn job_po2_for_limit_in(limit: u64, table: Po2Table) -> u8 {
                 20
             }
         }
+        Po2Table::W7 => {
+            if limit < 6 * GIB {
+                18
+            } else if limit < PO2_20_MIN_LIMIT {
+                19
+            } else {
+                20
+            }
+        }
+        Po2Table::R2 => {
+            if limit < R2_PO2_20_MIN_LIMIT {
+                19
+            } else {
+                20
+            }
+        }
     };
     po2.min(DEFAULT_JOB_PO2_CAP)
+}
+
+/// The default segment size for a GPU working-set limit and table, on this Mac
+/// ([`host_ram_bytes`]): [`job_po2_in`].
+pub fn job_po2_for_limit_in(limit: u64, table: Po2Table) -> u8 {
+    job_po2_in(limit, table, host_ram_bytes())
+}
+
+/// The default segment size for a GPU working-set limit, a table and the Mac's RAM.
+///
+/// M1 and M8: their GPU rule ([`gpu_po2_for_limit_in`]). W7 and R2: `min(GPU rule, footprint
+/// model)`, where the footprint model only ever removes a row above M8's (M8's rows are shipped and
+/// measured on every Mac size): a size above M8's is kept only when its [`footprint_bytes`] leaves
+/// [`FOOTPRINT_RESERVE_BYTES`] of `ram`; an unknown `ram` keeps M8's. Never above
+/// [`DEFAULT_JOB_PO2_CAP`].
+pub fn job_po2_in(limit: u64, table: Po2Table, ram: Option<u64>) -> u8 {
+    let gpu = gpu_po2_for_limit_in(limit, table);
+    match table {
+        Po2Table::M1 | Po2Table::M8 => gpu,
+        Po2Table::W7 | Po2Table::R2 => {
+            let m8 = gpu_po2_for_limit_in(limit, Po2Table::M8);
+            if gpu <= m8 {
+                return gpu;
+            }
+            let cap = ram.and_then(|r| footprint_po2_cap(r, table)).unwrap_or(0);
+            gpu.min(cap.max(m8))
+        }
+    }
 }
 
 /// Peak GPU memory of the largest STARK phase at `po2` with no budget enforced (the recursion phase,
@@ -145,13 +336,17 @@ pub fn stark_peak_bytes(po2: u8) -> u64 {
 /// Groth16 wrap's 3926 MiB is the largest phase; 6 GiB for 19; [`PO2_20_MIN_LIMIT`] for 20), and above
 /// 20, where nothing was measured under a budget, [`stark_peak_bytes`] as before.
 /// [`Po2Table::M1`]: [`stark_peak_bytes`].
+/// [`Po2Table::W7`]: M8's. [`Po2Table::R2`]: 4 GiB up to 19 ([`R2_PO2_19_MIN_LIMIT`]),
+/// [`R2_PO2_20_MIN_LIMIT`] for 20, then [`stark_peak_bytes`].
 pub fn min_limit_for_po2(po2: u8, table: Po2Table) -> u64 {
     match (table, po2) {
         (Po2Table::M1, p) => stark_peak_bytes(p),
-        (Po2Table::M8, 0..=18) => 4 * GIB,
-        (Po2Table::M8, 19) => 6 * GIB,
-        (Po2Table::M8, 20) => PO2_20_MIN_LIMIT,
-        (Po2Table::M8, p) => stark_peak_bytes(p),
+        (Po2Table::M8 | Po2Table::W7, 0..=18) => 4 * GIB,
+        (Po2Table::M8 | Po2Table::W7, 19) => 6 * GIB,
+        (Po2Table::M8 | Po2Table::W7, 20) => PO2_20_MIN_LIMIT,
+        (Po2Table::R2, 0..=19) => R2_PO2_19_MIN_LIMIT,
+        (Po2Table::R2, 20) => R2_PO2_20_MIN_LIMIT,
+        (_, p) => stark_peak_bytes(p),
     }
 }
 
@@ -296,7 +491,10 @@ pub fn same_for_job_in(a: u64, b: u64, po2: Option<u8>, enforced: bool, table: P
     }
     let (pa, pb) = match po2 {
         Some(p) => (p, p),
-        None => (job_po2_for_limit_in(a, table), job_po2_for_limit_in(b, table)),
+        None => (
+            job_po2_for_limit_in(a, table),
+            job_po2_for_limit_in(b, table),
+        ),
     };
     let admits = |l: u64, p: u8| max_po2_for_limit_in(l, table).is_some_and(|c| p <= c);
     pa == pb
@@ -315,7 +513,8 @@ pub fn same_for_job(a: u64, b: u64, po2: Option<u8>, enforced: bool) -> bool {
 /// Whether a worker started with figure `limit` admits a job of segment po2 `po2` (its hard ceiling,
 /// [`max_po2_for_limit`], of the figure as the worker sees it).
 pub fn admits_po2(limit: u64, po2: u8) -> bool {
-    max_po2_for_limit(host_working_set_limit(Some(limit)).unwrap_or(limit)).is_some_and(|c| po2 <= c)
+    max_po2_for_limit(host_working_set_limit(Some(limit)).unwrap_or(limit))
+        .is_some_and(|c| po2 <= c)
 }
 
 /// The figure a slot reports on the claim side for `tier` (`WorkerPool::risc0_slots`): the tier's
@@ -871,6 +1070,125 @@ mod tests {
                 "{gib} GiB"
             );
         }
+    }
+
+    /// W7-M11: the knobs. `ZKMINER_METAL_PO2_TABLE=m1` still wins; `ZKMINER_METAL_TIER_TABLE=m8`
+    /// restores M8's table, `r2` opts into W7-R2's small-Mac rows.
+    #[test]
+    fn the_tier_knobs_select_the_table() {
+        use Po2Table::*;
+        assert_eq!(po2_table_from(None, None), DEFAULT_TABLE);
+        assert_eq!(DEFAULT_TABLE, W7);
+        assert_eq!(po2_table_from(Some("m1"), Some("r2")), M1);
+        assert_eq!(po2_table_from(None, Some("m8")), M8);
+        assert_eq!(po2_table_from(None, Some("m1")), M1);
+        assert_eq!(po2_table_from(None, Some("r2")), R2);
+        assert_eq!(po2_table_from(None, Some("w7")), W7);
+        assert_eq!(
+            po2_table_from(Some("other"), Some("nonsense")),
+            DEFAULT_TABLE
+        );
+    }
+
+    /// W7-M11: the rule is min(GPU rule, footprint model), and the footprint model only removes rows
+    /// above M8's. Per Mac (RAM, host figure = RAM less 8 GiB), with the measured footprints:
+    #[test]
+    fn the_w7_tiers_follow_the_gpu_rule_and_the_footprint_model() {
+        use Po2Table::*;
+        let ram = |gib: u64| Some(gib * GIB);
+        let w7 = |ram_gib: u64, limit_gib: u64| job_po2_in(limit_gib * GIB, W7, ram(ram_gib));
+        let r2 = |ram_gib: u64, limit_gib: u64| job_po2_in(limit_gib * GIB, R2, ram(ram_gib));
+        // 18 GB Mac, 10 GiB figure: W7 keeps 19 (po2 20's 16.25 GiB + 4.5 GiB > 18 GiB); R2 (12 GiB
+        // with the graph release) gives 20.
+        assert_eq!(w7(18, 10), 19);
+        assert_eq!(r2(18, 10), 20);
+        // The same figure on a big Mac (a budget run): 20 in both; unknown RAM keeps M8's 19.
+        assert_eq!(w7(36, 10), 20);
+        assert_eq!(job_po2_in(10 * GIB, W7, None), 19);
+        assert_eq!(job_po2_in(10 * GIB, R2, None), 19);
+        // 16 GB Mac, 8 GiB figure: 19 in both (R2's po2 20 needs 12 + 4.5 GiB).
+        assert_eq!(w7(16, 8), 19);
+        assert_eq!(r2(16, 8), 19);
+        // R2's 4 GiB row (a 16 or 18 GB Mac's owner-active tier): 19 (7 + 4.5 GiB).
+        assert_eq!(r2(16, 4), 19);
+        assert_eq!(r2(18, 4), 19);
+        assert_eq!(w7(16, 4), 18);
+        // 24 GB: 20 in every table; its owner-active 8 GiB tier: 20 in R2 (12 + 4.5 <= 24).
+        for t in [M8, W7, R2] {
+            assert_eq!(job_po2_in(16 * GIB, t, ram(24)), 20);
+            assert_eq!(job_po2_in(28 * GIB, t, ram(36)), 20);
+        }
+        assert_eq!(r2(24, 8), 20);
+        assert_eq!(w7(24, 8), 19);
+        // W7 changes no real Mac's idle tier (only budget runs on Macs with >= 20.75 GiB of RAM).
+        for ram_gib in [16u64, 18, 24, 32, 36, 48, 64, 96, 128, 192] {
+            let figure = (ram_gib - 8) * GIB;
+            assert_eq!(
+                job_po2_in(figure, W7, ram(ram_gib)),
+                job_po2_in(figure, M8, None),
+                "{ram_gib} GB"
+            );
+        }
+        // Never below M8, never above the cap, monotonic in the limit, and the ceiling admits it.
+        for t in [W7, R2] {
+            for ram_gib in [12u64, 16, 18, 24, 36, 64] {
+                let mut last = 0;
+                for mib in (4096..=64 * 1024u64).step_by(256) {
+                    let limit = mib << 20;
+                    let p = job_po2_in(limit, t, ram(ram_gib));
+                    assert!(p >= job_po2_in(limit, M8, None), "{t:?} {ram_gib} {mib}");
+                    assert!(p <= DEFAULT_JOB_PO2_CAP);
+                    assert!(p >= last, "{t:?} {ram_gib} GB {mib} MiB");
+                    last = p;
+                    let ceiling = max_po2_for_limit_in(limit, t).unwrap();
+                    assert!(
+                        ceiling >= p,
+                        "{t:?} {ram_gib} GB {mib} MiB: {ceiling} < {p}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_footprint_model_and_the_r2_ceiling() {
+        use Po2Table::*;
+        // W7: 18 GiB of RAM holds 19 (10.5 + 4.5), 20.75 GiB holds 20; R2: 16.5 GiB holds 20.
+        assert_eq!(footprint_po2_cap(18 * GIB, W7), Some(19));
+        assert_eq!(footprint_po2_cap(20 * GIB + 3 * GIB / 4, W7), Some(20));
+        assert_eq!(footprint_po2_cap(16 * GIB, R2), Some(19));
+        assert_eq!(footprint_po2_cap(16 * GIB + GIB / 2, R2), Some(20));
+        assert_eq!(footprint_po2_cap(8 * GIB, W7), None);
+        for t in [W7, R2] {
+            for p in 16..24u8 {
+                assert!(footprint_bytes(p, t) <= footprint_bytes(p + 1, t));
+            }
+        }
+        let r2 = |gib: u64| max_po2_for_limit_in(gib * GIB, R2);
+        assert_eq!(
+            (r2(3), r2(4), r2(6), r2(8)),
+            (None, Some(19), Some(19), Some(20))
+        );
+        let w7 = |gib: u64| max_po2_for_limit_in(gib * GIB, W7);
+        assert_eq!((w7(4), w7(8), w7(10)), (Some(18), Some(19), Some(20)));
+        // Above 20 every table keeps M1's ceiling.
+        for gib in [16, 28, 64, 180] {
+            for t in [W7, R2] {
+                assert_eq!(
+                    max_po2_for_limit_in(gib * GIB, t),
+                    max_po2_for_limit_in(gib * GIB, M1)
+                );
+            }
+        }
+        // The active tier's floor stays the smallest row's budget, 4 GiB.
+        assert_eq!(active_limit_in(10 * GIB, R2), 4 * GIB);
+        assert_eq!(active_limit_in(10 * GIB, W7), 4 * GIB);
+        // W7-G1's graph release: only with R2, below 20 GiB, and not over the operator's value.
+        assert!(spawn_without_malloc_large_cache(10 * GIB, R2, false));
+        assert!(!spawn_without_malloc_large_cache(10 * GIB, R2, true));
+        assert!(!spawn_without_malloc_large_cache(20 * GIB, R2, false));
+        assert!(!spawn_without_malloc_large_cache(10 * GIB, W7, false));
+        assert!(!spawn_without_malloc_large_cache(10 * GIB, M8, false));
     }
 
     #[test]

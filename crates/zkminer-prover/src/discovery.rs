@@ -220,6 +220,24 @@ pub fn owner_reading() -> crate::metal_sizing::OwnerReading {
     read_owner(&MacOwnerSource)
 }
 
+/// W7-M11: this host's power state now, in the form a worker's benchmark entry carries it
+/// (`BenchmarkEntry::power_state`): Low Power Mode, battery, `NSProcessInfo.thermalState`. All
+/// `None` off macOS. `benchmark::load_cached_benchmark` compares it with a cached suite's marks.
+pub fn host_power_state() -> zkminer_prover_protocol::BenchPowerState {
+    #[cfg(target_os = "macos")]
+    {
+        zkminer_prover_protocol::BenchPowerState {
+            low_power_mode: mac_owner::low_power_mode(),
+            on_battery: mac_owner::on_battery(),
+            thermal: mac_owner::thermal_state(),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        zkminer_prover_protocol::BenchPowerState::default()
+    }
+}
+
 /// The real owner-activity source. Every probe works as an ordinary user, with no entitlement and
 /// no sudo:
 /// - IOKit `IOHIDSystem`'s `HIDIdleTime` (nanoseconds since the last HID event; what `ioreg -c
@@ -368,6 +386,32 @@ mod mac_owner {
             let text = ok.then(|| CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned());
             CFRelease(blob);
             text.map(|t| t == "Battery Power")
+        }
+    }
+
+    /// `[[NSProcessInfo processInfo] thermalState]` (0 nominal .. 3 critical).
+    pub fn thermal_state() -> Option<u8> {
+        type MsgId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+        type MsgInt = unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize;
+        // SAFETY: as in `low_power_mode`: `objc_msgSend` through each message's real signature;
+        // `thermalState` (macOS 10.10.3+) returns an NSInteger; the shared instance is not owned.
+        unsafe {
+            if NSFoundationVersionNumber <= 0.0 {
+                return None;
+            }
+            let class = objc_getClass(c"NSProcessInfo".as_ptr());
+            if class.is_null() {
+                return None;
+            }
+            let send = objc_msgSend as unsafe extern "C" fn();
+            let id: MsgId = std::mem::transmute(send);
+            let int: MsgInt = std::mem::transmute(send);
+            let info = id(class, sel_registerName(c"processInfo".as_ptr()));
+            if info.is_null() {
+                return None;
+            }
+            let t = int(info, sel_registerName(c"thermalState".as_ptr()));
+            (0..=3).contains(&t).then_some(t as u8)
         }
     }
 
@@ -2399,5 +2443,20 @@ mod tests {
             assert!(owner_reading().hid_idle.is_some());
         }
         eprintln!("one owner reading: {:.1} us", t.elapsed().as_secs_f64() * 1e4);
+    }
+
+    /// W7-M11: the host's power state answers here too (a Mac Studio on mains power, thermal
+    /// nominal or fair at rest), and is full power, so a marked cached suite would get re-benchmark
+    /// advice.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn this_macs_power_state_answers_and_is_full() {
+        let p = host_power_state();
+        eprintln!("host power state: {p:?}");
+        assert!(p.low_power_mode.is_some() && p.thermal.is_some(), "{p:?}");
+        assert_eq!(p.on_battery, owner_reading().on_battery);
+        if p.thermal.unwrap() < zkminer_prover_protocol::THERMAL_THROTTLED {
+            assert_eq!(p.reduced(), None, "{p:?}");
+        }
     }
 }

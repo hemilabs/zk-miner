@@ -27,7 +27,11 @@ use serde::{Deserialize, Serialize};
 /// image id, the SP1 verifying-key hash), derived without executing it. A v10 worker cannot decode the
 /// command, so the handshake refuses it. And `ExecuteResult` gained `host_entropy_reads`, whether the
 /// guest read host-supplied nondeterministic input (both in the same unreleased version).
-pub const PROTOCOL_VERSION: u32 = 11;
+/// 12: `BenchmarkEntry` gained `power_state`, the Mac's power state while that program was measured
+/// (Low Power Mode, battery, thermal state), so the host can mark a benchmark taken throttled
+/// (W7-M11). Last field, bincode-positional as for v4: a v11 entry is one field short, so the
+/// handshake refuses a v11 worker instead of the decoder failing mid-benchmark.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -731,7 +735,11 @@ pub struct ProgramIdRefused {
 
 impl std::fmt::Display for ProgramIdRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the worker refused to derive a program id: {}", self.message)
+        write!(
+            f,
+            "the worker refused to derive a program id: {}",
+            self.message
+        )
     }
 }
 
@@ -1052,6 +1060,76 @@ pub struct BenchmarkEntry {
     /// per slot: the wrap is fixed, and a second full proof per program would multiply the suite's
     /// run time against a per-slot benchmark timeout.
     pub wrap_secs: Option<f64>,
+    /// The power state while this program was measured (protocol v12), or `None` when the worker
+    /// cannot read one (non-Mac workers) or does not report it (`ZKMINER_POWER_STATE_IN_BENCH=0`).
+    /// A state read reduced before or after the program counts ([`BenchPowerState::merge`]).
+    #[serde(default)]
+    pub power_state: Option<BenchPowerState>,
+}
+
+/// Revert knob for the power state in benchmarks (W7-M11): `0` makes the worker report none and
+/// the host ignore any it gets, so a benchmark taken throttled is used as measured, as before.
+pub const POWER_STATE_IN_BENCH_ENV: &str = "ZKMINER_POWER_STATE_IN_BENCH";
+
+/// Whether [`POWER_STATE_IN_BENCH_ENV`] is off (`0`, `off` or `false`) in this process.
+pub fn power_state_in_bench_off() -> bool {
+    std::env::var(POWER_STATE_IN_BENCH_ENV).is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false"))
+}
+
+/// The host's power state while a benchmark program ran (macOS: `NSProcessInfo` and IOKit, as the
+/// risc0 Metal worker reads them). `None` fields could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BenchPowerState {
+    /// Low Power Mode (`NSProcessInfo.isLowPowerModeEnabled`).
+    pub low_power_mode: Option<bool>,
+    /// The providing power source is the battery.
+    pub on_battery: Option<bool>,
+    /// `NSProcessInfo.thermalState`: 0 nominal, 1 fair, 2 serious, 3 critical.
+    pub thermal: Option<u8>,
+}
+
+/// `NSProcessInfo.thermalState` from which proving is throttled (serious). Fair is normal under
+/// sustained load and does not count.
+pub const THERMAL_THROTTLED: u8 = 2;
+
+impl BenchPowerState {
+    /// Why proving in this state is slower than the host's full speed, or `None` when nothing says
+    /// so (unknown fields count as full speed).
+    pub fn reduced(&self) -> Option<String> {
+        let mut why = Vec::new();
+        if self.low_power_mode == Some(true) {
+            why.push("Low Power Mode");
+        }
+        if self.on_battery == Some(true) {
+            why.push("on battery");
+        }
+        match self.thermal {
+            Some(t) if t >= 3 => why.push("thermal critical"),
+            Some(t) if t >= THERMAL_THROTTLED => why.push("thermal serious"),
+            _ => {}
+        }
+        (!why.is_empty()).then(|| why.join(", "))
+    }
+
+    /// The worse of two readings, field by field (a reading of `true` or a higher thermal state
+    /// wins; a known value wins over an unknown one): the state a program was measured under, from
+    /// a reading before it and one after it.
+    pub fn merge(self, other: BenchPowerState) -> BenchPowerState {
+        let worst = |a: Option<bool>, b: Option<bool>| match (a, b) {
+            (Some(x), Some(y)) => Some(x || y),
+            (x, None) => x,
+            (None, y) => y,
+        };
+        BenchPowerState {
+            low_power_mode: worst(self.low_power_mode, other.low_power_mode),
+            on_battery: worst(self.on_battery, other.on_battery),
+            thermal: match (self.thermal, other.thermal) {
+                (Some(x), Some(y)) => Some(x.max(y)),
+                (x, None) => x,
+                (None, y) => y,
+            },
+        }
+    }
 }
 
 #[cfg(test)]

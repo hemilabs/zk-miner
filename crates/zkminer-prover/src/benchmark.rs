@@ -116,6 +116,16 @@ pub struct ProgramStage {
     /// `None` when the wrap was not measured for this program. SP1 measures it on one program per
     /// slot; see `BenchmarkEntry::wrap_secs`.
     pub wrap_secs: Option<f64>,
+    /// W7-M11: why this program was measured below the host's full speed (Low Power Mode, battery,
+    /// a throttling thermal state; `BenchmarkEntry::power_state`, protocol v12), or `None` when it
+    /// was measured at full power or the worker reports no power state. A suite holding a Low Power
+    /// Mode or battery row stays in use as measured, and the miner advises a re-benchmark once the
+    /// host is at full power again ([`power_redo_reason`]).
+    ///
+    /// JSON only (benchmarks.json, never bincode), so it may skip `None`; `#[serde(default)]` keeps
+    /// every older cache loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_reduced: Option<String>,
 }
 
 /// Measured throughput for one (device, prover-backend) combination.
@@ -505,6 +515,24 @@ impl DeviceBenchmark {
         } else {
             (measured[mid - 1] + measured[mid]) / 2.0
         })
+    }
+
+    /// W7-M11: why any program of this row was measured in reduced power (the reasons of
+    /// [`ProgramStage::power_reduced`], once each), or `None` when none was.
+    pub fn power_reduced(&self) -> Option<String> {
+        let mut why: Vec<&str> = Vec::new();
+        for r in self
+            .program_stages
+            .iter()
+            .filter_map(|p| p.power_reduced.as_deref())
+        {
+            for part in r.split(", ") {
+                if !why.contains(&part) {
+                    why.push(part);
+                }
+            }
+        }
+        (!why.is_empty()).then(|| why.join(", "))
     }
 
     /// Coefficient of variation across per-program throughputs.
@@ -1753,9 +1781,107 @@ fn host_peaks_from_workers(
     peaks
 }
 
+/// W7-M11: the reduced-power reason a worker's entry carries (protocol v12), unless
+/// `ZKMINER_POWER_STATE_IN_BENCH=0` (`knob_off`) says to use every entry as measured.
+fn entry_power_reduced(
+    entry: &zkminer_prover_protocol::BenchmarkEntry,
+    knob_off: bool,
+) -> Option<String> {
+    if knob_off {
+        return None;
+    }
+    entry.power_state.and_then(|p| p.reduced())
+}
+
+/// W7-M11: the part of a suite's reduced-power marks that a redo can clear: Low Power Mode and
+/// battery, the host states a benchmark cannot cause itself. `None` when no row carries either.
+///
+/// A thermal mark ("thermal serious"/"critical") never asks for a redo. The worker reads the power
+/// state before AND after each program and keeps the worse, and the after-reading comes at the end
+/// of minutes of GPU load: on a fanless or small Mac the benchmark heats the Mac to `serious`
+/// itself, which is the speed it really mines at. A redo at the next (cool) start would heat it
+/// again and be marked again, without end (fix round 1 of W7-M11). So thermal stays an
+/// informational mark and the row is priced as measured.
+pub fn power_redo_cause(suite: &BenchmarkSuite) -> Option<String> {
+    let mut parts: Vec<&'static str> = Vec::new();
+    for row in &suite.device_benchmarks {
+        let Some(why) = row.power_reduced() else {
+            continue;
+        };
+        for part in why.split(", ") {
+            for known in ["Low Power Mode", "on battery"] {
+                if part == known && !parts.contains(&known) {
+                    parts.push(known);
+                }
+            }
+        }
+    }
+    parts.sort_by_key(|p| if *p == "Low Power Mode" { 0 } else { 1 });
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// W7-M11's pricing rule for a benchmark taken in reduced power: **price as measured, redo on the
+/// operator's command, not discount**. A row measured in Low Power Mode or on battery stays in use
+/// as measured: it is what the Mac proves at in that state, so it only claims less and never
+/// over-promises. When the host is at full power again the miner advises a re-benchmark (the
+/// TUI's `[b]` or `zkminer benchmark`), and the full-power result replaces the suite when saved.
+/// A discount would need a slowdown factor per state, which nothing here measured (no laptop; Low
+/// Power Mode needs sudo).
+///
+/// The miner does not re-benchmark by itself: auto-benchmark at startup is disabled in
+/// `zkminer run` (GPU proving in passthrough VMs freezes the host), and no caller benchmarks when
+/// the cache is missing. So the cached suite is never dropped for its power marks (W7-M11 fix
+/// round 2: dropping it left the miner on placeholder prices with no measurement running).
+///
+/// Returns the advice, or `None` when there is nothing to advise:
+/// - no row carries a redo cause ([`power_redo_cause`]: a thermal mark alone never asks);
+/// - `knob_off` (`ZKMINER_POWER_STATE_IN_BENCH=0`);
+/// - `now` (the host's power state at load) is unknown or still in Low Power Mode or on battery.
+///   A hot Mac at load also gets no advice yet: a benchmark now would measure the heat.
+pub fn power_redo_reason(
+    suite: &BenchmarkSuite,
+    now: Option<zkminer_prover_protocol::BenchPowerState>,
+    knob_off: bool,
+) -> Option<String> {
+    if knob_off {
+        return None;
+    }
+    let cause = power_redo_cause(suite)?;
+    let now = now?;
+    let known = now.low_power_mode.is_some() || now.on_battery.is_some() || now.thermal.is_some();
+    if !known || now.reduced().is_some() {
+        return None;
+    }
+    let row = suite
+        .device_benchmarks
+        .iter()
+        .find(|d| d.power_reduced().is_some())
+        .map(|d| format!("{} / {}", d.device_id, d.prover_backend))
+        .unwrap_or_default();
+    Some(format!(
+        "{row} was benchmarked in reduced power ({cause}) and this host is at full power now: \
+         re-benchmark (press [b] on the Benchmark screen, or run `zkminer benchmark`) to price at \
+         full speed; until then it is priced as measured"
+    ))
+}
+
 fn build_gpu_device_benchmarks_from_workers(
     worker_results: &[crate::dispatcher::SlotBenchmarkResult],
     per_card_watts: &BTreeMap<String, f64>,
+) -> Vec<DeviceBenchmark> {
+    build_gpu_device_benchmarks_with(
+        worker_results,
+        per_card_watts,
+        zkminer_prover_protocol::power_state_in_bench_off(),
+    )
+}
+
+/// [`build_gpu_device_benchmarks_from_workers`] with `ZKMINER_POWER_STATE_IN_BENCH=0` passed in
+/// (`power_in_bench_off`), for tests that must not depend on the environment.
+fn build_gpu_device_benchmarks_with(
+    worker_results: &[crate::dispatcher::SlotBenchmarkResult],
+    per_card_watts: &BTreeMap<String, f64>,
+    power_in_bench_off: bool,
 ) -> Vec<DeviceBenchmark> {
     let mut benchmarks = Vec::new();
 
@@ -1806,8 +1932,21 @@ fn build_gpu_device_benchmarks_from_workers(
                 cycles: e.cycles,
                 stark_secs: e.duration_secs,
                 wrap_secs: e.wrap_secs,
+                power_reduced: entry_power_reduced(e, power_in_bench_off),
             })
             .collect();
+        if let Some(why) = program_stages
+            .iter()
+            .find_map(|p| p.power_reduced.as_deref())
+        {
+            tracing::warn!(
+                "{slot_key}: benchmarked in reduced power ({why}): the row is priced as measured; \
+                 for a Low Power Mode or battery row the miner advises a re-benchmark once the \
+                 host is at full power; a thermal mark is the sustained-load speed ({} = 0 \
+                 ignores the power state)",
+                zkminer_prover_protocol::POWER_STATE_IN_BENCH_ENV
+            );
+        }
 
         tracing::info!(
             "{slot_key}: {device_label} / {backend} → {:.1}M cycles/sec (avg of {} canonical programs)",
@@ -2671,12 +2810,66 @@ pub fn benchmark_cache_path() -> PathBuf {
 /// Load cached benchmarks from disk, verifying the hardware fingerprint.
 ///
 /// Returns `None` if the file is missing, corrupt, or the hardware has changed.
+///
+/// W7-M11: a suite's power marks never make it `None` (the callers do not benchmark on `None`);
+/// see [`load_cached_benchmark_with_advice`] for the re-benchmark advice.
 pub fn load_cached_benchmark() -> Option<BenchmarkSuite> {
-    load_cached_benchmark_from(
+    load_cached_benchmark_with_advice().map(|(suite, _)| suite)
+}
+
+/// [`load_cached_benchmark`], also returning the re-benchmark advice of [`power_redo_reason`]
+/// (logged here as a WARN too), for a caller that shows it to the operator or starts a benchmark.
+pub fn load_cached_benchmark_with_advice() -> Option<(BenchmarkSuite, Option<String>)> {
+    load_cached_benchmark_with_power(
         &benchmark_cache_path(),
         &suite_version(),
         &hardware_fingerprint(),
+        crate::discovery::host_power_state,
+        zkminer_prover_protocol::power_state_in_bench_off(),
     )
+}
+
+/// [`load_cached_benchmark_with_advice`] with its environment injected: the cache file, the host's
+/// power state at load (`now`, read only when a row carries a redo cause) and the knob.
+///
+/// Read-only: it never writes the cache, and it returns the cached suite whatever its marks.
+pub(crate) fn load_cached_benchmark_with_power(
+    path: &std::path::Path,
+    current_version: &str,
+    current_fp: &str,
+    now: impl FnOnce() -> zkminer_prover_protocol::BenchPowerState,
+    knob_off: bool,
+) -> Option<(BenchmarkSuite, Option<String>)> {
+    let suite = load_cached_benchmark_from(path, current_version, current_fp)?;
+    if knob_off {
+        return Some((suite, None));
+    }
+    let marked = suite
+        .device_benchmarks
+        .iter()
+        .find_map(|d| d.power_reduced().map(|w| (d.device_id.clone(), w)));
+    let Some((device, why)) = marked else {
+        return Some((suite, None));
+    };
+    if power_redo_cause(&suite).is_none() {
+        tracing::info!(
+            "The cached benchmark of {device} was taken hot ({why}); used as measured (the \
+             sustained-load speed of this Mac)"
+        );
+        return Some((suite, None));
+    }
+    let now = now();
+    let advice = power_redo_reason(&suite, Some(now), false);
+    match &advice {
+        Some(advice) => tracing::warn!("{advice}"),
+        None => tracing::warn!(
+            "The cached benchmark of {device} was taken in reduced power ({why}); it is priced as \
+             measured, and this host is not at full power either ({})",
+            now.reduced()
+                .unwrap_or_else(|| "power state unknown".to_string())
+        ),
+    }
+    Some((suite, advice))
 }
 
 /// The body of `load_cached_benchmark`, with its three environmental inputs injected.
@@ -2878,20 +3071,35 @@ fn normalize_gpu_name_for_match(s: &str) -> String {
 
 /// Save benchmark results to disk alongside the current hardware fingerprint.
 pub fn save_benchmark(suite: &BenchmarkSuite) {
+    let path = benchmark_cache_path();
+    match save_benchmark_to(&path, &suite_version(), &hardware_fingerprint(), suite) {
+        Ok(()) => tracing::info!("Saved benchmarks to {}", path.display()),
+        Err(e) => tracing::error!("{e}"),
+    }
+}
+
+/// The body of [`save_benchmark`], with the path and identity injected (W7-M11, for the power-state
+/// tests).
+pub(crate) fn save_benchmark_to(
+    path: &std::path::Path,
+    current_version: &str,
+    current_fp: &str,
+    suite: &BenchmarkSuite,
+) -> Result<(), String> {
     let saved = SavedBenchmark {
-        suite_version: suite_version(),
-        hardware_fingerprint: hardware_fingerprint(),
+        suite_version: current_version.to_string(),
+        hardware_fingerprint: current_fp.to_string(),
         suite: suite.clone(),
     };
+    write_saved_benchmark(path, &saved)
+}
 
-    let path = benchmark_cache_path();
-
+/// Writes `saved` to `path` atomically (temp file, fsync, rename, fsync of the directory).
+fn write_saved_benchmark(path: &std::path::Path, saved: &SavedBenchmark) -> Result<(), String> {
     // Ensure the directory exists
     if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            tracing::error!("Failed to create benchmark cache directory: {e}");
-            return;
-        }
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create benchmark cache directory: {e}"))?;
     }
 
     // TMP + RENAME, not an in-place truncating write.
@@ -2903,42 +3111,35 @@ pub fn save_benchmark(suite: &BenchmarkSuite) {
     // `host_peak_bytes` and hours of po2 calibration, reported as a single WARN at the next start.
     // `rename` within a directory is atomic, so a reader sees either the old file or the new one.
     // `JobJournal::save_to` next door already does exactly this.
-    match serde_json::to_string_pretty(&saved) {
-        Ok(json) => {
-            // A UNIQUE temp name, not a fixed one. Two savers can overlap — the TUI's `[b]` and a
-            // calibrate pass — and with a shared `benchmarks.json.tmp` they interleave into one file
-            // and rename a torn result, while the error path below deletes the other writer's temp.
-            let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-            // fsync the handle we actually WROTE. The first version reopened the file `O_RDONLY` and
-            // synced that, which syncs nothing we care about and whose result was discarded anyway.
-            let written = std::fs::File::create(&tmp).and_then(|mut f| {
-                use std::io::Write;
-                f.write_all(json.as_bytes())?;
-                f.sync_all()
-            });
-            if let Err(e) = written {
-                tracing::error!("Failed to write benchmark cache temp file: {e}");
-                let _ = std::fs::remove_file(&tmp);
-                return;
-            }
-            if let Err(e) = std::fs::rename(&tmp, &path) {
-                tracing::error!("Failed to install benchmark cache: {e}");
-                let _ = std::fs::remove_file(&tmp);
-            } else {
-                // And the DIRECTORY, so the rename itself survives a power loss rather than only the
-                // bytes it points at.
-                if let Some(parent) = path.parent() {
-                    if let Ok(d) = std::fs::File::open(parent) {
-                        let _ = d.sync_all();
-                    }
-                }
-                tracing::info!("Saved benchmarks to {}", path.display());
-            }
-        }
-        Err(e) => {
-            tracing::error!("Failed to serialize benchmark cache: {e}");
+    let json = serde_json::to_string_pretty(saved)
+        .map_err(|e| format!("Failed to serialize benchmark cache: {e}"))?;
+    // A UNIQUE temp name, not a fixed one. Two savers can overlap — the TUI's `[b]` and a
+    // calibrate pass — and with a shared `benchmarks.json.tmp` they interleave into one file
+    // and rename a torn result, while the error path below deletes the other writer's temp.
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    // fsync the handle we actually WROTE. The first version reopened the file `O_RDONLY` and
+    // synced that, which syncs nothing we care about and whose result was discarded anyway.
+    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Failed to write benchmark cache temp file: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Failed to install benchmark cache: {e}"));
+    }
+    // And the DIRECTORY, so the rename itself survives a power loss rather than only the
+    // bytes it points at.
+    if let Some(parent) = path.parent() {
+        if let Ok(d) = std::fs::File::open(parent) {
+            let _ = d.sync_all();
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3977,6 +4178,7 @@ mod tests {
                 weight: 0.10,
                 precompile: false,
                 wrap_secs: None,
+                power_state: None,
             }],
             vram_bytes,
             host_peak_bytes: None,
@@ -3999,6 +4201,7 @@ mod tests {
                 weight: 0.10,
                 precompile: false,
                 wrap_secs: wrap,
+                power_state: None,
             }
         };
         // SP1's shape: the wrap measured on one program per slot, by difference.
@@ -4037,6 +4240,7 @@ mod tests {
             cycles: 1_000_000,
             stark_secs: 1.0,
             wrap_secs: wrap,
+            power_reduced: None,
         };
         // The measured 4090 shape: one cold wrap, then five warm ones. The median is the warm figure;
         // a mean would read 2.17 s and overstate every proof's wrap by the one-off first-wrap cost.
@@ -4076,6 +4280,7 @@ mod tests {
             cycles,
             stark_secs: stark,
             wrap_secs: Some(wrap),
+            power_reduced: None,
         };
         d.program_stages = vec![
             stage("fibonacci", 32_768, 0.48, 2.96),
@@ -4895,5 +5100,329 @@ mod host_peak_tests {
         assert!(total > 1 << 30, "{total}");
         assert_eq!(Some(total), crate::memory::mem_total_bytes());
         assert!(!hardware_fingerprint().contains("|0GiB|"));
+    }
+}
+
+/// W7-M11: a benchmark taken in reduced power is marked on its row, survives the cache, and stays
+/// in use as measured, with re-benchmark advice at full power (the pricing rule,
+/// [`power_redo_reason`]).
+#[cfg(test)]
+mod power_state_tests {
+    use super::*;
+    use zkminer_prover_protocol::{BenchPowerState, BenchmarkEntry};
+
+    const FULL: BenchPowerState = BenchPowerState {
+        low_power_mode: Some(false),
+        on_battery: Some(false),
+        thermal: Some(0),
+    };
+    const LPM: BenchPowerState = BenchPowerState {
+        low_power_mode: Some(true),
+        on_battery: Some(false),
+        thermal: Some(0),
+    };
+    const HOT_BATTERY: BenchPowerState = BenchPowerState {
+        low_power_mode: Some(false),
+        on_battery: Some(true),
+        thermal: Some(2),
+    };
+
+    fn entry(name: &str, power: Option<BenchPowerState>) -> BenchmarkEntry {
+        BenchmarkEntry {
+            program_name: name.to_string(),
+            prover_backend: "risc0".to_string(),
+            cycles: 4_000_000,
+            duration_secs: 4.0,
+            throughput: 1_000_000.0,
+            weight: 0.15,
+            precompile: false,
+            wrap_secs: Some(1.5),
+            power_state: power,
+        }
+    }
+
+    fn metal_slot(entries: Vec<BenchmarkEntry>) -> crate::dispatcher::SlotBenchmarkResult {
+        crate::dispatcher::SlotBenchmarkResult {
+            slot_key: "risc0:metal:0".to_string(),
+            gpu_name: Some("Apple M5 Max".to_string()),
+            device_index: Some(0),
+            pci_bus_id: None,
+            gpu_tag: "metal".to_string(),
+            entries,
+            vram_bytes: Some(28 << 30),
+            host_peak_bytes: None,
+        }
+    }
+
+    /// The device rows, with the power knob as unset (independent of this process's environment).
+    fn rows_of(
+        slots: &[crate::dispatcher::SlotBenchmarkResult],
+        watts: &BTreeMap<String, f64>,
+    ) -> Vec<DeviceBenchmark> {
+        build_gpu_device_benchmarks_with(slots, watts, false)
+    }
+
+    fn suite_of(rows: Vec<DeviceBenchmark>) -> BenchmarkSuite {
+        BenchmarkSuite {
+            device_benchmarks: rows,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_program_measured_in_reduced_power_marks_its_row() {
+        let slot = metal_slot(vec![
+            entry("fibonacci", Some(FULL)),
+            entry("memory-merkle", Some(LPM)),
+            entry("chacha-mix", Some(HOT_BATTERY)),
+            entry("sha256-chain", None),
+        ]);
+        let rows = rows_of(&[slot], &BTreeMap::new());
+        let marks: Vec<Option<&str>> = rows[0]
+            .program_stages
+            .iter()
+            .map(|p| p.power_reduced.as_deref())
+            .collect();
+        assert_eq!(
+            marks,
+            [
+                None,
+                Some("Low Power Mode"),
+                Some("on battery, thermal serious"),
+                None
+            ]
+        );
+        assert_eq!(
+            rows[0].power_reduced().as_deref(),
+            Some("Low Power Mode, on battery, thermal serious")
+        );
+        // A full-power suite carries no mark.
+        let rows = rows_of(
+            &[metal_slot(vec![entry("fibonacci", Some(FULL))])],
+            &BTreeMap::new(),
+        );
+        assert_eq!(rows[0].power_reduced(), None);
+        // The knob uses every entry as measured.
+        assert_eq!(entry_power_reduced(&entry("x", Some(LPM)), true), None);
+        assert!(entry_power_reduced(&entry("x", Some(LPM)), false).is_some());
+    }
+
+    #[test]
+    fn a_reduced_benchmark_gets_advice_once_the_host_is_at_full_power() {
+        let marked = suite_of(rows_of(
+            &[metal_slot(vec![entry("memory-merkle", Some(LPM))])],
+            &BTreeMap::new(),
+        ));
+        let clean = suite_of(rows_of(
+            &[metal_slot(vec![entry("memory-merkle", Some(FULL))])],
+            &BTreeMap::new(),
+        ));
+        // Back at full power: advise a re-benchmark, naming the operator's command.
+        let why = power_redo_reason(&marked, Some(FULL), false).expect("advice");
+        assert!(why.contains("Low Power Mode"), "{why}");
+        assert!(
+            why.contains("[b]") && why.contains("zkminer benchmark"),
+            "{why}"
+        );
+        // A desktop Mac (no battery reading) at full power: advice too.
+        let desktop = BenchPowerState {
+            on_battery: None,
+            ..FULL
+        };
+        assert!(power_redo_reason(&marked, Some(desktop), false).is_some());
+        // Still reduced (any cause), or nothing readable: no advice yet.
+        assert_eq!(power_redo_reason(&marked, Some(LPM), false), None);
+        assert_eq!(power_redo_reason(&marked, Some(HOT_BATTERY), false), None);
+        assert_eq!(
+            power_redo_reason(&marked, Some(BenchPowerState::default()), false),
+            None
+        );
+        assert_eq!(power_redo_reason(&marked, None, false), None);
+        // The knob, and an unmarked suite: never.
+        assert_eq!(power_redo_reason(&marked, Some(FULL), true), None);
+        assert_eq!(power_redo_reason(&clean, Some(FULL), false), None);
+        assert_eq!(
+            power_redo_reason(&BenchmarkSuite::default(), Some(FULL), false),
+            None
+        );
+    }
+
+    /// The mark is JSON-only and optional: a cache written before it loads, a marked one keeps its
+    /// mark through save and load, and an unmarked stage writes no key. A cache carrying fix round
+    /// 1's `power_redo_attempted` key (never released) also loads: the key is ignored.
+    #[test]
+    fn the_mark_survives_the_cache_and_older_caches_still_load() {
+        let old = r#"{"program_name":"fibonacci","cycles":10,"stark_secs":1.0,"wrap_secs":null}"#;
+        let stage: ProgramStage = serde_json::from_str(old).unwrap();
+        assert_eq!(stage.power_reduced, None);
+        assert!(!serde_json::to_string(&stage)
+            .unwrap()
+            .contains("power_reduced"));
+
+        let suite = suite_of(rows_of(
+            &[metal_slot(vec![entry("memory-merkle", Some(LPM))])],
+            &BTreeMap::new(),
+        ));
+        let (dir, path) = scratch_cache("mark");
+        let saved = SavedBenchmark {
+            suite_version: "v-test".to_string(),
+            hardware_fingerprint: "fp-test".to_string(),
+            suite,
+        };
+        std::fs::write(&path, serde_json::to_string(&saved).unwrap()).unwrap();
+        let loaded = load_cached_benchmark_from(&path, "v-test", "fp-test").expect("loads");
+        assert_eq!(
+            loaded.device_benchmarks[0].power_reduced().as_deref(),
+            Some("Low Power Mode")
+        );
+        assert!(power_redo_reason(&loaded, Some(FULL), false).is_some());
+
+        let mut v: serde_json::Value = serde_json::to_value(&saved).unwrap();
+        v["power_redo_attempted"] = serde_json::json!("an earlier redo");
+        std::fs::write(&path, v.to_string()).unwrap();
+        assert!(load_cached_benchmark_from(&path, "v-test", "fp-test").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const HOT: BenchPowerState = BenchPowerState {
+        low_power_mode: Some(false),
+        on_battery: Some(false),
+        thermal: Some(2),
+    };
+    const BATTERY: BenchPowerState = BenchPowerState {
+        low_power_mode: Some(false),
+        on_battery: Some(true),
+        thermal: Some(0),
+    };
+
+    fn scratch_cache(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "zkbench-w7m11-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("benchmarks.json");
+        (dir, path)
+    }
+
+    fn suite_measured_in(state: BenchPowerState) -> BenchmarkSuite {
+        suite_of(rows_of(
+            &[metal_slot(vec![
+                entry("fibonacci", Some(FULL)),
+                entry("memory-merkle", Some(state)),
+            ])],
+            &BTreeMap::new(),
+        ))
+    }
+
+    /// One miner start, shaped like the real callers (`zkminer run` run.rs, `zkminer mock`): load
+    /// the cache with the host in `now` and price from what comes back. They never benchmark on
+    /// `None` (auto-benchmark at startup is disabled); `None` means placeholder prices. Returns the
+    /// suite in use and the advice, if any.
+    fn start(
+        path: &std::path::Path,
+        now: BenchPowerState,
+    ) -> (Option<BenchmarkSuite>, Option<String>) {
+        match load_cached_benchmark_with_power(path, "v-test", "fp-test", || now, false) {
+            Some((suite, advice)) => (Some(suite), advice),
+            None => (None, None),
+        }
+    }
+
+    /// The marked row of the suite in use, to tell which measurement prices the miner.
+    fn in_use_mark(suite: &Option<BenchmarkSuite>) -> Option<String> {
+        suite
+            .as_ref()
+            .expect("a measured suite in use")
+            .device_benchmarks[0]
+            .power_reduced()
+    }
+
+    /// The fix-round-1 finding: a benchmark that heats the Mac to `serious` itself is marked, and
+    /// the next start is cool. It stays in use as measured and never asks for a redo.
+    #[test]
+    fn a_self_heated_benchmark_is_never_redone() {
+        let (dir, path) = scratch_cache("heat");
+        save_benchmark_to(&path, "v-test", "fp-test", &suite_measured_in(HOT)).unwrap();
+        let cached = load_cached_benchmark_from(&path, "v-test", "fp-test").unwrap();
+        assert_eq!(
+            cached.device_benchmarks[0].power_reduced().as_deref(),
+            Some("thermal serious")
+        );
+        assert_eq!(power_redo_cause(&cached), None);
+        for now in [FULL, FULL, FULL, FULL, FULL, HOT] {
+            let (suite, advice) = start(&path, now);
+            assert_eq!(in_use_mark(&suite).as_deref(), Some("thermal serious"));
+            assert_eq!(advice, None);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fix-round-2 finding, caller-shaped: a battery suite at a full-power start used to be
+    /// dropped (and a one-shot record written) while no caller benchmarked, so that start priced
+    /// from placeholders and the next one kept the battery suite for good. Now every start keeps
+    /// the measured suite, never writes the cache, and advises a re-benchmark while the host is at
+    /// full power; once the operator's full-power benchmark is saved, that suite is in use and the
+    /// advice stops.
+    #[test]
+    fn a_reduced_suite_stays_in_use_until_the_operator_rebenchmarks() {
+        let (dir, path) = scratch_cache("caller");
+        save_benchmark_to(&path, "v-test", "fp-test", &suite_measured_in(BATTERY)).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        // Still on battery: in use, no advice.
+        let (suite, advice) = start(&path, BATTERY);
+        assert_eq!(in_use_mark(&suite).as_deref(), Some("on battery"));
+        assert_eq!(advice, None);
+        // Full power, on every one of many starts: still in use, advice every time.
+        for _ in 0..5 {
+            let (suite, advice) = start(&path, FULL);
+            assert_eq!(in_use_mark(&suite).as_deref(), Some("on battery"));
+            assert!(advice.expect("advice").contains("on battery"));
+        }
+        // Hot at load: in use, no advice (a benchmark now would measure the heat).
+        let (suite, advice) = start(&path, HOT);
+        assert!(suite.is_some());
+        assert_eq!(advice, None);
+        // A load never writes the cache.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // The operator presses [b] at full power: the clean suite is in use, no advice.
+        save_benchmark_to(&path, "v-test", "fp-test", &suite_measured_in(FULL)).unwrap();
+        for _ in 0..3 {
+            let (suite, advice) = start(&path, FULL);
+            assert_eq!(in_use_mark(&suite), None);
+            assert_eq!(advice, None);
+        }
+        // A [b] that is itself marked again (unplugged during it) is simply in use, with advice.
+        save_benchmark_to(&path, "v-test", "fp-test", &suite_measured_in(LPM)).unwrap();
+        let (suite, advice) = start(&path, FULL);
+        assert_eq!(in_use_mark(&suite).as_deref(), Some("Low Power Mode"));
+        assert!(advice.is_some());
+        // The knob: in use, no advice.
+        let (suite, advice) =
+            load_cached_benchmark_with_power(&path, "v-test", "fp-test", || FULL, true).unwrap();
+        assert!(suite.device_benchmarks[0].power_reduced().is_some());
+        assert_eq!(advice, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read-only cache directory changes nothing: the load needs no write.
+    #[test]
+    fn a_read_only_cache_still_loads_with_advice() {
+        let (dir, path) = scratch_cache("ro");
+        save_benchmark_to(&path, "v-test", "fp-test", &suite_measured_in(LPM)).unwrap();
+        let mut perm = std::fs::metadata(&dir).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perm.set_mode(0o500);
+        std::fs::set_permissions(&dir, perm.clone()).unwrap();
+        let kept = load_cached_benchmark_with_power(&path, "v-test", "fp-test", || FULL, false);
+        perm.set_mode(0o700);
+        std::fs::set_permissions(&dir, perm).unwrap();
+        let (_, advice) = kept.expect("in use");
+        assert!(advice.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

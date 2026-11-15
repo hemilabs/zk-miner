@@ -2698,6 +2698,17 @@ impl WorkerPool {
                         zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
                         vram.to_string(),
                     );
+                    // W7-M11: with the R2 tier table (opt-in), the footprints it was sized with
+                    // assume risc0 W7-G1's witness-graph release, which needs libmalloc's large
+                    // cache off from the worker's start (`metal_sizing::spawn_without_malloc_large_cache`).
+                    let ms = crate::metal_sizing::MALLOC_LARGE_CACHE_ENV;
+                    if crate::metal_sizing::spawn_without_malloc_large_cache(
+                        crate::metal_sizing::host_working_set_limit(Some(vram)).unwrap_or(vram),
+                        crate::metal_sizing::env_po2_table(),
+                        std::env::var_os(ms).is_some(),
+                    ) {
+                        env.insert(ms.into(), "0".into());
+                    }
                 }
             }
             _ => {}
@@ -13074,6 +13085,11 @@ mod declined_backend_tests {
     #[test]
     fn a_macs_risc0_slot_figure_follows_the_owner_tier() {
         use crate::metal_sizing::{OwnerForce, OwnerTier};
+        // The rows below are M8's (W7 decides alike for them); the opt-in R2 table has its own,
+        // pinned in `metal_sizing`.
+        if crate::metal_sizing::env_po2_table() == crate::metal_sizing::Po2Table::R2 {
+            return;
+        }
         let gib = 1u64 << 30;
         for (ram, idle_po2, active_po2) in [(16, 19, 18), (18, 19, 18), (24, 20, 19), (36, 20, 20)]
         {
