@@ -2452,72 +2452,89 @@ fn run_proof(
     if let Some(limit) = sp1_execute_cycle_limit() {
         exec = exec.cycle_limit(limit);
     }
-    let (public_values, report) = exec.run().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let cycles = report.total_instruction_count();
-
-    // Get-or-create the proving key for this ELF. The key depends only on the
-    // program (not the input), so it's cached and reused across proofs — no per-proof
-    // setup() and no per-proof GPU-key leak. See `pk_cache` in run_worker_loop.
+    // The execute runs on its own thread beside the key setup and the prove: nothing before the proof
+    // needs its result (the host measured cycles and journal before the claim), and serially it was
+    // 0.4-5 s of every job's wall time (a 212M-cycle sha job: 5 s). Its public values still bind the
+    // proof to this job's input below, after both finish. A guest that trips the cycle cap here has
+    // already passed the same cap at measure time, so letting its prove run to the end costs nothing
+    // a hostile guest could not already cost.
     let key = elf_hash(elf);
-    if pk_cache.contains(&key) {
-        pk_cache.touch(&key);
-    } else {
-        let pk = prover.setup(Elf::from(elf)).map_err(sdk_error)?;
-        // LRU-evict to bound host RAM + VRAM; free each evicted key's GPU memory in a runtime.
-        for evicted in pk_cache.insert(key, pk) {
-            tracing::info!(
-                "Evicting a cached SP1 proving key (cap {})",
-                pk_cache_capacity()
-            );
-            evict_key(evicted)?;
-        }
-    }
-    let pk = pk_cache.get(&key).expect("pk was just inserted or touched");
-
-    // Bind the served ELF to the job's on-chain programId. For SP1 the programId IS
-    // the verifying-key hash, so an ELF whose vkey hash != programId can never produce a proof the
-    // on-chain SP1 verifier accepts — proving it just burns a full GPU proof + fulfill gas on a
-    // guaranteed revert. Reject BEFORE proving. The exact byte order of the on-chain programId vs
-    // SP1's vkey hash is deployment-defined, so accept EITHER order (a wrong ELF matches neither; a
-    // legit one never false-rejects). Default-on; ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK=1 disables.
-    if let Some(pid) = program_id {
-        let skip = matches!(
-            std::env::var("ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK")
-                .ok()
-                .as_deref(),
-            Some("1") | Some("true") | Some("TRUE")
-        );
-        if !skip {
-            // Use bytes32() (a 0x-prefixed 64-hex string, zero-padded) and decode it, NOT
-            // bytes32_raw(): the latter does `result[1..].copy_from_slice(&digest.to_bytes_be())`,
-            // which PANICS unless the big-endian digest is exactly 31 bytes — a condition a
-            // submitter-crafted ELF (hence vkey) can violate, crashing the worker. bytes32() formats
-            // via `format!("0x{:0>64}", …)` and never panics.
-            match decode_hex32(&pk.verifying_key().bytes32()) {
-                Some(vk_hash) => {
-                    let matches =
-                        vk_hash == pid || vk_hash.iter().rev().copied().eq(pid.iter().copied());
-                    if !matches {
-                        anyhow::bail!(
-                            "ELF vkey hash does not match job programId (served ELF is not the \
-                             registered program) — refusing to prove"
-                        );
-                    }
-                }
-                None => {
-                    // The SDK returned a vkey string we can't parse to 32 bytes; refuse rather than
-                    // prove an unverifiable binding (a legit program's vkey always parses).
-                    anyhow::bail!("could not parse SP1 vkey hash for programId binding — refusing to prove");
+    let (exec_result, proved) = std::thread::scope(|s| {
+        let exec_thread = s.spawn(move || exec.run().map_err(|e| anyhow::anyhow!("{e}")));
+        let proved = (|| -> Result<_> {
+            // Get-or-create the proving key for this ELF. The key depends only on the
+            // program (not the input), so it's cached and reused across proofs — no per-proof
+            // setup() and no per-proof GPU-key leak. See `pk_cache` in run_worker_loop.
+            if pk_cache.contains(&key) {
+                pk_cache.touch(&key);
+            } else {
+                let pk = prover.setup(Elf::from(elf)).map_err(sdk_error)?;
+                // LRU-evict to bound host RAM + VRAM; free each evicted key's GPU memory in a runtime.
+                for evicted in pk_cache.insert(key, pk) {
+                    tracing::info!(
+                        "Evicting a cached SP1 proving key (cap {})",
+                        pk_cache_capacity()
+                    );
+                    evict_key(evicted)?;
                 }
             }
-        }
-    }
+            let pk = pk_cache.get(&key).expect("pk was just inserted or touched");
 
-    // Generate Groth16 proof for on-chain verification.
-    // The SP1 on-chain verifier expects: vkey_hash[0..4] || encoded_groth16_proof
-    let start = Instant::now();
-    let proof = prover.prove(pk, stdin).groth16().run().map_err(sdk_error)?;
-    let duration_secs = start.elapsed().as_secs_f64();
+            // Bind the served ELF to the job's on-chain programId. For SP1 the programId IS
+            // the verifying-key hash, so an ELF whose vkey hash != programId can never produce a proof the
+            // on-chain SP1 verifier accepts — proving it just burns a full GPU proof + fulfill gas on a
+            // guaranteed revert. Reject BEFORE proving. The exact byte order of the on-chain programId vs
+            // SP1's vkey hash is deployment-defined, so accept EITHER order (a wrong ELF matches neither; a
+            // legit one never false-rejects). Default-on; ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK=1 disables.
+            if let Some(pid) = program_id {
+                let skip = matches!(
+                    std::env::var("ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK")
+                        .ok()
+                        .as_deref(),
+                    Some("1") | Some("true") | Some("TRUE")
+                );
+                if !skip {
+                    // Use bytes32() (a 0x-prefixed 64-hex string, zero-padded) and decode it, NOT
+                    // bytes32_raw(): the latter does `result[1..].copy_from_slice(&digest.to_bytes_be())`,
+                    // which PANICS unless the big-endian digest is exactly 31 bytes — a condition a
+                    // submitter-crafted ELF (hence vkey) can violate, crashing the worker. bytes32() formats
+                    // via `format!("0x{:0>64}", …)` and never panics.
+                    match decode_hex32(&pk.verifying_key().bytes32()) {
+                        Some(vk_hash) => {
+                            let matches =
+                                vk_hash == pid || vk_hash.iter().rev().copied().eq(pid.iter().copied());
+                            if !matches {
+                                anyhow::bail!(
+                                    "ELF vkey hash does not match job programId (served ELF is not the \
+                                     registered program) — refusing to prove"
+                                );
+                            }
+                        }
+                        None => {
+                            // The SDK returned a vkey string we can't parse to 32 bytes; refuse rather than
+                            // prove an unverifiable binding (a legit program's vkey always parses).
+                            anyhow::bail!("could not parse SP1 vkey hash for programId binding — refusing to prove");
+                        }
+                    }
+                }
+            }
+
+            // Generate Groth16 proof for on-chain verification.
+            // The SP1 on-chain verifier expects: vkey_hash[0..4] || encoded_groth16_proof
+            let start = Instant::now();
+            let proof = prover.prove(pk, stdin).groth16().run().map_err(sdk_error)?;
+            let duration_secs = start.elapsed().as_secs_f64();
+            Ok((proof, duration_secs))
+        })();
+        let exec_result = exec_thread
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("the SP1 execute panicked")));
+        (exec_result, proved)
+    });
+    let (public_values, report) = exec_result?;
+    let cycles = report.total_instruction_count();
+    let (proof, duration_secs) = proved?;
+    let pk = pk_cache.get(&key).expect("the prove above set this key up");
 
     // The proof must be of THIS job's input, which `verify` below cannot say: a valid proof of another
     // input passes it, and the SDK's requests carry no id. Execution above saw what this input commits.
