@@ -578,7 +578,34 @@ sol! {
             StorageURI[] calldata initialURIs
         ) external;
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GasPriceOracle — the OP Stack L2 predeploy at 0x420000000000000000000000000000000000000F
+    // (GAS_PRICE_ORACLE below). Hemi runs it at version 1.4.0 with Fjord active (`isFjord()`), so
+    // `getL1GasUsed(unsignedTx)` is `max(100, -42.5856 + 0.8365 x (FastLZ(unsignedTx) + 68)) x 16`:
+    // divided by 16, the estimated DA size the sequencer's per-transaction DA cap compares (the
+    // same figure as a mined receipt's `l1GasUsed / 16`). Not part of the vendored HemiProve ABIs;
+    // the selectors are pinned by `tests` below.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[sol(rpc)]
+    #[derive(Debug)]
+    interface IGasPriceOracle {
+        function getL1GasUsed(bytes memory _data) external view returns (uint256);
+        function getL1Fee(bytes memory _data) external view returns (uint256);
+        function getL1FeeUpperBound(uint256 _unsignedTxSize) external view returns (uint256);
+        function isFjord() external view returns (bool);
+        function isEcotone() external view returns (bool);
+        function l1BaseFee() external view returns (uint256);
+        function baseFeeScalar() external view returns (uint32);
+        function blobBaseFeeScalar() external view returns (uint32);
+        function version() external view returns (string);
+    }
 }
+
+/// The OP Stack `GasPriceOracle` predeploy (present on both Hemi chains).
+pub const GAS_PRICE_ORACLE: alloy::primitives::Address =
+    alloy::primitives::address!("420000000000000000000000000000000000000F");
 
 /// The router's raw `jobs(jobId)` record (27 outputs, in ABI order). Decoded from the 27-word return
 /// by [`JobRecord::from_words`], which REJECTS a word whose value does not fit its declared type —
@@ -935,6 +962,43 @@ mod tests {
         assert_eq!(IHemiProveErrors::VerifierCallFailed::SELECTOR, [0xbe, 0xee, 0x77, 0xb7]);
         assert_eq!(IHemiProveErrors::JournalMismatch::SELECTOR, [0x91, 0xd0, 0x7f, 0x1e]);
         assert_eq!(IHemiProveErrors::EnforcedPause::SELECTOR, [0xd9, 0x3c, 0x06, 0x65]);
+    }
+
+    /// The GasPriceOracle predeploy has no vendored ABI: pin its selectors to the OP Stack
+    /// signatures (and `cast sig`'s values), and fulfillJobHashed's to its canonical signature —
+    /// the struct's member order is what `fulfill_job_hashed` encodes.
+    #[test]
+    fn gas_price_oracle_and_fulfill_job_hashed_selectors() {
+        assert_eq!(IGasPriceOracle::getL1GasUsedCall::SELECTOR, [0xde, 0x26, 0xc4, 0xa1]);
+        assert_eq!(IGasPriceOracle::getL1FeeCall::SELECTOR, [0x49, 0x94, 0x8e, 0x0e]);
+        assert_eq!(IGasPriceOracle::getL1FeeUpperBoundCall::SELECTOR, [0xf1, 0xc7, 0xa5, 0x8b]);
+        assert_eq!(IGasPriceOracle::isFjordCall::SELECTOR, [0x96, 0x0e, 0x3a, 0x23]);
+        assert_eq!(IGasPriceOracle::isEcotoneCall::SELECTOR, [0x4e, 0xf6, 0xe2, 0x24]);
+        assert_eq!(IGasPriceOracle::l1BaseFeeCall::SELECTOR, [0x51, 0x9b, 0x4b, 0xd3]);
+        assert_eq!(IGasPriceOracle::baseFeeScalarCall::SELECTOR, [0xc5, 0x98, 0x59, 0x18]);
+        assert_eq!(IGasPriceOracle::blobBaseFeeScalarCall::SELECTOR, [0x68, 0xd5, 0xdc, 0xa6]);
+        assert_eq!(IGasPriceOracle::versionCall::SELECTOR, [0x54, 0xfd, 0x4d, 0x50]);
+        assert_eq!(
+            format!("{GAS_PRICE_ORACLE}"),
+            "0x420000000000000000000000000000000000000F"
+        );
+        assert_eq!(
+            IHemiProveFulfill::fulfillJobHashedCall::SIGNATURE,
+            "fulfillJobHashed(bytes32,(bytes32,bytes32,address,address,bytes32,bytes32,bytes32,bytes32),\
+             bytes,bytes,bytes,bytes)"
+        );
+        assert_eq!(IHemiProveFulfill::fulfillJobHashedCall::SELECTOR, [0x80, 0xf7, 0x65, 0xf2]);
+        // ...and the member names line up with the ABI's HashedDescriptor, in order.
+        let f = only(&router(), "fulfillJobHashed");
+        let abi_names: Vec<&str> = f.inputs[1].components.iter().map(|c| c.name.as_str()).collect();
+        let bound = <HashedDescriptor as alloy::sol_types::SolStruct>::eip712_root_type();
+        let bound_names: Vec<&str> = bound
+            .trim_start_matches("HashedDescriptor(")
+            .trim_end_matches(')')
+            .split(',')
+            .map(|m| m.rsplit(' ').next().unwrap())
+            .collect();
+        assert_eq!(bound_names, abi_names, "HashedDescriptor member order drifted");
     }
 
     #[test]
