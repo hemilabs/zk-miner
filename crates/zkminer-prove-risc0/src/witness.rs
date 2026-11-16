@@ -1,4 +1,4 @@
-//! Witness-construction jobs in the risc0 worker (plan §5.4, §15.3).
+//! Witness-construction jobs in the risc0 worker (plan §5.4, §10.1, §15.3).
 //!
 //! - **The prove path** (`WorkerCommand::Prove` with `witness`, [`run_witness_proof`]): the input is
 //!   `prefix ‖ W`, read from the bundle's file through one descriptor and refused unless it has the
@@ -8,6 +8,10 @@
 //!   session, which would leave it unprovable. The measure checks run on that session, its journal is
 //!   compared with the bundle's, and only then is that same session proven, across the invalid-proof
 //!   retries. A run that does not reproduce the bundle is a typed `JournalDiverged`, never proven.
+//! - **The sandboxed execute** (`--witness-execute`, the CPU worker only, [`execute_main`]): a
+//!   one-shot process that restricts itself before anything else, then executes the guest at each po2
+//!   the miner may prove at, with the seed it is handed (it never sees a key), and reports journals,
+//!   cycles and serialized segment bytes.
 
 use std::fs::File;
 use std::io::Read;
@@ -501,6 +505,416 @@ pub(crate) mod keccak_assumptions {
     }
 }
 
+/// `--witness-execute` on a build without the mode: refuse, with the typed code.
+#[cfg(not(all(target_os = "linux", feature = "cpu")))]
+pub(crate) fn execute_main() -> ! {
+    eprintln!("this worker has no witness execute mode: use zkminer-prove-risc0-cpu on Linux");
+    std::process::exit(zkminer_prover_protocol::WitnessExecuteFailure::Unsupported.code())
+}
+
+#[cfg(all(target_os = "linux", feature = "cpu"))]
+pub(crate) use execute::execute_main;
+
+/// The one-shot sandboxed execute (plan §10.1, §5.2 step 6).
+///
+/// # Contract (with `zkminer_prover::witness_exec::run_witness_execute`)
+/// - fd 0: one [`WitnessExecuteRequest`] frame; fd 1: one [`WitnessExecuteResponse`] frame, written
+///   only on success; fd 2: logs (guest text included: never parsed); fd 3: `W`, a read-only regular
+///   file or a write-sealed memfd, read with `pread`.
+/// - Exit 0, or a [`WitnessExecuteFailure`] code.
+/// - The first thing the process does is [`zkminer_witness_sandbox::restrict_self`] with
+///   `Profile::ExecuteWorker`, while it has one thread: from then on it opens no file and keeps only
+///   its inherited fds. It never loads the `sys_rand` key (no environment variable, no file): it uses
+///   the seed in the request.
+/// - **`RISC0_KECCAK_PO2`.** risc0 reads the keccak po2 from the process environment in
+///   `ExecutorEnvBuilder::build`, overriding `keccak_max_po2`. The request is the one source: the
+///   launcher passes an empty environment, and the worker sets the variable from
+///   `WitnessExecuteRequest::keccak_po2` after reading the request and before it starts any thread
+///   (the executor's segment thread is the first). An inherited value is overwritten.
+///
+/// [`WitnessExecuteRequest`]: zkminer_prover_protocol::WitnessExecuteRequest
+/// [`WitnessExecuteResponse`]: zkminer_prover_protocol::WitnessExecuteResponse
+/// [`WitnessExecuteFailure`]: zkminer_prover_protocol::WitnessExecuteFailure
+#[cfg(all(target_os = "linux", feature = "cpu"))]
+mod execute {
+    use std::cell::RefCell;
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::FileExt;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use risc0_zkvm::{CoprocessorCallback, ExitCode};
+    use zkminer_prover_protocol::{
+        read_message, write_message, WitnessExecuteFailure as Failure, WitnessExecutePo2,
+        WitnessExecuteRequest, WitnessExecuteResponse, GUEST_EXIT_HALTED, RISC0_JOB_PO2_MAX,
+        RISC0_JOB_PO2_MIN, WITNESS_EXECUTE_W_FD,
+    };
+
+    use super::super::{check_claim_output, dup_cloexec, KeccakAudit};
+    use super::{exit_parts, journal_parts, read_prefixed, WitnessRefusal, PREFIX_BYTES};
+
+    pub(crate) fn execute_main() -> ! {
+        // 1. The sandbox, while this is still the only thread: Landlock with no filesystem rights,
+        //    the execute worker's seccomp denylist (no open, socket, exec or fork), no new
+        //    privileges, not dumpable, no core. Nothing is read before it.
+        if let Err(e) =
+            zkminer_witness_sandbox::restrict_self(&zkminer_witness_sandbox::Profile::ExecuteWorker)
+        {
+            let _ = writeln!(
+                std::io::stderr(),
+                "witness execute: the sandbox could not be applied: {e}"
+            );
+            std::process::exit(Failure::Sandbox.code());
+        }
+        // 2. The response goes out on a copy of fd 1, and fd 1 itself becomes fd 2: risc0 wires a
+        //    guest's stdout to this process's fd 1, and no guest byte may reach the response (the IPC
+        //    worker isolates its stream the same way). `dup` and `dup2` open nothing.
+        let response = match dup_cloexec(1).and_then(|fd| {
+            // SAFETY: `fd` was just duplicated and is owned by nothing else.
+            let file = unsafe { File::from_raw_fd(fd) };
+            // SAFETY: plain dup2 on two open descriptors.
+            if unsafe { libc::dup2(2, 1) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(file)
+        }) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "witness execute: fd 1: {e}");
+                std::process::exit(Failure::Internal.code());
+            }
+        };
+        // 3. Logs to fd 2, from this thread: the fmt subscriber starts no thread of its own.
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "warn".into()),
+            )
+            .init();
+        let code = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(response))) {
+            Ok(Ok(())) => 0,
+            Ok(Err(failure)) => failure.code(),
+            // A malformed or hostile ELF can panic risc0 (the measure path contains the same).
+            Err(_) => Failure::Panicked.code(),
+        };
+        std::process::exit(code)
+    }
+
+    fn run(response: File) -> Result<(), Failure> {
+        let req: WitnessExecuteRequest =
+            read_message(&mut std::io::stdin().lock()).map_err(|e| {
+                tracing::error!("reading the request: {e}");
+                Failure::BadRequest
+            })?;
+        validate(&req)?;
+        // Still the only thread (see the module docs): `ExecutorEnvBuilder::build` reads it.
+        std::env::set_var("RISC0_KECCAK_PO2", req.keccak_po2.to_string());
+        let input = read_w(&req)?;
+        let image_id = risc0_zkvm::compute_image_id(&req.elf).map_err(|e| {
+            tracing::error!("the ELF: {e:#}");
+            Failure::InvalidElf
+        })?;
+        let mut results = Vec::with_capacity(req.po2s.len());
+        for &po2 in &req.po2s {
+            let result = execute_po2(&req.elf, &input, req.sys_rand_seed, po2, req.max_cycles)?;
+            let halted_zero = result.exit_kind == GUEST_EXIT_HALTED && result.exit_code == 0;
+            results.push(result);
+            // No later po2 can make the job claimable: stop paying for it.
+            if !halted_zero {
+                break;
+            }
+        }
+        let resp = WitnessExecuteResponse {
+            image_id: image_id
+                .as_bytes()
+                .try_into()
+                .expect("a digest is 32 bytes"),
+            results,
+        };
+        let mut out = BufWriter::new(response);
+        write_message(&mut out, &resp)
+            .and_then(|()| out.flush().map_err(Into::into))
+            .map_err(|e| {
+                tracing::error!("writing the response: {e}");
+                Failure::Internal
+            })
+    }
+
+    pub(super) fn validate(req: &WitnessExecuteRequest) -> Result<(), Failure> {
+        let bad = |what: String| {
+            tracing::error!("bad request: {what}");
+            Failure::BadRequest
+        };
+        if !(req.prefix.is_empty() || req.prefix.len() == PREFIX_BYTES) {
+            return Err(bad(format!("a {}-byte prefix", req.prefix.len())));
+        }
+        if req.po2s.is_empty() {
+            return Err(bad("no po2".to_string()));
+        }
+        for (i, po2) in req.po2s.iter().enumerate() {
+            if !(RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX).contains(po2) {
+                return Err(bad(format!(
+                    "po2 {po2} outside {RISC0_JOB_PO2_MIN}..={RISC0_JOB_PO2_MAX}"
+                )));
+            }
+            if req.po2s[..i].contains(po2) {
+                return Err(bad(format!("po2 {po2} twice")));
+            }
+        }
+        if !risc0_circuit_keccak::KECCAK_PO2_RANGE.contains(&(req.keccak_po2 as usize)) {
+            return Err(bad(format!(
+                "keccak po2 {} outside {:?}",
+                req.keccak_po2,
+                risc0_circuit_keccak::KECCAK_PO2_RANGE
+            )));
+        }
+        Ok(())
+    }
+
+    /// `pread` from offset 0 up, as a reader.
+    struct Pread<'a> {
+        file: &'a File,
+        offset: u64,
+    }
+
+    impl std::io::Read for Pread<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.file.read_at(buf, self.offset)?;
+            self.offset += n as u64;
+            Ok(n)
+        }
+    }
+
+    /// Whether `file` cannot change under us: opened read-only, or a memfd sealed against writes and
+    /// resizing.
+    fn read_only_or_sealed(file: &File) -> bool {
+        let fd = file.as_raw_fd();
+        // SAFETY: fcntl getters on an open descriptor.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 && flags & libc::O_ACCMODE == libc::O_RDONLY {
+            return true;
+        }
+        // SAFETY: as above.
+        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+        seals >= 0
+            && seals & libc::F_SEAL_GROW != 0
+            && seals & libc::F_SEAL_SHRINK != 0
+            && seals & (libc::F_SEAL_WRITE | libc::F_SEAL_FUTURE_WRITE) != 0
+    }
+
+    /// `prefix ‖ W`, with `W` from fd 3.
+    fn read_w(req: &WitnessExecuteRequest) -> Result<Vec<u8>, Failure> {
+        // SAFETY: fd 3 is ours by the launcher's contract; nothing else in this process uses it.
+        let w = unsafe { File::from_raw_fd(WITNESS_EXECUTE_W_FD) };
+        let meta = w.metadata().map_err(|e| {
+            tracing::error!("fd {WITNESS_EXECUTE_W_FD}: {e}");
+            Failure::BadRequest
+        })?;
+        if !meta.is_file() || !read_only_or_sealed(&w) {
+            tracing::error!(
+                "fd {WITNESS_EXECUTE_W_FD} is not a read-only regular file or a sealed memfd"
+            );
+            return Err(Failure::BadRequest);
+        }
+        if meta.len() != req.w_len {
+            tracing::error!("W holds {} bytes, the request {}", meta.len(), req.w_len);
+            return Err(Failure::InputMismatch);
+        }
+        read_prefixed(
+            Pread {
+                file: &w,
+                offset: 0,
+            },
+            &req.prefix,
+            req.w_len,
+            &req.input_sha256,
+        )
+        .map_err(|e| {
+            tracing::error!("{e}");
+            match e {
+                WitnessRefusal::InputMismatch(_) => Failure::InputMismatch,
+                WitnessRefusal::InputUnreadable(_) => Failure::Internal,
+                _ => Failure::BadRequest,
+            }
+        })
+    }
+
+    /// The typed error a run's cycle budget stops it with.
+    #[derive(Debug)]
+    struct CycleLimitExceeded {
+        limit: u64,
+    }
+
+    impl std::fmt::Display for CycleLimitExceeded {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "the execution exceeded its cap of {} sized cycles",
+                self.limit
+            )
+        }
+    }
+
+    impl std::error::Error for CycleLimitExceeded {}
+
+    /// Sized cycles charged so far in one run (segments as they are cut, keccak requests as they are
+    /// made), against the request's cap.
+    #[derive(Clone)]
+    pub(super) struct CycleBudget {
+        used: Arc<AtomicU64>,
+        exceeded: Arc<AtomicBool>,
+        limit: Option<u64>,
+    }
+
+    impl CycleBudget {
+        pub(super) fn new(limit: Option<u64>) -> Self {
+            CycleBudget {
+                used: Arc::new(AtomicU64::new(0)),
+                exceeded: Arc::new(AtomicBool::new(false)),
+                limit,
+            }
+        }
+
+        fn charge(&self, cycles: u64) -> anyhow::Result<()> {
+            let before = self
+                .used
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |u| {
+                    Some(u.saturating_add(cycles))
+                })
+                .expect("the update always returns Some");
+            match self.limit {
+                Some(limit) if before.saturating_add(cycles) > limit => {
+                    self.exceeded.store(true, Ordering::SeqCst);
+                    Err(anyhow::Error::new(CycleLimitExceeded { limit }))
+                }
+                _ => Ok(()),
+            }
+        }
+
+        /// Whether a charge went over the cap. Set by this code only, so a run that failed after it
+        /// is classified by it, whatever the error says.
+        fn exceeded(&self) -> bool {
+            self.exceeded.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The measure path's keccak audit, charging each request to the budget.
+    struct BudgetedKeccak {
+        audit: KeccakAudit,
+        budget: CycleBudget,
+    }
+
+    impl CoprocessorCallback for BudgetedKeccak {
+        fn prove_keccak(&mut self, request: risc0_zkvm::ProveKeccakRequest) -> anyhow::Result<()> {
+            let before = self.audit.cycles;
+            self.audit.prove_keccak(request)?;
+            self.budget.charge(self.audit.cycles - before)
+        }
+    }
+
+    /// This process's peak resident set, in bytes (`getrusage`: `/proc` is out of reach).
+    fn peak_rss_bytes() -> u64 {
+        // SAFETY: getrusage fills the zeroed struct it is given.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+            return 0;
+        }
+        (usage.ru_maxrss.max(0) as u64).saturating_mul(1024)
+    }
+
+    /// Execute the guest on `input` at `po2` as the measure path does (`run_execute`: the input, the
+    /// seed, the segment size, the keccak audit as the coprocessor callback, its checks and its cycle
+    /// unit), counting what its segments serialize to without keeping or writing them.
+    pub(super) fn execute_po2(
+        elf: &[u8],
+        input: &[u8],
+        seed: [u8; 32],
+        po2: u8,
+        max_cycles: Option<u64>,
+    ) -> Result<WitnessExecutePo2, Failure> {
+        let budget = CycleBudget::new(max_cycles);
+        let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
+        if !input.is_empty() {
+            env_builder.write_slice(input);
+        }
+        env_builder.random_seed(seed);
+        env_builder.segment_limit_po2(po2 as u32);
+        let keccak = Rc::new(RefCell::new(BudgetedKeccak {
+            audit: KeccakAudit::default(),
+            budget: budget.clone(),
+        }));
+        env_builder.coprocessor_callback_ref(keccak.clone());
+        let env = env_builder.build().map_err(|e| {
+            tracing::error!("the executor environment: {e:#}");
+            Failure::BadRequest
+        })?;
+        let mut exec = risc0_zkvm::ExecutorImpl::from_elf(env, elf).map_err(|e| {
+            tracing::error!("the ELF: {e:#}");
+            Failure::InvalidElf
+        })?;
+        let segment_bytes = AtomicU64::new(0);
+        let segment_cycles = AtomicU64::new(0);
+        // On the executor's segment thread: count each segment and drop it.
+        let run = exec.run_with_callback(|segment| {
+            segment_bytes.fetch_add(bincode::serialized_size(&segment)?, Ordering::SeqCst);
+            let cycles = 1u64 << segment.po2();
+            segment_cycles.fetch_add(cycles, Ordering::SeqCst);
+            budget.charge(cycles)?;
+            Ok(Box::new(risc0_zkvm::NullSegmentRef) as Box<dyn risc0_zkvm::SegmentRef>)
+        });
+        drop(exec);
+        let session = match run {
+            Ok(session) => session,
+            Err(_) if budget.exceeded() => {
+                tracing::error!("po2 {po2}: over the cap of {max_cycles:?} sized cycles");
+                return Err(Failure::CycleLimit);
+            }
+            Err(e) => {
+                tracing::error!("po2 {po2}: the execution failed: {e:#}");
+                return Err(Failure::GuestFault);
+            }
+        };
+        let keccak = keccak.borrow();
+        if session.exit_code == ExitCode::Halted(0) {
+            let claim = session.claim().map_err(|e| {
+                tracing::error!("po2 {po2}: {e:#}");
+                Failure::Unprovable
+            })?;
+            check_claim_output(Some(&claim), keccak.audit.root().as_ref()).map_err(|e| {
+                tracing::error!("po2 {po2}: {e:#}");
+                Failure::Unprovable
+            })?;
+        }
+        let (exit_kind, exit_code) = exit_parts(session.exit_code);
+        let journal = session
+            .journal
+            .as_ref()
+            .map(|j| j.bytes.as_slice())
+            .unwrap_or_default();
+        let (journal, journal_len, journal_sha256) = journal_parts(journal);
+        Ok(WitnessExecutePo2 {
+            po2,
+            // The measure path's unit: every segment padded to its power of two, plus each keccak
+            // request at its keccak po2.
+            cycles: segment_cycles
+                .load(Ordering::SeqCst)
+                .saturating_add(keccak.audit.cycles),
+            journal,
+            journal_len,
+            journal_sha256,
+            exit_kind,
+            exit_code,
+            segment_bytes: segment_bytes.load(Ordering::SeqCst),
+            peak_host_bytes: peak_rss_bytes(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,5 +1248,90 @@ mod tests {
                 .err()
                 .expect("refused");
         assert!(format!("{err:#}").contains("po2 value"), "{err:#}");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "cpu"))]
+    mod execute_mode {
+        use super::super::execute::{execute_po2, validate};
+        use super::*;
+        use zkminer_prover_protocol::{WitnessExecuteFailure, WitnessExecuteRequest};
+
+        fn request(po2s: Vec<u8>) -> WitnessExecuteRequest {
+            WitnessExecuteRequest {
+                elf: vec![],
+                prefix: vec![],
+                w_len: 0,
+                input_sha256: [0; 32],
+                sys_rand_seed: [0; 32],
+                po2s,
+                keccak_po2: 17,
+                max_cycles: None,
+            }
+        }
+
+        #[test]
+        fn a_request_is_validated_before_anything_runs() {
+            assert!(validate(&request(vec![16, 20, 22])).is_ok());
+            for bad in [vec![], vec![15], vec![23], vec![20, 20]] {
+                assert_eq!(
+                    validate(&request(bad.clone())),
+                    Err(WitnessExecuteFailure::BadRequest),
+                    "{bad:?}"
+                );
+            }
+            let mut r = request(vec![20]);
+            r.keccak_po2 = 13;
+            assert_eq!(validate(&r), Err(WitnessExecuteFailure::BadRequest));
+            r.keccak_po2 = 18;
+            r.prefix = vec![0; 63];
+            assert_eq!(validate(&r), Err(WitnessExecuteFailure::BadRequest));
+        }
+
+        /// The core of the sandboxed execute, unsandboxed: the measure path's cycles, the journal at
+        /// every po2, the segment bytes a proof would write, and the cap.
+        #[test]
+        fn each_po2_reports_cycles_journal_and_segment_bytes() {
+            if FIBONACCI_ELF.is_empty() {
+                return;
+            }
+            let _serial = crate::serial_guest_execution();
+            let input = 40_000u32.to_le_bytes();
+            let at = |po2| execute_po2(FIBONACCI_ELF, &input, [1; 32], po2, None).unwrap();
+            let (a, b) = (at(16), at(20));
+            assert_eq!(a.journal, fib(40_000).to_le_bytes());
+            assert_eq!(
+                (a.journal.clone(), a.journal_sha256),
+                (b.journal.clone(), b.journal_sha256)
+            );
+            assert_eq!((a.exit_kind, a.exit_code), (GUEST_EXIT_HALTED, 0));
+            // Several segments at 16 (each padded to its power of two), one at 20.
+            assert!(a.cycles > 1 << 16, "{}", a.cycles);
+            assert!(
+                b.cycles.is_power_of_two() && b.cycles <= 1 << 20,
+                "{}",
+                b.cycles
+            );
+            assert!(
+                a.segment_bytes > b.segment_bytes / 2,
+                "more segments, more bytes"
+            );
+            assert!(a.segment_bytes > 0 && b.segment_bytes > 0);
+            assert!(a.peak_host_bytes > 0);
+            // The cap, in the same unit: one segment fewer than the run needs.
+            let err = execute_po2(
+                FIBONACCI_ELF,
+                &input,
+                [1; 32],
+                16,
+                Some(a.cycles - (1 << 16)),
+            );
+            assert_eq!(err, Err(WitnessExecuteFailure::CycleLimit));
+            assert!(execute_po2(FIBONACCI_ELF, &input, [1; 32], 16, Some(a.cycles)).is_ok());
+            // An ELF risc0 refuses.
+            assert_eq!(
+                execute_po2(b"\x7fELF not really", &input, [1; 32], 16, None),
+                Err(WitnessExecuteFailure::InvalidElf)
+            );
+        }
     }
 }
