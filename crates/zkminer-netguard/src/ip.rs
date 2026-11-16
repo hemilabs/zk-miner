@@ -106,16 +106,21 @@ impl Prefix {
         p
     }
 
-    /// Whether the two prefixes share an address, each read as [`Self::canonical_prefix`] (so
-    /// `::ffff:10.0.0.0/104` and `64:ff9b::a00:0/104` overlap `10.0.0.0/8`). Families never overlap
-    /// otherwise.
+    /// Whether the two prefixes share an address, as written or each read as
+    /// [`Self::canonical_prefix`] (so `::ffff:10.0.0.0/104` and `64:ff9b::a00:0/104` overlap
+    /// `10.0.0.0/8`, and `64:ff9b::/64` overlaps `64:ff9b::808:800/120`, which it holds as
+    /// written). Families never overlap otherwise.
     pub fn overlaps(&self, other: &Prefix) -> bool {
-        let (a, b) = (self.canonical_prefix(), other.canonical_prefix());
-        if a.addr.is_ipv4() != b.addr.is_ipv4() {
-            return false;
-        }
-        let len = a.len.min(b.len);
-        mask(a.addr, len) == mask(b.addr, len)
+        let raw = |a: Prefix, b: Prefix| {
+            a.addr.is_ipv4() == b.addr.is_ipv4() && {
+                let len = a.len.min(b.len);
+                mask(a.addr, len) == mask(b.addr, len)
+            }
+        };
+        raw(
+            Prefix::new(self.addr, self.len),
+            Prefix::new(other.addr, other.len),
+        ) || raw(self.canonical_prefix(), other.canonical_prefix())
     }
 }
 
@@ -925,6 +930,10 @@ mod tests {
             ("2001:db8::/32", "2001:db9::/32", false),
             ("::/0", "10.0.0.0/8", false), // families never mix outside the embedded /96s
             ("2606:4700::/32", "8.8.8.8/32", false),
+            // Review r2 R2-NG-5: as written, too.
+            ("64:ff9b::/64", "64:ff9b::808:800/120", true),
+            ("64:ff9b::808:800/120", "64:ff9b::/64", true),
+            ("64:ff9b::/64", "8.8.8.0/24", false),
         ] {
             assert_eq!(pfx(a).overlaps(&pfx(b)), overlap, "{a} {b}");
         }

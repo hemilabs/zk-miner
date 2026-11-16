@@ -254,19 +254,23 @@ pub fn admit(
         return Err(Denied::NotGlobal(ip));
     }
     let c = canonical_ip(ip);
-    if facts.own_addresses().iter().any(|o| canonical_ip(*o) == c) {
+    // Review r2 R2-NG-5: `contains` gets the address as given, and compares it both as written
+    // and in canonical form; handed the canonical form, a prefix written in another spelling (a
+    // deny of `64:ff9b::/64`) never saw the address as written (`64:ff9b::808:808`).
+    let same = |o: &IpAddr| *o == ip || canonical_ip(*o) == c;
+    if facts.own_addresses().iter().any(same) {
         return Err(Denied::OwnAddress(ip));
     }
-    if let Some(p) = facts.connected().iter().find(|p| p.contains(c)) {
+    if let Some(p) = facts.connected().iter().find(|p| p.contains(ip)) {
         return Err(Denied::ConnectedPrefix { ip, prefix: *p });
     }
-    if let Some(p) = facts.site_prefixes().iter().find(|p| p.contains(c)) {
+    if let Some(p) = facts.site_prefixes().iter().find(|p| p.contains(ip)) {
         return Err(Denied::SitePrefix { ip, prefix: *p });
     }
-    if facts.resolvers().iter().any(|r| canonical_ip(*r) == c) {
+    if facts.resolvers().iter().any(same) {
         return Err(Denied::DnsServer(ip));
     }
-    if let Some(p) = extra_deny.iter().find(|p| p.contains(c)) {
+    if let Some(p) = extra_deny.iter().find(|p| p.contains(ip)) {
         return Err(Denied::DenyCidr { ip, prefix: *p });
     }
     let routes = facts.routes();
@@ -636,6 +640,45 @@ mod tests {
     /// IPv4-compatible) denied the prefix at load (`admit_prefix`) but not the address at connect
     /// time (`admit`), which compared only the IPv4-mapped spelling. Both refuse it now, in every
     /// spelling of the address.
+    /// Review r2 R2-NG-5 (PoC `contains_overlaps_admit_prefix_consistency`), inverted: a deny CIDR
+    /// shorter than /96 that holds an embedded-IPv4 /96 (`64:ff9b::/64`) refuses the addresses it
+    /// holds as written; the prefix check agrees.
+    #[test]
+    fn a_deny_cidr_holds_what_it_holds_as_written() {
+        let f = HostFacts::empty();
+        let d = [pfx("64:ff9b::/64")];
+        assert_eq!(
+            admit(NetMode::Public, ip("64:ff9b::808:808"), &f, &d),
+            Err(Denied::DenyCidr {
+                ip: ip("64:ff9b::808:808"),
+                prefix: pfx("64:ff9b::/64")
+            })
+        );
+        assert!(matches!(
+            admit_prefix(NetMode::Public, pfx("64:ff9b::808:800/120"), &f, &d),
+            Err(Denied::PrefixOverlapsDeny { .. })
+        ));
+        // The same in the host's own prefixes and addresses, and the DNS servers.
+        let f = HostFacts::new(vec![pfx("64:ff9b::/64")], vec![ip("64:ff9b::101:101")]);
+        assert!(matches!(
+            admit(NetMode::Public, ip("64:ff9b::909:909"), &f, &[]),
+            Err(Denied::ConnectedPrefix { .. })
+        ));
+        assert!(matches!(
+            admit(NetMode::Public, ip("1.1.1.1"), &f, &[]),
+            Err(Denied::OwnAddress(_))
+        ));
+        assert!(matches!(
+            admit_prefix(NetMode::Public, pfx("64:ff9b::909:900/120"), &f, &[]),
+            Err(Denied::PrefixOverlapsConnected { .. })
+        ));
+        // Elsewhere, still admitted.
+        assert_eq!(
+            admit(NetMode::Public, ip("8.8.8.8"), &HostFacts::empty(), &d),
+            Ok(())
+        );
+    }
+
     #[test]
     fn deny_cidrs_in_any_embedded_form_deny_at_connect_time() {
         let f = HostFacts::empty();
