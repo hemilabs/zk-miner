@@ -6,6 +6,7 @@ use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -19,6 +20,9 @@ use crate::spawner::Spawner;
 pub const BROKER_PIDS_MAX: u32 = 32;
 /// Longest broker log line forwarded to the miner's log.
 const MAX_LOG_LINE: usize = 2_048;
+/// Makes each broker's cgroup name unique within the delegated root (one broker per miner, but tests
+/// run several in one process).
+static BROKER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub struct BrokerProcess {
     child: Child,
@@ -37,7 +41,13 @@ impl BrokerProcess {
     ) -> Result<Self> {
         let cgroup = Cgroup::create(
             cgroup_root,
-            &CgroupSpec { name: "broker".into(), memory_max: memory_bytes, pids_max: BROKER_PIDS_MAX, cpu_max: None, cpu_weight: 100 },
+            &CgroupSpec {
+                name: format!("broker-{}", BROKER_SEQ.fetch_add(1, Ordering::Relaxed)),
+                memory_max: memory_bytes,
+                pids_max: BROKER_PIDS_MAX,
+                cpu_max: None,
+                cpu_weight: 100,
+            },
         )
         .context("creating the broker's cgroup")?;
         let (miner_end, broker_end) = UnixStream::pair().context("control socketpair")?;

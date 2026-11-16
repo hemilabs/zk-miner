@@ -89,10 +89,14 @@ pub enum SkipReason {
     OperatorEndpoint,
     OperatorBudget,
     RetentionFull,
+    /// This host's own machinery failed, not the job: the retention store unavailable or failing,
+    /// a sandbox, cgroup or spawn failure, the broker's control channel lost, the execute worker's
+    /// own error or malformed answer. Never the caller's.
+    HostInternal,
 }
 
 impl SkipReason {
-    pub const ALL: [SkipReason; 42] = {
+    pub const ALL: [SkipReason; 43] = {
         use SkipReason::*;
         [
             EnvelopeMalformed, EnvelopeOutOfRange, UnsupportedBuilderType, UnsupportedProofSystem,
@@ -104,7 +108,7 @@ impl SkipReason {
             BuilderClampedByProbation, RunnerInternal, BuilderCrashed, RunnerCrashed, GuestFailed, GuestCyclesAboveLimit,
             BindingMismatch, JournalsDifferAcrossPo2, JournalTooLarge, FulfilDaTooLarge,
             BelowReservation, DeadlineMargin, ProveResources, VerifierSelectorMismatch,
-            OperatorEndpoint, OperatorBudget, RetentionFull,
+            OperatorEndpoint, OperatorBudget, RetentionFull, HostInternal,
         ]
     };
 
@@ -128,7 +132,7 @@ impl SkipReason {
             | WitnessDisabled => (OnHostChange, false),
             // State that moves on its own: chain, prices, DA backlog, resources, endpoints.
             NotClaimable | FulfilDaTooLarge | BelowReservation | ProveResources
-            | VerifierSelectorMismatch | OperatorEndpoint | OperatorBudget | RetentionFull
+            | VerifierSelectorMismatch | OperatorEndpoint | OperatorBudget | RetentionFull | HostInternal
             | RunnerInternal | ElfUnavailable => (Backoff { max_attempts: 8 }, false),
             // A crash while compiling: hostile input may cause it, but the module never ran, so a
             // few retries and never the caller's blame.
@@ -278,7 +282,7 @@ mod tests {
         assert_eq!(v(BindingMismatch).retry, Retry::OnceJittered);
         assert_eq!(v(BuilderTransient), Verdict { retry: Retry::OnceJittered, blames_caller: false });
         // Operator side and host support never blame the caller.
-        for r in [OperatorEndpoint, OperatorBudget, RetentionFull, RunnerInternal, UnsupportedSubmission,
+        for r in [OperatorEndpoint, OperatorBudget, RetentionFull, HostInternal, RunnerInternal, UnsupportedSubmission,
             UnsupportedBuilderType, CapabilityNotProvisioned, LimitsAboveHostMaxima, WitnessDisabled]
         {
             assert!(!v(r).blames_caller, "{r:?}");

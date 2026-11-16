@@ -113,6 +113,21 @@ pub fn risc0_seed(key: &[u8; 32], image_id: &[u8; 32], input_sha256: &[u8; 32]) 
     mac.finalize().into_bytes().into()
 }
 
+/// The domain tag of [`key_fingerprint`].
+pub const KEY_FINGERPRINT_TAG: &[u8] = b"zkminer/risc0/sys_rand/key-fingerprint/v1";
+
+/// A public fingerprint of the host key: `HMAC-SHA256(key, KEY_FINGERPRINT_TAG)`. A witness bundle
+/// records it (`BundleV1::sys_rand_key_fingerprint`), and revalidation compares it with the host's
+/// (plan §15.2), so a bundle executed under another key is never proven as if its journals still
+/// held. It reveals nothing about the key, and no seed can collide with it (a different tag).
+pub fn key_fingerprint(key: &[u8; 32]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    let mut mac =
+        <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(KEY_FINGERPRINT_TAG);
+    mac.finalize().into_bytes().into()
+}
+
 /// The key from [`SYS_RAND_KEY_ENV`]'s value; `None` unless it is exactly 64 hex digits.
 pub fn decode_key(s: &str) -> Option<[u8; 32]> {
     let s = s.as_bytes();
@@ -179,6 +194,20 @@ mod tests {
         let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&key).unwrap();
         mac.update(&[RISC0_SEED_TAG, &image[..], &input[..]].concat());
         assert_eq!(<[u8; 32]>::from(mac.finalize().into_bytes()), seed);
+    }
+
+    #[test]
+    fn the_fingerprint_is_fixed_by_the_key_and_is_no_seed() {
+        let key = [3u8; 32];
+        let fp = key_fingerprint(&key);
+        assert_eq!(key_fingerprint(&key), fp);
+        assert_ne!(key_fingerprint(&[4u8; 32]), fp);
+        assert_ne!(fp, key);
+        use hmac::{Hmac, Mac};
+        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&key).unwrap();
+        mac.update(KEY_FINGERPRINT_TAG);
+        assert_eq!(<[u8; 32]>::from(mac.finalize().into_bytes()), fp);
+        assert_ne!(KEY_FINGERPRINT_TAG, RISC0_SEED_TAG);
     }
 
     #[test]
