@@ -10,12 +10,14 @@
 //!    must export `memory` (32-bit) and `run: () -> i32` (INVALID_MODULE otherwise). **Other exports
 //!    are tolerated and ignored**: Rust's wasm32 cdylibs export the globals `__heap_base` and
 //!    `__data_end`, and the runner never calls anything but `run`.
-//! 2. **Compilation** with [`engine::engine_config`], single-threaded, at `OptLevel::None`, on the
-//!    execution thread; the wall clock is already running.
-//! 3. **Instantiation and `run()`**, with fuel and the epoch deadline armed on the store before
-//!    instantiation (a start function runs inside it), a [`wasmtime::ResourceLimiter`] that allows one
-//!    memory, one table and one instance, at most 65,536 table elements and the memory clamp, and that
-//!    records a denied growth.
+//! 2. **The epoch watchdog** starts, then **compilation** with [`engine::engine_config`],
+//!    single-threaded, at `OptLevel::None`, on the execution thread; the wall clock is already
+//!    running. A compile error is INVALID_MODULE.
+//! 3. **The started marker** ([`zkminer_witness::abi::MODULE_STARTED_MARKER`]) goes to the summary
+//!    pipe, then **instantiation and `run()`**, with fuel and the epoch deadline armed on the store
+//!    before instantiation (a start function runs inside it), a [`wasmtime::ResourceLimiter`] that
+//!    allows one memory, one table and one instance, at most 65,536 table elements and the memory
+//!    clamp, and that records a denied growth.
 //!
 //! # Exit classification ([`zkminer_witness::ipc::exit`])
 //! | Outcome | Exit |
@@ -24,15 +26,19 @@
 //! | `run()` returned anything else | NONZERO_RETURN |
 //! | a trap (wasm or a host function's bounds/request-cap trap) | TRAP, or MEMORY if a memory growth was denied earlier |
 //! | fuel exhausted (in wasm or charged by a host function) | FUEL |
-//! | the epoch deadline, or the deadline passing during a `fetch` | WALL_CLOCK |
+//! | the epoch deadline; the deadline passing during a `fetch`, or before a `witness_write` or `log`; `run()` returning after the deadline | WALL_CLOCK |
 //! | `witness_write` returned 1 at any point (overrides the above) | WITNESS_TOO_LARGE |
-//! | rejected by the pre-pass | INVALID_MODULE / UNKNOWN_IMPORT |
+//! | rejected by the pre-pass, or by compilation | INVALID_MODULE / UNKNOWN_IMPORT |
 //! | runner, sink or broker-channel failure | INTERNAL |
 //!
+//! The runner never reports a signal; a runner killed by one (an OOM kill, the miner's own timeout,
+//! or a crash) is the miner's to classify.
+//!
 //! # Threads
-//! At most three: the caller (main), the execution thread (8 MiB stack) and the epoch watchdog. This
-//! build of wasmtime starts none (no `parallel-compilation`, `async`, `cache`, `profiling`, pooling
-//! allocator or userfaultfd).
+//! Exactly three once the pre-pass has passed: the caller (main), the execution thread (8 MiB stack)
+//! and the epoch watchdog, started before compilation. This build of wasmtime starts none
+//! (no `parallel-compilation`, `async`, `cache`, `profiling`, pooling allocator or userfaultfd). The
+//! job cgroup's `pids.max` must be at least 3; with less, the run ends INTERNAL before compiling.
 
 pub mod cli;
 pub mod cost;
@@ -42,7 +48,7 @@ pub mod prepass;
 mod runner;
 
 pub use cli::{main_with_fds, parse_args, Args, RunnerFds, MAX_CONTEXT_BYTES};
-pub use host::{FUEL_PER_BYTE, FUEL_PER_HOST_CALL};
+pub use host::{FUEL_PER_BYTE, FUEL_PER_FETCH, FUEL_PER_HOST_CALL};
 pub use prepass::{prepass, prepass_with_caps, CompileCost, CostCaps, ModuleInfo, PrepassError, PROFILE_FEATURES};
 pub use runner::{run, BrokerChannel, RunnerConfig, RunnerIo, DEADLINE_GRACE};
 pub use zkminer_witness::ipc::BuilderSummary;

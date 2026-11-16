@@ -24,7 +24,7 @@ use std::thread;
 
 use zkminer_witness::context::{build_context, encode_context, DescriptorFields};
 use zkminer_witness::envelope::{encode_evm_rpc_config, Capability, Limits, CLASS_EVM_RPC_V1, METHOD_SET_STATE_READ};
-use zkminer_witness::ipc::{self, exit, BuilderSummary, FetchStatus, BUILDER_SUMMARY_BYTES};
+use zkminer_witness::ipc::{self, decode_summary_pipe, exit, BuilderSummary, FetchStatus};
 use zkminer_witness::WitnessJobV1;
 use zkminer_witness_sandbox::{
     delegated_root, landlock_abi, prepare_command, Cgroup, CgroupSpec, SandboxError, MIN_LANDLOCK_ABI,
@@ -147,6 +147,8 @@ fn status_field(pid: u32, field: &str) -> String {
 struct Run {
     code: Option<i32>,
     w: Vec<u8>,
+    /// The started marker came first on the summary pipe.
+    started: bool,
     summary: Option<BuilderSummary>,
     log: String,
     requests: Vec<(u32, Vec<u8>)>,
@@ -156,6 +158,7 @@ struct Run {
 /// on each fetch, then `reply` answers it.
 fn run_sandboxed(
     root: &Path,
+    pids_max: u32,
     module: &[u8],
     argv: &[&str],
     reply: Vec<u8>,
@@ -165,7 +168,7 @@ fn run_sandboxed(
     let name = format!("runner-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst));
     let cg = Cgroup::create(
         root,
-        &CgroupSpec { name, memory_max: 512 << 20, pids_max: 8, cpu_max: None, cpu_weight: 10 },
+        &CgroupSpec { name, memory_max: 512 << 20, pids_max, cpu_max: None, cpu_weight: 10 },
     )
     .unwrap();
     let (mut w_read, w_write) = pipe();
@@ -223,13 +226,8 @@ fn run_sandboxed(
     let (requests, cg) = broker_thread.join().unwrap();
     assert!(cg_path.exists());
     cg.remove().unwrap();
-    Run {
-        code: status.code(),
-        w,
-        summary: (summary.len() == BUILDER_SUMMARY_BYTES).then(|| BuilderSummary::decode(&summary)).flatten(),
-        log: String::from_utf8_lossy(&log).into_owned(),
-        requests,
-    }
+    let (started, summary) = decode_summary_pipe(&summary);
+    Run { code: status.code(), w, started, summary, log: String::from_utf8_lossy(&log).into_owned(), requests }
 }
 
 const ARGV: &[&str] = &[
@@ -240,7 +238,7 @@ const ARGV: &[&str] = &[
 #[test]
 fn the_example_runs_under_the_sandbox() {
     let Some(root) = delegated("the_example_runs_under_the_sandbox") else { return };
-    let r = run_sandboxed(&root, example_wasm(), ARGV, block_response(), |pid, cg| {
+    let r = run_sandboxed(&root, 8, example_wasm(), ARGV, block_response(), |pid, cg| {
         // The runner is blocked in `fetch`: check it from outside.
         assert_eq!(status_field(pid, "Seccomp:"), "2", "seccomp filter mode");
         assert_eq!(status_field(pid, "NoNewPrivs:"), "1");
@@ -252,6 +250,7 @@ fn the_example_runs_under_the_sandbox() {
         assert!(threads <= 4, "{threads} threads");
     });
     assert_eq!(r.code, Some(exit::OK), "log: {}", r.log);
+    assert!(r.started, "the marker precedes the summary");
     let s = r.summary.expect("a summary");
     assert_eq!(s.exit_code, exit::OK);
     assert_eq!(s.fetches, 1);
@@ -273,8 +272,9 @@ fn exit_classes_propagate_from_the_sandbox() {
     .unwrap();
     let argv: Vec<&str> =
         ARGV.iter().map(|a| if *a == "100000000" { "1000000" } else { *a }).collect();
-    let r = run_sandboxed(&root, &spin, &argv, vec![], |_, _| {});
+    let r = run_sandboxed(&root, 8, &spin, &argv, vec![], |_, _| {});
     assert_eq!(r.code, Some(exit::FUEL), "log: {}", r.log);
+    assert!(r.started);
     assert_eq!(r.summary.unwrap().exit_code, exit::FUEL);
     assert!(r.w.is_empty());
     // An import outside the ABI: UNKNOWN_IMPORT, before anything runs.
@@ -283,6 +283,40 @@ fn exit_classes_propagate_from_the_sandbox() {
                    (memory (export "memory") 1) (func (export "run") (result i32) (i32.const 0)))"#,
     )
     .unwrap();
-    let r = run_sandboxed(&root, &bad, ARGV, vec![], |_, _| {});
+    let r = run_sandboxed(&root, 8, &bad, ARGV, vec![], |_, _| {});
     assert_eq!(r.code, Some(exit::UNKNOWN_IMPORT), "log: {}", r.log);
+    assert!(!r.started, "refused before instantiation");
+    assert_eq!(r.summary.unwrap().exit_code, exit::UNKNOWN_IMPORT);
+}
+
+#[test]
+fn fewer_than_three_pids_fail_before_compiling() {
+    let Some(root) = delegated("fewer_than_three_pids_fail_before_compiling") else { return };
+    // Accepted by the pre-pass but slow to compile (~1.8 s in a release build, far longer in this
+    // debug one): 4,096 locals read inside 58 nested loops.
+    let reads: String = (0..4_096).map(|i| format!("(drop (local.get {i})) ")).collect();
+    let slow = wat::parse_str(format!(
+        r#"(module (memory (export "memory") 1) (func (export "run") (result i32) (i32.const 0))
+            (func (local {}) {} {reads} {}))"#,
+        "i32 ".repeat(4_096),
+        "(loop ".repeat(58),
+        ")".repeat(58)
+    ))
+    .unwrap();
+    // pids.max = 2: the main and execution threads fit; the epoch watchdog, started before
+    // compilation, does not.
+    let t = std::time::Instant::now();
+    let r = run_sandboxed(&root, 2, &slow, ARGV, vec![], |_, _| {});
+    assert_eq!(r.code, Some(exit::INTERNAL), "log: {}", r.log);
+    assert!(r.log.contains("[runner] internal: watchdog thread"), "{}", r.log);
+    assert!(!r.started);
+    assert_eq!(r.summary.unwrap().exit_code, exit::INTERNAL);
+    assert!(t.elapsed() < std::time::Duration::from_secs(3), "failed only after compiling: {:?}", t.elapsed());
+    // Three are enough.
+    let quick =
+        wat::parse_str(r#"(module (memory (export "memory") 1) (func (export "run") (result i32) (i32.const 0)))"#)
+            .unwrap();
+    let r = run_sandboxed(&root, 3, &quick, ARGV, vec![], |_, _| {});
+    assert_eq!(r.code, Some(exit::OK), "log: {}", r.log);
+    assert!(r.started);
 }

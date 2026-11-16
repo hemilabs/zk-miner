@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use common::*;
 use zkminer_witness::abi::{pack_fetch, unpack_fetch};
 use zkminer_witness::ipc::{self, exit, FetchStatus};
+use zkminer_witness_builder::{FUEL_PER_FETCH, FUEL_PER_HOST_CALL};
 
 /// `$do_fetch (cap, ptr, len)`: fetches, emits the packed result (8 bytes), then copies up to 64
 /// bytes of the held response to 2048 and emits the count (4 bytes) and those bytes.
@@ -203,4 +204,55 @@ fn broker_protocol_failures_are_internal() {
     // Exactly max_response_bytes is fine.
     let o = run_full(&m, b"", c, vec![Reply::Result(FetchStatus::Ok, vec![1; 16])]);
     assert_eq!(o.code(), exit::OK);
+}
+
+#[test]
+fn after_status_3_every_fetch_answers_3_without_reaching_the_broker() {
+    let calls = "(call $do_fetch (i32.const 0) (i32.const 0) (i32.const 5)) ".repeat(4);
+    let replies = vec![Reply::Result(FetchStatus::Ok, b"a".to_vec()), Reply::Result(FetchStatus::Exhausted, vec![])];
+    let o = run_full(&fetch_module(&calls), b"", cfg(), replies);
+    assert_eq!(o.code(), exit::OK);
+    assert_eq!(
+        fetch_records(&o.w),
+        vec![
+            (pack_fetch(0, 1), b"a".to_vec()),
+            (pack_fetch(3, 0), vec![]),
+            (pack_fetch(3, 0), vec![]),
+            (pack_fetch(3, 0), vec![])
+        ]
+    );
+    assert_eq!(o.requests.len(), 2, "the two after the 3 were answered locally");
+    assert_eq!(o.summary.fetches, 2);
+}
+
+#[test]
+fn a_fetch_storm_after_status_3_costs_fuel_not_ipc() {
+    let mut c = cfg();
+    c.fuel = 20 * FUEL_PER_FETCH;
+    let body = r#"(func (export "run") (result i32)
+        (loop $l (drop (call $fetch (i32.const 0) (i32.const 0) (i32.const 0))) (br $l))
+        (i32.const 0))"#;
+    let o = run_full(&module(body), b"", c, vec![Reply::Result(FetchStatus::Exhausted, vec![])]);
+    assert_eq!(o.code(), exit::FUEL);
+    assert_eq!(o.requests.len(), 1);
+}
+
+#[test]
+fn every_fetch_costs_fuel_per_fetch_whether_or_not_it_reaches_the_broker() {
+    let fuel_for = |calls: usize, replies: Vec<Reply>| {
+        let calls = "(call $do_fetch (i32.const 0) (i32.const 0) (i32.const 5)) ".repeat(calls);
+        let o = run_full(&fetch_module(&calls), b"", cfg(), replies);
+        assert_eq!(o.code(), exit::OK);
+        (o.summary.fuel_used, o.requests.len())
+    };
+    let denied = || Reply::Result(FetchStatus::Denied, vec![]);
+    let (one, _) = fuel_for(1, vec![denied()]);
+    let (two, sent) = fuel_for(2, vec![denied(), denied()]);
+    assert_eq!(sent, 2);
+    assert!(two - one >= FUEL_PER_FETCH + FUEL_PER_HOST_CALL + 5, "{one} {two}");
+    // A locally answered fetch costs exactly what a broker round trip does (the guest code after
+    // each fetch is the same for statuses 1 and 3).
+    let (local, sent) = fuel_for(2, vec![Reply::Result(FetchStatus::Exhausted, vec![])]);
+    assert_eq!(sent, 1);
+    assert_eq!(local, two);
 }

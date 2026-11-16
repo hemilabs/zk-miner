@@ -88,7 +88,7 @@ fn the_br_table_limit_is_wasmtimes_own() {
     assert_eq!(o.code(), exit::OK, "{}", String::from_utf8_lossy(&o.log));
     // One more: the pre-pass refuses it, and so would wasmtime, so the two agree.
     let o = run_module(&table(65_521), cfg());
-    assert_eq!(o.code(), exit::INVALID_MODULE);
+    assert_eq!((o.code(), o.started()), (exit::INVALID_MODULE, false));
     assert!(String::from_utf8_lossy(&o.log).contains("br_table with 65521 targets"));
     let engine = zkminer_witness_builder::engine::engine().unwrap();
     let err = wasmtime::Module::from_binary(&engine, &table(65_521)).unwrap_err();
@@ -354,7 +354,7 @@ fn nested_loops_over_many_locals() {
     accepted(&nested_loops(1, 1_024, 945), CLAMP);
     // And through the runner: refused before anything is compiled.
     let o = run_module(&nested_loops(1, 4_096, 64), cfg());
-    assert_eq!(o.code(), exit::INVALID_MODULE);
+    assert_eq!((o.code(), o.started()), (exit::INVALID_MODULE, false));
     assert!(o.elapsed < std::time::Duration::from_secs(1), "{:?}", o.elapsed);
 }
 

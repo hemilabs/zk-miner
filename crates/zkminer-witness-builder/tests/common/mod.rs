@@ -156,6 +156,8 @@ impl FakeBroker {
 
 pub struct Outcome {
     pub summary: BuilderSummary,
+    /// What the runner wrote to the marker sink: `[MODULE_STARTED_MARKER]` once instantiation began.
+    pub marker: Vec<u8>,
     pub w: Vec<u8>,
     pub w_writes: Vec<usize>,
     pub log: Vec<u8>,
@@ -166,6 +168,14 @@ pub struct Outcome {
 impl Outcome {
     pub fn code(&self) -> i32 {
         self.summary.exit_code
+    }
+    /// Whether the runner wrote the started marker (exactly once).
+    pub fn started(&self) -> bool {
+        match self.marker.as_slice() {
+            [] => false,
+            [zkminer_witness::abi::MODULE_STARTED_MARKER] => true,
+            other => panic!("marker sink holds {other:?}"),
+        }
     }
     /// W as little-endian i32s.
     pub fn w_i32s(&self) -> Vec<i32> {
@@ -178,14 +188,59 @@ pub fn run_full(module: &[u8], context: &[u8], cfg: RunnerConfig, replies: Vec<R
     let (broker, fake) = FakeBroker::spawn(replies);
     let w = SharedBuf::default();
     let log = SharedBuf::default();
+    let marker = SharedBuf::default();
     let t = Instant::now();
-    let summary = run(module, context, &cfg, RunnerIo { witness: w.clone(), broker, log: log.clone() });
+    let io = RunnerIo { witness: w.clone(), broker, log: log.clone(), marker: marker.clone() };
+    let summary = run(module, context, &cfg, io);
     let elapsed = t.elapsed();
     let requests = fake.finish();
     let w_writes = w.writes.lock().unwrap().clone();
-    Outcome { summary, w: w.take(), w_writes, log: log.take(), requests, elapsed }
+    Outcome { summary, marker: marker.take(), w: w.take(), w_writes, log: log.take(), requests, elapsed }
 }
 
 pub fn run_module(module: &[u8], cfg: RunnerConfig) -> Outcome {
     run_full(module, b"", cfg, vec![])
+}
+
+/// A sink that sleeps before every write, then keeps the bytes (a miner slow to drain a pipe).
+#[derive(Clone)]
+pub struct SlowSink {
+    pub delay: Duration,
+    pub inner: SharedBuf,
+}
+
+impl Write for SlowSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        thread::sleep(self.delay);
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A sink whose every write panics: a stand-in for a runner bug on the execution thread.
+pub struct PanickingSink;
+
+impl Write for PanickingSink {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        panic!("test sink panics on purpose");
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Runs a module with the given W and log sinks against a broker that never answers, without
+/// waiting for the execution thread (which a test may leave stuck): (summary, marker, elapsed).
+pub fn run_with_sinks<W, L>(module: &[u8], cfg: RunnerConfig, witness: W, log: L) -> (BuilderSummary, Vec<u8>, Duration)
+where
+    W: Write + Send + 'static,
+    L: Write + Send + 'static,
+{
+    let (broker, _fake) = FakeBroker::spawn(vec![]);
+    let marker = SharedBuf::default();
+    let t = Instant::now();
+    let summary = run(module, b"", &cfg, RunnerIo { witness, broker, log, marker: marker.clone() });
+    (summary, marker.take(), t.elapsed())
 }
