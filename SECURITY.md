@@ -19,12 +19,15 @@ Every connection a requester can cause goes through one guard
 - **Only globally routable unicast addresses** are connected to (`is_global`). Refused:
   `0/8`, RFC 1918, CGNAT `100.64/10` (which holds Alibaba's metadata address), loopback,
   link-local `169.254/16` (cloud metadata), `192.0.0/24`, the TEST-NETs, benchmarking,
-  multicast, `240/4`, Azure's `168.63.129.16`; on IPv6 everything outside `2000::/3` (loopback,
-  ULA `fc00::/7` with AWS's `fd00:ec2::254`, link-local, site-local, multicast, discard,
-  SRv6), documentation, 6to4, Teredo and the IETF block `2001::/23` except IANA's globally
-  reachable AMT (`2001:3::/32`), AS112-v6 (`2001:4:112::/48`) and DRIP (`2001:30::/28`)
-  ranges. All of `2001:1::/32` is refused, IANA's PCP, TURN and DNS-SD SRP anycast addresses
-  included: the nearest instance of an anycast service may be a box on your own network. An
+  multicast, `240/4`, Azure's `168.63.129.16`, the AMT relay anycast `192.52.193.0/24` and the
+  AS112 anycast sinks `192.31.196.0/24` and `192.175.48.0/24`; on IPv6 everything outside
+  `2000::/3` (loopback, ULA `fc00::/7` with AWS's `fd00:ec2::254`, link-local, site-local,
+  multicast, discard, SRv6), documentation, 6to4, Teredo and **all of the IETF block
+  `2001::/23`**, IANA's globally reachable assignments in it included: the PCP, TURN and
+  DNS-SD SRP anycast addresses in `2001:1::/32`, AMT's relay anycast `2001:3::/32` and
+  AS112-v6 `2001:4:112::/48` (the nearest instance of an anycast service may be a box on your
+  own network), and the ORCHIDv2 and DRIP identifier prefixes (`2001:20::/28`,
+  `2001:30::/28`), which are not locators. An
   IPv6 address that carries an IPv4 one (mapped, SIIT, the well-known NAT64 prefix) is judged
   by that IPv4 address; IPv4-compatible addresses are refused. Deny CIDRs and the host's
   prefixes match every such spelling too (`64:ff9b::808:808/128` denies `8.8.8.8`).

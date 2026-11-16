@@ -6,10 +6,13 @@
 //!
 //! - **IPv4:** everything except the ranges in `V4_NOT_GLOBAL` (this network, RFC 1918, CGNAT,
 //!   loopback, link-local and metadata, `192.0.0/24`, the three TEST-NETs, the 6to4 relay anycast,
-//!   benchmarking, multicast, `240/4` with the broadcast address, and Azure's `168.63.129.16`). All of
-//!   `192.0.0.0/24` is refused, including the two /32s IANA marks globally reachable (`192.0.0.9` PCP
-//!   anycast, `192.0.0.10` TURN anycast): no program store lives there, and the blocklist refuses
-//!   them.
+//!   the AMT relay anycast `192.52.193.0/24`, the AS112 sinks `192.31.196.0/24` and
+//!   `192.175.48.0/24`, benchmarking, multicast, `240/4` with the broadcast address, and Azure's
+//!   `168.63.129.16`). All of `192.0.0.0/24` is refused, including the two /32s IANA marks globally
+//!   reachable (`192.0.0.9` PCP anycast, `192.0.0.10` TURN anycast): no program store lives there,
+//!   and the blocklist refuses them. The AMT and AS112 blocks, which IANA also marks globally
+//!   reachable, are refused for the reason `2001:1::/32` is (below): anycast services answered by
+//!   the nearest instance, which may be a box on the operator's own network.
 //! - **IPv6:** only `2000::/3` is global unicast (every RIR allocation is inside it), so everything
 //!   else (`::/128`, `::1`, `100::/64`, `5f00::/16`, `fc00::/7` with `fd00:ec2::254`, `fe80::/10`,
 //!   `fec0::/10`, `ff00::/8`, and all of `64:ff9b::/32` except the well-known NAT64 /96) is refused,
@@ -19,14 +22,17 @@
 //!   `::a.b.c.d` (deprecated by RFC 4291; no host is reached at one, and a host with an automatic
 //!   `sit` tunnel carries it to its IPv4 address), 6to4 `2002::/16` and Teredo `2001::/32` (both
 //!   deprecated relay prefixes), and the local-use NAT64 `64:ff9b:1::/48` (outside `2000::/3`).
-//!   Inside `2000::/3`, also refused: `2001:db8::/32` and `3fff::/20` (documentation), and `2001::/23`
-//!   except IANA's globally reachable assignments in it: `2001:3::/32` (AMT), `2001:4:112::/48`
-//!   (AS112-v6) and `2001:30::/28` (DRIP DETs). All of `2001:1::/32` stays refused, IANA's three
-//!   globally reachable anycast addresses in it included (`2001:1::1` PCP, `2001:1::2` TURN,
-//!   `2001:1::3` DNS-SD SRP): an anycast service answers from whichever instance is nearest, which
-//!   on a network that runs one (a PCP-capable router, a site's TURN relay or SRP registrar) is a
-//!   local box, and no program store lives there. ORCHIDv2 `2001:20::/28`, globally reachable per
-//!   IANA, stays refused: its identifiers are not routable locators, and the blocklist refuses it.
+//!   Inside `2000::/3`, also refused: `2001:db8::/32` and `3fff::/20` (documentation), and **all of
+//!   the IETF protocol block `2001::/23`**, IANA's globally reachable assignments in it included.
+//!   `2001:1::/32` holds three anycast addresses (`2001:1::1` PCP, `2001:1::2` TURN, `2001:1::3`
+//!   DNS-SD SRP); `2001:3::/32` is AMT's relay discovery prefix (RFC 7450), an anycast prefix a
+//!   gateway uses to reach the nearest relay; `2001:4:112::/48` is AS112-v6 (RFC 7535), anycast DNS
+//!   sinks anyone may run locally. An anycast service answers from whichever instance is nearest,
+//!   which on a network that runs one (a PCP-capable router, a site's TURN relay, SRP registrar,
+//!   AMT relay or AS112 node) is a local box, and no program store lives there (review r2: AMT
+//!   had been admitted, against the `2001:1::/32` decision). ORCHIDv2 `2001:20::/28` and the DRIP
+//!   entity tags `2001:30::/28` (RFC 9374, ORCHIDv2-formatted) are identifiers, not routable
+//!   locators, and the blocklist refuses ORCHIDv2.
 //!
 //! Ported from the witness broker's egress predicate (`zkminer-witness-broker/src/egress.rs` @
 //! bd9aabf), which a review already hardened; the one change is the IPv4-compatible form, refused
@@ -244,6 +250,9 @@ const V4_NOT_GLOBAL: &[([u8; 4], u8)] = &[
     ([224, 0, 0, 0], 4),      // multicast
     ([240, 0, 0, 0], 4),      // reserved, incl. 255.255.255.255
     ([168, 63, 129, 16], 32), // Azure's platform endpoint (wireserver / DNS / DHCP)
+    ([192, 52, 193, 0], 24),  // AMT relay anycast (IANA global; refused, see the module doc)
+    ([192, 31, 196, 0], 24),  // AS112-v4 anycast (likewise)
+    ([192, 175, 48, 0], 24),  // AS112 direct delegation anycast (likewise)
 ];
 
 /// Inside `2000::/3`: ranges refused outright, as (network, length).
@@ -251,15 +260,7 @@ const V6_NOT_GLOBAL: &[(u128, u8)] = &[
     (0x2001_0db8 << 96, 32), // documentation
     (0x2002 << 112, 16),     // 6to4, whatever it embeds
     (0x3fff << 112, 20),     // documentation (RFC 9637)
-    (0x2001_0000 << 96, 23), // IETF protocol assignments (incl. Teredo), less the exceptions
-];
-
-/// IANA's globally reachable assignments inside `2001::/23` that are admitted (not ORCHIDv2, and
-/// not the anycast addresses in `2001:1::/32`: see the module doc).
-const V6_IANA_GLOBAL_EXCEPTIONS: &[(u128, u8)] = &[
-    (0x2001_0003 << 96, 32),      // AMT
-    (0x2001_0004_0112 << 80, 48), // AS112-v6
-    (0x2001_0030 << 96, 28),      // DRIP DETs
+    (0x2001_0000 << 96, 23), // IETF protocol assignments (incl. Teredo, AMT, AS112-v6): all
 ];
 
 fn in4(a: u32, net: [u8; 4], len: u8) -> bool {
@@ -302,12 +303,6 @@ fn v6_is_global(a: Ipv6Addr) -> bool {
     }
     if !in6(x, 0x2000 << 112, 3) {
         return false;
-    }
-    if V6_IANA_GLOBAL_EXCEPTIONS
-        .iter()
-        .any(|&(net, len)| in6(x, net, len))
-    {
-        return true;
     }
     !V6_NOT_GLOBAL.iter().any(|&(net, len)| in6(x, net, len))
 }
@@ -362,7 +357,6 @@ fn boundaries() -> &'static [Prefix] {
         let mut b: Vec<Prefix> = V4_NOT_GLOBAL.iter().map(|&(n, l)| v4(n, l)).collect();
         b.push(v6(0x2000 << 112, 3));
         b.extend(V6_NOT_GLOBAL.iter().map(|&(n, l)| v6(n, l)));
-        b.extend(V6_IANA_GLOBAL_EXCEPTIONS.iter().map(|&(n, l)| v6(n, l)));
         for base in EMBEDDED_V4_BASES {
             b.push(v6(base << 32, 96));
             // Inside a /96 judged by its IPv4 address, the IPv4 table's boundaries, embedded.
@@ -553,7 +547,18 @@ mod tests {
         "2001:4:113::1", // next to AS112-v6
         "2001:40::1",    // unassigned in 2001::/23
         "2001:1ff::1",   // the top of 2001::/23
-        "4000::1",       // outside 2000::/3
+        // Review r2: IANA-global anycast blocks, refused like 2001:1::/32; DRIP like ORCHIDv2.
+        "2001:3::1", // AMT relay discovery anycast
+        "2001:3:ffff::1",
+        "2001:4:112::1", // AS112-v6
+        "2001:4:112:ffff::1",
+        "2001:30::1", // DRIP DETs
+        "2001:3f:ffff::1",
+        "192.52.193.1", // AMT (IPv4)
+        "192.31.196.1", // AS112-v4
+        "192.175.48.1", // AS112 direct delegation
+        "::ffff:192.52.193.1",
+        "4000::1", // outside 2000::/3
         "1fff::1",
         "::ffff:0.0.0.0",
         "::2", // compatible 0.0.0.2
@@ -581,9 +586,12 @@ mod tests {
         "223.255.255.255", // just below multicast
         "168.63.129.15",
         "168.63.129.17",
-        "192.31.196.1", // AS112-v4 (IANA global)
-        "192.52.193.1", // AMT (IANA global)
-        "192.175.48.1", // AS112 direct delegation (IANA global)
+        "192.31.195.255", // next to AS112-v4
+        "192.31.197.0",
+        "192.52.192.255", // next to AMT
+        "192.52.194.0",
+        "192.175.47.255", // next to AS112 direct delegation
+        "192.175.49.0",
         "2606:4700:4700::1111",
         "2a00:1450:4001::1",
         "2001:200::1", // just above 2001::/23
@@ -591,13 +599,7 @@ mod tests {
         "2001:db9::1",
         "2003::1",
         "3ffe::1",
-        "3fff:1000::1", // just above 3fff::/20
-        "2001:3::1",    // IANA exceptions in 2001::/23
-        "2001:3:ffff::1",
-        "2001:4:112::1",
-        "2001:4:112:ffff::1",
-        "2001:30::1",
-        "2001:3f:ffff::1",
+        "3fff:1000::1",   // just above 3fff::/20
         "::ffff:8.8.8.8", // embedded forms of a public address
         "::ffff:0:808:808",
         "64:ff9b::808:808",
@@ -896,7 +898,10 @@ mod tests {
             ("2a00::/8", true),
             ("2001::/16", false),
             ("2001:200::/23", true),
-            ("2001:3::/32", true), // AMT, an IANA-global exception
+            ("2001:3::/32", false), // AMT anycast: refused (review r2)
+            ("2001:4:112::/48", false),
+            ("192.52.193.0/24", false),
+            ("192.52.192.0/24", true),
             ("2001:2::/48", false),
             ("2001:1::/120", false), // the three anycast /128s and their neighbours
             ("2001:1::1/128", false),
