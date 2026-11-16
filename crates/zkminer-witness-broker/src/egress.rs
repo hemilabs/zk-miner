@@ -190,11 +190,18 @@ impl EgressPolicy {
     }
 }
 
-/// The connected prefixes of every interface (netguard's [`zkminer_netguard::HostFacts::gather`]:
-/// each address under its netmask, plus point-to-point peers). Only callable before the sandbox is
-/// applied (netlink).
+/// netguard's facts about this host ([`zkminer_netguard::HostFacts::gather_with`]: interfaces,
+/// routes, DNS servers, and the public addresses if `opts` says so). Only callable before the
+/// sandbox is applied (netlink).
+pub fn host_facts(opts: &zkminer_netguard::FactsOptions) -> std::io::Result<zkminer_netguard::HostFacts> {
+    zkminer_netguard::HostFacts::gather_with(opts)
+}
+
+/// Every prefix this host's facts refuse ([`zkminer_netguard::HostFacts::refused_prefixes`]),
+/// without public-address discovery.
 pub fn connected_prefixes() -> std::io::Result<Vec<Prefix>> {
-    Ok(zkminer_netguard::HostFacts::gather()?.connected().to_vec())
+    let opts = zkminer_netguard::FactsOptions { discover_public_addresses: false, ..Default::default() };
+    Ok(host_facts(&opts)?.refused_prefixes())
 }
 
 /// Replaces every URL (scheme://…) in `s` with `<url>`; endpoints are logged by alias only. Also bare

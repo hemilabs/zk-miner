@@ -78,6 +78,7 @@ async fn lazy_resolution_goes_through_the_same_filter() {
         connected: vec![],
         own_addresses: vec![],
         dns_servers: vec![dns.addr],
+        resolvers: vec![],
     });
     let (client, _t) = spawn_broker(cfg, Hooks::real()).await;
     let mut b = register(&client, 1, vec![anvil_cap()], budget(10, 1 << 20, 1 << 20), false).await;

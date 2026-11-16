@@ -5,6 +5,11 @@
 //! miner's config and passes `--dev-private-network` exactly when its
 //! [`ZkMinerConfig::net_mode`] is [`NetMode::DevPrivate`] (`[dev] private_network`, never on
 //! mainnet). The broker's config file has no key for it.
+//!
+//! The broker cannot read the host's interfaces or routes once sandboxed, so the miner keeps its
+//! view current: every [`BROKER_FACTS_REFRESH_EVERY`] it gathers netguard's facts with its own
+//! `[egress]` options and, when they changed (and once at start), sends them with
+//! `RefreshPrefixes` (every prefix they refuse, and the own addresses, public NAT ones included).
 
 use std::io::{BufRead, BufReader};
 use std::os::fd::AsFd;
@@ -13,9 +18,10 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use zkminer_witness_broker::client::BrokerClient;
+use zkminer_witness_broker::client::{BrokerClient, ClientError};
 use zkminer_witness_broker::egress::sanitize_log;
 use zkminer_config::ZkMinerConfig;
 use zkminer_netguard::NetMode;
@@ -30,11 +36,14 @@ const MAX_LOG_LINE: usize = 2_048;
 /// Makes each broker's cgroup name unique within the delegated root (one broker per miner, but tests
 /// run several in one process).
 static BROKER_SEQ: AtomicU64 = AtomicU64::new(0);
+/// How often the miner re-reads the host's facts for the broker (see the module doc).
+pub const BROKER_FACTS_REFRESH_EVERY: Duration = Duration::from_secs(5);
 
 pub struct BrokerProcess {
     child: Child,
     cgroup: Option<Cgroup>,
     pub client: Arc<BrokerClient>,
+    refresher: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BrokerProcess {
@@ -51,6 +60,7 @@ impl BrokerProcess {
         miner: &ZkMinerConfig,
     ) -> Result<Self> {
         let net_mode = miner.net_mode();
+        let facts_options = miner.egress_facts_options()?;
         if net_mode == NetMode::DevPrivate {
             tracing::warn!("{}: the witness broker's endpoints may be on the local network", zkminer_netguard::DEV_MODE_BANNER);
         }
@@ -95,7 +105,8 @@ impl BrokerProcess {
                 .ok();
         }
         let client = Arc::new(BrokerClient::new(miner_end).context("broker client")?);
-        Ok(Self { child, cgroup: Some(cgroup), client })
+        let refresher = Some(tokio::spawn(refresh_facts(client.clone(), facts_options)));
+        Ok(Self { child, cgroup: Some(cgroup), client, refresher })
     }
 
     /// The broker's pid (for logs and `/proc` checks).
@@ -109,8 +120,46 @@ impl BrokerProcess {
     }
 }
 
+/// Sends the host's facts to the broker at start and whenever they change (see the module doc).
+async fn refresh_facts(client: Arc<BrokerClient>, opts: zkminer_netguard::FactsOptions) {
+    let mut sent = None;
+    let mut tick = tokio::time::interval(BROKER_FACTS_REFRESH_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let facts = match tokio::task::spawn_blocking(move || zkminer_netguard::HostFacts::gather_with(&opts)).await {
+            Ok(Ok(f)) => f,
+            Ok(Err(e)) => {
+                tracing::warn!("network guard: re-reading this host's facts for the witness broker failed: {e}");
+                continue;
+            }
+            Err(_) => continue,
+        };
+        let zkminer_witness::ipc::ControlRequest::RefreshPrefixes { prefixes, own_addresses } =
+            zkminer_witness_broker::hostinfo::refresh_message_for(&facts)
+        else {
+            continue;
+        };
+        let now = Some((prefixes.clone(), own_addresses.clone()));
+        if now == sent {
+            continue;
+        }
+        match client.refresh_prefixes(prefixes, own_addresses).await {
+            Ok(count) => {
+                tracing::debug!(count, "the witness broker's host facts refreshed");
+                sent = now;
+            }
+            Err(ClientError::Closed) => return,
+            Err(e) => tracing::warn!("network guard: refreshing the witness broker's host facts failed: {e}"),
+        }
+    }
+}
+
 impl Drop for BrokerProcess {
     fn drop(&mut self) {
+        if let Some(r) = self.refresher.take() {
+            r.abort();
+        }
         if let Some(cg) = self.cgroup.take() {
             let _ = cg.kill();
             let _ = self.child.wait();

@@ -192,6 +192,9 @@ fn refresh(b: &Broker, prefixes: &[zkminer_witness::ipc::IpPrefix], own: Vec<std
             Err(_) => return error(ControlErrorCode::Malformed),
         }
     }
+    // The site around each own IPv6 address, at this broker's `[egress] ipv6_site_prefix_len` (the
+    // miner sends its own; the union holds both).
+    parsed.extend(zkminer_netguard::site_prefixes(&own, b.cfg.facts_options.ipv6_site_prefix_len));
     let count = u32::try_from(parsed.len()).unwrap_or(u32::MAX);
     b.policy.write().unwrap_or_else(|p| p.into_inner()).facts = zkminer_netguard::HostFacts::new(parsed, own);
     // A host name's pinned answer may now name a connected or own address.

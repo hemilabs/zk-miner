@@ -196,16 +196,17 @@ async fn serve_conn(
 // ---------------------------------------------------------------------------------------------
 // The test network floor.
 
-/// The test seams of the egress hooks: injected connected prefixes and a simple redaction.
-/// Admission is the real floor.
+/// The test seams of the egress hooks: injected connected prefixes (with the host's real interface
+/// addresses as its own, and nothing else: no routes, site, DNS servers or public addresses) and
+/// a simple redaction. Admission is the real floor.
 #[derive(Debug, Default, Clone)]
 pub struct TestEgress {
     pub connected: Vec<Prefix>,
 }
 
 impl EgressHooks for TestEgress {
-    fn connected_prefixes(&self) -> std::io::Result<Vec<Prefix>> {
-        Ok(self.connected.clone())
+    fn host_facts(&self, _opts: &zkminer_netguard::FactsOptions) -> std::io::Result<zkminer_netguard::HostFacts> {
+        Ok(zkminer_netguard::HostFacts::new(self.connected.clone(), crate::hostinfo::own_addresses()?))
     }
 
     fn redact(&self, s: &str) -> String {

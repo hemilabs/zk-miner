@@ -47,7 +47,7 @@ impl Broker {
             cfg.net_mode,
             cfg.endpoints(),
             &host.resolved,
-            cfg.effective_deny(&host.dns_servers),
+            cfg.effective_deny_for(&host),
             host.connected.clone(),
             &host.own_addresses,
         )));

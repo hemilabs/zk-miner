@@ -19,7 +19,9 @@
 //! bad_manifest_max_entries = 65536
 //!
 //! [egress]
-//! deny_cidrs = ["203.0.113.7/32"]   # the host's and the fleet's public and NAT addresses
+//! deny_cidrs = ["203.0.113.7/32"]   # the fleet's addresses, the VPC's ranges
+//! ipv6_site_prefix_len = 56         # the site refused around each own IPv6 address (48..=64)
+//! discover_public_addresses = true  # learn the NAT public addresses from fixed reflectors
 //!
 //! [dns]
 //! servers = ["9.9.9.9", "[2620:fe::fe]:53"]   # default: the nameservers of /etc/resolv.conf
@@ -112,6 +114,12 @@
 //! when a role prefix that is not a host route (/32, /128) covers loopback, the metadata service,
 //! an RFC 1918 probe, one of the host's own addresses or a connected prefix: configure local nodes
 //! as host routes. In public mode it also fails when any role prefix is not public.
+//!
+//! The host's facts are netguard's ([`zkminer_netguard::HostFacts::gather_with`] with `[egress]
+//! ipv6_site_prefix_len` and `discover_public_addresses`): own addresses with the public NAT ones,
+//! connected prefixes with on-link routes, the IPv6 site, routes off the default path, and the DNS
+//! servers of `/etc/resolv.conf` and systemd-resolved's upstream file, all refused in public mode
+//! ([`HostFacts`]).
 //!
 //! A key travels only over `https`, or over `http` to an IP literal that is loopback or inside the
 //! endpoint's own `cidrs` (a node on the operator's own wire).
@@ -225,6 +233,12 @@ impl Default for CacheConfig {
 struct EgressFile {
     #[serde(default)]
     deny_cidrs: Vec<String>,
+    /// Default [`zkminer_netguard::DEFAULT_IPV6_SITE_PREFIX_LEN`].
+    #[serde(default)]
+    ipv6_site_prefix_len: Option<u8>,
+    /// Default true.
+    #[serde(default)]
+    discover_public_addresses: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -506,18 +520,25 @@ pub struct ArtifactsSpec {
 }
 
 /// Facts about the host the sandboxed broker cannot read itself: the DNS servers, what each
-/// endpoint host resolved to at startup, the connected prefixes and the host's own addresses.
-/// `main` reads them before `restrict_self`; [`crate::serve`] reads them itself when they are
-/// absent (tests).
+/// endpoint host resolved to at startup, the prefixes the host's facts refuse and the host's own
+/// addresses. `main` reads them before `restrict_self`; [`crate::serve`] reads them itself when
+/// they are absent (tests).
 #[derive(Debug, Clone, Default)]
 pub struct HostFacts {
     /// Endpoint alias → resolved addresses, unfiltered (empty when resolution failed; retried
     /// lazily). The floor filters them ([`crate::net::build_policy`]).
     pub resolved: HashMap<String, Vec<IpAddr>>,
+    /// Every prefix netguard's facts refuse ([`zkminer_netguard::HostFacts::refused_prefixes`]):
+    /// connected prefixes (interfaces and on-link routes), the IPv6 site, routes off the default
+    /// path and the host's DNS servers.
     pub connected: Vec<Prefix>,
+    /// The host's own addresses, its public (NAT) addresses included.
     pub own_addresses: Vec<IpAddr>,
     /// The servers host names are resolved with: `[dns] servers`, else `/etc/resolv.conf`'s.
     pub dns_servers: Vec<SocketAddr>,
+    /// Every DNS server the host itself uses (`/etc/resolv.conf`, systemd-resolved's upstream
+    /// servers behind its stub): denied like `dns_servers`.
+    pub resolvers: Vec<IpAddr>,
 }
 
 #[derive(Debug, Clone)]
@@ -536,6 +557,9 @@ pub struct BrokerConfig {
     pub host: Option<HostFacts>,
     /// The miner's network mode (never from this file): see the module doc.
     pub net_mode: NetMode,
+    /// How the host's facts are gathered (`[egress] ipv6_site_prefix_len`,
+    /// `discover_public_addresses`).
+    pub facts_options: zkminer_netguard::FactsOptions,
 }
 
 impl BrokerConfig {
@@ -581,15 +605,28 @@ impl BrokerConfig {
         deny
     }
 
+    /// [`Self::effective_deny`] with the host's facts: every server the broker's resolver dials and
+    /// every DNS server the host itself uses ([`HostFacts::resolvers`]).
+    pub fn effective_deny_for(&self, host: &HostFacts) -> Vec<Prefix> {
+        let mut deny = self.effective_deny(&host.dns_servers);
+        for r in &host.resolvers {
+            let p = Prefix::host(*r);
+            if !deny.contains(&p) {
+                deny.push(p);
+            }
+        }
+        deny
+    }
+
     /// In public mode, refuses a role entry that holds one of the host's own addresses or overlaps
-    /// one of its connected prefixes, the deny CIDRs or a DNS server (the checks the config file
-    /// alone cannot make). Nothing in developer mode.
+    /// one of the prefixes its facts refuse, the deny CIDRs or a DNS server (the checks the config
+    /// file alone cannot make). Nothing in developer mode.
     pub fn validate_host(&self, host: &HostFacts) -> Result<(), ConfigError> {
         if self.net_mode != NetMode::Public {
             return Ok(());
         }
         let facts = zkminer_netguard::HostFacts::new(host.connected.clone(), host.own_addresses.clone());
-        check_roles_public(self, &facts, &self.effective_deny(&host.dns_servers))
+        check_roles_public(self, &facts, &self.effective_deny_for(host))
     }
 
     /// Every endpoint, in a fixed order: evm-rpc, blob mirrors, the artifact endpoint, its mirror.
@@ -696,6 +733,11 @@ fn validate(f: FileConfig, base: &Path, net_mode: NetMode) -> Result<BrokerConfi
         .iter()
         .map(|s| parse_cidr(s).map_err(|e| ConfigError::Invalid(format!("egress.deny_cidrs: {e}"))))
         .collect::<Result<Vec<_>, _>>()?;
+    let facts_options = zkminer_netguard::FactsOptions {
+        ipv6_site_prefix_len: f.egress.ipv6_site_prefix_len.unwrap_or(zkminer_netguard::DEFAULT_IPV6_SITE_PREFIX_LEN),
+        discover_public_addresses: f.egress.discover_public_addresses.unwrap_or(true),
+    };
+    facts_options.validate().map_err(|e| ConfigError::Invalid(format!("egress.{e}")))?;
     if f.dns.reresolve_secs == 0 {
         return invalid("dns.reresolve_secs must be positive");
     }
@@ -821,6 +863,7 @@ fn validate(f: FileConfig, base: &Path, net_mode: NetMode) -> Result<BrokerConfi
         artifacts,
         host: None,
         net_mode,
+        facts_options,
     };
     // §11.1: never an endpoint on the miner's chain-RPC host.
     for e in cfg.endpoints() {
@@ -1521,6 +1564,7 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
             connected: connected.iter().map(|s| parse_cidr(s).unwrap()).collect(),
             own_addresses: own.iter().map(|s| s.parse().unwrap()).collect(),
             dns_servers: dns.iter().map(|s| s.parse().unwrap()).collect(),
+            resolvers: Vec::new(),
         };
         assert!(c.validate_host(&host(&["127.0.0.0/8", "192.168.1.0/24"], &["127.0.0.1", "192.168.1.10"], &["127.0.0.53:53"])).is_ok());
         for (h, why) in [
@@ -1536,6 +1580,30 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         }
         let dev = BrokerConfig::from_toml(&text, dir.path(), NetMode::DevPrivate).unwrap();
         assert!(dev.validate_host(&host(&["9.9.9.0/24"], &["1.1.1.1"], &["1.1.1.1:53"])).is_ok());
+    }
+
+    /// Review r1 (fetch F1b, F1c, I1): `[egress] ipv6_site_prefix_len` and
+    /// `discover_public_addresses` reach the facts options; a DNS server the host itself uses
+    /// (systemd-resolved's upstream ones) is denied like the resolver's own.
+    #[test]
+    fn egress_facts_options_and_host_resolvers() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let c = dev_toml(&minimal(""), d).unwrap();
+        assert_eq!(c.facts_options, zkminer_netguard::FactsOptions::default());
+        let c = dev_toml(&minimal("[egress]\nipv6_site_prefix_len = 48\ndiscover_public_addresses = false"), d).unwrap();
+        assert_eq!(c.facts_options.ipv6_site_prefix_len, 48);
+        assert!(!c.facts_options.discover_public_addresses);
+        for bad in ["47", "65", "0"] {
+            let e = err(&minimal(&format!("[egress]\nipv6_site_prefix_len = {bad}")), d);
+            assert!(e.contains("ipv6_site_prefix_len"), "{e}");
+        }
+        let text = minimal("[[blob_mirror]]\nalias = \"m\"\nurl_template = \"https://9.9.9.9/{sha256}\"\n");
+        let c = BrokerConfig::from_toml(&text, d, NetMode::Public).unwrap();
+        let host = HostFacts { resolvers: vec!["9.9.9.9".parse().unwrap()], ..Default::default() };
+        assert!(c.effective_deny_for(&host).contains(&parse_cidr("9.9.9.9/32").unwrap()));
+        let e = c.validate_host(&host).unwrap_err().to_string();
+        assert!(e.contains("deny CIDR 9.9.9.9/32"), "{e}");
     }
 
     /// The mode comes only from the miner: the file has no key for it.

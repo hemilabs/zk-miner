@@ -1,4 +1,4 @@
-//! The broker's seams: the host's interfaces and log redaction ([`EgressHooks`]) and
+//! The broker's seams: the host's facts and log redaction ([`EgressHooks`]) and
 //! [`crate::evm_rpc`] (the strict JSON-RPC codec). Production uses [`Hooks::real`]; tests can
 //! substitute their own to exercise the broker's logic (failover, budgets, caches, lanes)
 //! independently. Admission itself is no seam: every connection is judged by
@@ -9,16 +9,17 @@ use std::sync::Arc;
 
 use zkminer_witness::envelope::MethodSet;
 
-use crate::egress::{self, Prefix};
+use crate::egress;
 use crate::evm_rpc::{self, BlockPin, BlockTag, CallAnswer, Denied, ParsedRequest, ResponseError};
 
 /// Longest log line built from untrusted bytes.
 pub const LOG_MAX: usize = 512;
 
-/// The host's interfaces and log redaction.
+/// The host's facts and log redaction.
 pub trait EgressHooks: Send + Sync + 'static {
-    /// [`egress::connected_prefixes`] (only callable before the sandbox is applied).
-    fn connected_prefixes(&self) -> io::Result<Vec<Prefix>>;
+    /// netguard's facts about this host, gathered with `opts` ([`egress::host_facts`]; only
+    /// callable before the sandbox is applied).
+    fn host_facts(&self, opts: &zkminer_netguard::FactsOptions) -> io::Result<zkminer_netguard::HostFacts>;
     /// `redact_urls(sanitize_log(…))`: every log line built from an error or untrusted bytes.
     fn redact(&self, s: &str) -> String;
 }
@@ -28,8 +29,8 @@ pub trait EgressHooks: Send + Sync + 'static {
 pub struct RealEgress;
 
 impl EgressHooks for RealEgress {
-    fn connected_prefixes(&self) -> io::Result<Vec<Prefix>> {
-        egress::connected_prefixes()
+    fn host_facts(&self, opts: &zkminer_netguard::FactsOptions) -> io::Result<zkminer_netguard::HostFacts> {
+        egress::host_facts(opts)
     }
     fn redact(&self, s: &str) -> String {
         egress::redact_urls(&egress::sanitize_log(s.as_bytes(), LOG_MAX))
