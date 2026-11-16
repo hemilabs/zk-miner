@@ -293,7 +293,15 @@ Worth knowing:
   with `zkminer stop` first.
 
   Exit status 75 means it stopped with locks still held (or by keep-locks): start it again
-  before their deadlines. A miner killed outright (SIGKILL) picks its locks up the same way.
+  well before their deadlines. A miner killed outright (SIGKILL) picks its locks up the same way.
+  Under `Restart=on-failure` (or Docker's `--restart on-failure`) that exit restarts it, and the
+  restarted miner mines again; to stop it for good, use `systemctl stop` / `docker stop`, which
+  the supervisor never restarts. Before shutting the machine down, stop the miner and let it
+  finish (or `zkminer stop --abandon`): a shutdown rarely waits for a 50-minute drain, and
+  whatever it cuts off keeps its locks. On Windows, a miner run as a service keeps its
+  `.zkminer` in the service account's profile, so run `zkminer stop` as that account, and give
+  the service wrapper a stop timeout long enough for a drain (or stop it with `zkminer stop`
+  before stopping the service).
 - **One miner per key.** Two miners on one key drive the same locks and replace each
   other's transactions. `run` holds `~/.zkminer/miner.lock`, so a second one from the same
   home refuses to start (including while the first is still draining); it can't see one in

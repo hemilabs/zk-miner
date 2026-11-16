@@ -30,7 +30,8 @@ pub struct HeldJobs {
     pub release_penalty: u128,
     /// `proving` jobs whose collateral is not known here (so not in `release_penalty`).
     pub penalty_unknown: usize,
-    /// The earliest lock deadline among them (unix seconds), if any is known.
+    /// The earliest working cutoff among them (unix seconds: the last moment a proof is
+    /// accepted or a release is possible), if any is known.
     pub earliest_deadline: Option<u64>,
 }
 
@@ -50,10 +51,15 @@ pub fn held_jobs(state: &MinerState, now: u64) -> HeldJobs {
                 // Both known, or the 5% floor would understate it (the penalty scales up to 30%
                 // with the time left in the fulfilment window).
                 if job.info.locked_collateral > 0 && job.info.fulfillment_timeout > 0 {
+                    // `lock_deadline` here is the miner's working cutoff, the contract's
+                    // `lockDeadline` plus PROVER_GRACE; the penalty scales with the time left to
+                    // the contract's own deadline.
                     held.release_penalty += zkminer_chain::auction::compute_release_penalty(
                         job.info.locked_collateral,
                         job.info.fulfillment_timeout,
-                        job.info.lock_deadline,
+                        job.info
+                            .lock_deadline
+                            .saturating_sub(zkminer_chain::auction::PROVER_GRACE_SECS),
                         now,
                     );
                 } else {
@@ -102,6 +108,11 @@ fn choose(state: &mut MinerState, mode: StopMode) {
 pub fn handle_key(state: &mut MinerState, key: KeyEvent) -> bool {
     let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
     let quit = ctrl_c || matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'));
+    if state.shutdown.is_some() && state.stop_prompt == Some(StopPrompt::Quit) {
+        // A stop began elsewhere (`zkminer stop`, a signal) while the question was open: it no
+        // longer applies, and its keys would skip the confirmations the panel asks for.
+        state.stop_prompt = None;
+    }
     if let Some(prompt) = state.stop_prompt {
         match prompt {
             StopPrompt::Quit => match key.code {
@@ -135,14 +146,16 @@ pub fn handle_key(state: &mut MinerState, key: KeyEvent) -> bool {
                 ask(state, StopMode::KeepLocks)
             }
             KeyCode::Char('x') | KeyCode::Char('X') => ask(state, StopMode::Force),
-            // The miner is paused for the shutdown: `p` must not resume claiming.
-            KeyCode::Char('p') | KeyCode::Char('P') => {}
             _ if quit => state.add_log(
                 LogLevel::Warn,
                 "Already stopping — the dashboard closes when the miner exits. [a] abandon, \
                  [k] keep locks, [x] force exit.",
             ),
-            _ => return false,
+            // Moving around still works. Everything else is swallowed: `p` must not resume
+            // claiming, and the screens' actions (a benchmark, GPU tuning, the setup wizard's
+            // mint and stake) would compete with the stop for the workers and the signer.
+            _ if navigation(state, key.code) => return false,
+            _ => {}
         }
         return true;
     }
@@ -159,6 +172,24 @@ pub fn handle_key(state: &mut MinerState, key: KeyEvent) -> bool {
         return true;
     }
     false
+}
+
+/// Keys that only move around the dashboard.
+fn navigation(state: &MinerState, code: KeyCode) -> bool {
+    use crate::state::Screen;
+    match code {
+        KeyCode::Char('1'..='7')
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Char('j')
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Char('T') => true,
+        // Settings uses Tab between sections; Enter on Jobs opens a job's detail.
+        KeyCode::Tab | KeyCode::BackTab => state.current_screen == Screen::Settings,
+        KeyCode::Enter => state.current_screen == Screen::Jobs,
+        _ => false,
+    }
 }
 
 /// A box of `w` x `h` centred in `area`, clipped to it.
@@ -189,9 +220,16 @@ pub fn render_prompt(f: &mut Frame, area: Rect, state: &MinerState) {
         return;
     };
     let held = held_jobs(state, now_secs());
+    // The last moment the next start can still release the earliest lock in time: its cutoff
+    // less the margin a release needs (the miner publishes it). Finishing it needs earlier still.
     let restart_by = held
         .earliest_deadline
-        .map(|d| format!(" (start it again before {})", fmt_time(d)))
+        .map(|d| {
+            format!(
+                " (start it again well before {})",
+                fmt_time(d.saturating_sub(state.release_margin_secs))
+            )
+        })
         .unwrap_or_default();
     let (title, mut lines) = match prompt {
         StopPrompt::Quit => {
@@ -208,8 +246,8 @@ pub fn render_prompt(f: &mut Frame, area: Rect, state: &MinerState) {
                 Line::from(""),
                 key_line(
                     "d",
-                    "Drain: finish them, get paid, then exit (as long as the proofs take, up to \
-                     ~50 min)"
+                    "Drain: finish them, get paid, then exit (as long as the proofs take; after \
+                     ~50 min whatever is left is released, at a penalty)"
                         .into(),
                 ),
                 key_line(
@@ -287,7 +325,8 @@ fn panel_content(view: &ShutdownView) -> (&'static str, Vec<Line<'static>>) {
     let (title, hints): (&str, &str) = match view.stage {
         ShutdownStage::Draining => (
             " STOPPING — DRAINING ",
-            "[a] abandon (release now)  [k] keep locks and exit  [x] force exit  — or wait: it              exits by itself when the proofs are done",
+            "[a] abandon (release now)  [k] keep locks and exit  [x] force exit  — or wait: it \
+             exits by itself when the proofs are done",
         ),
         ShutdownStage::KeepingLocks => (
             " STOPPING — KEEPING LOCKS ",
@@ -456,10 +495,10 @@ mod tests {
         handle_key(&mut s, key(KeyCode::Char('k')));
         handle_key(&mut s, key(KeyCode::Char('y')));
         assert_eq!(s.stop_request, Some(StopMode::KeepLocks));
-        // Once releasing, keeping the locks is no longer on offer (`k` is just navigation again).
+        // Once releasing, keeping the locks is no longer on offer (and `k` does nothing).
         let mut s = miner();
         s.shutdown = Some(ShutdownView::new(ShutdownStage::Abandoning));
-        assert!(!handle_key(&mut s, key(KeyCode::Char('k'))));
+        assert!(handle_key(&mut s, key(KeyCode::Char('k'))));
         assert_eq!(s.stop_prompt, None);
     }
 
@@ -470,10 +509,16 @@ mod tests {
         let now = 1_000_000;
         let hemi = 1_000_000_000_000_000_000u128;
         let mut s = miner();
-        s.active_jobs
-            .push(job(MinerJobStatus::Queued, 100 * hemi, now + 3600));
-        s.active_jobs
-            .push(job(MinerJobStatus::Queued, 100 * hemi, now + 10));
+        s.active_jobs.push(job(
+            MinerJobStatus::Queued,
+            100 * hemi,
+            now + 3600 + zkminer_chain::auction::PROVER_GRACE_SECS,
+        ));
+        s.active_jobs.push(job(
+            MinerJobStatus::Queued,
+            100 * hemi,
+            now + 10 + zkminer_chain::auction::PROVER_GRACE_SECS,
+        ));
         s.active_jobs
             .push(job(MinerJobStatus::Submitting, 100 * hemi, now + 5));
         let held = held_jobs(&s, now);

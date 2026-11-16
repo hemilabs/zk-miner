@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 use zkminer_tui::state::StopMode;
 
-use super::run::{stop_mode_word, stop_request_path, zkminer_home};
+use super::run::{stop_mode_word, stop_request_path, stop_response_path, zkminer_home};
 
 /// How long to wait for the miner to pick up the request.
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -41,7 +41,8 @@ fn instance_running() -> Result<bool> {
 /// half a word).
 fn write_request(mode: StopMode) -> Result<()> {
     let path = stop_request_path();
-    let tmp = path.with_extension("tmp");
+    // Our own temporary: two `zkminer stop` at once must not rename each other's half-written word.
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     std::fs::write(&tmp, stop_mode_word(mode))
         .with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("write {}", path.display()))
@@ -81,11 +82,15 @@ fn held_report(mode: StopMode) -> String {
         return "No locks are recorded as held.".to_string();
     }
     let earliest = live.iter().copied().filter(|d| *d > 0).min();
+    // The journal records each lock's cutoff; the next start must be up a release margin before it
+    // to release one in time.
     let by = earliest
         .map(|d| {
             format!(
-                " before {} (the earliest deadline)",
-                zkminer_chain::exit::fmt_unix(d)
+                " well before {} (after that it cannot release the earliest one in time)",
+                zkminer_chain::exit::fmt_unix(
+                    d.saturating_sub(super::run::DEADLINE_RELEASE_MARGIN_SECS)
+                )
             )
         })
         .unwrap_or_default();
@@ -106,10 +111,14 @@ pub fn run(mode: StopMode, wait: bool, timeout: Option<u64>) -> Result<()> {
     if !instance_running()? {
         bail!(
             "no miner is running under {} (its miner.lock is free) — nothing to stop. A miner run \
-             as another user, or with another HOME / USERPROFILE, must be stopped as that user.",
+             as another user (a service account included), or with another HOME on Linux, must \
+             be stopped as that user.",
             home.display()
         );
     }
+    // An answer left from an earlier request must not be read as this one's.
+    let response = stop_response_path();
+    let _ = std::fs::remove_file(&response);
     write_request(mode)?;
     let path = stop_request_path();
     let started = Instant::now();
@@ -129,6 +138,23 @@ pub fn run(mode: StopMode, wait: bool, timeout: Option<u64>) -> Result<()> {
             );
         }
         std::thread::sleep(Duration::from_millis(250));
+    }
+    // Then its answer: what it is doing, or why it will not (a keep-locks stop asked for while it
+    // releases, an abandon after a keep-locks stop committed).
+    let answer = loop {
+        match std::fs::read_to_string(&response) {
+            Ok(text) => {
+                let _ = std::fs::remove_file(&response);
+                break Some(text);
+            }
+            Err(_) if started.elapsed() < ACK_TIMEOUT + Duration::from_secs(5) => {
+                std::thread::sleep(Duration::from_millis(100))
+            }
+            Err(_) => break None,
+        }
+    };
+    if let Some(why) = answer.as_deref().and_then(|a| a.strip_prefix("refused: ")) {
+        bail!("the miner refused the request: {why}");
     }
     println!("The miner took the request and is {}.", what_it_does(mode));
     if !wait {

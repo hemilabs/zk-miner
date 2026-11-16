@@ -116,25 +116,35 @@ pub(crate) fn spawn(sig_tx: tokio::sync::watch::Sender<u8>, state: SharedState, 
                     .await
                 }
                 1 => {
+                    // On the dashboard Ctrl+C is a key, which does not escalate; Ctrl+Break does.
+                    let again = if super::run::tui_up() {
+                        "Press Ctrl+Break again (or [a] on the dashboard)"
+                    } else {
+                        "Press Ctrl+C again"
+                    };
                     super::run::shutdown_say(
                         &state,
-                        "\nDRAINING — finishing in-flight proofs, no new claims. Press Ctrl+C \
-                         again to ABANDON (release jobs), a third time to force-exit.",
+                        format!(
+                            "\nDRAINING — finishing in-flight proofs, no new claims. {again} to \
+                             ABANDON (release jobs), a third time to force-exit."
+                        ),
                     )
                     .await
                 }
-                2 => {
-                    super::run::KEEP_LOCKS.store(false, Ordering::SeqCst);
-                    super::run::shutdown_say(
-                        &state,
-                        "\nABANDONING — releasing jobs, nearest deadline first...",
-                    )
-                    .await
-                }
+                2 => match super::run::begin_abandon() {
+                    Ok(()) => {
+                        super::run::shutdown_say(
+                            &state,
+                            "\nABANDONING — releasing jobs, nearest deadline first...",
+                        )
+                        .await
+                    }
+                    Err(why) => super::run::shutdown_say(&state, why).await,
+                },
                 _ => super::run::force_exit(),
             }
             n = stage;
-            let _ = sig_tx.send(n);
+            super::run::raise_stage(&sig_tx, n);
         }
     });
 }

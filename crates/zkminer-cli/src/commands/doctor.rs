@@ -54,6 +54,12 @@ fn rpc_host(url: &str) -> String {
     host.rsplit_once('@').map_or(host, |(_, h)| h).to_string()
 }
 
+/// An error's text with any URL in it reduced to its host: transport errors quote the request URL,
+/// and providers put API keys in its path or query.
+fn redact(e: &anyhow::Error) -> String {
+    super::simulate::redact_urls(&format!("{e:#}"))
+}
+
 /// Free bytes on the filesystem holding `path`.
 fn free_bytes(path: &Path) -> Option<u64> {
     #[cfg(windows)]
@@ -127,7 +133,7 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
     {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
-            report.say(Level::Fail, "RPC", format!("{host}: {e:#}"));
+            report.say(Level::Fail, "RPC", format!("{host}: {}", redact(&e)));
             return;
         }
         Err(_) => {
@@ -141,7 +147,7 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
             "RPC",
             format!("{host}, chain {}, block {b}", client.chain_id),
         ),
-        Err(e) => report.say(Level::Fail, "RPC", format!("{host}: {e:#}")),
+        Err(e) => report.say(Level::Fail, "RPC", format!("{host}: {}", redact(&e))),
     }
     // Reads the latest header, which also sets the clock comparison below.
     let (_, max_fee) = client.base_fees().await;
@@ -214,6 +220,21 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
             "stake",
             "nothing staked, so nothing can be claimed: `zkminer stake <HEMI>`",
         ),
+        // All of it in locks the miner holds: busy, not short.
+        Ok(stake)
+            if stake.available_collateral < min_claim.max(1) && stake.locked_collateral > 0 =>
+        {
+            report.say(
+                Level::Warn,
+                "stake",
+                format!(
+                    "{} HEMI staked, all but {} HEMI locked in jobs held: no new claim fits until \
+                     one settles. More stake (`zkminer stake <HEMI>`) lets it take more at once.",
+                    super::stake::fmt_hemi(stake.total_staked),
+                    super::stake::fmt_hemi(stake.available_collateral),
+                ),
+            )
+        }
         Ok(stake) if stake.available_collateral < min_claim.max(1) => report.say(
             Level::Fail,
             "stake",
@@ -250,20 +271,30 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
     report.section("This host");
     let home = super::run::zkminer_home();
     // Read-only probes: whether a miner holds the instance lock, what it left in the journal.
+    // (Taking the lock to probe it holds it for an instant: a miner started in that instant would
+    // be told another one is running.)
     let lock = home.join("miner.lock");
-    let running = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&lock)
-        .is_ok_and(|f| matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+    let running = match std::fs::OpenOptions::new().write(true).open(&lock) {
+        Ok(f) => match f.try_lock() {
+            Ok(()) => Some(false),
+            Err(std::fs::TryLockError::WouldBlock) => Some(true),
+            Err(std::fs::TryLockError::Error(_)) => None,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    };
     report.say(
         Level::Info,
         "miner",
-        if running {
-            "a zkminer is running under this home (miner, benchmark, or a stake prompt)"
-        } else {
-            "none running under this home"
+        match running {
+            Some(true) => {
+                "a zkminer is running under this home (miner, benchmark, or a stake prompt)".into()
+            }
+            Some(false) => "none running under this home".to_string(),
+            None => format!("unknown: cannot open {} to check", lock.display()),
         },
     );
+    let running = running.unwrap_or(false);
     if super::run::stop_request_path().exists() {
         report.say(
             Level::Warn,
@@ -288,7 +319,14 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
             format!(
                 "{held} recorded in the job journal{}{}",
                 earliest
-                    .map(|d| format!(", earliest deadline {}", zkminer_chain::exit::fmt_unix(d)))
+                    .map(|d| {
+                        format!(
+                            ", the earliest to be released by {} at the latest",
+                            zkminer_chain::exit::fmt_unix(
+                                d.saturating_sub(super::run::DEADLINE_RELEASE_MARGIN_SECS)
+                            )
+                        )
+                    })
                     .unwrap_or_default(),
                 if running {
                     ""
@@ -355,7 +393,7 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
         .prover
         .risc0_job_po2
         .iter()
-        .map(|(k, v)| (k.to_lowercase(), *v))
+        .map(|(k, v)| (k.clone(), *v))
         .collect();
     let suite = zkminer_prover::benchmark::load_cached_benchmark();
     let rows = super::capability::rows(

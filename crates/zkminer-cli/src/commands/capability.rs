@@ -70,6 +70,14 @@ fn card_label(gpu_tag: &str, index: Option<u32>, name: Option<&str>, vram: Optio
     label
 }
 
+/// Whether the dispatcher can read how much of a `gpu_tag` card's VRAM is in use, which its SP1
+/// free-VRAM gate needs (`WorkerPool::read_card`): `nvidia-smi` for NVIDIA cards everywhere, the
+/// amdgpu / xe drivers' sysfs and DRM figures for AMD and Intel cards on Linux only. Where it
+/// cannot, the gate is skipped and the card gets SP1 work whatever its size.
+fn free_vram_checked(gpu_tag: &str) -> bool {
+    gpu_tag == "cuda" || (cfg!(target_os = "linux") && matches!(gpu_tag, "rocm" | "intel"))
+}
+
 /// Whether the miner mines OpenVM jobs (`ZKMINER_ENABLE_OPENVM=1`; see `resolve_backend`).
 pub fn openvm_enabled() -> bool {
     std::env::var("ZKMINER_ENABLE_OPENVM").ok().as_deref() == Some("1")
@@ -110,6 +118,15 @@ fn running_verdict(
         BACKEND_SP1 => {
             let floor =
                 zkminer_prover::discovery::min_available_vram_bytes_for_backend(BACKEND_SP1);
+            if !free_vram_checked(&slot.gpu_tag) {
+                // The dispatcher cannot read this card's occupancy, so its free-VRAM gate lets
+                // every SP1 job through: a table that called the card idle would be wrong.
+                return Verdict::Ready(
+                    "its free VRAM is not checked on this platform, so a job can run out part-way \
+                     if something else holds VRAM on the card"
+                        .to_string(),
+                );
+            }
             match (floor, slot.vram_bytes) {
                 (Some(need), Some(have)) if have < need => Verdict::Idle(format!(
                     "SP1 work needs {:.1} GiB of VRAM free and this card has {:.1} GiB in all, so \
@@ -189,8 +206,26 @@ pub fn rows(
                     && s.gpu_tag == gpu.gpu_tag
                     && s.device_index == Some(gpu.device_index)
             });
+            let sp1_found = survey.slots.iter().find(|s| s.backend == BACKEND_SP1);
             let verdict = match slot {
                 Some(slot) => verdict_of(slot),
+                // The SP1 worker runs an AMD or Intel card through its vendor's server, which nothing
+                // downloads: without it the worker serves no such card, though the worker is there.
+                None if backend == BACKEND_SP1
+                    && matches!(gpu.gpu_tag.as_str(), "rocm" | "intel")
+                    && sp1_found.is_some() =>
+                {
+                    let server = zkminer_prover::discovery::sp1_server_name(&gpu.gpu_tag)
+                        .unwrap_or("its vendor's sp1-gpu-server");
+                    let worker = sp1_found
+                        .map(|s| s.path.display().to_string())
+                        .unwrap_or_default();
+                    Verdict::Missing(format!(
+                        "{worker} is there, but not {server}{}, which it runs this card with: \
+                         put it beside the worker or in ~/.sp1/bin",
+                        std::env::consts::EXE_SUFFIX
+                    ))
+                }
                 // A worker with no card (generic, or an explicit binary) may serve this card.
                 None if survey
                     .slots

@@ -16,8 +16,20 @@
 #       finishes the jobs held. A lock still held at its deadline is slashed, so don't leave it
 #       stopped.
 #   sudo -u zkminer -H zkminer stop --abandon
-#       Releases everything now (penalties apply), then exits.
+#       Releases everything now (penalties apply), then exits. Use it, not `systemctl kill`, to
+#       cut a drain short: `systemctl kill` signals the proving workers too (unless
+#       `--kill-whom=main`), which kills the proofs in flight.
 #   `systemctl restart` drains first, like `stop`.
+#
+# To stop it for good, use `systemctl stop`: systemd never restarts a unit it stopped itself. A
+# stop the miner was asked for with `zkminer stop` (drain or --abandon) ends with exit 75 when a
+# release could not be confirmed, and Restart=on-failure then starts it again to finish the job,
+# after which it mines again. `zkminer stop --force-exit` exits 130, which is not restarted.
+#
+# Shutting the machine down (poweroff, reboot) stops this unit like `systemctl stop`: it drains
+# for up to ~50 minutes, but a shutdown, a hypervisor or a cloud stop rarely waits that long, and
+# what is cut off keeps its locks. Run `systemctl stop zkminer` first and let it finish, or
+# `zkminer stop --abandon`, unless the machine will be back well before the earliest lock deadline.
 #
 # Run `zkminer stop` as the user the unit runs as, with its home: the request goes to that
 # user's ~/.zkminer.
@@ -51,6 +63,8 @@ TimeoutStopSec=4200
 # start finishes or releases them.
 Restart=on-failure
 RestartSec=10
+# A force exit (`zkminer stop --force-exit`, a third signal) means stop now: not restarted.
+RestartPreventExitStatus=130
 
 [Install]
 WantedBy=multi-user.target
