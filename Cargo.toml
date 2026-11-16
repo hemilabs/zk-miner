@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/zkminer-witness",
+    "crates/zkminer-witness-builder",
+    "crates/zkminer-witness-broker",
+    "crates/zkminer-witness-sandbox",
+    "crates/zkminer-witness-store",
     "crates/zkminer-contracts",
     "crates/zkminer-chain",
     "crates/zkminer-prover",
@@ -14,6 +19,11 @@ members = [
     "crates/zkminer-e2e",
 ]
 default-members = [
+    "crates/zkminer-witness",
+    "crates/zkminer-witness-builder",
+    "crates/zkminer-witness-broker",
+    "crates/zkminer-witness-sandbox",
+    "crates/zkminer-witness-store",
     "crates/zkminer-contracts",
     "crates/zkminer-chain",
     "crates/zkminer-prover",
@@ -85,6 +95,9 @@ zkminer-prover-protocol = { path = "crates/zkminer-prover-protocol" }
 zkminer-strategy = { path = "crates/zkminer-strategy" }
 zkminer-tui = { path = "crates/zkminer-tui" }
 zkminer-config = { path = "crates/zkminer-config" }
+zkminer-witness = { path = "crates/zkminer-witness" }
+zkminer-witness-store = { path = "crates/zkminer-witness-store" }
+zkminer-witness-sandbox = { path = "crates/zkminer-witness-sandbox" }
 
 # Patch risc0 crates to use hemilabs fork (AMD + NVIDIA GPU support)
 #

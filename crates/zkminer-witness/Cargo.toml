@@ -1,0 +1,17 @@
+[package]
+name = "zkminer-witness"
+version.workspace = true
+edition.workspace = true
+description = "Witness-job envelope, builder ABI context, hemi-code formats, journal-binding helpers and IPC frames"
+
+[dependencies]
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-sol-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = "0.10"
+hex = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
