@@ -352,12 +352,7 @@ static KEEP_LOCKS_EXEMPT: std::sync::Mutex<Option<std::collections::HashSet<B256
 /// releases anyway. Read from the ladder's phase, so it cannot disagree with it: a lifecycle whose
 /// worker is stopped on the way out does not release a lock the stop keeps.
 fn keeping_lock(job_id: B256) -> bool {
-    matches!(ladder_phase(), PHASE_KEEPING | PHASE_KEPT)
-        && !KEEP_LOCKS_EXEMPT
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .is_some_and(|s| s.contains(&job_id))
+    keep_in_progress() && !keep_exempt(job_id)
 }
 
 /// How long the next start needs, past the release margin, before its recovery can release a kept
@@ -378,9 +373,38 @@ pub(crate) fn start_by(cutoffs: impl IntoIterator<Item = u64>) -> Option<String>
         .map(|d| zkminer_chain::exit::fmt_unix(d.saturating_sub(RESTART_BY_SECS)))
 }
 
-/// What a keep-locks stop itself still takes after it picks the locks to release: their release
-/// (`RELEASE_JOIN_BUDGET`), a nonce-gap repair, and the worker reap.
-const KEEP_LOCKS_EXIT_SLACK_SECS: u64 = 120;
+/// What a keep-locks stop itself still takes after it picks the locks to release: their whole
+/// release ladder, a nonce-gap repair, and the worker reap.
+const KEEP_LOCKS_EXIT_SLACK_SECS: u64 = zkminer_chain::jobs::RELEASE_LADDER_SECS + 120;
+
+/// A lock whose cutoff is at or before this (unix seconds) is too close for a keep-locks stop to
+/// keep: the next start could not release it in time.
+fn keep_horizon() -> u64 {
+    zkminer_chain::client::chain_now().saturating_add(
+        DEADLINE_RELEASE_MARGIN_SECS + RESTART_ALLOWANCE_SECS + KEEP_LOCKS_EXIT_SLACK_SECS,
+    )
+}
+
+fn keep_exempt(job_id: B256) -> bool {
+    KEEP_LOCKS_EXEMPT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_some_and(|s| s.contains(&job_id))
+}
+
+/// Whether a keep-locks stop is under way or committed. A stop signal then leaves it be: it is
+/// already the quickest way out, and turning it into an abandon would release every lock the
+/// operator chose to keep (a supervisor's SIGTERM, a closing terminal, `systemctl stop`). Only an
+/// explicit abandon (`zkminer stop --abandon`, `a` on the dashboard) overrides it.
+pub(crate) fn keep_in_progress() -> bool {
+    matches!(ladder_phase(), PHASE_KEEPING | PHASE_KEPT)
+}
+
+/// What a signal that reaches the ABANDON stage says during a keep-locks stop.
+pub(crate) const KEEP_SIGNAL_MSG: &str =
+    "A stop signal arrived during a keep-locks stop: it goes on keeping the locks. `zkminer stop \
+     --abandon` (or [a] on the dashboard) releases them instead; one more signal forces an exit.";
 
 /// How long a keep-locks stop waits for proofs already being submitted: their fulfil is on its way
 /// to the chain, and cutting it off would leave the job for the next start to sort out.
@@ -605,9 +629,9 @@ pub(crate) fn force_exit() -> ! {
         .recv_timeout(std::time::Duration::from_secs(10))
         .is_err()
     {
-        eprintln!(
+        let _ = writeln_err(
             "worker reap did not finish in 10s — exiting anyway; check for an orphaned \
-             sp1-gpu-server holding VRAM."
+             sp1-gpu-server holding VRAM.",
         );
     }
     std::process::exit(130);
@@ -739,7 +763,7 @@ async fn apply_stop_request(
                 state,
                 "\nKEEPING LOCKS — no new claims; exiting without releasing (except a lock too \
                  close to its deadline to survive a restart), so the next start finishes the \
-                 jobs held.",
+                 jobs held. `zkminer stop --abandon` releases them instead.",
             )
             .await;
             if stage == 0 {
@@ -4076,9 +4100,12 @@ pub async fn run(
             // disposition either, so the operator's escalating Ctrl+C would silently no-op.
             // `sigterm` is hoisted for exactly this reason; keep the two symmetric.
             let mut sigint = signal(SignalKind::interrupt()).ok();
-            // The dashboard's terminal closing (an SSH session dropping, a terminal window shut):
-            // nobody is there any more, as with SIGTERM, so a supervised stop. Not listened for
-            // headless: a `nohup` miner ignores SIGHUP on purpose, and listening would undo that.
+            // The dashboard's terminal closing (an SSH session dropping, a terminal window shut).
+            // Unlike SIGTERM nothing follows it, so it starts a plain drain (the proofs in flight
+            // finish, and `zkminer stop` from a new session can still change course), and it
+            // never escalates: a closing session usually sends it twice, and a stop already chosen
+            // stays as chosen. Not listened for headless: a `nohup` miner ignores SIGHUP on
+            // purpose, and listening would undo that.
             let mut sighup = if headless {
                 None
             } else {
@@ -4127,20 +4154,25 @@ pub async fn run(
                         None => std::future::pending::<()>().await,
                     }
                 };
-                let supervised = match sigint.as_mut() {
+                // (supervised, hung up)
+                let (supervised, hung_up) = match sigint.as_mut() {
                     Some(si) => tokio::select! {
-                        _ = si.recv() => false,
-                        _ = sigterm.recv() => true,
-                        _ = hangup => true,
+                        _ = si.recv() => (false, false),
+                        _ = sigterm.recv() => (true, false),
+                        _ = hangup => (false, true),
                     },
                     // SIGINT registration failed: degrade to a per-iteration listener rather
                     // than losing SIGINT entirely.
                     None => tokio::select! {
-                        _ = tokio::signal::ctrl_c() => false,
-                        _ = sigterm.recv() => true,
-                        _ = hangup => true,
+                        _ = tokio::signal::ctrl_c() => (false, false),
+                        _ = sigterm.recv() => (true, false),
+                        _ = hangup => (false, true),
                     },
                 };
+                if hung_up && n.max(*sig_tx.borrow()) >= 1 {
+                    tracing::warn!("the terminal closed during the stop; it goes on as chosen");
+                    continue;
+                }
                 if supervised {
                     SUPERVISED_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -4174,6 +4206,7 @@ pub async fn run(
                         )
                         .await
                     }
+                    2 if keep_in_progress() => shutdown_say(&sig_state, KEEP_SIGNAL_MSG).await,
                     2 => match begin_abandon() {
                         Ok(()) => {
                             shutdown_say(
@@ -4193,7 +4226,7 @@ pub async fn run(
 
     // Windows: the console's control events drive the same ladder (see `signals_windows`).
     #[cfg(windows)]
-    super::signals_windows::spawn(sig_tx.clone(), state.clone(), headless);
+    super::signals_windows::spawn(sig_tx.clone(), state.clone());
 
     // Stops asked for at the dashboard's quit prompt or by `zkminer stop` (watch-only takes none: it
     // holds no instance lock, and may run beside the real miner).
@@ -4205,7 +4238,16 @@ pub async fn run(
     // the miner is about to exit.
     let mut tui_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
     if headless {
-        println!("zkminer running in headless mode. Press Ctrl+C (or run `zkminer stop`) to stop.");
+        // Watch-only takes no stop requests (it may share a home with the real miner, which
+        // `zkminer stop` would stop).
+        println!(
+            "zkminer running in headless mode. Press Ctrl+C{} to stop.",
+            if watch_only() {
+                ""
+            } else {
+                " (or run `zkminer stop`)"
+            }
+        );
         // Wait for the FIRST signal.
         #[cfg(any(unix, windows))]
         while *sig_rx.borrow() == 0 {
@@ -4236,7 +4278,8 @@ pub async fn run(
         {
             let mut st = state.write().await;
             st.stop_handled_by_miner = true;
-            st.release_margin_secs = DEADLINE_RELEASE_MARGIN_SECS + RESTART_ALLOWANCE_SECS;
+            st.release_margin_secs = RESTART_BY_SECS;
+            st.keep_horizon_secs = RESTART_BY_SECS + KEEP_LOCKS_EXIT_SLACK_SECS;
         }
         TUI_UP.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut tui = tokio::spawn(zkminer_tui::run_tui(state.clone(), Some(client.clone())));
@@ -4351,14 +4394,15 @@ pub async fn run(
     let mut drain_released: std::collections::HashMap<B256, std::time::Instant> =
         std::collections::HashMap::new();
     loop {
-        if *sig_rx.borrow() >= 2 {
-            tracing::warn!("drain interrupted — abandoning");
-            abandoned = true;
-            break;
-        }
+        // The keep first: during one, a stop signal raises the stage without abandoning.
         if ladder_phase() == PHASE_KEEPING {
             tracing::warn!("drain ended: keeping the locks for the next start");
             kept = true;
+            break;
+        }
+        if *sig_rx.borrow() >= 2 {
+            tracing::warn!("drain interrupted — abandoning");
+            abandoned = true;
             break;
         }
         // Union of what the UI thinks is in flight AND what the journal says we hold
@@ -4474,7 +4518,13 @@ pub async fn run(
                 let j = journal.lock().unwrap_or_else(|e| e.into_inner());
                 j.iter().count()
             };
-            set_ladder_phase(PHASE_FINISHING);
+            if move_ladder_phase(&[PHASE_MINING, PHASE_DRAINING], PHASE_FINISHING).is_err()
+                && ladder_phase() == PHASE_KEEPING
+            {
+                // A keep-locks request answered "ok" during this pass: honour it (exit 75).
+                kept = true;
+                break;
+            }
             if retained == 0 {
                 tracing::info!("drain complete — no jobs in flight, journal empty");
                 if !headless {
@@ -4629,11 +4679,17 @@ pub async fn run(
     //     miner again.
     // The locks the ABANDON stage releases on this pass; `None` releases every lock it can.
     let mut release_only: Option<std::collections::HashSet<B256>> = None;
+    if abandoned && ladder_phase() == PHASE_KEEPING {
+        // The drain gave up (its timeout, a stale claim intent) in the pass a keep-locks request
+        // won the phase: that request was answered "ok", so keep.
+        abandoned = false;
+        kept = true;
+    }
     if kept {
         shutdown_stage(&state, zkminer_tui::state::ShutdownStage::KeepingLocks).await;
         let grace_end = std::time::Instant::now() + KEEP_LOCKS_SUBMIT_GRACE;
         loop {
-            if *sig_rx.borrow() >= 2 || ladder_phase() == PHASE_ABANDONING {
+            if ladder_phase() == PHASE_ABANDONING {
                 tracing::warn!("keep-locks stop escalated — abandoning");
                 abandoned = true;
                 break;
@@ -4674,13 +4730,23 @@ pub async fn run(
             // stop still takes. A lock whose cutoff was never recorded counts from the earliest
             // its claim could have set it (the contract's shortest window); one already past its
             // recorded cutoff goes too (the release stage re-reads it, a pause may have moved it).
-            let horizon = zkminer_chain::client::chain_now().saturating_add(
-                DEADLINE_RELEASE_MARGIN_SECS + RESTART_ALLOWANCE_SECS + KEEP_LOCKS_EXIT_SLACK_SECS,
-            );
+            // A breadcrumb already past its recorded cutoff is left out: nothing releases it now
+            // (it waits for a keeper's slash), and the next start re-checks it. A lock whose
+            // fulfil gave up with its nonce stashed goes too, whatever its cutoff: that stuck tx
+            // sits below every release this pass sends, and only the job's own release (which
+            // reuses the stashed nonce) displaces it.
+            let horizon = keep_horizon();
+            let past = zkminer_chain::client::chain_now_floor();
             let too_close: std::collections::HashSet<B256> = {
                 let j = journal.lock().unwrap_or_else(|e| e.into_inner());
                 j.iter()
                     .filter(|e| {
+                        if client.has_abandoned_nonce(e.job_id) {
+                            return true;
+                        }
+                        if e.lock_deadline != 0 && e.lock_deadline <= past {
+                            return false;
+                        }
                         let cutoff = if e.lock_deadline != 0 {
                             e.lock_deadline
                         } else {
@@ -4714,6 +4780,8 @@ pub async fn run(
     //    its lock deadline, and the collateral is then locked until a keeper slashes. Every
     //    second spent on a job with hours of headroom is a second not spent on one about to
     //    expire, so releasing in deadline order is what actually minimises loss.
+    // Releases a keep-locks pass left running when it stopped waiting (see the full pass).
+    let mut still_releasing: std::collections::HashSet<B256> = std::collections::HashSet::new();
     loop {
         let partial = release_only.is_some();
         if !partial && !abandoned {
@@ -4726,15 +4794,28 @@ pub async fn run(
                 }
                 shutdown_stage(&state, zkminer_tui::state::ShutdownStage::Finishing).await;
                 let now = zkminer_chain::client::chain_now_floor();
-                let (held, earliest) = {
+                let (held, earliest, unreleased) = {
                     let j = journal.lock().unwrap_or_else(|e| e.into_inner());
-                    let live: Vec<u64> = j
+                    let live: Vec<(u64, bool)> = j
                         .iter()
                         .filter(|e| e.lock_deadline == 0 || e.lock_deadline > now)
-                        .map(|e| e.lock_deadline)
+                        .map(|e| (e.lock_deadline, keep_exempt(e.job_id)))
                         .collect();
-                    (live.len(), live.iter().copied().filter(|d| *d > 0).min())
+                    let kept_ones = live.iter().filter(|(_, x)| !x);
+                    (
+                        kept_ones.clone().count(),
+                        kept_ones.map(|(d, _)| *d).filter(|d| *d > 0).min(),
+                        live.iter().filter(|(_, x)| *x).count(),
+                    )
                 };
+                if unreleased > 0 {
+                    let msg = format!(
+                        "{unreleased} lock(s) too close to their deadline to keep could not be \
+                         released: start the miner again at once, or they are slashed."
+                    );
+                    tracing::error!("{msg}");
+                    shutdown_say(&state, msg).await;
+                }
                 exit_code = 75;
                 let verdict = if held == 0 {
                     "Keep-locks stop: no locks are held. Exiting with 75 so a supervisor starts \
@@ -4787,6 +4868,8 @@ pub async fn run(
             j.iter()
                 .filter(|e| !submitting.contains(&e.job_id))
                 .filter(|e| release_only.as_ref().is_none_or(|o| o.contains(&e.job_id)))
+                // A keep-locks pass's release still on its ladder: a second one would race it.
+                .filter(|e| !still_releasing.contains(&e.job_id))
                 .map(|e| (e.lock_deadline, e.job_id))
                 .collect()
         };
@@ -4934,9 +5017,12 @@ pub async fn run(
         // happened concurrently by the time we get here; waiting for receipts is a nicety.
         // So cap the total wait and carry on — a job whose receipt we never saw is simply
         // reported as still-held, which is exactly what the exit-75 path is for.
-        // A keep-locks pass only needs its releases broadcast before it exits.
-        let join_budget = if supervised || partial {
+        // A keep-locks pass releases the locks closest to their cutoff: give them their whole
+        // release ladder (fee bumps included), not just the first broadcast.
+        let join_budget = if supervised {
             RELEASE_JOIN_BUDGET
+        } else if partial {
+            std::time::Duration::from_secs(zkminer_chain::jobs::RELEASE_LADDER_SECS + 30)
         } else {
             INTERACTIVE_RELEASE_JOIN_BUDGET
         };
@@ -4949,11 +5035,13 @@ pub async fn run(
                      broadcast — the journal is the source of truth for whether it landed)",
                     short_id(jid)
                 );
+                still_releasing.insert(jid);
             } else if tokio::time::timeout(left, handle).await.is_err() {
                 tracing::warn!(
                     "release of job {} did not confirm within budget",
                     short_id(jid)
                 );
+                still_releasing.insert(jid);
             }
             // `release_and_clean` returns (); the JOURNAL is its outcome signal — it removes
             // the breadcrumb only when the lock is provably gone (released, or no longer/
@@ -5104,9 +5192,33 @@ pub async fn run(
         }
 
         if partial {
+            let _ = (released, stranded);
+            let (gone, kept_back, left) = {
+                let j = journal.lock().unwrap_or_else(|e| e.into_inner());
+                let mut counts = (0usize, 0usize, 0usize);
+                for jid in release_only.iter().flatten() {
+                    if !j.entries.contains_key(jid) {
+                        counts.0 += 1;
+                    } else if !keep_exempt(*jid) {
+                        counts.1 += 1;
+                    } else {
+                        counts.2 += 1;
+                    }
+                }
+                counts
+            };
             let msg = format!(
-                "keep-locks: released {released} lock(s) too close to their deadline to keep; \
-                 {stranded} could not be released"
+                "keep-locks: released {gone} lock(s) too close to their deadline to keep{}{}",
+                if kept_back > 0 {
+                    format!("; {kept_back} turned out to have time left and are kept")
+                } else {
+                    String::new()
+                },
+                if left > 0 {
+                    format!("; {left} not released (yet)")
+                } else {
+                    String::new()
+                }
             );
             tracing::warn!("{msg}");
             shutdown_say(&state, msg).await;
@@ -5157,7 +5269,8 @@ pub async fn run(
             // liveness-probe kill). systemd never restarts a unit it stopped itself
             // (`systemctl stop` leaves it `failed`), `docker stop` disables the restart policy
             // until the container is started again, and k8s only SIGTERMs a container whose pod
-            // is already terminating — and SIGTERM is the ONLY thing that sets SUPERVISED_STOP.
+            // is already terminating — and SUPERVISED_STOP is set only by SIGTERM (and a Windows
+            // console close / shutdown), never by a stop the operator asked for.
             // So on the supervised path this code is a VERDICT, not a remedy: recovery runs on
             // the next START, and a human has to perform it. Say so where the human is looking.
             exit_code = 75;
@@ -13626,6 +13739,33 @@ async fn release_and_clean_with_nonce(
     if view_read.is_err() {
         tokio::time::sleep(DEADLINE_READ_RETRY_DELAY).await;
         view_read = client.get_job_status_view(job_id).await;
+    }
+    // A keep-locks stop chose this lock from the journal's recorded cutoff, which a pause credit
+    // moves out unrecorded (and an unknown one was guessed from the shortest window). If the live
+    // cutoff leaves time for a restart after all, keep it rather than pay to release it, unless
+    // a stuck fulfil nonce of its own needs this release to displace it.
+    if ladder_phase() == PHASE_KEEPING && keep_exempt(job_id) && !client.has_abandoned_nonce(job_id)
+    {
+        if let Ok(v) = &view_read {
+            let cutoff = effective_cutoff(v);
+            if cutoff != 0 && cutoff > keep_horizon() {
+                if let Some(set) = KEEP_LOCKS_EXEMPT
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_mut()
+                {
+                    set.remove(&job_id);
+                }
+                tracing::warn!(
+                    "job {}: its live deadline leaves time for a restart — keeping it after all",
+                    short_id(job_id)
+                );
+                if let Some(n) = pre_nonce {
+                    client.abort_nonce(n);
+                }
+                return;
+            }
+        }
     }
     let proof_system = view_read
         .as_ref()

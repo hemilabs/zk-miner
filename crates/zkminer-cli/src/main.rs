@@ -121,7 +121,7 @@ enum Commands {
         #[arg(long)]
         abandon: bool,
         /// Exit at once, releasing nothing (exit code 130: a service is not restarted; start
-        /// it again before the earliest lock deadline)
+        /// it again by the time it prints, ~15 min before the earliest lock's cutoff)
         #[arg(long)]
         force_exit: bool,
         /// Wait until the miner has exited, then say what it left held

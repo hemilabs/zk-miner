@@ -459,7 +459,8 @@ impl ClaimOutlook {
 pub enum StopMode {
     /// Stop claiming, let the proofs in flight finish and be paid, then exit.
     Drain,
-    /// Stop claiming and exit now, leaving the locks held for the next start to finish (exit 75).
+    /// Stop claiming and exit within minutes, leaving the locks held for the next start to finish
+    /// (exit 75); a lock too close to its deadline to keep is released first.
     KeepLocks,
     /// Release every lock now (each pays its release penalty), then exit.
     Abandon,
@@ -592,10 +593,13 @@ pub struct MinerState {
     pub stop_prompt: Option<StopPrompt>,
     /// The shutdown under way, if any.
     pub shutdown: Option<ShutdownView>,
-    /// How long before a lock's cutoff a release must start to land in time (the miner's
-    /// `DEADLINE_RELEASE_MARGIN_SECS`): the quit prompt's "start it again before" is the earliest
-    /// cutoff less this. 0 until the miner sets it.
+    /// How long before a kept lock's cutoff the miner must be started again (its `RESTART_BY_SECS`):
+    /// the quit prompt's "start it again by" is the earliest kept cutoff less this. 0 until the
+    /// miner sets it.
     pub release_margin_secs: u64,
+    /// A lock whose cutoff is within this of now is too close for a keep-locks stop to keep: it is
+    /// released first. 0 until the miner sets it.
+    pub keep_horizon_secs: u64,
     pub connected: bool,
     pub block_number: u64,
     pub errors: Vec<String>,
@@ -1064,6 +1068,7 @@ impl Default for MinerState {
             stop_prompt: None,
             shutdown: None,
             release_margin_secs: 0,
+            keep_horizon_secs: 0,
             connected: false,
             block_number: 0,
             errors: Vec::new(),
