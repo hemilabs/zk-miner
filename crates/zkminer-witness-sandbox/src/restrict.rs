@@ -81,11 +81,15 @@ pub(crate) fn thread_count() -> std::io::Result<usize> {
 ///    an inherited fd (`fchmod`, `fchown`, `fsetxattr`, `fremovexattr`, `flock`, `fcntl`
 ///    `F_SETLEASE`/`F_NOTIFY`, `ioctl` `FS_IOC_SETFLAGS`/`FS_IOC_FSSETXATTR`), no `file_getattr`, no
 ///    reaching other processes of the same uid (`setpriority`, `ioprio_set`, `prlimit64`,
-///    `sched_set*` on another pid, `migrate_pages`, `move_pages`, `process_madvise`, `pidfd_getfd`),
+///    `sched_set*` on another pid, `migrate_pages`, `move_pages`, `process_madvise`, `pidfd_getfd`;
+///    `getsid`/`getpgid` of another pid, which map sessions and process groups),
+///    no LSM attribute writes (`lsm_set_self_attr`),
 ///    no `TIOCSTI`/`TIOCLINUX`, no `PR_SET_PDEATHSIG` (the parent-death signal stays), no
 ///    `PR_SET_DUMPABLE` (it stays 0) or `PR_SET_PTRACER`, no x32 syscalls. Runner and worker also
 ///    read no host metadata: no `uname`, `sysinfo`, `readlink*`, `access`/`faccessat*`,
-///    `statfs`/`fstatfs`, `*getxattr*`/`*listxattr*`, `chdir`/`fchdir`, and `statx` fails with `ENOSYS` (std and glibc fall back to `fstat`/`newfstatat`,
+///    `statfs`/`fstatfs`, `*getxattr*`/`*listxattr*`, `chdir`/`fchdir`, the mount table
+///    (`listmount`/`statmount`), the LSMs (`lsm_list_modules`, `lsm_get_self_attr`), `ustat` and
+///    `sysfs`, and `statx` fails with `ENOSYS` (std and glibc fall back to `fstat`/`newfstatat`,
 ///    which stay: a path's existence, size, owner and times remain readable without a mount
 ///    namespace). The broker additionally may `socketpair(AF_UNIX, SOCK_STREAM, ..)` (a connected
 ///    stream pair reaches nothing; tokio's signal driver needs one; a datagram pair could `sendto`
@@ -378,6 +382,11 @@ const SYS_REMOVEXATTRAT: i64 = 466;
 const SYS_OPEN_TREE_ATTR: i64 = 467;
 const SYS_FILE_GETATTR: i64 = 468;
 const SYS_FILE_SETATTR: i64 = 469;
+const SYS_STATMOUNT: i64 = 457;
+const SYS_LISTMOUNT: i64 = 458;
+const SYS_LSM_GET_SELF_ATTR: i64 = 459;
+const SYS_LSM_SET_SELF_ATTR: i64 = 460;
+const SYS_LSM_LIST_MODULES: i64 = 461;
 
 /// `prctl(PR_SET_PTRACER)` (Yama): lets a named process, or any (`PR_SET_PTRACER_ANY`), trace us.
 pub(crate) const PR_SET_PTRACER: libc::c_int = 0x5961_6d61;
@@ -429,9 +438,21 @@ fn host_metadata() -> Vec<Denied> {
         d("sysinfo", SYS_sysinfo),
         d("chdir", SYS_chdir),
         d("fchdir", SYS_fchdir),
+        // Review r2 B1: the mount table without opening anything (the source of every mount,
+        // NFS and CIFS servers' internal host names included), and the LSMs in force.
+        d("statmount", SYS_STATMOUNT),
+        d("listmount", SYS_LISTMOUNT),
+        d("lsm_get_self_attr", SYS_LSM_GET_SELF_ATTR),
+        d("lsm_list_modules", SYS_LSM_LIST_MODULES),
     ];
     #[cfg(target_arch = "x86_64")]
-    v.extend([d("readlink", SYS_readlink), d("access", SYS_access)]);
+    v.extend([
+        d("readlink", SYS_readlink),
+        d("access", SYS_access),
+        // A filesystem's free space by device number, and the kernel's filesystem types.
+        d("ustat", SYS_ustat),
+        d("sysfs", SYS_sysfs),
+    ]);
     v
 }
 
@@ -515,6 +536,7 @@ fn always_denied() -> Vec<Denied> {
         d("settimeofday", SYS_settimeofday),
         d("adjtimex", SYS_adjtimex),
         d("syslog", SYS_syslog),
+        d("lsm_set_self_attr", SYS_LSM_SET_SELF_ATTR),
         d("fanotify_init", SYS_fanotify_init),
         d("fanotify_mark", SYS_fanotify_mark),
         d("inotify_add_watch", SYS_inotify_add_watch),
@@ -701,6 +723,12 @@ fn conditional_denials(profile: &Profile) -> Result<Vec<(i64, Vec<SeccompRule>)>
             ],
         ),
     ];
+    // Sessions and process groups of other processes (review r2 B1): `getsid`/`getpgid` only of
+    // the caller itself (0, or its own pid, fixed when the filter is built in that process).
+    let me = u64::from(std::process::id());
+    for nr in [libc::SYS_getsid, libc::SYS_getpgid] {
+        v.push((nr, vec![rule(vec![cond(0, Dword, Ne, 0)?, cond(0, Dword, Ne, me)?])?]));
+    }
     if matches!(profile, Profile::Broker { .. }) {
         // All arguments are `int`s: the kernel ignores their upper 32 bits, and so do these
         // `Dword` comparisons. A connected AF_UNIX *stream* pair reaches nothing outside the process; tokio's signal
@@ -1452,6 +1480,33 @@ mod tests {
         }
         assert_eq!(call(&f, SYS_read, [3, 0x1000, 16, 0, 0, 0]), ALLOW);
         assert_eq!(call(&f, SYS_sendmsg, [3, 0x1000, 0, 0, 0, 0]), ALLOW);
+    }
+
+    /// Review r2 B1: `getsid`/`getpgid` only of the caller; the mount table, the LSMs, `ustat`
+    /// and `sysfs` are host metadata.
+    #[test]
+    fn other_processes_sessions_and_the_mount_table_are_denied() {
+        use libc::*;
+        let me = u64::from(std::process::id());
+        for p in [Profile::BuilderRunner, Profile::ExecuteWorker, broker()] {
+            let f = seccomp_filters(&p).unwrap();
+            for nr in [SYS_getsid, SYS_getpgid] {
+                assert_eq!(call(&f, nr, [0; 6]), ALLOW, "{p:?} {nr} self (0)");
+                assert_eq!(call(&f, nr, [me, 0, 0, 0, 0, 0]), ALLOW, "{p:?} {nr} own pid");
+                assert_eq!(call(&f, nr, [1, 0, 0, 0, 0, 0]), ERRNO_EPERM, "{p:?} {nr} init");
+                assert_eq!(call(&f, nr, [me + 1, 0, 0, 0, 0, 0]), ERRNO_EPERM, "{p:?} {nr} other");
+            }
+            assert_eq!(call(&f, SYS_LSM_SET_SELF_ATTR, [0; 6]), ERRNO_EPERM, "{p:?}");
+        }
+        for p in [Profile::BuilderRunner, Profile::ExecuteWorker] {
+            let f = seccomp_filters(&p).unwrap();
+            let mut nrs = vec![SYS_STATMOUNT, SYS_LISTMOUNT, SYS_LSM_GET_SELF_ATTR, SYS_LSM_LIST_MODULES];
+            #[cfg(target_arch = "x86_64")]
+            nrs.extend([SYS_ustat, SYS_sysfs]);
+            for nr in nrs {
+                assert_eq!(call(&f, nr, [0; 6]), ERRNO_EPERM, "{p:?} {nr}");
+            }
+        }
     }
 
     #[test]

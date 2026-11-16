@@ -91,6 +91,8 @@ const COMMON_CHECKS: &[&str] = &[
     "socket_netlink",
     "abstract_unix_connect",
     "kill_parent",
+    "getsid_parent",
+    "getpgid_parent",
     "ptrace_attach_child",
     "process_vm_readv_child",
     "setpriority_parent",
@@ -132,6 +134,14 @@ const METADATA_CHECKS: &[&str] = &[
     "llistxattr_root",
     "flistxattr_inherited",
     "statx_enosys",
+    "listmount",
+    "statmount",
+    "lsm_list_modules",
+    "lsm_get_self_attr",
+    #[cfg(target_arch = "x86_64")]
+    "ustat",
+    #[cfg(target_arch = "x86_64")]
+    "sysfs",
     "chdir",
     "fchdir",
 ];
@@ -768,6 +778,13 @@ fn run_checks(a: &ProbeArgs) -> i32 {
         let (r, e) = sys(|| unsafe { libc::kill(ppid, 0) } as libc::c_long);
         let (ok, d) = denied(r, e, &[libc::EPERM]);
         out.check("kill_parent", ok, format!("{d} (Landlock signal scope)"));
+        // Review r2 B1: sessions and process groups of other processes.
+        // SAFETY: integer arguments.
+        let (r, e) = sys(|| unsafe { libc::getsid(ppid) } as libc::c_long);
+        out.result("getsid_parent", denied(r, e, &[libc::EPERM]));
+        // SAFETY: integer arguments.
+        let (r, e) = sys(|| unsafe { libc::getpgid(ppid) } as libc::c_long);
+        out.result("getpgid_parent", denied(r, e, &[libc::EPERM]));
     }
     tracee_checks(tracee, &mut out);
     {
@@ -1319,6 +1336,45 @@ fn metadata_checks(root_dir: RawFd, out: &mut Out) {
         });
         out.result("statx_enosys", denied(r, e, &[libc::ENOSYS]));
     }
+    // Review r2 B1: the mount table and the LSMs, without opening anything.
+    {
+        // struct mnt_id_req { u32 size; u32 spare; u64 mnt_id; u64 param; }, LSMT_ROOT.
+        let req: [u64; 3] = [24, u64::MAX, 0x10 | 0x20 | 0x200];
+        let mut ids = [0u64; 64];
+        let (r, e) = sys(|| unsafe {
+            libc::syscall(458, req.as_ptr(), ids.as_mut_ptr(), ids.len(), 0u64)
+        });
+        out.result("listmount", denied(r, e, eperm));
+        let mut big = vec![0u8; 1 << 14];
+        let (r, e) = sys(|| unsafe {
+            libc::syscall(457, req.as_ptr(), big.as_mut_ptr(), big.len(), 0u64)
+        });
+        out.result("statmount", denied(r, e, eperm));
+        let mut lsm = [0u64; 16];
+        let mut size: u32 = std::mem::size_of_val(&lsm) as u32;
+        let (r, e) = sys(|| unsafe {
+            libc::syscall(461, lsm.as_mut_ptr(), &mut size as *mut u32, 0u32)
+        });
+        out.result("lsm_list_modules", denied(r, e, eperm));
+        let mut size: u32 = big.len() as u32;
+        // LSM_ATTR_CURRENT = 100.
+        let (r, e) = sys(|| unsafe {
+            libc::syscall(459, 100u32, big.as_mut_ptr(), &mut size as *mut u32, 0u32)
+        });
+        out.result("lsm_get_self_attr", denied(r, e, eperm));
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat into a valid struct; `root_dir` is ours.
+        let dev = if unsafe { libc::fstat(root_dir, &mut st) } == 0 { st.st_dev } else { 0 };
+        let mut ust = [0u8; 64];
+        let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_ustat, dev as libc::c_uint, ust.as_mut_ptr()) });
+        out.result("ustat", denied(r, e, eperm));
+        // sysfs(3): the number of filesystem types the kernel knows.
+        let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_sysfs, 3) });
+        out.result("sysfs", denied(r, e, eperm));
+    }
     let (r, e) = sys(|| unsafe { libc::fchdir(root_dir) } as libc::c_long);
     out.result("fchdir", denied(r, e, eperm));
     let (r, e) = sys(|| unsafe { libc::chdir(root.as_ptr()) } as libc::c_long);
@@ -1846,6 +1902,8 @@ mod tests {
         for c in ["tcp_connect_loopback", "connect_syscall", "reconnect_inherited_tcp", "seal_socket_creation"] {
             assert!(broker.contains(&c) && !runner.contains(&c) || c == "tcp_connect_loopback", "{c}");
         }
+        assert!(runner.contains(&"listmount") && !broker.contains(&"listmount"));
+        assert!(runner.contains(&"getsid_parent") && broker.contains(&"getsid_parent"));
         for c in ["uname", "sysinfo", "statx_enosys", "chdir", "cwd_root"] {
             assert!(runner.contains(&c) && !broker.contains(&c), "{c}");
             assert!(

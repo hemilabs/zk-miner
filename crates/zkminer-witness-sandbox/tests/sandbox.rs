@@ -166,6 +166,10 @@ const METADATA: &[&str] = &[
     "listxattr_root",
     "fgetxattr_inherited",
     "statx_enosys",
+    "listmount",
+    "statmount",
+    "lsm_list_modules",
+    "lsm_get_self_attr",
     "chdir",
     "fchdir",
 ];
@@ -224,6 +228,7 @@ fn broker_self_test() {
         "broker/fastopen_inherited_tcp",
         "broker/seal_socket_creation",
         "broker/listeners_untouched",
+        "broker/getsid_parent",
         "broker/socket_unix",
         "broker/abstract_unix_connect",
         "broker/read_readable",
