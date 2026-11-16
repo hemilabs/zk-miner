@@ -99,6 +99,7 @@ mod tests {
             job_id: B256::ZERO,
             descriptor_hash: B256::ZERO,
             prover: Address::ZERO,
+            version: 1,
             descriptor_hex: String::new(),
             submit_tx_hash: B256::ZERO,
             prefix: true,

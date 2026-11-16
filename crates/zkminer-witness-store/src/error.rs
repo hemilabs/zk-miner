@@ -10,10 +10,17 @@ use crate::store::BundleKey;
 /// (keep every lock, `PAGE: RETENTION-UNAVAILABLE`), [`StoreError::Missing`] and
 /// [`StoreError::Corrupt`] (`PAGE: BUNDLE-MISSING` on an available store), and
 /// [`StoreError::RetentionFull`] (skip new work). The rest refuse a caller's request.
+///
+/// The store errs toward [`StoreError::Unavailable`]: `Missing` and `Corrupt` can lead the miner to
+/// release a lock, so they are returned only when the store itself is known good (its root, layout
+/// and every directory on the path are what the store created) and the entry is absent or fails
+/// verification. A symlink or non-directory anywhere on a directory path is
+/// [`UnavailableKind::BadLayout`]; an I/O error is `Unavailable`; [`crate::Store::open`] and
+/// [`crate::Store::init`] return nothing but `Unavailable` (and `init` its two refusals).
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    /// The store cannot be used: absent or wrong root, wrong identity, lock held, or an I/O error
-    /// such as EIO, EROFS or ENOENT.
+    /// The store cannot be used: absent, unmounted or wrong root, wrong identity, lock held, a
+    /// damaged layout, a poisoned store, or an I/O error such as EIO, EROFS or ENOENT.
     #[error("retention store unavailable ({kind}): {}", .path.display())]
     Unavailable { kind: UnavailableKind, path: PathBuf },
     /// A new write would cross the store's quota or the free-space floor, or the filesystem itself
@@ -39,15 +46,12 @@ pub enum StoreError {
 }
 
 impl StoreError {
-    /// Maps an I/O error on `path` to a store state. ENOSPC and EDQUOT are a full filesystem; ELOOP
-    /// (an `O_NOFOLLOW` open met a symlink the store never creates) is a corrupt entry; the rest make
-    /// the store unavailable.
+    /// Maps an I/O error on `path` to a store state. ENOSPC and EDQUOT are a full filesystem; the
+    /// rest make the store unavailable. (A symlink met by an `O_NOFOLLOW` open is classified by the
+    /// caller, which knows whether a directory or a file of an entry was expected.)
     pub(crate) fn io(e: io::Error, path: &Path) -> StoreError {
         let kind = match e.raw_os_error() {
             Some(libc::ENOSPC) | Some(libc::EDQUOT) => return StoreError::RetentionFull(FullReason::Filesystem),
-            Some(libc::ELOOP) => {
-                return StoreError::Corrupt { defect: Defect::NotRegularFile, path: path.to_path_buf() }
-            }
             Some(libc::EIO) => UnavailableKind::Eio,
             Some(libc::EROFS) => UnavailableKind::ReadOnly,
             Some(libc::ENOENT) => UnavailableKind::NotFound,
@@ -64,6 +68,27 @@ impl StoreError {
         StoreError::Corrupt { defect, path: path.to_path_buf() }
     }
 
+    /// `path` is not what the layout puts there (a symlink, a file where a directory belongs, a
+    /// missing area).
+    pub(crate) fn layout(path: &Path) -> StoreError {
+        StoreError::unavailable(UnavailableKind::BadLayout, path)
+    }
+
+    /// The error contract of `open` and `init`: only [`StoreError::Unavailable`] (and `init`'s two
+    /// refusals). A full filesystem is an I/O error there, anything that would be corrupt or missing
+    /// on a running store is a bad layout.
+    pub(crate) fn only_unavailable(self, root: &Path) -> StoreError {
+        match self {
+            e @ StoreError::Unavailable { .. } => e,
+            e @ StoreError::Rejected(Reject::AlreadyInitialised | Reject::NotEmpty) => e,
+            StoreError::RetentionFull(_) => {
+                StoreError::unavailable(UnavailableKind::Io { errno: Some(libc::ENOSPC) }, root)
+            }
+            StoreError::Corrupt { path, .. } => StoreError::layout(&path),
+            StoreError::Missing { path } => StoreError::layout(&path),
+            _ => StoreError::layout(root),
+        }
+    }
     pub fn is_unavailable(&self) -> bool {
         matches!(self, StoreError::Unavailable { .. })
     }
@@ -90,16 +115,25 @@ pub enum UnavailableKind {
     NotADirectory,
     #[error("the root is a symlink")]
     SymlinkRoot,
-    /// tmpfs, ramfs or overlayfs (`statfs` magic).
+    /// The root's filesystem (`statfs` magic) is not ext2/3/4, xfs, btrfs, zfs or f2fs, and
+    /// `allow_any_filesystem` is off.
     #[error("the root is on an unsupported filesystem (f_type {f_type:#x})")]
     UnsupportedFilesystem { f_type: u32 },
-    /// An area the layout requires (`bundles/`, `pins/`, …) is not a directory.
-    #[error("a store area is not a directory")]
+    /// `require_dedicated_mount` is on and the root is not the root of a mounted filesystem (its
+    /// `st_dev` equals its parent's): typically a disk that failed to mount, leaving the bare mount
+    /// point.
+    #[error("the root is not a mount point")]
+    NotMounted,
+    /// An entry the layout requires is missing or is not what the store creates there: an area
+    /// (`bundles/`, `pins/`, …) absent, a symlink or a file where a directory belongs at any level,
+    /// `.lock` or `next_version` of the wrong type.
+    #[error("the store layout is damaged")]
     BadLayout,
     /// The root path no longer names the directory that was opened (unmounted or replaced).
     #[error("the root changed since it was opened")]
     RootChanged,
-    /// No identity record, and the root is not an empty directory this open may initialise.
+    /// No identity record (or no `.lock`): the directory is not an initialised store. `open`
+    /// never initialises one; [`crate::Store::init`] does, as an explicit operator step.
     #[error("the identity record is missing")]
     IdentityMissing,
     #[error("the identity record is unreadable")]
@@ -109,6 +143,12 @@ pub enum UnavailableKind {
     /// Another `Store` (this process or another) holds `<root>/.lock`.
     #[error("the store lock is held by another opener")]
     LockHeld,
+    /// An earlier change failed after it had become visible (an fsync or a rename failed, or a
+    /// metadata call failed with EIO), so what is on disk is no longer known to match what the store
+    /// promised. Every call fails this way until the store is reopened, and nothing is fsynced again
+    /// in this `Store` (a retried fsync can falsely succeed).
+    #[error("an earlier write failed after a visible change; reopen the store")]
+    Poisoned,
     #[error("I/O error (EIO)")]
     Eio,
     #[error("read-only filesystem (EROFS)")]
@@ -162,6 +202,15 @@ pub enum Defect {
     InputHash,
     #[error("the ELF does not have its image id")]
     ImageId,
+    /// The bundle's ELF is not in the store (it is never collected while a version references it).
+    #[error("the bundle's ELF is absent")]
+    ElfMissing,
+    /// `bundle.json`'s `version` is not the version directory it is stored in.
+    #[error("the record's version does not match its location")]
+    VersionMismatch,
+    /// The pinned version's `bundle.json` or `input_sha256` is not what its pin recorded.
+    #[error("the bundle does not match its pin")]
+    PinMismatch,
     #[error("the record does not parse")]
     Unparseable,
     #[error("the file exceeds its size bound")]
@@ -189,6 +238,16 @@ pub enum Reject {
     /// A previous write on this writer failed; it can only be dropped.
     #[error("the writer failed earlier")]
     WriterFailed,
+    /// `W` was sealed ([`crate::BundleWriter::seal_w`], or the writer reuses an existing `W`).
+    #[error("the witness is sealed")]
+    Sealed,
+    /// [`crate::Store::init`]: the root already holds an identity record.
+    #[error("the root is already an initialised store")]
+    AlreadyInitialised,
+    /// [`crate::Store::init`]: the root holds entries other than `lost+found` and what an
+    /// interrupted `init` leaves.
+    #[error("the root is not empty")]
+    NotEmpty,
     #[error("the terminal proof names another job")]
     TerminalJobMismatch,
     #[error("bundle versions exhausted")]

@@ -10,16 +10,6 @@ use zkminer_witness::bundle::PinRecord;
 use zkminer_witness::verdict::{SkipReason, VerdictRecord};
 use zkminer_witness_store::*;
 
-fn pin_rec(r: &BundleRef) -> PinRecord {
-    PinRecord {
-        job_id: r.job_id,
-        descriptor_hash: r.descriptor_hash,
-        prover: r.prover,
-        bundle_version: r.version,
-        pinned_at_block: 1234,
-    }
-}
-
 fn terminal(job_id: B256) -> TerminalProof {
     TerminalProof { job_id, state: TerminalState::Fulfilled, read_at_block: 99 }
 }
@@ -56,38 +46,60 @@ fn types_are_send_and_sync() {
 }
 
 #[test]
-fn creates_identity_and_reopens() {
+fn init_creates_the_identity_and_open_requires_it() {
     let d = tmpdir();
-    let s = open(d.path());
-    assert!(s.open_report().created);
-    let id = s.identity().clone();
+    let id = Store::init(d.path(), &init_id()).unwrap();
     assert_eq!((id.chain_id, id.router, id.prover), (CHAIN, router(), prover()));
     assert_eq!(id.store_uuid.len(), 36);
     assert_eq!(&id.store_uuid[14..15], "4", "version-4 UUID");
     for area in ["tmp", "bundles", "pins", "elfs", "verdicts"] {
         assert!(d.path().join(area).is_dir(), "{area}");
     }
-    assert_accounting(&s);
-    drop(s);
-
-    let s = open(d.path());
-    assert!(!s.open_report().created);
+    assert_eq!(fs::read_to_string(d.path().join("next_version")).unwrap(), "1");
+    let want = ExpectedIdentity { chain_id: CHAIN, router: router(), prover: prover(), store_uuid: id.store_uuid.clone() };
+    let s = Store::open(d.path(), &want, opts()).unwrap();
     assert_eq!(s.identity(), &id);
+    assert_eq!(s.open_report(), OpenReport::default());
+    assert_accounting(&s);
+    // init never touches a store, open or not.
+    assert_eq!(rejected(Store::init(d.path(), &init_id()).unwrap_err()), Reject::AlreadyInitialised);
     drop(s);
-    // Reopen naming the recorded UUID.
-    let want = ExpectedIdentity { store_uuid: Some(id.store_uuid.clone()), ..expected() };
-    Store::open(d.path(), &want, opts()).unwrap();
+    assert_eq!(rejected(Store::init(d.path(), &init_id()).unwrap_err()), Reject::AlreadyInitialised);
+    assert_eq!(uuid_of(d.path()), id.store_uuid);
+
+    // A directory with anything else in it is refused.
+    let e = tmpdir();
+    fs::write(e.path().join("stray"), b"x").unwrap();
+    assert_eq!(rejected(Store::init(e.path(), &init_id()).unwrap_err()), Reject::NotEmpty);
+    assert_eq!(fs::read_dir(e.path()).unwrap().count(), 1, "nothing written, not even .lock");
+    let f = tmpdir();
+    fs::create_dir_all(f.path().join("bundles/x")).unwrap();
+    assert_eq!(rejected(Store::init(f.path(), &init_id()).unwrap_err()), Reject::NotEmpty);
+    // What an interrupted init leaves (no identity yet) is finished by running it again.
+    let g = tmpdir();
+    for a in ["tmp", "bundles", "pins"] {
+        fs::create_dir(g.path().join(a)).unwrap();
+    }
+    fs::write(g.path().join(".lock"), b"").unwrap();
+    fs::write(g.path().join("next_version"), b"1").unwrap();
+    fs::write(g.path().join("tmp/0123.part"), b"{").unwrap();
+    fs::create_dir(g.path().join("lost+found")).unwrap();
+    let gid = Store::init(g.path(), &init_id()).unwrap();
+    assert_eq!(tmp_entries(g.path()), 0);
+    let s = Store::open(g.path(), &expected(g.path()), opts()).unwrap();
+    assert_eq!(s.identity(), &gid);
 }
 
 #[test]
-fn identity_mismatch_and_missing_are_unavailable() {
+fn identity_mismatch_and_missing_are_unavailable_and_open_never_creates() {
     let d = tmpdir();
     drop(open(d.path()));
+    let base = expected(d.path());
     let wrong = [
-        ExpectedIdentity { chain_id: 1, ..expected() },
-        ExpectedIdentity { router: Address::repeat_byte(0x99), ..expected() },
-        ExpectedIdentity { prover: Address::repeat_byte(0x99), ..expected() },
-        ExpectedIdentity { store_uuid: Some("00000000-0000-4000-8000-000000000000".into()), ..expected() },
+        ExpectedIdentity { chain_id: 1, ..base.clone() },
+        ExpectedIdentity { router: Address::repeat_byte(0x99), ..base.clone() },
+        ExpectedIdentity { prover: Address::repeat_byte(0x99), ..base.clone() },
+        ExpectedIdentity { store_uuid: "00000000-0000-4000-8000-000000000000".into(), ..base.clone() },
     ];
     for w in wrong {
         let e = Store::open(d.path(), &w, opts()).unwrap_err();
@@ -98,22 +110,22 @@ fn identity_mismatch_and_missing_are_unavailable() {
     let id = d.path().join("identity.json");
     make_writable(&id);
     fs::write(&id, b"{ not json").unwrap();
-    assert_eq!(unavailable(Store::open(d.path(), &expected(), opts()).unwrap_err()), UnavailableKind::IdentityInvalid);
+    assert_eq!(unavailable(Store::open(d.path(), &base, opts()).unwrap_err()), UnavailableKind::IdentityInvalid);
 
-    // No identity: an empty root is initialised only with `create`, a non-empty one never.
+    // An empty directory (an unmounted disk's mount point) is never initialised by open, and
+    // nothing is written into it — not even `.lock`.
     let e = tmpdir();
-    let no_create = StoreOptions { create: false, ..opts() };
-    assert_eq!(unavailable(Store::open(e.path(), &expected(), no_create).unwrap_err()), UnavailableKind::IdentityMissing);
-    fs::write(e.path().join("stray"), b"x").unwrap();
-    assert_eq!(unavailable(Store::open(e.path(), &expected(), opts()).unwrap_err()), UnavailableKind::IdentityMissing);
-    // Expecting a UUID means expecting an existing store.
-    let f = tmpdir();
-    let want = ExpectedIdentity { store_uuid: Some("00000000-0000-4000-8000-000000000000".into()), ..expected() };
-    assert_eq!(unavailable(Store::open(f.path(), &want, opts()).unwrap_err()), UnavailableKind::IdentityMissing);
+    let want = ExpectedIdentity { store_uuid: base.store_uuid.clone(), ..base.clone() };
+    assert_eq!(unavailable(Store::open(e.path(), &want, opts()).unwrap_err()), UnavailableKind::IdentityMissing);
+    assert_eq!(fs::read_dir(e.path()).unwrap().count(), 0);
+    fs::create_dir(e.path().join("lost+found")).unwrap();
+    assert_eq!(unavailable(Store::open(e.path(), &want, opts()).unwrap_err()), UnavailableKind::IdentityMissing);
+    assert_eq!(fs::read_dir(e.path()).unwrap().count(), 1);
 
     // An absent root is never created.
-    let gone = f.path().join("absent");
-    assert_eq!(unavailable(Store::open(&gone, &expected(), opts()).unwrap_err()), UnavailableKind::RootAbsent);
+    let gone = e.path().join("absent");
+    assert_eq!(unavailable(Store::open(&gone, &want, opts()).unwrap_err()), UnavailableKind::RootAbsent);
+    assert_eq!(unavailable(Store::init(&gone, &init_id()).unwrap_err()), UnavailableKind::RootAbsent);
     assert!(!gone.exists());
 }
 
@@ -121,36 +133,44 @@ fn identity_mismatch_and_missing_are_unavailable() {
 fn second_open_is_refused_while_the_lock_is_held() {
     let d = tmpdir();
     let a = open(d.path());
-    let e = Store::open(d.path(), &expected(), opts()).unwrap_err();
+    let e = Store::open(d.path(), &expected(d.path()), opts()).unwrap_err();
     assert_eq!(unavailable(e), UnavailableKind::LockHeld);
 
     // A live writer keeps the lock after its store is dropped.
     let w = a.begin_bundle(job(1), B256::ZERO, prover(), 100).unwrap();
     drop(a);
-    assert_eq!(unavailable(Store::open(d.path(), &expected(), opts()).unwrap_err()), UnavailableKind::LockHeld);
+    assert_eq!(unavailable(Store::open(d.path(), &expected(d.path()), opts()).unwrap_err()), UnavailableKind::LockHeld);
     drop(w);
     let b = open(d.path());
     assert_eq!(b.open_report().tmp_entries_removed, 0, "the dropped writer cleaned up after itself");
 }
 
 #[test]
-fn refuses_tmpfs_symlinks_and_files_as_root() {
+fn refuses_unsupported_filesystems_symlinks_and_files_as_root() {
     let shm = tempfile::Builder::new().prefix("wstore-").tempdir_in("/dev/shm").unwrap();
-    let e = Store::open(shm.path(), &expected(), opts()).unwrap_err();
-    assert_eq!(unavailable(e), UnavailableKind::UnsupportedFilesystem { f_type: 0x0102_1994 });
+    let tmpfs = UnavailableKind::UnsupportedFilesystem { f_type: 0x0102_1994 };
+    assert_eq!(unavailable(Store::init(shm.path(), &init_id()).unwrap_err()), tmpfs);
     assert_eq!(fs::read_dir(shm.path()).unwrap().count(), 0, "nothing written on tmpfs");
+    // The explicit override accepts it (for tests and exotic hosts), and only with the override.
+    let any = StoreIdentityInit { allow_any_filesystem: true, ..init_id() };
+    Store::init(shm.path(), &any).unwrap();
+    let want = expected(shm.path());
+    assert_eq!(unavailable(Store::open(shm.path(), &want, opts()).unwrap_err()), tmpfs);
+    drop(Store::open(shm.path(), &want, StoreOptions { allow_any_filesystem: true, ..opts() }).unwrap());
 
     let d = tmpdir();
     let real = d.path().join("real");
     fs::create_dir(&real).unwrap();
     let link = d.path().join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    assert_eq!(unavailable(Store::open(&link, &expected(), opts()).unwrap_err()), UnavailableKind::SymlinkRoot);
+    assert_eq!(unavailable(Store::init(&link, &init_id()).unwrap_err()), UnavailableKind::SymlinkRoot);
     assert_eq!(fs::read_dir(&real).unwrap().count(), 0, "nothing written through the symlink");
+    Store::init(&real, &init_id()).unwrap();
+    assert_eq!(unavailable(Store::open(&link, &expected(&real), opts()).unwrap_err()), UnavailableKind::SymlinkRoot);
 
     let file = d.path().join("file");
     fs::write(&file, b"x").unwrap();
-    assert_eq!(unavailable(Store::open(&file, &expected(), opts()).unwrap_err()), UnavailableKind::NotADirectory);
+    assert_eq!(unavailable(Store::open(&file, &expected(&real), opts()).unwrap_err()), UnavailableKind::NotADirectory);
 
     // An area replaced by a symlink makes the store unavailable rather than being followed.
     let root = d.path().join("store");
@@ -158,7 +178,7 @@ fn refuses_tmpfs_symlinks_and_files_as_root() {
     drop(open(&root));
     fs::remove_dir(root.join("pins")).unwrap();
     std::os::unix::fs::symlink(&real, root.join("pins")).unwrap();
-    assert_eq!(unavailable(Store::open(&root, &expected(), opts()).unwrap_err()), UnavailableKind::BadLayout);
+    assert_eq!(unavailable(Store::open(&root, &expected(&root), opts()).unwrap_err()), UnavailableKind::BadLayout);
 }
 
 #[test]
@@ -171,8 +191,9 @@ fn publish_read_and_open_w_round_trip() {
         let b = spec.bundle(&w);
         let r = put_and_publish(&s, &spec, &w);
         assert_eq!(r.key(), BundleKey::of_bundle(&b));
+        let b = at(&b, r.version);
         assert_eq!(s.read(&r, &desc_hash).unwrap(), b);
-        assert_eq!(s.verify(&r, &desc_hash).unwrap(), b);
+        assert_eq!(s.verify(&r, &desc_hash, &image_id).unwrap(), b);
         let mut f = s.open_w(&r).unwrap();
         // SAFETY: F_GETFL on a valid fd.
         let flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&f), libc::F_GETFL) };
@@ -181,14 +202,7 @@ fn publish_read_and_open_w_round_trip() {
         let mut back = Vec::new();
         f.read_to_end(&mut back).unwrap();
         assert_eq!(back, w, "the fd is rewound and serves W");
-        assert!(fs::OpenOptions::new().write(true).open(d.path().join(format!(
-            "bundles/{}/{}/{}/v{}/w.bin",
-            hex::encode(r.job_id),
-            hex::encode(r.descriptor_hash),
-            hex::encode(r.prover),
-            r.version
-        )))
-        .is_err());
+        assert!(fs::OpenOptions::new().write(true).open(vdir(d.path(), &r).join("w.bin")).is_err());
         assert_eq!(s.latest(r.job_id, r.descriptor_hash, r.prover).unwrap(), r);
     }
     // Published files are read-only; a new result is a new version.
@@ -206,7 +220,7 @@ fn publish_read_and_open_w_round_trip() {
     // Everything survives a reopen.
     drop(s);
     let s = open(d.path());
-    assert_eq!(s.verify(&r2, &desc_hash).unwrap(), spec.bundle(&w2));
+    assert_eq!(s.verify(&r2, &desc_hash, &image_id).unwrap(), at(&spec.bundle(&w2), r2.version));
     assert_accounting(&s);
 }
 
@@ -216,7 +230,7 @@ fn finish_refuses_records_that_do_not_match_what_was_written() {
     let s = open(d.path());
     let spec = Spec::new(job(3));
     drop(s.put_elf(sha256(&elf(1)), &elf(1), &image_id).unwrap());
-    let base = s.usage();
+    let base = data_usage(&s, d.path());
     let w = witness(3, 5000);
     let good = spec.bundle(&w);
 
@@ -238,28 +252,26 @@ fn finish_refuses_records_that_do_not_match_what_was_written() {
         }), Reject::Record(Defect::JournalTooLarge)),
         ("po2 twice", Box::new(|b| b.po2_results[1].po2 = 19), Reject::Record(Defect::Po2Duplicate)),
         ("format", Box::new(|b| b.format_version = 2), Reject::Record(Defect::FormatVersion)),
+        ("version", Box::new(|b| b.version += 1), Reject::Record(Defect::VersionMismatch)),
         ("elf", Box::new(|b| b.image_id = B256::repeat_byte(0xee)), Reject::ElfMissing),
     ];
     for (name, mutate, want) in cases {
-        let mut b = good.clone();
-        mutate(&mut b);
         // The key case: change the key the writer was opened with instead.
-        let (job_id, desc, prov) = if name == "key" {
-            (b.job_id, b.descriptor_hash, Address::repeat_byte(0x77))
-        } else {
-            (b.job_id, b.descriptor_hash, b.prover)
-        };
-        let mut wr = s.begin_bundle(job_id, desc, prov, 1 << 20).unwrap();
+        let prov = if name == "key" { Address::repeat_byte(0x77) } else { good.prover };
+        let mut wr = s.begin_bundle(good.job_id, good.descriptor_hash, prov, 1 << 20).unwrap();
+        let mut b = at(&good, wr.version());
+        mutate(&mut b);
         wr.write_w(&w).unwrap();
         assert_eq!(rejected(wr.finish(&b, &desc_hash).unwrap_err()), want, "{name}");
         assert_eq!(tmp_entries(d.path()), 0, "{name}: the failed writer is gone");
-        assert_eq!(s.usage(), base, "{name}");
+        assert_eq!(data_usage(&s, d.path()), base, "{name}");
         assert!(s.latest(good.job_id, good.descriptor_hash, good.prover).unwrap_err().is_missing(), "{name}");
     }
     // A descriptor hash function that cannot decode the descriptor refuses too.
     let mut wr = s.begin_bundle(good.job_id, good.descriptor_hash, good.prover, 1 << 20).unwrap();
     wr.write_w(&w).unwrap();
-    assert_eq!(rejected(wr.finish(&good, &|_| None).unwrap_err()), Reject::Record(Defect::DescriptorHash));
+    let v = wr.version();
+    assert_eq!(rejected(wr.finish(&at(&good, v), &|_| None).unwrap_err()), Reject::Record(Defect::DescriptorHash));
 
     // `max_w_bytes` is enforced mid-stream, and the writer is dead afterwards.
     let mut wr = s.begin_bundle(good.job_id, good.descriptor_hash, good.prover, 4096).unwrap();
@@ -267,7 +279,7 @@ fn finish_refuses_records_that_do_not_match_what_was_written() {
     assert_eq!(rejected(wr.write_w(&w[4000..4100]).unwrap_err()), Reject::WitnessTooLarge { max: 4096 });
     assert_eq!(rejected(wr.write_w(&[1]).unwrap_err()), Reject::WriterFailed);
     assert_eq!(rejected(wr.finish(&good, &desc_hash).unwrap_err()), Reject::WriterFailed);
-    assert_eq!(s.usage(), base);
+    assert_eq!(data_usage(&s, d.path()), base);
     assert_accounting(&s);
     // And the good record publishes.
     publish(&s, &good, &w, 999).unwrap();
@@ -321,15 +333,7 @@ fn corruption_is_corrupt_and_absence_is_missing() {
     let s = open(d.path());
     let w = witness(5, 9000);
     let refs: Vec<BundleRef> = (10..17).map(|j| put_and_publish(&s, &Spec::new(job(j)), &w)).collect();
-    let vdir = |r: &BundleRef| {
-        d.path().join(format!(
-            "bundles/{}/{}/{}/v{}",
-            hex::encode(r.job_id),
-            hex::encode(r.descriptor_hash),
-            hex::encode(r.prover),
-            r.version
-        ))
-    };
+    let vdir = |r: &BundleRef| vdir(d.path(), r);
 
     // A flipped byte in W: the record reads, W never verifies.
     let p = vdir(&refs[0]).join("w.bin");
@@ -339,7 +343,7 @@ fn corruption_is_corrupt_and_absence_is_missing() {
     fs::write(&p, &bytes).unwrap();
     assert!(s.read(&refs[0], &desc_hash).is_ok());
     assert_eq!(defect(s.open_w(&refs[0]).unwrap_err()), Defect::WHash);
-    assert_eq!(defect(s.verify(&refs[0], &desc_hash).unwrap_err()), Defect::WHash);
+    assert_eq!(defect(s.verify(&refs[0], &desc_hash, &image_id).unwrap_err()), Defect::WHash);
 
     // A truncated W.
     let p = vdir(&refs[1]).join("w.bin");
@@ -387,7 +391,7 @@ fn corruption_is_corrupt_and_absence_is_missing() {
     assert!(s.open_w(&absent).unwrap_err().is_missing());
     assert!(s.latest(job(99), B256::ZERO, prover()).unwrap_err().is_missing());
     // The untouched one still verifies.
-    s.verify(&refs[5], &desc_hash).unwrap();
+    s.verify(&refs[5], &desc_hash, &image_id).unwrap();
 
     // The scan reports every corrupt version rather than skipping it.
     let scan = s.scan().unwrap();
@@ -416,15 +420,16 @@ fn a_vanished_or_replaced_root_is_unavailable() {
     fs::create_dir(&root).unwrap();
     let s = open(&root);
     let r = put_and_publish(&s, &Spec::new(job(1)), &witness(1, 100));
+    let rec = pin_rec(&s, &r);
     let moved = parent.path().join("moved");
     fs::rename(&root, &moved).unwrap();
     assert_eq!(unavailable(s.read(&r, &desc_hash).unwrap_err()), UnavailableKind::RootAbsent);
     fs::create_dir(&root).unwrap();
     assert_eq!(unavailable(s.read(&r, &desc_hash).unwrap_err()), UnavailableKind::RootChanged);
-    assert_eq!(unavailable(s.pin(&pin_rec(&r)).unwrap_err()), UnavailableKind::RootChanged);
+    assert_eq!(unavailable(s.pin(&rec).unwrap_err()), UnavailableKind::RootChanged);
     fs::remove_dir(&root).unwrap();
     fs::rename(&moved, &root).unwrap();
-    s.verify(&r, &desc_hash).unwrap();
+    s.verify(&r, &desc_hash, &image_id).unwrap();
 
     // The bundles area vanishing is an unavailable store, not a missing bundle.
     let other = parent.path().join("bundles-elsewhere");
@@ -442,14 +447,14 @@ fn quota_and_floor_refuse_mid_stream() {
     let b = spec.bundle(&[]);
     let base = s.usage();
     drop(s);
-    let avail = Store::open(d.path(), &expected(), StoreOptions { quota_bytes: u64::MAX, ..opts() })
+    let avail = Store::open(d.path(), &expected(d.path()), StoreOptions { quota_bytes: u64::MAX, ..opts() })
         .unwrap()
         .headroom()
         .unwrap();
 
     // Byte quota: room for two 4 KiB pieces.
     let o = StoreOptions { quota_bytes: base.bytes + 10_000, ..opts() };
-    let s = Store::open(d.path(), &expected(), o).unwrap();
+    let s = Store::open(d.path(), &expected(d.path()), o).unwrap();
     let mut wr = s.begin_bundle(b.job_id, b.descriptor_hash, b.prover, 1 << 20).unwrap();
     wr.write_w(&[1; 4096]).unwrap();
     wr.write_w(&[2; 4096]).unwrap();
@@ -457,7 +462,7 @@ fn quota_and_floor_refuse_mid_stream() {
     assert_eq!(wr.written(), 8192);
     assert_eq!(rejected(wr.write_w(&[4; 1]).unwrap_err()), Reject::WriterFailed);
     drop(wr);
-    assert_eq!(s.usage(), base);
+    assert_eq!(s.usage(), base, "the counter went from 1 to 2: same size");
     assert_eq!(tmp_entries(d.path()), 0);
     // A verdict is refused at the quota; a pin never is (it protects a lock).
     let small = witness(6, 1500);
@@ -475,7 +480,7 @@ fn quota_and_floor_refuse_mid_stream() {
         wasmtime_version: None,
     };
     assert!(s.put_verdict(&v).unwrap_err().is_full());
-    s.pin(&pin_rec(&r)).unwrap();
+    s.pin(&pin_rec(&s, &r)).unwrap();
     drop(wr);
     assert_accounting(&s);
     drop(s);
@@ -483,7 +488,7 @@ fn quota_and_floor_refuse_mid_stream() {
     // Inode quota: a bundle needs up to six entries.
     let used = open(d.path()).usage().inodes;
     let o = StoreOptions { quota_inodes: used + 3, ..opts() };
-    let s = Store::open(d.path(), &expected(), o).unwrap();
+    let s = Store::open(d.path(), &expected(d.path()), o).unwrap();
     assert!(matches!(
         s.begin_bundle(b.job_id, b.descriptor_hash, b.prover, 1 << 20).unwrap_err(),
         StoreError::RetentionFull(FullReason::QuotaInodes)
@@ -493,7 +498,7 @@ fn quota_and_floor_refuse_mid_stream() {
     // Free-space floor: refused from the start when already crossed, and mid-stream when W grows
     // into it (3 MiB of room, 1 MiB pieces).
     let o = StoreOptions { free_space_floor_bytes: u64::MAX, ..opts() };
-    let s = Store::open(d.path(), &expected(), o).unwrap();
+    let s = Store::open(d.path(), &expected(d.path()), o).unwrap();
     assert!(matches!(
         s.begin_bundle(b.job_id, b.descriptor_hash, b.prover, 1 << 30).unwrap_err(),
         StoreError::RetentionFull(FullReason::FreeSpaceFloor)
@@ -502,7 +507,7 @@ fn quota_and_floor_refuse_mid_stream() {
     assert!(avail > 1 << 30, "the test needs some free disk");
     // 16 MiB of room above the floor, 4 MiB pieces (other writers on the disk move it a little).
     let o = StoreOptions { free_space_floor_bytes: avail - (16 << 20), quota_bytes: u64::MAX, ..opts() };
-    let s = Store::open(d.path(), &expected(), o).unwrap();
+    let s = Store::open(d.path(), &expected(d.path()), o).unwrap();
     let mut wr = s.begin_bundle(b.job_id, b.descriptor_hash, b.prover, 1 << 30).unwrap();
     let piece = vec![7u8; 4 << 20];
     let mut n = 0;
@@ -525,17 +530,14 @@ fn pins_are_durable_and_checked() {
     let d = tmpdir();
     let s = open(d.path());
     let r = put_and_publish(&s, &Spec::new(job(7)), &witness(7, 2000));
-    let rec = pin_rec(&r);
+    let rec = pin_rec(&s, &r);
+    assert_eq!(rec.input_sha256, s.read(&r, &desc_hash).unwrap().input_sha256);
+    assert_eq!(rec.bundle_json_sha256, sha256(&fs::read(vdir(d.path(), &r).join("bundle.json")).unwrap()));
     s.pin(&rec).unwrap();
     s.pin(&rec).unwrap(); // idempotent
     assert_eq!(s.pins(), vec![rec.clone()]);
     assert_eq!(s.pin_status(&r.key()), PinStatus::Pinned { version: r.version });
-    let pin_file = d.path().join("pins").join(format!(
-        "{}.{}.{}.json",
-        hex::encode(r.job_id),
-        hex::encode(r.descriptor_hash),
-        hex::encode(r.prover)
-    ));
+    let pin_file = pin_file(d.path(), &r);
     assert_eq!(serde_json::from_slice::<PinRecord>(&fs::read(&pin_file).unwrap()).unwrap(), rec);
     assert_eq!(fs::metadata(&pin_file).unwrap().permissions().mode() & 0o777, 0o444);
     assert_accounting(&s);
@@ -543,27 +545,30 @@ fn pins_are_durable_and_checked() {
 
     let s = open(d.path());
     assert_eq!(s.pins(), vec![rec.clone()], "the pin survives a reopen");
-    // A pin must name an existing, readable version.
+    // A pin must name an existing, readable version, with the hashes it has.
     let mut missing = rec.clone();
     missing.bundle_version += 50;
     assert!(s.pin(&missing).unwrap_err().is_missing());
+    for mismatch in [
+        PinRecord { input_sha256: B256::repeat_byte(1), ..rec.clone() },
+        PinRecord { bundle_json_sha256: B256::repeat_byte(1), ..rec.clone() },
+    ] {
+        assert_eq!(rejected(s.pin(&mismatch).unwrap_err()), Reject::Record(Defect::PinMismatch));
+    }
+    assert_eq!(s.pins(), vec![rec.clone()], "a refused pin changes nothing");
     let r2 = put_and_publish(&s, &Spec::new(job(8)), &witness(8, 2000));
-    let jp = d.path().join(format!(
-        "bundles/{}/{}/{}/v{}/bundle.json",
-        hex::encode(r2.job_id),
-        hex::encode(r2.descriptor_hash),
-        hex::encode(r2.prover),
-        r2.version
-    ));
+    let rec2 = pin_rec(&s, &r2);
+    let jp = vdir(d.path(), &r2).join("bundle.json");
     make_writable(&jp);
     fs::write(&jp, b"[]").unwrap();
-    assert!(s.pin(&pin_rec(&r2)).unwrap_err().is_corrupt());
+    assert!(s.pin(&rec2).unwrap_err().is_corrupt());
     // Re-pinning at a newer version replaces the pin.
     let spec = Spec::new(job(7));
     let w3 = witness(9, 10);
     let r3 = publish(&s, &spec.bundle(&w3), &w3, 4).unwrap();
-    s.pin(&pin_rec(&r3)).unwrap();
-    assert_eq!(s.pins(), vec![pin_rec(&r3)]);
+    let rec3 = pin_rec(&s, &r3);
+    s.pin(&rec3).unwrap();
+    assert_eq!(s.pins(), vec![rec3]);
     assert!(s.unpin(r.job_id, r.descriptor_hash, r.prover).unwrap());
     assert!(!s.unpin(r.job_id, r.descriptor_hash, r.prover).unwrap());
     assert!(s.pins().is_empty());
@@ -585,19 +590,13 @@ fn eviction_waits_for_the_scan_and_never_touches_pins() {
     let w = witness(1, 4000);
     let v0 = put_and_publish(&s, &spec(20, 1), &w);
     let va = put_and_publish(&s, &spec(20, 2), &w);
-    s.pin(&pin_rec(&va)).unwrap();
+    s.pin(&pin_rec(&s, &va)).unwrap();
     let vb = put_and_publish(&s, &spec(20, 3), &w);
     // Unpinned jobs with values 10, 11, 12 (by block).
     let others: Vec<BundleRef> = [(21, 10), (22, 11), (23, 12)].iter().map(|&(j, b)| put_and_publish(&s, &spec(j, b), &w)).collect();
     // A key whose pin file is unreadable: all its versions are protected.
     let u1 = put_and_publish(&s, &spec(24, 0), &w);
-    let upath = d.path().join("pins").join(format!(
-        "{}.{}.{}.json",
-        hex::encode(u1.job_id),
-        hex::encode(u1.descriptor_hash),
-        hex::encode(u1.prover)
-    ));
-    fs::write(&upath, b"garbage").unwrap();
+    fs::write(pin_file(d.path(), &u1), b"garbage").unwrap();
     drop(s);
 
     let s = open(d.path());
@@ -621,7 +620,7 @@ fn eviction_waits_for_the_scan_and_never_touches_pins() {
     let left: Vec<BundleRef> = s.scan().unwrap().bundles.iter().map(|m| m.bundle).collect();
     assert_eq!(left, vec![va, vb, u1], "pinned, latest of pinned, unreadable-pinned");
     for r in [va, vb, u1] {
-        s.verify(&r, &desc_hash).unwrap();
+        s.verify(&r, &desc_hash, &image_id).unwrap();
     }
     for r in &others {
         assert!(s.read(r, &desc_hash).unwrap_err().is_missing());
@@ -653,13 +652,13 @@ fn deletion_needs_no_pins_and_drops_elf_refs_and_verdicts() {
     };
     s.put_verdict(&v).unwrap();
 
-    s.pin(&pin_rec(&a2)).unwrap();
+    s.pin(&pin_rec(&s, &a2)).unwrap();
     match s.delete_job(job(30), &terminal(job(30))).unwrap_err() {
         StoreError::Pinned(keys) => assert_eq!(keys, vec![a2.key()]),
         e => panic!("{e:?}"),
     }
     assert_eq!(rejected(s.delete_job(job(30), &terminal(job(31))).unwrap_err()), Reject::TerminalJobMismatch);
-    s.verify(&a, &desc_hash).unwrap();
+    s.verify(&a, &desc_hash, &image_id).unwrap();
 
     s.unpin(a2.job_id, a2.descriptor_hash, a2.prover).unwrap();
     let rep = s.delete_job(job(30), &terminal(job(30))).unwrap();
@@ -716,7 +715,7 @@ fn elf_area_verifies_and_shares() {
     assert_eq!(fs::read_dir(d.path().join("elfs")).unwrap().count(), 1);
     // Holds keep the store (and its lock) alive.
     drop(s);
-    assert_eq!(unavailable(Store::open(d.path(), &expected(), opts()).unwrap_err()), UnavailableKind::LockHeld);
+    assert_eq!(unavailable(Store::open(d.path(), &expected(d.path()), opts()).unwrap_err()), UnavailableKind::LockHeld);
     drop((h1, h2));
     let s = open(d.path());
     assert_eq!(s.elf_refs(id), 2, "refcounts are rebuilt from bundle records");
@@ -770,7 +769,8 @@ fn scan_reports_layout_anomalies_pins_and_callers() {
     let r1 = put_and_publish(&s, &Spec { caller: alice, ..Spec::new(job(50)) }, &w);
     let r2 = put_and_publish(&s, &Spec { caller: alice, ..Spec::new(job(50)) }, &w);
     let r3 = put_and_publish(&s, &Spec { caller: bob, ..Spec::new(job(51)) }, &w);
-    s.pin(&pin_rec(&r1)).unwrap();
+    let rec1 = pin_rec(&s, &r1);
+    s.pin(&rec1).unwrap();
     fs::create_dir(d.path().join("bundles/not-a-job")).unwrap();
     fs::write(d.path().join("bundles").join(hex::encode(job(51))).join("stray"), b"x").unwrap();
     let scan = s.scan().unwrap();
@@ -784,7 +784,7 @@ fn scan_reports_layout_anomalies_pins_and_callers() {
     let by = s.bytes_by_caller();
     assert_eq!(by[&alice], m(r1).usage.bytes + m(r2).usage.bytes);
     assert_eq!(by[&bob], m(r3).usage.bytes);
-    assert_eq!(scan.pins, vec![pin_rec(&r1)]);
+    assert_eq!(scan.pins, vec![rec1]);
     assert_accounting(&s);
 }
 
@@ -835,7 +835,7 @@ fn concurrent_writers_get_distinct_versions() {
     assert_eq!(versions.len(), 8);
     assert_eq!(s.versions(job(70), spec.bundle(&[]).descriptor_hash, prover()).unwrap(), versions);
     for v in versions {
-        s.verify(&BundleKey::new(job(70), spec.bundle(&[]).descriptor_hash, prover()).at(v), &desc_hash).unwrap();
+        s.verify(&BundleKey::new(job(70), spec.bundle(&[]).descriptor_hash, prover()).at(v), &desc_hash, &image_id).unwrap();
     }
     assert_accounting(&s);
 }

@@ -36,6 +36,9 @@ pub struct BundleV1 {
     pub job_id: B256,
     pub descriptor_hash: B256,
     pub prover: Address,
+    /// The store version this record is published as (`v<version>/`); checked against the
+    /// directory on every read, so a record never passes for another version's.
+    pub version: u32,
     /// The full descriptor, ABI-encoded, hex; verified against `descriptor_hash` on read.
     pub descriptor_hex: String,
     pub submit_tx_hash: B256,
@@ -81,4 +84,9 @@ pub struct PinRecord {
     /// The bundle version the lock will prove.
     pub bundle_version: u32,
     pub pinned_at_block: u64,
+    /// The pinned version's `input_sha256` (`sha256(prefix ‖ W)`), checked on every read through
+    /// the pin.
+    pub input_sha256: B256,
+    /// `sha256` of the pinned version's `bundle.json` bytes, checked on every read through the pin.
+    pub bundle_json_sha256: B256,
 }

@@ -3,13 +3,12 @@
 //! under the lock).
 
 use std::collections::HashMap;
-use std::io;
 
 use alloy_primitives::{Address, B256};
 
 use crate::error::{Reject, StoreError};
-use crate::layout::{b256_name, parse_pin_name};
-use crate::store::{entries, BundleKey, BundleMeta, BundleRef, Store, TerminalProof, Usage};
+use crate::layout::{b256_name, parse_pin_name, version_name};
+use crate::store::{BundleKey, BundleMeta, BundleRef, Inner, State, Store, TerminalProof, Usage, VersionInfo};
 
 /// What [`Store::evict_to`] did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -43,6 +42,27 @@ fn job_range(job_id: B256) -> std::ops::RangeInclusive<BundleRef> {
     lo..=hi
 }
 
+impl Inner {
+    /// Removes one indexed version: its index entry goes the moment the rename into `tmp/`
+    /// succeeds, and a version already gone from disk is dropped from the index as removed. Returns
+    /// its index entry and whether this call removed it.
+    fn remove_version(&self, st: &mut State, r: &BundleRef) -> Result<(Option<VersionInfo>, bool), StoreError> {
+        let key_dir = match self.open_key(&r.key()) {
+            Ok(d) => d,
+            Err(StoreError::Missing { .. }) => return Ok((st.index_remove(r), false)),
+            Err(e) => return Err(e),
+        };
+        let mut info = None;
+        let removed = self.remove_entry(st, &key_dir, &version_name(r.version), true, &mut |st| {
+            info = st.index_remove(r);
+        })?;
+        if removed.is_none() {
+            info = st.index_remove(r);
+        }
+        Ok((info, removed.is_some()))
+    }
+}
+
 impl Store {
     /// Enables eviction. Call once this process has completed its full recovery scan.
     pub fn mark_recovery_scan_complete(&self) {
@@ -56,17 +76,22 @@ impl Store {
     /// Frees space until [`Store::headroom`] reaches `target_free_bytes`: first ELFs nothing
     /// references or holds, then unprotected versions in ascending `value_fn` order (ties: older
     /// block, then lower version). Never a pinned version, never the latest version of a pinned
-    /// key, never any version of a key whose pin is unreadable; protection is re-checked under the
-    /// lock before each removal. `value_fn` runs without the store lock held, but must not call
-    /// back into the store. [`StoreError::EvictionDisabled`] until
+    /// key, never any version of a key whose pin is unreadable or unknown; protection is re-checked
+    /// under the lock before each removal, so a pin taken while `value_fn` ran is honoured.
+    /// `value_fn` runs without the store lock held. [`StoreError::EvictionDisabled`] until
     /// [`Store::mark_recovery_scan_complete`].
+    ///
+    /// A version is renamed into `tmp/` and dropped from the index at once, its old parent is
+    /// fsynced, and only then is it deleted. One already gone from disk is dropped from the index
+    /// and not reported as evicted. A version behind a symlink is never followed:
+    /// [`crate::UnavailableKind::BadLayout`].
     pub fn evict_to(
         &self,
         target_free_bytes: u64,
         value_fn: &dyn Fn(&BundleMeta) -> u64,
     ) -> Result<EvictReport, StoreError> {
         let inner = &self.inner;
-        inner.check_root()?;
+        inner.check_usable()?;
         let metas = {
             let st = inner.state();
             if !st.scan_complete {
@@ -86,6 +111,7 @@ impl Store {
         ranked.sort();
 
         let mut st = inner.state();
+        inner.check_usable()?;
         let mut report = EvictReport::default();
         let before = st.total();
         let ids = inner.elf_ids()?;
@@ -98,10 +124,11 @@ impl Store {
             if st.meta(&r, info).protected() {
                 continue;
             }
-            inner.remove_entry(&mut st, &inner.version_dir(&r))?;
-            let info = st.index_remove(&r);
+            let (info, removed) = inner.remove_version(&mut st, &r)?;
             inner.prune_empty(&mut st, &r.key())?;
-            report.evicted.push(r);
+            if removed {
+                report.evicted.push(r);
+            }
             if let Some(Ok(s)) = info.map(|i| i.record) {
                 report.elfs_removed.extend(inner.collect_elfs(&mut st, &[s.image_id])?);
             }
@@ -135,20 +162,24 @@ impl Store {
     /// concurrent [`Store::pin`] either lands first (and the delete is refused) or finds the
     /// bundle gone ([`StoreError::Missing`]). A [`crate::BundleWriter`] still streaming for the job
     /// publishes afterwards as a new, unpinned version: a cache entry that eviction or a later
-    /// delete removes.
+    /// delete removes. The job directory is renamed into `tmp/` (its index entries dropped at once),
+    /// its parent fsynced, then deleted; a symlink there is never followed
+    /// ([`crate::UnavailableKind::BadLayout`]).
     pub fn delete_job(&self, job_id: B256, terminal: &TerminalProof) -> Result<DeleteReport, StoreError> {
         if terminal.job_id != job_id {
             return Err(StoreError::Rejected(Reject::TerminalJobMismatch));
         }
         let inner = &self.inner;
-        inner.check_root()?;
+        inner.check_usable()?;
+        let pins = inner.pins_area()?;
+        let bundles = inner.bundles()?;
         let mut st = inner.state();
         let mut pinned: Vec<BundleKey> = st.pins.keys().filter(|k| k.job_id == job_id).copied().collect();
         let prefix = format!("{}.", b256_name(&job_id));
-        for (n, _, _) in entries(&inner.pins_dir())? {
-            let Some(n) = n.filter(|n| n.starts_with(&prefix)) else { continue };
+        for e in pins.entries().map_err(|e| StoreError::io(e, pins.path()))? {
+            let Some(n) = e.utf8().filter(|n| n.starts_with(&prefix)) else { continue };
             // A pin file of this job that does not even parse still blocks the delete.
-            let k = parse_pin_name(&n).unwrap_or(BundleKey::new(job_id, B256::ZERO, Address::ZERO));
+            let k = parse_pin_name(n).unwrap_or(BundleKey::new(job_id, B256::ZERO, Address::ZERO));
             if !pinned.contains(&k) {
                 pinned.push(k);
             }
@@ -158,22 +189,23 @@ impl Store {
         }
 
         let mut report = DeleteReport::default();
-        let jdir = inner.job_dir(&job_id);
-        match std::fs::symlink_metadata(&jdir) {
-            Ok(_) => report.freed = inner.remove_entry(&mut st, &jdir)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(StoreError::io(e, &jdir)),
-        }
-        let refs: Vec<BundleRef> = st.versions.range(job_range(job_id)).map(|(r, _)| *r).collect();
         let mut image_ids = Vec::new();
-        for r in refs {
-            if let Some(info) = st.index_remove(&r) {
-                report.versions_removed += 1;
-                if let Ok(s) = info.record {
-                    image_ids.push(s.image_id);
+        let mut drop_index = |st: &mut State| {
+            let refs: Vec<BundleRef> = st.versions.range(job_range(job_id)).map(|(r, _)| *r).collect();
+            for r in refs {
+                if let Some(info) = st.index_remove(&r) {
+                    report.versions_removed += 1;
+                    if let Ok(s) = info.record {
+                        image_ids.push(s.image_id);
+                    }
                 }
             }
+        };
+        let freed = inner.remove_entry(&mut st, &bundles, &b256_name(&job_id), true, &mut drop_index)?;
+        if freed.is_none() {
+            drop_index(&mut st);
         }
+        report.freed = freed.unwrap_or_default();
         report.elfs_removed = inner.collect_elfs(&mut st, &image_ids)?;
         report.verdict_removed = inner.drop_verdict(&mut st, &job_id)?;
         Ok(report)

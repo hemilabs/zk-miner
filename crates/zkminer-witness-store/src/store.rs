@@ -1,11 +1,13 @@
-//! The store: open (filesystem, identity, lock, `tmp/` cleanup, usage), the in-memory index, quota
-//! admission, bundle reads and the recovery scan.
+//! The store: init and open (filesystem, mount, lock, identity, `tmp/` cleanup, usage), the
+//! in-memory index, quota admission, poisoning, bundle reads and the recovery scan.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::fs::{File, TryLockError};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use alloy_primitives::{Address, B256};
@@ -14,15 +16,14 @@ use sha2::{Digest, Sha256};
 use zkminer_witness::binding::{journal_prefix, MAX_JOURNAL_BYTES, STREAM_CHUNK_BYTES};
 use zkminer_witness::bundle::{BundleV1, PinRecord, StoreIdentity, BUNDLE_FORMAT_VERSION};
 
-use crate::error::{Defect, FullReason, StoreError, UnavailableKind};
+use crate::error::{Defect, FullReason, Reject, StoreError, UnavailableKind};
 use crate::fsutil::{
-    clear_nonblock, create_new, decode_hex, fs_avail_bytes, fs_type, fsync_dir, is_uuid, open_ro, random_name, read_capped,
-    refused_fs_type, remove_any, tree_usage, tree_usage_opt, uuid_v4, ReadError,
+    clear_nonblock, decode_hex, errno, fstat, is_enoent, is_not_a_real_dir, is_uuid, read_capped, supported_fs_type,
+    uuid_v4, write_file_atomic, Dir, Entry, Kind, ReadError, Staged,
 };
 use crate::layout::{
-    addr_name, b256_name, elf_name, parse_addr_name, parse_b256_name, parse_pin_name, parse_version_name, pin_name,
-    verdict_name, version_name, AREAS, BUNDLES, BUNDLE_JSON, ELFS, IDENTITY, LOCK, LOST_FOUND, NEXT_VERSION, OWNED,
-    PINS, TMP, VERDICTS, W_BIN,
+    addr_name, b256_name, parse_addr_name, parse_b256_name, parse_pin_name, parse_version_name, version_name, AREAS,
+    BUNDLES, BUNDLE_JSON, ELFS, IDENTITY, LOCK, LOST_FOUND, NEXT_VERSION, OWNED, PINS, TMP, VERDICTS, W_BIN,
 };
 
 /// The bound on `bundle.json` (the descriptor plus at most a few 32 KiB journals, hex).
@@ -36,30 +37,49 @@ pub const STORE_FORMAT_VERSION: u32 = 1;
 /// Entries a bundle can add: its directory, `w.bin`, `bundle.json` and three parent directories.
 pub(crate) const BUNDLE_MAX_INODES: u64 = 6;
 
-/// Limits and creation policy (plan §19 `[retention] quota`, `free_floor`).
+/// Limits and root checks (plan §19 `[retention] quota`, `free_floor`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreOptions {
-    /// Bytes of regular files the store may hold.
+    /// Bytes of regular files the store may hold. Evictable (unpinned) versions count until they
+    /// are evicted: call [`Store::evict_to`] before [`Store::begin_bundle`], or use
+    /// [`Store::begin_bundle_evicting`].
     pub quota_bytes: u64,
     /// Entries (files and directories) the store may hold.
     pub quota_inodes: u64,
-    /// New writes are refused when the filesystem's available bytes (`statvfs`) would fall below
-    /// this.
+    /// New writes are refused when the filesystem's available bytes (`statvfs`), less what
+    /// concurrent writers have been admitted for but not yet written, would fall below this.
     pub free_space_floor_bytes: u64,
-    /// Initialise a root directory that holds nothing yet (only `.lock`, `lost+found` or `tmp`).
-    /// The root itself is never created: an absent root is [`UnavailableKind::RootAbsent`], since
-    /// it usually means an unmounted filesystem.
-    pub create: bool,
+    /// Refuse a root that is not itself a mount point (its `st_dev` equals its parent's):
+    /// [`UnavailableKind::NotMounted`]. Set it when the store has its own filesystem (plan §15.1's
+    /// recommendation), so a disk that failed to mount is never taken for the store. A bind mount of
+    /// a directory on the same filesystem has its parent's `st_dev` and is refused too.
+    pub require_dedicated_mount: bool,
+    /// Accept any filesystem. Off, only ext2/3/4, xfs, btrfs, zfs and f2fs are accepted; NFS, CIFS,
+    /// FUSE, virtiofs, 9p, aufs, tmpfs, ramfs, overlay and every other type are
+    /// [`UnavailableKind::UnsupportedFilesystem`].
+    pub allow_any_filesystem: bool,
 }
 
-/// What `identity.json` must say for this miner. With `store_uuid` set (recorded from an earlier
-/// open, e.g. in the lock journal), the store must already exist with that UUID.
+/// What `identity.json` must say for this miner. `store_uuid` is the UUID [`Store::init`] returned,
+/// kept durably in the miner's configuration (never taken from the lock journal or from the store
+/// itself), so an empty or foreign directory at the configured path is never accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedIdentity {
     pub chain_id: u64,
     pub router: Address,
     pub prover: Address,
-    pub store_uuid: Option<String>,
+    pub store_uuid: String,
+}
+
+/// What [`Store::init`] writes, and the root checks it applies (as [`StoreOptions`]' fields of the
+/// same names do for `open`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreIdentityInit {
+    pub chain_id: u64,
+    pub router: Address,
+    pub prover: Address,
+    pub require_dedicated_mount: bool,
+    pub allow_any_filesystem: bool,
 }
 
 /// `identity.json`.
@@ -148,7 +168,8 @@ pub enum PinStatus {
     Unpinned,
     /// The key is pinned at `version`.
     Pinned { version: u32 },
-    /// A pin file exists for the key but cannot be read: every version of the key is protected.
+    /// A pin file exists but cannot be read, or a write or removal of the key's pin failed in this
+    /// process (so its state on disk is unknown): every version of the key is protected.
     Unreadable,
 }
 
@@ -215,7 +236,7 @@ pub struct Anomaly {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AnomalyKind {
-    /// A name or file type the layout does not produce.
+    /// A name or file type the layout does not produce (a symlink anywhere is one, never followed).
     UnexpectedEntry,
     /// A pin file whose record does not parse or does not match its name.
     UnreadablePin,
@@ -234,8 +255,6 @@ pub struct ScanReport {
 /// What `open` found and did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OpenReport {
-    /// The identity record was created by this open.
-    pub created: bool,
     /// Leftovers of interrupted writes removed from `tmp/`.
     pub tmp_entries_removed: usize,
     /// `next_version` was absent, unreadable or behind the highest version on disk, and was
@@ -267,15 +286,27 @@ pub(crate) struct VersionInfo {
     pub record: Result<BundleSummary, Defect>,
 }
 
+/// A key's pin as the store knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PinState {
+    /// A readable pin: read back from disk at open or a scan, or (`durable_here`) written and
+    /// fsynced by this `Store`. Only the latter lets an identical `pin` return without writing.
+    Readable { rec: PinRecord, durable_here: bool },
+    /// The file does not parse, or a write or removal of it failed: protects every version.
+    Unknown,
+}
+
 #[derive(Default)]
 pub(crate) struct State {
     /// Everything under the root except the contents of `tmp/`.
     pub durable: Usage,
     /// Contents of `tmp/`: writers in progress and anything a failed removal left.
     pub transient: Usage,
+    /// Bytes admitted to writers that are being written outside the lock: the free-space floor
+    /// counts them before `statvfs` can.
+    pub pending_bytes: u64,
     pub versions: BTreeMap<BundleRef, VersionInfo>,
-    /// `None`: the pin file exists but is unreadable.
-    pub pins: BTreeMap<BundleKey, Option<PinRecord>>,
+    pub pins: BTreeMap<BundleKey, PinState>,
     /// Readable versions referencing each ELF.
     pub elf_refs: HashMap<B256, u32>,
     /// In-memory holds ([`crate::ElfHold`]).
@@ -295,9 +326,23 @@ impl State {
     pub(crate) fn pin_status(&self, k: &BundleKey) -> PinStatus {
         match self.pins.get(k) {
             None => PinStatus::Unpinned,
-            Some(Some(p)) => PinStatus::Pinned { version: p.bundle_version },
-            Some(None) => PinStatus::Unreadable,
+            Some(PinState::Readable { rec, .. }) => PinStatus::Pinned { version: rec.bundle_version },
+            Some(PinState::Unknown) => PinStatus::Unreadable,
         }
+    }
+
+    pub(crate) fn readable_pins(&self) -> Vec<PinRecord> {
+        self.pins
+            .values()
+            .filter_map(|p| match p {
+                PinState::Readable { rec, .. } => Some(rec.clone()),
+                PinState::Unknown => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn unknown_pins(&self) -> Vec<BundleKey> {
+        self.pins.iter().filter(|(_, p)| **p == PinState::Unknown).map(|(k, _)| *k).collect()
     }
 
     pub(crate) fn key_versions(&self, k: &BundleKey) -> impl DoubleEndedIterator<Item = (&BundleRef, &VersionInfo)> {
@@ -365,7 +410,7 @@ impl State {
 #[derive(Default)]
 struct Loaded {
     versions: BTreeMap<BundleRef, VersionInfo>,
-    pins: BTreeMap<BundleKey, Option<PinRecord>>,
+    pins: BTreeMap<BundleKey, PinState>,
     anomalies: Vec<Anomaly>,
     durable: Usage,
     max_version: u32,
@@ -374,17 +419,19 @@ struct Loaded {
 pub(crate) struct Inner {
     pub root: PathBuf,
     root_id: (u64, u64),
-    root_dir: File,
+    /// The root, opened once: every path is walked from this fd.
+    pub root_dir: Dir,
     /// Holds the exclusive `flock` on `<root>/.lock` until the last reference is dropped.
     _lock: File,
     pub opts: StoreOptions,
     pub identity: StoreIdentity,
     pub open_report: OpenReport,
+    poisoned: AtomicBool,
     state: Mutex<State>,
 }
 
-/// The witness retention store (plan §15). Blocking (`std::fs`), `Send + Sync`, internally locked;
-/// call it from `spawn_blocking`. The `flock` on `<root>/.lock` is held until the `Store` and every
+/// The witness retention store (plan §15). Blocking, `Send + Sync`, internally locked; call it
+/// from `spawn_blocking`. The `flock` on `<root>/.lock` is held until the `Store` and every
 /// [`crate::BundleWriter`] and [`crate::ElfHold`] it handed out are dropped.
 pub struct Store {
     pub(crate) inner: Arc<Inner>,
@@ -396,72 +443,212 @@ impl std::fmt::Debug for Store {
     }
 }
 
+/// A failure to open a directory the layout requires: a symlink or a non-directory is a bad
+/// layout; anything else is an I/O error.
+pub(crate) fn dir_error(e: io::Error, path: &Path) -> StoreError {
+    if is_not_a_real_dir(&e) {
+        StoreError::layout(path)
+    } else {
+        StoreError::io(e, path)
+    }
+}
+
+/// A failure walking below `bundles/`: an absent directory is a missing entry (`missing`).
+fn below_bundles(e: io::Error, path: &Path, missing: &Path) -> StoreError {
+    if is_enoent(&e) {
+        StoreError::Missing { path: missing.to_path_buf() }
+    } else {
+        dir_error(e, path)
+    }
+}
+
 impl Inner {
     pub(crate) fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The root path still names the directory that was opened (not unmounted, not replaced).
-    pub(crate) fn check_root(&self) -> Result<(), StoreError> {
-        match fs::symlink_metadata(&self.root) {
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// The store can be used: not poisoned, and the root path still names the directory that was
+    /// opened (not unmounted, not replaced).
+    pub(crate) fn check_usable(&self) -> Result<(), StoreError> {
+        if self.is_poisoned() {
+            return Err(StoreError::unavailable(UnavailableKind::Poisoned, &self.root));
+        }
+        match std::fs::symlink_metadata(&self.root) {
             Ok(m) if (m.dev(), m.ino()) == self.root_id => Ok(()),
             Ok(_) => Err(StoreError::unavailable(UnavailableKind::RootChanged, &self.root)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                Err(StoreError::unavailable(UnavailableKind::RootAbsent, &self.root))
-            }
+            Err(e) if is_enoent(&e) => Err(StoreError::unavailable(UnavailableKind::RootAbsent, &self.root)),
             Err(e) => Err(StoreError::io(e, &self.root)),
         }
     }
 
-    pub(crate) fn tmp_dir(&self) -> PathBuf {
-        self.root.join(TMP)
+    /// Maps a failed mutating call. A failure after an earlier step of the same change had made it
+    /// visible, or an EIO (whose outcome is unknown), poisons the store: what is on disk may no
+    /// longer be what the store promised, and nothing will be fsynced again (fsyncgate).
+    pub(crate) fn failed(&self, e: io::Error, path: &Path, after_visible: bool) -> StoreError {
+        if after_visible || errno(&e) == Some(libc::EIO) {
+            self.poisoned.store(true, Ordering::Release);
+        }
+        StoreError::io(e, path)
     }
 
-    pub(crate) fn bundles_dir(&self) -> PathBuf {
-        self.root.join(BUNDLES)
+    fn staged(&self, s: Staged) -> StoreError {
+        self.failed(s.err, &s.path, s.visible)
     }
 
-    pub(crate) fn job_dir(&self, job_id: &B256) -> PathBuf {
-        self.bundles_dir().join(b256_name(job_id))
+    /// A top-level area: absent is `Unavailable(NotFound)`, a symlink or file `BadLayout`.
+    pub(crate) fn area(&self, name: &str) -> Result<Dir, StoreError> {
+        self.root_dir.sub(name).map_err(|e| {
+            let p = self.root.join(name);
+            if is_enoent(&e) {
+                StoreError::unavailable(UnavailableKind::NotFound, &p)
+            } else {
+                dir_error(e, &p)
+            }
+        })
     }
 
-    pub(crate) fn key_dir(&self, k: &BundleKey) -> PathBuf {
-        self.job_dir(&k.job_id).join(b256_name(&k.descriptor_hash)).join(addr_name(&k.prover))
+    pub(crate) fn tmp(&self) -> Result<Dir, StoreError> {
+        self.area(TMP)
     }
 
-    pub(crate) fn version_dir(&self, r: &BundleRef) -> PathBuf {
-        self.key_dir(&r.key()).join(version_name(r.version))
+    pub(crate) fn bundles(&self) -> Result<Dir, StoreError> {
+        self.area(BUNDLES)
     }
 
-    pub(crate) fn pins_dir(&self) -> PathBuf {
-        self.root.join(PINS)
+    pub(crate) fn pins_area(&self) -> Result<Dir, StoreError> {
+        self.area(PINS)
     }
 
-    pub(crate) fn pin_path(&self, k: &BundleKey) -> PathBuf {
-        self.pins_dir().join(pin_name(k))
+    pub(crate) fn elfs(&self) -> Result<Dir, StoreError> {
+        self.area(ELFS)
     }
 
-    pub(crate) fn elfs_dir(&self) -> PathBuf {
-        self.root.join(ELFS)
+    pub(crate) fn verdicts(&self) -> Result<Dir, StoreError> {
+        self.area(VERDICTS)
     }
 
-    pub(crate) fn elf_path(&self, image_id: &B256) -> PathBuf {
-        self.elfs_dir().join(elf_name(image_id))
+    pub(crate) fn key_path(&self, k: &BundleKey) -> PathBuf {
+        self.root
+            .join(BUNDLES)
+            .join(b256_name(&k.job_id))
+            .join(b256_name(&k.descriptor_hash))
+            .join(addr_name(&k.prover))
     }
 
-    pub(crate) fn verdicts_dir(&self) -> PathBuf {
-        self.root.join(VERDICTS)
+    pub(crate) fn version_path(&self, r: &BundleRef) -> PathBuf {
+        self.key_path(&r.key()).join(version_name(r.version))
     }
 
-    pub(crate) fn verdict_path(&self, job_id: &B256) -> PathBuf {
-        self.verdicts_dir().join(verdict_name(job_id))
+    fn walk(&self, names: &[String], missing: &Path) -> Result<Dir, StoreError> {
+        let mut d = self.bundles()?;
+        for name in names {
+            d = d.sub(name).map_err(|e| below_bundles(e, &d.child(name), missing))?;
+        }
+        Ok(d)
+    }
+
+    /// A key's directory, walked from the root without following any symlink: `Missing` when it
+    /// (or its job or descriptor directory) is absent, `Unavailable` when `bundles/` is, `BadLayout`
+    /// when any level is a symlink or not a directory.
+    pub(crate) fn open_key(&self, k: &BundleKey) -> Result<Dir, StoreError> {
+        let names = [b256_name(&k.job_id), b256_name(&k.descriptor_hash), addr_name(&k.prover)];
+        self.walk(&names, &self.key_path(k))
+    }
+
+    /// A version's directory, as [`Inner::open_key`].
+    pub(crate) fn open_version(&self, r: &BundleRef) -> Result<Dir, StoreError> {
+        let names =
+            [b256_name(&r.job_id), b256_name(&r.descriptor_hash), addr_name(&r.prover), version_name(r.version)];
+        self.walk(&names, &self.version_path(r))
+    }
+
+    /// A file of a version was absent: `Missing` when the version itself is gone meanwhile (evicted
+    /// or deleted while it was read), `Unavailable` when `bundles/` is, `Corrupt` only when the same
+    /// version directory is still there without the file.
+    pub(crate) fn vanished(&self, r: &BundleRef, vdir: &Dir, file: &Path) -> StoreError {
+        let now = match self.open_version(r) {
+            Ok(d) => d,
+            Err(e) => return e,
+        };
+        match (now.fstat(), vdir.fstat()) {
+            (Ok(a), Ok(b)) if (a.dev, a.ino) == (b.dev, b.ino) => StoreError::corrupt(Defect::FileMissing, file),
+            // Another directory took the version's name meanwhile: never a verdict on this bundle.
+            (Ok(_), Ok(_)) => StoreError::unavailable(UnavailableKind::NotFound, file),
+            (Err(e), _) | (_, Err(e)) => StoreError::io(e, file),
+        }
+    }
+
+    /// Reads and parses a version's `bundle.json` through its directory fd, checking its format and
+    /// that it belongs where it is stored (key and version). Returns it with the sha256 of its bytes.
+    pub(crate) fn load_record_in(&self, vdir: &Dir, r: &BundleRef) -> Result<(BundleV1, B256), StoreError> {
+        let p = vdir.child(BUNDLE_JSON);
+        let bytes = match read_capped(vdir, BUNDLE_JSON, MAX_BUNDLE_JSON_BYTES) {
+            Ok(b) => b,
+            Err(ReadError::Io(e)) if is_enoent(&e) => return Err(self.vanished(r, vdir, &p)),
+            Err(e) => return Err(entry_read_error(e, &p)),
+        };
+        let b: BundleV1 = serde_json::from_slice(&bytes).map_err(|_| StoreError::corrupt(Defect::Unparseable, &p))?;
+        if b.format_version != BUNDLE_FORMAT_VERSION {
+            return Err(StoreError::corrupt(Defect::FormatVersion, &p));
+        }
+        if BundleKey::of_bundle(&b) != r.key() {
+            return Err(StoreError::corrupt(Defect::KeyMismatch, &p));
+        }
+        if b.version != r.version {
+            return Err(StoreError::corrupt(Defect::VersionMismatch, &p));
+        }
+        Ok((b, sha256(&bytes)))
+    }
+
+    /// `w.bin` is a regular file of `w_len` bytes (no hashing).
+    pub(crate) fn check_w_in(&self, vdir: &Dir, r: &BundleRef, w_len: u64) -> Result<(), StoreError> {
+        let p = vdir.child(W_BIN);
+        match vdir.stat(W_BIN) {
+            Ok(s) if s.kind == Kind::File && s.len == w_len => Ok(()),
+            Ok(s) if s.kind == Kind::File => Err(StoreError::corrupt(Defect::WLength, &p)),
+            Ok(_) => Err(StoreError::corrupt(Defect::NotRegularFile, &p)),
+            Err(e) if is_enoent(&e) => Err(self.vanished(r, vdir, &p)),
+            Err(e) => Err(StoreError::io(e, &p)),
+        }
+    }
+
+    /// A read through a pin: the pinned version must still be the bundle the pin was taken on.
+    pub(crate) fn check_pin(
+        pins: &BTreeMap<BundleKey, PinState>,
+        r: &BundleRef,
+        b: &BundleV1,
+        json_sha256: B256,
+        path: &Path,
+    ) -> Result<(), StoreError> {
+        if let Some(PinState::Readable { rec, .. }) = pins.get(&r.key()) {
+            if rec.bundle_version == r.version
+                && (rec.input_sha256 != b.input_sha256 || rec.bundle_json_sha256 != json_sha256)
+            {
+                return Err(StoreError::corrupt(Defect::PinMismatch, path));
+            }
+        }
+        Ok(())
+    }
+
+    /// A version's directory and record, checked for reading: location, key, version, and its pin
+    /// when it is the pinned version. Takes the state lock briefly.
+    pub(crate) fn read_version(&self, r: &BundleRef) -> Result<(Dir, BundleV1), StoreError> {
+        let vdir = self.open_version(r)?;
+        let (b, js) = self.load_record_in(&vdir, r)?;
+        Inner::check_pin(&self.state().pins, r, &b, js, &vdir.child(BUNDLE_JSON))?;
+        Ok((vdir, b))
     }
 
     fn avail_bytes(&self) -> Result<u64, StoreError> {
-        fs_avail_bytes(&self.root_dir).map_err(|e| StoreError::io(e, &self.root))
+        self.root_dir.avail_bytes().map_err(|e| StoreError::io(e, &self.root))
     }
 
-    /// Refuses a write of `add` that would cross the quota or the free-space floor.
+    /// Refuses a write of `add` that would cross the quota or the free-space floor. The floor
+    /// counts bytes already admitted to concurrent writers but not yet on disk.
     pub(crate) fn admit(&self, st: &State, add: Usage) -> Result<(), StoreError> {
         let used = st.total();
         if used.bytes.saturating_add(add.bytes) > self.opts.quota_bytes {
@@ -470,7 +657,8 @@ impl Inner {
         if used.inodes.saturating_add(add.inodes) > self.opts.quota_inodes {
             return Err(StoreError::RetentionFull(FullReason::QuotaInodes));
         }
-        if self.avail_bytes()? < self.opts.free_space_floor_bytes.saturating_add(add.bytes) {
+        let avail = self.avail_bytes()?.saturating_sub(st.pending_bytes);
+        if avail < self.opts.free_space_floor_bytes.saturating_add(add.bytes) {
             return Err(StoreError::RetentionFull(FullReason::FreeSpaceFloor));
         }
         Ok(())
@@ -479,148 +667,169 @@ impl Inner {
     /// Bytes that can still be written before the quota or the floor.
     pub(crate) fn headroom(&self, st: &State) -> Result<u64, StoreError> {
         let quota = self.opts.quota_bytes.saturating_sub(st.total().bytes);
-        let fs = self.avail_bytes()?.saturating_sub(self.opts.free_space_floor_bytes);
+        let fs = self
+            .avail_bytes()?
+            .saturating_sub(st.pending_bytes)
+            .saturating_sub(self.opts.free_space_floor_bytes);
         Ok(quota.min(fs))
     }
 
     /// Replaces `dir/name` atomically and durably: the bytes go to a fresh file under `tmp/`, which
-    /// is fsynced, renamed over the destination, and the destination directory fsynced.
+    /// is fsynced, renamed over the destination, and the destination directory fsynced. A failure
+    /// after the rename poisons the store.
     pub(crate) fn write_atomic(
         &self,
         st: &mut State,
-        dir: &Path,
+        dir: &Dir,
         name: &str,
         bytes: &[u8],
         mode: u32,
     ) -> Result<(), StoreError> {
-        let dest = dir.join(name);
-        let old = match fs::symlink_metadata(&dest) {
-            Ok(m) if m.is_file() => Some(m.len()),
-            Ok(_) => return Err(StoreError::corrupt(Defect::NotRegularFile, &dest)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        let dest = dir.child(name);
+        let old = match dir.stat_opt(name) {
+            Ok(Some(s)) if s.kind == Kind::File => Some(s.len),
+            Ok(Some(_)) => return Err(StoreError::layout(&dest)),
+            Ok(None) => None,
             Err(e) => return Err(StoreError::io(e, &dest)),
         };
-        let tmp = self.tmp_dir();
-        let part = tmp.join(format!("{}.part", random_name().map_err(|e| StoreError::io(e, &tmp))?));
-        let res = (|| -> io::Result<()> {
-            let mut f = create_new(&part)?;
-            f.write_all(bytes)?;
-            f.set_permissions(fs::Permissions::from_mode(mode))?;
-            f.sync_all()?;
-            fs::rename(&part, &dest)
-        })();
-        if let Err(e) = res {
-            let _ = fs::remove_file(&part);
-            return Err(StoreError::io(e, &dest));
-        }
-        match old {
-            Some(o) => {
-                st.durable.sub(Usage::new(o, 0));
-                st.durable.add(Usage::new(bytes.len() as u64, 0));
+        let tmp = self.tmp()?;
+        let res = write_file_atomic(&tmp, dir, name, bytes, mode);
+        if res.as_ref().map_or_else(|s| s.visible, |()| true) {
+            match old {
+                Some(o) => {
+                    st.durable.sub(Usage::new(o, 0));
+                    st.durable.add(Usage::new(bytes.len() as u64, 0));
+                }
+                None => st.durable.add(Usage::new(bytes.len() as u64, 1)),
             }
-            None => st.durable.add(Usage::new(bytes.len() as u64, 1)),
         }
-        fsync_dir(dir).map_err(|e| StoreError::io(e, dir))
+        res.map_err(|s| self.staged(s))
     }
 
-    /// Creates `dir` if absent and makes its entry durable in its parent.
-    pub(crate) fn ensure_dir(&self, st: &mut State, dir: &Path) -> Result<(), StoreError> {
-        match fs::DirBuilder::new().mode(0o700).create(dir) {
-            Ok(()) => {
-                st.durable.add(Usage::new(0, 1));
-                let parent = dir.parent().unwrap_or(&self.root);
-                fsync_dir(parent).map_err(|e| StoreError::io(e, parent))
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match fs::symlink_metadata(dir) {
-                Ok(m) if m.is_dir() => Ok(()),
-                Ok(_) => Err(StoreError::corrupt(Defect::NotDirectory, dir)),
-                Err(e) => Err(StoreError::io(e, dir)),
-            },
-            Err(e) => Err(StoreError::io(e, dir)),
+    /// Opens `parent/name`, creating it if absent; a new directory's entry is fsynced into its
+    /// parent before it is used.
+    pub(crate) fn ensure_sub(&self, st: &mut State, parent: &Dir, name: &str) -> Result<Dir, StoreError> {
+        let path = parent.child(name);
+        match parent.sub(name) {
+            Ok(d) => return Ok(d),
+            Err(e) if is_enoent(&e) => {}
+            Err(e) => return Err(dir_error(e, &path)),
         }
+        self.admit(st, Usage::new(0, 1))?;
+        parent.mkdir(name).map_err(|e| self.failed(e, &path, false))?;
+        st.durable.add(Usage::new(0, 1));
+        parent.fsync().map_err(|e| self.failed(e, parent.path(), true))?;
+        parent.sub(name).map_err(|e| dir_error(e, &path))
     }
 
-    /// Removes a file or a tree as one step: it is renamed into `tmp/` (so nothing partial is ever
-    /// visible under its name), its old parent fsynced, then deleted.
-    pub(crate) fn remove_entry(&self, st: &mut State, path: &Path) -> Result<Usage, StoreError> {
-        let u = tree_usage(path).map_err(|e| StoreError::io(e, path))?;
-        let tmp = self.tmp_dir();
-        let grave = tmp.join(format!("{}.del", random_name().map_err(|e| StoreError::io(e, &tmp))?));
-        fs::rename(path, &grave).map_err(|e| StoreError::io(e, path))?;
+    /// The next store-wide version number, durably reserved: the counter is written (temp file,
+    /// fsync, rename, fsync of the root) before the number is used, so no number is ever reused.
+    pub(crate) fn reserve_version(&self, st: &mut State) -> Result<u32, StoreError> {
+        let v = st.next_version;
+        let next = v.checked_add(1).ok_or(StoreError::Rejected(Reject::VersionsExhausted))?;
+        self.write_atomic(st, &self.root_dir, NEXT_VERSION, next.to_string().as_bytes(), 0o600)?;
+        st.next_version = next;
+        Ok(v)
+    }
+
+    /// Removes `parent/name` (with `dir`, a directory tree) as one step: it is renamed into `tmp/`
+    /// (nothing partial is ever visible under its name), `on_renamed` updates the index at once, the
+    /// old parent is fsynced, and only then are the contents deleted. `Ok(None)` when it is already
+    /// gone. A directory entry must be a real directory, a file entry must not be a directory
+    /// (`BadLayout` otherwise); a symlink is removed as itself, never followed.
+    pub(crate) fn remove_entry(
+        &self,
+        st: &mut State,
+        parent: &Dir,
+        name: &str,
+        dir: bool,
+        on_renamed: &mut dyn FnMut(&mut State),
+    ) -> Result<Option<Usage>, StoreError> {
+        let path = parent.child(name);
+        let s = match parent.stat_opt(name) {
+            Ok(Some(s)) => s,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(StoreError::io(e, &path)),
+        };
+        if (s.kind == Kind::Dir) != dir {
+            return Err(StoreError::layout(&path));
+        }
+        let u = match parent.tree_usage(name) {
+            Ok(u) => u,
+            Err(e) if is_enoent(&e) => return Ok(None),
+            Err(e) => return Err(StoreError::io(e, &path)),
+        };
+        let tmp = self.tmp()?;
+        let grave = format!("{}.del", crate::fsutil::random_name().map_err(|e| StoreError::io(e, tmp.path()))?);
+        match parent.rename_to(name, &tmp, &grave, true) {
+            Ok(()) => {}
+            Err(e) if is_enoent(&e) => return Ok(None),
+            Err(e) => return Err(self.failed(e, &path, false)),
+        }
         st.durable.sub(u);
-        if let Err(e) = remove_any(&grave) {
-            // What is left is real usage until the next open cleans `tmp/`.
-            if let Ok(left) = tree_usage_opt(&grave) {
-                st.transient.add(left);
-            }
-            return Err(StoreError::io(e, &grave));
+        st.transient.add(u);
+        on_renamed(st);
+        parent.fsync().map_err(|e| self.failed(e, parent.path(), true))?;
+        let res = tmp.remove_tree(&grave);
+        st.transient.sub(u);
+        // What a failed removal left is real usage until the next open empties `tmp/`.
+        if let Ok(left) = tmp.tree_usage_opt(&grave) {
+            st.transient.add(left);
         }
-        let parent = path.parent().unwrap_or(&self.root);
-        fsync_dir(parent).map_err(|e| StoreError::io(e, parent))?;
-        Ok(u)
+        res.map_err(|e| self.failed(e, &tmp.child(&grave), false))?;
+        Ok(Some(u))
     }
 
-    /// Removes the key's directory and its parents while they are empty.
+    /// Removes the key's directory and its parents while they are empty, never through a symlink.
     pub(crate) fn prune_empty(&self, st: &mut State, k: &BundleKey) -> Result<(), StoreError> {
-        let prover = self.key_dir(k);
-        let desc = prover.parent().expect("descriptor dir").to_path_buf();
-        let job = desc.parent().expect("job dir").to_path_buf();
-        for d in [prover, desc, job] {
-            match fs::remove_dir(&d) {
-                Ok(()) => st.durable.sub(Usage::new(0, 1)),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTEMPTY) | Some(libc::EEXIST)) => return Ok(()),
-                Err(e) => return Err(StoreError::io(e, &d)),
+        let bundles = self.bundles()?;
+        let (jn, dn, pn) = (b256_name(&k.job_id), b256_name(&k.descriptor_hash), addr_name(&k.prover));
+        let Some(job) = self.real_sub(&bundles, &jn)? else { return Ok(()) };
+        if let Some(desc) = self.real_sub(&job, &dn)? {
+            if !self.rmdir_if_empty(st, &desc, &pn)? {
+                return Ok(());
             }
+        }
+        if self.rmdir_if_empty(st, &job, &dn)? {
+            self.rmdir_if_empty(st, &bundles, &jn)?;
         }
         Ok(())
     }
 
-    /// Reads and parses a version's `bundle.json`, checking its format and that it belongs where it
-    /// is stored. An absent version directory is [`StoreError::Missing`]; a version directory
-    /// without a readable record is [`StoreError::Corrupt`].
-    pub(crate) fn load_record(&self, r: &BundleRef) -> Result<BundleV1, StoreError> {
-        let vdir = self.version_dir(r);
-        match fs::symlink_metadata(&vdir) {
-            Ok(m) if m.is_dir() => {}
-            Ok(_) => return Err(StoreError::corrupt(Defect::NotDirectory, &vdir)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // A vanished bundles area is an unavailable store, not a missing bundle.
-                let b = self.bundles_dir();
-                fs::symlink_metadata(&b).map_err(|e| StoreError::io(e, &b))?;
-                return Err(StoreError::Missing { path: vdir });
+    /// `parent/name` when it is a real directory; `None` when absent or not one.
+    fn real_sub(&self, parent: &Dir, name: &str) -> Result<Option<Dir>, StoreError> {
+        match parent.sub(name) {
+            Ok(d) => Ok(Some(d)),
+            Err(e) if is_enoent(&e) || is_not_a_real_dir(&e) => Ok(None),
+            Err(e) => Err(StoreError::io(e, &parent.child(name))),
+        }
+    }
+
+    /// Removes an empty directory: `true` when it is gone, `false` when it is not empty or not a
+    /// directory.
+    fn rmdir_if_empty(&self, st: &mut State, parent: &Dir, name: &str) -> Result<bool, StoreError> {
+        match parent.rmdir(name) {
+            Ok(()) => {
+                st.durable.sub(Usage::new(0, 1));
+                Ok(true)
             }
-            Err(e) => return Err(StoreError::io(e, &vdir)),
-        }
-        let p = vdir.join(BUNDLE_JSON);
-        let bytes = read_capped(&p, MAX_BUNDLE_JSON_BYTES).map_err(|e| entry_read_error(e, &p))?;
-        let b: BundleV1 = serde_json::from_slice(&bytes).map_err(|_| StoreError::corrupt(Defect::Unparseable, &p))?;
-        if b.format_version != BUNDLE_FORMAT_VERSION {
-            return Err(StoreError::corrupt(Defect::FormatVersion, &p));
-        }
-        if BundleKey::of_bundle(&b) != r.key() {
-            return Err(StoreError::corrupt(Defect::KeyMismatch, &p));
-        }
-        Ok(b)
-    }
-
-    /// `w.bin` is a regular file of `w_len` bytes (no hashing).
-    pub(crate) fn check_w_file(&self, r: &BundleRef, w_len: u64) -> Result<(), StoreError> {
-        let p = self.version_dir(r).join(W_BIN);
-        match fs::symlink_metadata(&p) {
-            Ok(m) if m.is_file() && m.len() == w_len => Ok(()),
-            Ok(m) if m.is_file() => Err(StoreError::corrupt(Defect::WLength, &p)),
-            Ok(_) => Err(StoreError::corrupt(Defect::NotRegularFile, &p)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(StoreError::corrupt(Defect::FileMissing, &p)),
-            Err(e) => Err(StoreError::io(e, &p)),
+            Err(e) if is_enoent(&e) => Ok(true),
+            Err(e) if matches!(errno(&e), Some(libc::ENOTEMPTY | libc::EEXIST | libc::ENOTDIR)) => Ok(false),
+            Err(e) => Err(self.failed(e, &parent.child(name), false)),
         }
     }
 
-    /// The scan's view of one version: its summary, or why it is unreadable. I/O errors other than
-    /// corruption make the whole scan fail (the store is unavailable).
-    fn summarize(&self, r: &BundleRef) -> Result<Result<BundleSummary, Defect>, StoreError> {
-        let res = self.load_record(r).and_then(|b| {
-            self.check_w_file(r, b.w_len)?;
+    /// The scan's view of one version: its summary, or why it is unreadable. I/O errors (the store
+    /// is unavailable) fail the whole scan.
+    fn summarize(
+        &self,
+        vdir: &Dir,
+        r: &BundleRef,
+        pins: &BTreeMap<BundleKey, PinState>,
+    ) -> Result<Result<BundleSummary, Defect>, StoreError> {
+        let res = self.load_record_in(vdir, r).and_then(|(b, js)| {
+            self.check_w_in(vdir, r, b.w_len)?;
+            Inner::check_pin(pins, r, &b, js, &vdir.child(BUNDLE_JSON))?;
             Ok(b)
         });
         match res {
@@ -631,22 +840,22 @@ impl Inner {
         }
     }
 
-    /// Walks the store: usage, every version, every pin.
+    /// Walks the store: usage, every pin, every version.
     fn load(&self) -> Result<Loaded, StoreError> {
         let mut l = Loaded::default();
         for name in OWNED {
-            let p = self.root.join(name);
+            let io = |e| StoreError::io(e, &self.root.join(name));
             if name == TMP {
                 // `tmp/` itself is durable; its contents are transient.
-                if fs::symlink_metadata(&p).is_ok() {
+                if self.root_dir.stat_opt(TMP).map_err(io)?.is_some() {
                     l.durable.add(Usage::new(0, 1));
                 }
                 continue;
             }
-            l.durable.add(tree_usage_opt(&p).map_err(|e| StoreError::io(e, &p))?);
+            l.durable.add(self.root_dir.tree_usage_opt(name).map_err(io)?);
         }
-        self.load_bundles(&mut l)?;
         self.load_pins(&mut l)?;
+        self.load_bundles(&mut l)?;
         Ok(l)
     }
 
@@ -654,29 +863,43 @@ impl Inner {
         fn unexpected(l: &mut Loaded, path: PathBuf) {
             l.anomalies.push(Anomaly { path, kind: AnomalyKind::UnexpectedEntry });
         }
-        for (jn, jp, jd) in entries(&self.bundles_dir())? {
-            let Some(job_id) = jn.as_deref().and_then(parse_b256_name).filter(|_| jd) else {
-                unexpected(l, jp);
-                continue;
+        /// The subdirectory for an entry whose name parses; an anomaly otherwise (a symlink is one).
+        fn descend<T>(
+            l: &mut Loaded,
+            parent: &Dir,
+            e: &Entry,
+            parse: impl Fn(&str) -> Option<T>,
+        ) -> Result<Option<(T, Dir)>, StoreError> {
+            let p = parent.child(&e.name);
+            let Some(v) = e.utf8().and_then(parse).filter(|_| e.kind == Kind::Dir) else {
+                unexpected(l, p);
+                return Ok(None);
             };
-            for (dn, dp, dd) in entries(&jp)? {
-                let Some(descriptor_hash) = dn.as_deref().and_then(parse_b256_name).filter(|_| dd) else {
-                    unexpected(l, dp);
-                    continue;
-                };
-                for (pn, pp, pd) in entries(&dp)? {
-                    let Some(prover) = pn.as_deref().and_then(parse_addr_name).filter(|_| pd) else {
-                        unexpected(l, pp);
-                        continue;
-                    };
-                    for (vn, vp, vd) in entries(&pp)? {
-                        let Some(version) = vn.as_deref().and_then(parse_version_name).filter(|_| vd) else {
-                            unexpected(l, vp);
+            match parent.sub(&e.name) {
+                Ok(d) => Ok(Some((v, d))),
+                Err(err) if is_enoent(&err) => Ok(None),
+                Err(err) if is_not_a_real_dir(&err) => {
+                    unexpected(l, p);
+                    Ok(None)
+                }
+                Err(err) => Err(StoreError::io(err, &p)),
+            }
+        }
+        let list = |d: &Dir| d.entries().map_err(|e| StoreError::io(e, d.path()));
+        let bundles = self.bundles()?;
+        for je in list(&bundles)? {
+            let Some((job_id, job)) = descend(l, &bundles, &je, parse_b256_name)? else { continue };
+            for de in list(&job)? {
+                let Some((descriptor_hash, desc)) = descend(l, &job, &de, parse_b256_name)? else { continue };
+                for pe in list(&desc)? {
+                    let Some((prover, key_dir)) = descend(l, &desc, &pe, parse_addr_name)? else { continue };
+                    for ve in list(&key_dir)? {
+                        let Some((version, vdir)) = descend(l, &key_dir, &ve, parse_version_name)? else {
                             continue;
                         };
                         let r = BundleRef { job_id, descriptor_hash, prover, version };
-                        let usage = tree_usage(&vp).map_err(|e| StoreError::io(e, &vp))?;
-                        let record = self.summarize(&r)?;
+                        let usage = key_dir.tree_usage(&ve.name).map_err(|e| StoreError::io(e, vdir.path()))?;
+                        let record = self.summarize(&vdir, &r, &l.pins)?;
                         l.max_version = l.max_version.max(version);
                         l.versions.insert(r, VersionInfo { usage, record });
                     }
@@ -687,44 +910,39 @@ impl Inner {
     }
 
     fn load_pins(&self, l: &mut Loaded) -> Result<(), StoreError> {
-        for (n, p, _) in entries(&self.pins_dir())? {
-            let Some(key) = n.as_deref().and_then(parse_pin_name) else {
+        let pins = self.pins_area()?;
+        for e in pins.entries().map_err(|e| StoreError::io(e, pins.path()))? {
+            let p = pins.child(&e.name);
+            let Some(key) = e.utf8().and_then(parse_pin_name) else {
                 l.anomalies.push(Anomaly { path: p, kind: AnomalyKind::UnexpectedEntry });
                 continue;
             };
-            let rec = match read_capped(&p, MAX_SMALL_RECORD_BYTES) {
+            let rec = match read_capped(&pins, &e.name, MAX_SMALL_RECORD_BYTES) {
                 Ok(b) => serde_json::from_slice::<PinRecord>(&b).ok().filter(|r| BundleKey::of_pin(r) == key),
-                Err(ReadError::Io(e)) => return Err(StoreError::io(e, &p)),
+                Err(ReadError::Io(err)) if is_enoent(&err) => continue,
+                Err(ReadError::Io(err)) => return Err(StoreError::io(err, &p)),
                 Err(ReadError::TooLarge | ReadError::NotRegular) => None,
             };
-            if rec.is_none() {
-                l.anomalies.push(Anomaly { path: p, kind: AnomalyKind::UnreadablePin });
-            }
-            l.pins.insert(key, rec);
+            let state = match rec {
+                Some(rec) => PinState::Readable { rec, durable_here: false },
+                None => {
+                    l.anomalies.push(Anomaly { path: p, kind: AnomalyKind::UnreadablePin });
+                    PinState::Unknown
+                }
+            };
+            l.pins.insert(key, state);
         }
         Ok(())
     }
 }
 
-/// A directory's entries: (UTF-8 name, path, is a directory — symlinks are not followed).
-pub(crate) fn entries(p: &Path) -> Result<Vec<(Option<String>, PathBuf, bool)>, StoreError> {
-    let rd = fs::read_dir(p).map_err(|e| StoreError::io(e, p))?;
-    let mut out = Vec::new();
-    for e in rd {
-        let e = e.map_err(|e| StoreError::io(e, p))?;
-        let path = e.path();
-        let is_dir = e.file_type().map_err(|err| StoreError::io(err, &path))?.is_dir();
-        out.push((e.file_name().into_string().ok(), path, is_dir));
-    }
-    Ok(out)
-}
-
-/// A read of a file a complete entry must hold: absence is corruption, not a missing entry.
+/// A read of a file a complete entry must hold: absence is corruption, not a missing entry (the
+/// caller has already ruled out the entry itself being gone).
 pub(crate) fn entry_read_error(e: ReadError, p: &Path) -> StoreError {
     match e {
         ReadError::TooLarge => StoreError::corrupt(Defect::TooLarge, p),
         ReadError::NotRegular => StoreError::corrupt(Defect::NotRegularFile, p),
-        ReadError::Io(e) if e.kind() == io::ErrorKind::NotFound => StoreError::corrupt(Defect::FileMissing, p),
+        ReadError::Io(e) if is_enoent(&e) => StoreError::corrupt(Defect::FileMissing, p),
         ReadError::Io(e) => StoreError::io(e, p),
     }
 }
@@ -761,157 +979,227 @@ pub(crate) fn finalize(h: Sha256) -> B256 {
     B256::from(<[u8; 32]>::from(h.finalize()))
 }
 
-fn is_uninitialised(root: &Path) -> Result<bool, StoreError> {
-    for (n, _, _) in entries(root)? {
-        if !matches!(n.as_deref(), Some(LOCK | LOST_FOUND | TMP)) {
-            return Ok(false);
-        }
+/// Streams `f` to its end into both hashers; returns the bytes read.
+pub(crate) fn hash_into(f: &mut File, w_hash: &mut Sha256, input_hash: &mut Sha256) -> io::Result<u64> {
+    let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
+    let mut total = 0u64;
+    loop {
+        let n = match f.read(&mut buf) {
+            Ok(0) => return Ok(total),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        w_hash.update(&buf[..n]);
+        input_hash.update(&buf[..n]);
+        total += n as u64;
     }
-    Ok(true)
 }
 
-/// Verifies `identity.json`, or creates it in an uninitialised root when `create` allows.
-fn identity(root: &Path, want: &ExpectedIdentity, create: bool) -> Result<(StoreIdentity, bool), StoreError> {
+/// The root checks shared by `open` and `init`: a real directory (never a symlink) on an accepted
+/// filesystem and, when required, a mount point. Writes nothing.
+fn open_root(root: &Path, require_dedicated_mount: bool, allow_any_filesystem: bool) -> Result<(Dir, (u64, u64)), StoreError> {
+    let unavailable = |kind| StoreError::unavailable(kind, root);
+    match std::fs::symlink_metadata(root) {
+        Ok(m) if m.file_type().is_symlink() => return Err(unavailable(UnavailableKind::SymlinkRoot)),
+        Ok(m) if !m.is_dir() => return Err(unavailable(UnavailableKind::NotADirectory)),
+        Ok(_) => {}
+        Err(e) if is_enoent(&e) => return Err(unavailable(UnavailableKind::RootAbsent)),
+        Err(e) => return Err(StoreError::io(e, root)),
+    }
+    let dir = Dir::open_path(root).map_err(|e| match errno(&e) {
+        Some(libc::ELOOP) => unavailable(UnavailableKind::SymlinkRoot),
+        Some(libc::ENOTDIR) => unavailable(UnavailableKind::NotADirectory),
+        Some(libc::ENOENT) => unavailable(UnavailableKind::RootAbsent),
+        _ => StoreError::io(e, root),
+    })?;
+    let f_type = dir.fs_type().map_err(|e| StoreError::io(e, root))?;
+    if !allow_any_filesystem && !supported_fs_type(f_type) {
+        return Err(unavailable(UnavailableKind::UnsupportedFilesystem { f_type }));
+    }
+    let st = dir.fstat().map_err(|e| StoreError::io(e, root))?;
+    if require_dedicated_mount && !is_mount_root(&dir).map_err(|e| StoreError::io(e, root))? {
+        return Err(unavailable(UnavailableKind::NotMounted));
+    }
+    Ok((dir, (st.dev, st.ino)))
+}
+
+/// The directory is the root of a mounted filesystem: its `st_dev` differs from its parent's.
+pub(crate) fn is_mount_root(dir: &Dir) -> io::Result<bool> {
+    Ok(dir.fstat()?.dev != dir.parent_stat()?.dev)
+}
+
+/// Takes the exclusive `flock` on `.lock`, opened (with `create`, created) without following a
+/// symlink; anything but a regular file there is a bad layout.
+fn take_lock(root: &Path, dir: &Dir, create: bool) -> Result<File, StoreError> {
+    let lock_path = root.join(LOCK);
+    let lock = match dir.open_lock(LOCK, create) {
+        Ok(f) => f,
+        Err(e) if is_enoent(&e) => {
+            // Not an initialised store (an unmounted mount point looks like this): never written to.
+            let has_identity = dir.stat_opt(IDENTITY).map_err(|e| StoreError::io(e, root))?.is_some();
+            let kind = if has_identity { UnavailableKind::BadLayout } else { UnavailableKind::IdentityMissing };
+            return Err(StoreError::unavailable(kind, if has_identity { &lock_path } else { root }));
+        }
+        Err(e) if matches!(errno(&e), Some(libc::ELOOP | libc::EISDIR | libc::ENXIO | libc::ENOTDIR)) => {
+            return Err(StoreError::layout(&lock_path))
+        }
+        Err(e) => return Err(StoreError::io(e, &lock_path)),
+    };
+    if fstat(lock.as_raw_fd()).map_err(|e| StoreError::io(e, &lock_path))?.kind != Kind::File {
+        return Err(StoreError::layout(&lock_path));
+    }
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(TryLockError::WouldBlock) => Err(StoreError::unavailable(UnavailableKind::LockHeld, root)),
+        Err(TryLockError::Error(e)) => Err(StoreError::io(e, &lock_path)),
+    }
+}
+
+/// Reads and checks `identity.json` against what this miner expects.
+fn read_identity(root: &Path, dir: &Dir, want: &ExpectedIdentity) -> Result<StoreIdentity, StoreError> {
     let p = root.join(IDENTITY);
     let unavailable = |kind| StoreError::unavailable(kind, &p);
-    match read_capped(&p, MAX_SMALL_RECORD_BYTES) {
-        Ok(bytes) => {
-            let f: IdentityFile =
-                serde_json::from_slice(&bytes).map_err(|_| unavailable(UnavailableKind::IdentityInvalid))?;
-            if f.store_format != STORE_FORMAT_VERSION || !is_uuid(&f.store_uuid) {
-                return Err(unavailable(UnavailableKind::IdentityInvalid));
-            }
-            let mismatch = f.chain_id != want.chain_id
-                || f.router != want.router
-                || f.prover != want.prover
-                || want.store_uuid.as_ref().is_some_and(|u| *u != f.store_uuid);
-            if mismatch {
-                return Err(unavailable(UnavailableKind::IdentityMismatch));
-            }
-            let id = StoreIdentity { store_uuid: f.store_uuid, chain_id: f.chain_id, router: f.router, prover: f.prover };
-            Ok((id, false))
-        }
-        Err(ReadError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
-            if !create || want.store_uuid.is_some() || !is_uninitialised(root)? {
-                return Err(unavailable(UnavailableKind::IdentityMissing));
-            }
-            let f = IdentityFile {
-                store_format: STORE_FORMAT_VERSION,
-                store_uuid: uuid_v4().map_err(|e| StoreError::io(e, root))?,
-                chain_id: want.chain_id,
-                router: want.router,
-                prover: want.prover,
-            };
-            let json = serde_json::to_vec_pretty(&f).expect("identity serializes");
-            let tmp = root.join(TMP);
-            let res = (|| -> io::Result<()> {
-                match fs::DirBuilder::new().mode(0o700).create(&tmp) {
-                    Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
-                    _ => {}
-                }
-                let part = tmp.join(format!("{}.part", random_name()?));
-                let mut w = create_new(&part)?;
-                w.write_all(&json)?;
-                w.set_permissions(fs::Permissions::from_mode(0o444))?;
-                w.sync_all()?;
-                fs::rename(&part, &p)?;
-                fsync_dir(root)
-            })();
-            res.map_err(|e| StoreError::io(e, &p))?;
-            let id = StoreIdentity { store_uuid: f.store_uuid, chain_id: f.chain_id, router: f.router, prover: f.prover };
-            Ok((id, true))
-        }
-        Err(ReadError::Io(e)) => Err(StoreError::io(e, &p)),
-        Err(ReadError::TooLarge | ReadError::NotRegular) => Err(unavailable(UnavailableKind::IdentityInvalid)),
+    let bytes = match read_capped(dir, IDENTITY, MAX_SMALL_RECORD_BYTES) {
+        Ok(b) => b,
+        Err(ReadError::Io(e)) if is_enoent(&e) => return Err(unavailable(UnavailableKind::IdentityMissing)),
+        Err(ReadError::Io(e)) => return Err(StoreError::io(e, &p)),
+        Err(ReadError::TooLarge | ReadError::NotRegular) => return Err(unavailable(UnavailableKind::IdentityInvalid)),
+    };
+    let f: IdentityFile = serde_json::from_slice(&bytes).map_err(|_| unavailable(UnavailableKind::IdentityInvalid))?;
+    if f.store_format != STORE_FORMAT_VERSION || !is_uuid(&f.store_uuid) {
+        return Err(unavailable(UnavailableKind::IdentityInvalid));
     }
+    if f.chain_id != want.chain_id || f.router != want.router || f.prover != want.prover || f.store_uuid != want.store_uuid
+    {
+        return Err(unavailable(UnavailableKind::IdentityMismatch));
+    }
+    Ok(StoreIdentity { store_uuid: f.store_uuid, chain_id: f.chain_id, router: f.router, prover: f.prover })
+}
+
+/// `init` may run here: no identity yet, and nothing but `.lock`, `lost+found` and what an
+/// interrupted `init` leaves (empty areas, any `tmp/`, `next_version`).
+fn initialisable(root: &Path, dir: &Dir) -> Result<(), StoreError> {
+    let io = |e, p: &Path| StoreError::io(e, p);
+    for e in dir.entries().map_err(|e| io(e, root))? {
+        let empty_area = |a: &str| -> Result<bool, StoreError> {
+            let d = dir.sub(a).map_err(|e| dir_error(e, &root.join(a)))?;
+            Ok(a == TMP || d.entries().map_err(|e| io(e, d.path()))?.is_empty())
+        };
+        match (e.utf8(), e.kind) {
+            (Some(LOCK | LOST_FOUND), _) => {}
+            (Some(IDENTITY), _) => return Err(StoreError::Rejected(Reject::AlreadyInitialised)),
+            (Some(NEXT_VERSION), Kind::File) => {}
+            (Some(a), Kind::Dir) if AREAS.contains(&a) && empty_area(a)? => {}
+            _ => return Err(StoreError::Rejected(Reject::NotEmpty)),
+        }
+    }
+    Ok(())
 }
 
 impl Store {
-    /// Opens (or, with `opts.create`, initialises) the store at `root`.
+    /// Initialises a store in an existing, empty directory: the explicit operator step that
+    /// [`Store::open`] never takes. Returns the new identity; its `store_uuid` belongs in the miner's
+    /// configuration ([`ExpectedIdentity::store_uuid`]).
     ///
-    /// Refuses a symlinked root and tmpfs, ramfs and overlayfs; takes the exclusive `flock` on
-    /// `<root>/.lock` (a second open fails with [`UnavailableKind::LockHeld`]); verifies or creates
-    /// `identity.json`; removes leftovers of interrupted writes from `tmp/`; and scans usage, every
-    /// version and every pin. Eviction stays disabled until
-    /// [`Store::mark_recovery_scan_complete`].
-    pub fn open(root: impl AsRef<Path>, identity_want: &ExpectedIdentity, opts: StoreOptions) -> Result<Store, StoreError> {
-        let root = root.as_ref().to_path_buf();
-        let unavailable = |kind| StoreError::unavailable(kind, &root);
-        match fs::symlink_metadata(&root) {
-            Ok(m) if m.file_type().is_symlink() => return Err(unavailable(UnavailableKind::SymlinkRoot)),
-            Ok(m) if !m.is_dir() => return Err(unavailable(UnavailableKind::NotADirectory)),
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(unavailable(UnavailableKind::RootAbsent)),
-            Err(e) => return Err(StoreError::io(e, &root)),
-        }
-        let root_dir = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(&root)
-            .map_err(|e| match e.raw_os_error() {
-                Some(libc::ELOOP) => unavailable(UnavailableKind::SymlinkRoot),
-                Some(libc::ENOTDIR) => unavailable(UnavailableKind::NotADirectory),
-                Some(libc::ENOENT) => unavailable(UnavailableKind::RootAbsent),
-                _ => StoreError::io(e, &root),
-            })?;
-        let f_type = fs_type(&root_dir).map_err(|e| StoreError::io(e, &root))?;
-        if refused_fs_type(f_type) {
-            return Err(unavailable(UnavailableKind::UnsupportedFilesystem { f_type }));
-        }
-        let m = root_dir.metadata().map_err(|e| StoreError::io(e, &root))?;
-        let root_id = (m.dev(), m.ino());
+    /// Applies `open`'s root checks (`identity`'s `require_dedicated_mount` and
+    /// `allow_any_filesystem`) and, before writing anything, refuses a root that already has an
+    /// identity ([`Reject::AlreadyInitialised`]) or holds anything but `lost+found` and what an
+    /// interrupted `init` leaves (`.lock`, empty areas, `next_version`, `tmp/`)
+    /// ([`Reject::NotEmpty`]). Then creates and locks `.lock`, checks again, creates the areas,
+    /// writes `next_version` and, last, `identity.json`, each durably: an interrupted `init` leaves
+    /// no identity, and running it again finishes it. Every other failure is
+    /// [`StoreError::Unavailable`].
+    pub fn init(root: impl AsRef<Path>, identity: &StoreIdentityInit) -> Result<StoreIdentity, StoreError> {
+        let root = root.as_ref();
+        Store::init_inner(root, identity).map_err(|e| e.only_unavailable(root))
+    }
 
-        let lock_path = root.join(LOCK);
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&lock_path)
-            .map_err(|e| StoreError::io(e, &lock_path))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(unavailable(UnavailableKind::LockHeld)),
-            Err(TryLockError::Error(e)) => return Err(StoreError::io(e, &lock_path)),
-        }
-
-        let (ident, created) = identity(&root, identity_want, opts.create)?;
-
+    fn init_inner(root: &Path, want: &StoreIdentityInit) -> Result<StoreIdentity, StoreError> {
+        let (dir, _) = open_root(root, want.require_dedicated_mount, want.allow_any_filesystem)?;
+        // Refused before anything is written (not even `.lock`), and checked again under the lock.
+        initialisable(root, &dir)?;
+        let _lock = take_lock(root, &dir, true)?;
+        initialisable(root, &dir)?;
+        let io = |e, p: &Path| StoreError::io(e, p);
         let mut made = false;
         for a in AREAS {
-            let p = root.join(a);
-            match fs::DirBuilder::new().mode(0o700).create(&p) {
-                Ok(()) => made = true,
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    if !fs::symlink_metadata(&p).map_err(|e| StoreError::io(e, &p))?.is_dir() {
-                        return Err(StoreError::unavailable(UnavailableKind::BadLayout, &p));
-                    }
+            match dir.sub(a) {
+                Ok(_) => {}
+                Err(e) if is_enoent(&e) => {
+                    dir.mkdir(a).map_err(|e| io(e, &root.join(a)))?;
+                    made = true;
                 }
-                Err(e) => return Err(StoreError::io(e, &p)),
+                Err(e) => return Err(dir_error(e, &root.join(a))),
             }
         }
         if made {
-            fsync_dir(&root).map_err(|e| StoreError::io(e, &root))?;
+            dir.fsync().map_err(|e| io(e, root))?;
+        }
+        let tmp = dir.sub(TMP).map_err(|e| dir_error(e, &root.join(TMP)))?;
+        for e in tmp.entries().map_err(|e| io(e, tmp.path()))? {
+            tmp.remove_tree(&e.name).map_err(|err| io(err, &tmp.child(&e.name)))?;
+        }
+        let staged = |s: Staged| io(s.err, &s.path);
+        write_file_atomic(&tmp, &dir, NEXT_VERSION, b"1", 0o600).map_err(staged)?;
+        let f = IdentityFile {
+            store_format: STORE_FORMAT_VERSION,
+            store_uuid: uuid_v4().map_err(|e| io(e, root))?,
+            chain_id: want.chain_id,
+            router: want.router,
+            prover: want.prover,
+        };
+        let json = serde_json::to_vec_pretty(&f).expect("identity serializes");
+        write_file_atomic(&tmp, &dir, IDENTITY, &json, 0o444).map_err(staged)?;
+        Ok(StoreIdentity { store_uuid: f.store_uuid, chain_id: f.chain_id, router: f.router, prover: f.prover })
+    }
+
+    /// Opens the store at `root`. Never creates or initialises anything: a directory that is not
+    /// an initialised store ([`Store::init`]) is [`UnavailableKind::IdentityMissing`] and is left
+    /// untouched, so a disk that failed to mount is never taken for an empty store.
+    ///
+    /// Refuses a symlinked root, an unsupported filesystem and (with `require_dedicated_mount`) a
+    /// root that is not a mount point, before writing anything; takes the exclusive `flock` on
+    /// `<root>/.lock` (a second open fails with [`UnavailableKind::LockHeld`]); verifies
+    /// `identity.json` (its UUID included) and the areas; removes leftovers of interrupted writes
+    /// from `tmp/`; scans usage, every version and every pin; and repairs a lost or stale
+    /// `next_version`. Every error is [`StoreError::Unavailable`]. Eviction stays disabled until
+    /// [`Store::mark_recovery_scan_complete`].
+    pub fn open(root: impl AsRef<Path>, identity: &ExpectedIdentity, opts: StoreOptions) -> Result<Store, StoreError> {
+        let root = root.as_ref();
+        Store::open_inner(root, identity, opts).map_err(|e| e.only_unavailable(root))
+    }
+
+    fn open_inner(root: &Path, want: &ExpectedIdentity, opts: StoreOptions) -> Result<Store, StoreError> {
+        let (root_dir, root_id) = open_root(root, opts.require_dedicated_mount, opts.allow_any_filesystem)?;
+        let lock = take_lock(root, &root_dir, false)?;
+        let ident = read_identity(root, &root_dir, want)?;
+        for a in AREAS {
+            let p = root.join(a);
+            match root_dir.sub(a) {
+                Ok(_) => {}
+                Err(e) if is_enoent(&e) || is_not_a_real_dir(&e) => return Err(StoreError::layout(&p)),
+                Err(e) => return Err(StoreError::io(e, &p)),
+            }
         }
 
         // Interrupted writes never became versions: drop them.
-        let tmp = root.join(TMP);
+        let tmp = root_dir.sub(TMP).map_err(|e| dir_error(e, &root.join(TMP)))?;
         let mut tmp_entries_removed = 0;
-        for (_, p, _) in entries(&tmp)? {
-            remove_any(&p).map_err(|e| StoreError::io(e, &p))?;
+        for e in tmp.entries().map_err(|e| StoreError::io(e, tmp.path()))? {
+            tmp.remove_tree(&e.name).map_err(|err| StoreError::io(err, &tmp.child(&e.name)))?;
             tmp_entries_removed += 1;
         }
 
         let mut inner = Inner {
-            root,
+            root: root.to_path_buf(),
             root_id,
             root_dir,
             _lock: lock,
             opts,
             identity: ident,
             open_report: OpenReport::default(),
+            poisoned: AtomicBool::new(false),
             state: Mutex::new(State::default()),
         };
         let loaded = inner.load()?;
@@ -919,16 +1207,16 @@ impl Store {
         let mut st = State::default();
         st.install(loaded);
 
-        // Versions come from one store-wide counter, persisted before each publish, so a version
+        // Versions come from one store-wide counter, persisted before each version is begun, so a
         // number is never reused even after its bundle is evicted or deleted.
-        let floor = max_version.checked_add(1).ok_or(StoreError::Rejected(crate::Reject::VersionsExhausted))?;
-        let counter_path = inner.root.join(NEXT_VERSION);
-        let counter = match read_capped(&counter_path, MAX_SMALL_RECORD_BYTES) {
+        let floor = max_version.checked_add(1).ok_or_else(|| StoreError::layout(&root.join(BUNDLES)))?;
+        let counter_path = root.join(NEXT_VERSION);
+        let counter = match read_capped(&inner.root_dir, NEXT_VERSION, MAX_SMALL_RECORD_BYTES) {
             Ok(b) => std::str::from_utf8(&b).ok().and_then(|s| s.trim().parse::<u32>().ok()),
-            Err(ReadError::Io(e)) if e.kind() != io::ErrorKind::NotFound => {
-                return Err(StoreError::io(e, &counter_path))
-            }
-            Err(_) => None,
+            Err(ReadError::Io(e)) if is_enoent(&e) => None,
+            Err(ReadError::Io(e)) => return Err(StoreError::io(e, &counter_path)),
+            Err(ReadError::NotRegular) => return Err(StoreError::layout(&counter_path)),
+            Err(ReadError::TooLarge) => None,
         };
         let (next, recovered) = match counter {
             Some(c) if c >= floor => (c, false),
@@ -936,14 +1224,9 @@ impl Store {
         };
         st.next_version = next;
         if recovered {
-            let root = inner.root.clone();
-            inner.write_atomic(&mut st, &root, NEXT_VERSION, next.to_string().as_bytes(), 0o600)?;
+            inner.write_atomic(&mut st, &inner.root_dir, NEXT_VERSION, next.to_string().as_bytes(), 0o600)?;
         }
-        inner.open_report = OpenReport {
-            created,
-            tmp_entries_removed,
-            version_counter_recovered: recovered && !created,
-        };
+        inner.open_report = OpenReport { tmp_entries_removed, version_counter_recovered: recovered };
         *inner.state.get_mut().unwrap_or_else(|e| e.into_inner()) = st;
         Ok(Store { inner: Arc::new(inner) })
     }
@@ -964,6 +1247,12 @@ impl Store {
         self.inner.open_report
     }
 
+    /// An earlier change failed after it had become visible: every call is
+    /// [`UnavailableKind::Poisoned`] until the store is reopened.
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.is_poisoned()
+    }
+
     /// Usage as accounted in memory (every write and removal updates it).
     pub fn usage(&self) -> Usage {
         self.inner.state().total()
@@ -972,35 +1261,40 @@ impl Store {
     /// Usage re-counted from disk under the store's lock. Equals [`Store::usage`] whenever no
     /// writer is streaming at the same moment.
     pub fn recount_usage(&self) -> Result<Usage, StoreError> {
+        self.inner.check_usable()?;
         let _st = self.inner.state();
         let mut u = Usage::default();
         for name in OWNED {
-            let p = self.inner.root.join(name);
-            u.add(tree_usage_opt(&p).map_err(|e| StoreError::io(e, &p))?);
+            u.add(self.inner.root_dir.tree_usage_opt(name).map_err(|e| StoreError::io(e, &self.inner.root.join(name)))?);
         }
         Ok(u)
     }
 
     /// Bytes that can be written before the quota or the free-space floor is crossed.
     pub fn headroom(&self) -> Result<u64, StoreError> {
-        self.inner.check_root()?;
+        self.inner.check_usable()?;
         let st = self.inner.state();
         self.inner.headroom(&st)
     }
 
-    /// Every complete version of a key, ascending, from disk.
+    /// Every complete version of a key, ascending, from disk. A version name that is not a real
+    /// directory (a planted symlink) is [`UnavailableKind::BadLayout`].
     pub fn versions(&self, job_id: B256, descriptor_hash: B256, prover: Address) -> Result<Vec<u32>, StoreError> {
-        self.inner.check_root()?;
-        let dir = self.inner.key_dir(&BundleKey::new(job_id, descriptor_hash, prover));
-        let mut v = match entries(&dir) {
-            Ok(es) => es.into_iter().filter(|e| e.2).filter_map(|e| e.0.as_deref().and_then(parse_version_name)).collect(),
-            Err(StoreError::Unavailable { kind: UnavailableKind::NotFound, .. }) => {
-                let b = self.inner.bundles_dir();
-                fs::symlink_metadata(&b).map_err(|e| StoreError::io(e, &b))?;
-                Vec::new()
-            }
+        self.inner.check_usable()?;
+        let k = BundleKey::new(job_id, descriptor_hash, prover);
+        let dir = match self.inner.open_key(&k) {
+            Ok(d) => d,
+            Err(StoreError::Missing { .. }) => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
+        let mut v = Vec::new();
+        for e in dir.entries().map_err(|e| StoreError::io(e, dir.path()))? {
+            let Some(n) = e.utf8().and_then(parse_version_name) else { continue };
+            if e.kind != Kind::Dir {
+                return Err(StoreError::layout(&dir.child(&e.name)));
+            }
+            v.push(n);
+        }
         v.sort_unstable();
         Ok(v)
     }
@@ -1012,42 +1306,45 @@ impl Store {
         let k = BundleKey::new(job_id, descriptor_hash, prover);
         match self.versions(job_id, descriptor_hash, prover)?.last() {
             Some(&v) => Ok(k.at(v)),
-            None => Err(StoreError::Missing { path: self.inner.key_dir(&k) }),
+            None => Err(StoreError::Missing { path: self.inner.key_path(&k) }),
         }
     }
 
-    /// Reads a version's record, re-verifying its descriptor against `descriptor_hash` with
-    /// `descriptor_hash_fn` (decoding and hashing a descriptor is the chain crate's job), its po2
-    /// results, and that `w.bin` has `w_len` bytes. `sha256(W)` is verified by [`Store::open_w`].
+    /// Reads a version's record: it must say the key and version it is stored under, and match the
+    /// key's pin when it is the pinned version; its descriptor is re-verified against
+    /// `descriptor_hash` with `descriptor_hash_fn` (decoding and hashing a descriptor is the chain
+    /// crate's job), its po2 results re-checked, and `w.bin` must have `w_len` bytes. `sha256(W)` is
+    /// verified by [`Store::open_w`], the ELF by [`Store::verify`].
     pub fn read(
         &self,
         r: &BundleRef,
         descriptor_hash_fn: &dyn Fn(&[u8]) -> Option<B256>,
     ) -> Result<BundleV1, StoreError> {
-        self.inner.check_root()?;
-        let b = self.inner.load_record(r)?;
-        let p = self.inner.version_dir(r).join(BUNDLE_JSON);
-        check_record(&b, descriptor_hash_fn).map_err(|d| StoreError::corrupt(d, &p))?;
-        self.inner.check_w_file(r, b.w_len)?;
+        self.inner.check_usable()?;
+        let (vdir, b) = self.inner.read_version(r)?;
+        check_record(&b, descriptor_hash_fn).map_err(|d| StoreError::corrupt(d, &vdir.child(BUNDLE_JSON)))?;
+        self.inner.check_w_in(&vdir, r, b.w_len)?;
         Ok(b)
     }
 
     /// Opens `w.bin` read-only, verifies `|W|`, `sha256(W)` and `sha256(prefix ‖ W)` against the
-    /// record by streaming it, rewinds, and hands out the verified fd (plan §15.3: the worker
-    /// receives `W` as a read-only fd).
+    /// record (checked as [`Store::read`] checks it) by streaming it, rewinds, and hands out the
+    /// verified fd (plan §15.3: the worker receives `W` as a read-only fd).
     pub fn open_w(&self, r: &BundleRef) -> Result<File, StoreError> {
-        self.inner.check_root()?;
-        let b = self.inner.load_record(r)?;
-        let p = self.inner.version_dir(r).join(W_BIN);
-        let mut f = open_ro(&p).map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => StoreError::corrupt(Defect::FileMissing, &p),
-            _ => StoreError::io(e, &p),
-        })?;
-        let m = f.metadata().map_err(|e| StoreError::io(e, &p))?;
-        if !m.is_file() {
+        self.inner.check_usable()?;
+        let (vdir, b) = self.inner.read_version(r)?;
+        let p = vdir.child(W_BIN);
+        let mut f = match vdir.open_ro(W_BIN) {
+            Ok(f) => f,
+            Err(e) if is_enoent(&e) => return Err(self.inner.vanished(r, &vdir, &p)),
+            Err(e) if errno(&e) == Some(libc::ELOOP) => return Err(StoreError::corrupt(Defect::NotRegularFile, &p)),
+            Err(e) => return Err(StoreError::io(e, &p)),
+        };
+        let m = fstat(f.as_raw_fd()).map_err(|e| StoreError::io(e, &p))?;
+        if m.kind != Kind::File {
             return Err(StoreError::corrupt(Defect::NotRegularFile, &p));
         }
-        if m.len() != b.w_len {
+        if m.len != b.w_len {
             return Err(StoreError::corrupt(Defect::WLength, &p));
         }
         clear_nonblock(&f).map_err(|e| StoreError::io(e, &p))?;
@@ -1056,19 +1353,7 @@ impl Store {
         if b.prefix {
             input_hash.update(journal_prefix(b.job_id, b.prover));
         }
-        let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
-        let mut total = 0u64;
-        loop {
-            let n = match f.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(StoreError::io(e, &p)),
-            };
-            w_hash.update(&buf[..n]);
-            input_hash.update(&buf[..n]);
-            total += n as u64;
-        }
+        let total = hash_into(&mut f, &mut w_hash, &mut input_hash).map_err(|e| StoreError::io(e, &p))?;
         if total != b.w_len {
             return Err(StoreError::corrupt(Defect::WLength, &p));
         }
@@ -1082,30 +1367,38 @@ impl Store {
         Ok(f)
     }
 
-    /// [`Store::read`] and [`Store::open_w`] together: the record, its descriptor, and every byte
-    /// of `W`. For revalidation and recovery, where the fd itself is not needed.
+    /// Everything a proof from this version needs, verified (plan §15.1: "every read verifies
+    /// `sha256(W)` and the ELF's image id"): [`Store::read`], [`Store::open_w`] (every byte of `W`),
+    /// and the ELF `image_id` re-verified with `image_id_fn`. An ELF absent from an available store
+    /// is [`Defect::ElfMissing`]. For revalidation and recovery, where the fd itself is not needed.
     pub fn verify(
         &self,
         r: &BundleRef,
         descriptor_hash_fn: &dyn Fn(&[u8]) -> Option<B256>,
+        image_id_fn: &dyn Fn(&[u8]) -> Option<B256>,
     ) -> Result<BundleV1, StoreError> {
         let b = self.read(r, descriptor_hash_fn)?;
         self.open_w(r)?;
-        Ok(b)
+        match self.inner.read_elf(&b.image_id, image_id_fn) {
+            Ok(_) => Ok(b),
+            Err(StoreError::Missing { path }) => Err(StoreError::corrupt(Defect::ElfMissing, &path)),
+            Err(e) => Err(e),
+        }
     }
 
     /// The recovery scan: re-reads every version and pin from disk, refreshes the index and the
     /// durable usage, and reports every complete version with its pin status, size and caller.
-    /// Unreadable versions and pins are reported, never skipped.
+    /// Unreadable versions and pins are reported, never skipped; a symlink anywhere is an anomaly,
+    /// never followed.
     pub fn scan(&self) -> Result<ScanReport, StoreError> {
-        self.inner.check_root()?;
+        self.inner.check_usable()?;
         let mut st = self.inner.state();
         let loaded = self.inner.load()?;
         st.install(loaded);
         Ok(ScanReport {
             bundles: st.metas(),
-            pins: st.pins.values().flatten().cloned().collect(),
-            unreadable_pins: st.pins.iter().filter(|(_, p)| p.is_none()).map(|(k, _)| *k).collect(),
+            pins: st.readable_pins(),
+            unreadable_pins: st.unknown_pins(),
             anomalies: st.anomalies.clone(),
         })
     }
