@@ -971,14 +971,11 @@ fn with_rss_self_guard<T>(limit_bytes: Option<u64>, f: impl FnOnce() -> T) -> T 
 /// image id (one stripped, say) are the same program, and a lock re-driven after a restart may fetch
 /// the other one.
 fn sys_rand_seed(key: &[u8; 32], image_id: &[u8; 32], input_data: &[u8]) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
     use sha2::{Digest, Sha256};
 
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(b"zkminer/risc0/sys_rand/v2");
-    mac.update(image_id);
-    mac.update(&Sha256::digest(input_data));
-    mac.finalize().into_bytes().into()
+    // The one derivation the miner's witness path uses too (`RISC0_SEED_TAG`).
+    let input_sha256: [u8; 32] = Sha256::digest(input_data).into();
+    zkminer_prover_protocol::sys_rand::risc0_seed(key, image_id, &input_sha256)
 }
 
 /// This host's `sys_rand` key, loaded once per process: the one the miner passed in
