@@ -104,7 +104,7 @@ async fn registration_errors() {
 #[tokio::test]
 async fn raw_control_frames() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = zkminer_witness_broker::BrokerConfig::from_toml(&config_text(dir.path(), EVM), dir.path()).unwrap();
+    let cfg = zkminer_witness_broker::BrokerConfig::from_toml(&config_text(dir.path(), EVM), dir.path(), zkminer_witness_broker::egress::NetMode::DevPrivate).unwrap();
     let (miner, broker) = std::os::unix::net::UnixStream::pair().unwrap();
     let _t = tokio::spawn(zkminer_witness_broker::serve_with(cfg, broker.into(), test_hooks()));
     let miner = tokio::task::spawn_blocking(move || {
@@ -160,7 +160,7 @@ async fn concurrent_and_reused_control_ids() {
         dir.path(),
         &format!("[[evm_rpc]]\nalias = \"slow\"\nurl = \"{}\"\nchain_id = 8453\nmethod_sets = [\"state-read\"]\ncidrs = [\"127.0.0.1/32\"]\n", slow.url()),
     );
-    let cfg = zkminer_witness_broker::BrokerConfig::from_toml(&text, dir.path()).unwrap();
+    let cfg = zkminer_witness_broker::BrokerConfig::from_toml(&text, dir.path(), zkminer_witness_broker::egress::NetMode::DevPrivate).unwrap();
     let (miner, broker) = std::os::unix::net::UnixStream::pair().unwrap();
     let _t = tokio::spawn(zkminer_witness_broker::serve_with(cfg, broker.into(), test_hooks()));
     tokio::task::spawn_blocking(move || {
@@ -262,13 +262,14 @@ chain_id = 743111
     assert!(failing.contains(&SelfTestCheck::SeccompActive));
     assert!(!r.ok);
 
-    // The miner reports a global own address outside every connected prefix: the floor would let
-    // the requester path reach it, and the self-test says so.
+    // The miner reports a global own address outside every connected prefix. The broker's old
+    // floor refused own addresses only through their prefix, so this self-test used to fail;
+    // netguard's floor refuses the host's own addresses themselves.
     let n = client.refresh_prefixes(vec![], vec!["8.8.8.8".parse().unwrap()]).await.unwrap();
     assert_eq!(n, 0);
     let r = client.self_test().await.unwrap();
-    assert!(!r.ok);
-    assert!(r.checks.contains(&(SelfTestCheck::OwnAddressDenied, false)));
+    assert!(!r.ok, "the in-process sandbox checks still fail here");
+    assert!(r.checks.contains(&(SelfTestCheck::OwnAddressDenied, true)), "{r:?}");
     // Refreshed with its prefix, it passes again; deny CIDRs count too.
     let n = client
         .refresh_prefixes(vec![IpPrefix { addr: "8.8.8.8".parse().unwrap(), len: 24 }], vec!["8.8.8.8".parse().unwrap(), "8.8.4.4".parse().unwrap()])

@@ -99,7 +99,39 @@ impl Prefix {
             (IpAddr::V6(_), len) => len == 128,
         }
     }
+
+    /// The prefix as the address space it reaches: an IPv6 prefix of length 96 or more inside one of
+    /// the embedded-IPv4 /96s [`canonical_ip`] reads (mapped, compatible, SIIT, the well-known
+    /// NAT64) is the IPv4 prefix it embeds; any other is itself, with host bits cleared.
+    pub fn canonical_prefix(&self) -> Prefix {
+        let p = Prefix::new(self.addr, self.len);
+        if let (IpAddr::V6(v6), true) = (p.addr, p.len >= 96) {
+            if EMBEDDED_V4_BASES.contains(&(u128::from(v6) >> 32)) {
+                return Prefix::new(
+                    IpAddr::V4(Ipv4Addr::from(u128::from(v6) as u32)),
+                    p.len - 96,
+                );
+            }
+        }
+        p
+    }
+
+    /// Whether the two prefixes share an address, each read as [`Self::canonical_prefix`] (so
+    /// `::ffff:10.0.0.0/104` and `64:ff9b::a00:0/104` overlap `10.0.0.0/8`). Families never overlap
+    /// otherwise.
+    pub fn overlaps(&self, other: &Prefix) -> bool {
+        let (a, b) = (self.canonical_prefix(), other.canonical_prefix());
+        if a.addr.is_ipv4() != b.addr.is_ipv4() {
+            return false;
+        }
+        let len = a.len.min(b.len);
+        mask(a.addr, len) == mask(b.addr, len)
+    }
 }
+
+/// The high 96 bits of the IPv6 /96s that embed an IPv4 address [`canonical_ip`] reads: compatible
+/// `::/96`, mapped `::ffff:0:0/96`, SIIT `::ffff:0:0:0/96` and the well-known NAT64 `64:ff9b::/96`.
+const EMBEDDED_V4_BASES: [u128; 4] = [0, 0xffff, 0xffff_0000, 0x0064_ff9b_0000_0000_0000_0000];
 
 impl fmt::Display for Prefix {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -288,6 +320,64 @@ pub fn is_global(ip: IpAddr) -> bool {
         IpAddr::V4(v4) => v4_is_global(v4),
         IpAddr::V6(v6) => v6_is_global(v6),
     }
+}
+
+/// Whether **every** address in `p` is global ([`is_global`]): `0.0.0.0/0`, `::/0`, `8.0.0.0/6`
+/// (which holds `10.0.0.0/8`) and `::ffff:0:0/96` (every IPv4 address, mapped) are not.
+///
+/// Exact, from the same tables as [`is_global`]: those tables decide by membership in a fixed set
+/// of prefixes (the "boundaries"), so a prefix that strictly contains none of them is classified
+/// the same throughout and is judged by its first address; one that does is split in two halves,
+/// each judged the same way. The recursion only descends towards boundaries, so it is bounded by
+/// their number times the address width.
+pub fn prefix_is_global(p: Prefix) -> bool {
+    let p = Prefix::new(p.addr, p.len);
+    let width = if p.addr.is_ipv4() { 32 } else { 128 };
+    let split = p.len < width
+        && boundaries().iter().any(|b| {
+            b.addr.is_ipv4() == p.addr.is_ipv4() && b.len > p.len && mask(b.addr, p.len) == p.addr
+        });
+    if !split {
+        return is_global(p.addr);
+    }
+    let lower = Prefix::new(p.addr, p.len + 1);
+    let upper = Prefix::new(
+        match p.addr {
+            IpAddr::V4(a) => IpAddr::V4(Ipv4Addr::from(
+                u32::from(a) | (1u32 << (31 - u32::from(p.len))),
+            )),
+            IpAddr::V6(a) => IpAddr::V6(Ipv6Addr::from(
+                u128::from(a) | (1u128 << (127 - u32::from(p.len))),
+            )),
+        },
+        p.len + 1,
+    );
+    prefix_is_global(lower) && prefix_is_global(upper)
+}
+
+/// Every prefix whose membership [`is_global`] depends on (see [`prefix_is_global`]).
+fn boundaries() -> &'static [Prefix] {
+    static B: std::sync::OnceLock<Vec<Prefix>> = std::sync::OnceLock::new();
+    B.get_or_init(|| {
+        let v4 = |net: [u8; 4], len: u8| Prefix::new(IpAddr::V4(Ipv4Addr::from(net)), len);
+        let v6 = |net: u128, len: u8| Prefix::new(IpAddr::V6(Ipv6Addr::from(net)), len);
+        let mut b: Vec<Prefix> = V4_NOT_GLOBAL.iter().map(|&(n, l)| v4(n, l)).collect();
+        b.push(v6(0x2000 << 112, 3));
+        b.extend(V6_NOT_GLOBAL.iter().map(|&(n, l)| v6(n, l)));
+        b.extend(V6_IANA_GLOBAL_EXCEPTIONS.iter().map(|&(n, l)| v6(n, l)));
+        for base in EMBEDDED_V4_BASES {
+            b.push(v6(base << 32, 96));
+            // Inside a /96 judged by its IPv4 address, the IPv4 table's boundaries, embedded.
+            if base != 0 {
+                b.extend(
+                    V4_NOT_GLOBAL.iter().map(|&(n, l)| {
+                        v6((base << 32) | u128::from(u32::from_be_bytes(n)), 96 + l)
+                    }),
+                );
+            }
+        }
+        b
+    })
 }
 
 #[cfg(test)]
@@ -744,6 +834,125 @@ mod tests {
             "fe80::1%eth0/128",
         ] {
             assert!(bad.parse::<Prefix>().is_err(), "{bad:?} parsed");
+        }
+    }
+
+    #[test]
+    fn whole_prefixes_are_global_only_when_every_address_is() {
+        for (s, global) in [
+            ("0.0.0.0/0", false),
+            ("::/0", false),
+            ("0.0.0.0/1", false),
+            ("128.0.0.0/1", false), // holds 169.254/16, 172.16/12, 192.168/16, multicast
+            ("8.0.0.0/7", true),    // 8.0.0.0 - 9.255.255.255
+            ("8.0.0.0/6", false),   // holds 10.0.0.0/8
+            ("10.0.0.0/7", false),  // 10/8 and 11/8
+            ("11.0.0.0/8", true),
+            ("100.0.0.0/8", false), // holds CGNAT 100.64/10
+            ("100.0.0.0/10", true), // just below it
+            ("192.0.0.0/23", false),
+            ("192.0.4.0/22", true),
+            ("1.1.1.1/32", true),
+            ("127.0.0.1/32", false),
+            ("2000::/3", false), // holds 2001:db8::/32, 2002::/16, …
+            ("2a00::/8", true),
+            ("2001::/16", false),
+            ("2001:200::/23", true),
+            ("2001:3::/32", true), // AMT, an IANA-global exception
+            ("2001:2::/48", false),
+            ("2001:1::/120", false), // the three anycast /128s and their non-global neighbours
+            ("2001:1::1/128", true),
+            ("::ffff:0:0/96", false),       // every IPv4 address, mapped
+            ("::ffff:8.8.8.0/120", true),   // a public /24, mapped
+            ("64:ff9b::/96", false),        // NAT64 of every IPv4 address
+            ("64:ff9b::808:800/120", true), // NAT64 of a public /24
+            ("64:ff9b::a00:0/104", false),  // NAT64 of 10/8
+            ("::/96", false),               // IPv4-compatible, refused whatever it embeds
+            ("::808:800/120", false),
+            ("fc00::/7", false),
+            ("4000::/2", false),
+        ] {
+            assert_eq!(prefix_is_global(pfx(s)), global, "{s}");
+        }
+    }
+
+    #[test]
+    fn prefixes_overlap_in_their_canonical_space() {
+        for (a, b, overlap) in [
+            ("10.0.0.0/8", "10.1.0.0/16", true),
+            ("10.1.0.0/16", "10.0.0.0/8", true),
+            ("10.0.0.0/8", "11.0.0.0/8", false),
+            ("0.0.0.0/0", "203.0.113.7/32", true),
+            ("::ffff:10.0.0.0/104", "10.9.0.0/16", true),
+            ("64:ff9b::a00:0/104", "10.9.9.9/32", true),
+            ("::ffff:0:a00:0/104", "10.0.0.0/8", true),
+            ("64:ff9b::808:808/128", "8.8.8.8/32", true),
+            ("2001:db8::/32", "2001:db8:1::/48", true),
+            ("2001:db8::/32", "2001:db9::/32", false),
+            ("::/0", "10.0.0.0/8", false), // families never mix outside the embedded /96s
+            ("2606:4700::/32", "8.8.8.8/32", false),
+        ] {
+            assert_eq!(pfx(a).overlaps(&pfx(b)), overlap, "{a} {b}");
+        }
+        assert_eq!(
+            pfx("::ffff:10.0.0.0/104").canonical_prefix(),
+            pfx("10.0.0.0/8")
+        );
+        assert_eq!(
+            pfx("2001:db8::1/32").canonical_prefix(),
+            pfx("2001:db8::/32")
+        );
+    }
+
+    fn prefix_strategy() -> impl Strategy<Value = Prefix> {
+        prop_oneof![
+            (v4_strategy(), 0u8..=32).prop_map(|(a, l)| Prefix::new(IpAddr::V4(a), l)),
+            (v6_strategy(), 0u8..=128).prop_map(|(a, l)| Prefix::new(IpAddr::V6(a), l)),
+            // Long prefixes, where the interesting boundaries are.
+            (v6_strategy(), 90u8..=128).prop_map(|(a, l)| Prefix::new(IpAddr::V6(a), l)),
+            (v4_strategy(), 4u8..=32).prop_map(|(a, l)| Prefix::new(IpAddr::V4(a), l)),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 5_000, ..ProptestConfig::default() })]
+
+        /// A prefix judged entirely global holds no non-global address (sampled: its ends and
+        /// random addresses inside it); one judged not entirely global is either a non-global
+        /// address's prefix or has a non-global address inside, found by descending to it.
+        #[test]
+        fn prefix_is_global_agrees_with_is_global(p in prefix_strategy(), r in any::<u128>(), s in any::<u128>()) {
+            let inside = |x: u128| match p.addr {
+                IpAddr::V4(a) => {
+                    let host = if p.len == 32 { 0 } else { (x as u32) & (u32::MAX >> p.len) };
+                    IpAddr::V4(Ipv4Addr::from(u32::from(a) | host))
+                }
+                IpAddr::V6(a) => {
+                    let host = if p.len == 128 { 0 } else { x & (u128::MAX >> p.len) };
+                    IpAddr::V6(Ipv6Addr::from(u128::from(a) | host))
+                }
+            };
+            if prefix_is_global(p) {
+                for x in [0, u128::MAX, r, s] {
+                    prop_assert!(is_global(inside(x)), "{} judged global, {} inside is not", p, inside(x));
+                }
+            } else {
+                // Some non-global address exists: descend into a non-global half until a host route.
+                let mut q = p;
+                let width = if q.addr.is_ipv4() { 32 } else { 128 };
+                while q.len < width {
+                    let lower = Prefix::new(q.addr, q.len + 1);
+                    let upper = Prefix::new(
+                        match q.addr {
+                            IpAddr::V4(a) => IpAddr::V4(Ipv4Addr::from(u32::from(a) | (1u32 << (31 - u32::from(q.len))))),
+                            IpAddr::V6(a) => IpAddr::V6(Ipv6Addr::from(u128::from(a) | (1u128 << (127 - u32::from(q.len))))),
+                        },
+                        q.len + 1,
+                    );
+                    q = if !prefix_is_global(lower) { lower } else { upper };
+                }
+                prop_assert!(!is_global(q.addr), "{} judged not global, but descended to global {}", p, q.addr);
+            }
         }
     }
 

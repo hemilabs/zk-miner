@@ -409,6 +409,10 @@ pub enum SelfTestCheck {
     ConnectedPrefixDenied,
     EndpointsReachable,
     ArtifactEndpointChainId,
+    /// Public mode only: every prefix of every role entry the floor admits (configured or from a
+    /// DNS answer) is entirely global and reaches none of the host's addresses, its connected
+    /// prefixes, the deny CIDRs or a DNS server.
+    RoleEntriesPublic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

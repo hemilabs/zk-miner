@@ -80,9 +80,38 @@
 //!    broker's own stub resolver ([`crate::dns`]: `[dns] servers`, never `/etc/hosts`), at startup
 //!    and again every `reresolve_secs`; each answer replaces the pinned addresses.
 //!
-//! The self-test counts only `cidrs` and IP literals as configured, and fails when a role prefix
-//! that is not a host route (/32, /128) covers loopback, the metadata service, an RFC 1918 probe,
-//! one of the host's own addresses or a connected prefix: configure local nodes as host routes.
+//! # Public mode and developer mode
+//!
+//! The broker runs in the miner's network mode, never one of its own: [`NetMode::Public`] unless
+//! the miner was configured with `[dev] private_network = true`, in which case the miner starts it
+//! with `--dev-private-network` ([`NetMode::DevPrivate`]). This file has no key for it (a `dev` or
+//! `private_network` key is an unknown field).
+//!
+//! In **public mode** the configuration is refused when it loads if any endpoint (each `evm_rpc`,
+//! each `blob_mirror`, `artifacts` and its `mirror`):
+//!
+//! - has explicit `cidrs`, or an IP-literal URL host, that is not **entirely** global (netguard's
+//!   [`zkminer_netguard::prefix_is_global`]: `0.0.0.0/0`, `::/0`, `8.0.0.0/6` and
+//!   `::ffff:0:0/96` hold private space and are refused), or that overlaps the deny CIDRs or a DNS
+//!   server's address; and, once the host's facts are read ([`BrokerConfig::validate_host`]),
+//!   that holds one of the host's own addresses or overlaps one of its connected prefixes;
+//! - has a URL host name that fails netguard's host-name hygiene ([`zkminer_netguard::check_host_name`]:
+//!   `localhost`, `.local`, `.internal`, `.lan`, `.test`, single-label names, …).
+//!
+//! A host name's answers become its role entry only where netguard's public floor admits them, in
+//! both modes ([`crate::egress::EgressPolicy::dns_admissible`]). The DNS servers (`[dns] servers`,
+//! else `/etc/resolv.conf`'s) are operator infrastructure the resolver dials, not a destination:
+//! a loopback stub such as `127.0.0.53` stays allowed in public mode, and every DNS server address
+//! joins the deny CIDRs, so no fetch connects to one.
+//!
+//! In **developer mode** explicitly configured role entries (`cidrs`, IP literals) may be private
+//! and host names skip the hygiene rules, so a local test network serves. It is refused when any
+//! `evm_rpc` or `artifacts` `chain_id` is a production chain (Hemi mainnet, 43111).
+//!
+//! The self-test counts only `cidrs` and IP literals as configured (in developer mode), and fails
+//! when a role prefix that is not a host route (/32, /128) covers loopback, the metadata service,
+//! an RFC 1918 probe, one of the host's own addresses or a connected prefix: configure local nodes
+//! as host routes. In public mode it also fails when any role prefix is not public.
 //!
 //! A key travels only over `https`, or over `http` to an IP literal that is loopback or inside the
 //! endpoint's own `cidrs` (a node on the operator's own wire).
@@ -100,7 +129,7 @@ use url::Url;
 use zeroize::Zeroizing;
 use zkminer_witness::envelope::MethodSet;
 
-use crate::egress::{Prefix, Role};
+use crate::egress::{NetMode, Prefix, Role};
 
 pub const MAX_CONFIG_FILE_BYTES: u64 = 1 << 20;
 pub const MAX_KEY_BYTES: u64 = 4096;
@@ -505,12 +534,14 @@ pub struct BrokerConfig {
     pub blob_mirrors: Vec<EndpointSpec>,
     pub artifacts: Option<ArtifactsSpec>,
     pub host: Option<HostFacts>,
+    /// The miner's network mode (never from this file): see the module doc.
+    pub net_mode: NetMode,
 }
 
 impl BrokerConfig {
     /// Reads and validates the config file and every key file it names (relative key paths are
     /// taken from the config file's directory).
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+    pub fn load(path: &Path, net_mode: NetMode) -> Result<Self, ConfigError> {
         let io = |source| ConfigError::Io { path: path.to_path_buf(), source };
         let meta = std::fs::metadata(path).map_err(io)?;
         if meta.len() > MAX_CONFIG_FILE_BYTES {
@@ -518,13 +549,47 @@ impl BrokerConfig {
         }
         let text = std::fs::read_to_string(path).map_err(io)?;
         let base = path.parent().unwrap_or(Path::new("/"));
-        Self::from_toml(&text, base)
+        Self::from_toml(&text, base, net_mode)
     }
 
-    /// Parses and validates a config, reading key files relative to `base_dir`.
-    pub fn from_toml(text: &str, base_dir: &Path) -> Result<Self, ConfigError> {
+    /// Parses and validates a config in `net_mode`, reading key files relative to `base_dir`.
+    pub fn from_toml(text: &str, base_dir: &Path, net_mode: NetMode) -> Result<Self, ConfigError> {
         let file: FileConfig = toml::from_str(text).map_err(|e| ConfigError::Parse(e.message().to_string()))?;
-        validate(file, base_dir)
+        validate(file, base_dir, net_mode)
+    }
+
+    /// The prefixes an endpoint's role entry is configured as: its explicit `cidrs`, else its IP
+    /// literal's host route, else none (a host name: DNS-derived, judged at every answer).
+    pub fn role_prefixes(e: &EndpointSpec) -> Vec<Prefix> {
+        if !e.cidrs.is_empty() {
+            e.cidrs.clone()
+        } else {
+            e.literal.map(Prefix::host).into_iter().collect()
+        }
+    }
+
+    /// The deny CIDRs the floor enforces: the operator's, plus a host route for every DNS server
+    /// the resolver dials (`dns_servers`), so no fetch connects to one.
+    pub fn effective_deny(&self, dns_servers: &[SocketAddr]) -> Vec<Prefix> {
+        let mut deny = self.deny.clone();
+        for s in dns_servers {
+            let p = Prefix::host(s.ip());
+            if !deny.contains(&p) {
+                deny.push(p);
+            }
+        }
+        deny
+    }
+
+    /// In public mode, refuses a role entry that holds one of the host's own addresses or overlaps
+    /// one of its connected prefixes, the deny CIDRs or a DNS server (the checks the config file
+    /// alone cannot make). Nothing in developer mode.
+    pub fn validate_host(&self, host: &HostFacts) -> Result<(), ConfigError> {
+        if self.net_mode != NetMode::Public {
+            return Ok(());
+        }
+        let facts = zkminer_netguard::HostFacts::new(host.connected.clone(), host.own_addresses.clone());
+        check_roles_public(self, &facts, &self.effective_deny(&host.dns_servers))
     }
 
     /// Every endpoint, in a fixed order: evm-rpc, blob mirrors, the artifact endpoint, its mirror.
@@ -571,20 +636,36 @@ impl BrokerConfig {
     /// else its IP literal's host route, else nothing (a host name: DNS-derived, never counted as
     /// configured by the self-test).
     pub fn configured_prefixes(&self) -> HashMap<String, Vec<Prefix>> {
-        self.endpoints()
-            .map(|e| {
-                let p = if !e.cidrs.is_empty() {
-                    e.cidrs.clone()
-                } else {
-                    e.literal.map(host_prefix).into_iter().collect()
-                };
-                (e.alias.clone(), p)
-            })
-            .collect()
+        self.endpoints().map(|e| (e.alias.clone(), Self::role_prefixes(e))).collect()
     }
 }
 
-fn validate(f: FileConfig, base: &Path) -> Result<BrokerConfig, ConfigError> {
+/// Public mode: every endpoint's host name passes netguard's hygiene and every configured role
+/// prefix passes [`zkminer_netguard::admit_prefix`] against `facts` and `deny`.
+fn check_roles_public(cfg: &BrokerConfig, facts: &zkminer_netguard::HostFacts, deny: &[Prefix]) -> Result<(), ConfigError> {
+    for e in cfg.endpoints() {
+        if e.literal.is_none() {
+            zkminer_netguard::check_host_name(&e.host).map_err(|why| {
+                ConfigError::Invalid(format!(
+                    "{}: {} (outside developer mode an endpoint is named only by a public host name)",
+                    e.alias,
+                    zkminer_netguard::Denied::Host { host: e.host.clone(), why }
+                ))
+            })?;
+        }
+        for p in BrokerConfig::role_prefixes(e) {
+            zkminer_netguard::admit_prefix(NetMode::Public, p, facts, deny).map_err(|d| {
+                ConfigError::Invalid(format!(
+                    "{}: role entry {p}: {d} (outside developer mode an endpoint must be on the public internet)",
+                    e.alias
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate(f: FileConfig, base: &Path, net_mode: NetMode) -> Result<BrokerConfig, ConfigError> {
     let chain_rpc_host = normalize_host_input(&f.chain_rpc_host)
         .ok_or_else(|| ConfigError::Invalid("chain_rpc_host is not a host or URL".into()))?;
     if !f.spool_dir.is_absolute() {
@@ -739,11 +820,28 @@ fn validate(f: FileConfig, base: &Path) -> Result<BrokerConfig, ConfigError> {
         blob_mirrors,
         artifacts,
         host: None,
+        net_mode,
     };
     // §11.1: never an endpoint on the miner's chain-RPC host.
     for e in cfg.endpoints() {
         if e.host == cfg.chain_rpc_host {
             return invalid(format!("{}: its host is chain_rpc_host (the miner's chain RPC); use a separate endpoint", e.alias));
+        }
+    }
+    match net_mode {
+        NetMode::Public => {
+            // The host's own facts are checked once read (`validate_host`); the file's deny CIDRs
+            // and explicit DNS servers now.
+            check_roles_public(&cfg, &zkminer_netguard::HostFacts::empty(), &cfg.effective_deny(&cfg.dns.servers))?;
+        }
+        NetMode::DevPrivate => {
+            let chains = cfg.evm_rpc.iter().map(|e| e.chain_id).chain(cfg.artifacts.iter().map(|a| a.chain_id));
+            if let Some(id) = chains.into_iter().find(|id| zkminer_netguard::is_production_chain(*id)) {
+                return invalid(format!(
+                    "developer mode (--dev-private-network, from the miner's [dev] private_network) is refused: \
+                     an endpoint serves chain {id}, a production chain"
+                ));
+            }
         }
     }
     Ok(cfg)
@@ -962,33 +1060,14 @@ fn parse_cidrs(alias: &str, cidrs: &[String]) -> Result<Vec<Prefix>, ConfigError
 }
 
 /// `a.b.c.d/len`, `v6/len`, or a bare address (a host prefix). Host bits must be zero.
+/// netguard's parser ([`Prefix`]'s `FromStr`).
 pub fn parse_cidr(s: &str) -> Result<Prefix, String> {
-    let (addr, len) = match s.split_once('/') {
-        Some((a, l)) => {
-            let addr: IpAddr = a.parse().map_err(|_| format!("{s:?} is not an address"))?;
-            if l.is_empty() || l.len() > 3 || !l.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(format!("{s:?} has a malformed prefix length"));
-            }
-            (addr, l.parse::<u8>().map_err(|_| format!("{s:?} has a malformed prefix length"))?)
-        }
-        None => {
-            let addr: IpAddr = s.parse().map_err(|_| format!("{s:?} is not an address"))?;
-            (addr, if addr.is_ipv4() { 32 } else { 128 })
-        }
-    };
-    let max = if addr.is_ipv4() { 32 } else { 128 };
-    if len > max {
-        return Err(format!("{s:?}: prefix length above {max}"));
-    }
-    if mask(addr, len) != addr {
-        return Err(format!("{s:?} has host bits set"));
-    }
-    Ok(Prefix { addr, len })
+    s.parse::<Prefix>().map_err(|e| e.to_string())
 }
 
 /// The host prefix of `ip`.
 pub fn host_prefix(ip: IpAddr) -> Prefix {
-    Prefix { addr: ip, len: if ip.is_ipv4() { 32 } else { 128 } }
+    Prefix::host(ip)
 }
 
 /// `ip` with every bit past `len` cleared.
@@ -1007,15 +1086,14 @@ pub(crate) fn mask(ip: IpAddr, len: u8) -> IpAddr {
     }
 }
 
-/// Whether `p` contains `ip` (same family only). The broker's own check for configuration facts
-/// (the self-test's "explicitly configured" rule); admission itself is [`crate::egress`]'s.
-pub(crate) fn prefix_contains(p: &Prefix, ip: IpAddr) -> bool {
-    p.addr.is_ipv4() == ip.is_ipv4() && mask(ip, p.len) == mask(p.addr, p.len)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Most tests parse configs with private test addresses: developer mode.
+    fn dev_toml(text: &str, dir: &Path) -> Result<BrokerConfig, ConfigError> {
+        BrokerConfig::from_toml(text, dir, NetMode::DevPrivate)
+    }
 
     pub(crate) fn write_key(dir: &Path, name: &str, key: &str, mode: u32) -> PathBuf {
         let p = dir.join(name);
@@ -1086,7 +1164,7 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
     #[test]
     fn example_parses() {
         let dir = tempfile::tempdir().unwrap();
-        let c = BrokerConfig::from_toml(&example(dir.path()), dir.path()).unwrap();
+        let c = dev_toml(&example(dir.path()), dir.path()).unwrap();
         assert_eq!(c.chain_rpc_host, "rpc.hemi.network");
         assert_eq!(c.deny.len(), 2);
         assert_eq!(c.cache.rpc_max_entries, 10);
@@ -1120,7 +1198,7 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
     }
 
     fn err(text: &str, dir: &Path) -> String {
-        match BrokerConfig::from_toml(text, dir) {
+        match dev_toml(text, dir) {
             Ok(_) => panic!("accepted:\n{text}"),
             Err(e) => e.to_string(),
         }
@@ -1143,7 +1221,7 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         ] {
             assert!(err(&bad, dir.path()).contains("unknown field"), "{bad}");
         }
-        assert!(BrokerConfig::from_toml(&minimal(ep), dir.path()).is_ok());
+        assert!(dev_toml(&minimal(ep), dir.path()).is_ok());
     }
 
     #[test]
@@ -1192,7 +1270,7 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         assert!(err(&ep("https://u:p@x.example/", ""), d).contains("userinfo"));
         assert!(err(&ep("ftp://x.example/", ""), d).contains("scheme"));
         assert!(err(&ep("https://x.example/{api}", ""), d).contains("placeholder"));
-        let c = BrokerConfig::from_toml(&ep("https://x.example/a/{key}", "key_file = \"ok.key\""), d).unwrap();
+        let c = dev_toml(&ep("https://x.example/a/{key}", "key_file = \"ok.key\""), d).unwrap();
         assert_eq!(c.evm_rpc[0].spec.url(), "https://x.example/a/k1");
         // Keys never reach Debug output.
         assert!(!format!("{c:?}").contains("k1"));
@@ -1208,7 +1286,7 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
             ))
         };
         assert!(err(&ep("cidrs = [\"10.0.0.1/8\"]"), d).contains("host bits"));
-        assert!(err(&ep("cidrs = [\"10.0.0.0/33\"]"), d).contains("above 32"));
+        assert!(err(&ep("cidrs = [\"10.0.0.0/33\"]"), d).contains("above"));
         assert!(err(&ep("cidrs = [\"10.0.0.0/+8\"]"), d).contains("malformed"));
         assert!(err(&ep("max_concurrency = 0"), d).contains("max_concurrency"));
         assert!(err(&minimal("[[evm_rpc]]\nalias = \"a\"\nurl = \"https://x.example\"\nchain_id = 1\nmethod_sets = [\"state-write\"]"), d).contains("unknown method set"));
@@ -1252,21 +1330,21 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
             ("http://[::1]:8545/", hdr),
             ("http://10.0.0.5:8545/", "key_header = \"x-api-key\"\ncidrs = [\"10.0.0.5/32\"]"),
         ] {
-            assert!(BrokerConfig::from_toml(&ep(url, extra), d).is_ok(), "{url} {extra}");
+            assert!(dev_toml(&ep(url, extra), d).is_ok(), "{url} {extra}");
         }
         // Without a key, http to a host name is the operator's choice.
         let open = minimal("[[evm_rpc]]\nalias = \"a\"\nurl = \"http://node.example/\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n");
-        assert!(BrokerConfig::from_toml(&open, d).is_ok());
+        assert!(dev_toml(&open, d).is_ok());
     }
 
     #[test]
     fn the_dns_table() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
-        let c = BrokerConfig::from_toml(&minimal(""), d).unwrap();
+        let c = dev_toml(&minimal(""), d).unwrap();
         assert_eq!(c.dns, DnsConfig::default());
         assert_eq!(c.dns.reresolve, Duration::from_secs(300));
-        let c = BrokerConfig::from_toml(
+        let c = dev_toml(
             &minimal("[dns]\nservers = [\"9.9.9.9\", \"127.0.0.1:5353\", \"[2620:fe::fe]:53\"]\nreresolve_secs = 60"),
             d,
         )
@@ -1289,7 +1367,7 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
              [[evm_rpc]]\nalias = \"lit\"\nurl = \"http://10.0.0.5:8545\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n\
              [[evm_rpc]]\nalias = \"both\"\nurl = \"https://node2.example\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\ncidrs = [\"192.168.4.0/24\"]\n",
         );
-        let c = BrokerConfig::from_toml(&text, dir.path()).unwrap();
+        let c = dev_toml(&text, dir.path()).unwrap();
         let p = c.configured_prefixes();
         assert_eq!(p["named"], vec![]);
         assert_eq!(p["lit"], vec![host_prefix("10.0.0.5".parse().unwrap())]);
@@ -1303,7 +1381,7 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         let dir = tempfile::tempdir().unwrap();
         let named = "[[evm_rpc]]\nalias = \"named\"\nurl = \"https://node.example\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n";
         let literal = "[[evm_rpc]]\nalias = \"lit\"\nurl = \"http://10.0.0.5:8545\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n";
-        let ports = |extra: &str| BrokerConfig::from_toml(&minimal(extra), dir.path()).unwrap().tcp_connect_ports();
+        let ports = |extra: &str| dev_toml(&minimal(extra), dir.path()).unwrap().tcp_connect_ports();
         assert_eq!(ports(literal), vec![8545]);
         assert_eq!(ports(&format!("{named}{literal}")), vec![53, 443, 8545]);
         assert_eq!(
@@ -1312,7 +1390,7 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         );
         assert_eq!(ports(&format!("[dns]\nservers = [\"127.0.0.1:5353\"]\n{literal}")), vec![8545]);
         // Once the host facts are read (main does so before the sandbox), their servers count.
-        let mut c = BrokerConfig::from_toml(&minimal(named), dir.path()).unwrap();
+        let mut c = dev_toml(&minimal(named), dir.path()).unwrap();
         c.host = Some(HostFacts { dns_servers: vec!["127.0.0.53:53".parse().unwrap()], ..Default::default() });
         assert_eq!(c.tcp_connect_ports(), vec![53, 443]);
         c.host = Some(HostFacts { dns_servers: vec!["127.0.0.1:40053".parse().unwrap()], ..Default::default() });
@@ -1321,16 +1399,190 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         assert_eq!(c.tcp_connect_ports(), vec![443], "no server, no DNS port");
     }
 
+    fn public_err(text: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        match BrokerConfig::from_toml(text, dir.path(), NetMode::Public) {
+            Ok(_) => panic!("accepted in public mode:\n{text}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// Every role's endpoint, as the TOML that configures it with `url` and `extra` lines.
+    fn role_tables(url: &str, extra: &str) -> [(&'static str, String); 4] {
+        // A mirror's template needs its placeholders in the path.
+        let mirror_url = |slots: &str| format!("{}/{slots}", url.trim_end_matches('/'));
+        [
+            ("evm_rpc", format!("[[evm_rpc]]\nalias = \"a\"\nurl = \"{url}\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n{extra}\n")),
+            ("blob_mirror", format!("[[blob_mirror]]\nalias = \"a\"\nurl_template = \"{}\"\n{extra}\n", mirror_url("{sha256}"))),
+            ("artifacts", format!("[artifacts]\nalias = \"a\"\nurl = \"{url}\"\nchain_id = 1\n{extra}\n")),
+            (
+                "artifacts.mirror",
+                format!(
+                    "[artifacts]\nalias = \"p\"\nurl = \"https://artifacts.example.com\"\nchain_id = 1\n[artifacts.mirror]\nalias = \"a\"\nurl_template = \"{}\"\n{extra}\n",
+                    mirror_url("{type}/{id}")
+                ),
+            ),
+        ]
+    }
+
+    /// Public mode refuses, for every role, a configured address or CIDR that is not entirely
+    /// global and a host name that fails netguard's hygiene; developer mode accepts the same.
+    #[test]
+    fn public_mode_refuses_non_public_role_entries_for_every_role() {
+        let refused = [
+            // IP-literal hosts.
+            ("http://127.0.0.1:8545", "", "not on the public internet"),
+            ("http://10.0.0.5:8545", "", "not on the public internet"),
+            ("http://169.254.169.254", "", "not on the public internet"),
+            ("http://[::1]:8545", "", "not on the public internet"),
+            ("http://[::ffff:127.0.0.1]:8545", "", "not on the public internet"),
+            ("http://[fd00:ec2::254]", "", "not on the public internet"),
+            ("http://[64:ff9b::a00:5]", "", "not on the public internet"),
+            ("http://192.0.2.10", "", "not on the public internet"),
+            // Explicit cidrs: whole prefixes, judged entirely.
+            ("https://node.example.com", "cidrs = [\"0.0.0.0/0\"]", "not on the public internet"),
+            ("https://node.example.com", "cidrs = [\"::/0\"]", "not on the public internet"),
+            ("https://node.example.com", "cidrs = [\"172.0.0.0/8\"]", "not on the public internet"), // holds 172.16/12
+            ("https://node.example.com", "cidrs = [\"100.0.0.0/8\"]", "not on the public internet"), // holds CGNAT
+            ("https://node.example.com", "cidrs = [\"8.0.0.0/6\"]", "not on the public internet"),   // holds 10/8
+            ("https://node.example.com", "cidrs = [\"::ffff:0:0/96\"]", "not on the public internet"),
+            ("https://node.example.com", "cidrs = [\"1.1.1.0/24\", \"10.0.0.5/32\"]", "10.0.0.5/32"),
+            ("http://1.1.1.1", "cidrs = [\"127.0.0.1/32\"]", "not on the public internet"),
+            // Host names.
+            ("http://localhost:8545", "", "single label"),
+            ("http://node:8545", "", "single label"),
+            ("http://node.local:8545", "", ".local"),
+            ("http://metadata.google.internal", "", ".internal"),
+            ("http://nas.lan:8545", "", ".lan"),
+            ("http://anvil.test:8545", "", ".test"),
+            ("http://kubernetes.default.svc", "", ".svc"),
+            ("http://foo.localhost", "", ".localhost"),
+        ];
+        for (url, extra, why) in refused {
+            for (role, table) in role_tables(url, extra) {
+                let text = minimal(&table);
+                let e = public_err(&text);
+                assert!(e.contains(why) && e.contains("a:"), "{role} {url} {extra}: {e}");
+                let dir = tempfile::tempdir().unwrap();
+                let c = BrokerConfig::from_toml(&text, dir.path(), NetMode::DevPrivate)
+                    .unwrap_or_else(|e| panic!("developer mode refused {role} {url} {extra}: {e}"));
+                assert_eq!(c.net_mode, NetMode::DevPrivate);
+            }
+        }
+        // Public endpoints pass in public mode.
+        for (url, extra) in [
+            ("https://node.example.com", ""),
+            ("https://1.1.1.1", ""),
+            ("https://[2606:4700:4700::1111]", ""),
+            ("https://node.example.com", "cidrs = [\"1.1.1.0/24\", \"2606:4700::/32\"]"),
+            ("https://node.example.com", "cidrs = [\"8.0.0.0/7\"]"),
+            ("https://node.example.com", "cidrs = [\"64:ff9b::808:800/120\"]"),
+        ] {
+            for (role, table) in role_tables(url, extra) {
+                let dir = tempfile::tempdir().unwrap();
+                let c = BrokerConfig::from_toml(&minimal(&table), dir.path(), NetMode::Public)
+                    .unwrap_or_else(|e| panic!("public mode refused {role} {url} {extra}: {e}"));
+                assert_eq!(c.net_mode, NetMode::Public);
+            }
+        }
+    }
+
+    /// The deny CIDRs and the DNS servers are no destination: a role entry overlapping either is
+    /// refused in public mode, and a loopback DNS stub is itself allowed.
+    #[test]
+    fn public_mode_refuses_role_entries_on_denied_or_dns_server_addresses() {
+        let ep = |extra: &str| {
+            format!("[[evm_rpc]]\nalias = \"a\"\nurl = \"https://node.example.com\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n{extra}\n")
+        };
+        let e = public_err(&minimal(&format!("[egress]\ndeny_cidrs = [\"1.1.0.0/16\"]\n{}", ep("cidrs = [\"1.1.1.0/24\"]"))));
+        assert!(e.contains("deny CIDR 1.1.0.0/16"), "{e}");
+        let e = public_err(&minimal(&format!("[dns]\nservers = [\"1.1.1.1\"]\n{}", ep("cidrs = [\"1.1.1.0/24\"]"))));
+        assert!(e.contains("deny CIDR 1.1.1.1/32"), "{e}");
+        let e = public_err(&minimal(&format!("[dns]\nservers = [\"[2606:4700:4700::1111]:53\"]\n{}", ep("cidrs = [\"2606:4700::/32\"]"))));
+        assert!(e.contains("2606:4700:4700::1111/128"), "{e}");
+        let dir = tempfile::tempdir().unwrap();
+        let c = BrokerConfig::from_toml(&minimal(&format!("[dns]\nservers = [\"127.0.0.53\"]\n{}", ep(""))), dir.path(), NetMode::Public)
+            .expect("a loopback DNS stub is operator infrastructure, not a destination");
+        assert_eq!(c.effective_deny(&c.dns.servers), vec![parse_cidr("127.0.0.53/32").unwrap()]);
+    }
+
+    /// Once the host's facts are known: a role entry holding an own address or overlapping a
+    /// connected prefix (or a DNS server from `/etc/resolv.conf`) is refused in public mode only.
+    #[test]
+    fn public_mode_refuses_role_entries_on_the_hosts_own_networks() {
+        let text = minimal(
+            "[[evm_rpc]]\nalias = \"wide\"\nurl = \"https://node.example.com\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\ncidrs = [\"9.9.0.0/16\"]\n\
+             [[blob_mirror]]\nalias = \"lit\"\nurl_template = \"https://1.1.1.1/{sha256}\"\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let c = BrokerConfig::from_toml(&text, dir.path(), NetMode::Public).unwrap();
+        let host = |connected: &[&str], own: &[&str], dns: &[&str]| HostFacts {
+            resolved: HashMap::new(),
+            connected: connected.iter().map(|s| parse_cidr(s).unwrap()).collect(),
+            own_addresses: own.iter().map(|s| s.parse().unwrap()).collect(),
+            dns_servers: dns.iter().map(|s| s.parse().unwrap()).collect(),
+        };
+        assert!(c.validate_host(&host(&["127.0.0.0/8", "192.168.1.0/24"], &["127.0.0.1", "192.168.1.10"], &["127.0.0.53:53"])).is_ok());
+        for (h, why) in [
+            (host(&["9.9.9.0/24"], &[], &[]), "a network this host is connected to"),
+            (host(&["9.0.0.0/8"], &[], &[]), "a network this host is connected to"),
+            (host(&[], &["9.9.200.1"], &[]), "this host's own address"),
+            (host(&[], &["1.1.1.1"], &[]), "this host's own address"),
+            (host(&[], &[], &["1.1.1.1:53"]), "deny CIDR 1.1.1.1/32"),
+            (host(&["::ffff:9.9.9.0/120"], &[], &[]), "connected"),
+        ] {
+            let e = c.validate_host(&h).expect_err(why).to_string();
+            assert!(e.contains(why), "{e}");
+        }
+        let dev = BrokerConfig::from_toml(&text, dir.path(), NetMode::DevPrivate).unwrap();
+        assert!(dev.validate_host(&host(&["9.9.9.0/24"], &["1.1.1.1"], &["1.1.1.1:53"])).is_ok());
+    }
+
+    /// The mode comes only from the miner: the file has no key for it.
+    #[test]
+    fn the_file_has_no_developer_mode_key() {
+        for text in [
+            minimal("dev = true"),
+            minimal("private_network = true"),
+            minimal("dev_private_network = true"),
+            minimal("[dev]\nprivate_network = true"),
+            minimal("[egress]\nprivate_network = true"),
+        ] {
+            for mode in [NetMode::Public, NetMode::DevPrivate] {
+                let dir = tempfile::tempdir().unwrap();
+                let e = BrokerConfig::from_toml(&text, dir.path(), mode).expect_err(&text).to_string();
+                assert!(e.contains("unknown field"), "{text}: {e}");
+            }
+        }
+    }
+
+    /// Developer mode is refused when any endpoint serves a production chain (Hemi mainnet).
+    #[test]
+    fn developer_mode_is_refused_with_a_mainnet_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        for text in [
+            minimal("[[evm_rpc]]\nalias = \"a\"\nurl = \"http://127.0.0.1:8545\"\nchain_id = 43111\nmethod_sets = [\"state-read\"]\n"),
+            minimal("[[evm_rpc]]\nalias = \"a\"\nurl = \"http://127.0.0.1:8545\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n[[evm_rpc]]\nalias = \"b\"\nurl = \"https://rpc.example.com\"\nchain_id = 43111\nmethod_sets = [\"state-read\"]\n"),
+            minimal("[artifacts]\nalias = \"a\"\nurl = \"http://127.0.0.1:8545\"\nchain_id = 43111\n"),
+        ] {
+            let e = BrokerConfig::from_toml(&text, dir.path(), NetMode::DevPrivate).expect_err(&text).to_string();
+            assert!(e.contains("developer mode") && e.contains("43111"), "{e}");
+        }
+        // A mainnet endpoint is fine in public mode, on the public internet.
+        let ok = minimal("[[evm_rpc]]\nalias = \"a\"\nurl = \"https://rpc.example.com\"\nchain_id = 43111\nmethod_sets = [\"state-read\"]\n");
+        assert!(BrokerConfig::from_toml(&ok, dir.path(), NetMode::Public).is_ok());
+    }
+
     #[test]
     fn cidr_helpers() {
         let p = parse_cidr("192.168.0.0/16").unwrap();
-        assert!(prefix_contains(&p, "192.168.4.5".parse().unwrap()));
-        assert!(!prefix_contains(&p, "192.169.0.1".parse().unwrap()));
-        assert!(!prefix_contains(&p, "::ffff:192.168.0.1".parse().unwrap()), "families never mix");
+        assert!(p.contains("192.168.4.5".parse().unwrap()));
+        assert!(!p.contains("192.169.0.1".parse().unwrap()));
+        assert!(p.contains("::ffff:192.168.0.1".parse().unwrap()), "a mapped address is its IPv4 address");
         let all = parse_cidr("0.0.0.0/0").unwrap();
-        assert!(prefix_contains(&all, "8.8.8.8".parse().unwrap()));
+        assert!(all.contains("8.8.8.8".parse().unwrap()));
         let v6 = parse_cidr("fd00::/8").unwrap();
-        assert!(prefix_contains(&v6, "fd12::1".parse().unwrap()));
+        assert!(v6.contains("fd12::1".parse().unwrap()));
         assert_eq!(parse_cidr("::1").unwrap(), host_prefix("::1".parse().unwrap()));
     }
 }

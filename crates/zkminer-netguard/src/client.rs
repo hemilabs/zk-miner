@@ -696,10 +696,15 @@ mod tests {
     /// A failure that is not the guard's is told apart from one that is, and carries no URL.
     #[tokio::test]
     async fn a_connection_failure_is_not_a_denial() {
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
+        // A server that drops every connection unanswered (not a freed port, which another test's
+        // server can take in between).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
         let (c, _) = dev_client();
         let e = c
             .get_following_redirects(

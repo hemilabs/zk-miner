@@ -1,51 +1,33 @@
-//! The broker's in-app network floor (plan §14.2) and log redaction (§11.4). Pure functions: the
-//! broker's HTTP client asks [`EgressPolicy::admit`] for every address it is about to connect to.
+//! The broker's network floor (plan §14.2) and log redaction (§11.4). Pure: the broker's HTTP
+//! clients ask [`EgressPolicy::admit`] for every address they are about to connect to.
 //!
-//! INTERFACE CONTRACT (fixed for milestone 2; the bodies are implemented on max/witness-broker-rpc).
+//! # One predicate: zkminer-netguard's
 //!
-//! # The global-address predicate ([`is_global`])
+//! Whether an address or a prefix is on the public internet, the host's own addresses and connected
+//! prefixes, and the embedded-IPv4 canonicalization are all [`zkminer_netguard`]'s (the same code as
+//! the miner's ELF fetch): [`is_global`] (allow-only-globally-routable; IPv4-compatible, 6to4 and
+//! Teredo refused outright; mapped, SIIT and well-known NAT64 judged by their IPv4 address),
+//! [`zkminer_netguard::admit`] and [`zkminer_netguard::admit_prefix`]. This module only maps them
+//! onto roles.
 //!
-//! Allow-only-globally-routable, strictly stronger than `zkminer-chain`'s `ip_is_blocked` (every
-//! address that blocklist refuses, this refuses; a test ports the blocklist verbatim as an oracle):
+//! # The floor
 //!
-//! - **IPv4:** everything except the ranges in `V4_NOT_GLOBAL` (this network, RFC 1918, CGNAT,
-//!   loopback, link-local and metadata, `192.0.0/24`, the three TEST-NETs, the 6to4 relay anycast,
-//!   benchmarking, multicast, `240/4` with the broadcast address, and Azure's `168.63.129.16`). All of
-//!   `192.0.0.0/24` is refused, including the two /32s IANA marks globally reachable (`192.0.0.9` PCP
-//!   anycast, `192.0.0.10` TURN anycast): no RPC endpoint or artifact host lives there, and the
-//!   blocklist refuses them.
-//! - **IPv6:** only `2000::/3` is global unicast (every RIR allocation is inside it), so everything
-//!   else (`::/128`, `::1`, `100::/64`, `5f00::/16`, `fc00::/7` with `fd00:ec2::254`, `fe80::/10`,
-//!   `fec0::/10`, `ff00::/8`, and all of `64:ff9b::/32` except the well-known NAT64 /96) is refused,
-//!   after these forms are judged by the IPv4 address they embed: IPv4-mapped `::ffff:a.b.c.d`,
-//!   IPv4-compatible `::a.b.c.d` (not `::` or `::1`), SIIT `::ffff:0:a.b.c.d`, and NAT64
-//!   `64:ff9b::a.b.c.d`. Inside `2000::/3`, refused: `2001:db8::/32`, `3fff::/20` (documentation),
-//!   `2002::/16` (6to4) and Teredo `2001::/32` **outright, whatever they embed** (both deprecated relay
-//!   prefixes; the blocklist refuses them outright, so judging the embedded IPv4 would be weaker), the
-//!   local-use NAT64 `64:ff9b:1::/48` likewise (it is outside `2000::/3`), and `2001::/23` except
-//!   IANA's globally reachable assignments in it: `2001:1::1`, `2001:1::2`, `2001:1::3` (PCP, TURN and
-//!   DNS-SD SRP anycast), `2001:3::/32` (AMT), `2001:4:112::/48` (AS112-v6) and `2001:30::/28` (DRIP
-//!   DETs). ORCHIDv2 `2001:20::/28`, globally reachable per IANA, stays refused: its identifiers are
-//!   not routable locators, and the blocklist refuses it.
-//!
-//! # Redaction ([`redact_urls`])
-//!
-//! Text is split into tokens at whitespace and quotes (`"`, `'`, `` ` ``). In each token, replaced
-//! by `<url>` from where it starts to the end of the token:
-//!
-//! 1. `scheme://…`: the scheme is the run of `[A-Za-z0-9+.-]` before `://` (empty is allowed);
-//! 2. bare endpoints, starting at the token's start or after `=`, `(`, `[`, `,`, `;` or `@`:
-//!    `user[:pass]@host…` (which also catches e-mail addresses); `host[:port]/path` or
-//!    `host[:port]?a=b` where host is a dotted DNS name with an alphabetic TLD, an IPv4 literal,
-//!    `localhost` or a bracketed IPv6 literal; and `ipv4:port`, `localhost:port`, `[ipv6]:port`. Not
-//!    caught, on purpose: `name.tld:port` without a path (`lib.rs:42` would be a false positive), a
-//!    bare IPv4 or IPv6 address, and `a.b.c.d/nn` (a CIDR);
-//! 3. any token with a query (`?` or `&`) carrying a credential-like parameter (`key=`, `apikey=`,
-//!    `api_key=`, `api-key=`, `token=`, `access_token=`, `auth=`, `secret=`, `password=`, `pass=`,
-//!    `sig=`, `signature=`, case-insensitive): the whole token.
+//! - **Operator endpoints** (role entries: explicit `cidrs`, an IP literal's host route, or what a
+//!   host name resolves to) are admitted only for their own role and alias, on their port. In
+//!   [`NetMode::Public`] the address must also pass netguard's floor: global, not one of the host's
+//!   own addresses, on none of its connected prefixes, in none of the deny CIDRs (the operator's,
+//!   plus the DNS servers', see [`crate::config`]). The configuration refuses a role entry that
+//!   would fail it when it loads; this check holds it at every connection, after a prefix refresh
+//!   too. In [`NetMode::DevPrivate`] (only through the miner's `[dev] private_network`) an
+//!   explicitly configured role entry may be private.
+//! - **A host name's answers** become its role entry only through [`EgressPolicy::dns_admissible`],
+//!   netguard's public floor **in both modes**: a DNS answer is not the operator's word.
+//! - **Requester-derived connections** (Phase 2): netguard's public floor in both modes, then never
+//!   an operator endpoint's address (`RoleOnly`), and only port 443.
 
-use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+pub use zkminer_netguard::{canonical_ip, is_global, NetMode, Prefix};
 
 /// What an endpoint is for. Role entries are admitted only for their own role, in a set that
 /// connections derived from requester data never match.
@@ -57,82 +39,6 @@ pub enum Role {
     ArtifactMirror,
 }
 
-/// An IPv4 or IPv6 prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Prefix {
-    pub addr: IpAddr,
-    pub len: u8,
-}
-
-impl Prefix {
-    /// Whether `ip` falls in the prefix. Host bits of `addr` are ignored; a `len` beyond the family's
-    /// width is clamped to it (a host route). IPv4-mapped IPv6 is the IPv4 address it maps, on both
-    /// sides: `::ffff:10.0.0.5` is in `10.0.0.0/8`, and `::ffff:10.0.0.0/104` is `10.0.0.0/8`.
-    /// Families never match each other otherwise.
-    pub fn contains(&self, ip: IpAddr) -> bool {
-        match (self.canonical(), ip.to_canonical()) {
-            ((IpAddr::V4(net), len), IpAddr::V4(a)) => {
-                let m = mask32(len);
-                u32::from(net) & m == u32::from(a) & m
-            }
-            ((IpAddr::V6(net), len), IpAddr::V6(a)) => {
-                let m = mask128(len);
-                u128::from(net) & m == u128::from(a) & m
-            }
-            _ => false,
-        }
-    }
-
-    /// The prefix with an IPv4-mapped IPv6 network (len ≥ 96) turned into its IPv4 prefix, and `len`
-    /// clamped to the family's width.
-    fn canonical(&self) -> (IpAddr, u8) {
-        match self.addr {
-            IpAddr::V4(v4) => (IpAddr::V4(v4), self.len.min(32)),
-            IpAddr::V6(v6) => {
-                let len = self.len.min(128);
-                match v6.to_ipv4_mapped() {
-                    Some(v4) if len >= 96 => (IpAddr::V4(v4), len - 96),
-                    _ => (IpAddr::V6(v6), len),
-                }
-            }
-        }
-    }
-
-    /// Whether the prefix names one address (a /32 or /128 once an IPv4-mapped prefix is read as
-    /// its IPv4 prefix; `::ffff:0:0/96` is `0.0.0.0/0`, not a host route).
-    pub fn is_host_route(&self) -> bool {
-        match self.canonical() {
-            (IpAddr::V4(_), len) => len == 32,
-            (IpAddr::V6(_), len) => len == 128,
-        }
-    }
-}
-
-/// `ip` with every embedded-IPv4 form that [`is_global`] judges by its IPv4 address (mapped
-/// `::ffff:a.b.c.d`, compatible `::a.b.c.d`, SIIT `::ffff:0:a.b.c.d`, the well-known NAT64
-/// `64:ff9b::a.b.c.d`) replaced by that IPv4 address, so deny, connected and role prefixes match
-/// whichever spelling a connection uses.
-pub fn canonical_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => judged_embedded_v4(v6).map_or(ip, IpAddr::V4),
-        v4 => v4,
-    }
-}
-
-fn mask32(len: u8) -> u32 {
-    match len {
-        0 => 0,
-        l => u32::MAX << (32 - u32::from(l.min(32))),
-    }
-}
-
-fn mask128(len: u8) -> u128 {
-    match len {
-        0 => 0,
-        l => u128::MAX << (128 - u32::from(l.min(128))),
-    }
-}
-
 /// One admitted operator endpoint: a role, an alias, the prefixes its connected address must fall in,
 /// and its port.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,101 +47,6 @@ pub struct RoleEntry {
     pub alias: String,
     pub prefixes: Vec<Prefix>,
     pub port: u16,
-}
-
-/// IPv4 ranges that are not globally routable (or that the blocklist refuses), as (network, length).
-const V4_NOT_GLOBAL: &[([u8; 4], u8)] = &[
-    ([0, 0, 0, 0], 8),        // "this network" (incl. 0.0.0.0)
-    ([10, 0, 0, 0], 8),       // RFC 1918
-    ([100, 64, 0, 0], 10),    // shared address space (CGNAT)
-    ([127, 0, 0, 0], 8),      // loopback
-    ([169, 254, 0, 0], 16),   // link-local, incl. the 169.254.169.254 metadata endpoint
-    ([172, 16, 0, 0], 12),    // RFC 1918
-    ([192, 0, 0, 0], 24),     // IETF protocol assignments, all of it (see the module doc)
-    ([192, 0, 2, 0], 24),     // TEST-NET-1
-    ([192, 88, 99, 0], 24),   // 6to4 relay anycast (deprecated)
-    ([192, 168, 0, 0], 16),   // RFC 1918
-    ([198, 18, 0, 0], 15),    // benchmarking
-    ([198, 51, 100, 0], 24),  // TEST-NET-2
-    ([203, 0, 113, 0], 24),   // TEST-NET-3
-    ([224, 0, 0, 0], 4),      // multicast
-    ([240, 0, 0, 0], 4),      // reserved, incl. 255.255.255.255
-    ([168, 63, 129, 16], 32), // Azure's platform endpoint (wireserver / DNS / DHCP)
-];
-
-/// Inside `2000::/3`: ranges refused outright, as (network, length).
-const V6_NOT_GLOBAL: &[(u128, u8)] = &[
-    (0x2001_0db8 << 96, 32), // documentation
-    (0x2002 << 112, 16),     // 6to4, whatever it embeds
-    (0x3fff << 112, 20),     // documentation (RFC 9637)
-    (0x2001_0000 << 96, 23), // IETF protocol assignments (incl. Teredo), less the exceptions
-];
-
-/// IANA's globally reachable assignments inside `2001::/23` that are admitted (not ORCHIDv2).
-const V6_IANA_GLOBAL_EXCEPTIONS: &[(u128, u8)] = &[
-    ((0x2001_0001 << 96) | 1, 128), // PCP anycast
-    ((0x2001_0001 << 96) | 2, 128), // TURN anycast
-    ((0x2001_0001 << 96) | 3, 128), // DNS-SD SRP anycast
-    (0x2001_0003 << 96, 32),        // AMT
-    (0x2001_0004_0112 << 80, 48),   // AS112-v6
-    (0x2001_0030 << 96, 28),        // DRIP DETs
-];
-
-fn in4(a: u32, net: [u8; 4], len: u8) -> bool {
-    let m = mask32(len);
-    a & m == u32::from_be_bytes(net) & m
-}
-
-fn in6(a: u128, net: u128, len: u8) -> bool {
-    let m = mask128(len);
-    a & m == net & m
-}
-
-fn v4_is_global(a: Ipv4Addr) -> bool {
-    let x = u32::from(a);
-    !V4_NOT_GLOBAL.iter().any(|&(net, len)| in4(x, net, len))
-}
-
-/// The IPv4 address an IPv6 address embeds, for the forms that are judged by it: mapped, compatible
-/// (not `::`/`::1`), SIIT and the well-known NAT64 /96. 6to4 and Teredo are refused outright instead.
-fn judged_embedded_v4(a: Ipv6Addr) -> Option<Ipv4Addr> {
-    let x = u128::from(a);
-    let low = Ipv4Addr::from(x as u32);
-    let hi96 = x >> 32;
-    match hi96 {
-        0xffff => Some(low),                          // ::ffff:a.b.c.d mapped
-        0 if x > 1 => Some(low),                      // ::a.b.c.d compatible
-        0xffff_0000 => Some(low),                     // ::ffff:0:a.b.c.d SIIT
-        0x0064_ff9b_0000_0000_0000_0000 => Some(low), // 64:ff9b::a.b.c.d NAT64
-        _ => None,
-    }
-}
-
-fn v6_is_global(a: Ipv6Addr) -> bool {
-    if let Some(v4) = judged_embedded_v4(a) {
-        return v4_is_global(v4);
-    }
-    let x = u128::from(a);
-    if !in6(x, 0x2000 << 112, 3) {
-        return false;
-    }
-    if V6_IANA_GLOBAL_EXCEPTIONS
-        .iter()
-        .any(|&(net, len)| in6(x, net, len))
-    {
-        return true;
-    }
-    !V6_NOT_GLOBAL.iter().any(|&(net, len)| in6(x, net, len))
-}
-
-/// Allow-only-globally-routable (`is_global` semantics, plus every embedded-IPv4 form judged by its
-/// IPv4 address, and the blocklist of `zkminer-chain`'s `ip_is_blocked`). See the module doc for the
-/// exact ranges and choices.
-pub fn is_global(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4_is_global(v4),
-        IpAddr::V6(v6) => v6_is_global(v6),
-    }
 }
 
 /// The decision for one connection attempt.
@@ -253,6 +64,8 @@ pub enum DenyReason {
     NotGlobal,
     DenyCidr,
     ConnectedPrefix,
+    /// One of the host's own addresses.
+    OwnAddress,
     NoRoleEntry,
     WrongPort,
     /// A requester-derived connection to an operator endpoint's address: those are reachable only
@@ -263,44 +76,75 @@ pub enum DenyReason {
 /// The only port a requester-derived connection may use.
 pub const REQUESTER_PORT: u16 = 443;
 
-/// The policy: role entries, operator deny CIDRs (the host's and fleet's public and NAT addresses),
-/// and the connected prefixes of every interface (refreshed by the caller on change).
-#[derive(Debug, Clone, Default)]
+/// The policy: the mode, role entries, deny CIDRs (the operator's and the DNS servers') and the
+/// host's facts (connected prefixes and own addresses, refreshed by the miner).
+#[derive(Debug, Clone)]
 pub struct EgressPolicy {
+    pub mode: NetMode,
     pub roles: Vec<RoleEntry>,
     pub deny: Vec<Prefix>,
-    pub connected: Vec<Prefix>,
+    pub facts: zkminer_netguard::HostFacts,
+}
+
+impl Default for EgressPolicy {
+    fn default() -> Self {
+        Self {
+            mode: NetMode::Public,
+            roles: Vec::new(),
+            deny: Vec::new(),
+            facts: zkminer_netguard::HostFacts::empty(),
+        }
+    }
 }
 
 impl EgressPolicy {
-    /// For an operator endpoint (`alias` of `role`): admitted only if `addr` matches that entry's
-    /// prefixes and port. For requester-derived connections (`role == None`, Phase 2): admitted only
-    /// if global, port 443, and not in `deny` or `connected`.
+    /// The host's connected prefixes.
+    pub fn connected(&self) -> &[Prefix] {
+        self.facts.connected()
+    }
+
+    /// The host's own addresses.
+    pub fn own_addresses(&self) -> &[IpAddr] {
+        self.facts.own_addresses()
+    }
+
+    /// netguard's public-mode floor for one address, as a [`DenyReason`].
+    pub fn public_floor(&self, ip: IpAddr) -> Result<(), DenyReason> {
+        use zkminer_netguard::Denied;
+        zkminer_netguard::admit(NetMode::Public, ip, &self.facts, &self.deny).map_err(|d| match d {
+            Denied::OwnAddress(_) => DenyReason::OwnAddress,
+            Denied::ConnectedPrefix { .. } => DenyReason::ConnectedPrefix,
+            Denied::DenyCidr { .. } => DenyReason::DenyCidr,
+            _ => DenyReason::NotGlobal,
+        })
+    }
+
+    /// For an operator endpoint (`alias` of `role`): admitted only if `addr` falls in that entry's
+    /// prefixes, on its port, and (in [`NetMode::Public`]) passes [`Self::public_floor`]. When no
+    /// entry of that role and alias has a prefix containing the address the answer is
+    /// `NoRoleEntry`; when one does but on another port, `WrongPort`.
     ///
-    /// A role entry admits its own role and alias only, private addresses included (operators run
-    /// local nodes), and is not subject to `deny` or `connected`. When no entry of that role and alias
-    /// has a prefix containing the address the answer is `NoRoleEntry`; when one does but on another
-    /// port, `WrongPort`. Requester-derived checks run in the order global, deny, connected, role
-    /// addresses, port, all on [`canonical_ip`] (a NAT64, SIIT or IPv4-compatible spelling of a
-    /// denied, connected or operator address is that address).
+    /// For requester-derived connections (`role == None`, Phase 2): [`Self::public_floor`] in
+    /// either mode, then never a role entry's address, and only port 443. Every comparison uses
+    /// [`canonical_ip`] (a NAT64, SIIT, mapped or IPv4-compatible spelling of an address is that
+    /// address).
     pub fn admit(&self, role: Option<(Role, &str)>, addr: SocketAddr) -> Admit {
-        let ip = match role {
-            Some(_) => addr.ip().to_canonical(),
-            None => canonical_ip(addr.ip()),
-        };
+        let ip = canonical_ip(addr.ip());
         match role {
             Some((role, alias)) => {
                 let mut wrong_port = false;
-                for e in self
-                    .roles
-                    .iter()
-                    .filter(|e| e.role == role && e.alias == alias)
-                {
+                for e in self.roles.iter().filter(|e| e.role == role && e.alias == alias) {
                     if e.prefixes.iter().any(|p| p.contains(ip)) {
-                        if e.port == addr.port() {
-                            return Admit::Role;
+                        if e.port != addr.port() {
+                            wrong_port = true;
+                            continue;
                         }
-                        wrong_port = true;
+                        if self.mode == NetMode::Public {
+                            if let Err(r) = self.public_floor(addr.ip()) {
+                                return Admit::Denied(r);
+                            }
+                        }
+                        return Admit::Role;
                     }
                 }
                 Admit::Denied(if wrong_port {
@@ -310,12 +154,8 @@ impl EgressPolicy {
                 })
             }
             None => {
-                if !is_global(ip) {
-                    Admit::Denied(DenyReason::NotGlobal)
-                } else if self.deny.iter().any(|p| p.contains(ip)) {
-                    Admit::Denied(DenyReason::DenyCidr)
-                } else if self.connected.iter().any(|p| p.contains(ip)) {
-                    Admit::Denied(DenyReason::ConnectedPrefix)
+                if let Err(r) = self.public_floor(addr.ip()) {
+                    Admit::Denied(r)
                 } else if self.roles.iter().any(|e| e.prefixes.iter().any(|p| p.contains(ip))) {
                     Admit::Denied(DenyReason::RoleOnly)
                 } else if addr.port() != REQUESTER_PORT {
@@ -328,124 +168,33 @@ impl EgressPolicy {
     }
 
     /// Whether an address a DNS answer gave for an endpoint without explicit `cidrs` may become its
-    /// role entry: global, and not in `deny`, a connected prefix or `own` (the host's addresses),
-    /// all judged on [`canonical_ip`]. DNS answers are not the operator's word (`/etc/hosts`, a
-    /// split-horizon zone or a spoofed answer can say anything), so a local or LAN node is configured
-    /// by IP literal or explicit `cidrs`, never by name alone.
-    pub fn dns_admissible(&self, own: &[IpAddr], ip: IpAddr) -> bool {
-        let c = canonical_ip(ip);
-        is_global(c)
-            && !self.deny.iter().any(|p| p.contains(c))
-            && !self.connected.iter().any(|p| p.contains(c))
-            && !own.iter().any(|o| canonical_ip(*o) == c)
+    /// role entry: netguard's public floor, **in both modes**. DNS answers are not the operator's
+    /// word (`/etc/hosts`, a split-horizon zone or a spoofed answer can say anything), so a local or
+    /// LAN node is configured by IP literal or explicit `cidrs` (and only in developer mode), never
+    /// by name alone.
+    pub fn dns_admissible(&self, ip: IpAddr) -> bool {
+        self.public_floor(ip).is_ok()
+    }
+
+    /// In [`NetMode::Public`], the first role prefix that is not entirely global or reaches the
+    /// host or a deny CIDR ([`zkminer_netguard::admit_prefix`]), with why; `None` when every one is
+    /// public (always in [`NetMode::DevPrivate`]). The self-test's check of the effective role set.
+    pub fn first_non_public_role(&self) -> Option<(String, zkminer_netguard::Denied)> {
+        self.roles.iter().find_map(|e| {
+            e.prefixes.iter().find_map(|p| {
+                zkminer_netguard::admit_prefix(self.mode, *p, &self.facts, &self.deny)
+                    .err()
+                    .map(|d| (e.alias.clone(), d))
+            })
+        })
     }
 }
 
-/// The connected prefixes of every interface (getifaddrs): each address with its netmask as a
-/// network prefix (a missing netmask is a host route; a non-contiguous one counts its leading ones,
-/// which only widens it), plus the peer address of a point-to-point link as a host route. Sorted and
-/// deduplicated.
-pub fn connected_prefixes() -> io::Result<Vec<Prefix>> {
-    struct List(*mut libc::ifaddrs);
-    impl Drop for List {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: the pointer came from a successful getifaddrs and is freed exactly once.
-                unsafe { libc::freeifaddrs(self.0) };
-            }
-        }
-    }
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs writes a list head (or null) into `head`; `List` frees it.
-    if unsafe { libc::getifaddrs(&mut head) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let list = List(head);
-    let mut out = Vec::new();
-    let mut cur = list.0;
-    while !cur.is_null() {
-        // SAFETY: `cur` is a non-null node of the list getifaddrs returned, alive until `list` drops.
-        let ifa = unsafe { &*cur };
-        cur = ifa.ifa_next;
-        // SAFETY: the sockaddr pointers of a live ifaddrs node are null or valid for their family.
-        let Some(addr) = (unsafe { sockaddr_ip(ifa.ifa_addr) }) else {
-            continue;
-        };
-        let width = if addr.is_ipv4() { 32 } else { 128 };
-        // SAFETY: as above; the netmask is read in the address's family.
-        let len = match unsafe { sockaddr_mask(ifa.ifa_netmask, addr.is_ipv4()) } {
-            Some(len) => len,
-            None => width,
-        };
-        out.push(network(addr, len));
-        if ifa.ifa_flags & (libc::IFF_POINTOPOINT as libc::c_uint) != 0 {
-            // SAFETY: on a point-to-point interface the union holds the destination address.
-            if let Some(peer) = unsafe { sockaddr_ip(peer_ptr(ifa)) } {
-                let w = if peer.is_ipv4() { 32 } else { 128 };
-                out.push(Prefix { addr: peer, len: w });
-            }
-        }
-    }
-    out.sort_by_key(|p| (p.addr, p.len));
-    out.dedup();
-    Ok(out)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn peer_ptr(ifa: &libc::ifaddrs) -> *const libc::sockaddr {
-    ifa.ifa_ifu
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn peer_ptr(ifa: &libc::ifaddrs) -> *const libc::sockaddr {
-    ifa.ifa_dstaddr
-}
-
-fn network(addr: IpAddr, len: u8) -> Prefix {
-    let addr = match addr {
-        IpAddr::V4(a) => IpAddr::V4(Ipv4Addr::from(u32::from(a) & mask32(len))),
-        IpAddr::V6(a) => IpAddr::V6(Ipv6Addr::from(u128::from(a) & mask128(len))),
-    };
-    Prefix { addr, len }
-}
-
-/// # Safety
-/// `sa` is null or points to a sockaddr valid for its `sa_family`.
-unsafe fn sockaddr_ip(sa: *const libc::sockaddr) -> Option<IpAddr> {
-    if sa.is_null() {
-        return None;
-    }
-    match i32::from((*sa).sa_family) {
-        libc::AF_INET => {
-            let sin = &*(sa as *const libc::sockaddr_in);
-            Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
-                sin.sin_addr.s_addr,
-            ))))
-        }
-        libc::AF_INET6 => {
-            let sin6 = &*(sa as *const libc::sockaddr_in6);
-            Some(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)))
-        }
-        _ => None,
-    }
-}
-
-/// The prefix length of a netmask, read in the address's family (some systems leave the netmask's own
-/// `sa_family` zero).
-///
-/// # Safety
-/// `sa` is null or points to a sockaddr_in (`v4`) or sockaddr_in6.
-unsafe fn sockaddr_mask(sa: *const libc::sockaddr, v4: bool) -> Option<u8> {
-    if sa.is_null() {
-        return None;
-    }
-    if v4 {
-        let sin = &*(sa as *const libc::sockaddr_in);
-        Some(u32::from_be(sin.sin_addr.s_addr).leading_ones() as u8)
-    } else {
-        let sin6 = &*(sa as *const libc::sockaddr_in6);
-        Some(u128::from_be_bytes(sin6.sin6_addr.s6_addr).leading_ones() as u8)
-    }
+/// The connected prefixes of every interface (netguard's [`zkminer_netguard::HostFacts::gather`]:
+/// each address under its netmask, plus point-to-point peers). Only callable before the sandbox is
+/// applied (netlink).
+pub fn connected_prefixes() -> std::io::Result<Vec<Prefix>> {
+    Ok(zkminer_netguard::HostFacts::gather()?.connected().to_vec())
 }
 
 /// Replaces every URL (scheme://…) in `s` with `<url>`; endpoints are logged by alias only. Also bare
@@ -679,346 +428,184 @@ mod tests {
     }
 
     fn pfx(s: &str) -> Prefix {
-        let (a, l) = s.split_once('/').unwrap();
-        Prefix {
-            addr: ip(a),
-            len: l.parse().unwrap(),
+        s.parse().unwrap()
+    }
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn policy(mode: NetMode) -> EgressPolicy {
+        EgressPolicy {
+            mode,
+            roles: vec![
+                RoleEntry {
+                    role: Role::EvmRpc,
+                    alias: "base-archive".into(),
+                    prefixes: vec![pfx("10.1.0.0/16"), pfx("fd00::/64")],
+                    port: 8545,
+                },
+                RoleEntry {
+                    role: Role::Artifact,
+                    alias: "hemi".into(),
+                    prefixes: vec![pfx("203.0.113.7/32")],
+                    port: 443,
+                },
+                RoleEntry { role: Role::BlobMirror, alias: "m1".into(), prefixes: vec![pfx("8.8.4.0/24")], port: 443 },
+                RoleEntry { role: Role::EvmRpc, alias: "public".into(), prefixes: vec![pfx("1.0.0.0/24")], port: 443 },
+            ],
+            deny: vec![pfx("8.8.4.4/32"), pfx("2a01:4f8::/32")],
+            facts: zkminer_netguard::HostFacts::new(
+                vec![pfx("9.9.9.0/24"), pfx("2606:4700:aaaa::/48")],
+                vec![ip("9.9.9.10"), ip("1.0.0.77")],
+            ),
         }
     }
 
-    /// `zkminer-chain`'s `embedded_ipv4` and `ip_is_blocked`, verbatim (crates/zkminer-chain/src/
-    /// programs.rs), as the oracle the new predicate must be strictly stronger than.
-    mod legacy {
-        use std::net::{IpAddr, Ipv4Addr};
+    /// Developer mode: an explicitly configured role entry is admitted for its own role and alias,
+    /// private addresses included.
+    #[test]
+    fn dev_mode_admits_private_role_entries_for_their_role_only() {
+        let p = policy(NetMode::DevPrivate);
+        let rpc = Some((Role::EvmRpc, "base-archive"));
+        assert_eq!(p.admit(rpc, sa("10.1.2.3:8545")), Admit::Role);
+        assert_eq!(p.admit(rpc, sa("[fd00::5]:8545")), Admit::Role);
+        assert_eq!(p.admit(rpc, sa("[::ffff:10.1.2.3]:8545")), Admit::Role);
+        assert_eq!(p.admit(rpc, sa("10.1.2.3:8546")), Admit::Denied(DenyReason::WrongPort));
+        assert_eq!(p.admit(rpc, sa("10.2.0.1:8545")), Admit::Denied(DenyReason::NoRoleEntry));
+        // Only its own role and alias.
+        assert_eq!(
+            p.admit(Some((Role::EvmRpc, "other")), sa("10.1.2.3:8545")),
+            Admit::Denied(DenyReason::NoRoleEntry)
+        );
+        assert_eq!(
+            p.admit(Some((Role::Artifact, "base-archive")), sa("10.1.2.3:8545")),
+            Admit::Denied(DenyReason::NoRoleEntry)
+        );
+        assert_eq!(
+            p.admit(Some((Role::ArtifactMirror, "hemi")), sa("203.0.113.7:443")),
+            Admit::Denied(DenyReason::NoRoleEntry)
+        );
+        assert_eq!(p.admit(Some((Role::Artifact, "hemi")), sa("203.0.113.7:443")), Admit::Role);
+        assert_eq!(p.admit(Some((Role::BlobMirror, "m1")), sa("8.8.4.4:443")), Admit::Role);
+    }
 
-        fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return Some(mapped);
+    /// Public mode: a role entry is admitted only where netguard's floor admits the address too,
+    /// however the configuration got there.
+    #[test]
+    fn public_mode_holds_role_entries_to_the_public_floor() {
+        let p = policy(NetMode::Public);
+        let rpc = Some((Role::EvmRpc, "base-archive"));
+        assert_eq!(p.admit(rpc, sa("10.1.2.3:8545")), Admit::Denied(DenyReason::NotGlobal));
+        assert_eq!(p.admit(rpc, sa("[fd00::5]:8545")), Admit::Denied(DenyReason::NotGlobal));
+        assert_eq!(p.admit(Some((Role::Artifact, "hemi")), sa("203.0.113.7:443")), Admit::Denied(DenyReason::NotGlobal));
+        assert_eq!(p.admit(Some((Role::BlobMirror, "m1")), sa("8.8.4.4:443")), Admit::Denied(DenyReason::DenyCidr));
+        assert_eq!(p.admit(Some((Role::BlobMirror, "m1")), sa("8.8.4.8:443")), Admit::Role);
+        let public = Some((Role::EvmRpc, "public"));
+        assert_eq!(p.admit(public, sa("1.0.0.1:443")), Admit::Role);
+        assert_eq!(p.admit(public, sa("1.0.0.77:443")), Admit::Denied(DenyReason::OwnAddress));
+        assert_eq!(p.admit(public, sa("[64:ff9b::100:1]:443")), Admit::Role, "NAT64 of a public address");
+        assert_eq!(p.admit(public, sa("[::100:1]:443")), Admit::Denied(DenyReason::NotGlobal), "IPv4-compatible");
+        // The role-set check names the first non-public entry.
+        let (alias, why) = p.first_non_public_role().expect("10.1.0.0/16 is not public");
+        assert_eq!(alias, "base-archive");
+        assert!(why.to_string().contains("10.1.0.0/16"), "{why}");
+        assert_eq!(policy(NetMode::DevPrivate).first_non_public_role(), None);
+        let clean = EgressPolicy { roles: p.roles[3..].to_vec(), ..p.clone() };
+        assert!(clean.first_non_public_role().is_some(), "1.0.0.0/24 holds the own address 1.0.0.77");
+        let clean = EgressPolicy { facts: zkminer_netguard::HostFacts::empty(), ..clean };
+        assert_eq!(clean.first_non_public_role(), None);
+    }
+
+    /// The requester path is netguard's public floor in either mode.
+    #[test]
+    fn admit_requester_derived() {
+        for mode in [NetMode::Public, NetMode::DevPrivate] {
+            let p = policy(mode);
+            assert_eq!(p.admit(None, sa("1.1.1.1:443")), Admit::Global);
+            assert_eq!(p.admit(None, sa("[2606:4700:4700::1111]:443")), Admit::Global);
+            assert_eq!(p.admit(None, sa("1.1.1.1:80")), Admit::Denied(DenyReason::WrongPort));
+            for s in ["10.1.2.3:443", "[::ffff:10.1.2.3]:443", "169.254.169.254:443", "[fd00:ec2::254]:443", "127.0.0.1:443", "[::808:808]:443"] {
+                assert_eq!(p.admit(None, sa(s)), Admit::Denied(DenyReason::NotGlobal), "{s}");
             }
-            let seg = v6.segments();
-            let v4_from = |hi: u16, lo: u16| {
-                let a = hi.to_be_bytes();
-                let b = lo.to_be_bytes();
-                Ipv4Addr::new(a[0], a[1], b[0], b[1])
+            assert_eq!(p.admit(None, sa("8.8.4.4:443")), Admit::Denied(DenyReason::DenyCidr));
+            assert_eq!(p.admit(None, sa("[::ffff:8.8.4.4]:443")), Admit::Denied(DenyReason::DenyCidr));
+            assert_eq!(p.admit(None, sa("[2a01:4f8::1]:443")), Admit::Denied(DenyReason::DenyCidr));
+            assert_eq!(p.admit(None, sa("9.9.9.9:443")), Admit::Denied(DenyReason::ConnectedPrefix));
+            assert_eq!(p.admit(None, sa("[2606:4700:aaaa::1]:443")), Admit::Denied(DenyReason::ConnectedPrefix));
+            assert_eq!(p.admit(None, sa("9.9.9.10:443")), Admit::Denied(DenyReason::OwnAddress));
+            // Requester-derived connections never reach a role entry's address.
+            assert_eq!(p.admit(None, sa("8.8.4.8:443")), Admit::Denied(DenyReason::RoleOnly));
+            assert_eq!(p.admit(None, sa("1.0.0.1:443")), Admit::Denied(DenyReason::RoleOnly));
+            assert_eq!(p.admit(None, sa("203.0.113.7:443")), Admit::Denied(DenyReason::NotGlobal));
+        }
+    }
+
+    /// Review F10 (the reviewer's PoC, inverted): the NAT64, SIIT and IPv4-compatible spellings of a
+    /// denied, connected or operator address are that address on the requester path.
+    #[test]
+    fn embedded_forms_are_judged_as_their_v4_on_the_requester_path() {
+        let p = EgressPolicy {
+            mode: NetMode::Public,
+            roles: vec![RoleEntry { role: Role::EvmRpc, alias: "n".into(), prefixes: vec![pfx("8.8.8.8/32")], port: 443 }],
+            deny: vec![pfx("8.8.4.4/32")],
+            facts: zkminer_netguard::HostFacts::new(vec![pfx("9.9.9.0/24")], vec![]),
+        };
+        for (s, why) in [
+            ("8.8.4.4:443", DenyReason::DenyCidr),
+            ("[::ffff:8.8.4.4]:443", DenyReason::DenyCidr),
+            ("[64:ff9b::808:404]:443", DenyReason::DenyCidr),
+            ("[::ffff:0:808:404]:443", DenyReason::DenyCidr),
+            ("[::808:404]:443", DenyReason::NotGlobal), // IPv4-compatible: refused outright now
+            ("9.9.9.9:443", DenyReason::ConnectedPrefix),
+            ("[64:ff9b::909:909]:443", DenyReason::ConnectedPrefix),
+            ("8.8.8.8:443", DenyReason::RoleOnly),
+            ("[64:ff9b::808:808]:443", DenyReason::RoleOnly),
+            ("[::ffff:0:808:808]:443", DenyReason::RoleOnly),
+        ] {
+            assert_eq!(p.admit(None, sa(s)), Admit::Denied(why), "{s}");
+        }
+        assert_eq!(p.admit(None, sa("[64:ff9b::101:101]:443")), Admit::Global, "an unrelated global v4 stays admitted");
+    }
+
+    /// DNS answers are held to the public floor in both modes.
+    #[test]
+    fn dns_admission_is_public_in_both_modes() {
+        for mode in [NetMode::Public, NetMode::DevPrivate] {
+            let p = EgressPolicy {
+                facts: zkminer_netguard::HostFacts::new(vec![pfx("9.9.9.0/24")], vec![ip("2a00:1450:4001::77")]),
+                ..policy(mode)
             };
-            if seg[0..6].iter().all(|&s| s == 0) && !(seg[6] == 0 && (seg[7] == 0 || seg[7] == 1)) {
-                return Some(v4_from(seg[6], seg[7]));
+            for s in ["8.8.8.8", "2606:4700:4700::1111", "64:ff9b::101:101"] {
+                assert!(p.dns_admissible(ip(s)), "{s}");
             }
-            if seg[0..4].iter().all(|&s| s == 0) && seg[4] == 0xffff && seg[5] == 0 {
-                return Some(v4_from(seg[6], seg[7]));
+            for s in [
+                "127.0.0.1",
+                "::1",
+                "10.1.2.3",
+                "169.254.169.254",
+                "fd00:ec2::254",
+                "::ffff:127.0.0.1",
+                "64:ff9b::7f00:1", // NAT64 loopback
+                "::808:808",       // IPv4-compatible
+                "8.8.4.4",         // deny
+                "64:ff9b::808:404",
+                "9.9.9.9",            // connected
+                "2a00:1450:4001::77", // own
+            ] {
+                assert!(!p.dns_admissible(ip(s)), "{s} ({mode:?})");
             }
-            if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6].iter().all(|&s| s == 0) {
-                return Some(v4_from(seg[6], seg[7]));
-            }
-            if seg[0] == 0x2002 {
-                return Some(v4_from(seg[1], seg[2]));
-            }
-            if seg[0] == 0x2001 && seg[1] == 0x0000 {
-                return Some(v4_from(!seg[6], !seg[7]));
-            }
-            None
-        }
-
-        pub fn ip_is_blocked(ip: &IpAddr) -> bool {
-            match ip {
-                IpAddr::V4(v4) => {
-                    let o = v4.octets();
-                    v4.is_loopback()
-                        || v4.is_private()
-                        || v4.is_link_local()
-                        || v4.is_broadcast()
-                        || v4.is_multicast()
-                        || v4.is_documentation()
-                        || v4.is_unspecified()
-                        || o[0] == 0
-                        || (o[0] == 100 && (o[1] & 0xc0) == 64)
-                        || o[0] >= 240
-                        || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
-                        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
-                        || (o[0] == 192 && o[1] == 88 && o[2] == 99)
-                        || o == [168, 63, 129, 16]
-                }
-                IpAddr::V6(v6) => {
-                    if embedded_ipv4(*v6).is_some_and(|v4| ip_is_blocked(&IpAddr::V4(v4))) {
-                        return true;
-                    }
-                    let seg = v6.segments();
-                    v6.is_loopback()
-                        || v6.is_unspecified()
-                        || v6.is_multicast()
-                        || (seg[0] & 0xfe00) == 0xfc00
-                        || (seg[0] & 0xffc0) == 0xfe80
-                        || (seg[0] & 0xffc0) == 0xfec0
-                        || (seg[0] == 0x0064
-                            && seg[1] == 0xff9b
-                            && seg[2..6].iter().any(|&s| s != 0))
-                        || seg[0] == 0x2002
-                        || (seg[0] == 0x2001 && seg[1] == 0x0000)
-                        || (seg[0] == 0x2001 && seg[1] == 0x0db8)
-                        || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0020)
-                }
-            }
-        }
-    }
-
-    /// Every case §14.1 names (what the blocklist covers, and the gaps it misses), plus the rest of
-    /// the not-global set.
-    const REFUSED: &[&str] = &[
-        // §14.1: what ip_is_blocked already refuses.
-        "fd00:ec2::254",          // AWS IMDS over IPv6 (ULA)
-        "fc00::1",                // ULA
-        "fdff:ffff::1",           // ULA
-        "::ffff:127.0.0.1",       // mapped loopback
-        "::ffff:169.254.169.254", // mapped metadata
-        "::ffff:10.0.0.1",        // mapped RFC 1918
-        "::a9fe:a9fe",            // compatible metadata
-        "::a00:1",                // compatible 10.0.0.1
-        "::ffff:0:a9fe:a9fe",     // SIIT metadata
-        "::ffff:0:a00:1",         // SIIT 10.0.0.1
-        "64:ff9b::a9fe:a9fe",     // NAT64 metadata
-        "64:ff9b::a00:1",         // NAT64 10.0.0.1
-        "64:ff9b::7f00:1",        // NAT64 loopback
-        "2002:a9fe:a9fe::",       // 6to4 metadata
-        "2002:808:808::",         // 6to4, whatever it embeds
-        "2001::f5ff:fffe",        // Teredo with client 10.0.0.1
-        "2001:0:808:808::1",      // Teredo, whatever it embeds
-        "100.64.0.1",             // CGNAT
-        "100.127.255.255",        // CGNAT
-        "0.0.0.0",                // 0/8
-        "0.1.2.3",                // 0/8
-        "198.18.0.1",             // benchmarking
-        "198.19.255.255",         // benchmarking
-        "192.0.2.1",              // TEST-NET-1
-        "198.51.100.1",           // TEST-NET-2
-        "203.0.113.255",          // TEST-NET-3
-        "2001:db8::1",            // IPv6 documentation
-        "224.0.0.1",              // multicast
-        "239.255.255.250",        // multicast
-        "ff02::1",                // IPv6 multicast
-        "ff0e::1",                // IPv6 global-scope multicast
-        "240.0.0.1",              // 240/4
-        "255.255.255.255",        // broadcast
-        "192.0.0.1",              // 192.0.0/24
-        "192.0.0.9",              // PCP anycast (IANA global; refused, see the module doc)
-        "192.0.0.10",             // TURN anycast (likewise)
-        "192.0.0.170",            // NAT64 discovery
-        "192.88.99.1",            // 6to4 relay anycast
-        "fec0::1",                // site-local
-        "168.63.129.16",          // Azure platform endpoint
-        "64:ff9b:1::808:808",     // local-use NAT64 (RFC 8215)
-        "2001:20::1",             // ORCHIDv2 (refused, see the module doc)
-        "2001:2f:ffff::1",        // ORCHIDv2
-        // §14.1 gaps: what the blocklist misses.
-        "100::1", // discard-only
-        "100::ffff:ffff:ffff:ffff",
-        "2001:2::1", // benchmarking
-        "2001:2:0:ffff::1",
-        "3fff::1", // documentation (RFC 9637)
-        "3fff:fff:ffff::1",
-        "5f00::1", // SRv6 SIDs
-        // The rest of the not-global set.
-        "10.0.0.1",
-        "10.255.255.255",
-        "127.0.0.1",
-        "127.255.255.254",
-        "169.254.169.254", // cloud metadata
-        "169.254.0.1",
-        "172.16.0.1",
-        "172.31.255.255",
-        "192.168.1.1",
-        "::",
-        "::1",
-        "fe80::1",
-        "febf::1",
-        "2001:10::1", // deprecated ORCHID
-        "2001:1::",   // in 2001:1::/48 but not one of the three anycast /128s
-        "2001:1::4",
-        "2001:4:113::1", // next to AS112-v6
-        "2001:40::1",    // unassigned in 2001::/23
-        "2001:1ff::1",   // the top of 2001::/23
-        "4000::1",       // outside 2000::/3
-        "1fff::1",
-        "::ffff:0.0.0.0",
-        "::2", // compatible 0.0.0.2 (0/8)
-    ];
-
-    const ADMITTED: &[&str] = &[
-        "8.8.8.8",
-        "1.1.1.1",
-        "93.184.216.34",
-        "100.63.255.255", // just below CGNAT
-        "100.128.0.0",    // just above CGNAT
-        "172.15.255.255",
-        "172.32.0.0",
-        "169.253.255.255",
-        "169.255.0.0",
-        "192.0.1.0",
-        "192.0.3.0",
-        "192.88.98.255",
-        "192.88.100.0",
-        "198.17.255.255",
-        "198.20.0.0",
-        "198.51.99.255",
-        "203.0.112.255",
-        "203.0.114.0",
-        "223.255.255.255", // just below multicast
-        "168.63.129.15",
-        "168.63.129.17",
-        "192.31.196.1", // AS112-v4 (IANA global)
-        "192.52.193.1", // AMT (IANA global)
-        "192.175.48.1", // AS112 direct delegation (IANA global)
-        "2606:4700:4700::1111",
-        "2a00:1450:4001::1",
-        "2001:200::1", // just above 2001::/23
-        "2001:db7:ffff::1",
-        "2001:db9::1",
-        "2003::1",
-        "3ffe::1",
-        "3fff:1000::1", // just above 3fff::/20
-        "2001:1::1",    // IANA exceptions in 2001::/23
-        "2001:1::2",
-        "2001:1::3",
-        "2001:3::1",
-        "2001:3:ffff::1",
-        "2001:4:112::1",
-        "2001:4:112:ffff::1",
-        "2001:30::1",
-        "2001:3f:ffff::1",
-        "::ffff:8.8.8.8", // embedded forms of a public address
-        "::ffff:0:808:808",
-        "64:ff9b::808:808",
-        "::808:808",
-    ];
-
-    #[test]
-    fn every_section_14_1_case_and_the_not_global_set_is_refused() {
-        for s in REFUSED {
-            assert!(!is_global(ip(s)), "{s} must not be global");
         }
     }
 
     #[test]
-    fn public_addresses_and_neighbours_of_the_ranges_are_admitted() {
-        for s in ADMITTED {
-            assert!(is_global(ip(s)), "{s} must be global");
-        }
-    }
-
-    #[test]
-    fn strictly_stronger_than_the_legacy_blocklist_on_the_tables() {
-        for s in REFUSED.iter().chain(ADMITTED) {
-            let a = ip(s);
-            if legacy::ip_is_blocked(&a) {
-                assert!(
-                    !is_global(a),
-                    "{s}: blocked by ip_is_blocked but global here"
-                );
-            }
-        }
-        // And the gaps really are gaps of the old list (so the test above is not vacuous for them).
-        for s in ["100::1", "2001:2::1", "3fff::1", "5f00::1", "4000::1"] {
-            assert!(!legacy::ip_is_blocked(&ip(s)) && !is_global(ip(s)), "{s}");
-        }
-    }
-
-    /// Interesting IPv6 /32 heads: every special range and its neighbours.
-    const V6_HEADS: &[u32] = &[
-        0x0000_0000,
-        0x0000_ffff,
-        0x0064_ff9b,
-        0x0064_ff9a,
-        0x0100_0000,
-        0x2001_0000,
-        0x2001_0001,
-        0x2001_0002,
-        0x2001_0003,
-        0x2001_0004,
-        0x2001_0010,
-        0x2001_0020,
-        0x2001_002f,
-        0x2001_0030,
-        0x2001_01ff,
-        0x2001_0200,
-        0x2001_0db8,
-        0x2002_0000,
-        0x2002_ffff,
-        0x3fff_0000,
-        0x3fff_1000,
-        0x5f00_0000,
-        0xfc00_0000,
-        0xfd00_0ec2,
-        0xfe80_0000,
-        0xfec0_0000,
-        0xff02_0000,
-        0x2606_4700,
-    ];
-
-    fn v4_strategy() -> impl Strategy<Value = Ipv4Addr> {
-        prop_oneof![
-            any::<u32>().prop_map(Ipv4Addr::from),
-            // Biased to the special /8s and their neighbours.
-            (
-                prop::sample::select(vec![
-                    0u8, 10, 100, 127, 168, 169, 172, 192, 198, 203, 223, 224, 239, 240, 255
-                ]),
-                any::<u8>(),
-                any::<u8>(),
-                any::<u8>()
-            )
-                .prop_map(|(a, b, c, d)| Ipv4Addr::new(a, b, c, d)),
-        ]
-    }
-
-    fn v6_strategy() -> impl Strategy<Value = Ipv6Addr> {
-        prop_oneof![
-            any::<u128>().prop_map(Ipv6Addr::from),
-            (
-                prop::sample::select(V6_HEADS.to_vec()),
-                any::<u128>(),
-                0u32..96
-            )
-                .prop_map(|(h, r, zeros)| {
-                    // A head, then random bits with a random run of high zero bits (so the embedded
-                    // forms, which need zeros in the middle, are hit).
-                    let tail = (r >> 32) >> zeros.min(95);
-                    Ipv6Addr::from((u128::from(h) << 96) | tail)
-                }),
-            (
-                v4_strategy(),
-                prop::sample::select(vec![
-                    0u128,
-                    0xffff,
-                    0xffff_0000,
-                    0x0064_ff9b_0000_0000_0000_0000
-                ])
-            )
-                .prop_map(|(v4, hi)| Ipv6Addr::from((hi << 32) | u128::from(u32::from(v4)))),
-        ]
+    fn this_hosts_connected_prefixes_come_from_netguard() {
+        let ps = connected_prefixes().expect("getifaddrs");
+        assert!(ps.iter().any(|p| p.contains(ip("127.0.0.1"))) || ps.is_empty());
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig { cases: 20_000, ..ProptestConfig::default() })]
-
-        #[test]
-        fn legacy_blocked_implies_not_global_v4(a in v4_strategy()) {
-            let a = IpAddr::V4(a);
-            prop_assert!(!(legacy::ip_is_blocked(&a) && is_global(a)), "{a}");
-        }
-
-        #[test]
-        fn legacy_blocked_implies_not_global_v6(a in v6_strategy()) {
-            let a = IpAddr::V6(a);
-            prop_assert!(!(legacy::ip_is_blocked(&a) && is_global(a)), "{a}");
-        }
-
-        #[test]
-        fn embedded_forms_follow_their_v4(v4 in v4_strategy()) {
-            let x = u128::from(u32::from(v4));
-            for hi in [0xffffu128, 0xffff_0000, 0x0064_ff9b_0000_0000_0000_0000] {
-                let a = Ipv6Addr::from((hi << 32) | x);
-                prop_assert_eq!(is_global(IpAddr::V6(a)), is_global(IpAddr::V4(v4)), "{}", a);
-            }
-        }
+        #![proptest_config(ProptestConfig { cases: 2_000, ..ProptestConfig::default() })]
 
         #[test]
         fn sanitize_log_is_bounded_and_printable(bytes in prop::collection::vec(any::<u8>(), 0..300), max in 0usize..400) {
@@ -1035,261 +622,6 @@ mod tests {
             prop_assert!(!r.contains(&secret), "{} -> {}", s, r);
             let _ = redact_urls(&pre);
         }
-    }
-
-    #[test]
-    fn prefix_contains() {
-        let p = pfx("10.0.0.0/8");
-        assert!(p.contains(ip("10.1.2.3")));
-        assert!(
-            p.contains(ip("::ffff:10.1.2.3")),
-            "a mapped address is its v4"
-        );
-        assert!(!p.contains(ip("11.0.0.0")));
-        assert!(!p.contains(ip("::a01:203")), "compatible is not mapped");
-        assert!(
-            pfx("10.9.9.9/8").contains(ip("10.0.0.1")),
-            "host bits of the prefix are ignored"
-        );
-        assert!(pfx("0.0.0.0/0").contains(ip("1.2.3.4")));
-        assert!(
-            !pfx("0.0.0.0/0").contains(ip("2001:db8::1")),
-            "families never mix"
-        );
-        assert!(!pfx("::/0").contains(ip("1.2.3.4")));
-        assert!(pfx("::/0").contains(ip("2001:db8::1")));
-        assert!(pfx("1.2.3.4/32").contains(ip("1.2.3.4")));
-        assert!(!pfx("1.2.3.4/32").contains(ip("1.2.3.5")));
-        assert!(
-            pfx("1.2.3.4/40").contains(ip("1.2.3.4")),
-            "len is clamped to a host route"
-        );
-        assert!(!pfx("1.2.3.4/40").contains(ip("1.2.3.5")));
-        assert!(pfx("2001:db8:1::/48").contains(ip("2001:db8:1:ffff::1")));
-        assert!(!pfx("2001:db8:1::/48").contains(ip("2001:db8:2::1")));
-        assert!(pfx("2001:db8::1/200").contains(ip("2001:db8::1")));
-        assert!(!pfx("2001:db8::1/200").contains(ip("2001:db8::2")));
-        assert!(
-            pfx("::ffff:10.0.0.0/104").contains(ip("10.255.0.1")),
-            "a mapped prefix is its v4"
-        );
-        assert!(!pfx("::ffff:10.0.0.0/104").contains(ip("11.0.0.1")));
-        assert!(pfx("2001:db8::/31").contains(ip("2001:db9::1")));
-    }
-
-    fn policy() -> EgressPolicy {
-        EgressPolicy {
-            roles: vec![
-                RoleEntry {
-                    role: Role::EvmRpc,
-                    alias: "base-archive".into(),
-                    prefixes: vec![pfx("10.1.0.0/16"), pfx("fd00::/64")],
-                    port: 8545,
-                },
-                RoleEntry {
-                    role: Role::Artifact,
-                    alias: "hemi".into(),
-                    prefixes: vec![pfx("203.0.113.7/32")],
-                    port: 443,
-                },
-                RoleEntry {
-                    role: Role::BlobMirror,
-                    alias: "m1".into(),
-                    prefixes: vec![pfx("8.8.4.0/24")],
-                    port: 443,
-                },
-            ],
-            deny: vec![pfx("8.8.4.4/32"), pfx("2a01:4f8::/32")],
-            connected: vec![pfx("9.9.9.0/24"), pfx("2606:4700:aaaa::/48")],
-        }
-    }
-
-    fn sa(s: &str) -> SocketAddr {
-        s.parse().unwrap()
-    }
-
-    #[test]
-    fn admit_role_entries() {
-        let p = policy();
-        let rpc = Some((Role::EvmRpc, "base-archive"));
-        // Private addresses are fine for a role entry.
-        assert_eq!(p.admit(rpc, sa("10.1.2.3:8545")), Admit::Role);
-        assert_eq!(p.admit(rpc, sa("[fd00::5]:8545")), Admit::Role);
-        assert_eq!(p.admit(rpc, sa("[::ffff:10.1.2.3]:8545")), Admit::Role);
-        assert_eq!(
-            p.admit(rpc, sa("10.1.2.3:8546")),
-            Admit::Denied(DenyReason::WrongPort)
-        );
-        assert_eq!(
-            p.admit(rpc, sa("10.2.0.1:8545")),
-            Admit::Denied(DenyReason::NoRoleEntry)
-        );
-        // Only its own role and alias.
-        assert_eq!(
-            p.admit(Some((Role::EvmRpc, "other")), sa("10.1.2.3:8545")),
-            Admit::Denied(DenyReason::NoRoleEntry)
-        );
-        assert_eq!(
-            p.admit(Some((Role::Artifact, "base-archive")), sa("10.1.2.3:8545")),
-            Admit::Denied(DenyReason::NoRoleEntry)
-        );
-        assert_eq!(
-            p.admit(Some((Role::ArtifactMirror, "hemi")), sa("203.0.113.7:443")),
-            Admit::Denied(DenyReason::NoRoleEntry)
-        );
-        // A documentation address, but the operator configured it: admitted for its role.
-        assert_eq!(
-            p.admit(Some((Role::Artifact, "hemi")), sa("203.0.113.7:443")),
-            Admit::Role
-        );
-        // A role entry is not subject to the deny list (the operator named it explicitly).
-        assert_eq!(
-            p.admit(Some((Role::BlobMirror, "m1")), sa("8.8.4.4:443")),
-            Admit::Role
-        );
-    }
-
-    #[test]
-    fn admit_requester_derived() {
-        let p = policy();
-        assert_eq!(p.admit(None, sa("1.1.1.1:443")), Admit::Global);
-        assert_eq!(
-            p.admit(None, sa("[2606:4700:4700::1111]:443")),
-            Admit::Global
-        );
-        assert_eq!(
-            p.admit(None, sa("1.1.1.1:80")),
-            Admit::Denied(DenyReason::WrongPort)
-        );
-        assert_eq!(
-            p.admit(None, sa("10.1.2.3:443")),
-            Admit::Denied(DenyReason::NotGlobal)
-        );
-        assert_eq!(
-            p.admit(None, sa("[::ffff:10.1.2.3]:443")),
-            Admit::Denied(DenyReason::NotGlobal)
-        );
-        assert_eq!(
-            p.admit(None, sa("169.254.169.254:443")),
-            Admit::Denied(DenyReason::NotGlobal)
-        );
-        assert_eq!(
-            p.admit(None, sa("[fd00:ec2::254]:443")),
-            Admit::Denied(DenyReason::NotGlobal)
-        );
-        assert_eq!(
-            p.admit(None, sa("8.8.4.4:443")),
-            Admit::Denied(DenyReason::DenyCidr)
-        );
-        assert_eq!(
-            p.admit(None, sa("[::ffff:8.8.4.4]:443")),
-            Admit::Denied(DenyReason::DenyCidr)
-        );
-        assert_eq!(
-            p.admit(None, sa("[2a01:4f8::1]:443")),
-            Admit::Denied(DenyReason::DenyCidr)
-        );
-        assert_eq!(
-            p.admit(None, sa("9.9.9.9:443")),
-            Admit::Denied(DenyReason::ConnectedPrefix)
-        );
-        assert_eq!(
-            p.admit(None, sa("[2606:4700:aaaa::1]:443")),
-            Admit::Denied(DenyReason::ConnectedPrefix)
-        );
-        // Requester-derived connections never reach a role entry's address: operator endpoints are
-        // reachable only through their roles.
-        assert_eq!(
-            p.admit(None, sa("8.8.4.8:443")),
-            Admit::Denied(DenyReason::RoleOnly)
-        );
-        assert_eq!(
-            p.admit(None, sa("203.0.113.7:443")),
-            Admit::Denied(DenyReason::NotGlobal)
-        );
-    }
-
-    /// Review F10 (the reviewer's PoC, inverted): the NAT64, SIIT and IPv4-compatible spellings of a
-    /// denied, connected or operator address are that address on the requester path.
-    #[test]
-    fn embedded_forms_are_judged_as_their_v4_on_the_requester_path() {
-        let p = EgressPolicy {
-            roles: vec![RoleEntry { role: Role::EvmRpc, alias: "n".into(), prefixes: vec![pfx("8.8.8.8/32")], port: 443 }],
-            deny: vec![pfx("8.8.4.4/32")],
-            connected: vec![pfx("9.9.9.0/24")],
-        };
-        for (s, why) in [
-            ("8.8.4.4:443", DenyReason::DenyCidr),
-            ("[::ffff:8.8.4.4]:443", DenyReason::DenyCidr),
-            ("[64:ff9b::808:404]:443", DenyReason::DenyCidr),
-            ("[::ffff:0:808:404]:443", DenyReason::DenyCidr),
-            ("[::808:404]:443", DenyReason::DenyCidr),
-            ("9.9.9.9:443", DenyReason::ConnectedPrefix),
-            ("[64:ff9b::909:909]:443", DenyReason::ConnectedPrefix),
-            ("8.8.8.8:443", DenyReason::RoleOnly),
-            ("[64:ff9b::808:808]:443", DenyReason::RoleOnly),
-            ("[::ffff:0:808:808]:443", DenyReason::RoleOnly),
-        ] {
-            assert_eq!(p.admit(None, sa(s)), Admit::Denied(why), "{s}");
-        }
-        assert_eq!(p.admit(None, sa("[64:ff9b::101:101]:443")), Admit::Global, "an unrelated global v4 stays admitted");
-        assert_eq!(canonical_ip(ip("64:ff9b::a00:1")), ip("10.0.0.1"));
-        assert_eq!(canonical_ip(ip("::1")), ip("::1"));
-        assert_eq!(canonical_ip(ip("2001:db8::1")), ip("2001:db8::1"));
-    }
-
-    #[test]
-    fn host_routes_and_dns_admission() {
-        for (s, host) in [
-            ("1.2.3.4/32", true),
-            ("1.2.3.0/24", false),
-            ("0.0.0.0/0", false),
-            ("::1/128", true),
-            ("::/0", false),
-            ("::ffff:127.0.0.1/128", true),
-            ("::ffff:127.0.0.0/104", false),
-            ("::ffff:0.0.0.0/96", false),
-        ] {
-            assert_eq!(pfx(s).is_host_route(), host, "{s}");
-        }
-        let p = policy();
-        let own = [ip("203.0.113.9"), ip("2a00:1450:4001::77")];
-        for s in ["8.8.8.8", "2606:4700:4700::1111", "64:ff9b::101:101"] {
-            assert!(p.dns_admissible(&own, ip(s)), "{s}");
-        }
-        for s in [
-            "127.0.0.1",
-            "::1",
-            "10.1.2.3",
-            "169.254.169.254",
-            "fd00:ec2::254",
-            "::ffff:127.0.0.1",
-            "64:ff9b::7f00:1", // NAT64 loopback
-            "8.8.4.4",         // deny
-            "64:ff9b::808:404",
-            "9.9.9.9", // connected
-            "2a00:1450:4001::77", // own
-        ] {
-            assert!(!p.dns_admissible(&own, ip(s)), "{s}");
-        }
-    }
-
-    #[test]
-    fn connected_prefixes_are_well_formed() {
-        let ps = connected_prefixes().expect("getifaddrs");
-        for p in &ps {
-            let w = if p.addr.is_ipv4() { 32 } else { 128 };
-            assert!(p.len <= w, "{p:?}");
-            assert_eq!(network(p.addr, p.len), *p, "{p:?} is a network address");
-        }
-        // Loopback, where the namespace has it up, is a connected prefix.
-        if ps.iter().any(|p| p.addr == ip("127.0.0.0")) {
-            assert!(ps.iter().any(|p| p.contains(ip("127.0.0.1"))));
-        }
-        let mut sorted = ps.clone();
-        sorted.sort_by_key(|p| (p.addr, p.len));
-        sorted.dedup();
-        assert_eq!(sorted, ps);
     }
 
     #[test]

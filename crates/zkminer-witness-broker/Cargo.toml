@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 zkminer-witness = { path = "../zkminer-witness" }
 zkminer-witness-sandbox = { path = "../zkminer-witness-sandbox" }
+# The one network predicate (no HTTP client: the broker wires its own).
+zkminer-netguard = { workspace = true }
 tokio = { workspace = true }
 # No default features: no system proxy, no decompression, no HTTP/2; TLS is rustls with the compiled-in
 # webpki roots (never a CA bundle read from disk, which the sandbox forbids).

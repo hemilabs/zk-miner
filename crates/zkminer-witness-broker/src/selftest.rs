@@ -6,7 +6,13 @@
 //!
 //! A role prefix that is not a host route and covers a probe address fails the check whoever
 //! configured it (`0.0.0.0/0`, `10.0.0.0/8`, `::ffff:127.0.0.0/104`, which is `127.0.0.0/8`): local
-//! nodes are configured as host routes.
+//! nodes are configured as host routes. Only in developer mode can an operator have configured a
+//! private address on purpose, so only there does a configured host route vouch for a probe.
+//!
+//! In public mode one more check, [`SelfTestCheck::RoleEntriesPublic`]: every prefix of every role
+//! entry in force (configured, or pinned from a DNS answer) passes netguard's
+//! [`zkminer_netguard::admit_prefix`] against the host's current facts and the deny CIDRs. With it
+//! failing, `ok` is false.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -16,8 +22,7 @@ use zkminer_witness::ipc::{ControlResponse, SelfTestCheck};
 
 use crate::broker::Broker;
 use crate::config::mask;
-use crate::egress::{Admit, EgressPolicy, Prefix};
-use crate::hooks::EgressHooks;
+use crate::egress::{Admit, EgressPolicy, NetMode, Prefix};
 use crate::jsonrpc::RpcClient;
 use crate::lanes::WaitFlag;
 
@@ -26,24 +31,20 @@ const METADATA: [&str; 2] = ["169.254.169.254", "fd00:ec2::254"];
 const RFC1918: [&str; 3] = ["10.0.0.1", "172.16.0.1", "192.168.1.1"];
 
 /// Whether `ip` is refused on the requester path (ports 443 and 80), covered by no role prefix
-/// wider than a host route, and refused for every role entry whose operator did not configure that
-/// very address (`configured`: alias → explicit cidrs or IP literal).
-pub(crate) fn floor_denies(
-    eg: &dyn EgressHooks,
-    policy: &EgressPolicy,
-    configured: &HashMap<String, Vec<Prefix>>,
-    ip: IpAddr,
-) -> bool {
+/// wider than a host route, and refused for every role entry — except, in developer mode, one whose
+/// operator configured that very address (`configured`: alias → explicit cidrs or IP literal).
+pub(crate) fn floor_denies(policy: &EgressPolicy, configured: &HashMap<String, Vec<Prefix>>, ip: IpAddr) -> bool {
     let denied = |a: Admit| matches!(a, Admit::Denied(_));
-    if ![443, 80].into_iter().all(|port| denied(eg.admit(policy, None, SocketAddr::new(ip, port)))) {
+    if ![443, 80].into_iter().all(|port| denied(policy.admit(None, SocketAddr::new(ip, port)))) {
         return false;
     }
     policy.roles.iter().all(|e| {
         if e.prefixes.iter().any(|p| !p.is_host_route() && p.contains(ip)) {
             return false;
         }
-        let vouched = configured.get(&e.alias).is_some_and(|c| c.iter().any(|p| p.is_host_route() && p.contains(ip)));
-        vouched || denied(eg.admit(policy, Some((e.role, &e.alias)), SocketAddr::new(ip, e.port)))
+        let vouched = policy.mode == NetMode::DevPrivate
+            && configured.get(&e.alias).is_some_and(|c| c.iter().any(|p| p.is_host_route() && p.contains(ip)));
+        vouched || denied(policy.admit(Some((e.role, &e.alias)), SocketAddr::new(ip, e.port)))
     })
 }
 
@@ -64,18 +65,24 @@ fn probes(p: &Prefix) -> Vec<IpAddr> {
 
 pub(crate) async fn run(b: &Broker) -> ControlResponse {
     let policy = b.policy.read().unwrap_or_else(|p| p.into_inner()).clone();
-    let own = b.own_addresses.read().unwrap_or_else(|p| p.into_inner()).clone();
+    let own = policy.own_addresses().to_vec();
     let configured = b.cfg.configured_prefixes();
-    let eg = &*b.hooks.egress;
-    let denies = |ip: IpAddr| floor_denies(eg, &policy, &configured, ip);
+    let denies = |ip: IpAddr| floor_denies(&policy, &configured, ip);
     let all = |ips: &[&str]| ips.iter().all(|s| denies(s.parse().expect("constant address")));
     let mut checks = vec![
         (SelfTestCheck::LoopbackDenied, all(&LOOPBACK)),
         (SelfTestCheck::MetadataDenied, all(&METADATA)),
         (SelfTestCheck::Rfc1918Denied, all(&RFC1918)),
         (SelfTestCheck::OwnAddressDenied, own.iter().all(|ip| denies(*ip))),
-        (SelfTestCheck::ConnectedPrefixDenied, policy.connected.iter().flat_map(probes).all(denies)),
+        (SelfTestCheck::ConnectedPrefixDenied, policy.connected().iter().flat_map(probes).all(denies)),
     ];
+    if policy.mode == NetMode::Public {
+        let bad = policy.first_non_public_role();
+        if let Some((alias, why)) = &bad {
+            tracing::error!(endpoint = %alias, "PAGE: self-test: a role entry is not public: {why}");
+        }
+        checks.push((SelfTestCheck::RoleEntriesPublic, bad.is_none()));
+    }
     let ids = AtomicU64::new(1);
     let wait = WaitFlag::default();
     if let Some(ep) = b.artifacts.endpoint() {
@@ -147,31 +154,38 @@ mod tests {
     fn floor_denies_counts_only_configured_host_routes() {
         use crate::egress::{Role, RoleEntry};
         let p = |s: &str| crate::config::parse_cidr(s).unwrap();
-        let eg = crate::hooks::RealEgress;
-        let policy = |prefixes: Vec<Prefix>| EgressPolicy {
+        let in_mode = |mode: NetMode, prefixes: Vec<Prefix>| EgressPolicy {
+            mode,
             roles: vec![RoleEntry { role: Role::EvmRpc, alias: "n".into(), prefixes, port: 8545 }],
             deny: vec![],
-            connected: vec![p("192.168.7.0/24")],
+            facts: zkminer_netguard::HostFacts::new(vec![p("192.168.7.0/24")], vec![]),
         };
+        let policy = |prefixes: Vec<Prefix>| in_mode(NetMode::DevPrivate, prefixes);
         let loopback: IpAddr = "127.0.0.1".parse().unwrap();
         let configured = |c: Vec<Prefix>| HashMap::from([("n".to_string(), c)]);
         // An explicit host route at the probe: vouched for.
         let pol = policy(vec![p("127.0.0.1/32")]);
-        assert!(floor_denies(&eg, &pol, &configured(vec![p("127.0.0.1/32")]), loopback));
+        assert!(floor_denies(&pol, &configured(vec![p("127.0.0.1/32")]), loopback));
         // The same entry from a DNS answer (nothing configured): fails.
-        assert!(!floor_denies(&eg, &pol, &configured(vec![]), loopback));
+        assert!(!floor_denies(&pol, &configured(vec![]), loopback));
         // Wider than a host route, whoever configured it.
         for wide in ["127.0.0.0/8", "0.0.0.0/0", "::ffff:0.0.0.0/96", "::ffff:127.0.0.0/104", "192.168.7.0/24"] {
             let pol = policy(vec![p(wide)]);
             let probe: IpAddr = if wide.starts_with("192") { "192.168.7.1".parse().unwrap() } else { loopback };
-            assert!(!floor_denies(&eg, &pol, &configured(vec![p(wide)]), probe), "{wide}");
+            assert!(!floor_denies(&pol, &configured(vec![p(wide)]), probe), "{wide}");
         }
         // A host route elsewhere does not cover the probe.
         let pol = policy(vec![p("10.9.9.9/32")]);
-        assert!(floor_denies(&eg, &pol, &configured(vec![p("10.9.9.9/32")]), loopback));
+        assert!(floor_denies(&pol, &configured(vec![p("10.9.9.9/32")]), loopback));
         // A mapped host route is a host route.
         let pol = policy(vec![p("::ffff:127.0.0.1/128")]);
-        assert!(floor_denies(&eg, &pol, &configured(vec![p("::ffff:127.0.0.1/128")]), loopback));
+        assert!(floor_denies(&pol, &configured(vec![p("::ffff:127.0.0.1/128")]), loopback));
+        // Public mode vouches for nothing: a configured loopback host route fails the check.
+        let pol = in_mode(NetMode::Public, vec![p("127.0.0.1/32")]);
+        assert!(floor_denies(&pol, &configured(vec![]), loopback), "the public floor refuses it at admission");
+        let pol = in_mode(NetMode::Public, vec![p("127.0.0.0/8")]);
+        assert!(!floor_denies(&pol, &configured(vec![p("127.0.0.0/8")]), loopback));
+        assert!(pol.first_non_public_role().is_some());
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! [`refresh_message`].
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
 use zkminer_witness::ipc::{ControlRequest, IpPrefix};
 
@@ -25,41 +25,10 @@ impl HostFacts {
     }
 }
 
-/// Every address assigned to an interface of this host (`getifaddrs`).
+/// Every address assigned to an interface of this host (netguard's
+/// [`zkminer_netguard::HostFacts::gather`], sorted).
 pub fn own_addresses() -> io::Result<Vec<IpAddr>> {
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs fills `head` with a list we free below.
-    if unsafe { libc::getifaddrs(&mut head) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut out = Vec::new();
-    let mut cur = head;
-    while !cur.is_null() {
-        // SAFETY: `cur` walks the list getifaddrs returned; each ifa_addr, when non-null, points at a
-        // sockaddr whose family says which struct it is.
-        unsafe {
-            let ifa = &*cur;
-            if !ifa.ifa_addr.is_null() {
-                match i32::from((*ifa.ifa_addr).sa_family) {
-                    libc::AF_INET => {
-                        let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                        out.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))));
-                    }
-                    libc::AF_INET6 => {
-                        let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
-                        out.push(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
-                    }
-                    _ => {}
-                }
-            }
-            cur = ifa.ifa_next;
-        }
-    }
-    // SAFETY: frees the list from getifaddrs exactly once.
-    unsafe { libc::freeifaddrs(head) };
-    out.sort();
-    out.dedup();
-    Ok(out)
+    Ok(zkminer_netguard::HostFacts::gather()?.own_addresses().to_vec())
 }
 
 /// Miner side: the `RefreshPrefixes` message for the host's current interfaces.

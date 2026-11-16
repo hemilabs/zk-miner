@@ -1,24 +1,22 @@
-//! The broker's seams over its two pure modules: [`crate::egress`] (the network floor and log
-//! redaction) and [`crate::evm_rpc`] (the strict JSON-RPC codec). Production uses [`Hooks::real`],
-//! which calls those modules; tests can substitute their own to exercise the broker's logic
-//! (failover, budgets, caches, lanes) independently.
+//! The broker's seams: the host's interfaces and log redaction ([`EgressHooks`]) and
+//! [`crate::evm_rpc`] (the strict JSON-RPC codec). Production uses [`Hooks::real`]; tests can
+//! substitute their own to exercise the broker's logic (failover, budgets, caches, lanes)
+//! independently. Admission itself is no seam: every connection is judged by
+//! [`crate::egress::EgressPolicy::admit`], which is zkminer-netguard's predicate, in tests too.
 
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use zkminer_witness::envelope::MethodSet;
 
-use crate::egress::{self, Admit, EgressPolicy, Prefix, Role};
+use crate::egress::{self, Prefix};
 use crate::evm_rpc::{self, BlockPin, BlockTag, CallAnswer, Denied, ParsedRequest, ResponseError};
 
 /// Longest log line built from untrusted bytes.
 pub const LOG_MAX: usize = 512;
 
-/// The network floor and log redaction.
+/// The host's interfaces and log redaction.
 pub trait EgressHooks: Send + Sync + 'static {
-    /// [`EgressPolicy::admit`].
-    fn admit(&self, policy: &EgressPolicy, role: Option<(Role, &str)>, addr: SocketAddr) -> Admit;
     /// [`egress::connected_prefixes`] (only callable before the sandbox is applied).
     fn connected_prefixes(&self) -> io::Result<Vec<Prefix>>;
     /// `redact_urls(sanitize_log(…))`: every log line built from an error or untrusted bytes.
@@ -30,9 +28,6 @@ pub trait EgressHooks: Send + Sync + 'static {
 pub struct RealEgress;
 
 impl EgressHooks for RealEgress {
-    fn admit(&self, policy: &EgressPolicy, role: Option<(Role, &str)>, addr: SocketAddr) -> Admit {
-        policy.admit(role, addr)
-    }
     fn connected_prefixes(&self) -> io::Result<Vec<Prefix>> {
         egress::connected_prefixes()
     }

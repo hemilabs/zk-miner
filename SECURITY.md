@@ -94,9 +94,39 @@ job there could then reach this host's private network.
 | SP1 Groth16 circuit artifacts download and size probe (SP1 worker warm-up) | fixed in the build (the SP1 SDK's artifact URL) | none needed |
 | `sp1-gpu-server` | local IPC between the SP1 worker and its server | not a network destination |
 | `sp1-demo` (optional command) | serves an ELF on 127.0.0.1 for a local miner | the miner needs developer mode to fetch it |
+| Witness builder fetches (`evm-rpc/v1`) | the operator's `[[evm_rpc]]` endpoints; the request body from **the builder** | the witness broker's floor (below) |
+| Witness `blob/v1` fetches | the operator's `[[blob_mirror]]` templates; the hash from **the builder** | the broker's floor; the URL is built by the broker |
+| `hemi-code` artifact reads | the operator's `[artifacts]` endpoint and mirror; the address from **the job** | the broker's floor |
+| The broker's DNS resolver | the operator (`[dns] servers`, else `/etc/resolv.conf`) | dials only those servers; never a fetch destination |
+| The builder runner and the execute worker | none | seccomp denies `socket`, `socketpair` and `connect` |
+| The miner's witness host (pipeline, builder runs, store) | none | talks to the broker over a Unix socket pair only |
 
 Job inputs come from the chain (calldata), not from URLs, and zkVM guests have no network
 access.
+
+## Witness jobs: the broker
+
+A witness job's builder asks the miner's broker (`zkminer-witness-broker`, sandboxed) for data,
+and only the broker connects anywhere. Its endpoints are configured by the operator, but a builder
+can ask one anything its method set allows, so a node on loopback or the LAN would expose whatever
+that node can reach. The broker therefore holds them to the same rule, with netguard's predicate
+(there is no second one):
+
+- **Public mode** (the default, and the only mode on mainnet): the broker's config is refused when
+  it loads if any endpoint's explicit `cidrs` or IP-literal host is not **entirely** global
+  (`0.0.0.0/0`, `::/0`, a `/8` holding private space and `::ffff:0:0/96` are refused), overlaps
+  the deny CIDRs or a DNS server, or — once the host's interfaces are read — holds one of the
+  host's addresses or overlaps a connected prefix; or if a URL host name fails the host-name
+  hygiene above. Every connection is checked against the same floor again, and the broker's
+  self-test fails (`RoleEntriesPublic`) if any role entry in force is not public.
+- **Host names** resolve through the broker's own resolver, and only global answers outside the
+  deny CIDRs, connected prefixes and own addresses become an endpoint's addresses, in both modes.
+- **DNS servers** are operator infrastructure the resolver dials, so a stub such as `127.0.0.53`
+  is fine; every DNS server's address is added to the deny CIDRs, so no fetch connects to one.
+- **Developer mode** comes only from the miner: with `[dev] private_network = true` the miner
+  starts the broker with `--dev-private-network`, and only then may explicitly configured
+  endpoints be private (DNS answers still may not). The broker's config file has no key for it;
+  the broker refuses it when an endpoint serves Hemi mainnet (43111) and logs the DEV MODE banner.
 
 ## Known limits
 
@@ -119,6 +149,9 @@ access.
   targets. On such a network, keep the miner off DNS64 or ask for support.
 - **Plain `http` and any port** are still accepted for program URLs on public addresses, as
   before; content hashes, not the transport, protect the bytes.
+- **The broker's requester path is not in use yet.** Requester-chosen URLs (builder URIs, later
+  phases) will go through the broker's requester floor (global, not an operator endpoint, port
+  443), which stays public in developer mode; nothing calls it today.
 - **Your own endpoints are trusted.** The chain RPC and the fixed download URLs are not
   checked by the guard: requesters cannot change them, and a local chain node is a normal
   setup.

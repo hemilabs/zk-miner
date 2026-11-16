@@ -1,5 +1,10 @@
 //! The broker process (§10.1): one per host, spawned through the sandbox launcher into its own
 //! cgroup with its control socket at fd 3. The miner talks to it with [`BrokerClient`].
+//!
+//! The broker runs in the miner's network mode and no other: [`BrokerProcess::start`] takes the
+//! miner's config and passes `--dev-private-network` exactly when its
+//! [`ZkMinerConfig::net_mode`] is [`NetMode::DevPrivate`] (`[dev] private_network`, never on
+//! mainnet). The broker's config file has no key for it.
 
 use std::io::{BufRead, BufReader};
 use std::os::fd::AsFd;
@@ -12,6 +17,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use zkminer_witness_broker::client::BrokerClient;
 use zkminer_witness_broker::egress::sanitize_log;
+use zkminer_config::ZkMinerConfig;
+use zkminer_netguard::NetMode;
 use zkminer_witness_sandbox::{prepare_command, Cgroup, CgroupSpec};
 
 use crate::spawner::Spawner;
@@ -31,14 +38,22 @@ pub struct BrokerProcess {
 }
 
 impl BrokerProcess {
-    /// Spawns the broker. Must be called inside a tokio runtime (the client is async).
+    /// Spawns the broker with its config file `config`, in the network mode of `miner` (the miner's
+    /// own config: [`ZkMinerConfig::net_mode`]). Must be called inside a tokio runtime (the client
+    /// is async). In public mode the broker refuses, and exits with status 2, a config with an
+    /// endpoint that is not on the public internet.
     pub fn start(
         spawner: &Spawner,
         binary: &Path,
         config: &Path,
         cgroup_root: &Path,
         memory_bytes: u64,
+        miner: &ZkMinerConfig,
     ) -> Result<Self> {
+        let net_mode = miner.net_mode();
+        if net_mode == NetMode::DevPrivate {
+            tracing::warn!("{}: the witness broker's endpoints may be on the local network", zkminer_netguard::DEV_MODE_BANNER);
+        }
         let cgroup = Cgroup::create(
             cgroup_root,
             &CgroupSpec {
@@ -57,6 +72,9 @@ impl BrokerProcess {
             .run(move || {
                 let mut cmd = Command::new(&binary);
                 cmd.arg("--config").arg(&config).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+                if net_mode == NetMode::DevPrivate {
+                    cmd.arg("--dev-private-network");
+                }
                 cmd.env_clear();
                 let child = prepare_command(&mut cmd, &cgroup, &[(broker_end.as_fd(), 3)])
                     .map_err(std::io::Error::other)

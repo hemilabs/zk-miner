@@ -10,10 +10,12 @@
 //! [`RETRY_UNRESOLVED_EVERY`], while there is none). Each answer replaces the pinned addresses. For
 //! an endpoint without explicit `cidrs` the answer is also its role entry, **filtered**: only
 //! global addresses outside the deny CIDRs, the connected prefixes and the host's own addresses
-//! ([`EgressPolicy::dns_admissible`]), re-checked whenever the miner refreshes the prefixes. With
-//! explicit `cidrs`, the role entry is the cidrs and an answer outside them is never connected to.
-//! IP-literal hosts never reach a resolver (hyper connects to them directly), so [`Endpoint`]
-//! checks the floor itself before every request.
+//! ([`EgressPolicy::dns_admissible`], netguard's public floor in either mode), re-checked whenever
+//! the miner refreshes the prefixes. With explicit `cidrs`, the role entry is the cidrs and an
+//! answer outside them is never connected to. IP-literal hosts never reach a resolver (hyper
+//! connects to them directly), so [`Endpoint`] checks the floor itself before every request. In
+//! public mode every address is also held to netguard's public floor at connect time
+//! ([`EgressPolicy::admit`]).
 
 use std::error::Error as _;
 use std::net::{IpAddr, SocketAddr};
@@ -25,14 +27,12 @@ use reqwest::header::CONTENT_TYPE;
 
 use crate::config::{host_prefix, EndpointSpec, TimeoutConfig};
 use crate::dns::Resolver;
-use crate::egress::{Admit, EgressPolicy, Prefix, Role, RoleEntry};
+use crate::egress::{Admit, EgressPolicy, NetMode, Prefix, Role, RoleEntry};
 use crate::hooks::EgressHooks;
 use crate::lanes::{LanePermit, Lanes, Pacer, TokenBucket, WaitFlag};
 
-/// The shared, refreshable policy.
+/// The shared, refreshable policy (with the host's connected prefixes and own addresses).
 pub type PolicyHandle = Arc<RwLock<EgressPolicy>>;
-/// The host's own addresses (refreshed with the connected prefixes).
-pub type OwnHandle = Arc<RwLock<Vec<IpAddr>>>;
 
 /// How often a host name without any admitted address is resolved again.
 pub const RETRY_UNRESOLVED_EVERY: Duration = Duration::from_secs(10);
@@ -47,17 +47,20 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Builds the policy: one role entry per endpoint — its explicit CIDRs, else its IP literal, else
-/// the addresses its host name resolved to that [`EgressPolicy::dns_admissible`] admits — the
-/// operator deny CIDRs and the connected prefixes.
+/// Builds the policy in `mode`: one role entry per endpoint — its explicit CIDRs, else its IP
+/// literal, else the addresses its host name resolved to that [`EgressPolicy::dns_admissible`]
+/// admits — the deny CIDRs (the operator's and the DNS servers', see
+/// [`crate::config::BrokerConfig::effective_deny`]), the connected prefixes and own addresses.
 pub fn build_policy<'a>(
+    mode: NetMode,
     endpoints: impl Iterator<Item = &'a EndpointSpec>,
     resolved: &std::collections::HashMap<String, Vec<IpAddr>>,
     deny: Vec<Prefix>,
     connected: Vec<Prefix>,
     own: &[IpAddr],
 ) -> EgressPolicy {
-    let mut policy = EgressPolicy { roles: Vec::new(), deny, connected };
+    let mut policy =
+        EgressPolicy { mode, roles: Vec::new(), deny, facts: zkminer_netguard::HostFacts::new(connected, own.to_vec()) };
     let roles = endpoints
         .map(|e| RoleEntry {
             role: e.role,
@@ -69,7 +72,7 @@ pub fn build_policy<'a>(
             } else {
                 resolved
                     .get(&e.alias)
-                    .map(|ips| ips.iter().filter(|ip| policy.dns_admissible(own, **ip)).map(|ip| host_prefix(*ip)).collect())
+                    .map(|ips| ips.iter().filter(|ip| policy.dns_admissible(**ip)).map(|ip| host_prefix(*ip)).collect())
                     .unwrap_or_default()
             },
             port: e.port,
@@ -131,7 +134,6 @@ struct Shared {
     explicit_cidrs: bool,
     pins: Mutex<Pins>,
     policy: PolicyHandle,
-    own: OwnHandle,
     egress: Arc<dyn EgressHooks>,
     dns: Arc<Resolver>,
     reresolve: Duration,
@@ -144,7 +146,7 @@ impl Shared {
         addrs
             .into_iter()
             .map(|ip| SocketAddr::new(ip, self.port))
-            .filter(|sa| matches!(self.egress.admit(&policy, Some((self.role, &self.alias)), *sa), Admit::Role))
+            .filter(|sa| matches!(policy.admit(Some((self.role, &self.alias)), *sa), Admit::Role))
             .collect()
     }
 
@@ -196,8 +198,7 @@ impl Shared {
             ips.clone()
         } else {
             let policy = read(&self.policy);
-            let own = read(&self.own);
-            ips.iter().copied().filter(|ip| policy.dns_admissible(&own, *ip)).collect()
+            ips.iter().copied().filter(|ip| policy.dns_admissible(*ip)).collect()
         };
         if kept.len() < ips.len() {
             tracing::warn!(
@@ -266,7 +267,6 @@ pub fn client_builder(t: &TimeoutConfig, max_idle: usize) -> reqwest::ClientBuil
 /// What an [`Endpoint`] is built from besides its spec.
 pub struct EndpointEnv {
     pub policy: PolicyHandle,
-    pub own: OwnHandle,
     pub egress: Arc<dyn EgressHooks>,
     pub dns: Arc<Resolver>,
     pub reresolve: Duration,
@@ -335,7 +335,6 @@ impl Endpoint {
             explicit_cidrs: !spec.cidrs.is_empty(),
             pins: Mutex::new(Pins { addrs: Vec::new(), resolved_at, attempted_at: None, refreshing: false }),
             policy: env.policy.clone(),
-            own: env.own.clone(),
             egress: env.egress.clone(),
             dns: env.dns.clone(),
             reresolve: env.reresolve,

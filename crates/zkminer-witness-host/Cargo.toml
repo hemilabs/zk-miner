@@ -10,6 +10,8 @@ zkminer-witness-sandbox = { workspace = true }
 zkminer-witness-store = { workspace = true }
 zkminer-witness-broker = { path = "../zkminer-witness-broker" }
 zkminer-config = { workspace = true }
+# The network mode the broker runs in (from the miner's config, `ZkMinerConfig::net_mode`).
+zkminer-netguard = { workspace = true }
 # The router's binding mirror, the descriptor hash and the risc0 Groth16 proof-system id.
 zkminer-chain = { workspace = true }
 zkminer-contracts = { workspace = true }

@@ -41,7 +41,9 @@ pub const MAX_BLOCKING_THREADS: usize = 8;
 
 /// Serves the control channel `control` (a connected `AF_UNIX` stream socket) until the miner
 /// closes it. Uses `config.host` when present (read before the sandbox) and reads the host facts
-/// itself otherwise.
+/// itself otherwise. Runs in `config.net_mode` (the miner's); in public mode a role entry that
+/// reaches the host's own addresses, connected prefixes or DNS servers is refused here
+/// ([`BrokerConfig::validate_host`]).
 pub async fn serve(config: BrokerConfig, control: OwnedFd) -> anyhow::Result<()> {
     serve_with(config, control, Hooks::real()).await
 }
@@ -58,6 +60,10 @@ pub async fn serve_with(mut config: BrokerConfig, control: OwnedFd, hooks: Hooks
             tokio::task::spawn_blocking(move || HostFacts::gather(&c, &*e)).await??
         }
     };
+    config.validate_host(&host)?;
+    if config.net_mode == egress::NetMode::DevPrivate {
+        tracing::warn!("{}: operator endpoints may be on loopback and the local network", zkminer_netguard::DEV_MODE_BANNER);
+    }
     let broker = broker::Broker::new(config, host, hooks)?;
     if let Some(ep) = broker.artifacts.endpoint().cloned() {
         let want = broker.artifacts.chain_id();

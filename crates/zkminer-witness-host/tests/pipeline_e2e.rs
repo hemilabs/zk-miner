@@ -357,6 +357,16 @@ fn host_maxima() -> HostMaxima {
     }
 }
 
+/// A miner config on anvil's chain with `[dev] private_network = true`: the broker it starts runs
+/// in developer mode.
+fn dev_miner() -> zkminer_config::ZkMinerConfig {
+    let mut c = zkminer_config::ZkMinerConfig::default();
+    c.chain.chain_id = ANVIL_CHAIN;
+    c.dev.private_network = true;
+    assert_eq!(c.net_mode(), zkminer_netguard::NetMode::DevPrivate);
+    c
+}
+
 impl Env {
     async fn start(test: &str) -> Option<Self> {
         let root = delegated(test)?;
@@ -379,7 +389,10 @@ impl Env {
         )
         .unwrap();
         let spawner = Spawner::new().unwrap();
-        let broker = BrokerProcess::start(&spawner, &bins.broker, &config, &root, 512 << 20).unwrap();
+        // anvil is on 127.0.0.1: developer mode, as a miner with `[dev] private_network` runs it.
+        let broker =
+            BrokerProcess::start(&spawner, &bins.broker, &config, &root, 512 << 20, &dev_miner())
+                .unwrap();
 
         let (router, prover) = (Address::repeat_byte(0x0a), Address::repeat_byte(0x9e));
         let store_dir = dir.path().join("store");

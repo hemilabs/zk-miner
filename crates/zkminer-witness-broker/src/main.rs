@@ -1,4 +1,11 @@
-//! `zkminer-witness-broker --config <path>`: the control socket is fd 3 (plan §10.1).
+//! `zkminer-witness-broker --config <path> [--dev-private-network]`: the control socket is fd 3
+//! (plan §10.1).
+//!
+//! `--dev-private-network` is developer mode ([`NetMode::DevPrivate`]): the miner passes it only
+//! when its own config has `[dev] private_network = true`, and the broker config file has no key
+//! for it. Refused when an endpoint serves a production chain (Hemi mainnet); announced in the log.
+//! Without it the broker refuses, before its sandbox, any endpoint that is not on the public
+//! internet (see [`zkminer_witness_broker::config`]).
 //!
 //! Order matters: everything that needs the filesystem or netlink without the sandbox happens
 //! first, single-threaded — the config and key files, the host facts (the DNS servers from
@@ -18,28 +25,40 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use zkminer_witness::ipc::BROKER_CONTROL_FD;
+use zkminer_witness_broker::egress::NetMode;
 use zkminer_witness_broker::hooks::RealEgress;
 use zkminer_witness_broker::logging::{env_filter, Redacting};
 use zkminer_witness_broker::{serve, BrokerConfig, HostFacts, MAX_BLOCKING_THREADS, WORKER_THREADS};
 use zkminer_witness_sandbox::{restrict_self, Profile};
 
-fn config_path() -> Result<PathBuf, String> {
+const USAGE: &str = "usage: zkminer-witness-broker --config <path> [--dev-private-network] (control socket at fd 3)";
+
+/// `--config <path>` once, and `--dev-private-network` at most once, in either order.
+fn args() -> Result<(PathBuf, NetMode), String> {
+    let mut path = None;
+    let mut mode = NetMode::Public;
     let mut args = std::env::args_os().skip(1);
-    match (args.next(), args.next(), args.next()) {
-        (Some(flag), Some(path), None) if flag == "--config" => Ok(PathBuf::from(path)),
-        _ => Err("usage: zkminer-witness-broker --config <path> (control socket at fd 3)".into()),
+    while let Some(a) = args.next() {
+        if a == "--config" && path.is_none() {
+            path = Some(PathBuf::from(args.next().ok_or(USAGE)?));
+        } else if a == "--dev-private-network" && mode == NetMode::Public {
+            mode = NetMode::DevPrivate;
+        } else {
+            return Err(USAGE.into());
+        }
     }
+    Ok((path.ok_or(USAGE)?, mode))
 }
 
 fn main() -> ExitCode {
-    let path = match config_path() {
-        Ok(p) => p,
+    let (path, mode) = match args() {
+        Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(2);
         }
     };
-    let mut config = match BrokerConfig::load(&path) {
+    let mut config = match BrokerConfig::load(&path, mode) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("zkminer-witness-broker: {e}");
@@ -54,7 +73,13 @@ fn main() -> ExitCode {
     // SAFETY: fd 3 is open (checked above) and nothing else in this process owns it.
     let control = unsafe { OwnedFd::from_raw_fd(BROKER_CONTROL_FD) };
     match HostFacts::gather(&config, &RealEgress) {
-        Ok(h) => config.host = Some(h),
+        Ok(h) => {
+            if let Err(e) = config.validate_host(&h) {
+                eprintln!("zkminer-witness-broker: {e}");
+                return ExitCode::from(2);
+            }
+            config.host = Some(h);
+        }
         Err(e) => {
             eprintln!("zkminer-witness-broker: reading the host's interfaces: {e}");
             return ExitCode::from(2);
