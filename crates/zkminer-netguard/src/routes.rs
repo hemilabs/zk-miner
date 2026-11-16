@@ -779,12 +779,18 @@ mod sys {
                 family,
                 parse_route,
             )?);
-            rules.extend(dump_consistent(
+            match dump_consistent(
                 RTM_GETRULE,
                 RTM_NEWRULE,
                 family,
                 |p: &[u8], out: &mut Vec<Rule>| parse_rule(p, &flow, out),
-            )?);
+            ) {
+                Ok(r) => rules.extend(r),
+                // A kernel built without policy routing (CONFIG_FIB_RULES) has no rule dump and
+                // only the stock tables: no rules reads as the stock ones.
+                Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok((routes, rules))
     }
