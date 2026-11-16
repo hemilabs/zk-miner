@@ -20,6 +20,7 @@ pub mod hostinfo;
 pub(crate) mod job;
 pub mod jsonrpc;
 pub mod lanes;
+pub mod logging;
 pub mod net;
 pub(crate) mod rpc_serve;
 pub(crate) mod selftest;
