@@ -63,9 +63,12 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let readable: Vec<PathBuf> = RESOLVER_FILES.iter().map(PathBuf::from).filter(|p| p.exists()).collect();
-    // TODO(merge): the sandbox's Profile::Broker gains `writable`; pass
-    // `writable: vec![config.spool_dir.clone()]` (blob/v1 spool files are created there).
-    let profile = Profile::Broker { readable, tcp_connect_ports: config.tcp_connect_ports() };
+    // blob/v1 spool files are created in spool_dir.
+    let profile = Profile::Broker {
+        readable,
+        writable: vec![config.spool_dir.clone()],
+        tcp_connect_ports: config.tcp_connect_ports(),
+    };
     if let Err(e) = restrict_self(&profile) {
         eprintln!("zkminer-witness-broker: sandbox: {e}");
         return ExitCode::from(3);

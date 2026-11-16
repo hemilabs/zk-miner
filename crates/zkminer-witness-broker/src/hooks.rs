@@ -92,10 +92,7 @@ impl RpcReq for ParsedRequest {
         ParsedRequest::tags(self)
     }
     fn check_after_resolution(&self, resolve: &dyn Fn(BlockTag) -> u64) -> Result<(), Denied> {
-        // TODO(merge): `ParsedRequest::check_after_resolution(self, resolve)` (the eth_getLogs range
-        // with tags resolved) once evm_rpc.rs gains it; until then parse-time checks are all.
-        let _ = resolve;
-        Ok(())
+        ParsedRequest::check_after_resolution(self, resolve)
     }
     fn outgoing(&self, resolve: &dyn Fn(BlockTag) -> u64, first_id: u64) -> Vec<u8> {
         ParsedRequest::outgoing(self, resolve, first_id)

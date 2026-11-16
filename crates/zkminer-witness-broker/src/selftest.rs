@@ -74,10 +74,40 @@ pub(crate) async fn run(b: &Broker) -> ControlResponse {
         .await;
         checks.push((SelfTestCheck::EndpointsReachable, answers.into_iter().all(|ok| ok)));
     }
-    // TODO(merge): the sandbox's own checks (SeccompActive, NoNewPrivs, LandlockActive,
-    // SecretUnreadable, GpuNodeUnopenable) from zkminer_witness_sandbox, run inside this process.
+    // The sandbox as this process sees it. Unreadable secrets are proven by the sandbox crate's
+    // probe-based self-test for the broker profile, which the miner runs at startup and hourly.
+    checks.extend(in_process_sandbox_checks());
     let ok = checks.iter().all(|(_, passed)| *passed);
     ControlResponse::SelfTest { ok, checks }
+}
+
+/// Checks of the sandbox from inside the broker: seccomp in filter mode, `NO_NEW_PRIVS`, Landlock
+/// denying a directory it was not granted, and no GPU device node openable.
+fn in_process_sandbox_checks() -> Vec<(SelfTestCheck, bool)> {
+    // SAFETY: prctl reads of this process's own state.
+    let seccomp = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) } == 2;
+    let nnp = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } == 1;
+    let denied = |path: &str, flags: libc::c_int| -> bool {
+        let c = std::ffi::CString::new(path).expect("no NUL");
+        // SAFETY: open/close of a path; the fd, if any, is closed at once.
+        let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC) };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+            return false;
+        }
+        matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM))
+    };
+    let landlock = denied("/", libc::O_RDONLY | libc::O_DIRECTORY);
+    let gpu = ["/dev/nvidiactl", "/dev/nvidia0", "/dev/dri/renderD128", "/dev/kfd"]
+        .iter()
+        .filter(|p| std::path::Path::new(p).exists())
+        .all(|p| denied(p, libc::O_RDWR));
+    vec![
+        (SelfTestCheck::SeccompActive, seccomp),
+        (SelfTestCheck::NoNewPrivs, nnp),
+        (SelfTestCheck::LandlockActive, landlock),
+        (SelfTestCheck::GpuNodeUnopenable, gpu),
+    ]
 }
 
 #[cfg(test)]
@@ -92,5 +122,18 @@ mod tests {
         assert_eq!(probes(&p), vec!["2001:db8::5".parse::<IpAddr>().unwrap(), "2001:db8::1".parse().unwrap()]);
         let h = Prefix { addr: "10.1.1.1".parse().unwrap(), len: 32 };
         assert_eq!(probes(&h), vec!["10.1.1.1".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn in_process_checks_fail_outside_the_sandbox() {
+        // The unit-test process is not sandboxed: every sandbox check must say so (no vacuous pass,
+        // except the GPU check on a host without GPU nodes).
+        let checks = in_process_sandbox_checks();
+        for (c, passed) in &checks {
+            match c {
+                SelfTestCheck::GpuNodeUnopenable => {}
+                _ => assert!(!passed, "{c:?} passed outside the sandbox"),
+            }
+        }
     }
 }

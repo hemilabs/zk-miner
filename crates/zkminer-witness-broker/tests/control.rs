@@ -184,7 +184,18 @@ chain_id = 743111
     ] {
         assert_eq!(checks.get(&c), Some(&true), "{c:?}: {r:?}");
     }
-    assert!(r.ok);
+    // This test broker is not sandboxed, so its in-process sandbox checks fail and with them `ok`;
+    // nothing else does.
+    let failing: Vec<_> = r.checks.iter().filter(|(_, p)| !p).map(|(c, _)| *c).collect();
+    for c in &failing {
+        assert!(
+            matches!(c, SelfTestCheck::SeccompActive | SelfTestCheck::NoNewPrivs | SelfTestCheck::LandlockActive
+                | SelfTestCheck::GpuNodeUnopenable),
+            "{c:?}: {r:?}"
+        );
+    }
+    assert!(failing.contains(&SelfTestCheck::SeccompActive));
+    assert!(!r.ok);
 
     // The miner reports a global own address outside every connected prefix: the floor would let
     // the requester path reach it, and the self-test says so.
@@ -199,7 +210,13 @@ chain_id = 743111
         .await
         .unwrap();
     assert_eq!(n, 1);
-    assert!(client.self_test().await.unwrap().ok);
+    let r = client.self_test().await.unwrap();
+    assert!(
+        r.checks.iter().all(|(c, p)| *p
+            || matches!(c, SelfTestCheck::SeccompActive | SelfTestCheck::NoNewPrivs | SelfTestCheck::LandlockActive
+                | SelfTestCheck::GpuNodeUnopenable)),
+        "only the in-process sandbox checks may fail here: {r:?}"
+    );
     let e = client.refresh_prefixes(vec![IpPrefix { addr: "1.2.3.4".parse().unwrap(), len: 40 }], vec![]).await.unwrap_err();
     assert!(matches!(e, ClientError::Refused(ControlErrorCode::Malformed)));
 

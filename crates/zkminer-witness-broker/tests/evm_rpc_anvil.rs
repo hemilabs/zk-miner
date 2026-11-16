@@ -31,7 +31,6 @@ fn json_of(b: &[u8]) -> Value {
 }
 
 #[tokio::test]
-#[ignore = "needs evm_rpc impl (merge)"]
 async fn state_reads_through_the_broker() {
     let anvil = Anvil::start(&[]).await;
     // A contract that always reverts: PUSH1 0 PUSH1 0 REVERT.
@@ -94,7 +93,6 @@ async fn state_reads_through_the_broker() {
 }
 
 #[tokio::test]
-#[ignore = "needs evm_rpc impl (merge)"]
 async fn tags_resolve_once_per_fetch_against_anvil() {
     let anvil = Anvil::start(&[]).await;
     anvil.mine(40).await;
@@ -110,7 +108,6 @@ async fn tags_resolve_once_per_fetch_against_anvil() {
 }
 
 #[tokio::test]
-#[ignore = "needs egress impl (merge)"]
 async fn hemi_code_and_self_test_with_the_real_floor() {
     let anvil = Anvil::start(&[]).await;
     let p = publish(&anvil, &pattern(5_000, 1), 1_000).await;
