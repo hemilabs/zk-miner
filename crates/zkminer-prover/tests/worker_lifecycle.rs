@@ -657,6 +657,47 @@ fn warmup_reports_what_was_done() {
         .is_err());
 }
 
+/// A worker that has run a guest has no network, so a warm-up (which may download) never runs on
+/// one: the slot gets a fresh worker for it, without counting a failure. A worker that has only
+/// shaken hands keeps its process.
+#[test]
+fn a_warmup_after_a_guest_runs_on_a_fresh_worker() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    let first = pool.test_pid("mock:generic").unwrap();
+    assert_ne!(first, 0);
+    pool.warm_up("mock", Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        pool.test_pid("mock:generic"),
+        Some(first),
+        "nothing ran before it: same worker"
+    );
+
+    // A measurement on the prove slot (a backend with no measure pool) runs the job's guest there.
+    let m = pool
+        .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None, None)
+        .unwrap();
+    assert_eq!(m.cycles, 1000);
+    assert_eq!(pool.test_pid("mock:generic"), Some(first));
+    let summary = pool.warm_up("mock", Duration::from_secs(10)).unwrap();
+    assert_eq!(summary, "nothing to warm up");
+    let fresh = pool.test_pid("mock:generic").unwrap();
+    assert!(fresh != 0 && fresh != first, "{first} -> {fresh}");
+    assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
+    // And the fresh one, warmed, serves the next job.
+    pool.prove(
+        "mock:generic",
+        &[],
+        &[],
+        None,
+        Some(Duration::from_secs(10)),
+        None,
+    )
+    .unwrap();
+    assert_eq!(pool.test_pid("mock:generic"), Some(fresh));
+}
+
 /// A warm-up that hangs (a download that stalls) is killed at its deadline, like a benchmark: the
 /// slot is cleared for a respawn and the kill is not counted as a crash.
 #[test]

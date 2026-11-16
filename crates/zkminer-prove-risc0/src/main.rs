@@ -187,6 +187,53 @@ fn main() {
     }
 }
 
+/// Workers that run requester guests have no network. The first command that runs one (`Execute`,
+/// `Prove`, `ProgramId`, all of which parse or execute a requester's ELF) first denies this process,
+/// its threads and everything it starts any socket but a Unix one, for the rest of its life
+/// (`zkminer_witness_sandbox::netdeny`). Defense in depth: nothing the worker needs after its
+/// one-time setup reaches the network. That setup (`Warmup`: the Groth16 component's download) runs
+/// before, as the miner warms a backend before it claims its jobs; a `Warmup` after refuses rather
+/// than download (`groth16_component::ensure_installed`), and the miner runs it on a fresh worker.
+///
+/// An error means the guest must not run: the caller answers the command with it.
+#[cfg(target_os = "linux")]
+fn deny_network() -> Result<(), String> {
+    zkminer_witness_sandbox::netdeny::deny_network_all_threads().map_err(|e| e.to_string())
+}
+
+/// No seccomp off Linux: nothing to deny with.
+#[cfg(not(target_os = "linux"))]
+fn deny_network() -> Result<(), String> {
+    Ok(())
+}
+
+/// Whether this worker has denied itself the network ([`deny_network`]).
+fn network_denied() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        zkminer_witness_sandbox::netdeny::is_active()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// [`deny_network`] before a guest command, or the answer refusing it.
+fn guest_may_run(request_id: u64) -> std::result::Result<(), WorkerResponse> {
+    deny_network().map_err(|e| {
+        tracing::error!("cannot deny this worker the network, so it runs no guest: {e}");
+        WorkerResponse::Error {
+            request_id,
+            kind: ErrorKind::Internal,
+            message: format!(
+                "this worker could not deny itself the network, so it runs no requester's guest: \
+                 {e}"
+            ),
+        }
+    })
+}
+
 fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     let mut stdin = BufReader::new(io::stdin().lock());
     let mut stdout = BufWriter::new(ipc_stdout);
@@ -252,6 +299,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 program_id,
                 witness: Some(witness),
             } => {
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 tracing::info!(
                     "Proving witness request {request_id} ({} bytes ELF, {} bytes W, po2={po2:?})",
                     elf.len(),
@@ -322,6 +373,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 program_id,
                 witness: None,
             } => {
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 tracing::info!(
                     "Proving request {request_id} ({} bytes ELF, po2={po2:?})",
                     elf.len()
@@ -377,6 +432,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 program_id,
                 po2,
             } => {
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 tracing::info!(
                     "Execute request {request_id} ({} bytes ELF, po2={po2:?})",
                     elf.len()
@@ -483,6 +542,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             }
 
             WorkerCommand::ProgramId { request_id, elf } => {
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 // The image id alone: no execution. The ELF is submitter-controlled and reaches
                 // risc0's parser here, which can panic on a malformed one (see the Execute arm), so a
                 // panic is contained and reported as a property of the ELF. Under the same RSS

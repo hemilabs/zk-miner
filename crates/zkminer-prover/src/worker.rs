@@ -552,6 +552,11 @@ pub struct WorkerHandle {
     /// process exits, so the question has to be asked of an ancestor, which means asking it as a
     /// DELTA. See `memory::oom_kill_count`.
     oom_kills_at_spawn: Option<u64>,
+    /// Whether this worker has been sent a command that may have cost it its network: one that runs
+    /// a requester's guest, or a benchmark or calibration (which on SP1 starts the GPU server, under
+    /// the same filter). A worker denies itself the network before it runs a guest, for good (see
+    /// `zkminer_witness_sandbox::netdeny`), so a setup that downloads must run on a fresh worker.
+    may_lack_network: bool,
 }
 
 /// Request to the spawner thread: build a worker, hand back the handle.
@@ -934,6 +939,7 @@ impl WorkerHandle {
             stderr_task,
             reaped: false,
             oom_kills_at_spawn,
+            may_lack_network: false,
         };
 
         // Perform Hello handshake
@@ -1087,7 +1093,24 @@ impl WorkerHandle {
 
     /// Send a command to the worker.
     pub fn send(&mut self, cmd: &WorkerCommand) -> Result<()> {
+        if !matches!(
+            cmd,
+            WorkerCommand::Hello { .. }
+                | WorkerCommand::Capabilities
+                | WorkerCommand::Warmup { .. }
+                | WorkerCommand::Cancel { .. }
+                | WorkerCommand::Shutdown
+        ) {
+            self.may_lack_network = true;
+        }
         write_message(&mut self.writer, cmd).map_err(|e| anyhow::anyhow!("Send error: {e}"))
+    }
+
+    /// Whether this worker may have denied itself the network: it has been sent a command other
+    /// than the handshake, capabilities, warm-up, cancel and shutdown (see the field). Its warm-up,
+    /// which may download, then needs a fresh worker.
+    pub fn may_lack_network(&self) -> bool {
+        self.may_lack_network
     }
 
     /// Receive a response from the worker.

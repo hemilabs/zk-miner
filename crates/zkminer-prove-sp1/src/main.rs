@@ -540,9 +540,20 @@ const ORPHAN_EXIT_WAIT: Duration = Duration::from_secs(10);
 /// `AssertUnwindSafe` is sound here because the panic path leaves nothing of ours half-written: the
 /// prover slot is still `None` (we only assign on success), and the SDK's own state dies with the
 /// server it failed to reach.
+///
+/// The worker denies itself the network first ([`deny_network`]): the server it starts here runs
+/// requester guests (every proof executes its guest there), and inherits the filter only if it starts
+/// after it. It needs none: it speaks to this worker over a Unix socket, and the Groth16 artifacts it
+/// proves with were installed by the warm-up. So no server of this worker's ever has the network,
+/// even one started for a benchmark. A server the SDK would download first (absent, or another
+/// version) cannot be: that is refused here, in so many words.
 fn build_prover(
     cuda_device_id: Option<u32>,
 ) -> std::result::Result<sp1_sdk::blocking::CudaProver, String> {
+    deny_network().map_err(|e| {
+        format!("could not deny this worker the network, so it starts no sp1-gpu-server: {e}")
+    })?;
+    server_needs_no_download()?;
     reap_orphaned_gpu_servers(cuda_device_id, ORPHAN_EXIT_WAIT);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         tracing::info!("Initializing SP1 CUDA prover...");
@@ -569,6 +580,84 @@ fn build_prover(
                 .unwrap_or_else(|| "default".to_string()),
         )
     })
+}
+
+/// Workers that run requester guests have no network. Before the first command that runs one
+/// (`Execute` and `ProgramId` on the CPU prover, `Prove`) and before it starts `sp1-gpu-server`
+/// ([`build_prover`]), the worker denies itself, its threads and everything it starts from then on
+/// any socket but a Unix one, for the rest of its life (`zkminer_witness_sandbox::netdeny`). Defense
+/// in depth: nothing the worker or its server needs after the one-time setup reaches the network.
+/// That setup (`Warmup`: the Groth16 circuit download) runs before, as the miner warms a backend
+/// before it claims or benchmarks; a `Warmup` after refuses rather than download (`warmup::warm_up`),
+/// and the miner runs it on a fresh worker.
+///
+/// An error means no guest may run: the caller answers the command with it.
+#[cfg(target_os = "linux")]
+fn deny_network() -> Result<(), String> {
+    zkminer_witness_sandbox::netdeny::deny_network_all_threads().map_err(|e| e.to_string())
+}
+
+/// No seccomp off Linux: nothing to deny with.
+#[cfg(not(target_os = "linux"))]
+fn deny_network() -> Result<(), String> {
+    Ok(())
+}
+
+/// Whether this worker has denied itself the network ([`deny_network`]).
+pub(crate) fn network_denied() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        zkminer_witness_sandbox::netdeny::is_active()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// [`deny_network`] before a guest command, or the answer refusing it.
+fn guest_may_run(request_id: u64) -> std::result::Result<(), WorkerResponse> {
+    deny_network().map_err(|e| {
+        tracing::error!("cannot deny this worker the network, so it runs no guest: {e}");
+        WorkerResponse::Error {
+            request_id,
+            kind: ErrorKind::Internal,
+            message: format!(
+                "this worker could not deny itself the network, so it runs no requester's guest: \
+                 {e}"
+            ),
+        }
+    })
+}
+
+/// Refuses, before the SDK would try, a server the SDK would download first: none at its path, or
+/// one whose `--version` is not the SDK's (`maybe_download_server` replaces it then). With no network
+/// that download fails inside `build()` as a panic that reads like a GPU fault. A probe that cannot
+/// tell (it timed out, or did not run) is left to the SDK, as [`sp1_usability`] does.
+fn server_needs_no_download() -> std::result::Result<(), String> {
+    let server = warmup::server_path().map_err(|e| e.to_string())?;
+    if !server.exists() {
+        return Err(format!(
+            "there is no sp1-gpu-server at {}, and this worker has no network to download one \
+             with: install the one this release ships",
+            server.display()
+        ));
+    }
+    let (outcome, stdout) = proc::output_with_timeout_capturing_stdout(
+        std::process::Command::new(&server).arg("--version"),
+        PROBE_TIMEOUT,
+        PROBE_STDERR_CAP,
+    );
+    let want = sp1_primitives::SP1_CRATE_VERSION;
+    match outcome {
+        Outcome::Ran { .. } if stdout.trim() != want => Err(format!(
+            "{} reports version {:?}, not {want:?}; the SDK would download another, and this \
+             worker has no network to: install the one this release ships",
+            server.display(),
+            stdout.trim()
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Parse the parent pid out of a `/proc/<pid>/stat` line.
@@ -1142,8 +1231,9 @@ fn find_cuda12_runtime_dir() -> Option<std::path::PathBuf> {
 /// miner start, when no SP1 job may ever arrive, would be a worse trade than the bug.
 ///
 /// Returns `Err(reason)` only when SP1 provably CANNOT work here. A case we cannot settle
-/// cheaply (the server binary is absent, so the SDK would download it) returns `Ok`: this
-/// must not refuse a host that would in fact work.
+/// cheaply returns `Ok`: this must not refuse a host that would in fact work. An absent server
+/// binary is no longer such a case: the SDK would download one at the first proof, but the worker
+/// starts its server only once it has denied itself the network ([`build_prover`]).
 /// True when this worker was launched as the dedicated MEASURE-ONLY slot (see
 /// `SP1_MEASURE_ONLY_ENV`): it only ever sizes cycles on the CPU executor and must never build the
 /// CudaProver / fork `sp1-gpu-server`.
@@ -1200,9 +1290,15 @@ fn sp1_usability() -> Result<(), String> {
     //    object file"
     // `--version` is what the SDK itself runs, costs milliseconds, and touches no GPU.
     if !server.exists() {
-        // Absent: the SDK downloads it on first use. We cannot verify a binary that does
-        // not exist yet, and refusing here would disable SP1 on a host where it works.
-        return Ok(());
+        // Absent. The SDK would download upstream's build at the first proof, which has none of
+        // the fork's fixes (see `bundled_server`), but cannot: the worker starts its server only
+        // after it has denied itself the network (`build_prover`). Every proof would fail, after
+        // its job was claimed.
+        return Err(format!(
+            "there is no sp1-gpu-server at {}, and a worker has no network to download one with \
+             once it proves: install the one this release ships",
+            server.display()
+        ));
     }
     // Decline ONLY on an UNREPAIRABLE failure. Being stricter than this disables hosts
     // the SDK can fix by itself.
@@ -1823,6 +1919,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     write_message(&mut stdout, &resp)?;
                     continue;
                 }
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 // Announce proof START so the miner can move the job from Queued to Proving.
                 // Without this the job displays "Queued (waiting for GPU)" for the whole proof.
                 let started = WorkerResponse::Progress {
@@ -1959,6 +2059,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // submitter-declared `expectedCycles`. Runs on a lazily-built CPU executor (no
                 // gpu-server), so it is as cheap as risc0's sizing path.
                 tracing::info!("Execute (sizing) request {request_id} ({} bytes ELF)", elf.len());
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 let Some(cpu) = cpu_prover(&mut cpu_executor) else {
                     let resp = WorkerResponse::Error {
                         request_id,
@@ -2038,6 +2142,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     "ProgramId request {request_id} ({} bytes ELF): SP1 setup on the CPU",
                     elf.len()
                 );
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 let Some(cpu) = cpu_prover(&mut cpu_executor) else {
                     let resp = WorkerResponse::Error {
                         request_id,
@@ -3050,6 +3158,33 @@ mod orphan_exit_tests {
             wait < start,
             "the wait must come before the SDK starts a server"
         );
+        let deny = build
+            .find("deny_network()")
+            .expect("build_prover denies the network");
+        assert!(
+            deny < start,
+            "the server must start after the filter, to inherit it"
+        );
+    }
+
+    /// Every arm that hands a requester's ELF to the SDK denies the network first.
+    #[test]
+    fn every_guest_command_denies_the_network_first() {
+        let source = include_str!("main.rs");
+        let worker_loop = source.split_once("\nfn run_worker_loop(").unwrap().1;
+        let worker_loop = &worker_loop[..worker_loop.find("\nfn ").unwrap()];
+        for (arm, sdk_call) in [
+            ("WorkerCommand::Execute {", "run_execute_sp1("),
+            ("WorkerCommand::ProgramId {", "sp1_program_id("),
+            ("WorkerCommand::Prove {", "run_proof("),
+        ] {
+            let body = worker_loop.split_once(arm).unwrap().1;
+            let deny = body.find("guest_may_run(request_id)").expect(arm);
+            let cpu = body.find("cpu_prover(").unwrap_or(usize::MAX);
+            let gpu = body.find("get_prover!(").unwrap_or(usize::MAX);
+            let call = body.find(sdk_call).expect(sdk_call);
+            assert!(deny < cpu.min(gpu).min(call), "{arm}");
+        }
     }
 }
 
@@ -3443,10 +3578,10 @@ mod usability_tests {
         );
     }
 
-    /// An ABSENT server must NOT be reported unusable: the SDK downloads it on first use,
-    /// and refusing here would disable SP1 on a host where it actually works.
+    /// An ABSENT server is unusable: the SDK would download one at the first proof, but the
+    /// worker starts its server only once it has no network, so SP1 must not be advertised.
     #[test]
-    fn an_absent_server_is_not_treated_as_unusable() {
+    fn an_absent_server_is_unusable() {
         let _g = super::usability_tests::env_lock().lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("sp1probe-empty-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -3458,13 +3593,13 @@ mod usability_tests {
             None => unsafe { std::env::remove_var("HOME") },
         }
         let _ = std::fs::remove_dir_all(&tmp);
-        // Ok, or the no-GPU arm on a GPU-less machine -- never "cannot run".
-        if let Err(e) = r {
-            assert!(
-                e.contains("GPU"),
-                "an absent server must not be 'cannot run': {e}"
-            );
-        }
+        // Declined (or the no-GPU arm on a GPU-less machine): the SDK cannot download a server
+        // for a worker that has no network.
+        let e = r.expect_err("an absent server must be declined");
+        assert!(
+            e.contains("no sp1-gpu-server") || e.contains("GPU"),
+            "unexpected reason: {e}"
+        );
     }
 
     /// These tests mutate the process environment, so they must not interleave.
