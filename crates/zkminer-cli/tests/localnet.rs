@@ -94,12 +94,13 @@ use zkminer_contracts::bindings::{
     ResourceEstimate, StorageURI, IERC20,
 };
 
-/// The 743111 block the fork starts from by default, after the deployment's setup. Move it forward
-/// whenever `zkminer_chain::deployment::HEMI_TESTNET_743111` changes: the fork would otherwise run
-/// the old deployment, and zkminer's startup checks refuse it. A later block is fine even once
+/// The 743111 block the fork starts from by default, after the deployment's setup: the 2026-11-16
+/// stack's router exists from block 7226099 and its three adapters are registered by 7226300. Move it
+/// forward whenever `zkminer_chain::deployment::HEMI_TESTNET_743111` changes: the fork would otherwise
+/// run the old deployment, and zkminer's startup checks refuse it. A later block is fine even once
 /// someone registers this test's programs on 743111 (their ids are content-derived): setup clears
 /// such a registration first (see [`register_program`]).
-const FORK_BLOCK: u64 = 7_116_900;
+const FORK_BLOCK: u64 = 7_226_550;
 const DEFAULT_FORK_URL: &str = "https://testnet.rpc.hemi.network/rpc";
 const HEMI: u128 = 1_000_000_000_000_000_000;
 /// The fibonacci guest's jobs prove fibonacci(FIB_N), unless `ZKMINER_LOCALNET_FIB_N` says otherwise
@@ -145,7 +146,7 @@ fn prover_stake() -> u128 {
         .map_or(PROVER_STAKE, |hemi| hemi * HEMI)
 }
 /// [`Case::HighCollateral`]'s price, and its collateral rate: `MAX_COLLATERAL_BPS` (500%), the most a
-/// submitter may ask (zkmarket c8333aa, `src/libraries/Constants.sol`).
+/// submitter may ask (hemiprove-contracts 3bc441d, `src/libraries/Constants.sol`).
 const HIGH_COLLATERAL_PRICE: u128 = 250 * HEMI;
 const MAX_COLLATERAL_BPS: u64 = 50_000;
 // Its claim would lock 1,250 HEMI, more than the whole stake; sized at the 150% default (the miner's
@@ -1348,7 +1349,7 @@ async fn funded_owner(provider: &DynProvider, contract: Address) -> Address {
 
 alloy::sol! {
     /// The ProgramRegistry's governance calls (`onlyOwner`), which zkminer's bindings leave out
-    /// (zkmarket c8333aa, `src/core/ProgramRegistry.sol`).
+    /// (hemiprove-contracts 3bc441d, `src/core/ProgramRegistry.sol`).
     #[sol(rpc)]
     interface IProgramRegistryGovernance {
         function revokeProgram(bytes32 programId, string calldata reason) external;
