@@ -2407,6 +2407,15 @@ pub async fn run(
     if watch.is_none() {
         hold_instance_lock()?;
     }
+    // The lock journal, read before anything starts: a journal this build must not rewrite (a newer
+    // format) or cannot read refuses the start. A watch-only run holds nothing, and the journal on
+    // disk belongs to the miner that may be running beside it: it starts empty and never saves (see
+    // `save_journal_or_warn`).
+    let loaded_journal = if watch.is_none() {
+        JobJournal::load_checked()?
+    } else {
+        JobJournal::default()
+    };
     let splash = zkminer_tui::splash::Splash::start(!headless);
     splash.status("Connecting to the chain");
     let queue_horizon_secs = config.prover.queue_horizon_secs;
@@ -3127,13 +3136,8 @@ pub async fn run(
     // Miner brain: evaluates open jobs, claims, proves, and fulfills.
     let brain_client = client.clone();
     let brain_state = state.clone();
-    // A watch-only run holds nothing, and the journal on disk belongs to the miner that may be
-    // running beside it: start empty and never save (see `save_journal_or_warn`).
-    let journal: SharedJournal = Arc::new(Mutex::new(if watch_only() {
-        JobJournal::default()
-    } else {
-        JobJournal::load()
-    }));
+    // Read at the start (see `loaded_journal`).
+    let journal: SharedJournal = Arc::new(Mutex::new(loaded_journal));
     let brain_journal = journal.clone();
     let proving_timeout = Duration::from_secs(config.prover.proving_timeout_secs.max(60));
     let cost_params = CostParams {
