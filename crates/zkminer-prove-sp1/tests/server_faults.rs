@@ -238,6 +238,7 @@ impl Worker {
             input_data: input.to_le_bytes().to_vec(),
             po2: None,
             program_id,
+            witness: None,
         });
         self.answer()
     }
@@ -458,6 +459,7 @@ fn an_undelivered_answer_does_not_panic(elf: &[u8]) -> Result<(), String> {
         input_data: 10u32.to_le_bytes().to_vec(),
         po2: None,
         program_id: None,
+        witness: None,
     });
     // The miner gone: this worker's next write fails, and `?` leaves its loop.
     drop(worker.stdout.take());

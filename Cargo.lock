@@ -10671,7 +10671,9 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber 0.3.22",
+ "zkminer-prover",
  "zkminer-prover-protocol",
+ "zkminer-witness-sandbox",
 ]
 
 [[package]]
@@ -10716,6 +10718,7 @@ dependencies = [
  "sha2",
  "sp1-build",
  "sp1-sdk",
+ "tempfile",
  "thiserror 2.0.18",
  "tiny-keccak",
  "tokio",
@@ -10723,6 +10726,7 @@ dependencies = [
  "tracing-subscriber 0.3.22",
  "zkminer-config",
  "zkminer-prover-protocol",
+ "zkminer-witness-sandbox",
 ]
 
 [[package]]
@@ -10731,7 +10735,9 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "getrandom 0.3.4",
+ "hmac",
  "serde",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
 ]

@@ -30,7 +30,15 @@ use serde::{Deserialize, Serialize};
 /// 12: `Benchmark` carries the programs to run (`BenchmarkProgramSpec`): the suite is the host's, and
 /// the zkOP/s scoring proofs are requests of their own. A v11 worker ran its own list. And
 /// `SetupProgress`, what a `Warmup` is doing (both in the same unreleased version).
-pub const PROTOCOL_VERSION: u32 = 12;
+/// 13: witness-construction jobs (plan §15.3). `Prove` gained `witness` ([`WitnessProve`]): the input
+/// is `prefix ‖ W`, read by the worker from a file and checked against the bundle's length and
+/// `sha256(prefix ‖ W)` (a mismatch is the new [`ErrorKind::InputMismatch`]), executed once with its
+/// segments under `segment_dir`, and proven only if its journal hashes to the bundle's; otherwise the
+/// worker answers with the new `WorkerResponse::JournalDiverged`. A v12 worker cannot decode the
+/// field, so the handshake refuses it. The one-shot sandboxed execute
+/// ([`WitnessExecuteRequest`] / [`WitnessExecuteResponse`]) is not part of the IPC stream, but ships
+/// in the same version.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -177,6 +185,13 @@ pub enum WorkerCommand {
         /// the pre-existing behaviour (benchmark/calibration paths, mock worker).
         #[serde(default)]
         program_id: Option<[u8; 32]>,
+        /// A witness-construction job's input, by path (protocol v13): `None` for every other
+        /// proof. When set, `input_data` must be empty: the worker reads `prefix ‖ W` itself, refuses
+        /// it on a length or hash mismatch ([`ErrorKind::InputMismatch`]), and proves only if the
+        /// execution's journal hashes to `expect_journal_sha256` (else `JournalDiverged`). risc0
+        /// only; the other workers refuse it. Appended last, as bincode is positional.
+        #[serde(default)]
+        witness: Option<WitnessProve>,
     },
     /// EXECUTE the guest without proving, to measure its true cycle count.
     ///
@@ -372,6 +387,202 @@ pub enum WorkerResponse {
         /// What `done_bytes` is heading for, where it is known.
         total_bytes: Option<u64>,
     },
+    /// Answer to a witness `Prove` ([`WitnessProve`]) whose execution did not reproduce the bundle:
+    /// it did not halt with exit code 0, or its journal does not hash to `expect_journal_sha256`.
+    /// Nothing was proven. Typed so the host never classifies a divergence from text: it re-runs the
+    /// binding and the claim-gate limits on this journal and either re-dispatches a new bundle
+    /// version, hands the job back, or releases it (plan §15.3). Appended last (v13), so every
+    /// earlier variant keeps its bincode index.
+    JournalDiverged {
+        request_id: u64,
+        /// The journal this execution committed: empty when it is longer than
+        /// [`EXECUTE_JOURNAL_MAX_BYTES`] (no fulfil could carry it) or the guest committed none.
+        journal: Vec<u8>,
+        /// Its length in bytes, whether or not `journal` carries it.
+        journal_len: u32,
+        /// `sha256(journal)` over the full journal (of no bytes when there was none).
+        journal_sha256: [u8; 32],
+        /// How the guest ended: one of the `GUEST_EXIT_*` constants.
+        exit_kind: u8,
+        /// The guest's exit code for [`GUEST_EXIT_HALTED`] and [`GUEST_EXIT_PAUSED`], else 0.
+        exit_code: u32,
+        /// Sized cycles, in the unit of `ExecuteResult.cycles` (every segment padded to its power
+        /// of two, plus each keccak request).
+        cycles: u64,
+    },
+}
+
+/// The input of a witness-construction job's proof (`WorkerCommand::Prove::witness`, protocol v13).
+///
+/// The prove workers are trusted processes of the miner's own uid, so the input travels as a path:
+/// host RAM is not charged for a copy in the frame, and the worker hashes what it actually reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessProve {
+    /// `W` in the retention store (`w.bin` of the bundle). The worker opens it once and reads it
+    /// through that one descriptor.
+    pub input_path: String,
+    /// The guest input's prefix, prepended to `W`: `abi.encode(jobId, prover)` (64 bytes) for a
+    /// job with the journal-prefix marker, else empty. Any other length is refused.
+    pub prefix: Vec<u8>,
+    /// `sha256(prefix ‖ W)`, from the bundle.
+    pub input_sha256: [u8; 32],
+    /// `|W|`, from the bundle.
+    pub w_len: u64,
+    /// `sha256` of the journal the bundle recorded at this po2: the proof runs only if the execution
+    /// commits exactly it.
+    pub expect_journal_sha256: [u8; 32],
+    /// The directory the execution's segments are written to: an absolute path on an
+    /// operator-configured, non-tmpfs filesystem, one per prove slot. Created if missing; everything
+    /// in it is deleted before the execution and after the proof.
+    pub segment_dir: String,
+}
+
+/// `JournalDiverged.exit_kind` / [`WitnessExecutePo2`]`.exit_kind`: how a risc0 guest ended
+/// (`risc0_zkvm::ExitCode`). Only `Halted(0)` is provable for a job.
+pub const GUEST_EXIT_HALTED: u8 = 0;
+/// `ExitCode::Paused(code)`.
+pub const GUEST_EXIT_PAUSED: u8 = 1;
+/// `ExitCode::SystemSplit`.
+pub const GUEST_EXIT_SYSTEM_SPLIT: u8 = 2;
+/// `ExitCode::SessionLimit`.
+pub const GUEST_EXIT_SESSION_LIMIT: u8 = 3;
+/// An `ExitCode` this protocol version does not know (risc0's enum is `#[non_exhaustive]`).
+pub const GUEST_EXIT_UNKNOWN: u8 = 255;
+
+/// The argument that runs the risc0 CPU worker as a one-shot sandboxed witness execute (plan §10.1):
+/// it restricts itself before anything else, reads one [`WitnessExecuteRequest`] frame from fd 0 and
+/// `W` from fd 3, writes one [`WitnessExecuteResponse`] frame to fd 1, logs to fd 2, and exits with
+/// 0 or a [`WitnessExecuteFailure`] code.
+pub const WITNESS_EXECUTE_ARG: &str = "--witness-execute";
+
+/// The fd a witness execute reads `W` from: a read-only regular file or a write-sealed memfd.
+pub const WITNESS_EXECUTE_W_FD: i32 = 3;
+
+/// What a sandboxed witness execute runs: the guest on `prefix ‖ W` at each po2, with the given seed.
+///
+/// One length-prefixed bincode frame on fd 0 (see [`crate::codec`]). `W` itself is not in the frame:
+/// it is read from fd [`WITNESS_EXECUTE_W_FD`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessExecuteRequest {
+    /// The guest ELF.
+    pub elf: Vec<u8>,
+    /// Prepended to `W`: 0 or 64 bytes (see [`WitnessProve::prefix`]).
+    pub prefix: Vec<u8>,
+    /// `|W|`: fd 3's size must be exactly this.
+    pub w_len: u64,
+    /// `sha256(prefix ‖ W)`: the worker refuses any other input ([`WitnessExecuteFailure::InputMismatch`]).
+    pub input_sha256: [u8; 32],
+    /// The guest's `sys_rand` seed, derived by the miner (`crate::sys_rand::risc0_seed`). The
+    /// worker never sees, reads or derives a key in this mode.
+    pub sys_rand_seed: [u8; 32],
+    /// The segment sizes to execute at, in order, each within
+    /// [`RISC0_JOB_PO2_MIN`]..=[`RISC0_JOB_PO2_MAX`], without repeats.
+    pub po2s: Vec<u8>,
+    /// The keccak po2 (`RISC0_KECCAK_PO2`, 14..=18), which a guest can observe. The worker sets the
+    /// variable from this field before it starts any thread; the launcher passes no environment.
+    pub keccak_po2: u8,
+    /// A cap in sized cycles (segments padded to their power of two plus keccak requests) per po2;
+    /// `None` = no cap beyond the launcher's timeout and the cgroup's limits.
+    pub max_cycles: Option<u64>,
+}
+
+/// One po2 of a [`WitnessExecuteResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessExecutePo2 {
+    pub po2: u8,
+    /// Sized cycles, in the unit of `ExecuteResult.cycles`.
+    pub cycles: u64,
+    /// The journal: empty when it is longer than [`EXECUTE_JOURNAL_MAX_BYTES`] or there is none.
+    pub journal: Vec<u8>,
+    pub journal_len: u32,
+    /// `sha256` of the full journal (of no bytes when there is none).
+    pub journal_sha256: [u8; 32],
+    /// One of the `GUEST_EXIT_*` constants.
+    pub exit_kind: u8,
+    /// The code of `Halted` / `Paused`, else 0.
+    pub exit_code: u32,
+    /// What the execution's segments serialize to (`bincode`, as risc0 writes them to a
+    /// `segment_path`): the disk a proof at this po2 needs.
+    pub segment_bytes: u64,
+    /// The worker's peak resident set (`getrusage` `ru_maxrss`) after this po2 ran: a high-water mark
+    /// of the whole process, so it never decreases across the po2s of one response.
+    pub peak_host_bytes: u64,
+}
+
+/// The answer to a [`WitnessExecuteRequest`]: one frame on fd 1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessExecuteResponse {
+    /// The ELF's image id (`Digest::as_bytes`), as the seed and the bundle must name it.
+    pub image_id: [u8; 32],
+    /// One per requested po2, in the request's order. Execution stops after the first po2 whose
+    /// guest did not halt with code 0 (no later po2 can make the job claimable), so that result is
+    /// then the last one and there are fewer results than po2s.
+    pub results: Vec<WitnessExecutePo2>,
+}
+
+/// How a sandboxed witness execute failed, as its exit code: never parsed from text (its stderr can
+/// carry guest-controlled bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WitnessExecuteFailure {
+    /// The request frame or one of its fields is malformed, or fd 3 is not a read-only file.
+    BadRequest,
+    /// `W`'s length or `sha256(prefix ‖ W)` differs from the request.
+    InputMismatch,
+    /// risc0 refused the ELF.
+    InvalidElf,
+    /// The execution failed: a guest panic or trap, an execution the pinned risc0 refuses because no
+    /// proof of it could verify, or a keccak request that does not match its input.
+    GuestFault,
+    /// The guest halted with code 0, but no proof of the run can verify: no output, or an
+    /// assumption other than its keccak root.
+    Unprovable,
+    /// `max_cycles` was exceeded.
+    CycleLimit,
+    /// The sandbox could not be applied; nothing was read.
+    Sandbox,
+    /// The executor panicked (a malformed or hostile ELF, as on the measure path).
+    Panicked,
+    /// Anything else: writing the response, an allocation the cgroup refused.
+    Internal,
+    /// This binary has no witness execute mode.
+    Unsupported,
+}
+
+impl WitnessExecuteFailure {
+    const ALL: [WitnessExecuteFailure; 10] = [
+        Self::BadRequest,
+        Self::InputMismatch,
+        Self::InvalidElf,
+        Self::GuestFault,
+        Self::Unprovable,
+        Self::CycleLimit,
+        Self::Sandbox,
+        Self::Panicked,
+        Self::Internal,
+        Self::Unsupported,
+    ];
+
+    /// The process exit code: 80..=89, clear of 1 (a generic failure), 2 (usage), 101 (an uncaught
+    /// Rust panic), 126/127 (exec failures) and [`WORKER_EXIT_SERVER_LOST`].
+    pub const fn code(self) -> i32 {
+        match self {
+            Self::BadRequest => 80,
+            Self::InputMismatch => 81,
+            Self::InvalidElf => 82,
+            Self::GuestFault => 83,
+            Self::Unprovable => 84,
+            Self::CycleLimit => 85,
+            Self::Sandbox => 86,
+            Self::Panicked => 87,
+            Self::Internal => 88,
+            Self::Unsupported => 89,
+        }
+    }
+
+    /// The failure an exit code stands for, if it is one.
+    pub fn from_code(code: i32) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.code() == code)
+    }
 }
 
 /// What a worker's one-time setup is doing (`WorkerResponse::SetupProgress`), for display.
@@ -429,6 +640,11 @@ pub enum ErrorKind {
     ProtocolError,
     /// Catch-all for internal errors.
     Internal,
+    /// A witness `Prove`'s input, read in full, does not have the bundle's length or
+    /// `sha256(prefix ‖ W)`: the retained `W` is corrupt (plan §15.2), not the job or the worker. An
+    /// input the worker could not open or read is `Internal` instead (the store may be unavailable).
+    /// Appended last (v13).
+    InputMismatch,
 }
 /// The exit code of a worker whose proving server is gone, or whose connection to it is unusable.
 ///
@@ -1108,6 +1324,12 @@ impl WorkerProofError {
     pub fn is_program_mismatch(&self) -> bool {
         matches!(self.kind, ErrorKind::ProgramMismatch)
     }
+
+    /// Did a witness proof's input fail the bundle's length or hash? Then the retained `W` is
+    /// corrupt: no card can prove it, and the bundle needs §15.2's handling.
+    pub fn is_input_mismatch(&self) -> bool {
+        matches!(self.kind, ErrorKind::InputMismatch)
+    }
 }
 
 impl std::fmt::Display for WorkerProofError {
@@ -1593,6 +1815,7 @@ mod tests {
             input_data: vec![4, 5, 6],
             po2: Some(20),
             program_id: Some([7u8; 32]),
+            witness: None,
         };
         let bytes = bincode::serialize(&cmd).unwrap();
         let decoded: WorkerCommand = bincode::deserialize(&bytes).unwrap();
@@ -1603,14 +1826,35 @@ mod tests {
                 input_data,
                 po2,
                 program_id,
+                witness,
             } => {
                 assert_eq!(request_id, 42);
                 assert_eq!(elf, vec![1, 2, 3]);
                 assert_eq!(input_data, vec![4, 5, 6]);
                 assert_eq!(po2, Some(20));
                 assert_eq!(program_id, Some([7u8; 32]));
+                assert_eq!(witness, None);
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_witness_execute_failure_round_trips_through_its_exit_code() {
+        let codes: Vec<i32> = WitnessExecuteFailure::ALL
+            .iter()
+            .map(|f| f.code())
+            .collect();
+        for f in WitnessExecuteFailure::ALL {
+            assert_eq!(WitnessExecuteFailure::from_code(f.code()), Some(f));
+            assert!((80..=89).contains(&f.code()), "{f:?}");
+        }
+        let mut unique = codes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), codes.len(), "codes are distinct");
+        for other in [0, 1, 2, 75, 101, 126, 127, 137] {
+            assert_eq!(WitnessExecuteFailure::from_code(other), None, "{other}");
         }
     }
 

@@ -1128,6 +1128,7 @@ impl WorkerHandle {
                     // Continue reading (don't count progress toward stale limit)
                 }
                 WorkerResponse::ProofResult { request_id, .. }
+                | WorkerResponse::JournalDiverged { request_id, .. }
                 | WorkerResponse::ExecuteResult { request_id, .. }
                 | WorkerResponse::ProgramIdResult { request_id, .. }
                 | WorkerResponse::Error { request_id, .. }
