@@ -203,6 +203,10 @@ fn publish_read_and_open_w_round_trip() {
         f.read_to_end(&mut back).unwrap();
         assert_eq!(back, w, "the fd is rewound and serves W");
         assert!(fs::OpenOptions::new().write(true).open(vdir(d.path(), &r).join("w.bin")).is_err());
+        // The prove worker's path to W (plan §15.3), after the same verification.
+        let p = s.w_path(&r).unwrap();
+        assert_eq!(p, vdir(d.path(), &r).join("w.bin"));
+        assert_eq!(fs::read(&p).unwrap(), w);
         assert_eq!(s.latest(r.job_id, r.descriptor_hash, r.prover).unwrap(), r);
     }
     // Published files are read-only; a new result is a new version.
@@ -343,6 +347,7 @@ fn corruption_is_corrupt_and_absence_is_missing() {
     fs::write(&p, &bytes).unwrap();
     assert!(s.read(&refs[0], &desc_hash).is_ok());
     assert_eq!(defect(s.open_w(&refs[0]).unwrap_err()), Defect::WHash);
+    assert_eq!(defect(s.w_path(&refs[0]).unwrap_err()), Defect::WHash, "no path to a W that fails its hash");
     assert_eq!(defect(s.verify(&refs[0], &desc_hash, &image_id).unwrap_err()), Defect::WHash);
 
     // A truncated W.

@@ -1367,6 +1367,17 @@ impl Store {
         Ok(f)
     }
 
+    /// The path of a version's `w.bin`, for a prove worker that opens `W` itself (plan §15.3: the
+    /// prove command carries a path, so host RAM is not charged for a copy). `W` is verified first,
+    /// as [`Store::open_w`] verifies it (every byte against the record), so a version whose `W` is
+    /// missing or corrupt is reported here, before a proof is dispatched. The worker hashes what it
+    /// reads against the bundle's `sha256(prefix ‖ W)` again, so a file changed after this check is
+    /// refused there. Published files are read-only and a pinned version is never evicted.
+    pub fn w_path(&self, r: &BundleRef) -> Result<PathBuf, StoreError> {
+        drop(self.open_w(r)?);
+        Ok(self.inner.version_path(r).join(W_BIN))
+    }
+
     /// Everything a proof from this version needs, verified (plan §15.1: "every read verifies
     /// `sha256(W)` and the ELF's image id"): [`Store::read`], [`Store::open_w`] (every byte of `W`),
     /// and the ELF `image_id` re-verified with `image_id_fn`. An ELF absent from an available store
