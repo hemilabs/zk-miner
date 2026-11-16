@@ -15,8 +15,18 @@ pub struct Po2Result {
     pub journal_sha256: B256,
     /// Sized cycles in the `maxGuestCycles` unit.
     pub cycles: u64,
-    pub exit_code: u32,
+    pub exit: GuestExit,
     pub segment_bytes: u64,
+}
+
+/// How a guest execution ended (risc0 `ExitCode`); only `Halted(0)` is provable for a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "code", rename_all = "snake_case")]
+pub enum GuestExit {
+    Halted(u32),
+    Paused(u32),
+    SystemSplit,
+    SessionLimit,
 }
 
 /// Everything a lock is proven from (plan §15.1). `W` itself is a separate file (`w.bin`).

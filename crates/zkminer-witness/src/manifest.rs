@@ -4,6 +4,8 @@
 //! The artifact manifest is a data contract whose runtime code is exactly `77 + 20n` bytes:
 //! `0x00 ‖ ARTIFACT_MANIFEST_TAG_V1 (32) ‖ length (u64 BE) ‖ sha256 (32) ‖ n (u32 BE) ‖ n × address`.
 
+use std::io::Write;
+
 use alloy_primitives::{b256, Address, B256};
 use sha2::{Digest, Sha256};
 
@@ -143,52 +145,78 @@ pub fn chunk_body(code: &[u8]) -> Result<&[u8], ChunkError> {
     Ok(body)
 }
 
-/// Incrementally assembles an artifact from chunk bodies and verifies it (plan §13.4 steps 4–5).
-pub struct Assembler {
+/// Incrementally assembles an artifact from chunk bodies into `sink` and verifies it (plan §13.4
+/// steps 4–5): exactly the manifest's `n` chunks, at most `length` bytes at any point, exactly
+/// `length` at the end, hashing to the manifest's sha256. The broker passes a memfd so a 30 MB
+/// artifact is never held in a `Vec`.
+pub struct Assembler<W: Write> {
     expected_len: u64,
+    expected_chunks: usize,
     expected_sha256: [u8; 32],
     hasher: Sha256,
-    bytes: Vec<u8>,
+    written: u64,
+    chunks: usize,
+    sink: W,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AssembleError {
+    #[error("more chunks than the manifest lists")]
+    TooManyChunks,
+    #[error("fewer chunks than the manifest lists")]
+    TooFewChunks,
     #[error("chunks exceed the manifest length")]
     TooLong,
     #[error("chunks total less than the manifest length")]
     TooShort,
     #[error("assembled bytes do not hash to the manifest sha256")]
     HashMismatch,
+    #[error("writing the assembled bytes failed: {0:?}")]
+    Io(std::io::ErrorKind),
 }
 
-impl Assembler {
-    pub fn new(manifest: &ArtifactManifest) -> Self {
+impl<W: Write> Assembler<W> {
+    pub fn new(manifest: &ArtifactManifest, sink: W) -> Self {
         Self {
             expected_len: manifest.length,
+            expected_chunks: manifest.chunks.len(),
             expected_sha256: manifest.sha256,
             hasher: Sha256::new(),
-            bytes: Vec::with_capacity(manifest.length.min(64 << 20) as usize),
+            written: 0,
+            chunks: 0,
+            sink,
         }
     }
 
+    /// Appends one chunk body (already checked with [`chunk_body`]).
     pub fn push(&mut self, body: &[u8]) -> Result<(), AssembleError> {
-        if self.bytes.len() as u64 + body.len() as u64 > self.expected_len {
+        if self.chunks >= self.expected_chunks {
+            return Err(AssembleError::TooManyChunks);
+        }
+        if self.written + body.len() as u64 > self.expected_len {
             return Err(AssembleError::TooLong);
         }
+        self.sink.write_all(body).map_err(|e| AssembleError::Io(e.kind()))?;
         self.hasher.update(body);
-        self.bytes.extend_from_slice(body);
+        self.written += body.len() as u64;
+        self.chunks += 1;
         Ok(())
     }
 
-    pub fn finish(self) -> Result<Vec<u8>, AssembleError> {
-        if (self.bytes.len() as u64) < self.expected_len {
+    /// Verifies the totals and the hash and returns the sink.
+    pub fn finish(mut self) -> Result<W, AssembleError> {
+        if self.chunks < self.expected_chunks {
+            return Err(AssembleError::TooFewChunks);
+        }
+        if self.written < self.expected_len {
             return Err(AssembleError::TooShort);
         }
         let got: [u8; 32] = self.hasher.finalize().into();
         if got != self.expected_sha256 {
             return Err(AssembleError::HashMismatch);
         }
-        Ok(self.bytes)
+        self.sink.flush().map_err(|e| AssembleError::Io(e.kind()))?;
+        Ok(self.sink)
     }
 }
 
@@ -247,8 +275,8 @@ mod tests {
         assert_eq!(ARTIFACT_MANIFEST_TAG_V1, keccak256("hemiprove.artifact-manifest.v1"));
         assert_eq!(MANIFEST_FIXED_BYTES, 77);
         assert_eq!(MAX_MANIFEST_CHUNKS, 1_224);
-        assert!(MANIFEST_FIXED_BYTES + 20 * 1_224 <= MAX_CODE_BYTES);
-        assert!(MANIFEST_FIXED_BYTES + 20 * 1_225 > MAX_CODE_BYTES);
+        const _: () = assert!(MANIFEST_FIXED_BYTES + 20 * 1_224 <= MAX_CODE_BYTES);
+        const _: () = assert!(MANIFEST_FIXED_BYTES + 20 * 1_225 > MAX_CODE_BYTES);
         assert_eq!(u64::from(MAX_MANIFEST_CHUNKS) * MAX_CHUNK_BODY as u64, 30_079_800);
     }
 
@@ -261,7 +289,7 @@ mod tests {
         let code = manifest_runtime_code(artifact.len() as u64, &sha, &chunks);
         let m = parse_manifest(&code, addr(0xff), 1 << 30, Some(&sha)).unwrap();
         assert_eq!(m.chunks, chunks);
-        let mut a = Assembler::new(&m);
+        let mut a = Assembler::new(&m, Vec::new());
         for b in &bodies {
             let code = chunk_runtime_code(b);
             a.push(chunk_body(&code).unwrap()).unwrap();
@@ -313,15 +341,98 @@ mod tests {
         assert_eq!(chunk_body(&[0xef, 0x01, 0x00]), Err(ChunkError::Prefix), "a 7702 designator is refused");
         assert_eq!(chunk_body(&[0x00]), Err(ChunkError::BodySize));
         let m = ArtifactManifest { length: 4, sha256: sha256(b"abcd"), chunks: vec![addr(1), addr(2)] };
-        let mut a = Assembler::new(&m);
+        let mut a = Assembler::new(&m, Vec::new());
         a.push(b"abc").unwrap();
         assert_eq!(a.push(b"de"), Err(AssembleError::TooLong));
-        let mut a = Assembler::new(&m);
+        let mut a = Assembler::new(&m, Vec::new());
         a.push(b"ab").unwrap();
+        assert_eq!(a.finish(), Err(AssembleError::TooFewChunks));
+        let mut a = Assembler::new(&m, Vec::new());
+        a.push(b"ab").unwrap();
+        a.push(b"c").unwrap();
         assert_eq!(a.finish(), Err(AssembleError::TooShort));
-        let mut a = Assembler::new(&m);
-        a.push(b"abce").unwrap();
+        let mut a = Assembler::new(&m, Vec::new());
+        a.push(b"ab").unwrap();
+        a.push(b"ce").unwrap();
         assert_eq!(a.finish(), Err(AssembleError::HashMismatch));
+        // Three chunks listed: two bodies that already total `length` do not finish the artifact.
+        let m3 = ArtifactManifest { length: 4, sha256: sha256(b"abcd"), chunks: vec![addr(1), addr(2), addr(3)] };
+        let mut a = Assembler::new(&m3, Vec::new());
+        a.push(b"ab").unwrap();
+        a.push(b"cd").unwrap();
+        assert_eq!(a.finish(), Err(AssembleError::TooFewChunks));
+        let mut a = Assembler::new(&m, Vec::new());
+        a.push(b"a").unwrap();
+        a.push(b"b").unwrap();
+        assert_eq!(a.push(b"c"), Err(AssembleError::TooManyChunks));
+    }
+
+    #[test]
+    fn adjacent_checks_fail_in_order() {
+        use ManifestDefect as D;
+        let sha = [7u8; 32];
+        let p = |c: &[u8], own: Address, max: u64, id: Option<&[u8; 32]>| parse_manifest(c, own, max, id);
+        // Prefix before Tag.
+        let mut c = manifest_runtime_code(100, &sha, &[addr(1)]);
+        c[0] = 1;
+        c[5] ^= 1;
+        assert_eq!(p(&c, addr(9), 1 << 20, None), Err(ManifestError::Structural(D::Prefix)));
+        // Tag before ChunkCount.
+        let mut c = manifest_runtime_code(100, &sha, &[addr(1)]);
+        c[5] ^= 1;
+        c[73..77].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(p(&c, addr(9), 1 << 20, None), Err(ManifestError::Structural(D::Tag)));
+        // CodeLength before ZeroLength.
+        let mut c = manifest_runtime_code(0, &sha, &[addr(1)]);
+        c.push(0);
+        assert_eq!(p(&c, addr(9), 1 << 20, None), Err(ManifestError::Structural(D::CodeLength)));
+        // ZeroLength before TooLarge.
+        let c = manifest_runtime_code(0, &sha, &[addr(1)]);
+        assert_eq!(p(&c, addr(9), 0, None), Err(ManifestError::Structural(D::ZeroLength)));
+        // LengthVsChunks before TooLarge.
+        let c = manifest_runtime_code(30_000, &sha, &[addr(1)]);
+        assert_eq!(p(&c, addr(9), 10, None), Err(ManifestError::Structural(D::LengthVsChunks)));
+        // TooLarge before IdMismatch.
+        let c = manifest_runtime_code(100, &sha, &[addr(1)]);
+        assert_eq!(p(&c, addr(9), 99, Some(&[8u8; 32])), Err(ManifestError::TooLarge));
+        // IdMismatch before DuplicateAddress and SelfReference.
+        let c = manifest_runtime_code(100, &sha, &[addr(9), addr(9)]);
+        assert_eq!(p(&c, addr(9), 1 << 20, Some(&[8u8; 32])), Err(ManifestError::IdMismatch));
+        // SelfReference and DuplicateAddress: whichever address comes first.
+        assert_eq!(p(&c, addr(9), 1 << 20, None), Err(ManifestError::Structural(D::SelfReference)));
+    }
+
+    #[test]
+    fn manifest_bounds() {
+        let sha = [7u8; 32];
+        let many = |n: u32| -> Vec<Address> {
+            (0..n).map(|i| { let mut a = [0u8; 20]; a[16..].copy_from_slice(&(i + 1).to_be_bytes()); Address::from(a) }).collect()
+        };
+        let max_len = u64::from(MAX_MANIFEST_CHUNKS) * MAX_CHUNK_BODY as u64;
+        let c = manifest_runtime_code(max_len, &sha, &many(MAX_MANIFEST_CHUNKS));
+        assert_eq!(c.len(), 24_557);
+        assert!(parse_manifest(&c, Address::ZERO, u64::MAX, None).is_ok());
+        assert_eq!(
+            parse_manifest(&manifest_runtime_code(max_len + 1, &sha, &many(MAX_MANIFEST_CHUNKS)), Address::ZERO, u64::MAX, None),
+            Err(ManifestError::Structural(ManifestDefect::LengthVsChunks))
+        );
+        // n = 1,225 cannot be written by the publisher; craft it.
+        let mut c = manifest_runtime_code(1_225, &sha, &many(MAX_MANIFEST_CHUNKS));
+        c[73..77].copy_from_slice(&1_225u32.to_be_bytes());
+        c.extend_from_slice(&[0xee; 20]);
+        assert_eq!(parse_manifest(&c, Address::ZERO, u64::MAX, None), Err(ManifestError::Structural(ManifestDefect::ChunkCount)));
+        // length = n: every chunk one byte.
+        assert!(parse_manifest(&manifest_runtime_code(5, &sha, &many(5)), Address::ZERO, u64::MAX, None).is_ok());
+        // Code lengths of 77 + 20n ± 1.
+        let good = manifest_runtime_code(100, &sha, &many(2));
+        assert_eq!(parse_manifest(&good[..good.len() - 1], Address::ZERO, u64::MAX, None), Err(ManifestError::Structural(ManifestDefect::CodeLength)));
+        let mut long = good.clone();
+        long.push(0);
+        assert_eq!(parse_manifest(&long, Address::ZERO, u64::MAX, None), Err(ManifestError::Structural(ManifestDefect::CodeLength)));
+        // An EIP-7702 designator (23 bytes) is too short to be a manifest.
+        let mut d = vec![0xef, 0x01, 0x00];
+        d.extend_from_slice(&[0x42; 20]);
+        assert_eq!(parse_manifest(&d, Address::ZERO, u64::MAX, None), Err(ManifestError::Structural(ManifestDefect::TooShort)));
     }
 
     #[test]

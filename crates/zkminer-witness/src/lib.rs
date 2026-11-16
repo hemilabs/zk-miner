@@ -4,6 +4,7 @@
 //! (§16), IPC frames between the miner, the broker and builders (§10.1), and the retention bundle
 //! schema (§15.1).
 
+pub mod abi;
 pub mod binding;
 pub mod bundle;
 pub mod context;

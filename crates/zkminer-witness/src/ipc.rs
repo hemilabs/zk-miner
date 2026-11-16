@@ -75,6 +75,17 @@ pub fn read_frame(r: &mut impl Read, max: u32) -> Result<(u8, Vec<u8>), FrameErr
     Ok((header[0], payload))
 }
 
+/// The largest `KIND_FETCH` payload a reader accepts for a job whose effective `maxRequestBytes` is
+/// `max_request_bytes`: the 4-byte cap index plus the request (plan §11.4 caps the request bytes).
+pub fn fetch_frame_max(max_request_bytes: u32) -> u32 {
+    max_request_bytes.max(64 * 1024).saturating_add(4)
+}
+
+/// The largest `KIND_FETCH_RESULT` payload: the status byte plus the response.
+pub fn fetch_result_frame_max(max_response_bytes: u32) -> u32 {
+    max_response_bytes.saturating_add(1)
+}
+
 pub fn encode_fetch(cap: u32, request: &[u8]) -> Vec<u8> {
     let mut p = Vec::with_capacity(4 + request.len());
     p.extend_from_slice(&cap.to_be_bytes());
@@ -119,7 +130,7 @@ pub mod exit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BuilderSummary {
     pub exit_code: i32,
-    /// Some fetch returned status 2 (failed).
+    /// Some fetch returned status 2 (failed). Informational: verdicts take this from the broker.
     pub transient: bool,
     pub fetches: u32,
     pub fetch_bytes: u64,
@@ -148,7 +159,7 @@ impl BuilderSummary {
     }
 
     pub fn decode(b: &[u8]) -> Option<Self> {
-        if b.len() != BUILDER_SUMMARY_BYTES || b[0..4] != BUILDER_SUMMARY_MAGIC || b[8] > 1 {
+        if b.len() != BUILDER_SUMMARY_BYTES || b[0..4] != BUILDER_SUMMARY_MAGIC || b[8] > 1 || b[9..12] != [0; 3] {
             return None;
         }
         let u32_at = |i: usize| u32::from_be_bytes(b[i..i + 4].try_into().unwrap());
@@ -221,6 +232,8 @@ pub enum ArtifactFailure {
     ManifestInvalid { at_or_below_safe: bool },
     IdMismatch,
     ChunkInvalid { at_or_below_safe: bool },
+    /// The chunks assembled to bytes that do not hash to the manifest's own sha256.
+    HashMismatch { at_or_below_safe: bool },
     TooLarge,
     Endpoint,
     Budget,
@@ -230,12 +243,39 @@ pub enum ArtifactFailure {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlResponse {
     Registered { job_key: B256 },
-    JobStats { job_key: B256, fetches: u32, fetch_bytes: u64, transient: bool, denied: u32 },
+    /// The broker's account of a job, sent in answer to `EndJob`. `transient` = some fetch returned
+    /// status 2; `fetch_in_flight_at_end` = a fetch was still being served when the job ended.
+    JobStats {
+        job_key: B256,
+        fetches: u32,
+        fetch_bytes: u64,
+        transient: bool,
+        fetch_in_flight_at_end: bool,
+        denied: u32,
+    },
     /// The artifact is in the memfd sent with this frame.
     Artifact { len: u64, sha256: B256 },
     ArtifactFailed { failure: ArtifactFailure },
-    SelfTest { ok: bool, checks: Vec<(String, bool)> },
+    SelfTest { ok: bool, checks: Vec<(SelfTestCheck, bool)> },
     Error { code: ControlErrorCode },
+}
+
+/// The broker's self-test checks (plan §10.3): a fixed set, no broker-supplied strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfTestCheck {
+    SeccompActive,
+    NoNewPrivs,
+    LandlockActive,
+    SecretUnreadable,
+    GpuNodeUnopenable,
+    LoopbackDenied,
+    MetadataDenied,
+    Rfc1918Denied,
+    OwnAddressDenied,
+    ConnectedPrefixDenied,
+    EndpointsReachable,
+    ArtifactEndpointChainId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,6 +312,24 @@ mod tests {
         let mut huge = vec![KIND_FETCH];
         huge.extend_from_slice(&u32::MAX.to_be_bytes());
         assert!(matches!(read_frame(&mut &huge[..], 1024), Err(FrameError::TooLarge { .. })));
+        // EOF inside the payload is an error, not a short frame.
+        let mut cut = Vec::new();
+        write_frame(&mut cut, KIND_FETCH, &[1, 2, 3, 4, 5]).unwrap();
+        cut.truncate(cut.len() - 2);
+        assert!(matches!(read_frame(&mut &cut[..], 1024), Err(FrameError::Io(_))));
+    }
+
+    #[test]
+    fn a_maximal_legal_request_fits_its_frame() {
+        let req = vec![b'x'; 65_536];
+        let mut buf = Vec::new();
+        write_frame(&mut buf, KIND_FETCH, &encode_fetch(0, &req)).unwrap();
+        let (_, p) = read_frame(&mut &buf[..], fetch_frame_max(65_536)).unwrap();
+        assert_eq!(decode_fetch(&p).unwrap().1.len(), 65_536);
+        assert_eq!(fetch_frame_max(100), 65_540, "small limits still allow the 64 KiB floor");
+        assert_eq!(fetch_result_frame_max(10), 11);
+        assert!(matches!(decode_fetch_result(&[4]), Err(FrameError::Malformed)), "unknown status");
+        assert!(matches!(decode_fetch_result(&[]), Err(FrameError::Malformed)));
     }
 
     #[test]
@@ -281,6 +339,11 @@ mod tests {
         let mut b = s.encode();
         b[8] = 7;
         assert_eq!(BuilderSummary::decode(&b), None);
+        let mut b = s.encode();
+        b[10] = 1;
+        assert_eq!(BuilderSummary::decode(&b), None, "reserved bytes must be zero");
+        let neg = BuilderSummary { exit_code: -9, ..s };
+        assert_eq!(BuilderSummary::decode(&neg.encode()), Some(neg));
     }
 
     #[test]
@@ -297,5 +360,10 @@ mod tests {
         let bytes = encode_control(&m);
         assert_eq!(decode_control::<ControlRequest>(&bytes).unwrap(), m);
         assert!(decode_control::<ControlRequest>(b"not json").is_err());
+        let big = vec![b' '; MAX_CONTROL_BYTES as usize + 1];
+        assert!(matches!(decode_control::<ControlRequest>(&big), Err(FrameError::TooLarge { .. })));
+        let st = ControlResponse::SelfTest { ok: false, checks: vec![(SelfTestCheck::LoopbackDenied, false)] };
+        assert_eq!(decode_control::<ControlResponse>(&encode_control(&st)).unwrap(), st);
+        assert!(decode_control::<ControlResponse>(br#"{"type":"self_test","ok":true,"checks":[["made_up",true]]}"#).is_err());
     }
 }

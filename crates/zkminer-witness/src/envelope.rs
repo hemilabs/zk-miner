@@ -149,6 +149,8 @@ pub enum EnvelopeError {
     NotWitnessJob,
     #[error("envelope body does not ABI-decode")]
     Undecodable,
+    #[error("envelope body longer than {MAX_ENVELOPE_BODY_BYTES} bytes")]
+    BodyTooLarge,
     #[error("envelope body is not the canonical encoding of what it decodes to")]
     NonCanonical,
     #[error("unknown builder type")]
@@ -197,9 +199,53 @@ pub fn encode_envelope(job: &WitnessJobV1) -> Vec<u8> {
     out
 }
 
-/// Strictly decodes and range-checks an envelope from `inputData`.
+/// The longest canonical body whose every field is at its maximum (asserted by a test): 480 head
+/// bytes, 4 URIs of 512 bytes (2,336), 16 KiB of params (16,416) and 8 sources with 1 KiB configs
+/// (9,248). A longer body must fail a range check, so it is refused before decoding.
+pub const MAX_ENVELOPE_BODY_BYTES: usize = 28_480;
+
+/// A head word read as a `usize`, `None` if it is out of bounds or above `u64`.
+fn word_usize(b: &[u8], at: usize) -> Option<usize> {
+    let w = b.get(at..at.checked_add(32)?)?;
+    if w[..24].iter().any(|&x| x != 0) {
+        return None;
+    }
+    usize::try_from(u64::from_be_bytes(w[24..].try_into().ok()?)).ok()
+}
+
+/// Bounds the decoder's work before alloy runs: the body size, the outer head word, and the two
+/// array lengths. Without this, offsets that alias one long string make the decoder copy it once per
+/// array element (about 60 MB from 64 KB of `inputData`).
+fn precheck(body: &[u8]) -> Result<(), EnvelopeError> {
+    if body.len() > MAX_ENVELOPE_BODY_BYTES {
+        return Err(EnvelopeError::BodyTooLarge);
+    }
+    if word_usize(body, 0) != Some(0x20) {
+        return Err(EnvelopeError::NonCanonical);
+    }
+    // The tuple starts at 32; builderURIs' offset is its third head word, sources' its fifth.
+    let tuple = 32usize;
+    let uris = tuple
+        .checked_add(word_usize(body, tuple + 64).ok_or(EnvelopeError::Undecodable)?)
+        .ok_or(EnvelopeError::Undecodable)?;
+    let sources = tuple
+        .checked_add(word_usize(body, tuple + 128).ok_or(EnvelopeError::Undecodable)?)
+        .ok_or(EnvelopeError::Undecodable)?;
+    if word_usize(body, uris).ok_or(EnvelopeError::Undecodable)? > MAX_BUILDER_URIS {
+        return Err(EnvelopeError::TooManyUris);
+    }
+    let n_sources = word_usize(body, sources).ok_or(EnvelopeError::Undecodable)?;
+    if !(MIN_SOURCES..=MAX_SOURCES).contains(&n_sources) {
+        return Err(EnvelopeError::SourcesCount);
+    }
+    Ok(())
+}
+
+/// Strictly decodes and range-checks an envelope from `inputData`. A string that is not valid UTF-8
+/// is reported as `NonCanonical` (the decoder replaces invalid sequences, so it does not re-encode).
 pub fn decode(input_data: &[u8]) -> Result<Envelope, EnvelopeError> {
     let body = classify(input_data).ok_or(EnvelopeError::NotWitnessJob)?;
+    precheck(body)?;
     let job = WitnessJobV1::abi_decode(body).map_err(|_| EnvelopeError::Undecodable)?;
     if job.abi_encode() != body {
         return Err(EnvelopeError::NonCanonical);
@@ -290,6 +336,8 @@ pub enum IgnoredUri {
     OtherChain,
     /// `https`/`ipfs` entries: served from Phase 2 through the artifact egress.
     NotInThisPhase,
+    /// The same locator appeared earlier in the list.
+    Duplicate,
 }
 
 /// Classifies `builderURIs` for a job on `job_chain_id`, in envelope order.
@@ -308,7 +356,14 @@ pub fn usable_builder_sources(job: &WitnessJobV1, job_chain_id: u64) -> (Vec<Bui
         };
         match scheme {
             b"hemi-code" => match HemiCodeLocator::parse(uri) {
-                Ok(loc) if loc.chain_id == job_chain_id => usable.push(BuilderSource::HemiCode(loc)),
+                Ok(loc) if loc.chain_id == job_chain_id => {
+                    let src = BuilderSource::HemiCode(loc);
+                    if usable.contains(&src) {
+                        ignored.push(IgnoredUri::Duplicate);
+                    } else {
+                        usable.push(src);
+                    }
+                }
                 Ok(_) => ignored.push(IgnoredUri::OtherChain),
                 Err(e) => ignored.push(IgnoredUri::Malformed(e)),
             },
@@ -334,9 +389,13 @@ pub struct HostMaxima {
     pub max_builder_seconds: u32,
 }
 
-/// Hard ceilings in code, whatever the configuration (plan §9.1).
+/// Hard ceilings in code, whatever the configuration (plan §9.1). The operator's
+/// `[witness] max_witness_bytes` (default 32 MiB, §15.4) can be raised only up to the W ceiling.
 pub const HARD_MAX_BUILDER_MEMORY_BYTES: u64 = 1 << 30;
 pub const HARD_MAX_BUILDER_SECONDS: u32 = 300;
+pub const HARD_MAX_WITNESS_BYTES: u64 = 1 << 30;
+/// The Phase-1 default for `[witness] max_witness_bytes`.
+pub const DEFAULT_MAX_WITNESS_BYTES: u64 = 32 << 20;
 
 impl HostMaxima {
     /// Applies the hard ceilings to an operator configuration.
@@ -344,6 +403,7 @@ impl HostMaxima {
         self.max_builder_memory_bytes = self.max_builder_memory_bytes.min(HARD_MAX_BUILDER_MEMORY_BYTES);
         self.max_builder_seconds = self.max_builder_seconds.min(HARD_MAX_BUILDER_SECONDS);
         self.max_request_bytes = self.max_request_bytes.min(MAX_REQUEST_BYTES);
+        self.max_witness_bytes = self.max_witness_bytes.min(HARD_MAX_WITNESS_BYTES);
         self
     }
 }
@@ -525,6 +585,164 @@ pub(crate) mod tests {
         let mut l = sample_job().limits;
         l.maxGuestCycles = 1 << 31;
         assert_eq!(effective_limits(&l, &host), Err(LimitsRejected::GuestCycles));
+    }
+
+    #[test]
+    fn matches_solidity_abi_encode() {
+        // `cast abi-encode "f((uint8,bytes32,string[],bytes,(bytes32,bytes)[],(uint32,…,uint64)))"` of
+        // `sample_job()`, hashed.
+        let body = sample_job().abi_encode();
+        assert_eq!(body.len(), 992);
+        assert_eq!(keccak256(&body), b256!("3c00157f164915e258db1a464fad085e0a6e77306ba7dfd1730e2c8c1b53a114"));
+        let d = crate::context::DescriptorFields {
+            program_id: B256::repeat_byte(1),
+            proof_system_id: B256::repeat_byte(2),
+            expected_journal_hash: B256::repeat_byte(3),
+            journal_fields: B256::repeat_byte(4),
+        };
+        let ctx = crate::context::build_context(743111, alloy_primitives::Address::repeat_byte(5), &d, &sample_job());
+        let enc = crate::context::encode_context(&ctx);
+        assert_eq!(enc.len(), 928);
+        assert_eq!(keccak256(&enc), b256!("0d9043a9b52dbd3d89f7445c374f9a5e7b858ccc9884fbfdb95e13bcea3a45b8"));
+    }
+
+    fn maximal_job() -> WitnessJobV1 {
+        let mut j = sample_job();
+        j.builderURIs = vec!["u".repeat(MAX_BUILDER_URI_BYTES); MAX_BUILDER_URIS];
+        j.builderParams = vec![7u8; MAX_BUILDER_PARAMS_BYTES].into();
+        j.sources = vec![Capability { class: CLASS_BLOB_V1, config: vec![0u8; MAX_CONFIG_BYTES].into() }; MAX_SOURCES];
+        j
+    }
+
+    #[test]
+    fn maximal_body_is_exactly_the_precheck_bound() {
+        assert_eq!(maximal_job().abi_encode().len(), MAX_ENVELOPE_BODY_BYTES);
+        // Every field at its maximum passes the ranges (the 1 KiB configs fail only their schema).
+        let mut j = maximal_job();
+        j.sources = vec![j.sources[0].clone(); MAX_SOURCES];
+        assert_eq!(decode(&encode_envelope(&j)), Err(EnvelopeError::BadConfig));
+        let mut j = sample_job();
+        j.builderURIs = vec!["u".repeat(MAX_BUILDER_URI_BYTES); MAX_BUILDER_URIS];
+        j.builderParams = vec![7u8; MAX_BUILDER_PARAMS_BYTES].into();
+        j.sources = vec![j.sources[0].clone(); MAX_SOURCES];
+        j.limits.maxRequestBytes = MAX_REQUEST_BYTES;
+        assert!(decode(&encode_envelope(&j)).is_ok());
+        let mut input = encode_envelope(&maximal_job());
+        input.extend_from_slice(&[0u8; 32]);
+        assert_eq!(decode(&input), Err(EnvelopeError::BodyTooLarge));
+    }
+
+    #[test]
+    fn aliased_offsets_are_refused_before_decoding() {
+        // 1,000 builderURIs whose offsets all point at one long string: alloy would copy it 1,000
+        // times. The precheck rejects the count first.
+        let mut body = Vec::new();
+        let word = |v: u64| B256::left_padding_from(&v.to_be_bytes()).0;
+        body.extend_from_slice(&word(0x20));
+        let tuple_head = 5 * 32 + 9 * 32;
+        body.extend_from_slice(&word(1)); // builderType
+        body.extend_from_slice(&[0x11; 32]); // builderId
+        body.extend_from_slice(&word(tuple_head as u64)); // builderURIs offset
+        body.extend_from_slice(&word(0)); // builderParams offset (unused here)
+        body.extend_from_slice(&word(0)); // sources offset
+        body.extend_from_slice(&[0u8; 9 * 32]); // limits
+        body.extend_from_slice(&word(1000)); // builderURIs length
+        assert_eq!(decode(&[WITNESS_JOB_TAG_V1.as_slice(), &body].concat()), Err(EnvelopeError::TooManyUris));
+        // The same through sources.
+        let mut j = sample_job();
+        j.sources = vec![j.sources[0].clone(); 9];
+        assert_eq!(decode(&encode_envelope(&j)), Err(EnvelopeError::SourcesCount));
+        // A head offset that is not 0x20.
+        let mut input = encode_envelope(&sample_job());
+        input[63] = 0x40;
+        assert_eq!(decode(&input), Err(EnvelopeError::NonCanonical));
+    }
+
+    #[test]
+    fn dirty_config_encodings_are_refused() {
+        let cfg = encode_evm_rpc_config(1, true, METHOD_SET_STATE_READ, 0);
+        let check = |cfg: Vec<u8>| {
+            let mut j = sample_job();
+            j.sources[0].config = cfg.into();
+            decode(&encode_envelope(&j))
+        };
+        assert!(check(cfg.clone()).is_ok());
+        let mut c = cfg.clone();
+        c[63] = 2; // bool = 2
+        assert_eq!(check(c), Err(EnvelopeError::BadConfig));
+        let mut c = cfg.clone();
+        c[0] = 1; // high bits of the uint64 chainId
+        assert_eq!(check(c), Err(EnvelopeError::BadConfig));
+        let mut j = sample_job();
+        let mut b = encode_blob_config(5);
+        b.push(0);
+        j.sources[0] = Capability { class: CLASS_BLOB_V1, config: b.into() };
+        assert_eq!(decode(&encode_envelope(&j)), Err(EnvelopeError::BadConfig));
+        let mut j = sample_job();
+        j.sources[0] = Capability { class: CLASS_BLOB_V1, config: encode_blob_config(5).into() };
+        assert_eq!(decode(&encode_envelope(&j)).unwrap().capabilities, vec![CapabilityKind::BlobV1 { max_bytes: 5 }]);
+    }
+
+    #[test]
+    fn non_utf8_uri_is_refused() {
+        let mut input = encode_envelope(&sample_job());
+        let at = input.windows(9).position(|w| w == b"hemi-code").unwrap();
+        input[at] = 0xff;
+        assert_eq!(decode(&input), Err(EnvelopeError::NonCanonical));
+    }
+
+    #[test]
+    fn duplicate_locators_are_read_once() {
+        let mut j = sample_job();
+        j.builderURIs = vec![j.builderURIs[0].clone(), j.builderURIs[0].clone()];
+        let (usable, ignored) = usable_builder_sources(&j, 743111);
+        assert_eq!(usable.len(), 1);
+        assert_eq!(ignored, vec![IgnoredUri::Duplicate]);
+    }
+
+    #[test]
+    fn witness_ceiling_applies_whatever_the_host_says() {
+        let host = HostMaxima {
+            max_witness_bytes: u64::MAX,
+            max_guest_cycles: u64::MAX,
+            max_fetches: 1,
+            max_fetch_bytes: 1,
+            max_request_bytes: 1,
+            max_response_bytes: 1,
+            max_builder_fuel: 1,
+            max_builder_memory_bytes: 1,
+            max_builder_seconds: 1,
+        };
+        let mut l = sample_job().limits;
+        l.maxWitnessBytes = HARD_MAX_WITNESS_BYTES + 1;
+        assert_eq!(effective_limits(&l, &host), Err(LimitsRejected::WitnessBytes));
+        l.maxWitnessBytes = HARD_MAX_WITNESS_BYTES;
+        assert!(effective_limits(&l, &host).is_ok());
+    }
+
+    proptest::proptest! {
+        /// Structured mutation: change one byte of a valid envelope. Never panics, and anything that
+        /// still decodes re-encodes to exactly the input.
+        #[test]
+        fn mutated_envelopes_decode_strictly(at in 0usize..1024, v in proptest::prelude::any::<u8>()) {
+            let mut input = encode_envelope(&sample_job());
+            let at = 32 + at % (input.len() - 32);
+            input[at] = v;
+            if let Ok(env) = decode(&input) {
+                proptest::prop_assert_eq!(encode_envelope(&env.job), input);
+            }
+        }
+
+        /// Offsets and lengths nudged by small amounts.
+        #[test]
+        fn nudged_words_never_panic(word in 0usize..31, delta in -64i64..64) {
+            let mut input = encode_envelope(&sample_job());
+            let at = 32 + word * 32 + 24;
+            let mut v = u64::from_be_bytes(input[at..at + 8].try_into().unwrap()) as i64;
+            v = v.wrapping_add(delta);
+            input[at..at + 8].copy_from_slice(&(v as u64).to_be_bytes());
+            let _ = decode(&input);
+        }
     }
 
     proptest::proptest! {
