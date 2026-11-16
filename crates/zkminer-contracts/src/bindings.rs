@@ -257,6 +257,9 @@ sol! {
         function claimJobBatch(bytes32[] jobIds, uint96[] priceFloors, uint96[] premiumFloors) external returns (bool[] results);
         function topUpDeposit(bytes32 jobId, uint96 amount) external;
         function withdraw() external;
+        // Payouts the router credited instead of transferring (`PayoutCredited`); `withdraw()`
+        // sends the caller's whole balance.
+        function withdrawableBalances(address account) external view returns (uint256);
         function jobIndex() external view returns (uint48);
     }
 
@@ -483,6 +486,9 @@ sol! {
         function getProverStake(address prover) external view returns (ProverStake memory);
         function getAvailableCollateral(address prover) external view returns (uint128);
         function getProverStats(address prover) external view returns (ProverStats memory);
+        // The last fulfil / release / slash / bid refund / grace for this prover: `withdrawUnstaked`
+        // reverts `PostActivityCooldownActive` for an hour after it.
+        function lastProverActivityAt(address prover) external view returns (uint40);
         function hemiToken() external view returns (address);
     }
 
@@ -843,6 +849,7 @@ mod tests {
         pin_call!(r, IHemiProveCore::claimJobBatchCall, "claimJobBatch");
         pin_call!(r, IHemiProveCore::topUpDepositCall, "topUpDeposit");
         pin_call!(r, IHemiProveCore::withdrawCall, "withdraw");
+        pin_call!(r, IHemiProveCore::withdrawableBalancesCall, "withdrawableBalances");
         pin_call!(r, IHemiProveCore::jobIndexCall, "jobIndex");
         pin_call!(r, IHemiProveFulfill::fulfillJobCall, "fulfillJob");
         pin_call!(r, IHemiProveFulfill::fulfillJobHashedCall, "fulfillJobHashed");
@@ -1149,6 +1156,7 @@ mod tests {
         pin_call!(s, IHemiProveStaking::requestUnstakeCall, "requestUnstake");
         pin_call!(s, IHemiProveStaking::withdrawUnstakedCall, "withdrawUnstaked");
         pin_call!(s, IHemiProveStaking::cancelUnstakeCall, "cancelUnstake");
+        pin_call!(s, IHemiProveStaking::lastProverActivityAtCall, "lastProverActivityAt");
         pin_call!(s, IHemiProveStaking::getAvailableCollateralCall, "getAvailableCollateral");
         pin_call!(s, IHemiProveStaking::hemiTokenCall, "hemiToken");
         let f = pin_call!(s, IHemiProveStaking::getProverStakeCall, "getProverStake");

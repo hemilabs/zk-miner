@@ -24,6 +24,23 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
         println!("══════════════════════════════════════════════════");
     }
     println!("Prover Address: {}", client.address);
+    println!(
+        "Network:        {} (chain {})",
+        match zkminer_chain::deployment::known_deployment(client.chain_id) {
+            Some(_) if client.chain_id == zkminer_chain::staking::TESTNET_CHAIN_ID =>
+                "Hemi testnet",
+            Some(_) => "a known deployment",
+            None => "no known deployment",
+        },
+        client.chain_id
+    );
+    // The check `zkminer run` makes before it claims, and `stake` before it sends.
+    match client.verify_deployment().await {
+        Ok(_) => println!("Deployment:     verified"),
+        Err(e) => {
+            println!("Deployment:     NOT verified, so `zkminer run` and `stake` refuse it: {e:#}")
+        }
+    }
 
     // ETH balance
     match client.get_eth_balance().await {
@@ -103,6 +120,15 @@ true figure is lower)"
             }
         }
         Err(e) => println!("\nStaking info:   Error: {}", e),
+    }
+    // The way out: a pending unstake and payouts the router holds (the stake lines are above).
+    match client.get_exit_state(client.address).await {
+        Ok(exit) => {
+            for line in super::unstake::describe_exit(&exit) {
+                println!("{line}");
+            }
+        }
+        Err(e) => println!("Unstake/payouts:    Error: {e:#}"),
     }
 
     // Prover stats

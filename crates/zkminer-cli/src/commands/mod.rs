@@ -4,6 +4,9 @@ pub mod benchmark;
 pub mod init;
 pub mod mock;
 pub mod run;
+#[cfg(windows)]
+pub mod signals_windows;
+pub mod signer_guard;
 pub mod simulate;
 #[cfg(target_os = "linux")]
 pub mod simulate_witness;
@@ -16,3 +19,4 @@ pub mod stake;
 pub mod status;
 pub mod witness;
 pub mod witness_tools;
+pub mod unstake;

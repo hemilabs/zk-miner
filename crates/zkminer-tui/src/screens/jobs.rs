@@ -5,7 +5,7 @@ use ratatui::{
 };
 
 use super::dashboard::format_token_amount;
-use crate::state::{MinerJobStatus, MinerState};
+use crate::state::{MinerJobStatus, MinerState, TrackedJob};
 use crate::theme;
 use ratatui::text::Span;
 
@@ -17,7 +17,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
         "Max Price",
         "Timeout",
         "Bonus",
-        "Status",
+        "Status / why not claimed",
     ]
     .iter()
     .map(|h| Cell::from(*h).style(theme::table_header()));
@@ -31,15 +31,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
             let id_short = format!("{}...", &format!("{}", job.info.job_id)[..8]);
             let program_short = format!("{}...", &format!("{}", job.info.descriptor_hash)[..8]);
 
-            let status = match &job.status {
-                MinerJobStatus::Open => "Open",
-                MinerJobStatus::Queued => "Queued",
-                MinerJobStatus::Proving { .. } => "Proving",
-                MinerJobStatus::Submitting => "Submitting",
-                MinerJobStatus::Fulfilled { .. } => "Fulfilled",
-                MinerJobStatus::Released { .. } => "Released",
-                MinerJobStatus::Skipped { .. } => "Skipped",
-            };
+            let status = job_status_text(job, state);
 
             let mut style = theme::striped(i);
             if i == state.selected_job_index {
@@ -68,7 +60,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
             Constraint::Length(12),
             Constraint::Length(10),
             Constraint::Length(12),
-            Constraint::Length(12),
+            Constraint::Min(24),
         ],
     )
     .header(header)
@@ -76,7 +68,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
         Block::default()
             .title(Span::styled(
                 format!(
-                    " Open Jobs ({}) — [c]laim [f]ast-path [r]elease [Enter]detail ",
+                    " Open Jobs ({}) — [↑↓] select  [Enter] detail ",
                     state.open_jobs.len()
                 ),
                 theme::title(),
@@ -87,4 +79,26 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
     );
 
     f.render_widget(table, area);
+}
+
+/// The Status column: for an open job, why the miner did not claim it when it last looked (or that it
+/// has not looked yet); otherwise the job's state, with a skip's reason.
+pub(crate) fn job_status_text(job: &TrackedJob, state: &MinerState) -> String {
+    match &job.status {
+        MinerJobStatus::Open => match (
+            &state.claim_outlook.held,
+            state.job_why.get(&job.info.job_id),
+        ) {
+            // A hold stops every claim before any job is looked at: that is the reason now.
+            (Some(held), _) => format!("held: {held}"),
+            (None, Some(why)) => why.clone(),
+            (None, None) => "Open (not evaluated yet)".to_string(),
+        },
+        MinerJobStatus::Queued => "Queued".to_string(),
+        MinerJobStatus::Proving { .. } => "Proving".to_string(),
+        MinerJobStatus::Submitting => "Submitting".to_string(),
+        MinerJobStatus::Fulfilled { .. } => "Fulfilled".to_string(),
+        MinerJobStatus::Released { .. } => "Released".to_string(),
+        MinerJobStatus::Skipped { reason } => format!("Skipped: {reason}"),
+    }
 }

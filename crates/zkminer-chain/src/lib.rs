@@ -7,6 +7,7 @@ pub mod da;
 pub mod deployment;
 pub mod descriptor;
 pub mod governance;
+pub mod exit;
 pub mod revert;
 pub mod jobs;
 pub mod monitor;
