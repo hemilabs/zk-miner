@@ -1,5 +1,8 @@
-//! The broker's network floor (plan §14.2) and log redaction (§11.4). Pure: the broker's HTTP
-//! clients ask [`EgressPolicy::admit`] for every address they are about to connect to.
+//! The broker's own network floor (plan §14.2) and log redaction (§11.4). Pure: the broker's HTTP
+//! clients ask [`EgressPolicy::admit`] about every socket the miner's connector hands them, before
+//! using it. This is the second layer: the broker has no network of its own, and the connector
+//! ([`crate::connector`]) admits every connection with netguard's floor over the miner's facts
+//! first.
 //!
 //! # One predicate: zkminer-netguard's
 //!
@@ -125,11 +128,13 @@ impl EgressPolicy {
     /// `NoRoleEntry`; when one does but on another port, `WrongPort`.
     ///
     /// For requester-derived connections (`role == None`, Phase 2): [`Self::public_floor`] in
-    /// either mode, then never a role entry's address, and only port 443. Every comparison uses
-    /// [`canonical_ip`] (a NAT64, SIIT, mapped or IPv4-compatible spelling of an address is that
-    /// address).
+    /// either mode, then never a role entry's address, and only port 443. Every prefix comparison
+    /// is [`Prefix::contains`] on the address **as given**, which matches both its written and its
+    /// canonical form ([`canonical_ip`]: a NAT64, SIIT, mapped or IPv4-compatible spelling of an
+    /// address is that address); passing the canonical form alone would miss a prefix written in
+    /// an embedded form that has no canonical one (review r2 NG-5).
     pub fn admit(&self, role: Option<(Role, &str)>, addr: SocketAddr) -> Admit {
-        let ip = canonical_ip(addr.ip());
+        let ip = addr.ip();
         match role {
             Some((role, alias)) => {
                 let mut wrong_port = false;
@@ -427,6 +432,24 @@ pub fn sanitize_log(bytes: &[u8], max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Review r2 (NG-5 in the broker): role entries are matched with the address as given, so a
+    /// prefix written in IPv6 holds the IPv6 spelling of an embedded address (`::/64` holds the
+    /// IPv4-compatible `::a00:1`, whose canonical form is IPv4), exactly as `Prefix::contains` says.
+    #[test]
+    fn role_entries_match_the_address_as_given() {
+        let p = |s: &str| s.parse::<Prefix>().unwrap();
+        for (prefix, addr) in [("::/64", "::a00:1"), ("::ffff:0:0/96", "::ffff:10.0.0.1"), ("10.0.0.0/8", "::ffff:10.0.0.1"), ("64:ff9b::/96", "64:ff9b::a00:1")] {
+            let policy = EgressPolicy {
+                mode: NetMode::DevPrivate,
+                roles: vec![RoleEntry { role: Role::EvmRpc, alias: "n".into(), prefixes: vec![p(prefix)], port: 8545 }],
+                ..EgressPolicy::default()
+            };
+            let ip: IpAddr = addr.parse().unwrap();
+            assert!(p(prefix).contains(ip), "{prefix} {addr}");
+            assert_eq!(policy.admit(Some((Role::EvmRpc, "n")), SocketAddr::new(ip, 8545)), Admit::Role, "{prefix} {addr}");
+        }
+    }
     use super::*;
     use proptest::prelude::*;
 
