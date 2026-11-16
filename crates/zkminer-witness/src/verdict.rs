@@ -68,6 +68,11 @@ pub enum SkipReason {
     BuilderClampedByProbation,
     /// The runner itself failed (not the module).
     RunnerInternal,
+    /// The runner died on a signal (not an OOM kill or the miner's timeout) after the module
+    /// started: the module's doing, possibly an escape attempt (a seccomp SIGSYS included).
+    BuilderCrashed,
+    /// The runner died on a signal before the module started (compiling hostile input).
+    RunnerCrashed,
     // Guest execution.
     GuestFailed,
     GuestCyclesAboveLimit,
@@ -87,7 +92,7 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
-    pub const ALL: [SkipReason; 40] = {
+    pub const ALL: [SkipReason; 42] = {
         use SkipReason::*;
         [
             EnvelopeMalformed, EnvelopeOutOfRange, UnsupportedBuilderType, UnsupportedProofSystem,
@@ -96,7 +101,7 @@ impl SkipReason {
             ElfImageIdMismatch, ArtifactAllSourcesBad, ArtifactUnavailable, BuilderInvalidModule,
             BuilderUnknownImport, BuilderTrap, BuilderFuelExhausted, BuilderMemoryExhausted,
             BuilderNonZeroReturn, BuilderWitnessTooLarge, BuilderTransient, BuilderWallClock,
-            BuilderClampedByProbation, RunnerInternal, GuestFailed, GuestCyclesAboveLimit,
+            BuilderClampedByProbation, RunnerInternal, BuilderCrashed, RunnerCrashed, GuestFailed, GuestCyclesAboveLimit,
             BindingMismatch, JournalsDifferAcrossPo2, JournalTooLarge, FulfilDaTooLarge,
             BelowReservation, DeadlineMargin, ProveResources, VerifierSelectorMismatch,
             OperatorEndpoint, OperatorBudget, RetentionFull,
@@ -111,6 +116,7 @@ impl SkipReason {
             EnvelopeMalformed | EnvelopeOutOfRange | ElfImageIdMismatch | ArtifactAllSourcesBad
             | BuilderInvalidModule | BuilderUnknownImport | BuilderTrap | BuilderFuelExhausted
             | BuilderMemoryExhausted | BuilderNonZeroReturn | BuilderWitnessTooLarge | BuilderWallClock
+            | BuilderCrashed
             | GuestCyclesAboveLimit | JournalsDifferAcrossPo2 | JournalTooLarge => (Never, true),
             // A stale node can cause these: one rebuild on other endpoints, then the caller's.
             GuestFailed | BindingMismatch => (OnceJittered, true),
@@ -124,6 +130,9 @@ impl SkipReason {
             NotClaimable | FulfilDaTooLarge | BelowReservation | ProveResources
             | VerifierSelectorMismatch | OperatorEndpoint | OperatorBudget | RetentionFull
             | RunnerInternal | ElfUnavailable => (Backoff { max_attempts: 8 }, false),
+            // A crash while compiling: hostile input may cause it, but the module never ran, so a
+            // few retries and never the caller's blame.
+            RunnerCrashed => (Backoff { max_attempts: 2 }, false),
             // An empty manifest: at most three retries per job (§13.4), then permanent.
             ArtifactUnavailable => (Backoff { max_attempts: 3 }, false),
             // The deadline only gets closer.
@@ -155,6 +164,11 @@ pub struct BuilderOutcome {
     /// The runner wrote its "module started" marker (before instantiation) on its summary pipe:
     /// past it, the runner's own `INTERNAL` exit is the module's doing.
     pub module_started: bool,
+    /// The signal that killed the runner, when `exit` is `None`.
+    pub signal: Option<i32>,
+    /// The miner itself saw this job's W pipe or broker channel fail (its own side, not the
+    /// module's): an `INTERNAL` exit is then the operator's, even after the marker.
+    pub miner_side_failure: bool,
 }
 
 /// Classifies a builder run (plan §9.2, §16). `None` means success.
@@ -162,6 +176,9 @@ pub fn builder_verdict(o: &BuilderOutcome) -> Option<SkipReason> {
     use SkipReason::*;
     if o.exit == Some(exit::OK) && !o.wall_clock_hit && !o.oom_killed {
         return None;
+    }
+    if o.miner_side_failure {
+        return Some(RunnerInternal);
     }
     if o.exit == Some(exit::INTERNAL) && !o.module_started {
         return Some(RunnerInternal);
@@ -176,6 +193,10 @@ pub fn builder_verdict(o: &BuilderOutcome) -> Option<SkipReason> {
     if o.wall_clock_hit {
         return Some(BuilderWallClock);
     }
+    if o.exit.is_none() {
+        // Killed by a signal that was neither the OOM killer nor the miner's own timeout.
+        return Some(if o.module_started { BuilderCrashed } else { RunnerCrashed });
+    }
     Some(match o.exit {
         Some(exit::INVALID_MODULE) => BuilderInvalidModule,
         Some(exit::UNKNOWN_IMPORT) => BuilderUnknownImport,
@@ -183,7 +204,7 @@ pub fn builder_verdict(o: &BuilderOutcome) -> Option<SkipReason> {
         Some(exit::MEMORY) => BuilderMemoryExhausted,
         Some(exit::NONZERO_RETURN) => BuilderNonZeroReturn,
         Some(exit::WITNESS_TOO_LARGE) => BuilderWitnessTooLarge,
-        Some(exit::WALL_CLOCK) | None => BuilderWallClock,
+        Some(exit::WALL_CLOCK) => BuilderWallClock,
         // Includes INTERNAL once the module started.
         _ => BuilderTrap,
     })
@@ -280,6 +301,8 @@ mod tests {
             wall_clock_hit,
             oom_killed,
             module_started: true,
+            signal: None,
+            miner_side_failure: false,
         };
         assert_eq!(builder_verdict(&o(Some(exit::OK), false, false, false, false)), None);
         assert_eq!(
@@ -297,6 +320,18 @@ mod tests {
         assert_eq!(builder_verdict(&o(Some(exit::TRAP), false, false, false, false)), Some(BuilderTrap));
         assert_eq!(builder_verdict(&o(Some(-5), false, false, false, false)), Some(BuilderTrap));
         assert_eq!(builder_verdict(&o(Some(exit::OK), false, false, true, false)), Some(BuilderWallClock));
+        // A signal death that is neither the OOM killer nor the miner's timeout: the module's after
+        // the marker, the runner's before it.
+        let crash = BuilderOutcome { signal: Some(31), ..o(None, false, false, false, false) };
+        assert_eq!(builder_verdict(&crash), Some(BuilderCrashed));
+        assert_eq!(builder_verdict(&BuilderOutcome { module_started: false, ..crash }), Some(RunnerCrashed));
+        assert!(BuilderCrashed.verdict().blames_caller && !RunnerCrashed.verdict().blames_caller);
+        // INTERNAL after the marker is the module's, unless the miner saw its own side fail.
+        assert_eq!(builder_verdict(&o(Some(exit::INTERNAL), false, false, false, false)), Some(BuilderTrap));
+        assert_eq!(
+            builder_verdict(&BuilderOutcome { miner_side_failure: true, ..o(Some(exit::INTERNAL), false, false, false, false) }),
+            Some(RunnerInternal)
+        );
     }
 
     /// Review F2: a builder that made its own fetches fail (unknown hashes, missing state: the
