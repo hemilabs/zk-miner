@@ -6532,8 +6532,10 @@ async fn miner_brain(
                     // Not before the backend's one-time setup is done. SP1's first proof would
                     // otherwise download ~8 GB of circuit artifacts inside its 90 s watchdog, be
                     // killed mid-way, and leave an install that fails every later proof. See
-                    // `spawn_sp1_warmup`.
-                    if !sim_mode {
+                    // `spawn_sp1_warmup`. Not when watching: a watch-only run proves nothing, so it
+                    // never warms a backend up (see the startup warm-up), and this gate would hold
+                    // every risc0 and SP1 verdict short of the claim it is there to report.
+                    if !sim_mode && !watch_only() {
                         if let Some(pool) = zkminer_prover::engine::worker_pool() {
                             if !pool.backend_warmed(backend) {
                                 if memory_skips_this_tick.insert(format!("{backend}:warmup")) {
