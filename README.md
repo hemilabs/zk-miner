@@ -8,7 +8,10 @@ worth taking, claims the ones that are, generates the proof on a local GPU, and 
 it on-chain. Proving runs in separate worker processes — one per GPU — so a wedged or
 OOM-killed prover can't take the miner down with it.
 
-Backends: **RISC Zero** (CUDA, ROCm, Intel, and Metal on Apple Silicon Macs), **SP1**, **OpenVM**.
+Backends: **RISC Zero** (CUDA, ROCm, Intel, and Metal on Apple Silicon Macs) and **SP1**.
+**OpenVM** is experimental: its worker builds and starts, but the miner claims no OpenVM job
+unless `ZKMINER_ENABLE_OPENVM=1` is set, so leave `zkminer-prove-openvm` out of an install.
+`zkminer doctor` shows, card by card, what this host can prove, and why not.
 
 ## Requirements
 
@@ -659,6 +662,8 @@ zkminer benchmark --calibrate # also time each segment size (po2); saves benchma
 zkminer run                   # interactive TUI
 zkminer -v run --headless     # headless; -v shows per-job claim/skip reasoning
 zkminer run --watch-only      # watch the market; claim, sign and send nothing
+zkminer stop                  # stop the running miner (drain); --keep-locks, --abandon
+zkminer doctor                # what this host can prove, and why not
 ```
 
 `run --watch-only` runs every check up to the claim against the live market and logs each
@@ -681,7 +686,7 @@ measure workers and RPC budget the WOULD CLAIM decisions use, so on a busy marke
 come a tick or two later than a real miner's would, and the per-job reports can lag well
 behind the market.
 
-Verbosity is `-v`/`-vv` **before** the subcommand (`RUST_LOG` is ignored). Logs go to
+Verbosity is `-v`/`-vv`, before or after the subcommand (`RUST_LOG` is ignored). Logs go to
 stderr, so `zkminer benchmark --json` on stdout stays machine-readable.
 
 Worth knowing:
@@ -694,16 +699,39 @@ Worth knowing:
 - **If the miner sits idle with jobs available, suspect collateral.** Available
   collateral is `staked − locked`, and a claimed job that passes its deadline locks
   collateral permanently. This surfaces as a throttled warning at default verbosity.
-- **Stopping costs locks.** Ctrl-C (SIGINT) stops claiming and lets the jobs in flight
-  finish, for up to 50 minutes; a second signal stops waiting, and every lock still held is
-  then released. SIGTERM (a supervisor's stop: `systemctl stop` or `restart`, `docker stop`,
-  a Kubernetes rollout) releases every held lock at once. Each release costs 5% of that
-  lock's collateral. A miner that dies without releasing (SIGKILL) picks its locks up again
-  when it restarts, and drives each one that still has time; its workers die with it.
-  So to restart without paying for the locks — to upgrade the binary, say — send SIGINT
-  (it stops claiming), then SIGKILL (`systemctl kill -s KILL`, `docker kill`), and start
-  it again promptly. Exit status 75 means it stopped with locks still held: start it again
-  before their deadlines.
+- **Stopping can cost locks, so choose how.** Releasing a lock costs 5% of its collateral
+  at its deadline and up to 30% with the whole fulfilment window left. There are three ways
+  to stop:
+  - **Drain** (the default): stop claiming, let the jobs in flight finish and be paid, then
+    exit. That can take up to 50 minutes, after which whatever is still held is released.
+  - **Keep locks**: exit now without releasing (exit status 75). The next start picks the
+    locks up from `~/.zkminer/job_journal.json`, re-proves each one that still has time, and
+    releases the rest. Use it for restarts and upgrades, and start again before the earliest
+    lock deadline: a lock left past its deadline is slashed.
+  - **Abandon**: release everything now, then exit.
+
+  In the dashboard, `q` or Ctrl+C asks which one when jobs are held: `d` drain, `k` keep
+  locks, `a` abandon, `Esc` to keep mining. The dashboard stays open while the miner stops,
+  and `a`, `k` and `x` (force exit) still change course; a second Ctrl+C does nothing.
+
+  From another terminal or a script, `zkminer stop` drains, `zkminer stop --keep-locks` keeps
+  the locks, `zkminer stop --abandon` releases everything and `zkminer stop --force-exit`
+  exits at once; `--wait` waits for the miner to exit. It works on Windows too. It talks to
+  the miner running under the same home directory, so run it as the same user.
+
+  Signals, for headless and supervised runs: SIGINT (Ctrl+C) drains, a second one abandons,
+  a third exits at once. SIGTERM, the default stop signal of systemd, `docker stop` and
+  Kubernetes, releases every held lock at once, because a supervisor kills the process
+  before any drain could finish. [`contrib/zkminer.service`](contrib/zkminer.service) sets
+  `KillSignal=SIGINT`, `KillMode=mixed` and a long `TimeoutStopSec`, so `systemctl stop`
+  drains, and `Restart=on-failure`, so `zkminer stop --keep-locks` restarts it in place. For
+  Docker, run with `--stop-signal SIGINT --stop-timeout 4200 --restart on-failure` and
+  restart with `docker exec <container> zkminer stop --keep-locks`. On Windows, closing the
+  console window or shutting Windows down releases at once, so stop a long-running miner
+  with `zkminer stop` first.
+
+  Exit status 75 means it stopped with locks still held (or by keep-locks): start it again
+  before their deadlines. A miner killed outright (SIGKILL) picks its locks up the same way.
 - **One miner per key.** Two miners on one key drive the same locks and replace each
   other's transactions. `run` holds `~/.zkminer/miner.lock`, so a second one from the same
   home refuses to start (including while the first is still draining); it can't see one in
@@ -758,6 +786,16 @@ Worth knowing:
   killed worker's by hand. Workers that share one home from different pid namespaces (containers)
   cannot see each other and would remove each other's: give each its own home, or its own
   `[retention] segment_dir`.
+- **A card that proves nothing says why.** At startup the log lists, card by card, whether
+  each zkVM proves there, and if not, why and what changes it: a worker binary that isn't
+  found (with the directories searched) or isn't executable, a card the build has no GPU code
+  for, too little VRAM. The ones that need attention also go to the dashboard's activity log.
+  `zkminer doctor` prints the same table on demand, with the config, chain, gas and stake
+  checks, and starts nothing. Cards with 12 GB are the common case: SP1 work needs about
+  15.2 GiB of VRAM free (`ZKMINER_MIN_AVAILABLE_VRAM_MB` lowers that, at the risk of running
+  out part-way through a claimed job), and RISC Zero gives a card under 14 GiB no segment
+  size until you set one (`[prover.risc0_job_po2]`, below) or run `zkminer benchmark
+  --calibrate`.
 
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for

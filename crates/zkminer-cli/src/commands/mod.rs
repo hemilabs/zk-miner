@@ -1,6 +1,8 @@
 #[cfg(target_os = "linux")]
 pub mod artifact;
 pub mod benchmark;
+pub mod capability;
+pub mod doctor;
 pub mod init;
 pub mod mock;
 pub mod run;
@@ -19,4 +21,5 @@ pub mod stake;
 pub mod status;
 pub mod witness;
 pub mod witness_tools;
+pub mod stop;
 pub mod unstake;

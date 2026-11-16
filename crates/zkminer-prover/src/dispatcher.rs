@@ -460,7 +460,7 @@ fn whole_journal(journal: Option<Vec<u8>>, journal_len: u64) -> Option<Vec<u8>> 
 use anyhow::{bail, Result};
 use zkminer_prover_protocol::{BenchmarkEntry, ErrorKind, WorkerCommand, WorkerResponse};
 
-use crate::discovery::{discover_workers_reporting, DiscoveredWorker};
+use crate::discovery::DiscoveredWorker;
 use crate::engine::ProofOutput;
 use crate::worker::{WorkerDied, WorkerHandle};
 
@@ -1724,6 +1724,232 @@ fn physical_gpu_id(key: &str) -> Option<String> {
 /// answer here permanently disables VRAM-aware routing for that slot, while a slow one only
 /// delays startup.
 const VRAM_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One worker slot discovery proposed, and what became of it.
+#[derive(Debug, Clone)]
+pub struct SlotCheck {
+    pub backend: String,
+    /// "cuda", "rocm", "intel" or "generic".
+    pub gpu_tag: String,
+    pub device_index: Option<u32>,
+    pub gpu_name: Option<String>,
+    /// The card's VRAM, when it could be read.
+    pub vram_bytes: Option<u64>,
+    pub path: PathBuf,
+    pub outcome: SlotOutcome,
+}
+
+impl SlotCheck {
+    /// The card's benchmark device id (`gpu0`, `gpu-rocm0`, ...; `cpu` for a slot with no card):
+    /// its calibration row and its `[prover.risc0_job_po2]` size are keyed by it.
+    pub fn device_id(&self) -> String {
+        match self.device_index {
+            Some(i) if self.gpu_tag != "generic" => {
+                WorkerPool::gpu_device_id(&self.gpu_tag, &i.to_string())
+            }
+            _ => "cpu".to_string(),
+        }
+    }
+}
+
+/// What became of a worker slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotOutcome {
+    /// Its worker started.
+    Started,
+    /// Not started: this card cannot run it (why, in words).
+    Refused(String),
+    /// Its worker failed to start (the first line of the error).
+    Failed(String),
+    /// Passed every check; nothing was started (`check_workers`).
+    WouldStart,
+}
+
+/// The GPUs found, the worker slots for them, and where the worker binaries were looked for.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerSurvey {
+    pub gpus: Vec<crate::discovery::DetectedGpu>,
+    pub slots: Vec<SlotCheck>,
+    /// The directories searched for worker binaries, in order (then `PATH`).
+    pub searched: Vec<PathBuf>,
+}
+
+/// What `discover_and_spawn` would do on this host, without starting anything: every worker it
+/// would find, refused by the same checks or not (`zkminer doctor`).
+pub fn check_workers(
+    explicit_binaries: &HashMap<String, PathBuf>,
+    search_dirs: &[PathBuf],
+) -> WorkerSurvey {
+    let survey = crate::discovery::survey_workers(explicit_binaries, search_dirs, &|_| {});
+    let slots = survey
+        .workers
+        .into_iter()
+        .map(|w| {
+            let vram_bytes = gpu_vram_bytes(&w.gpu_tag, w.device_index, w.pci_bus_id.as_deref());
+            let outcome = match spawn_refusal(
+                &w.backend,
+                &w.gpu_tag,
+                w.pci_bus_id.as_deref(),
+                w.compute_cap,
+                &w.path,
+                vram_bytes,
+            ) {
+                Some(why) => SlotOutcome::Refused(why),
+                None => SlotOutcome::WouldStart,
+            };
+            SlotCheck {
+                backend: w.backend,
+                gpu_tag: w.gpu_tag,
+                device_index: w.device_index,
+                gpu_name: w.gpu_name,
+                vram_bytes,
+                path: w.path,
+                outcome,
+            }
+        })
+        .collect();
+    WorkerSurvey {
+        gpus: survey.gpus,
+        slots,
+        searched: survey.searched,
+    }
+}
+
+/// Why `backend`'s worker at `path` must not be started for this card, or `None` when nothing
+/// rules it out. `vram_bytes` is the card's VRAM, when known.
+fn spawn_refusal(
+    backend: &str,
+    gpu_tag: &str,
+    pci_bus_id: Option<&str>,
+    compute_cap: Option<(u32, u32)>,
+    path: &std::path::Path,
+    vram_bytes: Option<u64>,
+) -> Option<String> {
+    // A HARD VRAM floor, for a backend whose prover refuses the device outright.
+    //
+    // Unlike host memory (see the note below) this is not a risk to be weighed — it is a
+    // capability the card does not have. `sp1-gpu-server` panics with
+    // "Unsupported GPU memory: 20, must be at least 24GB" on the 16 GiB card here, before
+    // allocating anything, and no proving option can move it; see
+    // `discovery::min_vram_bytes_for_backend`.
+    //
+    // Checked at SPAWN rather than at dispatch because nothing earlier can see it: CUDA init
+    // is lazy, so the worker spawns and handshakes perfectly happily, and the `sp1_usability`
+    // probe only runs `sp1-gpu-server --version`, which starts no CUDA context. Left to
+    // dispatch, the slot is advertised as healthy and the floor is rediscovered on every job
+    // routed there, costing an attempt and a respawn each time.
+    //
+    // A card with UNKNOWN VRAM is allowed through: `nvidia-smi` failing is not evidence that
+    // the card is too small, and refusing on a missing reading would be the same fail-closed
+    // mistake the host-memory gate made. If it turns out to be too small, the worker declines
+    // on first use and the slot retires.
+    // A backend that FAULTS on this card's architecture, whatever its size.
+    //
+    // Separate from the VRAM floor because the two are different facts. SP1's CUDA kernels
+    // misalign a device pointer on Blackwell (sm_120): measured here, the 5080 dies in seconds
+    // with `CudaRustError: misaligned address` in the basefold path while the 4090 completes
+    // the whole GPU pipeline on the same binary. Forcing the full element threshold and
+    // reverting our own prover change both reproduce it, and native sm_120 SASS is present in
+    // the build — so it is the kernels, not the tier, not us, and not a JIT fallback.
+    //
+    // Checked at spawn for the same reason as the VRAM floor: CUDA init is lazy, so the worker
+    // handshakes happily and the fault only appears on the first real proof. Left to dispatch,
+    // the slot is advertised healthy and every SP1 job routed there burns attempts.
+    if crate::discovery::backend_broken_on_compute_cap(backend, compute_cap) {
+        return Some(format!(
+            "{backend} is known to fault on this card's compute capability {:?} (misaligned \
+             device address in its CUDA kernels), independent of VRAM. The slot is not \
+             advertised; {backend} jobs will be routed to another card.",
+            compute_cap,
+        ));
+    }
+
+    // A card this backend's binary carries no GPU code for.
+    //
+    // A different fact again: not a fault in the code but its absence. A release is built for
+    // a list of architectures, and a card outside it fails every kernel launch with "no kernel
+    // image is available for execution on the device". Checked at spawn for the same reason as
+    // the two gates around it — CUDA init is lazy, so nothing before the first real proof
+    // would notice, and the slot would claim work it can never prove. Read from the binary
+    // rather than from a list kept here, because the binary is the authority: an operator's
+    // own build, upstream's, or the next release's wider one all answer for themselves.
+    //
+    // Unknown is not "cannot": a binary this cannot read, or a card whose compute capability
+    // `nvidia-smi` did not report, is allowed through. `ZKMINER_ALLOW_BROKEN_GPU` overrides
+    // it, as it does the gate above.
+    if let Some(cap) = compute_cap.filter(|_| std::env::var("ZKMINER_ALLOW_BROKEN_GPU").is_err()) {
+        if let Some(binary) = crate::discovery::gpu_code_binary(backend, path) {
+            match crate::gpu_code::EmbeddedGpuCode::read(&binary) {
+                Ok(Some(code)) if !code.runs_on(cap) => {
+                    return Some(format!(
+                        "{} carries GPU code for {} only, and this card is compute \
+                         capability {}.{}, which can run none of it — every proof would \
+                         fail with \"no kernel image is available\". The slot is not \
+                         advertised; {backend} jobs will be routed to a card it can run \
+                         on. A build that includes this card's architecture lifts this.",
+                        binary.display(),
+                        code.describe(),
+                        cap.0,
+                        cap.1,
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!(
+                    "could not read the GPU code in {} ({e}); not checking it",
+                    binary.display()
+                ),
+            }
+        }
+    }
+
+    // The same for an AMD card: a HIP binary carries code objects for a list of targets
+    // (RX 7000 and 9000 in a release), with no JIT to fall back on, and a card outside it
+    // fails every launch with "invalid device function". The card's target comes from the
+    // kernel's KFD topology; the binary is the risc0 worker, or the HIP server the SP1 worker
+    // runs. Unknown is again not "cannot".
+    if gpu_tag == "rocm" && std::env::var("ZKMINER_ALLOW_BROKEN_GPU").is_err() {
+        if let (Some(gfx), Some(binary)) = (
+            pci_bus_id.and_then(crate::discovery::amd_gfx_target),
+            crate::discovery::hip_code_binary(backend, path),
+        ) {
+            match crate::gpu_code::EmbeddedHipCode::read(&binary) {
+                Ok(Some(code)) if !code.runs_on(&gfx) => {
+                    return Some(format!(
+                        "{} carries GPU code for {} only, and this card is {gfx}, which \
+                         can run none of it — every proof would fail with \"invalid device \
+                         function\". The slot is not advertised; {backend} jobs will be \
+                         routed to a card it can run on. A build that includes {gfx} lifts \
+                         this.",
+                        binary.display(),
+                        code.describe(),
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!(
+                    "could not read the GPU code in {} ({e}); not checking it",
+                    binary.display()
+                ),
+            }
+        }
+    }
+
+    if let (Some(floor), Some(have)) = (
+        crate::discovery::min_vram_bytes_for_backend(backend),
+        vram_bytes,
+    ) {
+        if have < floor {
+            return Some(format!(
+                "{backend} requires at least {:.1} GB of VRAM and this card has {:.1} GB. \
+                 Its prover refuses the device outright — this is not a tunable limit — so \
+                 the slot is not advertised and {backend} jobs will be routed to a larger \
+                 card.",
+                floor as f64 / 1e9,
+                have as f64 / 1e9,
+            ));
+        }
+    }
+    None
+}
 
 fn gpu_vram_bytes(
     gpu_tag: &str,
@@ -3043,6 +3269,10 @@ pub struct WorkerPool {
     startup_problems: Vec<String>,
     /// The slots `discover_and_spawn` found but could not start, and whether each declined (W10-BFIX).
     not_started: Vec<(String, bool)>,
+    /// What discovery found and what became of each slot. See [`Self::worker_survey`].
+    slot_checks: Vec<SlotCheck>,
+    survey_gpus: Vec<crate::discovery::DetectedGpu>,
+    survey_searched: Vec<PathBuf>,
     /// What each slot's one-time setup is doing now, by slot key. See [`Self::setup_status`].
     setup_status: Mutex<HashMap<String, zkminer_prover_protocol::SetupStep>>,
 }
@@ -3127,6 +3357,9 @@ impl WorkerPool {
             metal_tier_jobs: [AtomicU64::new(0), AtomicU64::new(0)],
             startup_problems: Vec::new(),
             not_started: Vec::new(),
+            slot_checks: Vec::new(),
+            survey_gpus: Vec::new(),
+            survey_searched: Vec::new(),
             setup_status: Mutex::new(HashMap::new()),
         }
     }
@@ -3146,6 +3379,15 @@ impl WorkerPool {
 
     pub fn startup_problems(&self) -> &[String] {
         &self.startup_problems
+    }
+
+    /// What `discover_and_spawn` found and did with each worker it found, for the startup table.
+    pub fn worker_survey(&self) -> WorkerSurvey {
+        WorkerSurvey {
+            gpus: self.survey_gpus.clone(),
+            searched: self.survey_searched.clone(),
+            slots: self.slot_checks.clone(),
+        }
     }
 
     /// What `key`'s one-time setup is doing now, if it is in one. Falls back to any slot of the same
@@ -3518,10 +3760,13 @@ impl WorkerPool {
     /// Discover and spawn all available worker binaries.
     /// Returns the list of compound keys that were successfully connected.
     pub fn discover_and_spawn(&mut self) -> Vec<String> {
-        let mut discovered =
-            discover_workers_reporting(&self.explicit_binaries, &self.search_dirs, &|text| {
+        let survey =
+            crate::discovery::survey_workers(&self.explicit_binaries, &self.search_dirs, &|text| {
                 self.report_progress(text.to_string())
             });
+        self.survey_gpus = survey.gpus;
+        self.survey_searched = survey.searched;
+        let mut discovered = survey.workers;
         if let Some(only) = &self.only_backends {
             discovered.retain(|w| only.contains(&w.backend));
         }
@@ -3567,140 +3812,27 @@ impl WorkerPool {
                 _ => String::new(),
             };
 
-            // A HARD VRAM floor, for a backend whose prover refuses the device outright.
-            //
-            // Unlike host memory (see the note below) this is not a risk to be weighed — it is a
-            // capability the card does not have. `sp1-gpu-server` panics with
-            // "Unsupported GPU memory: 20, must be at least 24GB" on the 16 GiB card here, before
-            // allocating anything, and no proving option can move it; see
-            // `discovery::min_vram_bytes_for_backend`.
-            //
-            // Checked at SPAWN rather than at dispatch because nothing earlier can see it: CUDA init
-            // is lazy, so the worker spawns and handshakes perfectly happily, and the `sp1_usability`
-            // probe only runs `sp1-gpu-server --version`, which starts no CUDA context. Left to
-            // dispatch, the slot is advertised as healthy and the floor is rediscovered on every job
-            // routed there, costing an attempt and a respawn each time.
-            //
-            // A card with UNKNOWN VRAM is allowed through: `nvidia-smi` failing is not evidence that
-            // the card is too small, and refusing on a missing reading would be the same fail-closed
-            // mistake the host-memory gate made. If it turns out to be too small, the worker declines
-            // on first use and the slot retires.
-            // A backend that FAULTS on this card's architecture, whatever its size.
-            //
-            // Separate from the VRAM floor because the two are different facts. SP1's CUDA kernels
-            // misalign a device pointer on Blackwell (sm_120): measured here, the 5080 dies in seconds
-            // with `CudaRustError: misaligned address` in the basefold path while the 4090 completes
-            // the whole GPU pipeline on the same binary. Forcing the full element threshold and
-            // reverting our own prover change both reproduce it, and native sm_120 SASS is present in
-            // the build — so it is the kernels, not the tier, not us, and not a JIT fallback.
-            //
-            // Checked at spawn for the same reason as the VRAM floor: CUDA init is lazy, so the worker
-            // handshakes happily and the fault only appears on the first real proof. Left to dispatch,
-            // the slot is advertised healthy and every SP1 job routed there burns attempts.
-            if crate::discovery::backend_broken_on_compute_cap(&backend, compute_cap) {
-                tracing::warn!(
-                    "not starting worker {key}{device_desc}: {backend} is known to fault on this \
-                     card's compute capability {:?} (misaligned device address in its CUDA kernels), \
-                     independent of VRAM. The slot is not advertised; {backend} jobs will be routed \
-                     to another card.",
-                    compute_cap,
-                );
-                continue;
-            }
-
-            // A card this backend's binary carries no GPU code for.
-            //
-            // A different fact again: not a fault in the code but its absence. A release is built for
-            // a list of architectures, and a card outside it fails every kernel launch with "no kernel
-            // image is available for execution on the device". Checked at spawn for the same reason as
-            // the two gates around it — CUDA init is lazy, so nothing before the first real proof
-            // would notice, and the slot would claim work it can never prove. Read from the binary
-            // rather than from a list kept here, because the binary is the authority: an operator's
-            // own build, upstream's, or the next release's wider one all answer for themselves.
-            //
-            // Unknown is not "cannot": a binary this cannot read, or a card whose compute capability
-            // `nvidia-smi` did not report, is allowed through. `ZKMINER_ALLOW_BROKEN_GPU` overrides
-            // it, as it does the gate above.
-            if let Some(cap) =
-                compute_cap.filter(|_| std::env::var("ZKMINER_ALLOW_BROKEN_GPU").is_err())
-            {
-                if let Some(binary) = crate::discovery::gpu_code_binary(&backend, &path) {
-                    match crate::gpu_code::EmbeddedGpuCode::read(&binary) {
-                        Ok(Some(code)) if !code.runs_on(cap) => {
-                            tracing::warn!(
-                                "not starting worker {key}{device_desc}: {} carries GPU code for \
-                                 {} only, and this card is compute capability {}.{}, which can run \
-                                 none of it — every proof would fail with \"no kernel image is \
-                                 available\". The slot is not advertised; {backend} jobs will be \
-                                 routed to a card it can run on. A build that includes this card's \
-                                 architecture lifts this.",
-                                binary.display(),
-                                code.describe(),
-                                cap.0,
-                                cap.1,
-                            );
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::debug!(
-                            "could not read the GPU code in {} ({e}); not checking it against \
-                             {key}",
-                            binary.display()
-                        ),
-                    }
-                }
-            }
-
-            // The same for an AMD card: a HIP binary carries code objects for a list of targets
-            // (RX 7000 and 9000 in a release), with no JIT to fall back on, and a card outside it
-            // fails every launch with "invalid device function". The card's target comes from the
-            // kernel's KFD topology; the binary is the risc0 worker, or the HIP server the SP1 worker
-            // runs. Unknown is again not "cannot".
-            if gpu_tag == "rocm" && std::env::var("ZKMINER_ALLOW_BROKEN_GPU").is_err() {
-                if let (Some(gfx), Some(binary)) = (
-                    pci_bus_id
-                        .as_deref()
-                        .and_then(crate::discovery::amd_gfx_target),
-                    crate::discovery::hip_code_binary(&backend, &path),
-                ) {
-                    match crate::gpu_code::EmbeddedHipCode::read(&binary) {
-                        Ok(Some(code)) if !code.runs_on(&gfx) => {
-                            tracing::warn!(
-                                "not starting worker {key}{device_desc}: {} carries GPU code for \
-                                 {} only, and this card is {gfx}, which can run none of it — every \
-                                 proof would fail with \"invalid device function\". The slot is not \
-                                 advertised; {backend} jobs will be routed to a card it can run on. \
-                                 A build that includes {gfx} lifts this.",
-                                binary.display(),
-                                code.describe(),
-                            );
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::debug!(
-                            "could not read the GPU code in {} ({e}); not checking it against \
-                             {key}",
-                            binary.display()
-                        ),
-                    }
-                }
-            }
-
-            if let (Some(floor), Some(have)) = (
-                crate::discovery::min_vram_bytes_for_backend(&backend),
-                gpu_vram_bytes(&gpu_tag, device_index, pci_bus_id.as_deref()),
+            let vram_bytes = gpu_vram_bytes(&gpu_tag, device_index, pci_bus_id.as_deref());
+            let check = |outcome| SlotCheck {
+                backend: backend.clone(),
+                gpu_tag: gpu_tag.clone(),
+                device_index,
+                gpu_name: gpu_name.clone(),
+                vram_bytes,
+                path: path.clone(),
+                outcome,
+            };
+            if let Some(why) = spawn_refusal(
+                &backend,
+                &gpu_tag,
+                pci_bus_id.as_deref(),
+                compute_cap,
+                &path,
+                vram_bytes,
             ) {
-                if have < floor {
-                    tracing::warn!(
-                        "not starting worker {key}{device_desc}: {backend} requires at least \
-                         {:.1} GB of VRAM and this card has {:.1} GB. Its prover refuses the device \
-                         outright — this is not a tunable limit — so the slot is not advertised and \
-                         {backend} jobs will be routed to a larger card.",
-                        floor as f64 / 1e9,
-                        have as f64 / 1e9,
-                    );
-                    continue;
-                }
+                tracing::warn!("not starting worker {key}{device_desc}: {why}");
+                self.slot_checks.push(check(SlotOutcome::Refused(why)));
+                continue;
             }
 
             // NOTE: there is deliberately NO host-memory gate here, and the earlier one was
@@ -3732,6 +3864,7 @@ impl WorkerPool {
                         "Worker {key} ready{device_desc} (pid {worker_pid}, binary {})",
                         path.display(),
                     );
+                    self.slot_checks.push(check(SlotOutcome::Started));
                     self.workers.insert(
                         key.clone(),
                         WorkerEntry {
@@ -3785,6 +3918,9 @@ impl WorkerPool {
                         gpu_name.as_deref().unwrap_or("this machine"),
                         msg.lines().next().unwrap_or_default(),
                     ));
+                    self.slot_checks.push(check(SlotOutcome::Failed(
+                        msg.lines().next().unwrap_or_default().to_string(),
+                    )));
                     let vram_bytes = gpu_vram_bytes(&gpu_tag, device_index, pci_bus_id.as_deref());
                     let entry_bus_id = pci_bus_id.clone().filter(|b| !b.is_empty());
                     self.not_started.push((key.clone(), declined.is_some()));

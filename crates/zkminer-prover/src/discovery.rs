@@ -1777,6 +1777,60 @@ pub fn discover_workers_reporting(
     search_dirs: &[PathBuf],
     report: &dyn Fn(&str),
 ) -> Vec<DiscoveredWorker> {
+    survey_workers(explicit_binaries, search_dirs, report).workers
+}
+
+/// What worker discovery found: the GPUs, a worker for each card a binary was found for, and the
+/// directories it searched.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoverySurvey {
+    pub gpus: Vec<DetectedGpu>,
+    pub workers: Vec<DiscoveredWorker>,
+    /// Searched in this order, then `PATH`.
+    pub searched: Vec<PathBuf>,
+}
+
+/// The directories searched for worker binaries, in order (then `PATH`): the configured ones,
+/// `~/.zkminer/provers`, and the directory of the running executable.
+pub fn worker_search_dirs(search_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut all_dirs: Vec<PathBuf> = search_dirs.to_vec();
+    if let Some(home_dir) = dirs::home_dir() {
+        all_dirs.push(home_dir.join(".zkminer").join("provers"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            all_dirs.push(parent.to_path_buf());
+        }
+    }
+    all_dirs
+}
+
+/// The file names a `backend` worker for `gpu_tag` cards is looked for under: the vendor's own,
+/// then the generic one.
+pub fn worker_file_names(backend: &str, gpu_tag: &str) -> Vec<String> {
+    let mut names = vec![worker_file_name(&worker_binary_name(backend, gpu_tag))];
+    if gpu_tag != "generic" {
+        names.push(worker_file_name(&worker_binary_name(backend, "generic")));
+    }
+    names
+}
+
+/// Files in `dirs` named like a `backend` worker for `gpu_tag` cards that discovery skips because
+/// they are not executable (on unix; elsewhere, none).
+pub fn non_executable_workers(backend: &str, gpu_tag: &str, dirs: &[PathBuf]) -> Vec<PathBuf> {
+    worker_file_names(backend, gpu_tag)
+        .iter()
+        .flat_map(|name| dirs.iter().map(move |d| d.join(name)))
+        .filter(|p| p.is_file() && !is_executable(p))
+        .collect()
+}
+
+/// [`discover_workers_reporting`], keeping the GPUs it detected and where it looked.
+pub fn survey_workers(
+    explicit_binaries: &HashMap<String, PathBuf>,
+    search_dirs: &[PathBuf],
+    report: &dyn Fn(&str),
+) -> DiscoverySurvey {
     let gpus = detect_all_gpus_with(explicit_binaries, search_dirs, report);
     let mut found: Vec<DiscoveredWorker> = Vec::new();
 
@@ -1835,15 +1889,7 @@ pub fn discover_workers_reporting(
         }
 
         // Build search directories list: configured -> ~/.zkminer/provers/ -> sibling of exe
-        let mut all_dirs: Vec<PathBuf> = search_dirs.to_vec();
-        if let Some(home_dir) = dirs::home_dir() {
-            all_dirs.push(home_dir.join(".zkminer").join("provers"));
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                all_dirs.push(parent.to_path_buf());
-            }
-        }
+        let all_dirs = worker_search_dirs(search_dirs);
 
         // Search for each GPU variant
         for gpu_tag in GPU_TAGS {
@@ -1924,7 +1970,11 @@ pub fn discover_workers_reporting(
         }
     }
 
-    found
+    DiscoverySurvey {
+        gpus,
+        workers: found,
+        searched: worker_search_dirs(search_dirs),
+    }
 }
 
 /// Check the one assumption every device pin in this program rests on.
@@ -2297,22 +2347,6 @@ fn infer_gpu_tag(path: &Path) -> String {
 /// executable suffix (`.exe` on Windows, nothing elsewhere).
 fn worker_file_name(bin_name: &str) -> String {
     format!("{bin_name}{}", std::env::consts::EXE_SUFFIX)
-}
-
-/// Where worker binaries are searched for: the configured directories, then ~/.zkminer/provers/,
-/// then the directory of this executable (as in `discover_workers`).
-#[cfg(windows)]
-fn worker_search_dirs(search_dirs: &[PathBuf]) -> Vec<PathBuf> {
-    let mut all_dirs: Vec<PathBuf> = search_dirs.to_vec();
-    if let Some(home_dir) = dirs::home_dir() {
-        all_dirs.push(home_dir.join(".zkminer").join("provers"));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            all_dirs.push(parent.to_path_buf());
-        }
-    }
-    all_dirs
 }
 
 fn search_in_dirs(bin_name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {

@@ -124,9 +124,17 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
 
             // A signal asked us to shut down: leave the TUI so `run()` continues into its
             // drain/abandon ladder. Without this the TUI owns the terminal forever and the
-            // ladder never runs.
-            if state.read().await.shutdown_requested {
-                break;
+            // ladder never runs. Under `zkminer run` the ladder runs while the dashboard stays
+            // open instead, and closes it (`shutdown.done`) when the miner is about to exit.
+            {
+                let s = state.read().await;
+                if s.stop_handled_by_miner {
+                    if s.shutdown.as_ref().is_some_and(|v| v.done) {
+                        break;
+                    }
+                } else if s.shutdown_requested {
+                    break;
+                }
             }
 
             // Process actions that need the lock released
@@ -187,7 +195,24 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
     Ok(())
 }
 
+/// Put the terminal back the way `run_tui` found it, for a caller about to `process::exit` while
+/// the dashboard is still open (a force exit); harmless when it is not.
+pub fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        crossterm::cursor::Show
+    );
+}
+
 fn handle_key(state: &mut MinerState, key: crossterm::event::KeyEvent) -> PostKeyAction {
+    // Under `zkminer run`, quitting asks how to stop and the stop runs with the dashboard open
+    // (screens::stop); the keys below then never see a quit.
+    if state.stop_handled_by_miner && screens::stop::handle_key(state, key) {
+        return PostKeyAction::None;
+    }
     let quitting = matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
     if state.return_to_setup_after_benchmark
@@ -877,8 +902,18 @@ fn draw(f: &mut Frame, state: &MinerState) {
 
     f.render_widget(tabs, chunks[0]);
 
-    // --- Content ---
-    let content_area = chunks[1];
+    // --- Content --- (with the shutdown panel under it while the miner stops)
+    let (content_area, panel_area) = match &state.shutdown {
+        Some(view) => {
+            let h = screens::stop::panel_height(view, chunks[1].width).min(chunks[1].height / 2);
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(h)])
+                .split(chunks[1]);
+            (split[0], Some(split[1]))
+        }
+        None => (chunks[1], None),
+    };
     match state.current_screen {
         Screen::Setup => screens::setup::render(f, content_area, state),
         Screen::Dashboard => screens::dashboard::render(f, content_area, state),
@@ -889,6 +924,10 @@ fn draw(f: &mut Frame, state: &MinerState) {
         Screen::Logs => screens::logs::render(f, content_area, state),
         Screen::Settings => screens::settings::render(f, content_area, state),
     }
+    if let (Some(view), Some(area)) = (&state.shutdown, panel_area) {
+        screens::stop::render_panel(f, area, view);
+    }
+    screens::stop::render_prompt(f, chunks[1], state);
 
     // --- Status bar ---
     let mut left_spans: Vec<Span> = Vec::new();
@@ -914,8 +953,12 @@ fn draw(f: &mut Frame, state: &MinerState) {
         ));
     }
 
-    // Paused badge
-    if state.paused {
+    // Paused badge (STOPPING once the miner is shutting down: it is paused for that, and `p`
+    // cannot resume it)
+    if state.shutdown.is_some() {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(" STOPPING ", theme::badge_warn()));
+    } else if state.paused {
         left_spans.push(Span::raw(" "));
         left_spans.push(Span::styled(" PAUSED ", theme::badge_warn()));
     }
@@ -945,8 +988,11 @@ fn draw(f: &mut Frame, state: &MinerState) {
 
     // Right-aligned keybind hints
     let mut right_spans: Vec<Span> = Vec::new();
-    right_spans.extend(theme::status_keybind("q", ":quit  "));
-    right_spans.extend(theme::status_keybind("p", ":pause  "));
+    // While stopping, the panel above names the keys; quit and pause no longer apply.
+    if state.shutdown.is_none() {
+        right_spans.extend(theme::status_keybind("q", ":quit  "));
+        right_spans.extend(theme::status_keybind("p", ":pause  "));
+    }
     right_spans.push(Span::styled("T", Style::default().fg(theme::peach())));
     right_spans.push(Span::styled(
         format!(":{name}  ", name = theme::active_theme().name()),
@@ -1024,5 +1070,76 @@ mod unusable_benchmark_tests {
         let log = logged(&s);
         assert_eq!(log.len(), 1, "{log:?}");
         assert!(log[0].1.contains("SIMULATED") && log[0].1.contains("nothing was"));
+    }
+}
+
+#[cfg(test)]
+mod stop_view_tests {
+    use super::*;
+    use crate::state::{ShutdownStage, ShutdownView, StopPrompt};
+    use ratatui::backend::TestBackend;
+
+    fn screen(state: &MinerState, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, state)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// While the miner stops, every screen shows the shutdown panel (stage, status, what it said,
+    /// the keys) and the STOPPING badge; a confirmation draws over it.
+    #[test]
+    fn the_shutdown_panel_and_its_prompt_show_on_every_screen() {
+        for screen_kind in Screen::all() {
+            let mut view = ShutdownView::new(ShutdownStage::Draining);
+            view.status = "draining: 2 job(s) still in flight".into();
+            view.lines
+                .push("DRAINING — finishing in-flight proofs, no new claims.".into());
+            let mut state = MinerState {
+                stop_handled_by_miner: true,
+                paused: true,
+                shutdown: Some(view),
+                current_screen: *screen_kind,
+                ..MinerState::default()
+            };
+            let out = screen(&state, 100, 30);
+            for want in [
+                "STOPPING — DRAINING",
+                "2 job(s) still in flight",
+                "[a] abandon",
+                "[k] keep locks",
+                " STOPPING ",
+            ] {
+                assert!(
+                    out.contains(want),
+                    "{screen_kind:?}: {want} missing:\n{out}"
+                );
+            }
+            let status_bar = out.lines().last().unwrap_or_default();
+            assert!(!status_bar.contains("q:quit"), "{status_bar}");
+            state.stop_prompt = Some(StopPrompt::Confirm(crate::state::StopMode::Abandon));
+            let out = screen(&state, 100, 30);
+            assert!(out.contains("Abandon?") && out.contains("[y]"), "{out}");
+        }
+    }
+
+    /// The smallest terminal still shows the panel without panicking.
+    #[test]
+    fn a_small_terminal_still_draws() {
+        let state = MinerState {
+            stop_handled_by_miner: true,
+            shutdown: Some(ShutdownView::new(ShutdownStage::Abandoning)),
+            stop_prompt: Some(StopPrompt::Quit),
+            ..MinerState::default()
+        };
+        let out = screen(&state, 40, 10);
+        assert!(out.contains("STOPPING"), "{out}");
     }
 }

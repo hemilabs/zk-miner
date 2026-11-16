@@ -57,7 +57,7 @@ const MIN_JOB_WINDOW_SECS: u64 = 300 + zkminer_chain::auction::PROVER_GRACE_SECS
 /// Far above a header's normal lag (a 12 s block plus RPC latency), and well below the skew at which
 /// a fresh lock on the shortest window (300 s + the 30-min PROVER_GRACE) would already look due for
 /// release (about 1,470 s with the host ahead).
-const MAX_CLAIM_CLOCK_SKEW_SECS: u64 = 300;
+pub(crate) const MAX_CLAIM_CLOCK_SKEW_SECS: u64 = 300;
 
 /// Below this much remaining proving budget it isn't worth starting another attempt
 /// — abandon the job now, while `releaseJob` can still land, instead of
@@ -341,6 +341,256 @@ const CLAIM_INTENT_MAX_AGE_SECS: u64 = 900;
 /// path that still releases a job whose earlier release failed on RPC.
 pub(crate) static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// A keep-locks stop (`zkminer stop --keep-locks`, or `k` at the dashboard's quit prompt): stop
+/// claiming and exit without releasing, leaving every lock in the job journal for the next start's
+/// recovery to finish. While set, `release_and_clean` releases nothing, so a lifecycle whose
+/// worker is stopped on the way out does not release its lock. Cleared if the stop escalates to
+/// ABANDON.
+pub(crate) static KEEP_LOCKS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// How long a keep-locks stop waits for proofs already being submitted: their fulfil is on its way
+/// to the chain, and cutting it off would leave the job for the next start to sort out.
+const KEEP_LOCKS_SUBMIT_GRACE: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The dashboard is open while the miner stops: shutdown messages go to its shutdown panel, not to
+/// stdout (which would draw over it). Cleared once it has closed.
+static TUI_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn tui_up() -> bool {
+    TUI_UP.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Report a step of the shutdown to the operator: on the dashboard's shutdown panel while it is open,
+/// else on stdout. (Each caller also logs it.)
+pub(crate) async fn shutdown_say(state: &zkminer_tui::state::SharedState, msg: impl Into<String>) {
+    let msg = msg.into();
+    if tui_up() {
+        // The first message of a stop opens the panel (the ladder sets its real stage as it starts).
+        let mut s = state.write().await;
+        s.shutdown
+            .get_or_insert_with(|| {
+                zkminer_tui::state::ShutdownView::new(zkminer_tui::state::ShutdownStage::Draining)
+            })
+            .lines
+            .push(msg.trim().to_string());
+    } else {
+        println!("{msg}");
+    }
+}
+
+/// What the shutdown is waiting on right now: the shutdown panel's status line, or (with no
+/// dashboard, outside headless mode) a line on stdout.
+async fn shutdown_status(state: &zkminer_tui::state::SharedState, headless: bool, msg: String) {
+    if tui_up() {
+        if let Some(view) = state.write().await.shutdown.as_mut() {
+            view.status = msg;
+        }
+    } else if !headless {
+        println!("{msg}");
+    }
+}
+
+/// Move the dashboard's shutdown panel to `stage` (opening it on the first call).
+async fn shutdown_stage(
+    state: &zkminer_tui::state::SharedState,
+    stage: zkminer_tui::state::ShutdownStage,
+) {
+    let mut s = state.write().await;
+    match s.shutdown.as_mut() {
+        Some(view) => view.stage = stage,
+        None => s.shutdown = Some(zkminer_tui::state::ShutdownView::new(stage)),
+    }
+}
+
+/// The third stop signal (or `x` at the dashboard, or `zkminer stop --force`): reap the workers
+/// with a cap and exit at once, releasing nothing more.
+pub(crate) fn force_exit() -> ! {
+    if tui_up() {
+        zkminer_tui::restore_terminal();
+    }
+    eprintln!("\nForce exit — in-flight jobs left locked on-chain.");
+    // Reap workers first. SP1's `sp1-gpu-server` is a GRANDCHILD that does NOT die with us; it can
+    // keep ~11.5 GB of VRAM allocated after the parent exited.
+    //
+    // BOUNDED, because `shutdown_all` is not: its phase 4 takes a BLOCKING slot lock, while phases
+    // 2/3 skip any slot whose `pid` is momentarily 0 — the respawn/recycle window (dispatcher.rs,
+    // where the pid is zeroed before the handle is dropped and only restored after
+    // `ensure_alive`). Such a worker is never signalled, so the lock it holds is not released until
+    // its whole proof finishes (up to the 600s watchdog). The "Force exit" print therefore comes
+    // BEFORE this call, and a force exit must terminate regardless: reap off-thread and cap the
+    // wait (a normal reap takes ~2.2s).
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if let Some(pool) = zkminer_prover::engine::worker_pool() {
+            pool.close();
+        }
+        let _ = done_tx.send(());
+    });
+    if done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .is_err()
+    {
+        eprintln!(
+            "worker reap did not finish in 10s — exiting anyway; check for an orphaned \
+             sp1-gpu-server holding VRAM."
+        );
+    }
+    std::process::exit(130);
+}
+
+/// `~/.zkminer`, where the instance lock, the job journal and stop requests live.
+pub(crate) fn zkminer_home() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".zkminer")
+}
+
+/// Where `zkminer stop` leaves its request for the running miner: one word, the stop mode.
+pub(crate) fn stop_request_path() -> PathBuf {
+    zkminer_home().join("stop-request")
+}
+
+/// The word a stop request file holds for each mode.
+pub(crate) fn stop_mode_word(mode: zkminer_tui::state::StopMode) -> &'static str {
+    use zkminer_tui::state::StopMode;
+    match mode {
+        StopMode::Drain => "drain",
+        StopMode::KeepLocks => "keep-locks",
+        StopMode::Abandon => "abandon",
+        StopMode::Force => "force",
+    }
+}
+
+pub(crate) fn parse_stop_mode(word: &str) -> Option<zkminer_tui::state::StopMode> {
+    use zkminer_tui::state::StopMode;
+    [
+        StopMode::Drain,
+        StopMode::KeepLocks,
+        StopMode::Abandon,
+        StopMode::Force,
+    ]
+    .into_iter()
+    .find(|m| stop_mode_word(*m) == word.trim())
+}
+
+/// Take a pending `zkminer stop` request: read it and remove the file (the removal is what tells
+/// `zkminer stop` it was seen). An unreadable word is removed too, and reported.
+fn take_stop_request_file() -> Option<zkminer_tui::state::StopMode> {
+    let path = stop_request_path();
+    let word = std::fs::read_to_string(&path).ok()?;
+    if let Err(e) = std::fs::remove_file(&path) {
+        // Left in place it would be read again every second.
+        tracing::error!(
+            "cannot remove the stop request {}: {e} — ignoring it",
+            path.display()
+        );
+        return None;
+    }
+    let mode = parse_stop_mode(&word);
+    if mode.is_none() {
+        tracing::warn!(
+            "ignored a stop request with an unknown mode {:?} ({})",
+            word.trim(),
+            path.display()
+        );
+    }
+    mode
+}
+
+/// Act on a stop asked for at the dashboard or by `zkminer stop`, advancing the same ladder the
+/// signals drive (`sig_tx`: 1 DRAIN, 2 ABANDON).
+async fn apply_stop_request(
+    mode: zkminer_tui::state::StopMode,
+    sig_tx: &tokio::sync::watch::Sender<u8>,
+    state: &zkminer_tui::state::SharedState,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    use zkminer_tui::state::StopMode;
+    let stage = *sig_tx.borrow();
+    match mode {
+        StopMode::Drain if stage == 0 => {
+            tracing::warn!("stop requested: draining");
+            let how = if tui_up() {
+                ""
+            } else {
+                " `zkminer stop --abandon` (or Ctrl+C) releases them now instead."
+            };
+            shutdown_say(
+                state,
+                format!("\nDRAINING — finishing in-flight proofs, no new claims.{how}"),
+            )
+            .await;
+            let _ = sig_tx.send(1);
+        }
+        StopMode::Drain => tracing::info!("stop requested: already stopping"),
+        StopMode::KeepLocks if stage >= 2 => {
+            tracing::warn!("keep-locks stop requested while already releasing: ignored");
+            shutdown_say(
+                state,
+                "Already releasing the jobs — too late to keep the locks.",
+            )
+            .await;
+        }
+        StopMode::KeepLocks => {
+            tracing::warn!("stop requested: keeping locks for the next start");
+            KEEP_LOCKS.store(true, SeqCst);
+            shutdown_say(
+                state,
+                "\nKEEPING LOCKS — no new claims; exiting without releasing, so the next start \
+                 finishes the jobs held.",
+            )
+            .await;
+            if stage == 0 {
+                let _ = sig_tx.send(1);
+            } else {
+                // Wake the drain so it sees KEEP_LOCKS now, not at its next poll.
+                sig_tx.send_modify(|_| {});
+            }
+        }
+        StopMode::Abandon if stage < 2 => {
+            tracing::warn!("stop requested: abandoning");
+            KEEP_LOCKS.store(false, SeqCst);
+            shutdown_say(
+                state,
+                "\nABANDONING — releasing jobs, nearest deadline first...",
+            )
+            .await;
+            let _ = sig_tx.send(2);
+        }
+        StopMode::Abandon => tracing::info!("abandon requested: already abandoning"),
+        StopMode::Force => force_exit(),
+    }
+}
+
+/// Poll for stops asked for at the dashboard (`stop_request`) or by `zkminer stop` (the request
+/// file), once a second, for the life of the process.
+fn spawn_stop_watcher(
+    sig_tx: tokio::sync::watch::Sender<u8>,
+    state: zkminer_tui::state::SharedState,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            let from_dashboard = state.write().await.stop_request.take();
+            let mode = match from_dashboard {
+                Some(m) => Some(m),
+                None => tokio::task::spawn_blocking(take_stop_request_file)
+                    .await
+                    .ok()
+                    .flatten()
+                    .inspect(|m| {
+                        tracing::warn!("`zkminer stop` asked for: {}", stop_mode_word(*m))
+                    }),
+            };
+            if let Some(mode) = mode {
+                apply_stop_request(mode, &sig_tx, &state).await;
+            }
+        }
+    });
+}
 
 /// `zkminer run --watch-only`: every check up to the claim runs against the live market, and the
 /// claim itself is replaced by a read-only preview that is logged. Nothing is signed or sent, no
@@ -2609,6 +2859,20 @@ pub async fn run(
     }
     if watch.is_none() {
         hold_instance_lock()?;
+        // A stop request left from before this start (one no miner picked up) must not stop this
+        // one. Requests made from here on are for this miner: it reads them once it is running.
+        match std::fs::remove_file(stop_request_path()) {
+            Ok(()) => tracing::warn!(
+                "removed a stale stop request ({}) left from before this start",
+                stop_request_path().display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => anyhow::bail!(
+                "cannot remove the stale stop request {}: {e} — remove it, or this miner would \
+                 stop as soon as it starts",
+                stop_request_path().display()
+            ),
+        }
     }
     // The lock journal, read before anything starts. One this build must not rewrite (a newer format)
     // or cannot read is left as it is, and this run drives only the locks it holds (the chain scan
@@ -2815,6 +3079,61 @@ pub async fn run(
     }
     let found = zkminer_tui::splash::found_summary(&pool.started_provers());
     let mut startup_problems = pool.startup_problems().to_vec();
+    // What each card can prove, and why not, in every mode: the log has every row, the dashboard's
+    // activity log and the splash the ones that need attention.
+    {
+        let sizes: super::capability::Risc0Sizes = config
+            .prover
+            .risc0_job_po2
+            .iter()
+            .map(|(k, v)| (k.to_lowercase(), *v))
+            .collect();
+        let suite = tokio::task::spawn_blocking(zkminer_prover::benchmark::load_cached_benchmark)
+            .await
+            .ok()
+            .flatten();
+        let rows = super::capability::rows(
+            &pool.worker_survey(),
+            &served_backends(),
+            &sizes,
+            suite.as_ref(),
+        );
+        tracing::info!("What this host can prove (`zkminer doctor` checks it again):");
+        let mut attention = Vec::new();
+        for (row, line) in rows.iter().zip(super::capability::lines(&rows)) {
+            if row.verdict.is_ready() {
+                tracing::info!("  {line}");
+            } else {
+                tracing::warn!("  {line}");
+                attention.push(line);
+            }
+        }
+        if !super::capability::anything_proves(&rows) && !watch_only() {
+            tracing::error!(
+                "PAGE: nothing on this host can prove a job this miner claims, so it will claim \
+                 none. See the lines above, or run `zkminer doctor`."
+            );
+        }
+        {
+            let mut st = state.write().await;
+            for line in &attention {
+                st.add_log(zkminer_tui::state::LogLevel::Warn, line.clone());
+            }
+        }
+        // On the splash, a few seconds each: the first three, then a pointer to the rest. A worker
+        // that failed to start is already there.
+        let new: Vec<String> = attention
+            .into_iter()
+            .filter(|l| !l.contains("its worker failed to start"))
+            .collect();
+        let more = new.len().saturating_sub(3);
+        startup_problems.extend(new.into_iter().take(3));
+        if more > 0 {
+            startup_problems.push(format!(
+                "{more} more — see the activity log, or run `zkminer doctor`"
+            ));
+        }
+    }
     init_worker_pool(pool);
     // SP1's one-time setup, in the background: SP1 jobs are not claimed until it is done (see the
     // pre-claim gate), and everything else proceeds meanwhile. Not when watching: it proves on the
@@ -3486,10 +3805,11 @@ pub async fn run(
                     }
                 }
             };
-            // In TUI mode the quit KEY already advanced the ladder to stage 1 (DRAIN is
-            // running by the time we get here), so the operator's first Ctrl+C must mean
-            // ABANDON — not a second "draining" message that does nothing.
-            let mut n = if headless { 0u8 } else { 1u8 };
+            // Each signal advances from the stage the ladder is at, however it got there: the
+            // dashboard's quit prompt and `zkminer stop` advance it too (`apply_stop_request`), so
+            // a Ctrl+C after a drain began there must mean ABANDON — not a second "draining"
+            // message that does nothing.
+            let mut n = 0u8;
             loop {
                 // A supervisor (systemd/docker) sends exactly ONE catchable signal and then
                 // SIGKILLs after its grace period — nobody is there to press Ctrl+C twice.
@@ -3517,54 +3837,37 @@ pub async fn run(
                     st.shutdown_requested = true;
                     st.paused = true;
                 }
-                n = n.saturating_add(1);
+                n = n.max(*sig_tx.borrow()).saturating_add(1);
                 match n {
                     // Wording must match what actually happens: with
                     // SUPERVISED_DRAIN_TIMEOUT == ZERO a supervised stop abandons on the same
                     // tick, so promising "signal again to ABANDON" there would be a lie — and
                     // this line is the only thing the operator sees.
-                    1 if supervised => println!(
-                        "\nSUPERVISED STOP — releasing held jobs now (no drain: a supervisor \
-                         will SIGKILL before any proof could finish)."
-                    ),
-                    1 => println!(
-                        "\nDRAINING — finishing in-flight proofs, no new claims. \
-                         Signal again to ABANDON (release jobs), a third time to force-exit."
-                    ),
-                    2 => println!("\nABANDONING — releasing jobs, nearest deadline first..."),
-                    _ => {
-                        eprintln!("\nForce exit — in-flight jobs left locked on-chain.");
-                        // Reap workers first. SP1's `sp1-gpu-server` is a GRANDCHILD
-                        // that does NOT die with us; it can keep ~11.5 GB of VRAM allocated
-                        // after the parent exited.
-                        //
-                        // BOUNDED, because `shutdown_all` is not: its phase 4 takes a
-                        // BLOCKING slot lock, while phases 2/3 skip any slot whose `pid` is
-                        // momentarily 0 — the respawn/recycle window (dispatcher.rs, where
-                        // the pid is zeroed before the handle is dropped and only restored
-                        // after `ensure_alive`). Such a worker is never signalled, so the
-                        // lock it holds is not released until its whole proof finishes (up
-                        // to the 600s watchdog). The "Force exit" print therefore comes BEFORE
-                        // this call, and the third signal must terminate regardless: reap
-                        // off-thread and cap the wait (a normal reap takes ~2.2s).
-                        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-                        std::thread::spawn(move || {
-                            if let Some(pool) = zkminer_prover::engine::worker_pool() {
-                                pool.close();
-                            }
-                            let _ = done_tx.send(());
-                        });
-                        if done_rx
-                            .recv_timeout(std::time::Duration::from_secs(10))
-                            .is_err()
-                        {
-                            eprintln!(
-                                "worker reap did not finish in 10s — exiting anyway; check for \
-                                 an orphaned sp1-gpu-server holding VRAM."
-                            );
-                        }
-                        std::process::exit(130);
+                    1 if supervised => {
+                        shutdown_say(
+                            &sig_state,
+                            "\nSUPERVISED STOP — releasing held jobs now (no drain: a supervisor \
+                             will SIGKILL before any proof could finish).",
+                        )
+                        .await
                     }
+                    1 => {
+                        shutdown_say(
+                            &sig_state,
+                            "\nDRAINING — finishing in-flight proofs, no new claims. \
+                             Signal again to ABANDON (release jobs), a third time to force-exit.",
+                        )
+                        .await
+                    }
+                    2 => {
+                        KEEP_LOCKS.store(false, std::sync::atomic::Ordering::SeqCst);
+                        shutdown_say(
+                            &sig_state,
+                            "\nABANDONING — releasing jobs, nearest deadline first...",
+                        )
+                        .await
+                    }
+                    _ => force_exit(),
                 }
                 let _ = sig_tx.send(n);
             }
@@ -3575,8 +3878,17 @@ pub async fn run(
     #[cfg(windows)]
     super::signals_windows::spawn(sig_tx.clone(), state.clone(), headless);
 
+    // Stops asked for at the dashboard's quit prompt or by `zkminer stop` (watch-only takes none: it
+    // holds no instance lock, and may run beside the real miner).
+    if !watch_only() {
+        spawn_stop_watcher(sig_tx.clone(), state.clone());
+    }
+
+    // The dashboard, when there is one. It stays open through the shutdown below and closes when
+    // the miner is about to exit.
+    let mut tui_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
     if headless {
-        println!("zkminer running in headless mode. Press Ctrl+C to stop.");
+        println!("zkminer running in headless mode. Press Ctrl+C (or run `zkminer stop`) to stop.");
         // Wait for the FIRST signal.
         #[cfg(any(unix, windows))]
         while *sig_rx.borrow() == 0 {
@@ -3602,14 +3914,45 @@ pub async fn run(
         // then ride past the lock deadline, after which releaseJob reverts permanently) and
         // the SP1 gpu-server grandchild holding its VRAM. Log and fall through instead.
         drop(splash);
-        let tui_result = zkminer_tui::run_tui(state.clone(), Some(client.clone())).await;
-        // Terminal is restored (raw mode off) and the TUI no longer owns the keyboard —
-        // release the signal handler so the drain below still has the abandon/force ladder.
+        // Quitting then asks how to stop and hands the answer to the stop watcher, and the
+        // dashboard stays open through the shutdown with its keys (abandon, keep locks, force).
+        state.write().await.stop_handled_by_miner = true;
+        TUI_UP.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut tui = tokio::spawn(zkminer_tui::run_tui(state.clone(), Some(client.clone())));
+        // Wait for a stop to begin, or for the dashboard to end on its own (an error).
+        let ended = loop {
+            if *sig_rx.borrow() >= 1 {
+                break None;
+            }
+            tokio::select! {
+                r = &mut tui => break Some(r),
+                c = sig_rx.changed() => if c.is_err() { break None },
+            }
+        };
+        match ended {
+            None => tui_task = Some(tui),
+            Some(r) => {
+                // Terminal is restored (raw mode off) and the TUI no longer owns the keyboard.
+                TUI_UP.store(false, std::sync::atomic::Ordering::SeqCst);
+                match r {
+                    Ok(Ok(())) => tracing::warn!("the dashboard closed — stopping (draining)"),
+                    Ok(Err(e)) => {
+                        tracing::error!(
+                            "TUI exited with an error: {e:#} — continuing into shutdown"
+                        )
+                    }
+                    Err(e) => {
+                        tracing::error!("TUI task failed: {e} — continuing into shutdown")
+                    }
+                }
+                if *sig_rx.borrow() == 0 {
+                    let _ = sig_tx.send(1);
+                }
+            }
+        }
+        // Release the signal handler so the drain below still has the abandon/force ladder.
         #[cfg(unix)]
         let _ = tui_done_tx.send(());
-        if let Err(e) = tui_result {
-            tracing::error!("TUI exited with an error: {e:#} — continuing into shutdown");
-        }
     }
 
     // ---- Shutdown -----------------------------------------------------------------
@@ -3628,6 +3971,15 @@ pub async fn run(
     if let Some(w) = &witness_rt {
         w.shutdown();
     }
+    shutdown_stage(
+        &state,
+        if KEEP_LOCKS.load(std::sync::atomic::Ordering::SeqCst) {
+            zkminer_tui::state::ShutdownStage::KeepingLocks
+        } else {
+            zkminer_tui::state::ShutdownStage::Draining
+        },
+    )
+    .await;
     monitor_handle.abort();
     event_handle.abort();
     hw_handle.abort();
@@ -3671,6 +4023,8 @@ pub async fn run(
     }
     let drain_deadline = std::time::Instant::now() + drain_budget;
     let mut abandoned = false;
+    // A keep-locks stop: leave without releasing (see KEEP_LOCKS).
+    let mut kept = false;
     // Lifecycle-less entries the drain already released at the margin (see the loop below).
     // Lifecycle-less entries the drain handed to release_and_clean, and when. Re-armed: a lock that
     // was KEPT (a pause, a Disabled adapter, an unreadable state) can become releasable mid-drain.
@@ -3678,8 +4032,13 @@ pub async fn run(
         std::collections::HashMap::new();
     loop {
         if *sig_rx.borrow() >= 2 {
-            tracing::warn!("drain interrupted by second signal — abandoning");
+            tracing::warn!("drain interrupted — abandoning");
             abandoned = true;
+            break;
+        }
+        if KEEP_LOCKS.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::warn!("drain ended: keeping the locks for the next start");
+            kept = true;
             break;
         }
         // Union of what the UI thinks is in flight AND what the journal says we hold
@@ -3798,7 +4157,11 @@ pub async fn run(
             if retained == 0 {
                 tracing::info!("drain complete — no jobs in flight, journal empty");
                 if !headless {
-                    println!("Shutdown clean — no jobs held, no collateral at risk.");
+                    shutdown_say(
+                        &state,
+                        "Shutdown clean — no jobs held, no collateral at risk.",
+                    )
+                    .await;
                 }
             } else {
                 tracing::warn!(
@@ -3806,11 +4169,15 @@ pub async fn run(
                      breadcrumb(s) remain: that collateral is STILL LOCKED until a keeper slash"
                 );
                 if !headless {
-                    println!(
-                        "Drain complete — nothing in flight, but {retained} past-deadline \
-                         breadcrumb(s) remain: that collateral is STILL LOCKED until a keeper \
-                         slash — details in ~/.zkminer/logs/zkminer.log"
-                    );
+                    shutdown_say(
+                        &state,
+                        format!(
+                            "Drain complete — nothing in flight, but {retained} past-deadline \
+                             breadcrumb(s) remain: that collateral is STILL LOCKED until a keeper \
+                             slash — details in ~/.zkminer/logs/zkminer.log"
+                        ),
+                    )
+                    .await;
                 }
             }
             break;
@@ -3902,16 +4269,23 @@ pub async fn run(
                 .join(", ")
         );
         // In TUI mode every line above goes to ~/.zkminer/logs/zkminer.log and NOTHING to the
-        // terminal, so the operator sees a blank screen for up to DRAIN_TIMEOUT and cannot tell
-        // a working drain from a wedged process — the usual response is a kill that strands
-        // collateral. The TUI has already restored the terminal by this point (the signal
-        // ladder above prints here too), so stdout is safe.
-        if !headless {
-            println!(
-                "draining: {} job(s) still proving — Ctrl+C to abandon and release now",
-                outstanding.len()
-            );
-        }
+        // terminal, so without this the operator could not tell a working drain from a wedged
+        // process — and the usual response is a kill that strands collateral. On the dashboard's
+        // shutdown panel while it is open, else on stdout.
+        shutdown_status(
+            &state,
+            headless,
+            format!(
+                "draining: {} job(s) still in flight{}",
+                outstanding.len(),
+                if tui_up() {
+                    ""
+                } else {
+                    " — Ctrl+C (or `zkminer stop --abandon`) to abandon and release now"
+                }
+            ),
+        )
+        .await;
         // Clamp the poll to the remaining budget. `drain_deadline` is only tested at loop
         // TOP, so an unclamped 5s quantum rounds the 6s supervised budget up to 10s — i.e.
         // `docker stop`'s ENTIRE grace period — and SIGKILL lands at the instant the loop
@@ -3926,6 +4300,83 @@ pub async fn run(
         }
     }
 
+    // 2b. KEEP LOCKS — let proofs already being submitted reach the chain, then exit without
+    //     releasing anything: the journal keeps every lock for the next start's recovery, which
+    //     re-proves each one there is still time for and releases the rest. Exit 75, so a
+    //     supervisor with `Restart=on-failure` starts the miner again.
+    if kept {
+        shutdown_stage(&state, zkminer_tui::state::ShutdownStage::KeepingLocks).await;
+        let grace_end = std::time::Instant::now() + KEEP_LOCKS_SUBMIT_GRACE;
+        loop {
+            if *sig_rx.borrow() >= 2 {
+                tracing::warn!("keep-locks stop escalated — abandoning");
+                abandoned = true;
+                break;
+            }
+            let submitting = {
+                let s = state.read().await;
+                s.active_jobs
+                    .iter()
+                    .filter(|j| matches!(j.status, MinerJobStatus::Submitting))
+                    .count()
+            };
+            if submitting == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= grace_end {
+                tracing::warn!(
+                    "keep-locks: {submitting} proof(s) still being submitted after {}s — exiting \
+                     anyway; the next start re-checks them",
+                    KEEP_LOCKS_SUBMIT_GRACE.as_secs()
+                );
+                break;
+            }
+            shutdown_status(
+                &state,
+                headless,
+                format!("keeping locks: waiting for {submitting} proof(s) being submitted"),
+            )
+            .await;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                _ = sig_rx.changed() => {}
+            }
+        }
+        if !abandoned {
+            let now = zkminer_chain::client::chain_now_floor();
+            let (held, earliest) = {
+                let j = journal.lock().unwrap_or_else(|e| e.into_inner());
+                let live: Vec<u64> = j
+                    .iter()
+                    .filter(|e| e.lock_deadline == 0 || e.lock_deadline > now)
+                    .map(|e| e.lock_deadline)
+                    .collect();
+                (live.len(), live.iter().copied().filter(|d| *d > 0).min())
+            };
+            exit_code = 75;
+            let verdict = if held == 0 {
+                "Keep-locks stop: no locks were held. Exiting with 75 so a supervisor starts the \
+                 miner again."
+                    .to_string()
+            } else {
+                format!(
+                    "Keep-locks stop: {held} lock(s) left for the next start. START THE MINER AGAIN \
+                     {}: it re-proves each kept job there is still time for and releases the rest; \
+                     a lock left past its deadline is slashed. Exiting with 75.",
+                    match earliest {
+                        Some(d) => format!(
+                            "before {} (the earliest deadline)",
+                            zkminer_chain::exit::fmt_unix(d)
+                        ),
+                        None => "soon".to_string(),
+                    }
+                )
+            };
+            tracing::warn!("{verdict}");
+            shutdown_say(&state, verdict).await;
+        }
+    }
+
     // 3. ABANDON — release whatever is still ours, NEAREST DEADLINE FIRST.
     //
     //    Ordering is the whole game for collateral: `releaseJob` reverts once a job is past
@@ -3933,6 +4384,10 @@ pub async fn run(
     //    second spent on a job with hours of headroom is a second not spent on one about to
     //    expire, so releasing in deadline order is what actually minimises loss.
     if abandoned {
+        // Abandon wins over an earlier keep-locks request: release_and_clean releases again.
+        KEEP_LOCKS.store(false, std::sync::atomic::Ordering::SeqCst);
+        shutdown_stage(&state, zkminer_tui::state::ShutdownStage::Abandoning).await;
+        shutdown_status(&state, headless, "releasing held jobs...".to_string()).await;
         // The LOWER chain-time estimate: an entry is only treated as already past its deadline once
         // it surely is.
         let now = zkminer_chain::client::chain_now_floor();
@@ -4293,11 +4748,16 @@ pub async fn run(
         // Mirror the verdict to the terminal: in TUI mode this is the ONLY way an operator
         // learns that collateral was stranded rather than released (see the drain note above).
         if !headless {
-            println!(
-                "shutdown summary: {released} released, {stranded} STILL LOCKED (past deadline \
-                 or failed release), {still_held} journal breadcrumb(s) ({recoverable} \
-                 recoverable on restart) — details in ~/.zkminer/logs/zkminer.log"
-            );
+            shutdown_say(
+                &state,
+                format!(
+                    "shutdown summary: {released} released, {stranded} STILL LOCKED (past \
+                     deadline or failed release), {still_held} journal breadcrumb(s) \
+                     ({recoverable} recoverable on restart) — details in \
+                     ~/.zkminer/logs/zkminer.log"
+                ),
+            )
+            .await;
         }
         if recoverable > 0 {
             // EX_TEMPFAIL. Keep it — but it only produces an AUTO-restart when the signal did
@@ -4316,14 +4776,20 @@ pub async fn run(
                  once its deadline passes."
             );
             if !headless {
-                println!(
-                    "{recoverable} job(s) STILL HOLD COLLATERAL — start the miner again to run \
-                     recovery; a supervisor will not necessarily restart it for you."
-                );
+                shutdown_say(
+                    &state,
+                    format!(
+                        "{recoverable} job(s) STILL HOLD COLLATERAL — start the miner again to \
+                         run recovery; a supervisor will not necessarily restart it for you."
+                    ),
+                )
+                .await;
             }
         }
     }
 
+    shutdown_stage(&state, zkminer_tui::state::ShutdownStage::Finishing).await;
+    shutdown_status(&state, headless, "stopping the provers...".to_string()).await;
     // 4. Only now tear down the workers. Releasing needs nothing but the job id, so keeping
     //    them alive until this point costs nothing and lets the drain path finish real work.
     // BOUNDED, for the same reason as the hard-kill reap: `shutdown_all` phase 4 takes a
@@ -4354,6 +4820,32 @@ pub async fn run(
     }
     brain_handle.abort();
     refresh_handle.abort();
+
+    // Close the dashboard, then print what the shutdown reported on it, so the verdict stays in
+    // the terminal's scrollback.
+    if let Some(tui) = tui_task {
+        if let Some(view) = state.write().await.shutdown.as_mut() {
+            view.done = true;
+        }
+        // It notices within its 1s tick.
+        if tokio::time::timeout(std::time::Duration::from_secs(5), tui)
+            .await
+            .is_err()
+        {
+            zkminer_tui::restore_terminal();
+        }
+        TUI_UP.store(false, std::sync::atomic::Ordering::SeqCst);
+        let lines = state
+            .read()
+            .await
+            .shutdown
+            .as_ref()
+            .map(|v| v.lines.clone())
+            .unwrap_or_default();
+        for line in lines {
+            println!("{line}");
+        }
+    }
 
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -9947,6 +10439,16 @@ async fn process_job_lifecycle(
         // the authoritative value read from the post-claim status view a few lines above.
         let mut claimed_info = job.info.clone();
         claimed_info.lock_deadline = lock_deadline;
+        // The collateral the dashboard's quit prompt prices an abandon from: what the claim locked,
+        // `computeCollateral(settledPrice, collateralBps, minCollateral)` with the job's own terms
+        // (0, "unknown", without them).
+        if let Some((min_collateral, bps)) = job_collateral_terms(job_id) {
+            claimed_info.locked_collateral = zkminer_chain::auction::compute_collateral(
+                view.settledPrice.to::<u128>(),
+                u64::try_from(bps).unwrap_or(u64::MAX),
+                min_collateral,
+            );
+        }
         s.active_jobs.push(TrackedJob {
             info: claimed_info,
             // Queued, not Proving: this job holds collateral but has not started. Showing it
@@ -11395,7 +11897,7 @@ pub(crate) fn resolve_backend(proof_system_id: alloy::primitives::B256) -> Optio
 }
 
 /// The backends `resolve_backend` serves in this build.
-fn served_backends() -> Vec<&'static str> {
+pub(crate) fn served_backends() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = zkminer_chain::auction::ProofSystem::ALL
         .iter()
         .filter_map(|p| resolve_backend(p.id()))
@@ -12699,6 +13201,20 @@ async fn release_and_clean_with_nonce(
     pre_nonce: Option<u64>,
 ) {
     use zkminer_chain::jobs::GovernanceHold;
+    // A keep-locks stop hands every lock to the next start: a lifecycle that fails on the way out
+    // (its worker stopped under it) must not release its lock. The breadcrumb stays for recovery.
+    if KEEP_LOCKS.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::warn!(
+            "job {}: not releasing — keeping the lock for the next start",
+            short_id(job_id)
+        );
+        if let Some(n) = pre_nonce {
+            client.abort_nonce(n);
+        }
+        let mut s = state.write().await;
+        s.active_jobs.retain(|j| j.info.job_id != job_id);
+        return;
+    }
     // Read the view first: the governance-hold decision needs the job's proof system.
     let mut view_read = client.get_job_status_view(job_id).await;
     if view_read.is_err() {

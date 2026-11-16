@@ -5,6 +5,7 @@ pub mod jobs;
 pub mod logs;
 pub mod settings;
 pub mod setup;
+pub mod stop;
 pub mod wallet;
 
 use crate::state::MinerState;

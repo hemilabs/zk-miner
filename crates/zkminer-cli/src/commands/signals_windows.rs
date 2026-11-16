@@ -90,6 +90,9 @@ pub(crate) fn spawn(sig_tx: tokio::sync::watch::Sender<u8>, state: SharedState, 
                 _ = recv_opt!(shutdown) => Event::Close,
             };
             let draining = !headless && super::run::SHUTTING_DOWN.load(Ordering::SeqCst);
+            // From the stage the ladder is at, however it got there (the dashboard's quit prompt
+            // and `zkminer stop` advance it too).
+            n = n.max(*sig_tx.borrow());
             let Some(stage) = next_stage(n, event, draining) else {
                 continue;
             };
@@ -104,37 +107,31 @@ pub(crate) fn spawn(sig_tx: tokio::sync::watch::Sender<u8>, state: SharedState, 
                 st.paused = true;
             }
             match stage {
-                1 | 2 if supervised => println!(
-                    "\nWINDOW CLOSING / SHUTDOWN — releasing held jobs now (Windows ends the \
-                     process within seconds; no proof could finish)."
-                ),
-                1 => println!(
-                    "\nDRAINING — finishing in-flight proofs, no new claims. Press Ctrl+C again \
-                     to ABANDON (release jobs), a third time to force-exit."
-                ),
-                2 => println!("\nABANDONING — releasing jobs, nearest deadline first..."),
-                _ => {
-                    eprintln!("\nForce exit — in-flight jobs left locked on-chain.");
-                    // Reap workers off-thread with a cap, as on unix: the SP1 gpu-server is a
-                    // grandchild that does not die with us and keeps its VRAM.
-                    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-                    std::thread::spawn(move || {
-                        if let Some(pool) = zkminer_prover::engine::worker_pool() {
-                            pool.close();
-                        }
-                        let _ = done_tx.send(());
-                    });
-                    if done_rx
-                        .recv_timeout(std::time::Duration::from_secs(10))
-                        .is_err()
-                    {
-                        eprintln!(
-                            "worker reap did not finish in 10s — exiting anyway; check for an \
-                             orphaned sp1-gpu-server holding VRAM."
-                        );
-                    }
-                    std::process::exit(130);
+                1 | 2 if supervised => {
+                    super::run::shutdown_say(
+                        &state,
+                        "\nWINDOW CLOSING / SHUTDOWN — releasing held jobs now (Windows ends the \
+                         process within seconds; no proof could finish).",
+                    )
+                    .await
                 }
+                1 => {
+                    super::run::shutdown_say(
+                        &state,
+                        "\nDRAINING — finishing in-flight proofs, no new claims. Press Ctrl+C \
+                         again to ABANDON (release jobs), a third time to force-exit.",
+                    )
+                    .await
+                }
+                2 => {
+                    super::run::KEEP_LOCKS.store(false, Ordering::SeqCst);
+                    super::run::shutdown_say(
+                        &state,
+                        "\nABANDONING — releasing jobs, nearest deadline first...",
+                    )
+                    .await
+                }
+                _ => super::run::force_exit(),
             }
             n = stage;
             let _ = sig_tx.send(n);

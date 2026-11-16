@@ -453,6 +453,63 @@ impl ClaimOutlook {
     }
 }
 
+/// How to stop the miner, as asked for at the dashboard's quit prompt, by `zkminer stop`, or by a
+/// signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopMode {
+    /// Stop claiming, let the proofs in flight finish and be paid, then exit.
+    Drain,
+    /// Stop claiming and exit now, leaving the locks held for the next start to finish (exit 75).
+    KeepLocks,
+    /// Release every lock now (each pays its release penalty), then exit.
+    Abandon,
+    /// Exit at once without releasing anything.
+    Force,
+}
+
+/// A question the dashboard is asking before it stops the miner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopPrompt {
+    /// Quit was pressed with jobs held: drain, keep the locks, abandon, or cancel.
+    Quit,
+    /// Confirm one of the stop modes (asked during a stop already under way).
+    Confirm(StopMode),
+}
+
+/// What the shutdown is doing, while the dashboard stays open through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownStage {
+    Draining,
+    KeepingLocks,
+    Abandoning,
+    /// Releasing workers and exiting.
+    Finishing,
+}
+
+/// The shutdown as the dashboard shows it. Written by the CLI's shutdown ladder.
+#[derive(Debug, Clone)]
+pub struct ShutdownView {
+    pub stage: ShutdownStage,
+    /// What is happening right now (refreshed, not appended), e.g. "2 proofs still running".
+    pub status: String,
+    /// Everything the shutdown reported, in order. Printed to the terminal once the dashboard
+    /// closes, so the verdict stays in the scrollback.
+    pub lines: Vec<String>,
+    /// The shutdown is over: the dashboard closes.
+    pub done: bool,
+}
+
+impl ShutdownView {
+    pub fn new(stage: ShutdownStage) -> Self {
+        Self {
+            stage,
+            status: String::new(),
+            lines: Vec::new(),
+            done: false,
+        }
+    }
+}
+
 /// The complete miner state, shared between TUI and background tasks.
 #[derive(Debug)]
 pub struct MinerState {
@@ -525,6 +582,16 @@ pub struct MinerState {
     /// exits the TUI *into* the shutdown ladder (drain -> abandon -> reap) instead of
     /// killing the process outright with collateral still held.
     pub shutdown_requested: bool,
+    /// Set by `zkminer run`, whose shutdown runs while the dashboard stays open: quitting then asks
+    /// how to stop (`stop_request`) instead of closing the dashboard. False in mock mode, where
+    /// quit just closes it.
+    pub stop_handled_by_miner: bool,
+    /// A stop asked for at the dashboard, waiting for the miner to take it.
+    pub stop_request: Option<StopMode>,
+    /// The question the dashboard is asking before it stops the miner.
+    pub stop_prompt: Option<StopPrompt>,
+    /// The shutdown under way, if any.
+    pub shutdown: Option<ShutdownView>,
     pub connected: bool,
     pub block_number: u64,
     pub errors: Vec<String>,
@@ -988,6 +1055,10 @@ impl Default for MinerState {
             last_refresh: None,
             paused: false,
             shutdown_requested: false,
+            stop_handled_by_miner: false,
+            stop_request: None,
+            stop_prompt: None,
+            shutdown: None,
             connected: false,
             block_number: 0,
             errors: Vec::new(),
