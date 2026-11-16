@@ -39,6 +39,14 @@ static LOOKUPS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
 
 /// The system resolver (getaddrinfo), on tokio's blocking pool, bounded by [`DNS_TIMEOUT`].
 ///
+/// **Absolute names only.** A name is looked up as written plus a trailing dot ([`absolute_name`]),
+/// so the resolver's `search` list (and `domain`, `LOCALDOMAIN`) and its `ndots` rule never apply:
+/// otherwise a requester's `secrets.corp` that has no public answer would be tried as
+/// `secrets.corp.<the operator's search domain>` and answered from the operator's own zone, and with
+/// `ndots:5` even `example.com` is tried under the search domain first. Requester names with a
+/// trailing dot are still refused by the hygiene rules ([`crate::check_host_name`]); the dot is
+/// added here, after them. IP literals are passed unchanged.
+///
 /// getaddrinfo cannot be cancelled: a lookup that times out keeps its pool thread until the OS
 /// resolver gives up (tens of seconds for a black-holed nameserver). A requester who points many
 /// names at a server that never answers could otherwise start lookups faster than they drain and
@@ -58,7 +66,7 @@ impl Lookup for SystemLookup {
                 .acquire()
                 .await
                 .ok();
-            let name = host.clone();
+            let name = absolute_name(&host);
             let answer = tokio::time::timeout(
                 DNS_TIMEOUT,
                 tokio::task::spawn_blocking(move || {
@@ -77,6 +85,16 @@ impl Lookup for SystemLookup {
                 Ok(Ok(r)) => r,
             }
         })
+    }
+}
+
+/// The name [`SystemLookup`] hands getaddrinfo for `host`: `host.` (absolute, so no search list or
+/// `ndots` applies), or `host` itself when it already ends with a dot or is an IP literal.
+pub fn absolute_name(host: &str) -> String {
+    if host.ends_with('.') || host.parse::<IpAddr>().is_ok() {
+        host.to_owned()
+    } else {
+        format!("{host}.")
     }
 }
 
@@ -432,6 +450,16 @@ pub(crate) mod tests {
             e.to_string().contains("refused by the network guard"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn the_system_lookup_asks_for_absolute_names() {
+        assert_eq!(absolute_name("example.com"), "example.com.");
+        assert_eq!(absolute_name("secrets.corp"), "secrets.corp.");
+        assert_eq!(absolute_name("localhost"), "localhost.");
+        assert_eq!(absolute_name("example.com."), "example.com.");
+        assert_eq!(absolute_name("192.0.2.1"), "192.0.2.1");
+        assert_eq!(absolute_name("2001:db8::1"), "2001:db8::1");
     }
 
     #[tokio::test]

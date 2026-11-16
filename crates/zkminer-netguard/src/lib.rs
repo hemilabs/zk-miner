@@ -68,7 +68,7 @@ pub use client::{
 };
 #[cfg(feature = "client")]
 pub use resolve::{
-    GuardedResolver, Lookup, LookupFuture, ResolveError, SystemLookup, DNS_TIMEOUT,
+    absolute_name, GuardedResolver, Lookup, LookupFuture, ResolveError, SystemLookup, DNS_TIMEOUT,
     MAX_CONCURRENT_LOOKUPS,
 };
 
