@@ -2388,6 +2388,17 @@ fn run_execute_sp1(
     let (run_result, peak_host_bytes) = with_peak_rss_sampling(|| req.run());
     let (public_values, report) =
         run_result.map_err(|e| canonicalize_sp1_execute_error(&e.to_string()))?;
+    // A guest that does not exit 0 (a panic exits 1, `halt(n)` exits n) still executes and proves, but
+    // the proof's exit code fails the SDK's verify and the on-chain verifier (`InvalidExitCode`): the
+    // (program, input) can never settle. Refuse it here, before the claim, as the risc0 worker does,
+    // so the host never locks collateral on it. Deterministic for (ELF, input).
+    if report.exit_code != 0 {
+        anyhow::bail!(
+            "execute: guest exited with code {} — a non-zero exit code can never produce an \
+             accepted proof for this program+input",
+            report.exit_code
+        );
+    }
     // The public values the guest commits here are byte-identical to the journal the
     // later Groth16 proof carries (both are a deterministic function of (ELF, input), and the host's
     // elf_hash gate makes measure-ELF == prove-ELF). The host checks the job's journal binding
@@ -2501,9 +2512,11 @@ fn run_proof(
                     // via `format!("0x{:0>64}", …)` and never panics.
                     match decode_hex32(&pk.verifying_key().bytes32()) {
                         Some(vk_hash) => {
-                            let matches =
-                                vk_hash == pid || vk_hash.iter().rev().copied().eq(pid.iter().copied());
-                            if !matches {
+                            // The native order only: the on-chain SP1 verifier checks
+                            // `vk.bytes32() == programId` as given, so a byte-reversed programId can
+                            // never verify. Accepting it would prove a job only to have the fulfil
+                            // revert `VerifierCallFailed` and the lock released at a penalty.
+                            if vk_hash != pid {
                                 anyhow::bail!(
                                     "ELF vkey hash does not match job programId (served ELF is not the \
                                      registered program) — refusing to prove"

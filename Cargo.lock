@@ -10116,6 +10116,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "flate2",
  "libc",
  "reqwest",
  "serde",
@@ -10125,6 +10126,7 @@ dependencies = [
  "sp1-primitives",
  "sp1-prover",
  "sp1-sdk",
+ "tar",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.22",

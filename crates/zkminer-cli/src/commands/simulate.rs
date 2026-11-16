@@ -444,15 +444,12 @@ pub fn redact_urls(text: &str) -> String {
     out
 }
 
-/// Whether `derived` (as a worker reports it) is `program_id`. risc0: the native order only, the one
-/// the deployed adapter verifies (see the risc0 worker's `image_id_matches`). SP1: either order, as
-/// the SP1 worker's prove-path gate accepts, since the on-chain order of a vkey hash is
-/// deployment-defined and a wrong ELF matches neither.
-pub fn program_id_matches(backend: &str, derived: &[u8; 32], program_id: &B256) -> bool {
-    if derived == &program_id.0 {
-        return true;
-    }
-    backend == BACKEND_SP1 && derived.iter().rev().eq(program_id.0.iter())
+/// Whether `derived` (as a worker reports it) is `program_id`: in the native order only, for every
+/// backend. It is the only order the deployed verifiers accept (the risc0 adapter verifies against
+/// programId verbatim, see the risc0 worker's `image_id_matches`; the SP1 verifier checks
+/// `vk.bytes32() == programId`), so a byte-reversed id could only be proved and then rejected.
+pub fn program_id_matches(_backend: &str, derived: &[u8; 32], program_id: &B256) -> bool {
+    derived == &program_id.0
 }
 
 /// Classify a failed `execute_cycles` the way the miner's measure path does: typed transients first
@@ -1736,7 +1733,7 @@ mod tests {
     }
 
     #[test]
-    fn risc0_binds_in_native_order_only_and_sp1_in_either() {
+    fn programs_bind_in_native_order_only() {
         let pid = B256::from(std::array::from_fn::<u8, 32, _>(|i| i as u8));
         let native = pid.0;
         let mut reversed = native;
@@ -1744,7 +1741,7 @@ mod tests {
         assert!(program_id_matches(BACKEND_RISC0, &native, &pid));
         assert!(!program_id_matches(BACKEND_RISC0, &reversed, &pid));
         assert!(program_id_matches(BACKEND_SP1, &native, &pid));
-        assert!(program_id_matches(BACKEND_SP1, &reversed, &pid));
+        assert!(!program_id_matches(BACKEND_SP1, &reversed, &pid));
         assert!(!program_id_matches(BACKEND_SP1, &[0u8; 32], &pid));
     }
 

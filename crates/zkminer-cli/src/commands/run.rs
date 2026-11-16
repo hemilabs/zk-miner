@@ -1453,11 +1453,28 @@ fn note_post_claim_divergence(
     caller: alloy::primitives::Address,
     why: &str,
 ) {
+    note_post_claim_divergence_for(program_id, backend, caller, why, true);
+}
+
+/// [`note_post_claim_divergence`], marking the program (once enough distinct submitters fail on it)
+/// only if `may_mark_program`: false where the failure may be the submitter's own per-job choice
+/// rather than the program's (a descriptor carrying a revert lever), so a decoy that names a
+/// legitimate program's id cannot get that program marked. The submitter is marked either way, and
+/// the failure counts toward the hold.
+fn note_post_claim_divergence_for(
+    program_id: alloy::primitives::B256,
+    backend: &'static str,
+    caller: alloy::primitives::Address,
+    why: &str,
+    may_mark_program: bool,
+) {
     let mut g = DIVERGENCE.lock().unwrap_or_else(|p| p.into_inner());
     let st = g.get_or_insert_with(Default::default);
     let key = (program_id, backend);
     let now = std::time::Instant::now();
-    let failers = if st.failers.len() < MEASURED_CYCLES_CAP || st.failers.contains_key(&key) {
+    let failers = if !may_mark_program {
+        0
+    } else if st.failers.len() < MEASURED_CYCLES_CAP || st.failers.contains_key(&key) {
         let f = st.failers.entry(key).or_default();
         f.retain(|(t, a)| now.duration_since(*t) < DIVERGENCE_MARK_MAX && *a != caller);
         f.push((now, caller));
@@ -10194,6 +10211,23 @@ async fn process_job_lifecycle(
                         if fulfill_no_lever {
                             mark_program_sim_reverted(fulfill_program_id, fulfill_proof_system);
                         }
+                        // A proof that passed our own verify and then failed the on-chain verifier is a
+                        // post-claim failure like any other, so it feeds the divergence breaker: the
+                        // submitter is marked on the escalating TTL, and the program too once
+                        // `PROGRAM_MARK_SUBMITTERS` distinct submitters fail on it. Without this a
+                        // requester could re-arm the 10-minute sim-revert cooldown with fresh programIds
+                        // and force a released (penalized) claim per job. A descriptor that carries a
+                        // submitter-controlled revert lever marks the submitter only: its programId may
+                        // be a legitimate program's.
+                        if rode_measurement {
+                            note_post_claim_divergence_for(
+                                program_id,
+                                backend,
+                                submitter,
+                                "the on-chain verifier rejected the proof",
+                                fulfill_no_lever,
+                            );
+                        }
                         clear_submitting("verifier rejected the proof — releasing").await;
                         return Err(anyhow::anyhow!(
                             "fulfil rejected by the verifier (VerifierCallFailed, no governance cause) \
@@ -13931,6 +13965,31 @@ mod r2_sizing_tests {
         // One submitter's failure didn't mark D3, so a later success proves it again.
         note_fulfil_success(prog(0xD3), "risc0");
         assert!(!divergence_blocks_claim(addr(0xEE), prog(0xD3), "risc0"));
+    }
+
+    /// A failure that may be the submitter's own per-job choice (a revert lever) marks the submitter
+    /// but never the program, however many submitters it comes from. (Reads the program marks
+    /// directly: the global hold is shared with the other breaker tests.)
+    #[test]
+    fn a_lever_failure_marks_the_submitter_but_not_the_program() {
+        let addr = alloy::primitives::Address::repeat_byte;
+        let prog = B256::repeat_byte(0xA7);
+        let program_marked = || {
+            DIVERGENCE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .is_some_and(|st| st.programs.contains_key(&(prog, "sp1")))
+        };
+        for submitter in [0xA1, 0xA2, 0xA3] {
+            note_post_claim_divergence_for(prog, "sp1", addr(submitter), "test", false);
+            assert!(divergence_blocks_claim(addr(submitter), B256::repeat_byte(0xA8), "sp1"));
+        }
+        assert!(!program_marked(), "a lever decoy must not mark the program it names");
+        // Without a lever, two distinct submitters mark it.
+        note_post_claim_divergence_for(prog, "sp1", addr(0xA4), "test", true);
+        note_post_claim_divergence_for(prog, "sp1", addr(0xA5), "test", true);
+        assert!(program_marked());
     }
 
     #[test]
