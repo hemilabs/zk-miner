@@ -85,7 +85,7 @@ fn check(s: &Store, m: &Model) {
     // Every pinned bundle is readable and serves its W.
     for (k, &v) in &m.pins {
         let r = k.at(v);
-        s.verify(&r, &desc_hash).unwrap_or_else(|e| panic!("pinned {r:?}: {e}"));
+        s.verify(&r, &desc_hash, &image_id).unwrap_or_else(|e| panic!("pinned {r:?}: {e}"));
         let mut back = Vec::new();
         s.open_w(&r).unwrap().read_to_end(&mut back).unwrap();
         assert_eq!(&back, &m.w[&r], "pinned W");
@@ -116,7 +116,7 @@ fn check(s: &Store, m: &Model) {
 
 fn run(ops: Vec<Op>, quota: u64) {
     let d = tmpdir();
-    let mut s = Store::open(d.path(), &expected(), opts_for(quota)).unwrap();
+    let mut s = open_with(d.path(), opts_for(quota));
     // The ELF every bundle references; held for the whole run so an empty store never collects it.
     let mut hold = Some(s.put_elf(sha256(&elf(1)), &elf(1), &image_id).unwrap());
     let mut m = Model::default();
@@ -154,13 +154,7 @@ fn run(ops: Vec<Op>, quota: u64) {
                 let k = key_of(job, desc, prov);
                 match m.latest(&k) {
                     Some(v) => {
-                        let rec = PinRecord {
-                            job_id: k.job_id,
-                            descriptor_hash: k.descriptor_hash,
-                            prover: k.prover,
-                            bundle_version: v,
-                            pinned_at_block: i as u64,
-                        };
+                        let rec = s.pin_record(&k.at(v), i as u64).unwrap();
                         s.pin(&rec).unwrap();
                         m.pins.insert(k, v);
                     }
@@ -171,6 +165,8 @@ fn run(ops: Vec<Op>, quota: u64) {
                             prover: k.prover,
                             bundle_version: m.global_max + 1,
                             pinned_at_block: 0,
+                            input_sha256: B256::ZERO,
+                            bundle_json_sha256: B256::ZERO,
                         };
                         assert!(s.pin(&rec).unwrap_err().is_missing());
                     }
@@ -225,7 +221,7 @@ fn run(ops: Vec<Op>, quota: u64) {
             Op::Reopen => {
                 drop(hold.take());
                 drop(s);
-                s = Store::open(d.path(), &expected(), opts_for(quota)).unwrap();
+                s = Store::open(d.path(), &expected(d.path()), opts_for(quota)).unwrap();
                 hold = Some(s.hold_elf(sha256(&elf(1))).unwrap());
                 assert_eq!(s.open_report().tmp_entries_removed, 0);
                 m.scan_complete = false;
