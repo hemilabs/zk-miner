@@ -1,28 +1,52 @@
 //! Process sandbox for witness builders, execute workers and the broker (plan §10.2, §10.3).
 //!
+//! This crate implements the **rootless** mode of §10.3: Landlock + seccomp + a cgroup in the
+//! user's delegated cgroup v2 subtree, all under the miner's own uid. The system mode (namespaces, a
+//! separate uid, an nftables floor) needs root and is not implemented here.
+//!
 //! Two halves:
-//! - the **parent side** (the miner): [`Cgroup`] creates a cgroup in the user's delegated cgroup v2
-//!   subtree with resource caps, and [`prepare_command`] installs a `pre_exec` hook that moves the
-//!   child into that cgroup before `exec` (so caps apply from the child's first instruction), sets
-//!   `NO_NEW_PRIVS`, `PR_SET_PDEATHSIG` (re-checked with `getppid`), `RLIMIT_CORE=0`, and closes every
-//!   fd except the ones listed;
-//! - the **child side** (the sandboxed binary itself, at startup, before it reads any untrusted
-//!   input): [`restrict_self`] applies Landlock (no filesystem access, no TCP bind/connect except the
-//!   profile's ports, scoped signals and abstract Unix sockets), a seccomp denylist, and
-//!   `PR_SET_DUMPABLE(0)`.
+//! - the **parent side** (the miner): [`delegated_root`] makes the miner's own delegated cgroup
+//!   usable, [`Cgroup`] creates one cgroup per sandboxed process with resource caps, and
+//!   [`prepare_command`] installs a `pre_exec` hook that moves the child into that cgroup before
+//!   `exec` (so caps apply from the new program's first instruction), places the listed fds at fixed
+//!   numbers, sets `NO_NEW_PRIVS`, `PR_SET_PDEATHSIG(SIGKILL)` (re-checked with `getppid`),
+//!   `RLIMIT_CORE=0`, and makes sure no other fd survives the `exec`;
+//! - the **child side** (the sandboxed binary itself, at startup, before it starts threads or reads
+//!   any untrusted input): [`restrict_self`] applies Landlock (no filesystem access, no TCP
+//!   bind/connect except the profile's ports, scoped signals and abstract Unix sockets), a seccomp
+//!   denylist, `NO_NEW_PRIVS`, `PR_SET_DUMPABLE(0)` and `RLIMIT_CORE=0`.
 //!
-//! [`self_test`] checks the resulting *properties* (plan §10.3), not just that calls succeeded.
+//! [`self_test`] checks the resulting *properties* (plan §10.3) by running the
+//! `zkminer-witness-sandbox-probe` binary inside each sandbox profile, not just that calls
+//! succeeded.
 //!
-//! This host-independent API is fixed for milestone 2; bodies are filled in by the sandbox work.
+//! # Requirements
+//! - Linux with Landlock ABI >= 6 (Linux 6.12+), seccomp filters and cgroup v2.
+//! - The miner must run in a **delegated** cgroup owned by its uid, e.g. launched with
+//!   `systemd-run --user --scope -p Delegate=yes -- zkminer ...` (or a user unit with
+//!   `Delegate=yes`). [`delegated_root`] fails with [`SandboxError::NotDelegated`] otherwise.
 
-use std::os::fd::RawFd;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+#![cfg(target_os = "linux")]
+
+use std::path::PathBuf;
+
+mod cgroup;
+#[doc(hidden)]
+pub mod probe;
+mod restrict;
+mod selftest;
+mod spawn;
+
+pub use cgroup::{delegated_root, Cgroup};
+pub use restrict::{landlock_abi, restrict_self, MIN_LANDLOCK_ABI};
+pub use selftest::{self_test, self_test_profile};
+pub use spawn::prepare_command;
 
 /// Which mode the operator configured (`[witness] sandbox_mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxMode {
     /// Namespaces, a separate uid and an nftables floor, set up by `zkminer witness setup` (root).
+    /// Not implemented by this crate: [`self_test`] reports it as a failed check.
     System,
     /// Landlock + seccomp + delegated cgroup under the miner's uid (no kernel egress floor).
     Rootless,
@@ -35,9 +59,15 @@ pub enum Profile {
     BuilderRunner,
     /// The CPU-only risc0 execute worker: no filesystem, no network, no new processes.
     ExecuteWorker,
-    /// The broker: no filesystem except read-only `readable` paths (its endpoints file), outbound TCP
-    /// only to `tcp_connect_ports`.
-    Broker { readable: Vec<PathBuf>, tcp_connect_ports: Vec<u16> },
+    /// The broker: no filesystem except read-only `readable` paths (its endpoints file, and anything
+    /// its resolver or TLS stack reads after [`restrict_self`]) and read-write `writable` directories
+    /// (its quota'd spool), outbound TCP only to `tcp_connect_ports`, sockets only `AF_INET` and
+    /// `AF_INET6`, no new processes. Every listed path must exist when [`restrict_self`] runs.
+    Broker {
+        readable: Vec<PathBuf>,
+        writable: Vec<PathBuf>,
+        tcp_connect_ports: Vec<u16>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -48,94 +78,63 @@ pub enum SandboxError {
     Landlock(String),
     #[error("seccomp: {0}")]
     Seccomp(String),
+    #[error(
+        "restrict_self must run before the process starts threads: {threads} threads in /proc/self/task"
+    )]
+    MultiThreaded { threads: usize },
+    #[error(
+        "cgroup {} is not a delegated cgroup this uid can manage ({reason}); run the miner under \
+         `systemd-run --user --scope -p Delegate=yes -- ...` or a user unit with Delegate=yes",
+        cgroup.display()
+    )]
+    NotDelegated { cgroup: PathBuf, reason: String },
     #[error("cgroup: {0}")]
     Cgroup(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
 
-/// What [`restrict_self`] applied.
+/// What [`restrict_self`] applied, each field verified after the fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestrictReport {
+    /// The kernel's Landlock ABI (>= [`MIN_LANDLOCK_ABI`]).
     pub landlock_abi: i32,
+    /// `prctl(PR_GET_SECCOMP) == 2` (filter mode) after installing the filters.
     pub seccomp: bool,
+    /// `prctl(PR_GET_NO_NEW_PRIVS) == 1`.
     pub no_new_privs: bool,
+    /// `prctl(PR_GET_DUMPABLE) == 0`.
     pub dumpable_cleared: bool,
-}
-
-/// Child side: applies the profile to the calling process (all threads created afterwards inherit
-/// it; call it before spawning threads that must be restricted, and before reading untrusted input).
-pub fn restrict_self(profile: &Profile) -> Result<RestrictReport, SandboxError> {
-    let _ = profile;
-    todo!("milestone 2: sandbox crate")
+    /// `RLIMIT_CORE` is 0 (soft and hard).
+    pub core_dumps_disabled: bool,
 }
 
 /// Resource caps for one sandboxed process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CgroupSpec {
-    /// Name of the child cgroup under the delegated root (one per job).
+    /// Name of the child cgroup under the delegated root (one per job): 1–128 characters of
+    /// `[A-Za-z0-9_-]`, starting with a letter or digit.
     pub name: String,
+    /// `memory.max` in bytes (`memory.swap.max` is always 0).
     pub memory_max: u64,
+    /// `pids.max`: processes *and threads*.
     pub pids_max: u32,
     /// `cpu.max` quota and period in microseconds, if limited.
     pub cpu_max: Option<(u64, u64)>,
+    /// `cpu.weight`, 1..=10000 (the kernel default is 100).
     pub cpu_weight: u32,
-}
-
-/// A cgroup the miner created and owns.
-#[derive(Debug)]
-pub struct Cgroup {
-    pub path: PathBuf,
-}
-
-impl Cgroup {
-    /// Creates `spec.name` under `root` (see [`delegated_root`]) and writes its limits
-    /// (`memory.max`, `memory.swap.max=0`, `pids.max`, `cpu.max`, `cpu.weight`).
-    pub fn create(root: &Path, spec: &CgroupSpec) -> Result<Self, SandboxError> {
-        let _ = (root, spec);
-        todo!("milestone 2: sandbox crate")
-    }
-
-    /// Kills every process in the cgroup (`cgroup.kill`).
-    pub fn kill(&self) -> Result<(), SandboxError> {
-        todo!("milestone 2: sandbox crate")
-    }
-
-    /// `memory.peak` in bytes, if the kernel exposes it.
-    pub fn memory_peak(&self) -> Option<u64> {
-        todo!("milestone 2: sandbox crate")
-    }
-
-    /// Whether the cgroup recorded an OOM kill (`memory.events` oom_kill > 0).
-    pub fn oom_killed(&self) -> bool {
-        todo!("milestone 2: sandbox crate")
-    }
-
-    /// Kills, waits for emptiness, and removes the cgroup directory.
-    pub fn remove(self) -> Result<(), SandboxError> {
-        todo!("milestone 2: sandbox crate")
-    }
-}
-
-/// The delegated cgroup v2 directory this process may create children in (for a systemd user
-/// session, a sub-cgroup of `user@<uid>.service`; created if needed).
-pub fn delegated_root() -> Result<PathBuf, SandboxError> {
-    todo!("milestone 2: sandbox crate")
-}
-
-/// Parent side: configures `cmd` so the child joins `cgroup` before `exec`, gets `NO_NEW_PRIVS`,
-/// `PR_SET_PDEATHSIG(SIGKILL)` (then exits if the parent already died), `RLIMIT_CORE=0`, and keeps
-/// only fds 0–2 plus `keep_fds` (which must already be at their intended numbers).
-pub fn prepare_command(cmd: &mut Command, cgroup: &Cgroup, keep_fds: &[RawFd]) -> Result<(), SandboxError> {
-    let _ = (cmd, cgroup, keep_fds);
-    todo!("milestone 2: sandbox crate")
 }
 
 /// One self-test check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
-    pub name: &'static str,
+    /// `<profile>/<check>`, e.g. `builder_runner/socket_inet`.
+    pub name: String,
     pub passed: bool,
+    /// What was observed (errno, values read back), for logs and the page.
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,15 +144,13 @@ pub struct SelfTestReport {
 }
 
 impl SelfTestReport {
+    /// True when there is at least one check and every check passed.
     pub fn passed(&self) -> bool {
-        self.checks.iter().all(|c| c.passed)
+        !self.checks.is_empty() && self.checks.iter().all(|c| c.passed)
     }
-}
 
-/// Runs the self-test (plan §10.3) by spawning `probe_binary` under each profile: the probe tries
-/// the forbidden operations and reports which succeeded. `secret_path` is a file the probe must not
-/// be able to read (e.g. `~/.zkminer/config.toml`).
-pub fn self_test(mode: SandboxMode, probe_binary: &Path, secret_path: &Path) -> SelfTestReport {
-    let _ = (mode, probe_binary, secret_path);
-    todo!("milestone 2: sandbox crate")
+    /// The checks that failed.
+    pub fn failures(&self) -> impl Iterator<Item = &Check> {
+        self.checks.iter().filter(|c| !c.passed)
+    }
 }
