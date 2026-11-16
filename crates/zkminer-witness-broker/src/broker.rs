@@ -14,7 +14,7 @@ use crate::hooks::Hooks;
 use crate::job::{Job, JobSource};
 use crate::dns::{Resolver, QUERY_TIMEOUT};
 use crate::lanes::ByteLanes;
-use crate::net::{build_policy, Endpoint, EndpointEnv, OwnHandle, PolicyHandle};
+use crate::net::{build_policy, Endpoint, EndpointEnv, PolicyHandle};
 use crate::spool::Spool;
 
 /// An `evm-rpc/v1` endpoint and what it is provisioned for.
@@ -26,8 +26,8 @@ pub(crate) struct EvmEndpoint {
 pub(crate) struct Broker {
     pub cfg: BrokerConfig,
     pub hooks: Hooks,
+    /// The network floor, with the host's connected prefixes and own addresses.
     pub policy: PolicyHandle,
-    pub own_addresses: OwnHandle,
     pub evm: Vec<EvmEndpoint>,
     pub blob_mirrors: Vec<Arc<Endpoint>>,
     pub artifacts: ArtifactReader,
@@ -44,19 +44,18 @@ impl Broker {
     /// Builds every endpoint client and the network floor. Needs a tokio runtime.
     pub fn new(cfg: BrokerConfig, host: HostFacts, hooks: Hooks) -> anyhow::Result<Arc<Self>> {
         let policy: PolicyHandle = Arc::new(RwLock::new(build_policy(
+            cfg.net_mode,
             cfg.endpoints(),
             &host.resolved,
-            cfg.deny.clone(),
+            cfg.effective_deny(&host.dns_servers),
             host.connected.clone(),
             &host.own_addresses,
         )));
-        let own: OwnHandle = Arc::new(RwLock::new(host.own_addresses.clone()));
         if host.dns_servers.is_empty() && cfg.endpoints().any(|e| e.literal.is_none()) {
             tracing::warn!("no DNS server ([dns] servers or /etc/resolv.conf): host-name endpoints cannot resolve");
         }
         let env = EndpointEnv {
             policy: policy.clone(),
-            own: own.clone(),
             egress: hooks.egress.clone(),
             dns: Arc::new(Resolver::new(host.dns_servers.clone(), QUERY_TIMEOUT)),
             reresolve: cfg.dns.reresolve,
@@ -86,7 +85,6 @@ impl Broker {
         let spool = Spool::new(&cfg.spool_dir, cfg.spool_quota_bytes, cfg.budget.held_lock_share)?;
         Ok(Arc::new(Self {
             rpc_cache: Mutex::new(Lru::new(cfg.cache.rpc_max_bytes, cfg.cache.rpc_max_entries)),
-            own_addresses: own,
             hooks,
             policy,
             evm,

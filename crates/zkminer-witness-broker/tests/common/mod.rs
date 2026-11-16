@@ -11,14 +11,17 @@ use zkminer_witness::ipc::JobBudget;
 use zkminer_witness::manifest::{chunk_runtime_code, creation_code, manifest_runtime_code, sha256};
 use zkminer_witness_broker::client::{job_socketpair, BrokerClient, JobRegistration};
 use zkminer_witness_broker::testkit::{spawn_broker, FakeBuilder, TestRequest, TestResponse};
+use zkminer_witness_broker::egress::NetMode;
 use zkminer_witness_broker::{BrokerConfig, Hooks};
 
 pub fn budget(max_fetches: u32, max_fetch_bytes: u64, max_response_bytes: u32) -> JobBudget {
     JobBudget { max_fetches, max_fetch_bytes, max_request_bytes: 65_536, max_response_bytes }
 }
 
+/// Starts an in-process broker in developer mode: these tests' endpoints are servers on
+/// 127.0.0.1, which only developer mode admits (the miner's `[dev] private_network`).
 pub async fn start(dir: &Path, text: &str, hooks: Hooks) -> (BrokerClient, tokio::task::JoinHandle<anyhow::Result<()>>) {
-    let cfg = BrokerConfig::from_toml(text, dir).expect("test config");
+    let cfg = BrokerConfig::from_toml(text, dir, NetMode::DevPrivate).expect("test config");
     spawn_broker(cfg, hooks).await
 }
 

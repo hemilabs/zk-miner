@@ -77,6 +77,13 @@ async fn the_broker_binary_serves_under_the_sandbox() {
     let config = dir.path().join("broker.toml");
     std::fs::write(&config, config_text(dir.path(), &endpoint)).unwrap();
 
+    // anvil is on 127.0.0.1: without `--dev-private-network` (a miner without `[dev]
+    // private_network`) the broker refuses this very config before it reads fd 3 or connects.
+    let refused = Command::new(BROKER).arg("--config").arg(&config).env_clear().stdin(Stdio::null()).output().unwrap();
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("anvil: role entry 127.0.0.1/32") && stderr.contains("not on the public internet"), "{stderr}");
+
     let cg = Cgroup::create(
         &root,
         &CgroupSpec {
@@ -90,7 +97,8 @@ async fn the_broker_binary_serves_under_the_sandbox() {
     .unwrap();
     let (miner_end, broker_end) = std::os::unix::net::UnixStream::pair().unwrap();
     let mut cmd = Command::new(BROKER);
-    cmd.arg("--config").arg(&config).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    cmd.arg("--config").arg(&config).arg("--dev-private-network");
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     cmd.env("RUST_LOG", "warn");
     prepare_command(&mut cmd, &cg, &[(broker_end.as_fd(), 3)]).unwrap();
     let mut child = cmd.spawn().unwrap();
@@ -169,8 +177,19 @@ async fn the_broker_binary_serves_under_the_sandbox() {
     cg.remove().unwrap();
 }
 
-/// Spawns the broker binary into a fresh cgroup with `config`; returns the client and the child.
+/// Spawns the broker binary into a fresh cgroup with `config`, in developer mode (these tests'
+/// endpoints are on 127.0.0.1, as a local test network's are); returns the client and the child.
 fn spawn_broker_binary(root: &std::path::Path, config: &std::path::Path, tag: &str) -> (BrokerClient, std::process::Child, Cgroup) {
+    spawn_broker_binary_in(root, config, tag, true)
+}
+
+/// [`spawn_broker_binary`], with or without `--dev-private-network`.
+fn spawn_broker_binary_in(
+    root: &std::path::Path,
+    config: &std::path::Path,
+    tag: &str,
+    dev: bool,
+) -> (BrokerClient, std::process::Child, Cgroup) {
     let cg = Cgroup::create(
         root,
         &CgroupSpec { name: format!("broker-test-{tag}-{}", std::process::id()), memory_max: 512 << 20, pids_max: 32, cpu_max: None, cpu_weight: 50 },
@@ -179,6 +198,9 @@ fn spawn_broker_binary(root: &std::path::Path, config: &std::path::Path, tag: &s
     let (miner_end, broker_end) = std::os::unix::net::UnixStream::pair().unwrap();
     let mut cmd = Command::new(BROKER);
     cmd.arg("--config").arg(config).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    if dev {
+        cmd.arg("--dev-private-network");
+    }
     cmd.env("RUST_LOG", "warn");
     prepare_command(&mut cmd, &cg, &[(broker_end.as_fd(), 3)]).unwrap();
     let child = cmd.spawn().unwrap();

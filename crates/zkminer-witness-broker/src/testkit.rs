@@ -1,10 +1,10 @@
 //! Test support, not for production: a minimal HTTP/1.1 server, a test network floor, a mock
 //! `evm-rpc` codec, a fake builder, and a broker started in-process (no sandbox).
 //!
-//! [`TestEgress`] stands in for [`crate::egress`] until its implementation merges: role entries
-//! match by prefix and port, the requester path admits only global addresses on 443, and
-//! redaction replaces URLs. [`MockCodec`] stands in for [`crate::evm_rpc`] with a toy request
-//! format (below), so the broker's failover, caching and budget logic can be tested now.
+//! [`TestEgress`] injects the host's connected prefixes and a simple redaction; admission is always
+//! the real floor ([`crate::egress::EgressPolicy::admit`], zkminer-netguard's predicate).
+//! [`MockCodec`] stands in for [`crate::evm_rpc`] with a toy request format (below), so the
+//! broker's failover, caching and budget logic can be tested on their own.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,7 +20,7 @@ use zkminer_witness::ipc::{
 
 use crate::client::BrokerClient;
 use crate::config::{mask, BrokerConfig};
-use crate::egress::{Admit, DenyReason, EgressPolicy, Prefix, Role};
+use crate::egress::Prefix;
 use crate::evm_rpc::{BlockPin, BlockTag, CallAnswer, Denied, ResponseError};
 use crate::hooks::{EgressHooks, Hooks, RpcCodec, RpcReq};
 
@@ -196,74 +196,14 @@ async fn serve_conn(
 // ---------------------------------------------------------------------------------------------
 // The test network floor.
 
-/// A stand-in for [`crate::egress`]: role entries by prefix and port; the requester path admits
-/// global addresses on 443 outside `deny` and `connected`.
+/// The test seams of the egress hooks: injected connected prefixes and a simple redaction.
+/// Admission is the real floor.
 #[derive(Debug, Default, Clone)]
 pub struct TestEgress {
     pub connected: Vec<Prefix>,
 }
 
-fn contains(p: &Prefix, ip: IpAddr) -> bool {
-    crate::config::prefix_contains(p, ip)
-}
-
-fn roughly_global(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v) => {
-            let o = v.octets();
-            !(v.is_private()
-                || v.is_loopback()
-                || v.is_link_local()
-                || v.is_unspecified()
-                || v.is_broadcast()
-                || v.is_documentation()
-                || v.is_multicast()
-                || o[0] == 0
-                || (o[0] == 100 && (o[1] & 0xc0) == 64))
-        }
-        IpAddr::V6(v) => {
-            if let Some(v4) = v.to_ipv4_mapped() {
-                return roughly_global(IpAddr::V4(v4));
-            }
-            let s = v.segments();
-            !(v.is_loopback() || v.is_unspecified() || v.is_multicast() || (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80)
-        }
-    }
-}
-
 impl EgressHooks for TestEgress {
-    fn admit(&self, policy: &EgressPolicy, role: Option<(Role, &str)>, addr: SocketAddr) -> Admit {
-        let ip = addr.ip();
-        match role {
-            Some((role, alias)) => {
-                let Some(e) = policy.roles.iter().find(|e| e.role == role && e.alias == alias) else {
-                    return Admit::Denied(DenyReason::NoRoleEntry);
-                };
-                if e.port != addr.port() {
-                    return Admit::Denied(DenyReason::WrongPort);
-                }
-                if e.prefixes.iter().any(|p| contains(p, ip)) {
-                    Admit::Role
-                } else {
-                    Admit::Denied(DenyReason::NoRoleEntry)
-                }
-            }
-            None => {
-                if !roughly_global(ip) {
-                    Admit::Denied(DenyReason::NotGlobal)
-                } else if policy.deny.iter().any(|p| contains(p, ip)) {
-                    Admit::Denied(DenyReason::DenyCidr)
-                } else if policy.connected.iter().any(|p| contains(p, ip)) {
-                    Admit::Denied(DenyReason::ConnectedPrefix)
-                } else if addr.port() != 443 {
-                    Admit::Denied(DenyReason::WrongPort)
-                } else {
-                    Admit::Global
-                }
-            }
-        }
-    }
-
     fn connected_prefixes(&self) -> std::io::Result<Vec<Prefix>> {
         Ok(self.connected.clone())
     }

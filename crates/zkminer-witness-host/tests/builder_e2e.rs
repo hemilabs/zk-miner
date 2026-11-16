@@ -167,6 +167,57 @@ mod serde_json_lite {
     }
 }
 
+/// A miner config on anvil's chain with `[dev] private_network = true`: the broker it starts runs
+/// in developer mode.
+fn dev_miner() -> zkminer_config::ZkMinerConfig {
+    let mut c = zkminer_config::ZkMinerConfig::default();
+    c.chain.chain_id = ANVIL_CHAIN;
+    c.dev.private_network = true;
+    assert_eq!(c.net_mode(), zkminer_netguard::NetMode::DevPrivate);
+    c
+}
+
+/// The same miner without developer mode.
+fn public_miner() -> zkminer_config::ZkMinerConfig {
+    let mut c = dev_miner();
+    c.dev.private_network = false;
+    c
+}
+
+/// The broker config of these tests: one `evm-rpc/v1` endpoint, anvil on 127.0.0.1 (a local test
+/// network's node), as an explicit host route.
+fn anvil_broker_config(dir: &Path, url: &str) -> String {
+    format!(
+        "chain_rpc_host = \"chain-rpc.invalid\"\nspool_dir = \"{}\"\n[[evm_rpc]]\nalias = \"anvil\"\nurl = \"{url}\"\n\
+         chain_id = {ANVIL_CHAIN}\narchive = true\nmax_proof_age = 1000000\nmethod_sets = [\"state-read\"]\n\
+         cidrs = [\"127.0.0.1/32\"]\n",
+        dir.join("spool").display()
+    )
+}
+
+/// The same config in public mode, as a miner without `[dev] private_network` starts its broker:
+/// the broker refuses the loopback endpoint and exits with status 2 before it serves anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_broker_config_is_refused_in_public_mode() {
+    let Some(root) = delegated("the_same_broker_config_is_refused_in_public_mode") else { return };
+    let (_, broker_bin) = binaries();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let config = dir.path().join("broker.toml");
+    std::fs::write(&config, anvil_broker_config(dir.path(), "http://127.0.0.1:8545")).unwrap();
+    let spawner = Spawner::new().unwrap();
+    let mut broker = BrokerProcess::start(&spawner, &broker_bin, &config, &root, 512 << 20, &public_miner()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = broker.exited() {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "the broker accepted a loopback endpoint in public mode");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(status.code(), Some(2), "{status:?}");
+    assert!(broker.client.self_test().await.is_err(), "nothing answers");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_builder_fetches_through_the_broker_and_w_reaches_the_sink() {
     let Some(root) = delegated("a_builder_fetches_through_the_broker_and_w_reaches_the_sink") else { return };
@@ -180,19 +231,10 @@ async fn a_builder_fetches_through_the_broker_and_w_reaches_the_sink() {
 
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let config = dir.path().join("broker.toml");
-    std::fs::write(
-        &config,
-        format!(
-            "chain_rpc_host = \"chain-rpc.invalid\"\nspool_dir = \"{}\"\n[[evm_rpc]]\nalias = \"anvil\"\nurl = \"{}\"\n\
-             chain_id = {ANVIL_CHAIN}\narchive = true\nmax_proof_age = 1000000\nmethod_sets = [\"state-read\"]\n\
-             cidrs = [\"127.0.0.1/32\"]\n",
-            dir.path().join("spool").display(),
-            anvil.url
-        ),
-    )
-    .unwrap();
+    std::fs::write(&config, anvil_broker_config(dir.path(), &anvil.url)).unwrap();
     let spawner = Spawner::new().unwrap();
-    let broker = BrokerProcess::start(&spawner, &broker_bin, &config, &root, 512 << 20).unwrap();
+    // anvil is on 127.0.0.1: developer mode, as a miner with `[dev] private_network` runs it.
+    let broker = BrokerProcess::start(&spawner, &broker_bin, &config, &root, 512 << 20, &dev_miner()).unwrap();
 
     let source = Capability {
         class: CLASS_EVM_RPC_V1,

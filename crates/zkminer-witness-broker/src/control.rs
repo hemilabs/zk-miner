@@ -193,8 +193,7 @@ fn refresh(b: &Broker, prefixes: &[zkminer_witness::ipc::IpPrefix], own: Vec<std
         }
     }
     let count = u32::try_from(parsed.len()).unwrap_or(u32::MAX);
-    b.policy.write().unwrap_or_else(|p| p.into_inner()).connected = parsed;
-    *b.own_addresses.write().unwrap_or_else(|p| p.into_inner()) = own;
+    b.policy.write().unwrap_or_else(|p| p.into_inner()).facts = zkminer_netguard::HostFacts::new(parsed, own);
     // A host name's pinned answer may now name a connected or own address.
     for ep in b.all_endpoints() {
         ep.refilter();

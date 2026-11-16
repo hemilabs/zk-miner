@@ -10824,6 +10824,7 @@ dependencies = [
  "tracing-subscriber 0.3.22",
  "url",
  "zeroize",
+ "zkminer-netguard",
  "zkminer-witness",
  "zkminer-witness-sandbox",
 ]
@@ -10864,6 +10865,7 @@ dependencies = [
  "zkminer-chain",
  "zkminer-config",
  "zkminer-contracts",
+ "zkminer-netguard",
  "zkminer-prover",
  "zkminer-prover-protocol",
  "zkminer-witness",

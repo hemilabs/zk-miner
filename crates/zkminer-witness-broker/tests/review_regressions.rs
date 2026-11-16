@@ -72,7 +72,7 @@ async fn lazy_resolution_goes_through_the_same_filter() {
     let dns = TestDns::start(&[("rpc.test", &["127.0.0.1"])]).await;
     let dir = tempfile::tempdir().unwrap();
     let text = config_text(dir.path(), &evm("provider", &format!("http://rpc.test:{}/", anvil.port), ANVIL_CHAIN, ""));
-    let mut cfg = BrokerConfig::from_toml(&text, dir.path()).unwrap();
+    let mut cfg = BrokerConfig::from_toml(&text, dir.path(), zkminer_witness_broker::egress::NetMode::DevPrivate).unwrap();
     cfg.host = Some(HostFacts {
         resolved: HashMap::from([("provider".to_string(), vec![])]),
         connected: vec![],
