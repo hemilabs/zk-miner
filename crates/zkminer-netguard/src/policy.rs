@@ -67,7 +67,8 @@ pub enum Denied {
     PrefixOverlapsSite { prefix: Prefix, site: Prefix },
     /// A prefix holds one of the DNS servers the host uses.
     PrefixHoldsDnsServer { prefix: Prefix, ip: IpAddr },
-    /// A prefix overlaps a route that does not take the default path.
+    /// A prefix overlaps a route that does not take the default path, a route that delivers to
+    /// this host, or a destination a policy rule sends to another table.
     PrefixOverlapsRoute { prefix: Prefix, route: Prefix },
     /// A prefix overlaps one of the operator's deny CIDRs.
     PrefixOverlapsDeny { prefix: Prefix, deny: Prefix },
@@ -195,7 +196,8 @@ impl Denied {
             }
             Denied::PrefixOverlapsRoute { prefix, route } => write!(
                 f,
-                "{prefix} overlaps {route}, a route of this host that is not its default route"
+                "{prefix} overlaps {route}, which this host routes other than by its default \
+                 route (another gateway, on-link, to itself, or by a policy rule)"
             ),
             Denied::NoAdmittedAddress { host, refused } => {
                 write!(f, "{host:?} resolves to no admitted address (")?;
