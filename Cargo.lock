@@ -10062,6 +10062,7 @@ dependencies = [
  "toml",
  "tracing",
  "zeroize",
+ "zkminer-netguard",
 ]
 
 [[package]]

@@ -14,3 +14,5 @@ tracing = { workspace = true }
 dirs = { workspace = true }
 hex = { workspace = true }
 zeroize = { workspace = true }
+# Only the mode and CIDR types: no HTTP client.
+zkminer-netguard = { workspace = true }
