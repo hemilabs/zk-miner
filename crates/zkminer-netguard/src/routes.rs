@@ -195,6 +195,8 @@ pub enum RouteKind {
     /// A policy-routing rule (`ip rule`) sends it to a routing table other than the default
     /// route's.
     PolicyRule,
+    /// The kernel has no route for it (unreachable, prohibited, blackholed).
+    NoRoute,
 }
 
 /// How a policy-routing rule's selectors, its destination (`to`) aside, read this process's own
@@ -582,6 +584,76 @@ fn covered(p: Prefix, set: &[Prefix]) -> bool {
     covered(Prefix::new(p.addr, p.len + 1), set) && covered(Prefix::new(upper, p.len + 1), set)
 }
 
+/// Where [`crate::admit`] learns how the kernel routes one destination (see
+/// [`RouteTable::judge`]): the kernel itself ([`KernelRoutes`]) for facts read from this host, a
+/// fake in tests.
+pub trait RouteOracle: Send + Sync + std::fmt::Debug {
+    /// The routing entry the kernel would use for a connection from this process to `dst` —
+    /// one [`Route`] per nexthop, all with the entry's prefix, table and type — or `Ok(None)`
+    /// when it has no route.
+    fn route_to(&self, dst: IpAddr) -> std::io::Result<Option<Vec<Route>>>;
+}
+
+/// The kernel, asked over netlink per destination (Linux; elsewhere every query fails, and a
+/// policy over gathered facts refuses everything: routes are only read on Linux anyway).
+///
+/// One `RTM_GETROUTE` per destination, non-dump, with the destination, this process's uid and
+/// TCP, and `RTM_F_FIB_MATCH`: the kernel runs its policy rules and answers with the routing
+/// entry it matched (prefix, table, type, every nexthop). No privileges needed. It is what a
+/// connection's first route lookup sees: the firewall mark is 0, the source not yet chosen, the
+/// ports not given.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KernelRoutes;
+
+impl RouteOracle for KernelRoutes {
+    fn route_to(&self, dst: IpAddr) -> std::io::Result<Option<Vec<Route>>> {
+        sys::query(dst)
+    }
+}
+
+impl RouteTable {
+    /// Judges the kernel's answer for one destination ([`RouteOracle::route_to`]; an empty
+    /// answer is no route): admitted only for a unicast route whose every nexthop is an uplink
+    /// (the gateway and interface of an ordinary table's default route), or that is itself a
+    /// default-like route of an ordinary table. Anything else is refused: a route that delivers
+    /// to this host, no route, a default-like route of a table only a rule's selector reaches
+    /// ([`RouteKind::PolicyRule`]), an on-link route, a route through another gateway or through
+    /// a nexthop object whose gateway the answer does not show.
+    pub fn judge(&self, answer: &[Route]) -> Result<(), RouteRefusal> {
+        let Some(first) = answer.first() else {
+            return Err(RouteRefusal {
+                prefix: Prefix::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+                kind: RouteKind::NoRoute,
+            });
+        };
+        if let Some(r) = answer.iter().find(|r| r.delivers_locally()) {
+            return Err(RouteRefusal::of(r));
+        }
+        let through_uplinks = answer.iter().all(|r| match r.hop {
+            Hop::Via(gw) => self.uplinks.contains(&(gw, r.ifindex)),
+            Hop::OnLink | Hop::Unknown => false,
+        });
+        if through_uplinks {
+            return Ok(());
+        }
+        if first.is_default_like() {
+            return if self.is_ordinary(first.prefix.addr.is_ipv6(), first.table) {
+                Ok(())
+            } else {
+                Err(RouteRefusal {
+                    prefix: first.prefix,
+                    kind: RouteKind::PolicyRule,
+                })
+            };
+        }
+        let off = answer
+            .iter()
+            .find(|r| !matches!(r.hop, Hop::Via(gw) if self.uplinks.contains(&(gw, r.ifindex))))
+            .unwrap_or(first);
+        Err(RouteRefusal::of(off))
+    }
+}
+
 /// Reads every unicast, `local`, `broadcast` and `anycast` route of every table, and every
 /// policy-routing rule, IPv4 and IPv6. `loopback` is the set of loopback interface indexes (from
 /// the interface list).
@@ -623,7 +695,10 @@ mod sys {
     const RTA_MULTIPATH: u16 = 9;
     const RTA_VIA: u16 = 18;
     const RTA_TABLE: u16 = 15;
+    const RTA_UID: u16 = 25;
+    const RTA_IP_PROTO: u16 = 27;
     const RTA_NH_ID: u16 = 30;
+    const RTM_F_FIB_MATCH: u32 = 0x2000;
     const RTM_NEWRULE: u16 = 32;
     const RTM_GETRULE: u16 = 34;
     const FR_ACT_TO_TBL: u8 = 1;
@@ -1111,12 +1186,115 @@ mod sys {
         Ok(v)
     }
 
+    /// How long the kernel may take to answer one route query.
+    const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// The route the kernel would take for a connection from this process to `dst`: a
+    /// non-dump `RTM_GETROUTE` with `RTA_DST`, `RTA_UID` (this process's uid) and `RTA_IP_PROTO`
+    /// (TCP), and `RTM_F_FIB_MATCH`, so the answer is the matching routing entry itself — its
+    /// prefix, table, type and every nexthop — as the rules (`ip rule`) select it. Unprivileged.
+    /// `Ok(None)` when the kernel has no route (unreachable, prohibited).
+    pub(super) fn query(dst: IpAddr) -> io::Result<Option<Vec<Route>>> {
+        let sock = socket()?;
+        let tv = libc::timeval {
+            tv_sec: QUERY_TIMEOUT.as_secs() as libc::time_t,
+            tv_usec: 0,
+        };
+        // SAFETY: `tv` is a valid timeval for SO_RCVTIMEO.
+        if unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&tv as *const libc::timeval).cast(),
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let (family, width, octets): (u8, u8, Vec<u8>) = match dst {
+            IpAddr::V4(a) => (libc::AF_INET as u8, 32, a.octets().to_vec()),
+            IpAddr::V6(a) => (libc::AF_INET6 as u8, 128, a.octets().to_vec()),
+        };
+        let mut body = vec![0u8; RTMSG_LEN];
+        body[0] = family;
+        body[1] = width;
+        body[8..12].copy_from_slice(&RTM_F_FIB_MATCH.to_ne_bytes());
+        // SAFETY: getuid cannot fail.
+        let uid = unsafe { libc::getuid() };
+        for (ty, data) in [
+            (RTA_DST, octets),
+            (RTA_UID, uid.to_ne_bytes().to_vec()),
+            (RTA_IP_PROTO, vec![libc::IPPROTO_TCP as u8]),
+        ] {
+            body.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
+            body.extend_from_slice(&ty.to_ne_bytes());
+            body.extend_from_slice(&data);
+            body.resize(align4(body.len()), 0);
+        }
+        let seq = 1;
+        send(&sock, &message(RTM_GETROUTE, NLM_F_REQUEST, seq, &body))?;
+        let mut buf = vec![0u8; RECV_BUF];
+        loop {
+            let n = recv(&sock, &mut buf)?;
+            if let Some(answer) = parse_answer(&buf[..n], seq)? {
+                return Ok(answer);
+            }
+        }
+    }
+
+    /// The answer to [`query`] in one datagram: `Some(Some(routes))` for a route,
+    /// `Some(None)` for none, `None` when the datagram does not answer it.
+    pub(super) fn parse_answer(mut b: &[u8], seq: u32) -> io::Result<Option<Option<Vec<Route>>>> {
+        while b.len() >= NLMSG_HDRLEN {
+            let len = u32_at(b, 0).ok_or_else(malformed)? as usize;
+            let ty = u16_at(b, 4).ok_or_else(malformed)?;
+            let mseq = u32_at(b, 8).ok_or_else(malformed)?;
+            if len < NLMSG_HDRLEN || len > b.len() {
+                return Err(malformed());
+            }
+            let payload = &b[NLMSG_HDRLEN..len];
+            if mseq == seq {
+                match ty {
+                    NLMSG_ERROR => {
+                        let code = u32_at(payload, 0).ok_or_else(malformed)? as i32;
+                        return match -code {
+                            0 => Err(malformed()),
+                            libc::ENETUNREACH | libc::EHOSTUNREACH | libc::EACCES => Ok(Some(None)),
+                            e => Err(io::Error::from_raw_os_error(e)),
+                        };
+                    }
+                    RTM_NEWROUTE => {
+                        let mut out = Vec::new();
+                        parse_route_entry(payload, &mut out)?;
+                        return Ok(Some((!out.is_empty()).then_some(out)));
+                    }
+                    _ => {}
+                }
+            }
+            b = &b[align4(len).min(b.len())..];
+        }
+        Ok(None)
+    }
+
+    /// One `RTM_NEWROUTE` of a dump into `out` (routes the kernel cached, `RTM_F_CLONED`, and
+    /// routes that reach nothing are skipped).
     fn parse_route(p: &[u8], out: &mut Vec<Route>) -> io::Result<()> {
+        let flags = u32_at(p, 8).ok_or_else(malformed)?;
+        if flags & RTM_F_CLONED != 0 {
+            return Ok(());
+        }
+        parse_route_entry(p, out)
+    }
+
+    /// One `RTM_NEWROUTE` into `out`, one [`Route`] per nexthop; nothing for a route of a type
+    /// that reaches nothing (`blackhole`, `unreachable`, `prohibit`, `throw`, `multicast`, …).
+    fn parse_route_entry(p: &[u8], out: &mut Vec<Route>) -> io::Result<()> {
         if p.len() < RTMSG_LEN {
             return Err(malformed());
         }
         let (family, dst_len, rtype) = (p[0], p[1], p[7]);
-        let flags = u32_at(p, 8).ok_or_else(malformed)?;
         let kind = match rtype {
             RTN_UNICAST => RouteType::Unicast,
             // Review r2 R2-NG-1: these deliver to this host; they were dropped, so an AnyIP
@@ -1126,9 +1304,6 @@ mod sys {
             RTN_ANYCAST => RouteType::Anycast,
             _ => return Ok(()),
         };
-        if flags & RTM_F_CLONED != 0 {
-            return Ok(());
-        }
         let mut table = u32::from(p[4]);
         let mut dst = None;
         let mut gateway = None;
@@ -1961,6 +2136,125 @@ mod sys {
             assert_eq!(out[0].table, 254);
         }
 
+        /// Review r2 R2-NG-3, on this host's real routing (read-only): the kernel answers per
+        /// destination, and on a host whose rules are the stock ones its verdicts agree with the
+        /// prefix model's: own addresses deliver locally, on-link neighbours are on-link, public
+        /// addresses take the default path.
+        #[test]
+        fn this_hosts_kernel_answers_agree_with_its_tables() {
+            use super::super::{RouteKind, RouteTable};
+            let (routes, rules) = dump().unwrap();
+            let t = RouteTable::with_rules(routes.clone(), rules.clone());
+            let stock = rules.iter().all(|r| {
+                r.to.is_none()
+                    && r.matches == RuleMatch::Always
+                    && !r.invert
+                    && matches!(r.action, RuleAction::Lookup(253..=255))
+            });
+            let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+            let mut checked = 0;
+            for v6 in [false, true] {
+                let has_default = t
+                    .routes()
+                    .iter()
+                    .any(|r| r.prefix.addr.is_ipv6() == v6 && r.prefix.len == 0);
+                let public = if v6 {
+                    ip("2606:4700:4700::1111")
+                } else {
+                    ip("8.8.8.8")
+                };
+                let answer = query(public).expect("route query");
+                if has_default {
+                    let a = answer.expect("a route to the internet");
+                    assert_eq!(t.judge(&a), Ok(()), "{public}: {a:?}");
+                    checked += 1;
+                } else {
+                    assert!(t.judge(answer.as_deref().unwrap_or_default()).is_err());
+                }
+            }
+            // This host's own addresses: delivered locally (link-local ones need a scope).
+            for r in t.local_routes() {
+                let a = r.prefix.addr;
+                if r.kind != RouteType::Local
+                    || matches!(a, IpAddr::V6(v) if v.segments()[0] & 0xffc0 == 0xfe80)
+                {
+                    continue;
+                }
+                let answer = query(a).unwrap().expect("a local route");
+                assert_eq!(
+                    t.judge(&answer).map_err(|r| r.kind),
+                    Err(RouteKind::Local),
+                    "{a}: {answer:?}"
+                );
+                checked += 1;
+            }
+            // A neighbour on each on-link route (not the host itself, not a broadcast address).
+            for prefix in t.on_link_prefixes() {
+                let width = if prefix.addr.is_ipv4() { 32 } else { 128 };
+                if prefix.len + 3 > width
+                    || matches!(prefix.addr, IpAddr::V6(v) if v.segments()[0] & 0xffc0 == 0xfe80)
+                {
+                    continue;
+                }
+                let n = match prefix.addr {
+                    IpAddr::V4(a) => IpAddr::V4(Ipv4Addr::from(u32::from(a) | 6)),
+                    IpAddr::V6(a) => IpAddr::V6(Ipv6Addr::from(u128::from(a) | 6)),
+                };
+                if t.local_routes().iter().any(|r| r.holds(n)) {
+                    continue;
+                }
+                let answer = query(n).unwrap().expect("an on-link route");
+                let kernel = t.judge(&answer).map_err(|r| r.kind);
+                assert_eq!(kernel, Err(RouteKind::OnLink), "{n}: {answer:?}");
+                if stock {
+                    assert_eq!(
+                        t.off_default_path(n).map(|r| r.kind),
+                        Some(RouteKind::OnLink)
+                    );
+                }
+                checked += 1;
+            }
+            eprintln!("{checked} kernel answers checked against the tables");
+            assert!(checked >= 2, "checked {checked}");
+        }
+
+        /// The answer to a route query: an entry, no route (`ENETUNREACH`), a type that reaches
+        /// nothing, another sequence number (not ours), a failure.
+        #[test]
+        fn route_answers_parse() {
+            let v4 = libc::AF_INET as u8;
+            let mut entry = rt(
+                v4,
+                1,
+                RTN_UNICAST,
+                &[
+                    attr(RTA_GATEWAY, &[10, 8, 0, 1]),
+                    attr(RTA_OIF, &7u32.to_ne_bytes()),
+                ],
+            );
+            entry[8..12].copy_from_slice(&RTM_F_CLONED.to_ne_bytes()); // kept in an answer
+            let got = parse_answer(&msg(RTM_NEWROUTE, 1, &entry), 1).unwrap();
+            let routes = got.unwrap().unwrap();
+            assert_eq!(routes.len(), 1);
+            assert_eq!(routes[0].prefix, "0.0.0.0/1".parse().unwrap());
+            assert_eq!(
+                parse_answer(&msg(NLMSG_ERROR, 1, &(-libc::ENETUNREACH).to_ne_bytes()), 1).unwrap(),
+                Some(None)
+            );
+            let blackhole = rt(v4, 8, 6, &[attr(RTA_DST, &[10, 0, 0, 0])]);
+            assert_eq!(
+                parse_answer(&msg(RTM_NEWROUTE, 1, &blackhole), 1).unwrap(),
+                Some(None)
+            );
+            assert_eq!(
+                parse_answer(&msg(RTM_NEWROUTE, 2, &entry), 1).unwrap(),
+                None
+            );
+            let e =
+                parse_answer(&msg(NLMSG_ERROR, 1, &(-libc::ENOBUFS).to_ne_bytes()), 1).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::ENOBUFS));
+        }
+
         /// This host's own tables and rules read, and have what every running Linux host has:
         /// `main` consulted for every connection.
         #[test]
@@ -1986,6 +2280,10 @@ mod sys {
 mod sys {
     pub(super) fn dump() -> std::io::Result<(Vec<super::Route>, Vec<super::Rule>)> {
         Ok((Vec::new(), Vec::new()))
+    }
+
+    pub(super) fn query(_: std::net::IpAddr) -> std::io::Result<Option<Vec<super::Route>>> {
+        Err(std::io::ErrorKind::Unsupported.into())
     }
 }
 

@@ -55,6 +55,8 @@ pub enum Denied {
     Host { host: String, why: HostDenied },
     /// The name resolved, but to no admitted address.
     NoAdmittedAddress { host: String, refused: Vec<Denied> },
+    /// The kernel could not be asked how the destination is routed.
+    RouteQueryFailed { ip: IpAddr, why: String },
     /// A prefix (an operator's role entry) holds an address that is not global.
     PrefixNotGlobal(Prefix),
     /// A prefix holds one of the host's own addresses.
@@ -154,6 +156,7 @@ impl Denied {
                     f,
                     "{ip} is delivered to this host itself (its local route {route})"
                 ),
+                RouteKind::NoRoute => write!(f, "{ip} has no route on this host"),
                 RouteKind::PolicyRule => write!(
                     f,
                     "{ip} is routed by {route}, which a policy-routing rule (ip rule) sends to \
@@ -162,6 +165,9 @@ impl Denied {
             },
             Denied::DenyCidr { ip, prefix } => {
                 write!(f, "{ip} is in the operator's deny CIDR {prefix}")
+            }
+            Denied::RouteQueryFailed { ip, why } => {
+                write!(f, "could not ask the kernel how {ip} is routed ({why})")
             }
             Denied::Url(why) => fmt::Display::fmt(why, f),
             Denied::Host { host, why } => write!(f, "host {host:?}: {why}"),
@@ -218,6 +224,7 @@ impl Denied {
                 | Denied::SitePrefix { .. }
                 | Denied::DnsServer(_)
                 | Denied::OffDefaultRoute { .. }
+                | Denied::RouteQueryFailed { .. }
         )
     }
 }
@@ -229,8 +236,11 @@ impl Denied {
 /// an IPv4-mapped, SIIT or NAT64 spelling of an address is that address), it is none of the host's
 /// own addresses (its public NAT addresses included), on none of its connected prefixes (on-link
 /// routes included), in none of its IPv6 site prefixes, none of the DNS servers it uses, in none of
-/// `extra_deny`, and its best route (as given, and as its canonical address) is the default path
-/// ([`crate::routes::RouteTable::off_default_path`]).
+/// `extra_deny`, its best route (as given, and as its canonical address) is the default path
+/// ([`crate::routes::RouteTable::off_default_path`]), and — for facts read from this host — the
+/// kernel, asked how it would route a connection to `ip`, answers with the default path
+/// ([`crate::routes::RouteTable::judge`]; one netlink round trip per destination and facts
+/// snapshot).
 pub fn admit(
     mode: NetMode,
     ip: IpAddr,
@@ -270,7 +280,9 @@ pub fn admit(
             kind: r.kind,
         });
     }
-    Ok(())
+    // Review r2 R2-NG-3: the kernel applies the policy rules exactly; the tables above are the
+    // prefix model, which a destination rule into a default-only table slipped past.
+    facts.kernel_verdict(ip)
 }
 
 /// [`admit`] for every address of a prefix at once (an operator's role entry, which admits
@@ -834,6 +846,183 @@ mod tests {
             assert!(f.refused_prefixes().contains(&pfx("52.95.0.0/16")));
             assert_eq!(admit(NetMode::Public, ip("8.8.8.8"), &f, &[]), Ok(()));
         }
+    }
+
+    /// Staged kernel answers, counted.
+    #[derive(Debug, Default)]
+    struct Staged {
+        answers: std::collections::HashMap<IpAddr, Option<Vec<crate::routes::Route>>>,
+        asked: std::sync::Mutex<Vec<IpAddr>>,
+    }
+
+    impl crate::routes::RouteOracle for Staged {
+        fn route_to(&self, dst: IpAddr) -> io::Result<Option<Vec<crate::routes::Route>>> {
+            self.asked.lock().unwrap().push(dst);
+            self.answers
+                .get(&dst)
+                .cloned()
+                .ok_or_else(|| io::Error::other("no staged answer"))
+        }
+    }
+
+    /// Review r2 R2-NG-3, the per-connection side: the kernel, asked per destination, applies the
+    /// rules the prefix model cannot see (here the rule is not in the dump at all), and its
+    /// answer is judged: only a unicast route through an uplink, or a default-like route of an
+    /// ordinary table, is admitted. Asked once per destination and facts snapshot.
+    #[test]
+    fn the_kernels_answer_per_destination_is_judged() {
+        use crate::facts::RawFacts;
+        use crate::routes::{Route, RouteType, Rule};
+        let main_default = Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 2);
+        let mut rules = Rule::stock(false);
+        rules.insert(
+            0,
+            Rule {
+                invert: true,
+                matches: crate::routes::RuleMatch::Never, // not fwmark 0xca6c
+                ..Rule::lookup(false, 51820)
+            },
+        );
+        let raw = RawFacts {
+            interface_prefixes: vec![pfx("192.168.1.0/24"), pfx("10.8.0.0/24")],
+            interface_addresses: vec![ip("192.168.1.33"), ip("10.8.0.6")],
+            routes: vec![
+                main_default,
+                Route::on_link(pfx("192.168.1.0/24"), 2),
+                Route::on_link(pfx("10.8.0.0/24"), 7),
+                Route::via(pfx("0.0.0.0/0"), ip("10.8.0.1"), 7).in_table(100),
+            ],
+            rules,
+            ..RawFacts::default()
+        };
+        let mut staged = Staged::default();
+        let mut stage = |a: &str, answer: Option<Vec<Route>>| {
+            staged.answers.insert(ip(a), answer);
+        };
+        stage("8.8.8.8", Some(vec![main_default]));
+        // `to 52.95.0.0/16 lookup 100`, added after the dump: the kernel answers table 100.
+        stage(
+            "52.95.1.1",
+            Some(vec![
+                Route::via(pfx("0.0.0.0/0"), ip("10.8.0.1"), 7).in_table(100)
+            ]),
+        );
+        // An AnyIP range the dump missed.
+        stage(
+            "185.199.108.10",
+            Some(vec![Route::local(pfx("185.199.108.0/24"), 1).in_table(255)]),
+        );
+        // ECMP: one path through the uplink, one through the VPN.
+        stage(
+            "9.9.1.1",
+            Some(vec![
+                Route::via(pfx("9.9.0.0/16"), ip("192.168.1.1"), 2),
+                Route::via(pfx("9.9.0.0/16"), ip("10.8.0.1"), 7),
+            ]),
+        );
+        // OpenVPN def1 in main: a split default.
+        stage(
+            "93.184.216.34",
+            Some(vec![Route::via(pfx("0.0.0.0/1"), ip("10.8.0.1"), 7)]),
+        );
+        // wg-quick's table, which `not fwmark` makes ordinary.
+        stage(
+            "1.0.0.1",
+            Some(vec![Route::on_link(pfx("0.0.0.0/0"), 9).in_table(51820)]),
+        );
+        // A DHCP option 121 host route via the router; an on-link one.
+        stage(
+            "172.233.157.223",
+            Some(vec![Route::via(
+                pfx("172.233.157.223/32"),
+                ip("192.168.1.1"),
+                2,
+            )]),
+        );
+        stage(
+            "45.60.1.20",
+            Some(vec![Route::on_link(pfx("45.60.1.0/24"), 8)]),
+        );
+        // No route; an unknown nexthop.
+        stage("203.0.114.9", None);
+        stage(
+            "198.18.0.0",
+            Some(vec![Route {
+                hop: crate::routes::Hop::Unknown,
+                ..Route::on_link(pfx("100.0.0.0/8"), 2)
+            }]),
+        );
+        let staged = Arc::new(staged);
+        let f = HostFacts::assemble(raw, &offline()).with_route_oracle(staged.clone());
+        let a = |s: &str| admit(NetMode::Public, ip(s), &f, &[]);
+        assert_eq!(a("8.8.8.8"), Ok(()));
+        assert_eq!(
+            a("52.95.1.1"),
+            Err(Denied::OffDefaultRoute {
+                ip: ip("52.95.1.1"),
+                route: pfx("0.0.0.0/0"),
+                kind: RouteKind::PolicyRule
+            })
+        );
+        assert_eq!(
+            a("185.199.108.10"),
+            Err(Denied::OffDefaultRoute {
+                ip: ip("185.199.108.10"),
+                route: pfx("185.199.108.0/24"),
+                kind: RouteKind::Local
+            })
+        );
+        assert_eq!(
+            a("9.9.1.1"),
+            Err(Denied::OffDefaultRoute {
+                ip: ip("9.9.1.1"),
+                route: pfx("9.9.0.0/16"),
+                kind: RouteKind::OtherGateway
+            })
+        );
+        assert_eq!(a("93.184.216.34"), Ok(()));
+        assert_eq!(a("1.0.0.1"), Ok(()));
+        assert_eq!(a("172.233.157.223"), Ok(()));
+        assert!(matches!(
+            a("45.60.1.20"),
+            Err(Denied::OffDefaultRoute {
+                kind: RouteKind::OnLink,
+                ..
+            })
+        ));
+        let e = a("203.0.114.9").unwrap_err();
+        assert_eq!(
+            e,
+            Denied::OffDefaultRoute {
+                ip: ip("203.0.114.9"),
+                route: pfx("203.0.114.9/32"),
+                kind: RouteKind::NoRoute
+            }
+        );
+        assert!(e.to_string().contains("no route"), "{e}");
+        assert!(matches!(
+            a("198.18.0.0"),
+            Err(Denied::NotGlobal(_)) // judged before the kernel is asked
+        ));
+        // A query that fails refuses, and says so.
+        let e = a("4.4.4.4").unwrap_err();
+        assert!(matches!(e, Denied::RouteQueryFailed { .. }), "{e:?}");
+        assert!(e.depends_on_facts());
+        assert!(e.to_string().contains("could not ask the kernel"), "{e}");
+        // An IPv4-mapped address is asked as its IPv4 address; each destination once.
+        assert_eq!(a("::ffff:8.8.8.8"), Ok(()));
+        assert_eq!(a("8.8.8.8"), Ok(()));
+        let asked = staged.asked.lock().unwrap().clone();
+        assert_eq!(
+            asked.iter().filter(|d| **d == ip("8.8.8.8")).count(),
+            1,
+            "{asked:?}"
+        );
+        assert!(!asked.contains(&ip("::ffff:8.8.8.8")));
+        assert!(!asked.contains(&ip("198.18.0.0")), "refused before asking");
+        // Developer mode asks nothing.
+        assert_eq!(admit(NetMode::DevPrivate, ip("52.95.1.1"), &f, &[]), Ok(()));
+        let _ = RouteType::Local;
     }
 
     /// Review r1 fetch F1 (PoC `facts`), inverted, on this host's real facts: neighbours in the
