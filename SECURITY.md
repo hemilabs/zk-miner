@@ -129,12 +129,13 @@ job there could then reach this host's private network.
 | SP1 Groth16 circuit artifacts download and size probe (SP1 worker warm-up) | fixed in the build (the SP1 SDK's artifact URL) | none needed |
 | `sp1-gpu-server` | local IPC between the SP1 worker and its server | not a network destination |
 | `sp1-demo` (optional command) | serves an ELF on 127.0.0.1 for a local miner | the miner needs developer mode to fetch it |
-| Witness builder fetches (`evm-rpc/v1`) | the operator's `[[evm_rpc]]` endpoints; the request body from **the builder** | the witness broker's floor (below) |
-| Witness `blob/v1` fetches | the operator's `[[blob_mirror]]` templates; the hash from **the builder** | the broker's floor; the URL is built by the broker |
-| `hemi-code` artifact reads | the operator's `[artifacts]` endpoint and mirror; the address from **the job** | the broker's floor |
-| The broker's DNS resolver | the operator (`[dns] servers`, else `/etc/resolv.conf`) | dials only those servers; never a fetch destination |
+| Witness builder fetches (`evm-rpc/v1`) | the operator's `[[evm_rpc]]` endpoints; the request body from **the builder** | the broker's connections are made by the miner's connector (below); the broker has no network |
+| Witness `blob/v1` fetches | the operator's `[[blob_mirror]]` templates; the hash from **the builder** | the connector; the URL is built by the broker |
+| `hemi-code` artifact reads | the operator's `[artifacts]` endpoint and mirror; the address from **the job** | the connector |
+| The connector's DNS resolver (in the miner) | the operator (`[dns] servers`, else `/etc/resolv.conf`) | dials only those servers, for the operator's endpoint names only; never a fetch destination |
 | Public-address discovery (miner and broker, at startup and every 5 minutes) | fixed in the build: `ns1.google.com` and `1.1.1.1` (and their IPv6 addresses), UDP port 53 | none needed: requesters cannot change them; `[egress] discover_public_addresses = false` turns it off |
 | The builder runner and the execute worker | none | seccomp denies `socket`, `socketpair` and `connect` |
+| The broker itself | none | seccomp denies `socket`, `connect`, `bind`, `listen`, `accept*` (and `socketpair` once its runtime is up); Landlock grants no TCP port |
 | The miner's witness host (pipeline, builder runs, store) | none | talks to the broker over a Unix socket pair only |
 
 Job inputs come from the chain (calldata), not from URLs, and zkVM guests have no network
@@ -142,11 +143,45 @@ access.
 
 ## Witness jobs: the broker
 
-A witness job's builder asks the miner's broker (`zkminer-witness-broker`, sandboxed) for data,
-and only the broker connects anywhere. Its endpoints are configured by the operator, but a builder
-can ask one anything its method set allows, so a node on loopback or the LAN would expose whatever
-that node can reach. The broker therefore holds them to the same rule, with netguard's predicate
-(there is no second one):
+A witness job's builder asks the miner's broker (`zkminer-witness-broker`, sandboxed) for data.
+The broker parses untrusted bytes (builder requests, endpoint answers), so it is treated as the
+process an attacker may get code execution in, and **it has no network of its own**: its seccomp
+filter denies `socket`, `connect`, `bind`, `listen` and `accept*`, Landlock grants it no TCP port,
+and once its runtime is up even `socketpair` is denied. Without `connect` it cannot disconnect a
+socket it holds (`connect(AF_UNSPEC)`) and aim it elsewhere, and TCP Fast Open to another address
+fails on a connected socket.
+
+Every connection the broker uses is made by the **connector**, in the miner
+(`crates/zkminer-witness-broker/src/connector`, run by `zkminer-witness-host`): the broker sends a
+fixed 32-byte request naming an operator endpoint **by index** (with the role and port it expects,
+which must match) over a Unix socket pair the miner created before starting it, and gets back the
+connected TCP socket (`SCM_RIGHTS`) or a refusal. The connector:
+
+- uses the broker's config file **as the miner loaded it** (in the miner's network mode, without
+  reading the provider keys), never anything the broker says; the broker can name an endpoint,
+  never a host, an address or a port of its own;
+- resolves the endpoint's host name itself (the broker resolves nothing), with the operator's DNS
+  servers, and keeps only the answers its role entry admits;
+- admits each address with netguard's floor over **the miner's** host facts (gathered with the
+  stricter of the miner's and the broker file's `[egress]` options), the miner's `[egress]
+  deny_cidrs`, the broker file's deny CIDRs and the DNS servers; developer mode only from the
+  miner's own `[dev] private_network`;
+- connects with the configured connect timeout, and paces attempts (64 at once, 16 a second: a
+  hard budget of `64 + 16·t` connections in any `t` seconds; at most each endpoint's
+  `max_concurrency` in flight);
+- treats the broker as hostile: strict fixed-size decoding, and a malformed frame, a file
+  descriptor sent to it, more than 64 requests in flight, a request id reused while in flight, or
+  more than 8 requests in a minute for an endpoint that does not exist **cut the broker off** —
+  the socket is closed, the miner pages `WITNESS-BROKER-CUT-OFF`, kills the broker's cgroup and
+  stops witness serving.
+
+So a broker an attacker controls can reach only the operator's configured endpoints, at addresses
+the miner's floor admits — the same set an honest broker reaches. The broker still checks every
+socket it is handed against its own floor (the endpoint's port and role entry; the public floor
+for a DNS-named endpoint) as a second layer.
+
+The configured endpoints themselves are held to the same rule, with netguard's predicate (there is
+no second one):
 
 - **Public mode** (the default, and the only mode on mainnet): the broker's config is refused when
   it loads if any endpoint's explicit `cidrs` or IP-literal host is not **entirely** global
@@ -157,19 +192,33 @@ that node can reach. The broker therefore holds them to the same rule, with netg
   `discover_public_addresses` in the broker's own config) — holds one of the host's addresses
   or overlaps one of its prefixes; or if a URL host name fails the host-name hygiene above. An
   IP-literal host must lie inside the endpoint's own `cidrs` when it has them, and is judged
-  too. Every connection is checked against the same floor again, and the broker's self-test
-  fails (`RoleEntriesPublic`) if any role entry in force is not public. The sandboxed broker
-  cannot read the host itself, so the miner re-reads the host's facts every 5 seconds and
-  sends them whenever they change.
+  too. The miner applies these checks to its own copy of the file before it starts the broker,
+  and the broker again to its copy. Every connection is admitted by the connector, and the
+  self-test fails (`RoleEntriesPublic`, `ConnectorRefusesPrivate`) if any role entry in force is
+  not public or the connector admits a private probe. The sandboxed broker cannot read the host
+  itself, so the miner re-reads the host's facts every 5 seconds and sends them, with its
+  `[egress] deny_cidrs`, whenever they change; the broker keeps the union of these and of what it
+  read at startup (a refresh never removes an address or prefix its own options found).
+- **The self-test** (at startup and hourly) also checks, from inside the sandboxed broker, that
+  `socket(AF_INET/AF_INET6)` fails and `connect`, `bind`, `listen` and `accept4` fail with the
+  filter's `EPERM`, and that the connector refuses an index past the configuration; and, in the
+  miner, that the connector refuses an address outside every role entry, a private address (public
+  mode) and a malformed request.
 - **Keys** (`key_file`) travel only over `https` in public mode. In developer mode they may also
-  go over `http` to a loopback IP literal or one inside the endpoint's own `cidrs`.
+  go over `http` to an IP literal that is **not global** and is loopback or inside the endpoint's
+  own `cidrs` (a global literal is never "the operator's own wire", whatever its `cidrs`).
+- **TLS** is rustls with the compiled-in webpki roots, in the broker (over the sockets the
+  connector hands it) and in every other HTTP client of the workspace; nothing links OpenSSL
+  (inside the sandbox OpenSSL could not read a CA store). The chain RPC client therefore trusts
+  the webpki roots, not the system's CA store.
 - **Cached RPC answers are per requester.** Answers to pinned queries are cached by the job's
   requester (its trust domain), so one requester's builder cannot tell, from how fast an answer
   comes back, whether another requester asked the same query.
-- **Host names** resolve through the broker's own resolver, and only global answers outside the
+- **Host names** resolve through the connector's resolver, and only global answers outside the
   deny CIDRs, connected prefixes and own addresses become an endpoint's addresses, in both modes.
-- **DNS servers** are operator infrastructure the resolver dials, so a stub such as `127.0.0.53`
-  is fine; every DNS server's address is added to the deny CIDRs, so no fetch connects to one.
+- **DNS servers** are operator infrastructure the connector's resolver dials, so a stub such as
+  `127.0.0.53` is fine; every DNS server's address is added to the deny CIDRs, so no fetch
+  connects to one.
 - **Developer mode** comes only from the miner: with `[dev] private_network = true` the miner
   starts the broker with `--dev-private-network`, and only then may explicitly configured
   endpoints be private (DNS answers still may not). The broker's config file has no key for it;
@@ -218,4 +267,21 @@ that node can reach. The broker therefore holds them to the same rule, with netg
   `chdir`/`fchdir`; `statx` fails as unimplemented. `stat` by path (`newfstatat`) stays open:
   Rust and glibc need it, and only a mount namespace (the system mode, not implemented) hides
   the filesystem from it, so a compromised builder can still tell whether a path exists and read
-  its size, owner, mode and times, though never its contents.
+  its size, owner, mode and times, though never its contents. They also may not read the mount
+  table (`listmount`/`statmount`, which would show the internal host names of NFS or CIFS
+  servers), the LSMs (`lsm_list_modules`, `lsm_get_self_attr`), `ustat` or `sysfs`, nor the
+  session or process group of another process (`getsid`/`getpgid` of any pid but their own);
+  their `argv[0]` is the binary's file name. What remains, irreducibly without a mount and pid
+  namespace: whether `/proc/<pid>` exists for any pid (so the host's process ids, and with `stat`
+  their owners, can be enumerated), the boot time (`CLOCK_BOOTTIME`), the kernel version (the
+  vDSO's ELF note, readable without a syscall), the CPU count (`sched_getaffinity`), and the
+  absolute path of the binary the miner started (`AT_EXECFN` in the auxiliary vector: the kernel
+  records the path `execve` was given).
+- **What a compromised broker can still do.** Within its sandbox, with the connector: open
+  connections to the operator's configured endpoints only (at the paced rate), and send them
+  anything — including requests its method sets would refuse, with the provider keys it holds.
+  So an endpoint's own exposure (an operator node with admin APIs, a provider account's quota)
+  is reachable by a broker compromise; keep endpoint nodes minimal (§11.1 of the design: `eth`,
+  `net`, `web3` only) and keys scoped. It can lie to the miner about fetch results (the guest
+  re-checks everything it uses) and read its spool directory. It cannot reach any other host,
+  port, or address, private or public, nor resolve a name.

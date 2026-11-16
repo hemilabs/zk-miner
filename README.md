@@ -232,6 +232,14 @@ Run the miner with the host's network (`--network host` in a container): inside 
 it sees only the container's interfaces and routes, so list the host's networks and addresses
 in `[egress] deny_cidrs` if it cannot.
 
+**Witness jobs.** The witness broker, which talks to your `[[evm_rpc]]`, mirror and artifact
+endpoints for builders, has no network of its own: its sandbox denies every socket call. The
+miner's *connector* makes each connection for it — the broker can only name one of the endpoints
+in its config file, which the miner reads itself — and admits the address with this same guard,
+using the miner's `[egress]` settings (the broker file's `[egress] deny_cidrs` are added to
+them) and the miner's `[dev] private_network`. So a broker an attacker took over still reaches
+only your configured endpoints. See SECURITY.md, "Witness jobs: the broker".
+
 | key | default | meaning |
 |---|---|---|
 | `[egress] deny_cidrs` | `[]` | More addresses no requester-caused connection may reach: CIDRs (`"203.0.113.0/24"`, `"2001:db8::/32"`) or bare addresses. Name the rest of your fleet, on a cloud host your VPC's IPv6 range (its other subnets have global addresses and are reached through the default route), and this host's public address behind NAT if discovering it fails or is off. Host bits must be zero. |
