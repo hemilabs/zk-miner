@@ -1,0 +1,25 @@
+# The builder SDK and its examples: their own workspace and lockfile, excluded from the zkminer
+# workspace (they target wasm32-unknown-unknown and have no dependencies). See README.md.
+[workspace]
+resolver = "2"
+members = ["hemiprove-builder-sdk", "examples/latest-block", "test-builders/faults"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Builders trap on panic (the runner reports TRAP); `panic = "abort"` makes a panic a wasm
+# `unreachable` instead of unwinding machinery. One codegen unit, LTO and no debug info keep the
+# module small and the build reproducible.
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false
+strip = true
+incremental = false
+
+[profile.dev]
+panic = "abort"

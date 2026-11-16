@@ -39,6 +39,9 @@ exclude = [
     # crates =0.4.3-succinct, and one workspace can hold only one 0.4.x. Build it with
     # `--manifest-path crates/zkminer-prove-openvm/Cargo.toml`.
     "crates/zkminer-prove-openvm",
+    # The witness-builder SDK and its examples: their own workspace and lockfile, built for
+    # wasm32-unknown-unknown (see sdk/README.md).
+    "sdk",
 ]
 
 [workspace.package]

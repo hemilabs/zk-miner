@@ -13,12 +13,9 @@ zkminer-witness = { path = "../zkminer-witness" }
 zkminer-witness-sandbox = { path = "../zkminer-witness-sandbox" }
 wasmtime = { version = "=48.0.8", default-features = false, features = ["runtime", "cranelift"] }
 wasmparser = { version = "=0.254.2", default-features = false, features = ["std", "validate", "features"] }
-anyhow = { workspace = true }
 thiserror = { workspace = true }
-sha2 = "0.10"
-hex = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
-tempfile = "3"
+hex = { workspace = true }
 wat = "1"
