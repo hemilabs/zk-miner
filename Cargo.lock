@@ -10714,6 +10714,7 @@ dependencies = [
  "sha2",
  "sp1-build",
  "sp1-sdk",
+ "tempfile",
  "thiserror 2.0.18",
  "tiny-keccak",
  "tokio",
@@ -10721,6 +10722,7 @@ dependencies = [
  "tracing-subscriber 0.3.22",
  "zkminer-config",
  "zkminer-prover-protocol",
+ "zkminer-witness-sandbox",
 ]
 
 [[package]]

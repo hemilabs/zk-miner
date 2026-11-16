@@ -11,6 +11,8 @@ mod windows_gpu_memory;
 #[cfg(windows)]
 pub mod windows_telemetry;
 pub mod worker;
+#[cfg(target_os = "linux")]
+pub mod witness_exec;
 
 #[cfg(feature = "risc0")]
 pub mod risc0;
