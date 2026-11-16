@@ -1,0 +1,13 @@
+[package]
+name = "faults"
+description = "Test builder for the runner's tests: panics or runs out of memory on request"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hemiprove-builder-sdk = { path = "../../hemiprove-builder-sdk" }

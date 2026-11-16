@@ -1,0 +1,9 @@
+[package]
+name = "hemiprove-builder-sdk"
+description = "Safe wrappers for HemiProve witness builders (builder ABI v1, wasm32-unknown-unknown)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No dependencies: everything a builder links is in this workspace and the Rust toolchain.
+[dependencies]
