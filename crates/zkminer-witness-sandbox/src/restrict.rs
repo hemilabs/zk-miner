@@ -78,7 +78,8 @@ pub(crate) fn thread_count() -> std::io::Result<usize> {
 ///    cover), no reaching other processes of the same uid (`setpriority`, `ioprio_set`, `prlimit64`,
 ///    `sched_set*` on another pid, `migrate_pages`, `move_pages`, `process_madvise`, `pidfd_getfd`),
 ///    no `TIOCSTI`/`TIOCLINUX`, no `PR_SET_PDEATHSIG` (the parent-death signal stays), no x32
-///    syscalls. The broker additionally may `socket(AF_INET | AF_INET6, ..)`, `connect`, and open
+///    syscalls. The broker additionally may `socket(AF_INET | AF_INET6, ..)`, `socketpair(AF_UNIX, ..)`
+///    (a connected pair reaches nothing; tokio's signal driver needs one), `connect`, and open
 ///    files (which Landlock confines).
 /// 4. Verification: `PR_GET_SECCOMP == 2`, `PR_GET_NO_NEW_PRIVS == 1`, `PR_GET_DUMPABLE == 0`,
 ///    `RLIMIT_CORE == 0`.
@@ -311,10 +312,11 @@ fn path_opens() -> Vec<Denied> {
     v
 }
 
-/// Socket syscalls the broker needs (`socket` itself is argument-filtered for it).
+/// Socket syscalls the broker needs (`socket` and `socketpair` are argument-filtered for it).
 fn client_sockets() -> Vec<Denied> {
     vec![
         d("socket", libc::SYS_socket),
+        d("socketpair", libc::SYS_socketpair),
         d("connect", libc::SYS_connect),
     ]
 }
@@ -323,7 +325,6 @@ fn client_sockets() -> Vec<Denied> {
 fn always_denied() -> Vec<Denied> {
     use libc::*;
     let mut v = vec![
-        d("socketpair", SYS_socketpair),
         d("bind", SYS_bind),
         d("listen", SYS_listen),
         d("accept", SYS_accept),
@@ -531,6 +532,9 @@ fn conditional_denials(profile: &Profile) -> Result<Vec<(i64, Vec<SeccompRule>)>
                 cond(0, Dword, Ne, libc::AF_INET6 as u64)?,
             ])?],
         ));
+        // A connected AF_UNIX pair reaches nothing outside the process; tokio's signal driver
+        // creates one when the runtime is built (the workspace enables tokio's `signal` feature).
+        v.push((libc::SYS_socketpair, vec![rule(vec![cond(0, Dword, Ne, libc::AF_UNIX as u64)?])?]));
     }
     Ok(v)
 }
@@ -662,7 +666,9 @@ mod tests {
         };
         let runner = names(&Profile::BuilderRunner);
         let b = names(&broker());
-        for s in ["socket", "connect", "openat", "openat2"] {
+        // `socket` and `socketpair` are argument-filtered for the broker (IPv4/IPv6 sockets, AF_UNIX
+        // pairs), not denied outright.
+        for s in ["socket", "socketpair", "connect", "openat", "openat2"] {
             assert!(runner.contains(&s), "{s}");
             assert!(!b.contains(&s), "{s}");
         }
@@ -673,10 +679,12 @@ mod tests {
             "execve",
             "ptrace",
             "io_uring_setup",
-            "socketpair",
         ] {
             assert!(b.contains(&s), "{s}");
         }
+        let filtered: Vec<i64> = conditional_denials(&broker()).unwrap().into_iter().map(|(nr, _)| nr).collect();
+        assert!(filtered.contains(&libc::SYS_socket));
+        assert!(filtered.contains(&libc::SYS_socketpair));
     }
 
     #[test]
