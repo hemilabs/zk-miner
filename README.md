@@ -208,7 +208,10 @@ against the deployment you intend to use** before running against a live market.
 chain zkminer knows (743111), `run` checks the addresses, their wiring and their code
 against the live deployment; a mismatch starts the miner without claiming anything (it
 still drives locks it already holds) and logs a `PAGE:` line naming the difference, so
-fix `[contracts]` and restart.
+fix `[contracts]` and restart. On 743111 the live deployment is the 2026-11-16 one (router
+`0xD931725db336B57dBB9A3123F2238A4FE3c6Ed58`, risc0 3.1 verifier); a config written for the
+2026-10-29 stack (router `0xE1a492Dc…470e`) names an abandoned deployment, so rewrite it with
+`zkminer init --network testnet --force`.
 
 ## Run
 
@@ -277,8 +280,8 @@ Worth knowing:
   and the proof after it agree; a lock re-proved after a restart needs the same key. Don't
   copy it off the host.
 - **Escape hatches, for after you've checked by hand:** `ZKMINER_SKIP_CODE_PINS=1` skips
-  the audited-code checks (router, Staking, Registry, facets, and the risc0 adapter and
-  verifier), `ZKMINER_ALLOW_UNKNOWN_DEPLOYMENT=1` accepts contract addresses that aren't
+  the audited-code checks (router, Staking, Registry, facets, and the risc0 and SP1 adapters
+  and verifiers), `ZKMINER_ALLOW_UNKNOWN_DEPLOYMENT=1` accepts contract addresses that aren't
   the known deployment's, `ZKMINER_RISC0_SKIP_PROGRAM_ID_CHECK=1` proves an ELF whose image
   id isn't the job's program id. Each one turns off a guard against losing collateral.
 - **Rebuild every worker with the miner.** A worker built for another protocol version is

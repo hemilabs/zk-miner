@@ -3,13 +3,14 @@
 //!
 //! Before the first transaction zkminer proves it is talking to the AUDITED code: every proxy is the
 //! audited ERC-1967 proxy, every implementation and router facet it routes through is audited code,
-//! and the RISC Zero adapter wraps the audited risc0-ethereum v3.1 verifier whose `SELECTOR()` is the
-//! seal prefix zkminer emits. The pins below are copied verbatim from the deployed contracts repo
-//! (`script/lib/AuditedCorePins.sol`, `script/lib/VerifierPins.sol` at zkmarket c8333aa; the risc0
-//! verifier's from hemiprove-contracts 3bc441dd8 `script/lib/VerifierPins.sol`) and are
-//! DEPLOYMENT-INDEPENDENT: an implementation's pin is its runtime keccak with its immutables zeroed,
-//! so the same audited code verifies at any address. Only the addresses and the scan floor are
-//! per-network.
+//! and each proof system it serves wraps the audited native verifier whose `SELECTOR()` /
+//! `VERIFIER_HASH()` is the seal prefix zkminer emits. The pins below are copied verbatim from the
+//! deployed contracts repo (hemiprove-contracts 3bc441d, the deployed 8e1808b apart from its LICENSE:
+//! `script/lib/ReleaseCorePins.sol` and `script/lib/VerifierPins.sol`) and are hashed the way that
+//! repo hashes the chain (`script/lib/CoreRuntimePins.sol`, `VerifierPins._adapterProblem`), so they
+//! are DEPLOYMENT-INDEPENDENT: an implementation's pin is its runtime keccak with its immutables
+//! zeroed, and the same audited code verifies at any address. Only the addresses and the scan floor
+//! are per-network.
 
 use alloy::primitives::{address, b256, keccak256, Address, B256};
 use alloy::providers::Provider;
@@ -22,38 +23,47 @@ use zkminer_contracts::bindings::{
     IVerifierAdapter,
 };
 
-/// Audited runtime pins (zkmarket c8333aa `script/lib/AuditedCorePins.sol`, `VerifierPins.sol`; the
-/// risc0 3.1 verifier's from hemiprove-contracts 3bc441dd8 `VerifierPins.sol`, where the adapter pin
-/// did not move).
+/// Release runtime pins: hemiprove-contracts 3bc441d `script/lib/ReleaseCorePins.sol`
+/// (`RELEASE_CORE_RUNTIME_KECCAK`) for the core, and `script/lib/VerifierPins.sol` for the adapters
+/// and native verifiers.
+///
+/// The core pins are `runtime-keccak` of the deploy-profile runtime with every immutable zeroed. The
+/// only immutable of the pinned implementations is UUPS `__self` (their own address), which the repo
+/// zeroes on chain as every 32-byte window equal to the left-padded address
+/// (`CoreRuntimePins.maskedKeccak`): [`masked_keccak`] does exactly that. The facets and the proxy have
+/// no immutable and are hashed as they are. The adapter pins zero their one immutable
+/// (`nativeVerifier`) at fixed 32-byte offsets (`*_IMMUTABLES`), each of which must first hold the
+/// verifier itself ([`immutables_are`]); the native verifiers' pins are raw runtime keccaks.
 pub mod pins {
     use super::*;
     /// OpenZeppelin ERC1967Proxy (no immutable) — every core proxy.
     pub const ERC1967_PROXY: B256 =
         b256!("46a010df31eb642b47284650e80051e8f6239a0c995003d230b437810bc4b9b4");
-    /// HemiProve router implementation (its one immutable, UUPS `__self`, zeroed).
+    /// HemiProve router implementation (`ROUTER`; its one immutable, UUPS `__self`, zeroed).
     pub const ROUTER_IMPL: B256 =
-        b256!("fe19d149183c16c2c5917745002d824fb94dc5f1766d8ecf2f1e2ab4c5f6d2aa");
-    /// HemiProveStaking implementation (`__self` zeroed).
+        b256!("072ef9e8a858aea90b1643fb26d8636dfa49930d7c799750459531081a15b65b");
+    /// HemiProveStaking implementation (`STAKING`; `__self` zeroed).
     pub const STAKING_IMPL: B256 =
-        b256!("8f2769b1ac7e443981de10adba5962fd42552bd14f10006b5f30921eb70aea94");
-    /// HemiProveRegistry implementation (`__self` zeroed).
+        b256!("d4f7e362dd8e983aaa92839496f5323d25b226bda1c99576c58999c5ceae6046");
+    /// HemiProveRegistry implementation (`REGISTRY`; `__self` zeroed).
     pub const REGISTRY_IMPL: B256 =
-        b256!("f6ea9179aa36f691770372da03089f89bd0f6b0e52a7976ad749167f9b4388b2");
-    /// ProgramRegistry implementation (`__self` zeroed).
+        b256!("66179b0a73aa40836725499dccca37576c75667d0f0ac6bf3b569354fc03b13f");
+    /// ProgramRegistry implementation (`PROGRAM_REGISTRY`; `__self` zeroed).
     pub const PROGRAM_REGISTRY_IMPL: B256 =
-        b256!("2b4b0456f6994a01cf2adf63ad65a2b1073cbfe3d1000cc8417beb0a9c7d5203");
-    /// The five router facets (no immutable): HemiProveCore, Fulfill, Aux, FulfillCycle, AuxGov.
+        b256!("47e0b59907c774b24a7d9f8ff2b9a5dbb5d2dfe826e7e1062ce6a5379f715574");
+    /// The five router facets (no immutable): `CORE`, `FULFILL`, `AUX`, `FULFILL_CYCLE`, `AUX_GOV`.
     pub const FACETS: [(&str, B256); 5] = [
-        ("HemiProveCore", b256!("96787200886d4ae567581ca248d382ffbd333c161a8f44a361573d376a024cff")),
-        ("HemiProveFulfill", b256!("5c18136573c55777c269943877a5965785fda93a82160a594b52e9cbecfaaffc")),
-        ("HemiProveAux", b256!("f7dd82f12ef38cb7ab190611497898d07b77d583043cb0d604bab0de05ecb3ba")),
-        ("HemiProveFulfillCycle", b256!("60675be0e8b7698b9c432039668443a867b30776cd7548fcbcad98c034118bcc")),
-        ("HemiProveAuxGov", b256!("500035cdde2939e214b1ab1d92e04328c9d75291f9e1081c07da6f4c0be0b879")),
+        ("HemiProveCore", b256!("2f5c34ff5e6f9a5dca915a187969a81065437be9dad0350e881625dae18c5fbd")),
+        ("HemiProveFulfill", b256!("50b6fe0ea4bb38f480809014f6d7d33b24e13b455c5fb42a191d45ddbd634e0b")),
+        ("HemiProveAux", b256!("c9ea43491c3db833ba7cc6eae89e210f4a792f48810e4cb68933ce049599a682")),
+        ("HemiProveFulfillCycle", b256!("6e11d32015642d76cf294fdf82dff9195d8b0c411a628d9609d31b68334342cd")),
+        ("HemiProveAuxGov", b256!("3a7aeee0d0547b79d4dc8295531120caa0335bf4d0d110bf329bcddb6e28242f")),
     ];
-    /// RiscZeroGroth16VerifierAdapter runtime with its `nativeVerifier` immutable zeroed at
-    /// [`RISC0_GROTH16_ADAPTER_IMMUTABLES`].
+    /// RiscZeroGroth16VerifierAdapter runtime (1,939 B) with its `nativeVerifier` immutable zeroed at
+    /// [`RISC0_GROTH16_ADAPTER_IMMUTABLES`] (`RISC_ZERO_GROTH16_VERIFIER_ADAPTER_RUNTIME`).
     pub const RISC0_GROTH16_ADAPTER: B256 =
         b256!("dc362a202817f67a52ef910bf022660f3723a4b7fc5e451f9799be71fb7b0a89");
+    pub const RISC0_GROTH16_ADAPTER_SIZE: usize = 1939;
     pub const RISC0_GROTH16_ADAPTER_IMMUTABLES: [usize; 3] = [101, 526, 1245];
     /// risc0-ethereum v3.1.0 RiscZeroGroth16Verifier runtime (immutables filled, raw keccak, 4,611 B):
     /// `RISC_ZERO_V3_1_GROTH16_RUNTIME`. v3.1.0 fixes GHSA-mm6c-35cm-g4x2, under which the v3.0
@@ -64,18 +74,34 @@ pub mod pins {
     /// (`RISC_ZERO_V3_1_PARAMS_DIGEST`, e71e6620a834…), the prefix of every risc0-zkvm 3.1 seal.
     pub const RISC0_V3_1_SELECTOR: [u8; 4] = [0xe7, 0x1e, 0x66, 0x20];
     /// SP1Groth16VerifierAdapter runtime with its `nativeVerifier` immutable zeroed at
-    /// [`SP1_GROTH16_ADAPTER_IMMUTABLES`] (1,851 B).
+    /// [`SP1_GROTH16_ADAPTER_IMMUTABLES`] (1,851 B; `SP1_GROTH16_VERIFIER_ADAPTER_RUNTIME`).
     pub const SP1_GROTH16_ADAPTER: B256 =
         b256!("99d18017af86518b2b86cd982aeadc69ed9c5c9611a52ccae7b637eb1b0c636d");
+    pub const SP1_GROTH16_ADAPTER_SIZE: usize = 1851;
     pub const SP1_GROTH16_ADAPTER_IMMUTABLES: [usize; 3] = [101, 527, 1165];
     /// SP1 circuit v6.1.0 Groth16 verifier (sp1-contracts v6.1.1 `SP1VerifierGroth16.sol`), runtime
-    /// keccak (5,463 B, no immutables).
+    /// keccak (5,463 B, no immutables; `SP1_V6_1_0_GROTH16_RUNTIME`).
     pub const SP1_V6_1_0_GROTH16_VERIFIER: B256 =
         b256!("6e1a354cfd1694f27c6258729ce14a5b29fe57624d1d10c759a33aa2d7aa002b");
     /// Its `VERIFIER_HASH()`: sha256 of the circuit's `groth16_vk.bin` (SP1 SDK 6.1.0 to 6.10.0). The
     /// first 4 bytes prefix every v6.1.0 Groth16 seal.
     pub const SP1_V6_1_0_GROTH16_VERIFIER_HASH: B256 =
         b256!("4388a21c687fdd5f218d7e3d13190cac4c5355818d3605fd5fb811df468ee696");
+    /// SP1PlonkVerifierAdapter runtime with its `nativeVerifier` immutable zeroed at
+    /// [`SP1_PLONK_ADAPTER_IMMUTABLES`] (1,849 B; `SP1_PLONK_VERIFIER_ADAPTER_RUNTIME`). The two SP1
+    /// adapters share their code and differ only in `name()`, so each pin admits only its own.
+    pub const SP1_PLONK_ADAPTER: B256 =
+        b256!("a8306b163225c75ecbf056f4b1de173fd7a1130ee61c5ba23c72b5f7f05c2ce0");
+    pub const SP1_PLONK_ADAPTER_SIZE: usize = 1849;
+    pub const SP1_PLONK_ADAPTER_IMMUTABLES: [usize; 3] = [101, 527, 1165];
+    /// SP1 circuit v6.1.0 PLONK verifier (sp1-contracts v6.1.1 `SP1VerifierPlonk.sol`), runtime keccak
+    /// (8,625 B, no immutables; `SP1_V6_1_0_PLONK_RUNTIME`).
+    pub const SP1_V6_1_0_PLONK_VERIFIER: B256 =
+        b256!("d41d21f0ede6aad839e0aaac997eea8e168333bc5d15fb5f520e385dcb227f47");
+    /// Its `VERIFIER_HASH()`: sha256 of the circuit's `plonk_vk.bin`. The first 4 bytes prefix every
+    /// v6.1.0 PLONK seal (964 B).
+    pub const SP1_V6_1_0_PLONK_VERIFIER_HASH: B256 =
+        b256!("5a093a2fcb46394f5cadfe55c44d4d572fad9cec7aeb38026b0278322ef07fac");
 }
 
 /// ERC-1967 implementation slot: `bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)`.
@@ -99,17 +125,20 @@ pub struct KnownDeployment {
     pub token_codehash: B256,
 }
 
-/// Hemi testnet, deployed 2026-10-29 from zkmarket c8333aa (handoff §1-§2). Every older 743111 stack
-/// — and the old free-mint tHEMI `0x60525eEB…E698` — is abandoned.
+/// Hemi testnet, deployed 2026-11-16 from hemiprove-contracts 3bc441d (8e1808b) with the risc0 3.1
+/// verifier (handoff §1-§2). Every older 743111 stack (the 2026-10-29 one had router
+/// `0xE1a492Dc…470e`) — and the old free-mint tHEMI `0x60525eEB…E698` — is abandoned. The tHEMI token
+/// did not change.
 pub const HEMI_TESTNET_743111: KnownDeployment = KnownDeployment {
-    name: "Hemi testnet (743111, 2026-10-29)",
+    name: "Hemi testnet (743111, 2026-11-16)",
     chain_id: 743111,
-    router: address!("E1a492Dc6D57fCC2B6deb5B64087E69666cA470e"),
-    staking: address!("44b2DDCfBe37900917E3750A4996BA007F4aA66E"),
-    registry: address!("77fDb1DCE2224B75BA295f2Cdd87Ba5247d4BBc6"),
+    router: address!("D931725db336B57dBB9A3123F2238A4FE3c6Ed58"),
+    staking: address!("F3498fCF729Eb7d4E0323880e4E6aD1EB6da2e2D"),
+    registry: address!("A80D9172931521f9bce0491C6374A5f28e79f10F"),
     token: address!("46955EdCF61b23a8c0b0d71428A9F1C07Bbf36cc"),
-    program_registry: address!("CC761A929747A81e34517e1f4F98247da925cAb4"),
-    scan_from_block: 7_095_745,
+    program_registry: address!("eBB9Fb9B82f80518f74725eFc2f3FD24ded7695D"),
+    // The deployment record's `fromBlock`; the router was created in block 7226099.
+    scan_from_block: 7_226_094,
     token_codehash: b256!("536084d8a9d1773c86d8dd25aef9e619741e48e072dbbfdc30cad81bc2521aba"),
 };
 
@@ -120,16 +149,19 @@ pub fn known_deployment(chain_id: u64) -> Option<&'static KnownDeployment> {
         .find(|d| d.chain_id == chain_id)
 }
 
-/// keccak256 of `code` with every occurrence of the 20-byte `self_addr` zeroed — a UUPS
-/// implementation's `__self` immutable is its own address, so this is its audited-pin hash.
-pub fn keccak_self_zeroed(code: &[u8], self_addr: Address) -> B256 {
-    let needle = self_addr.as_slice();
+/// keccak256 of `code` with every 32-byte window equal to `value` left-padded zeroed, scanning
+/// forward and skipping past each match: hemiprove-contracts `CoreRuntimePins.maskedKeccak`, the hash
+/// `ReleaseCorePins` pins. A UUPS implementation's `__self` immutable is its own address, so
+/// `masked_keccak(code, implementation)` is its pin hash (`runtimeKeccak`). A stray match can only
+/// make the hash differ from the pin (fail closed).
+pub fn masked_keccak(code: &[u8], value: Address) -> B256 {
+    let word = B256::left_padding_from(value.as_slice());
     let mut buf = code.to_vec();
     let mut i = 0;
-    while i + needle.len() <= buf.len() {
-        if &buf[i..i + needle.len()] == needle {
-            buf[i..i + needle.len()].fill(0);
-            i += needle.len();
+    while i + 32 <= buf.len() {
+        if buf[i..i + 32] == word[..] {
+            buf[i..i + 32].fill(0);
+            i += 32;
         } else {
             i += 1;
         }
@@ -307,7 +339,7 @@ impl ChainClient {
                 .get_code_at(implementation)
                 .await
                 .with_context(|| format!("{name} implementation code"))?;
-            if keccak_self_zeroed(&icode, implementation) != impl_pin {
+            if masked_keccak(&icode, implementation) != impl_pin {
                 refuse!(
                     "{name} implementation {implementation} is not the audited code (pin {impl_pin}) \
                      (set ZKMINER_SKIP_CODE_PINS=1 only after verifying an upgrade)"
@@ -422,13 +454,14 @@ impl ChainClient {
             ))
             .into());
         }
-        if ps == ProofSystem::Sp1Groth16 {
-            return self
-                .verify_sp1_groth16(ps, entry.adapter, seal_prefix)
-                .await;
-        }
-        if ps != ProofSystem::Risc0Groth16 {
-            bail!("{}: no pinned verifier — zkminer does not serve it yet", ps.label());
+        match ps {
+            ProofSystem::Risc0Groth16 => {}
+            ProofSystem::Sp1Groth16 | ProofSystem::Sp1Plonk => {
+                return self.verify_sp1(ps, entry.adapter, seal_prefix).await;
+            }
+            ProofSystem::OpenVmHalo2 => {
+                bail!("{}: no pinned verifier — zkminer does not serve it yet", ps.label())
+            }
         }
         let native = IVerifierAdapter::new(entry.adapter, &*self.provider)
             .nativeVerifier()
@@ -439,13 +472,13 @@ impl ChainClient {
             let acode = self.provider.get_code_at(entry.adapter).await.context("adapter code")?;
             // Its immutables are its verifier: each must be the `nativeVerifier()` pinned below, or
             // `verifyProof` could call another one (VerifierPins._adapterProblem checks the same).
-            if !immutables_are(
+            if !adapter_matches(
                 &acode,
+                pins::RISC0_GROTH16_ADAPTER_SIZE,
                 &pins::RISC0_GROTH16_ADAPTER_IMMUTABLES,
-                B256::left_padding_from(native.as_slice()),
-            ) || keccak_offsets_zeroed(&acode, &pins::RISC0_GROTH16_ADAPTER_IMMUTABLES)
-                != Some(pins::RISC0_GROTH16_ADAPTER)
-            {
+                pins::RISC0_GROTH16_ADAPTER,
+                native,
+            ) {
                 return Err(ProofSystemRefused(format!(
                     "{} adapter {} is not the audited RiscZeroGroth16VerifierAdapter",
                     ps.label(),
@@ -480,15 +513,18 @@ impl ChainClient {
         Ok(entry.adapter)
     }
 
-    /// `verify_proof_system` for `sp1.groth16.v1`: the adapter is the audited SP1Groth16VerifierAdapter
-    /// wrapping the audited circuit v6.1.0 Groth16 verifier, whose `VERIFIER_HASH()` is the v6.1.0
-    /// one and starts with `seal_prefix` (the first 4 bytes of every seal the SP1 worker returns).
-    async fn verify_sp1_groth16(
+    /// `verify_proof_system` for `sp1.groth16.v1` and `sp1.plonk.v1`: the adapter is that wrapper's
+    /// audited SP1 adapter wrapping the audited circuit v6.1.0 verifier of the same wrapper, whose
+    /// `VERIFIER_HASH()` is the pinned one and starts with `seal_prefix` (the first 4 bytes of every
+    /// seal zkminer would send for it). The two SP1 adapters differ only in `name()`, so each id
+    /// accepts only its own adapter over its own verifier.
+    async fn verify_sp1(
         &self,
         ps: ProofSystem,
         adapter: Address,
         seal_prefix: [u8; 4],
     ) -> Result<Address> {
+        let p = sp1_pins(ps).with_context(|| format!("{}: not an SP1 proof system", ps.label()))?;
         let native = IVerifierAdapter::new(adapter, &*self.provider)
             .nativeVerifier()
             .call()
@@ -500,16 +536,11 @@ impl ChainClient {
                 .get_code_at(adapter)
                 .await
                 .context("adapter code")?;
-            if !immutables_are(
-                &acode,
-                &pins::SP1_GROTH16_ADAPTER_IMMUTABLES,
-                B256::left_padding_from(native.as_slice()),
-            ) || keccak_offsets_zeroed(&acode, &pins::SP1_GROTH16_ADAPTER_IMMUTABLES)
-                != Some(pins::SP1_GROTH16_ADAPTER)
-            {
+            if !adapter_matches(&acode, p.adapter_size, &p.adapter_immutables, p.adapter, native) {
                 return Err(ProofSystemRefused(format!(
-                    "{} adapter {adapter} is not the audited SP1Groth16VerifierAdapter",
-                    ps.label()
+                    "{} adapter {adapter} is not the audited {}",
+                    ps.label(),
+                    p.adapter_name
                 ))
                 .into());
             }
@@ -518,10 +549,11 @@ impl ChainClient {
                 .get_code_at(native)
                 .await
                 .context("verifier code")?;
-            if keccak256(&vcode) != pins::SP1_V6_1_0_GROTH16_VERIFIER {
+            if keccak256(&vcode) != p.verifier {
                 return Err(ProofSystemRefused(format!(
-                    "{} native verifier {native} is not the audited SP1 circuit v6.1.0 Groth16 verifier",
-                    ps.label()
+                    "{} native verifier {native} is not the audited SP1 circuit v6.1.0 {} verifier",
+                    ps.label(),
+                    p.wrapper
                 ))
                 .into());
             }
@@ -531,17 +563,63 @@ impl ChainClient {
             .call()
             .await
             .context("verifier VERIFIER_HASH()")?;
-        if hash != pins::SP1_V6_1_0_GROTH16_VERIFIER_HASH || hash[..4] != seal_prefix {
+        if hash != p.verifier_hash || hash[..4] != seal_prefix {
             return Err(ProofSystemRefused(format!(
-                "{} verifier VERIFIER_HASH() is {hash} but zkminer's SP1 seals are prefixed 0x{} \
+                "{} verifier VERIFIER_HASH() is {hash} but zkminer's SP1 {} seals are prefixed 0x{} \
                  (circuit v6.1.0) — every proof would revert VerifierCallFailed",
                 ps.label(),
+                p.wrapper,
                 alloy::hex::encode(seal_prefix)
             ))
             .into());
         }
         Ok(adapter)
     }
+}
+
+/// One SP1 wrapper's pins: its adapter and the native verifier that adapter must wrap.
+struct Sp1Pins {
+    wrapper: &'static str,
+    adapter_name: &'static str,
+    adapter: B256,
+    adapter_size: usize,
+    adapter_immutables: [usize; 3],
+    verifier: B256,
+    verifier_hash: B256,
+}
+
+/// The pins of an SP1 proof system, `None` for any other.
+fn sp1_pins(ps: ProofSystem) -> Option<Sp1Pins> {
+    match ps {
+        ProofSystem::Sp1Groth16 => Some(Sp1Pins {
+            wrapper: "Groth16",
+            adapter_name: "SP1Groth16VerifierAdapter",
+            adapter: pins::SP1_GROTH16_ADAPTER,
+            adapter_size: pins::SP1_GROTH16_ADAPTER_SIZE,
+            adapter_immutables: pins::SP1_GROTH16_ADAPTER_IMMUTABLES,
+            verifier: pins::SP1_V6_1_0_GROTH16_VERIFIER,
+            verifier_hash: pins::SP1_V6_1_0_GROTH16_VERIFIER_HASH,
+        }),
+        ProofSystem::Sp1Plonk => Some(Sp1Pins {
+            wrapper: "PLONK",
+            adapter_name: "SP1PlonkVerifierAdapter",
+            adapter: pins::SP1_PLONK_ADAPTER,
+            adapter_size: pins::SP1_PLONK_ADAPTER_SIZE,
+            adapter_immutables: pins::SP1_PLONK_ADAPTER_IMMUTABLES,
+            verifier: pins::SP1_V6_1_0_PLONK_VERIFIER,
+            verifier_hash: pins::SP1_V6_1_0_PLONK_VERIFIER_HASH,
+        }),
+        ProofSystem::Risc0Groth16 | ProofSystem::OpenVmHalo2 => None,
+    }
+}
+
+/// Whether `code` is the pinned adapter wrapping `native` (`VerifierPins._adapterProblem`): exactly
+/// `size` bytes, every immutable reference at `offsets` the left-padded `native`, and with them
+/// zeroed the runtime keccak `pin`.
+fn adapter_matches(code: &[u8], size: usize, offsets: &[usize], pin: B256, native: Address) -> bool {
+    code.len() == size
+        && immutables_are(code, offsets, B256::left_padding_from(native.as_slice()))
+        && keccak_offsets_zeroed(code, offsets) == Some(pin)
 }
 
 #[cfg(test)]
@@ -573,21 +651,56 @@ mod tests {
     }
 
     #[test]
-    fn self_zeroing_matches_the_repos_method() {
-        // The UUPS __self immutable appears as the implementation's own 20-byte address inside
-        // PUSH32 words; zeroing every occurrence must leave the rest of the code untouched.
+    fn masking_matches_core_runtime_pins() {
+        // CoreRuntimePins.maskedKeccak zeroes every 32-byte window equal to the left-padded address
+        // (a PUSH32 of the `__self` immutable), and nothing else: a bare 20-byte occurrence (not
+        // preceded by 12 zero bytes) stays, so it makes the hash differ from the pin (fail closed).
         let me = Address::repeat_byte(0xAB);
-        let mut code = vec![0x60, 0x80];
-        code.extend_from_slice(&[0u8; 12]);
-        code.extend_from_slice(me.as_slice());
-        code.extend_from_slice(&[0x5b, 0x00]);
-        code.extend_from_slice(me.as_slice());
+        let word = B256::left_padding_from(me.as_slice());
+        let mut code = vec![0x60, 0x80, 0x7f];
+        code.extend_from_slice(word.as_slice()); // PUSH32 __self
+        code.extend_from_slice(&[0x5b, 0x01]);
+        let bare = code.len();
+        code.extend_from_slice(me.as_slice()); // a bare 20-byte occurrence
+        code.extend_from_slice(&[0x7f]);
+        let second = code.len();
+        code.extend_from_slice(word.as_slice()); // PUSH32 __self again
         let mut expect = code.clone();
-        for w in expect.windows(20).enumerate().filter(|(_, w)| *w == me.as_slice()).map(|(i, _)| i).collect::<Vec<_>>() {
-            expect[w..w + 20].fill(0);
-        }
-        assert_eq!(keccak_self_zeroed(&code, me), keccak256(&expect));
-        assert_ne!(keccak_self_zeroed(&code, me), keccak256(&code));
+        expect[3..35].fill(0);
+        expect[second..second + 32].fill(0);
+        assert_eq!(masked_keccak(&code, me), keccak256(&expect));
+        assert_eq!(&expect[bare..bare + 20], me.as_slice(), "the bare occurrence is kept");
+        assert_ne!(masked_keccak(&code, me), keccak256(&code));
+        // Another address masks nothing.
+        assert_eq!(masked_keccak(&code, Address::repeat_byte(0xCD)), keccak256(&code));
+    }
+
+    #[test]
+    fn an_adapter_must_be_exactly_its_pinned_size() {
+        let verifier = Address::repeat_byte(0xAB);
+        let word = B256::left_padding_from(verifier.as_slice());
+        let mut code = vec![0x5bu8; 100];
+        code[10..42].copy_from_slice(word.as_slice());
+        let pin = keccak_offsets_zeroed(&code, &[10]).unwrap();
+        assert!(adapter_matches(&code, 100, &[10], pin, verifier));
+        assert!(!adapter_matches(&code, 101, &[10], pin, verifier), "size");
+        assert!(!adapter_matches(&code, 100, &[10], pin, Address::repeat_byte(0xCD)), "verifier");
+        let mut longer = code.clone();
+        longer.push(0);
+        assert!(!adapter_matches(&longer, 100, &[10], pin, verifier));
+    }
+
+    #[test]
+    fn each_sp1_wrapper_has_its_own_pins() {
+        let g = sp1_pins(ProofSystem::Sp1Groth16).unwrap();
+        let p = sp1_pins(ProofSystem::Sp1Plonk).unwrap();
+        // The seal prefixes of handoff §3: Groth16 0x4388a21c (356 B), PLONK 0x5a093a2f (964 B).
+        assert_eq!(g.verifier_hash[..4], [0x43, 0x88, 0xa2, 0x1c]);
+        assert_eq!(p.verifier_hash[..4], [0x5a, 0x09, 0x3a, 0x2f]);
+        assert_ne!(g.adapter, p.adapter);
+        assert_ne!(g.verifier, p.verifier);
+        assert!(sp1_pins(ProofSystem::Risc0Groth16).is_none());
+        assert!(sp1_pins(ProofSystem::OpenVmHalo2).is_none());
     }
 
     #[test]
@@ -600,8 +713,62 @@ mod tests {
     #[test]
     fn the_743111_deployment_is_known() {
         let k = known_deployment(743111).expect("743111 known");
-        assert_eq!(k.scan_from_block, 7_095_745);
-        assert_eq!(k.router, address!("E1a492Dc6D57fCC2B6deb5B64087E69666cA470e"));
+        assert_eq!(k.scan_from_block, 7_226_094);
+        assert_eq!(k.router, address!("D931725db336B57dBB9A3123F2238A4FE3c6Ed58"));
+        assert_ne!(
+            k.router,
+            address!("E1a492Dc6D57fCC2B6deb5B64087E69666cA470e"),
+            "the 2026-10-29 stack is abandoned"
+        );
         assert!(known_deployment(43111).is_none(), "mainnet has no deployment yet");
+    }
+
+    /// The startup verification against the LIVE 743111 deployment, read-only, through a watch-only
+    /// client (no key; its transport refuses every send). It runs what `zkminer run` checks before
+    /// claiming — the chain id, the addresses, the wiring and the core code pins — then every proof
+    /// system's adapter and verifier, SP1 PLONK included (which `run` does not serve), with the seal
+    /// prefixes of handoff §3.
+    ///
+    /// `cargo test -p zkminer-chain --lib -- --ignored --nocapture live_743111`; set
+    /// `ZKMINER_LIVE_RPC` for another endpoint than the public testnet RPC.
+    #[tokio::test]
+    #[ignore = "reads the live Hemi testnet"]
+    async fn live_743111_deployment_verifies() {
+        let k = &HEMI_TESTNET_743111;
+        let mut config = zkminer_config::ZkMinerConfig::default();
+        config.chain.rpc_url = std::env::var("ZKMINER_LIVE_RPC")
+            .unwrap_or_else(|_| "https://testnet.rpc.hemi.network/rpc".into());
+        config.chain.chain_id = k.chain_id;
+        config.contracts.hemi_prove = k.router.to_string();
+        config.contracts.hemi_prove_staking = k.staking.to_string();
+        config.contracts.hemi_prove_registry = k.registry.to_string();
+        config.contracts.hemi_token = k.token.to_string();
+        config.contracts.program_registry = k.program_registry.to_string();
+        let client = ChainClient::new_watch_only(&config, Address::ZERO)
+            .await
+            .expect("connect (the chain id is checked here)");
+        assert_eq!(client.chain_id, 743111);
+        assert!(!code_pins_skipped(), "unset ZKMINER_SKIP_CODE_PINS");
+        for line in client.verify_deployment().await.expect("verify_deployment") {
+            println!("deployment: {line}");
+        }
+        for (ps, prefix) in [
+            (ProofSystem::Risc0Groth16, pins::RISC0_V3_1_SELECTOR),
+            (ProofSystem::Sp1Groth16, [0x43, 0x88, 0xa2, 0x1c]),
+            (ProofSystem::Sp1Plonk, [0x5a, 0x09, 0x3a, 0x2f]),
+        ] {
+            let adapter = client
+                .verify_proof_system(ps, prefix)
+                .await
+                .unwrap_or_else(|e| panic!("{}: {e:#}", ps.label()));
+            println!(
+                "{}: adapter {adapter} is the pinned adapter over the pinned verifier, seal prefix 0x{}",
+                ps.label(),
+                alloy::hex::encode(prefix)
+            );
+        }
+        // OpenVM Halo2 is not registered at launch.
+        let (adapter, status) = client.adapter_entry(ProofSystem::OpenVmHalo2).await.unwrap();
+        println!("{}: adapter {adapter}, status {status}", ProofSystem::OpenVmHalo2.label());
     }
 }
