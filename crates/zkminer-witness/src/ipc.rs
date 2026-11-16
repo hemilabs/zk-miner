@@ -45,6 +45,10 @@ pub const KIND_CONTROL: u8 = 0x10;
 pub const MAX_CONTROL_BYTES: u32 = 64 * 1024;
 /// The fd at which the broker finds its end of the control socketpair.
 pub const BROKER_CONTROL_FD: i32 = 3;
+/// The fd at which the broker finds its end of the socketpair to the miner's connector, which
+/// makes every network connection the broker uses (the broker's sandbox has no `socket` or
+/// `connect`): see `zkminer_witness_broker::connector`.
+pub const BROKER_CONNECTOR_FD: i32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -413,6 +417,22 @@ pub enum SelfTestCheck {
     /// DNS answer) is entirely global and reaches none of the host's addresses, its connected
     /// prefixes, the deny CIDRs or a DNS server.
     RoleEntriesPublic,
+    /// Inside the broker: `socket(AF_INET)` and `socket(AF_INET6)` fail (it has no network of
+    /// its own).
+    InetSocketDenied,
+    /// Inside the broker: `connect`, `bind`, `listen` and `accept4` fail with the filter's `EPERM`.
+    ConnectDenied,
+    /// The connector, asked by the broker over its socket for an endpoint index past the
+    /// miner's configuration, refuses.
+    ConnectorRefusesBadIndex,
+    /// The miner's connector (checked in the miner): no endpoint admits an address outside its
+    /// configured role entry or its current DNS answer.
+    ConnectorRefusesUnconfigured,
+    /// The miner's connector, public mode only: no endpoint admits loopback, the metadata
+    /// service, RFC 1918 probes, the host's own addresses or its connected prefixes.
+    ConnectorRefusesPrivate,
+    /// The miner's connector: a malformed request is refused and ends the broker's session.
+    ConnectorRefusesMalformed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

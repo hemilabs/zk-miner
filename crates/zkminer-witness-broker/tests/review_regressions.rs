@@ -3,7 +3,6 @@
 
 mod common;
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use alloy_primitives::B256;
@@ -64,8 +63,8 @@ async fn a_host_name_resolving_to_loopback_without_cidrs_is_refused() {
     assert_eq!(node.hits(), 1);
 }
 
-/// PoC 1b, inverted: startup resolution found nothing; the lazy resolution on first use goes
-/// through the same filter, so the loopback answer is still refused.
+/// PoC 1b, inverted: the first resolution happens on first use, in the miner's connector, through
+/// the same filter, so the loopback answer is still refused (the broker resolves nothing).
 #[tokio::test]
 async fn lazy_resolution_goes_through_the_same_filter() {
     let anvil = Anvil::start(&[]).await;
@@ -73,13 +72,7 @@ async fn lazy_resolution_goes_through_the_same_filter() {
     let dir = tempfile::tempdir().unwrap();
     let text = config_text(dir.path(), &evm("provider", &format!("http://rpc.test:{}/", anvil.port), ANVIL_CHAIN, ""));
     let mut cfg = BrokerConfig::from_toml(&text, dir.path(), zkminer_witness_broker::egress::NetMode::DevPrivate).unwrap();
-    cfg.host = Some(HostFacts {
-        resolved: HashMap::from([("provider".to_string(), vec![])]),
-        connected: vec![],
-        own_addresses: vec![],
-        dns_servers: vec![dns.addr],
-        resolvers: vec![],
-    });
+    cfg.host = Some(HostFacts { connected: vec![], own_addresses: vec![], dns_servers: vec![dns.addr], resolvers: vec![] });
     let (client, _t) = spawn_broker(cfg, Hooks::real()).await;
     let mut b = register(&client, 1, vec![anvil_cap()], budget(10, 1 << 20, 1 << 20), false).await;
     assert_eq!(b.fetch(0, CHAIN_ID).await.0, FetchStatus::Failed, "127.0.0.1 admitted after lazy resolution");

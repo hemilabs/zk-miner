@@ -119,7 +119,6 @@ fn t3_an_on_link_neighbour_of_a_dhcpv6_host_is_refused() {
         let policy = zkminer_witness_broker::net::build_policy(
             NetMode::Public,
             cfg.endpoints(),
-            &facts.resolved,
             cfg.effective_deny_for(&facts),
             facts.connected.clone(),
             &facts.own_addresses,
@@ -127,6 +126,10 @@ fn t3_an_on_link_neighbour_of_a_dhcpv6_host_is_refused() {
         let target = cfg.evm_rpc[0].spec.literal.unwrap();
         let a = policy.admit(Some((Role::EvmRpc, alias)), SocketAddr::new(target, 8545));
         assert!(matches!(a, Admit::Denied(_)), "{alias}: {a:?}");
+        // The miner's connector, which makes the connection, refuses it on the same facts.
+        let floor = zkminer_netguard::NetPolicy::with_facts(NetMode::Public, net.clone(), cfg.effective_deny_for(&facts));
+        let connector = zkminer_witness_broker::connector::Connector::with_floor(&cfg, vec![], floor).unwrap();
+        assert!(connector.admit(0, target).is_err(), "{alias}: the connector admits it");
     }
     // This host's real facts carry its routes' on-link prefixes too.
     let real = zkminer_netguard::HostFacts::gather_with(&FactsOptions { discover_public_addresses: false, ..FactsOptions::default() })

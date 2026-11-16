@@ -3,6 +3,13 @@
 //!
 //! The process: `main` reads the config and key files and the host facts, applies the sandbox, then
 //! runs [`serve`] on the control socket at fd 3. The miner drives it with [`client::BrokerClient`].
+//!
+//! The broker has **no network of its own** (review r2 F5): its sandbox denies `socket`,
+//! `connect`, `bind`, `listen` and `accept*`. Every TCP connection it uses comes, already
+//! connected, from the miner's [`connector`] over the socket at fd 4: the broker names an operator
+//! endpoint by its index, and the miner — which loaded the same configuration itself — resolves,
+//! admits and connects. A broker an attacker controls can therefore reach nothing but the
+//! endpoints the operator configured, at addresses the miner's network floor admits.
 
 pub mod artifact;
 pub mod blob;
@@ -10,6 +17,7 @@ pub(crate) mod broker;
 pub mod cache;
 pub mod client;
 pub mod config;
+pub mod connector;
 pub(crate) mod control;
 pub mod dns;
 pub mod egress;
@@ -40,19 +48,22 @@ pub const WORKER_THREADS: usize = 4;
 pub const MAX_BLOCKING_THREADS: usize = 8;
 
 /// Serves the control channel `control` (a connected `AF_UNIX` stream socket) until the miner
-/// closes it. Uses `config.host` when present (read before the sandbox) and reads the host facts
-/// itself otherwise. Runs in `config.net_mode` (the miner's); in public mode a role entry that
-/// reaches the host's own addresses, connected prefixes or DNS servers is refused here
-/// ([`BrokerConfig::validate_host`]).
-pub async fn serve(config: BrokerConfig, control: OwnedFd) -> anyhow::Result<()> {
-    serve_with(config, control, Hooks::real()).await
+/// closes it, with every connection from the miner's connector at `connector` (the broker's end
+/// of the connector socketpair). Uses `config.host` when present (read before the sandbox) and
+/// reads the host facts itself otherwise. Runs in `config.net_mode` (the miner's); in public mode
+/// a role entry that reaches the host's own addresses, connected prefixes or DNS servers is
+/// refused here ([`BrokerConfig::validate_host`]).
+pub async fn serve(config: BrokerConfig, control: OwnedFd, connector: OwnedFd) -> anyhow::Result<()> {
+    serve_with(config, control, connector, Hooks::real()).await
 }
 
 /// [`serve`] with explicit seams (tests).
-pub async fn serve_with(mut config: BrokerConfig, control: OwnedFd, hooks: Hooks) -> anyhow::Result<()> {
+pub async fn serve_with(mut config: BrokerConfig, control: OwnedFd, connector: OwnedFd, hooks: Hooks) -> anyhow::Result<()> {
     if !fdpass::is_unix_stream(control.as_fd()) {
         anyhow::bail!("the control fd is not a Unix stream socket");
     }
+    let wait = connector::request_budget(config.timeouts.connect()) + std::time::Duration::from_secs(2);
+    let connector = std::sync::Arc::new(connector::ConnectorClient::new(connector, wait)?);
     let host = match config.host.take() {
         Some(h) => h,
         None => {
@@ -64,7 +75,7 @@ pub async fn serve_with(mut config: BrokerConfig, control: OwnedFd, hooks: Hooks
     if config.net_mode == egress::NetMode::DevPrivate {
         tracing::warn!("{}: operator endpoints may be on loopback and the local network", zkminer_netguard::DEV_MODE_BANNER);
     }
-    let broker = broker::Broker::new(config, host, hooks)?;
+    let broker = broker::Broker::new(config, host, hooks, connector)?;
     if let Some(ep) = broker.artifacts.endpoint().cloned() {
         let want = broker.artifacts.chain_id();
         tokio::spawn(async move {

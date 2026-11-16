@@ -355,6 +355,12 @@ pub fn prepare_command(
         .collect();
     cmd.env_clear();
     cmd.envs(explicit);
+    // Review r2 B1: the child's argv[0] is the program's file name, not its install path (the
+    // kernel's AT_EXECFN still holds the path `execve` was given).
+    let name = std::path::Path::new(cmd.get_program()).file_name().map(|n| n.to_owned());
+    if let Some(name) = name {
+        cmd.arg0(name);
+    }
     let parent = std::process::id() as libc::pid_t;
     let mut scratch = vec![-1 as RawFd; plan.moves.len()];
     // SAFETY: the closure only makes async-signal-safe syscalls and does not allocate.

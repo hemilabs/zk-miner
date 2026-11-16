@@ -78,9 +78,10 @@
 //!    CIDRs, the connected prefixes and the host's own addresses. A DNS answer is not the operator's
 //!    word (a split-horizon zone, a stale record or a spoofed answer can name anything), so a local
 //!    or LAN node (loopback, RFC 1918, ULA, link-local, a neighbour on a connected prefix) is
-//!    configured by IP literal or explicit `cidrs`, never by name alone. Names resolve through the
-//!    broker's own stub resolver ([`crate::dns`]: `[dns] servers`, never `/etc/hosts`), at startup
-//!    and again every `reresolve_secs`; each answer replaces the pinned addresses.
+//!    configured by IP literal or explicit `cidrs`, never by name alone. Names are resolved by the
+//!    miner's connector ([`crate::connector`]) with the stub resolver of [`crate::dns`] (`[dns]
+//!    servers`, never `/etc/hosts`), on first use and again once `reresolve_secs` old; each answer
+//!    replaces the pinned addresses. The broker itself resolves nothing.
 //!
 //! # Public mode and developer mode
 //!
@@ -126,17 +127,25 @@
 //! public checks as the cidrs.
 //!
 //! A key travels only over `https` in public mode. In developer mode it may also travel over
-//! `http` to an IP literal that is loopback or inside the endpoint's own `cidrs` (a node on the
-//! operator's own wire).
+//! `http` to an IP literal that is not global and is loopback or inside the endpoint's own
+//! `cidrs` (a node on the operator's own wire).
+//!
+//! # Who loads this file
+//!
+//! Both processes: the miner ([`BrokerConfig::load_for_connector`], for its connector, without
+//! reading key files) and the broker ([`BrokerConfig::load`]). The broker's copy serves its URLs,
+//! keys and in-process checks; every connection is admitted by the miner's copy alone
+//! ([`crate::connector`]), so a broker that read another file, or lies about this one, can still
+//! only name the endpoints the miner loaded.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use reqwest::header::{HeaderName, HeaderValue};
+use http::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
 use url::Url;
 use zeroize::Zeroizing;
@@ -261,11 +270,12 @@ impl Default for DnsFile {
     }
 }
 
-/// `[dns]`: the broker's own resolver for endpoint host names (see [`crate::dns`]).
+/// `[dns]`: the resolver the miner's connector uses for endpoint host names (see [`crate::dns`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsConfig {
-    /// Explicit servers; empty = the nameservers of `/etc/resolv.conf` (read before the sandbox,
-    /// into [`HostFacts::dns_servers`]).
+    /// Explicit servers; empty = the nameservers of `/etc/resolv.conf` (read by the connector when
+    /// it starts, and by the broker before its sandbox, into [`HostFacts::dns_servers`], to deny
+    /// them as destinations).
     pub servers: Vec<SocketAddr>,
     /// How long a host name's answer stays pinned before it is resolved again.
     pub reresolve: Duration,
@@ -524,22 +534,20 @@ pub struct ArtifactsSpec {
     pub mirror: Option<EndpointSpec>,
 }
 
-/// Facts about the host the sandboxed broker cannot read itself: the DNS servers, what each
-/// endpoint host resolved to at startup, the prefixes the host's facts refuse and the host's own
-/// addresses. `main` reads them before `restrict_self`; [`crate::serve`] reads them itself when
-/// they are absent (tests).
+/// Facts about the host the sandboxed broker cannot read itself, for its own (second-layer) floor:
+/// the DNS servers, the prefixes the host's facts refuse and the host's own addresses. `main`
+/// reads them before `restrict_self`; [`crate::serve`] reads them itself when they are absent
+/// (tests). The broker resolves no names: the miner's connector does ([`crate::connector`]).
 #[derive(Debug, Clone, Default)]
 pub struct HostFacts {
-    /// Endpoint alias → resolved addresses, unfiltered (empty when resolution failed; retried
-    /// lazily). The floor filters them ([`crate::net::build_policy`]).
-    pub resolved: HashMap<String, Vec<IpAddr>>,
     /// Every prefix netguard's facts refuse ([`zkminer_netguard::HostFacts::refused_prefixes`]):
     /// connected prefixes (interfaces and on-link routes), the IPv6 site, routes off the default
     /// path and the host's DNS servers.
     pub connected: Vec<Prefix>,
     /// The host's own addresses, its public (NAT) addresses included.
     pub own_addresses: Vec<IpAddr>,
-    /// The servers host names are resolved with: `[dns] servers`, else `/etc/resolv.conf`'s.
+    /// The servers the connector resolves host names with: `[dns] servers`, else
+    /// `/etc/resolv.conf`'s. Denied as destinations.
     pub dns_servers: Vec<SocketAddr>,
     /// Every DNS server the host itself uses (`/etc/resolv.conf`, systemd-resolved's upstream
     /// servers behind its stub): denied like `dns_servers`.
@@ -571,20 +579,31 @@ impl BrokerConfig {
     /// Reads and validates the config file and every key file it names (relative key paths are
     /// taken from the config file's directory).
     pub fn load(path: &Path, net_mode: NetMode) -> Result<Self, ConfigError> {
-        let io = |source| ConfigError::Io { path: path.to_path_buf(), source };
-        let meta = std::fs::metadata(path).map_err(io)?;
-        if meta.len() > MAX_CONFIG_FILE_BYTES {
-            return invalid("config file larger than 1 MiB");
-        }
-        let text = std::fs::read_to_string(path).map_err(io)?;
-        let base = path.parent().unwrap_or(Path::new("/"));
+        let (text, base) = read_file(path)?;
         Self::from_toml(&text, base, net_mode)
     }
 
     /// Parses and validates a config in `net_mode`, reading key files relative to `base_dir`.
     pub fn from_toml(text: &str, base_dir: &Path, net_mode: NetMode) -> Result<Self, ConfigError> {
         let file: FileConfig = toml::from_str(text).map_err(|e| ConfigError::Parse(e.message().to_string()))?;
-        validate(file, base_dir, net_mode)
+        validate(file, base_dir, net_mode, Keys::Read)
+    }
+
+    /// The miner's load, for its connector ([`crate::connector::Connector::for_miner`]): the same
+    /// parse and the same validation in the miner's `net_mode` — every endpoint, role entry and
+    /// public-mode check — except that no key file is read (the miner never holds a provider key;
+    /// a key's presence still counts, so a key over `http` is refused as in [`Self::load`]). The
+    /// connector takes only what it needs from the result (roles, hosts, literals, ports, cidrs,
+    /// limits, `[dns]`, `[egress]`, timeouts) and never anything from the broker.
+    pub fn load_for_connector(path: &Path, net_mode: NetMode) -> Result<Self, ConfigError> {
+        let (text, base) = read_file(path)?;
+        Self::from_toml_for_connector(&text, base, net_mode)
+    }
+
+    /// [`Self::load_for_connector`] from text.
+    pub fn from_toml_for_connector(text: &str, base_dir: &Path, net_mode: NetMode) -> Result<Self, ConfigError> {
+        let file: FileConfig = toml::from_str(text).map_err(|e| ConfigError::Parse(e.message().to_string()))?;
+        validate(file, base_dir, net_mode, Keys::Skip)
     }
 
     /// The prefixes an endpoint's role entry is configured as: its explicit `cidrs`, else its IP
@@ -643,32 +662,6 @@ impl BrokerConfig {
             .chain(self.artifacts.iter().flat_map(|a| std::iter::once(&a.spec).chain(a.mirror.iter())))
     }
 
-    /// The TCP ports the broker connects to (its sandbox profile): every endpoint's port, and —
-    /// when an endpoint is named by host name, so the resolver runs — the DNS servers' ports (53,
-    /// unless `[dns] servers` names another), since [`crate::dns`] queries over TCP.
-    ///
-    /// Landlock admits a port to *any* host. That the broker dials only the configured endpoints
-    /// on theirs is the network floor's work ([`crate::net`]), and only the resolver's servers on
-    /// theirs is [`crate::dns`]'s: the server list is fixed at startup, from `[dns] servers` or
-    /// `/etc/resolv.conf`, and no other code connects to it.
-    pub fn tcp_connect_ports(&self) -> Vec<u16> {
-        let mut ports: BTreeSet<u16> = self.endpoints().map(|e| e.port).collect();
-        if self.endpoints().any(|e| e.literal.is_none()) {
-            ports.extend(self.dns_server_ports());
-        }
-        ports.into_iter().collect()
-    }
-
-    /// The ports of the servers the resolver will use: the host facts' (read before the sandbox),
-    /// else `[dns] servers`, else the DNS port (`/etc/resolv.conf` names addresses only).
-    fn dns_server_ports(&self) -> Vec<u16> {
-        match &self.host {
-            Some(h) => h.dns_servers.iter().map(|s| s.port()).collect(),
-            None if !self.dns.servers.is_empty() => self.dns.servers.iter().map(|s| s.port()).collect(),
-            None => vec![crate::dns::DNS_PORT],
-        }
-    }
-
     /// The bytes reserved for held-lock work.
     pub fn held_lock_reserved_bytes(&self) -> u64 {
         ((self.budget.inflight_bytes as f64) * self.budget.held_lock_share) as u64
@@ -709,7 +702,25 @@ fn check_roles_public(cfg: &BrokerConfig, facts: &zkminer_netguard::HostFacts, d
     Ok(())
 }
 
-fn validate(f: FileConfig, base: &Path, net_mode: NetMode) -> Result<BrokerConfig, ConfigError> {
+/// Whether key files are read ([`BrokerConfig::load`], the broker) or only their presence counts
+/// ([`BrokerConfig::load_for_connector`], the miner).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keys {
+    Read,
+    Skip,
+}
+
+fn read_file(path: &Path) -> Result<(String, &Path), ConfigError> {
+    let io = |source| ConfigError::Io { path: path.to_path_buf(), source };
+    let meta = std::fs::metadata(path).map_err(io)?;
+    if meta.len() > MAX_CONFIG_FILE_BYTES {
+        return invalid("config file larger than 1 MiB");
+    }
+    let text = std::fs::read_to_string(path).map_err(io)?;
+    Ok((text, path.parent().unwrap_or(Path::new("/"))))
+}
+
+fn validate(f: FileConfig, base: &Path, net_mode: NetMode, keys: Keys) -> Result<BrokerConfig, ConfigError> {
     let chain_rpc_host = normalize_host_input(&f.chain_rpc_host)
         .ok_or_else(|| ConfigError::Invalid("chain_rpc_host is not a host or URL".into()))?;
     if !f.spool_dir.is_absolute() {
@@ -805,6 +816,7 @@ fn validate(f: FileConfig, base: &Path, net_mode: NetMode) -> Result<BrokerConfi
             e.max_units_per_minute,
             base,
             net_mode,
+            keys,
         )?;
         evm_rpc.push(EvmRpcEndpoint {
             spec,
@@ -846,6 +858,7 @@ fn validate(f: FileConfig, base: &Path, net_mode: NetMode) -> Result<BrokerConfi
                 None,
                 base,
                 net_mode,
+                keys,
             )?;
             let mirror = match &a.mirror {
                 None => None,
@@ -921,6 +934,7 @@ fn rpc_endpoint(
     max_units_per_minute: Option<u64>,
     base: &Path,
     net_mode: NetMode,
+    keys: Keys,
 ) -> Result<EndpointSpec, ConfigError> {
     const TOKEN: &str = "zkminerkeyslot";
     let slots = url.matches("{key}").count();
@@ -947,7 +961,12 @@ fn rpc_endpoint(
                 return invalid(format!("{alias}: key_file needs exactly one of {{key}} in the url path or key_header"));
             }
             let path = if p.is_absolute() { p.to_path_buf() } else { base.join(p) };
-            Some(read_key(alias, &path)?)
+            match keys {
+                Keys::Read => Some(read_key(alias, &path)?),
+                // A stand-in that passes every check a real key must (the broker reads the real
+                // one and checks it again).
+                Keys::Skip => Some(Secret(Zeroizing::new("zkminer-unread-key".to_string()))),
+            }
         }
     };
     let mut final_url = Zeroizing::new(url.to_string());
@@ -990,12 +1009,15 @@ fn rpc_endpoint(
         if net_mode == NetMode::Public {
             return invalid(format!("{alias}: a key is sent only over https outside developer mode"));
         }
+        // Review r2 B3: on the operator's own wire means not global, whatever the cidrs say
+        // (`0.0.0.0/0` or a public /32 would otherwise send the key in clear to the internet).
         let local = literal.is_some_and(|ip| {
-            crate::egress::canonical_ip(ip).is_loopback() || cidrs.iter().any(|p| p.contains(ip))
+            let c = crate::egress::canonical_ip(ip);
+            !zkminer_netguard::is_global(ip) && (c.is_loopback() || cidrs.iter().any(|p| p.contains(ip)))
         });
         if !local {
             return invalid(format!(
-                "{alias}: a key is sent only over https (or http to a loopback IP literal or one inside the endpoint's cidrs)"
+                "{alias}: a key is sent only over https (or http to a loopback IP literal, or a non-global one inside the endpoint's cidrs)"
             ));
         }
     }
@@ -1254,8 +1276,6 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         let m = a.mirror.as_ref().unwrap();
         assert_eq!(m.url_with(&[("type", "1"), ("id", "ab")]), "https://mirror.example/artifacts/1/ab");
         assert_eq!(c.blob_mirrors[0].url_with(&[("sha256", "ff")]), "https://mirror.example/blobs/ff");
-        // Host-name endpoints: the resolver's port (TCP DNS) too.
-        assert_eq!(c.tcp_connect_ports(), vec![53, 443, 8545]);
         assert_eq!(c.held_lock_reserved_bytes(), 64 << 20);
     }
 
@@ -1387,6 +1407,11 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
             ("http://10.0.0.5:8545/", hdr),
             ("http://10.0.0.5:8545/", "key_header = \"x-api-key\"\ncidrs = [\"10.0.1.0/24\"]"),
             ("http://node.example/", "key_header = \"x-api-key\"\ncidrs = [\"10.0.0.5/32\"]"),
+            // Review r2 B3: a global literal is never the operator's own wire, whatever its cidrs.
+            ("http://1.1.1.1:8545/v1/{key}", "cidrs = [\"0.0.0.0/0\"]"),
+            ("http://1.1.1.1:8545/v1/{key}", "cidrs = [\"1.1.1.1/32\"]"),
+            ("http://[2606:4700:4700::1111]:8545/v1/{key}", "cidrs = [\"::/0\"]"),
+            ("http://[::ffff:1.1.1.1]:8545/", "key_header = \"x-api-key\"\ncidrs = [\"::ffff:0:0/96\"]"),
         ] {
             assert!(err(&ep(url, extra), d).contains("only over https"), "{url} {extra}");
         }
@@ -1440,29 +1465,25 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         assert_eq!(p["both"], vec![parse_cidr("192.168.4.0/24").unwrap()]);
     }
 
-    /// The resolver queries over TCP, so its servers' ports join the sandbox's connect ports —
-    /// only when some endpoint is named by host name.
+    /// The miner's load reads no key file (a missing one included) but applies every other rule,
+    /// a key's presence too: the same endpoints in the same order as the broker's load.
     #[test]
-    fn tcp_connect_ports_include_the_resolver_only_when_names_resolve() {
+    fn the_connectors_load_reads_no_key() {
         let dir = tempfile::tempdir().unwrap();
-        let named = "[[evm_rpc]]\nalias = \"named\"\nurl = \"https://node.example\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n";
-        let literal = "[[evm_rpc]]\nalias = \"lit\"\nurl = \"http://10.0.0.5:8545\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n";
-        let ports = |extra: &str| dev_toml(&minimal(extra), dir.path()).unwrap().tcp_connect_ports();
-        assert_eq!(ports(literal), vec![8545]);
-        assert_eq!(ports(&format!("{named}{literal}")), vec![53, 443, 8545]);
-        assert_eq!(
-            ports(&format!("[dns]\nservers = [\"127.0.0.1:5353\", \"9.9.9.9\"]\n{named}")),
-            vec![53, 443, 5353]
-        );
-        assert_eq!(ports(&format!("[dns]\nservers = [\"127.0.0.1:5353\"]\n{literal}")), vec![8545]);
-        // Once the host facts are read (main does so before the sandbox), their servers count.
-        let mut c = dev_toml(&minimal(named), dir.path()).unwrap();
-        c.host = Some(HostFacts { dns_servers: vec!["127.0.0.53:53".parse().unwrap()], ..Default::default() });
-        assert_eq!(c.tcp_connect_ports(), vec![53, 443]);
-        c.host = Some(HostFacts { dns_servers: vec!["127.0.0.1:40053".parse().unwrap()], ..Default::default() });
-        assert_eq!(c.tcp_connect_ports(), vec![443, 40053]);
-        c.host = Some(HostFacts::default());
-        assert_eq!(c.tcp_connect_ports(), vec![443], "no server, no DNS port");
+        let d = dir.path();
+        let text = example(d);
+        let full = dev_toml(&text, d).unwrap();
+        std::fs::remove_file(d.join("base.key")).unwrap();
+        std::fs::remove_file(d.join("hdr.key")).unwrap();
+        assert!(dev_toml(&text, d).is_err(), "the broker's load reads the keys");
+        let miner = BrokerConfig::from_toml_for_connector(&text, d, NetMode::DevPrivate).unwrap();
+        let ids = |c: &BrokerConfig| c.endpoints().map(|e| (e.role, e.alias.clone(), e.host.clone(), e.port, e.cidrs.clone())).collect::<Vec<_>>();
+        assert_eq!(ids(&miner), ids(&full));
+        assert!(miner.evm_rpc.iter().all(|e| !e.spec.url().contains("abcDEF")), "no key in the miner's copy");
+        // A key over http is refused in public mode even when the key is not read.
+        let http = minimal("[[evm_rpc]]\nalias = \"a\"\nurl = \"http://node.example.com/v2/{key}\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\nkey_file = \"nope\"\n");
+        let e = BrokerConfig::from_toml_for_connector(&http, d, NetMode::Public).unwrap_err().to_string();
+        assert!(e.contains("only over https"), "{e}");
     }
 
     fn public_err(text: &str) -> String {
@@ -1583,7 +1604,6 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         let dir = tempfile::tempdir().unwrap();
         let c = BrokerConfig::from_toml(&text, dir.path(), NetMode::Public).unwrap();
         let host = |connected: &[&str], own: &[&str], dns: &[&str]| HostFacts {
-            resolved: HashMap::new(),
             connected: connected.iter().map(|s| parse_cidr(s).unwrap()).collect(),
             own_addresses: own.iter().map(|s| s.parse().unwrap()).collect(),
             dns_servers: dns.iter().map(|s| s.parse().unwrap()).collect(),
@@ -1652,8 +1672,10 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
             ));
             let e = BrokerConfig::from_toml(&text, d, NetMode::Public).expect_err(url).to_string();
             assert!(e.contains("only over https outside developer mode"), "{e}");
-            // Developer mode keeps the operator's-own-wire exception.
-            assert!(BrokerConfig::from_toml(&text, d, NetMode::DevPrivate).is_ok(), "{url}");
+            // Review r2 B3: a global literal is not the operator's own wire in developer mode
+            // either.
+            let e = BrokerConfig::from_toml(&text, d, NetMode::DevPrivate).expect_err(url).to_string();
+            assert!(e.contains("only over https"), "{e}");
             let https = text.replace("http://", "https://");
             let c = BrokerConfig::from_toml(&https, d, NetMode::Public).unwrap();
             assert!(c.evm_rpc[0].spec.key_bearing);

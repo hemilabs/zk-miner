@@ -1,10 +1,11 @@
 //! The real broker binary under the real sandbox, against anvil: spawned through the sandbox launcher
-//! into a job cgroup with its control socket at fd 3, it restricts itself (Landlock: no readable
-//! file, the spool dir writable, TCP connect only to the configured ports; seccomp; no new
-//! privileges), then serves a builder's `evm-rpc/v1` and `blob/v1` fetches and `hemi-code` reads
-//! through the real codec and floor, resolves host names with its own resolver (TCP, no `bind`; a
-//! TCP DNS server on a loopback port the broker's `tcp_connect_ports` gains from `[dns] servers`),
-//! passes its own self-test, sandbox checks included, and exits 0 when the control socket closes.
+//! into a job cgroup with its control socket at fd 3 and its connector socket at fd 4 (the real
+//! connector, run here as the miner runs it), it restricts itself (Landlock: no readable file, the
+//! spool dir writable, no TCP; seccomp: no socket, connect, bind, listen or accept, and no socket
+//! pair once its runtime is up; no new privileges), then serves a builder's `evm-rpc/v1` and
+//! `blob/v1` fetches and `hemi-code` reads through the real codec over sockets the connector made,
+//! host names resolved by the connector (a TCP DNS server on a loopback port), passes its own
+//! self-test, sandbox and no-network checks included, and exits 0 when the control socket closes.
 //!
 //! Needs a delegated cgroup:
 //!
@@ -25,6 +26,9 @@ use common::*;
 use zkminer_witness::envelope::{encode_evm_rpc_config, CLASS_EVM_RPC_V1, METHOD_SET_STATE_READ};
 use zkminer_witness::ipc::{FetchStatus, JobBudget, SelfTestCheck};
 use zkminer_witness_broker::client::{job_socketpair, BrokerClient, JobRegistration};
+use zkminer_witness_broker::connector::{Connector, SessionEnd};
+use zkminer_witness_broker::egress::NetMode;
+use zkminer_witness_broker::BrokerConfig;
 use zkminer_witness_broker::testkit::{config_text, FakeBuilder, TestDns, TestResponse, TestServer};
 use zkminer_witness_sandbox::{
     delegated_root, landlock_abi, prepare_command, Cgroup, CgroupSpec, SandboxError, MIN_LANDLOCK_ABI,
@@ -54,6 +58,20 @@ fn delegated(test: &str) -> Option<PathBuf> {
         }
         Err(e) => panic!("{test}: delegated_root: {e}"),
     }
+}
+
+/// The miner's connector for the broker config at `config`, loaded as the miner loads it, and
+/// its session on a fresh socketpair: the broker's end (for fd 4), the connector and the session.
+fn connector_session(
+    config: &std::path::Path,
+    mode: NetMode,
+) -> (std::os::unix::net::UnixStream, std::sync::Arc<Connector>, tokio::task::JoinHandle<SessionEnd>) {
+    let cfg = BrokerConfig::load_for_connector(config, mode).expect("the miner loads the config");
+    let facts = zkminer_netguard::FactsOptions { discover_public_addresses: false, ..Default::default() };
+    let connector = Connector::for_miner(&cfg, &[], facts).expect("connector");
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let session = tokio::spawn(connector.clone().serve(ours));
+    (theirs, connector, session)
 }
 
 fn status_field(pid: u32, field: &str) -> String {
@@ -96,13 +114,15 @@ async fn the_broker_binary_serves_under_the_sandbox() {
     )
     .unwrap();
     let (miner_end, broker_end) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (connector_end, connector, session) = connector_session(&config, NetMode::DevPrivate);
     let mut cmd = Command::new(BROKER);
     cmd.arg("--config").arg(&config).arg("--dev-private-network");
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     cmd.env("RUST_LOG", "warn");
-    prepare_command(&mut cmd, &cg, &[(broker_end.as_fd(), 3)]).unwrap();
+    prepare_command(&mut cmd, &cg, &[(broker_end.as_fd(), 3), (connector_end.as_fd(), 4)]).unwrap();
     let mut child = cmd.spawn().unwrap();
     drop(broker_end);
+    drop(connector_end);
     drop(cmd);
     let pid = child.id();
 
@@ -161,25 +181,39 @@ async fn the_broker_binary_serves_under_the_sandbox() {
         SelfTestCheck::MetadataDenied,
         SelfTestCheck::Rfc1918Denied,
         SelfTestCheck::EndpointsReachable,
+        SelfTestCheck::InetSocketDenied,
+        SelfTestCheck::ConnectDenied,
+        SelfTestCheck::ConnectorRefusesBadIndex,
     ] {
         assert!(r.checks.contains(&(c, true)), "{c:?}: {r:?}");
     }
     assert!(r.ok, "{r:?}");
+    // And the connector's own checks, in this (the miner's) process.
+    let checks = connector.self_test().await;
+    assert!(checks.iter().all(|(_, ok)| *ok), "{checks:?}");
 
     let stats = client.end_job(B256::repeat_byte(7)).await.unwrap();
     assert_eq!(stats.fetches, 3);
     assert_eq!(stats.denied, 1);
+    // Every connection the broker used came from the connector.
+    assert!(connector.stats.connected.load(std::sync::atomic::Ordering::Relaxed) >= 1);
 
-    // Closing the control socket ends the broker, cleanly.
+    // Closing the control socket ends the broker, cleanly, and its connector session with it.
     drop(client);
     let out = tokio::task::spawn_blocking(move || child.wait_with_output()).await.unwrap().unwrap();
     assert_eq!(out.status.code(), Some(0), "{:?}; stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
+    assert_eq!(session.await.unwrap(), SessionEnd::Closed);
     cg.remove().unwrap();
 }
 
 /// Spawns the broker binary into a fresh cgroup with `config`, in developer mode (these tests'
-/// endpoints are on 127.0.0.1, as a local test network's are); returns the client and the child.
-fn spawn_broker_binary(root: &std::path::Path, config: &std::path::Path, tag: &str) -> (BrokerClient, std::process::Child, Cgroup) {
+/// endpoints are on 127.0.0.1, as a local test network's are), with the miner's connector at fd
+/// 4; returns the client, the child, its cgroup and the connector.
+fn spawn_broker_binary(
+    root: &std::path::Path,
+    config: &std::path::Path,
+    tag: &str,
+) -> (BrokerClient, std::process::Child, Cgroup, std::sync::Arc<Connector>) {
     spawn_broker_binary_in(root, config, tag, true)
 }
 
@@ -189,28 +223,31 @@ fn spawn_broker_binary_in(
     config: &std::path::Path,
     tag: &str,
     dev: bool,
-) -> (BrokerClient, std::process::Child, Cgroup) {
+) -> (BrokerClient, std::process::Child, Cgroup, std::sync::Arc<Connector>) {
     let cg = Cgroup::create(
         root,
         &CgroupSpec { name: format!("broker-test-{tag}-{}", std::process::id()), memory_max: 512 << 20, pids_max: 32, cpu_max: None, cpu_weight: 50 },
     )
     .unwrap();
     let (miner_end, broker_end) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mode = if dev { NetMode::DevPrivate } else { NetMode::Public };
+    let (connector_end, connector, _session) = connector_session(config, mode);
     let mut cmd = Command::new(BROKER);
     cmd.arg("--config").arg(config).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     if dev {
         cmd.arg("--dev-private-network");
     }
     cmd.env("RUST_LOG", "warn");
-    prepare_command(&mut cmd, &cg, &[(broker_end.as_fd(), 3)]).unwrap();
+    prepare_command(&mut cmd, &cg, &[(broker_end.as_fd(), 3), (connector_end.as_fd(), 4)]).unwrap();
     let child = cmd.spawn().unwrap();
     drop(broker_end);
-    (BrokerClient::new(miner_end).unwrap(), child, cg)
+    drop(connector_end);
+    (BrokerClient::new(miner_end).unwrap(), child, cg, connector)
 }
 
 /// `blob/v1` (spool files under Landlock), `hemi-code` (memfds, seals, `SCM_RIGHTS`, a cached
-/// duplicate) and an endpoint named by host name, resolved at startup and again inside the sandbox
-/// by the broker's own resolver.
+/// duplicate) and an endpoint named by host name, resolved — on first use and again once stale —
+/// by the miner's connector, never by the sandboxed broker.
 #[tokio::test]
 async fn blob_hemi_code_and_host_names_under_the_sandbox() {
     let Some(root) = delegated("blob_hemi_code_and_host_names_under_the_sandbox") else { return };
@@ -239,7 +276,7 @@ async fn blob_hemi_code_and_host_names_under_the_sandbox() {
     );
     let config = dir.path().join("broker.toml");
     std::fs::write(&config, config_text(dir.path(), &endpoint)).unwrap();
-    let (client, mut child, cg) = spawn_broker_binary(&root, &config, "names");
+    let (client, mut child, cg, _connector) = spawn_broker_binary(&root, &config, "names");
     let pid = child.id();
 
     let (builder_end, broker_job_end) = job_socketpair().unwrap();
@@ -269,13 +306,10 @@ async fn blob_hemi_code_and_host_names_under_the_sandbox() {
     let chain_id = br#"{"jsonrpc":"2.0","id":7,"method":"eth_chainId","params":[]}"#;
     let (s, body) = b.fetch(0, chain_id).await;
     assert_eq!(s, FetchStatus::Ok, "{}", String::from_utf8_lossy(&body));
-    // The name is resolved again inside the sandbox once its answer is a second old.
-    let before = dns.queries();
-    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
-    assert_eq!(b.fetch(0, chain_id).await.0, FetchStatus::Ok);
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert!(dns.queries() > before, "no DNS query from inside the sandbox");
-    assert_eq!(b.fetch(0, chain_id).await.0, FetchStatus::Ok, "still served after the new answer");
+    // The name was resolved by the connector, in this process: the sandboxed broker has no
+    // socket to ask a DNS server with (re-resolution is covered in-process by review_regressions).
+    assert!(dns.queries() >= 1, "the connector resolved the endpoint's name");
+    assert_eq!(b.fetch(0, chain_id).await.0, FetchStatus::Ok, "served again");
 
     // blob/v1: a spool file in spool_dir (O_TMPFILE under Landlock), written off the runtime.
     let (s, body) = b.fetch(1, &blob_id).await;
@@ -307,7 +341,7 @@ async fn blob_hemi_code_and_host_names_under_the_sandbox() {
     let r = client.self_test().await.unwrap();
     assert!(r.ok, "{r:?}");
     let stats = client.end_job(B256::repeat_byte(7)).await.unwrap();
-    assert_eq!(stats.fetches, 4);
+    assert_eq!(stats.fetches, 3);
     assert!(!stats.operator_failure && !stats.unanswerable);
     drop(client);
     let out = tokio::task::spawn_blocking(move || child.wait_with_output()).await.unwrap().unwrap();

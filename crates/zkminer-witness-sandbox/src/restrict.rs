@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use landlock::{
-    Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
+    Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd,
     RestrictSelfAttr, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
     Scope, ABI,
 };
@@ -64,12 +64,13 @@ pub(crate) fn thread_count() -> std::io::Result<usize> {
 /// 1. **Landlock** (ABI >= [`MIN_LANDLOCK_ABI`], else [`SandboxError::LandlockUnavailable`]): every
 ///    filesystem right of ABI 6 is handled (plus newer ones the kernel knows, best effort) with no
 ///    rules, except read-only rules for [`Profile::Broker`]'s `readable` paths and read-write rules
-///    for its `writable` directories; TCP bind and connect are handled, with connect rules only for
-///    the broker's `tcp_connect_ports`; signals and abstract Unix sockets are scoped to the sandbox.
+///    for its `writable` directories; TCP bind and connect are handled with no rule (no profile
+///    binds or connects TCP); signals and abstract Unix sockets are scoped to the sandbox.
 ///    `/proc`, `~/.zkminer`, `/tmp`, `/dev/shm` and GPU device nodes are therefore denied by path.
 /// 2. `PR_SET_NO_NEW_PRIVS`, `PR_SET_DUMPABLE(0)`, `RLIMIT_CORE=0`.
 /// 3. **seccomp** (default allow, denied syscalls fail with `EPERM`): see the module source for the
-///    full list. Runner and worker: no `socket*`, `connect`, `bind`, `listen`, `accept*`, `open*`,
+///    full list. Every profile: no `socket`, `connect`, `bind`, `listen`, `accept*`. Runner and
+///    worker also: no `socketpair`, `open*`,
 ///    `creat`, `exec*`, `ptrace`, `process_vm_*`, namespaces, mounts, `bpf`, `perf_event_open`, keys,
 ///    `userfaultfd`, `io_uring_*`, module/kexec/clock/swap/reboot/quota/acct/iopl, file handles,
 ///    `personality`; also no new processes (`fork`, `vfork`, `clone` without `CLONE_THREAD`;
@@ -80,18 +81,22 @@ pub(crate) fn thread_count() -> std::io::Result<usize> {
 ///    an inherited fd (`fchmod`, `fchown`, `fsetxattr`, `fremovexattr`, `flock`, `fcntl`
 ///    `F_SETLEASE`/`F_NOTIFY`, `ioctl` `FS_IOC_SETFLAGS`/`FS_IOC_FSSETXATTR`), no `file_getattr`, no
 ///    reaching other processes of the same uid (`setpriority`, `ioprio_set`, `prlimit64`,
-///    `sched_set*` on another pid, `migrate_pages`, `move_pages`, `process_madvise`, `pidfd_getfd`),
+///    `sched_set*` on another pid, `migrate_pages`, `move_pages`, `process_madvise`, `pidfd_getfd`;
+///    `getsid`/`getpgid` of another pid, which map sessions and process groups),
+///    no LSM attribute writes (`lsm_set_self_attr`),
 ///    no `TIOCSTI`/`TIOCLINUX`, no `PR_SET_PDEATHSIG` (the parent-death signal stays), no
 ///    `PR_SET_DUMPABLE` (it stays 0) or `PR_SET_PTRACER`, no x32 syscalls. Runner and worker also
 ///    read no host metadata: no `uname`, `sysinfo`, `readlink*`, `access`/`faccessat*`,
-///    `statfs`/`fstatfs`, `*getxattr*`/`*listxattr*`, `chdir`/`fchdir`, and `statx` fails with
-///    `ENOSYS` (std and glibc fall back to `fstat`/`newfstatat`, which stay: a path's existence,
-///    size, owner and times remain readable without a mount namespace). The broker additionally may
-///    `socket(AF_INET | AF_INET6, SOCK_STREAM, 0 | IPPROTO_TCP)` — TCP only: Landlock restricts TCP
-///    connect by port but not UDP, ICMP, raw, SCTP or MPTCP sockets, so those are refused here —
-///    `socketpair(AF_UNIX, SOCK_STREAM, ..)` (a connected stream pair reaches nothing; tokio's signal
-///    driver needs one; a datagram pair could `sendto` any pathname socket, which Landlock ABI 8
-///    cannot restrict), `connect`, and open files (which Landlock confines).
+///    `statfs`/`fstatfs`, `*getxattr*`/`*listxattr*`, `chdir`/`fchdir`, the mount table
+///    (`listmount`/`statmount`), the LSMs (`lsm_list_modules`, `lsm_get_self_attr`), `ustat` and
+///    `sysfs`, and `statx` fails with `ENOSYS` (std and glibc fall back to `fstat`/`newfstatat`,
+///    which stay: a path's existence, size, owner and times remain readable without a mount
+///    namespace). The broker additionally may `socketpair(AF_UNIX, SOCK_STREAM, ..)` (a connected
+///    stream pair reaches nothing; tokio's signal driver needs one; a datagram pair could `sendto`
+///    any pathname socket, which Landlock ABI 8 cannot restrict) until it calls
+///    [`seal_socket_creation`], and open files (which Landlock confines). It has no `socket` and
+///    no `connect`: its TCP connections come from the miner's connector, already connected, and
+///    without `connect` it cannot disconnect one (`connect(AF_UNSPEC)`) to aim it elsewhere.
 /// 4. Verification: `PR_GET_SECCOMP == 2`, `PR_GET_NO_NEW_PRIVS == 1`, `PR_GET_DUMPABLE == 0`,
 ///    `RLIMIT_CORE == 0`.
 ///
@@ -142,6 +147,78 @@ pub fn restrict_self(profile: &Profile) -> Result<RestrictReport, SandboxError> 
         )));
     }
     Ok(report)
+}
+
+/// The broker's second step, once its runtime has made the one socket pair it needs (tokio's
+/// signal driver): a further seccomp filter, on every thread (`TSYNC`), that denies
+/// `socketpair` as well (and, again, `socket`, `connect`, `bind`, `listen`, `accept`,
+/// `accept4`). After it the process can make no socket of any kind; it keeps the ones it holds.
+/// Requires [`restrict_self`] first (`NO_NEW_PRIVS`), and checks the result: `socketpair` must
+/// then fail with `EPERM`.
+pub fn seal_socket_creation() -> Result<(), SandboxError> {
+    // SAFETY: a getter prctl.
+    if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 1 {
+        return Err(SandboxError::Seccomp(
+            "seal_socket_creation needs restrict_self first".into(),
+        ));
+    }
+    let filter = sealed_sockets_filter()?;
+    seccompiler::apply_filter_all_threads(&filter)
+        .map_err(|e| SandboxError::Seccomp(e.to_string()))?;
+    let mut sv = [-1 as libc::c_int; 2];
+    // SAFETY: socketpair writes two fds into `sv`; they are closed at once if it succeeds.
+    let r = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    };
+    let e = std::io::Error::last_os_error().raw_os_error();
+    if r == 0 {
+        // SAFETY: both fds were just created here.
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
+        }
+        return Err(SandboxError::Seccomp(
+            "socketpair still works after seal_socket_creation".into(),
+        ));
+    }
+    if e != Some(libc::EPERM) {
+        return Err(SandboxError::Seccomp(format!(
+            "socketpair after seal_socket_creation: {e:?}, not EPERM"
+        )));
+    }
+    Ok(())
+}
+
+/// The syscalls [`seal_socket_creation`] denies.
+pub(crate) const SEALED_SOCKET_SYSCALLS: &[(&str, i64)] = &[
+    ("socket", libc::SYS_socket),
+    ("socketpair", libc::SYS_socketpair),
+    ("connect", libc::SYS_connect),
+    ("bind", libc::SYS_bind),
+    ("listen", libc::SYS_listen),
+    ("accept", libc::SYS_accept),
+    ("accept4", libc::SYS_accept4),
+];
+
+pub(crate) fn sealed_sockets_filter() -> Result<BpfProgram, SandboxError> {
+    let rules: BTreeMap<i64, Vec<SeccompRule>> = SEALED_SOCKET_SYSCALLS
+        .iter()
+        .map(|&(_, nr)| (nr, Vec::new()))
+        .collect();
+    SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        target_arch()?,
+    )
+    .map_err(|e| SandboxError::Seccomp(e.to_string()))?
+    .try_into()
+    .map_err(|e: seccompiler::BackendError| SandboxError::Seccomp(e.to_string()))
 }
 
 /// Reads back the process attributes [`restrict_self`] sets.
@@ -255,12 +332,7 @@ fn landlock_ruleset(profile: &Profile) -> Result<RulesetCreated, SandboxError> {
         .map_err(ll)?
         .set_compatibility(CompatLevel::HardRequirement);
 
-    if let Profile::Broker {
-        readable,
-        writable,
-        tcp_connect_ports,
-    } = profile
-    {
+    if let Profile::Broker { readable, writable } = profile {
         for path in readable {
             created = created
                 .add_rule(path_rule(path, read_only_access)?)
@@ -269,11 +341,6 @@ fn landlock_ruleset(profile: &Profile) -> Result<RulesetCreated, SandboxError> {
         for path in writable {
             created = created
                 .add_rule(path_rule(path, read_write_access)?)
-                .map_err(ll)?;
-        }
-        for port in tcp_connect_ports {
-            created = created
-                .add_rule(NetPort::new(*port, AccessNet::ConnectTcp))
                 .map_err(ll)?;
         }
     }
@@ -315,6 +382,11 @@ const SYS_REMOVEXATTRAT: i64 = 466;
 const SYS_OPEN_TREE_ATTR: i64 = 467;
 const SYS_FILE_GETATTR: i64 = 468;
 const SYS_FILE_SETATTR: i64 = 469;
+const SYS_STATMOUNT: i64 = 457;
+const SYS_LISTMOUNT: i64 = 458;
+const SYS_LSM_GET_SELF_ATTR: i64 = 459;
+const SYS_LSM_SET_SELF_ATTR: i64 = 460;
+const SYS_LSM_LIST_MODULES: i64 = 461;
 
 /// `prctl(PR_SET_PTRACER)` (Yama): lets a named process, or any (`PR_SET_PTRACER_ANY`), trace us.
 pub(crate) const PR_SET_PTRACER: libc::c_int = 0x5961_6d61;
@@ -366,9 +438,21 @@ fn host_metadata() -> Vec<Denied> {
         d("sysinfo", SYS_sysinfo),
         d("chdir", SYS_chdir),
         d("fchdir", SYS_fchdir),
+        // Review r2 B1: the mount table without opening anything (the source of every mount,
+        // NFS and CIFS servers' internal host names included), and the LSMs in force.
+        d("statmount", SYS_STATMOUNT),
+        d("listmount", SYS_LISTMOUNT),
+        d("lsm_get_self_attr", SYS_LSM_GET_SELF_ATTR),
+        d("lsm_list_modules", SYS_LSM_LIST_MODULES),
     ];
     #[cfg(target_arch = "x86_64")]
-    v.extend([d("readlink", SYS_readlink), d("access", SYS_access)]);
+    v.extend([
+        d("readlink", SYS_readlink),
+        d("access", SYS_access),
+        // A filesystem's free space by device number, and the kernel's filesystem types.
+        d("ustat", SYS_ustat),
+        d("sysfs", SYS_sysfs),
+    ]);
     v
 }
 
@@ -382,19 +466,20 @@ pub(crate) fn enosys_syscalls(profile: &Profile) -> Vec<(&'static str, i64)> {
     v
 }
 
-/// Socket syscalls the broker needs (`socket` and `socketpair` are argument-filtered for it).
-fn client_sockets() -> Vec<Denied> {
-    vec![
-        d("socket", libc::SYS_socket),
-        d("socketpair", libc::SYS_socketpair),
-        d("connect", libc::SYS_connect),
-    ]
+/// `socketpair`: denied to the runner and the worker; argument-filtered for the broker (an
+/// `AF_UNIX` stream pair for its runtime, until [`seal_socket_creation`]).
+fn socketpair() -> Vec<Denied> {
+    vec![d("socketpair", libc::SYS_socketpair)]
 }
 
 /// Denied for every profile.
 fn always_denied() -> Vec<Denied> {
     use libc::*;
     let mut v = vec![
+        // No profile has a network of its own: the broker's TCP connections come from the miner's
+        // connector, already connected (review r2 F5).
+        d("socket", SYS_socket),
+        d("connect", SYS_connect),
         d("bind", SYS_bind),
         d("listen", SYS_listen),
         d("accept", SYS_accept),
@@ -451,6 +536,7 @@ fn always_denied() -> Vec<Denied> {
         d("settimeofday", SYS_settimeofday),
         d("adjtimex", SYS_adjtimex),
         d("syslog", SYS_syslog),
+        d("lsm_set_self_attr", SYS_LSM_SET_SELF_ATTR),
         d("fanotify_init", SYS_fanotify_init),
         d("fanotify_mark", SYS_fanotify_mark),
         d("inotify_add_watch", SYS_inotify_add_watch),
@@ -526,7 +612,7 @@ pub(crate) fn denied_syscalls(profile: &Profile) -> Vec<Denied> {
     let mut v = always_denied();
     if !matches!(profile, Profile::Broker { .. }) {
         v.extend(path_opens());
-        v.extend(client_sockets());
+        v.extend(socketpair());
         v.extend(host_metadata());
     }
     v
@@ -637,23 +723,15 @@ fn conditional_denials(profile: &Profile) -> Result<Vec<(i64, Vec<SeccompRule>)>
             ],
         ),
     ];
+    // Sessions and process groups of other processes (review r2 B1): `getsid`/`getpgid` only of
+    // the caller itself (0, or its own pid, fixed when the filter is built in that process).
+    let me = u64::from(std::process::id());
+    for nr in [libc::SYS_getsid, libc::SYS_getpgid] {
+        v.push((nr, vec![rule(vec![cond(0, Dword, Ne, 0)?, cond(0, Dword, Ne, me)?])?]));
+    }
     if matches!(profile, Profile::Broker { .. }) {
-        // The broker may create TCP sockets only: AF_INET/AF_INET6, SOCK_STREAM, protocol 0 or
-        // IPPROTO_TCP. Landlock (ABI <= 8) restricts TCP bind/connect by port and nothing else: a UDP,
-        // ICMP ("ping"), raw, SCTP or MPTCP (IPPROTO_MPTCP over SOCK_STREAM) socket reaches any host
-        // and port. All arguments are `int`s: the kernel ignores their upper 32 bits, and so do these
-        // `Dword` comparisons.
-        let mut socket_rules = vec![rule(vec![
-            cond(0, Dword, Ne, libc::AF_INET as u64)?,
-            cond(0, Dword, Ne, libc::AF_INET6 as u64)?,
-        ])?];
-        socket_rules.extend(non_stream_types(1)?);
-        socket_rules.push(rule(vec![
-            cond(2, Dword, Ne, 0)?,
-            cond(2, Dword, Ne, libc::IPPROTO_TCP as u64)?,
-        ])?);
-        v.push((libc::SYS_socket, socket_rules));
-        // A connected AF_UNIX *stream* pair reaches nothing outside the process; tokio's signal
+        // All arguments are `int`s: the kernel ignores their upper 32 bits, and so do these
+        // `Dword` comparisons. A connected AF_UNIX *stream* pair reaches nothing outside the process; tokio's signal
         // driver creates one when the runtime is built (the workspace enables tokio's `signal`
         // feature). A datagram or seqpacket pair would not: `sendto` on either end reaches any
         // pathname datagram socket of the host, which Landlock ABI 8 has no right for.
@@ -801,7 +879,6 @@ mod tests {
         Profile::Broker {
             readable: vec![],
             writable: vec![],
-            tcp_connect_ports: vec![443],
         }
     }
 
@@ -815,7 +892,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_keeps_client_sockets_and_opens() {
+    fn broker_keeps_socketpairs_and_opens() {
         let names = |p: &Profile| {
             denied_syscalls(p)
                 .iter()
@@ -824,13 +901,16 @@ mod tests {
         };
         let runner = names(&Profile::BuilderRunner);
         let b = names(&broker());
-        // `socket` and `socketpair` are argument-filtered for the broker (IPv4/IPv6 sockets, AF_UNIX
-        // pairs), not denied outright.
-        for s in ["socket", "socketpair", "connect", "openat", "openat2"] {
+        // `socketpair` is argument-filtered for the broker (AF_UNIX stream pairs), and it may open
+        // files (Landlock confines them).
+        for s in ["socketpair", "openat", "openat2"] {
             assert!(runner.contains(&s), "{s}");
             assert!(!b.contains(&s), "{s}");
         }
+        // Review r2 F5: no profile has a socket of its own.
         for s in [
+            "socket",
+            "connect",
             "bind",
             "listen",
             "accept4",
@@ -845,7 +925,7 @@ mod tests {
             .into_iter()
             .map(|(nr, _)| nr)
             .collect();
-        assert!(filtered.contains(&libc::SYS_socket));
+        assert!(!filtered.contains(&libc::SYS_socket));
         assert!(filtered.contains(&libc::SYS_socketpair));
     }
 
@@ -1257,25 +1337,25 @@ mod tests {
     }
 
     #[test]
-    fn broker_sockets_are_tcp_and_unix_stream_pairs_only() {
+    fn broker_sockets_are_unix_stream_pairs_only() {
         use libc::*;
         let u = |v: c_int| v as u64;
         let flags = u(SOCK_NONBLOCK | SOCK_CLOEXEC);
         let b = seccomp_filters(&broker()).unwrap();
         let runner = seccomp_filters(&Profile::BuilderRunner).unwrap();
         let socket_cases: Vec<(&str, [u64; 3], u32)> = vec![
-            ("tcp", [u(AF_INET), u(SOCK_STREAM), 0], ALLOW),
-            ("tcp flags", [u(AF_INET), u(SOCK_STREAM) | flags, 0], ALLOW),
+            ("tcp", [u(AF_INET), u(SOCK_STREAM), 0], ERRNO_EPERM),
+            ("tcp flags", [u(AF_INET), u(SOCK_STREAM) | flags, 0], ERRNO_EPERM),
             (
                 "tcp6 IPPROTO_TCP",
                 [u(AF_INET6), u(SOCK_STREAM) | flags, u(IPPROTO_TCP)],
-                ALLOW,
+                ERRNO_EPERM,
             ),
             // The kernel takes `int`s: upper bits are not part of the argument.
             (
                 "tcp upper bits",
                 [(7 << 32) | u(AF_INET), (9 << 32) | u(SOCK_STREAM), 5 << 32],
-                ALLOW,
+                ERRNO_EPERM,
             ),
             ("udp", [u(AF_INET), u(SOCK_DGRAM), 0], ERRNO_EPERM),
             (
@@ -1377,12 +1457,56 @@ mod tests {
                 "runner socketpair {what}"
             );
         }
-        // connect is the broker's (Landlock confines the port); never the runner's.
-        assert_eq!(call(&b, SYS_connect, [3, 0x1000, 16, 0, 0, 0]), ALLOW);
-        assert_eq!(
-            call(&runner, SYS_connect, [3, 0x1000, 16, 0, 0, 0]),
-            ERRNO_EPERM
-        );
+        // Review r2 F5: no `connect` for anyone (the broker's sockets come connected; without
+        // `connect` it cannot disconnect one with AF_UNSPEC and aim it elsewhere), and no server
+        // side.
+        for nr in [SYS_connect, SYS_bind, SYS_listen, SYS_accept, SYS_accept4] {
+            assert_eq!(call(&b, nr, [3, 0x1000, 16, 0, 0, 0]), ERRNO_EPERM, "broker {nr}");
+            assert_eq!(call(&runner, nr, [3, 0x1000, 16, 0, 0, 0]), ERRNO_EPERM, "runner {nr}");
+        }
+    }
+
+    /// After `seal_socket_creation` the broker cannot make even a Unix stream pair.
+    #[test]
+    fn the_seal_denies_every_socket_call() {
+        use libc::*;
+        let mut f = seccomp_filters(&broker()).unwrap();
+        let pair = [u64::from(AF_UNIX as u32), u64::from(SOCK_STREAM as u32), 0, 0x1000, 0, 0];
+        assert_eq!(call(&f, SYS_socketpair, pair), ALLOW);
+        f.push(sealed_sockets_filter().unwrap());
+        assert_eq!(call(&f, SYS_socketpair, pair), ERRNO_EPERM);
+        for &(name, nr) in SEALED_SOCKET_SYSCALLS {
+            assert_eq!(call(&f, nr, [3, 0x1000, 16, 0, 0, 0]), ERRNO_EPERM, "{name}");
+        }
+        assert_eq!(call(&f, SYS_read, [3, 0x1000, 16, 0, 0, 0]), ALLOW);
+        assert_eq!(call(&f, SYS_sendmsg, [3, 0x1000, 0, 0, 0, 0]), ALLOW);
+    }
+
+    /// Review r2 B1: `getsid`/`getpgid` only of the caller; the mount table, the LSMs, `ustat`
+    /// and `sysfs` are host metadata.
+    #[test]
+    fn other_processes_sessions_and_the_mount_table_are_denied() {
+        use libc::*;
+        let me = u64::from(std::process::id());
+        for p in [Profile::BuilderRunner, Profile::ExecuteWorker, broker()] {
+            let f = seccomp_filters(&p).unwrap();
+            for nr in [SYS_getsid, SYS_getpgid] {
+                assert_eq!(call(&f, nr, [0; 6]), ALLOW, "{p:?} {nr} self (0)");
+                assert_eq!(call(&f, nr, [me, 0, 0, 0, 0, 0]), ALLOW, "{p:?} {nr} own pid");
+                assert_eq!(call(&f, nr, [1, 0, 0, 0, 0, 0]), ERRNO_EPERM, "{p:?} {nr} init");
+                assert_eq!(call(&f, nr, [me + 1, 0, 0, 0, 0, 0]), ERRNO_EPERM, "{p:?} {nr} other");
+            }
+            assert_eq!(call(&f, SYS_LSM_SET_SELF_ATTR, [0; 6]), ERRNO_EPERM, "{p:?}");
+        }
+        for p in [Profile::BuilderRunner, Profile::ExecuteWorker] {
+            let f = seccomp_filters(&p).unwrap();
+            let mut nrs = vec![SYS_STATMOUNT, SYS_LISTMOUNT, SYS_LSM_GET_SELF_ATTR, SYS_LSM_LIST_MODULES];
+            #[cfg(target_arch = "x86_64")]
+            nrs.extend([SYS_ustat, SYS_sysfs]);
+            for nr in nrs {
+                assert_eq!(call(&f, nr, [0; 6]), ERRNO_EPERM, "{p:?} {nr}");
+            }
+        }
     }
 
     #[test]

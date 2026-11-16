@@ -14,9 +14,20 @@ zkminer-witness-sandbox = { path = "../zkminer-witness-sandbox" }
 # The one network predicate (no HTTP client: the broker wires its own).
 zkminer-netguard = { workspace = true }
 tokio = { workspace = true }
-# No default features: no system proxy, no decompression, no HTTP/2; TLS is rustls with the compiled-in
-# webpki roots (never a CA bundle read from disk, which the sandbox forbids).
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# The HTTP client: hyper's HTTP/1.1 client over TCP sockets the miner's connector hands the
+# broker (`connector`), TLS by rustls (ring) with the compiled-in webpki roots (never a CA bundle
+# read from disk, which the sandbox forbids). No proxy, no redirects, no decompression, no HTTP/2:
+# none of them exists in this stack.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+tower-service = "0.3"
+bytes = "1"
 url = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -34,5 +45,14 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Test clients only (anvil, the redirect control); the broker itself has no reqwest.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tempfile = "3"
 proptest = "1"
+
+# A compromised broker under the real sandbox (review r2 F5): the test re-executes itself as the
+# probe, so it needs its own `main` (restrict_self refuses a process with a second thread).
+[[test]]
+name = "broker_escape"
+path = "tests/broker_escape.rs"
+harness = false
