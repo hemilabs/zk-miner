@@ -1503,8 +1503,9 @@ fn run_pids(a: &ProbeArgs) -> i32 {
 // ---------------------------------------------------------------------------------------------
 // test helpers
 
-/// Unrestricted: prints `FD <n> <st_dev> <st_ino>` for every open fd and `CGROUP <path>`, then
-/// reads stdin to EOF (a parent that keeps stdin open keeps the probe alive).
+/// Unrestricted: prints `FD <n> <st_dev> <st_ino>` for every open fd, `ENV <name>` for every
+/// environment variable and `CGROUP <path>`, then reads stdin to EOF (a parent that keeps stdin
+/// open keeps the probe alive).
 fn run_fds() -> i32 {
     for fd in open_fds() {
         let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -1514,6 +1515,9 @@ fn run_fds() -> i32 {
             let st = unsafe { st.assume_init() };
             println!("FD {fd} {} {}", st.st_dev, st.st_ino);
         }
+    }
+    for (k, _) in std::env::vars_os() {
+        println!("ENV {}", k.to_string_lossy());
     }
     let cg = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     println!(

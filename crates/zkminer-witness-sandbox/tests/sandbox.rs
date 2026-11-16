@@ -534,24 +534,31 @@ fn prepare_command_places_fds_and_joins_cgroup() {
     let mut cmd = Command::new(PROBE);
     cmd.args(["fds", "--profile", "builder_runner"])
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
+        .stdout(Stdio::piped())
+        .env("ZKMINER_PROBE_BEFORE", "1");
     prepare_command(
         &mut cmd,
         &cg,
         &[(a.as_fd(), 601), (b.as_fd(), 600), (c.as_fd(), 3)],
     )
     .unwrap();
+    cmd.env("ZKMINER_PROBE_AFTER", "2");
+    // The test process's own environment (PATH, HOME, CARGO_*, ...) must not reach the child.
+    assert!(std::env::vars_os().count() > 0);
     let mut child = cmd.spawn().unwrap();
     drop(cmd);
 
     let mut fds = Vec::new();
+    let mut env = Vec::new();
     let mut cgroup_line = String::new();
     for line in BufReader::new(child.stdout.take().unwrap()).lines() {
         let line = line.unwrap();
         if line == "DONE" {
             break;
         }
-        if let Some(rest) = line.strip_prefix("FD ") {
+        if let Some(rest) = line.strip_prefix("ENV ") {
+            env.push(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("FD ") {
             let v: Vec<u64> = rest.split(' ').map(|x| x.parse().unwrap()).collect();
             fds.push((v[0] as RawFd, (v[1], v[2])));
         } else if let Some(rest) = line.strip_prefix("CGROUP ") {
@@ -567,6 +574,9 @@ fn prepare_command_places_fds_and_joins_cgroup() {
         cgroup_line.ends_with(&format!("/sandboxes/{}", spec.name)),
         "{cgroup_line}"
     );
+    // Only what was set on the Command, before or after prepare_command.
+    env.sort();
+    assert_eq!(env, vec!["ZKMINER_PROBE_AFTER", "ZKMINER_PROBE_BEFORE"]);
     drop(leak);
 
     // The probe now blocks on stdin; remove() must kill it.
@@ -598,4 +608,69 @@ fn prepare_command_rejects_bad_targets() {
     }
     assert!(prepare_command(&mut cmd, &cg, &[(r.as_fd(), 3), (r.as_fd(), 3)]).is_err());
     cg.remove().unwrap();
+}
+
+/// Review L2: with fd 0, 1 or 2 closed in the parent, opening `cgroup.procs` returns that number,
+/// and std puts the child's stdin/stdout/stderr there before the hook writes "0" to it: the child
+/// stayed in the miner's cgroup, uncapped (the "0" went to /dev/null or the stdout pipe).
+/// `prepare_command` must keep the fd above 2. The parent's stdio is restored right after
+/// `prepare_command` (nothing may print meanwhile), which with the old code also replaced the
+/// procs fd itself, so the old code fails this test either way.
+#[test]
+fn prepare_command_survives_closed_stdio() {
+    let test = "prepare_command_survives_closed_stdio";
+    let Some(root) = delegated(test) else { return };
+    for closed in [&[0][..], &[1], &[2], &[0, 1, 2]] {
+        let tag: String = closed.iter().map(|f| f.to_string()).collect();
+        let spec = CgroupSpec {
+            name: format!("test-stdio-{}-{tag}", std::process::id()),
+            memory_max: 64 << 20,
+            pids_max: 8,
+            cpu_max: None,
+            cpu_weight: 10,
+        };
+        let cg = Cgroup::create(&root, &spec).unwrap();
+        let mut cmd = Command::new(PROBE);
+        cmd.args(["fds", "--profile", "builder_runner"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        // SAFETY: dup/close/dup2 of this process's stdio, restored before anything else runs.
+        let saved: Vec<(RawFd, RawFd)> = closed
+            .iter()
+            .map(|&fd| (fd, unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 100) }))
+            .collect();
+        for &(fd, copy) in &saved {
+            assert!(copy >= 100);
+            unsafe { libc::close(fd) };
+        }
+        let prepared = prepare_command(&mut cmd, &cg, &[]);
+        for &(fd, copy) in &saved {
+            unsafe {
+                libc::dup2(copy, fd);
+                libc::close(copy);
+            }
+        }
+        prepared.unwrap();
+        let out = cmd.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "stdio {closed:?} closed: {:?} {text}",
+            out.status
+        );
+        let cgroup_line = text
+            .lines()
+            .find_map(|l| l.strip_prefix("CGROUP "))
+            .unwrap_or("");
+        assert!(
+            cgroup_line.ends_with(&format!("/sandboxes/{}", spec.name)),
+            "stdio {closed:?} closed while preparing: the child ran in {cgroup_line:?}"
+        );
+        assert!(
+            text.starts_with("FD 0 "),
+            "stdio {closed:?}: stray bytes on stdout: {text:?}"
+        );
+        cg.remove().unwrap();
+    }
 }

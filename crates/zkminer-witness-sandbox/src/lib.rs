@@ -10,7 +10,8 @@
 //!   [`prepare_command`] installs a `pre_exec` hook that moves the child into that cgroup before
 //!   `exec` (so caps apply from the new program's first instruction), places the listed fds at fixed
 //!   numbers, sets `NO_NEW_PRIVS`, `PR_SET_PDEATHSIG(SIGKILL)` (re-checked with `getppid`),
-//!   `RLIMIT_CORE=0`, and makes sure no other fd survives the `exec`;
+//!   `RLIMIT_CORE=0`, and makes sure no other fd survives the `exec` and none of the miner's
+//!   environment reaches the child;
 //! - the **child side** (the sandboxed binary itself, at startup, before it starts threads or reads
 //!   any untrusted input): [`restrict_self`] applies Landlock (no filesystem access, no TCP
 //!   bind/connect except the profile's ports, scoped signals and abstract Unix sockets), a seccomp
