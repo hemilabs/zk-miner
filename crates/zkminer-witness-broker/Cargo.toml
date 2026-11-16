@@ -12,6 +12,8 @@ path = "src/main.rs"
 zkminer-witness = { path = "../zkminer-witness" }
 zkminer-witness-sandbox = { path = "../zkminer-witness-sandbox" }
 tokio = { workspace = true }
+# No default features: no system proxy, no decompression, no HTTP/2; TLS is rustls with the compiled-in
+# webpki roots (never a CA bundle read from disk, which the sandbox forbids).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 url = "2"
 serde = { workspace = true }
@@ -20,12 +22,15 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 sha2 = "0.10"
 hex = { workspace = true }
 alloy-primitives = { workspace = true, features = ["serde"] }
 futures = { workspace = true }
 libc = "0.2"
+zeroize = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 proptest = "1"
