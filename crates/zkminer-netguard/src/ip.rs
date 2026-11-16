@@ -20,10 +20,13 @@
 //!   `sit` tunnel carries it to its IPv4 address), 6to4 `2002::/16` and Teredo `2001::/32` (both
 //!   deprecated relay prefixes), and the local-use NAT64 `64:ff9b:1::/48` (outside `2000::/3`).
 //!   Inside `2000::/3`, also refused: `2001:db8::/32` and `3fff::/20` (documentation), and `2001::/23`
-//!   except IANA's globally reachable assignments in it: `2001:1::1`, `2001:1::2`, `2001:1::3` (PCP,
-//!   TURN and DNS-SD SRP anycast), `2001:3::/32` (AMT), `2001:4:112::/48` (AS112-v6) and
-//!   `2001:30::/28` (DRIP DETs). ORCHIDv2 `2001:20::/28`, globally reachable per IANA, stays refused:
-//!   its identifiers are not routable locators, and the blocklist refuses it.
+//!   except IANA's globally reachable assignments in it: `2001:3::/32` (AMT), `2001:4:112::/48`
+//!   (AS112-v6) and `2001:30::/28` (DRIP DETs). All of `2001:1::/32` stays refused, IANA's three
+//!   globally reachable anycast addresses in it included (`2001:1::1` PCP, `2001:1::2` TURN,
+//!   `2001:1::3` DNS-SD SRP): an anycast service answers from whichever instance is nearest, which
+//!   on a network that runs one (a PCP-capable router, a site's TURN relay or SRP registrar) is a
+//!   local box, and no program store lives there. ORCHIDv2 `2001:20::/28`, globally reachable per
+//!   IANA, stays refused: its identifiers are not routable locators, and the blocklist refuses it.
 //!
 //! Ported from the witness broker's egress predicate (`zkminer-witness-broker/src/egress.rs` @
 //! bd9aabf), which a review already hardened; the one change is the IPv4-compatible form, refused
@@ -254,14 +257,12 @@ const V6_NOT_GLOBAL: &[(u128, u8)] = &[
     (0x2001_0000 << 96, 23), // IETF protocol assignments (incl. Teredo), less the exceptions
 ];
 
-/// IANA's globally reachable assignments inside `2001::/23` that are admitted (not ORCHIDv2).
+/// IANA's globally reachable assignments inside `2001::/23` that are admitted (not ORCHIDv2, and
+/// not the anycast addresses in `2001:1::/32`: see the module doc).
 const V6_IANA_GLOBAL_EXCEPTIONS: &[(u128, u8)] = &[
-    ((0x2001_0001 << 96) | 1, 128), // PCP anycast
-    ((0x2001_0001 << 96) | 2, 128), // TURN anycast
-    ((0x2001_0001 << 96) | 3, 128), // DNS-SD SRP anycast
-    (0x2001_0003 << 96, 32),        // AMT
-    (0x2001_0004_0112 << 80, 48),   // AS112-v6
-    (0x2001_0030 << 96, 28),        // DRIP DETs
+    (0x2001_0003 << 96, 32),      // AMT
+    (0x2001_0004_0112 << 80, 48), // AS112-v6
+    (0x2001_0030 << 96, 28),      // DRIP DETs
 ];
 
 fn in4(a: u32, net: [u8; 4], len: u8) -> bool {
@@ -547,7 +548,10 @@ mod tests {
         "fe80::1",
         "febf::1",
         "2001:10::1", // deprecated ORCHID
-        "2001:1::",   // in 2001:1::/48 but not one of the three anycast /128s
+        "2001:1::",   // all of 2001:1::/32, its three IANA anycast addresses included
+        "2001:1::1",  // PCP anycast: answered by the nearest instance, often a local router
+        "2001:1::2",  // TURN anycast
+        "2001:1::3",  // DNS-SD SRP anycast
         "2001:1::4",
         "2001:4:113::1", // next to AS112-v6
         "2001:40::1",    // unassigned in 2001::/23
@@ -591,10 +595,7 @@ mod tests {
         "2003::1",
         "3ffe::1",
         "3fff:1000::1", // just above 3fff::/20
-        "2001:1::1",    // IANA exceptions in 2001::/23
-        "2001:1::2",
-        "2001:1::3",
-        "2001:3::1",
+        "2001:3::1",    // IANA exceptions in 2001::/23
         "2001:3:ffff::1",
         "2001:4:112::1",
         "2001:4:112:ffff::1",
@@ -860,8 +861,9 @@ mod tests {
             ("2001:200::/23", true),
             ("2001:3::/32", true), // AMT, an IANA-global exception
             ("2001:2::/48", false),
-            ("2001:1::/120", false), // the three anycast /128s and their non-global neighbours
-            ("2001:1::1/128", true),
+            ("2001:1::/120", false), // the three anycast /128s and their neighbours
+            ("2001:1::1/128", false),
+            ("2001:1::/32", false),
             ("::ffff:0:0/96", false),       // every IPv4 address, mapped
             ("::ffff:8.8.8.0/120", true),   // a public /24, mapped
             ("64:ff9b::/96", false),        // NAT64 of every IPv4 address
