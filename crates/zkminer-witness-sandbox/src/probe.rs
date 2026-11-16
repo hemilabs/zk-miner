@@ -337,7 +337,8 @@ impl ProbeArgs {
     }
 }
 
-/// Entry point of the probe binary: `<checks|oom|pids|fds|threaded> --profile <..> [flags]`.
+/// Entry point of the probe binary: `<checks|oom|pids|fds|threaded|delegation> --profile <..>
+/// [flags]`.
 /// Returns the exit code.
 pub fn main() -> i32 {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -358,6 +359,7 @@ pub fn main() -> i32 {
         "pids" => run_pids(&parsed),
         "fds" => run_fds(),
         "threaded" => run_threaded(&parsed),
+        "delegation" => run_delegation(),
         _ => {
             eprintln!("{PROBE_BINARY}: unknown command {command}");
             64
@@ -1528,6 +1530,29 @@ fn run_fds() -> i32 {
     let _ = io::stdout().flush();
     let mut sink = Vec::new();
     let _ = io::stdin().read_to_end(&mut sink);
+    0
+}
+
+/// Unrestricted: calls [`crate::delegated_root`] in whatever cgroup the probe was started in and
+/// prints `DELEGATION ok <root>` or `DELEGATION not_delegated|error <message>`, then
+/// `SUPERVISOR <exists>`: whether `<own>/supervisor` exists afterwards (a refusal must change
+/// nothing).
+fn run_delegation() -> i32 {
+    let own = crate::cgroup::own_cgroup();
+    match crate::delegated_root() {
+        Ok(root) => println!("DELEGATION ok {}", root.display()),
+        Err(e @ crate::SandboxError::NotDelegated { .. }) => {
+            println!("DELEGATION not_delegated {e}")
+        }
+        Err(e) => println!("DELEGATION error {e}"),
+    }
+    match own {
+        Ok(own) => println!(
+            "SUPERVISOR {}",
+            own.join(crate::cgroup::SUPERVISOR).exists()
+        ),
+        Err(e) => println!("SUPERVISOR unknown: {e}"),
+    }
     0
 }
 

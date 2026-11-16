@@ -674,3 +674,48 @@ fn prepare_command_survives_closed_stdio() {
         cg.remove().unwrap();
     }
 }
+
+/// Review L5: a user scope *without* `Delegate=yes` is owned by this uid as well (the user manager
+/// runs as the user), so ownership proves nothing; `delegated_root` must ask systemd, refuse, and
+/// change nothing.
+#[test]
+fn delegated_root_refuses_a_scope_without_delegate() {
+    let test = "delegated_root_refuses_a_scope_without_delegate";
+    if delegated(test).is_none() {
+        return;
+    }
+    let out = match Command::new("systemd-run")
+        .args(["--user", "--scope", "-q", "--"])
+        .arg(PROBE)
+        .args(["delegation", "--profile", "builder_runner"])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            skip(
+                test,
+                &format!(
+                    "systemd-run --user --scope: {:?} {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            );
+            return;
+        }
+        Err(e) => {
+            skip(test, &format!("systemd-run: {e}"));
+            return;
+        }
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("DELEGATION not_delegated"), "{text}");
+    assert!(
+        text.contains("Delegate=\"no\""),
+        "refused by systemd's answer: {text}"
+    );
+    assert!(
+        text.contains("SUPERVISOR false"),
+        "a refusal changed the cgroup: {text}"
+    );
+}

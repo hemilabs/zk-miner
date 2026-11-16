@@ -27,7 +27,9 @@
 //! - Linux with Landlock ABI >= 6 (Linux 6.12+), seccomp filters and cgroup v2.
 //! - The miner must run in a **delegated** cgroup owned by its uid, e.g. launched with
 //!   `systemd-run --user --scope -p Delegate=yes -- zkminer ...` (or a user unit with
-//!   `Delegate=yes`). [`delegated_root`] fails with [`SandboxError::NotDelegated`] otherwise.
+//!   `Delegate=yes`), with `cpu`, `memory` and `pids` available. [`delegated_root`] asks the unit's
+//!   systemd manager (`systemctl [--user] show --property=Delegate`) and fails with
+//!   [`SandboxError::NotDelegated`] otherwise, before changing anything.
 
 #![cfg(target_os = "linux")]
 
