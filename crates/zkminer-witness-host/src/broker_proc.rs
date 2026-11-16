@@ -76,8 +76,9 @@ impl BrokerProcess {
         )
         .context("creating the broker's cgroup")?;
         let (miner_end, broker_end) = UnixStream::pair().context("control socketpair")?;
-        let binary = binary.to_path_buf();
-        let config = config.to_path_buf();
+        // Absolute: the sandbox launcher starts the broker in `/`.
+        let binary = std::path::absolute(binary).context("the broker binary's path")?;
+        let config = std::path::absolute(config).context("the broker config's path")?;
         let (spawned, cgroup) = spawner
             .run(move || {
                 let mut cmd = Command::new(&binary);

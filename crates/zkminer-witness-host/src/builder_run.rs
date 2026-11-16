@@ -340,8 +340,10 @@ pub async fn run_builder_abortable<S: WitnessSink>(
     let module = sealed_memfd("builder-module", run.module)?;
     let context = sealed_memfd("builder-context", run.context)?;
     let spawner = spawner.clone();
+    // Absolute: the sandbox launcher starts the runner in `/`.
+    let binary = std::path::absolute(run.binary).unwrap_or_else(|_| run.binary.to_path_buf());
     let (binary, root, key, limits, abort) =
-        (run.binary.to_path_buf(), run.cgroup_root.to_path_buf(), run.job_key, run.limits.clone(), abort.clone());
+        (binary, run.cgroup_root.to_path_buf(), run.job_key, run.limits.clone(), abort.clone());
     let joined = tokio::task::spawn_blocking(move || {
         run_blocking(&spawner, binary, root, key, module, context, OwnedFd::from(runner_end), limits, sink, abort)
     })

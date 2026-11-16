@@ -247,14 +247,19 @@ fn child_setup(
         if libc::getppid() != parent {
             libc::_exit(127);
         }
+        // 4. Start in `/`: the miner's working directory (a home or project path) is nothing a
+        //    sandboxed process needs to see, and an escaped one could read it back with `getcwd`.
+        if libc::chdir(c"/".as_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
-    // 4. Each source is still the object the caller handed us.
+    // 5. Each source is still the object the caller handed us.
     for (&(src, _), want) in plan.moves.iter().zip(identities) {
         if fd_identity(src)? != *want {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
     }
-    // 5. Fixed fd numbers; nothing else survives the exec.
+    // 6. Fixed fd numbers; nothing else survives the exec.
     apply_plan(&mut LibcFds, plan, scratch)
 }
 
@@ -266,11 +271,13 @@ fn child_setup(
 /// 2. sets `RLIMIT_CORE=0` and `NO_NEW_PRIVS`;
 /// 3. sets `PR_SET_PDEATHSIG(SIGKILL)`, then compares `getppid()` with this process's pid
 ///    (captured now) and `_exit(127)`s if they differ (the parent died before the signal was armed);
-/// 4. checks that every source fd still refers to the file it referred to now (device and inode);
-/// 5. places each `(source, target)` of `fds` at `target`: every source is first duplicated to a
+/// 4. changes its working directory to `/`, so nothing of the miner's (its home, its project
+///    path) is visible through `getcwd`; this overrides `Command::current_dir`;
+/// 5. checks that every source fd still refers to the file it referred to now (device and inode);
+/// 6. places each `(source, target)` of `fds` at `target`: every source is first duplicated to a
 ///    temporary above the highest target, then `dup2`ed onto its target, so swaps and chains
 ///    (one pair's source is another's target) work;
-/// 6. marks every other fd >= 3 close-on-exec with `close_range(.., CLOSE_RANGE_CLOEXEC)`, so the
+/// 7. marks every other fd >= 3 close-on-exec with `close_range(.., CLOSE_RANGE_CLOEXEC)`, so the
 ///    new program starts with exactly fds 0–2 and the targets.
 ///
 /// The hook is async-signal-safe and does not allocate (the plan and scratch space are built
@@ -282,7 +289,8 @@ fn child_setup(
 /// memory even though nothing else can (it is not dumpable). `prepare_command` calls
 /// `Command::env_clear` and re-adds only the variables already set on `cmd` with `Command::env` or
 /// `envs`; variables set after it are passed too. Set what the program needs (e.g. `RUST_LOG`)
-/// explicitly, and give the program as an absolute path: there is no `PATH`.
+/// explicitly, and give the program, and any path among its arguments, as an absolute path: there
+/// is no `PATH`, and the child starts in `/`.
 ///
 /// # Why this is equivalent to `clone3(CLONE_INTO_CGROUP)` here
 /// The point of `CLONE_INTO_CGROUP` (plan §10.2) is that the caps apply before the sandboxed

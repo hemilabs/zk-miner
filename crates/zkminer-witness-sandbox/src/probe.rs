@@ -110,6 +110,32 @@ const COMMON_CHECKS: &[&str] = &[
 
 const NO_NETWORK_CHECKS: &[&str] = &["socket_inet", "socket_inet6", "tcp_connect_loopback"];
 
+/// The runner's and the worker's host-metadata checks (review r1 broker F3): what an escaped
+/// builder could read about the host without opening anything.
+const METADATA_CHECKS: &[&str] = &[
+    "cwd_root",
+    "uname",
+    "sysinfo",
+    #[cfg(target_arch = "x86_64")]
+    "readlink_proc_self_exe",
+    "readlinkat_proc_self_exe",
+    #[cfg(target_arch = "x86_64")]
+    "access_root",
+    "faccessat_root",
+    "faccessat2_root",
+    "statfs_root",
+    "fstatfs_inherited",
+    "getxattr_root",
+    "lgetxattr_root",
+    "fgetxattr_inherited",
+    "listxattr_root",
+    "llistxattr_root",
+    "flistxattr_inherited",
+    "statx_enosys",
+    "chdir",
+    "fchdir",
+];
+
 const BROKER_CHECKS: &[&str] = &[
     "socket_inet_allowed",
     "socket_inet6_allowed",
@@ -152,15 +178,23 @@ pub const UNSANDBOXED_EXEMPT: &[(&str, &str)] = &[
         "without CAP_NET_RAW the kernel refuses a raw socket with EPERM too; the seccomp rule \
          itself is proven by restrict.rs's BPF interpreter test",
     ),
+    (
+        "cwd_root",
+        "a property of prepare_command (the child starts in /), which the negative control does \
+         not use",
+    ),
 ];
 
 /// Every check a `checks` run must print for `kind`.
 pub fn expected_checks(kind: ProfileKind) -> Vec<&'static str> {
     let mut v = COMMON_CHECKS.to_vec();
-    v.extend_from_slice(match kind {
-        ProfileKind::Broker => BROKER_CHECKS,
-        _ => NO_NETWORK_CHECKS,
-    });
+    match kind {
+        ProfileKind::Broker => v.extend_from_slice(BROKER_CHECKS),
+        _ => {
+            v.extend_from_slice(NO_NETWORK_CHECKS);
+            v.extend_from_slice(METADATA_CHECKS);
+        }
+    }
     v
 }
 
@@ -872,6 +906,7 @@ fn run_checks(a: &ProbeArgs) -> i32 {
         broker_checks(a, &mut out);
     } else {
         no_network_checks(a, inet_sock, &mut out);
+        metadata_checks(root_dir, &mut out);
     }
     close(unix_sock);
     close(inet_sock);
@@ -1138,6 +1173,156 @@ fn no_network_checks(a: &ProbeArgs, inet_sock: RawFd, out: &mut Out) {
             "could not create a socket before restricting",
         ),
     }
+}
+
+/// The runner's and the worker's host metadata (see [`METADATA_CHECKS`]): each read fails with the
+/// filter's `EPERM` (`statx`: `ENOSYS`, so std falls back to `fstat`). `root_dir` is a directory fd
+/// opened before restricting. Last of the runner's checks: unrestricted, `chdir` moves to `/`.
+fn metadata_checks(root_dir: RawFd, out: &mut Out) {
+    let eperm: &[i32] = &[libc::EPERM];
+    {
+        let mut buf = [0u8; 4096];
+        // SAFETY: `buf` is writable for its length.
+        let r = unsafe { libc::getcwd(buf.as_mut_ptr().cast(), buf.len()) };
+        let cwd = if r.is_null() {
+            errname(errno())
+        } else {
+            // SAFETY: getcwd wrote a NUL-terminated string into `buf`.
+            unsafe { std::ffi::CStr::from_ptr(buf.as_ptr().cast()) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        out.check("cwd_root", cwd == "/", format!("getcwd = {cwd}"));
+    }
+    {
+        // SAFETY: a zeroed utsname is valid to be written.
+        let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+        // SAFETY: `u` is a valid utsname.
+        let (r, e) = sys(|| unsafe { libc::uname(&mut u) } as libc::c_long);
+        out.result("uname", denied(r, e, eperm));
+        // SAFETY: a zeroed sysinfo is valid to be written.
+        let mut si: libc::sysinfo = unsafe { std::mem::zeroed() };
+        // SAFETY: `si` is a valid sysinfo.
+        let (r, e) = sys(|| unsafe { libc::sysinfo(&mut si) } as libc::c_long);
+        out.result("sysinfo", denied(r, e, eperm));
+    }
+    let exe = c"/proc/self/exe";
+    let root = c"/";
+    let mut buf = [0u8; 512];
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: valid path and buffer.
+        let (r, e) = sys(|| unsafe {
+            libc::syscall(
+                libc::SYS_readlink,
+                exe.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        });
+        out.result("readlink_proc_self_exe", denied(r, e, eperm));
+        // SAFETY: a valid path.
+        let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_access, root.as_ptr(), libc::F_OK) });
+        out.result("access_root", denied(r, e, eperm));
+    }
+    // SAFETY (each call below): valid NUL-terminated paths, valid buffers for their lengths, and
+    // `root_dir` an fd of ours (or -1, which fails harmlessly).
+    let (r, e) = sys(|| unsafe {
+        libc::syscall(
+            libc::SYS_readlinkat,
+            libc::AT_FDCWD,
+            exe.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+        )
+    });
+    out.result("readlinkat_proc_self_exe", denied(r, e, eperm));
+    let (r, e) = sys(|| unsafe {
+        libc::syscall(
+            libc::SYS_faccessat,
+            libc::AT_FDCWD,
+            root.as_ptr(),
+            libc::F_OK,
+        )
+    });
+    out.result("faccessat_root", denied(r, e, eperm));
+    let (r, e) = sys(|| unsafe {
+        libc::syscall(
+            libc::SYS_faccessat2,
+            libc::AT_FDCWD,
+            root.as_ptr(),
+            libc::F_OK,
+            0,
+        )
+    });
+    out.result("faccessat2_root", denied(r, e, eperm));
+    {
+        // SAFETY: a zeroed statfs is valid to be written.
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        let (r, e) = sys(|| unsafe { libc::statfs(root.as_ptr(), &mut st) } as libc::c_long);
+        out.result("statfs_root", denied(r, e, eperm));
+        let (r, e) = sys(|| unsafe { libc::fstatfs(root_dir, &mut st) } as libc::c_long);
+        out.result("fstatfs_inherited", denied(r, e, eperm));
+    }
+    let name = c"user.zkminer-probe";
+    let (r, e) = sys(|| unsafe {
+        libc::getxattr(
+            root.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    } as libc::c_long);
+    out.result("getxattr_root", denied(r, e, eperm));
+    let (r, e) = sys(|| unsafe {
+        libc::lgetxattr(
+            root.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    } as libc::c_long);
+    out.result("lgetxattr_root", denied(r, e, eperm));
+    let (r, e) = sys(|| unsafe {
+        libc::fgetxattr(root_dir, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
+    } as libc::c_long);
+    out.result("fgetxattr_inherited", denied(r, e, eperm));
+    let (r, e) =
+        sys(
+            || unsafe { libc::listxattr(root.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) }
+                as libc::c_long,
+        );
+    out.result("listxattr_root", denied(r, e, eperm));
+    let (r, e) =
+        sys(
+            || unsafe { libc::llistxattr(root.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) }
+                as libc::c_long,
+        );
+    out.result("llistxattr_root", denied(r, e, eperm));
+    let (r, e) = sys(
+        || unsafe { libc::flistxattr(root_dir, buf.as_mut_ptr().cast(), buf.len()) }
+            as libc::c_long,
+    );
+    out.result("flistxattr_inherited", denied(r, e, eperm));
+    {
+        // SAFETY: a zeroed statx is valid to be written.
+        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+        let (r, e) = sys(|| unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                libc::AT_FDCWD,
+                root.as_ptr(),
+                0,
+                libc::STATX_BASIC_STATS,
+                &mut stx as *mut libc::statx,
+            )
+        });
+        out.result("statx_enosys", denied(r, e, &[libc::ENOSYS]));
+    }
+    let (r, e) = sys(|| unsafe { libc::fchdir(root_dir) } as libc::c_long);
+    out.result("fchdir", denied(r, e, eperm));
+    let (r, e) = sys(|| unsafe { libc::chdir(root.as_ptr()) } as libc::c_long);
+    out.result("chdir", denied(r, e, eperm));
 }
 
 /// How a socket the broker must not have was tried.
@@ -1616,6 +1801,13 @@ mod tests {
         let broker = expected_checks(ProfileKind::Broker);
         assert!(runner.contains(&"socket_inet") && !runner.contains(&"socket_inet_allowed"));
         assert!(broker.contains(&"tcp_connect_denied_port") && !broker.contains(&"socket_inet"));
+        for c in ["uname", "sysinfo", "statx_enosys", "chdir", "cwd_root"] {
+            assert!(runner.contains(&c) && !broker.contains(&c), "{c}");
+            assert!(
+                expected_checks(ProfileKind::ExecuteWorker).contains(&c),
+                "{c}"
+            );
+        }
         let mut all = broker.clone();
         all.sort_unstable();
         all.dedup();

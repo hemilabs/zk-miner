@@ -142,7 +142,33 @@ fn builder_runner_self_test() {
     ] {
         assert!(n.contains(&c), "missing {c}");
     }
+    // Review r1 broker F3 (PoC `meta`), inverted: nothing about the host is readable without
+    // opening a file, and the runner starts in `/`.
+    for c in METADATA {
+        assert!(
+            n.contains(&format!("builder_runner/{c}").as_str()),
+            "missing {c}"
+        );
+    }
 }
+
+/// The host-metadata checks every runner and worker self-test reports (and passes).
+const METADATA: &[&str] = &[
+    "cwd_root",
+    "uname",
+    "sysinfo",
+    "readlinkat_proc_self_exe",
+    "faccessat_root",
+    "faccessat2_root",
+    "statfs_root",
+    "fstatfs_inherited",
+    "getxattr_root",
+    "listxattr_root",
+    "fgetxattr_inherited",
+    "statx_enosys",
+    "chdir",
+    "fchdir",
+];
 
 #[test]
 fn execute_worker_self_test() {
@@ -158,7 +184,14 @@ fn execute_worker_self_test() {
         s.path(),
     );
     assert_passed(test, &report);
-    assert!(names(&report).contains(&"execute_worker/seccomp_denylist"));
+    let n = names(&report);
+    assert!(n.contains(&"execute_worker/seccomp_denylist"));
+    for c in METADATA {
+        assert!(
+            n.contains(&format!("execute_worker/{c}").as_str()),
+            "missing {c}"
+        );
+    }
 }
 
 #[test]
@@ -204,6 +237,10 @@ fn broker_self_test() {
         "broker/inherited_file_unchanged",
     ] {
         assert!(n.contains(&c), "missing {c}");
+    }
+    // The broker keeps them (it reads its spool).
+    for c in METADATA {
+        assert!(!n.contains(&format!("broker/{c}").as_str()), "{c}");
     }
 }
 
@@ -616,8 +653,41 @@ fn prepare_command_rejects_bad_targets() {
 /// `prepare_command` must keep the fd above 2. The parent's stdio is restored right after
 /// `prepare_command` (nothing may print meanwhile), which with the old code also replaced the
 /// procs fd itself, so the old code fails this test either way.
+///
+/// It closes this process's stdio for a moment, so any fd another test opens meanwhile lands on
+/// 0-2 and is clobbered when stdio comes back (which made `prepare_command_places_fds_and_joins_cgroup`
+/// fail with EBADF, and this test's own `dup`, now and then). So its body runs in a child test
+/// process of its own, alone.
 #[test]
 fn prepare_command_survives_closed_stdio() {
+    const CHILD: &str = "ZKMINER_SANDBOX_TEST_STDIO_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return closed_stdio_body();
+    }
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "prepare_command_survives_closed_stdio",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("1 passed"), "{text}");
+    for line in text.lines().filter(|l| l.contains("SKIPPED")) {
+        say(line);
+    }
+}
+
+fn closed_stdio_body() {
     let test = "prepare_command_survives_closed_stdio";
     let Some(root) = delegated(test) else { return };
     for closed in [&[0][..], &[1], &[2], &[0, 1, 2]] {

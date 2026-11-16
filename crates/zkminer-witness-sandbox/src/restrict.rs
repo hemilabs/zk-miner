@@ -82,7 +82,11 @@ pub(crate) fn thread_count() -> std::io::Result<usize> {
 ///    reaching other processes of the same uid (`setpriority`, `ioprio_set`, `prlimit64`,
 ///    `sched_set*` on another pid, `migrate_pages`, `move_pages`, `process_madvise`, `pidfd_getfd`),
 ///    no `TIOCSTI`/`TIOCLINUX`, no `PR_SET_PDEATHSIG` (the parent-death signal stays), no
-///    `PR_SET_DUMPABLE` (it stays 0) or `PR_SET_PTRACER`, no x32 syscalls. The broker additionally may
+///    `PR_SET_DUMPABLE` (it stays 0) or `PR_SET_PTRACER`, no x32 syscalls. Runner and worker also
+///    read no host metadata: no `uname`, `sysinfo`, `readlink*`, `access`/`faccessat*`,
+///    `statfs`/`fstatfs`, `*getxattr*`/`*listxattr*`, `chdir`/`fchdir`, and `statx` fails with
+///    `ENOSYS` (std and glibc fall back to `fstat`/`newfstatat`, which stay: a path's existence,
+///    size, owner and times remain readable without a mount namespace). The broker additionally may
 ///    `socket(AF_INET | AF_INET6, SOCK_STREAM, 0 | IPPROTO_TCP)` — TCP only: Landlock restricts TCP
 ///    connect by port but not UDP, ICMP, raw, SCTP or MPTCP sockets, so those are refused here —
 ///    `socketpair(AF_UNIX, SOCK_STREAM, ..)` (a connected stream pair reaches nothing; tokio's signal
@@ -305,6 +309,8 @@ const fn d(name: &'static str, nr: i64) -> Denied {
 
 // Not in libc 0.2.191; new syscalls share one number on every architecture since Linux 5.1.
 const SYS_SETXATTRAT: i64 = 463;
+const SYS_GETXATTRAT: i64 = 464;
+const SYS_LISTXATTRAT: i64 = 465;
 const SYS_REMOVEXATTRAT: i64 = 466;
 const SYS_OPEN_TREE_ATTR: i64 = 467;
 const SYS_FILE_GETATTR: i64 = 468;
@@ -328,6 +334,51 @@ fn path_opens() -> Vec<Denied> {
     ];
     #[cfg(target_arch = "x86_64")]
     v.extend([d("open", libc::SYS_open), d("creat", libc::SYS_creat)]);
+    v
+}
+
+/// Syscalls that read the host's metadata without opening anything, denied to the runner and the
+/// worker (review r1 broker F3): an escaped builder could otherwise learn the host's name and
+/// kernel (`uname`), its memory, uptime and process count (`sysinfo`), the targets of symlinks such
+/// as `/proc/<pid>/cwd` (`readlink*`), which paths exist and are readable (`access`/`faccessat*`),
+/// filesystem types and sizes (`statfs`/`fstatfs`), extended attributes (`*getxattr*`,
+/// `*listxattr*`), or walk its working directory (`chdir`/`fchdir`; `prepare_command` starts it in
+/// `/`). `statx` fails with `ENOSYS` instead ([`raw_filter`]): Rust's std and glibc then fall back to
+/// `fstat`/`newfstatat`, which stay allowed — by path they still tell whether a file exists and
+/// its size, owner and times; only a mount namespace would close that.
+fn host_metadata() -> Vec<Denied> {
+    use libc::*;
+    let mut v = vec![
+        d("readlinkat", SYS_readlinkat),
+        d("faccessat", SYS_faccessat),
+        d("faccessat2", SYS_faccessat2),
+        d("statfs", SYS_statfs),
+        d("fstatfs", SYS_fstatfs),
+        d("getxattr", SYS_getxattr),
+        d("lgetxattr", SYS_lgetxattr),
+        d("fgetxattr", SYS_fgetxattr),
+        d("getxattrat", SYS_GETXATTRAT),
+        d("listxattr", SYS_listxattr),
+        d("llistxattr", SYS_llistxattr),
+        d("flistxattr", SYS_flistxattr),
+        d("listxattrat", SYS_LISTXATTRAT),
+        d("uname", SYS_uname),
+        d("sysinfo", SYS_sysinfo),
+        d("chdir", SYS_chdir),
+        d("fchdir", SYS_fchdir),
+    ];
+    #[cfg(target_arch = "x86_64")]
+    v.extend([d("readlink", SYS_readlink), d("access", SYS_access)]);
+    v
+}
+
+/// Syscalls that fail with `ENOSYS` (in [`raw_filter`]) for `profile`: `clone3` for every profile;
+/// `statx` for the runner and the worker (see [`host_metadata`]).
+pub(crate) fn enosys_syscalls(profile: &Profile) -> Vec<(&'static str, i64)> {
+    let mut v = vec![("clone3", libc::SYS_clone3)];
+    if !matches!(profile, Profile::Broker { .. }) {
+        v.push(("statx", libc::SYS_statx));
+    }
     v
 }
 
@@ -476,6 +527,7 @@ pub(crate) fn denied_syscalls(profile: &Profile) -> Vec<Denied> {
     if !matches!(profile, Profile::Broker { .. }) {
         v.extend(path_opens());
         v.extend(client_sockets());
+        v.extend(host_metadata());
     }
     v
 }
@@ -672,14 +724,15 @@ fn insn(code: u16, jt: u8, jf: u8, k: u32) -> seccompiler::sock_filter {
     seccompiler::sock_filter { code, jt, jf, k }
 }
 
-/// A small hand-written filter for what seccompiler cannot express:
-/// - `clone3` fails with `ENOSYS` (its flags live in memory, so a filter cannot see
-///   `CLONE_NEW*` or the absence of `CLONE_THREAD`; libc then falls back to `clone`, which the
-///   denylist filters by flags);
+/// A small hand-written filter for what seccompiler cannot express (one action per filter):
+/// - the [`enosys_syscalls`] fail with `ENOSYS`: `clone3` (its flags live in memory, so a filter
+///   cannot see `CLONE_NEW*` or the absence of `CLONE_THREAD`; libc then falls back to `clone`,
+///   which the denylist filters by flags), and for the runner and the worker `statx` (see
+///   [`host_metadata`]; std and glibc fall back to `fstat`/`newfstatat` on `ENOSYS`);
 /// - on x86_64, any x32 syscall (`nr >= 0x40000000`) fails with `EPERM`; a denylist keyed by
 ///   64-bit syscall numbers would otherwise miss the x32 aliases on kernels with
 ///   `CONFIG_X86_X32_ABI`.
-fn raw_filter() -> BpfProgram {
+fn raw_filter(profile: &Profile) -> BpfProgram {
     const ARCH_OFFSET: u32 = 4;
     const NR_OFFSET: u32 = 0;
     #[cfg(target_arch = "x86_64")]
@@ -689,39 +742,55 @@ fn raw_filter() -> BpfProgram {
     let allow = libc::SECCOMP_RET_ALLOW;
     let enosys = libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
     let kill = libc::SECCOMP_RET_KILL_PROCESS;
+    let nrs = enosys_syscalls(profile);
+    let n = nrs.len() as u8;
 
+    // Jump offsets count from the next instruction.
     #[cfg(target_arch = "x86_64")]
     {
+        // 0 ld arch; 1 arch?; 2 ld nr; 3 x32?; 4..4+n ENOSYS nrs; 4+n allow; 5+n enosys;
+        // 6+n eperm; 7+n kill.
         let eperm = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
-        vec![
-            /* 0 */ insn(BPF_LD_W_ABS, 0, 0, ARCH_OFFSET),
-            /* 1 */ insn(BPF_JEQ_K, 0, 6, AUDIT_ARCH), // else -> 8 (kill)
-            /* 2 */ insn(BPF_LD_W_ABS, 0, 0, NR_OFFSET),
-            /* 3 */ insn(BPF_JGE_K, 3, 0, 0x4000_0000), // x32 -> 7 (EPERM)
-            /* 4 */ insn(BPF_JEQ_K, 1, 0, libc::SYS_clone3 as u32), // -> 6 (ENOSYS)
-            /* 5 */ insn(BPF_RET_K, 0, 0, allow),
-            /* 6 */ insn(BPF_RET_K, 0, 0, enosys),
-            /* 7 */ insn(BPF_RET_K, 0, 0, eperm),
-            /* 8 */ insn(BPF_RET_K, 0, 0, kill),
-        ]
+        let mut f = vec![
+            insn(BPF_LD_W_ABS, 0, 0, ARCH_OFFSET),
+            insn(BPF_JEQ_K, 0, 5 + n, AUDIT_ARCH), // else -> kill
+            insn(BPF_LD_W_ABS, 0, 0, NR_OFFSET),
+            insn(BPF_JGE_K, 2 + n, 0, 0x4000_0000), // x32 -> EPERM
+        ];
+        for (j, (_, nr)) in nrs.iter().enumerate() {
+            f.push(insn(BPF_JEQ_K, n - j as u8, 0, *nr as u32)); // -> ENOSYS
+        }
+        f.extend([
+            insn(BPF_RET_K, 0, 0, allow),
+            insn(BPF_RET_K, 0, 0, enosys),
+            insn(BPF_RET_K, 0, 0, eperm),
+            insn(BPF_RET_K, 0, 0, kill),
+        ]);
+        f
     }
     #[cfg(target_arch = "aarch64")]
     {
-        vec![
-            /* 0 */ insn(BPF_LD_W_ABS, 0, 0, ARCH_OFFSET),
-            /* 1 */ insn(BPF_JEQ_K, 0, 4, AUDIT_ARCH), // else -> 6 (kill)
-            /* 2 */ insn(BPF_LD_W_ABS, 0, 0, NR_OFFSET),
-            /* 3 */ insn(BPF_JEQ_K, 1, 0, libc::SYS_clone3 as u32), // -> 5 (ENOSYS)
-            /* 4 */ insn(BPF_RET_K, 0, 0, allow),
-            /* 5 */ insn(BPF_RET_K, 0, 0, enosys),
-            /* 6 */ insn(BPF_RET_K, 0, 0, kill),
-        ]
+        // 0 ld arch; 1 arch?; 2 ld nr; 3..3+n ENOSYS nrs; 3+n allow; 4+n enosys; 5+n kill.
+        let mut f = vec![
+            insn(BPF_LD_W_ABS, 0, 0, ARCH_OFFSET),
+            insn(BPF_JEQ_K, 0, 3 + n, AUDIT_ARCH), // else -> kill
+            insn(BPF_LD_W_ABS, 0, 0, NR_OFFSET),
+        ];
+        for (j, (_, nr)) in nrs.iter().enumerate() {
+            f.push(insn(BPF_JEQ_K, n - j as u8, 0, *nr as u32)); // -> ENOSYS
+        }
+        f.extend([
+            insn(BPF_RET_K, 0, 0, allow),
+            insn(BPF_RET_K, 0, 0, enosys),
+            insn(BPF_RET_K, 0, 0, kill),
+        ]);
+        f
     }
 }
 
 /// The filters [`restrict_self`] installs, in order.
 pub(crate) fn seccomp_filters(profile: &Profile) -> Result<Vec<BpfProgram>, SandboxError> {
-    Ok(vec![raw_filter(), denylist_filter(profile)?])
+    Ok(vec![raw_filter(profile), denylist_filter(profile)?])
 }
 
 #[cfg(test)]
@@ -935,6 +1004,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Review r1 broker F3: the runner and the worker read no host metadata (uname, sysinfo,
+    /// symlink targets, access checks, filesystem stats, xattrs, chdir) and `statx` fails with
+    /// ENOSYS so std falls back to `fstat`; the broker keeps them (it reads its spool).
+    #[test]
+    fn runner_and_worker_read_no_host_metadata() {
+        use libc::*;
+        let mut metadata: Vec<(&str, i64)> = vec![
+            ("readlinkat", SYS_readlinkat),
+            ("faccessat", SYS_faccessat),
+            ("faccessat2", SYS_faccessat2),
+            ("statfs", SYS_statfs),
+            ("fstatfs", SYS_fstatfs),
+            ("getxattr", SYS_getxattr),
+            ("lgetxattr", SYS_lgetxattr),
+            ("fgetxattr", SYS_fgetxattr),
+            ("getxattrat", 464),
+            ("listxattr", SYS_listxattr),
+            ("llistxattr", SYS_llistxattr),
+            ("flistxattr", SYS_flistxattr),
+            ("listxattrat", 465),
+            ("uname", SYS_uname),
+            ("sysinfo", SYS_sysinfo),
+            ("chdir", SYS_chdir),
+            ("fchdir", SYS_fchdir),
+        ];
+        #[cfg(target_arch = "x86_64")]
+        metadata.extend([("readlink", SYS_readlink), ("access", SYS_access)]);
+        for p in [Profile::BuilderRunner, Profile::ExecuteWorker] {
+            let f = seccomp_filters(&p).unwrap();
+            for (name, nr) in &metadata {
+                assert!(
+                    denied_syscalls(&p).iter().any(|s| s.nr == *nr),
+                    "{name} not listed for {p:?}"
+                );
+                for args in ARG_PATTERNS {
+                    assert_eq!(call(&f, *nr, args), ERRNO_EPERM, "{name} for {p:?}");
+                }
+            }
+            for args in ARG_PATTERNS {
+                assert_eq!(call(&f, SYS_statx, args), ERRNO_ENOSYS, "statx for {p:?}");
+                assert_eq!(call(&f, SYS_clone3, args), ERRNO_ENOSYS, "clone3 for {p:?}");
+            }
+            // What stays: stat by path and by fd, and getcwd (which says `/`).
+            assert_eq!(call(&f, SYS_newfstatat, [0; 6]), ALLOW);
+            assert_eq!(call(&f, SYS_fstat, [0; 6]), ALLOW);
+            assert_eq!(call(&f, SYS_getcwd, [0; 6]), ALLOW);
+        }
+        let b = seccomp_filters(&broker()).unwrap();
+        for (name, nr) in metadata.iter().chain([("statx", SYS_statx)].iter()) {
+            assert_eq!(call(&b, *nr, [0; 6]), ALLOW, "{name} for the broker");
+        }
+        assert_eq!(call(&b, SYS_clone3, [0; 6]), ERRNO_ENOSYS);
     }
 
     #[test]
