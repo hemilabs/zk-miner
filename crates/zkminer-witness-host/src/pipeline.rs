@@ -115,7 +115,9 @@ pub struct HostContext {
     /// `RISC0_KECCAK_PO2` of the provers (guest-visible, §5.4).
     pub keccak_po2: u8,
     pub sys_rand_key: [u8; 32],
-    /// The build id of every worker binary that may prove a bundle (§15.1).
+    /// The build id of every prove worker that may prove a bundle (§15.1), as
+    /// [`risc0_build_id`] names it. The bundle records these and the execute worker's own (from its
+    /// response).
     pub worker_builds: Vec<String>,
     /// `memory.max` of one execute (`[witness] execute_memory_bytes`).
     pub execute_memory_bytes: u64,
@@ -174,6 +176,12 @@ pub trait PipelineHooks: Send + Sync {
     /// Fired by run.rs on `JobCancelled`, `JobClaimed` by another prover, `BidSubmitted` and the
     /// governance events that end an attempt.
     fn abort_token(&self) -> &AbortToken;
+}
+
+/// The build id a witness bundle records for a risc0 worker: its SDK and worker versions as its
+/// `Hello` (or a witness execute's response) names them.
+pub fn risc0_build_id(sdk_version: &str, worker_version: &str) -> String {
+    format!("risc0/{sdk_version}/{worker_version}")
 }
 
 /// Where in the pipeline a job was skipped.
@@ -294,6 +302,9 @@ pub struct Simulated {
     pub limits: Limits,
     pub builder: BuilderStats,
     pub timings: Timings,
+    /// The execute worker's build ([`risc0_build_id`]), which the bundle records with the prove
+    /// workers'.
+    pub execute_build: String,
 }
 
 /// `abi.encode(descriptor)`: what a bundle records as `descriptor_hex`.
@@ -905,6 +916,10 @@ pub async fn simulate_witness_job(
     let resp = execute(ctx, token, req, w_file, format!("wexec-{}", short(job_key))).await?;
     let journal = check_execution(&resp, &po2s, program_id, limits.maxGuestCycles).map_err(|(r, d)| Skip::new(r, E, d))?;
     timings.execute = t.elapsed();
+    let execute_build = risc0_build_id(&resp.sdk_version, &resp.worker_version);
+    let mut worker_builds: Vec<String> = ctx.worker_builds.iter().cloned().chain([execute_build.clone()]).collect();
+    worker_builds.sort();
+    worker_builds.dedup();
     let execute_ms_per_po2 = (timings.execute.as_millis() as u64).div_ceil(po2s.len().max(1) as u64);
 
     // 5. The binding at every po2, as the router judges it, with the real prover.
@@ -965,7 +980,7 @@ pub async fn simulate_witness_job(
         w_len,
         sys_rand_key_fingerprint: key_fingerprint(&ctx.sys_rand_key),
         keccak_po2: u32::from(ctx.keccak_po2),
-        worker_builds: ctx.worker_builds.clone(),
+        worker_builds,
         created_at_block: job.current_block,
         builder_id: envelope.job.builderId,
         caller: job.caller,
@@ -1000,6 +1015,7 @@ pub async fn simulate_witness_job(
         limits,
         builder: builder_stats,
         timings,
+        execute_build,
     })
 }
 
@@ -1088,7 +1104,12 @@ mod tests {
     #[test]
     fn execution_checks() {
         let id = B256::repeat_byte(5);
-        let resp = |results| WitnessExecuteResponse { image_id: id.0, results };
+        let resp = |results| WitnessExecuteResponse {
+            image_id: id.0,
+            results,
+            sdk_version: "risc0-zkvm 3.1.0".into(),
+            worker_version: "0.1.0".into(),
+        };
         let ok = resp(vec![po2(16, b"j", 100), po2(18, b"j", 120)]);
         assert_eq!(check_execution(&ok, &[16, 18], id, 120).unwrap(), b"j");
         assert_eq!(check_execution(&ok, &[16, 18], id, 119).unwrap_err().0, SkipReason::GuestCyclesAboveLimit);

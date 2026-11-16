@@ -507,6 +507,8 @@ mod tests {
         let resp = WitnessExecuteResponse {
             image_id: [3; 32],
             results: vec![po2(16), po2(20)],
+            sdk_version: "risc0-zkvm 3.1.0".to_string(),
+            worker_version: "0.1.0".to_string(),
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &resp).unwrap();

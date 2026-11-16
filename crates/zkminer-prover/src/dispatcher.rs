@@ -398,6 +398,33 @@ struct WorkerEntry {
     /// Prevents the error handler from incrementing consecutive_failures,
     /// which would permanently retire the slot after 3 timeouts.
     intentional_kill: Arc<AtomicBool>,
+    /// The build the slot's worker named at its handshake, published at every spawn. Outside the
+    /// slot mutex like the pid, so it can be read while the slot proves.
+    build: WorkerBuild,
+}
+
+/// A worker's build as its `Hello` names it: `(sdk_version, worker_version)`, `None` until a worker of
+/// the slot has completed its handshake (or when it named neither).
+#[derive(Debug, Default)]
+struct WorkerBuild(Mutex<Option<(String, String)>>);
+
+impl WorkerBuild {
+    fn of(h: Option<&WorkerHandle>) -> Self {
+        let b = Self::default();
+        if let Some(h) = h {
+            b.note(h);
+        }
+        b
+    }
+
+    fn note(&self, h: &WorkerHandle) {
+        let v = h.sdk_version.clone().zip(h.worker_version.clone());
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = v;
+    }
+
+    fn get(&self) -> Option<(String, String)> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 /// A pre-claim cycle MEASUREMENT currently in flight, recorded so a committed (claimed) proof that
@@ -476,11 +503,17 @@ impl Drop for InflightMeasureGuard<'_> {
 /// need no worker.
 trait PidSlot {
     fn clear(&self);
+    /// A worker was (re)spawned behind this slot: publish the build its handshake named.
+    fn note_build(&self, _h: &WorkerHandle) {}
 }
 
 impl PidSlot for WorkerEntry {
     fn clear(&self) {
         self.clear_pid();
+    }
+
+    fn note_build(&self, h: &WorkerHandle) {
+        self.build.note(h);
     }
 }
 
@@ -2474,6 +2507,7 @@ impl WorkerPool {
             match WorkerHandle::spawn(&backend, &path, &env) {
                 Ok(handle) => {
                     let worker_pid = handle.pid();
+                    let build = WorkerBuild::of(Some(&handle));
                     tracing::info!(
                         "Worker {key} ready{device_desc} (pid {worker_pid}, binary {})",
                         path.display(),
@@ -2506,6 +2540,7 @@ impl WorkerPool {
                                 crate::memory::pid_starttime(worker_pid).unwrap_or(0),
                             )),
                             intentional_kill: Arc::new(AtomicBool::new(false)),
+                            build,
                         },
                     );
                     connected.push(key);
@@ -2556,6 +2591,7 @@ impl WorkerPool {
                             pid: Arc::new(AtomicU32::new(0)),
                             pid_starttime: Arc::new(AtomicU64::new(0)),
                             intentional_kill: Arc::new(AtomicBool::new(false)),
+                            build: WorkerBuild::default(),
                         },
                     );
                 }
@@ -2652,6 +2688,7 @@ impl WorkerPool {
                     pid: Arc::new(AtomicU32::new(pid)),
                     pid_starttime: Arc::new(AtomicU64::new(starttime)),
                     intentional_kill: Arc::new(AtomicBool::new(false)),
+                    build: WorkerBuild::default(),
                 });
             }
             self.measure_workers.insert(backend, pool);
@@ -2807,6 +2844,7 @@ impl WorkerPool {
                     pid: Arc::new(AtomicU32::new(pid)),
                     pid_starttime: Arc::new(AtomicU64::new(starttime)),
                     intentional_kill: Arc::new(AtomicBool::new(false)),
+                    build: WorkerBuild::default(),
                 });
             }
             self.measure_workers.insert(backend, pool);
@@ -3119,6 +3157,25 @@ impl WorkerPool {
             }
         }
         None
+    }
+
+    /// Every prove slot of `backend` that has not declined, with the build its worker named at its
+    /// last handshake (`(sdk_version, worker_version)`), or `None` while no worker of the slot has
+    /// completed one. Read without waiting on a slot: a slot that is proving still answers. A witness
+    /// bundle records the build of every worker that may prove it (plan §15.1).
+    pub fn worker_builds(&self, backend: &str) -> Vec<(String, Option<(String, String)>)> {
+        let mut v: Vec<_> = self
+            .keys_for_prefix(backend)
+            .into_iter()
+            .filter_map(|k| {
+                let e = self.workers.get(&k)?;
+                // A busy slot is proving, so it has not declined.
+                let declined = e.slot.try_lock().is_ok_and(|s| s.declined.is_some());
+                (!declined).then(|| (k, e.build.get()))
+            })
+            .collect();
+        v.sort();
+        v
     }
 
     fn worker_info_from_key(&self, key: &str) -> Option<WorkerInfo> {
@@ -4010,6 +4067,7 @@ impl WorkerPool {
                     }
                     if let Some(h) = slot.handle.as_ref() {
                         entry.publish_pid(h.pid());
+                        entry.build.note(h);
                     }
                 }
             }
@@ -4440,6 +4498,7 @@ impl WorkerPool {
                     }
                     if let Some(h) = slot.handle.as_ref() {
                         entry.publish_pid(h.pid());
+                        entry.build.note(h);
                     }
                 }
             }
@@ -8482,6 +8541,9 @@ impl WorkerPool {
                 );
             }
             Self::respawn(slot)?;
+            if let Some(h) = slot.handle.as_ref() {
+                pid.note_build(h);
+            }
         }
 
         slot.handle
@@ -8669,6 +8731,7 @@ impl WorkerPool {
         );
         let handle = WorkerHandle::spawn(backend, &path, &env)?;
         let pid = handle.pid();
+        let build = WorkerBuild::of(Some(&handle));
         self.workers.insert(
             key.to_string(),
             WorkerEntry {
@@ -8693,6 +8756,7 @@ impl WorkerPool {
                     crate::memory::pid_starttime(pid).unwrap_or(0),
                 )),
                 intentional_kill: Arc::new(AtomicBool::new(false)),
+                build,
             },
         );
         Ok(())
@@ -8733,6 +8797,7 @@ impl WorkerPool {
                 crate::memory::pid_starttime(pid).unwrap_or(0),
             )),
             intentional_kill: Arc::new(AtomicBool::new(false)),
+            build: WorkerBuild::default(),
         };
         self.measure_workers
             .entry(backend.to_string())
@@ -8982,6 +9047,7 @@ mod tests {
                     pid: Arc::new(AtomicU32::new(0)),
                     pid_starttime: Arc::new(AtomicU64::new(0)),
                     intentional_kill: Arc::new(AtomicBool::new(false)),
+                    build: WorkerBuild::default(),
                 },
             );
         }
@@ -11255,6 +11321,7 @@ mod declined_backend_tests {
                     pid: Arc::new(AtomicU32::new(0)),
                     pid_starttime: Arc::new(AtomicU64::new(0)),
                     intentional_kill: Arc::new(AtomicBool::new(false)),
+                    build: WorkerBuild::default(),
                 },
             );
         }
@@ -11286,6 +11353,7 @@ mod declined_backend_tests {
             pid: Arc::new(AtomicU32::new(0)),
             pid_starttime: Arc::new(AtomicU64::new(0)),
             intentional_kill: Arc::new(AtomicBool::new(false)),
+            build: WorkerBuild::default(),
         }
     }
 
@@ -11478,6 +11546,7 @@ mod bus_id_locking_tests {
                 pid: Arc::new(AtomicU32::new(0)),
                 pid_starttime: Arc::new(AtomicU64::new(0)),
                 intentional_kill: Arc::new(AtomicBool::new(false)),
+                build: WorkerBuild::default(),
             },
         );
         pool
