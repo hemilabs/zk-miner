@@ -106,6 +106,13 @@ access.
 - **The miner is a timing oracle for public hosts.** Whether and how fast a public address
   answers is observable to the requester; the guard bounds where connections go, not what can
   be inferred from public ones.
+- **Global addresses inside your own network.** Connected prefixes come from the interfaces'
+  netmasks. A cloud instance whose IPv6 address shows as a /128 (AWS does this) does not reveal
+  its subnet, and other subnets of the same VPC hold global addresses too, so the guard cannot
+  tell them from the internet. Put your VPC's IPv6 range (and any public IPv4 range your
+  network uses internally) in `[egress] deny_cidrs`. On a cloud host, also block the metadata
+  service inside the instance (IMDSv2 required, hop limit 1, or the endpoint off) as defense in
+  depth.
 - **NAT64 with a network-specific prefix.** Addresses under the well-known NAT64 prefix
   `64:ff9b::/96` are judged by the IPv4 address they carry; a DNS64 resolver that synthesizes
   under a prefix of your own network would hand out global-looking addresses for private IPv4

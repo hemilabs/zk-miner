@@ -188,13 +188,34 @@ impl GuardedClient {
             {
                 return Err(FetchError::Denied(Denied::Url(UrlDenied::BadCharacter)));
             }
-            let next = url
-                .join(location)
-                .map_err(|_| FetchError::BadRedirect("a redirect to an invalid Location"))?;
-            url = self
-                .policy
-                .check_url(next.as_str())
-                .map_err(FetchError::Denied)?;
+            // A target that names its own host (`scheme://host…`, or `//host…` on this hop's
+            // scheme) is checked as written, so the strict reading sees the host the server sent,
+            // not the standard parser's rewrite of it (`0x7f.1` would otherwise arrive as
+            // `127.0.0.1`). A path-relative one keeps this hop's host and is checked once joined.
+            let raw_target = if location.starts_with("//") {
+                Some(format!("{}:{location}", url.scheme()))
+            } else if let Some(rest) = after_scheme(location) {
+                if !rest.starts_with("//") {
+                    // `https:host/x` and friends: the standard reads a host into some of them.
+                    return Err(FetchError::BadRedirect(
+                        "a redirect to a target with a scheme but no '//'",
+                    ));
+                }
+                Some(location.to_string())
+            } else {
+                None
+            };
+            url = match raw_target {
+                Some(raw) => self.policy.check_url(&raw).map_err(FetchError::Denied)?,
+                None => {
+                    let next = url.join(location).map_err(|_| {
+                        FetchError::BadRedirect("a redirect to an invalid Location")
+                    })?;
+                    self.policy
+                        .check_url(next.as_str())
+                        .map_err(FetchError::Denied)?
+                }
+            };
             tracing::debug!(
                 "guarded fetch redirected to {:?}",
                 crate::printable(url.as_str(), 256)
@@ -202,6 +223,19 @@ impl GuardedClient {
         }
         Err(FetchError::TooManyRedirects)
     }
+}
+
+/// What follows the scheme of an absolute URL reference (`scheme:`, the scheme a letter then
+/// letters, digits, `+`, `-` or `.`, before any `/`, `?` or `#`), or `None` for a relative one.
+fn after_scheme(reference: &str) -> Option<&str> {
+    let end = reference.find([':', '/', '?', '#'])?;
+    let (scheme, rest) = reference.split_at(end);
+    let is_scheme = rest.starts_with(':')
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+    is_scheme.then(|| &rest[1..])
 }
 
 /// Why a guarded fetch failed.
@@ -530,6 +564,57 @@ mod tests {
             ["elfs.example.com", "elfs.example.com"]
         );
         assert!(server.requests.lock().unwrap()[1].starts_with("get /moved/elf "));
+    }
+
+    /// A URL in a relative target's query is no target: the redirect stays on the host.
+    #[tokio::test]
+    async fn a_relative_location_with_a_url_in_its_query_is_followed() {
+        let server = canned_server(&[
+            &redirect_to("/moved?to=http://127.0.0.1/&next=https://x.example/"),
+            OK_ELF,
+        ]);
+        let lookup = public_names();
+        let c = public_client(lookup.clone());
+        let response = c
+            .get_following_redirects(&start(&server, "elfs.example.com"), 5, BUDGET)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(server.hosts(), ["elfs.example.com", "elfs.example.com"]);
+    }
+
+    /// An absolute or scheme-relative target is read as the server wrote it, so the strict rules
+    /// hold for it in developer mode too (where only the destination checks are off).
+    #[tokio::test]
+    async fn a_redirect_target_is_checked_as_written() {
+        for (target, denied) in [
+            ("http://0x7f.0.0.1:{port}/", true),
+            ("//0x7f.0.0.1:{port}/", true),
+            ("http://127.1:{port}/", true),
+            ("https:store.invalid/x", false),
+            ("javascript:alert(1)", false),
+        ] {
+            let server = canned_server(&[&redirect_to(target), OK_ELF]);
+            let (c, _) = dev_client();
+            let e = c
+                .get_following_redirects(&start(&server, "store.invalid"), 5, BUDGET)
+                .await
+                .unwrap_err();
+            assert_eq!(e.is_denied(), denied, "{target}: {e:?}");
+            assert_eq!(
+                server.hosts(),
+                ["store.invalid"],
+                "{target} was connected to"
+            );
+        }
+        assert_eq!(after_scheme("https://a/b"), Some("//a/b"));
+        assert_eq!(after_scheme("HTTP://a"), Some("//a"));
+        assert_eq!(after_scheme("javascript:x"), Some("x"));
+        assert_eq!(after_scheme("/a?u=http://b"), None);
+        assert_eq!(after_scheme("a/b:c"), None);
+        assert_eq!(after_scheme("?x:y"), None);
+        assert_eq!(after_scheme("1http://a"), None);
+        assert_eq!(after_scheme("moved"), None);
     }
 
     #[tokio::test]

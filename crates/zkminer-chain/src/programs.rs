@@ -90,7 +90,8 @@ impl ElfFetcher {
     pub fn from_config(config: &zkminer_config::ZkMinerConfig) -> Result<Self> {
         let mode = config.net_mode();
         let policy = NetPolicy::new(mode, config.egress_deny()?).context(
-            "reading this host's network interfaces, which the ELF fetch's network guard refuses",
+            "reading this host's network interfaces (the ELF fetch refuses this host's own \
+             addresses and networks, so it cannot run without knowing them)",
         )?;
         Self::new(&policy)
     }

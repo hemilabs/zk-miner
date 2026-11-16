@@ -224,7 +224,7 @@ answers (`localhost`, `*.local`, `*.internal`, `*.lan`, single-label names, …)
 
 | key | default | meaning |
 |---|---|---|
-| `[egress] deny_cidrs` | `[]` | More addresses no requester-caused connection may reach: CIDRs (`"203.0.113.0/24"`, `"2001:db8::/32"`) or bare addresses. Name this host's public address if it sits behind NAT (its interfaces don't show it, so only this stops a connection to it), and the rest of your fleet. Host bits must be zero. |
+| `[egress] deny_cidrs` | `[]` | More addresses no requester-caused connection may reach: CIDRs (`"203.0.113.0/24"`, `"2001:db8::/32"`) or bare addresses. Name this host's public address if it sits behind NAT (its interfaces don't show it, so only this stops a connection to it), the rest of your fleet, and on a cloud host your VPC's IPv6 range (its other hosts have global addresses). Host bits must be zero. |
 | `[dev] private_network` | `false` | **Developer mode.** Lets those connections reach private destinations, so a local test network can serve programs from this machine. The only way to turn the guard off (there is no environment variable or flag). Refused on Hemi mainnet (43111); while it is on, every start logs `DEV MODE: private network access enabled — never run on a public market`, `zkminer status` prints it, and the TUI's status bar shows a red `DEV MODE` badge. Never set it on a miner that serves a public market. |
 
 Unknown keys in `[dev]` and `[egress]` are errors, so a misspelt setting stops the miner
