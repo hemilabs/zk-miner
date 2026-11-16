@@ -154,6 +154,11 @@ impl Denied {
                     f,
                     "{ip} is delivered to this host itself (its local route {route})"
                 ),
+                RouteKind::PolicyRule => write!(
+                    f,
+                    "{ip} is routed by {route}, which a policy-routing rule (ip rule) sends to \
+                     another routing table than the default route's"
+                ),
             },
             Denied::DenyCidr { ip, prefix } => {
                 write!(f, "{ip} is in the operator's deny CIDR {prefix}")
@@ -692,6 +697,7 @@ mod tests {
             ],
             resolvers: vec![ip("127.0.0.53"), ip("2606:a300:c::7d"), ip("9.9.9.9")],
             public_addresses: vec![ip("168.1.2.57")],
+            ..RawFacts::default()
         };
         let f = HostFacts::assemble(raw, &offline());
         let a = |s: &str| admit(NetMode::Public, ip(s), &f, &[]);
@@ -776,6 +782,58 @@ mod tests {
             prefix: pfx("8.8.8.8/32")
         }
         .depends_on_facts());
+    }
+
+    /// Review r2 R2-NG-3 (PoC `destination_policy_rule_into_a_vpn_table_is_admitted`), inverted:
+    /// with `ip rule add to 52.95.0.0/16 lookup 100` and a default in table 100 (through a VPN
+    /// gateway, or a gateway-less WireGuard one), the address and the prefix are refused.
+    #[test]
+    fn a_destination_rule_into_a_vpn_table_is_refused() {
+        use crate::facts::RawFacts;
+        use crate::routes::{Route, Rule};
+        for vpn in [
+            Route::via(pfx("0.0.0.0/0"), ip("10.8.0.1"), 7).in_table(100),
+            Route::on_link(pfx("0.0.0.0/0"), 9).in_table(100),
+        ] {
+            let mut rules = Rule::stock(false);
+            rules.insert(0, Rule::to(pfx("52.95.0.0/16"), 100));
+            let f = HostFacts::assemble(
+                RawFacts {
+                    interface_prefixes: vec![pfx("192.168.1.0/24"), pfx("10.8.0.0/24")],
+                    interface_addresses: vec![ip("192.168.1.33"), ip("10.8.0.6")],
+                    routes: vec![
+                        Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 2),
+                        Route::on_link(pfx("192.168.1.0/24"), 2),
+                        Route::on_link(pfx("10.8.0.0/24"), 7),
+                        vpn,
+                    ],
+                    rules,
+                    ..RawFacts::default()
+                },
+                &offline(),
+            );
+            let e = admit(NetMode::Public, ip("52.95.1.1"), &f, &[]).unwrap_err();
+            assert_eq!(
+                e,
+                Denied::OffDefaultRoute {
+                    ip: ip("52.95.1.1"),
+                    route: pfx("52.95.0.0/16"),
+                    kind: RouteKind::PolicyRule
+                }
+            );
+            assert!(e.to_string().contains("policy-routing rule"), "{e}");
+            assert!(e.depends_on_facts());
+            assert!(matches!(
+                admit(NetMode::Public, ip("64:ff9b::345f:101"), &f, &[]),
+                Err(Denied::OffDefaultRoute { .. })
+            ));
+            assert!(matches!(
+                admit_prefix(NetMode::Public, pfx("52.95.0.0/16"), &f, &[]),
+                Err(Denied::PrefixOverlapsRoute { .. })
+            ));
+            assert!(f.refused_prefixes().contains(&pfx("52.95.0.0/16")));
+            assert_eq!(admit(NetMode::Public, ip("8.8.8.8"), &f, &[]), Ok(()));
+        }
     }
 
     /// Review r1 fetch F1 (PoC `facts`), inverted, on this host's real facts: neighbours in the

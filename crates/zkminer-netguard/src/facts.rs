@@ -30,7 +30,7 @@ use std::ops::RangeInclusive;
 use std::time::Instant;
 
 use crate::ip::{is_global, Prefix};
-use crate::routes::{Route, RouteTable};
+use crate::routes::{Route, RouteTable, Rule};
 
 /// The default `[egress] ipv6_site_prefix_len`.
 pub const DEFAULT_IPV6_SITE_PREFIX_LEN: u8 = 56;
@@ -83,6 +83,8 @@ pub struct RawFacts {
     pub interface_addresses: Vec<IpAddr>,
     /// Every unicast, `local`, `broadcast` and `anycast` route of every table.
     pub routes: Vec<Route>,
+    /// The policy-routing rules, read for this process (none: a stock host's, [`Rule::stock`]).
+    pub rules: Vec<Rule>,
     /// The DNS servers the host uses.
     pub resolvers: Vec<IpAddr>,
     /// The host's public addresses as reflectors see them.
@@ -139,7 +141,7 @@ impl HostFacts {
 
     /// The facts `raw` amounts to under `opts` (see the module doc).
     pub fn assemble(raw: RawFacts, opts: &FactsOptions) -> Self {
-        let routes = RouteTable::new(raw.routes);
+        let routes = RouteTable::with_rules(raw.routes, raw.rules);
         let mut connected = raw.interface_prefixes;
         connected.extend(routes.on_link_prefixes());
         let mut own = raw.interface_addresses;
@@ -169,7 +171,7 @@ impl HostFacts {
     /// public-mode policy that does not know them cannot refuse what they name.
     pub fn gather_with(opts: &FactsOptions) -> io::Result<Self> {
         let (interface_prefixes, interface_addresses, loopback) = sys::interfaces()?;
-        let routes = crate::routes::read_routes(&loopback)?;
+        let (routes, rules) = crate::routes::read_routing(&loopback)?;
         let public_addresses = if opts.discover_public_addresses {
             crate::public::public_addresses()
         } else {
@@ -180,6 +182,7 @@ impl HostFacts {
                 interface_prefixes,
                 interface_addresses,
                 routes,
+                rules,
                 resolvers: system_resolvers(),
                 public_addresses,
             },
