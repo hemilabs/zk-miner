@@ -127,8 +127,8 @@
 //! public checks as the cidrs.
 //!
 //! A key travels only over `https` in public mode. In developer mode it may also travel over
-//! `http` to an IP literal that is loopback or inside the endpoint's own `cidrs` (a node on the
-//! operator's own wire).
+//! `http` to an IP literal that is not global and is loopback or inside the endpoint's own
+//! `cidrs` (a node on the operator's own wire).
 //!
 //! # Who loads this file
 //!
@@ -1009,12 +1009,15 @@ fn rpc_endpoint(
         if net_mode == NetMode::Public {
             return invalid(format!("{alias}: a key is sent only over https outside developer mode"));
         }
+        // Review r2 B3: on the operator's own wire means not global, whatever the cidrs say
+        // (`0.0.0.0/0` or a public /32 would otherwise send the key in clear to the internet).
         let local = literal.is_some_and(|ip| {
-            crate::egress::canonical_ip(ip).is_loopback() || cidrs.iter().any(|p| p.contains(ip))
+            let c = crate::egress::canonical_ip(ip);
+            !zkminer_netguard::is_global(ip) && (c.is_loopback() || cidrs.iter().any(|p| p.contains(ip)))
         });
         if !local {
             return invalid(format!(
-                "{alias}: a key is sent only over https (or http to a loopback IP literal or one inside the endpoint's cidrs)"
+                "{alias}: a key is sent only over https (or http to a loopback IP literal, or a non-global one inside the endpoint's cidrs)"
             ));
         }
     }
@@ -1404,6 +1407,11 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
             ("http://10.0.0.5:8545/", hdr),
             ("http://10.0.0.5:8545/", "key_header = \"x-api-key\"\ncidrs = [\"10.0.1.0/24\"]"),
             ("http://node.example/", "key_header = \"x-api-key\"\ncidrs = [\"10.0.0.5/32\"]"),
+            // Review r2 B3: a global literal is never the operator's own wire, whatever its cidrs.
+            ("http://1.1.1.1:8545/v1/{key}", "cidrs = [\"0.0.0.0/0\"]"),
+            ("http://1.1.1.1:8545/v1/{key}", "cidrs = [\"1.1.1.1/32\"]"),
+            ("http://[2606:4700:4700::1111]:8545/v1/{key}", "cidrs = [\"::/0\"]"),
+            ("http://[::ffff:1.1.1.1]:8545/", "key_header = \"x-api-key\"\ncidrs = [\"::ffff:0:0/96\"]"),
         ] {
             assert!(err(&ep(url, extra), d).contains("only over https"), "{url} {extra}");
         }
@@ -1664,8 +1672,10 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
             ));
             let e = BrokerConfig::from_toml(&text, d, NetMode::Public).expect_err(url).to_string();
             assert!(e.contains("only over https outside developer mode"), "{e}");
-            // Developer mode keeps the operator's-own-wire exception.
-            assert!(BrokerConfig::from_toml(&text, d, NetMode::DevPrivate).is_ok(), "{url}");
+            // Review r2 B3: a global literal is not the operator's own wire in developer mode
+            // either.
+            let e = BrokerConfig::from_toml(&text, d, NetMode::DevPrivate).expect_err(url).to_string();
+            assert!(e.contains("only over https"), "{e}");
             let https = text.replace("http://", "https://");
             let c = BrokerConfig::from_toml(&https, d, NetMode::Public).unwrap();
             assert!(c.evm_rpc[0].spec.key_bearing);
