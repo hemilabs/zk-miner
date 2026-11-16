@@ -13,28 +13,41 @@
 //! - else `whoami.cloudflare` `CH TXT`, asked of `1.1.1.1` / `2606:4700:4700::1111`.
 //!
 //! The names and server addresses are compiled in: nothing a requester supplies chooses them, and
-//! the answer only ever adds an address to refuse (a forged answer can make the miner refuse one
-//! more public address, nothing else). When every reflector fails for a family, a loud WARN says
-//! so (once per run of failures) and the miner carries on with what its interfaces show: name the
-//! public addresses in `[egress] deny_cidrs` then (or always, as a belt to these braces). A family
-//! the host has no route for at all is skipped quietly: there is no public address to learn, and
-//! no requester connection goes out over it either. `[egress] discover_public_addresses = false`
+//! an answer only ever adds an address to refuse. **Both reflectors** of a family are asked, and
+//! every address either reports is refused (their union; when they disagree, a WARN says so). An
+//! address both report alike is **confirmed**, and only a confirmed address (or one in an
+//! interface address's own site) gives the IPv6 site around it ([`crate::FactsOptions`]'s
+//! `ipv6_site_prefix_len`): an answer forged by one reflector or by a box that redirects DNS to
+//! itself can then make the miner refuse one more address, not a whole /48–/56 of someone else's
+//! (review r2, R2-NG-7). When every reflector fails for a family, a loud WARN says so (once per
+//! run of failures) and the miner carries on with what its interfaces show: name the public
+//! addresses in `[egress] deny_cidrs` then (or always, as a belt to these braces). A family the
+//! host has no route for at all is skipped quietly: there is no public address to learn, and no
+//! requester connection goes out over it either. `[egress] discover_public_addresses = false`
 //! turns the queries off.
 //!
-//! The answers are cached process-wide: the first call blocks (at most [`DISCOVERY_TIMEOUT`]:
-//! every reflector is asked at once, from the calling thread, which starts no other — the witness
-//! broker gathers its facts right before a sandbox that refuses a second thread), later calls
-//! return the cache and refresh it on a background thread once it is older than [`DISCOVERY_TTL`]
-//! (after a failure, retried at most every [`RETRY_AFTER_FAILURE`]). The last good answer of a
-//! family stays in force when a refresh fails.
+//! The answers are cached process-wide. The first call runs discovery on the calling thread (at
+//! most [`DISCOVERY_TIMEOUT`] and [`AGREEMENT_GRACE`]: every reflector is asked at once, from the
+//! calling thread, which starts no other — the witness broker gathers its facts right before a
+//! sandbox that refuses a second thread); a call that arrives while that first discovery runs
+//! waits for it (at most [`FIRST_DISCOVERY_WAIT`], review r2 R2-NG-6: it got nothing before, and
+//! facts gathered then missed the NAT address). Later calls return the cache and refresh it on a
+//! background thread once it is older than [`DISCOVERY_TTL`] (after a failure, retried at most
+//! every [`RETRY_AFTER_FAILURE`]). The last good answer of a family stays in force when a refresh
+//! fails.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long one reflector query may take.
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Once one reflector of a family has answered, how much longer the other gets (within
+/// [`DISCOVERY_TIMEOUT`]).
+pub const AGREEMENT_GRACE: Duration = Duration::from_millis(500);
+/// How long a call waits for a first discovery another thread is running.
+pub const FIRST_DISCOVERY_WAIT: Duration = Duration::from_secs(3);
 /// How long learned public addresses are trusted before they are learned again.
 pub const DISCOVERY_TTL: Duration = Duration::from_secs(300);
 /// How soon a failed discovery is tried again.
@@ -53,7 +66,7 @@ const CLASS_IN: u16 = 1;
 const CLASS_CH: u16 = 3;
 const TYPE_TXT: u16 = 16;
 
-/// Every reflector, in the order asked (per family, the first that answers wins).
+/// Every reflector: two operators, each asked over IPv4 and over IPv6.
 pub const REFLECTORS: &[Reflector] = &[
     Reflector {
         name: "o-o.myaddr.l.google.com",
@@ -77,43 +90,97 @@ pub const REFLECTORS: &[Reflector] = &[
     },
 ];
 
-#[derive(Debug, Default)]
+/// What discovery learned: every public address a reflector reported, and those both reflectors
+/// of their family reported alike.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Learned {
+    /// Every reported address (refused as the host's own).
+    pub addresses: Vec<IpAddr>,
+    /// The confirmed ones (they also give their IPv6 site).
+    pub confirmed: Vec<IpAddr>,
+}
+
+/// One family's last good answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FamilyAnswer {
+    addresses: Vec<IpAddr>,
+    confirmed: Vec<IpAddr>,
+}
+
+#[derive(Debug)]
 struct State {
-    v4: Option<IpAddr>,
-    v6: Option<IpAddr>,
+    families: [FamilyAnswer; 2],
     learned_at: Option<Instant>,
     attempted_at: Option<Instant>,
     running: bool,
+    /// Whether the first discovery has finished (successfully or not).
+    first_done: bool,
     /// Whether the current failure streak of a family has been warned about (once per streak).
     warned: [bool; 2],
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
-    v4: None,
-    v6: None,
+    families: [
+        FamilyAnswer {
+            addresses: Vec::new(),
+            confirmed: Vec::new(),
+        },
+        FamilyAnswer {
+            addresses: Vec::new(),
+            confirmed: Vec::new(),
+        },
+    ],
     learned_at: None,
     attempted_at: None,
     running: false,
+    first_done: false,
     warned: [false; 2],
 });
+
+/// Signalled when the first discovery finishes.
+static FIRST_DONE: Condvar = Condvar::new();
 
 fn state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// This host's public addresses (at most one per family), from the process-wide cache; see the
-/// module doc for when this blocks and when it refreshes.
+/// This host's public addresses, every family's, from the process-wide cache; see the module doc
+/// for when this blocks and when it refreshes.
 pub fn public_addresses() -> Vec<IpAddr> {
-    let first = {
-        let mut s = state();
-        let first = s.attempted_at.is_none() && !s.running;
+    learned().addresses
+}
+
+/// This host's public addresses and the confirmed ones among them, from the process-wide cache;
+/// see the module doc for when this blocks and when it refreshes.
+pub fn learned() -> Learned {
+    let mut s = state();
+    if s.attempted_at.is_none() && !s.running {
+        // The first call: discover on this thread.
+        s.running = true;
+        s.attempted_at = Some(Instant::now());
+        drop(s);
+        learn(discover());
+        s = state();
+    } else if !s.first_done {
+        // Review r2 R2-NG-6: the first discovery is running on another thread; wait for it
+        // rather than answer with nothing.
+        let deadline = Instant::now() + FIRST_DISCOVERY_WAIT;
+        while !s.first_done {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            s = FIRST_DONE
+                .wait_timeout(s, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    } else {
         let stale = s.learned_at.is_none_or(|t| t.elapsed() >= DISCOVERY_TTL);
         let may_retry = s
             .attempted_at
             .is_none_or(|t| t.elapsed() >= RETRY_AFTER_FAILURE);
-        if first {
-            s.running = true;
-        } else if stale && may_retry && !s.running {
+        if stale && may_retry && !s.running {
             s.running = true;
             s.attempted_at = Some(Instant::now());
             let spawned = std::thread::Builder::new()
@@ -123,38 +190,38 @@ pub fn public_addresses() -> Vec<IpAddr> {
                 s.running = false;
             }
         }
-        first
-    };
-    if first {
-        state().attempted_at = Some(Instant::now());
-        learn(discover());
     }
-    let s = state();
-    s.v4.into_iter().chain(s.v6).collect()
+    let mut out = Learned::default();
+    for f in &s.families {
+        out.addresses.extend(&f.addresses);
+        out.confirmed.extend(&f.confirmed);
+    }
+    out
 }
 
-/// What one round of discovery found for a family: its public address, `None` when the host has
-/// no route for the family at all (nothing to learn, and nothing a requester could reach over it),
-/// or why every reflector failed.
-type FamilyFound = Result<Option<IpAddr>, String>;
+/// What one round of discovery found for a family: what its reflectors reported, `None` when the
+/// host has no route for the family at all (nothing to learn, and nothing a requester could reach
+/// over it), or why every reflector failed.
+type FamilyFound = Result<Option<FamilyAnswer>, String>;
 
 fn learn((v4, v6): (FamilyFound, FamilyFound)) {
     let mut guard = state();
     let s = &mut *guard;
     s.running = false;
+    s.first_done = true;
     let mut any = false;
-    for (i, (slot, got, family)) in [(&mut s.v4, v4, "IPv4"), (&mut s.v6, v6, "IPv6")]
-        .into_iter()
-        .enumerate()
-    {
+    for (i, (got, family)) in [(v4, "IPv4"), (v6, "IPv6")].into_iter().enumerate() {
         match got {
-            Ok(Some(ip)) => {
-                if *slot != Some(ip) {
+            Ok(Some(answer)) => {
+                if s.families[i] != answer {
+                    let list: Vec<String> =
+                        answer.addresses.iter().map(|a| a.to_string()).collect();
                     tracing::info!(
-                        "network guard: this host's public {family} address is {ip}; refusing it"
+                        "network guard: this host's public {family} address is {}; refusing it",
+                        list.join(" and ")
                     );
                 }
-                *slot = Some(ip);
+                s.families[i] = answer;
                 s.warned[i] = false;
                 any = true;
             }
@@ -177,19 +244,55 @@ fn learn((v4, v6): (FamilyFound, FamilyFound)) {
     if any {
         s.learned_at = Some(Instant::now());
     }
+    drop(guard);
+    FIRST_DONE.notify_all();
+}
+
+/// One family's answers, `(reflector name, address)`, as [`FamilyAnswer`]: the union, and what
+/// every reflector that answered reported alike when at least two did. Warns when they disagree.
+fn agree(family: &str, answers: &[(&'static str, IpAddr)]) -> FamilyAnswer {
+    let mut addresses: Vec<IpAddr> = answers.iter().map(|(_, a)| *a).collect();
+    addresses.sort();
+    addresses.dedup();
+    let mut names: Vec<&str> = answers.iter().map(|(n, _)| *n).collect();
+    names.sort();
+    names.dedup();
+    let confirmed = if names.len() >= 2 && addresses.len() == 1 {
+        addresses.clone()
+    } else {
+        Vec::new()
+    };
+    if addresses.len() > 1 {
+        let list: Vec<String> = answers
+            .iter()
+            .map(|(n, a)| format!("{n} says {a}"))
+            .collect();
+        tracing::warn!(
+            "network guard: the public-address reflectors disagree about this host's {family} \
+             address ({}); refusing every one, deriving no IPv6 site from them. A box that \
+             redirects DNS, or a multi-homed uplink, does this",
+            list.join(", ")
+        );
+    }
+    FamilyAnswer {
+        addresses,
+        confirmed,
+    }
 }
 
 /// Asks every reflector at once, on this thread (no helper thread: the witness broker gathers its
 /// facts single-threaded, right before a sandbox that refuses a process with a second thread), and
-/// takes the first valid answer per family within [`DISCOVERY_TIMEOUT`].
+/// takes every valid answer per family within [`DISCOVERY_TIMEOUT`] — a family's other reflector
+/// gets [`AGREEMENT_GRACE`] once the first has answered.
 fn discover() -> (FamilyFound, FamilyFound) {
     struct Pending {
         sock: UdpSocket,
         id: u16,
         v6: bool,
+        name: &'static str,
         what: String,
     }
-    let mut found: [Option<IpAddr>; 2] = [None, None];
+    let mut found: [Vec<(&'static str, IpAddr)>; 2] = [Vec::new(), Vec::new()];
     let mut errors: [Vec<String>; 2] = [Vec::new(), Vec::new()];
     // A family is unroutable when every one of its sends failed at once for want of a route.
     let mut unroutable = [true, true];
@@ -204,6 +307,7 @@ fn discover() -> (FamilyFound, FamilyFound) {
                     sock,
                     id,
                     v6: r.server.is_ipv6(),
+                    name: r.name,
                     what,
                 });
             }
@@ -217,19 +321,27 @@ fn discover() -> (FamilyFound, FamilyFound) {
         }
     }
     let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+    // Per family: when its first answer came.
+    let mut first_answer: [Option<Instant>; 2] = [None, None];
     let mut buf = [0u8; 1500];
-    while !pending.is_empty() && Instant::now() < deadline {
+    while !pending.is_empty() {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
         let mut progressed = false;
         pending.retain(|p| {
             let fam = usize::from(p.v6);
-            if found[fam].is_some() {
+            if first_answer[fam].is_some_and(|t| now >= t + AGREEMENT_GRACE) {
+                errors[fam].push(format!("{}: no answer within the grace", p.what));
                 return false;
             }
             loop {
                 match p.sock.recv(&mut buf) {
                     Ok(n) => match parse_answer(&buf[..n], p.id, p.v6) {
                         Some(Ok(ip)) => {
-                            found[fam] = Some(ip);
+                            found[fam].push((p.name, ip));
+                            first_answer[fam].get_or_insert(Instant::now());
                             progressed = true;
                             return false;
                         }
@@ -255,14 +367,16 @@ fn discover() -> (FamilyFound, FamilyFound) {
     for p in &pending {
         errors[usize::from(p.v6)].push(format!("{}: no answer within the timeout", p.what));
     }
-    let result = |fam: usize| -> FamilyFound {
-        match found[fam] {
-            Some(ip) => Ok(Some(ip)),
-            None if unroutable[fam] => Ok(None),
-            None => Err(errors[fam].join("; ")),
+    let result = |fam: usize, family: &str| -> FamilyFound {
+        if !found[fam].is_empty() {
+            Ok(Some(agree(family, &found[fam])))
+        } else if unroutable[fam] {
+            Ok(None)
+        } else {
+            Err(errors[fam].join("; "))
         }
     };
-    (result(0), result(1))
+    (result(0, "IPv4"), result(1, "IPv6"))
 }
 
 /// A non-blocking UDP socket connected to `r`'s server, with its query sent, and the query's id.
@@ -476,8 +590,8 @@ mod tests {
         assert!(matches!(a(&cut, false), Some(Err(_))));
     }
 
-    /// Every reflector at once, on this thread: each family's answer is a global address of that
-    /// family (or the family is unroutable here, or failed with reasons), within the timeout.
+    /// Every reflector at once, on this thread: each family's answers are global addresses of
+    /// that family (or the family is unroutable here, or failed with reasons), within the timeout.
     #[test]
     fn discovery_asks_everything_at_once_on_this_thread() {
         let t = Instant::now();
@@ -485,11 +599,54 @@ mod tests {
         assert!(t.elapsed() < DISCOVERY_TIMEOUT + Duration::from_millis(500));
         for (got, six) in [(v4, false), (v6, true)] {
             match got {
-                Ok(Some(ip)) => assert!(ip.is_ipv6() == six && crate::is_global(ip), "{ip}"),
+                Ok(Some(a)) => {
+                    assert!(!a.addresses.is_empty());
+                    for ip in a.addresses.iter().chain(&a.confirmed) {
+                        assert!(ip.is_ipv6() == six && crate::is_global(*ip), "{ip}");
+                    }
+                    assert!(a.confirmed.iter().all(|c| a.addresses.contains(c)));
+                    eprintln!("{a:?}");
+                }
                 Ok(None) => eprintln!("no route for this family here"),
                 Err(e) => assert!(!e.is_empty()),
             }
         }
+    }
+
+    /// Review r2 R2-NG-7: both reflectors' answers are kept (their union), and an address is
+    /// confirmed only when two reflectors report it alike.
+    #[test]
+    fn answers_are_united_and_confirmed_only_by_agreement() {
+        let g = "o-o.myaddr.l.google.com";
+        let c = "whoami.cloudflare";
+        let a = |s: &str| s.parse::<IpAddr>().unwrap();
+        let both = agree("IPv6", &[(g, a("2606:a300::5")), (c, a("2606:a300::5"))]);
+        assert_eq!(both.addresses, vec![a("2606:a300::5")]);
+        assert_eq!(both.confirmed, vec![a("2606:a300::5")]);
+        let one = agree("IPv6", &[(c, a("2606:4700:4700::64"))]);
+        assert_eq!(one.addresses, vec![a("2606:4700:4700::64")]);
+        assert!(one.confirmed.is_empty());
+        let split = agree("IPv4", &[(g, a("203.0.114.9")), (c, a("198.51.99.7"))]);
+        assert_eq!(split.addresses, vec![a("198.51.99.7"), a("203.0.114.9")]);
+        assert!(split.confirmed.is_empty());
+    }
+
+    /// Review r2 R2-NG-6 (PoC `pubrace`), inverted: a call that arrives while the first discovery
+    /// runs on another thread waits for it and gets its answer, instead of nothing.
+    #[test]
+    fn a_call_during_the_first_discovery_waits_for_it() {
+        let first = std::thread::spawn(learned);
+        std::thread::sleep(Duration::from_millis(2));
+        let t = Instant::now();
+        let second = learned();
+        let waited = t.elapsed();
+        let first = first.join().unwrap();
+        assert!(waited < FIRST_DISCOVERY_WAIT + Duration::from_millis(500));
+        assert_eq!(
+            second, first,
+            "the second caller sees the first discovery's answer"
+        );
+        assert!(state().first_done);
     }
 
     /// Against the real reflectors (public DNS): an answer is this host's public address of that

@@ -1075,10 +1075,16 @@ mod tests {
     fn this_hosts_site_resolvers_and_public_addresses_are_refused() {
         let p = NetPolicy::new(NetMode::Public, Vec::new()).expect("read the host");
         let f = p.facts();
+        // A site comes from an interface address or a public address both reflectors confirmed.
+        let confirmed = crate::public::learned().confirmed;
         for own in f.own_addresses() {
             assert!(p.admit(*own).is_err(), "{own}");
+            let on_interface = f
+                .connected()
+                .iter()
+                .any(|c| c.contains(*own) && c.len < 128);
             if let IpAddr::V6(v6) = own {
-                if is_global(*own) {
+                if is_global(*own) && (on_interface || confirmed.contains(own)) {
                     // Another /64 of the same /56.
                     let other = IpAddr::V6(std::net::Ipv6Addr::from(
                         (u128::from(*v6) ^ (0x7f << 64)) | 1,

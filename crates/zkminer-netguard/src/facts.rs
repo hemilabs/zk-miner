@@ -92,8 +92,11 @@ pub struct RawFacts {
     pub rules: Vec<Rule>,
     /// The DNS servers the host uses.
     pub resolvers: Vec<IpAddr>,
-    /// The host's public addresses as reflectors see them.
+    /// The host's public addresses as reflectors see them (refused as its own).
     pub public_addresses: Vec<IpAddr>,
+    /// The public addresses both reflectors of their family reported alike: only these (and the
+    /// interface addresses) give an IPv6 site ([`crate::public`]).
+    pub public_confirmed: Vec<IpAddr>,
 }
 
 /// A snapshot of the host's facts (see the module doc).
@@ -166,12 +169,22 @@ impl HostFacts {
         let routes = RouteTable::with_rules(raw.routes, raw.rules);
         let mut connected = raw.interface_prefixes;
         connected.extend(routes.on_link_prefixes());
+        // Review r2 R2-NG-7: a public address one reflector alone reported (or a forger) is
+        // refused as an own address, but gives no site: that would refuse a /48-/56 of whoever
+        // the forged address belongs to.
+        let mut site_from = raw.interface_addresses.clone();
+        site_from.extend(raw.public_confirmed.iter().filter(|a| is_global(**a)));
         let mut own = raw.interface_addresses;
-        own.extend(raw.public_addresses.into_iter().filter(|a| is_global(*a)));
+        own.extend(
+            raw.public_addresses
+                .into_iter()
+                .chain(raw.public_confirmed)
+                .filter(|a| is_global(*a)),
+        );
         let own = sorted(own);
         HostFacts {
             connected: sorted(connected),
-            site: site_prefixes(&own, opts.ipv6_site_prefix_len),
+            site: site_prefixes(&site_from, opts.ipv6_site_prefix_len),
             own,
             resolvers: sorted(raw.resolvers),
             routes,
@@ -263,10 +276,10 @@ impl HostFacts {
     pub fn gather_with(opts: &FactsOptions) -> io::Result<Self> {
         let (interface_prefixes, interface_addresses, loopback) = sys::interfaces()?;
         let (routes, rules) = crate::routes::read_routing(&loopback)?;
-        let public_addresses = if opts.discover_public_addresses {
-            crate::public::public_addresses()
+        let public = if opts.discover_public_addresses {
+            crate::public::learned()
         } else {
-            Vec::new()
+            crate::public::Learned::default()
         };
         Ok(Self::assemble(
             RawFacts {
@@ -275,7 +288,8 @@ impl HostFacts {
                 routes,
                 rules,
                 resolvers: system_resolvers(),
-                public_addresses,
+                public_addresses: public.addresses,
+                public_confirmed: public.confirmed,
             },
             opts,
         )
@@ -659,6 +673,7 @@ mod tests {
                 ip("::1"),
             ],
             public_addresses: vec![ip("2a01:4f8:1:2::9"), ip("10.0.0.1")],
+            public_confirmed: vec![ip("2a01:4f8:1:2::9")],
             ..RawFacts::default()
         };
         let f = HostFacts::assemble(raw.clone(), &offline());
@@ -692,6 +707,55 @@ mod tests {
             };
             assert!(o.validate().is_err(), "{bad}");
         }
+    }
+
+    /// Review r2 R2-NG-7 (PoC `a_forged_v6_reflector_answer_refuses_a_site`), inverted: one
+    /// reflector's answer (or a forged one) is refused as an own address, and gives no site, so
+    /// the rest of that /48 and an operator's role entry in it stay admitted. An answer both
+    /// reflectors gave, or one inside an interface address's site, gives its site.
+    #[test]
+    fn an_unconfirmed_public_answer_refuses_one_address_not_a_site() {
+        use crate::{admit, admit_prefix, NetMode};
+        let forged = ip("2606:4700:4700::64");
+        let raw = RawFacts {
+            interface_addresses: vec![ip("192.168.1.33")],
+            interface_prefixes: vec![p("192.168.1.0/24")],
+            public_addresses: vec![forged],
+            ..Default::default()
+        };
+        let opts = FactsOptions {
+            discover_public_addresses: false,
+            ipv6_site_prefix_len: 48,
+        };
+        let f = HostFacts::assemble(raw.clone(), &opts);
+        assert!(f.site_prefixes().is_empty(), "{:?}", f.site_prefixes());
+        assert!(admit(NetMode::Public, forged, &f, &[]).is_err());
+        assert_eq!(
+            admit(NetMode::Public, ip("2606:4700:4700::1111"), &f, &[]),
+            Ok(())
+        );
+        assert_eq!(
+            admit_prefix(NetMode::Public, p("2606:4700:4700:1::/64"), &f, &[]),
+            Ok(())
+        );
+        // Confirmed by both reflectors: the site is refused.
+        let f = HostFacts::assemble(
+            RawFacts {
+                public_confirmed: vec![forged],
+                ..raw.clone()
+            },
+            &opts,
+        );
+        assert_eq!(f.site_prefixes(), &[p("2606:4700:4700::/48")]);
+        // In an interface address's site: that site, from the interface address.
+        let f = HostFacts::assemble(
+            RawFacts {
+                interface_addresses: vec![ip("2606:4700:4700:9::2")],
+                ..raw
+            },
+            &opts,
+        );
+        assert_eq!(f.site_prefixes(), &[p("2606:4700:4700::/48")]);
     }
 
     #[test]
