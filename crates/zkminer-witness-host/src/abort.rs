@@ -23,6 +23,9 @@ pub enum AbortReason {
     Governance,
     /// The miner is shutting down.
     Shutdown,
+    /// Witness serving was switched off (the kill switch, or a failed self-test), or the operator
+    /// paused claiming: running simulations are abandoned, held locks continue.
+    Disabled,
 }
 
 /// A shared, fire-once abort signal. Cloning shares it.

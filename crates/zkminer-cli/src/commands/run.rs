@@ -1837,6 +1837,21 @@ fn set_job_aside(job_id: B256, wait: Duration) {
     );
 }
 
+/// What the candidate loop does with a job's witness route: `true` skips it this tick. A witness job
+/// the witness path serves is its; one this host does not serve is set aside for as long as that
+/// lasts, so it ranks last in the Open set (see [`open_rank`]) and stays out of the per-tick cut, as
+/// any job the inline path finds it cannot claim on a lasting verdict.
+fn witness_route_skips(job_id: B256, route: witness::Route) -> bool {
+    match route {
+        witness::Route::Inline => false,
+        witness::Route::Witness => true,
+        witness::Route::WitnessUnserved { wait } => {
+            set_job_aside(job_id, wait);
+            true
+        }
+    }
+}
+
 fn job_set_aside(job_id: B256) -> bool {
     SET_ASIDE
         .lock()
@@ -4879,6 +4894,9 @@ async fn miner_brain(
     // Witness locks join `in_flight` when they are locked (or recovered), with their collateral and
     // sized cycles, and leave it through `done_tx` like every other lock.
     let (witness_held_tx, mut witness_held_rx) = mpsc::unbounded_channel::<(B256, u128, u64)>();
+    // The witness locks among `in_flight` (their tasks take a card of their own): the witness runtime
+    // is told each tick how many inline jobs still need a card besides them.
+    let mut witness_held: std::collections::HashSet<B256> = std::collections::HashSet::new();
     if let Some(w) = &witness_rt {
         w.attach_brain(witness_held_tx, done_tx.clone());
     } else {
@@ -4934,6 +4952,7 @@ async fn miner_brain(
     let mut recovery_scan = startup_pass.scan;
     spawn_recovery_actions(
         startup_pass.actions,
+        startup_pass.deferred,
         &mut in_flight,
         &client,
         &state,
@@ -5216,7 +5235,9 @@ async fn miner_brain(
         while let Ok((jid, collateral, cycles)) = witness_held_rx.try_recv() {
             in_flight.insert(jid, collateral);
             inflight_work.insert(jid, (cycles, zkminer_prover_protocol::BACKEND_RISC0));
+            witness_held.insert(jid);
         }
+        witness_held.retain(|j| in_flight.contains_key(j));
         // Reap finished job tasks before re-evaluating the concurrency budget.
         while let Ok(jid) = done_rx.try_recv() {
             in_flight.remove(&jid);
@@ -5548,6 +5569,7 @@ async fn miner_brain(
                     }
                     spawn_recovery_actions(
                         pass.actions,
+                        pass.deferred,
                         &mut in_flight,
                         &client,
                         &state,
@@ -5597,6 +5619,15 @@ async fn miner_brain(
                 risc0_job_po2_overrides(&s.runtime_settings),
             )
         };
+
+        // The cards as a witness lock sees them: inline jobs still needing one, and the cap.
+        if let Some(w) = &witness_rt {
+            let inline_needing = in_flight
+                .keys()
+                .filter(|j| !proved.contains(*j) && !witness_held.contains(*j))
+                .count();
+            w.note_cards(inline_needing, max_concurrent);
+        }
 
         // Each risc0 card's job size (see `risc0_job_po2`), published for the Settings screen before
         // anything below can skip the tick, so it never shows a stale or guessed size.
@@ -6357,13 +6388,15 @@ async fn miner_brain(
             // A witness-construction job (`inputData` starts with WITNESS_JOB_TAG_V1) takes the witness
             // path: simulated in the sandbox, locked and proven from its retained bundle. It never
             // reaches the measure path, the inline caches or the inline claim below.
-            if witness::route(
-                witness_rt.as_ref(),
-                job,
-                snapshot.descriptor_hash,
-                claim_predicate_now,
-            ) == witness::Route::Witness
-            {
+            if witness_route_skips(
+                jid,
+                witness::route(
+                    witness_rt.as_ref(),
+                    job,
+                    snapshot.descriptor_hash,
+                    claim_predicate_now,
+                ),
+            ) {
                 continue;
             }
             // EVICT a descriptor whose fulfill payload a prior measurement found to be over the
@@ -12862,6 +12895,7 @@ async fn recover_claimed_jobs(
 #[allow(clippy::too_many_arguments)]
 fn spawn_recovery_actions(
     pass_actions: Vec<(B256, RecoveryAction)>,
+    deferred: bool,
     in_flight: &mut HashMap<B256, u128>,
     client: &ChainClient,
     state: &zkminer_tui::state::SharedState,
@@ -12872,6 +12906,12 @@ fn spawn_recovery_actions(
 ) {
     for (jid, action) in pass_actions {
         if in_flight.contains_key(&jid) || SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            continue;
+        }
+        // A witness task may have taken the job since the pass read who owns what (a lock it just
+        // claimed, or one the store pass re-drove): it drives the lock, and a release beside its
+        // fulfil would race it.
+        if witness_rt.is_some_and(|w| w.owns(jid)) {
             continue;
         }
         // A witness lock's task takes its `in_flight` slot itself once its bundle is found (see
@@ -12909,6 +12949,11 @@ fn spawn_recovery_actions(
             }
             RecoveryAction::Witness(_) => unreachable!("handled above"),
         }
+    }
+    // After the handover: the witness runtime enables eviction only once a complete pass has handed
+    // it every witness lock (and it has pinned each).
+    if let Some(w) = witness_rt {
+        w.note_recovery_pass(deferred);
     }
 }
 
@@ -14210,6 +14255,57 @@ mod r2_sizing_tests {
         let expired = job(0xB4);
         set_job_aside(expired.info.job_id, Duration::ZERO);
         assert_eq!(open_rank(&expired), 1_000, "only while it lasts");
+    }
+
+    /// A witness job this host does not serve (no runtime, its caller not admitted, serving off,
+    /// ...) is set aside as an inline job it cannot claim is: it ranks last in the Open set and
+    /// stays out of the per-tick cut, so high-priced witness decoys never hold the top slots or push
+    /// claimable jobs out of the capped Open set. Before witness jobs were served, such a job was
+    /// measured as an inline one, failed, and was set aside the same way.
+    #[test]
+    fn unserved_witness_jobs_are_set_aside_like_unclaimable_inline_jobs() {
+        let job = |b| TrackedJob {
+            info: zkminer_chain::jobs::JobInfo {
+                job_id: B256::repeat_byte(b),
+                ..Default::default()
+            },
+            status: zkminer_tui::state::MinerJobStatus::Open,
+            current_price: u128::MAX / 2,
+            gpu_bus_id: None,
+            prover_backend: String::new(),
+            estimated_cycles: 0,
+        };
+        assert_eq!(
+            witness::policy::UNSERVED_SET_ASIDE,
+            DETERMINISTIC_SKIP_TTL,
+            "the inline path's set-aside for a verdict that lasts"
+        );
+        // No witness runtime here: a job classified as a witness job is unserved.
+        let decoy = job(0xC1);
+        witness::note_class(decoy.info.job_id, witness::Class::Witness);
+        let route = witness::route(None, &decoy, B256::ZERO, true);
+        assert!(matches!(route, witness::Route::WitnessUnserved { .. }), "{route:?}");
+        assert!(witness_route_skips(decoy.info.job_id, route));
+        assert!(job_set_aside(decoy.info.job_id) && claim_backing_off(decoy.info.job_id));
+        assert_eq!(open_rank(&decoy), 0, "a high-priced unserved witness job ranks last");
+        // A served witness job is skipped by the inline path but keeps its rank; an inline job is
+        // the inline path's.
+        let served = job(0xC2);
+        assert!(witness_route_skips(served.info.job_id, witness::Route::Witness));
+        assert_eq!(open_rank(&served), served.current_price);
+        assert!(!witness_route_skips(job(0xC3).info.job_id, witness::Route::Inline));
+        // A capped Open set keeps the claimable job over a pile of unserved decoys.
+        let mut open: Vec<TrackedJob> = (0xD0..0xD8u8)
+            .map(|b| {
+                let j = job(b);
+                witness_route_skips(j.info.job_id, witness::Route::WitnessUnserved { wait: Duration::from_secs(600) });
+                j
+            })
+            .collect();
+        let honest = TrackedJob { current_price: 1, ..job(0xE0) };
+        open.push(honest.clone());
+        retain_top_by_key(&mut open, 1, open_rank);
+        assert_eq!(open[0].info.job_id, honest.info.job_id);
     }
 
     #[test]

@@ -1,13 +1,15 @@
 //! The pure decisions of the witness path (docs/witness-construction-jobs.md §5.2 step 7, §15.2,
-//! §16, §17.2): routing, verdict lifetimes, the artifact budget, the reservation, the deadline and
-//! prove-resource fits, and which cards may prove a bundle. No I/O, so each is unit-tested here.
+//! §16, §17.2): routing, verdict lifetimes, the artifact budget, the reservation, the proving-time
+//! estimate and its fits (the watchdog, the deadline), prove resources, which cards may prove a
+//! bundle, pin evidence, and the post-lock failure tallies. No I/O, so each is unit-tested here.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{keccak256, Address, B256, U256};
 use zkminer_chain::claimability::NotClaimable;
 use zkminer_chain::governance::GateRefusal;
-use zkminer_witness::verdict::{Retry, SkipReason};
+use zkminer_witness::verdict::{PostLockFailureClass, Retry, SkipReason};
 
 // ── routing ───────────────────────────────────────────────────────────────────
 
@@ -20,6 +22,22 @@ pub(crate) fn is_witness_input(input_data: &[u8]) -> bool {
 /// simulated; open admission is refused by the config's validation in this release.
 pub(crate) fn caller_admitted(callers: &[Address], caller: Address) -> bool {
     callers.contains(&caller)
+}
+
+/// How long a witness job this host does not serve is set aside: ranked last in the Open set and
+/// skipped by the candidate loop, as the inline path sets aside a job it cannot claim on a verdict
+/// that lasts (`DETERMINISTIC_SKIP_TTL`). For a witness job with no runtime here, a caller not on
+/// `[witness] callers`, journal-bound jobs off, or a caller over its post-lock failure limit: a
+/// flood of high-priced witness jobs nobody here serves must not hold the Open set's top slots.
+pub(crate) const UNSERVED_SET_ASIDE: Duration = Duration::from_secs(600);
+/// The set-aside while witness serving is off here (its self-tests not passed yet, or failing): an
+/// allowlisted caller's job is looked at again soon after serving comes back.
+pub(crate) const SERVING_OFF_SET_ASIDE: Duration = Duration::from_secs(60);
+
+/// The set-aside for a job whose verdict holds until `until` (unix seconds) at `now`: the rest of
+/// the verdict.
+pub(crate) fn verdict_set_aside(until: u64, now: u64) -> Duration {
+    Duration::from_secs(until.saturating_sub(now))
 }
 
 // ── verdicts (§15.2, §16) ─────────────────────────────────────────────────────
@@ -209,30 +227,87 @@ pub(crate) fn reservation_wei(r: &ReservationInputs) -> u128 {
     }
 }
 
-// ── the deadline margin ───────────────────────────────────────────────────────
+// ── the proving-time estimate (§5.2 step 7: "prove time leaves a margin before D") ──────────
 
 /// Seconds allowed for the lock transaction to be mined after the gate.
 pub(crate) const CLAIM_MINE_ALLOWANCE_SECS: u64 = 60;
-/// Seconds of a risc0 proof that do not scale with cycles: the Groth16 wrap (about half a minute
-/// on a CPU for any guest), which a cycles-per-second rate measured on large jobs hides.
+/// Seconds of a risc0 proof on a GPU card that do not scale with cycles when its benchmark measured
+/// no Groth16 wrap (or it has no row): a GPU wraps in seconds; this covers a cold proving key and a
+/// slow card.
 pub(crate) const RISC0_GROTH16_ALLOWANCE_SECS: u64 = 120;
+/// The same for a CPU slot with no measured wrap: on a CPU the Groth16 path (the succinct lift, the
+/// `identity_p254` recursion and the shrink-wrap) takes minutes, whatever the guest — 337 s of a
+/// 359 s proof of a 32k-cycle guest on an idle 32-core host; the same proof took 859 s beside other
+/// heavy builds (a debug worker, 2026-11-16). A benchmarked CPU slot uses its measured wrap instead.
+pub(crate) const RISC0_CPU_PROOF_ALLOWANCE_SECS: u64 = 900;
+/// The cycles-per-second floor of a CPU slot with no benchmark row (the GPU floor is the inline
+/// path's `risc0_conservative_cps`).
+pub(crate) const RISC0_CPU_CONSERVATIVE_CPS: f64 = 10_000.0;
+/// A measured wrap is budgeted at this multiple of the measurement...
+pub(crate) const MEASURED_WRAP_FACTOR: f64 = 2.0;
+/// ...and never below this.
+pub(crate) const MEASURED_WRAP_FLOOR_SECS: u64 = 30;
 
-/// The expected proving time of a witness lock: its sized cycles at `cps` (the slowest card that may
-/// prove it, from the benchmark, or the conservative floor), the execute allowance (three times the
-/// measured execute, as `execute_allowance_secs` grants inline jobs: the prove executes again and
-/// replays segments) and the Groth16 wrap.
-pub(crate) fn estimate_prove_secs(cycles: u64, cps: f64, execute_secs: u64) -> u64 {
-    let cps = if cps.is_finite() && cps >= 1.0 { cps } else { 1.0 };
-    let proving = (cycles as f64 / cps).ceil();
-    let proving = if proving >= u64::MAX as f64 { u64::MAX } else { proving as u64 };
-    proving
-        .saturating_add(execute_secs.saturating_mul(3))
-        .saturating_add(RISC0_GROTH16_ALLOWANCE_SECS)
+/// The seconds of one card's proof that do not scale with cycles: its benchmark's measured Groth16
+/// wrap (`DeviceBenchmark::wrap_secs`) with headroom, else the allowance for its kind.
+pub(crate) fn fixed_allowance_secs(measured_wrap_secs: Option<f64>, cpu: bool) -> u64 {
+    match measured_wrap_secs.filter(|w| w.is_finite() && *w > 0.0) {
+        Some(w) => ((w * MEASURED_WRAP_FACTOR).ceil() as u64).max(MEASURED_WRAP_FLOOR_SECS),
+        None if cpu => RISC0_CPU_PROOF_ALLOWANCE_SECS,
+        None => RISC0_GROTH16_ALLOWANCE_SECS,
+    }
 }
 
-/// Whether a lock taken now leaves the margin before `D` (§5.2 step 7): the proof, the lock's
-/// mining, one minimum attempt's slack and the fulfil margin all fit in the job's
-/// `fulfillmentTimeout` window.
+/// How a witness proof's time is planned: the slowest rate among the cards that may prove it, the
+/// largest fixed allowance among them, and the operator's `deadline_safety_margin`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ProvePlan {
+    /// Cycles per second (each card's benchmarked rate at its size, else the floor for its kind).
+    pub cps: f64,
+    /// [`fixed_allowance_secs`], the largest over the cards.
+    pub fixed_secs: u64,
+    /// `[prover] deadline_safety_margin`, at least 1.
+    pub margin: f64,
+}
+
+impl ProvePlan {
+    /// The plan over cards given as `(cycles/s, fixed seconds)`; `None` without any.
+    pub(crate) fn over(cards: impl IntoIterator<Item = (f64, u64)>, margin: f64) -> Option<Self> {
+        let mut plan: Option<ProvePlan> = None;
+        let margin = if margin.is_finite() && margin >= 1.0 { margin } else { 1.0 };
+        for (cps, fixed) in cards {
+            let cps = if cps.is_finite() && cps >= 1.0 { cps } else { 1.0 };
+            plan = Some(match plan {
+                None => ProvePlan { cps, fixed_secs: fixed, margin },
+                Some(p) => ProvePlan { cps: p.cps.min(cps), fixed_secs: p.fixed_secs.max(fixed), margin },
+            });
+        }
+        plan
+    }
+}
+
+/// The expected seconds of one proof attempt of a witness lock: its sized cycles at the plan's rate,
+/// times the safety margin (as the inline gate sizes a job), plus the execute allowance (three times
+/// the measured execute, as `execute_allowance_secs` grants inline jobs: the prove executes again and
+/// replays segments) and the fixed allowance (the Groth16 wrap).
+pub(crate) fn estimate_prove_secs(cycles: u64, plan: &ProvePlan, execute_secs: u64) -> u64 {
+    let cps = if plan.cps.is_finite() && plan.cps >= 1.0 { plan.cps } else { 1.0 };
+    let margin = if plan.margin.is_finite() && plan.margin >= 1.0 { plan.margin } else { 1.0 };
+    let proving = (cycles as f64 / cps * margin).ceil();
+    let proving = if proving >= u64::MAX as f64 { u64::MAX } else { proving as u64 };
+    proving.saturating_add(execute_secs.saturating_mul(3)).saturating_add(plan.fixed_secs)
+}
+
+/// Whether one attempt of `prove_secs` finishes inside the per-attempt watchdog (the witness prove
+/// runs under `[prover] proving_timeout_secs`): a proof the watchdog kills on every attempt is
+/// released at a penalty, however long its window. The inline gate refuses at `>=` too.
+pub(crate) fn watchdog_admits(prove_secs: u64, proving_timeout_secs: u64) -> bool {
+    prove_secs < proving_timeout_secs
+}
+
+/// Whether a lock taken now leaves the margin before `D` (§5.2 step 7): the proof (with the safety
+/// margin, [`estimate_prove_secs`]), the lock's mining, one minimum attempt's slack and the fulfil
+/// margin all fit in the job's `fulfillmentTimeout` window.
 pub(crate) fn deadline_fits(window_secs: u64, prove_secs: u64, fulfil_margin_secs: u64, min_attempt_secs: u64) -> bool {
     // An overflowing need never fits.
     prove_secs
@@ -242,18 +317,44 @@ pub(crate) fn deadline_fits(window_secs: u64, prove_secs: u64, fulfil_margin_sec
         .is_some_and(|need| need <= window_secs)
 }
 
-/// The host-derived maximum for `maxGuestCycles` when `[witness] max_guest_cycles` is unset: an
-/// hour of proving at `cps` (the slowest card's benchmarked rate, or the conservative floor),
-/// clamped to `[2^24, 2^34]` sized cycles. The deadline gate then checks the job's own window.
-pub(crate) fn host_max_guest_cycles(cps: f64) -> u64 {
-    const MIN: u64 = 1 << 24;
+/// The host-derived maximum for `maxGuestCycles` when `[witness] max_guest_cycles` is unset: the
+/// sized cycles one attempt can prove inside the watchdog at the plan's rate and margin (beside its
+/// fixed allowance), at most an hour of proving, at most 2^34. Zero when the fixed allowance alone
+/// fills the watchdog: no witness job can be proven here, and every one is refused at the static
+/// gates rather than simulated. The claim gate then checks each job's measured cycles and execute.
+pub(crate) fn host_max_guest_cycles(plan: &ProvePlan, proving_timeout_secs: u64) -> u64 {
     const MAX: u64 = 1 << 34;
-    let cps = if cps.is_finite() && cps > 0.0 { cps } else { 0.0 };
-    let cycles = cps * 3600.0;
+    let cps = if plan.cps.is_finite() && plan.cps > 0.0 { plan.cps } else { 0.0 };
+    let margin = if plan.margin.is_finite() && plan.margin >= 1.0 { plan.margin } else { 1.0 };
+    // The watchdog admits an estimate strictly below it.
+    let room = proving_timeout_secs.saturating_sub(plan.fixed_secs).saturating_sub(1) as f64;
+    let cycles = (room * cps / margin).min(cps * 3600.0);
     if cycles >= MAX as f64 {
         MAX
     } else {
-        (cycles as u64).clamp(MIN, MAX)
+        cycles.max(0.0) as u64
+    }
+}
+
+/// `ZKMINER_RISC0_MAX_SESSION_CYCLES` as the risc0 prove worker reads it (it inherits the miner's
+/// environment): `None` when unset, unparsable or zero.
+pub(crate) fn parse_session_cap(v: Option<&str>) -> Option<u64> {
+    v.and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n > 0)
+}
+
+/// Whether a proof of `cycles` (sized: segments padded to their power of two, at least what the
+/// executor counts against its session limit) stays inside the operator's session cap.
+pub(crate) fn session_cap_admits(cycles: u64, cap: Option<u64>) -> bool {
+    cap.is_none_or(|c| cycles <= c)
+}
+
+/// The time a held witness lock must be proven and fulfilled by: its deadline, or a pending
+/// verifier swap's `readyAt` when that comes first (§5.5: a proof for the old verifier can then only
+/// be released, so the miner acts before `readyAt`).
+pub(crate) fn proving_cutoff(lock_deadline: u64, switch_ready_at: Option<u64>) -> u64 {
+    match switch_ready_at {
+        Some(r) if r < lock_deadline => r,
+        _ => lock_deadline,
     }
 }
 
@@ -274,6 +375,23 @@ pub(crate) fn segment_need(per_po2_segment_bytes: impl IntoIterator<Item = u64>)
     per_po2_segment_bytes.into_iter().max().unwrap_or(0)
 }
 
+/// Whether the ETH balance funds this claim and the fulfil of every lock held besides it (`held`)
+/// and of this one, at `max_fee` per gas: the inline gate's funding check (`FUNDS-SHORT`), so a
+/// witness lock is never taken on a key whose fulfils the node would refuse.
+pub(crate) fn funds_cover(balance: U256, fulfil_gas: u64, max_fee: u128, held: usize) -> bool {
+    let fulfils = u128::from(fulfil_gas).saturating_mul(max_fee).saturating_mul(held as u128 + 1);
+    let need = fulfils.saturating_add(u128::from(CLAIM_GAS).saturating_mul(max_fee));
+    balance >= U256::from(need)
+}
+
+/// Whether a card is free for one more witness lock: the inline jobs still needing a card and the
+/// witness locks held here leave room under the concurrency cap. A witness proof has no priority at
+/// the dispatcher, so a lock queued behind a full look-ahead queue of inline work could wait out
+/// its margin.
+pub(crate) fn card_room(inline_needing: usize, witness_locks: usize, max_concurrent: usize) -> bool {
+    inline_needing.saturating_add(witness_locks) < max_concurrent.max(1)
+}
+
 // ── which cards prove a bundle ────────────────────────────────────────────────
 
 /// The cards (slot, its job po2) that may prove a bundle executed at `executed`, each at the
@@ -292,13 +410,12 @@ pub(crate) fn witness_prove_sizes(cards: &[(String, u8)], executed: &[u32]) -> H
 
 // ── per-caller accounting (§16, Phase 1) ──────────────────────────────────────
 
-/// Per-caller blame: final verdicts that count against the caller (`blames_caller`), and post-lock
-/// witness failures (never fed to program-wide marks). A simple counter for Phase 1; the credit
-/// ledger of §17.4 replaces it.
+/// Per-caller blame: final verdicts that count against the caller (`blames_caller`). A simple
+/// counter for Phase 1; the credit ledger of §17.4 replaces it. Post-lock failures are tallied apart
+/// ([`caller_tally_key`]), persisted in the store.
 #[derive(Debug, Default)]
 pub(crate) struct Blame {
     simulation: HashMap<Address, u32>,
-    post_lock: HashMap<Address, u32>,
 }
 
 /// Callers tracked at most (a flood of fresh addresses evicts the oldest counts, never grows).
@@ -318,15 +435,102 @@ impl Blame {
         Some(*n)
     }
 
-    /// Records a post-lock failure of a witness lock; returns the caller's count.
-    pub(crate) fn note_post_lock(&mut self, caller: Address) -> u32 {
-        if self.post_lock.len() >= BLAME_CAP && !self.post_lock.contains_key(&caller) {
-            self.post_lock.clear();
-        }
-        let n = self.post_lock.entry(caller).or_default();
-        *n = n.saturating_add(1);
-        *n
+}
+
+// ── post-lock failures (§16) ──────────────────────────────────────────────────
+
+/// Post-lock witness failures of one caller (within [`POST_LOCK_TALLY_TTL_SECS`] of the latest)
+/// from which its witness jobs are no longer admitted.
+pub(crate) const POST_LOCK_CALLER_LIMIT: u8 = 3;
+/// Post-lock witness failures of one class on one device from which the device proves no witness
+/// lock (§16: "a device with ≥ 2 is quarantined").
+pub(crate) const POST_LOCK_DEVICE_LIMIT: u8 = 2;
+/// How long a post-lock tally lasts after its latest failure.
+pub(crate) const POST_LOCK_TALLY_TTL_SECS: u64 = 7 * 24 * 3600;
+
+/// The store key a caller's post-lock tally is kept under (a verdict record whose `attempts` is the
+/// count): domain-separated, so never a job id, and fixed-size (no attacker string is stored).
+pub(crate) fn caller_tally_key(caller: Address) -> B256 {
+    keccak256([b"zkminer/witness/post-lock/caller/v1".as_slice(), caller.as_slice()].concat())
+}
+
+/// The store key of one device's tally for one failure class. `device` is this host's own name for
+/// the card (its PCI bus id, or the slot), never anything a job supplies.
+pub(crate) fn device_tally_key(device: &str, class: PostLockFailureClass) -> B256 {
+    keccak256([b"zkminer/witness/post-lock/device/v1".as_slice(), device.as_bytes(), &[class as u8]].concat())
+}
+
+/// Every post-lock failure class, for the quarantine check.
+pub(crate) const POST_LOCK_CLASSES: [PostLockFailureClass; 7] = [
+    PostLockFailureClass::Gpu,
+    PostLockFailureClass::ProverCrash,
+    PostLockFailureClass::ResourceLimit,
+    PostLockFailureClass::ProveTimeEstimate,
+    PostLockFailureClass::GasOrRpc,
+    PostLockFailureClass::BundleLoss,
+    PostLockFailureClass::JournalDiverged,
+];
+
+/// A tally's count at `now`: its count while it lasts, else 0 (an expired tally starts again).
+pub(crate) fn tally_count(attempts: u8, expires_at: u64, now: u64) -> u8 {
+    if expires_at > now {
+        attempts
+    } else {
+        0
     }
+}
+
+// ── pin evidence (§15.2) ──────────────────────────────────────────────────────
+
+/// A read of a pinned job's record: its state and the block it was read at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PinRead {
+    pub status: u8,
+    pub prover: Address,
+    pub reopen_count: u8,
+    pub at_block: u64,
+}
+
+/// What a pin records about the lock it was taken for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PinFacts {
+    /// The job's `reopenCount` when the pin was taken.
+    pub reopen_count: Option<u8>,
+    /// A block the job read Locked by us at (0: the claim was never confirmed).
+    pub lock_block: u64,
+    pub pinned_at_block: u64,
+    /// Chain time when the pin was taken (0: unknown).
+    pub pinned_at_unix: u64,
+}
+
+/// Whether a non-terminal read proves the lock a pin was taken for is gone (or never was), so the
+/// pin may go (§15.2: "removed only on an authoritative terminal read, or when the claim provably
+/// never landed ... judged by chain time, never wall clock alone"). Anything less keeps the pin:
+///
+/// - the reopen count is above the pin's (read at or after the pin's block when it was taken): that
+///   lock instance ended, whoever held it (a read never shows a count above the chain's, however far
+///   it lags);
+/// - a read at or after our lock block shows another prover, or no one;
+/// - the claim was never confirmed, chain time is past the claim-intent age since the pin, and a read
+///   at or after the pin's block shows the job not ours: every claim attempt of ours has ended
+///   (zkminer's breadcrumb rule), and none landed.
+///
+/// A read showing the job Locked by us is never evidence that a lock of ours is gone. `chain_now` is
+/// the lower chain-time estimate (`chain_now_floor`), so the age is never overstated.
+pub(crate) fn pin_lock_gone(pin: &PinFacts, read: &PinRead, us: Address, chain_now: u64, claim_intent_max_age: u64) -> bool {
+    const LOCKED: u8 = 1;
+    if read.prover == us && read.status == LOCKED {
+        return false;
+    }
+    if pin.reopen_count.is_some_and(|r| read.reopen_count > r) {
+        return true;
+    }
+    if pin.lock_block != 0 {
+        return read.at_block >= pin.lock_block;
+    }
+    pin.pinned_at_unix != 0
+        && chain_now >= pin.pinned_at_unix.saturating_add(claim_intent_max_age)
+        && read.at_block >= pin.pinned_at_block
 }
 
 /// The journal-divergence decision (§15.3): a re-executed journal is acceptable for one re-dispatch
@@ -426,7 +630,10 @@ mod tests {
         assert!(host.final_verdict);
         assert_eq!(b.note_verdict(c, HostInternal, &host), None, "this host's failures are never the caller's");
         assert_eq!(b.note_verdict(c, BuilderTrap, &verdict_plan(BuilderTrap, 0, 0.0)), Some(2));
-        assert_eq!(b.note_post_lock(c), 1);
+        // A post-lock failure is final for its job and never the caller's simulation record.
+        let post = verdict_plan(PostLockFailure, 0, 0.0);
+        assert!(post.final_verdict);
+        assert_eq!(b.note_verdict(c, PostLockFailure, &post), None);
     }
 
     #[test]
@@ -474,11 +681,17 @@ mod tests {
         assert_eq!(reservation_wei(&max), u128::MAX);
     }
 
+    fn plan(cps: f64, fixed: u64, margin: f64) -> ProvePlan {
+        ProvePlan::over([(cps, fixed)], margin).unwrap()
+    }
+
     #[test]
-    fn the_deadline_margin_includes_every_allowance() {
-        let prove = estimate_prove_secs(400_000 * 100, 400_000.0, 10);
-        assert_eq!(prove, 100 + 30 + RISC0_GROTH16_ALLOWANCE_SECS);
-        assert_eq!(estimate_prove_secs(10, 0.0, 0), 10 + RISC0_GROTH16_ALLOWANCE_SECS, "a bad rate is 1 c/s");
+    fn the_estimate_includes_the_margin_and_every_allowance() {
+        let p = plan(400_000.0, RISC0_GROTH16_ALLOWANCE_SECS, 1.5);
+        let prove = estimate_prove_secs(400_000 * 100, &p, 10);
+        assert_eq!(prove, 150 + 30 + RISC0_GROTH16_ALLOWANCE_SECS);
+        assert_eq!(estimate_prove_secs(10, &plan(0.0, 0, 1.0), 0), 10, "a bad rate is 1 c/s");
+        assert_eq!(estimate_prove_secs(10, &plan(1.0, 0, f64::NAN), 0), 10, "a bad margin is 1");
         let need = prove + 60 + 30 + CLAIM_MINE_ALLOWANCE_SECS;
         assert!(deadline_fits(need, prove, 60, 30));
         assert!(!deadline_fits(need - 1, prove, 60, 30));
@@ -486,11 +699,155 @@ mod tests {
     }
 
     #[test]
-    fn the_host_cycle_maximum_is_an_hour_of_proving() {
-        assert_eq!(host_max_guest_cycles(400_000.0), 1_440_000_000);
-        assert_eq!(host_max_guest_cycles(0.0), 1 << 24);
-        assert_eq!(host_max_guest_cycles(f64::NAN), 1 << 24);
-        assert_eq!(host_max_guest_cycles(1e12), 1 << 34);
+    fn a_plan_takes_the_slowest_rate_and_the_largest_allowance() {
+        let p = ProvePlan::over([(1e6, 30), (2e5, 120), (5e5, 600)], 1.5).unwrap();
+        assert_eq!(p, ProvePlan { cps: 2e5, fixed_secs: 600, margin: 1.5 });
+        assert_eq!(ProvePlan::over([], 1.5), None);
+        assert_eq!(ProvePlan::over([(1e6, 0)], 0.5).unwrap().margin, 1.0, "never below 1");
+    }
+
+    #[test]
+    fn the_fixed_allowance_is_measured_or_by_kind() {
+        assert_eq!(fixed_allowance_secs(Some(2.02), false), MEASURED_WRAP_FLOOR_SECS);
+        assert_eq!(fixed_allowance_secs(Some(100.0), true), 200);
+        assert_eq!(fixed_allowance_secs(None, false), RISC0_GROTH16_ALLOWANCE_SECS);
+        assert_eq!(fixed_allowance_secs(None, true), RISC0_CPU_PROOF_ALLOWANCE_SECS);
+        assert_eq!(fixed_allowance_secs(Some(f64::NAN), true), RISC0_CPU_PROOF_ALLOWANCE_SECS);
+        assert_eq!(fixed_allowance_secs(Some(-1.0), false), RISC0_GROTH16_ALLOWANCE_SECS);
+    }
+
+    /// The live localnet case: a CPU slot with no benchmark proved a 32,768-cycle witness job in
+    /// 358.9 s (`identity_p254` alone 244 s) on an idle host and in 859.2 s on a loaded one, while
+    /// the gate said ~121 s. The estimate is now above both, the 600 s default watchdog refuses it,
+    /// and a timeout sized for a CPU proof admits it.
+    #[test]
+    fn a_cpu_proof_is_estimated_above_what_it_took() {
+        let p = ProvePlan::over([(RISC0_CPU_CONSERVATIVE_CPS, fixed_allowance_secs(None, true))], 1.5).unwrap();
+        let est = estimate_prove_secs(32_768, &p, 0);
+        assert!(est >= 860, "{est}");
+        assert!(!watchdog_admits(est, 600), "the default watchdog would kill it");
+        assert!(watchdog_admits(est, 1_800));
+    }
+
+    /// A 900M-cycle job on a 1M c/s card in a 3-hour window passed the deadline gate and was then
+    /// killed by the 600 s watchdog on every attempt. The watchdog check refuses it, and the host
+    /// maximum no longer admits it at the static gates.
+    #[test]
+    fn the_claim_gate_refuses_what_the_watchdog_would_kill() {
+        let p = plan(1_000_000.0, RISC0_GROTH16_ALLOWANCE_SECS, 1.5);
+        let cycles = 900_000_000u64;
+        let prove = estimate_prove_secs(cycles, &p, 20);
+        assert!(deadline_fits(3 * 3600, prove, 60, 30), "the window alone would admit it");
+        assert!(!watchdog_admits(prove, 600));
+        let max = host_max_guest_cycles(&p, 600);
+        assert!(cycles > max, "{max}");
+        // A job at the host maximum fits the watchdog (before its execute allowance).
+        assert!(watchdog_admits(estimate_prove_secs(max, &p, 0), 600));
+        assert!(!watchdog_admits(600, 600), "the inline gate refuses at >= too");
+    }
+
+    #[test]
+    fn the_host_cycle_maximum_fits_the_watchdog() {
+        // (600 - 120 - 1) s x 400k c/s / 1.5.
+        assert_eq!(host_max_guest_cycles(&plan(400_000.0, 120, 1.5), 600), 127_733_333);
+        // At most an hour of proving, at most 2^34.
+        assert_eq!(host_max_guest_cycles(&plan(400_000.0, 0, 1.0), 1_000_000), 1_440_000_000);
+        assert_eq!(host_max_guest_cycles(&plan(1e12, 0, 1.0), 1_000_000), 1 << 34);
+        // A fixed allowance that fills the watchdog: nothing can be proven here.
+        assert_eq!(host_max_guest_cycles(&plan(RISC0_CPU_CONSERVATIVE_CPS, 600, 1.5), 600), 0);
+    }
+
+    #[test]
+    fn the_operator_session_cap_and_a_verifier_swap() {
+        assert_eq!(parse_session_cap(None), None);
+        assert_eq!(parse_session_cap(Some(" 1000 ")), Some(1000));
+        assert_eq!(parse_session_cap(Some("0")), None);
+        assert_eq!(parse_session_cap(Some("x")), None);
+        assert!(session_cap_admits(1000, Some(1000)));
+        assert!(!session_cap_admits(1001, Some(1000)));
+        assert!(session_cap_admits(u64::MAX, None));
+        assert_eq!(proving_cutoff(1000, None), 1000);
+        assert_eq!(proving_cutoff(1000, Some(800)), 800, "act before readyAt");
+        assert_eq!(proving_cutoff(1000, Some(2000)), 1000);
+    }
+
+    #[test]
+    fn funds_and_card_room() {
+        // 10M gas at 1 gwei per fulfil, 400k for the claim: two held locks plus this one.
+        let need = 3 * 10_000_000u128 * 1_000_000_000 + 400_000 * 1_000_000_000;
+        assert!(funds_cover(U256::from(need), 10_000_000, 1_000_000_000, 2));
+        assert!(!funds_cover(U256::from(need - 1), 10_000_000, 1_000_000_000, 2));
+        assert!(card_room(1, 0, 2));
+        assert!(!card_room(1, 1, 2));
+        assert!(!card_room(3, 0, 2), "a look-ahead queue of inline work");
+        assert!(card_room(0, 0, 0), "a cap of 0 counts as 1");
+    }
+
+    #[test]
+    fn unserved_jobs_are_set_aside_for_their_verdict_or_the_inline_ttl() {
+        assert_eq!(UNSERVED_SET_ASIDE, Duration::from_secs(600));
+        assert_eq!(verdict_set_aside(1_000, 400), Duration::from_secs(600));
+        assert_eq!(verdict_set_aside(1_000, 2_000), Duration::ZERO);
+        assert!(SERVING_OFF_SET_ASIDE < UNSERVED_SET_ASIDE);
+    }
+
+    /// A released witness lock left no verdict, so its job reopened and was re-locked from the
+    /// retained bundle once the release cooldown ended, at another 5% each time.
+    /// The post-lock verdict is final and outlives any job's window (at most 7 days), so a restart
+    /// reading it back never locks the job again.
+    #[test]
+    fn a_job_released_after_a_lock_is_never_locked_again() {
+        for prior in [0u8, 3, 200] {
+            let p = verdict_plan(PostLockFailure, prior, 0.5);
+            assert!(p.final_verdict);
+            assert!(p.ttl_secs >= 7 * 24 * 3600 + 3600, "outlives the window and the cooldown");
+        }
+    }
+
+    #[test]
+    fn post_lock_tallies_are_keyed_apart_and_expire() {
+        let (a, b) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        assert_ne!(caller_tally_key(a), caller_tally_key(b));
+        let gpu = |bus: &str| device_tally_key(bus, PostLockFailureClass::Gpu);
+        assert_ne!(gpu("0000:02:00.0"), device_tally_key("0000:02:00.0", PostLockFailureClass::ProverCrash));
+        assert_ne!(gpu("0000:02:00.0"), gpu("0000:03:00.0"));
+        assert_ne!(caller_tally_key(a), device_tally_key(&format!("{a}"), PostLockFailureClass::Gpu));
+        assert_eq!(tally_count(2, 100, 99), 2);
+        assert_eq!(tally_count(2, 100, 100), 0, "expired: starts again");
+        let mut classes: Vec<u8> = POST_LOCK_CLASSES.iter().map(|c| *c as u8).collect();
+        classes.dedup();
+        assert_eq!(classes.len(), 7);
+    }
+
+    #[test]
+    fn a_pin_goes_only_on_evidence() {
+        let us = Address::repeat_byte(0xaa);
+        let other = Address::repeat_byte(0xbb);
+        let read = |status, prover, reopen_count, at_block| PinRead { status, prover, reopen_count, at_block };
+        const AGE: u64 = 900;
+        // Pinned at block 100 / t=10_000 for reopen 1; the claim never confirmed.
+        let pending = PinFacts { reopen_count: Some(1), lock_block: 0, pinned_at_block: 100, pinned_at_unix: 10_000 };
+        // A lagging or early read showing it Open keeps the pin, however old it is by wall clock.
+        assert!(!pin_lock_gone(&pending, &read(0, Address::ZERO, 1, 120), us, 10_100, AGE));
+        assert!(!pin_lock_gone(&pending, &read(0, Address::ZERO, 1, 99), us, 20_000, AGE), "a read below the pin");
+        // Past the claim-intent age by chain time, a read at or after the pin: never landed.
+        assert!(pin_lock_gone(&pending, &read(0, Address::ZERO, 1, 120), us, 10_900, AGE));
+        assert!(pin_lock_gone(&pending, &read(1, other, 1, 120), us, 10_900, AGE));
+        // Ours and Locked: held, never gone.
+        assert!(!pin_lock_gone(&pending, &read(1, us, 1, 120), us, 99_999, AGE));
+        // A risen reopen count ends the instance on any read, unless the job reads Locked by us.
+        assert!(pin_lock_gone(&pending, &read(0, Address::ZERO, 2, 50), us, 0, AGE));
+        assert!(pin_lock_gone(&pending, &read(1, other, 2, 50), us, 0, AGE));
+        assert!(!pin_lock_gone(&pending, &read(1, us, 2, 50), us, 0, AGE), "ours and Locked: never gone");
+        // A confirmed lock: gone only on a read at or after the lock block.
+        let held = PinFacts { lock_block: 200, ..pending };
+        assert!(!pin_lock_gone(&held, &read(0, Address::ZERO, 1, 199), us, 99_999, AGE), "lags our lock");
+        assert!(pin_lock_gone(&held, &read(1, other, 1, 200), us, 0, AGE));
+        assert!(!pin_lock_gone(&held, &read(1, us, 1, 300), us, 99_999, AGE));
+        // A pin with no evidence recorded (an older pin): only the reopen count can end it, and
+        // without a count, nothing.
+        let bare = PinFacts { pinned_at_block: 100, ..Default::default() };
+        assert!(!pin_lock_gone(&bare, &read(0, Address::ZERO, 5, 500), us, 99_999, AGE));
     }
 
     #[test]

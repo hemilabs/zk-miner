@@ -6,21 +6,37 @@
 //!   `[witness] enabled`, a configuration that validates now, a usable `sys_rand` key, the delegated
 //!   cgroup, the spawner thread, the sandboxed binaries, a passing sandbox self-test, the broker
 //!   process and its own self-test. Any failure leaves serving off with
-//!   `PAGE: WITNESS-DISABLED <reason>`; inline jobs are unaffected. The self-tests run again hourly
-//!   and switch serving off (and back on) with their result.
+//!   `PAGE: WITNESS-DISABLED <reason>`; inline jobs are unaffected. Serving starts in the background
+//!   (the brain does not wait for it), each self-test is bounded, and they run again hourly and
+//!   switch serving off (aborting running simulations) and back on with their result.
 //! - **Routing and single flight** ([`WitnessRuntime::route`]): one task per jobId, from the first
-//!   simulation to the terminal state; a job with a live verdict is not simulated again.
+//!   simulation to the terminal state; a job with a live verdict, or a pending or held claim of
+//!   ours, is not simulated again. A witness job this host does not serve is set aside by the brain
+//!   (`Route::WitnessUnserved`).
 //! - **Simulation**: `pipeline::simulate_witness_job`, with [`Hooks`] supplying the chain gates
-//!   (submission form, deployment, claimability, governance, the reservation), the artifact budget
-//!   and the abort token (the governance watcher's `JobCancelled`, `JobClaimed` by another prover
-//!   and `BidSubmitted`, and shutdown). A bundle already published for the job is reused after
-//!   revalidation instead of simulating again.
-//! - **The claim gate**, the **lock** (revalidate, pin, journal, claimability, claim), the **prove**
-//!   (only at an executed po2; a journal divergence is re-versioned once), the **fulfil**
-//!   (`fulfillJobHashed` under the DA nonce rule), and the **terminal cleanup** (unpin, delete).
+//!   (submission form, deployment, claimability, governance, the reservation), the guest ELF (fetched
+//!   only after those passed, its image id derived on a measure worker), the artifact budget and the
+//!   abort token (the governance watcher's `JobCancelled`, `JobClaimed` by another prover and
+//!   `BidSubmitted`, serving switched off, and shutdown). A bundle already published for the job is
+//!   reused after revalidation instead of simulating again.
+//! - **The claim gate** (the proving-time estimate against the per-attempt watchdog and the window,
+//!   the operator's session cap, funds, segment disk reserved for the job, host RAM, the
+//!   reservation), the **lock** (revalidate at the cards' current po2 set, re-check pause, risc0,
+//!   serving, a jammed signer, funds and a free card, pin with the lock's evidence, journal,
+//!   claimability, claim), the **prove** (only at an executed po2, never on a quarantined device,
+//!   by a pending verifier swap's `readyAt`; a journal divergence is re-versioned once and proven on
+//!   the slot that diverged), the **fulfil** (`fulfillJobHashed` under the DA nonce rule), and the
+//!   **terminal cleanup** (unpin, delete).
 //! - **Recovery**: the store's pins are the index of witness locks; a periodic pass re-drives the
-//!   held ones from their bundles, unpins locks that ended, deletes bundles of terminal jobs, and,
-//!   once a full pass has completed, enables eviction.
+//!   held ones from their bundles, unpins locks that provably ended (a terminal read, a risen reopen
+//!   count, a read at or after the lock block showing another prover, or a claim that never landed
+//!   by chain time), deletes bundles of terminal jobs, and, once a full pass has completed and the
+//!   brain's first complete recovery pass has handed every witness lock over and each is pinned,
+//!   enables eviction. A lock with no readable pin is found by the brain's chain scan and re-pinned
+//!   from the store's latest version for it.
+//! - **Post-lock failures** (§16): a lock released after it failed records a final verdict for its
+//!   job, a tally for its caller (admission stops at a limit) and one for the device and failure
+//!   class (a device with two of a class proves no witness lock), all persisted in the store.
 //!
 //! Lanes: pre-claim chain reads run in `Lane::PreClaim`, the lock transaction (and the claimability
 //! read right before it) in `Lane::Lock`, and everything for a lock already held in
@@ -29,7 +45,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -60,17 +76,16 @@ use zkminer_prover::dispatcher::{JournalDivergence, WitnessProveOutcome};
 use zkminer_prover::engine::ProofOutput;
 use zkminer_prover_protocol::{WitnessProve, GUEST_EXIT_HALTED};
 use zkminer_tui::state::{LogLevel, MinerJobStatus, SharedState, TrackedJob};
-use zkminer_witness::binding::journal_prefix;
-use zkminer_witness::bundle::{BundleV1, GuestExit, Po2Result};
+use zkminer_witness::bundle::{BundleV1, GuestExit, PinRecord, Po2Result};
 use zkminer_witness::envelope::HostMaxima;
-use zkminer_witness::verdict::{SkipReason, VerdictRecord};
+use zkminer_witness::verdict::{PostLockFailureClass, SkipReason, VerdictRecord};
 use zkminer_witness_broker::client::{ArtifactCharge, BrokerClient};
 use zkminer_witness_host::abort::{AbortReason, AbortToken};
 use zkminer_witness_host::broker_proc::BrokerProcess;
 use zkminer_witness_host::paths;
 use zkminer_witness_host::pipeline::{
-    descriptor_hash_of_abi, eviction_by_age, key_fingerprint, simulate_witness_job, HookFuture, HostContext, ImageIdFn,
-    JobInput, PipelineHooks, Simulated, Skip,
+    descriptor_hash_of_abi, eviction_by_age, key_fingerprint, risc0_build_id, simulate_witness_job, HookFuture,
+    HostContext, ImageIdFn, JobInput, PipelineHooks, Simulated, Skip,
 };
 use zkminer_witness_host::spawner::Spawner;
 use zkminer_witness_host::store_open::open_store;
@@ -80,9 +95,13 @@ use zkminer_witness_store::{
 
 use super::super as run;
 use super::policy::{
-    caller_admitted, deadline_fits, divergence_reusable, estimate_prove_secs, gate_refusal_reason,
-    host_max_guest_cycles, is_witness_input, not_claimable_reason, rate_secs_left, reservation_wei, segment_need,
-    segments_fit, short, verdict_plan, witness_prove_sizes, ArtifactBudget, Blame, ReservationInputs, CLAIM_GAS,
+    caller_admitted, caller_tally_key, card_room, deadline_fits, device_tally_key, divergence_reusable,
+    estimate_prove_secs, fixed_allowance_secs, funds_cover, gate_refusal_reason, host_max_guest_cycles,
+    is_witness_input, not_claimable_reason, parse_session_cap, pin_lock_gone, proving_cutoff, rate_secs_left,
+    reservation_wei, segment_need, segments_fit, session_cap_admits, short, tally_count, verdict_plan,
+    verdict_set_aside, watchdog_admits, witness_prove_sizes, ArtifactBudget, Blame, PinFacts, PinRead, ProvePlan,
+    ReservationInputs, POST_LOCK_CALLER_LIMIT, POST_LOCK_CLASSES, POST_LOCK_DEVICE_LIMIT,
+    POST_LOCK_TALLY_TTL_SECS, RISC0_CPU_CONSERVATIVE_CPS, SERVING_OFF_SET_ASIDE, UNSERVED_SET_ASIDE,
 };
 use super::{known_class, note_class, Class, Route};
 use crate::journal::WitnessBundleRef;
@@ -94,6 +113,9 @@ const MAX_ARTIFACT_BYTES: u64 = 4 << 20;
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(600);
 /// How often the sandbox and broker self-tests run again.
 const SELF_TEST_EVERY: Duration = Duration::from_secs(3600);
+/// Bound on one self-test (sandbox or broker): one that does not finish is a failure, so a wedged
+/// broker or spawner never holds serving (or the miner's start) hostage.
+const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often the retention store is reconciled with the chain.
 const STORE_PASS_EVERY: Duration = Duration::from_secs(300);
 /// Simulations at once (each runs a builder and executes the guest at every po2, on the CPU).
@@ -117,8 +139,17 @@ const RETENTION_LOW_SHARE: f64 = 0.8;
 /// Reads of a just-fulfilled job's record before its terminal cleanup is left to the store pass (a
 /// lagging replica may still show it Locked).
 const TERMINAL_READS: u32 = 4;
-/// Bound on deriving one ELF's image id (milliseconds of work on a measure worker).
+/// Bound on deriving one ELF's image id, waiting for a measure worker included (the derivation is
+/// milliseconds of work; the measure workers may all be busy measuring inline jobs).
 const IMAGE_ID_TIMEOUT: Duration = Duration::from_secs(120);
+/// How often a derivation that found every measure worker busy tries again.
+const IMAGE_ID_RETRY: Duration = Duration::from_millis(250);
+/// A device (its PCI bus id, or the slot for a card without one) named for the post-lock tallies.
+fn device_of_slot(slot: &str) -> String {
+    zkminer_prover::engine::worker_pool()
+        .and_then(|p| p.bus_id_for_slot(slot))
+        .unwrap_or_else(|| slot.to_string())
+}
 /// Bounds on the per-job memories of the runtime (the oldest are dropped past them).
 const PER_JOB_CAP: usize = 16_384;
 
@@ -202,12 +233,13 @@ struct Candidate {
 impl Candidate {
     fn from_sim(s: Simulated, elf: Vec<u8>) -> Self {
         let n = s.per_po2.len().max(1) as u64;
+        let execute_ms = s.record.execute_ms_per_po2.unwrap_or_else(|| (s.timings.execute.as_millis() as u64).div_ceil(n));
         Self {
             bundle: s.bundle,
             journal: s.journal,
             per_po2: s.per_po2.iter().map(|p| (p.po2, p.cycles, p.segment_bytes, p.peak_host_bytes)).collect(),
             simulation_secs: (s.timings.builder + s.timings.execute).as_secs_f64(),
-            execute_secs_per_po2: s.timings.execute.as_secs() / n,
+            execute_secs_per_po2: execute_ms.div_ceil(1000),
             record: s.record,
             elf,
         }
@@ -223,6 +255,8 @@ struct GateOk {
     reservation: u128,
     /// The job's `fulfillmentTimeout` (from its record): a lock taken now ends this long after.
     window: u64,
+    /// The fulfil's gas limit the gate funded.
+    fulfil_gas: u64,
 }
 
 /// A held witness lock, as the prove and fulfil steps need it.
@@ -237,6 +271,8 @@ struct LockCtx {
     lock_deadline: u64,
     locked_collateral: u128,
     cycles: u64,
+    /// The slot of the last proof attempt that failed, and how (for the post-lock tallies).
+    failure: Option<(Option<String>, PostLockFailureClass)>,
 }
 
 /// The chain gates' inputs for one job (§5.3).
@@ -287,6 +323,20 @@ pub(crate) struct WitnessRuntime {
     /// Jobs a one-off notice was logged for (not admitted, needs claim_predicate_jobs).
     noticed: Mutex<HashSet<(B256, &'static str)>>,
     store_pass_running: AtomicBool,
+    /// The execute worker's build, from its latest response here (`None` until one ran).
+    execute_build: Mutex<Option<String>>,
+    /// The brain's view of the cards, each tick: inline jobs still needing a card, and the cap.
+    cards: Mutex<Option<(usize, usize)>>,
+    /// The brain's first complete recovery pass has handed over every witness lock it found.
+    brain_recovered: AtomicBool,
+    /// Witness locks recovery handed over whose bundle is not pinned yet: eviction waits for them.
+    unpinned_recoveries: Mutex<HashSet<B256>>,
+    /// Image-id derivations that could not run (no measure worker free within the bound).
+    image_id_unavailable: Arc<AtomicU64>,
+    /// Callers' post-lock failure counts as last read or written here, with when they expire.
+    post_lock_callers: Mutex<HashMap<Address, (u8, u64)>>,
+    /// Post-lock tallies when no store is open (counted for this process only).
+    tallies: Mutex<HashMap<B256, (u8, u64)>>,
 }
 
 impl WitnessRuntime {
@@ -312,8 +362,17 @@ impl WitnessRuntime {
         if !w.enabled && config.retention.is_none() {
             return None;
         }
-        let (sys_rand_key, key_err) =
-            zkminer_prover_protocol::sys_rand::host_key(dirs::home_dir().as_deref());
+        // The key every risc0 worker of this miner was handed (run.rs loads it once): the seed the
+        // execute runs under must be the one the prove worker derives. A key for this run only
+        // (the file unusable) refuses serving: a bundle must stay provable after a restart.
+        let (sys_rand_key, key_err) = match zkminer_prover::worker::risc0_sys_rand_key() {
+            Some((key, false)) => (key, None),
+            Some((key, true)) => (
+                key,
+                Some(std::io::Error::other("the workers were given a key for this run only")),
+            ),
+            None => zkminer_prover_protocol::sys_rand::host_key(dirs::home_dir().as_deref()),
+        };
         let backlog = match config.dev_da_backlog_bytes() {
             Some(b) => {
                 tracing::warn!(
@@ -372,10 +431,22 @@ impl WitnessRuntime {
             scan_complete: AtomicBool::new(false),
             noticed: Mutex::new(HashSet::new()),
             store_pass_running: AtomicBool::new(false),
+            execute_build: Mutex::new(None),
+            cards: Mutex::new(None),
+            brain_recovered: AtomicBool::new(false),
+            unpinned_recoveries: Mutex::new(HashSet::new()),
+            image_id_unavailable: Arc::new(AtomicU64::new(0)),
+            post_lock_callers: Mutex::new(HashMap::new()),
+            tallies: Mutex::new(HashMap::new()),
         });
         rt.open_store().await;
         if w.enabled {
-            rt.start_serving(config, key_err).await;
+            // §19: the effective configuration, whether or not serving then starts.
+            tracing::info!("{}", effective_summary(w, config.retention.as_ref(), config.broker.as_ref()));
+            // In the background: the self-tests and the broker start take seconds (minutes, bounded,
+            // when something is wedged), and the brain and every inline job go on meanwhile.
+            let (rt2, config) = (rt.clone(), config.clone());
+            tokio::spawn(async move { rt2.start_serving(&config, key_err).await });
         } else {
             tracing::info!(
                 "witness serving is off ([witness] enabled = false): witness jobs are not simulated; \
@@ -419,12 +490,31 @@ impl WitnessRuntime {
              unaffected",
             zkminer_chain::programs::sanitize_log(&why)
         );
+        // §19: switching serving off aborts the running simulations; held locks continue.
+        self.abort_simulations(AbortReason::Disabled);
+    }
+
+    /// Fires every running simulation's abort token (a held lock's task is never aborted).
+    fn abort_simulations(&self, reason: AbortReason) {
+        for (jid, t) in lock(&self.tasks).iter() {
+            if t.phase == Phase::Simulating && t.token.abort(reason) {
+                tracing::info!("witness job {}: simulation aborted ({reason:?})", short(*jid));
+            }
+        }
     }
 
     async fn start_serving(self: &Arc<Self>, config: &ZkMinerConfig, key_err: Option<std::io::Error>) {
         let w = &config.witness;
         if let Err(e) = validate(w, config.retention.as_ref(), config.broker.as_ref(), chrono::Utc::now().timestamp()) {
             return self.disable(e.to_string());
+        }
+        // §5.3: witness jobs only on a deployment whose core code this host verified.
+        if zkminer_chain::deployment::code_pins_skipped() {
+            return self.disable(
+                "ZKMINER_SKIP_CODE_PINS is set: the deployment's core code is not verified, and witness \
+                 jobs are served only on a verified deployment"
+                    .into(),
+            );
         }
         if let Some(e) = key_err {
             return self.disable(format!(
@@ -472,8 +562,8 @@ impl WitnessRuntime {
             Ok(b) => b,
             Err(e) => return self.disable(e),
         };
-        if let Err(why) = self.sandbox_self_test(&spawner, &probe_binary).await {
-            return self.disable(format!("the sandbox self-test failed: {why}"));
+        if let Err(why) = bounded_self_test("sandbox", self.sandbox_self_test(&spawner, &probe_binary)).await {
+            return self.disable(why);
         }
         let broker = match BrokerProcess::start(
             &spawner,
@@ -487,10 +577,9 @@ impl WitnessRuntime {
             Err(e) => return self.disable(format!("starting the broker: {e:#}")),
         };
         let broker_client = broker.client.clone();
-        if let Err(why) = broker_self_test(&broker_client).await {
-            return self.disable(format!("the broker self-test failed: {why}"));
+        if let Err(why) = bounded_self_test("broker", broker_self_test(&broker_client)).await {
+            return self.disable(why);
         }
-        tracing::info!("{}", effective_summary(w, config.retention.as_ref(), config.broker.as_ref()));
         *lock(&self.serving) = Some(Arc::new(Serving {
             spawner,
             broker: Mutex::new(broker),
@@ -537,9 +626,9 @@ impl WitnessRuntime {
             let exited = lock(&s.broker).exited();
             let result = match exited {
                 Some(status) => Err(format!("the broker exited ({status})")),
-                None => match self.sandbox_self_test(&s.spawner, &s.probe_binary).await {
-                    Err(why) => Err(format!("the sandbox self-test failed: {why}")),
-                    Ok(()) => broker_self_test(&s.broker_client).await.map_err(|why| format!("the broker self-test failed: {why}")),
+                None => match bounded_self_test("sandbox", self.sandbox_self_test(&s.spawner, &s.probe_binary)).await {
+                    Err(why) => Err(why),
+                    Ok(()) => bounded_self_test("broker", broker_self_test(&s.broker_client)).await,
                 },
             };
             match result {
@@ -589,6 +678,39 @@ impl WitnessRuntime {
         lock(&self.tasks).keys().copied().collect()
     }
 
+    /// Whether a witness task owns `jid` now (recovery re-checks it right before it releases a lock:
+    /// a task may have taken the job since its pass began).
+    pub(crate) fn owns(&self, jid: B256) -> bool {
+        lock(&self.tasks).contains_key(&jid)
+    }
+
+    /// The brain's view of the cards this tick: inline jobs still needing a card, and the
+    /// concurrency cap. A witness lock is taken only while a card is free for it (see
+    /// [`card_room`]).
+    pub(crate) fn note_cards(&self, inline_needing: usize, max_concurrent: usize) {
+        *lock(&self.cards) = Some((inline_needing, max_concurrent));
+    }
+
+    /// Witness locks held (or being recovered) here.
+    fn witness_locks(&self) -> usize {
+        lock(&self.tasks).values().filter(|t| t.phase == Phase::Locked).count()
+    }
+
+    /// Whether a card is free for one more witness lock (false until the brain has said).
+    fn card_free(&self) -> bool {
+        let witness_locks = self.witness_locks();
+        lock(&self.cards).is_some_and(|(inline, max)| card_room(inline, witness_locks, max))
+    }
+
+    /// The brain finished a recovery pass (`deferred`: cut short). After its first complete one,
+    /// every witness lock it found has been handed to [`Self::drive_recovered`]; eviction then waits
+    /// only for those to be pinned (§15.2: nothing is evicted before one full recovery scan).
+    pub(crate) fn note_recovery_pass(&self, deferred: bool) {
+        if !deferred && !self.brain_recovered.swap(true, Ordering::SeqCst) {
+            tracing::info!("witness: the brain's recovery pass handed over every witness lock it found");
+        }
+    }
+
     /// Whether a lock of ours is a witness lock this runtime knows: the journal references its
     /// bundle, or the store holds a pin for it.
     pub(crate) fn is_witness_lock(&self, job_id: B256) -> bool {
@@ -600,11 +722,7 @@ impl WitnessRuntime {
 
     /// Fires every simulation's abort token (shutdown). Held locks are left to the drain.
     pub(crate) fn shutdown(&self) {
-        for (jid, t) in lock(&self.tasks).iter() {
-            if t.phase == Phase::Simulating && t.token.abort(AbortReason::Shutdown) {
-                tracing::info!("witness job {}: simulation aborted (shutdown)", short(*jid));
-            }
-        }
+        self.abort_simulations(AbortReason::Shutdown);
     }
 
     /// See [`super::route`].
@@ -615,10 +733,7 @@ impl WitnessRuntime {
         }
         match known_class(jid) {
             Some(Class::Inline) => Route::Inline,
-            Some(Class::Witness) => {
-                self.offer(job, descriptor_hash, claim_predicate_jobs);
-                Route::Witness
-            }
+            Some(Class::Witness) => self.offer(job, descriptor_hash, claim_predicate_jobs),
             None => {
                 if !self.serving_enabled() || !caller_admitted(&self.witness.callers, job.info.caller) {
                     return Route::Inline;
@@ -700,12 +815,12 @@ impl WitnessRuntime {
         n.insert((jid, kind))
     }
 
-    /// Starts a known witness job's task unless one runs, a verdict holds, or it is not served.
-    fn offer(self: &Arc<Self>, job: &TrackedJob, descriptor_hash: B256, claim_predicate_jobs: bool) {
+    /// Starts a known witness job's task unless one runs, a verdict holds, or it is not served, and
+    /// says how the brain treats the job meanwhile: a job this host does not serve now is set aside
+    /// ([`Route::WitnessUnserved`]), as the inline path sets aside one it cannot claim.
+    fn offer(self: &Arc<Self>, job: &TrackedJob, descriptor_hash: B256, claim_predicate_jobs: bool) -> Route {
         let jid = job.info.job_id;
-        if !self.serving_enabled() || shutting_down() {
-            return;
-        }
+        let unserved = |wait| Route::WitnessUnserved { wait };
         if !caller_admitted(&self.witness.callers, job.info.caller) {
             if self.notice(jid, "not-admitted") {
                 tracing::info!(
@@ -714,7 +829,13 @@ impl WitnessRuntime {
                     job.info.caller
                 );
             }
-            return;
+            return unserved(UNSERVED_SET_ASIDE);
+        }
+        if !self.serving_enabled() {
+            return unserved(SERVING_OFF_SET_ASIDE);
+        }
+        if shutting_down() {
+            return Route::Witness;
         }
         if !claim_predicate_jobs {
             if self.notice(jid, "predicate") {
@@ -724,29 +845,57 @@ impl WitnessRuntime {
                     short(jid)
                 );
             }
-            return;
+            return unserved(UNSERVED_SET_ASIDE);
         }
-        if lock(&self.verdict_until).get(&jid).is_some_and(|t| *t > now_unix()) {
-            return;
+        let now = now_unix();
+        if let Some(until) = lock(&self.verdict_until).get(&jid).copied().filter(|t| *t > now) {
+            return unserved(verdict_set_aside(until, now));
+        }
+        // A claim of ours may be pending or held (a journal entry, or a pin): recovery's, never
+        // simulated again (§15.2 single flight: a pinned job is never re-simulated).
+        if run::journal_has(&self.journal, jid) || self.is_witness_lock(jid) {
+            return Route::Witness;
+        }
+        if let Some(n) = self.caller_post_lock_failures(job.info.caller) {
+            if n >= POST_LOCK_CALLER_LIMIT {
+                if self.notice(jid, "post-lock") {
+                    tracing::warn!(
+                        "witness job {}: caller {} has {n} post-lock witness failure(s) in the last {} days — \
+                         not admitted",
+                        short(jid),
+                        job.info.caller,
+                        POST_LOCK_TALLY_TTL_SECS / 86_400
+                    );
+                }
+                return unserved(UNSERVED_SET_ASIDE);
+            }
+        }
+        // Not now, and not the job's doing: no card free (inline work or witness locks fill them),
+        // or the host's prove-worker builds are not all known yet.
+        if !self.card_free() || self.worker_builds().is_none() {
+            return Route::Witness;
         }
         let token = AbortToken::new();
         {
             let mut t = lock(&self.tasks);
             if t.contains_key(&jid) {
-                return;
+                return Route::Witness;
             }
             t.insert(jid, Task { token: token.clone(), phase: Phase::Simulating });
         }
         let (rt, job) = (self.clone(), job.clone());
         tokio::spawn(async move {
             let _entry = TaskEntry { rt: rt.clone(), job_id: jid };
-            if let Some(l) = rt.simulate_and_lock(&job, descriptor_hash, &token).await {
-                if let Some(t) = lock(&rt.tasks).get_mut(&jid) {
-                    t.phase = Phase::Locked;
+            let locked = rt.simulate_and_lock(&job, descriptor_hash, &token).await;
+            match locked {
+                Some(l) => rt.run_locked(l).await,
+                // Not locked: whatever the gate reserved for the proof goes.
+                None => {
+                    lock(&rt.segment_reserved).remove(&jid);
                 }
-                rt.run_locked(l).await;
             }
         });
+        Route::Witness
     }
 
     /// Fires a running simulation's abort token (the governance watcher's events).
@@ -784,66 +933,121 @@ impl WitnessRuntime {
         run::risc0_job_sizes(&run::current_risc0_cards(&self.state, true).await)
     }
 
-    /// The slowest rate (cycles/s) a card that may prove the job runs at, from the benchmark, or
-    /// the conservative floor for the sizes (the inline claim gate's sizing).
-    async fn planning_cps(&self, po2s: &[u8]) -> f64 {
+    /// How a witness proof on this host is planned (§5.2 step 7): over every enabled risc0 card
+    /// that may prove it, the slowest rate (its benchmark row at its size, else the floor for its
+    /// kind: a card with no row is never left out) and the largest fixed allowance (its measured
+    /// Groth16 wrap, else the allowance for its kind; a CPU slot's wrap is minutes), with the
+    /// operator's `deadline_safety_margin`. `po2s` (the host's sizes) only seed the floor when no
+    /// card is enabled.
+    async fn prove_plan(&self, po2s: &[u8]) -> ProvePlan {
         let cards = run::current_risc0_cards(&self.state, true).await;
         let st = self.state.read().await;
-        let mut slowest: Option<f64> = None;
-        if let Some(suite) = st.benchmark_results.as_ref().filter(|s| !run::is_synthetic_suite(s)) {
-            for c in &cards {
-                let row = suite
-                    .device_benchmarks
+        let margin = st.runtime_settings.deadline_safety_margin;
+        let suite = st.benchmark_results.as_ref().filter(|s| !run::is_synthetic_suite(s));
+        let per_card = cards.iter().map(|c| {
+            let row = suite.and_then(|s| {
+                s.device_benchmarks
                     .iter()
-                    .find(|d| d.device_id == c.device && d.prover_backend == zkminer_prover_protocol::BACKEND_RISC0);
-                if let Some(row) = row {
-                    let t = zkminer_prover::benchmark::risc0_job_throughput(row, c.po2);
-                    if t.is_finite() && t > 0.0 {
-                        slowest = Some(slowest.map_or(t, |s| s.min(t)));
-                    }
+                    .find(|d| d.device_id == c.device && d.prover_backend == zkminer_prover_protocol::BACKEND_RISC0)
+            });
+            let cpu = c.device == "cpu";
+            let measured = row
+                .map(|r| zkminer_prover::benchmark::risc0_job_throughput(r, c.po2))
+                .filter(|t| t.is_finite() && *t > 0.0);
+            let cps = measured.unwrap_or_else(|| {
+                if cpu {
+                    RISC0_CPU_CONSERVATIVE_CPS
+                } else {
+                    run::risc0_conservative_cps(&[c.po2])
                 }
-            }
-        }
-        slowest.unwrap_or_else(|| run::risc0_conservative_cps(po2s))
+            });
+            (cps, fixed_allowance_secs(row.and_then(|r| r.wrap_secs()), cpu))
+        });
+        ProvePlan::over(per_card.collect::<Vec<_>>(), margin).unwrap_or(ProvePlan {
+            cps: run::risc0_conservative_cps(po2s),
+            fixed_secs: fixed_allowance_secs(None, false),
+            margin: if margin.is_finite() && margin >= 1.0 { margin } else { 1.0 },
+        })
     }
 
-    fn worker_builds(&self) -> Vec<String> {
-        let info = zkminer_prover::engine::worker_pool().and_then(|p| p.worker_info(zkminer_prover_protocol::BACKEND_RISC0));
-        vec![match info {
-            Some(i) => format!(
-                "risc0/{}/{}",
-                i.sdk_version.as_deref().unwrap_or("unknown"),
-                i.worker_version.as_deref().unwrap_or("unknown")
-            ),
-            None => "risc0/none".to_string(),
-        }]
+    /// The build of every risc0 prove worker that may prove a witness bundle here (§15.1): each prove
+    /// slot's, as its worker named it at its last handshake, published at spawn and read without
+    /// waiting on a busy slot. A slot whose worker has never started has no build to record (it
+    /// cannot prove; if it starts with another build, revalidation at the lock sees it). `None` when
+    /// no slot's build is known yet: nothing is recorded or compared against a placeholder.
+    fn prove_worker_builds(&self) -> Option<Vec<String>> {
+        let pool = zkminer_prover::engine::worker_pool()?;
+        let mut builds: Vec<String> = pool
+            .worker_builds(zkminer_prover_protocol::BACKEND_RISC0)
+            .into_iter()
+            .filter_map(|(_slot, build)| build.map(|(sdk, worker)| risc0_build_id(&sdk, &worker)))
+            .collect();
+        builds.sort();
+        builds.dedup();
+        (!builds.is_empty()).then_some(builds)
     }
 
-    fn host_profile(&self, po2s: &[u8]) -> HostProfile {
-        HostProfile {
+    /// [`Self::prove_worker_builds`] and the execute worker's build once one ran here (its journals
+    /// are the bundle's): what revalidation compares a bundle with (§15.2).
+    fn worker_builds(&self) -> Option<Vec<String>> {
+        let mut builds = self.prove_worker_builds()?;
+        builds.extend(lock(&self.execute_build).clone());
+        builds.sort();
+        builds.dedup();
+        Some(builds)
+    }
+
+    /// The host as it is now, for revalidation; `None` while a worker build is unknown.
+    fn host_profile(&self, po2s: &[u8]) -> Option<HostProfile> {
+        Some(HostProfile {
             po2s: po2s.iter().map(|p| u32::from(*p)).collect(),
             sys_rand_key_fingerprint: key_fingerprint(&self.sys_rand_key),
             keccak_po2: u32::from(self.keccak_po2),
-            worker_builds: self.worker_builds(),
-        }
+            worker_builds: self.worker_builds()?,
+        })
     }
 
-    /// risc0's image id of an ELF, derived on a risc0 measure worker (cached by the ELF's keccak).
-    /// `None` without a measure pool (deriving on a prove worker could cost it a proof).
+    /// risc0's image id of an ELF, derived on a risc0 measure worker (cached by the ELF's keccak),
+    /// waiting up to [`IMAGE_ID_TIMEOUT`] for one to be free. `None` without a measure pool (deriving
+    /// on a prove worker could cost it a proof), or when none came free in time: that is counted in
+    /// `image_id_unavailable`, so a caller can tell "could not derive now" from "not this image id".
+    /// A held lock's reads need no derivation (its bundle records the ELF's digest).
     fn image_id_fn(&self) -> ImageIdFn {
         let cache = self.image_ids.clone();
+        let unavailable = self.image_id_unavailable.clone();
         Arc::new(move |elf: &[u8]| {
             let key = keccak256(elf);
             if let Some(id) = lock(&cache).get(&key) {
                 return Some(*id);
             }
-            let pool = zkminer_prover::engine::worker_pool()?;
-            pool.measure_worker_count(zkminer_prover_protocol::BACKEND_RISC0).filter(|n| *n > 0)?;
-            let id = match pool.derive_program_id(zkminer_prover_protocol::BACKEND_RISC0, elf, Some(IMAGE_ID_TIMEOUT)) {
-                Ok(d) => B256::from(d.program_id),
-                Err(e) => {
-                    tracing::warn!("witness: deriving an ELF's image id failed: {e:#}");
-                    return None;
+            let give_up = || {
+                unavailable.fetch_add(1, Ordering::SeqCst);
+                None
+            };
+            let Some(pool) = zkminer_prover::engine::worker_pool() else { return give_up() };
+            if pool.measure_worker_count(zkminer_prover_protocol::BACKEND_RISC0).filter(|n| *n > 0).is_none() {
+                return give_up();
+            }
+            let deadline = Instant::now() + IMAGE_ID_TIMEOUT;
+            let id = loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match pool.derive_program_id(zkminer_prover_protocol::BACKEND_RISC0, elf, Some(left.max(Duration::from_secs(5)))) {
+                    Ok(d) => break B256::from(d.program_id),
+                    Err(e) => {
+                        let busy = e.downcast_ref::<zkminer_prover_protocol::types::MeasureSlotsBusy>().is_some()
+                            || e.downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>().is_some_and(|h| !h.attempted)
+                            || e.downcast_ref::<zkminer_prover_protocol::types::MeasureWorkerGone>().is_some();
+                        if busy && Instant::now() + IMAGE_ID_RETRY < deadline {
+                            std::thread::sleep(IMAGE_ID_RETRY);
+                            continue;
+                        }
+                        tracing::warn!("witness: deriving an ELF's image id failed: {e:#}");
+                        // The worker refused the bytes: not an ELF it knows (a verdict on them).
+                        if e.downcast_ref::<zkminer_prover_protocol::types::ProgramIdRefused>().is_some() {
+                            return None;
+                        }
+                        return give_up();
+                    }
                 }
             };
             let mut c = lock(&cache);
@@ -855,7 +1059,14 @@ impl WitnessRuntime {
         })
     }
 
-    fn host_context(&self, serving: &Serving, store: &Arc<Store>, po2s: Vec<u8>, cps: f64) -> HostContext {
+    fn host_context(
+        &self,
+        serving: &Serving,
+        store: &Arc<Store>,
+        po2s: Vec<u8>,
+        plan: &ProvePlan,
+        worker_builds: Vec<String>,
+    ) -> HostContext {
         let w = &self.witness;
         let c = &w.builder_clamps;
         HostContext {
@@ -867,7 +1078,9 @@ impl WitnessRuntime {
             execute_binary: serving.execute_binary.clone(),
             host_maxima: HostMaxima {
                 max_witness_bytes: w.max_witness_bytes,
-                max_guest_cycles: w.max_guest_cycles.unwrap_or_else(|| host_max_guest_cycles(cps)),
+                max_guest_cycles: w
+                    .max_guest_cycles
+                    .unwrap_or_else(|| host_max_guest_cycles(plan, self.proving_timeout.as_secs())),
                 max_fetches: c.fetches,
                 max_fetch_bytes: c.fetch_bytes,
                 max_request_bytes: c.request_bytes,
@@ -879,7 +1092,7 @@ impl WitnessRuntime {
             po2s,
             keccak_po2: self.keccak_po2,
             sys_rand_key: self.sys_rand_key,
-            worker_builds: self.worker_builds(),
+            worker_builds,
             execute_memory_bytes: w.execute_memory_bytes,
             execute_timeout: EXECUTE_TIMEOUT,
             max_artifact_bytes: MAX_ARTIFACT_BYTES,
@@ -963,7 +1176,10 @@ impl WitnessRuntime {
             if !matches!(g.form, SubmissionForm::Direct { .. }) {
                 return Err(SkipReason::UnsupportedSubmission);
             }
-            if !run::DEPLOYMENT_VERIFIED.load(Ordering::SeqCst) || !run::risc0_claimable() {
+            if !run::DEPLOYMENT_VERIFIED.load(Ordering::SeqCst)
+                || zkminer_chain::deployment::code_pins_skipped()
+                || !run::risc0_claimable()
+            {
                 return Err(SkipReason::DeploymentNotVerified);
             }
             if !self.serving_enabled() {
@@ -1048,23 +1264,27 @@ impl WitnessRuntime {
     }
 
     /// A bundle already published for this job and prover that is current on this host: reused
-    /// instead of simulating again (§15.2 single flight; re-locks reuse their bundle).
+    /// instead of simulating again (§15.2 single flight; re-locks reuse their bundle). Not before the
+    /// execute worker's build is known here (a simulation in this process learns it), and never one
+    /// that does not record its execute time (the prove's execute allowance).
     async fn retained_candidate(&self, store: &Arc<Store>, jid: B256, dh: B256, po2s: &[u8]) -> Option<Candidate> {
-        let (s, prover, idf, profile) = (store.clone(), self.client.address, self.image_id_fn(), self.host_profile(po2s));
+        lock(&self.execute_build).as_ref()?;
+        let profile = self.host_profile(po2s)?;
+        let (s, prover, idf) = (store.clone(), self.client.address, self.image_id_fn());
         blocking(move || {
             let r = s.latest(jid, dh, prover).ok()?;
-            let record = s.verify(&r, &descriptor_hash_of_abi, &*idf).ok()?;
+            let (record, elf) = s.verify_with_elf(&r, &descriptor_hash_of_abi, &*idf).ok()?;
+            let execute_ms = record.execute_ms_per_po2?;
             if !revalidate(&record, &profile).is_current() {
                 return None;
             }
             let journal = hex::decode(&record.po2_results.first()?.journal_hex).ok()?;
-            let elf = s.open_elf(record.image_id, &*idf).ok()?;
             Some(Candidate {
                 bundle: r,
                 journal,
                 per_po2: record.po2_results.iter().map(|p| (p.po2, p.cycles, p.segment_bytes, 0)).collect(),
                 simulation_secs: 0.0,
-                execute_secs_per_po2: 0,
+                execute_secs_per_po2: execute_ms.div_ceil(1000),
                 record,
                 elf,
             })
@@ -1074,13 +1294,43 @@ impl WitnessRuntime {
         .flatten()
     }
 
+    /// Why new witness work must not start now, though nothing is wrong with any job: the operator
+    /// paused claiming (or the miner drives held locks only), or switched risc0 off.
+    async fn claims_held(&self) -> Option<&'static str> {
+        if run::held_locks_only() {
+            return Some("the miner drives held locks only");
+        }
+        let st = self.state.read().await;
+        if st.paused {
+            return Some("claiming is paused");
+        }
+        if st.runtime_settings.disabled_backends.contains(zkminer_prover_protocol::BACKEND_RISC0) {
+            return Some("risc0 is switched off");
+        }
+        None
+    }
+
     /// Everything before a witness lock (§5.2 steps 0–9). `None` when the job is not locked now.
     async fn simulate_and_lock(self: &Arc<Self>, job: &TrackedJob, dh: B256, token: &AbortToken) -> Option<LockCtx> {
         let jid = job.info.job_id;
         let caller = job.info.caller;
         let store = self.store()?;
         let serving = self.serving()?;
+        // A pending or held claim of ours is recovery's: a pinned job is never simulated again, and
+        // the builder never runs after a lock (§5.1, §15.2).
+        if run::journal_has(&self.journal, jid) || self.is_witness_lock(jid) {
+            return None;
+        }
+        if let Some(why) = self.claims_held().await {
+            tracing::debug!("witness job {}: not simulated now ({why})", short(jid));
+            return None;
+        }
         if self.verdict_holds(&store, jid).await {
+            return None;
+        }
+        // §16: a caller with too many post-lock failures is not admitted (read from the store, so a
+        // restart forgets nothing; routing then sets its jobs aside).
+        if self.caller_post_lock_failures_now(caller).await >= POST_LOCK_CALLER_LIMIT {
             return None;
         }
         // The governance watcher must be synced before any of its gates means anything; a host-side
@@ -1146,7 +1396,11 @@ impl WitnessRuntime {
             self.record_verdict(jid, caller, SkipReason::ProveResources, "no enabled risc0 card has a job size").await;
             return None;
         }
-        let cps = self.planning_cps(&po2s).await;
+        let plan = self.prove_plan(&po2s).await;
+        let Some(prove_builds) = self.prove_worker_builds() else {
+            tracing::debug!("witness job {}: no risc0 prove worker has named its build yet", short(jid));
+            return None;
+        };
         let gate_input = ChainGateInput {
             job_id: jid,
             proof_system_id: d.proofSystemId,
@@ -1168,29 +1422,15 @@ impl WitnessRuntime {
                 }
             }
             None => {
-                let elf = match with_lane(
-                    Lane::PreClaim,
-                    tokio::time::timeout(FETCH_BUDGET, run::fetch_or_download_elf(&self.client, &self.state, d.programId, None, false)),
-                )
-                .await
-                {
-                    Ok(Ok(elf)) => elf,
-                    Ok(Err(e)) => {
-                        self.record_verdict(jid, caller, SkipReason::ElfUnavailable, &format!("{e:#}")).await;
-                        return None;
-                    }
-                    Err(_) => {
-                        self.record_verdict(jid, caller, SkipReason::ElfUnavailable, "ELF fetch timed out").await;
-                        return None;
-                    }
-                };
-                let ctx = self.host_context(&serving, &store, po2s.clone(), cps);
+                let ctx = self.host_context(&serving, &store, po2s.clone(), &plan, prove_builds);
                 let hooks = Hooks {
                     rt: self.clone(),
                     gate: gate_input.clone(),
                     token: token.clone(),
                     budget: ArtifactBudget::for_max_bytes(MAX_ARTIFACT_BYTES),
                     quote: Mutex::new(None),
+                    program_id: d.programId,
+                    elf: Mutex::new(None),
                 };
                 let current_block = self.client.head_block_cached().await.unwrap_or(0);
                 let input = JobInput {
@@ -1202,17 +1442,20 @@ impl WitnessRuntime {
                     prover: self.client.address,
                     chain_id: self.client.chain_id,
                     router: self.client.hemi_prove,
-                    elf: &elf,
+                    // Fetched by the hook once the static gates have passed (§5.2 step 3).
+                    elf: None,
                     current_block,
                 };
                 tracing::info!("witness job {}: simulating (po2 {po2s:?})", short(jid));
                 match simulate_witness_job(&ctx, &input, &hooks).await {
                     Ok(sim) => {
                         let quote = lock(&hooks.quote).take();
-                        let Some(quote) = quote else {
-                            tracing::error!("witness job {}: simulated without a claimability quote", short(jid));
+                        let elf = lock(&hooks.elf).take();
+                        let (Some(quote), Some(elf)) = (quote, elf) else {
+                            tracing::error!("witness job {}: simulated without a claimability quote or its ELF", short(jid));
                             return None;
                         };
+                        *lock(&self.execute_build) = Some(sim.execute_build.clone());
                         tracing::info!(
                             "witness job {}: simulated — bundle v{}, |W| {} bytes, journal {} bytes",
                             short(jid),
@@ -1236,30 +1479,27 @@ impl WitnessRuntime {
         if token.is_aborted() || shutting_down() {
             return None;
         }
-        let gate = match self.claim_gate(jid, &d, &rec, &candidate, &po2s, cps, quote.price_floor).await {
+        let gate = match self.claim_gate(jid, &d, &rec, &candidate, &plan, quote.price_floor).await {
             Ok(g) => g,
             Err((reason, detail)) => {
                 self.record_verdict(jid, caller, reason, &format!("claim gate: {detail}")).await;
                 return None;
             }
         };
-        self.lock(job, d, &fetched, candidate, gate, &po2s, token).await
+        self.lock(job, d, &fetched, candidate, gate, rec.reopen_count, token).await
     }
 
     // ── the claim gate (§5.2 step 7) ──────────────────────────────────────────
 
-    #[allow(clippy::too_many_arguments)]
     async fn claim_gate(
         &self,
         jid: B256,
         d: &JobDescriptor,
         rec: &JobRecord,
         c: &Candidate,
-        po2s: &[u8],
-        cps: f64,
+        plan: &ProvePlan,
         price: u128,
     ) -> Result<GateOk, (SkipReason, String)> {
-        let _ = po2s;
         with_lane(Lane::PreClaim, async {
             if c.journal.len() > MAX_JOURNAL_BYTES {
                 return Err((SkipReason::JournalTooLarge, format!("{} bytes", c.journal.len())));
@@ -1281,29 +1521,52 @@ impl WitnessRuntime {
                 .max(self.client.fulfill_gas_limit);
             let (_, max_fee) = self.client.base_fees().await;
             if let Ok(bal) = self.client.get_eth_balance().await {
-                let need = u128::from(fulfil_gas.saturating_add(CLAIM_GAS)).saturating_mul(max_fee);
-                if bal < alloy::primitives::U256::from(need) {
-                    return Err((SkipReason::NotAdmitted, format!("ETH balance {bal} below {need} wei for the claim and fulfil")));
+                if !funds_cover(bal, fulfil_gas, max_fee, self.held_locks()) {
+                    return Err((
+                        SkipReason::NotAdmitted,
+                        format!("ETH balance {bal} wei does not fund this claim and every held fulfil"),
+                    ));
                 }
             }
-            // The deadline margin: the measured cycles at the slowest card's benchmarked rate.
-            let prove_secs = estimate_prove_secs(c.cycles(), cps, c.execute_secs_per_po2);
+            // The operator's risc0 session cap (the prove worker applies it), on the sized cycles.
+            let cycles = c.cycles();
+            let cap = parse_session_cap(std::env::var("ZKMINER_RISC0_MAX_SESSION_CYCLES").ok().as_deref());
+            if !session_cap_admits(cycles, cap) {
+                return Err((
+                    SkipReason::LimitsAboveHostMaxima,
+                    format!("{cycles} sized cycles, over ZKMINER_RISC0_MAX_SESSION_CYCLES {}", cap.unwrap_or(0)),
+                ));
+            }
+            // The proving time: every attempt inside the watchdog, and the margin before D.
+            let prove_secs = estimate_prove_secs(cycles, plan, c.execute_secs_per_po2);
+            let timeout = self.proving_timeout.as_secs();
+            if !watchdog_admits(prove_secs, timeout) {
+                // This host's limit (a raised `proving_timeout_secs` or a faster card changes it).
+                return Err((
+                    SkipReason::LimitsAboveHostMaxima,
+                    format!("about {prove_secs} s to prove, at or over the {timeout} s per-attempt proving timeout"),
+                ));
+            }
             if !deadline_fits(rec.fulfillment_timeout, prove_secs, run::DEADLINE_FULFILL_MARGIN_SECS, run::MIN_ATTEMPT_BUDGET_SECS) {
                 return Err((
                     SkipReason::DeadlineMargin,
                     format!("about {prove_secs} s to prove in a {} s window", rec.fulfillment_timeout),
                 ));
             }
-            // Prove resources: segment disk, then host RAM through the dispatcher's ledger.
+            // Prove resources: segment disk (reserved now, for this job, against every other proof
+            // planned or running), then host RAM through the dispatcher's ledger.
             let need = segment_need(c.per_po2.iter().map(|p| p.2));
             if let Some(dir) = self.retention.as_ref().map(|r| r.segment_dir.clone()) {
-                let reserved: u64 = lock(&self.segment_reserved).values().sum();
+                let mut reserved = lock(&self.segment_reserved);
+                let others: u64 = reserved.iter().filter(|(j, _)| **j != jid).map(|(_, b)| *b).sum();
                 match free_bytes(&dir) {
-                    Ok(free) if segments_fit(need, reserved, free) => {}
+                    Ok(free) if segments_fit(need, others, free) => {
+                        reserved.insert(jid, need);
+                    }
                     Ok(free) => {
                         return Err((
                             SkipReason::ProveResources,
-                            format!("segments need {need} bytes beside {reserved} reserved; {free} free under {}", dir.display()),
+                            format!("segments need {need} bytes beside {others} reserved; {free} free under {}", dir.display()),
                         ))
                     }
                     Err(e) => return Err((SkipReason::ProveResources, format!("segment directory {}: {e}", dir.display()))),
@@ -1341,26 +1604,73 @@ impl WitnessRuntime {
                 return Err((SkipReason::BelowReservation, format!("price {price} below the reservation {reservation}")));
             }
             tracing::info!(
-                "witness job {}: claim gate passed — fulfil {} estimated DA bytes, {fulfil_gas} gas, ~{prove_secs} s to prove",
+                "witness job {}: claim gate passed — fulfil {} estimated DA bytes, {fulfil_gas} gas, ~{prove_secs} s to prove \
+                 ({} c/s, {} s fixed, margin {:.2}; watchdog {timeout} s)",
                 short(jid),
-                est.estimated_bytes
+                est.estimated_bytes,
+                plan.cps.round(),
+                plan.fixed_secs,
+                plan.margin
             );
-            Ok(GateOk { reservation, window: rec.fulfillment_timeout })
+            Ok(GateOk { reservation, window: rec.fulfillment_timeout, fulfil_gas })
         })
         .await
     }
 
+    /// Locks held here, inline and witness, besides any being claimed now: the journal's entries
+    /// (each a claim of ours, pending or held).
+    fn held_locks(&self) -> usize {
+        lock(&self.journal).entries.len()
+    }
+
     // ── the lock (§5.2 step 9) ────────────────────────────────────────────────
 
-    /// Drops what a claim that provably did not land left: the claim intent (unless an earlier
-    /// claim of ours is unresolved) and the pin.
+    /// Drops what a claim that provably did not land left: the claim intent and the pin. When an
+    /// earlier claim of ours is unresolved (`prior`), both stay: that claim may have landed, and its
+    /// lock would then be proven from this pin (recovery decides from the chain).
     async fn abandon_intent(&self, jid: B256, bundle: BundleRef, prior: bool) {
-        if !prior {
-            run::journal_update(&self.journal, |j| j.remove(jid));
+        lock(&self.segment_reserved).remove(&jid);
+        if prior {
+            return;
         }
+        run::journal_update(&self.journal, |j| j.remove(jid));
         if let Some(s) = self.store() {
             let _ = blocking(move || s.unpin(bundle.job_id, bundle.descriptor_hash, bundle.prover)).await;
         }
+    }
+
+    /// Why a witness lock must not be taken right now, though the job passed every gate: re-checked
+    /// right before the claim intent and again before the claim, as the inline path re-checks before
+    /// it bonds collateral (a pause, a jammed signer, funds, a card, serving switched off).
+    async fn lock_held_back(&self, fulfil_gas: u64) -> Option<String> {
+        if let Some(why) = self.claims_held().await {
+            return Some(why.to_string());
+        }
+        if !self.serving_enabled() {
+            return Some("witness serving is off".into());
+        }
+        if self.client.signer_is_jammed() {
+            return Some(format!("the signer is jammed at nonce {:?}", self.client.jammed_nonce()));
+        }
+        if self.client.funds_short() {
+            return Some("a recent send was refused for insufficient funds".into());
+        }
+        let (_, max_fee) = self.client.base_fees().await;
+        match self.client.get_eth_balance().await {
+            Ok(bal) if !funds_cover(bal, fulfil_gas, max_fee, self.held_locks()) => {
+                return Some(format!("ETH balance {bal} wei does not fund this claim and every held fulfil"));
+            }
+            Ok(_) => {}
+            Err(e) => return Some(format!("the ETH balance is unreadable ({e:#})")),
+        }
+        if !self.card_free() {
+            return Some("no card is free for its proof (inline work or witness locks fill them)".into());
+        }
+        let slots: Vec<String> = run::current_risc0_cards(&self.state, true).await.into_iter().map(|c| c.slot).collect();
+        if !slots.is_empty() && self.quarantined(&slots).await.len() == slots.len() {
+            return Some("every risc0 card is quarantined for witness proofs (post-lock failures)".into());
+        }
+        None
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1371,13 +1681,14 @@ impl WitnessRuntime {
         fetched: &FetchedDescriptor,
         c: Candidate,
         gate: GateOk,
-        po2s: &[u8],
+        reopen_count: u8,
         token: &AbortToken,
     ) -> Option<LockCtx> {
         let jid = job.info.job_id;
         let caller = job.info.caller;
         let store = self.store()?;
-        // 1. Revalidate the bundle against the host as it is now.
+        // 1. Revalidate the bundle against the host as it is now: the cards' po2 set read again here,
+        //    not the one the simulation began with.
         let (s, b, idf) = (store.clone(), c.bundle, self.image_id_fn());
         match blocking(move || s.verify(&b, &descriptor_hash_of_abi, &*idf)).await {
             Ok(Ok(r)) if r == c.record => {}
@@ -1394,7 +1705,12 @@ impl WitnessRuntime {
                 return None;
             }
         }
-        let reval = revalidate(&c.record, &self.host_profile(po2s));
+        let po2s = self.host_po2s().await;
+        let Some(profile) = self.host_profile(&po2s) else {
+            tracing::debug!("witness job {}: a worker build is not known; not locked now", short(jid));
+            return None;
+        };
+        let reval = revalidate(&c.record, &profile);
         if !reval.is_current() {
             self.record_verdict(jid, caller, SkipReason::HostInternal, &format!("the bundle is not current on this host: {reval:?}"))
                 .await;
@@ -1403,11 +1719,39 @@ impl WitnessRuntime {
         if token.is_aborted() || shutting_down() {
             return None;
         }
-        // 2. Pin it, before the claim intent is journaled and before the lock is signed.
+        if let Some(why) = self.lock_held_back(gate.fulfil_gas).await {
+            // Not the job's doing: a short, deferred verdict, and the bundle stays for the next try.
+            tracing::info!("witness job {}: not locked now — {}", short(jid), zkminer_chain::programs::sanitize_log(&why));
+            self.record_verdict(jid, caller, SkipReason::NotAdmitted, &why).await;
+            return None;
+        }
+        // 2. Pin it, before the claim intent is journaled and before the lock is signed, with the
+        //    lock instance it is for and the chain time (§15.2: a pin goes only on evidence). The
+        //    instance is read at or after the head, so a lagging replica cannot record an earlier
+        //    one (a later read's higher count would then look like proof the claim's lock ended).
         let head = self.client.head_block_cached().await.unwrap_or(c.record.created_at_block);
+        let reopen_count = match with_lane(Lane::Lock, self.client.read_job_record(jid, Some(head))).await {
+            Ok((now, _)) if now.status == JOB_STATUS_OPEN && now.prover == Address::ZERO => now.reopen_count.max(reopen_count),
+            Ok(_) => {
+                tracing::info!("witness job {}: no longer Open at the lock", short(jid));
+                return None;
+            }
+            Err(e) => {
+                tracing::debug!("witness job {}: its record is unreadable at the lock ({e:#}); not locked now", short(jid));
+                return None;
+            }
+        };
+        let pinned_at_unix = zkminer_chain::client::chain_now_floor();
         let (s, b) = (store.clone(), c.bundle);
-        match blocking(move || s.pin_record(&b, head).and_then(|rec| s.pin(&rec))).await {
-            Ok(Ok(())) => {}
+        let pinned = blocking(move || {
+            let mut rec = s.pin_record(&b, head)?;
+            rec.reopen_count = Some(reopen_count);
+            rec.pinned_at_unix = pinned_at_unix;
+            s.pin(&rec).map(|()| rec)
+        })
+        .await;
+        let pin = match pinned {
+            Ok(Ok(rec)) => rec,
             Ok(Err(e)) => {
                 self.record_verdict(jid, caller, SkipReason::HostInternal, &format!("pinning: {e}")).await;
                 return None;
@@ -1416,7 +1760,7 @@ impl WitnessRuntime {
                 self.record_verdict(jid, caller, SkipReason::HostInternal, &format!("pinning: {e:#}")).await;
                 return None;
             }
-        }
+        };
         tracing::info!("WITNESS-LOCK {}: bundle v{} pinned", short(jid), c.bundle.version);
         // 3. The claim intent, with the bundle it will be proven from.
         let prior = run::journal_has(&self.journal, jid);
@@ -1455,6 +1799,17 @@ impl WitnessRuntime {
         if token.is_aborted() || shutting_down() {
             self.abandon_intent(jid, c.bundle, prior).await;
             return None;
+        }
+        if let Some(why) = self.lock_held_back(gate.fulfil_gas).await {
+            self.abandon_intent(jid, c.bundle, prior).await;
+            tracing::info!("witness job {}: not locked now — {}", short(jid), zkminer_chain::programs::sanitize_log(&why));
+            self.record_verdict(jid, caller, SkipReason::NotAdmitted, &why).await;
+            return None;
+        }
+        // From here the task holds (or may hold) a lock: no abort reaches it, and it counts against
+        // the cards.
+        if let Some(t) = lock(&self.tasks).get_mut(&jid) {
+            t.phase = Phase::Locked;
         }
         {
             let mut s = self.state.write().await;
@@ -1516,6 +1871,10 @@ impl WitnessRuntime {
             }
         };
         let lock_deadline = run::effective_cutoff(&view);
+        // The pin learns where the lock was seen, and its instance: a read at or after the block
+        // showing another prover, or a higher count, is proof the lock is gone (best effort; without
+        // it the pin stays until other evidence).
+        self.note_pin_lock(&store, pin, lock_block, view.reopenCount).await;
         let locked_collateral = with_lane(Lane::HeldLock, self.client.read_job_record(jid, Some(lock_block)))
             .await
             .map(|(r, _)| r.locked_collateral)
@@ -1551,23 +1910,40 @@ impl WitnessRuntime {
             lock_block,
             lock_deadline,
             locked_collateral,
+            failure: None,
         })
+    }
+
+    /// Re-pins `pin` with the block the lock was seen at and its reopen count (best effort).
+    async fn note_pin_lock(&self, store: &Arc<Store>, mut pin: PinRecord, lock_block: u64, reopen_count: u8) {
+        if lock_block == 0 || (pin.lock_block == lock_block && pin.reopen_count == Some(reopen_count)) {
+            return;
+        }
+        pin.lock_block = lock_block;
+        pin.reopen_count = Some(reopen_count);
+        let (s, jid) = (store.clone(), pin.job_id);
+        match blocking(move || s.pin(&pin)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("witness lock {}: recording the lock block in its pin failed ({e})", short(jid)),
+            Err(e) => tracing::warn!("witness lock {}: recording the lock block in its pin failed ({e:#})", short(jid)),
+        }
     }
 
     // ── a held lock ───────────────────────────────────────────────────────────
 
-    /// Proves and fulfils a held witness lock; on a failure that is not a hand-back, releases it.
-    async fn run_locked(self: &Arc<Self>, l: LockCtx) {
+    /// Proves and fulfils a held witness lock; on a failure that is not a hand-back, releases it and
+    /// records the post-lock failure (§16).
+    async fn run_locked(self: &Arc<Self>, mut l: LockCtx) {
         let jid = l.job_id;
         let caller = l.caller;
-        let bundle = l.bundle;
         let link = lock(&self.brain).clone();
         let _slot = link.map(|b| {
             let _ = b.held.send((jid, l.locked_collateral, l.cycles));
             run::SlotGuard(jid, b.done)
         });
-        let result = with_lane(Lane::HeldLock, self.prove_and_fulfil(l)).await;
+        let result = with_lane(Lane::HeldLock, self.prove_and_fulfil(&mut l)).await;
         lock(&self.segment_reserved).remove(&jid);
+        let bundle = l.bundle;
         match result {
             Ok(()) => {}
             Err(e) if e.downcast_ref::<run::HandBack>().is_some() => {
@@ -1580,19 +1956,19 @@ impl WitnessRuntime {
                 run::request_recovery();
             }
             Err(e) => {
-                let n = lock(&self.blame).note_post_lock(caller);
                 let msg = zkminer_chain::programs::sanitize_log(&format!("{e:#}"));
-                tracing::error!(
-                    "witness lock {} failed after the lock ({msg}); releasing (caller {caller}: {n} post-lock failure(s))",
-                    short(jid)
-                );
+                let (slot, class) = l.failure.clone().unwrap_or_else(|| (None, failure_class(&e)));
+                tracing::error!("witness lock {} failed after the lock ({msg}); releasing", short(jid));
                 self.state.write().await.add_log(LogLevel::Error, format!("Witness job {} failed: {msg}", short(jid)));
+                // Before the release: a restart between the two must not lock the job again.
+                self.record_post_lock_failure(jid, caller, slot.as_deref().map(device_of_slot), class).await;
                 if run::journal_has(&self.journal, jid) {
                     with_lane(Lane::HeldLock, run::release_and_clean(&self.client, &self.state, &self.journal, jid)).await;
                 } else {
                     self.state.write().await.active_jobs.retain(|j| j.info.job_id != jid);
                 }
-                // Released (or gone): the reopen count rose, so the pin goes; the bundle stays a cache.
+                // Released (or gone): the reopen count rose, so the pin goes; the bundle stays a cache
+                // (the job's final verdict keeps it from being locked again).
                 if !run::journal_has(&self.journal, jid) {
                     if let Some(s) = self.store() {
                         let _ = blocking(move || s.unpin(bundle.job_id, bundle.descriptor_hash, bundle.prover)).await;
@@ -1602,7 +1978,122 @@ impl WitnessRuntime {
         }
     }
 
-    async fn prove_and_fulfil(self: &Arc<Self>, mut l: LockCtx) -> Result<()> {
+    /// A witness lock of `jid` failed after the lock (§16): a final verdict for the job (its bundle
+    /// is never locked again, across restarts), and the caller's and the device's tallies, kept in
+    /// the store. Never fed to the host-wide program marks.
+    async fn record_post_lock_failure(&self, jid: B256, caller: Address, device: Option<String>, class: PostLockFailureClass) {
+        self.record_verdict(jid, caller, SkipReason::PostLockFailure, &format!("{class:?}")).await;
+        let n = self.bump_tally(caller_tally_key(caller)).await;
+        lock(&self.post_lock_callers).insert(caller, (n, now_unix().saturating_add(POST_LOCK_TALLY_TTL_SECS)));
+        tracing::error!(
+            "witness lock {}: post-lock failure ({class:?}{}) — caller {caller} has {n} in the last {} days{}",
+            short(jid),
+            device.as_deref().map_or(String::new(), |d| format!(" on {d}")),
+            POST_LOCK_TALLY_TTL_SECS / 86_400,
+            if n >= POST_LOCK_CALLER_LIMIT { "; its witness jobs are no longer admitted" } else { "" }
+        );
+        if let Some(d) = device {
+            let k = self.bump_tally(device_tally_key(&d, class)).await;
+            if k >= POST_LOCK_DEVICE_LIMIT {
+                tracing::error!(
+                    "PAGE: WITNESS-DEVICE-QUARANTINED {d}: {k} post-lock witness failures of class {class:?} in the \
+                     last {} days — it proves no witness lock until they age out (inline jobs are unaffected)",
+                    POST_LOCK_TALLY_TTL_SECS / 86_400
+                );
+            }
+        }
+    }
+
+    /// Adds one to a post-lock tally (a store verdict record under a key that is never a job id) and
+    /// returns the count. An expired tally starts again. Without a store, counted in memory.
+    async fn bump_tally(&self, key: B256) -> u8 {
+        let now = now_unix();
+        let Some(store) = self.store() else {
+            let mut m = lock(&self.tallies);
+            let e = m.entry(key).or_insert((0, 0));
+            let n = tally_count(e.0, e.1, now).saturating_add(1);
+            *e = (n, now.saturating_add(POST_LOCK_TALLY_TTL_SECS));
+            return n;
+        };
+        let result = blocking(move || {
+            let prior = store.verdict(key).ok().flatten().map_or(0, |v| tally_count(v.attempts, v.expires_at, now));
+            let n = prior.saturating_add(1);
+            let rec = VerdictRecord {
+                job_id: key,
+                reason: SkipReason::PostLockFailure,
+                attempts: n,
+                recorded_at: now,
+                expires_at: now.saturating_add(POST_LOCK_TALLY_TTL_SECS),
+                wasmtime_version: None,
+            };
+            store.put_verdict(&rec).map(|()| n).map_err(|e| (n, e))
+        })
+        .await;
+        match result {
+            Ok(Ok(n)) => n,
+            Ok(Err((n, e))) => {
+                tracing::warn!("witness: a post-lock failure tally was not persisted: {e}");
+                n
+            }
+            Err(e) => {
+                tracing::warn!("witness: a post-lock failure tally was not persisted: {e:#}");
+                1
+            }
+        }
+    }
+
+    /// A post-lock tally's count now (0 when there is none, or it expired).
+    async fn tally(&self, key: B256) -> u8 {
+        let now = now_unix();
+        let Some(store) = self.store() else {
+            return lock(&self.tallies).get(&key).map_or(0, |(n, t)| tally_count(*n, *t, now));
+        };
+        blocking(move || store.verdict(key).ok().flatten().map_or(0, |v| tally_count(v.attempts, v.expires_at, now)))
+            .await
+            .unwrap_or(0)
+    }
+
+    /// The caller's post-lock failures as last read here (`None` when not read yet).
+    fn caller_post_lock_failures(&self, caller: Address) -> Option<u8> {
+        let now = now_unix();
+        lock(&self.post_lock_callers).get(&caller).map(|(n, t)| tally_count(*n, *t, now))
+    }
+
+    /// The caller's post-lock failures read from the store (and remembered for routing).
+    async fn caller_post_lock_failures_now(&self, caller: Address) -> u8 {
+        let n = self.tally(caller_tally_key(caller)).await;
+        let mut m = lock(&self.post_lock_callers);
+        if m.len() >= PER_JOB_CAP {
+            m.clear();
+        }
+        m.insert(caller, (n, now_unix().saturating_add(POST_LOCK_TALLY_TTL_SECS)));
+        n
+    }
+
+    /// The slots among `slots` whose device is quarantined: a post-lock witness failure tally of
+    /// some class at [`POST_LOCK_DEVICE_LIMIT`] (§16).
+    async fn quarantined(&self, slots: &[String]) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for slot in slots {
+            let device = device_of_slot(slot);
+            for class in POST_LOCK_CLASSES {
+                if self.tally(device_tally_key(&device, class)).await >= POST_LOCK_DEVICE_LIMIT {
+                    out.insert(slot.clone());
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// The time a held lock must be proven by: its deadline, or a pending verifier swap's `readyAt`
+    /// for its proof system when that comes first (§5.5).
+    fn proving_cutoff(&self, l: &LockCtx) -> u64 {
+        let ready = self.gov.state().pending_switch(l.descriptor.proofSystemId).map(|p| p.ready_at);
+        proving_cutoff(l.lock_deadline, ready)
+    }
+
+    async fn prove_and_fulfil(self: &Arc<Self>, l: &mut LockCtx) -> Result<()> {
         let jid = l.job_id;
         let mut card = run::CardRelease(Some(jid));
         let Some(store) = self.store() else {
@@ -1613,22 +2104,31 @@ impl WitnessRuntime {
             if self.client.job_clock_stopped(l.descriptor.proofSystemId).await {
                 return Err(run::HandBack(format!("{e:#} while the job's clock is stopped")).into());
             }
+            l.failure = Some((None, PostLockFailureClass::ProveTimeEstimate));
             return Err(e);
         }
         run::journal_update(&self.journal, |j| j.mark_proving(jid));
         self.state.write().await.add_log(LogLevel::Info, format!("Proving witness job {}...", short(jid)));
-        let proof = self.prove(&store, &mut l).await?;
+        let (proof, slot) = self.prove(&store, l).await?;
         card.release();
         tracing::info!("WITNESS-LOCK {}: proved ({} cycles, {:.1} s)", short(jid), proof.cycles, proof.duration.as_secs_f64());
-        self.fulfil(&mut l, proof).await
+        self.fulfil(l, proof, slot).await
     }
 
     /// A bundle problem on a held lock (§15.2): unavailable keeps the lock; missing or corrupt pages
     /// `BUNDLE-MISSING` and keeps it too — recovery's room rule releases it before `D + G` minus the
-    /// release margin. Salvage (rebuilding `W`) is not implemented: the lock is released then.
-    fn bundle_trouble(&self, jid: B256, lock_deadline: u64, e: &StoreError) -> anyhow::Error {
-        if e.is_unavailable() {
+    /// release margin. Salvage (rebuilding `W`) is not implemented: the lock is released then. A
+    /// read that failed only because no image id could be derived just now is unavailability, not a
+    /// verdict on the bundle (`derivation_unavailable`).
+    fn bundle_trouble(&self, jid: B256, lock_deadline: u64, e: &StoreError, derivation_unavailable: bool) -> anyhow::Error {
+        if e.is_unavailable() || e.is_full() {
             tracing::error!("PAGE: RETENTION-UNAVAILABLE witness lock {} is kept: {e}", short(jid));
+        } else if derivation_unavailable {
+            tracing::warn!(
+                "witness lock {} is kept: its ELF's image id could not be derived just now (no measure worker \
+                 came free); retried",
+                short(jid)
+            );
         } else {
             tracing::error!(
                 "PAGE: BUNDLE-MISSING witness lock {} (D+G {lock_deadline}): {e}; kept until its window \
@@ -1644,8 +2144,10 @@ impl WitnessRuntime {
         root.join(format!("{:x}", jid).trim_start_matches("0x").chars().take(16).collect::<String>())
     }
 
-    /// Execute, compare, prove (§15.3), only on a card at an executed po2.
-    async fn prove(self: &Arc<Self>, store: &Arc<Store>, l: &mut LockCtx) -> Result<ProofOutput> {
+    /// Execute, compare, prove (§15.3), only on a card at an executed po2 and never on a quarantined
+    /// device. Returns the proof and the slot it ran on. Before every `Err` that is not a hand-back,
+    /// `l.failure` says on which slot and how it failed (the post-lock tallies).
+    async fn prove(self: &Arc<Self>, store: &Arc<Store>, l: &mut LockCtx) -> Result<(ProofOutput, Option<String>)> {
         use zkminer_prover_protocol::types::{GpuMemoryShortage, HostMemoryShortage, ProofDeadlineReached, WorkerProofError};
         let jid = l.job_id;
         let pool = zkminer_prover::engine::worker_pool().ok_or_else(|| anyhow!("no worker pool available"))?;
@@ -1655,32 +2157,42 @@ impl WitnessRuntime {
         let mut excluded: Vec<String> = Vec::new();
         let mut diverged = false;
         let mut warned_no_card = false;
+        // After a divergence, the re-versioned bundle is proven on the slot that diverged: it is the
+        // one whose execution the new version records.
+        let mut only_slot: Option<String> = None;
         loop {
             attempt += 1;
             run::refresh_lock_deadline(&self.client, &self.journal, jid, &mut l.lock_deadline).await;
-            let abort_at = match run::deadline_proof_budget(l.lock_deadline) {
+            let cutoff = self.proving_cutoff(l);
+            let abort_at = match run::deadline_proof_budget(cutoff) {
                 None => None,
                 Some(b) if b < Duration::from_secs(run::MIN_ATTEMPT_BUDGET_SECS) => {
-                    if !shutting_down() && self.client.job_clock_stopped(psid).await {
+                    if !shutting_down() && cutoff == l.lock_deadline && self.client.job_clock_stopped(psid).await {
                         tokio::time::sleep(run::FULFIL_RETRY_WAIT).await;
                         attempt = attempt.saturating_sub(1);
                         continue;
                     }
+                    l.failure = Some((None, PostLockFailureClass::ProveTimeEstimate));
                     bail!(
-                        "abandoning witness lock {} before its deadline: only {} s of proving budget left",
+                        "abandoning witness lock {} before its {}: only {} s of proving budget left",
                         short(jid),
+                        if cutoff < l.lock_deadline { "verifier swap's readyAt" } else { "deadline" },
                         b.as_secs()
                     );
                 }
                 Some(b) => Some(Instant::now() + b),
             };
             let disabled = run::operator_disabled_slots(&self.state).await;
-            let cards: Vec<(String, u8)> = run::current_risc0_cards(&self.state, false)
+            let all: Vec<(String, u8)> = run::current_risc0_cards(&self.state, false)
                 .await
                 .into_iter()
                 .filter(|c| !disabled.contains(&c.slot))
+                .filter(|c| only_slot.as_ref().is_none_or(|s| *s == c.slot))
                 .map(|c| (c.slot, c.po2))
                 .collect();
+            let slots: Vec<String> = all.iter().map(|(s, _)| s.clone()).collect();
+            let quarantined = self.quarantined(&slots).await;
+            let cards: Vec<(String, u8)> = all.into_iter().filter(|(s, _)| !quarantined.contains(s)).collect();
             let executed: Vec<u32> =
                 l.record.po2_results.iter().filter(|r| r.exit == GuestExit::Halted(0)).map(|r| r.po2).collect();
             let sizes = witness_prove_sizes(&cards, &executed);
@@ -1691,19 +2203,21 @@ impl WitnessRuntime {
                 if !warned_no_card {
                     warned_no_card = true;
                     tracing::warn!(
-                        "witness lock {} waits for a card at an executed po2 {executed:?} (it is never proven \
+                        "witness lock {} waits for a card at an executed po2 {executed:?}{}{} (it is never proven \
                          at another size); released before its deadline otherwise",
-                        short(jid)
+                        short(jid),
+                        only_slot.as_ref().map_or(String::new(), |s| format!(" on {s}, where it diverged")),
+                        if quarantined.is_empty() { String::new() } else { format!(", not on quarantined {quarantined:?}") }
                     );
                 }
                 attempt = attempt.saturating_sub(1);
-                tokio::time::sleep(run::no_card_wait(run::deadline_proof_budget(l.lock_deadline))).await;
+                tokio::time::sleep(run::no_card_wait(run::deadline_proof_budget(cutoff))).await;
                 continue;
             }
             let (s, b) = (store.clone(), l.bundle);
             let input_path = match blocking(move || s.w_path(&b)).await? {
                 Ok(p) => p,
-                Err(e) => return Err(self.bundle_trouble(jid, l.lock_deadline, &e)),
+                Err(e) => return Err(self.bundle_trouble(jid, l.lock_deadline, &e, false)),
             };
             let first = l
                 .record
@@ -1713,7 +2227,7 @@ impl WitnessRuntime {
                 .ok_or_else(|| anyhow!("the bundle has no provable po2"))?;
             let wp = WitnessProve {
                 input_path: input_path.to_string_lossy().into_owned(),
-                prefix: if l.record.prefix { journal_prefix(jid, l.record.prover).to_vec() } else { Vec::new() },
+                prefix: l.record.input_prefix().map(|p| p.to_vec()).unwrap_or_default(),
                 input_sha256: l.record.input_sha256.0,
                 w_len: l.record.w_len,
                 expect_journal_sha256: first.journal_sha256.0,
@@ -1721,8 +2235,8 @@ impl WitnessRuntime {
             };
             lock(&self.segment_reserved).insert(jid, segment_need(l.record.po2_results.iter().map(|r| r.segment_bytes)));
             // The configured cap (`prover.proving_timeout_secs`), not the inline path's tightened
-            // estimate: a watchdog kill costs a witness lock its proof, and the estimate (cycles at a
-            // benchmarked rate) cannot see what a CPU-only slot's Groth16 wrap costs. The deadline
+            // estimate: a watchdog kill costs a witness lock its proof. The claim gate admitted the
+            // lock only if its realistic estimate (the CPU wrap included) fits this cap; the deadline
             // budget (`abort_at`) still bounds every attempt.
             let timeout = self.proving_timeout;
             let (elf, sizes2, excl, dis, program_id) = (l.elf.clone(), sizes.clone(), excluded.clone(), disabled.clone(), l.record.image_id.0);
@@ -1752,7 +2266,7 @@ impl WitnessRuntime {
             .await
             .map_err(|e| anyhow!("prove task panicked: {e}"))?;
             match res {
-                Ok(WitnessProveOutcome::Proved(p)) => return Ok(p),
+                Ok(WitnessProveOutcome::Proved(p)) => return Ok((p, used)),
                 Ok(WitnessProveOutcome::JournalDiverged(dv)) => {
                     let po2 = used.as_ref().and_then(|s| sizes.get(s)).copied();
                     tracing::error!(
@@ -1762,10 +2276,17 @@ impl WitnessRuntime {
                         dv.journal_len
                     );
                     if diverged {
+                        l.failure = Some((used, PostLockFailureClass::JournalDiverged));
                         bail!("a second journal divergence on witness lock {}: releasing", short(jid));
                     }
                     diverged = true;
-                    self.reversion(store, l, &dv, po2).await?;
+                    if let Err(e) = self.reversion(store, l, &dv, po2).await {
+                        if e.downcast_ref::<run::HandBack>().is_none() {
+                            l.failure = Some((used, PostLockFailureClass::JournalDiverged));
+                        }
+                        return Err(e);
+                    }
+                    only_slot = used;
                     attempt = attempt.saturating_sub(1);
                     continue;
                 }
@@ -1773,12 +2294,13 @@ impl WitnessRuntime {
                     let msg = zkminer_chain::programs::sanitize_log(&format!("{e:#}"));
                     if e.downcast_ref::<ProofDeadlineReached>().is_some() {
                         if run::refresh_lock_deadline(&self.client, &self.journal, jid, &mut l.lock_deadline).await
-                            && run::deadline_proof_budget(l.lock_deadline)
+                            && run::deadline_proof_budget(self.proving_cutoff(l))
                                 .is_some_and(|b| b >= Duration::from_secs(run::MIN_ATTEMPT_BUDGET_SECS))
                         {
                             attempt = attempt.saturating_sub(1);
                             continue;
                         }
+                        l.failure = Some((used, PostLockFailureClass::ProveTimeEstimate));
                         bail!("proving stopped for witness lock {} (deadline): {msg}", short(jid));
                     }
                     if let Some(shortage) = e.downcast_ref::<GpuMemoryShortage>() {
@@ -1804,8 +2326,9 @@ impl WitnessRuntime {
                         // The retained W failed its hash at the worker: check the bundle as §15.2 says.
                         let (s, b, idf) = (store.clone(), l.bundle, self.image_id_fn());
                         if let Err(se) = blocking(move || s.verify(&b, &descriptor_hash_of_abi, &*idf)).await? {
-                            return Err(self.bundle_trouble(jid, l.lock_deadline, &se));
+                            return Err(self.bundle_trouble(jid, l.lock_deadline, &se, false));
                         }
+                        l.failure = Some((used, PostLockFailureClass::ProverCrash));
                         bail!("the worker refused the bundle's input although it verifies: {msg}");
                     } else if let Some(k) = used.clone() {
                         if !excluded.contains(&k) {
@@ -1816,6 +2339,7 @@ impl WitnessRuntime {
                         tracing::warn!("witness lock {}: proof attempt {attempt} failed ({msg}); retrying", short(jid));
                         continue;
                     }
+                    l.failure = Some((used, failure_class(&e)));
                     bail!("proving witness lock {} failed after {attempt} attempt(s): {msg}", short(jid));
                 }
             }
@@ -1844,7 +2368,12 @@ impl WitnessRuntime {
 
     /// A journal divergence (§15.3): the new journal is checked against the binding and the
     /// claim-gate limits; if it passes, a new bundle version is written and pinned (the old `W`, by
-    /// hard link) and the proof is dispatched again, once. Otherwise `Err`: the lock is released.
+    /// hard link) and the proof is dispatched again, once, on the slot that diverged. Otherwise `Err`:
+    /// the lock is released. A store that cannot write the new version now is §15.2's: the lock is
+    /// kept (a hand-back), never released over it.
+    ///
+    /// After the lock, the DA check is the operator cap alone: the fulfil's nonce rule waits out a
+    /// high backlog (§5.5), so a transient DA reading never releases a held lock.
     async fn reversion(&self, store: &Arc<Store>, l: &mut LockCtx, dv: &JournalDivergence, po2: Option<u8>) -> Result<()> {
         let jid = l.job_id;
         let po2 = po2.ok_or_else(|| anyhow!("the diverged proof's po2 is unknown"))?;
@@ -1858,19 +2387,42 @@ impl WitnessRuntime {
         check_journal_binding(&l.descriptor, &dv.journal, jid, self.client.address)
             .map_err(|m| anyhow!("the diverged journal does not satisfy the binding ({m})"))?;
         let fulfil = HashedFulfil::from_descriptor(&l.descriptor);
-        let est = estimate_fulfil_da_bytes(&self.client, jid, &fulfil, &dv.journal, &SealSpec::risc0_groth16()).await?;
-        let reading = self.backlog.read(&self.client).await;
-        if let Decision::Skip(s) = self.da_policy.fulfil_fits(est.estimated_bytes, reading.backlog) {
-            bail!("the diverged journal's fulfil does not fit the DA cap ({s:?})");
+        let est = match estimate_fulfil_da_bytes(&self.client, jid, &fulfil, &dv.journal, &SealSpec::risc0_groth16()).await {
+            Ok(est) => est,
+            // An unreadable estimate is the endpoint's, not the journal's: keep the lock.
+            Err(e) => return Err(run::HandBack(format!("the diverged journal's DA size is unreadable ({e:#})")).into()),
+        };
+        if est.estimated_bytes > self.da_policy.cap_bytes() {
+            bail!(
+                "the diverged journal's fulfil is {} estimated DA bytes, over the {}-byte cap",
+                est.estimated_bytes,
+                self.da_policy.cap_bytes()
+            );
         }
-        let cps = self.planning_cps(&[po2]).await;
-        let need = estimate_prove_secs(dv.cycles, cps, 0);
-        if run::deadline_proof_budget(l.lock_deadline).is_some_and(|b| b.as_secs() < need) {
+        if !session_cap_admits(dv.cycles, parse_session_cap(std::env::var("ZKMINER_RISC0_MAX_SESSION_CYCLES").ok().as_deref())) {
+            bail!("the diverged execution ({} cycles) is over ZKMINER_RISC0_MAX_SESSION_CYCLES", dv.cycles);
+        }
+        let plan = self.prove_plan(&[po2]).await;
+        let execute_secs = l.record.execute_ms_per_po2.unwrap_or(0).div_ceil(1000);
+        let need = estimate_prove_secs(dv.cycles, &plan, execute_secs);
+        if !watchdog_admits(need, self.proving_timeout.as_secs()) {
+            bail!(
+                "the diverged execution ({} cycles, ~{need} s) does not fit the {} s proving timeout",
+                dv.cycles,
+                self.proving_timeout.as_secs()
+            );
+        }
+        if run::deadline_proof_budget(self.proving_cutoff(l)).is_some_and(|b| b.as_secs() < need) {
             bail!("the diverged execution ({} cycles, ~{need} s) no longer fits the lock's window", dv.cycles);
         }
         let old = l.record.at(u32::from(po2)).cloned().ok_or_else(|| anyhow!("po2 {po2} is not in the bundle"))?;
+        let deadline = l.lock_deadline;
+        let trouble = |e: &StoreError| self.bundle_trouble(jid, deadline, e, false);
         let (s, b) = (store.clone(), l.bundle);
-        let writer = blocking(move || s.begin_version_from(&b)).await??;
+        let writer = match blocking(move || s.begin_version_from(&b)).await? {
+            Ok(w) => w,
+            Err(e) => return Err(trouble(&e)),
+        };
         let mut record = l.record.clone();
         record.version = writer.version();
         record.po2_results = vec![Po2Result {
@@ -1882,9 +2434,25 @@ impl WitnessRuntime {
             segment_bytes: old.segment_bytes,
         }];
         let rec2 = record.clone();
-        let new_ref = blocking(move || writer.finish(&rec2, &descriptor_hash_of_abi)).await??;
+        let new_ref = match blocking(move || writer.finish(&rec2, &descriptor_hash_of_abi)).await? {
+            Ok(r) => r,
+            Err(e) => return Err(trouble(&e)),
+        };
+        // The new version's pin keeps the lock evidence of the one it replaces.
         let (s, head) = (store.clone(), self.client.head_block_cached().await.unwrap_or(0));
-        blocking(move || s.pin_record(&new_ref, head).and_then(|rec| s.pin(&rec))).await??;
+        let old_pin = self.pin_of(store, &l.bundle);
+        let (reopen_count, lock_block) = (old_pin.as_ref().and_then(|p| p.reopen_count), l.lock_block);
+        let pinned = blocking(move || {
+            let mut rec = s.pin_record(&new_ref, head)?;
+            rec.reopen_count = reopen_count;
+            rec.lock_block = lock_block;
+            rec.pinned_at_unix = zkminer_chain::client::chain_now_floor();
+            s.pin(&rec)
+        })
+        .await?;
+        if let Err(e) = pinned {
+            return Err(trouble(&e));
+        }
         let wref = bundle_ref(&new_ref);
         run::journal_update(&self.journal, |j| j.record_witness_bundle(jid, wref));
         tracing::warn!(
@@ -1898,15 +2466,29 @@ impl WitnessRuntime {
         Ok(())
     }
 
+    /// The readable pin of `r`'s key, if any.
+    fn pin_of(&self, store: &Arc<Store>, r: &BundleRef) -> Option<PinRecord> {
+        store
+            .pins()
+            .into_iter()
+            .find(|p| p.job_id == r.job_id && p.descriptor_hash == r.descriptor_hash && p.prover == r.prover)
+    }
+
     /// `fulfillJobHashed` under the DA rules (§5.5), retried by class until the job settles or its
     /// window closes, as the inline fulfil is.
-    async fn fulfil(self: &Arc<Self>, l: &mut LockCtx, proof: ProofOutput) -> Result<()> {
+    async fn fulfil(self: &Arc<Self>, l: &mut LockCtx, proof: ProofOutput, proved_on: Option<String>) -> Result<()> {
         use zkminer_chain::revert::{FulfilClass, FulfilFailure};
         let jid = l.job_id;
+        // A proof the router would refuse is the proving device's failure; a fulfil that cannot land
+        // in time is the chain's (gas, RPC, blockspace).
+        let proof_defect = Some((proved_on.clone(), PostLockFailureClass::Gpu));
+        let chain = Some((None, PostLockFailureClass::GasOrRpc));
         if proof.journal.len() > MAX_JOURNAL_BYTES {
+            l.failure = proof_defect;
             bail!("the proof's journal is {} bytes, over the cap", proof.journal.len());
         }
         if let Err(why) = check_journal_binding(&l.descriptor, &proof.journal, jid, self.client.address) {
+            l.failure = proof_defect;
             bail!("the proof's journal does not satisfy the binding ({why}); releasing instead of publishing it");
         }
         let selector = run::risc0_seal_selector();
@@ -1949,6 +2531,7 @@ impl WitnessRuntime {
                 }
                 Some(b) if b < min => {
                     clear_submitting("fulfil window closing — releasing").await;
+                    l.failure = chain.clone();
                     bail!("the fulfil window of witness lock {} is closing ({} s left); releasing", short(jid), b.as_secs());
                 }
                 Some(b) => Some(b),
@@ -1970,11 +2553,13 @@ impl WitnessRuntime {
             match class {
                 FulfilClass::ProofDefect => {
                     clear_submitting("proof rejected — releasing").await;
+                    l.failure = proof_defect.clone();
                     bail!("fulfil rejected ({reason}); releasing");
                 }
                 FulfilClass::VerifierFailed => match self.client.verifier_failure_has_governance_cause(psid).await {
                     Ok(false) => {
                         clear_submitting("verifier rejected the proof — releasing").await;
+                        l.failure = proof_defect.clone();
                         bail!("fulfil rejected by the verifier (VerifierCallFailed, no governance cause); releasing");
                     }
                     Ok(true) => tracing::warn!("KEEP: witness lock {} VerifierCallFailed while paused or disabled", short(jid)),
@@ -1996,6 +2581,7 @@ impl WitnessRuntime {
                 FulfilClass::Late => {
                     tracing::error!("PAGE: LOCK-LATE: witness lock {} — {reason}; the lock will be slashed", short(jid));
                     clear_submitting("past the fulfil window").await;
+                    l.failure = chain.clone();
                     bail!("the fulfil window of witness lock {} passed: {reason}", short(jid));
                 }
                 FulfilClass::Gas | FulfilClass::Unknown => {
@@ -2016,6 +2602,7 @@ impl WitnessRuntime {
                         continue;
                     }
                     clear_submitting("fulfil window closing — releasing").await;
+                    l.failure = chain.clone();
                     bail!("the fulfil window of witness lock {} is closing; releasing", short(jid));
                 }
                 _ if published_unconfirmed => tokio::time::sleep(Duration::from_secs(1)).await,
@@ -2095,6 +2682,7 @@ impl WitnessRuntime {
     // ── recovery ──────────────────────────────────────────────────────────────
 
     /// Re-drives a witness lock of ours from its bundle (single flight). `false` when a task owns it.
+    /// Until its bundle is found and pinned, eviction waits for it (§15.2).
     pub(crate) fn drive_recovered(self: &Arc<Self>, jid: B256) -> bool {
         {
             let mut t = lock(&self.tasks);
@@ -2103,6 +2691,7 @@ impl WitnessRuntime {
             }
             t.insert(jid, Task { token: AbortToken::new(), phase: Phase::Locked });
         }
+        lock(&self.unpinned_recoveries).insert(jid);
         let rt = self.clone();
         tokio::spawn(async move {
             let _entry = TaskEntry { rt: rt.clone(), job_id: jid };
@@ -2113,13 +2702,21 @@ impl WitnessRuntime {
         true
     }
 
-    /// A held witness lock's context, from the store (§15.2): the pin (else the journal's bundle
-    /// reference) names the bundle; its descriptor, ELF, po2 set and journals come from it, never from
-    /// the chain or the lock journal.
+    /// A recovered lock needs no more protection from eviction: pinned, gone, or its bundle missing.
+    fn recovery_resolved(&self, jid: B256) {
+        lock(&self.unpinned_recoveries).remove(&jid);
+    }
+
+    /// A held witness lock's context, from the store (§15.2): the pin, else the journal's bundle
+    /// reference, else the store's latest version for (job, descriptor, prover) — the store is the
+    /// authoritative index, and a lock whose pin is unreadable or gone is proven from what the store
+    /// holds; its descriptor, ELF, po2 set and journals come from the bundle, never from the chain or
+    /// the lock journal. The version proven is pinned (again) with the lock's evidence.
     async fn recover_lock(self: &Arc<Self>, jid: B256) -> Option<LockCtx> {
         let us = self.client.address;
         let (rec, at) = self.client.read_job_record(jid, None).await.ok()?;
         if rec.prover != us || rec.status != JOB_STATUS_LOCKED {
+            self.recovery_resolved(jid);
             return None;
         }
         let Some(store) = self.store() else {
@@ -2130,51 +2727,98 @@ impl WitnessRuntime {
             );
             return None;
         };
-        let pinned = store
+        let pin = store
             .pins()
             .into_iter()
             .filter(|p| p.job_id == jid && p.prover == us && p.descriptor_hash == rec.descriptor_hash)
-            .map(|p| BundleKey::of_pin(&p).at(p.bundle_version))
-            .max_by_key(|r| r.version);
+            .max_by_key(|p| p.bundle_version);
+        let pinned = pin.as_ref().map(|p| BundleKey::of_pin(p).at(p.bundle_version));
         let from_journal = lock(&self.journal)
             .witness_bundle(jid)
             .filter(|w| w.prover == us && w.descriptor_hash == rec.descriptor_hash)
             .map(|w| BundleKey::new(w.job_id, w.descriptor_hash, w.prover).at(w.version));
-        let Some(bref) = pinned.or(from_journal) else {
-            tracing::error!(
-                "PAGE: BUNDLE-MISSING witness lock {} (D+G {}) has no pin and no bundle reference in the store \
-                 at {}: kept until its window closes, then released",
-                short(jid),
-                rec.lock_deadline.saturating_add(PROVER_GRACE_SECS),
-                store.root().display()
-            );
-            return None;
-        };
         let (s, idf) = (store.clone(), self.image_id_fn());
+        let unavailable_before = self.image_id_unavailable.load(Ordering::SeqCst);
+        let dh = rec.descriptor_hash;
         let verified = blocking(move || {
-            let record = s.verify(&bref, &descriptor_hash_of_abi, &*idf)?;
-            let elf = s.open_elf(record.image_id, &*idf)?;
-            Ok::<_, StoreError>((record, elf))
+            let mut tried = Vec::new();
+            let mut last: Option<StoreError> = None;
+            for r in [pinned, from_journal].into_iter().flatten() {
+                if tried.contains(&r) {
+                    continue;
+                }
+                tried.push(r);
+                match s.verify_with_elf(&r, &descriptor_hash_of_abi, &*idf) {
+                    Ok((record, elf)) => return Ok((r, record, elf)),
+                    // An unavailable store is not a reason to look elsewhere.
+                    Err(e) if e.is_unavailable() => return Err(e),
+                    Err(e) => last = Some(e),
+                }
+            }
+            match s.latest(jid, dh, us) {
+                Ok(r) if !tried.contains(&r) => s.verify_with_elf(&r, &descriptor_hash_of_abi, &*idf).map(|(record, elf)| (r, record, elf)),
+                // The latest is one already tried, and its failure (set when it was) is the answer.
+                Ok(r) => Err(last.unwrap_or_else(|| StoreError::Missing { path: s.root().join(format!("v{}", r.version)) })),
+                Err(e) => Err(last.unwrap_or(e)),
+            }
         })
         .await
         .ok()?;
-        let (record, elf) = match verified {
+        let (bref, record, elf) = match verified {
             Ok(v) => v,
             Err(e) => {
-                let _ = self.bundle_trouble(jid, rec.lock_deadline.saturating_add(PROVER_GRACE_SECS), &e);
+                let derivation = e.is_corrupt() && self.image_id_unavailable.load(Ordering::SeqCst) != unavailable_before;
+                let _ = self.bundle_trouble(jid, rec.lock_deadline.saturating_add(PROVER_GRACE_SECS), &e, derivation);
+                if !(e.is_unavailable() || e.is_full() || derivation) {
+                    if e.is_missing() {
+                        tracing::error!(
+                            "PAGE: BUNDLE-MISSING witness lock {} (D+G {}) has no bundle in the store at {}: kept until \
+                             its window closes, then released",
+                            short(jid),
+                            rec.lock_deadline.saturating_add(PROVER_GRACE_SECS),
+                            store.root().display()
+                        );
+                    }
+                    // Nothing in the store to protect for it.
+                    self.recovery_resolved(jid);
+                }
                 return None;
             }
         };
         let descriptor = hex::decode(&record.descriptor_hex).ok().and_then(|b| JobDescriptor::abi_decode(&b).ok())?;
         if compute_descriptor_hash(&descriptor) != rec.descriptor_hash {
             tracing::error!("PAGE: BUNDLE-MISSING witness lock {}: its bundle's descriptor is not the job's", short(jid));
+            self.recovery_resolved(jid);
             return None;
         }
-        if pinned.is_none() {
-            let (s, b, head) = (store.clone(), bref, at);
-            if let Ok(Err(e)) = blocking(move || s.pin_record(&b, head).and_then(|r| s.pin(&r))).await {
-                tracing::warn!("witness lock {}: re-pinning its bundle failed ({e})", short(jid));
+        // Pin what is proven, with the lock's evidence (a read here shows it ours and Locked at `at`).
+        let needs_pin = pin.as_ref().is_none_or(|p| {
+            p.bundle_version != bref.version || p.lock_block == 0 || p.reopen_count != Some(rec.reopen_count)
+        });
+        if needs_pin {
+            let (s, b) = (store.clone(), bref);
+            let reopen = rec.reopen_count;
+            let pinned_at_unix = pin.as_ref().map_or_else(zkminer_chain::client::chain_now_floor, |p| p.pinned_at_unix);
+            let res = blocking(move || {
+                let mut r = s.pin_record(&b, at)?;
+                r.reopen_count = Some(reopen);
+                r.lock_block = at;
+                r.pinned_at_unix = pinned_at_unix;
+                s.pin(&r)
+            })
+            .await;
+            match res {
+                Ok(Ok(())) => {
+                    if pin.is_none() {
+                        tracing::warn!("witness lock {}: had no readable pin; pinned bundle v{} from the store", short(jid), bref.version);
+                    }
+                    self.recovery_resolved(jid);
+                }
+                Ok(Err(e)) => tracing::warn!("witness lock {}: pinning its bundle failed ({e}); eviction waits", short(jid)),
+                Err(e) => tracing::warn!("witness lock {}: pinning its bundle failed ({e:#}); eviction waits", short(jid)),
             }
+        } else {
+            self.recovery_resolved(jid);
         }
         let view = self.client.get_job_status_view_at(jid, at).await.ok()?;
         let lock_deadline = run::effective_cutoff(&view);
@@ -2224,13 +2868,14 @@ impl WitnessRuntime {
             lock_deadline,
             locked_collateral: 0,
             cycles,
+            failure: None,
         })
     }
 
     async fn store_pass_loop(self: Arc<Self>) {
         loop {
             if !self.store_pass_running.swap(true, Ordering::SeqCst) {
-                with_lane(Lane::HeldLock, self.store_pass()).await;
+                self.store_pass().await;
                 self.store_pass_running.store(false, Ordering::SeqCst);
             }
             tokio::time::sleep(STORE_PASS_EVERY).await;
@@ -2240,29 +2885,32 @@ impl WitnessRuntime {
         }
     }
 
-    /// Whether our claim on `jid` may still be pending (a fresh `Claiming` breadcrumb): its pin
-    /// must stay until the claim provably never landed (zkminer's breadcrumb rule).
-    fn claim_may_be_pending(&self, jid: B256) -> bool {
-        let j = lock(&self.journal);
-        j.entries.get(&jid).is_some_and(|e| {
-            e.state == crate::journal::JournalState::Claiming
-                && now_unix().saturating_sub(e.claimed_at.max(0) as u64) <= run::CLAIM_INTENT_MAX_AGE_SECS
-        })
-    }
-
     /// The store's reconciliation with the chain (§15.2): drive held witness locks, unpin locks that
-    /// ended, delete bundles of terminal jobs, and after the first complete pass enable eviction and
-    /// evict; page a low or unavailable store.
+    /// provably ended ([`pin_lock_gone`]), delete bundles of terminal jobs, and once a complete pass
+    /// has run and the brain's recovery has handed over (and this runtime pinned) every witness lock,
+    /// enable eviction and evict; page a low or unavailable store. Reads for pins (possible held
+    /// locks) go in the held-lock lane; reads for unpinned bundles in the pre-claim lane.
     async fn store_pass(self: &Arc<Self>) {
         if self.store().is_none() {
             self.open_store().await;
         }
         let Some(store) = self.store() else { return };
+        let us = self.client.address;
         if store.is_poisoned() {
             tracing::error!(
                 "PAGE: RETENTION-UNAVAILABLE the retention store is poisoned (a write failed after it became \
-                 visible): every witness lock is kept; check the disk and restart the miner"
+                 visible): held witness locks are still proven from their pinned bundles (every byte re-verified); \
+                 nothing is pinned, unpinned, deleted or evicted, and no new witness lock is taken until the \
+                 miner restarts — check the disk"
             );
+            let owned = self.owned_jobs();
+            for pin in store.pins().into_iter().filter(|p| p.prover == us && !owned.contains(&p.job_id)) {
+                if let Ok((rec, _)) = with_lane(Lane::HeldLock, self.client.read_job_record(pin.job_id, None)).await {
+                    if rec.prover == us && rec.status == JOB_STATUS_LOCKED && self.drive_recovered(pin.job_id) {
+                        tracing::info!("witness lock {}: held, re-driven from its pinned bundle", short(pin.job_id));
+                    }
+                }
+            }
             return;
         }
         let s = store.clone();
@@ -2277,10 +2925,13 @@ impl WitnessRuntime {
                 return;
             }
         };
-        let us = self.client.address;
         let mut complete = scan.unreadable_pins.is_empty();
         for k in &scan.unreadable_pins {
-            tracing::error!("PAGE: BUNDLE-MISSING the pin of witness job {} cannot be read; its bundles are kept", short(k.job_id));
+            tracing::error!(
+                "PAGE: BUNDLE-MISSING the pin of witness job {} cannot be read; its bundles are kept (a held lock \
+                 is proven from the store's latest version)",
+                short(k.job_id)
+            );
         }
         let mut reads = 0usize;
         let owned = self.owned_jobs();
@@ -2295,7 +2946,11 @@ impl WitnessRuntime {
                 break;
             }
             reads += 1;
-            let Ok((rec, at)) = self.client.read_job_record(pin.job_id, None).await else {
+            // At or after the pin's block (and the lock's): an earlier replica says nothing about it.
+            let min_block = pin.pinned_at_block.max(pin.lock_block);
+            let Ok((rec, at)) =
+                with_lane(Lane::HeldLock, self.client.read_job_record(pin.job_id, Some(min_block))).await
+            else {
                 complete = false;
                 continue;
             };
@@ -2305,11 +2960,30 @@ impl WitnessRuntime {
                 }
             } else if let Some(state) = terminal_state(&rec) {
                 self.delete_terminal(&store, pin.job_id, state, at).await;
-            } else if !self.claim_may_be_pending(pin.job_id) {
-                let (s, p) = (store.clone(), pin.clone());
-                if let Ok(Ok(true)) = blocking(move || s.unpin(p.job_id, p.descriptor_hash, p.prover)).await {
-                    tracing::info!(
-                        "witness job {}: unpinned (status {}, prover {}): no lock of ours; the bundle stays a cache",
+            } else {
+                let facts = PinFacts {
+                    reopen_count: pin.reopen_count,
+                    lock_block: pin.lock_block,
+                    pinned_at_block: pin.pinned_at_block,
+                    pinned_at_unix: pin.pinned_at_unix,
+                };
+                let read = PinRead { status: rec.status, prover: rec.prover, reopen_count: rec.reopen_count, at_block: at };
+                let now = zkminer_chain::client::chain_now_floor();
+                if pin_lock_gone(&facts, &read, us, now, run::CLAIM_INTENT_MAX_AGE_SECS) {
+                    let (s, p) = (store.clone(), pin.clone());
+                    if let Ok(Ok(true)) = blocking(move || s.unpin(p.job_id, p.descriptor_hash, p.prover)).await {
+                        tracing::info!(
+                            "witness job {}: unpinned (status {}, prover {}, reopen {}): the lock it was taken for is \
+                             gone; the bundle stays a cache",
+                            short(pin.job_id),
+                            rec.status,
+                            rec.prover,
+                            rec.reopen_count
+                        );
+                    }
+                } else {
+                    tracing::debug!(
+                        "witness job {}: pin kept (status {}, prover {}): no proof yet that its lock is gone",
                         short(pin.job_id),
                         rec.status,
                         rec.prover
@@ -2331,15 +3005,44 @@ impl WitnessRuntime {
                 break;
             }
             reads += 1;
-            if let Ok((rec, at)) = self.client.read_job_record(jid, None).await {
+            if let Ok((rec, at)) = with_lane(Lane::PreClaim, self.client.read_job_record(jid, None)).await {
                 if let Some(state) = terminal_state(&rec) {
                     self.delete_terminal(&store, jid, state, at).await;
                 }
             }
         }
-        if complete && !self.scan_complete.swap(true, Ordering::SeqCst) {
+        // A handed-over lock that recovery could not pin, and that provably ended since (a terminal
+        // read, or the journal's evidence: a risen reopen count, another prover at or after the lock
+        // block), has nothing left to protect. An unpinned read alone may lag: it keeps waiting.
+        let waiting: Vec<B256> = lock(&self.unpinned_recoveries).iter().copied().filter(|j| !owned.contains(j)).collect();
+        for jid in waiting {
+            if reads >= STORE_PASS_MAX_READS {
+                break;
+            }
+            reads += 1;
+            if let Ok((rec, _)) = with_lane(Lane::HeldLock, self.client.read_job_record(jid, None)).await {
+                let ended = terminal_state(&rec).is_some()
+                    || (!(rec.prover == us && rec.status == JOB_STATUS_LOCKED)
+                        && run::lock_ownership(&self.client, &self.journal, jid, rec.reopen_count).await
+                            == run::LockOwnership::Gone);
+                if ended {
+                    self.recovery_resolved(jid);
+                }
+            }
+        }
+        // Eviction (§15.2: "nothing is evicted until this process has completed one full recovery
+        // scan"): this pass read every pin, the brain's recovery has handed over every witness lock
+        // it found on chain or in the journal, and each of those is pinned.
+        let handed = self.brain_recovered.load(Ordering::SeqCst);
+        let waiting = lock(&self.unpinned_recoveries).len();
+        if complete && handed && waiting == 0 && !self.scan_complete.swap(true, Ordering::SeqCst) {
             store.mark_recovery_scan_complete();
             tracing::info!("witness: the retention store's recovery scan is complete; eviction is enabled");
+        } else if !store.recovery_scan_complete() {
+            tracing::debug!(
+                "witness: eviction waits (pass complete {complete}, brain recovery done {handed}, {waiting} recovered \
+                 lock(s) not pinned yet)"
+            );
         }
         if store.recovery_scan_complete() {
             let (s, target) = (store.clone(), self.witness.max_witness_bytes.saturating_add(BUNDLE_JSON_ALLOWANCE));
@@ -2369,7 +3072,8 @@ impl WitnessRuntime {
 
 // ── the pipeline's hooks ──────────────────────────────────────────────────────
 
-/// What run.rs supplies to one simulation: the chain gates, the artifact budget, the abort token.
+/// What run.rs supplies to one simulation: the chain gates, the guest ELF, the artifact budget, the
+/// abort token.
 struct Hooks {
     rt: Arc<WitnessRuntime>,
     gate: ChainGateInput,
@@ -2377,6 +3081,10 @@ struct Hooks {
     budget: ArtifactBudget,
     /// The claimability quote the chain gates read, for the claim gate.
     quote: Mutex<Option<ClaimQuote>>,
+    /// The job's `programId`, which the ELF's image id must equal.
+    program_id: B256,
+    /// The guest ELF once fetched, for the lock (its prove dispatch).
+    elf: Mutex<Option<Vec<u8>>>,
 }
 
 impl PipelineHooks for Hooks {
@@ -2406,6 +3114,44 @@ impl PipelineHooks for Hooks {
     fn abort_token(&self) -> &AbortToken {
         &self.token
     }
+
+    /// Today's ELF path (after the static gates, §5.2 step 3), then the image id derived on a
+    /// measure worker (waiting for one) and checked against `programId`: the bundle's retention of
+    /// the ELF later hits the derived id, so no builder or execute runs for an ELF that cannot be
+    /// retained.
+    fn guest_elf(&self) -> HookFuture<'_, Result<Vec<u8>, (SkipReason, String)>> {
+        Box::pin(async move {
+            let rt = &self.rt;
+            let fetched = with_lane(
+                Lane::PreClaim,
+                tokio::time::timeout(
+                    FETCH_BUDGET,
+                    run::fetch_or_download_elf(&rt.client, &rt.state, self.program_id, None, false),
+                ),
+            )
+            .await;
+            let elf = match fetched {
+                Ok(Ok(elf)) => elf,
+                Ok(Err(e)) => return Err((SkipReason::ElfUnavailable, format!("{e:#}"))),
+                Err(_) => return Err((SkipReason::ElfUnavailable, "ELF fetch timed out".into())),
+            };
+            let (idf, bytes) = (rt.image_id_fn(), elf.clone());
+            let before = rt.image_id_unavailable.load(Ordering::SeqCst);
+            let id = blocking(move || idf(&bytes)).await.map_err(|e| (SkipReason::HostInternal, format!("{e:#}")))?;
+            match id {
+                Some(id) if id == self.program_id => {
+                    *lock(&self.elf) = Some(elf.clone());
+                    Ok(elf)
+                }
+                Some(id) => Err((SkipReason::ElfImageIdMismatch, format!("the ELF's image id is {id}"))),
+                None if rt.image_id_unavailable.load(Ordering::SeqCst) != before => Err((
+                    SkipReason::HostInternal,
+                    "the ELF's image id could not be derived now (no risc0 measure worker came free)".into(),
+                )),
+                None => Err((SkipReason::ElfImageIdMismatch, "the ELF is not one risc0 derives an image id for".into())),
+            }
+        })
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -2415,6 +3161,29 @@ fn host_abort(r: GovAbort) -> AbortReason {
         GovAbort::Cancelled { .. } => AbortReason::JobCancelled,
         GovAbort::ClaimedByOther { .. } => AbortReason::JobClaimed,
         GovAbort::BidSubmitted { .. } => AbortReason::BidSubmitted,
+    }
+}
+
+/// How a held lock's proof failed, from its typed errors (never from text, §16): the class its
+/// device's tally counts.
+fn failure_class(e: &anyhow::Error) -> PostLockFailureClass {
+    use zkminer_prover_protocol::types::{ErrorKind, GpuMemoryShortage, HostMemoryShortage, ProofDeadlineReached, WorkerProofError};
+    if e.downcast_ref::<ProofDeadlineReached>().is_some() {
+        PostLockFailureClass::ProveTimeEstimate
+    } else if e.downcast_ref::<GpuMemoryShortage>().is_some() || e.downcast_ref::<HostMemoryShortage>().is_some() {
+        PostLockFailureClass::ResourceLimit
+    } else if let Some(w) = e.downcast_ref::<WorkerProofError>() {
+        match w.kind {
+            _ if w.is_gpu_oom() => PostLockFailureClass::ResourceLimit,
+            ErrorKind::ResourceExhausted => PostLockFailureClass::ResourceLimit,
+            ErrorKind::ProofFailed => PostLockFailureClass::Gpu,
+            ErrorKind::InputMismatch => PostLockFailureClass::BundleLoss,
+            _ => PostLockFailureClass::ProverCrash,
+        }
+    } else if e.downcast_ref::<zkminer_chain::revert::FulfilFailure>().is_some() {
+        PostLockFailureClass::GasOrRpc
+    } else {
+        PostLockFailureClass::ProverCrash
     }
 }
 
@@ -2442,6 +3211,15 @@ fn free_bytes(dir: &Path) -> std::io::Result<u64> {
         return Err(std::io::Error::last_os_error());
     }
     Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+/// A self-test bounded by [`SELF_TEST_TIMEOUT`]: one that does not finish is a failure.
+async fn bounded_self_test(name: &str, test: impl std::future::Future<Output = Result<(), String>>) -> Result<(), String> {
+    match tokio::time::timeout(SELF_TEST_TIMEOUT, test).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(why)) => Err(format!("the {name} self-test failed: {why}")),
+        Err(_) => Err(format!("the {name} self-test did not finish in {} s", SELF_TEST_TIMEOUT.as_secs())),
+    }
 }
 
 async fn broker_self_test(client: &BrokerClient) -> Result<(), String> {

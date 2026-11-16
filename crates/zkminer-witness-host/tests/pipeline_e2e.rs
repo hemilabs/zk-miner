@@ -548,7 +548,7 @@ impl Env {
             prover: self.prover,
             chain_id: ANVIL_CHAIN,
             router: self.router,
-            elf: &fibonacci().0,
+            elf: Some(&fibonacci().0),
             current_block: block,
         };
         let r = simulate_witness_job(&self.ctx, &job, hooks).await;

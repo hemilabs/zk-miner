@@ -10,6 +10,8 @@
 //!    host's maxima (§7.1: `maxWitnessBytes` and `maxGuestCycles` reject, the builder-side limits
 //!    clamp); every capability provisioned by the broker; then run.rs's chain gates through
 //!    [`PipelineHooks::claimable`] (claimability `eth_call`, submission form, deployment, admission).
+//!    Only then the guest ELF ([`PipelineHooks::guest_elf`], unless [`JobInput::elf`] carries it):
+//!    nothing is downloaded for a job the static gates refuse.
 //! 2. **The builder artifact** (§13.4): the operator mirror, then the job's `hemi-code` locators in
 //!    envelope order, at most one of them read past its manifest. The broker answers from its
 //!    artifact cache before any read (on the mirror request only when a mirror is configured) and
@@ -154,8 +156,9 @@ pub struct JobInput<'a> {
     /// locators for another chain are ignored).
     pub chain_id: u64,
     pub router: Address,
-    /// The guest ELF, fetched by today's ELF path with its image id checked against `programId`.
-    pub elf: &'a [u8],
+    /// The guest ELF, with its image id checked against `programId`; `None` to have
+    /// [`PipelineHooks::guest_elf`] fetch it once the static gates have passed.
+    pub elf: Option<&'a [u8]>,
     /// The current block number (the bundle's `created_at_block`).
     pub current_block: u64,
 }
@@ -176,6 +179,13 @@ pub trait PipelineHooks: Send + Sync {
     /// Fired by run.rs on `JobCancelled`, `JobClaimed` by another prover, `BidSubmitted` and the
     /// governance events that end an attempt.
     fn abort_token(&self) -> &AbortToken;
+
+    /// §5.2 step 3: the guest ELF (today's ELF path), its image id checked against `programId`.
+    /// Called once, after the static gates passed and before the artifact, when [`JobInput::elf`] is
+    /// `None`; `Err` skips the job with that verdict.
+    fn guest_elf(&self) -> HookFuture<'_, Result<Vec<u8>, (SkipReason, String)>> {
+        Box::pin(async { Err((SkipReason::HostInternal, "no guest ELF source".to_string())) })
+    }
 }
 
 /// The build id a witness bundle records for a risc0 worker: its SDK and worker versions as its
@@ -797,6 +807,16 @@ pub async fn simulate_witness_job(
     // 1. Static gates.
     check_abort(token, Step::StaticGates)?;
     let Gated { envelope, limits, prefix, po2s } = static_gates(ctx, job, hooks).await?;
+    let fetched_elf;
+    let elf: &[u8] = match job.elf {
+        Some(e) => e,
+        None => {
+            fetched_elf = abortable(token, Step::StaticGates, hooks.guest_elf())
+                .await?
+                .map_err(|(r, d)| Skip::new(r, Step::StaticGates, format!("the guest ELF: {d}")))?;
+            &fetched_elf
+        }
+    };
     timings.static_gates = started.elapsed();
     let job_key = attempt_key(job);
     tracing::info!(job = %job.job_id, attempt = %short(job_key), ?po2s, prefix = prefix.is_some(), "witness job: static gates passed");
@@ -904,7 +924,7 @@ pub async fn simulate_witness_job(
     }
     let seed = sys_rand::risc0_seed(&ctx.sys_rand_key, &program_id.0, &input.0);
     let req = WitnessExecuteRequest {
-        elf: job.elf.to_vec(),
+        elf: elf.to_vec(),
         prefix: prefix.map(|p| p.to_vec()).unwrap_or_default(),
         w_len,
         input_sha256: input.0,
@@ -934,7 +954,7 @@ pub async fn simulate_witness_job(
     check_abort(token, P)?;
     let t = Instant::now();
     let hold = {
-        let (store, image_id_fn, elf) = (ctx.store.clone(), ctx.image_id_fn.clone(), job.elf.to_vec());
+        let (store, image_id_fn, elf) = (ctx.store.clone(), ctx.image_id_fn.clone(), elf.to_vec());
         blocking(P, move || store.put_elf(program_id, &elf, &*image_id_fn)).await?.map_err(|e| match e {
             StoreError::Rejected(Reject::Record(_)) => {
                 Skip::new(SkipReason::HostInternal, P, format!("the image-id function refused the verified ELF: {e}"))

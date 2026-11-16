@@ -68,6 +68,12 @@ pub fn set_risc0_sys_rand_key(key: [u8; 32], ephemeral: bool) {
     let _ = RISC0_SYS_RAND_KEY.set((key, ephemeral));
 }
 
+/// The key [`set_risc0_sys_rand_key`] set, and whether it is for this run only: the one key the
+/// miner's own seed derivations must use, so they agree with every risc0 worker it spawns.
+pub fn risc0_sys_rand_key() -> Option<([u8; 32], bool)> {
+    RISC0_SYS_RAND_KEY.get().copied()
+}
+
 /// Settings of the pinned risc0 and SP1 SDKs that hand proving or execution to someone else (a
 /// remote service, an external `r0vm`, a Docker image), fetch what they prove with from elsewhere, or
 /// put them in a developer mode whose proofs are not real. No worker of the miner's uses any of them:
