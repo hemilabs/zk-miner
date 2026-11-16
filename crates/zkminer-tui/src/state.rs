@@ -479,6 +479,9 @@ pub struct MinerState {
     pub setup_status: SetupStatus,
     /// Chain ID from config (used to detect testnet).
     pub chain_id: u64,
+    /// `[dev] private_network` is in force: requesters' ELF URLs may reach this host's private
+    /// network. The status bar says so on every frame.
+    pub dev_private_network: bool,
 }
 
 /// Phase of a single benchmark program on a device.
@@ -919,6 +922,7 @@ impl Default for MinerState {
             benchmark_tracker: None,
             setup_status: SetupStatus::default(),
             chain_id: 0,
+            dev_private_network: false,
         }
     }
 }

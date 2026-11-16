@@ -12,6 +12,10 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
 
     println!("zkminer status");
     println!("══════════════════════════════════════════════════");
+    if let Some(banner) = config.dev_mode_banner() {
+        println!("!! {banner} !!");
+        println!("══════════════════════════════════════════════════");
+    }
     println!("Prover Address: {}", client.address);
 
     // ETH balance

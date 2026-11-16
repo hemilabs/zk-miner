@@ -2401,6 +2401,9 @@ pub async fn run(
 ) -> Result<()> {
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
+    if let Some(banner) = config.dev_mode_banner() {
+        tracing::warn!("{banner}");
+    }
     if watch.is_none() {
         hold_instance_lock()?;
     }
@@ -2679,6 +2682,10 @@ pub async fn run(
         s.address = format!("{}", client.address);
         s.connected = true;
         s.chain_id = config.chain.chain_id;
+        if let Some(banner) = config.dev_mode_banner() {
+            s.dev_private_network = true;
+            s.add_log(LogLevel::Warn, banner.to_string());
+        }
 
         // Hydrate head + ETH/HEMI balances + stake + prover-stats in
         // ONE Multicall3 round-trip instead of 6 sequential reads, de-peaking the boot burst

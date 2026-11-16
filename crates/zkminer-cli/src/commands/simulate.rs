@@ -1474,6 +1474,9 @@ pub async fn run(config_path: Option<&Path>, opts: SimulateOptions) -> Result<()
     anyhow::ensure!(opts.max_cycles > 0, "--max-cycles must be at least 1");
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
+    if let Some(banner) = config.dev_mode_banner() {
+        tracing::warn!("{banner}");
+    }
     // No key is read (the client signs with a throwaway one), so none must reach a worker either.
     if config.wallet.key_source == "env" {
         std::env::remove_var(&config.wallet.key_env_var);

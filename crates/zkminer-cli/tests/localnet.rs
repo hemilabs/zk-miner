@@ -1977,6 +1977,13 @@ async fn watch_only_reports_every_job() {
     if world.elf_hits.load(Ordering::SeqCst) == 0 {
         failures.push("the guest was never downloaded from its registry URI".into());
     }
+    // Served from 127.0.0.1 because the config's `[dev] private_network` let it, and said so.
+    if !lines
+        .iter()
+        .any(|l| l.contains(zkminer_config::DEV_MODE_BANNER))
+    {
+        failures.push("the miner never announced developer mode".into());
+    }
     if !lines
         .iter()
         .any(|l| l.contains("does not match job programId"))
