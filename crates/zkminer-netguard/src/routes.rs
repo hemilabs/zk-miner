@@ -230,13 +230,57 @@ mod sys {
     /// A ceiling on the routes read, against a runaway dump.
     const MAX_ROUTES: usize = 1 << 20;
 
+    /// Times a dump the kernel flags as interrupted (`NLM_F_DUMP_INTR`: the table changed while it
+    /// was read) is started again before the read fails.
+    const DUMP_ATTEMPTS: usize = 5;
+    /// `nlmsghdr.nlmsg_flags`: the dump was interrupted by a change and may be inconsistent.
+    const NLM_F_DUMP_INTR: u16 = 0x10;
+
     pub(super) fn dump() -> io::Result<Vec<Route>> {
         let mut out = Vec::new();
         for family in [libc::AF_INET, libc::AF_INET6] {
-            dump_family(family as u8, &mut out)?;
+            out.extend(dump_consistent(family as u8)?);
         }
         Ok(out)
     }
+
+    /// One family's routes from a dump the kernel neither aborted nor flagged as interrupted,
+    /// retried up to [`DUMP_ATTEMPTS`] times; a table that keeps changing fails the read (the
+    /// caller then keeps its last good facts, or refuses to start).
+    fn dump_consistent(family: u8) -> io::Result<Vec<Route>> {
+        for _ in 0..DUMP_ATTEMPTS {
+            let mut out = Vec::new();
+            match dump_family(family, &mut out) {
+                Ok(()) => return Ok(out),
+                Err(e) if is_interrupted(&e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::other(format!(
+            "the routing table changed during each of {DUMP_ATTEMPTS} reads (NLM_F_DUMP_INTR); \
+             a partial table is not used"
+        )))
+    }
+
+    /// The error [`parse_messages`] returns for a dump flagged `NLM_F_DUMP_INTR`.
+    fn interrupted() -> io::Error {
+        io::Error::new(io::ErrorKind::Interrupted, DumpInterrupted)
+    }
+
+    fn is_interrupted(e: &io::Error) -> bool {
+        e.get_ref().is_some_and(|i| i.is::<DumpInterrupted>())
+    }
+
+    #[derive(Debug)]
+    struct DumpInterrupted;
+
+    impl std::fmt::Display for DumpInterrupted {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("the netlink dump was interrupted by a change (NLM_F_DUMP_INTR)")
+        }
+    }
+
+    impl std::error::Error for DumpInterrupted {}
 
     fn align4(n: usize) -> usize {
         (n + 3) & !3
@@ -335,18 +379,34 @@ mod sys {
     }
 
     /// Parses one datagram of the dump into `out`; `true` once the dump is done.
+    ///
+    /// Fails closed (review r2, R2-NG-8): an `NLMSG_DONE` that carries a negative errno (the kernel
+    /// aborted the dump, `dump_done_errno`) is that error, and a message flagged `NLM_F_DUMP_INTR`
+    /// (the table changed while it was dumped, so routes may be missing) fails the dump at once
+    /// with an error [`dump_consistent`] retries; neither is ever taken as a complete table.
     pub(super) fn parse_messages(mut b: &[u8], seq: u32, out: &mut Vec<Route>) -> io::Result<bool> {
         while b.len() >= NLMSG_HDRLEN {
             let len = u32_at(b, 0).ok_or_else(malformed)? as usize;
             let ty = u16_at(b, 4).ok_or_else(malformed)?;
+            let flags = u16_at(b, 6).ok_or_else(malformed)?;
             let mseq = u32_at(b, 8).ok_or_else(malformed)?;
             if len < NLMSG_HDRLEN || len > b.len() {
                 return Err(malformed());
             }
             let payload = &b[NLMSG_HDRLEN..len];
             if mseq == seq {
+                if flags & NLM_F_DUMP_INTR != 0 {
+                    return Err(interrupted());
+                }
                 match ty {
-                    NLMSG_DONE => return Ok(true),
+                    NLMSG_DONE => {
+                        // `int error`: 0, or the negative errno of an aborted dump.
+                        let code = u32_at(payload, 0).map_or(0, |c| c as i32);
+                        if code < 0 {
+                            return Err(io::Error::from_raw_os_error(-code));
+                        }
+                        return Ok(true);
+                    }
                     NLMSG_ERROR => {
                         let code = u32_at(payload, 0).ok_or_else(malformed)? as i32;
                         if code != 0 {
@@ -647,6 +707,62 @@ mod sys {
             let mut bad = msg(RTM_NEWROUTE, 1, &rt(v4, 0, RTN_UNICAST, &[]));
             bad[0] = 200;
             assert!(parse_messages(&bad, 1, &mut out).is_err());
+        }
+
+        /// Review r2 R2-NG-8 (PoC `an_aborted_or_interrupted_dump_counts_as_complete`), inverted:
+        /// an `NLMSG_DONE` carrying a negative errno is that error, and a message flagged
+        /// `NLM_F_DUMP_INTR` fails the dump (to be retried) instead of counting as complete.
+        #[test]
+        fn an_aborted_or_interrupted_dump_is_an_error() {
+            let v4 = libc::AF_INET as u8;
+            let default = msg(
+                RTM_NEWROUTE,
+                1,
+                &rt(
+                    v4,
+                    0,
+                    RTN_UNICAST,
+                    &[
+                        attr(RTA_GATEWAY, &[192, 168, 1, 1]),
+                        attr(RTA_OIF, &2u32.to_ne_bytes()),
+                    ],
+                ),
+            );
+            let mut d = default.clone();
+            d.extend(msg(NLMSG_DONE, 1, &(-libc::EINTR).to_ne_bytes()));
+            let mut out = Vec::new();
+            let e = parse_messages(&d, 1, &mut out).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::EINTR), "{e}");
+            assert!(!is_interrupted(&e));
+            // NLM_F_DUMP_INTR on a route message: the dump is refused, and marked for a retry.
+            let mut m = msg(
+                RTM_NEWROUTE,
+                1,
+                &rt(
+                    v4,
+                    16,
+                    RTN_UNICAST,
+                    &[
+                        attr(RTA_DST, &[52, 95, 0, 0]),
+                        attr(RTA_OIF, &7u32.to_ne_bytes()),
+                    ],
+                ),
+            );
+            m[6..8].copy_from_slice(&(2u16 | NLM_F_DUMP_INTR).to_ne_bytes());
+            let e = parse_messages(&m, 1, &mut Vec::new()).unwrap_err();
+            assert!(is_interrupted(&e), "{e}");
+            // On the DONE message too.
+            let mut d = default.clone();
+            let mut done = msg(NLMSG_DONE, 1, &[0; 4]);
+            done[6..8].copy_from_slice(&(2u16 | NLM_F_DUMP_INTR).to_ne_bytes());
+            d.extend(done);
+            assert!(is_interrupted(
+                &parse_messages(&d, 1, &mut Vec::new()).unwrap_err()
+            ));
+            // A clean DONE (error 0, or no payload at all) still ends the dump.
+            let mut d = default;
+            d.extend(msg(NLMSG_DONE, 1, &[]));
+            assert!(parse_messages(&d, 1, &mut Vec::new()).unwrap());
         }
 
         /// This host's own table reads, and has what every running Linux host has.
