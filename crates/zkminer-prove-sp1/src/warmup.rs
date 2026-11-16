@@ -11,6 +11,10 @@
 //!   (hemilabs `sp1` from v6.8.1, `--sp1-groth16-cpu-helper`). Building it reads the full circuit:
 //!   ~26 s and ~14 GiB at peak, once per host. The server takes its own host-wide final-wrap slot
 //!   for it. Older servers prove Groth16 in-process and have nothing to build.
+//!
+//! The downloads here are the worker's only use of the network, and only before it runs any
+//! requester's guest or starts its server (see `deny_network` in main.rs). Their clients and
+//! runtimes are dropped before `warm_up` returns, so no connection outlives them.
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -30,6 +34,12 @@ const REQUIRED_FILES: &[&str] = &[
 /// What the SDK's installer downloads into the directory before extracting it, and removes after:
 /// a directory that still has it was interrupted.
 const DOWNLOAD_LEFTOVER: &str = "artifacts.tar.gz";
+/// The marker the SDK's installer writes once an install is complete
+/// (`sp1_prover::build::CIRCUIT_ARTIFACTS_COMPLETE_FILE`, private), and the only thing its
+/// `try_install_circuit_artifacts` checks before it downloads the artifacts again. `sp1-gpu-server`
+/// runs that check at every Groth16 proof, with no network (see `deny_network` in main.rs), so a
+/// directory the warm-up calls complete must have it too.
+const SDK_COMPLETE_MARKER: &str = ".complete";
 
 /// The argument that makes a hemilabs `sp1-gpu-server` act as its Groth16 CPU helper.
 const CPU_HELPER_ARG: &str = "--sp1-groth16-cpu-helper";
@@ -60,6 +70,16 @@ pub(crate) fn warm_up(
         .context("cannot locate the Groth16 circuit artifacts directory")?;
     let started = Instant::now();
     let installed = ensure_installed(&dir, |staging| {
+        // A worker that has run a requester's guest (or started its server) has no network: say so
+        // rather than fail inside the download.
+        if crate::network_denied() {
+            bail!(
+                "the Groth16 circuit artifacts are not installed in {}, and this worker cannot \
+                 download them: it has run a requester's guest, after which a worker has no \
+                 network. A fresh worker installs them in its warm-up",
+                dir.display()
+            );
+        }
         let archive_bytes = archive_size();
         report(DOWNLOADING, Some(0), archive_bytes);
         with_progress(
@@ -143,9 +163,11 @@ impl Installed {
     }
 }
 
-/// Whether `dir` holds a complete set of Groth16 circuit artifacts.
+/// Whether `dir` holds a complete set of Groth16 circuit artifacts: one the SDK too takes as
+/// installed (its [`SDK_COMPLETE_MARKER`]), and so never downloads again in a proof.
 pub(crate) fn is_complete(dir: &Path) -> bool {
     !dir.join(DOWNLOAD_LEFTOVER).exists()
+        && dir.join(SDK_COMPLETE_MARKER).is_file()
         && REQUIRED_FILES.iter().all(|name| {
             fs::metadata(dir.join(name)).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
         })
@@ -461,7 +483,23 @@ mod tests {
         for name in REQUIRED_FILES {
             fs::write(dir.join(name), b"x")?;
         }
+        fs::write(dir.join(SDK_COMPLETE_MARKER), b"")?;
         Ok(())
+    }
+
+    /// Every file but the SDK's marker: the SDK would download the artifacts again, inside a proof,
+    /// so the warm-up replaces them now.
+    #[test]
+    fn an_install_without_the_sdks_marker_is_replaced() {
+        let root = TestDir::new();
+        let dir = root.path().join("v6.0.0");
+        fs::create_dir(&dir).unwrap();
+        fill(&dir).unwrap();
+        assert!(is_complete(&dir));
+        fs::remove_file(dir.join(SDK_COMPLETE_MARKER)).unwrap();
+        assert!(!is_complete(&dir));
+        assert_eq!(ensure_installed(&dir, fill).unwrap(), Installed::Downloaded);
+        assert!(is_complete(&dir));
     }
 
     #[test]

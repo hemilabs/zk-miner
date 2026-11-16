@@ -3417,6 +3417,25 @@ impl WorkerPool {
         };
 
         self.ensure_alive(&mut slot, entry)?;
+        // A worker that has run a requester's guest has no network (it denies itself it first; see
+        // `zkminer_witness_sandbox::netdeny`), and this warm-up may download: it would only refuse.
+        // That happens where the slot measured a job before its backend was warmed (a risc0 slot
+        // with no measure pool) or benchmarked first. Run it on a fresh worker, whose first command
+        // it is, under this same lock.
+        if slot.handle.as_ref().is_some_and(|h| h.may_lack_network()) {
+            tracing::info!(
+                "{key}: starting a fresh worker for the warm-up, which may download (a worker \
+                 that has run a guest has no network)"
+            );
+            let before = self.read_card(key).map(|c| c.available_to(key));
+            entry.clear_pid();
+            if let Some(h) = slot.handle.as_mut() {
+                h.shutdown();
+            }
+            Self::mark_slot_dead(&mut slot, entry);
+            self.await_own_vram_release(key, before, None);
+            self.ensure_alive(&mut slot, entry)?;
+        }
         if let Some(h) = slot.handle.as_ref() {
             entry.publish_pid(h.pid());
         }

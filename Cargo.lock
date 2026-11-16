@@ -10710,6 +10710,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.22",
  "zkminer-prover-protocol",
+ "zkminer-witness-sandbox",
 ]
 
 [[package]]
