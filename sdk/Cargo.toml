@@ -7,6 +7,7 @@ members = [
     "hemiprove-builder-sdk",
     "examples/latest-block",
     "test-builders/faults",
+    "test-builders/params-echo",
     "test-builders/receipts-proof",
     "test-builders/storage-proof",
 ]

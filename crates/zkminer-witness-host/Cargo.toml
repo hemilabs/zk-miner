@@ -10,7 +10,16 @@ zkminer-witness-sandbox = { workspace = true }
 zkminer-witness-store = { workspace = true }
 zkminer-witness-broker = { path = "../zkminer-witness-broker" }
 zkminer-config = { workspace = true }
+# The router's binding mirror, the descriptor hash and the risc0 Groth16 proof-system id.
+zkminer-chain = { workspace = true }
+zkminer-contracts = { workspace = true }
+# The sandboxed witness execute (`witness_exec`) and its request, response and seed.
+zkminer-prover = { workspace = true }
+zkminer-prover-protocol = { workspace = true }
 alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-sol-types = { workspace = true }
+sha2 = "0.10"
+hex = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -20,4 +29,5 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 wat = "1"
-hex = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false }
