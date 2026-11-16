@@ -2,7 +2,8 @@
 //! into a job cgroup with its control socket at fd 3, it restricts itself (Landlock: no readable
 //! file, the spool dir writable, TCP connect only to the configured ports; seccomp; no new
 //! privileges), then serves a builder's `evm-rpc/v1` and `blob/v1` fetches and `hemi-code` reads
-//! through the real codec and floor, resolves host names with its own resolver (UDP, no `bind`),
+//! through the real codec and floor, resolves host names with its own resolver (TCP, no `bind`; a
+//! TCP DNS server on a loopback port the broker's `tcp_connect_ports` gains from `[dns] servers`),
 //! passes its own self-test, sandbox checks included, and exits 0 when the control socket closes.
 //!
 //! Needs a delegated cgroup:

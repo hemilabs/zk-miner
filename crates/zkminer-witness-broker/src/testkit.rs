@@ -535,8 +535,9 @@ pub fn config_text(dir: &std::path::Path, extra: &str) -> String {
 // ---------------------------------------------------------------------------------------------
 // DNS.
 
-/// A UDP DNS server on 127.0.0.1 answering `A`/`AAAA` queries from a fixed table (lowercase names,
-/// no trailing dot); `NXDOMAIN` for other names. Counts the queries it answered.
+/// A DNS server over TCP (RFC 7766: 2-byte length-prefixed messages) on 127.0.0.1, answering
+/// `A`/`AAAA` queries from a fixed table (lowercase names, no trailing dot); `NXDOMAIN` for other
+/// names. Several queries per connection are answered in order. Counts the queries it answered.
 pub struct TestDns {
     pub addr: SocketAddr,
     pub queries: Arc<AtomicUsize>,
@@ -552,22 +553,36 @@ impl Drop for TestDns {
 
 impl TestDns {
     pub async fn start(records: &[(&str, &[&str])]) -> Self {
-        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind");
-        let addr = sock.local_addr().expect("addr");
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
         let queries = Arc::new(AtomicUsize::new(0));
         let table = Arc::new(std::sync::Mutex::new(
             records.iter().map(|(n, ips)| (n.to_string(), ips.iter().map(|s| s.parse().expect("ip")).collect())).collect(),
         ));
         let (q, t) = (queries.clone(), table.clone());
         let task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 2048];
+            let mut conns = tokio::task::JoinSet::new();
             loop {
-                let Ok((n, peer)) = sock.recv_from(&mut buf).await else { return };
-                let answer = dns_answer(&buf[..n], &t.lock().unwrap());
-                if let Some(answer) = answer {
-                    q.fetch_add(1, Ordering::SeqCst);
-                    let _ = sock.send_to(&answer, peer).await;
-                }
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                while conns.try_join_next().is_some() {}
+                let (q, t) = (q.clone(), t.clone());
+                conns.spawn(async move {
+                    loop {
+                        let Ok(len) = sock.read_u16().await else { return };
+                        let mut query = vec![0u8; usize::from(len)];
+                        if sock.read_exact(&mut query).await.is_err() {
+                            return;
+                        }
+                        let Some(answer) = dns_answer(&query, &t.lock().unwrap()) else { return };
+                        q.fetch_add(1, Ordering::SeqCst);
+                        let mut framed = (answer.len() as u16).to_be_bytes().to_vec();
+                        framed.extend_from_slice(&answer);
+                        if sock.write_all(&framed).await.is_err() {
+                            return;
+                        }
+                    }
+                });
             }
         });
         Self { addr, queries, records: table, task }

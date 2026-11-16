@@ -1,8 +1,9 @@
 //! Parent side: [`prepare_command`].
 
+use std::ffi::OsString;
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
@@ -10,6 +11,8 @@ use crate::{Cgroup, SandboxError};
 
 /// Highest fd number a mapping may target.
 pub(crate) const MAX_TARGET_FD: RawFd = 1023;
+/// `statfs.f_type` of the cgroup v2 filesystem.
+pub(crate) const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 
 /// How the child rearranges its fds: computed in the parent, executed in the child without
 /// allocating.
@@ -175,6 +178,32 @@ fn fd_identity(fd: RawFd) -> io::Result<FdIdentity> {
     })
 }
 
+/// Whether `fd` is a file on the cgroup v2 filesystem (`fstatfs`; async-signal-safe).
+pub(crate) fn on_cgroup2(fd: RawFd) -> io::Result<bool> {
+    let mut st = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: fstatfs writes a statfs into `st`.
+    if unsafe { libc::fstatfs(fd, st.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatfs succeeded, so `st` is initialised.
+    let st = unsafe { st.assume_init() };
+    Ok(st.f_type as u64 == CGROUP2_SUPER_MAGIC)
+}
+
+/// `fd` moved to the lowest free number >= 3, close-on-exec (the original is closed).
+fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
+    if fd.as_raw_fd() >= 3 {
+        return Ok(fd);
+    }
+    // SAFETY: fcntl on an fd we own; the result, when valid, is a new fd owned by nothing else.
+    let r = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if r < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `r` was just created and is owned here alone.
+    Ok(unsafe { OwnedFd::from_raw_fd(r) })
+}
+
 /// The hook body, run in the child between `fork` and `exec`: async-signal-safe and
 /// allocation-free (only syscalls, and `io::Error`s built from errno).
 fn child_setup(
@@ -184,6 +213,13 @@ fn child_setup(
     identities: &[FdIdentity],
     scratch: &mut [RawFd],
 ) -> io::Result<()> {
+    // 0. `procs` must still be the job's `cgroup.procs`: std sets up fds 0-2 (stdin, stdout,
+    //    stderr) before this hook runs, and a write of "0" that lands in a pipe or /dev/null would
+    //    leave the child in the miner's cgroup, uncapped. `prepare_command` keeps it above 2; this
+    //    fails closed if anything else ever replaced it.
+    if !on_cgroup2(procs)? {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
     // SAFETY (whole block): plain syscalls on integers and stack memory.
     unsafe {
         // 1. Join the job cgroup ("0" = the writing process) before anything else.
@@ -222,9 +258,11 @@ fn child_setup(
     apply_plan(&mut LibcFds, plan, scratch)
 }
 
-/// Parent side: configures `cmd` so that, between `fork` and `exec`, the child
-/// 1. joins `cgroup` by writing `0` to its `cgroup.procs` (through an fd opened now, by the
-///    parent);
+/// Parent side: configures `cmd` so that its environment is only what the caller set on it, and
+/// so that, between `fork` and `exec`, the child
+/// 1. joins `cgroup` by writing `0` to its `cgroup.procs`, through an fd opened now, by the parent,
+///    at a number >= 3 (std places the child's stdin, stdout and stderr on 0-2 before the hook runs),
+///    after checking with `fstatfs` that the fd is still on cgroup2 (else the spawn fails);
 /// 2. sets `RLIMIT_CORE=0` and `NO_NEW_PRIVS`;
 /// 3. sets `PR_SET_PDEATHSIG(SIGKILL)`, then compares `getppid()` with this process's pid
 ///    (captured now) and `_exit(127)`s if they differ (the parent died before the signal was armed);
@@ -237,6 +275,14 @@ fn child_setup(
 ///
 /// The hook is async-signal-safe and does not allocate (the plan and scratch space are built
 /// here, in the parent).
+///
+/// # The environment
+/// The child does **not** inherit the miner's environment, which may hold secrets (provider keys,
+/// RPC URLs with credentials, `ZKMINER_*` settings) that a sandboxed process can read from its own
+/// memory even though nothing else can (it is not dumpable). `prepare_command` calls
+/// `Command::env_clear` and re-adds only the variables already set on `cmd` with `Command::env` or
+/// `envs`; variables set after it are passed too. Set what the program needs (e.g. `RUST_LOG`)
+/// explicitly, and give the program as an absolute path: there is no `PATH`.
 ///
 /// # Why this is equivalent to `clone3(CLONE_INTO_CGROUP)` here
 /// The point of `CLONE_INTO_CGROUP` (plan §10.2) is that the caps apply before the sandboxed
@@ -279,11 +325,28 @@ pub fn prepare_command(
         .map(|&(src, _)| fd_identity(src))
         .collect::<io::Result<Vec<_>>>()?;
     let procs_path = cgroup.path().join("cgroup.procs");
+    let cg_err = |e: io::Error| SandboxError::Cgroup(format!("{}: {e}", procs_path.display()));
     let procs: OwnedFd = std::fs::OpenOptions::new()
         .write(true)
         .open(&procs_path)
-        .map_err(|e| SandboxError::Cgroup(format!("{}: {e}", procs_path.display())))?
+        .map_err(cg_err)?
         .into();
+    // A parent with fd 0, 1 or 2 closed gets one of them here; in the child std would replace it
+    // with a stdio fd before the hook writes to it.
+    let procs = above_stdio(procs).map_err(cg_err)?;
+    if !on_cgroup2(procs.as_raw_fd()).map_err(cg_err)? {
+        return Err(SandboxError::Cgroup(format!(
+            "{} is not on the cgroup2 filesystem",
+            procs_path.display()
+        )));
+    }
+    // Only what the caller set explicitly reaches the child (see "The environment").
+    let explicit: Vec<(OsString, OsString)> = cmd
+        .get_envs()
+        .filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned())))
+        .collect();
+    cmd.env_clear();
+    cmd.envs(explicit);
     let parent = std::process::id() as libc::pid_t;
     let mut scratch = vec![-1 as RawFd; plan.moves.len()];
     // SAFETY: the closure only makes async-signal-safe syscalls and does not allocate.
@@ -467,6 +530,42 @@ mod tests {
         let plan = FdPlan::new(&[(9, 3)]).unwrap();
         let mut scratch = vec![-1];
         assert!(apply_plan(&mut Table::with(&stdio()), &plan, &mut scratch).is_err());
+    }
+
+    #[test]
+    fn the_hook_refuses_a_procs_fd_that_is_not_on_cgroup2() {
+        // What the child would hold if std had replaced the fd with /dev/null: the hook must fail
+        // before writing anything (or setting any process attribute).
+        let null = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        assert!(!on_cgroup2(null.as_raw_fd()).unwrap());
+        let plan = FdPlan::new(&[]).unwrap();
+        let parent = std::process::id() as libc::pid_t;
+        let e = child_setup(null.as_raw_fd(), parent, &plan, &[], &mut []).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EBADF));
+        // A closed fd: fstatfs fails, so does the hook.
+        assert!(child_setup(-1, parent, &plan, &[], &mut []).is_err());
+    }
+
+    #[test]
+    fn cgroup2_files_are_recognised() {
+        let Ok(mount) = crate::cgroup::cgroup2_mount() else {
+            return;
+        };
+        let f = std::fs::File::open(mount.join("cgroup.controllers")).unwrap();
+        assert!(on_cgroup2(f.as_raw_fd()).unwrap());
+    }
+
+    #[test]
+    fn above_stdio_keeps_high_fds_and_moves_low_ones() {
+        let f: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let n = f.as_raw_fd();
+        assert!(n >= 3);
+        assert_eq!(above_stdio(f).unwrap().as_raw_fd(), n);
+        // A low fd cannot be produced here without closing the harness's stdio; the integration
+        // test `prepare_command_survives_closed_stdio` covers that path.
     }
 
     #[test]

@@ -10,11 +10,14 @@
 //!   [`prepare_command`] installs a `pre_exec` hook that moves the child into that cgroup before
 //!   `exec` (so caps apply from the new program's first instruction), places the listed fds at fixed
 //!   numbers, sets `NO_NEW_PRIVS`, `PR_SET_PDEATHSIG(SIGKILL)` (re-checked with `getppid`),
-//!   `RLIMIT_CORE=0`, and makes sure no other fd survives the `exec`;
+//!   `RLIMIT_CORE=0`, and makes sure no other fd survives the `exec` and none of the miner's
+//!   environment reaches the child;
 //! - the **child side** (the sandboxed binary itself, at startup, before it starts threads or reads
 //!   any untrusted input): [`restrict_self`] applies Landlock (no filesystem access, no TCP
 //!   bind/connect except the profile's ports, scoped signals and abstract Unix sockets), a seccomp
-//!   denylist, `NO_NEW_PRIVS`, `PR_SET_DUMPABLE(0)` and `RLIMIT_CORE=0`.
+//!   denylist (including SysV IPC, metadata writes through inherited fds, and for the broker every
+//!   socket but TCP and Unix stream pairs), `NO_NEW_PRIVS`, `PR_SET_DUMPABLE(0)` (locked) and
+//!   `RLIMIT_CORE=0`.
 //!
 //! [`self_test`] checks the resulting *properties* (plan §10.3) by running the
 //! `zkminer-witness-sandbox-probe` binary inside each sandbox profile, not just that calls
@@ -24,7 +27,9 @@
 //! - Linux with Landlock ABI >= 6 (Linux 6.12+), seccomp filters and cgroup v2.
 //! - The miner must run in a **delegated** cgroup owned by its uid, e.g. launched with
 //!   `systemd-run --user --scope -p Delegate=yes -- zkminer ...` (or a user unit with
-//!   `Delegate=yes`). [`delegated_root`] fails with [`SandboxError::NotDelegated`] otherwise.
+//!   `Delegate=yes`), with `cpu`, `memory` and `pids` available. [`delegated_root`] asks the unit's
+//!   systemd manager (`systemctl [--user] show --property=Delegate`) and fails with
+//!   [`SandboxError::NotDelegated`] otherwise, before changing anything.
 
 #![cfg(target_os = "linux")]
 
@@ -61,8 +66,12 @@ pub enum Profile {
     ExecuteWorker,
     /// The broker: no filesystem except read-only `readable` paths (its endpoints file, and anything
     /// its resolver or TLS stack reads after [`restrict_self`]) and read-write `writable` directories
-    /// (its quota'd spool), outbound TCP only to `tcp_connect_ports`, sockets only `AF_INET` and
-    /// `AF_INET6`, no new processes. Every listed path must exist when [`restrict_self`] runs.
+    /// (its quota'd spool), outbound TCP only to `tcp_connect_ports` (Landlock: to *any* host on
+    /// those ports; which hosts is the broker's own business), no new processes. Its only sockets
+    /// are TCP (`AF_INET`/`AF_INET6`, `SOCK_STREAM`, protocol 0 or `IPPROTO_TCP`) and `AF_UNIX`
+    /// `SOCK_STREAM` socketpairs: Landlock restricts TCP alone, so UDP, ICMP, raw, SCTP and MPTCP
+    /// sockets (and datagram socketpairs, which reach pathname sockets) are refused by seccomp.
+    /// Every listed path must exist when [`restrict_self`] runs.
     Broker {
         readable: Vec<PathBuf>,
         writable: Vec<PathBuf>,

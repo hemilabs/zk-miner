@@ -180,7 +180,115 @@ fn owned_by_us(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Why `dir` is not a cgroup this uid can manage, if it is not.
+/// The controllers of [`CONTROLLERS`] missing from `cgroup.controllers` text.
+pub(crate) fn missing_controllers(available: &str) -> Vec<&'static str> {
+    CONTROLLERS
+        .into_iter()
+        .filter(|c| !available.split_whitespace().any(|a| a == *c))
+        .collect()
+}
+
+/// Which systemd manager owns the unit a cgroup belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SystemdUnit {
+    /// No unit on the path (a cgroup namespace root, a host without systemd): nothing to ask.
+    None,
+    /// A unit of the system manager (`systemctl show`).
+    System(String),
+    /// A unit of a user manager (`systemctl --user show`).
+    User(String),
+    /// A cgroup systemd never delegates to us: a slice, or a user manager's own `user@N.service`.
+    NotDelegable(String),
+}
+
+/// The innermost systemd unit (`*.service` or `*.scope`) on cgroup path `rel` (relative to the
+/// cgroup2 mount), and its manager: a user manager when a `user@<uid>.service` lies above it.
+/// Components below the unit are the unit's own (delegated) subtree, e.g. `<unit>/supervisor`.
+pub(crate) fn systemd_unit(rel: &Path) -> SystemdUnit {
+    let parts: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    let is_user_manager = |p: &str| {
+        p.strip_prefix("user@")
+            .and_then(|r| r.strip_suffix(".service"))
+            .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit()))
+    };
+    for (i, p) in parts.iter().enumerate().rev() {
+        if p.ends_with(".slice") {
+            return SystemdUnit::NotDelegable(format!("{p} is a systemd slice"));
+        }
+        if p.ends_with(".service") || p.ends_with(".scope") {
+            if is_user_manager(p) {
+                return SystemdUnit::NotDelegable(format!("{p} is the user manager's own cgroup"));
+            }
+            return if parts[..i].iter().any(|q| is_user_manager(q)) {
+                SystemdUnit::User(p.clone())
+            } else {
+                SystemdUnit::System(p.clone())
+            };
+        }
+    }
+    SystemdUnit::None
+}
+
+/// Asks the unit's systemd manager for its `Delegate` property; a problem unless it says `yes`.
+///
+/// systemd owns every cgroup of its units unless the unit has `Delegate=yes`: a user manager runs
+/// as the user, so its units' cgroups are owned by the user whether delegated or not, and on a
+/// reload or a property change it re-applies its own `cgroup.subtree_control` (which would remove
+/// the job cgroups' `memory.max`, `pids.max` and `cpu.max` files, and with them the caps) and may
+/// move or kill processes it finds in sub-cgroups. Ownership and controllers cannot tell the two
+/// apart, so the manager is asked. If it cannot be asked (no `systemctl`, no bus), this fails
+/// closed.
+fn systemd_delegation_problem(rel: &Path) -> Option<String> {
+    let (unit, user) = match systemd_unit(rel) {
+        SystemdUnit::None => return None,
+        SystemdUnit::NotDelegable(why) => {
+            return Some(format!("{why}, which systemd never delegates"))
+        }
+        SystemdUnit::System(u) => (u, false),
+        SystemdUnit::User(u) => (u, true),
+    };
+    let mut cmd = std::process::Command::new("systemctl");
+    if user {
+        cmd.arg("--user");
+    }
+    cmd.args(["show", "--property=Delegate", "--value", "--"])
+        .arg(&unit)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let manager = if user {
+        "the user manager"
+    } else {
+        "the system manager"
+    };
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if value == "yes" {
+                None
+            } else {
+                Some(format!(
+                    "systemd unit {unit} has Delegate={value:?} ({manager})"
+                ))
+            }
+        }
+        Ok(out) => Some(format!(
+            "could not ask {manager} whether {unit} is delegated: systemctl {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Some(format!(
+            "could not ask {manager} whether {unit} is delegated: systemctl: {e}"
+        )),
+    }
+}
+
+/// Why `dir` is not a cgroup this uid can manage, if it is not. Reads only: nothing is changed.
 fn delegation_problem(dir: &Path) -> Option<String> {
     let meta = match std::fs::metadata(dir) {
         Ok(m) => m,
@@ -205,6 +313,28 @@ fn delegation_problem(dir: &Path) -> Option<String> {
                 p.display()
             ));
         }
+    }
+    let rel = match cgroup2_mount() {
+        Ok(m) => dir
+            .strip_prefix(&m)
+            .map(Path::to_path_buf)
+            .unwrap_or_default(),
+        Err(e) => return Some(e.to_string()),
+    };
+    if let Some(p) = systemd_delegation_problem(&rel) {
+        return Some(p);
+    }
+    match std::fs::read_to_string(dir.join("cgroup.controllers")) {
+        Ok(text) => {
+            let missing = missing_controllers(&text);
+            if !missing.is_empty() {
+                return Some(format!(
+                    "controllers {missing:?} are not available (cgroup.controllers: {:?})",
+                    text.trim()
+                ));
+            }
+        }
+        Err(e) => return Some(format!("{}/cgroup.controllers: {e}", dir.display())),
     }
     None
 }
@@ -272,13 +402,25 @@ fn enable_controllers(dir: &Path) -> Result<(), SandboxError> {
 /// The delegated cgroup v2 directory per-job cgroups are created in: `<own>/sandboxes`, where
 /// `<own>` is this process's cgroup from `/proc/self/cgroup`.
 ///
-/// `<own>` must be owned by and writable for this uid (a systemd `Delegate=yes` scope or unit),
-/// else [`SandboxError::NotDelegated`]. The shell's `session-N.scope` is root-owned and does not
-/// qualify; launch the miner with `systemd-run --user --scope -p Delegate=yes -- zkminer ...`.
+/// Before changing anything it checks that `<own>` is delegated to this uid, else
+/// [`SandboxError::NotDelegated`]:
+/// - `<own>`, its `cgroup.procs` and its `cgroup.subtree_control` are owned by and writable for
+///   this uid (the kernel's delegation model). The shell's `session-N.scope` is root-owned and does
+///   not qualify;
+/// - when `<own>` belongs to a systemd unit (the innermost `*.service`/`*.scope` on its path), that
+///   unit's manager reports `Delegate=yes` (`systemctl [--user] show --property=Delegate`). Under a
+///   user manager ownership proves nothing — the manager runs as the user, so every unit's cgroup
+///   is the user's — and a manager that was not asked to delegate re-applies its own
+///   `cgroup.subtree_control` on reloads, which would take the caps away. A slice, or the user
+///   manager's own `user@N.service`, never qualifies; if `systemctl` cannot be asked, this fails;
+/// - `cpu`, `memory` and `pids` are listed in `<own>/cgroup.controllers` (the parent grants them).
 ///
-/// It makes `<own>` usable under cgroup v2's rules: no process may live in a cgroup that enables
-/// controllers for its children, and moving a process needs write access to the common ancestor's
-/// `cgroup.procs`, so everything must stay inside `<own>`. Hence:
+/// Launch the miner with `systemd-run --user --scope -p Delegate=yes -- zkminer ...` or from a
+/// unit with `Delegate=yes`.
+///
+/// It then makes `<own>` usable under cgroup v2's rules: no process may live in a cgroup that
+/// enables controllers for its children, and moving a process needs write access to the common
+/// ancestor's `cgroup.procs`, so everything must stay inside `<own>`. Hence:
 /// - create `<own>/supervisor` and move **every** process in `<own>` into it (all of them are this
 ///   uid's processes in a delegated scope: the miner, and e.g. cargo in tests);
 /// - enable `+cpu +memory +pids` in `<own>/cgroup.subtree_control`;
@@ -595,6 +737,58 @@ mod tests {
         assert_eq!(parse_keyed("populated 1\nfrozen 0\n", "populated"), Some(1));
         // "oom" must not match the "oom_kill" line, and vice versa.
         assert_eq!(parse_keyed("oom_kill 5\n", "oom"), None);
+    }
+
+    #[test]
+    fn controllers() {
+        assert!(missing_controllers("cpuset cpu io memory hugetlb pids rdma misc\n").is_empty());
+        assert_eq!(missing_controllers("memory pids\n"), vec!["cpu"]);
+        assert_eq!(missing_controllers(""), vec!["cpu", "memory", "pids"]);
+        // Whole words only.
+        assert_eq!(missing_controllers("cpuset memory pids"), vec!["cpu"]);
+    }
+
+    #[test]
+    fn systemd_units_on_a_path() {
+        let u = |s: &str| systemd_unit(Path::new(s));
+        let user = "user.slice/user-1000.slice/user@1000.service";
+        assert_eq!(
+            u(&format!("{user}/app.slice/run-p1-i2.scope")),
+            SystemdUnit::User("run-p1-i2.scope".into())
+        );
+        // The unit's own subtree: still that unit.
+        assert_eq!(
+            u(&format!("{user}/app.slice/zkminer.service/supervisor")),
+            SystemdUnit::User("zkminer.service".into())
+        );
+        assert_eq!(
+            u("system.slice/zkminer.service"),
+            SystemdUnit::System("zkminer.service".into())
+        );
+        assert_eq!(
+            u("system.slice/zkminer.service/sandboxes"),
+            SystemdUnit::System("zkminer.service".into())
+        );
+        assert!(matches!(
+            u(&format!("{user}/app.slice")),
+            SystemdUnit::NotDelegable(_)
+        ));
+        assert!(matches!(u(user), SystemdUnit::NotDelegable(_)));
+        assert!(matches!(
+            u(&format!("{user}/init.scope")),
+            SystemdUnit::User(_)
+        ));
+        assert!(matches!(
+            u("user.slice/user-1000.slice/session-1.scope"),
+            SystemdUnit::System(_)
+        ));
+        assert_eq!(u(""), SystemdUnit::None);
+        assert_eq!(u("my-container/workers"), SystemdUnit::None);
+        // A name that only looks like a user manager.
+        assert_eq!(
+            u("system.slice/user@x.service/a.scope"),
+            SystemdUnit::System("a.scope".into())
+        );
     }
 
     #[test]
