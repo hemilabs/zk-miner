@@ -24,3 +24,5 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 zkminer-prover = { workspace = true }
+# Paused-clock tests of the RPC lanes and the governance watcher.
+tokio = { workspace = true, features = ["test-util"] }
