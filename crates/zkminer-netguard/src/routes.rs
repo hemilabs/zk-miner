@@ -1,0 +1,844 @@
+//! The host's routing table, and the best-route rule (review r1, fetch F1 / broker F1).
+//!
+//! An interface's netmask does not say everything the host is directly attached to. A DHCPv6
+//! address is a /128 while the router advertises its /64 as on-link (a route, `proto ra`); an IPv4
+//! address can be a /32 with the subnet installed as a route; a VPN, WireGuard, Tailscale or Docker
+//! network is a route on its own interface, sometimes to global addresses. So the facts include
+//! every unicast route of every routing table (netlink `RTM_GETROUTE`, which needs no privileges),
+//! and two rules come from it:
+//!
+//! - **on-link routes are connected prefixes:** a unicast route with no gateway, not on a loopback
+//!   interface and not a default route names a network the host reaches directly
+//!   ([`RouteTable::on_link_prefixes`]);
+//! - **the best route must be the default path** ([`RouteTable::off_default_path`]): for a
+//!   destination, the routes whose prefix holds it with the longest prefix length (the kernel's
+//!   longest-prefix match) must all take the default path, else the destination is refused. A
+//!   route takes the default path when it is a default route — `0.0.0.0/0`, `::/0`, or a
+//!   "split default" no longer than /[`DEFAULT_LIKE_MAX_LEN`] (`0.0.0.0/1` + `128.0.0.0/1`,
+//!   `2000::/4`, …: how full-tunnel VPNs override the default without replacing it), whether it has
+//!   a gateway or not (a PPPoE or WireGuard uplink is a gateway-less default route) — or when it
+//!   goes through the gateway, on the interface, of a true default route (`/0`): a DHCP option 121
+//!   route to a DNS or NTP server via the home router reaches nothing the default route does not.
+//!   Anything else — an on-link route, a route on a loopback interface, a route through another
+//!   gateway (a VPN's pushed routes, a static route into a DMZ), a route through a nexthop object
+//!   whose gateway the dump does not show — is refused.
+//!
+//! Routes of every table are merged, so policy routing (`ip rule`) is not modelled: a specific
+//! route in any table refuses its destinations, even where a rule would never consult that table.
+//! That errs towards refusing. A destination no route holds is admitted (the kernel will not
+//! connect to it either).
+//!
+//! Only Linux (and Android) routing tables are read; elsewhere the table is empty and only the
+//! interfaces' own prefixes are known (put further ranges in `[egress] deny_cidrs`).
+
+use std::net::IpAddr;
+
+use crate::ip::{mask, Prefix};
+
+/// The longest prefix length that still counts as a default route: a "split default" that covers
+/// at least 1/16 of its family's address space (OpenVPN's `def1`: `0.0.0.0/1` and `128.0.0.0/1`;
+/// its IPv6 equivalent: `::/3`, `2000::/4`, `3000::/4`).
+pub const DEFAULT_LIKE_MAX_LEN: u8 = 4;
+
+/// Where a route sends packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Hop {
+    /// Directly to the destination on the interface (no gateway): an on-link route.
+    OnLink,
+    /// Through this gateway.
+    Via(IpAddr),
+    /// Through a nexthop object whose gateway the dump does not show.
+    Unknown,
+}
+
+/// One unicast route (of any routing table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Route {
+    /// The destination (`0.0.0.0/0` or `::/0` for a default route).
+    pub prefix: Prefix,
+    pub hop: Hop,
+    /// The outgoing interface's index (0 when the route names none).
+    pub ifindex: u32,
+    /// Whether the outgoing interface is a loopback interface.
+    pub loopback: bool,
+}
+
+impl Route {
+    /// An on-link route on interface `ifindex` (tests, and callers with their own source).
+    pub fn on_link(prefix: Prefix, ifindex: u32) -> Self {
+        Route {
+            prefix: Prefix::new(prefix.addr, prefix.len),
+            hop: Hop::OnLink,
+            ifindex,
+            loopback: false,
+        }
+    }
+
+    /// A route through `gateway` on interface `ifindex`.
+    pub fn via(prefix: Prefix, gateway: IpAddr, ifindex: u32) -> Self {
+        Route {
+            prefix: Prefix::new(prefix.addr, prefix.len),
+            hop: Hop::Via(gateway),
+            ifindex,
+            loopback: false,
+        }
+    }
+
+    /// Whether the route counts as a default route (`/0`, or a split default up to
+    /// /[`DEFAULT_LIKE_MAX_LEN`]).
+    pub fn is_default_like(&self) -> bool {
+        self.prefix.len <= DEFAULT_LIKE_MAX_LEN
+    }
+
+    /// Whether `ip` is in the route's prefix, read as written (a routing table is per family).
+    fn holds(&self, ip: IpAddr) -> bool {
+        self.prefix.addr.is_ipv4() == ip.is_ipv4() && mask(ip, self.prefix.len) == self.prefix.addr
+    }
+}
+
+/// The routing table, with the default path worked out (see the module doc).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteTable {
+    routes: Vec<Route>,
+    /// `(gateway, interface)` of every true default route (`/0`) that has a gateway.
+    uplinks: Vec<(IpAddr, u32)>,
+}
+
+impl RouteTable {
+    pub fn new(mut routes: Vec<Route>) -> Self {
+        for r in &mut routes {
+            r.prefix = Prefix::new(r.prefix.addr, r.prefix.len);
+        }
+        routes.sort();
+        routes.dedup();
+        let mut uplinks: Vec<(IpAddr, u32)> = routes
+            .iter()
+            .filter(|r| r.prefix.len == 0)
+            .filter_map(|r| match r.hop {
+                Hop::Via(gw) => Some((gw, r.ifindex)),
+                _ => None,
+            })
+            .collect();
+        uplinks.sort();
+        uplinks.dedup();
+        RouteTable { routes, uplinks }
+    }
+
+    /// Every route, sorted.
+    pub fn routes(&self) -> &[Route] {
+        &self.routes
+    }
+
+    /// Whether `r` takes the default path: it is a default route (or a split default), or it goes
+    /// through the gateway, on the interface, of a true default route.
+    pub fn via_default_path(&self, r: &Route) -> bool {
+        if r.is_default_like() {
+            return true;
+        }
+        match r.hop {
+            Hop::Via(gw) => self.uplinks.contains(&(gw, r.ifindex)),
+            Hop::OnLink | Hop::Unknown => false,
+        }
+    }
+
+    /// The route that refuses `ip`: among the routes holding `ip` with the longest prefix length
+    /// (the kernel's choice, up to policy routing), the first that does not take the default path.
+    /// `None` when every one of them does, or when no route holds `ip`.
+    pub fn off_default_path(&self, ip: IpAddr) -> Option<&Route> {
+        let best = self
+            .routes
+            .iter()
+            .filter(|r| r.holds(ip))
+            .map(|r| r.prefix.len)
+            .max()?;
+        self.routes
+            .iter()
+            .filter(|r| r.prefix.len == best && r.holds(ip))
+            .find(|r| !self.via_default_path(r))
+    }
+
+    /// The prefixes of the on-link routes: no gateway, not on a loopback interface, not a default
+    /// route. Connected prefixes the interfaces' netmasks may not show.
+    pub fn on_link_prefixes(&self) -> Vec<Prefix> {
+        let mut v: Vec<Prefix> = self
+            .routes
+            .iter()
+            .filter(|r| r.hop == Hop::OnLink && !r.loopback && !r.is_default_like())
+            .map(|r| r.prefix)
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// The prefixes of every route that does not take the default path (on-link routes, routes on
+    /// a loopback interface, routes through another gateway): what a consumer that knows only
+    /// prefixes must refuse to refuse what [`Self::off_default_path`] refuses. Wider than the
+    /// rule itself where a more specific default-path route sits inside one of them.
+    pub fn off_default_prefixes(&self) -> Vec<Prefix> {
+        let mut v: Vec<Prefix> = self
+            .routes
+            .iter()
+            .filter(|r| !self.via_default_path(r))
+            .map(|r| r.prefix)
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+}
+
+/// Reads every unicast route of every table, IPv4 and IPv6. `loopback` is the set of loopback
+/// interface indexes (from the interface list).
+pub(crate) fn read_routes(loopback: &[u32]) -> std::io::Result<Vec<Route>> {
+    let mut routes = sys::dump()?;
+    for r in &mut routes {
+        r.loopback = r.ifindex != 0 && loopback.contains(&r.ifindex);
+    }
+    Ok(routes)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod sys {
+    //! A netlink `RTM_GETROUTE` dump, per family. Unprivileged; every table.
+
+    use std::io;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    use super::{Hop, Route};
+    use crate::ip::Prefix;
+
+    const NLMSG_HDRLEN: usize = 16;
+    const RTMSG_LEN: usize = 12;
+    const NLMSG_ERROR: u16 = 2;
+    const NLMSG_DONE: u16 = 3;
+    const RTM_NEWROUTE: u16 = 24;
+    const RTM_GETROUTE: u16 = 26;
+    const NLM_F_REQUEST: u16 = 1;
+    const NLM_F_DUMP: u16 = 0x300;
+    const RTN_UNICAST: u8 = 1;
+    const RTM_F_CLONED: u32 = 0x200;
+    const RTA_DST: u16 = 1;
+    const RTA_OIF: u16 = 4;
+    const RTA_GATEWAY: u16 = 5;
+    const RTA_MULTIPATH: u16 = 9;
+    const RTA_VIA: u16 = 18;
+    const RTA_NH_ID: u16 = 30;
+    /// The most a dump message can be (the kernel caps dump skbs at 32 KiB).
+    const RECV_BUF: usize = 64 * 1024;
+    /// A ceiling on the routes read, against a runaway dump.
+    const MAX_ROUTES: usize = 1 << 20;
+
+    pub(super) fn dump() -> io::Result<Vec<Route>> {
+        let mut out = Vec::new();
+        for family in [libc::AF_INET, libc::AF_INET6] {
+            dump_family(family as u8, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    fn align4(n: usize) -> usize {
+        (n + 3) & !3
+    }
+
+    fn dump_family(family: u8, out: &mut Vec<Route>) -> io::Result<()> {
+        // SAFETY: plain socket(2); the fd is owned by `sock` from here on.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::NETLINK_ROUTE,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just created and is owned here alone.
+        let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+        let seq: u32 = 1;
+        let mut req = Vec::with_capacity(NLMSG_HDRLEN + RTMSG_LEN);
+        req.extend_from_slice(&((NLMSG_HDRLEN + RTMSG_LEN) as u32).to_ne_bytes());
+        req.extend_from_slice(&RTM_GETROUTE.to_ne_bytes());
+        req.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+        req.extend_from_slice(&seq.to_ne_bytes());
+        req.extend_from_slice(&0u32.to_ne_bytes());
+        let mut rtmsg = [0u8; RTMSG_LEN];
+        rtmsg[0] = family;
+        req.extend_from_slice(&rtmsg);
+        // SAFETY: a zeroed sockaddr_nl is the kernel's address (nl_pid 0, no groups).
+        let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        // SAFETY: `req` and `kernel` are valid for the lengths given.
+        let sent = unsafe {
+            libc::sendto(
+                sock.as_raw_fd(),
+                req.as_ptr().cast(),
+                req.len(),
+                0,
+                (&kernel as *const libc::sockaddr_nl).cast(),
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buf = vec![0u8; RECV_BUF];
+        loop {
+            // SAFETY: a zeroed sockaddr_nl is valid to be overwritten by recvfrom.
+            let mut from: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            let mut from_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+            // SAFETY: `buf` and `from` are valid for the lengths given.
+            let n = unsafe {
+                libc::recvfrom(
+                    sock.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    0,
+                    (&mut from as *mut libc::sockaddr_nl).cast(),
+                    &mut from_len,
+                )
+            };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if from.nl_pid != 0 {
+                // Not from the kernel.
+                continue;
+            }
+            if parse_messages(&buf[..n as usize], seq, out)? {
+                return Ok(());
+            }
+            if out.len() > MAX_ROUTES {
+                return Err(io::Error::other("the routing table dump never ended"));
+            }
+        }
+    }
+
+    fn malformed() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed netlink route message",
+        )
+    }
+
+    fn u16_at(b: &[u8], i: usize) -> Option<u16> {
+        Some(u16::from_ne_bytes(b.get(i..i + 2)?.try_into().ok()?))
+    }
+
+    fn u32_at(b: &[u8], i: usize) -> Option<u32> {
+        Some(u32::from_ne_bytes(b.get(i..i + 4)?.try_into().ok()?))
+    }
+
+    /// Parses one datagram of the dump into `out`; `true` once the dump is done.
+    pub(super) fn parse_messages(mut b: &[u8], seq: u32, out: &mut Vec<Route>) -> io::Result<bool> {
+        while b.len() >= NLMSG_HDRLEN {
+            let len = u32_at(b, 0).ok_or_else(malformed)? as usize;
+            let ty = u16_at(b, 4).ok_or_else(malformed)?;
+            let mseq = u32_at(b, 8).ok_or_else(malformed)?;
+            if len < NLMSG_HDRLEN || len > b.len() {
+                return Err(malformed());
+            }
+            let payload = &b[NLMSG_HDRLEN..len];
+            if mseq == seq {
+                match ty {
+                    NLMSG_DONE => return Ok(true),
+                    NLMSG_ERROR => {
+                        let code = u32_at(payload, 0).ok_or_else(malformed)? as i32;
+                        if code != 0 {
+                            return Err(io::Error::from_raw_os_error(-code));
+                        }
+                        return Ok(true);
+                    }
+                    RTM_NEWROUTE => parse_route(payload, out)?,
+                    _ => {}
+                }
+            }
+            b = &b[align4(len).min(b.len())..];
+        }
+        Ok(false)
+    }
+
+    fn addr(family: u8, data: &[u8]) -> Option<IpAddr> {
+        match (i32::from(family), data.len()) {
+            (libc::AF_INET, 4) => Some(IpAddr::V4(Ipv4Addr::new(
+                data[0], data[1], data[2], data[3],
+            ))),
+            (libc::AF_INET6, 16) => {
+                Some(IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(data).ok()?)))
+            }
+            _ => None,
+        }
+    }
+
+    /// `RTA_VIA`: `struct rtvia { __kernel_sa_family_t rtvia_family; __u8 rtvia_addr[]; }`.
+    fn via(data: &[u8]) -> Option<IpAddr> {
+        let fam = u16_at(data, 0)?;
+        addr(fam as u8, data.get(2..)?)
+    }
+
+    /// The attributes in `b`, as `(type, data)`.
+    fn attrs(mut b: &[u8]) -> io::Result<Vec<(u16, &[u8])>> {
+        let mut v = Vec::new();
+        while b.len() >= 4 {
+            let len = usize::from(u16_at(b, 0).ok_or_else(malformed)?);
+            let ty = u16_at(b, 2).ok_or_else(malformed)? & 0x3fff; // strip NLA_F_NESTED/BYTEORDER
+            if len < 4 || len > b.len() {
+                return Err(malformed());
+            }
+            v.push((ty, &b[4..len]));
+            b = &b[align4(len).min(b.len())..];
+        }
+        Ok(v)
+    }
+
+    fn parse_route(p: &[u8], out: &mut Vec<Route>) -> io::Result<()> {
+        if p.len() < RTMSG_LEN {
+            return Err(malformed());
+        }
+        let (family, dst_len, rtype) = (p[0], p[1], p[7]);
+        let flags = u32_at(p, 8).ok_or_else(malformed)?;
+        if rtype != RTN_UNICAST || flags & RTM_F_CLONED != 0 {
+            return Ok(());
+        }
+        let mut dst = None;
+        let mut gateway = None;
+        let mut oif = 0u32;
+        let mut nh_object = false;
+        let mut multipath: Vec<(Hop, u32)> = Vec::new();
+        for (ty, data) in attrs(&p[RTMSG_LEN..])? {
+            match ty {
+                RTA_DST => dst = addr(family, data),
+                RTA_GATEWAY => gateway = addr(family, data),
+                RTA_VIA => gateway = via(data),
+                RTA_OIF => oif = u32_at(data, 0).unwrap_or(0),
+                RTA_NH_ID => nh_object = true,
+                RTA_MULTIPATH => {
+                    // struct rtnexthop { u16 len; u8 flags; u8 hops; i32 ifindex; } + attributes.
+                    let mut m = data;
+                    while m.len() >= 8 {
+                        let len = usize::from(u16_at(m, 0).ok_or_else(malformed)?);
+                        if len < 8 || len > m.len() {
+                            return Err(malformed());
+                        }
+                        let ifindex = u32_at(m, 4).ok_or_else(malformed)?;
+                        let mut gw = None;
+                        for (t, d) in attrs(&m[8..len])? {
+                            match t {
+                                RTA_GATEWAY => gw = addr(family, d),
+                                RTA_VIA => gw = via(d),
+                                _ => {}
+                            }
+                        }
+                        multipath.push((gw.map_or(Hop::OnLink, Hop::Via), ifindex));
+                        m = &m[align4(len).min(m.len())..];
+                    }
+                }
+                _ => {}
+            }
+        }
+        let unspecified = if i32::from(family) == libc::AF_INET {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else if i32::from(family) == libc::AF_INET6 {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        } else {
+            return Ok(());
+        };
+        let prefix = Prefix::new(dst.unwrap_or(unspecified), dst_len);
+        let mut push = |hop: Hop, ifindex: u32| {
+            out.push(Route {
+                prefix,
+                hop,
+                ifindex,
+                loopback: false,
+            })
+        };
+        if !multipath.is_empty() {
+            for (hop, ifindex) in multipath {
+                push(hop, ifindex);
+            }
+        } else {
+            let hop = match (gateway, nh_object) {
+                (Some(gw), _) => Hop::Via(gw),
+                (None, true) => Hop::Unknown,
+                (None, false) => Hop::OnLink,
+            };
+            push(hop, oif);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn attr(ty: u16, data: &[u8]) -> Vec<u8> {
+            let mut v = Vec::new();
+            v.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
+            v.extend_from_slice(&ty.to_ne_bytes());
+            v.extend_from_slice(data);
+            while v.len() % 4 != 0 {
+                v.push(0);
+            }
+            v
+        }
+
+        fn msg(ty: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
+            let mut v = Vec::new();
+            v.extend_from_slice(&((NLMSG_HDRLEN + payload.len()) as u32).to_ne_bytes());
+            v.extend_from_slice(&ty.to_ne_bytes());
+            v.extend_from_slice(&2u16.to_ne_bytes()); // NLM_F_MULTI
+            v.extend_from_slice(&seq.to_ne_bytes());
+            v.extend_from_slice(&0u32.to_ne_bytes());
+            v.extend_from_slice(payload);
+            v
+        }
+
+        fn rt(family: u8, dst_len: u8, rtype: u8, attrs: &[Vec<u8>]) -> Vec<u8> {
+            let mut v = vec![family, dst_len, 0, 0, 254, 3, 0, rtype, 0, 0, 0, 0];
+            for a in attrs {
+                v.extend_from_slice(a);
+            }
+            v
+        }
+
+        #[test]
+        fn route_messages_parse() {
+            let v4 = libc::AF_INET as u8;
+            let v6 = libc::AF_INET6 as u8;
+            let mut dgram = Vec::new();
+            // default via 192.168.1.1 dev 2
+            dgram.extend(msg(
+                RTM_NEWROUTE,
+                1,
+                &rt(
+                    v4,
+                    0,
+                    RTN_UNICAST,
+                    &[
+                        attr(RTA_GATEWAY, &[192, 168, 1, 1]),
+                        attr(RTA_OIF, &2u32.to_ne_bytes()),
+                    ],
+                ),
+            ));
+            // 172.17.0.0/16 dev 3 (on-link)
+            dgram.extend(msg(
+                RTM_NEWROUTE,
+                1,
+                &rt(
+                    v4,
+                    16,
+                    RTN_UNICAST,
+                    &[
+                        attr(RTA_DST, &[172, 17, 0, 0]),
+                        attr(RTA_OIF, &3u32.to_ne_bytes()),
+                    ],
+                ),
+            ));
+            // local 192.168.1.33 (type local): skipped
+            dgram.extend(msg(
+                RTM_NEWROUTE,
+                1,
+                &rt(v4, 32, 2, &[attr(RTA_DST, &[192, 168, 1, 33])]),
+            ));
+            // 2606:4700:1::/64 dev 2 (on-link, proto ra)
+            let mut d6 = [0u8; 16];
+            d6[..6].copy_from_slice(&[0x26, 0x06, 0x47, 0x00, 0, 1]);
+            dgram.extend(msg(
+                RTM_NEWROUTE,
+                1,
+                &rt(
+                    v6,
+                    64,
+                    RTN_UNICAST,
+                    &[attr(RTA_DST, &d6), attr(RTA_OIF, &2u32.to_ne_bytes())],
+                ),
+            ));
+            // ::/0 through a nexthop object (no gateway shown)
+            dgram.extend(msg(
+                RTM_NEWROUTE,
+                1,
+                &rt(v6, 0, RTN_UNICAST, &[attr(RTA_NH_ID, &7u32.to_ne_bytes())]),
+            ));
+            // 10.9.0.0/16 multipath: via 10.0.0.1 dev 4, on-link dev 5
+            let mut nh1 = Vec::new();
+            let gw = attr(RTA_GATEWAY, &[10, 0, 0, 1]);
+            nh1.extend_from_slice(&((8 + gw.len()) as u16).to_ne_bytes());
+            nh1.extend_from_slice(&[0, 0]);
+            nh1.extend_from_slice(&4u32.to_ne_bytes());
+            nh1.extend(gw);
+            nh1.extend_from_slice(&8u16.to_ne_bytes());
+            nh1.extend_from_slice(&[0, 0]);
+            nh1.extend_from_slice(&5u32.to_ne_bytes());
+            dgram.extend(msg(
+                RTM_NEWROUTE,
+                1,
+                &rt(
+                    v4,
+                    16,
+                    RTN_UNICAST,
+                    &[attr(RTA_DST, &[10, 9, 0, 0]), attr(RTA_MULTIPATH, &nh1)],
+                ),
+            ));
+            // Another sequence number: ignored.
+            dgram.extend(msg(
+                RTM_NEWROUTE,
+                9,
+                &rt(v4, 8, RTN_UNICAST, &[attr(RTA_DST, &[11, 0, 0, 0])]),
+            ));
+            let mut out = Vec::new();
+            assert!(!parse_messages(&dgram, 1, &mut out).unwrap());
+            let p = |s: &str| s.parse::<Prefix>().unwrap();
+            let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+            assert_eq!(
+                out,
+                vec![
+                    Route {
+                        prefix: p("0.0.0.0/0"),
+                        hop: Hop::Via(ip("192.168.1.1")),
+                        ifindex: 2,
+                        loopback: false
+                    },
+                    Route {
+                        prefix: p("172.17.0.0/16"),
+                        hop: Hop::OnLink,
+                        ifindex: 3,
+                        loopback: false
+                    },
+                    Route {
+                        prefix: p("2606:4700:1::/64"),
+                        hop: Hop::OnLink,
+                        ifindex: 2,
+                        loopback: false
+                    },
+                    Route {
+                        prefix: p("::/0"),
+                        hop: Hop::Unknown,
+                        ifindex: 0,
+                        loopback: false
+                    },
+                    Route {
+                        prefix: p("10.9.0.0/16"),
+                        hop: Hop::Via(ip("10.0.0.1")),
+                        ifindex: 4,
+                        loopback: false
+                    },
+                    Route {
+                        prefix: p("10.9.0.0/16"),
+                        hop: Hop::OnLink,
+                        ifindex: 5,
+                        loopback: false
+                    },
+                ]
+            );
+            assert!(parse_messages(&msg(NLMSG_DONE, 1, &[0; 4]), 1, &mut out).unwrap());
+            let err = msg(NLMSG_ERROR, 1, &(-libc::EPERM).to_ne_bytes());
+            assert_eq!(
+                parse_messages(&err, 1, &mut out)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EPERM)
+            );
+            // A length past the datagram is malformed.
+            let mut bad = msg(RTM_NEWROUTE, 1, &rt(v4, 0, RTN_UNICAST, &[]));
+            bad[0] = 200;
+            assert!(parse_messages(&bad, 1, &mut out).is_err());
+        }
+
+        /// This host's own table reads, and has what every running Linux host has.
+        #[test]
+        fn this_hosts_routes_read() {
+            let routes = dump().expect("netlink route dump");
+            assert!(routes.len() < MAX_ROUTES);
+            for r in &routes {
+                assert_eq!(Prefix::new(r.prefix.addr, r.prefix.len), r.prefix, "{r:?}");
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+mod sys {
+    pub(super) fn dump() -> std::io::Result<Vec<super::Route>> {
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> Prefix {
+        s.parse().unwrap()
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// A home host: DHCP default via the router, the LAN on-link, Docker's bridge, DHCP option 121
+    /// host routes via the router, and IPv6 from router advertisements.
+    fn home() -> RouteTable {
+        RouteTable::new(vec![
+            Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 2),
+            Route::via(p("1.1.1.1/32"), ip("192.168.1.1"), 2),
+            Route::via(p("172.233.157.223/32"), ip("192.168.1.1"), 2),
+            Route::on_link(p("192.168.1.0/24"), 2),
+            Route::on_link(p("192.168.1.1/32"), 2),
+            Route::on_link(p("172.17.0.0/16"), 3),
+            Route::on_link(p("2606:a300:9024:184::/64"), 2),
+            Route::on_link(p("fe80::/64"), 2),
+            Route::via(p("::/0"), ip("fe80::1"), 2),
+        ])
+    }
+
+    #[test]
+    fn the_default_path_is_admitted_and_everything_else_refused() {
+        let t = home();
+        for a in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.233.157.223",
+            "2606:4700::1",
+            "2606:a300:9024:185::1",
+        ] {
+            assert_eq!(t.off_default_path(ip(a)), None, "{a}");
+        }
+        for (a, route) in [
+            ("192.168.1.7", "192.168.1.0/24"),
+            ("172.17.0.2", "172.17.0.0/16"),
+            ("2606:a300:9024:184::99", "2606:a300:9024:184::/64"),
+        ] {
+            assert_eq!(
+                t.off_default_path(ip(a)).map(|r| r.prefix),
+                Some(p(route)),
+                "{a}"
+            );
+        }
+        assert_eq!(
+            t.on_link_prefixes(),
+            vec![
+                p("172.17.0.0/16"),
+                p("192.168.1.0/24"),
+                p("192.168.1.1/32"),
+                p("2606:a300:9024:184::/64"),
+                p("fe80::/64"),
+            ]
+        );
+        assert_eq!(t.off_default_prefixes(), t.on_link_prefixes());
+    }
+
+    /// The reviewers' case: a DHCPv6 host has a /128 address; its /64 is only a route.
+    #[test]
+    fn a_dhcpv6_host_routes_its_on_link_64() {
+        let t = RouteTable::new(vec![
+            Route::on_link(p("2606:4700:1::/64"), 2),
+            Route::via(p("::/0"), ip("fe80::1"), 2),
+        ]);
+        assert_eq!(t.on_link_prefixes(), vec![p("2606:4700:1::/64")]);
+        assert!(t.off_default_path(ip("2606:4700:1::6")).is_some());
+        assert!(t.off_default_path(ip("2606:4700:2::6")).is_none());
+    }
+
+    /// An IPv4 /32 address with its subnet as a route (cloud images, some DHCP clients).
+    #[test]
+    fn a_slash_32_host_routes_its_subnet() {
+        let t = RouteTable::new(vec![
+            Route::on_link(p("203.0.113.0/24"), 2),
+            Route::via(p("0.0.0.0/0"), ip("203.0.113.1"), 2),
+        ]);
+        assert!(t.off_default_path(ip("203.0.113.50")).is_some());
+        assert_eq!(t.on_link_prefixes(), vec![p("203.0.113.0/24")]);
+    }
+
+    /// VPNs: a split tunnel's pushed routes (through the VPN's gateway, or on its interface) are
+    /// refused, a full tunnel's split default is the default path, and so is the VPN server's own
+    /// host route via the LAN router.
+    #[test]
+    fn vpn_routes_are_refused_and_full_tunnels_are_the_default_path() {
+        let t = RouteTable::new(vec![
+            Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 2),
+            Route::on_link(p("10.8.0.0/24"), 7),
+            Route::via(p("198.51.100.0/24"), ip("10.8.0.1"), 7), // a company's public range
+            Route::on_link(p("100.64.0.0/10"), 8),               // Tailscale
+            Route::on_link(p("203.0.113.0/24"), 9),              // WireGuard AllowedIPs
+            Route::via(p("0.0.0.0/1"), ip("10.8.0.1"), 7),       // OpenVPN def1
+            Route::via(p("128.0.0.0/1"), ip("10.8.0.1"), 7),
+            Route::via(p("192.0.2.10/32"), ip("192.168.1.1"), 2), // the VPN server, via the LAN
+            Route::via(p("2000::/4"), ip("fd00::1"), 7),
+        ]);
+        for (a, refused) in [
+            ("198.51.100.20", true),
+            ("203.0.113.5", true),
+            ("100.100.100.100", true),
+            ("8.8.8.8", false),   // the /1 split default
+            ("200.1.1.1", false), // the other half
+            ("192.0.2.10", false),
+            ("2606:4700::1", false),
+        ] {
+            assert_eq!(t.off_default_path(ip(a)).is_some(), refused, "{a}");
+        }
+        assert!(t.off_default_prefixes().contains(&p("198.51.100.0/24")));
+        assert!(!t.off_default_prefixes().contains(&p("0.0.0.0/1")));
+        assert!(!t.on_link_prefixes().contains(&p("198.51.100.0/24")));
+    }
+
+    /// A gateway-less default route (PPPoE, a WireGuard full tunnel) is the default path; so is a
+    /// split default without a gateway. A route on a loopback interface is not, and is not a
+    /// connected prefix either.
+    #[test]
+    fn gateway_less_defaults_and_loopback_routes() {
+        let mut lo = Route::on_link(p("198.18.0.0/15"), 1);
+        lo.loopback = true;
+        let t = RouteTable::new(vec![
+            Route::on_link(p("0.0.0.0/0"), 5),
+            Route::on_link(p("::/3"), 5),
+            lo,
+        ]);
+        assert!(t.off_default_path(ip("8.8.8.8")).is_none());
+        assert!(t.off_default_path(ip("2606:4700::1")).is_none());
+        assert!(t.off_default_path(ip("198.18.0.1")).is_some());
+        assert!(t.on_link_prefixes().is_empty());
+        assert_eq!(t.off_default_prefixes(), vec![p("198.18.0.0/15")]);
+    }
+
+    /// Ties at the best length: one off-path route among them refuses. A nexthop object whose
+    /// gateway is not shown is not the default path; a default through one still is.
+    #[test]
+    fn ties_and_unknown_gateways() {
+        let t = RouteTable::new(vec![
+            Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 2),
+            Route::via(p("9.9.0.0/16"), ip("192.168.1.1"), 2),
+            Route::on_link(p("9.9.0.0/16"), 4),
+            Route {
+                prefix: p("8.8.0.0/16"),
+                hop: Hop::Unknown,
+                ifindex: 2,
+                loopback: false,
+            },
+            Route {
+                prefix: p("::/0"),
+                hop: Hop::Unknown,
+                ifindex: 2,
+                loopback: false,
+            },
+        ]);
+        assert!(t.off_default_path(ip("9.9.1.1")).is_some());
+        assert!(t.off_default_path(ip("8.8.8.8")).is_some());
+        assert!(t.off_default_path(ip("2606:4700::1")).is_none());
+        // A route through the default gateway on another interface is not the default path.
+        let t = RouteTable::new(vec![
+            Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 2),
+            Route::via(p("9.9.0.0/16"), ip("192.168.1.1"), 3),
+        ]);
+        assert!(t.off_default_path(ip("9.9.1.1")).is_some());
+        // Nothing holds it: no route, no refusal.
+        assert!(RouteTable::default()
+            .off_default_path(ip("8.8.8.8"))
+            .is_none());
+    }
+}

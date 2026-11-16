@@ -1,36 +1,132 @@
-//! What the host itself is on the network: its own addresses and the prefixes its interfaces are
-//! connected to.
+//! What the host itself is on the network: its own addresses, the prefixes it is connected to,
+//! the site around its IPv6 addresses, the DNS servers it uses, and its routing table.
 //!
 //! A global address can still be the host itself (its public address, reached by hairpin through
-//! the router) or a neighbour on its own link (a NAS or a BMC with a global IPv6 address in the
-//! miner's /64, a server on the same public subnet). A connection a requester causes is refused to
-//! all of them ([`crate::admit`]). A public address the host only has behind NAT is not on any
-//! interface, so the operator names it in the deny CIDRs instead.
+//! the router) or a neighbour (a NAS or a BMC with a global IPv6 address in the miner's /64, a
+//! server on the same public subnet, a host behind a VPN route). A connection a requester causes
+//! is refused to all of them ([`crate::admit`]). The facts, gathered by [`HostFacts::gather_with`]:
+//!
+//! - **own addresses:** every interface address, plus the public addresses the host has behind NAT,
+//!   learned from fixed reflectors ([`crate::public`]; `discover_public_addresses`);
+//! - **connected prefixes:** every interface address under its netmask, the peer of a
+//!   point-to-point link, and every on-link route (no gateway, not on loopback, not a default
+//!   route): a DHCPv6 address is a /128 whose /64 is only a route ([`crate::routes`]);
+//! - **site prefixes:** the enclosing /`ipv6_site_prefix_len` (default /56) of every own global
+//!   IPv6 address. A home or office is delegated a /56 (or a /48) and numbers its other networks
+//!   from it, none of which the host's own /64 shows;
+//! - **DNS servers:** the `nameserver`s of `/etc/resolv.conf` and of systemd-resolved's
+//!   `/run/systemd/resolve/resolv.conf` (the upstream servers behind its `127.0.0.53` stub), which
+//!   may answer only their own customers;
+//! - **the routing table**, for the best-route rule: a destination whose best route is not the
+//!   default path is refused ([`crate::routes::RouteTable::off_default_path`]).
+//!
+//! A miner in a container sees the container's network, not the host's: run it with host
+//! networking, or list the host's networks in `[egress] deny_cidrs`.
 
 use std::io;
 use std::net::IpAddr;
+use std::ops::RangeInclusive;
 use std::time::Instant;
 
-use crate::ip::Prefix;
+use crate::ip::{is_global, Prefix};
+use crate::routes::{Route, RouteTable};
 
-/// A snapshot of the host's addresses and connected prefixes.
+/// The default `[egress] ipv6_site_prefix_len`.
+pub const DEFAULT_IPV6_SITE_PREFIX_LEN: u8 = 56;
+/// The lengths `[egress] ipv6_site_prefix_len` may take.
+pub const IPV6_SITE_PREFIX_LENS: RangeInclusive<u8> = 48..=64;
+
+/// The operator's settings for gathering host facts (`[egress]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FactsOptions {
+    /// The site around each of the host's own global IPv6 addresses that is refused
+    /// ([`IPV6_SITE_PREFIX_LENS`], default [`DEFAULT_IPV6_SITE_PREFIX_LEN`]).
+    pub ipv6_site_prefix_len: u8,
+    /// Whether to learn the host's public (NAT) addresses from fixed reflectors
+    /// ([`crate::public`]). Default true.
+    pub discover_public_addresses: bool,
+}
+
+impl Default for FactsOptions {
+    fn default() -> Self {
+        FactsOptions {
+            ipv6_site_prefix_len: DEFAULT_IPV6_SITE_PREFIX_LEN,
+            discover_public_addresses: true,
+        }
+    }
+}
+
+impl FactsOptions {
+    /// Refuses a site prefix length outside [`IPV6_SITE_PREFIX_LENS`].
+    pub fn validate(&self) -> Result<(), String> {
+        if IPV6_SITE_PREFIX_LENS.contains(&self.ipv6_site_prefix_len) {
+            Ok(())
+        } else {
+            Err(format!(
+                "ipv6_site_prefix_len = {} is outside {}..={}",
+                self.ipv6_site_prefix_len,
+                IPV6_SITE_PREFIX_LENS.start(),
+                IPV6_SITE_PREFIX_LENS.end()
+            ))
+        }
+    }
+}
+
+/// What the system said, before it is judged: the injectable input of [`HostFacts::assemble`]
+/// (tests stage a DHCPv6 host or a VPN with it, no root needed).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawFacts {
+    /// Every interface address under its netmask, and point-to-point peers.
+    pub interface_prefixes: Vec<Prefix>,
+    /// Every interface address.
+    pub interface_addresses: Vec<IpAddr>,
+    /// Every unicast route of every table.
+    pub routes: Vec<Route>,
+    /// The DNS servers the host uses.
+    pub resolvers: Vec<IpAddr>,
+    /// The host's public addresses as reflectors see them.
+    pub public_addresses: Vec<IpAddr>,
+}
+
+/// A snapshot of the host's facts (see the module doc).
 #[derive(Debug, Clone)]
 pub struct HostFacts {
     connected: Vec<Prefix>,
     own: Vec<IpAddr>,
+    site: Vec<Prefix>,
+    resolvers: Vec<IpAddr>,
+    routes: RouteTable,
     gathered_at: Instant,
 }
 
+fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> {
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// The enclosing /`len` of every global IPv6 address in `own` (`len` clamped to
+/// [`IPV6_SITE_PREFIX_LENS`]).
+pub fn site_prefixes(own: &[IpAddr], len: u8) -> Vec<Prefix> {
+    let len = len.clamp(*IPV6_SITE_PREFIX_LENS.start(), *IPV6_SITE_PREFIX_LENS.end());
+    sorted(
+        own.iter()
+            .filter(|a| a.is_ipv6() && is_global(**a) && crate::canonical_ip(**a) == **a)
+            .map(|a| Prefix::new(*a, len))
+            .collect(),
+    )
+}
+
 impl HostFacts {
-    /// Facts given by the caller (tests, or a caller with its own source).
-    pub fn new(mut connected: Vec<Prefix>, mut own: Vec<IpAddr>) -> Self {
-        connected.sort();
-        connected.dedup();
-        own.sort();
-        own.dedup();
+    /// Facts given by the caller: connected prefixes and own addresses only (no site prefixes,
+    /// DNS servers or routes). Tests, and the witness broker, which is told the facts.
+    pub fn new(connected: Vec<Prefix>, own: Vec<IpAddr>) -> Self {
         HostFacts {
-            connected,
-            own,
+            connected: sorted(connected),
+            own: sorted(own),
+            site: Vec::new(),
+            resolvers: Vec::new(),
+            routes: RouteTable::default(),
             gathered_at: Instant::now(),
         }
     }
@@ -40,29 +136,129 @@ impl HostFacts {
         Self::new(Vec::new(), Vec::new())
     }
 
-    /// Reads every interface of the host: each address is one of its own, and its network (the
-    /// address under its netmask or on-link prefix length) a connected prefix, plus the peer of a
-    /// point-to-point link as a host route. An address without a netmask counts as a host route; a
-    /// non-contiguous netmask counts its leading ones, which only widens the prefix.
-    pub fn gather() -> io::Result<Self> {
-        let (connected, own) = sys::interfaces()?;
-        Ok(Self::new(connected, own))
+    /// The facts `raw` amounts to under `opts` (see the module doc).
+    pub fn assemble(raw: RawFacts, opts: &FactsOptions) -> Self {
+        let routes = RouteTable::new(raw.routes);
+        let mut connected = raw.interface_prefixes;
+        connected.extend(routes.on_link_prefixes());
+        let mut own = raw.interface_addresses;
+        own.extend(raw.public_addresses.into_iter().filter(|a| is_global(*a)));
+        let own = sorted(own);
+        HostFacts {
+            connected: sorted(connected),
+            site: site_prefixes(&own, opts.ipv6_site_prefix_len),
+            own,
+            resolvers: sorted(raw.resolvers),
+            routes,
+            gathered_at: Instant::now(),
+        }
     }
 
-    /// The connected prefixes, sorted.
+    /// Reads the host's facts with the default options ([`FactsOptions::default`]).
+    pub fn gather() -> io::Result<Self> {
+        Self::gather_with(&FactsOptions::default())
+    }
+
+    /// Reads every interface (each address is one of its own, and its network — the address under
+    /// its netmask or on-link prefix length — a connected prefix, plus the peer of a
+    /// point-to-point link as a host route; an address without a netmask counts as a host route; a
+    /// non-contiguous netmask counts its leading ones, which only widens the prefix), the routing
+    /// table, the DNS servers, and (if `opts` says so) the public addresses, then
+    /// [`Self::assemble`]s them. Fails if the interfaces or the routing table cannot be read: a
+    /// public-mode policy that does not know them cannot refuse what they name.
+    pub fn gather_with(opts: &FactsOptions) -> io::Result<Self> {
+        let (interface_prefixes, interface_addresses, loopback) = sys::interfaces()?;
+        let routes = crate::routes::read_routes(&loopback)?;
+        let public_addresses = if opts.discover_public_addresses {
+            crate::public::public_addresses()
+        } else {
+            Vec::new()
+        };
+        Ok(Self::assemble(
+            RawFacts {
+                interface_prefixes,
+                interface_addresses,
+                routes,
+                resolvers: system_resolvers(),
+                public_addresses,
+            },
+            opts,
+        ))
+    }
+
+    /// The connected prefixes (interfaces and on-link routes), sorted.
     pub fn connected(&self) -> &[Prefix] {
         &self.connected
     }
 
-    /// The host's own addresses, sorted.
+    /// The host's own addresses (interfaces and public addresses), sorted.
     pub fn own_addresses(&self) -> &[IpAddr] {
         &self.own
+    }
+
+    /// The site prefixes around the own global IPv6 addresses, sorted.
+    pub fn site_prefixes(&self) -> &[Prefix] {
+        &self.site
+    }
+
+    /// The DNS servers the host uses, sorted.
+    pub fn resolvers(&self) -> &[IpAddr] {
+        &self.resolvers
+    }
+
+    /// The routing table.
+    pub fn routes(&self) -> &RouteTable {
+        &self.routes
+    }
+
+    /// Every prefix these facts refuse, flattened for a consumer that knows only connected prefixes
+    /// and own addresses (the sandboxed witness broker, which cannot read the host itself): the
+    /// connected and site prefixes, the prefixes of every route off the default path, and a host
+    /// route for every DNS server.
+    pub fn refused_prefixes(&self) -> Vec<Prefix> {
+        let mut v = self.connected.clone();
+        v.extend_from_slice(&self.site);
+        v.extend(self.routes.off_default_prefixes());
+        v.extend(self.resolvers.iter().map(|r| Prefix::host(*r)));
+        sorted(v)
     }
 
     /// When these facts were read.
     pub fn gathered_at(&self) -> Instant {
         self.gathered_at
     }
+}
+
+/// Files whose `nameserver` lines name DNS servers this host uses: the resolver's own, and the
+/// upstream servers behind a local stub (systemd-resolved's, NetworkManager's).
+pub const RESOLV_CONF_PATHS: &[&str] = &[
+    "/etc/resolv.conf",
+    "/run/systemd/resolve/resolv.conf",
+    "/run/NetworkManager/no-stub-resolv.conf",
+];
+
+/// Every `nameserver` address in a `resolv.conf` (all of them, not glibc's first three; an IPv6
+/// zone id is dropped).
+pub fn parse_nameservers(text: &str) -> Vec<IpAddr> {
+    text.lines()
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            (words.next()? == "nameserver").then_some(())?;
+            let w = words.next()?;
+            w.split('%').next()?.parse::<IpAddr>().ok()
+        })
+        .collect()
+}
+
+/// The DNS servers of every file in [`RESOLV_CONF_PATHS`] that exists, sorted.
+pub fn system_resolvers() -> Vec<IpAddr> {
+    sorted(
+        RESOLV_CONF_PATHS
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .flat_map(|t| parse_nameservers(&t))
+            .collect(),
+    )
 }
 
 #[cfg(unix)]
@@ -72,7 +268,8 @@ mod sys {
 
     use crate::ip::Prefix;
 
-    pub(super) fn interfaces() -> io::Result<(Vec<Prefix>, Vec<IpAddr>)> {
+    /// `(connected prefixes, own addresses, loopback interface indexes)`.
+    pub(super) fn interfaces() -> io::Result<(Vec<Prefix>, Vec<IpAddr>, Vec<u32>)> {
         struct List(*mut libc::ifaddrs);
         impl Drop for List {
             fn drop(&mut self) {
@@ -91,12 +288,21 @@ mod sys {
         let list = List(head);
         let mut connected = Vec::new();
         let mut own = Vec::new();
+        let mut loopback = Vec::new();
         let mut cur = list.0;
         while !cur.is_null() {
             // SAFETY: `cur` is a non-null node of the list getifaddrs returned, alive until `list`
             // drops.
             let ifa = unsafe { &*cur };
             cur = ifa.ifa_next;
+            if ifa.ifa_flags & (libc::IFF_LOOPBACK as libc::c_uint) != 0 && !ifa.ifa_name.is_null()
+            {
+                // SAFETY: a live node's name is a NUL-terminated string.
+                let index = unsafe { libc::if_nametoindex(ifa.ifa_name) };
+                if index != 0 && !loopback.contains(&index) {
+                    loopback.push(index);
+                }
+            }
             // SAFETY: the sockaddr pointers of a live ifaddrs node are null or valid for their
             // family.
             let Some(addr) = (unsafe { sockaddr_ip(ifa.ifa_addr) }) else {
@@ -114,7 +320,7 @@ mod sys {
                 }
             }
         }
-        Ok((connected, own))
+        Ok((connected, own, loopback))
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -181,8 +387,9 @@ mod sys {
 
     use crate::ip::Prefix;
 
-    /// Every unicast address of every adapter, with its on-link prefix length.
-    pub(super) fn interfaces() -> io::Result<(Vec<Prefix>, Vec<IpAddr>)> {
+    /// Every unicast address of every adapter, with its on-link prefix length (no loopback
+    /// indexes: routes are not read on Windows).
+    pub(super) fn interfaces() -> io::Result<(Vec<Prefix>, Vec<IpAddr>, Vec<u32>)> {
         let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
         // The documented way: start at 15 KB and grow to what the call asks for, a few times
         // (adapters can appear between calls).
@@ -235,7 +442,7 @@ mod sys {
             }
             adapter = a.Next;
         }
-        Ok((connected, own))
+        Ok((connected, own, Vec::new()))
     }
 
     /// The IP of a SOCKET_ADDRESS, read from its bytes (family at 0; IPv4 at 4..8; IPv6 at 8..24).
@@ -268,7 +475,7 @@ mod sys {
 
     use crate::ip::Prefix;
 
-    pub(super) fn interfaces() -> io::Result<(Vec<Prefix>, Vec<IpAddr>)> {
+    pub(super) fn interfaces() -> io::Result<(Vec<Prefix>, Vec<IpAddr>, Vec<u32>)> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "reading the host's interfaces is not supported on this platform",
@@ -280,9 +487,16 @@ mod sys {
 mod tests {
     use super::*;
 
+    fn offline() -> FactsOptions {
+        FactsOptions {
+            discover_public_addresses: false,
+            ..FactsOptions::default()
+        }
+    }
+
     #[test]
     fn gathered_facts_are_well_formed() {
-        let f = HostFacts::gather().expect("read the interfaces");
+        let f = HostFacts::gather_with(&offline()).expect("read the interfaces");
         for p in f.connected() {
             let w = if p.addr.is_ipv4() { 32 } else { 128 };
             assert!(p.len <= w, "{p:?}");
@@ -303,5 +517,128 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted, f.connected());
+        // The routing table read too, and every on-link route is a connected prefix.
+        for p in f.routes().on_link_prefixes() {
+            assert!(f.connected().contains(&p), "{p}");
+        }
+        assert_eq!(f.resolvers(), system_resolvers().as_slice());
+    }
+
+    fn p(s: &str) -> Prefix {
+        s.parse().unwrap()
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// Review r1 (fetch F1, broker F1 / PoC t3): a DHCPv6 address is a /128, and the on-link /64
+    /// is a route; an IPv4 /32 address has its subnet as a route. Both are connected prefixes now.
+    #[test]
+    fn on_link_routes_are_connected_prefixes() {
+        let raw = RawFacts {
+            interface_prefixes: vec![p("2606:4700:1::5/128"), p("203.0.113.9/32")],
+            interface_addresses: vec![ip("2606:4700:1::5"), ip("203.0.113.9")],
+            routes: vec![
+                Route::on_link(p("2606:4700:1::/64"), 2),
+                Route::on_link(p("203.0.113.0/24"), 2),
+                Route::via(p("::/0"), ip("fe80::1"), 2),
+                Route::via(p("0.0.0.0/0"), ip("203.0.113.1"), 2),
+            ],
+            ..RawFacts::default()
+        };
+        let f = HostFacts::assemble(raw, &offline());
+        assert!(f.connected().contains(&p("2606:4700:1::/64")));
+        assert!(f.connected().contains(&p("203.0.113.0/24")));
+        assert!(!f.connected().iter().any(|c| c.len == 0));
+    }
+
+    #[test]
+    fn site_prefixes_enclose_own_global_ipv6_addresses() {
+        let raw = RawFacts {
+            interface_addresses: vec![
+                ip("2606:a300:9024:184:be24:11ff:fe33:f724"),
+                ip("fe80::1"),
+                ip("192.168.1.33"),
+                ip("::1"),
+            ],
+            public_addresses: vec![ip("2a01:4f8:1:2::9"), ip("10.0.0.1")],
+            ..RawFacts::default()
+        };
+        let f = HostFacts::assemble(raw.clone(), &offline());
+        assert_eq!(
+            f.site_prefixes(),
+            &[p("2606:a300:9024:100::/56"), p("2a01:4f8:1::/56")]
+        );
+        // A public address is an own address; a non-global "public" answer is dropped.
+        assert!(f.own_addresses().contains(&ip("2a01:4f8:1:2::9")));
+        assert!(!f.own_addresses().contains(&ip("10.0.0.1")));
+        let f48 = HostFacts::assemble(
+            raw,
+            &FactsOptions {
+                ipv6_site_prefix_len: 48,
+                ..offline()
+            },
+        );
+        assert_eq!(
+            f48.site_prefixes(),
+            &[p("2606:a300:9024::/48"), p("2a01:4f8:1::/48")]
+        );
+        assert_eq!(
+            site_prefixes(&[ip("2606:a300::1")], 99),
+            vec![p("2606:a300::/64")]
+        );
+        assert!(FactsOptions::default().validate().is_ok());
+        for bad in [47u8, 65, 0, 128] {
+            let o = FactsOptions {
+                ipv6_site_prefix_len: bad,
+                ..offline()
+            };
+            assert!(o.validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn nameservers_parse_from_every_resolv_conf_line() {
+        let text =
+            "# comment\nnameserver 1.1.1.1\nnameserver 9.9.9.9\n  nameserver   2606:a300:c::7d\n\
+                    nameserver 2606:a300:c::7e\nnameserver fe80::1%eth0\nsearch .\noptions edns0\n\
+                    nameserver bogus\n";
+        assert_eq!(
+            parse_nameservers(text),
+            vec![
+                ip("1.1.1.1"),
+                ip("9.9.9.9"),
+                ip("2606:a300:c::7d"),
+                ip("2606:a300:c::7e"),
+                ip("fe80::1")
+            ]
+        );
+    }
+
+    #[test]
+    fn refused_prefixes_flatten_everything_the_facts_refuse() {
+        let raw = RawFacts {
+            interface_prefixes: vec![p("192.168.1.0/24")],
+            interface_addresses: vec![ip("192.168.1.33"), ip("2606:a300:9024:184::5")],
+            routes: vec![
+                Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 2),
+                Route::via(p("198.51.100.0/24"), ip("10.8.0.1"), 7),
+                Route::on_link(p("2606:a300:9024:184::/64"), 2),
+            ],
+            resolvers: vec![ip("9.9.9.9")],
+            ..RawFacts::default()
+        };
+        let f = HostFacts::assemble(raw, &offline());
+        assert_eq!(
+            f.refused_prefixes(),
+            vec![
+                p("9.9.9.9/32"),
+                p("192.168.1.0/24"),
+                p("198.51.100.0/24"),
+                p("2606:a300:9024:100::/56"),
+                p("2606:a300:9024:184::/64"),
+            ]
+        );
     }
 }

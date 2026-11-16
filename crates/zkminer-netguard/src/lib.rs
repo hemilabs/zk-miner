@@ -14,7 +14,9 @@
 //! - [`is_global`]: allow-only-globally-routable unicast, every embedded-IPv4 form judged by its
 //!   IPv4 address or refused ([`ip`] module doc for the ranges);
 //! - [`check_host_name`]: host-name hygiene for requester names ([`INTERNAL_SUFFIXES`]);
-//! - [`HostFacts`]: the host's own addresses and connected prefixes, from its interfaces;
+//! - [`HostFacts`]: the host's own addresses (its public NAT addresses included, [`public`]),
+//!   connected prefixes (interfaces and on-link routes), IPv6 site prefixes, DNS servers and
+//!   routing table ([`routes`]: a destination whose best route is not the default path is refused);
 //! - [`admit`]: the single admission decision for an address, by [`NetMode`];
 //! - [`check_url`]: the gate for a requester URL (scheme, user information, a strict reading that
 //!   the URL standard's parser must agree with, host hygiene, and IP literals through [`admit`]);
@@ -33,6 +35,8 @@ mod facts;
 mod host;
 pub mod ip;
 mod policy;
+pub mod public;
+pub mod routes;
 mod url;
 
 #[cfg(feature = "client")]
@@ -43,10 +47,17 @@ mod resolve;
 pub use crate::url::{check_url, MAX_URL_LEN};
 pub use ::url::Url;
 pub use content::{arweave_gateway_url, ipfs_gateway_url, ContentIdDenied};
-pub use facts::HostFacts;
+pub use facts::{
+    parse_nameservers, site_prefixes, system_resolvers, FactsOptions, HostFacts, RawFacts,
+    DEFAULT_IPV6_SITE_PREFIX_LEN, IPV6_SITE_PREFIX_LENS, RESOLV_CONF_PATHS,
+};
 pub use host::{check_host_name, HostDenied, INTERNAL_SUFFIXES};
 pub use ip::{canonical_ip, is_global, prefix_is_global, Prefix, PrefixParseError};
-pub use policy::{admit, admit_prefix, Denied, NetMode, NetPolicy, UrlDenied, FACTS_TTL};
+pub use policy::{
+    admit, admit_prefix, Denied, NetMode, NetPolicy, RouteKind, UrlDenied, FACTS_TTL,
+    FORCED_REFRESH_MIN_AGE,
+};
+pub use routes::{Hop, Route, RouteTable};
 
 /// Chain ids zkminer treats as production markets, where developer mode
 /// ([`NetMode::DevPrivate`]) is refused: Hemi mainnet. The miner's config and the witness broker
