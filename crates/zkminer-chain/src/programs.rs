@@ -75,24 +75,29 @@ const ARWEAVE_GATEWAY: &str = "https://arweave.net";
 /// Every storage URI is submitter-controlled, so every hop of every fetch (the URI and each
 /// redirect, up to [`MAX_ELF_REDIRECTS`]) passes [`zkminer_netguard::check_url`], and every
 /// connection goes only to an address the guarded resolver admitted from its one lookup: in the
-/// default [`NetMode::Public`], a globally routable address that is not this host's, not on a network
-/// it is connected to, and not in `[egress] deny_cidrs`. No proxy is used. The only way to reach a
-/// private address is `[dev] private_network = true` ([`NetMode::DevPrivate`]), which is refused on
-/// mainnet; there is no environment-variable bypass.
+/// default [`NetMode::Public`], a globally routable address that is not this host's (public NAT
+/// addresses included), not on a network it is connected to or in its IPv6 site, not a DNS server
+/// it uses, reached by its default route, and not in `[egress] deny_cidrs`. No proxy is used. The
+/// only way to reach a private address is `[dev] private_network = true`
+/// ([`NetMode::DevPrivate`]), which is refused on mainnet; there is no environment-variable bypass.
 #[derive(Debug, Clone)]
 pub struct ElfFetcher {
     client: GuardedClient,
 }
 
 impl ElfFetcher {
-    /// A fetcher under `config`'s network mode and deny CIDRs, over this host's own addresses and
-    /// connected prefixes. Says [`zkminer_config::DEV_MODE_BANNER`] when developer mode is on.
+    /// A fetcher under `config`'s network mode, deny CIDRs and `[egress]` facts options, over this
+    /// host's facts (own and public addresses, connected and site prefixes, DNS servers, routing
+    /// table). Says [`zkminer_config::DEV_MODE_BANNER`] when developer mode is on.
     pub fn from_config(config: &zkminer_config::ZkMinerConfig) -> Result<Self> {
         let mode = config.net_mode();
-        let policy = NetPolicy::new(mode, config.egress_deny()?).context(
-            "reading this host's network interfaces (the ELF fetch refuses this host's own \
-             addresses and networks, so it cannot run without knowing them)",
-        )?;
+        let policy =
+            NetPolicy::with_options(mode, config.egress_deny()?, config.egress_facts_options()?)
+                .context(
+                    "reading this host's network interfaces and routes (the ELF fetch refuses \
+                     this host's own addresses and networks, so it cannot run without knowing \
+                     them)",
+                )?;
         Self::new(&policy)
     }
 

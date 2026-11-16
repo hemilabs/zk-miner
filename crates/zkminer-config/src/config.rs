@@ -50,20 +50,59 @@ impl DevConfig {
 }
 
 /// `[egress]`: the network guard's operator settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EgressConfig {
     /// Extra CIDRs no requester-caused connection may reach (`"203.0.113.7/32"`, `"2001:db8::/32"`,
-    /// or a bare address). Name this host's public address when it sits behind NAT (its interfaces
-    /// do not show it, so only this stops a hairpin to it), and the addresses of the rest of your
-    /// fleet. The host's own interface addresses and the networks they are on are refused already.
+    /// or a bare address): the addresses of the rest of your fleet, your VPC's ranges, and this
+    /// host's public address behind NAT if discovering it fails or is off. The host's own
+    /// addresses, the networks it is connected to or routes off its default route, its IPv6 site
+    /// and its DNS servers are refused already.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_cidrs: Vec<String>,
+    /// The site around each of this host's own global IPv6 addresses that is refused: its
+    /// enclosing /N, 48..=64 (default 56, the usual delegation to a home or office, whose other
+    /// networks hold the operator's other machines).
+    #[serde(
+        default = "default_ipv6_site_prefix_len",
+        skip_serializing_if = "is_default_ipv6_site_prefix_len"
+    )]
+    pub ipv6_site_prefix_len: u8,
+    /// Learn this host's public addresses behind NAT (asking two fixed DNS reflectors, Google's
+    /// and Cloudflare's, which address the query came from) and refuse them. Default true.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub discover_public_addresses: bool,
+}
+
+fn default_ipv6_site_prefix_len() -> u8 {
+    zkminer_netguard::DEFAULT_IPV6_SITE_PREFIX_LEN
+}
+
+fn is_default_ipv6_site_prefix_len(n: &u8) -> bool {
+    *n == zkminer_netguard::DEFAULT_IPV6_SITE_PREFIX_LEN
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+impl Default for EgressConfig {
+    fn default() -> Self {
+        EgressConfig {
+            deny_cidrs: Vec::new(),
+            ipv6_site_prefix_len: default_ipv6_site_prefix_len(),
+            discover_public_addresses: true,
+        }
+    }
 }
 
 impl EgressConfig {
     fn is_empty(&self) -> bool {
-        self.deny_cidrs.is_empty()
+        *self == EgressConfig::default()
     }
 }
 
@@ -490,12 +529,25 @@ impl ZkMinerConfig {
             .collect()
     }
 
+    /// The options the network guard gathers this host's facts with (`[egress]
+    /// ipv6_site_prefix_len`, `discover_public_addresses`). Refuses a site length outside 48..=64.
+    pub fn egress_facts_options(&self) -> Result<zkminer_netguard::FactsOptions> {
+        let o = zkminer_netguard::FactsOptions {
+            ipv6_site_prefix_len: self.egress.ipv6_site_prefix_len,
+            discover_public_addresses: self.egress.discover_public_addresses,
+        };
+        o.validate()
+            .map_err(|e| anyhow::anyhow!("egress.{e}"))?;
+        Ok(o)
+    }
+
     /// [`DEV_MODE_BANNER`] while developer mode is in force, else `None`.
     pub fn dev_mode_banner(&self) -> Option<&'static str> {
         (self.net_mode() == zkminer_netguard::NetMode::DevPrivate).then_some(DEV_MODE_BANNER)
     }
 
-    /// Refuses `[dev] private_network` on a production chain, and malformed `[egress]` CIDRs.
+    /// Refuses `[dev] private_network` on a production chain, malformed `[egress]` CIDRs and an
+    /// `[egress] ipv6_site_prefix_len` outside 48..=64.
     pub fn validate_network(&self) -> Result<()> {
         if self.dev.private_network && is_production_chain(self.chain.chain_id) {
             anyhow::bail!(
@@ -506,6 +558,7 @@ impl ZkMinerConfig {
             );
         }
         self.egress_deny()?;
+        self.egress_facts_options()?;
         Ok(())
     }
 
@@ -681,6 +734,44 @@ mod validation_tests {
             let err = c.validate_network().expect_err(bad).to_string();
             assert!(err.contains("egress.deny_cidrs"), "{err}");
         }
+    }
+
+    /// Review r1 (fetch F1b/F1c): `[egress] ipv6_site_prefix_len` (48..=64, default 56) and
+    /// `discover_public_addresses` (default true) reach netguard's facts options, and are not
+    /// written while they hold their defaults.
+    #[test]
+    fn egress_site_prefix_and_discovery_options() {
+        let c = parse("[chain]\nchain_id = 743111\n").unwrap();
+        assert_eq!(
+            c.egress_facts_options().unwrap(),
+            zkminer_netguard::FactsOptions::default()
+        );
+        assert_eq!(c.egress.ipv6_site_prefix_len, 56);
+        assert!(c.egress.discover_public_addresses);
+        let c = parse(
+            "[chain]\nchain_id = 743111\n[egress]\nipv6_site_prefix_len = 48\ndiscover_public_addresses = false\n",
+        )
+        .unwrap();
+        let o = c.egress_facts_options().unwrap();
+        assert_eq!(o.ipv6_site_prefix_len, 48);
+        assert!(!o.discover_public_addresses);
+        assert!(c.validate_network().is_ok());
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("ipv6_site_prefix_len = 48"), "{text}");
+        assert!(text.contains("discover_public_addresses = false"), "{text}");
+        assert_eq!(parse(&text).unwrap().egress, c.egress);
+        for (len, ok) in [(47, false), (48, true), (56, true), (64, true), (65, false), (0, false)] {
+            let c = parse(&format!(
+                "[chain]\nchain_id = 743111\n[egress]\nipv6_site_prefix_len = {len}\n"
+            ))
+            .unwrap();
+            assert_eq!(c.validate_network().is_ok(), ok, "{len}");
+            if !ok {
+                let err = c.validate_network().unwrap_err().to_string();
+                assert!(err.contains("ipv6_site_prefix_len"), "{err}");
+            }
+        }
+        assert!(parse("[egress]\nipv6_site_prefix_len = 300\n").is_err());
     }
 
     /// The guard must not reject a genuine value — it is easy to write one that rejects all.
