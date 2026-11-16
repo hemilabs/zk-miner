@@ -33,6 +33,9 @@ pub struct HeldJobs {
     /// The earliest working cutoff among them (unix seconds: the last moment a proof is
     /// accepted or a release is possible), if any is known.
     pub earliest_deadline: Option<u64>,
+    /// Queued or proving jobs whose cutoff is too close for a restart to save them: a keep-locks
+    /// stop releases these first.
+    pub too_close_to_keep: usize,
 }
 
 impl HeldJobs {
@@ -68,6 +71,15 @@ pub fn held_jobs(state: &MinerState, now: u64) -> HeldJobs {
             }
             MinerJobStatus::Submitting => held.submitting += 1,
             _ => continue,
+        }
+        if matches!(
+            job.status,
+            MinerJobStatus::Queued | MinerJobStatus::Proving { .. }
+        ) && job.info.lock_deadline > 0
+            && state.release_margin_secs > 0
+            && job.info.lock_deadline <= now.saturating_add(state.release_margin_secs + 120)
+        {
+            held.too_close_to_keep += 1;
         }
         if job.info.lock_deadline > 0 {
             held.earliest_deadline = Some(
@@ -146,10 +158,25 @@ pub fn handle_key(state: &mut MinerState, key: KeyEvent) -> bool {
                 ask(state, StopMode::KeepLocks)
             }
             KeyCode::Char('x') | KeyCode::Char('X') => ask(state, StopMode::Force),
+            KeyCode::Char('a') | KeyCode::Char('A') => state.add_log(
+                LogLevel::Warn,
+                "Too late to abandon: the miner is already releasing, or exiting.",
+            ),
             _ if quit => state.add_log(
                 LogLevel::Warn,
-                "Already stopping — the dashboard closes when the miner exits. [a] abandon, \
-                 [k] keep locks, [x] force exit.",
+                match stage {
+                    ShutdownStage::Draining => {
+                        "Already stopping — the dashboard closes when the miner exits. [a] \
+                         abandon, [k] keep locks, [x] force exit."
+                    }
+                    ShutdownStage::KeepingLocks => {
+                        "Already stopping, keeping the locks. [a] abandon instead, [x] force exit."
+                    }
+                    _ => {
+                        "Already stopping — the dashboard closes when the miner exits. [x] force \
+                          exit."
+                    }
+                },
             ),
             // Moving around still works. Everything else is swallowed: `p` must not resume
             // claiming, and the screens' actions (a benchmark, GPU tuning, the setup wizard's
@@ -221,16 +248,22 @@ pub fn render_prompt(f: &mut Frame, area: Rect, state: &MinerState) {
     };
     let held = held_jobs(state, now_secs());
     // The last moment the next start can still release the earliest lock in time: its cutoff
-    // less the margin a release needs (the miner publishes it). Finishing it needs earlier still.
+    // less the margin a release and a restart need (the miner publishes it). Finishing it needs
+    // earlier still.
     let restart_by = held
         .earliest_deadline
+        .filter(|_| state.release_margin_secs > 0)
         .map(|d| {
             format!(
-                " (start it again well before {})",
+                " (start it again by {})",
                 fmt_time(d.saturating_sub(state.release_margin_secs))
             )
         })
         .unwrap_or_default();
+    let too_close = match held.too_close_to_keep {
+        0 => String::new(),
+        n => format!("; {n} too close to their deadline to keep are released first"),
+    };
     let (title, mut lines) = match prompt {
         StopPrompt::Quit => {
             let mut lines = vec![
@@ -252,7 +285,10 @@ pub fn render_prompt(f: &mut Frame, area: Rect, state: &MinerState) {
                 ),
                 key_line(
                     "k",
-                    format!("Keep locks: exit now; the next start finishes them{restart_by}"),
+                    format!(
+                        "Keep locks: exit within minutes; the next start finishes them\
+                         {restart_by}{too_close}"
+                    ),
                 ),
             ];
             if held.proving > 0 {

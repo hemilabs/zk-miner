@@ -342,22 +342,17 @@ const CLAIM_INTENT_MAX_AGE_SECS: u64 = 900;
 pub(crate) static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// A keep-locks stop (`zkminer stop --keep-locks`, or `k` at the dashboard's quit prompt): stop
-/// claiming and exit without releasing, leaving every lock in the job journal for the next start's
-/// recovery to finish. While set, `release_and_clean` releases nothing but the locks in
-/// [`KEEP_LOCKS_EXEMPT`], so a lifecycle whose worker is stopped on the way out does not release
-/// its lock. Cleared if the stop escalates to ABANDON before the keep commits.
-pub(crate) static KEEP_LOCKS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Locks a keep-locks stop releases anyway: too close to their cutoff for a restart to release
 /// them in time (see `RESTART_ALLOWANCE_SECS`).
 static KEEP_LOCKS_EXEMPT: std::sync::Mutex<Option<std::collections::HashSet<B256>>> =
     std::sync::Mutex::new(None);
 
-/// Whether a keep-locks stop holds on to `job_id` (so it must not be released now).
+/// Whether a keep-locks stop holds on to `job_id`, so it must not be released now: one was asked
+/// for (or committed) and has not given way to an abandon, and the lock is not one of those it
+/// releases anyway. Read from the ladder's phase, so it cannot disagree with it: a lifecycle whose
+/// worker is stopped on the way out does not release a lock the stop keeps.
 fn keeping_lock(job_id: B256) -> bool {
-    KEEP_LOCKS.load(std::sync::atomic::Ordering::SeqCst)
+    matches!(ladder_phase(), PHASE_KEEPING | PHASE_KEPT)
         && !KEEP_LOCKS_EXEMPT
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -370,25 +365,43 @@ fn keeping_lock(job_id: B256) -> bool {
 /// releases what is closer to its cutoff than the margin plus this.
 const RESTART_ALLOWANCE_SECS: u64 = 600;
 
-/// How long a keep-locks stop waits for the releases of locks too close to their cutoff to keep.
-const KEEP_LOCKS_RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+/// How long before a kept lock's cutoff the miner must be started again for its recovery to still
+/// release the lock in time: every "start it by" an operator reads is the cutoff less this.
+pub(crate) const RESTART_BY_SECS: u64 = DEADLINE_RELEASE_MARGIN_SECS + RESTART_ALLOWANCE_SECS;
+
+/// "start it by HH:MM UTC" for the earliest of `cutoffs` (unix seconds, 0 = unknown), or `None`.
+pub(crate) fn start_by(cutoffs: impl IntoIterator<Item = u64>) -> Option<String> {
+    cutoffs
+        .into_iter()
+        .filter(|d| *d > 0)
+        .min()
+        .map(|d| zkminer_chain::exit::fmt_unix(d.saturating_sub(RESTART_BY_SECS)))
+}
+
+/// What a keep-locks stop itself still takes after it picks the locks to release: their release
+/// (`RELEASE_JOIN_BUDGET`), a nonce-gap repair, and the worker reap.
+const KEEP_LOCKS_EXIT_SLACK_SECS: u64 = 120;
 
 /// How long a keep-locks stop waits for proofs already being submitted: their fulfil is on its way
 /// to the chain, and cutting it off would leave the job for the next start to sort out.
 const KEEP_LOCKS_SUBMIT_GRACE: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// Where the shutdown ladder is. A stop asked for while it runs may only move it forward: a
-/// keep-locks request cannot switch off releases already under way, and an abandon that arrives
-/// after a keep-locks stop has committed (or after there is nothing left) is refused, not
-/// announced and then skipped.
+/// Where the shutdown ladder is. A stop asked for while it runs may only move it forward, and
+/// every move that decides between keeping and releasing locks is one compare-and-swap, so a
+/// keep-locks request and an abandon cannot both win: a keep-locks request cannot switch off
+/// releases already under way, and an abandon after a keep-locks stop committed is refused, not
+/// announced and then skipped. [`keeping_lock`] reads it directly.
 static LADDER_PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(PHASE_MINING);
 const PHASE_MINING: u8 = 0;
 const PHASE_DRAINING: u8 = 1;
-const PHASE_ABANDONING: u8 = 2;
-/// A keep-locks stop committed: exiting with its locks held for the next start.
-const PHASE_KEPT: u8 = 3;
+/// A keep-locks stop was asked for and has not committed yet.
+const PHASE_KEEPING: u8 = 2;
+const PHASE_ABANDONING: u8 = 3;
 /// Nothing left to release or keep: reaping the workers and exiting.
 const PHASE_FINISHING: u8 = 4;
+/// A keep-locks stop committed: exiting with its locks held for the next start. Terminal (the
+/// highest value, so `set_ladder_phase(PHASE_FINISHING)` leaves it be).
+const PHASE_KEPT: u8 = 5;
 
 fn ladder_phase() -> u8 {
     LADDER_PHASE.load(std::sync::atomic::Ordering::SeqCst)
@@ -396,6 +409,26 @@ fn ladder_phase() -> u8 {
 
 fn set_ladder_phase(phase: u8) {
     LADDER_PHASE.fetch_max(phase, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Move the phase from one of `from` to `to` in one step; `Err(phase)` with the phase found when
+/// it was in none of them.
+fn move_ladder_phase(from: &[u8], to: u8) -> Result<(), u8> {
+    let mut seen = ladder_phase();
+    loop {
+        if !from.contains(&seen) {
+            return Err(seen);
+        }
+        match LADDER_PHASE.compare_exchange(
+            seen,
+            to,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(now) => seen = now,
+        }
+    }
 }
 
 /// Raise the ladder to `stage` (1 DRAIN, 2 ABANDON), never lower it: a signal and a stop request
@@ -411,20 +444,25 @@ pub(crate) fn raise_stage(sig_tx: &tokio::sync::watch::Sender<u8>, stage: u8) {
     });
 }
 
-/// Begin ABANDON for a signal or a request, or say why it is too late. Clears [`KEEP_LOCKS`]: an
-/// abandon asked for before a keep-locks stop commits wins.
+/// Begin ABANDON for a signal or a request, or say why it is too late. An abandon asked for before
+/// a keep-locks stop commits wins over it.
 pub(crate) fn begin_abandon() -> Result<(), &'static str> {
-    match ladder_phase() {
-        PHASE_KEPT => Err(
+    match move_ladder_phase(
+        &[
+            PHASE_MINING,
+            PHASE_DRAINING,
+            PHASE_KEEPING,
+            PHASE_ABANDONING,
+        ],
+        PHASE_ABANDONING,
+    ) {
+        Ok(()) => Ok(()),
+        Err(PHASE_KEPT) => Err(
             "Too late to abandon: the miner is already exiting with its locks kept for the next \
              start. Start it again (it finishes or releases them), and stop that one with \
              `zkminer stop --abandon` if you want them released.",
         ),
-        PHASE_FINISHING => Err("Nothing left to release: the miner is already exiting."),
-        _ => {
-            KEEP_LOCKS.store(false, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
+        Err(_) => Err("Nothing left to release: the miner is already exiting."),
     }
 }
 
@@ -436,6 +474,19 @@ pub(crate) fn tui_up() -> bool {
     TUI_UP.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Print a line, ignoring a terminal that has gone away (`println!` panics on EIO, and a closed
+/// terminal must not take the shutdown down with it).
+pub(crate) fn say_out(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stdout(), "{line}");
+}
+
+/// [`say_out`] for stderr.
+fn writeln_err(line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    writeln!(std::io::stderr(), "{line}")
+}
+
 /// If the dashboard ended during the stop (an error, a panic), carry on on the terminal: print
 /// what the panel had shown, and send everything after it there too. Without this a 50-minute
 /// drain would run behind a silent terminal.
@@ -444,10 +495,10 @@ async fn check_dashboard(state: &zkminer_tui::state::SharedState) {
         TUI_UP.store(false, std::sync::atomic::Ordering::SeqCst);
         tracing::error!("the dashboard closed during the shutdown — continuing on the terminal");
         let s = state.read().await;
-        println!("\nThe dashboard closed. The shutdown so far:");
+        say_out("\nThe dashboard closed. The shutdown so far:");
         if let Some(view) = s.shutdown.as_ref() {
             for line in &view.lines {
-                println!("{line}");
+                say_out(line);
             }
         }
     }
@@ -469,7 +520,7 @@ pub(crate) async fn shutdown_say(state: &zkminer_tui::state::SharedState, msg: i
             .push(msg.trim().to_string());
         close_quit_prompt(&mut s);
     } else {
-        println!("{msg}");
+        say_out(&msg);
     }
 }
 
@@ -489,7 +540,7 @@ async fn shutdown_status(state: &zkminer_tui::state::SharedState, headless: bool
             view.status = msg;
         }
     } else if !headless {
-        println!("{msg}");
+        say_out(&msg);
     }
 }
 
@@ -511,7 +562,28 @@ async fn shutdown_stage(
 pub(crate) fn force_exit() -> ! {
     // Stops the dashboard drawing before the terminal is handed back (a no-op without one).
     zkminer_tui::restore_terminal();
-    eprintln!("\nForce exit — in-flight jobs left locked on-chain.");
+    let now = zkminer_chain::client::chain_now_floor();
+    let journal = crate::journal::JobJournal::load();
+    let live: Vec<u64> = journal
+        .iter()
+        .filter(|e| e.lock_deadline == 0 || e.lock_deadline > now)
+        .map(|e| e.lock_deadline)
+        .collect();
+    let _ = writeln_err(&format!(
+        "\nForce exit — in-flight jobs left locked on-chain{}.",
+        if live.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ": {} lock(s) held. Start the miner again {} (a service is not restarted after a \
+                 force exit), or they are slashed",
+                live.len(),
+                start_by(live.iter().copied())
+                    .map(|t| format!("by {t}"))
+                    .unwrap_or_else(|| "soon".into())
+            )
+        }
+    ));
     // Reap workers first. SP1's `sp1-gpu-server` is a GRANDCHILD that does NOT die with us; it can
     // keep ~11.5 GB of VRAM allocated after the parent exited.
     //
@@ -625,7 +697,6 @@ async fn apply_stop_request(
     sig_tx: &tokio::sync::watch::Sender<u8>,
     state: &zkminer_tui::state::SharedState,
 ) -> Result<String, String> {
-    use std::sync::atomic::Ordering::SeqCst;
     use zkminer_tui::state::StopMode;
     let stage = *sig_tx.borrow();
     match mode {
@@ -649,11 +720,14 @@ async fn apply_stop_request(
             Ok("already stopping".into())
         }
         StopMode::KeepLocks => {
-            let too_late = match ladder_phase() {
-                PHASE_ABANDONING => Some("it is already releasing the jobs"),
-                PHASE_KEPT => Some("it is already exiting with its locks kept"),
-                PHASE_FINISHING => Some("it is already exiting, with nothing left to keep"),
-                _ => None,
+            let too_late = match move_ladder_phase(
+                &[PHASE_MINING, PHASE_DRAINING, PHASE_KEEPING],
+                PHASE_KEEPING,
+            ) {
+                Ok(()) => None,
+                Err(PHASE_ABANDONING) => Some("it is already releasing the jobs"),
+                Err(PHASE_KEPT) => Some("it is already exiting with its locks kept"),
+                Err(_) => Some("it is already exiting, with nothing left to keep"),
             };
             if let Some(why) = too_late {
                 tracing::warn!("keep-locks stop requested too late: {why}");
@@ -661,7 +735,6 @@ async fn apply_stop_request(
                 return Err(format!("too late to keep the locks: {why}"));
             }
             tracing::warn!("stop requested: keeping locks for the next start");
-            KEEP_LOCKS.store(true, SeqCst);
             shutdown_say(
                 state,
                 "\nKEEPING LOCKS — no new claims; exiting without releasing (except a lock too \
@@ -672,7 +745,7 @@ async fn apply_stop_request(
             if stage == 0 {
                 raise_stage(sig_tx, 1);
             } else {
-                // Wake the drain so it sees KEEP_LOCKS now, not at its next poll.
+                // Wake the drain so it sees the keep-locks request now, not at its next poll.
                 sig_tx.send_modify(|_| {});
             }
             Ok("keeping its locks".into())
@@ -740,12 +813,13 @@ mod stop_ladder_tests {
     use super::*;
     use zkminer_tui::state::StopMode;
 
-    /// The only test touching the ladder's process-wide state (phase, KEEP_LOCKS): stop requests move it forward only,
-    /// a keep-locks request cannot switch off an abandon, and an abandon after a keep-locks stop
-    /// committed is refused rather than announced and skipped.
+    /// The only test touching the ladder's process-wide phase: stop requests move it forward only,
+    /// a keep-locks request cannot switch off an abandon, an abandon after a keep-locks stop
+    /// committed is refused rather than announced and skipped, and a keep-locks stop holds every
+    /// lock but those it exempted.
     #[tokio::test]
     async fn stop_requests_only_move_the_ladder_forward() {
-        // A keep-locks stop releases only the locks it exempted.
+        let set = |p| LADDER_PHASE.store(p, std::sync::atomic::Ordering::SeqCst);
         let (kept, close) = (B256::repeat_byte(1), B256::repeat_byte(2));
         assert!(
             !keeping_lock(kept),
@@ -756,10 +830,7 @@ mod stop_ladder_tests {
             .unwrap()
             .get_or_insert_with(Default::default)
             .insert(close);
-        KEEP_LOCKS.store(true, std::sync::atomic::Ordering::SeqCst);
-        let (k, c) = (keeping_lock(kept), keeping_lock(close));
-        KEEP_LOCKS.store(false, std::sync::atomic::Ordering::SeqCst);
-        assert!(k && !c);
+
         let (tx, rx) = tokio::sync::watch::channel(0u8);
         let state = zkminer_tui::state::new_shared_state();
         raise_stage(&tx, 2);
@@ -775,28 +846,45 @@ mod stop_ladder_tests {
         assert!(apply_stop_request(StopMode::KeepLocks, &tx, &state)
             .await
             .is_ok());
-        assert!(KEEP_LOCKS.load(std::sync::atomic::Ordering::SeqCst));
-        // Abandon before the keep commits: wins, and clears KEEP_LOCKS.
+        assert!(keeping_lock(kept) && !keeping_lock(close));
+        // Abandon before the keep commits: wins, and nothing is held back any more.
         assert!(apply_stop_request(StopMode::Abandon, &tx, &state)
             .await
             .is_ok());
-        assert!(!KEEP_LOCKS.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!keeping_lock(kept));
         assert_eq!(*rx.borrow(), 2);
-        // A drain timeout's abandon: keep-locks is refused from then on.
-        set_ladder_phase(PHASE_ABANDONING);
+        // From then on keep-locks is refused, and the commit fails.
         assert!(apply_stop_request(StopMode::KeepLocks, &tx, &state)
             .await
             .is_err());
-        assert!(!KEEP_LOCKS.load(std::sync::atomic::Ordering::SeqCst));
-        // The phase never moves back.
+        assert!(!keeping_lock(kept));
+        assert!(move_ladder_phase(&[PHASE_KEEPING], PHASE_KEPT).is_err());
         set_ladder_phase(PHASE_DRAINING);
-        assert_eq!(ladder_phase(), PHASE_ABANDONING);
-        set_ladder_phase(PHASE_KEPT);
+        assert_eq!(
+            ladder_phase(),
+            PHASE_ABANDONING,
+            "the phase never moves back"
+        );
+
+        // A keep that commits holds its locks through the exit, and refuses an abandon.
+        set(PHASE_KEEPING);
+        assert!(move_ladder_phase(&[PHASE_KEEPING], PHASE_KEPT).is_ok());
+        set_ladder_phase(PHASE_FINISHING);
+        assert_eq!(ladder_phase(), PHASE_KEPT);
+        assert!(keeping_lock(kept));
         assert!(begin_abandon().is_err());
         assert!(apply_stop_request(StopMode::Abandon, &tx, &state)
             .await
             .is_err());
-        LADDER_PHASE.store(PHASE_MINING, std::sync::atomic::Ordering::SeqCst);
+        assert!(keeping_lock(kept));
+
+        // After a clean drain there is nothing to keep or release.
+        set(PHASE_FINISHING);
+        assert!(apply_stop_request(StopMode::KeepLocks, &tx, &state)
+            .await
+            .is_err());
+        assert!(begin_abandon().is_err());
+        set(PHASE_MINING);
     }
 }
 
@@ -3988,6 +4076,14 @@ pub async fn run(
             // disposition either, so the operator's escalating Ctrl+C would silently no-op.
             // `sigterm` is hoisted for exactly this reason; keep the two symmetric.
             let mut sigint = signal(SignalKind::interrupt()).ok();
+            // The dashboard's terminal closing (an SSH session dropping, a terminal window shut):
+            // nobody is there any more, as with SIGTERM, so a supervised stop. Not listened for
+            // headless: a `nohup` miner ignores SIGHUP on purpose, and listening would undo that.
+            let mut sighup = if headless {
+                None
+            } else {
+                signal(SignalKind::hangup()).ok()
+            };
             let mut sigterm = match signal(SignalKind::terminate()) {
                 Ok(s) => s,
                 Err(e) => {
@@ -4023,16 +4119,26 @@ pub async fn run(
                 // SIGKILLs after its grace period — nobody is there to press Ctrl+C twice.
                 // So SIGTERM gets a SHORT drain that auto-escalates to ABANDON, while SIGINT
                 // (a human at a terminal, who can escalate) keeps the long drain.
+                let hangup = async {
+                    match sighup.as_mut() {
+                        Some(h) => {
+                            h.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 let supervised = match sigint.as_mut() {
                     Some(si) => tokio::select! {
                         _ = si.recv() => false,
                         _ = sigterm.recv() => true,
+                        _ = hangup => true,
                     },
                     // SIGINT registration failed: degrade to a per-iteration listener rather
                     // than losing SIGINT entirely.
                     None => tokio::select! {
                         _ = tokio::signal::ctrl_c() => false,
                         _ = sigterm.recv() => true,
+                        _ = hangup => true,
                     },
                 };
                 if supervised {
@@ -4187,7 +4293,7 @@ pub async fn run(
     set_ladder_phase(PHASE_DRAINING);
     shutdown_stage(
         &state,
-        if KEEP_LOCKS.load(std::sync::atomic::Ordering::SeqCst) {
+        if ladder_phase() == PHASE_KEEPING {
             zkminer_tui::state::ShutdownStage::KeepingLocks
         } else {
             zkminer_tui::state::ShutdownStage::Draining
@@ -4237,7 +4343,7 @@ pub async fn run(
     }
     let drain_deadline = std::time::Instant::now() + drain_budget;
     let mut abandoned = false;
-    // A keep-locks stop: leave without releasing (see KEEP_LOCKS).
+    // A keep-locks stop: leave without releasing (see `keeping_lock`).
     let mut kept = false;
     // Lifecycle-less entries the drain already released at the margin (see the loop below).
     // Lifecycle-less entries the drain handed to release_and_clean, and when. Re-armed: a lock that
@@ -4250,7 +4356,7 @@ pub async fn run(
             abandoned = true;
             break;
         }
-        if KEEP_LOCKS.load(std::sync::atomic::Ordering::SeqCst) {
+        if ladder_phase() == PHASE_KEEPING {
             tracing::warn!("drain ended: keeping the locks for the next start");
             kept = true;
             break;
@@ -4515,65 +4621,19 @@ pub async fn run(
         }
     }
 
-    // 2b. KEEP LOCKS — let proofs already being submitted reach the chain, then exit without
-    //     releasing anything: the journal keeps every lock for the next start's recovery, which
-    //     re-proves each one there is still time for and releases the rest. Exit 75, so a
-    //     supervisor with `Restart=on-failure` starts the miner again.
+    // 2b. KEEP LOCKS — let proofs already being submitted reach the chain, release the locks too
+    //     close to their cutoff for a restart to save them (through the ABANDON stage below,
+    //     restricted to them), then exit without releasing anything else: the journal keeps every
+    //     other lock for the next start's recovery, which re-proves each one there is still time
+    //     for and releases the rest. Exit 75, so a supervisor with `Restart=on-failure` starts the
+    //     miner again.
+    // The locks the ABANDON stage releases on this pass; `None` releases every lock it can.
+    let mut release_only: Option<std::collections::HashSet<B256>> = None;
     if kept {
         shutdown_stage(&state, zkminer_tui::state::ShutdownStage::KeepingLocks).await;
-        // A lock this close to its cutoff would not survive a restart: the next start needs the
-        // release margin plus its own start-up to release it, so keeping it trades a release
-        // penalty for a slash. Release those now (a lock already being submitted is left to its
-        // fulfil; `release_and_clean` re-reads each one and skips any no longer releasable).
-        let now = zkminer_chain::client::chain_now();
-        let horizon = now.saturating_add(DEADLINE_RELEASE_MARGIN_SECS + RESTART_ALLOWANCE_SECS);
-        let submitting: std::collections::HashSet<B256> = {
-            let s = state.read().await;
-            s.active_jobs
-                .iter()
-                .filter(|j| matches!(j.status, MinerJobStatus::Submitting))
-                .map(|j| j.info.job_id)
-                .collect()
-        };
-        let mut too_close: Vec<(u64, B256)> = {
-            let j = journal.lock().unwrap_or_else(|e| e.into_inner());
-            j.iter()
-                .filter(|e| e.lock_deadline != 0 && e.lock_deadline <= horizon)
-                .filter(|e| !submitting.contains(&e.job_id))
-                .map(|e| (e.lock_deadline, e.job_id))
-                .collect()
-        };
-        too_close.sort_unstable();
-        if !too_close.is_empty() {
-            KEEP_LOCKS_EXEMPT
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get_or_insert_with(Default::default)
-                .extend(too_close.iter().map(|(_, id)| *id));
-            let msg = format!(
-                "Releasing {} lock(s) too close to their deadline for a restart to save them...",
-                too_close.len()
-            );
-            tracing::warn!("keep-locks: {msg}");
-            shutdown_say(&state, msg).await;
-            let mut releasing = Vec::new();
-            for (_, jid) in &too_close {
-                // Nonces in deadline order, as the abandon stage takes them.
-                let pre_nonce = client.reserve_nonce().await.ok();
-                let (c, st, jr, jid) = (client.clone(), state.clone(), journal.clone(), *jid);
-                releasing.push(tokio::spawn(async move {
-                    release_and_clean_with_nonce(&c, &st, &jr, jid, pre_nonce).await;
-                }));
-            }
-            let deadline = std::time::Instant::now() + KEEP_LOCKS_RELEASE_BUDGET;
-            for handle in releasing {
-                let left = deadline.saturating_duration_since(std::time::Instant::now());
-                let _ = tokio::time::timeout(left, handle).await;
-            }
-        }
         let grace_end = std::time::Instant::now() + KEEP_LOCKS_SUBMIT_GRACE;
         loop {
-            if *sig_rx.borrow() >= 2 {
+            if *sig_rx.borrow() >= 2 || ladder_phase() == PHASE_ABANDONING {
                 tracing::warn!("keep-locks stop escalated — abandoning");
                 abandoned = true;
                 break;
@@ -4608,43 +4668,43 @@ pub async fn run(
             }
         }
         if !abandoned {
-            // Committed: from here an abandon is refused (`begin_abandon`), not half-done.
-            set_ladder_phase(PHASE_KEPT);
-            shutdown_stage(&state, zkminer_tui::state::ShutdownStage::Finishing).await;
-            let now = zkminer_chain::client::chain_now_floor();
-            let (held, earliest) = {
+            // A lock this close to its cutoff would not survive a restart: the next start needs
+            // the release margin plus its own start-up to release it, so keeping it trades a
+            // release penalty for a slash. Measured from now, after the wait above, plus what this
+            // stop still takes. A lock whose cutoff was never recorded counts from the earliest
+            // its claim could have set it (the contract's shortest window); one already past its
+            // recorded cutoff goes too (the release stage re-reads it, a pause may have moved it).
+            let horizon = zkminer_chain::client::chain_now().saturating_add(
+                DEADLINE_RELEASE_MARGIN_SECS + RESTART_ALLOWANCE_SECS + KEEP_LOCKS_EXIT_SLACK_SECS,
+            );
+            let too_close: std::collections::HashSet<B256> = {
                 let j = journal.lock().unwrap_or_else(|e| e.into_inner());
-                let live: Vec<u64> = j
-                    .iter()
-                    .filter(|e| e.lock_deadline == 0 || e.lock_deadline > now)
-                    .map(|e| e.lock_deadline)
-                    .collect();
-                (live.len(), live.iter().copied().filter(|d| *d > 0).min())
+                j.iter()
+                    .filter(|e| {
+                        let cutoff = if e.lock_deadline != 0 {
+                            e.lock_deadline
+                        } else {
+                            (e.claimed_at.max(0) as u64).saturating_add(MIN_JOB_WINDOW_SECS)
+                        };
+                        cutoff <= horizon
+                    })
+                    .map(|e| e.job_id)
+                    .collect()
             };
-            exit_code = 75;
-            let verdict = if held == 0 {
-                "Keep-locks stop: no locks were held. Exiting with 75 so a supervisor starts the \
-                 miner again."
-                    .to_string()
-            } else {
-                format!(
-                    "Keep-locks stop: {held} lock(s) left for the next start. START THE MINER AGAIN \
-                     {}: it re-proves each kept job there is still time for and releases the rest; \
-                     a lock left past its deadline is slashed. Exiting with 75.",
-                    match earliest {
-                        Some(d) => format!(
-                            "well before {} (after that it cannot release the earliest one in \
-                             time)",
-                            zkminer_chain::exit::fmt_unix(
-                                d.saturating_sub(DEADLINE_RELEASE_MARGIN_SECS)
-                            )
-                        ),
-                        None => "soon".to_string(),
-                    }
-                )
-            };
-            tracing::warn!("{verdict}");
-            shutdown_say(&state, verdict).await;
+            if !too_close.is_empty() {
+                KEEP_LOCKS_EXEMPT
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_or_insert_with(Default::default)
+                    .extend(too_close.iter().copied());
+                let msg = format!(
+                    "Releasing {} lock(s) too close to their deadline for a restart to save them...",
+                    too_close.len()
+                );
+                tracing::warn!("keep-locks: {msg}");
+                shutdown_say(&state, msg).await;
+                release_only = Some(too_close);
+            }
         }
     }
 
@@ -4654,15 +4714,59 @@ pub async fn run(
     //    its lock deadline, and the collateral is then locked until a keeper slashes. Every
     //    second spent on a job with hours of headroom is a second not spent on one about to
     //    expire, so releasing in deadline order is what actually minimises loss.
-    if abandoned {
-        // Abandon wins over an earlier keep-locks request: release_and_clean releases again. Marked
-        // on the ladder too (a drain timeout gets here without a signal), so a keep-locks request
-        // from now on is refused rather than switching off releases still to start.
-        set_ladder_phase(PHASE_ABANDONING);
-        raise_stage(&sig_tx, 2);
-        KEEP_LOCKS.store(false, std::sync::atomic::Ordering::SeqCst);
-        shutdown_stage(&state, zkminer_tui::state::ShutdownStage::Abandoning).await;
-        shutdown_status(&state, headless, "releasing held jobs...".to_string()).await;
+    loop {
+        let partial = release_only.is_some();
+        if !partial && !abandoned {
+            if kept {
+                // Commit the keep, unless an abandon won the race to the phase meanwhile.
+                if move_ladder_phase(&[PHASE_KEEPING], PHASE_KEPT).is_err() {
+                    tracing::warn!("keep-locks stop overtaken by an abandon — abandoning");
+                    abandoned = true;
+                    continue;
+                }
+                shutdown_stage(&state, zkminer_tui::state::ShutdownStage::Finishing).await;
+                let now = zkminer_chain::client::chain_now_floor();
+                let (held, earliest) = {
+                    let j = journal.lock().unwrap_or_else(|e| e.into_inner());
+                    let live: Vec<u64> = j
+                        .iter()
+                        .filter(|e| e.lock_deadline == 0 || e.lock_deadline > now)
+                        .map(|e| e.lock_deadline)
+                        .collect();
+                    (live.len(), live.iter().copied().filter(|d| *d > 0).min())
+                };
+                exit_code = 75;
+                let verdict = if held == 0 {
+                    "Keep-locks stop: no locks are held. Exiting with 75 so a supervisor starts \
+                     the miner again."
+                        .to_string()
+                } else {
+                    format!(
+                        "Keep-locks stop: {held} lock(s) left for the next start. START THE MINER \
+                         AGAIN {} (a service with Restart=on-failure does that itself): it \
+                         re-proves each kept job there is still time for and releases the rest; \
+                         a lock left past its deadline is slashed. Exiting with 75.",
+                        match start_by(earliest) {
+                            Some(t) => format!("by {t} at the latest"),
+                            None => "soon".to_string(),
+                        }
+                    )
+                };
+                tracing::warn!("{verdict}");
+                shutdown_say(&state, verdict).await;
+            }
+            break;
+        }
+        if !partial {
+            // Abandon wins over an earlier keep-locks request: release_and_clean releases again.
+            // Marked on the ladder too (a drain timeout gets here without a signal), so a
+            // keep-locks request from now on is refused rather than switching off releases still
+            // to start.
+            set_ladder_phase(PHASE_ABANDONING);
+            raise_stage(&sig_tx, 2);
+            shutdown_stage(&state, zkminer_tui::state::ShutdownStage::Abandoning).await;
+            shutdown_status(&state, headless, "releasing held jobs...".to_string()).await;
+        }
         // The LOWER chain-time estimate: an entry is only treated as already past its deadline once
         // it surely is.
         let now = zkminer_chain::client::chain_now_floor();
@@ -4682,6 +4786,7 @@ pub async fn run(
             let j = journal.lock().unwrap_or_else(|e| e.into_inner());
             j.iter()
                 .filter(|e| !submitting.contains(&e.job_id))
+                .filter(|e| release_only.as_ref().is_none_or(|o| o.contains(&e.job_id)))
                 .map(|e| (e.lock_deadline, e.job_id))
                 .collect()
         };
@@ -4829,7 +4934,8 @@ pub async fn run(
         // happened concurrently by the time we get here; waiting for receipts is a nicety.
         // So cap the total wait and carry on — a job whose receipt we never saw is simply
         // reported as still-held, which is exactly what the exit-75 path is for.
-        let join_budget = if supervised {
+        // A keep-locks pass only needs its releases broadcast before it exits.
+        let join_budget = if supervised || partial {
             RELEASE_JOIN_BUDGET
         } else {
             INTERACTIVE_RELEASE_JOIN_BUDGET
@@ -4997,6 +5103,17 @@ pub async fn run(
             );
         }
 
+        if partial {
+            let msg = format!(
+                "keep-locks: released {released} lock(s) too close to their deadline to keep; \
+                 {stranded} could not be released"
+            );
+            tracing::warn!("{msg}");
+            shutdown_say(&state, msg).await;
+            // Next: commit the keep (or, if an abandon arrived meanwhile, the full abandon).
+            release_only = None;
+            continue;
+        }
         // Leave a machine-readable verdict and a NON-ZERO exit when anything is still
         // held: every path previously returned Ok(()) -> exit 0, so `Restart=on-failure`
         // saw success and did NOT restart — disabling the recovery path that is the actual
@@ -5061,6 +5178,7 @@ pub async fn run(
                 .await;
             }
         }
+        break;
     }
 
     set_ladder_phase(PHASE_FINISHING);
@@ -5131,7 +5249,7 @@ pub async fn run(
             .map(|v| v.lines.clone())
             .unwrap_or_default();
         for line in lines {
-            println!("{line}");
+            say_out(&line);
         }
     }
 

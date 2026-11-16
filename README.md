@@ -152,7 +152,7 @@ no error.**
 ├── sp1-gpu-server-sycl-lib -> zkminer-intel/lib
 ├── libcudart.so.12
 ├── libcudart.so.12.LICENSE.txt
-└── zkminer-prove-openvm
+└── zkminer-prove-openvm          (experimental, not mined: leave it out)
 ```
 
 **From a release**, put the single-file provers there and unpack the AMD or Intel tarball into the
@@ -704,10 +704,13 @@ Worth knowing:
   to stop:
   - **Drain** (the default): stop claiming, let the jobs in flight finish and be paid, then
     exit. That can take up to 50 minutes, after which whatever is still held is released.
-  - **Keep locks**: exit now without releasing (exit status 75). The next start picks the
-    locks up from `~/.zkminer/job_journal.json`, re-proves each one that still has time, and
-    releases the rest. Use it for restarts and upgrades, and start again before the earliest
-    lock deadline: a lock left past its deadline is slashed.
+  - **Keep locks**: stop claiming and exit without releasing (exit status 75), after any proof
+    already being submitted lands; a lock too close to its deadline for a restart to release
+    it in time is released first. That takes seconds to a few minutes. The next start picks
+    the locks up from `~/.zkminer/job_journal.json`, re-proves each one that still has time,
+    and releases the rest. Use it for restarts and upgrades, and start again by the time it
+    prints (the earliest lock's deadline less ~25 minutes for the restart and a release): a
+    lock left past its deadline is slashed.
   - **Abandon**: release everything now, then exit.
 
   In the dashboard, `q` or Ctrl+C asks which one when jobs are held: `d` drain, `k` keep
@@ -724,22 +727,34 @@ Worth knowing:
   Kubernetes, releases every held lock at once, because a supervisor kills the process
   before any drain could finish. [`contrib/zkminer.service`](contrib/zkminer.service) sets
   `KillSignal=SIGINT`, `KillMode=mixed` and a long `TimeoutStopSec`, so `systemctl stop`
-  drains, and `Restart=on-failure`, so `zkminer stop --keep-locks` restarts it in place. For
-  Docker, run with `--stop-signal SIGINT --stop-timeout 4200 --restart on-failure` and
-  restart with `docker exec <container> zkminer stop --keep-locks`. On Windows, closing the
-  console window or shutting Windows down releases at once, so stop a long-running miner
-  with `zkminer stop` first.
+  drains, and `Restart=on-failure`, so `zkminer stop --keep-locks` restarts it in place. To
+  upgrade, `install -m755` the new miner and every worker over the old ones (all of them: a
+  worker from another build is refused), then `zkminer stop --keep-locks`. For Docker, run
+  with `--stop-signal SIGINT --stop-timeout 4200 --restart on-failure` and keep `~/.zkminer`
+  on a volume (`-v zkminer-home:/root/.zkminer`): the kept locks are found through the job
+  journal there, and a new container without it never finds them. Restart in place with
+  `docker exec <container> zkminer stop --keep-locks` (not `--wait`, which ends with the
+  container); for a new image, start the new container on the same volume promptly. On
+  Windows, the workers have consoles of their own, so Ctrl+C reaches only the miner.
+  Closing the console window or shutting Windows down gives the miner only seconds: it
+  releases what it can in them, and what it doesn't finish stays held until the next start,
+  so stop a long-running miner with `zkminer stop` first.
 
   Exit status 75 means it stopped with locks still held (or by keep-locks): start it again
   well before their deadlines. A miner killed outright (SIGKILL) picks its locks up the same way.
   Under `Restart=on-failure` (or Docker's `--restart on-failure`) that exit restarts it, and the
   restarted miner mines again; to stop it for good, use `systemctl stop` / `docker stop`, which
-  the supervisor never restarts. Before shutting the machine down, stop the miner and let it
-  finish (or `zkminer stop --abandon`): a shutdown rarely waits for a 50-minute drain, and
-  whatever it cuts off keeps its locks. On Windows, a miner run as a service keeps its
-  `.zkminer` in the service account's profile, so run `zkminer stop` as that account, and give
-  the service wrapper a stop timeout long enough for a drain (or stop it with `zkminer stop`
-  before stopping the service).
+  the supervisor never restarts. A reboot or poweroff under the systemd unit drains like
+  `systemctl stop` and can hold the shutdown for up to 70 minutes; a hypervisor or cloud stop
+  rarely waits that long, and whatever it cuts off keeps its locks. So stop the miner first
+  and let it finish, or `zkminer stop --abandon`, or, for maintenance you'll be back from
+  soon, `zkminer stop --keep-locks --wait && sudo systemctl stop zkminer` (within the 10 s
+  before systemd restarts it). On Windows, a miner run as a service keeps its `.zkminer` in
+  the service account's profile (for LocalSystem,
+  `C:\Windows\System32\config\systemprofile\.zkminer`), so run `zkminer stop` as that
+  account (`psexec -s` for LocalSystem). A service wrapper's stop (NSSM sends Ctrl+C, then
+  kills the process after its timeout) starts a drain it then cuts off: run `zkminer stop`
+  first, or give it a stop timeout long enough for a drain.
 - **One miner per key.** Two miners on one key drive the same locks and replace each
   other's transactions. `run` holds `~/.zkminer/miner.lock`, so a second one from the same
   home refuses to start (including while the first is still draining); it can't see one in
@@ -800,10 +815,10 @@ Worth knowing:
   for, too little VRAM. The ones that need attention also go to the dashboard's activity log.
   `zkminer doctor` prints the same table on demand, with the config, chain, gas and stake
   checks, and starts nothing. Cards with 12 GB are the common case: SP1 work needs about
-  15.2 GiB of VRAM free (`ZKMINER_MIN_AVAILABLE_VRAM_MB` lowers that, at the risk of running
-  out part-way through a claimed job), and RISC Zero gives a card under 14 GiB no segment
-  size until you set one (`[prover.risc0_job_po2]`, below) or run `zkminer benchmark
-  --calibrate`.
+  15.2 GiB of VRAM free (`ZKMINER_MIN_AVAILABLE_VRAM_MB` lowers that, untested: 12 GB cards
+  have proved small SP1 jobs, but a larger job can run out part-way and lose its lock), and
+  RISC Zero gives a card under 14 GiB no segment size until `zkminer benchmark --calibrate`
+  measures one or you set one (`[prover.risc0_job_po2]`, below; untested on such cards).
 
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for

@@ -24,6 +24,8 @@ pub struct Row {
 pub enum Verdict {
     /// It proves here (what it proves at, e.g. "segment size 2^20").
     Ready(String),
+    /// It gets jobs here, but some may fail part-way (why).
+    Risky(String),
     /// Its worker runs, but it gets no jobs here (why, and what changes that).
     Idle(String),
     /// No worker for it here (why, and what changes that).
@@ -31,8 +33,9 @@ pub enum Verdict {
 }
 
 impl Verdict {
+    /// Whether jobs reach it here (safely or not).
     pub fn is_ready(&self) -> bool {
-        matches!(self, Verdict::Ready(_))
+        matches!(self, Verdict::Ready(_) | Verdict::Risky(_))
     }
 }
 
@@ -74,8 +77,11 @@ fn card_label(gpu_tag: &str, index: Option<u32>, name: Option<&str>, vram: Optio
 /// free-VRAM gate needs (`WorkerPool::read_card`): `nvidia-smi` for NVIDIA cards everywhere, the
 /// amdgpu / xe drivers' sysfs and DRM figures for AMD and Intel cards on Linux only. Where it
 /// cannot, the gate is skipped and the card gets SP1 work whatever its size.
-fn free_vram_checked(gpu_tag: &str) -> bool {
-    gpu_tag == "cuda" || (cfg!(target_os = "linux") && matches!(gpu_tag, "rocm" | "intel"))
+/// `vram_known`: whether the card's size could be read, which on Linux comes from the same driver
+/// query as its occupancy (an Arc card on i915 has neither).
+fn free_vram_checked(gpu_tag: &str, vram_known: bool) -> bool {
+    gpu_tag == "cuda"
+        || (cfg!(target_os = "linux") && matches!(gpu_tag, "rocm" | "intel") && vram_known)
 }
 
 /// Whether the miner mines OpenVM jobs (`ZKMINER_ENABLE_OPENVM=1`; see `resolve_backend`).
@@ -109,8 +115,9 @@ fn running_verdict(
                 )),
                 None => Verdict::Idle(format!(
                     "no segment size for a card under {:.0} GiB, so it proves no RISC Zero job. \
-                     Set a smaller one (`[prover.risc0_job_po2]` {device} = 19) or run `zkminer \
-                     benchmark --calibrate` with the miner stopped.",
+                     Run `zkminer benchmark --calibrate` with the miner stopped to measure one, or \
+                     set one (`[prover.risc0_job_po2]` {device} = 19; untested on cards this \
+                     size).",
                     zkminer_prover::benchmark::RISC0_JOB_MIN_VRAM_BYTES as f64 / GIB
                 )),
             }
@@ -118,23 +125,42 @@ fn running_verdict(
         BACKEND_SP1 => {
             let floor =
                 zkminer_prover::discovery::min_available_vram_bytes_for_backend(BACKEND_SP1);
-            if !free_vram_checked(&slot.gpu_tag) {
+            // What SP1's smallest measured configuration needs free, whatever the override.
+            let measured = zkminer_prover_protocol::types::sp1_min_available_vram_bytes();
+            let small = slot.vram_bytes.is_some_and(|v| v < measured);
+            if !free_vram_checked(&slot.gpu_tag, slot.vram_bytes.is_some()) {
                 // The dispatcher cannot read this card's occupancy, so its free-VRAM gate lets
                 // every SP1 job through: a table that called the card idle would be wrong.
-                return Verdict::Ready(
-                    "its free VRAM is not checked on this platform, so a job can run out part-way \
-                     if something else holds VRAM on the card"
-                        .to_string(),
-                );
+                return if small {
+                    Verdict::Risky(format!(
+                        "it gets SP1 jobs (free VRAM is not checked for this card here), but it is \
+                         under the {:.1} GiB SP1's measured configurations need: cards this size \
+                         have proved small SP1 jobs, and a larger one can run out part-way, \
+                         losing its lock",
+                        measured as f64 / GIB
+                    ))
+                } else {
+                    Verdict::Ready(
+                        "its free VRAM is not checked on this platform, so a job can run out \
+                         part-way if something else holds VRAM on the card"
+                            .to_string(),
+                    )
+                };
             }
             match (floor, slot.vram_bytes) {
                 (Some(need), Some(have)) if have < need => Verdict::Idle(format!(
                     "SP1 work needs {:.1} GiB of VRAM free and this card has {:.1} GiB in all, so \
-                     it gets none. {}=<MiB> lowers the bar, at the risk of running out part-way \
-                     through a claimed job.",
+                     it gets none. {}=<MiB> lowers the bar, untested: cards this size have proved \
+                     small SP1 jobs, but a larger job can run out part-way and lose its lock.",
                     need as f64 / GIB,
                     have as f64 / GIB,
                     zkminer_prover::discovery::MIN_AVAILABLE_VRAM_MB_ENV,
+                )),
+                (Some(_), Some(_)) if small => Verdict::Risky(format!(
+                    "{} lowers the bar below the {:.1} GiB SP1's measured configurations need: a \
+                     larger job can run out part-way and lose its lock",
+                    zkminer_prover::discovery::MIN_AVAILABLE_VRAM_MB_ENV,
+                    measured as f64 / GIB
                 )),
                 (Some(need), _) => Verdict::Ready(format!(
                     "when {:.1} GiB of its VRAM is free",
@@ -274,6 +300,7 @@ pub fn lines(rows: &[Row]) -> Vec<String> {
         .map(|r| {
             let (word, why) = match &r.verdict {
                 Verdict::Ready(why) => ("ready", why),
+                Verdict::Risky(why) => ("RISKY", why),
                 Verdict::Idle(why) => ("IDLE", why),
                 Verdict::Missing(why) => ("NOT AVAILABLE", why),
             };
