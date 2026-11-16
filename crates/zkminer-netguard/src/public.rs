@@ -426,7 +426,7 @@ pub fn ask(r: &Reflector, timeout: Duration) -> io::Result<IpAddr> {
     }
 }
 
-fn query_id() -> u16 {
+pub(crate) fn query_id() -> u16 {
     use std::hash::{BuildHasher, Hasher};
     // A per-process random key, and the clock: unpredictable enough for an id whose forgery can
     // only add an address to refuse.
@@ -442,9 +442,21 @@ fn query_id() -> u16 {
 
 /// A query for `name` `TXT` in `class`, recursion not desired.
 pub(crate) fn build_query(id: u16, name: &str, class: u16) -> io::Result<Vec<u8>> {
+    build_query_with(id, name, TYPE_TXT, class, false)
+}
+
+/// A query for `name` of type `qtype` in `class`, recursion desired or not.
+pub(crate) fn build_query_with(
+    id: u16,
+    name: &str,
+    qtype: u16,
+    class: u16,
+    recursion_desired: bool,
+) -> io::Result<Vec<u8>> {
     let mut q = Vec::with_capacity(12 + name.len() + 6);
     q.extend_from_slice(&id.to_be_bytes());
-    q.extend_from_slice(&0u16.to_be_bytes()); // flags: a standard query, RD clear
+    // A standard query; RD as asked.
+    q.extend_from_slice(&if recursion_desired { 0x0100u16 } else { 0 }.to_be_bytes());
     q.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
     q.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
     for label in name.split('.') {
@@ -455,17 +467,17 @@ pub(crate) fn build_query(id: u16, name: &str, class: u16) -> io::Result<Vec<u8>
         q.extend_from_slice(label.as_bytes());
     }
     q.push(0);
-    q.extend_from_slice(&TYPE_TXT.to_be_bytes());
+    q.extend_from_slice(&qtype.to_be_bytes());
     q.extend_from_slice(&class.to_be_bytes());
     Ok(q)
 }
 
-fn u16_at(m: &[u8], i: usize) -> Option<u16> {
+pub(crate) fn u16_at(m: &[u8], i: usize) -> Option<u16> {
     Some(u16::from_be_bytes([*m.get(i)?, *m.get(i + 1)?]))
 }
 
 /// The offset just past the (possibly compressed) name at `off`.
-fn skip_name(m: &[u8], mut off: usize) -> Option<usize> {
+pub(crate) fn skip_name(m: &[u8], mut off: usize) -> Option<usize> {
     for _ in 0..128 {
         let len = *m.get(off)?;
         match len >> 6 {

@@ -34,6 +34,7 @@ pub mod content;
 mod facts;
 mod host;
 pub mod ip;
+pub mod nat64;
 mod policy;
 pub mod public;
 pub mod routes;

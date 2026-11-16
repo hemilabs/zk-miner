@@ -34,6 +34,10 @@
 //!   entity tags `2001:30::/28` (RFC 9374, ORCHIDv2-formatted) are identifiers, not routable
 //!   locators, and the blocklist refuses ORCHIDv2.
 //!
+//! - **NAT64 network-specific prefixes** ([`crate::nat64`]: `[egress] nat64_prefixes`, and what
+//!   the host's DNS64 reveals): an address under one is also judged by the IPv4 address it
+//!   carries (RFC 6052 layouts), and read as it by [`canonical_ip`].
+//!
 //! Ported from the witness broker's egress predicate (`zkminer-witness-broker/src/egress.rs` @
 //! bd9aabf), which a review already hardened; the one change is the IPv4-compatible form, refused
 //! outright here where the broker judged it by its IPv4 address.
@@ -93,8 +97,9 @@ impl Prefix {
 
     /// The prefix as the address space it reaches: an IPv6 prefix of length 96 or more inside one of
     /// the embedded-IPv4 /96s [`canonical_ip`] reads (mapped, compatible, SIIT, the well-known
-    /// NAT64) is the IPv4 prefix it embeds; any other is itself, with host bits cleared. Like
-    /// [`canonical_ip`], `::/128` and `::1/128` stay themselves.
+    /// NAT64), or inside a NAT64 network-specific prefix in force ([`crate::nat64`]) with no
+    /// nonzero u-octet bit fixed, is the IPv4 prefix it embeds; any other is itself, with host
+    /// bits cleared. Like [`canonical_ip`], `::/128` and `::1/128` stay themselves.
     pub fn canonical_prefix(&self) -> Prefix {
         let p = Prefix::new(self.addr, self.len);
         if let (IpAddr::V6(v6), true) = (p.addr, p.len >= 96) {
@@ -107,6 +112,15 @@ impl Prefix {
                     IpAddr::V4(Ipv4Addr::from(u128::from(v6) as u32)),
                     p.len - 96,
                 );
+            }
+        }
+        if p.addr.is_ipv6() {
+            for n in crate::nat64::current().iter() {
+                if p.len >= n.len && in_prefix(*n, p.addr) {
+                    if let Some(q) = nsp_canonical(p, *n) {
+                        return q;
+                    }
+                }
             }
         }
         p
@@ -207,14 +221,90 @@ pub(crate) fn mask(ip: IpAddr, len: u8) -> IpAddr {
 }
 
 /// `ip` with every embedded-IPv4 form replaced by that IPv4 address (mapped `::ffff:a.b.c.d`,
-/// compatible `::a.b.c.d`, SIIT `::ffff:0:a.b.c.d`, the well-known NAT64 `64:ff9b::a.b.c.d`), so deny
-/// CIDRs, connected prefixes and the host's own addresses match whichever spelling a connection
-/// uses. Used for those comparisons only: [`is_global`] judges the original address.
+/// compatible `::a.b.c.d`, SIIT `::ffff:0:a.b.c.d`, the well-known NAT64 `64:ff9b::a.b.c.d`, and
+/// an address under a NAT64 network-specific prefix in force, [`crate::nat64`]), so deny CIDRs,
+/// connected prefixes and the host's own addresses match whichever spelling a connection uses.
+/// Used for those comparisons only: [`is_global`] judges the original address.
 pub fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => embedded_v4(v6).map_or(ip, IpAddr::V4),
+        IpAddr::V6(v6) => embedded_v4(v6)
+            .or_else(|| nsp_v4(v6).map(|(v4, _)| v4))
+            .map_or(ip, IpAddr::V4),
         v4 => v4,
     }
+}
+
+/// The IPv6 bit (0 = the most significant) that holds bit `i` of the IPv4 address under an
+/// RFC 6052 prefix of length `len`: the bits right after the prefix, skipping bits 64–71 (the "u"
+/// octet); for a /96, the last 32 bits.
+fn nsp_bit(len: u8, i: u8) -> u8 {
+    if len == 96 {
+        96 + i
+    } else if len + i < 64 {
+        len + i
+    } else {
+        len + i + 8
+    }
+}
+
+/// The IPv4 address the IPv6 address `x` carries under an RFC 6052 prefix of length `len`, and
+/// whether its u octet (bits 64–71) is zero, as RFC 6052 requires (always true for a /96).
+pub(crate) fn nsp_extract(x: u128, len: u8) -> (Ipv4Addr, bool) {
+    let mut v4 = 0u32;
+    for i in 0..32u8 {
+        let bit = (x >> (127 - u32::from(nsp_bit(len, i)))) & 1;
+        v4 |= (bit as u32) << (31 - u32::from(i));
+    }
+    (Ipv4Addr::from(v4), len == 96 || (x >> 56) & 0xff == 0)
+}
+
+/// The IPv6 prefix under the NAT64 prefix `nsp` that holds every address carrying an address of
+/// the IPv4 prefix `v4` with a zero u octet (any suffix): the NSP, then the IPv4 prefix's bits
+/// laid out as RFC 6052 says, the u octet zero where they pass it.
+pub(crate) fn nsp_embed(nsp: Prefix, v4: Prefix) -> Prefix {
+    let (IpAddr::V6(n), IpAddr::V4(a)) = (nsp.addr, v4.addr) else {
+        return nsp;
+    };
+    let mut x = u128::from(n) & mask128(nsp.len);
+    let bits = u32::from(a);
+    let v4_len = v4.len.min(32);
+    for i in 0..v4_len {
+        if (bits >> (31 - u32::from(i))) & 1 == 1 {
+            x |= 1u128 << (127 - u32::from(nsp_bit(nsp.len, i)));
+        }
+    }
+    let len = if v4_len == 0 {
+        nsp.len
+    } else {
+        nsp_bit(nsp.len, v4_len - 1) + 1
+    };
+    Prefix::new(IpAddr::V6(Ipv6Addr::from(x)), len)
+}
+
+/// `p` (inside the NAT64 prefix `nsp`, at least as long) read as the IPv4 prefix it carries:
+/// `None` when it fixes a u-octet bit to one (such addresses are not global).
+fn nsp_canonical(p: Prefix, nsp: Prefix) -> Option<Prefix> {
+    let IpAddr::V6(v6) = p.addr else { return None };
+    let x = u128::from(v6);
+    if nsp.len < 96 && p.len > 64 {
+        let fixed = p.len.min(72) - 64;
+        let u = ((x >> 56) & 0xff) as u8;
+        if u & !(0xffu8.checked_shr(u32::from(fixed)).unwrap_or(0)) != 0 {
+            return None;
+        }
+    }
+    let k = (0..32u8).filter(|&i| nsp_bit(nsp.len, i) < p.len).count() as u8;
+    Some(Prefix::new(IpAddr::V4(nsp_extract(x, nsp.len).0), k))
+}
+
+/// The IPv4 address `a` carries under a NAT64 network-specific prefix in force (the first that
+/// holds it), and whether its u octet is zero.
+fn nsp_v4(a: Ipv6Addr) -> Option<(Ipv4Addr, bool)> {
+    let x = u128::from(a);
+    crate::nat64::current()
+        .iter()
+        .find(|n| in_prefix(**n, IpAddr::V6(a)))
+        .map(|n| nsp_extract(x, n.len))
 }
 
 fn mask32(len: u8) -> u32 {
@@ -278,6 +368,13 @@ fn v4_is_global(a: Ipv4Addr) -> bool {
     !V4_NOT_GLOBAL.iter().any(|&(net, len)| in4(x, net, len))
 }
 
+/// The IPv4 ranges that are not global, as prefixes.
+pub(crate) fn v4_not_global() -> impl Iterator<Item = Prefix> {
+    V4_NOT_GLOBAL
+        .iter()
+        .map(|&(n, l)| Prefix::new(IpAddr::V4(Ipv4Addr::from(n)), l))
+}
+
 /// The IPv4 address an IPv6 address embeds, in the forms [`canonical_ip`] reads: mapped, compatible
 /// (not `::`/`::1`), SIIT and the well-known NAT64 /96.
 fn embedded_v4(a: Ipv6Addr) -> Option<Ipv4Addr> {
@@ -304,7 +401,19 @@ fn v6_is_global(a: Ipv6Addr) -> bool {
     if !in6(x, 0x2000 << 112, 3) {
         return false;
     }
-    !V6_NOT_GLOBAL.iter().any(|&(net, len)| in6(x, net, len))
+    if V6_NOT_GLOBAL.iter().any(|&(net, len)| in6(x, net, len)) {
+        return false;
+    }
+    // Review r2 R2-NG-4: under every NAT64 network-specific prefix in force, also judged by the
+    // IPv4 address it carries (which only ever refuses more).
+    let a = IpAddr::V6(a);
+    crate::nat64::current()
+        .iter()
+        .filter(|n| in_prefix(**n, a))
+        .all(|n| {
+            let (v4, u_zero) = nsp_extract(x, n.len);
+            u_zero && v4_is_global(v4)
+        })
 }
 
 /// Allow-only-globally-routable unicast: see the module doc for the exact ranges and choices.
@@ -325,6 +434,35 @@ pub fn is_global(ip: IpAddr) -> bool {
 /// their number times the address width.
 pub fn prefix_is_global(p: Prefix) -> bool {
     let p = Prefix::new(p.addr, p.len);
+    // A prefix that meets a NAT64 network-specific prefix in force: holding all of it, it holds
+    // `<NSP>::10.0.0.1`; inside it, it must fix a zero u octet and carry a global IPv4 prefix.
+    if p.addr.is_ipv6() {
+        for n in crate::nat64::current().iter() {
+            let len = p.len.min(n.len);
+            if mask(p.addr, len) != mask(n.addr, len) {
+                continue;
+            }
+            if p.len <= n.len {
+                return false;
+            }
+            let u_fixed_zero = n.len == 96
+                || (p.len >= 72 && {
+                    let IpAddr::V6(a) = p.addr else {
+                        unreachable!()
+                    };
+                    (u128::from(a) >> 56) & 0xff == 0
+                });
+            match nsp_canonical(p, *n) {
+                Some(q) if u_fixed_zero && plain_prefix_is_global(q) => {}
+                _ => return false,
+            }
+        }
+    }
+    plain_prefix_is_global(p)
+}
+
+/// [`prefix_is_global`] by the fixed tables (see its doc); [`is_global`] judges each leaf.
+fn plain_prefix_is_global(p: Prefix) -> bool {
     let width = if p.addr.is_ipv4() { 32 } else { 128 };
     let split = p.len < width
         && boundaries().iter().any(|b| {
@@ -345,7 +483,7 @@ pub fn prefix_is_global(p: Prefix) -> bool {
         },
         p.len + 1,
     );
-    prefix_is_global(lower) && prefix_is_global(upper)
+    plain_prefix_is_global(lower) && plain_prefix_is_global(upper)
 }
 
 /// Every prefix whose membership [`is_global`] depends on (see [`prefix_is_global`]).
@@ -1002,6 +1140,45 @@ mod tests {
                 prop_assert!(!is_global(q.addr), "{} judged not global, but descended to global {}", p, q.addr);
             }
         }
+    }
+
+    /// RFC 6052 §2.4's example: 192.0.2.33 under each prefix length.
+    #[test]
+    fn rfc6052_layouts() {
+        let v4 = Ipv4Addr::new(192, 0, 2, 33);
+        for (nsp, addr) in [
+            ("2001:db8::/32", "2001:db8:c000:221::"),
+            ("2001:db8:100::/40", "2001:db8:1c0:2:21::"),
+            ("2001:db8:122::/48", "2001:db8:122:c000:2:2100::"),
+            ("2001:db8:122:300::/56", "2001:db8:122:3c0:0:221::"),
+            ("2001:db8:122:344::/64", "2001:db8:122:344:c0:2:2100:0"),
+            ("2001:db8:122:344::/96", "2001:db8:122:344::192.0.2.33"),
+        ] {
+            let n = pfx(nsp);
+            let IpAddr::V6(a) = ip(addr) else { panic!() };
+            assert_eq!(nsp_extract(u128::from(a), n.len), (v4, true), "{nsp}");
+            let host = nsp_embed(n, Prefix::host(IpAddr::V4(v4)));
+            assert!(in_prefix(host, ip(addr)), "{nsp}: {host}");
+            assert_eq!(
+                nsp_canonical(host, n),
+                Some(Prefix::host(IpAddr::V4(v4))),
+                "{nsp}"
+            );
+            // A /24 of IPv4 addresses, embedded and read back.
+            let net = nsp_embed(n, pfx("192.0.2.0/24"));
+            assert!(in_prefix(net, ip(addr)), "{nsp}: {net}");
+            assert_eq!(nsp_canonical(net, n), Some(pfx("192.0.2.0/24")), "{nsp}");
+            // A nonzero u octet is seen (where there is one).
+            let x = u128::from(a) | (1 << 60);
+            assert_eq!(nsp_extract(x, n.len).1, n.len == 96, "{nsp}");
+        }
+        // A prefix that fixes a u-octet bit to one reads as nothing.
+        let n = pfx("2001:db8:122:344::/64");
+        assert_eq!(nsp_canonical(pfx("2001:db8:122:344:8000::/65"), n), None);
+        assert_eq!(
+            nsp_canonical(pfx("2001:db8:122:344::/65"), n),
+            Some(pfx("0.0.0.0/0"))
+        );
     }
 
     #[test]

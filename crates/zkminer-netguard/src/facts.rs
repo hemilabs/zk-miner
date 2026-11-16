@@ -23,6 +23,9 @@
 //!   table ([`crate::routes::RouteTable::off_default_path`]); and the kernel itself, asked per
 //!   destination how it would route a connection ([`crate::routes::RouteTable::judge`]).
 //!
+//! - **NAT64 prefixes**, configured or learned ([`crate::nat64`]): process-wide, read by the
+//!   address predicate itself.
+//!
 //! A miner in a container sees the container's network, not the host's: run it with host
 //! networking, or list the host's networks in `[egress] deny_cidrs`.
 
@@ -270,11 +273,14 @@ impl HostFacts {
     /// its netmask or on-link prefix length — a connected prefix, plus the peer of a
     /// point-to-point link as a host route; an address without a netmask counts as a host route; a
     /// non-contiguous netmask counts its leading ones, which only widens the prefix), the routing
-    /// table, the DNS servers, and (if `opts` says so) the public addresses, then
-    /// [`Self::assemble`]s them. Fails if the interfaces or the routing table cannot be read: a
+    /// tables and rules, the DNS servers, (if `opts` says so) the public addresses, and the NAT64
+    /// prefixes the DNS servers reveal ([`crate::nat64`]), then [`Self::assemble`]s them, with the
+    /// kernel as the route oracle. Fails if the interfaces or the routing table cannot be read: a
     /// public-mode policy that does not know them cannot refuse what they name.
     pub fn gather_with(opts: &FactsOptions) -> io::Result<Self> {
         let (interface_prefixes, interface_addresses, loopback) = sys::interfaces()?;
+        // The NAT64 prefixes the host's DNS64 reveals (process-wide; the first call asks).
+        crate::nat64::ensure_discovered();
         let (routes, rules) = crate::routes::read_routing(&loopback)?;
         let public = if opts.discover_public_addresses {
             crate::public::learned()
@@ -323,13 +329,29 @@ impl HostFacts {
 
     /// Every prefix these facts refuse, flattened for a consumer that knows only connected prefixes
     /// and own addresses (the sandboxed witness broker, which cannot read the host itself): the
-    /// connected and site prefixes, the prefixes of every route off the default path, and a host
-    /// route for every DNS server.
+    /// connected and site prefixes, the prefixes of every route off the default path, of every
+    /// route that delivers to this host and of every destination rule into another table, a host
+    /// route for every DNS server, and what the NAT64 network-specific prefixes in force imply
+    /// ([`crate::nat64::embedded_refusals`]).
     pub fn refused_prefixes(&self) -> Vec<Prefix> {
         let mut v = self.connected.clone();
         v.extend_from_slice(&self.site);
         v.extend(self.routes.off_default_prefixes());
         v.extend(self.resolvers.iter().map(|r| Prefix::host(*r)));
+        // Under each NAT64 network-specific prefix in force, the IPv4 ranges refused here and
+        // the non-global ones, embedded (the consumer may not know the prefix).
+        let mut v4: Vec<Prefix> = v
+            .iter()
+            .map(Prefix::canonical_prefix)
+            .filter(|p| p.addr.is_ipv4())
+            .collect();
+        v4.extend(
+            self.own
+                .iter()
+                .map(|a| Prefix::host(crate::canonical_ip(*a)))
+                .filter(|p| p.addr.is_ipv4()),
+        );
+        v.extend(crate::nat64::embedded_refusals(&v4));
         sorted(v)
     }
 
