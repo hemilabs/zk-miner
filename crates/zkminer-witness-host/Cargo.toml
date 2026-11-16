@@ -1,0 +1,21 @@
+[package]
+name = "zkminer-witness-host"
+version.workspace = true
+edition.workspace = true
+description = "The miner side of witness-construction jobs: sandboxed spawns, the broker process, the retention store, builder runs and the pre-claim pipeline"
+
+[dependencies]
+zkminer-witness = { workspace = true }
+zkminer-witness-sandbox = { workspace = true }
+zkminer-witness-store = { workspace = true }
+zkminer-witness-broker = { path = "../zkminer-witness-broker" }
+zkminer-config = { workspace = true }
+alloy-primitives = { workspace = true, features = ["serde"] }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

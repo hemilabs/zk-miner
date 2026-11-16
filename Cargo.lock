@@ -10822,6 +10822,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "zkminer-witness-host"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "anyhow",
+ "libc",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zkminer-config",
+ "zkminer-witness",
+ "zkminer-witness-broker",
+ "zkminer-witness-sandbox",
+ "zkminer-witness-store",
+]
+
+[[package]]
 name = "zkminer-witness-sandbox"
 version = "0.1.0"
 dependencies = [
