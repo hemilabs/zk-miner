@@ -536,9 +536,30 @@ impl BrokerConfig {
             .chain(self.artifacts.iter().flat_map(|a| std::iter::once(&a.spec).chain(a.mirror.iter())))
     }
 
-    /// The TCP ports the broker connects to (its sandbox profile).
+    /// The TCP ports the broker connects to (its sandbox profile): every endpoint's port, and —
+    /// when an endpoint is named by host name, so the resolver runs — the DNS servers' ports (53,
+    /// unless `[dns] servers` names another), since [`crate::dns`] queries over TCP.
+    ///
+    /// Landlock admits a port to *any* host. That the broker dials only the configured endpoints
+    /// on theirs is the network floor's work ([`crate::net`]), and only the resolver's servers on
+    /// theirs is [`crate::dns`]'s: the server list is fixed at startup, from `[dns] servers` or
+    /// `/etc/resolv.conf`, and no other code connects to it.
     pub fn tcp_connect_ports(&self) -> Vec<u16> {
-        self.endpoints().map(|e| e.port).collect::<BTreeSet<_>>().into_iter().collect()
+        let mut ports: BTreeSet<u16> = self.endpoints().map(|e| e.port).collect();
+        if self.endpoints().any(|e| e.literal.is_none()) {
+            ports.extend(self.dns_server_ports());
+        }
+        ports.into_iter().collect()
+    }
+
+    /// The ports of the servers the resolver will use: the host facts' (read before the sandbox),
+    /// else `[dns] servers`, else the DNS port (`/etc/resolv.conf` names addresses only).
+    fn dns_server_ports(&self) -> Vec<u16> {
+        match &self.host {
+            Some(h) => h.dns_servers.iter().map(|s| s.port()).collect(),
+            None if !self.dns.servers.is_empty() => self.dns.servers.iter().map(|s| s.port()).collect(),
+            None => vec![crate::dns::DNS_PORT],
+        }
     }
 
     /// The bytes reserved for held-lock work.
@@ -1089,7 +1110,8 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         let m = a.mirror.as_ref().unwrap();
         assert_eq!(m.url_with(&[("type", "1"), ("id", "ab")]), "https://mirror.example/artifacts/1/ab");
         assert_eq!(c.blob_mirrors[0].url_with(&[("sha256", "ff")]), "https://mirror.example/blobs/ff");
-        assert_eq!(c.tcp_connect_ports(), vec![443, 8545]);
+        // Host-name endpoints: the resolver's port (TCP DNS) too.
+        assert_eq!(c.tcp_connect_ports(), vec![53, 443, 8545]);
         assert_eq!(c.held_lock_reserved_bytes(), 64 << 20);
     }
 
@@ -1272,6 +1294,31 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         assert_eq!(p["named"], vec![]);
         assert_eq!(p["lit"], vec![host_prefix("10.0.0.5".parse().unwrap())]);
         assert_eq!(p["both"], vec![parse_cidr("192.168.4.0/24").unwrap()]);
+    }
+
+    /// The resolver queries over TCP, so its servers' ports join the sandbox's connect ports —
+    /// only when some endpoint is named by host name.
+    #[test]
+    fn tcp_connect_ports_include_the_resolver_only_when_names_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = "[[evm_rpc]]\nalias = \"named\"\nurl = \"https://node.example\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n";
+        let literal = "[[evm_rpc]]\nalias = \"lit\"\nurl = \"http://10.0.0.5:8545\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n";
+        let ports = |extra: &str| BrokerConfig::from_toml(&minimal(extra), dir.path()).unwrap().tcp_connect_ports();
+        assert_eq!(ports(literal), vec![8545]);
+        assert_eq!(ports(&format!("{named}{literal}")), vec![53, 443, 8545]);
+        assert_eq!(
+            ports(&format!("[dns]\nservers = [\"127.0.0.1:5353\", \"9.9.9.9\"]\n{named}")),
+            vec![53, 443, 5353]
+        );
+        assert_eq!(ports(&format!("[dns]\nservers = [\"127.0.0.1:5353\"]\n{literal}")), vec![8545]);
+        // Once the host facts are read (main does so before the sandbox), their servers count.
+        let mut c = BrokerConfig::from_toml(&minimal(named), dir.path()).unwrap();
+        c.host = Some(HostFacts { dns_servers: vec!["127.0.0.53:53".parse().unwrap()], ..Default::default() });
+        assert_eq!(c.tcp_connect_ports(), vec![53, 443]);
+        c.host = Some(HostFacts { dns_servers: vec!["127.0.0.1:40053".parse().unwrap()], ..Default::default() });
+        assert_eq!(c.tcp_connect_ports(), vec![443, 40053]);
+        c.host = Some(HostFacts::default());
+        assert_eq!(c.tcp_connect_ports(), vec![443], "no server, no DNS port");
     }
 
     #[test]

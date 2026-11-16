@@ -7,7 +7,8 @@
 //! refuses a process that already has a second thread), and only then logging (every line
 //! redacted at the writer), the tokio runtime and the HTTP clients. The sandbox grants no file
 //! but the spool directory: no `/etc/hosts`, `/etc/nsswitch.conf` or `/etc/resolv.conf` (host names
-//! are resolved over UDP to the servers read before it).
+//! are resolved over TCP to the servers read before it). Its sockets are TCP only (no UDP): the
+//! connect ports are the endpoints' and, when a host name needs resolving, the DNS servers' (53).
 //!
 //! Threads: the main thread, [`WORKER_THREADS`] runtime workers and at most
 //! [`MAX_BLOCKING_THREADS`] blocking-pool threads: 13 in all, the broker cgroup's `pids.max` floor.
@@ -63,7 +64,9 @@ fn main() -> ExitCode {
         eprintln!("zkminer-witness-broker: creating spool_dir: {e}");
         return ExitCode::from(2);
     }
-    // No readable files; blob/v1 spool files are created in spool_dir.
+    // No readable files; blob/v1 spool files are created in spool_dir. The connect ports include
+    // the resolver's (port 53 to any host, as far as Landlock goes; only `dns` dials it, and only
+    // the servers in `config.host`).
     let profile = Profile::Broker {
         readable: Vec::new(),
         writable: vec![config.spool_dir.clone()],

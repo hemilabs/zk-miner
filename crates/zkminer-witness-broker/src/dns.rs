@@ -3,40 +3,52 @@
 //! The broker does not use the system resolver: `getaddrinfo` reads `/etc/hosts` and
 //! `/etc/nsswitch.conf` and may load NSS modules (mDNS, LLMNR, split-horizon), none of which the
 //! sandbox grants. Instead it asks the servers of `[dns] servers` (default: the `nameserver` lines
-//! of `/etc/resolv.conf`, read before the sandbox) directly, over plain UDP:
+//! of `/etc/resolv.conf`, read before the sandbox) directly, over **TCP** (RFC 1035 §4.2.2,
+//! RFC 7766):
 //!
-//! - one `A` and one `AAAA` query per resolution, recursion desired, EDNS(0) with a 1,232-byte UDP
-//!   payload and no options (no client subnet);
-//! - a fresh socket per query, created with `socket` and `connect` only (the sandbox denies `bind`;
-//!   `connect` binds an ephemeral port implicitly), so the kernel drops datagrams from any other
-//!   source; a random 16-bit id;
+//! - one `A` and one `AAAA` query per resolution, recursion desired, EDNS(0) with no options (no
+//!   client subnet);
+//! - a fresh connection per query, made with `socket(SOCK_STREAM)` and `connect` only (the sandbox
+//!   denies `bind`, and every socket but TCP: Landlock restricts TCP connects by port and nothing
+//!   else, so the broker may not have UDP sockets at all); each message carries its 2-byte length
+//!   prefix; a random 16-bit id; the connection is closed after the one answer;
 //! - every answer is validated: the id, `QR`, opcode 0, one question echoing ours exactly, record
-//!   bounds, compression pointers that only point backwards; datagrams with another id or question
-//!   are ignored until the timeout; a truncated (`TC`) answer is an error (no TCP fallback);
-//!   `NXDOMAIN` is an empty answer; other error codes move to the next server;
+//!   bounds, compression pointers that only point backwards; over our own connection an answer
+//!   with another id or question is an error, as is one with `TC` set (TCP has no truncation: the
+//!   length prefix carries answers up to 65,535 bytes); `NXDOMAIN` is an empty answer; other error
+//!   codes move to the next server;
 //! - only `A`/`AAAA` records of class `IN` owned by the queried name, or by a name a `CNAME` chain
 //!   (at most 8 hops) from it leads to, are taken; at most 32 addresses.
 //!
+//! **Which hosts it dials.** Only the resolver's own server list, fixed when the broker starts (the
+//! configured `[dns] servers`, or `/etc/resolv.conf`'s, read before the sandbox): nothing a job,
+//! a builder or an answer supplies ever becomes a server. The sandbox cannot say as much — Landlock
+//! admits a TCP port to *any* host, so with port 53 in the broker's `tcp_connect_ports` (see
+//! [`crate::config::BrokerConfig::tcp_connect_ports`]) the kernel lets the process reach every host
+//! on port 53 — so this module is where that guarantee lives: connections to a server are made
+//! here and nowhere else, never through the HTTP clients or the network floor.
+//!
 //! What the answers are allowed to become is the network floor's business ([`crate::net`]): a
 //! DNS-derived address is admitted only when it is global and outside the deny CIDRs, the connected
-//! prefixes and the host's own addresses. With `127.0.0.53` (systemd-resolved) as the server, that
-//! daemon's own `/etc/hosts`, LLMNR and mDNS handling still applies; configure `[dns] servers` to a
-//! dedicated resolver to avoid it.
+//! prefixes and the host's own addresses. With `127.0.0.53` (systemd-resolved, which also answers
+//! on TCP) as the server, that daemon's own `/etc/hosts`, LLMNR and mDNS handling still applies;
+//! configure `[dns] servers` to a dedicated resolver to avoid it.
 
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// The DNS port.
 pub const DNS_PORT: u16 = 53;
-/// How long one query waits for its answer from one server.
+/// How long one query (connect, send, answer) may take with one server.
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// The most addresses taken from one answer.
 pub const MAX_ADDRS: usize = 32;
 const MAX_CNAME_HOPS: usize = 8;
+/// The OPT record's payload size: meaningless over TCP, kept at the common safe value.
 const EDNS_UDP_PAYLOAD: u16 = 1232;
-const RECV_BUF: usize = 4096;
 /// How many times the server list is walked for one query.
 const ROUNDS: usize = 2;
 
@@ -74,6 +86,8 @@ pub enum DnsError {
     Malformed,
     #[error("truncated answer (TC set)")]
     Truncated,
+    #[error("the answer is not to our query (another id or question)")]
+    NotOurs,
     #[error("server answered with rcode {0}")]
     Rcode(u8),
 }
@@ -131,10 +145,10 @@ pub fn build_query(id: u16, qname: &[u8], qtype: QType) -> Vec<u8> {
     q
 }
 
-/// Why a datagram was not taken.
+/// Why a message was not taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rejected {
-    /// Not an answer to this query (another id or question): keep waiting.
+    /// Not an answer to this query (another id or question).
     NotOurs,
     /// An answer to this query that is unusable: try the next server.
     Bad(DnsError),
@@ -274,56 +288,26 @@ pub fn parse_answer(msg: &[u8], id: u16, qname: &[u8], qtype: QType) -> Result<V
     Ok(out)
 }
 
-/// A UDP socket connected to `server`, made with `socket` + `connect` only (no `bind`).
-fn connected_udp(server: SocketAddr, nonblocking: bool) -> io::Result<std::net::UdpSocket> {
-    let family = if server.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
-    let flags = libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | if nonblocking { libc::SOCK_NONBLOCK } else { 0 };
-    // SAFETY: socket() with constant arguments; a non-negative result is a new fd owned here.
-    let fd = unsafe { libc::socket(family, flags, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
+/// `query` with its 2-byte length prefix (RFC 1035 §4.2.2).
+fn framed(query: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(2 + query.len());
+    m.extend_from_slice(&(query.len() as u16).to_be_bytes());
+    m.extend_from_slice(query);
+    m
+}
+
+/// What one TCP exchange's answer means for the query: over our own connection there is exactly
+/// one message, so an answer to another query is an error too.
+fn judge(answer: &[u8], id: u16, qname: &[u8], qtype: QType) -> Result<Vec<IpAddr>, DnsError> {
+    match parse_answer(answer, id, qname, qtype) {
+        Ok(v) => Ok(v),
+        Err(Rejected::NotOurs) => Err(DnsError::NotOurs),
+        Err(Rejected::Bad(e)) => Err(e),
     }
-    // SAFETY: `fd` is a fresh descriptor nobody else owns.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let r = match server {
-        SocketAddr::V4(a) => {
-            let sin = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: a.port().to_be(),
-                sin_addr: libc::in_addr { s_addr: u32::from(*a.ip()).to_be() },
-                sin_zero: [0; 8],
-            };
-            // SAFETY: connect with a valid sockaddr_in of the size passed.
-            unsafe {
-                libc::connect(
-                    std::os::fd::AsRawFd::as_raw_fd(&fd),
-                    (&sin as *const libc::sockaddr_in).cast(),
-                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                )
-            }
-        }
-        SocketAddr::V6(a) => {
-            let sin6 = libc::sockaddr_in6 {
-                sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                sin6_port: a.port().to_be(),
-                sin6_flowinfo: 0,
-                sin6_addr: libc::in6_addr { s6_addr: a.ip().octets() },
-                sin6_scope_id: a.scope_id(),
-            };
-            // SAFETY: connect with a valid sockaddr_in6 of the size passed.
-            unsafe {
-                libc::connect(
-                    std::os::fd::AsRawFd::as_raw_fd(&fd),
-                    (&sin6 as *const libc::sockaddr_in6).cast(),
-                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                )
-            }
-        }
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(std::net::UdpSocket::from(fd))
+}
+
+fn timed_out(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
 }
 
 fn random_id() -> u16 {
@@ -384,32 +368,30 @@ impl Resolver {
         Err(last)
     }
 
+    /// One query to one server over a fresh TCP connection (`socket` + `connect`; std makes no
+    /// `bind`), within the timeout.
     fn ask_blocking(&self, server: SocketAddr, qname: &[u8], qtype: QType) -> Result<Vec<IpAddr>, DnsError> {
-        let sock = connected_udp(server, false)?;
-        let id = random_id();
-        sock.send(&build_query(id, qname, qtype))?;
         let deadline = Instant::now() + self.timeout;
-        let mut buf = vec![0u8; RECV_BUF];
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(DnsError::Timeout);
+        let left = || {
+            let l = deadline.saturating_duration_since(Instant::now());
+            if l.is_zero() {
+                Err(DnsError::Timeout)
+            } else {
+                Ok(l)
             }
-            sock.set_read_timeout(Some(left))?;
-            let n = match sock.recv(&mut buf) {
-                Ok(n) => n,
-                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                    return Err(DnsError::Timeout)
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
-            };
-            match parse_answer(&buf[..n], id, qname, qtype) {
-                Ok(v) => return Ok(v),
-                Err(Rejected::NotOurs) => continue,
-                Err(Rejected::Bad(e)) => return Err(e),
-            }
-        }
+        };
+        let to_dns = |e: io::Error| if timed_out(&e) { DnsError::Timeout } else { e.into() };
+        let mut sock = TcpStream::connect_timeout(&server, left()?).map_err(to_dns)?;
+        let id = random_id();
+        sock.set_write_timeout(Some(left()?))?;
+        sock.write_all(&framed(&build_query(id, qname, qtype))).map_err(to_dns)?;
+        let mut len = [0u8; 2];
+        sock.set_read_timeout(Some(left()?))?;
+        sock.read_exact(&mut len).map_err(to_dns)?;
+        let mut answer = vec![0u8; usize::from(u16::from_be_bytes(len))];
+        sock.set_read_timeout(Some(left()?))?;
+        sock.read_exact(&mut answer).map_err(to_dns)?;
+        judge(&answer, id, qname, qtype)
     }
 
     async fn query(&self, qname: &[u8], qtype: QType) -> Result<Vec<IpAddr>, DnsError> {
@@ -425,20 +407,17 @@ impl Resolver {
         Err(last)
     }
 
+    /// One query to one server over a fresh TCP connection (tokio: `socket(SOCK_STREAM |
+    /// SOCK_NONBLOCK | SOCK_CLOEXEC, 0)` + `connect`, no `bind`), within the timeout.
     async fn ask(&self, server: SocketAddr, qname: &[u8], qtype: QType) -> Result<Vec<IpAddr>, DnsError> {
-        let sock = tokio::net::UdpSocket::from_std(connected_udp(server, true)?)?;
         let id = random_id();
         let exchange = async {
-            sock.send(&build_query(id, qname, qtype)).await?;
-            let mut buf = vec![0u8; RECV_BUF];
-            loop {
-                let n = sock.recv(&mut buf).await?;
-                match parse_answer(&buf[..n], id, qname, qtype) {
-                    Ok(v) => return Ok(v),
-                    Err(Rejected::NotOurs) => continue,
-                    Err(Rejected::Bad(e)) => return Err(e),
-                }
-            }
+            let mut sock = tokio::net::TcpStream::connect(server).await?;
+            sock.write_all(&framed(&build_query(id, qname, qtype))).await?;
+            let len = sock.read_u16().await?;
+            let mut answer = vec![0u8; usize::from(len)];
+            sock.read_exact(&mut answer).await?;
+            judge(&answer, id, qname, qtype)
         };
         tokio::time::timeout(self.timeout, exchange).await.unwrap_or(Err(DnsError::Timeout))
     }
@@ -490,6 +469,7 @@ pub fn system_servers() -> Vec<SocketAddr> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn answer(id: u16, qname: &[u8], qtype: QType, rcode: u8, flags_extra: u16, records: &[Vec<u8>]) -> Vec<u8> {
         let mut m = Vec::new();
@@ -606,6 +586,104 @@ mod tests {
     fn a_resolver_without_servers_fails() {
         let r = Resolver::new(vec![], QUERY_TIMEOUT);
         assert_eq!(r.resolve_blocking("a.io"), Err(DnsError::NoServers));
+    }
+
+    #[test]
+    fn queries_are_length_prefixed() {
+        let q = build_query(0xbeef, &encode_name("a.io").unwrap(), QType::A);
+        let f = framed(&q);
+        assert_eq!(u16::from_be_bytes([f[0], f[1]]) as usize, q.len());
+        assert_eq!(&f[2..], &q[..]);
+    }
+
+    /// A TCP server that answers every query on a connection with `respond(query)` (framed), or
+    /// stays silent when it returns `None`.
+    async fn tcp_server(respond: impl Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync + 'static) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let respond = std::sync::Arc::new(respond);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                let respond = respond.clone();
+                tokio::spawn(async move {
+                    let Ok(len) = s.read_u16().await else { return };
+                    let mut q = vec![0u8; usize::from(len)];
+                    if s.read_exact(&mut q).await.is_err() {
+                        return;
+                    }
+                    match respond(&q) {
+                        Some(a) => {
+                            let _ = s.write_all(&framed(&a)).await;
+                        }
+                        None => tokio::time::sleep(Duration::from_secs(30)).await,
+                    }
+                });
+            }
+        });
+        (addr, task)
+    }
+
+    /// The question of `query` and an answer to it with `records`.
+    fn reply(query: &[u8], id_delta: u16, records: &[Vec<u8>]) -> Vec<u8> {
+        let id = u16::from_be_bytes([query[0], query[1]]).wrapping_add(id_delta);
+        let qname = read_name(query, 12).unwrap().0;
+        let qtype = if u16_at(query, 12 + qname.len()) == Some(28) { QType::Aaaa } else { QType::A };
+        answer(id, &qname, qtype, 0, 0, records)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolves_over_tcp_blocking_and_async() {
+        let dns = crate::testkit::TestDns::start(&[("rpc.test", &["192.0.2.7", "2001:db8::7"])]).await;
+        let r = Resolver::new(vec![dns.addr], QUERY_TIMEOUT);
+        let want: Vec<IpAddr> = vec!["192.0.2.7".parse().unwrap(), "2001:db8::7".parse().unwrap()];
+        assert_eq!(r.resolve("RPC.test.").await.unwrap(), want);
+        let rb = r.clone();
+        let got = tokio::task::spawn_blocking(move || rb.resolve_blocking("rpc.test")).await.unwrap();
+        assert_eq!(got.unwrap(), want);
+        assert_eq!(r.resolve("other.test").await.unwrap(), Vec::<IpAddr>::new(), "NXDOMAIN");
+        assert_eq!(dns.queries(), 6);
+    }
+
+    /// Answers longer than any UDP payload arrive whole: TCP has no truncation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn large_answers_arrive_whole() {
+        let ips: Vec<String> = (0..100u16).map(|i| format!("2001:db8::{i:x}")).collect();
+        let ips: Vec<&str> = ips.iter().map(String::as_str).collect();
+        let dns = crate::testkit::TestDns::start(&[("big.test", &ips)]).await;
+        let r = Resolver::new(vec![dns.addr], QUERY_TIMEOUT);
+        let got = r.resolve("big.test").await.unwrap();
+        assert_eq!(got.len(), MAX_ADDRS);
+        assert_eq!(got[0], "2001:db8::".parse::<IpAddr>().unwrap());
+    }
+
+    /// Over our own connection, an answer to another query is an error (and the next server is
+    /// asked); a silent server times out; a closed port moves on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn misbehaving_servers() {
+        let (wrong_id, _t1) = tcp_server(|q| Some(reply(q, 1, &[rr(1, &[8, 8, 8, 8])]))).await;
+        let (silent, _t2) = tcp_server(|_| None).await;
+        let (good, _t3) = tcp_server(|q| Some(reply(q, 0, &[rr(1, &[9, 9, 9, 9])]))).await;
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let q = encode_name("x.test").unwrap();
+        let fast = Duration::from_millis(300);
+        assert_eq!(Resolver::new(vec![wrong_id], fast).query(&q, QType::A).await, Err(DnsError::NotOurs));
+        assert_eq!(Resolver::new(vec![silent], fast).query(&q, QType::A).await, Err(DnsError::Timeout));
+        assert!(matches!(Resolver::new(vec![closed], fast).query(&q, QType::A).await, Err(DnsError::Io(_))));
+        let r = Resolver::new(vec![closed, wrong_id, silent, good], fast);
+        assert_eq!(r.query(&q, QType::A).await.unwrap(), vec![IpAddr::from([9, 9, 9, 9])]);
+        let rb = Resolver::new(vec![wrong_id, good], fast);
+        let qb = q.clone();
+        let got = tokio::task::spawn_blocking(move || rb.query_blocking(&qb, QType::A)).await.unwrap();
+        assert_eq!(got.unwrap(), vec![IpAddr::from([9, 9, 9, 9])]);
+        let rs = Resolver::new(vec![silent], fast);
+        let t0 = Instant::now();
+        let got = tokio::task::spawn_blocking(move || rs.query_blocking(&q, QType::A)).await.unwrap();
+        assert_eq!(got, Err(DnsError::Timeout));
+        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
     }
 
     proptest! {
