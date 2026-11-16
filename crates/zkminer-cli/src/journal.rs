@@ -17,11 +17,15 @@
 //!   load unchanged; they are written back as version 2.
 //!
 //! Loading never silently drops anything: an entry that does not parse is kept verbatim (and written
-//! back) and reported with a `PAGE: JOURNAL-ENTRY-UNREADABLE`; a file that does not parse at all is
-//! moved aside, never overwritten, with a `PAGE: JOURNAL-CORRUPT`; a file from a NEWER format, or one
-//! that cannot be read, refuses the start ([`JobJournal::load_checked`]): an older build must not
-//! rewrite a newer build's record of the locks it holds. The journal is not the authoritative index
-//! of witness locks (the retention store's pins are), and the chain scan finds every lock either way.
+//! back) and reported with a `PAGE: JOURNAL-ENTRY-UNREADABLE`, until an authoritative read shows its
+//! job terminal ([`JobJournal::drop_unparsed`]); a file that does not parse at all is moved aside,
+//! never overwritten, with a `PAGE: JOURNAL-CORRUPT`; a file from a NEWER format, or one that cannot
+//! be read, is an error ([`JobJournal::load_checked`]): an older build must not rewrite a newer
+//! build's record of the locks it holds. The miner then starts in held-locks-only mode with this
+//! run's journal written beside the file ([`JobJournal::write_aside`]), never over it: refusing to
+//! start would leave every lock it holds undriven until slashed, while the chain scan (and the
+//! retention store, for witness locks) still finds each of them. The journal is not the
+//! authoritative index of witness locks (the retention store's pins are).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -37,6 +41,10 @@ pub const JOURNAL_FORMAT_VERSION: u32 = 2;
 fn format_v1() -> u32 {
     1
 }
+
+/// Where this process writes the journal instead of the default path, once
+/// [`JobJournal::write_aside`] set it.
+static SAVE_PATH_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// The retention-store bundle a witness lock is proven from: the store key and version. Recovery
 /// does not depend on it (the store's pins are the authoritative index); it tells the journal's
@@ -133,6 +141,13 @@ impl Default for JobJournal {
             unparsed: BTreeMap::new(),
         }
     }
+}
+
+/// `<path>.aside-<stamp>`: where a run that could not load `path` writes its journal.
+fn aside_path(path: &Path, stamp: i64) -> PathBuf {
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".aside-{stamp}"));
+    PathBuf::from(aside)
 }
 
 /// Why a journal refused to load ([`JobJournal::load_checked`]).
@@ -304,9 +319,37 @@ impl JobJournal {
         }
     }
 
-    /// Write the journal atomically: write to a sibling tmp file then rename.
+    /// Write the journal atomically: write to a sibling tmp file then rename. To the default path,
+    /// or where [`Self::write_aside`] sent this process's writes.
     pub fn save(&self) -> Result<()> {
-        self.save_to(&Self::default_path())
+        match SAVE_PATH_OVERRIDE.get() {
+            Some(p) => self.save_to(p),
+            None => self.save_to(&Self::default_path()),
+        }
+    }
+
+    /// The journal at `path` could not be loaded (unreadable, or a newer format): from now on this
+    /// process writes its journal to `<path>.aside-<unix seconds>` and never touches `path`, which
+    /// keeps what an operator, or the build that wrote it, needs. Returns the aside path. Once per
+    /// process (a later call returns the first path).
+    pub fn write_aside(path: &Path) -> PathBuf {
+        SAVE_PATH_OVERRIDE
+            .get_or_init(|| aside_path(path, chrono::Utc::now().timestamp()))
+            .clone()
+    }
+
+    /// Job ids of the entries that did not parse but whose key is a job id: an authoritative read
+    /// of each can show it terminal ([`Self::drop_unparsed`]).
+    pub fn unparsed_job_ids(&self) -> Vec<B256> {
+        self.unparsed.keys().filter_map(|k| k.parse::<B256>().ok()).collect()
+    }
+
+    /// Drops the unparsed entries of `terminal` jobs (read Fulfilled, Cancelled, or Open at the
+    /// reopen limit: whatever the entry said, no lock of that job is left). Returns how many.
+    pub fn drop_unparsed(&mut self, terminal: &[B256]) -> usize {
+        let before = self.unparsed.len();
+        self.unparsed.retain(|k, _| !matches!(k.parse::<B256>(), Ok(id) if terminal.contains(&id)));
+        before - self.unparsed.len()
     }
 
     pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
@@ -554,6 +597,33 @@ mod tests {
         let j = JobJournal::load_checked_from(&path).unwrap();
         assert!(j.entries.is_empty());
         assert_eq!(j.format_version, JOURNAL_FORMAT_VERSION);
+    }
+
+    /// A journal this build cannot load is never written over: the run's journal goes beside it.
+    #[test]
+    fn an_unloadable_journal_is_written_beside_not_over() {
+        let path = PathBuf::from("/home/x/.zkminer/job_journal.json");
+        assert_eq!(aside_path(&path, 42), PathBuf::from("/home/x/.zkminer/job_journal.json.aside-42"));
+    }
+
+    /// Entries that do not parse are kept until an authoritative read shows their job terminal.
+    #[test]
+    fn unparsed_entries_go_once_their_job_is_terminal() {
+        let path = tmp_path("unparsed-gc");
+        let (a, b) = (B256::repeat_byte(0x41), B256::repeat_byte(0x42));
+        std::fs::write(
+            &path,
+            format!(r#"{{"format_version":2,"entries":{{"{a}":{{"state":"Teleported"}},"{b}":7,"not-a-job":{{}}}}}}"#),
+        )
+        .unwrap();
+        let mut j = JobJournal::load_checked_from(&path).unwrap();
+        let mut ids = j.unparsed_job_ids();
+        ids.sort();
+        assert_eq!(ids, vec![a, b]);
+        assert_eq!(j.drop_unparsed(&[a]), 1);
+        assert!(j.unparsed.contains_key(&format!("{b}")) && j.unparsed.contains_key("not-a-job"));
+        assert_eq!(j.drop_unparsed(&[]), 0);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

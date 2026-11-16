@@ -260,6 +260,16 @@ fn watch_only() -> bool {
     WATCH_ONLY.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// The lock journal could not be loaded (unreadable, or written by a newer build): this run drives
+/// the locks it holds — found on chain, and witness locks in the retention store — and takes no new
+/// claim, with its journal written beside the file (`JobJournal::write_aside`). Set once, before
+/// the brain starts.
+static HELD_LOCKS_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn held_locks_only() -> bool {
+    HELD_LOCKS_ONLY.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// The options of `zkminer run --watch-only`.
 pub struct WatchOnly {
     /// The prover address to watch as; the configured key's address when `None`.
@@ -2410,12 +2420,29 @@ pub async fn run(
     if watch.is_none() {
         hold_instance_lock()?;
     }
-    // The lock journal, read before anything starts: a journal this build must not rewrite (a newer
-    // format) or cannot read refuses the start. A watch-only run holds nothing, and the journal on
-    // disk belongs to the miner that may be running beside it: it starts empty and never saves (see
-    // `save_journal_or_warn`).
+    // The lock journal, read before anything starts. One this build must not rewrite (a newer format)
+    // or cannot read is left as it is, and this run drives only the locks it holds (the chain scan
+    // finds each; the retention store each witness lock), taking no new claim, with its own journal
+    // written beside the file: refusing to start would leave every held lock undriven until slashed.
+    // A watch-only run holds nothing, and the journal on disk belongs to the miner that may be
+    // running beside it: it starts empty and never saves (see `save_journal_or_warn`).
     let loaded_journal = if watch.is_none() {
-        JobJournal::load_checked()?
+        match JobJournal::load_checked() {
+            Ok(j) => j,
+            Err(e) => {
+                let aside = JobJournal::write_aside(&JobJournal::default_path());
+                HELD_LOCKS_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
+                let msg = format!(
+                    "PAGE: JOURNAL-UNUSABLE {e} — driving held locks only (found on chain and in the retention \
+                     store): no new claim is taken, and this run's journal is written to {} (the file is left as \
+                     it is). Fix the file, or run the release that wrote it, then restart",
+                    aside.display()
+                );
+                tracing::error!("{msg}");
+                note_page(msg);
+                JobJournal::default()
+            }
+        }
     } else {
         JobJournal::default()
     };
@@ -5612,7 +5639,7 @@ async fn miner_brain(
             }
         }
 
-        if paused || open_jobs.is_empty() {
+        if paused || held_locks_only() || open_jobs.is_empty() {
             continue;
         }
         // The hard concurrency cap still applies: look-ahead queues CLAIMS, it does not run
@@ -7575,7 +7602,7 @@ async fn miner_brain(
         // the drain, which a 6s supervised budget can never fulfil. Nothing on-chain has
         // happened yet (the breadcrumb and the tx both come after this point), so dropping
         // the batch just returns the reserved slots.
-        if !batch.is_empty() && state.read().await.paused {
+        if !batch.is_empty() && (state.read().await.paused || held_locks_only()) {
             tracing::info!(
                 "shutdown began mid-tick — dropping {} pending claim(s), nothing locked",
                 batch.len()
@@ -12266,6 +12293,39 @@ struct RecoveryScan {
 /// Blocks each incremental recovery scan re-reads behind its cursor (see `recover_claimed_jobs`).
 const RECOVERY_SCAN_OVERLAP: u64 = 64;
 
+/// Journal entries that did not parse (a newer build's, or a damaged one) are kept as written; once
+/// an authoritative read shows the job terminal (Fulfilled, Cancelled, or Open at the reopen limit),
+/// no lock of it is left, and the entry goes. One batched read per pass, only while there are some.
+async fn gc_unparsed_journal_entries(client: &ChainClient, journal: &SharedJournal) {
+    let ids = journal.lock().unwrap_or_else(|p| p.into_inner()).unparsed_job_ids();
+    if ids.is_empty() {
+        return;
+    }
+    let Ok(views) = client.get_job_status_views_batch(&ids).await else {
+        return;
+    };
+    let terminal: Vec<B256> = views
+        .into_iter()
+        .filter_map(|(jid, v)| v.map(|v| (jid, v)))
+        .filter(|(_, v)| {
+            v.status == zkminer_chain::jobs::JOB_STATUS_FULFILLED
+                || v.status == 3
+                || (v.status == zkminer_chain::jobs::JOB_STATUS_OPEN
+                    && v.reopenCount >= zkminer_chain::jobs::MAX_REOPEN_COUNT)
+        })
+        .map(|(jid, _)| jid)
+        .collect();
+    if terminal.is_empty() {
+        return;
+    }
+    journal_update(journal, |j| {
+        let n = j.drop_unparsed(&terminal);
+        if n > 0 {
+            tracing::info!("journal: dropped {n} unreadable entr{} of terminal jobs", if n == 1 { "y" } else { "ies" });
+        }
+    });
+}
+
 /// Reconcile every lock we might hold — the journal's breadcrumbs plus every job the chain says we
 /// locked within `lookback_blocks` — against live chain state.
 ///
@@ -12281,6 +12341,7 @@ async fn recover_claimed_jobs(
     scan: Option<RecoveryScan>,
     witness_rt: Option<&Arc<witness::WitnessRuntime>>,
 ) -> RecoveryPass {
+    gc_unparsed_journal_entries(client, journal).await;
     // Reconcile everything the journal is tracking, PLUS any job this miner has
     // locked on-chain that the journal doesn't know about (crash before the
     // journal write, a cleared journal, or a claim from a previous machine).
