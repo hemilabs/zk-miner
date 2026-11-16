@@ -10617,6 +10617,7 @@ dependencies = [
  "alloy",
  "alloy-primitives",
  "anyhow",
+ "chrono",
  "dirs 6.0.0",
  "hex",
  "serde",
@@ -10624,6 +10625,7 @@ dependencies = [
  "toml",
  "tracing",
  "zeroize",
+ "zkminer-witness",
 ]
 
 [[package]]

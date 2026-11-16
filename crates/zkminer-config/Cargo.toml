@@ -14,3 +14,5 @@ tracing = { workspace = true }
 dirs = { workspace = true }
 hex = { workspace = true }
 zeroize = { workspace = true }
+chrono = { workspace = true }
+zkminer-witness = { workspace = true }

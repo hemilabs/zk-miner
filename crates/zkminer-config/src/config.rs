@@ -14,6 +14,13 @@ pub struct ZkMinerConfig {
     pub wallet: WalletConfig,
     #[serde(default)]
     pub prover: ProverConfig,
+    /// Witness-construction jobs (docs/witness-construction-jobs.md §19); off by default.
+    #[serde(default)]
+    pub witness: crate::witness::WitnessConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<crate::witness::RetentionConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker: Option<crate::witness::BrokerSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +91,9 @@ pub struct ChainConfig {
     /// limit with any miner on the same host and IP.
     #[serde(default)]
     pub max_requests_per_sec: Option<u32>,
+    /// Share of the chain limiter that pre-claim reads may use (witness plan §17.6). None = 0.25.
+    #[serde(default)]
+    pub preclaim_read_share: Option<f64>,
 }
 
 fn default_rpc_url() -> String {
@@ -110,6 +120,7 @@ impl Default for ChainConfig {
             scan_from_block: None,
             claim_predicate_jobs: None,
             max_requests_per_sec: None,
+            preclaim_read_share: None,
         }
     }
 }
