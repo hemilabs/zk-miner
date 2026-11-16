@@ -11,7 +11,9 @@ use common::*;
 use serde_json::Value;
 use zkminer_witness::envelope::{encode_evm_rpc_config, CLASS_EVM_RPC_V1, METHOD_SET_STATE_READ};
 use zkminer_witness::ipc::FetchStatus;
+use zkminer_witness_broker::egress::NetMode;
 use zkminer_witness_broker::testkit::{config_text, mock_node, test_hooks, TestDns, TestRequest, TestResponse, TestServer};
+use zkminer_witness_broker::BrokerConfig;
 
 fn cap() -> (B256, Vec<u8>) {
     (CLASS_EVM_RPC_V1, encode_evm_rpc_config(8453, false, METHOD_SET_STATE_READ, 0))
@@ -214,10 +216,22 @@ async fn keys_go_in_the_header_and_requests_carry_no_referer_or_redirects() {
 async fn an_endpoint_outside_its_role_entry_is_never_contacted() {
     let dir = tempfile::tempdir().unwrap();
     let node = TestServer::start(mock_node(1)).await;
-    // The role entry names another address: the floor refuses 127.0.0.1 for this endpoint.
+    // An IP literal outside its own role entry does not even load (review r1 broker F4).
     let text = config_text(
         dir.path(),
         &format!("[[evm_rpc]]\nalias = \"n\"\nurl = \"{}\"\nchain_id = 8453\nmethod_sets = [\"state-read\"]\ncidrs = [\"10.9.9.9/32\"]\n", node.url()),
+    );
+    let e = BrokerConfig::from_toml(&text, dir.path(), NetMode::DevPrivate).expect_err("outside its cidrs").to_string();
+    assert!(e.contains("outside the endpoint's cidrs"), "{e}");
+    // A host name whose answer is outside the role entry: the floor refuses 127.0.0.1 for it.
+    let outside = TestDns::start(&[("node.test", &["127.0.0.1"])]).await;
+    let text = config_text(
+        dir.path(),
+        &format!(
+            "{}[[evm_rpc]]\nalias = \"n\"\nurl = \"http://node.test:{}\"\nchain_id = 8453\nmethod_sets = [\"state-read\"]\ncidrs = [\"10.9.9.9/32\"]\n",
+            outside.config(),
+            node.port()
+        ),
     );
     let (client, _t) = start(dir.path(), &text, test_hooks()).await;
     let mut b = register(&client, 11, vec![cap()], budget(100, 1 << 20, 1 << 20), false).await;

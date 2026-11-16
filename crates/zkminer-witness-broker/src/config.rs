@@ -121,8 +121,13 @@
 //! servers of `/etc/resolv.conf` and systemd-resolved's upstream file, all refused in public mode
 //! ([`HostFacts`]).
 //!
-//! A key travels only over `https`, or over `http` to an IP literal that is loopback or inside the
-//! endpoint's own `cidrs` (a node on the operator's own wire).
+//! An endpoint with both an IP-literal URL host and explicit `cidrs` must have the literal inside
+//! the cidrs (in either mode), and in public mode the literal's host route is held to the same
+//! public checks as the cidrs.
+//!
+//! A key travels only over `https` in public mode. In developer mode it may also travel over
+//! `http` to an IP literal that is loopback or inside the endpoint's own `cidrs` (a node on the
+//! operator's own wire).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -690,7 +695,9 @@ fn check_roles_public(cfg: &BrokerConfig, facts: &zkminer_netguard::HostFacts, d
                 ))
             })?;
         }
-        for p in BrokerConfig::role_prefixes(e) {
+        // The role entry, and an IP-literal host's own host route even when explicit cidrs are the
+        // role entry (review r1 broker F4: a loopback literal with global cidrs loaded).
+        for p in BrokerConfig::role_prefixes(e).into_iter().chain(e.literal.map(Prefix::host)) {
             zkminer_netguard::admit_prefix(NetMode::Public, p, facts, deny).map_err(|d| {
                 ConfigError::Invalid(format!(
                     "{}: role entry {p}: {d} (outside developer mode an endpoint must be on the public internet)",
@@ -797,6 +804,7 @@ fn validate(f: FileConfig, base: &Path, net_mode: NetMode) -> Result<BrokerConfi
             e.max_requests_per_sec,
             e.max_units_per_minute,
             base,
+            net_mode,
         )?;
         evm_rpc.push(EvmRpcEndpoint {
             spec,
@@ -837,6 +845,7 @@ fn validate(f: FileConfig, base: &Path, net_mode: NetMode) -> Result<BrokerConfi
                 Some(a.max_requests_per_sec),
                 None,
                 base,
+                net_mode,
             )?;
             let mirror = match &a.mirror {
                 None => None,
@@ -869,6 +878,13 @@ fn validate(f: FileConfig, base: &Path, net_mode: NetMode) -> Result<BrokerConfi
     for e in cfg.endpoints() {
         if e.host == cfg.chain_rpc_host {
             return invalid(format!("{}: its host is chain_rpc_host (the miner's chain RPC); use a separate endpoint", e.alias));
+        }
+        // An IP literal outside its own explicit cidrs could never be connected to (the cidrs are
+        // the role entry), and in public mode its own address would escape the checks.
+        if let Some(ip) = e.literal {
+            if !e.cidrs.is_empty() && !e.cidrs.iter().any(|p| p.contains(ip)) {
+                return invalid(format!("{}: the URL's IP literal {ip} is outside the endpoint's cidrs", e.alias));
+            }
         }
     }
     match net_mode {
@@ -904,6 +920,7 @@ fn rpc_endpoint(
     max_requests_per_sec: Option<u32>,
     max_units_per_minute: Option<u64>,
     base: &Path,
+    net_mode: NetMode,
 ) -> Result<EndpointSpec, ConfigError> {
     const TOKEN: &str = "zkminerkeyslot";
     let slots = url.matches("{key}").count();
@@ -964,9 +981,15 @@ fn rpc_endpoint(
         return invalid(format!("{alias}: rate limits must be positive"));
     }
     let cidrs = parse_cidrs(alias, cidrs)?;
-    // A key never crosses a network in clear text: http only to a loopback IP literal or one inside
-    // the endpoint's own explicit cidrs (a node on the operator's own wire); never to a host name.
+    // A key never crosses a network in clear text. In public mode every endpoint is on the public
+    // internet, so a key travels only over https (review r1 broker F5: a global literal inside its
+    // own cidrs took a key over http). In developer mode, http also to a loopback IP literal or one
+    // inside the endpoint's own explicit cidrs (a node on the operator's own wire); never to a
+    // host name.
     if key.is_some() && parsed.scheme() == "http" {
+        if net_mode == NetMode::Public {
+            return invalid(format!("{alias}: a key is sent only over https outside developer mode"));
+        }
         let local = literal.is_some_and(|ip| {
             crate::egress::canonical_ip(ip).is_loopback() || cidrs.iter().any(|p| p.contains(ip))
         });
@@ -1490,7 +1513,7 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
             ("https://node.example.com", "cidrs = [\"8.0.0.0/6\"]", "not on the public internet"),   // holds 10/8
             ("https://node.example.com", "cidrs = [\"::ffff:0:0/96\"]", "not on the public internet"),
             ("https://node.example.com", "cidrs = [\"1.1.1.0/24\", \"10.0.0.5/32\"]", "10.0.0.5/32"),
-            ("http://1.1.1.1", "cidrs = [\"127.0.0.1/32\"]", "not on the public internet"),
+            ("http://127.0.0.1:8545", "cidrs = [\"127.0.0.0/8\"]", "not on the public internet"),
             // Host names.
             ("http://localhost:8545", "", "single label"),
             ("http://node:8545", "", "single label"),
@@ -1580,6 +1603,61 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         }
         let dev = BrokerConfig::from_toml(&text, dir.path(), NetMode::DevPrivate).unwrap();
         assert!(dev.validate_host(&host(&["9.9.9.0/24"], &["1.1.1.1"], &["1.1.1.1:53"])).is_ok());
+    }
+
+    /// Review r1 broker F4 (PoC t1): with explicit `cidrs`, an IP-literal URL host was never
+    /// checked, so a loopback literal with global cidrs loaded in public mode. The literal must be
+    /// inside the cidrs (either mode), and in public mode its host route is judged too.
+    #[test]
+    fn an_ip_literal_must_be_inside_its_cidrs_and_public() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |url: &str, cidrs: &str| {
+            minimal(&format!(
+                "[[evm_rpc]]\nalias = \"x\"\nurl = \"{url}\"\nchain_id = 8453\nmethod_sets = [\"state-read\"]\ncidrs = [{cidrs}]\n"
+            ))
+        };
+        for (url, cidrs) in [
+            ("http://127.0.0.1:36749/", "\"1.1.1.0/24\""),
+            ("http://[::1]:8545/", "\"2606:4700:4700::/48\""),
+            ("http://1.0.0.1:8545/", "\"1.1.1.0/24\""),
+        ] {
+            for mode in [NetMode::Public, NetMode::DevPrivate] {
+                let e = BrokerConfig::from_toml(&ep(url, cidrs), dir.path(), mode).expect_err(url).to_string();
+                assert!(e.contains("outside the endpoint's cidrs"), "{mode:?} {url}: {e}");
+            }
+        }
+        // A literal inside its cidrs, in any spelling, loads.
+        for (url, cidrs) in [("http://1.1.1.1:8545/", "\"1.1.1.0/24\""), ("http://[::ffff:1.1.1.1]:8545/", "\"1.1.1.0/24\"")] {
+            let c = BrokerConfig::from_toml(&ep(url, cidrs), dir.path(), NetMode::Public).unwrap();
+            // ...and once the host owns that address, the literal's host route is refused too.
+            let host = HostFacts { own_addresses: vec!["1.1.1.1".parse().unwrap()], ..Default::default() };
+            let e = c.validate_host(&host).expect_err(url).to_string();
+            assert!(e.contains("this host's own address"), "{e}");
+        }
+    }
+
+    /// Review r1 broker F5 (PoC t2): in public mode a key travels only over https, even to a
+    /// global IP literal inside the endpoint's own cidrs.
+    #[test]
+    fn public_mode_sends_keys_only_over_https() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        write_key(d, "k", "SECRETKEY123", 0o600);
+        for (url, extra) in [
+            ("http://1.1.1.1:8545/v1/{key}", "cidrs = [\"1.1.1.1/32\"]"),
+            ("http://1.1.1.1:8545/", "key_header = \"x-api-key\"\ncidrs = [\"1.1.1.0/24\"]"),
+        ] {
+            let text = minimal(&format!(
+                "[[evm_rpc]]\nalias = \"p\"\nurl = \"{url}\"\nchain_id = 8453\nmethod_sets = [\"state-read\"]\nkey_file = \"k\"\n{extra}\n"
+            ));
+            let e = BrokerConfig::from_toml(&text, d, NetMode::Public).expect_err(url).to_string();
+            assert!(e.contains("only over https outside developer mode"), "{e}");
+            // Developer mode keeps the operator's-own-wire exception.
+            assert!(BrokerConfig::from_toml(&text, d, NetMode::DevPrivate).is_ok(), "{url}");
+            let https = text.replace("http://", "https://");
+            let c = BrokerConfig::from_toml(&https, d, NetMode::Public).unwrap();
+            assert!(c.evm_rpc[0].spec.key_bearing);
+        }
     }
 
     /// Review r1 (fetch F1b, F1c, I1): `[egress] ipv6_site_prefix_len` and
