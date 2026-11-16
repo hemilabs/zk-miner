@@ -359,6 +359,10 @@ impl ChainClient {
         //  - ThrottleLayer (OUTERMOST, MeterLayer innermost so genuine 429s still reach
         //    the meter) paces dispatch to <=4/s, structurally preventing same-second
         //    spikes regardless of concurrency. Steady state (~1-2/s) is untouched.
+        //    Queued requests are served by priority lane (design §17.6): held-lock reads and
+        //    sends, then lock transactions, then pre-claim reads (capped at 25% of the rate),
+        //    then everything else. A request takes the lane of its `rpc_meter::with_lane`
+        //    scope; unscoped requests are all `Lane::Default`, i.e. the single FIFO limiter.
         //  - with_poll_interval(12s) widens alloy's watcher heartbeat cadence. NOTE: on
         //    the `run` path this is now DEFENSE-IN-DEPTH ONLY — no code registers the
         //    watcher anymore (every receipt wait goes through crate::tx::await_receipt,
@@ -369,11 +373,12 @@ impl ChainClient {
         // The send guard goes OUTERMOST, so a refused send is neither paced nor counted.
         let rpc_client = alloy::rpc::client::ClientBuilder::default()
             .layer(crate::send_guard::SendGuardLayer::new(watch_only))
-            .layer(crate::rpc_meter::ThrottleLayer::new(
+            .layer(crate::rpc_meter::ThrottleLayer::with_lanes(
                 config
                     .chain
                     .max_requests_per_sec
                     .unwrap_or(if watch_only { 1 } else { 4 }),
+                crate::rpc_meter::LaneConfig::default(),
             ))
             .layer(crate::rpc_meter::MeterLayer::new(rpc_meter.clone()))
             .transport(http, false)

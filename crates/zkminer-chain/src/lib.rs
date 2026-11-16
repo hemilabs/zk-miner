@@ -4,6 +4,7 @@ pub mod binding;
 pub mod client;
 pub mod deployment;
 pub mod descriptor;
+pub mod governance;
 pub mod revert;
 pub mod jobs;
 pub mod monitor;

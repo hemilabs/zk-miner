@@ -367,6 +367,30 @@ sol! {
         function getBidState(bytes32 jobId) external view returns (BidState memory);
         function submitBid(bytes32 jobId, uint96 bidAmount) external;
         function settleBid(bytes32 jobId) external;
+
+        // A competitive bid on `jobId`. A witness simulation of the job stops on it (design §5.2):
+        // zkminer does not bid in Phase 1, and once a bid is live the caller can no longer cancel.
+        event BidSubmitted(
+            bytes32 indexed jobId, address indexed bidder, uint96 bidAmount, uint40 newBidDeadline,
+            address operator, address previousBidder
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Router upgrade timelock (HemiProve.sol). One pending operation at a time: an upgrade, a facet
+    // update, or both, named by its `operationHash`. Watched by the governance watcher (design §5.5):
+    // no witness lock whose deadline falls after a pending upgrade's `readyAt`.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[sol(rpc)]
+    #[derive(Debug)]
+    interface IHemiProveRouterGov {
+        event UpgradeProposed(bytes32 indexed operationHash, uint48 readyAt);
+        event UpgradeCancelled(bytes32 indexed operationHash);
+        event UpgradeExecuted(bytes32 indexed operationHash);
+
+        // `(0, 0)` when nothing is pending.
+        function pendingUpgrade() external view returns (bytes32 operationHash, uint48 readyAt);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -469,10 +493,34 @@ sol! {
     #[derive(Debug)]
     interface IHemiProveRegistry {
         event AdapterDisabledEvent(bytes32 indexed proofSystemId);
+        // Emitted by the instant re-enable AND by `executePendingReactivation` (the verifier swap
+        // landing): either way the adapter is enabled again, at `adapter`.
+        event AdapterReactivated(bytes32 indexed proofSystemId, address adapter);
+        event AdapterRegistered(
+            bytes32 indexed proofSystemId, address adapter, uint16 feeRateBps, uint128 minStake,
+            uint96 defaultCollateralRatio, uint8 cycleAttestationMode
+        );
+        // A verifier swap for a Disabled adapter, executable from `readyAt` (the switch delay: 48 h by
+        // default, governable from 1 h to 30 days). A new proposal replaces a pending one, emitting
+        // `VerifierSwitchCancelled` for the old one first.
+        event VerifierSwitchProposed(bytes32 indexed proofSystemId, address indexed newAdapter, uint40 readyAt);
+        event VerifierSwitchCancelled(bytes32 indexed proofSystemId, address indexed rejectedAdapter);
+        // `Paused`/`Unpaused` share topic0 with the router's: filter by address.
+        event Paused(address account);
+        event Unpaused(address account);
+        // The Registry's own upgrade timelock. `UpgradeExecuted` differs from the router's (it also
+        // names the implementation), so its topic0 does too.
+        event UpgradeProposed(bytes32 indexed opHash, uint48 readyAt);
+        event UpgradeCancelled(bytes32 indexed opHash);
+        event UpgradeExecuted(bytes32 indexed opHash, address indexed newImpl);
 
         function getAdapter(bytes32 proofSystemId) external view returns (AdapterEntry memory);
         function isBlacklisted(address verifier) external view returns (bool);
         function paused() external view returns (bool);
+        // The pending verifier swap for a proof system; `(0, 0)` when none.
+        function pendingReactivation(bytes32 proofSystemId) external view returns (address newAdapter, uint40 readyAt);
+        // `(0, 0)` when nothing is pending.
+        function pendingUpgrade() external view returns (bytes32 opHash, uint48 readyAt);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -895,6 +943,24 @@ mod tests {
         assert_eq!(IHemiProveFulfill::DeadlineExtended::SIGNATURE_HASH, topic("DeadlineExtended"));
         assert_eq!(IHemiProveAux::Paused::SIGNATURE_HASH, topic("Paused"));
         assert_eq!(IHemiProveAux::Unpaused::SIGNATURE_HASH, topic("Unpaused"));
+        assert_eq!(
+            IHemiProveAux::BidSubmitted::SIGNATURE_HASH,
+            topic("BidSubmitted")
+        );
+        assert_eq!(
+            IHemiProveRouterGov::UpgradeProposed::SIGNATURE_HASH,
+            topic("UpgradeProposed")
+        );
+        assert_eq!(
+            IHemiProveRouterGov::UpgradeCancelled::SIGNATURE_HASH,
+            topic("UpgradeCancelled")
+        );
+        assert_eq!(
+            IHemiProveRouterGov::UpgradeExecuted::SIGNATURE_HASH,
+            topic("UpgradeExecuted")
+        );
+        let f = pin_call!(r, IHemiProveRouterGov::pendingUpgradeCall, "pendingUpgrade");
+        assert_eq!(outputs(&f), "(bytes32,uint48)");
         // Handoff Appendix C values, as a second, independent anchor.
         assert_eq!(
             format!("{:x}", IHemiProveCore::JobSubmitted::SIGNATURE_HASH),
@@ -903,6 +969,80 @@ mod tests {
         assert_eq!(
             format!("{:x}", IHemiProveFulfill::JobCancelled::SIGNATURE_HASH),
             "a96b38c2858070b5eb59b3be21c9261ebf35b64c358634f372d7e2b1e17b4e88"
+        );
+    }
+
+    /// The Registry events the governance watcher decodes (verifier swaps, adapter disables, pauses,
+    /// upgrades), pinned against the deployed Registry ABI. `Paused`/`Unpaused` and the upgrade events
+    /// must equal the router's where the signatures agree, since the watcher tells them apart by
+    /// address only.
+    #[test]
+    fn registry_event_topics_match_the_deployed_abi() {
+        let g = abi("HemiProveRegistry.abi.json");
+        let topic = |name: &str| -> B256 {
+            let es = g
+                .event(name)
+                .unwrap_or_else(|| panic!("event {name} missing"));
+            assert_eq!(es.len(), 1);
+            es[0].selector()
+        };
+        assert_eq!(
+            IHemiProveRegistry::AdapterDisabledEvent::SIGNATURE_HASH,
+            topic("AdapterDisabledEvent")
+        );
+        assert_eq!(
+            IHemiProveRegistry::AdapterReactivated::SIGNATURE_HASH,
+            topic("AdapterReactivated")
+        );
+        assert_eq!(
+            IHemiProveRegistry::AdapterRegistered::SIGNATURE_HASH,
+            topic("AdapterRegistered")
+        );
+        assert_eq!(
+            IHemiProveRegistry::VerifierSwitchProposed::SIGNATURE_HASH,
+            topic("VerifierSwitchProposed")
+        );
+        assert_eq!(
+            IHemiProveRegistry::VerifierSwitchCancelled::SIGNATURE_HASH,
+            topic("VerifierSwitchCancelled")
+        );
+        assert_eq!(IHemiProveRegistry::Paused::SIGNATURE_HASH, topic("Paused"));
+        assert_eq!(
+            IHemiProveRegistry::Unpaused::SIGNATURE_HASH,
+            topic("Unpaused")
+        );
+        assert_eq!(
+            IHemiProveRegistry::UpgradeProposed::SIGNATURE_HASH,
+            topic("UpgradeProposed")
+        );
+        assert_eq!(
+            IHemiProveRegistry::UpgradeCancelled::SIGNATURE_HASH,
+            topic("UpgradeCancelled")
+        );
+        assert_eq!(
+            IHemiProveRegistry::UpgradeExecuted::SIGNATURE_HASH,
+            topic("UpgradeExecuted")
+        );
+        // Shared with the router's (same signature) — or not (UpgradeExecuted names the impl here).
+        assert_eq!(
+            IHemiProveRegistry::Paused::SIGNATURE_HASH,
+            IHemiProveAux::Paused::SIGNATURE_HASH
+        );
+        assert_eq!(
+            IHemiProveRegistry::Unpaused::SIGNATURE_HASH,
+            IHemiProveAux::Unpaused::SIGNATURE_HASH
+        );
+        assert_eq!(
+            IHemiProveRegistry::UpgradeProposed::SIGNATURE_HASH,
+            IHemiProveRouterGov::UpgradeProposed::SIGNATURE_HASH
+        );
+        assert_eq!(
+            IHemiProveRegistry::UpgradeCancelled::SIGNATURE_HASH,
+            IHemiProveRouterGov::UpgradeCancelled::SIGNATURE_HASH
+        );
+        assert_ne!(
+            IHemiProveRegistry::UpgradeExecuted::SIGNATURE_HASH,
+            IHemiProveRouterGov::UpgradeExecuted::SIGNATURE_HASH
         );
     }
 
@@ -956,6 +1096,14 @@ mod tests {
         assert_eq!(outputs(&f), "((address,uint8,uint40,bytes32,uint96,uint128,uint16,uint8))");
         pin_call!(g, IHemiProveRegistry::isBlacklistedCall, "isBlacklisted");
         pin_call!(g, IHemiProveRegistry::pausedCall, "paused");
+        let f = pin_call!(
+            g,
+            IHemiProveRegistry::pendingReactivationCall,
+            "pendingReactivation"
+        );
+        assert_eq!(outputs(&f), "(address,uint40)");
+        let f = pin_call!(g, IHemiProveRegistry::pendingUpgradeCall, "pendingUpgrade");
+        assert_eq!(outputs(&f), "(bytes32,uint48)");
 
         let p = abi("ProgramRegistry.abi.json");
         let f = pin_call!(p, IProgramRegistry::getProgramCall, "getProgram");
