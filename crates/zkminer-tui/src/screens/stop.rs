@@ -77,7 +77,7 @@ pub fn held_jobs(state: &MinerState, now: u64) -> HeldJobs {
         if matches!(
             job.status,
             MinerJobStatus::Queued | MinerJobStatus::Proving { .. }
-        ) && job.info.lock_deadline > 0
+        ) && job.info.lock_deadline > now
             && state.keep_horizon_secs > 0
         {
             if job.info.lock_deadline <= now.saturating_add(state.keep_horizon_secs) {
@@ -348,7 +348,7 @@ pub fn render_prompt(f: &mut Frame, area: Rect, state: &MinerState) {
     let inner = width.saturating_sub(2).max(1) as usize;
     let height = lines
         .iter()
-        .map(|l| l.width().div_ceil(inner).max(1) as u16)
+        .map(|l| rows_for(l.width(), inner))
         .sum::<u16>()
         + 2;
     let rect = centred(area, width, height);
@@ -411,8 +411,16 @@ pub fn panel_height(view: &ShutdownView, width: u16) -> u16 {
     let (_, lines) = panel_content(view);
     2 + lines
         .iter()
-        .map(|l| l.width().div_ceil(inner).max(1) as u16)
+        .map(|l| rows_for(l.width(), inner))
         .sum::<u16>()
+}
+
+/// Rows a line of `width` columns takes wrapped at `inner`: word wrapping can need one more than
+/// the characters alone, so a line that wraps gets a spare row (better a blank row than a cut-off
+/// last line of keys).
+fn rows_for(width: usize, inner: usize) -> u16 {
+    let rows = width.div_ceil(inner).max(1);
+    (if rows > 1 { rows + 1 } else { rows }) as u16
 }
 
 /// The shutdown panel: what the stop is doing and the keys that change it.

@@ -124,7 +124,9 @@ pub fn run(
     println!("  3. Stake it:          zkminer stake 150");
     println!("  4. Check everything:  zkminer status");
     println!("  5. Start mining:      zkminer run   (it benchmarks your GPUs first)");
-    println!("  Later, to leave:      zkminer unstake --all, then zkminer withdraw 7 days on");
+    println!("  Check it first:       zkminer doctor");
+    println!("  Later, to leave:      zkminer stop (let its jobs settle), zkminer unstake --all,");
+    println!("                        then zkminer withdraw 7 days on");
 
     Ok(())
 }

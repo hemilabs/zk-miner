@@ -51,6 +51,7 @@ extern "system" {
         length: u32,
     ) -> i32;
     fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+    fn GetCurrentProcess() -> *mut c_void;
     fn CloseHandle(handle: *mut c_void) -> i32;
 }
 
@@ -78,6 +79,16 @@ fn job() -> Result<*mut c_void, String> {
                 CloseHandle(job);
                 return Err(e);
             }
+            // The miner joins it itself, before it starts any worker: a child then belongs to it
+            // from its creation. (Assigning each worker after it started raced the SP1 worker,
+            // which puts itself in a job of its own early; a process already in a job can join
+            // another only if that one is empty or in its tree, so the miner's assignment failed.
+            // Jobs nest, so the SP1 worker's job now sits inside this one.)
+            if AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
+                let e = std::io::Error::last_os_error().to_string();
+                CloseHandle(job);
+                return Err(e);
+            }
             // Deliberately never closed: the system closes it when the miner ends, and that is
             // what ends the workers.
             Ok(job as usize)
@@ -87,8 +98,19 @@ fn job() -> Result<*mut c_void, String> {
     .map(|h| h as *mut c_void)
 }
 
+/// Join this process to the job before a worker is started (see the module docs). Idempotent.
+pub(crate) fn join() {
+    if let Err(e) = job() {
+        tracing::warn!(
+            "workers will not end with the miner ({e}): if the miner is killed or its window \
+             closed, end them by hand before the next start"
+        );
+    }
+}
+
 /// Make `child` end when this process ends. Never fails the spawn: without it a worker outlives an
-/// abruptly ended miner, as it did before.
+/// abruptly ended miner, as it did before. (A child started after [`join`] is in the job already;
+/// assigning it again is harmless.)
 pub(crate) fn end_with_this_process(child: &std::process::Child) {
     let result = job().and_then(|job| {
         // SAFETY: a valid job handle and the live child's process handle.
@@ -116,8 +138,13 @@ mod tests {
     fn a_worker_ends_with_the_miner() {
         use std::process::Command;
         if std::env::var_os("ZKMINER_MINER_JOB_TEST_PARENT").is_some() {
+            super::join();
             let mut cmd = Command::new("powershell");
-            cmd.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"]);
+            cmd.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+                // Not our stdout: `.output()` below would wait for it to close, and the test would
+                // pass by outwaiting the sleep even with the job broken.
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
             // As a worker is started: in a console of its own.
             crate::worker::isolate_from_console(&mut cmd);
             let child = cmd.spawn().unwrap();

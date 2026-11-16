@@ -110,6 +110,8 @@ pub struct SetupStatus {
     pub last_error: Option<String>,
     /// Currently highlighted step in the wizard (0-indexed).
     pub selected_step: usize,
+    /// `s` was pressed once: the next `s` stakes (any other key disarms it).
+    pub stake_armed: bool,
 }
 
 impl SetupStatus {

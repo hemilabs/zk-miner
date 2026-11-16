@@ -858,7 +858,10 @@ impl WorkerHandle {
         // from it (and from the sp1-gpu-server it starts, which inherits it); the miner still
         // stops it, through its pipes and the reap.
         #[cfg(windows)]
-        isolate_from_console(&mut cmd);
+        {
+            isolate_from_console(&mut cmd);
+            crate::windows_job::join();
+        }
 
         // Kill worker if parent process dies (prevents orphan GPU processes after host crash).
         // PR_SET_PDEATHSIG is Linux-specific.

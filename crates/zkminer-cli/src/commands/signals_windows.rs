@@ -88,7 +88,13 @@ pub(crate) fn spawn(sig_tx: tokio::sync::watch::Sender<u8>, state: SharedState) 
                 _ = recv_opt!(shutdown) => Event::Close,
             };
             // From the stage the ladder is at, however it got there (the dashboard's quit prompt
-            // and `zkminer stop` advance it too).
+            // and `zkminer stop` advance it too) — but a stage-2 ABANDON another reached is not
+            // this task's to escalate past: the first interrupt to see it does not force an exit.
+            if event == Event::Interrupt && *sig_tx.borrow() >= 2 && n < 2 {
+                n = 2;
+                super::run::shutdown_say(&state, super::run::ALREADY_RELEASING_MSG).await;
+                continue;
+            }
             n = n.max(*sig_tx.borrow());
             let Some(stage) = next_stage(n, event) else {
                 continue;
@@ -115,6 +121,9 @@ pub(crate) fn spawn(sig_tx: tokio::sync::watch::Sender<u8>, state: SharedState) 
                             Ok(()) => super::run::shutdown_say(&state, closing).await,
                             Err(why) => super::run::shutdown_say(&state, why).await,
                         },
+                        _ if super::run::keep_in_progress() => {
+                            super::run::shutdown_say(&state, super::run::KEEP_SIGNAL_MSG).await
+                        }
                         _ => super::run::shutdown_say(&state, closing).await,
                     }
                 }
