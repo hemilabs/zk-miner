@@ -216,7 +216,7 @@ fix `[contracts]` and restart.
 ## Run
 
 ```bash
-export ZKMINER_PRIVATE_KEY=0x...
+zkminer init --generate-key   # a key file only you can read (or: read -rs ZKMINER_PRIVATE_KEY; export ZKMINER_PRIVATE_KEY)
 
 zkminer status                # balance, stake, collateral, job stats
 zkminer benchmark             # measure real per-GPU proving throughput
@@ -310,8 +310,11 @@ Worth knowing:
   Exit status 75 means it stopped with locks still held (or by keep-locks): start it again
   well before their deadlines. A miner killed outright (SIGKILL) picks its locks up the same way.
   Under `Restart=on-failure` (or Docker's `--restart on-failure`) that exit restarts it, and the
-  restarted miner mines again; to stop it for good, use `systemctl stop` / `docker stop`, which
-  the supervisor never restarts. A reboot or poweroff under the systemd unit drains like
+  restarted miner mines again; to stop it for good, use `systemctl disable --now` (a plain
+  `systemctl stop` starts again at the next boot) / `docker stop`, which the supervisor never
+  restarts. After installing new workers, restart only with `zkminer stop --keep-locks`, not
+  `systemctl restart`: the old miner would drain for up to 50 min while any worker it respawns
+  is the new build, which it refuses. A reboot or poweroff under the systemd unit drains like
   `systemctl stop` and can hold the shutdown for up to 70 minutes; a hypervisor or cloud stop
   rarely waits that long, and whatever it cuts off keeps its locks. So stop the miner first
   and let it finish, or `zkminer stop --abandon`, or, for maintenance you'll be back from
@@ -320,8 +323,9 @@ Worth knowing:
   the service account's profile (for LocalSystem,
   `C:\Windows\System32\config\systemprofile\.zkminer`), so run `zkminer stop` as that
   account (`psexec -s` for LocalSystem). A service wrapper's stop (NSSM sends Ctrl+C, then
-  kills the process after its timeout) starts a drain it then cuts off: run `zkminer stop`
-  first, or give it a stop timeout long enough for a drain.
+  kills the process after its timeout) starts a drain it then cuts off: run `zkminer stop
+  --wait` (as the service account) before stopping the service, or give NSSM a timeout long
+  enough for a drain (`nssm set <service> AppStopMethodConsole 3900000`).
 - **One miner per key.** Two miners on one key drive the same locks and replace each
   other's transactions. `run` holds `~/.zkminer/miner.lock`, so a second one from the same
   home refuses to start (including while the first is still draining); it can't see one in

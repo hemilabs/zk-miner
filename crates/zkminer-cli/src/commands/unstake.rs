@@ -180,6 +180,15 @@ pub async fn run_unstake(
                     "no stake is free to unstake (all of it is locked in jobs or already pending)"
                 );
             }
+            if matches!(action, UnstakeAction::All) && before.locked_collateral > 0 {
+                // Only one request can be pending: the locked part needs another 7-day round.
+                println!(
+                    "Note: {} HEMI is locked in jobs the miner holds and is not included. Only one \
+                     unstake can be pending, so taking that out later starts another 7-day wait; to \
+                     leave entirely, stop the miner (`zkminer stop`) first and let its jobs settle.",
+                    super::stake::fmt_hemi(before.locked_collateral)
+                );
+            }
             (
                 ExitTx::RequestUnstake(wei),
                 format!(

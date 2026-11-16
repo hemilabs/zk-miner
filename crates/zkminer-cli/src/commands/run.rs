@@ -309,6 +309,53 @@ pub(crate) fn keep_in_progress() -> bool {
     matches!(ladder_phase(), PHASE_KEEPING | PHASE_KEPT)
 }
 
+/// The locks a keep-locks stop releases rather than keeps: a cutoff within [`keep_horizon`] (an
+/// unknown one counted from the contract's shortest window), or a fulfil that gave up with its
+/// nonce stashed (that stuck tx sits below every release sent after it, and only the job's own
+/// release, which reuses the stashed nonce, displaces it). A breadcrumb already past its recorded
+/// cutoff is left out: nothing releases it now, and the next start re-checks it.
+fn keep_too_close(
+    journal: &SharedJournal,
+    client: &ChainClient,
+) -> std::collections::HashSet<B256> {
+    let horizon = keep_horizon();
+    let past = zkminer_chain::client::chain_now_floor();
+    let j = journal.lock().unwrap_or_else(|e| e.into_inner());
+    j.iter()
+        .filter(|e| {
+            if client.has_abandoned_nonce(e.job_id) {
+                return true;
+            }
+            if e.lock_deadline != 0 && e.lock_deadline <= past {
+                return false;
+            }
+            let cutoff = if e.lock_deadline != 0 {
+                e.lock_deadline
+            } else {
+                (e.claimed_at.max(0) as u64).saturating_add(MIN_JOB_WINDOW_SECS)
+            };
+            cutoff <= horizon
+        })
+        .map(|e| e.job_id)
+        .collect()
+}
+
+/// Exempt `ids` from a keep-locks stop (they are released, see [`keep_too_close`]).
+fn exempt_from_keep(ids: impl IntoIterator<Item = B256>) {
+    KEEP_LOCKS_EXEMPT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(Default::default)
+        .extend(ids);
+}
+
+/// What a signal says when the ABANDON stage was reached by a request or by the drain itself,
+/// not by an earlier signal: it does not force an exit (which would drop the releases' fee bumps
+/// and the nonce repair, and is not restarted); one more does.
+pub(crate) const ALREADY_RELEASING_MSG: &str =
+    "Already releasing the jobs (abandon was asked for). One more signal forces an exit, which \
+     stops waiting for the releases to land.";
+
 /// What a signal that reaches the ABANDON stage says during a keep-locks stop.
 pub(crate) const KEEP_SIGNAL_MSG: &str =
     "A stop signal arrived during a keep-locks stop: it goes on keeping the locks. `zkminer stop \
@@ -394,7 +441,9 @@ pub(crate) fn begin_abandon() -> Result<(), &'static str> {
              start. Start it again (it finishes or releases them), and stop that one with \
              `zkminer stop --abandon` if you want them released.",
         ),
-        Err(_) => Err("Nothing left to release: the miner is already exiting."),
+        Err(_) => Err(
+            "Too late: the miner is already exiting (what it still holds is in its final report).",
+        ),
     }
 }
 
@@ -411,6 +460,17 @@ pub(crate) fn tui_up() -> bool {
 pub(crate) fn say_out(line: &str) {
     use std::io::Write;
     let _ = writeln!(std::io::stdout(), "{line}");
+}
+
+/// `zkminer_tui::restore_terminal`, on a helper thread, given 3 s: writing to a terminal that
+/// stopped reading blocks, and a force exit must still exit.
+fn restore_terminal_bounded() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        zkminer_tui::restore_terminal();
+        let _ = tx.send(());
+    });
+    let _ = rx.recv_timeout(std::time::Duration::from_secs(3));
 }
 
 /// [`say_out`] for stderr.
@@ -493,7 +553,7 @@ async fn shutdown_stage(
 /// workers with a cap and exit at once, releasing nothing more.
 pub(crate) fn force_exit() -> ! {
     // Stops the dashboard drawing before the terminal is handed back (a no-op without one).
-    zkminer_tui::restore_terminal();
+    restore_terminal_bounded();
     let now = zkminer_chain::client::chain_now_floor();
     let journal = crate::journal::JobJournal::load();
     let live: Vec<u64> = journal
@@ -610,10 +670,11 @@ fn take_stop_request_file() -> Option<Result<zkminer_tui::state::StopMode, Strin
 }
 
 /// Answer a `zkminer stop` request (tmp + rename, so it never reads half an answer).
-fn write_stop_response(answer: &Result<String, String>) {
+fn write_stop_response(word: &str, answer: &Result<String, String>) {
+    // `<mode word> ok: …` / `<mode word> refused: …`: the client checks the word is its own.
     let text = match answer {
-        Ok(what) => format!("ok: {what}"),
-        Err(why) => format!("refused: {why}"),
+        Ok(what) => format!("{word} ok: {what}"),
+        Err(why) => format!("{word} refused: {why}"),
     };
     let path = stop_response_path();
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
@@ -659,7 +720,7 @@ async fn apply_stop_request(
                 Ok(()) => None,
                 Err(PHASE_ABANDONING) => Some("it is already releasing the jobs"),
                 Err(PHASE_KEPT) => Some("it is already exiting with its locks kept"),
-                Err(_) => Some("it is already exiting, with nothing left to keep"),
+                Err(_) => Some("it is already exiting"),
             };
             if let Some(why) = too_late {
                 tracing::warn!("keep-locks stop requested too late: {why}");
@@ -723,18 +784,20 @@ fn spawn_stop_watcher(
                 .ok()
                 .flatten();
             if let Some(request) = from_file {
-                let answer = match request {
+                let (word, answer) = match request {
                     Ok(mode) => {
-                        tracing::warn!("`zkminer stop` asked for: {}", stop_mode_word(mode));
+                        let word = stop_mode_word(mode);
+                        tracing::warn!("`zkminer stop` asked for: {word}");
                         if mode == zkminer_tui::state::StopMode::Force {
                             // Answered first: force_exit does not return.
-                            write_stop_response(&Ok("exiting at once".into()));
+                            write_stop_response(word, &Ok("exiting at once".into()));
                         }
-                        apply_stop_request(mode, &sig_tx, &state).await
+                        (word, apply_stop_request(mode, &sig_tx, &state).await)
                     }
-                    Err(why) => Err(why),
+                    Err(why) => ("unknown", Err(why)),
                 };
-                let _ = tokio::task::spawn_blocking(move || write_stop_response(&answer)).await;
+                let _ =
+                    tokio::task::spawn_blocking(move || write_stop_response(word, &answer)).await;
             }
         }
     });
@@ -944,7 +1007,7 @@ impl std::error::Error for InstanceLockBusy {}
 /// held for the life of the process (the kernel drops it when the process exits, however it exits;
 /// the descriptor is close-on-exec, so no worker inherits it). Watch-only takes none: it never
 /// writes the journal or sends anything.
-pub(crate) fn hold_instance_lock() -> Result<()> {
+pub(crate) fn hold_instance_lock(role: &str) -> Result<()> {
     static LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
     let dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -1003,7 +1066,17 @@ pub(crate) fn hold_instance_lock() -> Result<()> {
         }
     }
     let _ = LOCK.set(file);
+    // Who holds it, for a command that finds it held (`signer_guard`): a benchmark signs nothing,
+    // a miner does. Beside the lock, which Windows does not let others read while it is held.
+    let _ = std::fs::write(dir.join("miner.lock.holder"), role);
     Ok(())
+}
+
+/// Who holds `~/.zkminer/miner.lock` ("miner", "benchmark", "stake", ...), as its holder recorded.
+pub(crate) fn instance_lock_holder() -> Option<String> {
+    std::fs::read_to_string(zkminer_home().join("miner.lock.holder"))
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// Whether new claims on a job of `proof_system_id` from `submitter` for `program_id` are held right
@@ -3022,7 +3095,15 @@ pub async fn run(
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
     if watch.is_none() {
-        hold_instance_lock()?;
+        hold_instance_lock("miner")?;
+        let others = super::signer_guard::other_running_miners();
+        if !others.is_empty() {
+            tracing::error!(
+                "PAGE: another `zkminer run` is running on this host (pid {others:?}), under another \
+                 home. If it uses this key, stop one of them now: two miners on one key replace \
+                 each other's transactions and drive (and release) each other's locks."
+            );
+        }
         // A stop request left from before this start (one no miner picked up) must not stop this
         // one. Requests made from here on are for this miner: it reads them once it is running.
         match std::fs::remove_file(stop_request_path()) {
@@ -3898,12 +3979,17 @@ pub async fn run(
             // Unlike SIGTERM nothing follows it, so it starts a plain drain (the proofs in flight
             // finish, and `zkminer stop` from a new session can still change course), and it
             // never escalates: a closing session usually sends it twice, and a stop already chosen
-            // stays as chosen. Not listened for headless: a `nohup` miner ignores SIGHUP on
-            // purpose, and listening would undo that.
-            let mut sighup = if headless {
-                None
-            } else {
-                signal(SignalKind::hangup()).ok()
+            // stays as chosen.
+            // Listened for whenever stdout is a terminal (the dashboard, or `--headless` in an SSH
+            // session, which the default disposition would kill outright, releasing nothing): a
+            // `nohup` miner has stdout redirected, and keeps ignoring it.
+            let mut sighup = {
+                use std::io::IsTerminal;
+                if std::io::stdout().is_terminal() {
+                    signal(SignalKind::hangup()).ok()
+                } else {
+                    None
+                }
             };
             let mut sigterm = match signal(SignalKind::terminate()) {
                 Ok(s) => s,
@@ -3967,6 +4053,13 @@ pub async fn run(
                     tracing::warn!("the terminal closed during the stop; it goes on as chosen");
                     continue;
                 }
+                if *sig_tx.borrow() >= 2 && n < 2 {
+                    // ABANDON came from `zkminer stop --abandon`, the dashboard or the drain:
+                    // this is the first signal to see it, so it does not force an exit yet.
+                    n = 2;
+                    shutdown_say(&sig_state, ALREADY_RELEASING_MSG).await;
+                    continue;
+                }
                 if supervised {
                     SUPERVISED_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -3983,6 +4076,7 @@ pub async fn run(
                     // SUPERVISED_DRAIN_TIMEOUT == ZERO a supervised stop abandons on the same
                     // tick, so promising "signal again to ABANDON" there would be a lie — and
                     // this line is the only thing the operator sees.
+                    1 if keep_in_progress() => shutdown_say(&sig_state, KEEP_SIGNAL_MSG).await,
                     1 if supervised => {
                         shutdown_say(
                             &sig_state,
@@ -4035,7 +4129,9 @@ pub async fn run(
         // Watch-only takes no stop requests (it may share a home with the real miner, which
         // `zkminer stop` would stop).
         println!(
-            "zkminer running in headless mode. Press Ctrl+C{} to stop.",
+            "zkminer running in headless mode. Press Ctrl+C{} to stop (it finishes the jobs in \
+             flight first). SIGTERM (`kill`, `docker stop`, a plain systemd stop) releases every \
+             held job at once, at a 5-30% penalty each.",
             if watch_only() {
                 ""
             } else {
@@ -4180,8 +4276,10 @@ pub async fn run(
     // Lifecycle-less entries the drain already released at the margin (see the loop below).
     // Lifecycle-less entries the drain handed to release_and_clean, and when. Re-armed: a lock that
     // was KEPT (a pause, a Disabled adapter, an unreadable state) can become releasable mid-drain.
-    let mut drain_released: std::collections::HashMap<B256, std::time::Instant> =
-        std::collections::HashMap::new();
+    let mut drain_released: std::collections::HashMap<
+        B256,
+        (std::time::Instant, tokio::task::JoinHandle<()>),
+    > = std::collections::HashMap::new();
     loop {
         // The keep first: during one, a stop signal raises the stage without abandoning.
         if ladder_phase() == PHASE_KEEPING {
@@ -4359,9 +4457,11 @@ pub async fn run(
             j.iter()
                 .filter(|e| {
                     !live.contains(&e.job_id)
-                        && drain_released
-                            .get(&e.job_id)
-                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
+                        // Again only once the last one finished (its ladder runs for minutes) and
+                        // left the lock held: a second one meanwhile would only race it.
+                        && drain_released.get(&e.job_id).is_none_or(|(t, h)| {
+                            h.is_finished() && t.elapsed() >= Duration::from_secs(60)
+                        })
                 })
                 .filter(|e| {
                     if e.lock_deadline == 0 {
@@ -4384,11 +4484,11 @@ pub async fn run(
                 "drain: {} has no live lifecycle and reached the release margin — releasing it now",
                 short_id(jid)
             );
-            drain_released.insert(jid, std::time::Instant::now());
             let (c, st, jr) = (client.clone(), state.clone(), journal.clone());
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 release_and_clean(&c, &st, &jr, jid).await;
             });
+            drain_released.insert(jid, (std::time::Instant::now(), handle));
         }
         // `Submitting` jobs are excluded from the ABANDON release list, so the DRAIN is
         // the ONLY stage that can still free their collateral — by letting the fulfil land
@@ -4475,6 +4575,9 @@ pub async fn run(
         shutdown_stage(&state, zkminer_tui::state::ShutdownStage::KeepingLocks).await;
         let grace_end = std::time::Instant::now() + KEEP_LOCKS_SUBMIT_GRACE;
         loop {
+            // Exempted at once, and again each second: a lifecycle reaching its release margin
+            // during this wait must be free to release, not held back by the keep.
+            exempt_from_keep(keep_too_close(&journal, &client));
             if ladder_phase() == PHASE_ABANDONING {
                 tracing::warn!("keep-locks stop escalated — abandoning");
                 abandoned = true;
@@ -4512,43 +4615,22 @@ pub async fn run(
         if !abandoned {
             // A lock this close to its cutoff would not survive a restart: the next start needs
             // the release margin plus its own start-up to release it, so keeping it trades a
-            // release penalty for a slash. Measured from now, after the wait above, plus what this
-            // stop still takes. A lock whose cutoff was never recorded counts from the earliest
-            // its claim could have set it (the contract's shortest window); one already past its
-            // recorded cutoff goes too (the release stage re-reads it, a pause may have moved it).
-            // A breadcrumb already past its recorded cutoff is left out: nothing releases it now
-            // (it waits for a keeper's slash), and the next start re-checks it. A lock whose
-            // fulfil gave up with its nonce stashed goes too, whatever its cutoff: that stuck tx
-            // sits below every release this pass sends, and only the job's own release (which
-            // reuses the stashed nonce) displaces it.
-            let horizon = keep_horizon();
-            let past = zkminer_chain::client::chain_now_floor();
-            let too_close: std::collections::HashSet<B256> = {
+            // release penalty for a slash (see `keep_too_close`). Those exempted during the wait
+            // and those that crossed the horizon since.
+            let mut too_close = keep_too_close(&journal, &client);
+            {
+                let exempt = KEEP_LOCKS_EXEMPT.lock().unwrap_or_else(|p| p.into_inner());
                 let j = journal.lock().unwrap_or_else(|e| e.into_inner());
-                j.iter()
-                    .filter(|e| {
-                        if client.has_abandoned_nonce(e.job_id) {
-                            return true;
-                        }
-                        if e.lock_deadline != 0 && e.lock_deadline <= past {
-                            return false;
-                        }
-                        let cutoff = if e.lock_deadline != 0 {
-                            e.lock_deadline
-                        } else {
-                            (e.claimed_at.max(0) as u64).saturating_add(MIN_JOB_WINDOW_SECS)
-                        };
-                        cutoff <= horizon
-                    })
-                    .map(|e| e.job_id)
-                    .collect()
-            };
+                too_close.extend(
+                    exempt
+                        .iter()
+                        .flatten()
+                        .filter(|id| j.entries.contains_key(*id))
+                        .copied(),
+                );
+            }
             if !too_close.is_empty() {
-                KEEP_LOCKS_EXEMPT
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .get_or_insert_with(Default::default)
-                    .extend(too_close.iter().copied());
+                exempt_from_keep(too_close.iter().copied());
                 let msg = format!(
                     "Releasing {} lock(s) too close to their deadline for a restart to save them...",
                     too_close.len()
@@ -4628,8 +4710,22 @@ pub async fn run(
             // Abandon wins over an earlier keep-locks request: release_and_clean releases again.
             // Marked on the ladder too (a drain timeout gets here without a signal), so a
             // keep-locks request from now on is refused rather than switching off releases still
-            // to start.
-            set_ladder_phase(PHASE_ABANDONING);
+            // to start. One step: a keep request answered "ok" just before it is honoured instead.
+            if move_ladder_phase(
+                &[PHASE_MINING, PHASE_DRAINING, PHASE_ABANDONING],
+                PHASE_ABANDONING,
+            ) == Err(PHASE_KEEPING)
+            {
+                tracing::warn!("a keep-locks request arrived as the drain gave up — keeping");
+                abandoned = false;
+                kept = true;
+                let too_close = keep_too_close(&journal, &client);
+                if !too_close.is_empty() {
+                    exempt_from_keep(too_close.iter().copied());
+                    release_only = Some(too_close);
+                }
+                continue;
+            }
             raise_stage(&sig_tx, 2);
             shutdown_stage(&state, zkminer_tui::state::ShutdownStage::Abandoning).await;
             shutdown_status(&state, headless, "releasing held jobs...".to_string()).await;
@@ -4649,6 +4745,12 @@ pub async fn run(
                 .map(|j| j.info.job_id)
                 .collect()
         };
+        // Releases the drain started that are still on their ladder: a second one would race them.
+        for (jid, (_, handle)) in &drain_released {
+            if !handle.is_finished() {
+                still_releasing.insert(*jid);
+            }
+        }
         let mut doomed: Vec<(u64, B256)> = {
             let j = journal.lock().unwrap_or_else(|e| e.into_inner());
             j.iter()
@@ -4799,7 +4901,8 @@ pub async fn run(
         // reported as still-held, which is exactly what the exit-75 path is for.
         // A keep-locks pass releases the locks closest to their cutoff: give them their whole
         // release ladder (fee bumps included), not just the first broadcast.
-        let join_budget = if supervised {
+        let join_budget = if supervised || SUPERVISED_STOP.load(std::sync::atomic::Ordering::SeqCst)
+        {
             RELEASE_JOIN_BUDGET
         } else if partial {
             std::time::Duration::from_secs(zkminer_chain::jobs::RELEASE_LADDER_SECS + 30)
@@ -5122,7 +5225,7 @@ pub async fn run(
             Ok(Ok(Err(e))) => tracing::error!("the dashboard ended with an error: {e:#}"),
             Ok(Err(e)) => tracing::error!("the dashboard task failed: {e}"),
             Err(_) => {
-                zkminer_tui::restore_terminal();
+                restore_terminal_bounded();
                 tui.abort();
             }
         }

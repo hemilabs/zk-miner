@@ -94,11 +94,13 @@ impl KeyFile {
 /// Generate a private key into `path` (hex, readable by this user only), or keep the key already
 /// there — the funds behind an existing key would be lost with it, so it is never replaced.
 ///
-/// The file is created exclusively (an existing file is never truncated). On unix it is mode 0600;
-/// on Windows its ACL is set to the current user and SYSTEM only, with inheritance removed, before
-/// the key is written (a folder outside the profile, such as `C:\zkminer`, would otherwise let every
-/// local user read it). A write that fails part-way removes the file it created. An existing key is
-/// kept only if no one else can read or write it (checked on unix).
+/// The file is created exclusively (an existing file is never truncated), already private: on unix
+/// mode 0600; on Windows with a protected ACL of its owner and SYSTEM only, set by the call that
+/// creates it, and opened unshared until the key is written. (Restricting it after creation left a
+/// window in which, in a folder outside the profile such as `C:\zkminer`, any local user could open
+/// it for reading, or rename it away and plant their own.) A write that fails part-way removes the
+/// file it created. An existing key is kept only if no one else can read or write it (checked on
+/// unix).
 pub fn generate_key_file(path: &std::path::Path) -> Result<KeyFile> {
     use std::io::Write;
     if path.exists() {
@@ -116,23 +118,14 @@ pub fn generate_key_file(path: &std::path::Path) -> Result<KeyFile> {
     hex.push_str("0x");
     hex.push_str(&Zeroizing::new(alloy::hex::encode(signer.to_bytes())));
     hex.push('\n');
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
+    let mut file = create_private(path)
         .with_context(|| format!("Failed to create key file {}", path.display()))?;
     // From here the file is ours: remove it on any failure rather than leave a partial key that
     // every later run would refuse.
-    let written = restrict_to_owner(path).and_then(|()| {
-        file.write_all(hex.as_bytes())
-            .and_then(|()| file.sync_all())
-            .with_context(|| format!("Failed to write key file {}", path.display()))
-    });
+    let written = file
+        .write_all(hex.as_bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("Failed to write key file {}", path.display()));
     if let Err(e) = written {
         drop(file);
         let _ = std::fs::remove_file(path);
@@ -165,40 +158,102 @@ fn check_private(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Windows: give `path` an ACL of the current user and SYSTEM only (`icacls /inheritance:r`).
-#[cfg(windows)]
-fn restrict_to_owner(path: &std::path::Path) -> Result<()> {
-    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
-        (Ok(d), Ok(u)) if !d.is_empty() && !u.is_empty() => format!("{d}\\{u}"),
-        _ => bail!("cannot restrict the key file to its owner: USERDOMAIN/USERNAME are not set"),
-    };
-    // By full path, not PATH: a planted `icacls` would see the key's path at least.
-    let icacls = std::path::Path::new(
-        &std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
-    )
-    .join("System32")
-    .join("icacls.exe");
-    let out = std::process::Command::new(icacls)
-        .arg(path)
-        .args(["/inheritance:r", "/grant:r"])
-        .arg(format!("{user}:F"))
-        // SYSTEM, by SID (its name is localized).
-        .args(["/grant:r", "*S-1-5-18:F"])
-        .output()
-        .context("cannot run icacls to restrict the key file")?;
-    if !out.status.success() {
-        bail!(
-            "cannot restrict {} to its owner: icacls said {}",
-            path.display(),
-            String::from_utf8_lossy(&out.stdout).trim()
-        );
+/// Create `path`, which must not exist, readable and writable by this user only (unix: 0600).
+#[cfg(not(windows))]
+fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    Ok(())
+    options.open(path)
 }
 
-#[cfg(not(windows))]
-fn restrict_to_owner(_path: &std::path::Path) -> Result<()> {
-    Ok(()) // created 0600 above
+/// Create `path`, which must not exist, with a protected ACL (no inherited entries) granting full
+/// access to its owner (`OW`) and SYSTEM (`SY`) only, in the same call that creates it, and open it
+/// for writing with no sharing, so nothing else can open it until it is closed.
+#[cfg(windows)]
+fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+
+    #[repr(C)]
+    struct SecurityAttributes {
+        length: u32,
+        descriptor: *mut c_void,
+        inherit_handle: i32,
+    }
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl: *const u16,
+            revision: u32,
+            descriptor: *mut *mut c_void,
+            size: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            attributes: *const SecurityAttributes,
+            disposition: u32,
+            flags: u32,
+            template: *mut c_void,
+        ) -> *mut c_void;
+        fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    }
+    const SDDL_REVISION_1: u32 = 1;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const CREATE_NEW: u32 = 1;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    let invalid = usize::MAX as *mut c_void; // INVALID_HANDLE_VALUE
+
+    let sddl: Vec<u16> = "D:P(A;;FA;;;OW)(A;;FA;;;SY)\0".encode_utf16().collect();
+    let name: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut descriptor: *mut c_void = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated SDDL string and an out-pointer; the descriptor is freed below.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let attributes = SecurityAttributes {
+        length: std::mem::size_of::<SecurityAttributes>() as u32,
+        descriptor,
+        inherit_handle: 0,
+    };
+    // SAFETY: a NUL-terminated path and a valid SECURITY_ATTRIBUTES that outlives the call.
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    let error = std::io::Error::last_os_error();
+    // SAFETY: allocated by the conversion above, no longer used.
+    unsafe { LocalFree(descriptor) };
+    if handle == invalid || handle.is_null() {
+        return Err(error);
+    }
+    // SAFETY: a valid file handle we own, handed to `File` to close.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
 #[cfg(test)]
@@ -245,6 +300,10 @@ mod tests {
                 "{acl}"
             );
             assert!(!acl.contains("(i)"), "inheritance removed: {acl}");
+            assert!(
+                acl.contains("owner rights:(f)") || acl.contains("s-1-3-4:(f)"),
+                "the owner has full access: {acl}"
+            );
         }
         // A file that is not a key is refused, not replaced.
         let junk = dir.join("junk");

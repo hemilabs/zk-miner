@@ -117,15 +117,31 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
     let mut events = spawn_event_reader(Duration::from_secs(1));
 
     loop {
-        // Draw
+        // Draw: render the frame under the state lock, then write it to the terminal with the lock
+        // released (ratatui's `draw`, split). A terminal that stops reading (a frozen SSH session)
+        // blocks the write; holding the state lock through it would stall every shutdown step
+        // waiting to write the state.
         {
-            let state = state.read().await;
-            let taken = TERMINAL.lock().unwrap_or_else(|p| p.into_inner());
-            if *taken {
+            if *TERMINAL.lock().unwrap_or_else(|p| p.into_inner()) {
                 // `restore_terminal` took it back (a force exit): stop, drawing nothing more.
                 return Ok(());
             }
-            terminal.draw(|f| draw(f, &state))?;
+            terminal.autoresize()?;
+        }
+        {
+            let state = state.read().await;
+            let mut frame = terminal.get_frame();
+            draw(&mut frame, &state);
+        }
+        {
+            let taken = TERMINAL.lock().unwrap_or_else(|p| p.into_inner());
+            if *taken {
+                return Ok(());
+            }
+            terminal.flush()?;
+            terminal.hide_cursor()?;
+            terminal.swap_buffers();
+            io::Write::flush(terminal.backend_mut())?;
         }
 
         // Handle events
@@ -231,8 +247,23 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
 /// Put the terminal back the way `run_tui` found it, for a caller about to `process::exit` while
 /// the dashboard is still open (a force exit); harmless when it is not.
 pub fn restore_terminal() {
-    // Taken under the draw lock: a draw in progress finishes first, and none starts after.
-    let mut taken = TERMINAL.lock().unwrap_or_else(|p| p.into_inner());
+    // Taken under the draw lock: a draw in progress finishes first, and none starts after. Not
+    // forever: a draw stuck writing to a terminal that stopped reading would hold it for good, and
+    // the caller (a force exit) must still exit; then the terminal is past restoring anyway.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut taken = loop {
+        match TERMINAL.try_lock() {
+            Ok(g) => break g,
+            Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+        }
+    };
     if *taken || !RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
         return;
     }
@@ -813,6 +844,16 @@ async fn setup_stake_async(state: SharedState, chain_client: std::sync::Arc<Opti
         }
     };
 
+    // Not into a deployment `zkminer run` would refuse (a stale config naming an abandoned stack):
+    // the same check `zkminer stake` makes.
+    if let Err(e) = client.verify_deployment().await {
+        let mut s = state.write().await;
+        s.setup_status.pending_action = None;
+        let msg = format!("Not staking: the configured deployment did not pass its check: {e:#}");
+        s.setup_status.last_error = Some(msg.clone());
+        s.add_log(LogLevel::Error, msg);
+        return;
+    }
     // Stake the minimum amount (100 HEMI)
     let stake_amount = MIN_STAKE_WEI;
     match client.approve_and_stake(stake_amount).await {

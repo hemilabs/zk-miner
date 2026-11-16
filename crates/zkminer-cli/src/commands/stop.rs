@@ -118,7 +118,20 @@ pub fn run(mode: StopMode, wait: bool, timeout: Option<u64>) -> Result<()> {
     let deadline = timeout.map(|s| started + Duration::from_secs(s));
     let past_deadline = || deadline.is_some_and(|d| Instant::now() >= d);
     // The miner removes the file when it takes the request.
+    let mut last_lock_check = Instant::now();
     while path.exists() {
+        // The holder may be a benchmark or a prompt that never takes requests and then exits.
+        if last_lock_check.elapsed() >= Duration::from_secs(2) {
+            last_lock_check = Instant::now();
+            if !instance_running()? {
+                let _ = std::fs::remove_file(&path);
+                bail!(
+                    "the process holding {} exited without taking the request (it was not a miner, \
+                     or it stopped on its own); the request is withdrawn.",
+                    home.join("miner.lock").display()
+                );
+            }
+        }
         // Without --wait, a few seconds; with it, until --timeout (a miner still starting up
         // takes the request once it is running).
         if (!wait && started.elapsed() >= ACK_TIMEOUT) || (wait && past_deadline()) {
@@ -156,6 +169,15 @@ pub fn run(mode: StopMode, wait: bool, timeout: Option<u64>) -> Result<()> {
             ),
         }
     };
+    // `<mode word> ok: …` / `<mode word> refused: …`; another word is another client's answer.
+    let word = stop_mode_word(mode);
+    let Some(answer) = answer.strip_prefix(&format!("{word} ")) else {
+        bail!(
+            "another `zkminer stop` was answered instead ({}); check the miner's dashboard or \
+             output for what it is doing.",
+            answer.trim()
+        );
+    };
     if let Some(why) = answer.strip_prefix("refused: ") {
         bail!("the miner refused the request: {why}");
     }
@@ -164,6 +186,10 @@ pub fn run(mode: StopMode, wait: bool, timeout: Option<u64>) -> Result<()> {
             println!("The miner is already stopping; this request changes nothing.")
         }
         _ => println!("The miner took the request and is {}.", what_it_does(mode)),
+    }
+    if !wait && mode == StopMode::KeepLocks {
+        // Without --wait the report after the exit never comes: say now by when to start again.
+        println!("{}", held_report(mode));
     }
     if !wait {
         println!(

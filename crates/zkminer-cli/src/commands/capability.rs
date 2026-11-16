@@ -54,8 +54,15 @@ fn zkvm_name(backend: &str) -> &'static str {
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 fn card_label(gpu_tag: &str, index: Option<u32>, name: Option<&str>, vram: Option<u64>) -> String {
-    if gpu_tag == "generic" || index.is_none() {
+    if gpu_tag == "generic" {
         return "this machine".to_string();
+    }
+    if index.is_none() {
+        // An explicit vendor binary (`[prover.worker_binaries]`): one slot, not pinned to a card.
+        return match gpu_tag {
+            "cuda" => "GPU 0 (one worker, not pinned to a card)".to_string(),
+            other => format!("{other} card 0 (one worker, not pinned to a card)"),
+        };
     }
     let vendor = match gpu_tag {
         "cuda" => "GPU",

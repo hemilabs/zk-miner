@@ -10,7 +10,8 @@
 //! Three nets, from the strongest:
 //! 1. `~/.zkminer/miner.lock`, which `zkminer run` holds for its whole life. The command takes it
 //!    too and keeps it until it exits, so a miner started meanwhile refuses to start rather than
-//!    racing the transaction. Works on every platform.
+//!    racing the transaction. Per home directory: it cannot see a miner run by another user (a
+//!    service account), in another container, or on another host.
 //! 2. A scan of `/proc` for a `zkminer run` (Linux): a miner running under another home.
 //! 3. The mempool (pending != latest): a sharer of the key this host cannot see.
 //!
@@ -126,19 +127,27 @@ pub(crate) async fn ensure_key_is_free(client: &ChainClient, force: bool) -> Res
          deadline, and the collateral is slashed.\n\nStop the miner (Ctrl-C drains queued jobs \
          cleanly), run this, then start the miner again.\nUse --force only if you are certain no \
          other process sends with this key.";
-    if let Err(e) = super::run::hold_instance_lock() {
+    if let Err(e) = super::run::hold_instance_lock("stake/unstake/withdraw") {
         // Only a lock HELD by another process says a miner may be sending; failing to open it
         // (permissions, a full disk) is an error of its own.
         if e.downcast_ref::<super::run::InstanceLockBusy>().is_none() {
             return Err(e);
         }
-        if !force {
-            anyhow::bail!("{e:#}.\n\n{STOP_FIRST}");
+        match super::run::instance_lock_holder().as_deref() {
+            // A benchmark signs nothing: no nonce to collide with, so no --force needed.
+            Some("benchmark") => eprintln!(
+                "Note: a `zkminer benchmark` holds the miner lock; it sends nothing, so this goes \
+                 ahead (a miner started meanwhile is still caught after the prompt)."
+            ),
+            // A miner (or another signing command) in this very home is certain, not a guess:
+            // --force, which overrides the heuristics below, does not override it.
+            holder => anyhow::bail!(
+                "{e:#}{}.\n\n{STOP_FIRST}",
+                holder
+                    .map(|h| format!(" (its holder: {h})"))
+                    .unwrap_or_default()
+            ),
         }
-        eprintln!(
-            "WARNING: --force while another zkminer holds the miner lock ({e:#}). This transaction \
-             may replace an in-flight fulfillJob and get that job's collateral slashed."
-        );
     }
     let running = other_running_miners();
     if !running.is_empty() {
@@ -201,10 +210,20 @@ pub(crate) fn confirm(question: &str, yes: bool) -> Result<()> {
     if yes {
         return Ok(());
     }
-    print!("\n{question} [y/N] ");
+    print!("\n{question} [y/N] (5 min) ");
     std::io::stdout().flush().ok();
-    let mut answer = String::new();
-    let read = std::io::stdin().read_line(&mut answer)?;
+    // Bounded: this process holds the miner lock while it waits, and a prompt left open would
+    // keep a supervised miner from starting again to finish its held locks.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut answer = String::new();
+        let read = std::io::stdin().read_line(&mut answer);
+        let _ = tx.send(read.map(|n| (n, answer)));
+    });
+    let (read, answer) = match rx.recv_timeout(std::time::Duration::from_secs(300)) {
+        Ok(r) => r?,
+        Err(_) => anyhow::bail!("no answer in 5 minutes — nothing sent"),
+    };
     if read == 0 {
         anyhow::bail!(
             "no input on stdin (not a terminal?) — nothing sent; pass --yes to skip the \

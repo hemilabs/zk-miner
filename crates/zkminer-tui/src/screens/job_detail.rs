@@ -20,11 +20,31 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
             .chain(state.active_jobs.iter())
             .find(|j| j.info.job_id == id)
     };
-    let selected = state
-        .selected_job_id
-        .and_then(by_id)
-        .or_else(|| state.open_jobs.get(state.selected_job_index))
-        .or_else(|| state.active_jobs.first());
+    // A job picked by id that is no longer listed (fulfilled, released, claimed by another prover)
+    // is reported as such: falling back to the index would show a different job as if it were it.
+    let selected = match state.selected_job_id {
+        Some(id) => by_id(id),
+        None => state
+            .open_jobs
+            .get(state.selected_job_index)
+            .or_else(|| state.active_jobs.first()),
+    };
+    if selected.is_none() && state.selected_job_id.is_some() {
+        let paragraph = Paragraph::new(Span::styled(
+            "That job is no longer listed (fulfilled, released, or claimed by another prover). \
+             Press 2 to browse jobs.",
+            theme::placeholder(),
+        ))
+        .block(
+            Block::default()
+                .title(Span::styled(" Job Detail ", theme::title()))
+                .borders(Borders::ALL)
+                .border_style(theme::border())
+                .border_type(theme::border_type()),
+        );
+        f.render_widget(paragraph, area);
+        return;
+    }
 
     let block = Block::default()
         .title(Span::styled(" Job Detail ", theme::title()))

@@ -31,7 +31,8 @@
 #       `--kill-whom=main`), which kills the proofs in flight.
 #   `systemctl restart` drains first, like `stop`.
 #
-# To stop it for good, use `systemctl stop`: systemd never restarts a unit it stopped itself. A
+# To stop it for good, use `systemctl disable --now zkminer` (a plain `systemctl stop` starts it
+# again at the next boot): systemd never restarts a unit it stopped itself. A
 # stop the miner was asked for with `zkminer stop` (drain or --abandon) ends with exit 75 when a
 # release could not be confirmed, and Restart=on-failure then starts it again to finish the job,
 # after which it mines again. `zkminer stop --force-exit` exits 130, which is not restarted.
@@ -62,6 +63,10 @@ WorkingDirectory=~
 # writes one), or ZKMINER_PRIVATE_KEY in this file, readable by root only:
 EnvironmentFile=-/etc/zkminer/env
 ExecStart=/usr/local/bin/zkminer run --headless
+# A stop (systemctl stop, a reboot) asks the miner to drain and waits for it to exit, so a stop
+# already under way (`zkminer stop`, a keep-locks stop) is not escalated by systemd's own signal;
+# KillSignal below is the fallback if the miner does not take the request.
+ExecStop=/usr/local/bin/zkminer stop --wait
 
 # A stop drains instead of releasing (see above).
 KillSignal=SIGINT

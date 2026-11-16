@@ -456,8 +456,26 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
             let path = config_path
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| ZkMinerConfig::default_dir().join("config.toml"));
+            // A missing file loads as defaults: often the wrong user or home (a service's config
+            // lives in the service account's home).
+            let level = if path.exists() {
+                Level::Pass
+            } else {
+                Level::Warn
+            };
+            if !path.exists() {
+                report.say(
+                    Level::Warn,
+                    "config",
+                    format!(
+                        "no file at {}: using defaults. Running as the right user (a service's \
+                         config is in its own home)?",
+                        path.display()
+                    ),
+                );
+            }
             report.say(
-                Level::Pass,
+                level,
                 "config",
                 format!(
                     "{} (chain {}, {})",
