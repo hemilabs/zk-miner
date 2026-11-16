@@ -1849,6 +1849,32 @@ mod program_id_tests {
 }
 
 #[cfg(test)]
+mod groth16_selector_tests {
+    use risc0_zkvm::sha::Digestible;
+
+    /// The miner prefixes every seal with the pinned verifier's `SELECTOR()`, 0xe71e6620
+    /// (zkminer-chain `pins::RISC0_V3_1_SELECTOR`, hemiprove-contracts `RISC_ZERO_V3_1_SELECTOR`):
+    /// the first 4 bytes of this worker's Groth16 verifier parameters. A risc0 whose parameters
+    /// differ proves seals that verifier rejects, so it must move with a new verifier and selector.
+    #[test]
+    fn groth16_verifier_parameters_match_the_pinned_selector() {
+        let digest = risc0_zkvm::Groth16ReceiptVerifierParameters::default().digest();
+        assert_eq!(
+            digest.as_bytes(),
+            unhex("e71e6620a834f4d8dc1998476b865a9a6437a14474f9442cf8664f9ec22a5eee"),
+            "risc0 3.1's Groth16 verifier parameters (RISC_ZERO_V3_1_PARAMS_DIGEST)"
+        );
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+}
+
+#[cfg(test)]
 mod keccak_audit_tests {
     use super::*;
     use risc0_zkvm::sha::Digestible;

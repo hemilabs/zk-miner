@@ -3,9 +3,10 @@
 //!
 //! Before the first transaction zkminer proves it is talking to the AUDITED code: every proxy is the
 //! audited ERC-1967 proxy, every implementation and router facet it routes through is audited code,
-//! and the RISC Zero adapter wraps the audited risc0-ethereum v3.0 verifier whose `SELECTOR()` is the
+//! and the RISC Zero adapter wraps the audited risc0-ethereum v3.1 verifier whose `SELECTOR()` is the
 //! seal prefix zkminer emits. The pins below are copied verbatim from the deployed contracts repo
-//! (`script/lib/AuditedCorePins.sol`, `script/lib/VerifierPins.sol` at zkmarket c8333aa) and are
+//! (`script/lib/AuditedCorePins.sol`, `script/lib/VerifierPins.sol` at zkmarket c8333aa; the risc0
+//! verifier's from hemiprove-contracts 3bc441dd8 `script/lib/VerifierPins.sol`) and are
 //! DEPLOYMENT-INDEPENDENT: an implementation's pin is its runtime keccak with its immutables zeroed,
 //! so the same audited code verifies at any address. Only the addresses and the scan floor are
 //! per-network.
@@ -21,7 +22,9 @@ use zkminer_contracts::bindings::{
     IVerifierAdapter,
 };
 
-/// Audited runtime pins (zkmarket c8333aa `script/lib/AuditedCorePins.sol`, `VerifierPins.sol`).
+/// Audited runtime pins (zkmarket c8333aa `script/lib/AuditedCorePins.sol`, `VerifierPins.sol`; the
+/// risc0 3.1 verifier's from hemiprove-contracts 3bc441dd8 `VerifierPins.sol`, where the adapter pin
+/// did not move).
 pub mod pins {
     use super::*;
     /// OpenZeppelin ERC1967Proxy (no immutable) — every core proxy.
@@ -52,11 +55,14 @@ pub mod pins {
     pub const RISC0_GROTH16_ADAPTER: B256 =
         b256!("dc362a202817f67a52ef910bf022660f3723a4b7fc5e451f9799be71fb7b0a89");
     pub const RISC0_GROTH16_ADAPTER_IMMUTABLES: [usize; 3] = [101, 526, 1245];
-    /// risc0-ethereum v3.0 RiscZeroGroth16Verifier runtime (immutables filled, raw keccak).
-    pub const RISC0_V3_0_GROTH16_VERIFIER: B256 =
-        b256!("0d2be77d8f4614c7c80be0da5f3b2a836b72b8650071d14006fbf43ecf34cf29");
-    /// Its `SELECTOR()`: the 4-byte prefix of every risc0 3.0 Groth16 seal it accepts.
-    pub const RISC0_V3_0_SELECTOR: [u8; 4] = [0x73, 0xc4, 0x57, 0xba];
+    /// risc0-ethereum v3.1.0 RiscZeroGroth16Verifier runtime (immutables filled, raw keccak, 4,611 B):
+    /// `RISC_ZERO_V3_1_GROTH16_RUNTIME`. v3.1.0 fixes GHSA-mm6c-35cm-g4x2, under which the v3.0
+    /// verifier (0x0d2be77d…, SELECTOR 0x73c457ba) accepts a forged receipt for any claim.
+    pub const RISC0_V3_1_GROTH16_VERIFIER: B256 =
+        b256!("26e455ef699495f789d6b9956244b62c4ed95dc3c2d81663c4b13ce14fd81c0c");
+    /// Its `SELECTOR()`: the first 4 bytes of the risc0 3.1 Groth16ReceiptVerifierParameters digest
+    /// (`RISC_ZERO_V3_1_PARAMS_DIGEST`, e71e6620a834…), the prefix of every risc0-zkvm 3.1 seal.
+    pub const RISC0_V3_1_SELECTOR: [u8; 4] = [0xe7, 0x1e, 0x66, 0x20];
     /// SP1Groth16VerifierAdapter runtime with its `nativeVerifier` immutable zeroed at
     /// [`SP1_GROTH16_ADAPTER_IMMUTABLES`] (1,851 B).
     pub const SP1_GROTH16_ADAPTER: B256 =
@@ -448,9 +454,9 @@ impl ChainClient {
                 .into());
             }
             let vcode = self.provider.get_code_at(native).await.context("verifier code")?;
-            if keccak256(&vcode) != pins::RISC0_V3_0_GROTH16_VERIFIER {
+            if keccak256(&vcode) != pins::RISC0_V3_1_GROTH16_VERIFIER {
                 return Err(ProofSystemRefused(format!(
-                    "{} native verifier {native} is not the audited risc0-ethereum v3.0 verifier",
+                    "{} native verifier {native} is not the audited risc0-ethereum v3.1 verifier",
                     ps.label()
                 ))
                 .into());
