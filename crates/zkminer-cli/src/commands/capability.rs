@@ -323,7 +323,7 @@ pub fn lines(rows: &[Row]) -> Vec<String> {
 /// Whether anything on this host can prove a job the miner claims.
 pub fn anything_proves(rows: &[Row]) -> bool {
     rows.iter()
-        .any(|r| r.verdict.is_ready() && r.zkvm != zkvm_name(BACKEND_OPENVM))
+        .any(|r| r.verdict.is_ready() && (r.zkvm != zkvm_name(BACKEND_OPENVM) || openvm_enabled()))
 }
 
 #[cfg(test)]

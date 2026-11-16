@@ -171,9 +171,11 @@ fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-/// Create `path`, which must not exist, with a protected ACL (no inherited entries) granting full
-/// access to its owner (`OW`) and SYSTEM (`SY`) only, in the same call that creates it, and open it
-/// for writing with no sharing, so nothing else can open it until it is closed.
+/// Create `path`, which must not exist, owned by this user and with a protected ACL (no inherited
+/// entries) granting full access to this user and SYSTEM only, in the same call that creates it,
+/// and open it for writing with no sharing, so nothing else can open it until it is closed. By the
+/// user's own SID, not OWNER RIGHTS: from an elevated prompt the default owner is Administrators,
+/// and a later non-elevated miner could then not read its own key.
 #[cfg(windows)]
 fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::ffi::c_void;
@@ -214,7 +216,10 @@ fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
     let invalid = usize::MAX as *mut c_void; // INVALID_HANDLE_VALUE
 
-    let sddl: Vec<u16> = "D:P(A;;FA;;;OW)(A;;FA;;;SY)\0".encode_utf16().collect();
+    let user = current_user_sid()?;
+    let sddl: Vec<u16> = format!("O:{user}D:P(A;;FA;;;{user})(A;;FA;;;SY)\0")
+        .encode_utf16()
+        .collect();
     let name: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     let mut descriptor: *mut c_void = std::ptr::null_mut();
     // SAFETY: a NUL-terminated SDDL string and an out-pointer; the descriptor is freed below.
@@ -254,6 +259,66 @@ fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     }
     // SAFETY: a valid file handle we own, handed to `File` to close.
     Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
+/// This process's user SID as a string (`S-1-5-21-…`), from its token.
+#[cfg(windows)]
+fn current_user_sid() -> std::io::Result<String> {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    }
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+        fn GetTokenInformation(
+            token: *mut c_void,
+            class: u32,
+            info: *mut c_void,
+            length: u32,
+            returned: *mut u32,
+        ) -> i32;
+        fn ConvertSidToStringSidW(sid: *mut c_void, string: *mut *mut u16) -> i32;
+    }
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER: u32 = 1;
+    // SAFETY: plain advapi32/kernel32 calls; every buffer outlives its use, every handle and
+    // allocation is released below.
+    unsafe {
+        let mut token: *mut c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut needed = 0u32;
+        GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut needed);
+        // u64s: TOKEN_USER starts with a pointer, so the buffer must be pointer-aligned.
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_USER,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 8) as u32,
+            &mut needed,
+        );
+        let error = std::io::Error::last_os_error();
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(error);
+        }
+        // TOKEN_USER { User: SID_AND_ATTRIBUTES { Sid: PSID, Attributes: u32 } }
+        let sid = *(buf.as_ptr() as *const *mut c_void);
+        let mut string: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(sid, &mut string) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let len = (0..).take_while(|&i| *string.add(i) != 0).count();
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(string, len));
+        LocalFree(string.cast());
+        Ok(text)
+    }
 }
 
 #[cfg(test)]
@@ -300,9 +365,11 @@ mod tests {
                 "{acl}"
             );
             assert!(!acl.contains("(i)"), "inheritance removed: {acl}");
+            // The user by name (not localized, unlike SYSTEM's or OWNER RIGHTS').
+            let user = std::env::var("USERNAME").unwrap_or_default().to_lowercase();
             assert!(
-                acl.contains("owner rights:(f)") || acl.contains("s-1-3-4:(f)"),
-                "the owner has full access: {acl}"
+                acl.contains(&format!("{user}:(f)")),
+                "the user has full access: {acl}"
             );
         }
         // A file that is not a key is refused, not replaced.

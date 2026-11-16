@@ -23,8 +23,8 @@
 #       stopped. To upgrade, `install -m755` the new miner and every worker first (all of them:
 #       a worker from another build is refused). During a `systemctl stop`, a keep-locks stop
 #       is not restarted (the stop job wins): start it again yourself. Signals never turn a
-#       keep-locks stop into an abandon, but `systemctl stop` after a `zkminer stop` drain
-#       does (its SIGINT counts as the second): use --keep-locks --wait, then systemctl stop.
+#       keep-locks stop into an abandon, and `systemctl stop` during any stop already under way
+#       just waits for it (ExecStop asks for a drain, which is answered "already stopping").
 #   sudo -u zkminer -H zkminer stop --abandon
 #       Releases everything now (penalties apply), then exits. Use it, not `systemctl kill`, to
 #       cut a drain short: `systemctl kill` signals the proving workers too (unless
@@ -38,8 +38,8 @@
 # after which it mines again. `zkminer stop --force-exit` exits 130, which is not restarted.
 #
 # Shutting the machine down (poweroff, reboot) stops this unit like `systemctl stop`: it drains,
-# holding the shutdown for up to TimeoutStopSec (70 min); a hypervisor or a cloud stop rarely
-# waits that long, and what is cut off keeps its locks. Run `systemctl stop zkminer` first and let
+# but systemd forces a reboot or poweroff after 30 min (JobTimeoutSec of those targets), and a
+# hypervisor or a cloud stop rarely waits that long; what is cut off keeps its locks. Run `systemctl stop zkminer` first and let
 # it finish, or `zkminer stop --abandon`; or, for maintenance you'll be back from by the start-by
 # time it prints, `sudo -u zkminer -H zkminer stop --keep-locks --wait && sudo systemctl stop
 # zkminer` (within the 10 s before it is restarted).
@@ -66,7 +66,9 @@ ExecStart=/usr/local/bin/zkminer run --headless
 # A stop (systemctl stop, a reboot) asks the miner to drain and waits for it to exit, so a stop
 # already under way (`zkminer stop`, a keep-locks stop) is not escalated by systemd's own signal;
 # KillSignal below is the fallback if the miner does not take the request.
-ExecStop=/usr/local/bin/zkminer stop --wait
+# `-`: when the miner already exited by itself (a `zkminer stop`), this finds none and fails,
+# and without it systemd would count that as a failure and restart it.
+ExecStop=-/usr/local/bin/zkminer stop --wait
 
 # A stop drains instead of releasing (see above).
 KillSignal=SIGINT
