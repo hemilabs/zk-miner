@@ -322,17 +322,11 @@ pub enum ArtifactFailure {
     NotConfigured,
     EmptyManifest,
     /// Structural failure, permanent for the manifest address when read at or below the safe head.
-    ManifestInvalid {
-        at_or_below_safe: bool,
-    },
+    ManifestInvalid { at_or_below_safe: bool },
     IdMismatch,
-    ChunkInvalid {
-        at_or_below_safe: bool,
-    },
+    ChunkInvalid { at_or_below_safe: bool },
     /// The chunks assembled to bytes that do not hash to the manifest's own sha256.
-    HashMismatch {
-        at_or_below_safe: bool,
-    },
+    HashMismatch { at_or_below_safe: bool },
     TooLarge,
     Endpoint,
     Budget,
@@ -345,9 +339,7 @@ pub enum ArtifactFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlResponse {
-    Registered {
-        job_key: B256,
-    },
+    Registered { job_key: B256 },
     /// The broker's account of a job, sent in answer to `EndJob`. `transient` = some fetch returned
     /// status 2; `fetch_in_flight_at_end` = a fetch was still being served when the job ended.
     JobStats {
@@ -366,31 +358,17 @@ pub enum ControlResponse {
         #[serde(default)]
         cached: bool,
     },
-    ArtifactFailed {
-        failure: ArtifactFailure,
-    },
-    SelfTest {
-        ok: bool,
-        checks: Vec<(SelfTestCheck, bool)>,
-    },
-    Error {
-        code: ControlErrorCode,
-    },
+    ArtifactFailed { failure: ArtifactFailure },
+    SelfTest { ok: bool, checks: Vec<(SelfTestCheck, bool)> },
+    Error { code: ControlErrorCode },
     /// One entry per `CheckProvisioned` source, in order.
-    Provisioned {
-        ok: Vec<bool>,
-    },
+    Provisioned { ok: Vec<bool> },
     /// Interim answer to a `hemi-code` `FetchArtifact` (same id), sent after the manifest passed and
     /// before any chunk is read (plan §13.4 step 3): `length` bytes and `chunks` chunk reads (`chunks
     /// + 1` reads with the manifest). The broker waits for a `ChargeDecision`.
-    ArtifactCharge {
-        length: u64,
-        chunks: u32,
-    },
+    ArtifactCharge { length: u64, chunks: u32 },
     /// `RefreshPrefixes` applied: the number of prefixes now in the floor.
-    PrefixesRefreshed {
-        count: u32,
-    },
+    PrefixesRefreshed { count: u32 },
 }
 
 /// The broker's self-test checks (plan §10.3): a fixed set, no broker-supplied strings.
@@ -471,16 +449,7 @@ mod tests {
 
     #[test]
     fn summary_round_trip() {
-        let s = BuilderSummary {
-            exit_code: exit::FUEL,
-            transient: true,
-            fetches: 7,
-            fetch_bytes: 99,
-            fuel_used: 5,
-            witness_bytes: 3,
-            compile_ms: 1,
-            run_ms: 2,
-        };
+        let s = BuilderSummary { exit_code: exit::FUEL, transient: true, fetches: 7, fetch_bytes: 99, fuel_used: 5, witness_bytes: 3, compile_ms: 1, run_ms: 2 };
         assert_eq!(BuilderSummary::decode(&s.encode()), Some(s));
         let mut b = s.encode();
         b[8] = 7;
@@ -533,8 +502,7 @@ mod tests {
         assert!(matches!(decode_control::<ControlRequest>(&big), Err(FrameError::TooLarge { .. })));
         let st = ControlResponse::SelfTest { ok: false, checks: vec![(SelfTestCheck::LoopbackDenied, false)] };
         assert_eq!(decode_control::<ControlResponse>(&encode_control(&st)).unwrap(), st);
-        assert!(decode_control::<ControlResponse>(br#"{"type":"self_test","ok":true,"checks":[["made_up",true]]}"#)
-            .is_err());
+        assert!(decode_control::<ControlResponse>(br#"{"type":"self_test","ok":true,"checks":[["made_up",true]]}"#).is_err());
     }
 
     #[test]
@@ -574,8 +542,6 @@ mod tests {
             decode_control::<ControlMessage<ControlResponse>>(a).unwrap().body,
             ControlResponse::Artifact { cached: false, .. }
         ));
-        assert!(
-            decode_control::<ControlMessage<ControlRequest>>(br#"{"id":1,"body":{"type":"self_test"},"x":1}"#).is_err()
-        );
+        assert!(decode_control::<ControlMessage<ControlRequest>>(br#"{"id":1,"body":{"type":"self_test"},"x":1}"#).is_err());
     }
 }
