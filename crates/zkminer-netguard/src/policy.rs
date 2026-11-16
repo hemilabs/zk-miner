@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::facts::HostFacts;
 use crate::host::HostDenied;
-use crate::ip::{canonical_ip, is_global, Prefix};
+use crate::ip::{canonical_ip, is_global, prefix_is_global, Prefix};
 
 /// Whether connections a requester causes may reach non-public destinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -42,6 +42,14 @@ pub enum Denied {
     Host { host: String, why: HostDenied },
     /// The name resolved, but to no admitted address.
     NoAdmittedAddress { host: String, refused: Vec<Denied> },
+    /// A prefix (an operator's role entry) holds an address that is not global.
+    PrefixNotGlobal(Prefix),
+    /// A prefix holds one of the host's own addresses.
+    PrefixHoldsOwnAddress { prefix: Prefix, ip: IpAddr },
+    /// A prefix overlaps a network the host is connected to.
+    PrefixOverlapsConnected { prefix: Prefix, connected: Prefix },
+    /// A prefix overlaps one of the operator's deny CIDRs.
+    PrefixOverlapsDeny { prefix: Prefix, deny: Prefix },
 }
 
 /// What is wrong with a URL, apart from where it points.
@@ -114,6 +122,21 @@ impl Denied {
             }
             Denied::Url(why) => fmt::Display::fmt(why, f),
             Denied::Host { host, why } => write!(f, "host {host:?}: {why}"),
+            Denied::PrefixNotGlobal(p) => {
+                write!(f, "{p} holds addresses that are not on the public internet")
+            }
+            Denied::PrefixHoldsOwnAddress { prefix, ip } => {
+                write!(f, "{prefix} holds {ip}, this host's own address")
+            }
+            Denied::PrefixOverlapsConnected { prefix, connected } => {
+                write!(
+                    f,
+                    "{prefix} overlaps {connected}, a network this host is connected to"
+                )
+            }
+            Denied::PrefixOverlapsDeny { prefix, deny } => {
+                write!(f, "{prefix} overlaps the operator's deny CIDR {deny}")
+            }
             Denied::NoAdmittedAddress { host, refused } => {
                 write!(f, "{host:?} resolves to no admitted address (")?;
                 for (i, d) in refused.iter().enumerate() {
@@ -157,6 +180,43 @@ pub fn admit(
     }
     if let Some(p) = extra_deny.iter().find(|p| p.contains(c)) {
         return Err(Denied::DenyCidr { ip, prefix: *p });
+    }
+    Ok(())
+}
+
+/// [`admit`] for every address of a prefix at once (an operator's role entry, which admits
+/// connections to any address inside it): in [`NetMode::Public`] the whole prefix must be global
+/// ([`crate::ip::prefix_is_global`]), hold none of the host's own addresses, and overlap none of its
+/// connected prefixes and none of `extra_deny`, each compared in canonical form
+/// ([`Prefix::canonical_prefix`]). [`NetMode::DevPrivate`] admits every prefix.
+pub fn admit_prefix(
+    mode: NetMode,
+    prefix: Prefix,
+    facts: &HostFacts,
+    extra_deny: &[Prefix],
+) -> Result<(), Denied> {
+    if mode == NetMode::DevPrivate {
+        return Ok(());
+    }
+    let prefix = Prefix::new(prefix.addr, prefix.len);
+    if !prefix_is_global(prefix) {
+        return Err(Denied::PrefixNotGlobal(prefix));
+    }
+    if let Some(ip) = facts
+        .own_addresses()
+        .iter()
+        .find(|o| prefix.overlaps(&Prefix::host(**o)))
+    {
+        return Err(Denied::PrefixHoldsOwnAddress { prefix, ip: *ip });
+    }
+    if let Some(c) = facts.connected().iter().find(|c| prefix.overlaps(c)) {
+        return Err(Denied::PrefixOverlapsConnected {
+            prefix,
+            connected: *c,
+        });
+    }
+    if let Some(d) = extra_deny.iter().find(|d| prefix.overlaps(d)) {
+        return Err(Denied::PrefixOverlapsDeny { prefix, deny: *d });
     }
     Ok(())
 }
@@ -426,6 +486,49 @@ mod tests {
         for a in p.facts().own_addresses() {
             assert!(p.admit(*a).is_err(), "{a} is this host's");
         }
+    }
+
+    #[test]
+    fn whole_prefixes_are_admitted_only_when_public_and_apart_from_the_host() {
+        let f = facts();
+        let deny = [pfx("8.8.4.4/32"), pfx("2a02:1234::/32")];
+        let a = |s: &str| admit_prefix(NetMode::Public, pfx(s), &f, &deny);
+        for s in [
+            "1.1.1.0/24",
+            "1.1.1.1/32",
+            "2606:4700:4700::/48",
+            "64:ff9b::101:100/120",
+            "8.8.8.0/24",
+        ] {
+            assert_eq!(a(s), Ok(()), "{s}");
+        }
+        for (s, why) in [
+            ("0.0.0.0/0", "not on the public internet"),
+            ("::/0", "not on the public internet"),
+            ("8.0.0.0/6", "not on the public internet"), // holds 10.0.0.0/8
+            ("127.0.0.1/32", "not on the public internet"),
+            ("::ffff:127.0.0.1/128", "not on the public internet"),
+            ("10.0.0.5/32", "not on the public internet"),
+            ("2a01:4f8:1::77/128", "this host's own address"),
+            ("2a01:4f8::/32", "this host's own address"),
+            ("9.9.9.16/28", "a network this host is connected to"),
+            ("9.0.0.0/8", "this host's own address"),
+            (
+                "2606:4700:aaaa:0:8000::/65",
+                "a network this host is connected to",
+            ),
+            ("2606:4700:aaaa::/48", "this host's own address"),
+            ("8.8.4.0/24", "deny CIDR"),
+            ("::ffff:8.8.4.4/128", "deny CIDR"),
+            ("2a02:1234:5::/48", "deny CIDR"),
+        ] {
+            let e = a(s).expect_err(s).to_string();
+            assert!(e.contains(why), "{s}: {e}");
+        }
+        assert_eq!(
+            admit_prefix(NetMode::DevPrivate, pfx("0.0.0.0/0"), &f, &deny),
+            Ok(())
+        );
     }
 
     #[test]

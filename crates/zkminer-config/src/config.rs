@@ -67,18 +67,10 @@ impl EgressConfig {
     }
 }
 
-/// Chain ids zkminer treats as production markets, where `[dev] private_network` is refused:
-/// Hemi mainnet.
-pub const PRODUCTION_CHAIN_IDS: &[u64] = &[43111];
-
-/// Whether `chain_id` is a production market (see [`PRODUCTION_CHAIN_IDS`]).
-pub fn is_production_chain(chain_id: u64) -> bool {
-    PRODUCTION_CHAIN_IDS.contains(&chain_id)
-}
-
-/// What zkminer says, at every start and in `status`, while `[dev] private_network` is on.
-pub const DEV_MODE_BANNER: &str =
-    "DEV MODE: private network access enabled — never run on a public market";
+/// Chain ids zkminer treats as production markets, where `[dev] private_network` is refused
+/// (Hemi mainnet), whether the switch reaches netguard's mode, and what every start says while it
+/// is on. Defined in zkminer-netguard, so the witness broker refuses exactly the same chains.
+pub use zkminer_netguard::{is_production_chain, DEV_MODE_BANNER, PRODUCTION_CHAIN_IDS};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainConfig {

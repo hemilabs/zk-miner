@@ -45,8 +45,22 @@ pub use ::url::Url;
 pub use content::{arweave_gateway_url, ipfs_gateway_url, ContentIdDenied};
 pub use facts::HostFacts;
 pub use host::{check_host_name, HostDenied, INTERNAL_SUFFIXES};
-pub use ip::{canonical_ip, is_global, Prefix, PrefixParseError};
-pub use policy::{admit, Denied, NetMode, NetPolicy, UrlDenied, FACTS_TTL};
+pub use ip::{canonical_ip, is_global, prefix_is_global, Prefix, PrefixParseError};
+pub use policy::{admit, admit_prefix, Denied, NetMode, NetPolicy, UrlDenied, FACTS_TTL};
+
+/// Chain ids zkminer treats as production markets, where developer mode
+/// ([`NetMode::DevPrivate`]) is refused: Hemi mainnet. The miner's config and the witness broker
+/// both refuse it here.
+pub const PRODUCTION_CHAIN_IDS: &[u64] = &[43111];
+
+/// Whether `chain_id` is a production market (see [`PRODUCTION_CHAIN_IDS`]).
+pub fn is_production_chain(chain_id: u64) -> bool {
+    PRODUCTION_CHAIN_IDS.contains(&chain_id)
+}
+
+/// What zkminer and its witness broker say at every start while developer mode is in force.
+pub const DEV_MODE_BANNER: &str =
+    "DEV MODE: private network access enabled — never run on a public market";
 
 #[cfg(feature = "client")]
 pub use client::{
