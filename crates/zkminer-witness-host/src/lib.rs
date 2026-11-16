@@ -3,6 +3,7 @@
 //! builder run and the pre-claim pipeline. `zkminer-cli` drives these; nothing here signs or sends.
 
 pub mod broker_proc;
+pub mod builder_run;
 pub mod paths;
 pub mod spawner;
 pub mod store_open;
