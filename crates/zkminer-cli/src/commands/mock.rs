@@ -189,7 +189,10 @@ pub async fn run(headless: bool) -> Result<()> {
         if let Some(suite) = load_cached_benchmark() {
             s.add_log(
                 LogLevel::Info,
-                format!("Loaded cached benchmarks (zkOP/s: {:.0})", suite.zkops),
+                format!(
+                    "Loaded cached benchmarks ({})",
+                    zkminer_prover::benchmark::format_mzkops(suite.zkops)
+                ),
             );
             s.benchmark_results = Some(suite);
         }
@@ -907,7 +910,7 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
         s.benchmark_tracker = Some(BenchmarkTracker {
             devices: Vec::new(),
             all_complete: false,
-            started_at: Some(chrono::Utc::now()),
+            started_at: Some(std::time::Instant::now()),
             active_device_index: 0,
         });
         s.add_log(LogLevel::Info, "Starting GPU benchmarks...");

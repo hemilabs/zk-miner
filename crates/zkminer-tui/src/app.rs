@@ -113,7 +113,9 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
                         s.benchmark_tracker.as_mut(),
                         zkminer_prover::engine::worker_pool(),
                     ) {
-                        tracker.refresh_setup_status(|key| pool.setup_status(key));
+                        tracker.refresh_setup_status(|key| {
+                            pool.setup_status(key).map(|step| step.describe())
+                        });
                     }
                     PostKeyAction::None
                 }
@@ -395,7 +397,7 @@ async fn run_streaming_gpu_benchmark(state: SharedState) {
         s.benchmark_tracker = Some(crate::state::BenchmarkTracker {
             devices: Vec::new(),
             all_complete: false,
-            started_at: Some(chrono::Utc::now()),
+            started_at: Some(std::time::Instant::now()),
             active_device_index: 0,
         });
         s.add_log(LogLevel::Info, "Running GPU benchmarks (real proving)...");
@@ -587,7 +589,10 @@ async fn run_full_benchmark(state: SharedState) {
         benchmark::save_benchmark(&suite);
         s.add_log(
             LogLevel::Success,
-            format!("CPU benchmark complete (zkOP/s: {:.0})", suite.zkops),
+            format!(
+                "CPU benchmark complete ({})",
+                benchmark::format_mzkops(suite.zkops)
+            ),
         );
         s.benchmark_results = Some(suite);
     }

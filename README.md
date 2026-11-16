@@ -32,10 +32,10 @@ export PATH="$HOME/.risc0/bin:$PATH"
 rzup install rust
 ```
 
-Running needs RISC Zero's `risc0-groth16` component (the Groth16 proving key, 5 GB), but not
+Running needs RISC Zero's `risc0-groth16` component (the Groth16 proving key, 5.8 GB), but not
 `rzup`: the risc0 worker installs it in its one-time setup, before the miner claims any risc0 job,
-when `~/.risc0/extensions/v0.1.0-risc0-groth16` (or `RISC0_GROTH16_DIR`) does not hold it. It
-downloads the 2.3 GB archive rzup itself uses from RISC Zero's artifact store and checks its
+when `~/.risc0/extensions/v0.2.0-risc0-groth16` (or `RISC0_GROTH16_DIR`) does not hold it. It
+downloads the 2.4 GB archive rzup itself uses from RISC Zero's artifact store and checks its
 SHA-256 (`crates/zkminer-prove-risc0/src/groth16_component.rs`). `rzup install risc0-groth16`
 installs the same files.
 

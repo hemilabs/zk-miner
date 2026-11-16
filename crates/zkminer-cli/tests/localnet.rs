@@ -113,19 +113,20 @@ fn fib_n() -> u32 {
         .and_then(|n| n.trim().parse().ok())
         .unwrap_or(FIB_N)
 }
-/// The contract suite's RISC Zero Groth16 receipt (zkmarket c8333aa,
-/// `test/fixtures/RiscZeroTestReceipt.sol`): risc0 v3.0 Groth16, accepted by the deployed
-/// `RiscZeroGroth16Verifier` (SELECTOR 0x73c457ba) for this image id and journal.
+/// The contract suite's RISC Zero Groth16 receipt (hemiprove-contracts 3bc441dd8,
+/// `test/fixtures/RiscZeroTestReceipt.sol`, risc0-ethereum v3.1.0's `TestReceiptV3_1.sol`): risc0
+/// v3.1 Groth16, accepted by the `RiscZeroGroth16Verifier` (SELECTOR 0xe71e6620) for this image id
+/// and journal.
 const FIXTURE_IMAGE_ID: B256 =
-    alloy::primitives::b256!("bc93ea63d7adda6b4e2f0f930c2c9fe53d57e8f4add5aa81af2373949517edfe");
-const FIXTURE_JOURNAL: &[u8] = b"zkpool e2e test";
+    alloy::primitives::b256!("c92414d80cdeb43ba0f4ff4882447c21f18b547d41ffa506a84da164e8e31f7d");
+const FIXTURE_JOURNAL: &[u8] = b"just a simple receipt";
 /// The fixture's 260-byte seal: the 4-byte selector, then the proof.
 const FIXTURE_SEAL_HEX: &str = concat!(
-    "73c457ba24677d214ea29517cc0f883aa3a8b2514eb49f2dc4a36b217d42b5846a230e28278fb944762bb974fe0383a41cf1dc78",
-    "58050e64b70a2ffc4503598c41eb12382402e2f159318f290703591d36b097fe07ae8709d72805e5eed3e229d88e713b26d90595",
-    "7d4a98702d3dbf19047b05102eb0b9726a70e7f146f2026f272973b222028908b6aa9c6e87b36e63121c601016261f92be7877f7",
-    "58475101f64277d40fb8f805de9db44c9ac2e6095f5422599ceb8bf8df9edbb766ab19bb89f2b2a824d17896c55a0487f4172c96",
-    "1aba47cd3e0422037fc1bf524fdb01e21dc4f8300bc0f922f535135f8a0a36942ceae7c81d12e0b255cda9eda5d161715ad74d46",
+    "e71e662021a0c81a5cc1c5cddabc3eefe6a3841315ad1a1cd74da3f34db1db91d01240a70b220d069e774da52f06c0d0ca166b21",
+    "9f0e1b0548a08270fa88f5e71a55bb2911fba8d9c52968295894f9b6e1804afcda16b66956ad973a290cb8d6736813502b336b4e",
+    "c0382ab1a7508781f3e1a8d7ea73d4491382cae39ec9f14aff07f53623bc5d3d6a718a686588bd6027b1713110031c85fa34117a",
+    "4fed94d98a41fe8e0bcf572d3389eedcc34ec00bd1aa571b0bcaa80af13b30bf3cb26741e56deabb23d1abf7efdfba3f55523687",
+    "ce10ef220c8d6d879f2e9161684f044e6e3597a2087d050b687d2242476dde08f789d726635f51ccd6fc216091297f0b7b416a6a",
 );
 /// Every job but [`Case::HighCollateral`]'s is fixed-price at this.
 const JOB_PRICE: u128 = 5 * HEMI;

@@ -101,6 +101,26 @@ pub fn zkops_from_stark_secs(stark_secs: f64) -> f64 {
     }
 }
 
+/// A typical GPU's SP1 zkOP/s over its RISC Zero zkOP/s, across a blend of hardware: the geometric
+/// mean of five cards measured in November 2026 (RTX 5090 2.91, RTX 4090 3.35, Arc Pro B70 3.82,
+/// RX 9060 XT 4.05, Arc A770 4.63). It puts a RISC Zero measurement in SP1 terms. Provisional: it
+/// may be set again from more hardware before the first public release.
+pub const ZKOP_SP1_PER_RISC0: f64 = 3.71;
+
+/// A GPU's score: the geometric mean, weighted equally, of its SP1 zkOP/s and its RISC Zero zkOP/s
+/// in SP1 terms (`ZKOP_SP1_PER_RISC0` times), over whichever of the two it measured. A card exactly
+/// as much slower at RISC Zero as a typical one scores its SP1 figure; one weaker at RISC Zero
+/// scores below it, one stronger above. `None` when it measured neither.
+pub fn blended_zkops(sp1: Option<f64>, risc0: Option<f64>) -> Option<f64> {
+    let parts: Vec<f64> = [sp1, risc0.map(|r| r * ZKOP_SP1_PER_RISC0)]
+        .into_iter()
+        .flatten()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .collect();
+    // A single zkVM scores exactly its own figure: `x.powf(1.0)` is `x`.
+    (!parts.is_empty()).then(|| parts.iter().product::<f64>().powf(1.0 / parts.len() as f64))
+}
+
 /// Runs the scoring measurement, given a closure that proves `zkop-mix` at some iteration count:
 /// one discarded warm-up, then up to three scored proofs inside the time budget, reporting the
 /// median. Other work on the GPU shows up as slow runs, which a median ignores; a slow card stops
@@ -345,9 +365,47 @@ pub enum WorkerResponse {
     /// Appended last, so every earlier variant keeps its bincode index.
     SetupProgress {
         request_id: u64,
-        /// For the operator, e.g. "Downloading SP1's Groth16 circuit (first run, about 8 GB)".
+        /// The step, for the operator, e.g. "Downloading the Groth16 circuit (first run)".
         status: String,
+        /// Bytes of a download or an unpack done so far, for a step that has them.
+        done_bytes: Option<u64>,
+        /// What `done_bytes` is heading for, where it is known.
+        total_bytes: Option<u64>,
     },
+}
+
+/// What a worker's one-time setup is doing (`WorkerResponse::SetupProgress`), for display.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetupStep {
+    pub status: String,
+    pub done_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+}
+
+impl SetupStep {
+    /// How far through the step, 0 to 1, where both byte counts are known.
+    pub fn fraction(&self) -> Option<f64> {
+        let total = self.total_bytes.filter(|&t| t > 0)?;
+        Some((self.done_bytes? as f64 / total as f64).clamp(0.0, 1.0))
+    }
+
+    /// The bytes so far, "2.6 of 6.2 GB" or "2.6 GB so far", for a step that counts them.
+    pub fn amount(&self) -> Option<String> {
+        let done = self.done_bytes? as f64 / 1e9;
+        Some(match self.total_bytes.filter(|&t| t > 0) {
+            Some(total) => format!("{done:.1} of {:.1} GB", total as f64 / 1e9),
+            None => format!("{done:.1} GB so far"),
+        })
+    }
+
+    /// One line: the step, then its bytes and how far through.
+    pub fn describe(&self) -> String {
+        match (self.amount(), self.fraction()) {
+            (Some(amount), Some(f)) => format!("{}: {amount} ({:.0}%)", self.status, f * 100.0),
+            (Some(amount), None) => format!("{}: {amount}", self.status),
+            _ => self.status.clone(),
+        }
+    }
 }
 
 /// Classification of worker errors.
@@ -1166,6 +1224,47 @@ mod zkop_mix_tests {
             times.next().map(|secs| entry(*secs))
         });
         (result, calls)
+    }
+
+    #[test]
+    fn a_setup_step_describes_its_bytes() {
+        let step = |done, total| SetupStep {
+            status: "Downloading".to_string(),
+            done_bytes: done,
+            total_bytes: total,
+        };
+        assert_eq!(
+            step(Some(2_600_000_000), Some(6_200_000_000)).describe(),
+            "Downloading: 2.6 of 6.2 GB (42%)"
+        );
+        assert_eq!(
+            step(Some(2_600_000_000), None).describe(),
+            "Downloading: 2.6 GB so far"
+        );
+        assert_eq!(step(None, None).describe(), "Downloading");
+        assert_eq!(step(Some(7), Some(5)).fraction(), Some(1.0));
+        assert_eq!(step(Some(1), Some(0)).fraction(), None);
+    }
+
+    #[test]
+    fn a_gpu_scores_the_geometric_mean_of_its_zkvms_in_sp1_terms() {
+        let close = |a: f64, b: f64| (a - b).abs() / b < 1e-9;
+        // At the typical ratio, a card scores its SP1 figure.
+        let typical = blended_zkops(Some(10e6), Some(10e6 / ZKOP_SP1_PER_RISC0)).unwrap();
+        assert!(close(typical, 10e6), "{typical}");
+        // Weaker at RISC Zero than typical: below its SP1 figure.
+        let weak = blended_zkops(Some(10e6), Some(1.5e6)).unwrap();
+        assert!(
+            close(weak, (10e6 * 1.5e6 * ZKOP_SP1_PER_RISC0).sqrt()),
+            "{weak}"
+        );
+        assert!(weak < 10e6);
+        // Only the zkVMs it measured count.
+        assert_eq!(blended_zkops(Some(10e6), None), Some(10e6));
+        let risc0_only = blended_zkops(None, Some(2e6)).unwrap();
+        assert!(close(risc0_only, 2e6 * ZKOP_SP1_PER_RISC0));
+        assert_eq!(blended_zkops(None, None), None);
+        assert_eq!(blended_zkops(Some(0.0), Some(f64::NAN)), None);
     }
 
     #[test]

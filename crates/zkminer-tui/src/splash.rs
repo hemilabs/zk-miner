@@ -86,12 +86,13 @@ impl Splash {
                 };
                 let started = Instant::now();
                 let _ = paint_art(art);
+                let mut painted = 0u16;
                 while !stop.load(Ordering::Relaxed) {
-                    let line = status_text(&status.get(), started.elapsed(), max_status);
-                    let _ = paint_status(&line);
+                    let lines = status_lines(&status.get(), started.elapsed(), max_status);
+                    let _ = paint_status(&lines, &mut painted);
                     thread::sleep(FRAME);
                 }
-                let _ = erase(lines_above);
+                let _ = erase(lines_above + painted.saturating_sub(1));
             })
         };
         Self {
@@ -146,16 +147,14 @@ pub fn run_setup(status: &StatusLine, backends: &[&str]) -> Vec<String> {
             })
             .collect();
         while running.iter().any(|(_, setup)| !setup.is_finished()) {
-            let steps: Vec<String> = running
-                .iter()
-                .filter(|(_, setup)| !setup.is_finished())
-                .map(|(backend, _)| {
-                    pool.setup_status(backend).unwrap_or_else(|| {
-                        format!("Checking {}'s setup", crate::state::zkvm_label(backend))
-                    })
-                })
-                .collect();
-            status.set(steps.join("; "));
+            let mut lines = vec!["Setting up the provers".to_string()];
+            for (backend, setup) in &running {
+                let finished = setup.is_finished();
+                let step = (!finished).then(|| pool.setup_status(backend)).flatten();
+                let zkvm = crate::state::zkvm_label(backend);
+                lines.push(setup_line(zkvm, step.as_ref(), finished));
+            }
+            status.set(lines.join("\n"));
             thread::sleep(FRAME);
         }
         running
@@ -175,6 +174,41 @@ pub fn run_setup(status: &StatusLine, backends: &[&str]) -> Vec<String> {
             })
             .collect()
     })
+}
+
+const BAR_WIDTH: usize = 20;
+
+/// A prover's line under "Setting up the provers": its zkVM, then a bar, percentage and bytes for a
+/// step that counts them, then the step.
+fn setup_line(
+    zkvm: &str,
+    step: Option<&zkminer_prover_protocol::SetupStep>,
+    finished: bool,
+) -> String {
+    let what = match step {
+        _ if finished => "done".to_string(),
+        None => "checking".to_string(),
+        Some(step) => match (step.fraction(), step.amount()) {
+            (Some(f), Some(amount)) => format!(
+                "{} {:>3.0}%  {amount}  {}",
+                progress_bar(f),
+                f * 100.0,
+                step.status
+            ),
+            (None, Some(amount)) => format!("{amount}  {}", step.status),
+            _ => step.status.clone(),
+        },
+    };
+    format!("{zkvm:<10} {what}")
+}
+
+fn progress_bar(fraction: f64) -> String {
+    let filled = ((fraction.clamp(0.0, 1.0) * BAR_WIDTH as f64).round() as usize).min(BAR_WIDTH);
+    format!(
+        "[{}{}]",
+        "\u{2588}".repeat(filled),
+        "\u{2591}".repeat(BAR_WIDTH - filled)
+    )
 }
 
 /// What startup found, for the status line: each card and the zkVMs running on it, from
@@ -233,17 +267,41 @@ fn paint_art(art: &[&str]) -> io::Result<()> {
     out.flush()
 }
 
-fn paint_status(status: &str) -> io::Result<()> {
+/// The status as the lines to paint: the first with the spinner and elapsed time, and any further
+/// ones (a line per prover being set up) indented under it, each cut to `max` characters.
+fn status_lines(status: &str, elapsed: Duration, max: usize) -> Vec<String> {
+    let mut parts = status.split('\n');
+    let first = status_text(parts.next().unwrap_or_default(), elapsed, max);
+    std::iter::once(first)
+        .chain(parts.map(|part| format!("  {part}").chars().take(max).collect()))
+        .collect()
+}
+
+/// Paints `lines` over the `painted` lines the last call left, the cursor on the first of them's
+/// row's last line, and clears what a taller status leaves below.
+fn paint_status(lines: &[String], painted: &mut u16) -> io::Result<()> {
     let mut out = io::stdout().lock();
-    queue!(
-        out,
-        cursor::MoveToColumn(0),
-        Print(INDENT),
-        SetForegroundColor(Color::Grey),
-        Print(status),
-        ResetColor,
-        Clear(ClearType::UntilNewLine),
-    )?;
+    queue!(out, cursor::MoveToColumn(0))?;
+    if *painted > 1 {
+        queue!(out, cursor::MoveUp(*painted - 1))?;
+    }
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            queue!(out, Print("\r\n"))?;
+        }
+        queue!(
+            out,
+            Print(INDENT),
+            SetForegroundColor(Color::Grey),
+            Print(line),
+            ResetColor,
+            Clear(ClearType::UntilNewLine),
+        )?;
+    }
+    if (lines.len() as u16) < *painted {
+        queue!(out, Clear(ClearType::FromCursorDown))?;
+    }
+    *painted = lines.len() as u16;
     out.flush()
 }
 
@@ -303,6 +361,53 @@ mod tests {
         assert_eq!(
             status_text("Starting workers", elapsed, 8).chars().count(),
             8
+        );
+    }
+
+    #[test]
+    fn each_prover_being_set_up_gets_its_own_line() {
+        let lines = status_lines(
+            "Setting up the provers\nSP1        a\nRISC Zero  b",
+            Duration::from_secs(12),
+            80,
+        );
+        assert_eq!(
+            lines,
+            [
+                "| Setting up the provers... 12s",
+                "  SP1        a",
+                "  RISC Zero  b"
+            ]
+        );
+        assert!(status_lines(&"x\n".repeat(3), Duration::ZERO, 5)
+            .iter()
+            .all(|l| l.chars().count() <= 5));
+    }
+
+    #[test]
+    fn a_setup_line_has_a_bar_where_the_total_is_known() {
+        let step = |done, total| zkminer_prover_protocol::SetupStep {
+            status: "Downloading the Groth16 circuit (first run)".to_string(),
+            done_bytes: done,
+            total_bytes: total,
+        };
+        let half = step(Some(3_100_000_000), Some(6_200_000_000));
+        assert_eq!(
+            setup_line("SP1", Some(&half), false),
+            format!(
+                "SP1        [{}{}]  50%  3.1 of 6.2 GB  Downloading the Groth16 circuit (first run)",
+                "\u{2588}".repeat(10),
+                "\u{2591}".repeat(10)
+            )
+        );
+        assert_eq!(
+            setup_line("SP1", Some(&step(Some(3_100_000_000), None)), false),
+            "SP1        3.1 GB so far  Downloading the Groth16 circuit (first run)"
+        );
+        assert_eq!(setup_line("RISC Zero", None, false), "RISC Zero  checking");
+        assert_eq!(
+            setup_line("RISC Zero", Some(&half), true),
+            "RISC Zero  done"
         );
     }
 

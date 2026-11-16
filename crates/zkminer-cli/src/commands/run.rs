@@ -143,17 +143,18 @@ const DEFAULT_MONITOR_BACKFILL_BLOCKS: u64 = u64::MAX;
 /// faster just burns eth_blockNumber/eth_getLogs calls. Override with `chain.monitor_poll_secs`.
 const DEFAULT_MONITOR_POLL_SECS: u64 = 10;
 
-/// RISC Zero Groth16 seal selector (risc0 v3.0.x). On-chain verification requires
-/// the seal to be `selector ++ abi.encode(a,b,c)` (260 bytes); the worker returns
-/// the bare 256-byte proof, so the miner prepends this. It is the first 4 bytes of
-/// the verifier-parameters digest and is fixed per risc0 version — override via
-/// config for a testnet on a different version.
-const RISC0_GROTH16_SELECTOR: [u8; 4] = [0x73, 0xc4, 0x57, 0xba];
+/// RISC Zero Groth16 seal selector (risc0 v3.1.x: 0xe71e6620, the pinned verifier's `SELECTOR()`).
+/// On-chain verification requires the seal to be `selector ++ abi.encode(a,b,c)` (260 bytes); the
+/// worker returns the bare 256-byte proof, so the miner prepends this. It is the first 4 bytes of
+/// the verifier-parameters digest and is fixed per risc0 version (the worker's
+/// `groth16_selector_tests` hold its risc0 to it) — override via config for a testnet on a
+/// different version.
+const RISC0_GROTH16_SELECTOR: [u8; 4] = zkminer_chain::deployment::pins::RISC0_V3_1_SELECTOR;
 
 /// The resolved seal selector for this run (config override, else the default).
 static SEAL_SELECTOR: std::sync::OnceLock<[u8; 4]> = std::sync::OnceLock::new();
 
-/// Parse a 4-byte hex selector like "0x73c457ba" (or "73c457ba").
+/// Parse a 4-byte hex selector like "0xe71e6620" (or "e71e6620").
 fn parse_seal_selector(s: &str) -> Option<[u8; 4]> {
     let h = s.strip_prefix("0x").unwrap_or(s);
     let bytes = (0..h.len())
@@ -2459,7 +2460,7 @@ pub async fn run(
             DEPLOYMENT_RETRY.as_secs()
         ),
     }
-    // Resolve the RISC Zero groth16 seal selector (config override or the built-in risc0 v3.0.x
+    // Resolve the RISC Zero groth16 seal selector (config override or the built-in risc0 v3.1.x
     // default) BEFORE verifying it against the live verifier: verifying the default while seals are
     // later prefixed with an override would pass the check and then revert every fulfil.
     let sel = match config.prover.risc0_groth16_selector.as_deref() {
@@ -2642,10 +2643,11 @@ pub async fn run(
         // Load cached benchmarks if available.
         // If no cache, benchmarks will run in the background after TUI starts.
         if let Some(suite) = load_cached_benchmark() {
-            tracing::info!("Loaded cached benchmarks (zkOP/s: {:.0})", suite.zkops);
+            let score = zkminer_prover::benchmark::format_mzkops(suite.zkops);
+            tracing::info!("Loaded cached benchmarks ({score})");
             s.add_log(
                 LogLevel::Info,
-                format!("Loaded cached benchmarks (zkOP/s: {:.0})", suite.zkops),
+                format!("Loaded cached benchmarks ({score})"),
             );
             s.benchmark_results = Some(suite);
         }
@@ -10400,7 +10402,7 @@ pub(crate) fn resolve_backend(proof_system_id: alloy::primitives::B256) -> Optio
     use zkminer_chain::auction::ProofSystem;
     match ProofSystem::from_id(proof_system_id)? {
         // The one system this build can prove AND verify end-to-end against the deployed verifier:
-        // risc0 3.0.x Groth16 receipts encoded to the 260-byte seal (SELECTOR 0x73c457ba ‖ proof).
+        // risc0 3.1.x Groth16 receipts encoded to the 260-byte seal (SELECTOR 0xe71e6620 ‖ proof).
         // Checked at startup against the live adapter's native verifier.
         ProofSystem::Risc0Groth16 => Some("risc0"),
         // SP1 6.8.1 (hemilabs/sp1 #19) Groth16 proofs of circuit v6.1.0, the circuit the 743111 SP1
@@ -12694,7 +12696,7 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
         s.benchmark_tracker = Some(BenchmarkTracker {
             devices: Vec::new(),
             all_complete: false,
-            started_at: Some(chrono::Utc::now()),
+            started_at: Some(std::time::Instant::now()),
             active_device_index: 0,
         });
         s.add_log(LogLevel::Info, "Starting GPU benchmarks...");
