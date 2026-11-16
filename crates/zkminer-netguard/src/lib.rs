@@ -12,12 +12,16 @@
 //! The pieces, each usable alone:
 //!
 //! - [`is_global`]: allow-only-globally-routable unicast, every embedded-IPv4 form judged by its
-//!   IPv4 address or refused ([`ip`] module doc for the ranges);
+//!   IPv4 address or refused ([`ip`] module doc for the ranges), NAT64 network-specific prefixes
+//!   included ([`nat64`]: configured, or learned from the host's DNS64);
 //! - [`check_host_name`]: host-name hygiene for requester names ([`INTERNAL_SUFFIXES`]);
 //! - [`HostFacts`]: the host's own addresses (its public NAT addresses included, [`public`]),
-//!   connected prefixes (interfaces and on-link routes), IPv6 site prefixes, DNS servers and
-//!   routing table ([`routes`]: a destination whose best route is not the default path is refused);
-//! - [`admit`]: the single admission decision for an address, by [`NetMode`];
+//!   connected prefixes (interfaces and on-link routes), IPv6 site prefixes, DNS servers, and
+//!   routing tables and policy rules ([`routes`]: a destination whose route is not the default
+//!   path, or that a local route delivers to the host, is refused);
+//! - [`admit`]: the single admission decision for an address, by [`NetMode`]; for facts read from
+//!   this host it also asks the kernel how it would route the connection
+//!   ([`RouteTable::judge`]);
 //! - [`check_url`]: the gate for a requester URL (scheme, user information, a strict reading that
 //!   the URL standard's parser must agree with, host hygiene, and IP literals through [`admit`]);
 //! - [`NetPolicy`]: the mode, refreshing host facts and the operator's deny CIDRs, as one value;

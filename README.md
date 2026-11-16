@@ -223,9 +223,11 @@ are chosen by strangers. zkminer only ever connects to **public internet** addre
 their behalf: never loopback, the LAN, link-local or cloud metadata, this host's own
 addresses (its public address behind NAT included, which it learns from two fixed DNS
 reflectors), a neighbour on a network it is connected to or routes to other than through its
-default route, the rest of its IPv6 site, the DNS servers it uses, or a name only a local
-resolver answers (`localhost`, `*.local`, `*.internal`, `*.lan`, single-label names, …).
-Anycast addresses in `2001:1::/32` are refused too. See [SECURITY.md](SECURITY.md) for exactly
+default route (the kernel is asked, per destination, how it would route the connection, policy
+rules included), an address a `local` route delivers to this host, the rest of its IPv6 site,
+the DNS servers it uses, a private address behind NAT64, or a name only a local resolver
+answers (`localhost`, `*.local`, `*.internal`, `*.lan`, single-label names, …). Anycast
+service addresses (`2001:1::/32`, AMT, AS112) are refused too. See [SECURITY.md](SECURITY.md) for exactly
 what is refused and why.
 
 Run the miner with the host's network (`--network host` in a container): inside a container
@@ -236,7 +238,8 @@ in `[egress] deny_cidrs` if it cannot.
 |---|---|---|
 | `[egress] deny_cidrs` | `[]` | More addresses no requester-caused connection may reach: CIDRs (`"203.0.113.0/24"`, `"2001:db8::/32"`) or bare addresses. Name the rest of your fleet, on a cloud host your VPC's IPv6 range (its other subnets have global addresses and are reached through the default route), and this host's public address behind NAT if discovering it fails or is off. Host bits must be zero. |
 | `[egress] ipv6_site_prefix_len` | `56` | The site refused around each of this host's global IPv6 addresses: its enclosing /N, 48 to 64. Use 48 if your site was delegated a /48. |
-| `[egress] discover_public_addresses` | `true` | Learn this host's public addresses (behind NAT) at startup and every 5 minutes by asking `ns1.google.com` and `1.1.1.1` which address a DNS query came from, and refuse them. Off: list them in `deny_cidrs`. |
+| `[egress] discover_public_addresses` | `true` | Learn this host's public addresses (behind NAT) at startup and every 5 minutes by asking `ns1.google.com` and `1.1.1.1` which address a DNS query came from, and refuse every address either reports (only one both report alike also refuses its IPv6 site). Off: list them in `deny_cidrs`. |
+| `[egress] nat64_prefixes` | `[]` | NAT64 prefixes this host's translator uses besides the well-known `64:ff9b::/96` (RFC 6052: a `/32`, `/40`, `/48`, `/56`, `/64` or `/96`, e.g. `"2001:db8:64::/96"`). An address under one is judged by the IPv4 address it carries, so `<prefix>::10.0.0.1` is refused. The prefix a DNS64 resolver uses is learned at startup from this host's DNS servers (`ipv4only.arpa`, RFC 7050); name it here when it cannot be. |
 | `[dev] private_network` | `false` | **Developer mode.** Lets those connections reach private destinations, so a local test network can serve programs from this machine. The only way to turn the guard off (there is no environment variable or flag). Refused on Hemi mainnet (43111); while it is on, every start logs `DEV MODE: private network access enabled — never run on a public market`, `zkminer status` prints it, and the TUI's status bar shows a red `DEV MODE` badge. Never set it on a miner that serves a public market. |
 
 Unknown keys in `[dev]` and `[egress]` are errors, so a misspelt setting stops the miner

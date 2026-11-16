@@ -4,8 +4,9 @@
 //! address is a /128 while the router advertises its /64 as on-link (a route, `proto ra`); an IPv4
 //! address can be a /32 with the subnet installed as a route; a VPN, WireGuard, Tailscale or Docker
 //! network is a route on its own interface, sometimes to global addresses. So the facts include
-//! every unicast route of every routing table (netlink `RTM_GETROUTE`, which needs no privileges),
-//! and two rules come from it:
+//! every unicast route of every routing table (netlink `RTM_GETROUTE`, which needs no privileges)
+//! with its table, the routes that deliver to the host itself, and the policy-routing rules, and
+//! two rules come from the routes:
 //!
 //! - **on-link routes are connected prefixes:** a unicast route with no gateway, not on a loopback
 //!   interface and not a default route names a network the host reaches directly
