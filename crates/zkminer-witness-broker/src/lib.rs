@@ -11,6 +11,7 @@ pub mod cache;
 pub mod client;
 pub mod config;
 pub(crate) mod control;
+pub mod dns;
 pub mod egress;
 pub mod evm_rpc;
 pub mod fdpass;

@@ -97,6 +97,26 @@ impl Prefix {
             }
         }
     }
+
+    /// Whether the prefix names one address (a /32 or /128 once an IPv4-mapped prefix is read as
+    /// its IPv4 prefix; `::ffff:0:0/96` is `0.0.0.0/0`, not a host route).
+    pub fn is_host_route(&self) -> bool {
+        match self.canonical() {
+            (IpAddr::V4(_), len) => len == 32,
+            (IpAddr::V6(_), len) => len == 128,
+        }
+    }
+}
+
+/// `ip` with every embedded-IPv4 form that [`is_global`] judges by its IPv4 address (mapped
+/// `::ffff:a.b.c.d`, compatible `::a.b.c.d`, SIIT `::ffff:0:a.b.c.d`, the well-known NAT64
+/// `64:ff9b::a.b.c.d`) replaced by that IPv4 address, so deny, connected and role prefixes match
+/// whichever spelling a connection uses.
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => judged_embedded_v4(v6).map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
 }
 
 fn mask32(len: u8) -> u32 {
@@ -260,9 +280,14 @@ impl EgressPolicy {
     /// A role entry admits its own role and alias only, private addresses included (operators run
     /// local nodes), and is not subject to `deny` or `connected`. When no entry of that role and alias
     /// has a prefix containing the address the answer is `NoRoleEntry`; when one does but on another
-    /// port, `WrongPort`. Requester-derived checks run in the order global, deny, connected, port.
+    /// port, `WrongPort`. Requester-derived checks run in the order global, deny, connected, role
+    /// addresses, port, all on [`canonical_ip`] (a NAT64, SIIT or IPv4-compatible spelling of a
+    /// denied, connected or operator address is that address).
     pub fn admit(&self, role: Option<(Role, &str)>, addr: SocketAddr) -> Admit {
-        let ip = addr.ip().to_canonical();
+        let ip = match role {
+            Some(_) => addr.ip().to_canonical(),
+            None => canonical_ip(addr.ip()),
+        };
         match role {
             Some((role, alias)) => {
                 let mut wrong_port = false;
@@ -300,6 +325,19 @@ impl EgressPolicy {
                 }
             }
         }
+    }
+
+    /// Whether an address a DNS answer gave for an endpoint without explicit `cidrs` may become its
+    /// role entry: global, and not in `deny`, a connected prefix or `own` (the host's addresses),
+    /// all judged on [`canonical_ip`]. DNS answers are not the operator's word (`/etc/hosts`, a
+    /// split-horizon zone or a spoofed answer can say anything), so a local or LAN node is configured
+    /// by IP literal or explicit `cidrs`, never by name alone.
+    pub fn dns_admissible(&self, own: &[IpAddr], ip: IpAddr) -> bool {
+        let c = canonical_ip(ip);
+        is_global(c)
+            && !self.deny.iter().any(|p| p.contains(c))
+            && !self.connected.iter().any(|p| p.contains(c))
+            && !own.iter().any(|o| canonical_ip(*o) == c)
     }
 }
 
@@ -1169,6 +1207,71 @@ mod tests {
             p.admit(None, sa("203.0.113.7:443")),
             Admit::Denied(DenyReason::NotGlobal)
         );
+    }
+
+    /// Review F10 (the reviewer's PoC, inverted): the NAT64, SIIT and IPv4-compatible spellings of a
+    /// denied, connected or operator address are that address on the requester path.
+    #[test]
+    fn embedded_forms_are_judged_as_their_v4_on_the_requester_path() {
+        let p = EgressPolicy {
+            roles: vec![RoleEntry { role: Role::EvmRpc, alias: "n".into(), prefixes: vec![pfx("8.8.8.8/32")], port: 443 }],
+            deny: vec![pfx("8.8.4.4/32")],
+            connected: vec![pfx("9.9.9.0/24")],
+        };
+        for (s, why) in [
+            ("8.8.4.4:443", DenyReason::DenyCidr),
+            ("[::ffff:8.8.4.4]:443", DenyReason::DenyCidr),
+            ("[64:ff9b::808:404]:443", DenyReason::DenyCidr),
+            ("[::ffff:0:808:404]:443", DenyReason::DenyCidr),
+            ("[::808:404]:443", DenyReason::DenyCidr),
+            ("9.9.9.9:443", DenyReason::ConnectedPrefix),
+            ("[64:ff9b::909:909]:443", DenyReason::ConnectedPrefix),
+            ("8.8.8.8:443", DenyReason::RoleOnly),
+            ("[64:ff9b::808:808]:443", DenyReason::RoleOnly),
+            ("[::ffff:0:808:808]:443", DenyReason::RoleOnly),
+        ] {
+            assert_eq!(p.admit(None, sa(s)), Admit::Denied(why), "{s}");
+        }
+        assert_eq!(p.admit(None, sa("[64:ff9b::101:101]:443")), Admit::Global, "an unrelated global v4 stays admitted");
+        assert_eq!(canonical_ip(ip("64:ff9b::a00:1")), ip("10.0.0.1"));
+        assert_eq!(canonical_ip(ip("::1")), ip("::1"));
+        assert_eq!(canonical_ip(ip("2001:db8::1")), ip("2001:db8::1"));
+    }
+
+    #[test]
+    fn host_routes_and_dns_admission() {
+        for (s, host) in [
+            ("1.2.3.4/32", true),
+            ("1.2.3.0/24", false),
+            ("0.0.0.0/0", false),
+            ("::1/128", true),
+            ("::/0", false),
+            ("::ffff:127.0.0.1/128", true),
+            ("::ffff:127.0.0.0/104", false),
+            ("::ffff:0.0.0.0/96", false),
+        ] {
+            assert_eq!(pfx(s).is_host_route(), host, "{s}");
+        }
+        let p = policy();
+        let own = [ip("203.0.113.9"), ip("2a00:1450:4001::77")];
+        for s in ["8.8.8.8", "2606:4700:4700::1111", "64:ff9b::101:101"] {
+            assert!(p.dns_admissible(&own, ip(s)), "{s}");
+        }
+        for s in [
+            "127.0.0.1",
+            "::1",
+            "10.1.2.3",
+            "169.254.169.254",
+            "fd00:ec2::254",
+            "::ffff:127.0.0.1",
+            "64:ff9b::7f00:1", // NAT64 loopback
+            "8.8.4.4",         // deny
+            "64:ff9b::808:404",
+            "9.9.9.9", // connected
+            "2a00:1450:4001::77", // own
+        ] {
+            assert!(!p.dns_admissible(&own, ip(s)), "{s}");
+        }
     }
 
     #[test]
