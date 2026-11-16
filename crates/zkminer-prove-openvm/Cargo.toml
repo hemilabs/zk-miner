@@ -17,6 +17,10 @@ bincode = "1"
 libc = "0.2"
 openvm-sdk = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.5.0-rc.1" }
 
+# Denies the worker the network before it handles a requester's ELF (`deny_network`).
+[target.'cfg(target_os = "linux")'.dependencies]
+zkminer-witness-sandbox = { path = "../zkminer-witness-sandbox" }
+
 # A workspace of its own (see the root Cargo.toml's `exclude`): OpenVM's p3 crates cannot share a
 # lockfile with SP1 6.8.1's. Its Cargo.lock started as a copy of the root one.
 [workspace]

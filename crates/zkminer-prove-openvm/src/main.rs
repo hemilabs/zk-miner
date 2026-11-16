@@ -52,6 +52,39 @@ fn main() {
     }
 }
 
+/// Workers that run requester guests have no network: before the first command that carries a
+/// requester's ELF (`Execute`, `Prove`, `ProgramId`), the worker denies itself, its threads and
+/// everything it starts any socket but a Unix one, for the rest of its life
+/// (`zkminer_witness_sandbox::netdeny`), as the risc0 and SP1 workers do. This worker parses no ELF
+/// yet (it declines all three), so this only keeps it so when it does. It has nothing to download.
+///
+/// An error means the command must not run: the caller answers it with that.
+#[cfg(target_os = "linux")]
+fn deny_network() -> Result<(), String> {
+    zkminer_witness_sandbox::netdeny::deny_network_all_threads().map_err(|e| e.to_string())
+}
+
+/// No seccomp off Linux: nothing to deny with.
+#[cfg(not(target_os = "linux"))]
+fn deny_network() -> Result<(), String> {
+    Ok(())
+}
+
+/// [`deny_network`] before a command with a requester's ELF, or the answer refusing it.
+fn guest_may_run(request_id: u64) -> std::result::Result<(), WorkerResponse> {
+    deny_network().map_err(|e| {
+        tracing::error!("cannot deny this worker the network, so it runs no guest: {e}");
+        WorkerResponse::Error {
+            request_id,
+            kind: ErrorKind::Internal,
+            message: format!(
+                "this worker could not deny itself the network, so it runs no requester's guest: \
+                 {e}"
+            ),
+        }
+    })
+}
+
 fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     let mut stdin = BufReader::new(io::stdin().lock());
     let mut stdout = BufWriter::new(ipc_stdout);
@@ -113,6 +146,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 program_id: _,  // for risc0 this is the image id; OpenVM has no such binding
                 witness: _,     // witness jobs are risc0-only; every Prove is refused below
             } => {
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 tracing::info!("Proving request {request_id} ({} bytes ELF)", elf.len());
                 // OpenVM SDK compiles guests at runtime, so proving is handled differently.
                 // For now, return an error indicating this is not yet fully implemented.
@@ -141,6 +178,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             }
 
             WorkerCommand::Execute { request_id, .. } => {
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 // Cycle measurement is implemented for risc0 only: it is the backend whose
                 // executor reports the same `total_cycles` the prover does, so the number is
                 // directly comparable to what proving will report. Decline explicitly rather
@@ -156,6 +197,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             }
 
             WorkerCommand::ProgramId { request_id, .. } => {
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 // Not implemented for openvm, which measures nothing either (see Execute): decline
                 // rather than answer an id the chain would not bind a proof to. `Internal`, not
                 // `InvalidInput`: a missing capability, not this worker's verdict on the bytes (the

@@ -68,9 +68,40 @@ pub fn set_risc0_sys_rand_key(key: [u8; 32], ephemeral: bool) {
     let _ = RISC0_SYS_RAND_KEY.set((key, ephemeral));
 }
 
+/// Settings of the pinned risc0 and SP1 SDKs that hand proving or execution to someone else (a
+/// remote service, an external `r0vm`, a Docker image), fetch what they prove with from elsewhere, or
+/// put them in a developer mode whose proofs are not real. No worker of the miner's uses any of them:
+/// every one proves and executes locally with real proofs, and has no network once it runs a guest
+/// (see `zkminer_witness_sandbox::netdeny`). So none reaches a worker, from the miner's environment
+/// or the dispatcher's overrides, and every worker gets `RISC0_PROVER=local`.
+const REMOTE_PROVER_AND_DEV_ENV: &[&str] = &[
+    // risc0-zkvm: `default_prover` / `default_executor` (Bonsai, an `r0vm` over IPC, the actor
+    // prover), dev mode (fake receipts), and skipping the prover's own check of its receipts.
+    "BONSAI_API_URL",
+    "BONSAI_API_KEY",
+    "BONSAI_POLL_INTERVAL_MS",
+    "RISC0_PROVER",
+    "RISC0_EXECUTOR",
+    "RISC0_SERVER_PATH",
+    "RISC0_DEV_MODE",
+    "RISC0_SKIP_VERIFY",
+    // sp1-sdk: `ProverClient::from_env` (the prover network and its key), its simulation skip,
+    // developer circuits (built locally or downloaded from S3), a token for downloading
+    // `sp1-gpu-server` from GitHub, gnark's Docker image, and the recursion's vk-check bypass.
+    "SP1_PROVER",
+    "NETWORK_RPC_URL",
+    "NETWORK_PRIVATE_KEY",
+    "SKIP_SIMULATION",
+    "SP1_CIRCUIT_MODE",
+    "DEV_GITHUB_TOKEN",
+    "SP1_GNARK_IMAGE",
+    "WITHOUT_VK_VERIFICATION",
+];
+
 /// The environment a worker for `backend` starts with: `inherited` minus secret-named variables
-/// (and any inherited `sys_rand` key), then the dispatcher's `overrides`, then — for a risc0 worker
-/// only — the miner's `sys_rand` key (see [`set_risc0_sys_rand_key`]). Later entries win.
+/// (and any inherited `sys_rand` key), then the dispatcher's `overrides`, all without
+/// [`REMOTE_PROVER_AND_DEV_ENV`]; then `RISC0_PROVER=local`, and for a risc0 worker the miner's
+/// `sys_rand` key (see [`set_risc0_sys_rand_key`]). Later entries win.
 fn worker_env(
     backend: &str,
     inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
@@ -87,8 +118,16 @@ fn worker_env(
                 is_secret_env_name(n) || n == SYS_RAND_KEY_ENV || n == SYS_RAND_KEY_EPHEMERAL_ENV
             })
         })
+        .chain(overrides.iter().map(|(k, v)| (k.into(), v.into())))
+        // Exact names: they are the SDKs' own, which read them case-sensitively.
+        .filter(|(k, _)| {
+            !k.to_str()
+                .is_some_and(|n| REMOTE_PROVER_AND_DEV_ENV.contains(&n))
+        })
         .collect();
-    env.extend(overrides.iter().map(|(k, v)| (k.into(), v.into())));
+    // risc0's own default anyway (the workers call the local prover and executor directly); set so
+    // anything that asks `default_prover` gets it too.
+    env.push(("RISC0_PROVER".into(), "local".into()));
     if backend.starts_with("risc0") {
         if let Some((key, ephemeral)) = sys_rand_key {
             env.push((SYS_RAND_KEY_ENV.into(), encode_key(key).into()));
@@ -552,6 +591,11 @@ pub struct WorkerHandle {
     /// process exits, so the question has to be asked of an ancestor, which means asking it as a
     /// DELTA. See `memory::oom_kill_count`.
     oom_kills_at_spawn: Option<u64>,
+    /// Whether this worker has been sent a command that may have cost it its network: one that runs
+    /// a requester's guest, or a benchmark or calibration (which on SP1 starts the GPU server, under
+    /// the same filter). A worker denies itself the network before it runs a guest, for good (see
+    /// `zkminer_witness_sandbox::netdeny`), so a setup that downloads must run on a fresh worker.
+    may_lack_network: bool,
 }
 
 /// Request to the spawner thread: build a worker, hand back the handle.
@@ -934,6 +978,7 @@ impl WorkerHandle {
             stderr_task,
             reaped: false,
             oom_kills_at_spawn,
+            may_lack_network: false,
         };
 
         // Perform Hello handshake
@@ -1087,7 +1132,24 @@ impl WorkerHandle {
 
     /// Send a command to the worker.
     pub fn send(&mut self, cmd: &WorkerCommand) -> Result<()> {
+        if !matches!(
+            cmd,
+            WorkerCommand::Hello { .. }
+                | WorkerCommand::Capabilities
+                | WorkerCommand::Warmup { .. }
+                | WorkerCommand::Cancel { .. }
+                | WorkerCommand::Shutdown
+        ) {
+            self.may_lack_network = true;
+        }
         write_message(&mut self.writer, cmd).map_err(|e| anyhow::anyhow!("Send error: {e}"))
+    }
+
+    /// Whether this worker may have denied itself the network: it has been sent a command other
+    /// than the handshake, capabilities, warm-up, cancel and shutdown (see the field). Its warm-up,
+    /// which may download, then needs a fresh worker.
+    pub fn may_lack_network(&self) -> bool {
+        self.may_lack_network
     }
 
     /// Receive a response from the worker.
@@ -1952,6 +2014,87 @@ mod tests {
             None,
             "no miner key: the worker reads the file"
         );
+    }
+
+    /// No remote-prover, external-executor or developer-mode setting of the SDKs reaches a worker,
+    /// whether the miner's environment or the dispatcher's overrides carry it; `RISC0_PROVER` is
+    /// `local` for every worker; what a worker needs passes.
+    #[test]
+    fn remote_prover_and_dev_settings_never_reach_a_worker() {
+        let knobs = [
+            ("BONSAI_API_URL", "https://bonsai.example"),
+            ("BONSAI_API_KEY", "k"),
+            ("BONSAI_POLL_INTERVAL_MS", "10"),
+            ("RISC0_PROVER", "bonsai"),
+            ("RISC0_EXECUTOR", "ipc"),
+            ("RISC0_SERVER_PATH", "/tmp/r0vm"),
+            ("RISC0_DEV_MODE", "1"),
+            ("RISC0_SKIP_VERIFY", "1"),
+            ("SP1_PROVER", "network"),
+            ("NETWORK_RPC_URL", "https://rpc.example"),
+            ("NETWORK_PRIVATE_KEY", "0xdead"),
+            ("SKIP_SIMULATION", "true"),
+            ("SP1_CIRCUIT_MODE", "dev"),
+            ("DEV_GITHUB_TOKEN", "t"),
+            ("SP1_GNARK_IMAGE", "example/gnark"),
+            ("WITHOUT_VK_VERIFICATION", "1"),
+        ];
+        let kept = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/miner"),
+            ("RISC0_HOME", "/home/miner/.risc0"),
+            ("RISC0_GROTH16_DIR", "/opt/groth16"),
+            ("SP1_GPU_SERVER_NAME", "sp1-gpu-server-hip"),
+            ("SP1_WORKER_NUM_CORE_WORKERS", "2"),
+            // Not the SDK's spelling: kept (the names are case-sensitive to the SDKs).
+            ("risc0_dev_mode", "1"),
+        ];
+        let inherited = || {
+            knobs
+                .iter()
+                .chain(&kept)
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect::<Vec<(std::ffi::OsString, std::ffi::OsString)>>()
+        };
+        let overrides: std::collections::HashMap<String, String> = knobs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .chain([("CUDA_VISIBLE_DEVICES".to_string(), "1".to_string())])
+            .collect();
+        let get = |env: &[(std::ffi::OsString, std::ffi::OsString)], k: &str| {
+            env.iter()
+                .rev()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.to_str().unwrap().to_string())
+        };
+        let local: (std::ffi::OsString, std::ffi::OsString) =
+            ("RISC0_PROVER".into(), "local".into());
+        for backend in ["risc0", "sp1", "openvm"] {
+            for overrides in [&overrides, &std::collections::HashMap::new()] {
+                let env = super::worker_env(backend, inherited(), overrides, None);
+                for (k, _) in knobs {
+                    let values: Vec<_> = env.iter().filter(|(n, _)| n == k).collect();
+                    if k == "RISC0_PROVER" {
+                        assert_eq!(
+                            values,
+                            [&local],
+                            "{backend}: RISC0_PROVER is local, and only local"
+                        );
+                    } else {
+                        assert!(values.is_empty(), "{backend}: {k} reached the worker");
+                    }
+                }
+                for (k, v) in kept {
+                    assert_eq!(get(&env, k).as_deref(), Some(v), "{backend}: {k}");
+                }
+            }
+            let env = super::worker_env(backend, inherited(), &overrides, None);
+            assert_eq!(get(&env, "CUDA_VISIBLE_DEVICES").as_deref(), Some("1"));
+        }
+        assert!(knobs
+            .iter()
+            .all(|(k, _)| super::REMOTE_PROVER_AND_DEV_ENV.contains(k)));
+        assert_eq!(knobs.len(), super::REMOTE_PROVER_AND_DEV_ENV.len());
     }
 
     #[test]

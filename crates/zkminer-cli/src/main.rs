@@ -146,6 +146,11 @@ enum Commands {
         #[arg(long, default_value_t = 42)]
         input: u32,
     },
+    /// Witness-construction jobs: set up and check what serving them needs
+    Witness {
+        #[command(subcommand)]
+        command: WitnessCommand,
+    },
     /// Initialize config file with defaults
     Init {
         /// Overwrite existing config
@@ -157,6 +162,31 @@ enum Commands {
         /// Generate a fresh private key and save to ~/.zkminer/key
         #[arg(long)]
         generate_key: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum WitnessCommand {
+    /// Initialise the retention store in an empty (or new) directory and print its store_uuid for
+    /// `[retention] store_uuid`. The miner never creates a store itself.
+    InitStore {
+        /// The store directory (default: `[retention] dir`). On its own filesystem, never tmpfs.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Refuse a directory that is not a mount point.
+        #[arg(long)]
+        require_dedicated_mount: bool,
+        /// Accept a filesystem other than ext4, xfs, btrfs, zfs or f2fs (never tmpfs).
+        #[arg(long)]
+        allow_any_filesystem: bool,
+    },
+    /// Run the sandbox self-test (and, with a `[broker]` section, the broker's), as the miner does
+    /// at startup and hourly. Needs a delegated cgroup: run it under
+    /// `systemd-run --user --scope -p Delegate=yes`.
+    SelfTest {
+        /// The sandbox probe binary (default: `zkminer-witness-sandbox-probe` next to zkminer).
+        #[arg(long)]
+        probe: Option<std::path::PathBuf>,
     },
 }
 
@@ -296,6 +326,21 @@ async fn main() -> Result<()> {
             network,
             generate_key,
         } => commands::init::run(config_path, force, &network, generate_key),
+        Commands::Witness { command } => match command {
+            WitnessCommand::InitStore {
+                dir,
+                require_dedicated_mount,
+                allow_any_filesystem,
+            } => commands::witness::init_store(
+                config_path,
+                dir,
+                require_dedicated_mount,
+                allow_any_filesystem,
+            ),
+            WitnessCommand::SelfTest { probe } => {
+                commands::witness::self_test(config_path, probe).await
+            }
+        },
     }
 }
 
@@ -345,6 +390,33 @@ mod tests {
         assert_eq!(simulate_bound("x", 0).as_secs(), min);
         assert_eq!(simulate_bound("x", 600).as_secs(), 600);
         assert_eq!(simulate_bound("x", u64::MAX).as_secs(), 86_400);
+    }
+
+    #[test]
+    fn witness_subcommands_parse() {
+        let cli = Cli::try_parse_from(["zkminer", "witness", "init-store", "--dir", "/srv/r"]).unwrap();
+        match cli.command {
+            Commands::Witness {
+                command:
+                    WitnessCommand::InitStore {
+                        dir,
+                        require_dedicated_mount,
+                        allow_any_filesystem,
+                    },
+            } => {
+                assert_eq!(dir, Some(std::path::PathBuf::from("/srv/r")));
+                assert!(!require_dedicated_mount && !allow_any_filesystem);
+            }
+            _ => panic!("not witness init-store"),
+        }
+        let cli = Cli::try_parse_from(["zkminer", "witness", "self-test"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Witness {
+                command: WitnessCommand::SelfTest { probe: None }
+            }
+        ));
+        assert!(Cli::try_parse_from(["zkminer", "witness"]).is_err());
     }
 
     #[test]
