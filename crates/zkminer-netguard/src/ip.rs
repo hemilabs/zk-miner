@@ -62,54 +62,41 @@ impl Prefix {
     }
 
     /// Whether `ip` falls in the prefix. Host bits of `addr` are ignored; a `len` beyond the family's
-    /// width is clamped to it (a host route). IPv4-mapped IPv6 is the IPv4 address it maps, on both
-    /// sides: `::ffff:10.0.0.5` is in `10.0.0.0/8`, and `::ffff:10.0.0.0/104` is `10.0.0.0/8`.
-    /// Families never match each other otherwise.
+    /// width is clamped to it (a host route).
+    ///
+    /// Compared in the canonical space on both sides: the prefix as [`Self::canonical_prefix`]
+    /// against the address as [`canonical_ip`], so every embedded-IPv4 spelling (mapped
+    /// `::ffff:a.b.c.d`, compatible `::a.b.c.d`, SIIT `::ffff:0:a.b.c.d`, the well-known NAT64
+    /// `64:ff9b::a.b.c.d`) of an address or a network is that IPv4 address or network:
+    /// `::ffff:10.0.0.5` and `64:ff9b::a00:5` are in `10.0.0.0/8`, and a deny CIDR written
+    /// `64:ff9b::808:808/128` holds `8.8.8.8`. A prefix also holds what it holds as written (so
+    /// `::1/128` holds `::1`, which [`canonical_ip`] leaves alone). Families never match each other
+    /// otherwise.
     pub fn contains(&self, ip: IpAddr) -> bool {
-        match (self.canonical(), ip.to_canonical()) {
-            ((IpAddr::V4(net), len), IpAddr::V4(a)) => {
-                let m = mask32(len);
-                u32::from(net) & m == u32::from(a) & m
-            }
-            ((IpAddr::V6(net), len), IpAddr::V6(a)) => {
-                let m = mask128(len);
-                u128::from(net) & m == u128::from(a) & m
-            }
-            _ => false,
-        }
+        in_prefix(Prefix::new(self.addr, self.len), ip)
+            || in_prefix(self.canonical_prefix(), canonical_ip(ip))
     }
 
-    /// The prefix with an IPv4-mapped IPv6 network (len ≥ 96) turned into its IPv4 prefix, and `len`
-    /// clamped to the family's width.
-    fn canonical(&self) -> (IpAddr, u8) {
-        match self.addr {
-            IpAddr::V4(v4) => (IpAddr::V4(v4), self.len.min(32)),
-            IpAddr::V6(v6) => {
-                let len = self.len.min(128);
-                match v6.to_ipv4_mapped() {
-                    Some(v4) if len >= 96 => (IpAddr::V4(v4), len - 96),
-                    _ => (IpAddr::V6(v6), len),
-                }
-            }
-        }
-    }
-
-    /// Whether the prefix names one address (a /32 or /128 once an IPv4-mapped prefix is read as
-    /// its IPv4 prefix; `::ffff:0:0/96` is `0.0.0.0/0`, not a host route).
+    /// Whether the prefix names one address (a /32 or /128 once an embedded-IPv4 prefix is read as
+    /// its IPv4 prefix, [`Self::canonical_prefix`]; `::ffff:0:0/96` is `0.0.0.0/0`, not a host
+    /// route).
     pub fn is_host_route(&self) -> bool {
-        match self.canonical() {
-            (IpAddr::V4(_), len) => len == 32,
-            (IpAddr::V6(_), len) => len == 128,
-        }
+        let p = self.canonical_prefix();
+        p.len == width(p.addr)
     }
 
     /// The prefix as the address space it reaches: an IPv6 prefix of length 96 or more inside one of
     /// the embedded-IPv4 /96s [`canonical_ip`] reads (mapped, compatible, SIIT, the well-known
-    /// NAT64) is the IPv4 prefix it embeds; any other is itself, with host bits cleared.
+    /// NAT64) is the IPv4 prefix it embeds; any other is itself, with host bits cleared. Like
+    /// [`canonical_ip`], `::/128` and `::1/128` stay themselves.
     pub fn canonical_prefix(&self) -> Prefix {
         let p = Prefix::new(self.addr, self.len);
         if let (IpAddr::V6(v6), true) = (p.addr, p.len >= 96) {
-            if EMBEDDED_V4_BASES.contains(&(u128::from(v6) >> 32)) {
+            let x = u128::from(v6);
+            if p.len == 128 && x <= 1 {
+                return p;
+            }
+            if EMBEDDED_V4_BASES.contains(&(x >> 32)) {
                 return Prefix::new(
                     IpAddr::V4(Ipv4Addr::from(u128::from(v6) as u32)),
                     p.len - 96,
@@ -185,6 +172,11 @@ impl FromStr for Prefix {
         }
         Ok(Prefix { addr, len })
     }
+}
+
+/// `ip` is in the (normalized) prefix `p`, compared as written: same family, same network bits.
+fn in_prefix(p: Prefix, ip: IpAddr) -> bool {
+    p.addr.is_ipv4() == ip.is_ipv4() && mask(ip, p.len) == p.addr
 }
 
 fn width(ip: IpAddr) -> u8 {
@@ -761,7 +753,22 @@ mod tests {
             "a mapped address is its v4"
         );
         assert!(!p.contains(ip("11.0.0.0")));
-        assert!(!p.contains(ip("::a01:203")), "compatible is not mapped");
+        assert!(
+            p.contains(ip("::a01:203")),
+            "a compatible address is its v4"
+        );
+        assert!(
+            p.contains(ip("::ffff:0:a01:203")),
+            "an SIIT address is its v4"
+        );
+        assert!(
+            p.contains(ip("64:ff9b::a01:203")),
+            "a NAT64 address is its v4"
+        );
+        assert!(
+            !p.contains(ip("64:ff9b:1::a01:203")),
+            "a local-use NAT64 is not"
+        );
         assert!(
             pfx("10.9.9.9/8").contains(ip("10.0.0.1")),
             "host bits of the prefix are ignored"
@@ -790,6 +797,31 @@ mod tests {
         );
         assert!(!pfx("::ffff:10.0.0.0/104").contains(ip("11.0.0.1")));
         assert!(pfx("2001:db8::/31").contains(ip("2001:db9::1")));
+        // Review r1 broker F6: a prefix written in any embedded form holds the IPv4 addresses it
+        // embeds, in every spelling (it was the mapped form only).
+        for p in [
+            "64:ff9b::808:808/128",
+            "::ffff:0:808:808/128",
+            "::808:808/128",
+            "::ffff:8.8.8.8/128",
+            "8.8.8.8/32",
+        ] {
+            for a in [
+                "8.8.8.8",
+                "::ffff:8.8.8.8",
+                "::ffff:0:808:808",
+                "64:ff9b::808:808",
+                "::808:808",
+            ] {
+                assert!(pfx(p).contains(ip(a)), "{p} holds {a}");
+            }
+            assert!(!pfx(p).contains(ip("8.8.4.4")), "{p}");
+        }
+        assert!(pfx("64:ff9b::a00:0/104").contains(ip("10.1.2.3")));
+        // What canonical_ip leaves alone is held as written.
+        assert!(pfx("::1/128").contains(ip("::1")));
+        assert!(pfx("::/128").contains(ip("::")));
+        assert!(!pfx("::1/128").contains(ip("0.0.0.1")));
     }
 
     #[test]

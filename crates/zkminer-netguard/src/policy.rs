@@ -445,6 +445,49 @@ mod tests {
         );
     }
 
+    /// Review r1 broker F6 (PoC t6): a deny CIDR written in an embedded-IPv4 form (NAT64, SIIT,
+    /// IPv4-compatible) denied the prefix at load (`admit_prefix`) but not the address at connect
+    /// time (`admit`), which compared only the IPv4-mapped spelling. Both refuse it now, in every
+    /// spelling of the address.
+    #[test]
+    fn deny_cidrs_in_any_embedded_form_deny_at_connect_time() {
+        let f = HostFacts::empty();
+        for deny in [
+            "64:ff9b::808:808/128",
+            "::ffff:0:808:808/128",
+            "::808:808/128",
+            "::ffff:8.8.8.8/128",
+            "64:ff9b::808:800/120",
+        ] {
+            let d = [pfx(deny)];
+            for a in [
+                "8.8.8.8",
+                "::ffff:8.8.8.8",
+                "::ffff:0:808:808",
+                "64:ff9b::808:808",
+            ] {
+                assert!(
+                    matches!(
+                        admit(NetMode::Public, ip(a), &f, &d),
+                        Err(Denied::DenyCidr { .. })
+                    ),
+                    "deny {deny}: {a}"
+                );
+            }
+            assert!(matches!(
+                admit_prefix(NetMode::Public, pfx("8.8.8.8/32"), &f, &d),
+                Err(Denied::PrefixOverlapsDeny { .. })
+            ));
+            assert_eq!(admit(NetMode::Public, ip("1.1.1.1"), &f, &d), Ok(()));
+        }
+        // A connected prefix or an own address in NAT64 form is the IPv4 one, too.
+        let f = HostFacts::new(vec![pfx("64:ff9b::909:900/120")], vec![]);
+        assert!(matches!(
+            admit(NetMode::Public, ip("9.9.9.20"), &f, &[]),
+            Err(Denied::ConnectedPrefix { .. })
+        ));
+    }
+
     #[test]
     fn dev_mode_admits_everything() {
         let f = facts();
