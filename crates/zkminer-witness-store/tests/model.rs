@@ -167,6 +167,9 @@ fn run(ops: Vec<Op>, quota: u64) {
                             pinned_at_block: 0,
                             input_sha256: B256::ZERO,
                             bundle_json_sha256: B256::ZERO,
+                            reopen_count: None,
+                            lock_block: 0,
+                            pinned_at_unix: 0,
                         };
                         assert!(s.pin(&rec).unwrap_err().is_missing());
                     }

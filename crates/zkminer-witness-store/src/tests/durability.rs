@@ -13,14 +13,34 @@ fn terminal(job_id: alloy_primitives::B256) -> TerminalProof {
     TerminalProof { job_id, state: TerminalState::Fulfilled, read_at_block: 1 }
 }
 
-/// Every public call on a poisoned store is refused, and none of them touches the disk.
-fn assert_all_refused(s: &Store, f: &faults::Faults, r: &BundleRef, rec: &zkminer_witness::bundle::PinRecord) {
+/// Every public call on a poisoned store is refused, and none of them touches the disk, except the
+/// verified reads of a version a readable pin names (`pinned_readable`): a held lock is proven from
+/// them while the store waits for a restart.
+fn assert_all_refused(
+    s: &Store,
+    f: &faults::Faults,
+    r: &BundleRef,
+    rec: &zkminer_witness::bundle::PinRecord,
+    pinned_readable: bool,
+) {
     f.trace(true);
     poisoned(s.latest(r.job_id, r.descriptor_hash, r.prover));
     poisoned(s.versions(r.job_id, r.descriptor_hash, r.prover));
-    poisoned(s.read(r, &desc_hash));
-    poisoned(s.open_w(r));
-    poisoned(s.verify(r, &desc_hash, &image_id));
+    if pinned_readable {
+        let b = s.read(r, &desc_hash).unwrap();
+        s.open_w(r).unwrap();
+        s.w_path(r).unwrap();
+        let (v, elf_bytes) = s.verify_with_elf(r, &desc_hash, &image_id).unwrap();
+        assert_eq!(v, b);
+        assert_eq!(s.open_bundle_elf(&b, &image_id).unwrap(), elf_bytes);
+        // Another version of the key is not what the pin names: refused.
+        poisoned(s.read(&r.key().at(r.version + 1000), &desc_hash));
+    } else {
+        poisoned(s.read(r, &desc_hash));
+        poisoned(s.open_w(r));
+        poisoned(s.w_path(r));
+        poisoned(s.verify(r, &desc_hash, &image_id));
+    }
     poisoned(s.pin_record(r, 1));
     poisoned(s.pin(rec));
     poisoned(s.unpin(r.job_id, r.descriptor_hash, r.prover));
@@ -65,7 +85,7 @@ fn a_publish_whose_final_fsync_fails_is_rolled_back_and_poisons() {
     assert!(!vdir(d.path(), &new).exists(), "renamed back out of view");
     assert!(!s.inner.state().versions.contains_key(&new), "never indexed");
     assert_eq!(tmp_entries(d.path()), 0, "the writer removed it");
-    assert_all_refused(&s, &f, &old, &rec);
+    assert_all_refused(&s, &f, &old, &rec, true);
     drop(f);
     drop(s);
 
@@ -101,7 +121,7 @@ fn a_pin_whose_directory_fsync_fails_poisons_and_protects() {
     poisoned(s.scan());
     poisoned(s.pin(&rec));
     assert_eq!(f.take_mutations(), Vec::<String>::new());
-    assert_all_refused(&s, &f, &r, &rec);
+    assert_all_refused(&s, &f, &r, &rec, false);
     drop(f);
     drop(s);
 

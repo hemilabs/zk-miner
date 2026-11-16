@@ -712,6 +712,9 @@ fn elf_area_verifies_and_shares() {
     assert_eq!(s.usage(), usage);
     assert_eq!(s.open_elf(id, &image_id).unwrap(), elf(1));
     assert_eq!(h1.image_id(), h2.image_id());
+    // Each hold names the digest of the copy kept, the twin's included.
+    assert_eq!(h1.sha256(), sha256(&elf(1)));
+    assert_eq!(h2.sha256(), sha256(&elf(1)), "the first copy is the one kept");
     // Two bundles share one file.
     let w = witness(1, 100);
     put_and_publish(&s, &Spec::new(job(40)), &w);
@@ -843,4 +846,34 @@ fn concurrent_writers_get_distinct_versions() {
         s.verify(&BundleKey::new(job(70), spec.bundle(&[]).descriptor_hash, prover()).at(v), &desc_hash, &image_id).unwrap();
     }
     assert_accounting(&s);
+}
+
+/// A bundle read checks its ELF against the digest recorded when the ELF was retained, so proving a
+/// held lock needs no image-id derivation (which runs on a measure worker that may be busy); bytes
+/// that do not match the digest fall back to the image id.
+#[test]
+fn a_bundle_read_checks_its_elf_by_digest_before_the_image_id() {
+    let d = tmpdir();
+    let s = open(d.path());
+    let spec = Spec::new(job(50));
+    let w = witness(50, 2000);
+    let r = put_and_publish(&s, &spec, &w);
+    let underivable = |_: &[u8]| None;
+    let (b, elf_bytes) = s.verify_with_elf(&r, &desc_hash, &underivable).unwrap();
+    assert_eq!(elf_bytes, elf(spec.elf));
+    assert_eq!(s.open_bundle_elf(&b, &underivable).unwrap(), elf(spec.elf));
+    // A record without the digest (an older one), or with another copy's: the image id decides.
+    let no_digest = zkminer_witness::bundle::BundleV1 { elf_sha256: None, ..b.clone() };
+    assert_eq!(defect(s.open_bundle_elf(&no_digest, &underivable).unwrap_err()), Defect::ImageId);
+    assert_eq!(s.open_bundle_elf(&no_digest, &image_id).unwrap(), elf(spec.elf));
+    let other = zkminer_witness::bundle::BundleV1 { elf_sha256: Some(B256::repeat_byte(7)), ..b.clone() };
+    assert_eq!(defect(s.open_bundle_elf(&other, &underivable).unwrap_err()), Defect::ImageId);
+    assert_eq!(s.open_bundle_elf(&other, &image_id).unwrap(), elf(spec.elf));
+    // A changed ELF file fails both checks.
+    let p = d.path().join("elfs").join(hex::encode(b.image_id));
+    let mut perm = fs::metadata(&p).unwrap().permissions();
+    perm.set_mode(0o644);
+    fs::set_permissions(&p, perm).unwrap();
+    fs::write(&p, elf(99)).unwrap();
+    assert_eq!(defect(s.verify(&r, &desc_hash, &image_id).unwrap_err()), Defect::ImageId);
 }

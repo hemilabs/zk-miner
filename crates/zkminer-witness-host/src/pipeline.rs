@@ -905,6 +905,7 @@ pub async fn simulate_witness_job(
     let resp = execute(ctx, token, req, w_file, format!("wexec-{}", short(job_key))).await?;
     let journal = check_execution(&resp, &po2s, program_id, limits.maxGuestCycles).map_err(|(r, d)| Skip::new(r, E, d))?;
     timings.execute = t.elapsed();
+    let execute_ms_per_po2 = (timings.execute.as_millis() as u64).div_ceil(po2s.len().max(1) as u64);
 
     // 5. The binding at every po2, as the router judges it, with the real prover.
     const BI: Step = Step::Binding;
@@ -968,6 +969,8 @@ pub async fn simulate_witness_job(
         created_at_block: job.current_block,
         builder_id: envelope.job.builderId,
         caller: job.caller,
+        execute_ms_per_po2: Some(execute_ms_per_po2),
+        elf_sha256: Some(hold.sha256()),
     };
     let bundle = {
         let record = record.clone();

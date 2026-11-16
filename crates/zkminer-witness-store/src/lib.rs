@@ -30,7 +30,8 @@
 //!       w.bin                              W (0444; may be a hard link shared with other versions)
 //!       bundle.json                        BundleV1 (0444), whose `version` is n
 //!   pins/<jobId>.<descriptorHash>.<prover>.json   PinRecord (0444)
-//!   elfs/<imageId>                         guest ELF, content-addressed (0444)
+//!   elfs/<imageId>                         guest ELF, content-addressed (0444); a bundle records
+//!                                          its sha256, checked on reads through the bundle
 //!   verdicts/<jobId>.json                  VerdictRecord
 //! ```
 //!
@@ -63,9 +64,12 @@
 //! - **Poisoning.** When a change fails after it became visible (an fsync after a rename, a rename
 //!   after a mkdir), or a metadata call fails with EIO, the store no longer knows that the disk
 //!   holds what it promised, and a retried fsync can falsely succeed (fsyncgate). The store is then
-//!   *poisoned*: every later call is [`UnavailableKind::Poisoned`] until it is reopened. A publish
-//!   whose final fsync fails is renamed back into `tmp/` and never indexed; a pin whose write fails
-//!   leaves its key's pin unknown, protecting every version of the key.
+//!   *poisoned*: every later call is [`UnavailableKind::Poisoned`] until it is reopened, except the
+//!   verified reads of a version a readable pin names ([`Store::read`], [`Store::open_w`],
+//!   [`Store::w_path`], [`Store::verify`]) and of a bundle's ELF ([`Store::open_bundle_elf`]),
+//!   which re-check every byte they return, so a held lock is still proven. A publish whose final fsync fails is renamed back
+//!   into `tmp/` and never indexed; a pin whose write fails leaves its key's pin unknown, protecting
+//!   every version of the key.
 //!
 //! # Admission
 //!

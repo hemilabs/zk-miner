@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zkminer_witness::binding::{journal_prefix, MAX_JOURNAL_BYTES, STREAM_CHUNK_BYTES};
+use zkminer_witness::binding::{MAX_JOURNAL_BYTES, STREAM_CHUNK_BYTES};
 use zkminer_witness::bundle::{BundleV1, PinRecord, StoreIdentity, BUNDLE_FORMAT_VERSION};
 
 use crate::error::{Defect, FullReason, Reject, StoreError, UnavailableKind};
@@ -477,6 +477,30 @@ impl Inner {
         if self.is_poisoned() {
             return Err(StoreError::unavailable(UnavailableKind::Poisoned, &self.root));
         }
+        self.check_root()
+    }
+
+    /// A read of version `r` may go ahead: as [`Inner::check_usable`], except that a poisoned store
+    /// still serves the version a readable pin names. Poisoning means the store no longer knows the
+    /// disk holds what it promised; a read of a pinned version re-checks every byte it returns
+    /// (`bundle.json` against the pin, `W` against the record, the ELF against its digest or image
+    /// id), so what it hands out is what was published, and a held lock is proven from it instead of
+    /// waiting for a restart.
+    pub(crate) fn check_readable(&self, r: &BundleRef) -> Result<(), StoreError> {
+        if self.is_poisoned() {
+            let pinned = matches!(
+                self.state().pins.get(&r.key()),
+                Some(PinState::Readable { rec, .. }) if rec.bundle_version == r.version
+            );
+            if !pinned {
+                return Err(StoreError::unavailable(UnavailableKind::Poisoned, &self.root));
+            }
+        }
+        self.check_root()
+    }
+
+    /// The root path still names the directory that was opened (not unmounted, not replaced).
+    pub(crate) fn check_root(&self) -> Result<(), StoreError> {
         match std::fs::symlink_metadata(&self.root) {
             Ok(m) if (m.dev(), m.ino()) == self.root_id => Ok(()),
             Ok(_) => Err(StoreError::unavailable(UnavailableKind::RootChanged, &self.root)),
@@ -1320,7 +1344,7 @@ impl Store {
         r: &BundleRef,
         descriptor_hash_fn: &dyn Fn(&[u8]) -> Option<B256>,
     ) -> Result<BundleV1, StoreError> {
-        self.inner.check_usable()?;
+        self.inner.check_readable(r)?;
         let (vdir, b) = self.inner.read_version(r)?;
         check_record(&b, descriptor_hash_fn).map_err(|d| StoreError::corrupt(d, &vdir.child(BUNDLE_JSON)))?;
         self.inner.check_w_in(&vdir, r, b.w_len)?;
@@ -1331,7 +1355,7 @@ impl Store {
     /// record (checked as [`Store::read`] checks it) by streaming it, rewinds, and hands out the
     /// verified fd (plan §15.3: the worker receives `W` as a read-only fd).
     pub fn open_w(&self, r: &BundleRef) -> Result<File, StoreError> {
-        self.inner.check_usable()?;
+        self.inner.check_readable(r)?;
         let (vdir, b) = self.inner.read_version(r)?;
         let p = vdir.child(W_BIN);
         let mut f = match vdir.open_ro(W_BIN) {
@@ -1350,8 +1374,8 @@ impl Store {
         clear_nonblock(&f).map_err(|e| StoreError::io(e, &p))?;
         let mut w_hash = Sha256::new();
         let mut input_hash = Sha256::new();
-        if b.prefix {
-            input_hash.update(journal_prefix(b.job_id, b.prover));
+        if let Some(p) = b.input_prefix() {
+            input_hash.update(p);
         }
         let total = hash_into(&mut f, &mut w_hash, &mut input_hash).map_err(|e| StoreError::io(e, &p))?;
         if total != b.w_len {
@@ -1380,18 +1404,30 @@ impl Store {
 
     /// Everything a proof from this version needs, verified (plan §15.1: "every read verifies
     /// `sha256(W)` and the ELF's image id"): [`Store::read`], [`Store::open_w`] (every byte of `W`),
-    /// and the ELF `image_id` re-verified with `image_id_fn`. An ELF absent from an available store
-    /// is [`Defect::ElfMissing`]. For revalidation and recovery, where the fd itself is not needed.
+    /// and the ELF checked against the record's `elf_sha256`, else its `image_id` re-derived with
+    /// `image_id_fn`. An ELF absent from an available store is [`Defect::ElfMissing`]. For
+    /// revalidation and recovery, where the fd itself is not needed. Like every read of a pinned
+    /// version, usable while the store is poisoned.
     pub fn verify(
         &self,
         r: &BundleRef,
         descriptor_hash_fn: &dyn Fn(&[u8]) -> Option<B256>,
         image_id_fn: &dyn Fn(&[u8]) -> Option<B256>,
     ) -> Result<BundleV1, StoreError> {
+        self.verify_with_elf(r, descriptor_hash_fn, image_id_fn).map(|(b, _)| b)
+    }
+
+    /// [`Store::verify`], also returning the verified ELF bytes.
+    pub fn verify_with_elf(
+        &self,
+        r: &BundleRef,
+        descriptor_hash_fn: &dyn Fn(&[u8]) -> Option<B256>,
+        image_id_fn: &dyn Fn(&[u8]) -> Option<B256>,
+    ) -> Result<(BundleV1, Vec<u8>), StoreError> {
         let b = self.read(r, descriptor_hash_fn)?;
         self.open_w(r)?;
-        match self.inner.read_elf(&b.image_id, image_id_fn) {
-            Ok(_) => Ok(b),
+        match self.inner.read_elf(&b.image_id, b.elf_sha256, image_id_fn) {
+            Ok(elf) => Ok((b, elf)),
             Err(StoreError::Missing { path }) => Err(StoreError::corrupt(Defect::ElfMissing, &path)),
             Err(e) => Err(e),
         }

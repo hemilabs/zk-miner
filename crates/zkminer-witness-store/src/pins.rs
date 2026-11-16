@@ -11,7 +11,8 @@ use crate::store::{BundleKey, BundleRef, PinState, PinStatus, Store};
 
 impl Store {
     /// The pin record for a version as it is on disk: its `input_sha256` and the sha256 of its
-    /// `bundle.json` bytes, which every read through the pin re-checks. The version is read as
+    /// `bundle.json` bytes, which every read through the pin re-checks. The lock evidence
+    /// (`reopen_count`, `lock_block`, `pinned_at_unix`) is the caller's to fill in. The version is read as
     /// [`Store::read`] reads it (without the descriptor re-hash). The caller compares
     /// `input_sha256` with the input it executed before pinning.
     pub fn pin_record(&self, r: &BundleRef, pinned_at_block: u64) -> Result<PinRecord, StoreError> {
@@ -28,6 +29,9 @@ impl Store {
             pinned_at_block,
             input_sha256: b.input_sha256,
             bundle_json_sha256: json_sha256,
+            reopen_count: None,
+            lock_block: 0,
+            pinned_at_unix: 0,
         })
     }
 

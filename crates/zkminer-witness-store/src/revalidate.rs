@@ -114,6 +114,8 @@ mod tests {
             created_at_block: 1,
             builder_id: B256::ZERO,
             caller: Address::ZERO,
+            execute_ms_per_po2: None,
+            elf_sha256: None,
         }
     }
 
