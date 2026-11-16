@@ -104,6 +104,32 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Check whether this miner will claim and prove jobs, and if not, why not: config, key, chain,
+    /// gas, stake, and card by card what this host can prove. Sends nothing, starts no worker.
+    Doctor,
+    /// Stop the miner running under this home directory (from another terminal, a script or a
+    /// service manager). By default it drains: no new claims, and it exits once the proofs in
+    /// flight are fulfilled.
+    #[command(group(clap::ArgGroup::new("mode").args(["keep_locks", "abandon", "force_exit"])))]
+    Stop {
+        /// Exit now without releasing (exit code 75, so `Restart=on-failure` starts it again);
+        /// the next start finishes the jobs held. For restarts and upgrades: start it again
+        /// before the earliest lock deadline.
+        #[arg(long)]
+        keep_locks: bool,
+        /// Release every job held now (each pays a 5-30% release penalty), then exit
+        #[arg(long)]
+        abandon: bool,
+        /// Exit at once, releasing nothing
+        #[arg(long)]
+        force_exit: bool,
+        /// Wait until the miner has exited, then say what it left held
+        #[arg(long)]
+        wait: bool,
+        /// With --wait: give up waiting after this many seconds (the miner keeps stopping)
+        #[arg(long, requires = "wait", value_name = "SECS")]
+        timeout: Option<u64>,
+    },
     /// Run benchmarks to measure proving performance
     Benchmark {
         /// Output results as JSON instead of a formatted table
@@ -263,6 +289,8 @@ async fn main() -> Result<()> {
             .init();
     } else {
         let filter = match cli.verbose {
+            // `doctor` prints its own report; the probes' INFO lines would only interleave with it.
+            0 if matches!(cli.command, Commands::Doctor) => "error",
             0 => "warn,zkminer=info",
             1 => "info,zkminer=debug",
             2 => "debug",
@@ -317,6 +345,23 @@ async fn main() -> Result<()> {
             force,
             yes,
         } => commands::unstake::run_withdraw(config_path, dry_run, force, yes).await,
+        Commands::Doctor => commands::doctor::run(config_path).await,
+        Commands::Stop {
+            keep_locks,
+            abandon,
+            force_exit,
+            wait,
+            timeout,
+        } => {
+            use zkminer_tui::state::StopMode;
+            let mode = match (keep_locks, abandon, force_exit) {
+                (true, _, _) => StopMode::KeepLocks,
+                (_, true, _) => StopMode::Abandon,
+                (_, _, true) => StopMode::Force,
+                _ => StopMode::Drain,
+            };
+            commands::stop::run(mode, wait, timeout)
+        }
         Commands::Benchmark { json, calibrate } => {
             commands::benchmark::run(config_path, json, calibrate).await
         }

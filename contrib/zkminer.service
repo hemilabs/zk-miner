@@ -1,0 +1,56 @@
+# systemd unit for a headless zkminer.
+#
+#   sudo cp contrib/zkminer.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now zkminer
+#   journalctl -u zkminer -f
+#
+# Stopping:
+#   sudo systemctl stop zkminer
+#       Drains: no new claims, the proofs in flight are fulfilled and paid, then it exits (up to
+#       ~50 min, then whatever is still held is released). KillSignal=SIGINT is what makes this a
+#       drain: SIGTERM, systemd's default, releases every held lock at once, at a 5-30% penalty
+#       each.
+#   sudo -u zkminer -H zkminer stop --keep-locks
+#       For upgrades and restarts: exits at once without releasing (exit 75), and
+#       Restart=on-failure starts it again, on the new binary if you replaced it; the new start
+#       finishes the jobs held. A lock still held at its deadline is slashed, so don't leave it
+#       stopped.
+#   sudo -u zkminer -H zkminer stop --abandon
+#       Releases everything now (penalties apply), then exits.
+#   `systemctl restart` drains first, like `stop`.
+#
+# Run `zkminer stop` as the user the unit runs as, with its home: the request goes to that
+# user's ~/.zkminer.
+
+[Unit]
+Description=zkminer (HemiProve prover)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=zkminer
+Group=zkminer
+# GPU access for AMD and Intel cards.
+SupplementaryGroups=render video
+WorkingDirectory=~
+# The key: either `key_source = "file"` in ~/.zkminer/config.toml (`zkminer init --generate-key`
+# writes one), or ZKMINER_PRIVATE_KEY in this file, readable by root only:
+EnvironmentFile=-/etc/zkminer/env
+ExecStart=/usr/local/bin/zkminer run --headless
+
+# A stop drains instead of releasing (see above).
+KillSignal=SIGINT
+# The signal goes to the miner only. Its proving workers must keep running through the drain;
+# whatever is left of them is killed once the miner has exited.
+KillMode=mixed
+# Drain (up to 3000 s) plus the releases after it (up to 800 s).
+TimeoutStopSec=4200
+
+# Exit 75: the miner stopped with locks held, or a keep-locks stop. Start it again so the new
+# start finishes or releases them.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

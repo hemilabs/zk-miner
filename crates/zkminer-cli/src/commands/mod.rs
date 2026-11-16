@@ -1,4 +1,6 @@
 pub mod benchmark;
+pub mod capability;
+pub mod doctor;
 pub mod init;
 pub mod mock;
 pub mod run;
@@ -10,4 +12,5 @@ pub mod simulate;
 pub mod sp1_demo;
 pub mod stake;
 pub mod status;
+pub mod stop;
 pub mod unstake;
