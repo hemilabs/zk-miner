@@ -36,6 +36,7 @@
 use std::path::PathBuf;
 
 mod cgroup;
+pub mod netdeny;
 #[doc(hidden)]
 pub mod probe;
 mod restrict;
