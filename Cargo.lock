@@ -10086,6 +10086,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "zkminer-netguard"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "proptest",
+ "reqwest",
+ "tokio",
+ "tracing",
+ "url",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "zkminer-prove-risc0"
 version = "0.1.0"
 dependencies = [

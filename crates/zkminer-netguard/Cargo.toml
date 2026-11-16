@@ -1,0 +1,39 @@
+[package]
+name = "zkminer-netguard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "zkminer's network guard: nothing a requester controls makes the miner connect anywhere but the public internet"
+
+[features]
+default = ["client"]
+# The guarded DNS resolver and HTTP client (reqwest, tokio). Without it, only the pure parts: the
+# address predicate, host-name hygiene, URL checks, the admission decision and the host's facts.
+client = ["dep:reqwest", "dep:tokio"]
+# Test seams for the tests of crates that depend on this one: a resolver that connects to another
+# address than the one it admitted (so a public-mode fetch can be served by a server on loopback).
+# Only ever enabled from a `[dev-dependencies]` entry; nothing in a release build turns it on.
+test-util = ["client"]
+
+[dependencies]
+url = "2"
+tracing = { workspace = true }
+# No default features: no system proxy, no decompression, no HTTP/2; TLS is rustls with the
+# compiled-in webpki roots.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+tokio = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+proptest = "1"
