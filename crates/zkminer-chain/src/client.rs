@@ -110,6 +110,9 @@ pub struct ChainClient {
     /// from a monotonic index and reopen does not re-emit), so the cached tx IS the
     /// tx the scan would find. FIFO-bounded; a miss just uses the scan fallback.
     submit_tx_cache: Arc<std::sync::Mutex<SubmitTxCache>>,
+    /// Downloads programs' ELFs through the network guard, under the config's `[dev]` and
+    /// `[egress]` settings (see [`crate::programs::ElfFetcher`]). Shared across clones.
+    elf_fetcher: crate::programs::ElfFetcher,
 }
 
 /// FIFO-bounded programId → ProgramInfo cache (see `ChainClient::program_info_cache`) with a TTL:
@@ -326,12 +329,21 @@ impl ChainClient {
         self.watch_only
     }
 
+    /// The guarded ELF downloader every program fetch goes through.
+    pub fn elf_fetcher(&self) -> &crate::programs::ElfFetcher {
+        &self.elf_fetcher
+    }
+
     async fn connect(
         config: &ZkMinerConfig,
         signer: PrivateKeySigner,
         address: Address,
         watch_only: bool,
     ) -> Result<Self> {
+        // First: a config that would let requesters reach this host's private network on a
+        // production chain is refused before anything connects anywhere.
+        config.validate_network()?;
+        let elf_fetcher = crate::programs::ElfFetcher::from_config(config)?;
         let wallet = EthereumWallet::from(signer.clone());
 
         let rpc_url = config.chain.rpc_url.parse().context("Invalid RPC URL")?;
@@ -485,6 +497,7 @@ impl ChainClient {
             head_block: Arc::new(AtomicU64::new(0)),
             program_info_cache: Arc::new(std::sync::Mutex::new(ProgramInfoCache::default())),
             submit_tx_cache: Arc::new(std::sync::Mutex::new(SubmitTxCache::default())),
+            elf_fetcher,
             nonce_mgr: Arc::new(crate::nonce::NonceManager::new()),
             abandoned_fulfill_nonces: Arc::new(std::sync::Mutex::new(Default::default())),
             da_book: Arc::new(std::sync::Mutex::new(Default::default())),

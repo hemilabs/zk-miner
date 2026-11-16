@@ -2401,6 +2401,9 @@ pub async fn run(
 ) -> Result<()> {
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
+    if let Some(banner) = config.dev_mode_banner() {
+        tracing::warn!("{banner}");
+    }
     if watch.is_none() {
         hold_instance_lock()?;
     }
@@ -2679,6 +2682,10 @@ pub async fn run(
         s.address = format!("{}", client.address);
         s.connected = true;
         s.chain_id = config.chain.chain_id;
+        if let Some(banner) = config.dev_mode_banner() {
+            s.dev_private_network = true;
+            s.add_log(LogLevel::Warn, banner.to_string());
+        }
 
         // Hydrate head + ETH/HEMI balances + stake + prover-stats in
         // ONE Multicall3 round-trip instead of 6 sequential reads, de-peaking the boot burst
@@ -6532,8 +6539,10 @@ async fn miner_brain(
                     // Not before the backend's one-time setup is done. SP1's first proof would
                     // otherwise download ~8 GB of circuit artifacts inside its 90 s watchdog, be
                     // killed mid-way, and leave an install that fails every later proof. See
-                    // `spawn_sp1_warmup`.
-                    if !sim_mode {
+                    // `spawn_sp1_warmup`. Not when watching: a watch-only run proves nothing, so it
+                    // never warms a backend up (see the startup warm-up), and this gate would hold
+                    // every risc0 and SP1 verdict short of the claim it is there to report.
+                    if !sim_mode && !watch_only() {
                         if let Some(pool) = zkminer_prover::engine::worker_pool() {
                             if !pool.backend_warmed(backend) {
                                 if memory_skips_this_tick.insert(format!("{backend}:warmup")) {
@@ -11578,9 +11587,16 @@ pub(crate) async fn fetch_or_download_elf(
             ),
         );
     }
-    let elf = zkminer_chain::programs::download_elf(&info.storage_uris, integrity_hash)
-        .await
-        .context("ELF download failed")?;
+    // Through the network guard built from this config (`client.elf_fetcher()`): every storage URI
+    // and redirect is submitter-controlled, so only public destinations are reached unless
+    // `[dev] private_network` is on.
+    let elf = zkminer_chain::programs::download_elf(
+        client.elf_fetcher(),
+        &info.storage_uris,
+        integrity_hash,
+    )
+    .await
+    .context("ELF download failed")?;
     // Cache only bytes bound to a known hash. Unverified risc0 bytes (the measure bootstrap, a
     // recovery re-fetch) are cached by the measure path once the worker has image-id-verified them.
     if integrity_hash.is_none() && !honor_registry_hash {

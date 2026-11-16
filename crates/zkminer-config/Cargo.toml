@@ -16,3 +16,5 @@ hex = { workspace = true }
 zeroize = { workspace = true }
 chrono = { workspace = true }
 zkminer-witness = { workspace = true }
+# Only the mode and CIDR types: no HTTP client.
+zkminer-netguard = { workspace = true }

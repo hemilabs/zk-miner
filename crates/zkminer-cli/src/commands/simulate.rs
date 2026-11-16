@@ -959,7 +959,7 @@ impl Simulator {
             return Ok(elf);
         }
         if let Some(h) = info.elf_hash {
-            match download_elf(&info.storage_uris, Some(h)).await {
+            match download_elf(self.client.elf_fetcher(), &info.storage_uris, Some(h)).await {
                 Ok(elf) => return Ok(elf),
                 Err(e) if e.downcast_ref::<NoStorageUris>().is_some() => return Err(e),
                 Err(e) => tracing::info!(
@@ -969,7 +969,7 @@ impl Simulator {
                 ),
             }
         }
-        download_elf(&info.storage_uris, None).await
+        download_elf(self.client.elf_fetcher(), &info.storage_uris, None).await
     }
 
     /// SP1: set up the measure worker the next request runs on (its CPU prover), outside that
@@ -1474,6 +1474,9 @@ pub async fn run(config_path: Option<&Path>, opts: SimulateOptions) -> Result<()
     anyhow::ensure!(opts.max_cycles > 0, "--max-cycles must be at least 1");
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
+    if let Some(banner) = config.dev_mode_banner() {
+        tracing::warn!("{banner}");
+    }
     // No key is read (the client signs with a throwaway one), so none must reach a worker either.
     if config.wallet.key_source == "env" {
         std::env::remove_var(&config.wallet.key_env_var);

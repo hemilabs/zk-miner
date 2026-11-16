@@ -94,12 +94,13 @@ use zkminer_contracts::bindings::{
     ResourceEstimate, StorageURI, IERC20,
 };
 
-/// The 743111 block the fork starts from by default, after the deployment's setup. Move it forward
-/// whenever `zkminer_chain::deployment::HEMI_TESTNET_743111` changes: the fork would otherwise run
-/// the old deployment, and zkminer's startup checks refuse it. A later block is fine even once
+/// The 743111 block the fork starts from by default, after the deployment's setup: the 2026-11-16
+/// stack's router exists from block 7226099 and its three adapters are registered by 7226300. Move it
+/// forward whenever `zkminer_chain::deployment::HEMI_TESTNET_743111` changes: the fork would otherwise
+/// run the old deployment, and zkminer's startup checks refuse it. A later block is fine even once
 /// someone registers this test's programs on 743111 (their ids are content-derived): setup clears
 /// such a registration first (see [`register_program`]).
-const FORK_BLOCK: u64 = 7_116_900;
+const FORK_BLOCK: u64 = 7_226_550;
 const DEFAULT_FORK_URL: &str = "https://testnet.rpc.hemi.network/rpc";
 const HEMI: u128 = 1_000_000_000_000_000_000;
 /// The fibonacci guest's jobs prove fibonacci(FIB_N), unless `ZKMINER_LOCALNET_FIB_N` says otherwise
@@ -145,7 +146,7 @@ fn prover_stake() -> u128 {
         .map_or(PROVER_STAKE, |hemi| hemi * HEMI)
 }
 /// [`Case::HighCollateral`]'s price, and its collateral rate: `MAX_COLLATERAL_BPS` (500%), the most a
-/// submitter may ask (zkmarket c8333aa, `src/libraries/Constants.sol`).
+/// submitter may ask (hemiprove-contracts 3bc441d, `src/libraries/Constants.sol`).
 const HIGH_COLLATERAL_PRICE: u128 = 250 * HEMI;
 const MAX_COLLATERAL_BPS: u64 = 50_000;
 // Its claim would lock 1,250 HEMI, more than the whole stake; sized at the 150% default (the miner's
@@ -1270,6 +1271,10 @@ impl World {
         c.contracts.hemi_prove_registry = DEPLOYMENT.registry.to_string();
         c.contracts.hemi_token = DEPLOYMENT.token.to_string();
         c.contracts.program_registry = DEPLOYMENT.program_registry.to_string();
+        // The programs are served from this machine (127.0.0.1), which the network guard refuses
+        // outside developer mode. The config file is the only switch: there is no environment
+        // variable for it, and the miner refuses it on mainnet (the fork is 743111).
+        c.dev.private_network = true;
         // A 5 HEMI job is the whole market here: claim anything that pays.
         c.prover.min_profit_threshold = 0.0;
         c.prover.skip_benchmark_gate = true;
@@ -1348,7 +1353,7 @@ async fn funded_owner(provider: &DynProvider, contract: Address) -> Address {
 
 alloy::sol! {
     /// The ProgramRegistry's governance calls (`onlyOwner`), which zkminer's bindings leave out
-    /// (zkmarket c8333aa, `src/core/ProgramRegistry.sol`).
+    /// (hemiprove-contracts 3bc441d, `src/core/ProgramRegistry.sol`).
     #[sol(rpc)]
     interface IProgramRegistryGovernance {
         function revokeProgram(bytes32 programId, string calldata reason) external;
@@ -1709,8 +1714,6 @@ impl Miner {
         }
         cmd.env("HOME", dir)
             .env("PATH", path_without_workers())
-            // The programs are served from this machine.
-            .env("ZKMINER_ELF_ALLOW_PRIVATE_URLS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1974,6 +1977,13 @@ async fn watch_only_reports_every_job() {
     // some other failure.
     if world.elf_hits.load(Ordering::SeqCst) == 0 {
         failures.push("the guest was never downloaded from its registry URI".into());
+    }
+    // Served from 127.0.0.1 because the config's `[dev] private_network` let it, and said so.
+    if !lines
+        .iter()
+        .any(|l| l.contains(zkminer_config::DEV_MODE_BANNER))
+    {
+        failures.push("the miner never announced developer mode".into());
     }
     if !lines
         .iter()

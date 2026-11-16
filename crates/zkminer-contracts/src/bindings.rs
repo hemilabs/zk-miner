@@ -1,10 +1,11 @@
 use alloy::sol;
 
-// Bindings for the HemiProve v2 stack deployed on Hemi testnet 743111 (zkmarket c8333aa). Every
-// item here is pinned against the vendored ABI JSON in `hemiprove-abi/` by `tests` below: a struct
-// whose layout drifts from the deployed contract still DECODES (alloy's call decoding does not
-// validate a static return's field order), it just yields the wrong values — so the pin is what
-// keeps a renamed or reordered field from becoming a silent misread.
+// Bindings for the HemiProve v2 stack deployed on Hemi testnet 743111 on 2026-11-16
+// (hemiprove-contracts 3bc441d, the deployed 8e1808b apart from its LICENSE). Every item here is
+// pinned against the vendored ABI JSON in `hemiprove-abi/` by `tests` below: a struct whose layout
+// drifts from the deployed contract still DECODES (alloy's call decoding does not validate a static
+// return's field order), it just yields the wrong values — so the pin is what keeps a renamed or
+// reordered field from becoming a silent misread.
 sol! {
     // ═══════════════════════════════════════════════════════════════════════════
     // Shared Types
@@ -772,7 +773,7 @@ impl JobRecord {
     }
 }
 
-/// Pins every binding against the vendored c8333aa ABI JSON (`hemiprove-abi/`). These compare the
+/// Pins every binding against the vendored 3bc441d ABI JSON (`hemiprove-abi/`). These compare the
 /// CANONICAL SIGNATURES (inputs, and for views the full output tuple incl. struct member types in
 /// order) — so a reordered, removed or added struct member fails here instead of decoding silently
 /// shifted values at runtime, which is exactly how the July `JobStatusView` drifted unnoticed.

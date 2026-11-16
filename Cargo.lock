@@ -10579,6 +10579,7 @@ dependencies = [
  "tracing",
  "zkminer-config",
  "zkminer-contracts",
+ "zkminer-netguard",
  "zkminer-prover",
 ]
 
@@ -10625,6 +10626,7 @@ dependencies = [
  "toml",
  "tracing",
  "zeroize",
+ "zkminer-netguard",
  "zkminer-witness",
 ]
 
@@ -10647,6 +10649,19 @@ dependencies = [
  "rstest",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "zkminer-netguard"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "proptest",
+ "reqwest",
+ "tokio",
+ "tracing",
+ "url",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

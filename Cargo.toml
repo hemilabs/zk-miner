@@ -9,6 +9,7 @@ members = [
     "crates/zkminer-witness-host",
     "crates/zkminer-contracts",
     "crates/zkminer-chain",
+    "crates/zkminer-netguard",
     "crates/zkminer-prover",
     "crates/zkminer-prover-protocol",
     "crates/zkminer-strategy",
@@ -28,6 +29,7 @@ default-members = [
     "crates/zkminer-witness-host",
     "crates/zkminer-contracts",
     "crates/zkminer-chain",
+    "crates/zkminer-netguard",
     "crates/zkminer-prover",
     "crates/zkminer-prover-protocol",
     "crates/zkminer-strategy",
@@ -95,6 +97,8 @@ rand = "0.8"
 # Internal crates
 zkminer-contracts = { path = "crates/zkminer-contracts" }
 zkminer-chain = { path = "crates/zkminer-chain" }
+# Members that need the guarded HTTP client ask for `features = ["client"]`.
+zkminer-netguard = { path = "crates/zkminer-netguard", default-features = false }
 zkminer-prover = { path = "crates/zkminer-prover" }
 zkminer-prover-protocol = { path = "crates/zkminer-prover-protocol" }
 zkminer-strategy = { path = "crates/zkminer-strategy" }

@@ -21,7 +21,64 @@ pub struct ZkMinerConfig {
     pub retention: Option<crate::witness::RetentionConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broker: Option<crate::witness::BrokerSection>,
+    /// Developer settings: never for a miner on a market. Not written when off.
+    #[serde(default, skip_serializing_if = "DevConfig::is_off")]
+    pub dev: DevConfig,
+    /// The network guard's operator settings. Not written when empty.
+    #[serde(default, skip_serializing_if = "EgressConfig::is_empty")]
+    pub egress: EgressConfig,
 }
+
+/// `[dev]`: developer settings. Unknown keys are refused, so a misspelt switch fails loudly instead
+/// of leaving the guard in a state nobody chose.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevConfig {
+    /// Lets connections a requester causes (a program's ELF download URLs and their redirects)
+    /// reach non-public destinations: loopback, the LAN, link-local, the host's own addresses.
+    /// For local test networks and test scripts only, which serve programs from this machine.
+    /// The ONLY way to turn the network guard off: there is no environment variable or flag.
+    /// Refused on Hemi mainnet (43111); announced by a warning at every start. Default false.
+    #[serde(default)]
+    pub private_network: bool,
+}
+
+impl DevConfig {
+    fn is_off(&self) -> bool {
+        !self.private_network
+    }
+}
+
+/// `[egress]`: the network guard's operator settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressConfig {
+    /// Extra CIDRs no requester-caused connection may reach (`"203.0.113.7/32"`, `"2001:db8::/32"`,
+    /// or a bare address). Name this host's public address when it sits behind NAT (its interfaces
+    /// do not show it, so only this stops a hairpin to it), and the addresses of the rest of your
+    /// fleet. The host's own interface addresses and the networks they are on are refused already.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_cidrs: Vec<String>,
+}
+
+impl EgressConfig {
+    fn is_empty(&self) -> bool {
+        self.deny_cidrs.is_empty()
+    }
+}
+
+/// Chain ids zkminer treats as production markets, where `[dev] private_network` is refused:
+/// Hemi mainnet.
+pub const PRODUCTION_CHAIN_IDS: &[u64] = &[43111];
+
+/// Whether `chain_id` is a production market (see [`PRODUCTION_CHAIN_IDS`]).
+pub fn is_production_chain(chain_id: u64) -> bool {
+    PRODUCTION_CHAIN_IDS.contains(&chain_id)
+}
+
+/// What zkminer says, at every start and in `status`, while `[dev] private_network` is on.
+pub const DEV_MODE_BANNER: &str =
+    "DEV MODE: private network access enabled — never run on a public market";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainConfig {
@@ -75,7 +132,7 @@ pub struct ChainConfig {
     pub fee_ceiling_gwei: Option<f64>,
     /// First block of every HemiProve log scan (job discovery, lock recovery, descriptor
     /// reconstruction): the deployment's `fromBlock`. None = the known deployment's value for this
-    /// chain (743111: 7095745), else no floor.
+    /// chain (743111: 7226094), else no floor.
     #[serde(default)]
     pub scan_from_block: Option<u64>,
     /// Whether to claim journal-bound jobs: a non-zero `expectedJournalHash` (FULL or FIELDS
@@ -414,8 +471,56 @@ impl ZkMinerConfig {
         Ok(())
     }
 
+    /// The network guard's mode for connections a requester causes: [`NetMode::DevPrivate`] only
+    /// with `[dev] private_network = true` on a chain that is not a production market. On one,
+    /// this is [`NetMode::Public`] whatever the config says ([`Self::validate_for_chain`] refuses
+    /// that config outright; this holds even where validation was skipped).
+    ///
+    /// [`NetMode::DevPrivate`]: zkminer_netguard::NetMode::DevPrivate
+    /// [`NetMode::Public`]: zkminer_netguard::NetMode::Public
+    pub fn net_mode(&self) -> zkminer_netguard::NetMode {
+        if self.dev.private_network && !is_production_chain(self.chain.chain_id) {
+            zkminer_netguard::NetMode::DevPrivate
+        } else {
+            zkminer_netguard::NetMode::Public
+        }
+    }
+
+    /// `[egress] deny_cidrs`, parsed. Host bits must be zero (`10.0.0.1/8` is an error).
+    pub fn egress_deny(&self) -> Result<Vec<zkminer_netguard::Prefix>> {
+        self.egress
+            .deny_cidrs
+            .iter()
+            .map(|s| {
+                s.parse::<zkminer_netguard::Prefix>()
+                    .map_err(|e| anyhow::anyhow!("egress.deny_cidrs: {e}"))
+            })
+            .collect()
+    }
+
+    /// [`DEV_MODE_BANNER`] while developer mode is in force, else `None`.
+    pub fn dev_mode_banner(&self) -> Option<&'static str> {
+        (self.net_mode() == zkminer_netguard::NetMode::DevPrivate).then_some(DEV_MODE_BANNER)
+    }
+
+    /// Refuses `[dev] private_network` on a production chain, and malformed `[egress]` CIDRs.
+    pub fn validate_network(&self) -> Result<()> {
+        if self.dev.private_network && is_production_chain(self.chain.chain_id) {
+            anyhow::bail!(
+                "[dev] private_network = true is refused on chain {} (a production market): it lets \
+                 requesters reach this host's private network. Remove it, or point the config at a \
+                 test network",
+                self.chain.chain_id
+            );
+        }
+        self.egress_deny()?;
+        Ok(())
+    }
+
     /// Validate that required fields are set for production use.
     pub fn validate_for_chain(&self) -> Result<()> {
+        // First, so no other error can hide it.
+        self.validate_network()?;
         // `gas_price_gwei` reaches the client as `(g * 1e9).round() as u128`, which saturates
         // a negative or NaN to 0 — and `base_fees` short-circuits `Some(0)` to `(0, 0)` BEFORE
         // the floor. Every escalation path is gated on `base_max_fee > 0`, so a zero
@@ -492,6 +597,97 @@ mod validation_tests {
                 err.contains("at least 1 wei"),
                 "wrong rejection reason for {g}: {err}"
             );
+        }
+    }
+
+    fn parse(toml_text: &str) -> Result<ZkMinerConfig> {
+        Ok(toml::from_str(toml_text)?)
+    }
+
+    #[test]
+    fn dev_mode_is_off_by_default_and_unwritten() {
+        let c = ZkMinerConfig::default();
+        assert!(!c.dev.private_network);
+        assert_eq!(c.net_mode(), zkminer_netguard::NetMode::Public);
+        assert_eq!(c.dev_mode_banner(), None);
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(
+            !text.contains("[dev]") && !text.contains("[egress]"),
+            "{text}"
+        );
+        let c = parse("[chain]\nchain_id = 743111\n").unwrap();
+        assert_eq!(c.net_mode(), zkminer_netguard::NetMode::Public);
+    }
+
+    #[test]
+    fn dev_mode_is_refused_on_mainnet() {
+        for text in [
+            // Explicitly mainnet, and by default (43111 is the default chain id).
+            "[chain]\nchain_id = 43111\n[dev]\nprivate_network = true\n",
+            "[dev]\nprivate_network = true\n",
+        ] {
+            let c = parse(text).unwrap();
+            let err = c.validate_for_chain().expect_err(text).to_string();
+            assert!(
+                err.contains("private_network") && err.contains("43111"),
+                "{err}"
+            );
+            // And even where validation is skipped, the mode stays public on mainnet.
+            assert_eq!(c.net_mode(), zkminer_netguard::NetMode::Public, "{text}");
+            assert_eq!(c.dev_mode_banner(), None);
+        }
+        assert!(is_production_chain(43111) && !is_production_chain(743111));
+    }
+
+    #[test]
+    fn dev_mode_on_a_test_network_is_announced() {
+        let c = parse("[chain]\nchain_id = 743111\n[dev]\nprivate_network = true\n").unwrap();
+        assert!(c.validate_network().is_ok());
+        assert_eq!(c.net_mode(), zkminer_netguard::NetMode::DevPrivate);
+        let banner = c.dev_mode_banner().expect("a banner");
+        assert_eq!(banner, DEV_MODE_BANNER);
+        assert!(banner.starts_with("DEV MODE: private network access enabled"));
+        assert!(banner.contains("never run on a public market"));
+        // It round-trips through the file, which is how the localnet test turns it on.
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("[dev]\nprivate_network = true"), "{text}");
+        assert_eq!(
+            parse(&text).unwrap().net_mode(),
+            zkminer_netguard::NetMode::DevPrivate
+        );
+    }
+
+    #[test]
+    fn unknown_keys_in_dev_and_egress_are_refused() {
+        for text in [
+            "[dev]\nprivate_netwrok = true\n",
+            "[dev]\nprivate_network = true\nallow_everything = true\n",
+            "[dev]\nprivate_network = \"true\"\n",
+            "[egress]\ndeny_cidr = [\"10.0.0.0/8\"]\n",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn egress_deny_cidrs_parse_strictly() {
+        let c = parse(
+            "[chain]\nchain_id = 743111\n[egress]\ndeny_cidrs = [\"203.0.113.7/32\", \"2001:db8::/32\", \"198.51.100.4\"]\n",
+        )
+        .unwrap();
+        let deny = c.egress_deny().unwrap();
+        assert_eq!(
+            deny.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+            ["203.0.113.7/32", "2001:db8::/32", "198.51.100.4/32"]
+        );
+        assert!(c.validate_network().is_ok());
+        for bad in ["10.0.0.1/8", "not-an-ip", "10.0.0.0/33", ""] {
+            let c = parse(&format!(
+                "[chain]\nchain_id = 743111\n[egress]\ndeny_cidrs = [\"{bad}\"]\n"
+            ))
+            .unwrap();
+            let err = c.validate_network().expect_err(bad).to_string();
+            assert!(err.contains("egress.deny_cidrs"), "{err}");
         }
     }
 
