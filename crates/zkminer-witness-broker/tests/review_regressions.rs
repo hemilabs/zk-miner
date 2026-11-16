@@ -181,6 +181,8 @@ async fn a_builder_cannot_make_its_failure_transient() {
         fetch_in_flight_at_end: stats.fetch_in_flight_at_end,
         in_flight_operator_wait: stats.in_flight_operator_wait,
         module_started: true,
+        signal: None,
+        miner_side_failure: false,
     });
     assert_eq!(v, Some(SkipReason::BuilderTrap));
     assert!(SkipReason::BuilderTrap.verdict().blames_caller);
