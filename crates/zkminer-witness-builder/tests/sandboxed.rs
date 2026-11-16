@@ -12,6 +12,8 @@
 //!
 //! Elsewhere it prints `SKIPPED` to stderr and returns (or fails, with ZKMINER_SANDBOX_TESTS_REQUIRED).
 
+mod common;
+
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
@@ -59,24 +61,9 @@ fn delegated(test: &str) -> Option<PathBuf> {
 fn example_wasm() -> &'static [u8] {
     static WASM: OnceLock<Vec<u8>> = OnceLock::new();
     WASM.get_or_init(|| {
-        let sdk = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sdk").canonicalize().unwrap();
-        let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sdk-target-sandboxed");
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let out = Command::new(cargo)
-            .current_dir(&sdk)
-            .args(["build", "--locked", "--release", "--target", "wasm32-unknown-unknown", "-p", "latest-block"])
-            .arg("--target-dir")
-            .arg(&target)
-            .env_remove("RUSTFLAGS")
-            .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            .env_remove("CARGO_BUILD_RUSTFLAGS")
-            .env_remove("CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS")
-            .env_remove("CARGO_BUILD_TARGET")
-            .env_remove("CARGO_TARGET_DIR")
-            .output()
-            .expect("cargo runs");
-        assert!(out.status.success(), "building the example failed:\n{}", String::from_utf8_lossy(&out.stderr));
-        std::fs::read(target.join("wasm32-unknown-unknown/release/latest_block.wasm")).unwrap()
+        let out =
+            common::build_sdk(&["latest-block"], &Path::new(env!("CARGO_TARGET_TMPDIR")).join("sdk-target-sandboxed"));
+        std::fs::read(out.join("latest_block.wasm")).unwrap()
     })
 }
 

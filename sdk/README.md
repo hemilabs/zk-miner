@@ -16,7 +16,7 @@ This directory is its own Cargo workspace (excluded from the zkminer workspace):
 | `test-builders/receipts-proof/`, `test-builders/storage-proof/` | realistic builders with heavy dependencies (serde_json, alloy-rlp, alloy-primitives, alloy-trie, alloy-sol-types, tiny-keccak, sha2) that calibrate and test the runner's compile-cost budget; built at `opt-level = 3` |
 | `.cargo/config.toml` | the pinned target-feature list (the WASM profile) |
 | `rust-toolchain.toml` | the pinned toolchain (1.97.1, with the wasm32-unknown-unknown target) |
-| `build-reproducible.sh` | the reproducible build |
+| `build-reproducible.sh` | the reproducible build, which also runs the runner's pre-pass on what it built |
 
 ## Writing a builder
 
@@ -64,8 +64,9 @@ against exactly the profile, and `the_example_imports_only_hemiprove_builder_v1_
 its imports.
 
 `RUSTFLAGS` (or `CARGO_ENCODED_RUSTFLAGS`) **replaces** the config's target rustflags, so never set
-it when building a builder; add flags with `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS`, which
-cargo appends to them (that is what `build-reproducible.sh` does).
+it when building a builder. `build-reproducible.sh` sets `CARGO_ENCODED_RUSTFLAGS` itself, to the
+complete list: the config's target features followed by its path remapping (a test keeps the two
+lists equal).
 
 ## Building reproducibly
 
@@ -79,16 +80,33 @@ sha256sum target/wasm32-unknown-unknown/release/latest_block.wasm
 ```
 
 The script runs `cargo build --locked --release --target wasm32-unknown-unknown` from this directory
-(so `.cargo/config.toml` and `rust-toolchain.toml` apply), with:
+(so `.cargo/config.toml` and `rust-toolchain.toml` apply), after it:
 
-- `--locked`: exactly the dependency versions in `Cargo.lock` (the SDK itself has none);
-- the release profile in `Cargo.toml`: `panic = "abort"`, `opt-level = "s"`, `lto = true`,
-  `codegen-units = 1`, no debug info, `strip = true`, no incremental compilation;
-- `--remap-path-prefix` for every host path that can reach the module through panic locations:
+- **pins the toolchain:** unsets `RUSTUP_TOOLCHAIN`, `RUSTC`, `CARGO_BUILD_RUSTC*` and sets
+  `RUSTC_WRAPPER` and `RUSTC_WORKSPACE_WRAPPER` empty (which also overrides a wrapper in a cargo
+  config file); checks that `rustc -vV` is the release `rust-toolchain.toml` names and the commit
+  hash the script records, and that `cargo -V` is the same release; then points `RUSTC` at exactly
+  that rustc;
+- **pins the profile:** unsets every `CARGO_PROFILE_*`, `CARGO_INCREMENTAL` and
+  `CARGO_BUILD_INCREMENTAL`, so the release profile in `Cargo.toml` applies: `panic = "abort"`,
+  `opt-level = "s"`, `lto = true`, `codegen-units = 1`, no debug info, `strip = true`, no
+  incremental compilation;
+- **pins the flags:** unsets `RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS` and the target's own
+  `RUSTFLAGS`/`LINKER` variables, and passes the complete list in `CARGO_ENCODED_RUSTFLAGS`, which
+  replaces rustflags from every other source, config files included: the profile's target features,
+  then `--remap-path-prefix` for every host path that can reach the module through panic locations:
   the toolchain's `rust-src` directory → `/rustc/<commit-hash>` (without this, inlined `core` code
   records `~/.rustup/toolchains/…/library/core/src/…` when the `rust-src` component is installed,
   and `/rustc/<commit-hash>/…` when it is not), `$CARGO_HOME` → `/cargo` (registry dependencies),
-  and this directory → `/sdk`.
+  and this directory → `/sdk`;
+- uses `--locked`: exactly the dependency versions in `Cargo.lock`.
+
+Then it puts every module it built through the runner's own pre-pass (`zkminer-builder-check`: the
+profile, the imports and exports, the structural limits and the compile-cost budget), printing each
+one's compile-cost estimate, and fails if any is refused. Inside the zkminer repository it builds
+the checker itself; elsewhere, point `ZKMINER_BUILDER_CHECK` at a `zkminer-builder-check` binary.
+The runner's test `the_script_rebuilds_the_published_example` runs the script, with hostile values in
+all of those variables, and checks the hash below.
 
 A builder with its own repository should copy `.cargo/config.toml`, `rust-toolchain.toml`, the
 release profile and the script, and commit its `Cargo.lock`.
@@ -115,5 +133,7 @@ The module has 17 initial memory pages (1.06 MiB, mostly Rust's 1 MiB shadow sta
 
 - `cargo test` here runs the SDK's host-side unit tests (the context decoder and the JSON
   extraction; the ABI imports exist only on wasm32).
-- `cargo test -p zkminer-witness-builder` from the zkminer root builds `latest-block` and `faults`
-  for wasm32 with this configuration and runs them through the runner against a fake broker.
+- `cargo test -p zkminer-witness-builder` from the zkminer root builds every builder here for wasm32
+  with this configuration and runs them through the runner against a fake broker; checks that
+  `receipts-proof` and `storage-proof` pass the pre-pass with at least 10× headroom under every
+  compile-cost cap; and rebuilds `latest-block` with `build-reproducible.sh` against the hash above.
