@@ -95,7 +95,9 @@ pub struct ArtifactCharge {
     pub chunks: u32,
 }
 
-/// A verified artifact: a sealed memfd of exactly `len` bytes (read it with `pread`/`mmap`).
+/// A verified artifact: a sealed memfd of exactly `len` bytes. Read it with `pread`/`mmap` only:
+/// a cache hit is a duplicate of the broker's cached descriptor, so its file offset is shared with
+/// the broker and with every other job served the same artifact, and is never meaningful.
 #[derive(Debug)]
 pub struct FetchedArtifact {
     pub memfd: File,
