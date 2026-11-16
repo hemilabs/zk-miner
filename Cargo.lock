@@ -10811,8 +10811,10 @@ dependencies = [
 name = "zkminer-witness-builder"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "hex",
  "libc",
+ "sha2",
  "thiserror 2.0.18",
  "wasmparser 0.254.2",
  "wasmtime",

@@ -8,7 +8,12 @@
 //!   from `offset`);
 //! - bounds-checks exactly the guest range it then copies, with checked `u32` arithmetic, and traps
 //!   when it is out of bounds;
-//! - charges [`FUEL_PER_BYTE`] for every byte it copies, before copying.
+//! - charges [`FUEL_PER_BYTE`] for every byte it copies, before copying;
+//! - `witness_write` and `log`, which can block on their sinks, return the WALL_CLOCK fault once the
+//!   deadline has passed (`fetch` bounds its own waits by it).
+//!
+//! `fetch` also charges [`FUEL_PER_FETCH`]; once any fetch has returned status 3 (exhausted), every
+//! later one answers 3 locally, without reaching the broker.
 //!
 //! Pointers, lengths and offsets are the guest's `i32`s reinterpreted as `u32` (wasm32 addresses).
 
@@ -25,13 +30,18 @@ use crate::prepass::MAX_TABLE_ELEMENTS;
 use crate::BrokerChannel;
 
 /// Fuel charged per byte a host function copies between guest memory and the host (in either
-/// direction). wasmtime meters one unit per wasm operator, so a guest-side copy loop costs at least
-/// one unit per 8 bytes; one unit per byte keeps host copies from being a cheaper way to move data
-/// than wasm itself, while a 32 MiB witness still costs only ~3.4e7 units.
+/// direction). The same as wasmtime 48 charges a wasm bulk-memory operator: `memory.copy`,
+/// `memory.fill` and `memory.init` cost one unit per byte (on top of one per operator), so neither a
+/// host copy nor a bulk operator moves data more cheaply than the other; a 32 MiB witness costs
+/// ~3.4e7 units.
 pub const FUEL_PER_BYTE: u64 = 1;
 /// Fuel charged on entry to every host function, for the call itself (a host call costs about as
 /// much CPU as tens of wasm operators). Time blocked in `fetch` is not charged.
 pub const FUEL_PER_HOST_CALL: u64 = 64;
+/// Fuel charged by every `fetch`, on top of [`FUEL_PER_HOST_CALL`] and the request bytes: a fetch
+/// costs an IPC round trip and the broker's work, about as much CPU as 10^5 wasm operators. Charged
+/// whether or not the fetch reaches the broker, so the guest cannot tell the two apart by fuel.
+pub const FUEL_PER_FETCH: u64 = 100_000;
 
 /// Counters shared with the waiting thread, so a summary can be written even if the execution
 /// thread is stuck past the deadline.
@@ -41,6 +51,8 @@ pub(crate) struct Progress {
     pub fetch_bytes: AtomicU64,
     pub witness_bytes: AtomicU64,
     pub transient: AtomicBool,
+    /// Set once compilation has finished.
+    pub compile_ms: AtomicU32,
 }
 
 /// A host-side reason to stop the guest. Returned from host functions as the `wasmtime::Error`.
@@ -52,7 +64,7 @@ pub(crate) enum Fault {
     RequestTooLarge(u32),
     #[error("out of fuel in a host function")]
     Fuel,
-    #[error("wall clock expired during a fetch")]
+    #[error("wall clock expired in a host function")]
     WallClock,
     #[error("module has no `memory` export")]
     NoMemory,
@@ -110,6 +122,8 @@ pub(crate) struct HostState {
     pub log_remaining: usize,
     pub witness_written: u64,
     pub witness_over_limit: bool,
+    /// A fetch returned status 3: every later fetch answers 3 without IPC.
+    pub fetch_exhausted: bool,
     pub max_witness_bytes: u64,
     pub max_request_bytes: u32,
     pub max_response_bytes: u32,
@@ -171,8 +185,18 @@ fn read_into_guest(
     Ok(n as i32)
 }
 
+/// The WALL_CLOCK fault once the deadline has passed: a host function about to block on a sink does
+/// not start after it.
+fn before_deadline(caller: &Caller<'_, HostState>) -> wasmtime::Result<()> {
+    if Instant::now() >= caller.data().deadline {
+        return Err(fault(Fault::WallClock));
+    }
+    Ok(())
+}
+
 fn witness_write(caller: &mut Caller<'_, HostState>, ptr: u32, len: u32) -> wasmtime::Result<i32> {
     charge(caller, FUEL_PER_HOST_CALL)?;
+    before_deadline(caller)?;
     let state = caller.data_mut();
     // Checked before guest memory is touched. Once over, every later write is refused too.
     if state.witness_over_limit || u64::from(len) > state.max_witness_bytes - state.witness_written {
@@ -193,6 +217,7 @@ fn witness_write(caller: &mut Caller<'_, HostState>, ptr: u32, len: u32) -> wasm
 
 fn log(caller: &mut Caller<'_, HostState>, ptr: u32, len: u32) -> wasmtime::Result<()> {
     charge(caller, FUEL_PER_HOST_CALL)?;
+    before_deadline(caller)?;
     let n = (len as usize).min(caller.data().log_remaining) as u32;
     if n == 0 {
         return Ok(()); // over the per-job budget: dropped without touching guest memory
@@ -274,11 +299,16 @@ fn fetch(caller: &mut Caller<'_, HostState>, cap: u32, req_ptr: u32, req_len: u3
     }
     let mem = memory(caller)?;
     let range = guest_range(req_ptr, req_len, mem.data_size(&*caller))?;
-    charge(caller, u64::from(req_len) * FUEL_PER_BYTE)?;
+    charge(caller, FUEL_PER_FETCH + u64::from(req_len) * FUEL_PER_BYTE)?;
     let (data, state) = mem.data_and_store_mut(&mut *caller);
-    let frame = ipc::encode_fetch(cap, &data[range]);
     // A new fetch replaces the held response, whatever its outcome.
     state.response = Vec::new();
+    // The budget is spent for good: answer without a round trip (a storm of fetches after it costs
+    // the broker nothing).
+    if state.fetch_exhausted {
+        return Ok(abi::pack_fetch(ipc::FetchStatus::Exhausted as u8, 0));
+    }
+    let frame = ipc::encode_fetch(cap, &data[range]);
     let max_result = ipc::fetch_result_frame_max(state.max_response_bytes);
     let mut io = DeadlineIo { ch: &mut *state.broker, deadline: state.deadline };
     ipc::write_frame(&mut io, ipc::KIND_FETCH, &frame).map_err(io_fault)?;
@@ -298,8 +328,10 @@ fn fetch(caller: &mut Caller<'_, HostState>, cap: u32, req_ptr: u32, req_len: u3
     payload.remove(0);
     let len = payload.len() as u32; // ≤ max_response_bytes, by the frame cap
     state.progress.fetch_bytes.fetch_add(u64::from(len), Ordering::Relaxed);
-    if status == ipc::FetchStatus::Failed {
-        state.progress.transient.store(true, Ordering::Relaxed);
+    match status {
+        ipc::FetchStatus::Failed => state.progress.transient.store(true, Ordering::Relaxed),
+        ipc::FetchStatus::Exhausted => state.fetch_exhausted = true,
+        ipc::FetchStatus::Ok | ipc::FetchStatus::Denied => {}
     }
     state.response = payload;
     Ok(abi::pack_fetch(status as u8, len))

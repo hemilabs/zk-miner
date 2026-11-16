@@ -13,7 +13,7 @@ use zkminer_witness::abi;
 use zkminer_witness::envelope::{
     HARD_MAX_BUILDER_MEMORY_BYTES, HARD_MAX_BUILDER_SECONDS, HARD_MAX_WITNESS_BYTES, MAX_REQUEST_BYTES,
 };
-use zkminer_witness::ipc::{exit, BuilderSummary};
+use zkminer_witness::ipc::{self, exit, BuilderSummary, FUEL_USED_UNKNOWN};
 
 use crate::engine::{self, EXEC_THREAD_STACK_BYTES};
 use crate::host::{self, Fault, HostState, Limiter, Progress};
@@ -78,7 +78,7 @@ impl BrokerChannel for UnixStream {
 }
 
 /// Where a run's output goes.
-pub struct RunnerIo<W, B, L> {
+pub struct RunnerIo<W, B, L, M> {
     /// The W sink, written in pieces of at most [`abi::W_CHUNK_BYTES`]. Kept by the miner only on
     /// exit 0.
     pub witness: W,
@@ -88,26 +88,34 @@ pub struct RunnerIo<W, B, L> {
     /// the runner's own one-line reasons for a rejected module or an internal error, prefixed
     /// `[runner]`. The miner sanitizes it.
     pub log: L,
+    /// The summary pipe (a second handle to it): [`run`] writes [`abi::MODULE_STARTED_MARKER`] here
+    /// once the module compiled and passed every check, immediately before instantiation, and never
+    /// after it has returned. The caller writes the summary itself, after [`run`] returns.
+    pub marker: M,
 }
 
 /// Runs one builder and returns its summary. Never panics on guest input.
 ///
-/// Threads: the caller's thread waits; one execution thread (8 MiB of stack) compiles, instantiates
-/// and runs the module; one watchdog thread bumps the epoch once the deadline passes. Three in all,
-/// and wasmtime starts none of its own in this build.
+/// Threads: the caller's thread waits; one execution thread (8 MiB of stack) runs the pre-pass,
+/// then starts the epoch watchdog thread, then compiles, instantiates and runs the module. Three in
+/// all (wasmtime starts none of its own in this build), so the job cgroup's `pids.max` must be at
+/// least 3: with less, the run ends INTERNAL before anything is compiled.
 ///
 /// If the execution thread has not finished [`DEADLINE_GRACE`] after the deadline (it is stuck in
-/// compilation or in a blocking write), this returns WALL_CLOCK and leaves that thread behind; the
+/// compilation or in a blocking write), this returns WALL_CLOCK with the fuel used unknown
+/// ([`FUEL_USED_UNKNOWN`]) and leaves that thread behind, unable to write the marker any more; the
 /// binary then exits, which ends it.
-pub fn run<W, B, L>(module: &[u8], context: &[u8], cfg: &RunnerConfig, io: RunnerIo<W, B, L>) -> BuilderSummary
+pub fn run<W, B, L, M>(module: &[u8], context: &[u8], cfg: &RunnerConfig, io: RunnerIo<W, B, L, M>) -> BuilderSummary
 where
     W: Write + Send + 'static,
     B: BrokerChannel,
     L: Write + Send + 'static,
+    M: Write + Send + 'static,
 {
     let started = Instant::now();
     let cfg = cfg.clamped();
     let progress = Arc::new(Progress::default());
+    let marker: Marker = Arc::new(Mutex::new(Some(Box::new(io.marker))));
     let (tx, rx) = mpsc::channel();
     let job = Job {
         module: module.to_vec(),
@@ -116,6 +124,7 @@ where
         witness: Box::new(io.witness),
         broker: Box::new(io.broker),
         log: Box::new(io.log),
+        marker: marker.clone(),
         progress: progress.clone(),
     };
     let spawned =
@@ -126,22 +135,27 @@ where
         return BuilderSummary { exit_code: exit::INTERNAL, ..Default::default() };
     }
     let wait = cfg.deadline.saturating_duration_since(Instant::now()) + DEADLINE_GRACE;
-    match rx.recv_timeout(wait) {
-        Ok(summary) => summary,
-        Err(mpsc::RecvTimeoutError::Timeout) => BuilderSummary {
-            exit_code: exit::WALL_CLOCK,
-            transient: progress.transient.load(Ordering::Relaxed),
-            fetches: progress.fetches.load(Ordering::Relaxed),
-            fetch_bytes: progress.fetch_bytes.load(Ordering::Relaxed),
-            fuel_used: 0,
-            witness_bytes: progress.witness_bytes.load(Ordering::Relaxed),
-            compile_ms: 0,
-            run_ms: millis(started.elapsed()),
-        },
-        // The execution thread panicked: a runner bug.
-        Err(mpsc::RecvTimeoutError::Disconnected) => BuilderSummary { exit_code: exit::INTERNAL, ..Default::default() },
-    }
+    let exit_code = match rx.recv_timeout(wait) {
+        Ok(summary) => return summary,
+        Err(mpsc::RecvTimeoutError::Timeout) => exit::WALL_CLOCK,
+        // The execution thread panicked: a runner bug (its message went to stderr, the log).
+        Err(mpsc::RecvTimeoutError::Disconnected) => exit::INTERNAL,
+    };
+    // From here on the execution thread may not write the marker: the summary follows it.
+    drop(marker.lock().unwrap_or_else(|e| e.into_inner()).take());
+    let mut summary = BuilderSummary {
+        exit_code,
+        fuel_used: FUEL_USED_UNKNOWN,
+        compile_ms: progress.compile_ms.load(Ordering::Relaxed),
+        run_ms: millis(started.elapsed()),
+        ..Default::default()
+    };
+    fill_counters(&progress, &mut summary);
+    summary
 }
+
+/// The marker's sink, shared so the waiting thread can retire it (see [`run`]).
+type Marker = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
 
 fn millis(d: Duration) -> u32 {
     d.as_millis().min(u128::from(u32::MAX)) as u32
@@ -154,6 +168,7 @@ struct Job {
     witness: Box<dyn Write + Send>,
     broker: Box<dyn BrokerChannel>,
     log: Box<dyn Write + Send>,
+    marker: Marker,
     progress: Arc<Progress>,
 }
 
@@ -232,34 +247,41 @@ fn check_compiled(module: &Module) -> Result<(), PrepassError> {
 }
 
 impl Job {
-    fn execute(mut self) -> BuilderSummary {
+    fn execute(self) -> BuilderSummary {
+        let Job { module: bytes, context, cfg, witness, broker, mut log, marker, progress } = self;
         let t0 = Instant::now();
-        let cfg = self.cfg;
         let mut summary = BuilderSummary::default();
 
-        if let Err(e) = prepass::prepass(&self.module, cfg.memory_bytes) {
-            let _ = writeln!(self.log, "[runner] {e}");
+        if let Err(e) = prepass::prepass(&bytes, cfg.memory_bytes) {
+            let _ = writeln!(log, "[runner] {e}");
             summary.exit_code = e.exit_code();
             summary.compile_ms = millis(t0.elapsed());
             return summary;
         }
         let engine = match engine::engine() {
             Ok(e) => e,
-            Err(e) => return self.internal(summary, format!("engine: {e}")),
+            Err(e) => return internal(&mut log, summary, format!("engine: {e:#}")),
         };
-        let module = match Module::from_binary(&engine, &self.module) {
+        // Before compiling: a job cgroup without room for this third thread fails the run now, not
+        // after a long compilation. (The waiting thread's own deadline covers the compilation.)
+        let watchdog = match Watchdog::start(engine.clone(), cfg.deadline) {
+            Ok(w) => w,
+            Err(e) => return internal(&mut log, summary, format!("watchdog thread: {e}")),
+        };
+        let module = match Module::from_binary(&engine, &bytes) {
             Ok(m) => m,
             Err(e) => {
-                let _ = writeln!(self.log, "[runner] invalid module: {e}");
+                let _ = writeln!(log, "[runner] invalid module: {e:#}");
                 summary.exit_code = exit::INVALID_MODULE;
                 summary.compile_ms = millis(t0.elapsed());
                 return summary;
             }
         };
-        drop(std::mem::take(&mut self.module));
+        drop(bytes);
         summary.compile_ms = millis(t0.elapsed());
+        progress.compile_ms.store(summary.compile_ms, Ordering::Relaxed);
         if let Err(e) = check_compiled(&module) {
-            let _ = writeln!(self.log, "[runner] {e}");
+            let _ = writeln!(log, "[runner] {e}");
             summary.exit_code = e.exit_code();
             return summary;
         }
@@ -269,18 +291,18 @@ impl Job {
         }
 
         let t1 = Instant::now();
-        let progress = self.progress.clone();
         let mut log_for_runner: Option<String> = None;
         let state = HostState {
             limiter: Limiter { memory_bytes: cfg.memory_bytes as usize, memory_denied: false },
-            context: std::mem::take(&mut self.context),
+            context,
             response: Vec::new(),
-            witness: self.witness,
-            broker: self.broker,
-            log: self.log,
+            witness,
+            broker,
+            log,
             log_remaining: abi::LOG_CAP_BYTES,
             witness_written: 0,
             witness_over_limit: false,
+            fetch_exhausted: false,
             max_witness_bytes: cfg.max_witness_bytes,
             max_request_bytes: cfg.max_request_bytes,
             max_response_bytes: cfg.max_response_bytes,
@@ -291,26 +313,35 @@ impl Job {
         store.limiter(|s| &mut s.limiter);
         // Armed before instantiation: a start function runs inside `instantiate`.
         if let Err(e) = store.set_fuel(cfg.fuel) {
-            return internal_with(store, summary, format!("fuel: {e}"));
+            return internal(&mut store.data_mut().log, summary, format!("fuel: {e:#}"));
         }
         store.set_epoch_deadline(1);
         store.epoch_deadline_trap();
-        let watchdog = match Watchdog::start(engine.clone(), cfg.deadline) {
-            Ok(w) => w,
-            Err(e) => return internal_with(store, summary, format!("watchdog: {e}")),
-        };
         let linker = match host::linker(&engine) {
             Ok(l) => l,
-            Err(e) => return internal_with(store, summary, format!("linker: {e}")),
+            Err(e) => return internal(&mut store.data_mut().log, summary, format!("linker: {e:#}")),
         };
+        // The last step before module code can run (a start function runs inside `instantiate`).
+        match mark_started(&marker) {
+            Ok(true) => {}
+            // The waiting thread has already reported WALL_CLOCK; nothing reads this summary.
+            Ok(false) => {
+                summary.exit_code = exit::WALL_CLOCK;
+                return summary;
+            }
+            Err(e) => return internal(&mut store.data_mut().log, summary, format!("summary pipe: {e}")),
+        }
 
         let outcome = linker.instantiate(&mut store, &module).and_then(|instance| {
             let run = instance.get_typed_func::<(), i32>(&mut store, abi::EXPORT_RUN)?;
             run.call(&mut store, ())
         });
+        let finished = Instant::now();
         drop(watchdog);
 
         let mut code = match &outcome {
+            // A run that returns after its deadline did not finish in time, whatever it returned.
+            Ok(_) if finished >= cfg.deadline => exit::WALL_CLOCK,
             Ok(0) => exit::OK,
             Ok(_) => exit::NONZERO_RETURN,
             Err(e) => {
@@ -331,7 +362,15 @@ impl Job {
             }
         }
         summary.exit_code = code;
-        summary.fuel_used = cfg.fuel.saturating_sub(store.get_fuel().unwrap_or(0));
+        // After an epoch interrupt `get_fuel` still answers, but stale: wasmtime 48 keeps a function's
+        // fuel in a register and saves it only at calls, returns and the out-of-fuel check, not before
+        // the epoch trap (a loop that ran for seconds reads as 0 used). Every other outcome left it
+        // saved.
+        let interrupted = matches!(&outcome, Err(e) if matches!(e.downcast_ref::<Trap>(), Some(Trap::Interrupt)));
+        summary.fuel_used = match store.get_fuel() {
+            Ok(left) if !interrupted => cfg.fuel.saturating_sub(left),
+            _ => FUEL_USED_UNKNOWN,
+        };
         summary.run_ms = millis(t1.elapsed());
         fill_counters(&progress, &mut summary);
         if let Some(why) = log_for_runner {
@@ -340,11 +379,14 @@ impl Job {
         let _ = store.data_mut().log.flush();
         summary
     }
+}
 
-    fn internal(mut self, mut summary: BuilderSummary, why: String) -> BuilderSummary {
-        let _ = writeln!(self.log, "[runner] internal: {why}");
-        summary.exit_code = exit::INTERNAL;
-        summary
+/// Writes the marker unless the waiting thread has retired it (`Ok(false)`).
+fn mark_started(marker: &Marker) -> std::io::Result<bool> {
+    let mut slot = marker.lock().unwrap_or_else(|e| e.into_inner());
+    match slot.as_mut() {
+        None => Ok(false),
+        Some(w) => ipc::write_module_started(w).map(|()| true),
     }
 }
 
@@ -355,8 +397,8 @@ fn fill_counters(p: &Progress, s: &mut BuilderSummary) {
     s.witness_bytes = p.witness_bytes.load(Ordering::Relaxed);
 }
 
-fn internal_with(mut store: Store<HostState>, mut summary: BuilderSummary, why: String) -> BuilderSummary {
-    let _ = writeln!(store.data_mut().log, "[runner] internal: {why}");
+fn internal(log: &mut dyn Write, mut summary: BuilderSummary, why: String) -> BuilderSummary {
+    let _ = writeln!(log, "[runner] internal: {why}");
     summary.exit_code = exit::INTERNAL;
     summary
 }

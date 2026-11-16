@@ -165,6 +165,9 @@ pub struct BuilderSummary {
     pub transient: bool,
     pub fetches: u32,
     pub fetch_bytes: u64,
+    /// Fuel consumed, start function included; [`FUEL_USED_UNKNOWN`] when the runner cannot know it:
+    /// after the epoch interrupt (wasmtime does not save its fuel counter before that trap), and when
+    /// the waiting thread reports alone (a stuck or panicked execution thread).
     pub fuel_used: u64,
     pub witness_bytes: u64,
     pub compile_ms: u32,
@@ -173,6 +176,29 @@ pub struct BuilderSummary {
 
 pub const BUILDER_SUMMARY_MAGIC: [u8; 4] = *b"WBS1";
 pub const BUILDER_SUMMARY_BYTES: usize = 48;
+/// [`BuilderSummary::fuel_used`] when the fuel consumed is not known.
+pub const FUEL_USED_UNKNOWN: u64 = u64::MAX;
+/// The most a runner writes to its summary pipe: the marker and the summary. A reader stops there.
+pub const SUMMARY_PIPE_MAX_BYTES: usize = 1 + BUILDER_SUMMARY_BYTES;
+
+/// Writes [`abi::MODULE_STARTED_MARKER`](crate::abi::MODULE_STARTED_MARKER) to the summary pipe (the
+/// runner, once, just before instantiation).
+pub fn write_module_started(w: &mut impl Write) -> io::Result<()> {
+    w.write_all(&[crate::abi::MODULE_STARTED_MARKER])?;
+    w.flush()
+}
+
+/// Everything a runner wrote to its summary pipe, read to EOF (at most [`SUMMARY_PIPE_MAX_BYTES`]):
+/// whether the module started (the marker is the first byte), and the summary if exactly one
+/// well-formed summary follows. A missing or malformed summary (`None`) after the marker is still
+/// `started`: the module may have run.
+pub fn decode_summary_pipe(bytes: &[u8]) -> (bool, Option<BuilderSummary>) {
+    let (started, rest) = match bytes.split_first() {
+        Some((&crate::abi::MODULE_STARTED_MARKER, rest)) => (true, rest),
+        _ => (false, bytes),
+    };
+    (started, BuilderSummary::decode(rest))
+}
 
 impl BuilderSummary {
     pub fn encode(&self) -> [u8; BUILDER_SUMMARY_BYTES] {
@@ -455,6 +481,29 @@ mod tests {
         assert_eq!(BuilderSummary::decode(&b), None, "reserved bytes must be zero");
         let neg = BuilderSummary { exit_code: -9, ..s };
         assert_eq!(BuilderSummary::decode(&neg.encode()), Some(neg));
+    }
+
+    #[test]
+    fn summary_pipe_with_and_without_the_marker() {
+        let s = BuilderSummary { exit_code: exit::TRAP, fuel_used: FUEL_USED_UNKNOWN, ..Default::default() };
+        let mut pipe = Vec::new();
+        write_module_started(&mut pipe).unwrap();
+        assert_eq!(pipe, [crate::abi::MODULE_STARTED_MARKER]);
+        assert_eq!(decode_summary_pipe(&pipe), (true, None), "started, then died before the summary");
+        pipe.extend_from_slice(&s.encode());
+        assert_eq!(pipe.len(), SUMMARY_PIPE_MAX_BYTES);
+        assert_eq!(decode_summary_pipe(&pipe), (true, Some(s)));
+        // A pre-pass or compile failure: the summary alone.
+        assert_eq!(decode_summary_pipe(&s.encode()), (false, Some(s)));
+        assert_eq!(decode_summary_pipe(&[]), (false, None));
+        // Anything else is malformed, but a leading marker still counts.
+        let mut twice = vec![crate::abi::MODULE_STARTED_MARKER; 2];
+        twice.extend_from_slice(&s.encode());
+        assert_eq!(decode_summary_pipe(&twice), (true, None));
+        let mut trailing = s.encode().to_vec();
+        trailing.push(crate::abi::MODULE_STARTED_MARKER);
+        assert_eq!(decode_summary_pipe(&trailing), (false, None));
+        assert_ne!(crate::abi::MODULE_STARTED_MARKER, BUILDER_SUMMARY_MAGIC[0]);
     }
 
     #[test]

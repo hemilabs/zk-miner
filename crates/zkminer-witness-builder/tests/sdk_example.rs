@@ -4,8 +4,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use common::*;
@@ -22,33 +21,14 @@ use zkminer_witness_builder::{prepass, PROFILE_FEATURES};
 const REQUEST: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["finalized",false]}"#;
 const HASH: &str = "0x9b83c12c69edb74f6c8dd5d052765c1adf940e320bd1291696e6fa07829eee71";
 
-fn sdk_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sdk").canonicalize().unwrap()
-}
-
 /// Builds the SDK workspace's builders once per test binary, from the SDK directory (so its
 /// `.cargo/config.toml` applies), into this test's own target dir, with no inherited flags that would
 /// replace the pinned target features. Returns `name`'s module.
 fn built(name: &str) -> &'static [u8] {
     static WASM: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
     let (example, faults) = WASM.get_or_init(|| {
-        let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sdk-target");
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let out = Command::new(cargo)
-            .current_dir(sdk_dir())
-            .args(["build", "--locked", "--release", "--target", "wasm32-unknown-unknown"])
-            .args(["-p", "latest-block", "-p", "faults", "--target-dir"])
-            .arg(&target)
-            .env_remove("RUSTFLAGS")
-            .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            .env_remove("CARGO_BUILD_RUSTFLAGS")
-            .env_remove("CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS")
-            .env_remove("CARGO_BUILD_TARGET")
-            .env_remove("CARGO_TARGET_DIR")
-            .output()
-            .expect("cargo runs");
-        assert!(out.status.success(), "building the SDK builders failed:\n{}", String::from_utf8_lossy(&out.stderr));
-        let read = |n: &str| std::fs::read(target.join("wasm32-unknown-unknown/release").join(n)).unwrap();
+        let out = build_sdk(&["latest-block", "faults"], &Path::new(env!("CARGO_TARGET_TMPDIR")).join("sdk-target"));
+        let read = |n: &str| std::fs::read(out.join(n)).unwrap();
         (read("latest_block.wasm"), read("faults.wasm"))
     });
     match name {

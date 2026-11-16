@@ -5,9 +5,9 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use zkminer_witness::abi::{LOG_CAP_BYTES, W_CHUNK_BYTES};
-use zkminer_witness::ipc::exit;
-use zkminer_witness_builder::{run, RunnerIo, FUEL_PER_BYTE, PROFILE_FEATURES};
+use zkminer_witness::abi::{self, LOG_CAP_BYTES, W_CHUNK_BYTES};
+use zkminer_witness::ipc::{exit, FUEL_USED_UNKNOWN};
+use zkminer_witness_builder::{run, RunnerIo, DEADLINE_GRACE, FUEL_PER_BYTE, PROFILE_FEATURES};
 
 #[test]
 fn engine_features_are_exactly_the_profile() {
@@ -377,7 +377,8 @@ fn internal_when_the_w_sink_fails() {
     let log = SharedBuf::default();
     let body =
         r#"(func (export "run") (result i32) (drop (call $witness_write (i32.const 0) (i32.const 8))) (i32.const 0))"#;
-    let s = run(&module(body), b"", &cfg(), RunnerIo { witness: FailingSink, broker, log: log.clone() });
+    let io = RunnerIo { witness: FailingSink, broker, log: log.clone(), marker: SharedBuf::default() };
+    let s = run(&module(body), b"", &cfg(), io);
     fake.finish();
     assert_eq!(s.exit_code, exit::INTERNAL);
     assert!(String::from_utf8_lossy(&log.take()).contains("[runner] internal: runner: W sink"));
@@ -453,4 +454,167 @@ fn other_exports_are_tolerated() {
             (global (export "__heap_base") i32 (i32.const 1024)) (global (export "__data_end") i32 (i32.const 1024))
             (func (export "run") (result i32) (i32.const 0)) (func (export "other") (param i64)))"#);
     assert_eq!(run_module(&m, cfg()).code(), exit::OK);
+}
+
+// The started marker.
+
+#[test]
+fn the_marker_is_written_once_a_module_reaches_instantiation() {
+    for (body, code) in [
+        (r#"(func (export "run") (result i32) (i32.const 0))"#, exit::OK),
+        (r#"(func (export "run") (result i32) (i32.const 3))"#, exit::NONZERO_RETURN),
+        (r#"(func (export "run") (result i32) unreachable)"#, exit::TRAP),
+        (r#"(func $s unreachable) (start $s) (func (export "run") (result i32) (i32.const 0))"#, exit::TRAP),
+    ] {
+        let o = run_module(&module(body), cfg());
+        assert_eq!(o.code(), code, "{body}");
+        assert!(o.started(), "{body}");
+    }
+    // A host-side INTERNAL after the marker (here the W sink) still has it: the miner blames the
+    // builder for that unless it saw its own side fail.
+    let body =
+        r#"(func (export "run") (result i32) (drop (call $witness_write (i32.const 0) (i32.const 8))) (i32.const 0))"#;
+    let (s, marker, _) = run_with_sinks(&module(body), cfg(), FailingSink, SharedBuf::default());
+    assert_eq!((s.exit_code, marker.as_slice()), (exit::INTERNAL, &[abi::MODULE_STARTED_MARKER][..]));
+}
+
+#[test]
+fn no_marker_for_modules_that_never_reach_instantiation() {
+    // Rejected by the pre-pass (an unknown import, a malformed module, over the compile budget).
+    let unknown = raw(
+        r#"(module (import "env" "x" (func)) (memory (export "memory") 1) (func (export "run") (result i32) (i32.const 0)))"#,
+    );
+    let o = run_module(&unknown, cfg());
+    assert_eq!((o.code(), o.started()), (exit::UNKNOWN_IMPORT, false));
+    let o = run_module(b"\0asm\x01\0\0\0garbage", cfg());
+    assert_eq!((o.code(), o.started()), (exit::INVALID_MODULE, false));
+    let deep = module(&format!(
+        r#"(func (export "run") (result i32) {} (i32.const 0))"#,
+        "(block ".repeat(1_025) + &")".repeat(1_025)
+    ));
+    let o = run_module(&deep, cfg());
+    assert_eq!((o.code(), o.started()), (exit::INVALID_MODULE, false));
+    // Compiled, but the deadline passed before instantiation.
+    let mut c = cfg();
+    c.deadline = Instant::now();
+    let o = run_module(&module(r#"(func (export "run") (result i32) (i32.const 0))"#), c);
+    assert_eq!((o.code(), o.started()), (exit::WALL_CLOCK, false));
+}
+
+// The deadline in host functions and after `run` returns.
+
+/// Writes 8 bytes of W (the sink sleeps past the deadline), then `then`, then returns 0.
+fn slow_write_then(then: &str) -> Vec<u8> {
+    module(&format!(
+        r#"(func (export "run") (result i32)
+            (drop (call $witness_write (i32.const 0) (i32.const 8)))
+            {then}
+            (i32.const 0))"#
+    ))
+}
+
+#[test]
+fn a_run_that_returns_0_after_its_deadline_is_wall_clock() {
+    let mut c = cfg();
+    c.deadline = Instant::now() + Duration::from_millis(400);
+    let sink = SlowSink { delay: Duration::from_millis(500), inner: SharedBuf::default() };
+    let (s, marker, elapsed) = run_with_sinks(&slow_write_then(""), c, sink.clone(), SharedBuf::default());
+    assert_eq!(s.exit_code, exit::WALL_CLOCK, "returned 0 at {elapsed:?}, after the deadline");
+    assert!(elapsed < Duration::from_millis(400) + DEADLINE_GRACE, "the execution thread reported it: {elapsed:?}");
+    assert_eq!(marker, [abi::MODULE_STARTED_MARKER]);
+    assert_eq!(sink.inner.take().len(), 8, "the write itself completed");
+    assert_ne!(s.fuel_used, FUEL_USED_UNKNOWN);
+}
+
+#[test]
+fn witness_write_and_log_past_the_deadline_are_wall_clock() {
+    for then in
+        [r#"(drop (call $witness_write (i32.const 0) (i32.const 8)))"#, r#"(call $log (i32.const 0) (i32.const 8))"#]
+    {
+        let mut c = cfg();
+        c.deadline = Instant::now() + Duration::from_millis(400);
+        let sink = SlowSink { delay: Duration::from_millis(500), inner: SharedBuf::default() };
+        let log = SharedBuf::default();
+        let (s, _, _) = run_with_sinks(&slow_write_then(then), c, sink.clone(), log.clone());
+        assert_eq!(s.exit_code, exit::WALL_CLOCK, "{then}");
+        assert_eq!(sink.inner.take().len(), 8, "{then}: the second write never reached the sink");
+        assert!(log.take().is_empty(), "{then}: nothing was logged");
+    }
+}
+
+// Fuel on WALL_CLOCK, and the two paths on which the waiting thread reports alone.
+
+#[test]
+fn fuel_used_is_unknown_after_an_epoch_interrupt() {
+    let mut c = cfg();
+    c.fuel = 1 << 60;
+    c.deadline = Instant::now() + Duration::from_secs(1);
+    let o = run_module(&module(r#"(func (export "run") (result i32) (loop (br 0)) (i32.const 0))"#), c);
+    assert_eq!((o.code(), o.started()), (exit::WALL_CLOCK, true));
+    // `Store::get_fuel` still answers after the epoch trap, but with the fuel saved at `run`'s entry
+    // (wasmtime saves it at calls, not before the epoch trap): unknown, not 0.
+    assert_eq!(o.summary.fuel_used, FUEL_USED_UNKNOWN);
+    // A WALL_CLOCK raised by a host function knows it: the guest saved its fuel to make the call.
+    let mut c = cfg();
+    c.deadline = Instant::now() + Duration::from_millis(400);
+    let sink = SlowSink { delay: Duration::from_millis(500), inner: SharedBuf::default() };
+    let then = r#"(call $log (i32.const 0) (i32.const 8))"#;
+    let (s, _, _) = run_with_sinks(&slow_write_then(then), c, sink, SharedBuf::default());
+    assert_eq!(s.exit_code, exit::WALL_CLOCK);
+    assert!(s.fuel_used > 0 && s.fuel_used < cfg().fuel, "{}", s.fuel_used);
+}
+
+#[test]
+fn the_waiting_thread_reports_wall_clock_when_the_execution_thread_is_stuck() {
+    let mut c = cfg();
+    let t0 = Instant::now();
+    c.deadline = t0 + Duration::from_millis(400);
+    // The first W write blocks for 2 s, well past the deadline and the grace.
+    let sink = SlowSink { delay: Duration::from_secs(2), inner: SharedBuf::default() };
+    let (s, marker, _) = run_with_sinks(&slow_write_then(""), c, sink, SharedBuf::default());
+    let elapsed = t0.elapsed();
+    assert_eq!(s.exit_code, exit::WALL_CLOCK);
+    assert_eq!(s.fuel_used, FUEL_USED_UNKNOWN, "the store is on the stuck thread");
+    assert_eq!(s.witness_bytes, 0, "the write in progress is not counted");
+    assert_eq!(marker, [abi::MODULE_STARTED_MARKER], "written before the module ran");
+    assert!(elapsed >= Duration::from_millis(400) + DEADLINE_GRACE, "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(400) + DEADLINE_GRACE + Duration::from_millis(700), "{elapsed:?}");
+}
+
+#[test]
+fn a_panic_on_the_execution_thread_is_internal() {
+    // Before the marker: the log sink panics on the pre-pass's rejection message.
+    let (s, marker, _) = run_with_sinks(b"\0asm\x01\0\0\0garbage", cfg(), SharedBuf::default(), PanickingSink);
+    assert_eq!((s.exit_code, s.fuel_used), (exit::INTERNAL, FUEL_USED_UNKNOWN));
+    assert!(marker.is_empty());
+    // After it: the W sink panics inside `witness_write`, and the panic crosses the wasm frames.
+    let body =
+        r#"(func (export "run") (result i32) (drop (call $witness_write (i32.const 0) (i32.const 8))) (i32.const 0))"#;
+    let (s, marker, _) = run_with_sinks(&module(body), cfg(), PanickingSink, SharedBuf::default());
+    assert_eq!((s.exit_code, s.fuel_used), (exit::INTERNAL, FUEL_USED_UNKNOWN));
+    assert_eq!(marker, [abi::MODULE_STARTED_MARKER]);
+}
+
+#[test]
+fn bulk_memory_operators_cost_one_fuel_per_byte() {
+    // Measured, not assumed (plan §9.1): wasmtime 48 meters memory.fill / memory.copy / memory.init
+    // by the byte, so they are no cheaper than a host copy.
+    let fuel_for = |op: &str, n: u32| {
+        let body = format!(
+            r#"(data $d "{}")
+            (func (export "run") (result i32) {} (i32.const 0))"#,
+            "x".repeat(20_000),
+            op.replace("N", &n.to_string())
+        );
+        let o = run_module(&module(&body), cfg());
+        assert_eq!(o.code(), exit::OK, "{op}");
+        o.summary.fuel_used
+    };
+    for op in [
+        "(memory.fill (i32.const 0) (i32.const 7) (i32.const N))",
+        "(memory.copy (i32.const 30000) (i32.const 0) (i32.const N))",
+        "(memory.init $d (i32.const 0) (i32.const 0) (i32.const N))",
+    ] {
+        assert_eq!(fuel_for(op, 15_000) - fuel_for(op, 5_000), 10_000, "{op}");
+    }
 }

@@ -156,6 +156,8 @@ impl FakeBroker {
 
 pub struct Outcome {
     pub summary: BuilderSummary,
+    /// What the runner wrote to the marker sink: `[MODULE_STARTED_MARKER]` once instantiation began.
+    pub marker: Vec<u8>,
     pub w: Vec<u8>,
     pub w_writes: Vec<usize>,
     pub log: Vec<u8>,
@@ -166,6 +168,14 @@ pub struct Outcome {
 impl Outcome {
     pub fn code(&self) -> i32 {
         self.summary.exit_code
+    }
+    /// Whether the runner wrote the started marker (exactly once).
+    pub fn started(&self) -> bool {
+        match self.marker.as_slice() {
+            [] => false,
+            [zkminer_witness::abi::MODULE_STARTED_MARKER] => true,
+            other => panic!("marker sink holds {other:?}"),
+        }
     }
     /// W as little-endian i32s.
     pub fn w_i32s(&self) -> Vec<i32> {
@@ -178,14 +188,109 @@ pub fn run_full(module: &[u8], context: &[u8], cfg: RunnerConfig, replies: Vec<R
     let (broker, fake) = FakeBroker::spawn(replies);
     let w = SharedBuf::default();
     let log = SharedBuf::default();
+    let marker = SharedBuf::default();
     let t = Instant::now();
-    let summary = run(module, context, &cfg, RunnerIo { witness: w.clone(), broker, log: log.clone() });
+    let io = RunnerIo { witness: w.clone(), broker, log: log.clone(), marker: marker.clone() };
+    let summary = run(module, context, &cfg, io);
     let elapsed = t.elapsed();
     let requests = fake.finish();
     let w_writes = w.writes.lock().unwrap().clone();
-    Outcome { summary, w: w.take(), w_writes, log: log.take(), requests, elapsed }
+    Outcome { summary, marker: marker.take(), w: w.take(), w_writes, log: log.take(), requests, elapsed }
 }
 
 pub fn run_module(module: &[u8], cfg: RunnerConfig) -> Outcome {
     run_full(module, b"", cfg, vec![])
+}
+
+/// A sink that sleeps before every write, then keeps the bytes (a miner slow to drain a pipe).
+#[derive(Clone)]
+pub struct SlowSink {
+    pub delay: Duration,
+    pub inner: SharedBuf,
+}
+
+impl Write for SlowSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        thread::sleep(self.delay);
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A sink whose every write panics: a stand-in for a runner bug on the execution thread.
+pub struct PanickingSink;
+
+impl Write for PanickingSink {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        panic!("test sink panics on purpose");
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Runs a module with the given W and log sinks against a broker that never answers, without
+/// waiting for the execution thread (which a test may leave stuck): (summary, marker, elapsed).
+pub fn run_with_sinks<W, L>(module: &[u8], cfg: RunnerConfig, witness: W, log: L) -> (BuilderSummary, Vec<u8>, Duration)
+where
+    W: Write + Send + 'static,
+    L: Write + Send + 'static,
+{
+    let (broker, _fake) = FakeBroker::spawn(vec![]);
+    let marker = SharedBuf::default();
+    let t = Instant::now();
+    let summary = run(module, b"", &cfg, RunnerIo { witness, broker, log, marker: marker.clone() });
+    (summary, marker.take(), t.elapsed())
+}
+
+/// The SDK workspace (`sdk/`).
+pub fn sdk_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sdk").canonicalize().unwrap()
+}
+
+/// `tool` of the toolchain the SDK's `rust-toolchain.toml` pins (`rustup which`, run in the SDK without
+/// this process's `RUSTUP_TOOLCHAIN`), or plain `tool` without rustup.
+fn sdk_tool(tool: &str) -> std::ffi::OsString {
+    let out = std::process::Command::new("rustup")
+        .args(["which", tool])
+        .current_dir(sdk_dir())
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8(o.stdout).unwrap().trim().into(),
+        _ => tool.into(),
+    }
+}
+
+/// Builds `packages` of the SDK workspace for wasm32 from the SDK directory (so its
+/// `.cargo/config.toml` applies), into `target`, with the cargo and rustc its `rust-toolchain.toml`
+/// pins (`RUSTC` explicit: cargo runs rustc for registry crates from their own directories, where a
+/// rustup proxy would not see the SDK's toolchain file), and nothing inherited that would pick
+/// another toolchain or compiler or replace the pinned target features. Returns the release output
+/// directory.
+pub fn build_sdk(packages: &[&str], target: &std::path::Path) -> std::path::PathBuf {
+    let mut cmd = std::process::Command::new(sdk_tool("cargo"));
+    cmd.current_dir(sdk_dir()).args(["build", "--locked", "--release", "--target", "wasm32-unknown-unknown"]);
+    for p in packages {
+        cmd.args(["-p", p]);
+    }
+    cmd.arg("--target-dir").arg(target).env("RUSTC", sdk_tool("rustc"));
+    for var in [
+        "RUSTUP_TOOLCHAIN",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS",
+        "CARGO_BUILD_TARGET",
+        "CARGO_TARGET_DIR",
+    ] {
+        cmd.env_remove(var);
+    }
+    let out = cmd.output().expect("cargo runs");
+    assert!(out.status.success(), "building {packages:?} failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    target.join("wasm32-unknown-unknown/release")
 }

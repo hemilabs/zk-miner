@@ -16,7 +16,7 @@ use std::thread;
 use std::time::Instant;
 
 use common::*;
-use zkminer_witness::ipc::{exit, BuilderSummary, FetchStatus, BUILDER_SUMMARY_BYTES};
+use zkminer_witness::ipc::{decode_summary_pipe, exit, BuilderSummary, FetchStatus, BUILDER_SUMMARY_BYTES};
 use zkminer_witness_builder::{main_with_fds, parse_args, Args, RunnerFds};
 
 const CHILD_ENV: &str = "ZKMINER_WITNESS_BUILDER_TEST_CHILD_ARGS";
@@ -135,7 +135,9 @@ fn main_with_fds_in_process() {
         vec![Reply::Result(FetchStatus::Ok, b"the response".to_vec())],
     );
     assert_eq!(c.code, exit::OK);
-    let s = BuilderSummary::decode(&c.summary).expect("a 48-byte summary");
+    let (started, s) = decode_summary_pipe(&c.summary);
+    assert!(started, "the marker precedes the summary");
+    let s = s.expect("a 48-byte summary after the marker");
     assert_eq!(s.exit_code, exit::OK);
     assert_eq!((s.fetches, s.fetch_bytes, s.witness_bytes), (1, 12, 23));
     assert_eq!(c.w, b"the contextthe response");
@@ -169,7 +171,8 @@ fn main_with_fds_writes_a_summary_for_bad_args_and_bad_modules() {
 
     let c = in_process(GOOD_ARGS, memfd(b"\0asm\x01\0\0\0\x05"), memfd(b""), vec![]);
     assert_eq!(c.code, exit::INVALID_MODULE);
-    assert_eq!(c.summary.len(), BUILDER_SUMMARY_BYTES);
+    assert_eq!(c.summary.len(), BUILDER_SUMMARY_BYTES, "no marker: nothing was instantiated");
+    assert!(!decode_summary_pipe(&c.summary).0);
 
     let too_big = vec![0u8; zkminer_witness_builder::prepass::MAX_MODULE_BYTES + 1];
     let c = in_process(GOOD_ARGS, memfd(&too_big), memfd(b""), vec![]);
@@ -237,7 +240,9 @@ fn main_with_fds_in_a_child_with_fds_2_to_7() {
     drop((plan, w, summary, log, broker, module, context));
     let status = child.wait().unwrap();
 
-    let summary = BuilderSummary::decode(&summary_out.join().unwrap()).expect("a 48-byte summary on fd 4");
+    let (started, summary) = decode_summary_pipe(&summary_out.join().unwrap());
+    assert!(started);
+    let summary = summary.expect("the marker and a 48-byte summary on fd 4");
     assert_eq!(summary.exit_code, exit::OK);
     assert_eq!(status.code(), Some(exit::OK), "the exit status is the summary's exit code");
     assert_eq!(w_out.join().unwrap(), b"child contextfrom the broker");
@@ -279,6 +284,7 @@ fn a_child_exits_with_the_summary_code() {
     drop((plan, w, summary, log, module, context));
     let status = child.wait().unwrap();
     assert_eq!(status.code(), Some(exit::TRAP));
-    assert_eq!(BuilderSummary::decode(&summary_out.join().unwrap()).unwrap().exit_code, exit::TRAP);
+    let (started, summary) = decode_summary_pipe(&summary_out.join().unwrap());
+    assert_eq!((started, summary.unwrap().exit_code), (true, exit::TRAP));
     fake.finish();
 }

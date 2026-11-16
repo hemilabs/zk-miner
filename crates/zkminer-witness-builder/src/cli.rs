@@ -12,12 +12,15 @@
 //! |---|---|---|
 //! | 2 | write | diagnostics ([`RunnerIo::log`]) |
 //! | 3 | write | `W`, raw, in pieces of ≤ `W_CHUNK_BYTES` |
-//! | 4 | write | the 48-byte [`BuilderSummary`], written once, last |
+//! | 4 | write | [`abi::MODULE_STARTED_MARKER`] just before instantiation (never for a module rejected before), then the 48-byte [`BuilderSummary`], once, last ([`decode_summary_pipe`](zkminer_witness::ipc::decode_summary_pipe) reads both) |
 //! | 5 | read/write | the job's `SOCK_STREAM` socket to the broker (`ipc` fetch frames) |
 //! | 6 | read | the module bytes (a sealed memfd; read with `pread` from offset 0) |
 //! | 7 | read | `abi.encode(BuilderContextV1)` (a sealed memfd; same) |
 //!
 //! The process exit status is the summary's exit code.
+//!
+//! The job cgroup's `pids.max` must be at least 3: the runner has three threads (see [`run`](crate::run)).
+//! With fewer it exits INTERNAL before compiling anything.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -153,12 +156,13 @@ fn read_input(fd: OwnedFd, max: usize) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
-/// Everything the binary does after `restrict_self`: reads the inputs, runs the builder, writes the
-/// summary to the summary fd, and returns the exit code. `process_start` is when `main` began; the
-/// wall clock counts from it.
+/// Everything the binary does after `restrict_self`: reads the inputs, runs the builder (which
+/// writes the started marker to the summary fd), writes the summary to the summary fd, and returns
+/// the exit code. `process_start` is when `main` began; the wall clock counts from it.
 pub fn main_with_fds(args: &[String], fds: RunnerFds, process_start: Instant) -> i32 {
     let RunnerFds { witness, summary: summary_fd, broker, module, context, log } = fds;
     let mut log = File::from(log);
+    let mut out = File::from(summary_fd);
     let summary = (|| {
         let internal = BuilderSummary { exit_code: exit::INTERNAL, ..Default::default() };
         let args = match parse_args(args) {
@@ -190,17 +194,16 @@ pub fn main_with_fds(args: &[String], fds: RunnerFds, process_start: Instant) ->
                 return internal;
             }
         };
-        let run_log = match log.try_clone() {
-            Ok(l) => l,
-            Err(e) => {
-                let _ = writeln!(log, "[runner] log fd: {e}");
+        let (run_log, marker) = match (log.try_clone(), out.try_clone()) {
+            (Ok(l), Ok(m)) => (l, m),
+            (Err(e), _) | (_, Err(e)) => {
+                let _ = writeln!(log, "[runner] dup of the log or summary fd: {e}");
                 return internal;
             }
         };
-        let io = RunnerIo { witness: File::from(witness), broker: UnixStream::from(broker), log: run_log };
+        let io = RunnerIo { witness: File::from(witness), broker: UnixStream::from(broker), log: run_log, marker };
         run(&module, &context, &args.config(process_start), io)
     })();
-    let mut out = File::from(summary_fd);
     if let Err(e) = out.write_all(&summary.encode()) {
         let _ = writeln!(log, "[runner] summary fd {}: {e}", out.as_raw_fd());
     }

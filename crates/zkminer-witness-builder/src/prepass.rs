@@ -1,13 +1,16 @@
 //! The streaming pre-pass (plan §9.1): one wasmparser pass over the module, before any compilation,
 //! that validates it against exactly the ABI v1 profile and rejects shapes that are cheap to write
-//! and expensive to compile or instantiate.
+//! and expensive to compile or instantiate: the structural limits below, and the compile-cost budget
+//! of [`crate::cost`], whose terms the same pass accumulates (function types as the type section
+//! streams in, every body's locals, nesting and branch targets as it is scanned).
 //!
 //! A module the pre-pass rejects never reaches cranelift. Every rejection is [`exit::INVALID_MODULE`]
 //! except an import outside `hemiprove_builder_v1`'s six functions, which is [`exit::UNKNOWN_IMPORT`].
 //!
 //! Order of the checks, which decides the exit code of a module with several faults: sections are
-//! checked as they stream in (so an unknown import is reported before a later invalid function body),
-//! and the required exports are checked at the end.
+//! checked as they stream in (so an unknown import is reported before a later invalid function body,
+//! and the budget is checked after the type section and after every body), and the required exports
+//! are checked at the end.
 
 use wasmparser::types::{CoreTypeId, EntityType, TypesRef};
 use wasmparser::{
@@ -15,6 +18,11 @@ use wasmparser::{
     ValidPayload, Validator, WasmFeatures,
 };
 use zkminer_witness::{abi, ipc::exit};
+
+use crate::cost::FunctionShape;
+pub use crate::cost::{
+    CompileCost, CostCaps, COMPILE_BUDGET_NS, MAX_CONTROL_DEPTH, MAX_FUNCTION_BRANCH_LOCALS, MAX_TYPES, MAX_TYPE_ARITY,
+};
 
 /// The ABI v1 WASM profile (plan §9.1): MVP (with floats), mutable globals, sign-extension,
 /// saturating float-to-int, bulk memory, multi-value, and reference types for `funcref` only (which
@@ -40,8 +48,9 @@ pub const MAX_FUNCTION_BODY_BYTES: usize = 256 * 1024;
 pub const MAX_LOCALS: u64 = 4_096;
 /// Most functions, imported and defined together.
 pub const MAX_FUNCTIONS: u64 = 100_000;
-/// Most targets in one `br_table` (the default target not counted).
-pub const MAX_BR_TABLE_TARGETS: u32 = 65_536;
+/// Most targets in one `br_table` (the default target not counted): wasmtime 48's own limit, so a
+/// table the pre-pass accepts also compiles.
+pub const MAX_BR_TABLE_TARGETS: u32 = 65_520;
 /// Most elements in the table, at instantiation and after any `table.grow`; also the most element
 /// items across all element segments.
 pub const MAX_TABLE_ELEMENTS: u64 = 65_536;
@@ -78,6 +87,8 @@ pub struct ModuleInfo {
     pub functions: u64,
     /// The memory's initial size in bytes.
     pub initial_memory_bytes: u64,
+    /// The module's compile-cost terms (all within [`CostCaps::DEFAULT`] for an accepted module).
+    pub cost: CompileCost,
 }
 
 fn invalid(msg: impl Into<String>) -> PrepassError {
@@ -125,8 +136,9 @@ fn check_import(types: &TypesRef<'_>, module: &str, name: &str, ty: Option<Entit
     Ok(())
 }
 
-/// Scans a body for the limits wasmparser does not enforce at our sizes, before validating it.
-fn check_body(body: &FunctionBody<'_>) -> Result<(), PrepassError> {
+/// Scans a body, before validating it, for the limits wasmparser does not enforce at our sizes and
+/// for its compile-cost shape. `params` is the function's parameter count.
+fn check_body(body: &FunctionBody<'_>, params: u64) -> Result<FunctionShape, PrepassError> {
     let size = body.range().len();
     if size > MAX_FUNCTION_BODY_BYTES {
         return Err(invalid(format!("function body of {size} bytes (max {MAX_FUNCTION_BODY_BYTES})")));
@@ -139,19 +151,68 @@ fn check_body(body: &FunctionBody<'_>) -> Result<(), PrepassError> {
             return Err(invalid(format!("more than {MAX_LOCALS} locals in one function")));
         }
     }
+    let mut shape = FunctionShape { locals: params + locals, ..Default::default() };
+    // The open control frames, innermost last: whether each is a `loop`.
+    let mut frames: Vec<bool> = Vec::new();
+    let mut loops = 0u32;
     let mut ops = body.get_operators_reader().map_err(wasm_err)?;
     while !ops.eof() {
-        if let Operator::BrTable { targets } = ops.read().map_err(wasm_err)? {
-            if targets.len() > MAX_BR_TABLE_TARGETS {
-                return Err(invalid(format!("br_table with {} targets (max {MAX_BR_TABLE_TARGETS})", targets.len())));
+        let op = ops.read().map_err(wasm_err)?;
+        let opened = match op {
+            Operator::Block { .. } => Some(false),
+            Operator::Loop { .. } => Some(true),
+            Operator::If { .. } => {
+                shape.branches += 1;
+                Some(false)
+            }
+            Operator::End => {
+                if frames.pop() == Some(true) {
+                    loops -= 1;
+                }
+                None
+            }
+            Operator::Br { .. } | Operator::BrIf { .. } => {
+                shape.branches += 1;
+                None
+            }
+            Operator::BrTable { targets } => {
+                if targets.len() > MAX_BR_TABLE_TARGETS {
+                    return Err(invalid(format!(
+                        "br_table with {} targets (max {MAX_BR_TABLE_TARGETS})",
+                        targets.len()
+                    )));
+                }
+                shape.branches += u64::from(targets.len()) + 1;
+                None
+            }
+            _ => None,
+        };
+        if let Some(is_loop) = opened {
+            frames.push(is_loop);
+            let depth = frames.len() as u32;
+            if depth > MAX_CONTROL_DEPTH {
+                return Err(invalid(format!("control nesting deeper than {MAX_CONTROL_DEPTH} in one function")));
+            }
+            shape.max_depth = shape.max_depth.max(depth);
+            if is_loop {
+                loops += 1;
+                shape.max_loop_depth = shape.max_loop_depth.max(loops);
             }
         }
     }
-    Ok(())
+    Ok(shape)
 }
 
-/// Runs the pre-pass. `memory_clamp_bytes` is the effective `maxBuilderMemoryBytes`.
+/// Runs the pre-pass with the default compile-cost caps. `memory_clamp_bytes` is the effective
+/// `maxBuilderMemoryBytes`.
 pub fn prepass(module: &[u8], memory_clamp_bytes: u64) -> Result<ModuleInfo, PrepassError> {
+    prepass_with_caps(module, memory_clamp_bytes, &CostCaps::DEFAULT)
+}
+
+/// [`prepass`] with explicit compile-cost caps, for calibration and tests. The runner always uses
+/// [`CostCaps::DEFAULT`]; the structural limits ([`MAX_CONTROL_DEPTH`], [`MAX_TYPE_ARITY`] and the
+/// rest) apply whatever `caps` says.
+pub fn prepass_with_caps(module: &[u8], memory_clamp_bytes: u64, caps: &CostCaps) -> Result<ModuleInfo, PrepassError> {
     if module.len() > MAX_MODULE_BYTES {
         return Err(invalid(format!("module of {} bytes (max {MAX_MODULE_BYTES})", module.len())));
     }
@@ -165,15 +226,38 @@ pub fn prepass(module: &[u8], memory_clamp_bytes: u64) -> Result<ModuleInfo, Pre
     let mut initial_memory_bytes = 0u64;
     let mut data_bytes = 0u64;
     let mut element_items = 0u64;
+    let mut cost = CompileCost::default();
+    // Parameter count of every type, and the type of every defined function, for the bodies.
+    let mut type_params: Vec<u64> = Vec::new();
+    let mut defined_types: Vec<u32> = Vec::new();
+    let mut bodies_seen = 0usize;
 
     for payload in Parser::new(0).parse_all(module) {
         let payload = payload.map_err(wasm_err)?;
         // Function bodies are size-checked and scanned before the validator touches them.
         if let Payload::CodeSectionEntry(body) = &payload {
-            check_body(body)?;
+            let params =
+                defined_types.get(bodies_seen).and_then(|&t| type_params.get(t as usize)).copied().unwrap_or(0);
+            bodies_seen += 1;
+            cost.add_function(&check_body(body, params)?);
+            cost.check(caps).map_err(invalid)?;
         }
         let valid = validator.payload(&payload).map_err(wasm_err)?;
         match &payload {
+            Payload::TypeSection(reader) => {
+                for ty in reader.clone().into_iter_err_on_gc_types() {
+                    let ty = ty.map_err(wasm_err)?;
+                    let arity = ty.params().len() + ty.results().len();
+                    if arity > MAX_TYPE_ARITY {
+                        return Err(invalid(format!(
+                            "function type with {arity} params and results (max {MAX_TYPE_ARITY})"
+                        )));
+                    }
+                    type_params.push(ty.params().len() as u64);
+                    cost.add_type(arity as u64);
+                }
+                cost.check(caps).map_err(invalid)?;
+            }
             Payload::ImportSection(reader) => {
                 let types = validator.types(0).ok_or_else(|| invalid("no module types"))?;
                 for import in reader.clone().into_imports() {
@@ -195,6 +279,9 @@ pub fn prepass(module: &[u8], memory_clamp_bytes: u64) -> Result<ModuleInfo, Pre
                 functions = imported_funcs + u64::from(reader.count());
                 if functions > MAX_FUNCTIONS {
                     return Err(invalid(format!("{functions} functions (max {MAX_FUNCTIONS})")));
+                }
+                for ty in reader.clone() {
+                    defined_types.push(ty.map_err(wasm_err)?);
                 }
             }
             Payload::MemorySection(reader) => {
@@ -269,7 +356,7 @@ pub fn prepass(module: &[u8], memory_clamp_bytes: u64) -> Result<ModuleInfo, Pre
             }
             ValidPayload::End(types) => {
                 check_exports(&types.as_ref())?;
-                return Ok(ModuleInfo { imports, functions, initial_memory_bytes });
+                return Ok(ModuleInfo { imports, functions, initial_memory_bytes, cost });
             }
             ValidPayload::Parser(_) => return Err(invalid("nested modules and components")),
             ValidPayload::Ok => {}
