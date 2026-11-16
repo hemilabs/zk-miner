@@ -28,6 +28,10 @@ tracing-appender = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
 dirs = { workspace = true }
+# The RISC Zero Groth16 seal selector is derived from the linked risc0 (its default Groth16 verifier
+# parameters digest, first 4 bytes), so it follows the risc0 the worker is built with (3.1: e71e6620).
+# Verify-only: no prover, no GPU kernels. "3.1" refuses a 3.0 resolve, whose selector is 0x73c457ba.
+risc0-zkvm = { version = "3.1", default-features = false, features = ["std"] }
 # Only needed by the optional `sp1-demo` command; made optional so the `zkminer`
 # binary (and the RISC0 prover path) builds without the SP1 native toolchain.
 sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813", default-features = false, features = ["blocking"], optional = true }

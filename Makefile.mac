@@ -14,7 +14,7 @@
 # Every target sources $(ENV_SH) (Metal compiler on PATH, the RISC Zero C++ guest archiver), sets
 # NVCC=off HIPCC=off (sppark must not look for CUDA/HIP) and builds with -j $(JOBS) (at least 4).
 # The layout it expects is the one Cargo.toml's [patch.crates-io] expects:
-#   <root>/zk-miner (this repo)   <root>/deps/risc0 (the Metal-port fork)   <root>/env.sh
+#   <root>/zk-miner* (this repo)   <root>/deps/risc0-3.1 (the Metal-port fork on risc0 3.1)   <root>/env.sh
 # Override any of ZKMINER_ROOT, ENV_SH, RISC0_DIR, PROVERS_DIR, JOBS on the command line.
 
 SHELL := /bin/bash
@@ -23,7 +23,7 @@ SHELL := /bin/bash
 MAKEFILE_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 ZKMINER_ROOT ?= $(abspath $(MAKEFILE_DIR)/..)
 ENV_SH       ?= $(ZKMINER_ROOT)/env.sh
-RISC0_DIR    ?= $(ZKMINER_ROOT)/deps/risc0
+RISC0_DIR    ?= $(ZKMINER_ROOT)/deps/risc0-3.1
 PROVERS_DIR  ?= $(HOME)/.zkminer/provers
 
 # Parallel jobs: $CARGO_BUILD_JOBS if set, else the performance-core count, never below 4
@@ -98,12 +98,12 @@ mac-prereqs:
 	  || bad "no RISC Zero Rust toolchain: rzup install rust"; \
 	if [ -n "$${AR_riscv32im_risc0_zkvm_elf:-}" ]; then ok "RISC Zero C++ toolchain archiver (AR_riscv32im_risc0_zkvm_elf)"; \
 	  else warn "no AR_riscv32im_risc0_zkvm_elf (rzup install cpp): only the fork's risc0-zkvm tests need it"; fi; \
-	ls "$$HOME"/.risc0/extensions/*-risc0-groth16/stark_verify_final.zkey >/dev/null 2>&1 || [ -n "$${RISC0_GROTH16_DIR:-}" ] \
-	  && ok "risc0-groth16 component" || warn "no risc0-groth16 component yet: the worker downloads it (2.3 GB) at its first Warmup"; \
+	ls "$$HOME"/.risc0/extensions/v0.2.0-risc0-groth16/stark_verify_final.zkey >/dev/null 2>&1 || [ -n "$${RISC0_GROTH16_DIR:-}" ] \
+	  && ok "risc0-groth16 component" || warn "no risc0-groth16 component yet: the worker downloads it (2.4 GB) at its first Warmup"; \
 	command -v docker >/dev/null && warn "docker found: not needed, the Groth16 wrap runs natively on Metal" || ok "no Docker needed (native Metal Groth16)"; \
 	echo "Fork:"; \
 	if [ -f "$(RISC0_DIR)/risc0/zkvm/Cargo.toml" ]; then ok "$(RISC0_DIR) ($$(git -C "$(RISC0_DIR)" rev-parse --abbrev-ref HEAD 2>/dev/null) $$(git -C "$(RISC0_DIR)" rev-parse --short HEAD 2>/dev/null))"; \
-	  else bad "risc0 fork not found at $(RISC0_DIR) (Cargo.toml patches ../deps/risc0)"; fi; \
+	  else bad "risc0 fork not found at $(RISC0_DIR) (Cargo.toml patches ../deps/risc0-3.1)"; fi; \
 	echo "Build: -j $(JOBS), NVCC=off HIPCC=off"; \
 	exit $$fail
 

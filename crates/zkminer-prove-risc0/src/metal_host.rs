@@ -508,8 +508,11 @@ pub fn start_groth16_graph_preload(at: &str) -> bool {
             let t = Instant::now();
             match risc0_groth16::prove::preload_graph() {
                 Ok(()) => tracing::info!(
-                    "Groth16 witness graph ready {:.2} s after the preload started at {at}",
-                    t.elapsed().as_secs_f64()
+                    "Groth16 witness graph ready {:.2} s after the preload started at {at} \
+                     (risc0-groth16 {}, graph sha256 {}... checked by risc0)",
+                    t.elapsed().as_secs_f64(),
+                    crate::groth16_component::VERSION,
+                    crate::groth16_component::GRAPH_SHA256_PREFIX
                 ),
                 Err(e) => tracing::warn!("Groth16 witness graph preload failed: {e:#}"),
             }
@@ -522,11 +525,71 @@ pub fn start_groth16_graph_preload(at: &str) -> bool {
     true
 }
 
+/// Knob for the keccak part of the worker-start pipeline build (P31-19): `on` builds the keccak
+/// pipelines at start with the others (wave 7's behaviour), `off` never does (the first keccak proof
+/// builds them, through its binary archive), `auto` (the default) builds them unless the Groth16
+/// prover would then no longer fit the working-set limit beside the pipelines ([keccak_prewarm_refusal]).
+pub const KECCAK_PREWARM_ENV: &str = "ZKMINER_METAL_PREWARM_KECCAK";
+
+/// What the keccak pipelines add to the device allocation, with room to spare: 16 MiB measured on
+/// risc0 3.1 (process-wide pipelines 45.9 -> 62.1 MiB with them, P31-19 note), reserved twice.
+const KECCAK_PIPELINES_RESERVE: u64 = 32 << 20;
+
+/// Under `auto`, a working-set limit at least this much above the Groth16 prover's planned footprint
+/// can hold every process-wide pipeline beside it (62 MiB of them measured), so the keccak build
+/// keeps running in parallel with the others; below it, it runs after them, so the decision can
+/// read what they allocated.
+const KECCAK_PREWARM_TIGHT_MARGIN: u64 = 512 << 20;
+
+/// Why the worker-start keccak pipeline build must not run, or `None` when it should. `limit` is
+/// the working-set limit, `allocated` the device allocation after the other circuits' pipelines,
+/// `groth16` the Groth16 prover's planned footprint (`None`: unknown, e.g. no component yet).
+///
+/// risc0 3.1's Groth16 prover (v0.2.0 key) plans 4039 MiB at a 4 GiB budget (P31-12 `split_h`), and
+/// the worker's process-wide pipelines hold 62 MiB with keccak's, 46 MiB without: 4101 MiB does not
+/// fit 4096, 4085 MiB does. The keccak pipelines are never freed once built, so building them at
+/// start under such a limit would fail every wrap of the worker's life, keccak or not.
+fn keccak_prewarm_refusal(
+    knob: Option<&str>,
+    limit: Option<u64>,
+    allocated: u64,
+    groth16: Option<u64>,
+) -> Option<String> {
+    match knob.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("off" | "0" | "false") => return Some(format!("{KECCAK_PREWARM_ENV}=off")),
+        Some("on" | "1" | "true") => return None,
+        _ => {}
+    }
+    let (limit, groth16) = (limit?, groth16?);
+    let need = allocated
+        .saturating_add(groth16)
+        .saturating_add(KECCAK_PIPELINES_RESERVE);
+    (need > limit).then(|| {
+        format!(
+            "the Groth16 prover ({:.0} MiB planned) would not fit the {:.0} MiB working-set limit \
+             beside {:.0} MiB of pipelines plus keccak's; the first keccak proof builds them",
+            groth16 as f64 / (1u64 << 20) as f64,
+            limit as f64 / (1u64 << 20) as f64,
+            allocated as f64 / (1u64 << 20) as f64,
+        )
+    })
+}
+
+/// The Groth16 prover's planned device footprint with this process's memory switches and limit, if
+/// the component is installed (reads only file headers).
+fn groth16_planned_bytes() -> Option<u64> {
+    let dir = crate::groth16_component::dir()?;
+    let setup = risc0_groth16_sys::SetupParams::new(&dir).ok()?;
+    risc0_groth16_sys::metal_planned_bytes(&setup).ok()
+}
+
 /// Build every circuit's Metal pipeline states once per process: rv32im (with the zkp kernels),
 /// recursion, keccak (through its binary archive, K5) and the Groth16 prover, each on its own thread
 /// so the compiler service builds them in parallel. None of them takes the GPU lock for long, and
 /// each is process-wide, so later proofs find them built. Returns (and logs) how long each took: tens
 /// of seconds to minutes cold (first run of a newly built binary), well under a second warm.
+/// Under a tight working-set limit the keccak build may be left to the first keccak proof
+/// ([KECCAK_PREWARM_ENV], [keccak_prewarm_refusal]).
 pub fn warm_up_pipelines() -> &'static str {
     static DONE: OnceLock<String> = OnceLock::new();
     DONE.get_or_init(|| {
@@ -538,10 +601,28 @@ pub fn warm_up_pipelines() -> &'static str {
                 t.elapsed()
             }
         };
-        let (rv32im, recursion, keccak, groth16) = std::thread::scope(|s| {
+        let knob = std::env::var(KECCAK_PREWARM_ENV).ok();
+        let limit = risc0_groth16_sys::effective_working_set_limit();
+        let groth16_plan = groth16_planned_bytes();
+        // Decide now when the answer cannot depend on what the other builds allocate.
+        let early = match knob
+            .as_deref()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("off" | "0" | "false") | Some("on" | "1" | "true") => Some(
+                keccak_prewarm_refusal(knob.as_deref(), limit, 0, groth16_plan),
+            ),
+            _ => match (limit, groth16_plan) {
+                (Some(l), Some(g)) if l < g.saturating_add(KECCAK_PREWARM_TIGHT_MARGIN) => None,
+                _ => Some(None),
+            },
+        };
+        let (rv32im, recursion, mut keccak, groth16) = std::thread::scope(|s| {
             let rv32im = s.spawn(timed(risc0_circuit_rv32im::prove::metal_warmup));
             let recursion = s.spawn(timed(risc0_circuit_recursion::prove::metal_warmup));
-            let keccak = s.spawn(timed(risc0_circuit_keccak::prove::metal_warmup));
+            let keccak = matches!(early, Some(None))
+                .then(|| s.spawn(timed(risc0_circuit_keccak::prove::metal_warmup)));
             let groth16 = s.spawn(|| {
                 let t = Instant::now();
                 if let Err(e) = risc0_groth16_sys::metal_warmup() {
@@ -550,18 +631,38 @@ pub fn warm_up_pipelines() -> &'static str {
                 t.elapsed()
             });
             let get = |h: std::thread::ScopedJoinHandle<'_, Duration>| h.join().unwrap_or_default();
-            (get(rv32im), get(recursion), get(keccak), get(groth16))
+            (
+                get(rv32im),
+                get(recursion),
+                keccak.map(|h| Ok(get(h))),
+                get(groth16),
+            )
         });
+        if keccak.is_none() {
+            let refusal = match early {
+                Some(r) => r,
+                None => {
+                    keccak_prewarm_refusal(knob.as_deref(), limit, allocated_bytes(), groth16_plan)
+                }
+            };
+            keccak = Some(match refusal {
+                None => Ok(timed(risc0_circuit_keccak::prove::metal_warmup)()),
+                Some(why) => Err(why),
+            });
+        }
+        let keccak_text = match keccak.expect("decided above") {
+            Ok(t) => format!("keccak {:.1} s", t.as_secs_f64()),
+            Err(why) => format!("keccak not built ({why})"),
+        };
         let total = started.elapsed();
         let cold = total > Duration::from_secs(10);
         let summary = format!(
             "built the Metal pipelines in {:.1} s ({}): rv32im+zkp {:.1} s, recursion {:.1} s, \
-             keccak {:.1} s, groth16 {:.1} s",
+             {keccak_text}, groth16 {:.1} s",
             total.as_secs_f64(),
             if cold { "cold" } else { "warm" },
             rv32im.as_secs_f64(),
             recursion.as_secs_f64(),
-            keccak.as_secs_f64(),
             groth16.as_secs_f64(),
         );
         tracing::info!("{summary}");
@@ -673,6 +774,42 @@ mod tests {
         // The 36 GB dev machine (28.1 GiB) releases it; a 48 GB Mac (~36 GiB) keeps it.
         assert!(!keep_groth16_cache(28 * GIB, 20));
         assert!(keep_groth16_cache(36 * GIB, 20));
+    }
+
+    /// P31-19: the keccak pipelines are left to the first keccak proof only when the Groth16
+    /// prover would not fit beside them, or when the knob says so.
+    #[test]
+    fn the_keccak_prewarm_yields_to_the_groth16_prover_under_a_tight_limit() {
+        const MIB: u64 = 1 << 20;
+        let g16 = 4039 * MIB;
+        // The 4 GiB tier on risc0 3.1: 46 MiB of other pipelines, 4039 MiB prover.
+        assert!(keccak_prewarm_refusal(None, Some(4 * GIB), 46 * MIB, Some(g16)).is_some());
+        assert!(keccak_prewarm_refusal(Some("auto"), Some(4 * GIB), 46 * MIB, Some(g16)).is_some());
+        // Room enough: built.
+        assert_eq!(
+            keccak_prewarm_refusal(None, Some(8 * GIB), 46 * MIB, Some(g16)),
+            None
+        );
+        assert_eq!(
+            keccak_prewarm_refusal(None, Some(4 * GIB + 100 * MIB), 46 * MIB, Some(g16)),
+            None
+        );
+        // Unknown limit or prover footprint: built (wave 7's behaviour).
+        assert_eq!(
+            keccak_prewarm_refusal(None, None, 46 * MIB, Some(g16)),
+            None
+        );
+        assert_eq!(
+            keccak_prewarm_refusal(None, Some(4 * GIB), 46 * MIB, None),
+            None
+        );
+        // The knob wins either way.
+        assert_eq!(
+            keccak_prewarm_refusal(Some("on"), Some(4 * GIB), 46 * MIB, Some(g16)),
+            None
+        );
+        assert!(keccak_prewarm_refusal(Some("off"), Some(28 * GIB), 0, Some(g16)).is_some());
+        assert!(keccak_prewarm_refusal(Some("0"), None, 0, None).is_some());
     }
 
     #[test]

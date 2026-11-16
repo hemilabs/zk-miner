@@ -232,9 +232,13 @@ pub struct ProverConfig {
     #[serde(default)]
     pub worker_binaries: HashMap<String, String>,
     /// Override for the RISC Zero groth16 seal selector (4-byte hex, e.g.
-    /// "0x73c457ba"). The miner prepends this to each seal for on-chain
+    /// "0xe71e6620"). The miner prepends this to each seal for on-chain
     /// verification; it must equal the target chain's verifier `SELECTOR` for
-    /// the risc0 version in use. Defaults to the risc0 v3.0.x value when unset.
+    /// the risc0 version in use. When unset it is derived from the linked risc0
+    /// (first 4 bytes of its default Groth16 verifier parameters digest):
+    /// 0xe71e6620 for risc0 3.1 (3.0 was 0x73c457ba). An override does not change
+    /// the proofs the worker makes, only the prefix: use it only for a chain whose
+    /// verifier accepts this risc0's receipts under another selector.
     #[serde(default)]
     pub risc0_groth16_selector: Option<String>,
     /// The segment size (po2) a card measures and proves risc0 jobs at, keyed by its benchmark device

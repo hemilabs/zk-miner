@@ -135,26 +135,31 @@ zkminer-config = { path = "crates/zkminer-config" }
 # A rev and not a branch for the reason given on `sppark` below: a branch pin follows a moved head on
 # the next `cargo update` without anyone choosing to.
 [patch.crates-io]
-# macOS/Metal port: the risc0 crates come from the local clone ../deps/risc0 (branch zkminer/metal, based on
-# the rev below) while the Metal kernels are being fixed and extended. To go back to the pinned fork,
-# restore the `git = ..., rev = "68b3eacb..."` form on each line.
-risc0-zkvm = { path = "../deps/risc0/risc0/zkvm" }
-risc0-build = { path = "../deps/risc0/risc0/build" }
-risc0-zkp = { path = "../deps/risc0/risc0/zkp" }
-risc0-sys = { path = "../deps/risc0/risc0/sys" }
-risc0-core = { path = "../deps/risc0/risc0/core" }
-risc0-binfmt = { path = "../deps/risc0/risc0/binfmt" }
-risc0-build-kernel = { path = "../deps/risc0/risc0/build_kernel" }
-risc0-groth16 = { path = "../deps/risc0/risc0/groth16" }
-risc0-groth16-sys = { path = "../deps/risc0/risc0/groth16-sys" }
-risc0-circuit-rv32im = { path = "../deps/risc0/risc0/circuit/rv32im" }
-risc0-circuit-rv32im-sys = { path = "../deps/risc0/risc0/circuit/rv32im-sys" }
-risc0-circuit-recursion = { path = "../deps/risc0/risc0/circuit/recursion" }
-risc0-circuit-recursion-sys = { path = "../deps/risc0/risc0/circuit/recursion-sys" }
-risc0-circuit-keccak = { path = "../deps/risc0/risc0/circuit/keccak" }
-risc0-circuit-keccak-sys = { path = "../deps/risc0/risc0/circuit/keccak-sys" }
-risc0-zkos-v1compat = { path = "../deps/risc0/risc0/zkos/v1compat" }
-risc0-zkvm-platform = { path = "../deps/risc0/risc0/zkvm/platform" }
+# macOS/Metal port: the risc0 crates come from the local clone ../deps/risc0-3.1 (branch zkminer/metal-3.1:
+# hemilabs release-3.1 = risc0 v3.1.0 with the fork re-applied, plus the Metal port merged onto it) while
+# the Metal kernels are being fixed and extended. risc0 3.1 carries the GHSA-g6qg-9j8p-7j87 circuit and
+# verifier fixes: its receipts (control root e6feef13..., Groth16 selector e71e6620) are not accepted by a
+# 3.0 verifier, and 3.0 receipts are not accepted by a 3.1 verifier. The 3.1-only crates
+# risc0-circuit-recursion-zkrs / -control-zkrs are path dependencies inside that workspace, so they
+# need no patch line here. To go back to a pinned fork, restore the `git = ..., rev = "..."` form on
+# each line (a release-3.1 rev; the old 68b3eacb rev is risc0 3.0).
+risc0-zkvm = { path = "../deps/risc0-3.1/risc0/zkvm" }
+risc0-build = { path = "../deps/risc0-3.1/risc0/build" }
+risc0-zkp = { path = "../deps/risc0-3.1/risc0/zkp" }
+risc0-sys = { path = "../deps/risc0-3.1/risc0/sys" }
+risc0-core = { path = "../deps/risc0-3.1/risc0/core" }
+risc0-binfmt = { path = "../deps/risc0-3.1/risc0/binfmt" }
+risc0-build-kernel = { path = "../deps/risc0-3.1/risc0/build_kernel" }
+risc0-groth16 = { path = "../deps/risc0-3.1/risc0/groth16" }
+risc0-groth16-sys = { path = "../deps/risc0-3.1/risc0/groth16-sys" }
+risc0-circuit-rv32im = { path = "../deps/risc0-3.1/risc0/circuit/rv32im" }
+risc0-circuit-rv32im-sys = { path = "../deps/risc0-3.1/risc0/circuit/rv32im-sys" }
+risc0-circuit-recursion = { path = "../deps/risc0-3.1/risc0/circuit/recursion" }
+risc0-circuit-recursion-sys = { path = "../deps/risc0-3.1/risc0/circuit/recursion-sys" }
+risc0-circuit-keccak = { path = "../deps/risc0-3.1/risc0/circuit/keccak" }
+risc0-circuit-keccak-sys = { path = "../deps/risc0-3.1/risc0/circuit/keccak-sys" }
+risc0-zkos-v1compat = { path = "../deps/risc0-3.1/risc0/zkos/v1compat" }
+risc0-zkvm-platform = { path = "../deps/risc0-3.1/risc0/zkvm/platform" }
 # Pinned by immutable REV, not a branch: a branch head can silently move the build
 # off a validated commit (which is why the risc0/sp1 patches below carry a
 # do-not-cargo-update warning). 5f68eb3 = hemilabs/risc0-sppark `zkminer/windows-amd`

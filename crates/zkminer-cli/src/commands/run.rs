@@ -143,17 +143,27 @@ const DEFAULT_MONITOR_BACKFILL_BLOCKS: u64 = u64::MAX;
 /// faster just burns eth_blockNumber/eth_getLogs calls. Override with `chain.monitor_poll_secs`.
 const DEFAULT_MONITOR_POLL_SECS: u64 = 10;
 
-/// RISC Zero Groth16 seal selector (risc0 v3.0.x). On-chain verification requires
-/// the seal to be `selector ++ abi.encode(a,b,c)` (260 bytes); the worker returns
-/// the bare 256-byte proof, so the miner prepends this. It is the first 4 bytes of
-/// the verifier-parameters digest and is fixed per risc0 version — override via
-/// config for a testnet on a different version.
-const RISC0_GROTH16_SELECTOR: [u8; 4] = [0x73, 0xc4, 0x57, 0xba];
+/// The RISC Zero Groth16 seal selector of the linked risc0: the first 4 bytes of its default
+/// `Groth16ReceiptVerifierParameters` digest (control root, BN254 identity control id and Groth16
+/// verifying key), which is what risc0-ethereum's `encode_seal` prefixes and what a
+/// `RiscZeroGroth16Verifier` built for that release returns from `SELECTOR()`. On-chain verification
+/// requires the seal to be `selector ++ abi.encode(a,b,c)` (260 bytes); the worker returns the bare
+/// 256-byte proof, so the miner prepends this. risc0 3.1 (the GHSA-g6qg-9j8p-7j87 circuit and
+/// verifier fixes) is `0xe71e6620`; 3.0 was `0x73c457ba`. Derived rather than hard-coded so the
+/// default follows the risc0 the workspace links (the worker's); override it with
+/// `prover.risc0_groth16_selector` for a testnet on a different version.
+fn risc0_groth16_default_selector() -> [u8; 4] {
+    use risc0_zkvm::sha::Digestible;
+    let digest = risc0_zkvm::Groth16ReceiptVerifierParameters::default().digest();
+    let mut sel = [0u8; 4];
+    sel.copy_from_slice(&digest.as_bytes()[..4]);
+    sel
+}
 
 /// The resolved seal selector for this run (config override, else the default).
 static SEAL_SELECTOR: std::sync::OnceLock<[u8; 4]> = std::sync::OnceLock::new();
 
-/// Parse a 4-byte hex selector like "0x73c457ba" (or "73c457ba").
+/// Parse a 4-byte hex selector like "0xe71e6620" (or "e71e6620").
 fn parse_seal_selector(s: &str) -> Option<[u8; 4]> {
     let h = s.strip_prefix("0x").unwrap_or(s);
     let bytes = (0..h.len())
@@ -165,7 +175,19 @@ fn parse_seal_selector(s: &str) -> Option<[u8; 4]> {
 
 /// The RISC Zero seal selector to prefix onto seals (config override or default).
 fn risc0_seal_selector() -> [u8; 4] {
-    *SEAL_SELECTOR.get().unwrap_or(&RISC0_GROTH16_SELECTOR)
+    match SEAL_SELECTOR.get() {
+        Some(sel) => *sel,
+        None => risc0_groth16_default_selector(),
+    }
+}
+
+/// The seal a RISC Zero Groth16 job is fulfilled with: `selector ++ proof`, the encoding of
+/// risc0-ethereum's `encode_seal` (260 bytes for the worker's 256-byte proof).
+fn risc0_onchain_seal(selector: [u8; 4], proof: &[u8]) -> Vec<u8> {
+    let mut s = Vec::with_capacity(selector.len() + proof.len());
+    s.extend_from_slice(&selector);
+    s.extend_from_slice(proof);
+    s
 }
 
 /// True if a proving error is the intermittent multi-segment invalid-proof (the
@@ -2444,14 +2466,14 @@ pub async fn run(
             DEPLOYMENT_RETRY.as_secs()
         ),
     }
-    // Resolve the RISC Zero groth16 seal selector (config override or the built-in risc0 v3.0.x
-    // default) BEFORE verifying it against the live verifier: verifying the default while seals are
+    // Resolve the RISC Zero groth16 seal selector (config override or the linked risc0's default,
+    // 0xe71e6620 for 3.1) BEFORE verifying it against the live verifier: verifying the default while seals are
     // later prefixed with an override would pass the check and then revert every fulfil.
     let sel = match config.prover.risc0_groth16_selector.as_deref() {
         Some(s) => parse_seal_selector(s).ok_or_else(|| {
             anyhow::anyhow!("prover.risc0_groth16_selector {s:?} is not a 4-byte hex selector")
         })?,
-        None => RISC0_GROTH16_SELECTOR,
+        None => risc0_groth16_default_selector(),
     };
     let _ = SEAL_SELECTOR.set(sel);
     // NOT fatal: a held lock must still be recovered (fulfilled, kept through a Disabled window, or
@@ -9949,11 +9971,7 @@ async fn process_job_lifecycle(
     // RISC Zero groth16 seals must be selector-prefixed for on-chain verification;
     // the worker returns the bare 256-byte proof, so prepend the 4-byte selector.
     let seal_bytes: Vec<u8> = if backend == "risc0" {
-        let selector = risc0_seal_selector();
-        let mut s = Vec::with_capacity(selector.len() + proof.seal.len());
-        s.extend_from_slice(&selector);
-        s.extend_from_slice(&proof.seal);
-        s
+        risc0_onchain_seal(risc0_seal_selector(), &proof.seal)
     } else {
         proof.seal.clone()
     };
@@ -10360,8 +10378,9 @@ pub(crate) fn resolve_backend(proof_system_id: alloy::primitives::B256) -> Optio
     use zkminer_chain::auction::ProofSystem;
     match ProofSystem::from_id(proof_system_id)? {
         // The one system this build can prove AND verify end-to-end against the deployed verifier:
-        // risc0 3.0.x Groth16 receipts encoded to the 260-byte seal (SELECTOR 0x73c457ba ‖ proof).
-        // Checked at startup against the live adapter's native verifier.
+        // Groth16 receipts of the linked risc0 (3.1: SELECTOR 0xe71e6620) encoded to the 260-byte seal
+        // (SELECTOR ‖ proof). Checked at startup against the live adapter's native verifier, whose
+        // SELECTOR() must equal ours (a 3.0 verifier returns 0x73c457ba and is refused).
         ProofSystem::Risc0Groth16 => Some("risc0"),
         // SP1 6.8.1 (hemilabs/sp1 #19) Groth16 proofs of circuit v6.1.0, the circuit the 743111 SP1
         // verifiers accept; checked at startup against the live adapter's native verifier.
@@ -12734,6 +12753,38 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
 mod tests {
     use super::*;
     use alloy::primitives::B256;
+
+    /// P31-19: the default RISC Zero seal selector is the linked risc0's, and that is 3.1's
+    /// (`Groth16ReceiptVerifierParameters::default().digest()` = e71e6620a834f4d8...). A 3.0 build
+    /// (0x73c457ba) fails here: its seals would only verify against a 3.0 verifier.
+    #[test]
+    fn the_default_seal_selector_is_risc0_3_1s() {
+        assert_eq!(risc0_groth16_default_selector(), [0xe7, 0x1e, 0x66, 0x20]);
+        assert_ne!(risc0_groth16_default_selector(), [0x73, 0xc4, 0x57, 0xba]);
+        // With no override resolved, the selector the miner prefixes is the derived default.
+        if SEAL_SELECTOR.get().is_none() {
+            assert_eq!(risc0_seal_selector(), [0xe7, 0x1e, 0x66, 0x20]);
+        }
+        assert_eq!(
+            parse_seal_selector("0xe71e6620"),
+            Some([0xe7, 0x1e, 0x66, 0x20])
+        );
+        assert_eq!(
+            parse_seal_selector("e71e6620"),
+            Some([0xe7, 0x1e, 0x66, 0x20])
+        );
+        assert_eq!(parse_seal_selector("0xe71e66"), None);
+    }
+
+    /// The fulfilled seal is selector ++ the worker's 256-byte proof: 260 bytes.
+    #[test]
+    fn a_risc0_seal_is_the_selector_then_the_proof() {
+        let proof: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+        let seal = risc0_onchain_seal(risc0_groth16_default_selector(), &proof);
+        assert_eq!(seal.len(), 260);
+        assert_eq!(&seal[..4], &[0xe7, 0x1e, 0x66, 0x20]);
+        assert_eq!(&seal[4..], &proof[..]);
+    }
 
     /// The terminal-vs-retryable classification is by TYPE, and guest text cannot forge it.
     ///

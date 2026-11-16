@@ -2088,6 +2088,7 @@ fn benchmark_program(
         );
         return None;
     }
+    dump_benchmark_receipt(name, &groth16, image_id);
 
     let cycles = prove_info.stats.total_cycles;
     // STARK = segments + recursion: everything up to one constant-size proof. `throughput` is over
@@ -2125,6 +2126,29 @@ fn benchmark_program(
         wrap_secs: Some(wrap_secs),
         power_state,
     })
+}
+
+/// Test aid (P31-19): with `ZKMINER_BENCH_RECEIPT_DIR` set, write each verified benchmark Groth16
+/// receipt there as `<name>.groth16.receipt` (bincode 1.3 `risc0_zkvm::Receipt`, the encoding an
+/// independent verifier such as risc0's `tools/stock_verify31` reads) with `<name>.image_id` (hex).
+/// Unset (the default): nothing is written. A failed write is logged, never fatal.
+fn dump_benchmark_receipt(name: &str, receipt: &risc0_zkvm::Receipt, image_id: risc0_zkvm::Digest) {
+    let Some(dir) = std::env::var_os("ZKMINER_BENCH_RECEIPT_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let written = std::fs::create_dir_all(&dir)
+        .map_err(anyhow::Error::from)
+        .and_then(|()| Ok(bincode::serialize(receipt)?))
+        .and_then(|bytes| {
+            std::fs::write(dir.join(format!("{name}.groth16.receipt")), bytes)?;
+            std::fs::write(dir.join(format!("{name}.image_id")), image_id.to_string())?;
+            Ok(())
+        });
+    match written {
+        Ok(()) => tracing::info!("{name}: Groth16 receipt written to {}", dir.display()),
+        Err(e) => tracing::warn!("{name}: could not write the Groth16 receipt: {e:#}"),
+    }
 }
 
 /// The power state a benchmark entry reports (protocol v12, W7-M11): on a Mac, M9's reading;
