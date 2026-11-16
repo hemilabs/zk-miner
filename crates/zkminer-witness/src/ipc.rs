@@ -3,8 +3,33 @@
 //! Every frame is `kind (u8) ‖ length (u32 BE) ‖ payload`. A reader is given a per-channel maximum
 //! and rejects a larger length *before* allocating. The builder is treated as hostile: its frames
 //! are fixed-layout binary; control frames between the miner and the broker carry capped JSON.
+//!
+//! # The control channel
+//!
+//! The miner spawns the broker with one end of a Unix stream socketpair at fd [`BROKER_CONTROL_FD`].
+//! Each frame is `KIND_CONTROL` with a JSON [`ControlMessage`] payload of at most
+//! [`MAX_CONTROL_BYTES`]: `{"id":…,"body":…}`. The miner picks the ids; every response carries the
+//! id of the request it answers, so requests are served concurrently and answered in any order (a
+//! held-lock `RegisterJob` never waits behind a slow `FetchArtifact`).
+//!
+//! **File descriptors** travel as `SCM_RIGHTS` ancillary data on the frame that names them: exactly
+//! one fd, sent in the same `sendmsg` as the frame's first byte (its header). A reader takes fds
+//! only while it reads a frame's 5-byte header, never reads past the frame it is reading (so one
+//! `recvmsg` never spans two frames), and treats a frame with an fd it does not expect, without one
+//! it expects, with more than one, or with one attached to a later byte as malformed (closing every
+//! fd it received). Two messages carry one:
+//! - `RegisterJob` carries the broker's end of the job's socketpair (a connected `AF_UNIX`
+//!   `SOCK_STREAM` socket). The job's identity at the broker is that socket, never `SO_PEERCRED`.
+//! - `Artifact` carries a memfd holding exactly `len` bytes, sealed with
+//!   `F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE`. The receiver checks the seals and
+//!   the size before trusting it, and reads it with `pread`/`mmap`.
+//!
+//! **Artifact charge.** Before it reads a `hemi-code` artifact's chunks, the broker sends the
+//! interim response `ArtifactCharge` (same id as the `FetchArtifact`) and waits for the miner's
+//! `ChargeDecision` (same id): `proceed: false` ends the fetch with `ArtifactFailure::Budget`.
 
 use std::io::{self, Read, Write};
+use std::net::IpAddr;
 
 use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
@@ -18,6 +43,8 @@ pub const KIND_FETCH_RESULT: u8 = 0x02;
 /// Miner ↔ broker control frames (JSON payloads, at most `MAX_CONTROL_BYTES`).
 pub const KIND_CONTROL: u8 = 0x10;
 pub const MAX_CONTROL_BYTES: u32 = 64 * 1024;
+/// The fd at which the broker finds its end of the control socketpair.
+pub const BROKER_CONTROL_FD: i32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -186,7 +213,16 @@ pub struct JobBudget {
     pub max_response_bytes: u32,
 }
 
-/// Miner → broker control messages. The builder end of the job's socketpair travels with
+/// One control frame's payload: a request or response and the id that pairs them (see the module
+/// docs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlMessage<T> {
+    pub id: u64,
+    pub body: T,
+}
+
+/// Miner → broker control messages. The broker's end of the job's socketpair travels with
 /// `RegisterJob` as an `SCM_RIGHTS` fd; artifacts come back as a sealed memfd.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -214,6 +250,37 @@ pub enum ControlRequest {
         held_lock: bool,
     },
     SelfTest,
+    /// Which `(class, config)` pairs this broker provisions (plan §11.1), answered by `Provisioned`
+    /// with one entry per source, in order.
+    CheckProvisioned {
+        sources: Vec<(B256, Vec<u8>)>,
+    },
+    /// The answer to an `ArtifactCharge`, sent with the id of the `FetchArtifact` it answers.
+    ChargeDecision {
+        proceed: bool,
+    },
+    /// Replaces the broker's view of the host's connected prefixes and own addresses (plan §14.2),
+    /// which it cannot read itself once sandboxed (no netlink). The miner sends it when interfaces
+    /// change; answered by `PrefixesRefreshed`.
+    RefreshPrefixes {
+        prefixes: Vec<IpPrefix>,
+        own_addresses: Vec<IpAddr>,
+    },
+}
+
+/// An IPv4 or IPv6 prefix on the control channel (`len` ≤ 32 or ≤ 128).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IpPrefix {
+    pub addr: IpAddr,
+    pub len: u8,
+}
+
+impl IpPrefix {
+    /// Whether `len` fits the address family.
+    pub fn is_valid(&self) -> bool {
+        self.len <= if self.addr.is_ipv4() { 32 } else { 128 }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +304,10 @@ pub enum ArtifactFailure {
     TooLarge,
     Endpoint,
     Budget,
+    /// The operator artifact mirror does not have it (404 or 410): operator side, not the caller's.
+    MirrorMissing,
+    /// The operator artifact mirror served bytes that do not hash to the builder id: operator side.
+    MirrorMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,11 +324,25 @@ pub enum ControlResponse {
         fetch_in_flight_at_end: bool,
         denied: u32,
     },
-    /// The artifact is in the memfd sent with this frame.
-    Artifact { len: u64, sha256: B256 },
+    /// The artifact is in the memfd sent with this frame. `sha256` is the broker's own hash of the
+    /// bytes; `cached` = served from the broker's artifact cache, with no endpoint reads.
+    Artifact {
+        len: u64,
+        sha256: B256,
+        #[serde(default)]
+        cached: bool,
+    },
     ArtifactFailed { failure: ArtifactFailure },
     SelfTest { ok: bool, checks: Vec<(SelfTestCheck, bool)> },
     Error { code: ControlErrorCode },
+    /// One entry per `CheckProvisioned` source, in order.
+    Provisioned { ok: Vec<bool> },
+    /// Interim answer to a `hemi-code` `FetchArtifact` (same id), sent after the manifest passed and
+    /// before any chunk is read (plan §13.4 step 3): `length` bytes and `chunks` chunk reads (`chunks
+    /// + 1` reads with the manifest). The broker waits for a `ChargeDecision`.
+    ArtifactCharge { length: u64, chunks: u32 },
+    /// `RefreshPrefixes` applied: the number of prefixes now in the floor.
+    PrefixesRefreshed { count: u32 },
 }
 
 /// The broker's self-test checks (plan §10.3): a fixed set, no broker-supplied strings.
@@ -285,6 +370,10 @@ pub enum ControlErrorCode {
     UnknownJob,
     Busy,
     Internal,
+    /// `RegisterJob` named a source this broker does not provision.
+    NotProvisioned,
+    /// `RegisterJob` for a job key that is already registered.
+    DuplicateJob,
 }
 
 pub fn encode_control<T: Serialize>(msg: &T) -> Vec<u8> {
@@ -365,5 +454,45 @@ mod tests {
         let st = ControlResponse::SelfTest { ok: false, checks: vec![(SelfTestCheck::LoopbackDenied, false)] };
         assert_eq!(decode_control::<ControlResponse>(&encode_control(&st)).unwrap(), st);
         assert!(decode_control::<ControlResponse>(br#"{"type":"self_test","ok":true,"checks":[["made_up",true]]}"#).is_err());
+    }
+
+    #[test]
+    fn control_messages_carry_ids() {
+        let m = ControlMessage {
+            id: 7,
+            body: ControlRequest::CheckProvisioned { sources: vec![(B256::repeat_byte(1), vec![1, 2])] },
+        };
+        let bytes = encode_control(&m);
+        assert_eq!(decode_control::<ControlMessage<ControlRequest>>(&bytes).unwrap(), m);
+        let d = ControlMessage { id: 9, body: ControlRequest::ChargeDecision { proceed: false } };
+        assert_eq!(decode_control::<ControlMessage<ControlRequest>>(&encode_control(&d)).unwrap(), d);
+        let r = ControlMessage {
+            id: 10,
+            body: ControlRequest::RefreshPrefixes {
+                prefixes: vec![IpPrefix { addr: "192.0.2.0".parse().unwrap(), len: 24 }],
+                own_addresses: vec!["2001:db8::1".parse().unwrap()],
+            },
+        };
+        assert_eq!(decode_control::<ControlMessage<ControlRequest>>(&encode_control(&r)).unwrap(), r);
+        assert!(!IpPrefix { addr: "192.0.2.0".parse().unwrap(), len: 33 }.is_valid());
+        assert!(IpPrefix { addr: "::".parse().unwrap(), len: 128 }.is_valid());
+        for r in [
+            ControlResponse::Provisioned { ok: vec![true, false] },
+            ControlResponse::ArtifactCharge { length: 5, chunks: 1 },
+            ControlResponse::Artifact { len: 3, sha256: B256::repeat_byte(2), cached: true },
+            ControlResponse::ArtifactFailed { failure: ArtifactFailure::MirrorMismatch },
+            ControlResponse::Error { code: ControlErrorCode::NotProvisioned },
+            ControlResponse::PrefixesRefreshed { count: 3 },
+        ] {
+            let m = ControlMessage { id: 1, body: r };
+            assert_eq!(decode_control::<ControlMessage<ControlResponse>>(&encode_control(&m)).unwrap(), m);
+        }
+        // `cached` defaults to false; unknown envelope keys are refused.
+        let a = br#"{"id":1,"body":{"type":"artifact","len":1,"sha256":"0x0202020202020202020202020202020202020202020202020202020202020202"}}"#;
+        assert!(matches!(
+            decode_control::<ControlMessage<ControlResponse>>(a).unwrap().body,
+            ControlResponse::Artifact { cached: false, .. }
+        ));
+        assert!(decode_control::<ControlMessage<ControlRequest>>(br#"{"id":1,"body":{"type":"self_test"},"x":1}"#).is_err());
     }
 }
