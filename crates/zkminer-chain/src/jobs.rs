@@ -186,6 +186,158 @@ pub fn fulfill_gas_formula(callback_gas_limit: u32, calldata_len: usize, journal
         + 500_000
 }
 
+/// What `fulfillJobHashed` takes besides the jobId, journal and seal (HemiProveFulfill.sol at
+/// 3bc441dd8; the same entry point on the c8333aa stack). The router rebuilds the job's
+/// `descriptorHash` as `keccak256(abi.encode(programId, proofSystemId, callbackContract,
+/// assignedProver, tag, inputDataHash, keccak256(callbackExtraData), keccak256(extraVerifierData),
+/// expectedJournalHash, journalFields))` — `inputData` is never sent, only its keccak256, while
+/// `callbackExtraData` and `extraVerifierData` travel raw and are hashed on-chain — and reverts
+/// `InvalidDescriptorHash(stored, rebuilt)` on a mismatch. It then builds a descriptor with
+/// `inputData = ""` and the raw extras, and runs `fulfillJob`'s checks (journal cap, binding in every
+/// mode, governance gates, gas, verifier, settlement): nothing after the hash check reads `inputData`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HashedFulfil {
+    /// Every descriptor field but the three `bytes`, with `inputDataHash = keccak256(inputData)`;
+    /// the binding words verbatim.
+    pub hashed: HashedDescriptor,
+    pub callback_extra_data: Bytes,
+    pub extra_verifier_data: Bytes,
+}
+
+impl HashedFulfil {
+    /// The hashed form of `d`.
+    pub fn from_descriptor(d: &JobDescriptor) -> Self {
+        Self {
+            hashed: HashedDescriptor {
+                programId: d.programId,
+                proofSystemId: d.proofSystemId,
+                callbackContract: d.callbackContract,
+                assignedProver: d.assignedProver,
+                tag: d.tag,
+                inputDataHash: alloy::primitives::keccak256(&d.inputData),
+                expectedJournalHash: d.expectedJournalHash,
+                journalFields: d.journalFields,
+            },
+            callback_extra_data: d.callbackExtraData.clone(),
+            extra_verifier_data: d.extraVerifierData.clone(),
+        }
+    }
+
+    /// The `descriptorHash` the router rebuilds from this (`_hashDescriptorFields`): it must equal
+    /// the job's stored one, or the fulfil reverts `InvalidDescriptorHash`.
+    pub fn descriptor_hash(&self) -> B256 {
+        use alloy::sol_types::SolValue;
+        let h = &self.hashed;
+        alloy::primitives::keccak256(
+            (
+                h.programId,
+                h.proofSystemId,
+                h.callbackContract,
+                h.assignedProver,
+                h.tag,
+                h.inputDataHash,
+                alloy::primitives::keccak256(&self.callback_extra_data),
+                alloy::primitives::keccak256(&self.extra_verifier_data),
+                h.expectedJournalHash,
+                h.journalFields,
+            )
+                .abi_encode(),
+        )
+    }
+}
+
+/// The `fulfillJobHashed` calldata (selector included) — what [`ChainClient::fulfill_job_hashed`]
+/// sends and what its DA estimate and gas limit are sized from.
+pub fn fulfill_job_hashed_calldata(
+    job_id: B256,
+    fulfil: &HashedFulfil,
+    public_values: &[u8],
+    proof_bytes: &[u8],
+) -> Bytes {
+    IHemiProveFulfill::fulfillJobHashedCall {
+        jobId: job_id,
+        hashedDesc: fulfil.hashed.clone(),
+        callbackExtraData: fulfil.callback_extra_data.clone(),
+        extraVerifierData: fulfil.extra_verifier_data.clone(),
+        publicValues: Bytes::copy_from_slice(public_values),
+        proofBytes: Bytes::copy_from_slice(proof_bytes),
+    }
+    .abi_encode()
+    .into()
+}
+
+/// The fulfil entry point one send uses.
+#[derive(Debug, Clone)]
+enum FulfilCall {
+    /// `fulfillJob(jobId, descriptor, publicValues, proofBytes)`.
+    Full(JobDescriptor),
+    /// `fulfillJobHashed(jobId, hashedDesc, callbackExtraData, extraVerifierData, publicValues,
+    /// proofBytes)`: `inputData` stays out of the calldata.
+    Hashed(HashedFulfil),
+}
+
+impl FulfilCall {
+    fn name(&self) -> &'static str {
+        match self {
+            FulfilCall::Full(_) => "fulfillJob",
+            FulfilCall::Hashed(_) => "fulfillJobHashed",
+        }
+    }
+
+    fn proof_system_id(&self) -> B256 {
+        match self {
+            FulfilCall::Full(d) => d.proofSystemId,
+            FulfilCall::Hashed(f) => f.hashed.proofSystemId,
+        }
+    }
+
+    fn calldata(&self, job_id: B256, public_values: &Bytes, proof_bytes: &Bytes) -> Bytes {
+        match self {
+            FulfilCall::Full(d) => IHemiProveFulfill::fulfillJobCall {
+                jobId: job_id,
+                descriptor: d.clone(),
+                publicValues: public_values.clone(),
+                proofBytes: proof_bytes.clone(),
+            }
+            .abi_encode()
+            .into(),
+            FulfilCall::Hashed(f) => fulfill_job_hashed_calldata(job_id, f, public_values, proof_bytes),
+        }
+    }
+}
+
+/// The DA throttle rules a hashed fulfil is sent under (witness-construction-jobs §5.5; see
+/// [`ChainClient::fulfill_job_hashed`]).
+#[derive(Clone)]
+pub struct FulfilDa {
+    pub rule: crate::da::NonceRuleConfig,
+    /// Where the backlog readings come from (the miner's shared [`crate::da::BacklogReader`]).
+    pub backlog: crate::da::BacklogSource,
+}
+
+/// How many filler self-transfers one fulfil may spend to go out as the highest pending nonce
+/// before it is sent anyway (the stuck detector then bounds what a filtered one costs).
+const DA_MAX_FILLS: u32 = 3;
+
+/// One hashed fulfil's DA state across its send loop.
+struct DaRun<'a> {
+    cfg: &'a FulfilDa,
+    /// The exact fulfil's estimated DA bytes ([`crate::da::estimate_fulfil_da_bytes`]).
+    est: u64,
+    large: bool,
+}
+
+/// The stuck detector's step inside the send loop.
+enum DaStep {
+    Continue,
+    /// Replaced by a self-transfer: hold, re-send once the throttle clears.
+    Replaced(String),
+    /// The fulfil settled meanwhile.
+    Fulfilled,
+    /// A replacement was due and could not be made.
+    Failed(String),
+}
+
 /// The exact claim floors for one job, read at ONE mined block (handoff §7 step 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimQuote {
@@ -362,8 +514,8 @@ fn log_is_authentic_fulfilled(
         && topics.get(1) == Some(&job_id)
 }
 use zkminer_contracts::bindings::{
-    IHemiProveAux, IHemiProveCore, IHemiProveFulfill, IHemiProveRegistry, JobDescriptor, JobRecord,
-    JobStatusView,
+    HashedDescriptor, IHemiProveAux, IHemiProveCore, IHemiProveFulfill, IHemiProveRegistry,
+    JobDescriptor, JobRecord, JobStatusView,
 };
 
 // Explicit gas on the single claimJob so GasFiller sees a limit and both
@@ -1813,9 +1965,89 @@ impl ChainClient {
         budget: Option<Duration>,
         lock_block: Option<u64>,
     ) -> Result<()> {
+        self.fulfill_inner(
+            job_id,
+            FulfilCall::Full(descriptor),
+            public_values,
+            proof_bytes,
+            budget,
+            lock_block,
+            None,
+        )
+        .await
+    }
+
+    /// Fulfil a locked job with `fulfillJobHashed`: [`Self::fulfill_job`]'s path (the same lock
+    /// checks, governance holds, fee ladder, nonce stash, gas bumps, receipt checks and typed
+    /// failures), but `inputData` stays out of the calldata — only its keccak256 travels, in
+    /// `fulfil.hashed.inputDataHash` (see [`HashedFulfil`] for the router's semantics). The gas limit
+    /// is sized from the hashed calldata. Before publishing, the descriptor hash the router will
+    /// rebuild is checked against the job's stored one: a mismatch is a `ProofDefect`
+    /// (`InvalidDescriptorHash`) with nothing published.
+    ///
+    /// With `da`, the DA throttle rules of witness-construction-jobs §5.5 apply:
+    /// - the exact transaction's DA size is estimated first ([`crate::da::estimate_fulfil_da_bytes`]);
+    /// - a LARGE fulfil (above [`crate::da::STANDARD_FULFIL_DA_BYTES`]) is first sent only as this
+    ///   key's highest pending nonce (a lower reserved nonce is spent on a filler self-transfer), and
+    ///   held unsent while a reading proves the live DA cap below it;
+    /// - while it is unmined, the detector ([`crate::da::NonceRuleConfig::verdict`]) watches the head
+    ///   and the safe-head lag; once it is due, the fulfil is replaced at its nonce by a minimal
+    ///   self-transfer ([`ChainClient::replace_with_self_transfer`]) and this returns a `Keep`
+    ///   [`FulfilFailure`] named [`crate::da::DA_THROTTLE_HOLD_NAME`] (`published`: the seal was
+    ///   broadcast). Keep the lock and call this again: it holds (same failure, no nonce touched)
+    ///   until [`crate::da::NonceRuleConfig::resend`] lets it re-send at a fresh nonce.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fulfill_job_hashed(
+        &self,
+        job_id: B256,
+        fulfil: HashedFulfil,
+        public_values: Bytes,
+        proof_bytes: Bytes,
+        budget: Option<Duration>,
+        lock_block: Option<u64>,
+        da: Option<&FulfilDa>,
+    ) -> Result<()> {
+        let out = self
+            .fulfill_inner(
+                job_id,
+                FulfilCall::Hashed(fulfil),
+                public_values,
+                proof_bytes,
+                budget,
+                lock_block,
+                da,
+            )
+            .await;
+        // A settled job, or a lock that is gone, leaves nothing for the DA rules to track. A held or
+        // unconfirmed fulfil (Keep, Unknown) may still be pending: its entries stay.
+        let settled = match &out {
+            Ok(()) => true,
+            Err(e) => e
+                .downcast_ref::<FulfilFailure>()
+                .is_some_and(|f| !matches!(f.class, FulfilClass::Keep | FulfilClass::Unknown)),
+        };
+        if settled {
+            self.da_book().forget_job(job_id);
+        }
+        out
+    }
+
+    /// The fulfil path shared by [`Self::fulfill_job`] and [`Self::fulfill_job_hashed`].
+    #[allow(clippy::too_many_arguments)]
+    async fn fulfill_inner(
+        &self,
+        job_id: B256,
+        call: FulfilCall,
+        public_values: Bytes,
+        proof_bytes: Bytes,
+        budget: Option<Duration>,
+        lock_block: Option<u64>,
+        da: Option<&FulfilDa>,
+    ) -> Result<()> {
         const MAX_ATTEMPTS: u32 = MAX_TX_ATTEMPTS;
         const MAX_GAS_BUMPS: u64 = 3;
-        let fulfill = IHemiProveFulfill::new(self.hemi_prove, &*self.provider);
+        let what = call.name();
+        let proof_system_id = call.proof_system_id();
         let started = std::time::Instant::now();
         let fail = |class: FulfilClass, error_name: String, reason: String, published: bool| -> anyhow::Error {
             FulfilFailure {
@@ -1831,7 +2063,7 @@ impl ChainClient {
         // gap watchdog answers it with a >= 2 gwei self-transfer every ~2 minutes for the whole hold,
         // which can last days. Any stashed nonce stays stashed. The lock is still re-read, so a third
         // party's `graceRelease` ends the loop instead of holding for a lock that is gone.
-        if let Ok(Some(hold)) = self.governance_hold(descriptor.proofSystemId).await {
+        if let Ok(Some(hold)) = self.governance_hold(proof_system_id).await {
             let was_published = self.has_abandoned_nonce(job_id);
             if let Ok((rec, _)) = self.read_job_record(job_id, lock_block).await {
                 if rec.status == JOB_STATUS_FULFILLED && rec.prover == self.address {
@@ -1861,6 +2093,69 @@ impl ChainClient {
                 was_published,
             ));
         }
+        // The DA throttle rules (witness-construction-jobs §5.5), for a hashed fulfil sent with them:
+        // estimate the exact transaction, then gate a re-send after a replacement, or a large
+        // fulfil's first send, on a backlog reading. A hold touches no nonce.
+        let da_run: Option<DaRun> = match (&call, da) {
+            (FulfilCall::Hashed(f), Some(cfg)) => {
+                let est = match crate::da::estimate_fulfil_da_bytes(
+                    self,
+                    job_id,
+                    f,
+                    &public_values,
+                    &crate::da::SealSpec::Exact(proof_bytes.clone()),
+                )
+                .await
+                {
+                    Ok(e) => e.estimated_bytes,
+                    Err(e) => {
+                        let tx = crate::da::conservative_fulfil_tx(
+                            self.chain_id,
+                            self.hemi_prove,
+                            call.calldata(job_id, &public_values, &proof_bytes),
+                        );
+                        let bound = crate::da::da_bytes_upper_bound(tx.len());
+                        tracing::warn!(
+                            "{what}: DA estimate for {job_id} failed ({e:#}); using the FastLZ upper \
+                             bound, {bound} bytes"
+                        );
+                        bound
+                    }
+                };
+                let large = est > crate::da::STANDARD_FULFIL_DA_BYTES;
+                let replaced = self.da_book().replaced(job_id);
+                let stashed = self.has_abandoned_nonce(job_id);
+                if replaced.is_some() || (large && !stashed) {
+                    let reading = cfg.backlog.read(self).await;
+                    let gate = match replaced {
+                        Some(r) => {
+                            let head = match reading.head {
+                                Some(h) => h,
+                                None => self.get_block_number().await.unwrap_or(r.head),
+                            };
+                            cfg.rule
+                                .resend(r.head, head, est, reading.backlog, reading.safe_lag_secs)
+                        }
+                        None => cfg.rule.presend(est, reading.backlog),
+                    };
+                    if let crate::da::Gate::Hold(why) = gate {
+                        tracing::info!("{what} for {job_id} held by the DA throttle: {why}");
+                        return Err(fail(
+                            FulfilClass::Keep,
+                            crate::da::DA_THROTTLE_HOLD_NAME.to_string(),
+                            format!("DA throttle: holding the fulfil — {why}"),
+                            replaced.is_some() || stashed,
+                        ));
+                    }
+                    if replaced.is_some() {
+                        tracing::info!("{what} for {job_id}: the DA throttle cleared — re-sending");
+                        self.da_book().clear_replaced(job_id);
+                    }
+                }
+                Some(DaRun { cfg, est, large })
+            }
+            _ => None,
+        };
         // Resume the nonce a previous attempt for THIS job left pending (so the re-publish replaces
         // it at the same nonce instead of queueing behind it), else reserve a fresh one.
         let (mut nonce, resumed) = match self.take_abandoned_nonce(job_id) {
@@ -1869,6 +2164,19 @@ impl ChainClient {
         };
         // A resumed nonce means an earlier attempt already broadcast this job's fulfil.
         let mut published = resumed;
+        // DA nonce rule: a large fulfil's first send goes out only as the highest pending nonce. A
+        // lower nonce we reserved is spent on a filler self-transfer (siblings hold nonces above it),
+        // and a fresh one taken; re-checked under the send lock below.
+        let mut fills: u32 = 0;
+        if da_run.as_ref().is_some_and(|d| d.large) && !resumed {
+            while !self.nonce_is_highest_reserved(nonce) && fills < DA_MAX_FILLS {
+                fills += 1;
+                if let Err(e) = self.fill_reserved_nonce(nonce).await {
+                    tracing::warn!("{e:#}");
+                }
+                nonce = self.reserve_nonce().await?;
+            }
+        }
         let (base_tip, base_max_fee) = self.base_fees().await;
         // Read once per invocation: bounds the fee ladder to what the node will admit (see
         // `job_path_bid`). Unknown → unbounded (the node's refusal is then the bound).
@@ -1878,14 +2186,10 @@ impl ChainClient {
             .await
             .ok()
             .map(|b| b.min(U256::from(u128::MAX)).to::<u128>());
-        let calldata_len = IHemiProveFulfill::fulfillJobCall {
-            jobId: job_id,
-            descriptor: descriptor.clone(),
-            publicValues: public_values.clone(),
-            proofBytes: proof_bytes.clone(),
-        }
-        .abi_encode()
-        .len();
+        // The exact calldata of the entry point used: what is sent, replayed, and sized for gas
+        // (the hashed form leaves `inputData` out, so its gas formula input is smaller).
+        let calldata = call.calldata(job_id, &public_values, &proof_bytes);
+        let calldata_len = calldata.len();
         let mut extra_gas: u64 = 0;
         let mut gas_bumps: u64 = 0;
 
@@ -1894,17 +2198,42 @@ impl ChainClient {
             attempt += 1;
             if budget.is_some_and(|b| started.elapsed() >= b) {
                 tracing::warn!(
-                    "fulfillJob budget reached for {job_id} after {} attempt(s)",
+                    "{what} budget reached for {job_id} after {} attempt(s)",
                     attempt - 1
                 );
                 break;
+            }
+            // DA nonce rule: a published large fulfil that stays unmined while the head advances (or
+            // the safe-head lag passes its limit) is replaced at its nonce by a self-transfer.
+            if let Some(d) = da_run.as_ref().filter(|d| d.large && published) {
+                match self.da_stuck_step(job_id, nonce, d).await {
+                    DaStep::Continue => {}
+                    DaStep::Replaced(why) => {
+                        // The nonce is spent by the self-transfer: nothing to stash.
+                        return Err(fail(
+                            FulfilClass::Keep,
+                            crate::da::DA_THROTTLE_HOLD_NAME.to_string(),
+                            why,
+                            true,
+                        ));
+                    }
+                    DaStep::Fulfilled => {
+                        self.abort_nonce(nonce);
+                        tracing::info!("Job {job_id} Fulfilled on-chain");
+                        return Ok(());
+                    }
+                    DaStep::Failed(why) => {
+                        self.stash_or_abort(job_id, nonce, published);
+                        return Err(fail(FulfilClass::Unknown, String::new(), why, published));
+                    }
+                }
             }
             // Hold while paused or while the job's adapter is Disabled: the send would revert
             // (EnforcedPause / RegistryPaused / AdapterDisabled) and publish the seal for nothing,
             // every round, for the whole window; the lock's clock is credited meanwhile.
             // (Attempt 1 was checked above, before the nonce was touched.)
             let later_hold = if attempt > 1 {
-                self.governance_hold(descriptor.proofSystemId).await
+                self.governance_hold(proof_system_id).await
             } else {
                 Ok(None)
             };
@@ -1926,7 +2255,7 @@ impl ChainClient {
             let (rec, _) = match self.read_job_record(job_id, lock_block).await {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!("fulfillJob: lock read for {job_id} failed: {e:#}");
+                    tracing::warn!("{what}: lock read for {job_id} failed: {e:#}");
                     if attempt < MAX_ATTEMPTS {
                         tokio::time::sleep(SEND_FAILURE_RETRY_WAIT).await;
                     }
@@ -1950,6 +2279,24 @@ impl ChainClient {
                     published,
                 ));
             }
+            // The router rebuilds the descriptor hash from the hashed fields: a mismatch would revert
+            // InvalidDescriptorHash after publishing the seal, so refuse it here, unsent.
+            if let FulfilCall::Hashed(f) = &call {
+                let rebuilt = f.descriptor_hash();
+                if rebuilt != rec.descriptor_hash {
+                    self.stash_or_abort(job_id, nonce, published);
+                    return Err(fail(
+                        FulfilClass::ProofDefect,
+                        "InvalidDescriptorHash".to_string(),
+                        format!(
+                            "the hashed descriptor rebuilds {rebuilt}, the job's descriptorHash is {} \
+                             — not publishing",
+                            rec.descriptor_hash
+                        ),
+                        published,
+                    ));
+                }
+            }
             let gas = self
                 .fulfill_gas_limit
                 .max(fulfill_gas_formula(
@@ -1963,68 +2310,81 @@ impl ChainClient {
             // The bid is at its ceiling: a re-publish is byte-identical, so the node answers "already
             // known" and there is nothing to bump.
             let mut held = false;
+            // DA nonce rule: the first send of a large fulfil only as the highest pending nonce.
+            let must_be_highest = da_run.as_ref().is_some_and(|d| d.large) && !published;
             let send_result = {
                 let _guard = self.tx_lock.lock().await;
-                let mut tx = fulfill
-                    .fulfillJob(
-                        job_id,
-                        descriptor.clone(),
-                        public_values.clone(),
-                        proof_bytes.clone(),
-                    )
-                    .nonce(nonce)
-                    // Explicit gas limit (never `eth_estimateGas`: an estimate shows the seal to the
-                    // RPC operator, and the router's settlement preflight reverts
-                    // InsufficientGasForFullSettlement if under-provisioned).
-                    .gas(gas);
-                if base_max_fee > 0 {
-                    let (tip, seed_max_fee) = escalated_fees(base_tip, base_max_fee, attempt);
-                    // The fulfil climbs (>= 12.5% per re-publish) toward the key-wide ceiling but
-                    // stops RELEASE_DISPLACE_RUNGS rungs below the cap, then keeps re-publishing at
-                    // that level: the same-nonce release must always be able to out-bid it.
-                    let affordable = balance
-                        .map_or(u128::MAX, |b| (b / 10 * 9).min(TX_FEE_CAP_WEI) / u128::from(gas.max(1)));
-                    let (tip, max_fee) = match job_path_bid(
-                        self.nonce_fee_floor_state(nonce),
-                        tip,
-                        seed_max_fee,
-                        self.fee_ceiling,
-                        RELEASE_DISPLACE_RUNGS,
-                        affordable,
-                    ) {
-                        JobBid::Send(t, m) => (t, m),
-                        JobBid::Hold(t, m) => {
-                            held = true;
-                            (t, m)
-                        }
-                        JobBid::Exhausted => {
-                            if let Some(st) = self.nonce_fee_floor_state(nonce) {
-                                log_fee_cap_exhausted("fulfillJob", nonce, &st);
+                if must_be_highest && fills < DA_MAX_FILLS && !self.nonce_is_highest_reserved(nonce)
+                {
+                    None
+                } else {
+                    let mut tx = alloy::contract::CallBuilder::new_raw(&*self.provider, calldata.clone())
+                        .to(self.hemi_prove)
+                        .nonce(nonce)
+                        // Explicit gas limit (never `eth_estimateGas`: an estimate shows the seal to the
+                        // RPC operator, and the router's settlement preflight reverts
+                        // InsufficientGasForFullSettlement if under-provisioned).
+                        .gas(gas);
+                    if base_max_fee > 0 {
+                        let (tip, seed_max_fee) = escalated_fees(base_tip, base_max_fee, attempt);
+                        // The fulfil climbs (>= 12.5% per re-publish) toward the key-wide ceiling but
+                        // stops RELEASE_DISPLACE_RUNGS rungs below the cap, then keeps re-publishing at
+                        // that level: the same-nonce release must always be able to out-bid it.
+                        let affordable = balance
+                            .map_or(u128::MAX, |b| (b / 10 * 9).min(TX_FEE_CAP_WEI) / u128::from(gas.max(1)));
+                        let (tip, max_fee) = match job_path_bid(
+                            self.nonce_fee_floor_state(nonce),
+                            tip,
+                            seed_max_fee,
+                            self.fee_ceiling,
+                            RELEASE_DISPLACE_RUNGS,
+                            affordable,
+                        ) {
+                            JobBid::Send(t, m) => (t, m),
+                            JobBid::Hold(t, m) => {
+                                held = true;
+                                (t, m)
                             }
-                            // Do NOT hand this nonce to the gap healer: its self-transfer would evict
-                            // OUR OWN pending fulfil (seal already public, lock unsettled). Keep it
-                            // stashed for this job so the next attempt or a release resumes it. A
-                            // nonce we never published at carries someone ELSE's resident: leave it
-                            // unresolved (healable) rather than recycle it into `freed`, where the
-                            // next reserver would draw the same poisoned nonce and bail again.
-                            self.note_nonce_undisplaceable(nonce);
-                            if published {
-                                self.stash_abandoned_nonce(job_id, nonce);
-                            } else {
-                                self.note_nonce_unresolved(nonce);
+                            JobBid::Exhausted => {
+                                if let Some(st) = self.nonce_fee_floor_state(nonce) {
+                                    log_fee_cap_exhausted(what, nonce, &st);
+                                }
+                                // Do NOT hand this nonce to the gap healer: its self-transfer would evict
+                                // OUR OWN pending fulfil (seal already public, lock unsettled). Keep it
+                                // stashed for this job so the next attempt or a release resumes it. A
+                                // nonce we never published at carries someone ELSE's resident: leave it
+                                // unresolved (healable) rather than recycle it into `freed`, where the
+                                // next reserver would draw the same poisoned nonce and bail again.
+                                self.note_nonce_undisplaceable(nonce);
+                                if published {
+                                    self.stash_abandoned_nonce(job_id, nonce);
+                                } else {
+                                    self.note_nonce_unresolved(nonce);
+                                }
+                                return Err(fail(
+                                    FulfilClass::Unknown,
+                                    String::new(),
+                                    format!("{FEE_CAP_EXHAUSTED} at nonce {nonce} ({what})"),
+                                    published,
+                                ));
                             }
-                            return Err(fail(
-                                FulfilClass::Unknown,
-                                String::new(),
-                                format!("{FEE_CAP_EXHAUSTED} at nonce {nonce} (fulfillJob)"),
-                                published,
-                            ));
-                        }
-                    };
-                    bid = Some((tip, max_fee, seed_max_fee));
-                    tx = tx.max_priority_fee_per_gas(tip).max_fee_per_gas(max_fee);
+                        };
+                        bid = Some((tip, max_fee, seed_max_fee));
+                        tx = tx.max_priority_fee_per_gas(tip).max_fee_per_gas(max_fee);
+                    }
+                    Some(tx.send().await)
                 }
-                tx.send().await
+            };
+            let Some(send_result) = send_result else {
+                // A sibling reserved a nonce above ours since the check before the loop: spend ours
+                // on a filler and take a fresh one. Not a send attempt.
+                fills += 1;
+                if let Err(e) = self.fill_reserved_nonce(nonce).await {
+                    tracing::warn!("{e:#}");
+                }
+                nonce = self.reserve_nonce().await?;
+                attempt -= 1;
+                continue;
             };
 
             let pending = match send_result {
@@ -2032,6 +2392,22 @@ impl ChainClient {
                     published = true;
                     if let Some((t, m, seed)) = bid {
                         self.note_broadcast_fee(nonce, t, m, seed);
+                    }
+                    // The DA rules track each accepted hashed fulfil from its first acceptance's
+                    // head (re-publishes at the same nonce keep it).
+                    if let Some(d) = &da_run {
+                        let tracked = self.da_book().get(nonce).is_some_and(|s| s.job_id == job_id);
+                        if !tracked {
+                            match self.provider.get_block_number().await {
+                                Ok(head) => {
+                                    self.da_book().note_accepted(job_id, nonce, d.est, head);
+                                }
+                                Err(e) => tracing::debug!(
+                                    "{what}: head read after the send failed ({e:#}); tracking \
+                                     nonce {nonce} from the next publish"
+                                ),
+                            }
+                        }
                     }
                     p
                 }
@@ -2046,7 +2422,7 @@ impl ChainClient {
                             // receipt does, rather than burn the remaining attempts (and the shared RPC
                             // budget) in seconds re-sending the same bytes.
                             tracing::info!(
-                                "fulfillJob at nonce {nonce} is pending at its fee ceiling (attempt \
+                                "{what} at nonce {nonce} is pending at its fee ceiling (attempt \
                                  {attempt}/{MAX_ATTEMPTS}) — waiting for it"
                             );
                             let mut poll_end = std::time::Instant::now() + FULFIL_HELD_WAIT;
@@ -2066,7 +2442,7 @@ impl ChainClient {
                             }
                             continue;
                         }
-                        tracing::warn!("fulfillJob replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — bumping fee, keeping nonce");
+                        tracing::warn!("{what} replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — bumping fee, keeping nonce");
                         if attempt < MAX_ATTEMPTS {
                             tokio::time::sleep(nonce_retry_backoff(
                                 attempt,
@@ -2078,7 +2454,7 @@ impl ChainClient {
                         continue;
                     }
                     if is_nonce_error(&raw) {
-                        tracing::warn!("fulfillJob nonce error (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — re-syncing");
+                        tracing::warn!("{what} nonce error (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — re-syncing");
                         let rejected = nonce;
                         self.abort_nonce(nonce);
                         self.resync_nonce().await.ok();
@@ -2088,7 +2464,7 @@ impl ChainClient {
                                 progressed = n != rejected;
                                 nonce = n;
                             }
-                            Err(e) => tracing::warn!("fulfillJob nonce re-sync failed (attempt {attempt}/{MAX_ATTEMPTS}): {e:#} — retrying"),
+                            Err(e) => tracing::warn!("{what} nonce re-sync failed (attempt {attempt}/{MAX_ATTEMPTS}): {e:#} — retrying"),
                         }
                         if attempt < MAX_ATTEMPTS {
                             tokio::time::sleep(nonce_retry_backoff(
@@ -2107,7 +2483,7 @@ impl ChainClient {
                         if class == FulfilClass::Gas && gas_bumps < MAX_GAS_BUMPS {
                             gas_bumps += 1;
                             extra_gas += FULFIL_GAS_BUMP;
-                            tracing::warn!("fulfillJob preflight {} — resending with +{FULFIL_GAS_BUMP} gas", d.name());
+                            tracing::warn!("{what} preflight {} — resending with +{FULFIL_GAS_BUMP} gas", d.name());
                             continue;
                         }
                         if class == FulfilClass::Stale {
@@ -2132,7 +2508,7 @@ impl ChainClient {
                                 }
                                 other => {
                                     tracing::warn!(
-                                        "fulfillJob preflight {} for {job_id}, but jobs() at or after the \
+                                        "{what} preflight {} for {job_id}, but jobs() at or after the \
                                          lock block {} — a lagging preflight node; retrying",
                                         d.name(),
                                         if other.is_ok() { "still shows our lock" } else { "is unreadable" }
@@ -2150,7 +2526,7 @@ impl ChainClient {
                     if is_funds_refusal(&raw) {
                         self.note_funds_short();
                     }
-                    tracing::warn!("fulfillJob send failed (attempt {attempt}/{MAX_ATTEMPTS}): {msg}");
+                    tracing::warn!("{what} send failed (attempt {attempt}/{MAX_ATTEMPTS}): {msg}");
                     if attempt < MAX_ATTEMPTS {
                         tokio::time::sleep(SEND_FAILURE_RETRY_WAIT).await;
                     }
@@ -2159,7 +2535,7 @@ impl ChainClient {
             };
             let tx_hash = *pending.tx_hash();
             tracing::info!(
-                "fulfillJob tx sent (attempt {attempt}/{MAX_ATTEMPTS}, gas {gas}): {tx_hash:?}, waiting for receipt..."
+                "{what} tx sent (attempt {attempt}/{MAX_ATTEMPTS}, gas {gas}): {tx_hash:?}, waiting for receipt..."
             );
 
             // Short per-attempt wait (FULFIL_RECEIPT_WAIT, ~3 blocks), not the generic 120 s: an
@@ -2189,19 +2565,14 @@ impl ChainClient {
                         return Err(fail(
                             FulfilClass::Unknown,
                             String::new(),
-                            format!("fulfillJob {tx_hash:?} mined but emitted no JobFulfilled for {job_id}"),
+                            format!("{what} {tx_hash:?} mined but emitted no JobFulfilled for {job_id}"),
                             true,
                         ));
                     }
                     // A mined revert: replay the identical call (same gas) at its block for the
                     // reason — the calldata is already public, so the replay exposes nothing new.
-                    let sim = fulfill
-                        .fulfillJob(
-                            job_id,
-                            descriptor.clone(),
-                            public_values.clone(),
-                            proof_bytes.clone(),
-                        )
+                    let sim = alloy::contract::CallBuilder::new_raw(&*self.provider, calldata.clone())
+                        .to(self.hemi_prove)
                         .from(self.address)
                         .gas(gas)
                         .block(BlockId::number(receipt_block))
@@ -2222,13 +2593,13 @@ impl ChainClient {
                         Ok(_) => (
                             FulfilClass::Unknown,
                             String::new(),
-                            format!("fulfillJob {tx_hash:?} reverted but replays cleanly at block {receipt_block}"),
+                            format!("{what} {tx_hash:?} reverted but replays cleanly at block {receipt_block}"),
                         ),
                     };
                     if class == FulfilClass::Gas && gas_bumps < MAX_GAS_BUMPS {
                         gas_bumps += 1;
                         extra_gas += FULFIL_GAS_BUMP;
-                        tracing::warn!("fulfillJob {tx_hash:?} reverted {reason} — resending with +{FULFIL_GAS_BUMP} gas");
+                        tracing::warn!("{what} {tx_hash:?} reverted {reason} — resending with +{FULFIL_GAS_BUMP} gas");
                         nonce = self.reserve_nonce().await?;
                         continue;
                     }
@@ -2236,7 +2607,7 @@ impl ChainClient {
                 }
                 None => {
                     tracing::warn!(
-                        "fulfillJob receipt not confirmed (attempt {attempt}/{MAX_ATTEMPTS}, tx {tx_hash:?}); \
+                        "{what} receipt not confirmed (attempt {attempt}/{MAX_ATTEMPTS}, tx {tx_hash:?}); \
                          polling on-chain state before re-broadcast"
                     );
                     let mut poll_end = std::time::Instant::now() + FULFIL_STATE_POLL;
@@ -2278,7 +2649,7 @@ impl ChainClient {
         Err(fail(
             FulfilClass::Unknown,
             String::new(),
-            format!("fulfillJob not confirmed after {attempt} attempt(s) (RPC may be dropping txs)"),
+            format!("{what} not confirmed after {attempt} attempt(s) (RPC may be dropping txs)"),
             published,
         ))
     }
@@ -2357,6 +2728,73 @@ impl ChainClient {
             self.stash_abandoned_nonce(job_id, nonce);
         } else {
             self.abort_nonce(nonce);
+        }
+    }
+
+    /// The DA nonce rule's detector, once per send attempt of a published large fulfil at `nonce`:
+    /// observe the head, the mined count and the safe-head lag; past the head-advance threshold,
+    /// read the backlog for evidence that the throttle may be what holds it; replace it by a
+    /// self-transfer when [`crate::da::NonceRuleConfig::verdict`] says so.
+    async fn da_stuck_step(&self, job_id: B256, nonce: u64, d: &DaRun<'_>) -> DaStep {
+        let entry = self.da_book().get(nonce);
+        let Some(entry) = entry.filter(|e| e.job_id == job_id) else {
+            return DaStep::Continue;
+        };
+        let obs = match self.observe_pending().await {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::debug!("DA detector read failed ({e:#}); checking again next attempt");
+                return DaStep::Continue;
+            }
+        };
+        let rule = d.cfg.rule;
+        let unmined = obs.head.saturating_sub(entry.first_accepted_head);
+        // Only read the backlog when it can change the verdict (past the head-advance threshold).
+        let filter = if rule.require_da_evidence && unmined >= rule.unmined_blocks.max(1) {
+            d.cfg.backlog.read(self).await.backlog.would_filter(d.est)
+        } else {
+            None
+        };
+        let reason = match rule.verdict(nonce, entry.first_accepted_head, obs, filter) {
+            crate::da::StuckVerdict::Mined | crate::da::StuckVerdict::Waiting { .. } => {
+                return DaStep::Continue
+            }
+            crate::da::StuckVerdict::Replace(reason) => reason,
+        };
+        tracing::warn!(
+            "PAGE: PENDING-UNMINED — the {}-byte (estimated DA) fulfil of {job_id} at nonce {nonce} \
+             is {reason}: the DA throttle may be filtering it, and every later nonce of this key waits \
+             behind it",
+            d.est
+        );
+        match self.replace_with_self_transfer(nonce).await {
+            Ok(confirmed) => {
+                self.da_book().note_replaced(
+                    job_id,
+                    crate::da::Replaced {
+                        nonce,
+                        head: obs.head,
+                        estimated_bytes: d.est,
+                    },
+                );
+                DaStep::Replaced(format!(
+                    "DA nonce rule: the fulfil at nonce {nonce} was {reason}; replaced by a \
+                     self-transfer{} — it is re-sent once the throttle clears",
+                    if confirmed { "" } else { " (not yet confirmed)" }
+                ))
+            }
+            Err(e) => {
+                // The fulfil may have mined first (the replacement then meets "nonce too low").
+                if let Ok((rec, _)) = self.read_job_record(job_id, None).await {
+                    if rec.status == JOB_STATUS_FULFILLED && rec.prover == self.address {
+                        return DaStep::Fulfilled;
+                    }
+                }
+                DaStep::Failed(format!(
+                    "DA nonce rule: the fulfil at nonce {nonce} was {reason}, and replacing it failed: \
+                     {e:#}"
+                ))
+            }
         }
     }
 
@@ -3402,5 +3840,182 @@ mod job_path_bid_tests {
             job_path_bid(st((10, 1_000), 8_000), 0, 0, 4_000_000, RELEASE_DISPLACE_RUNGS, 1_100),
             JobBid::Hold(10, 1_000)
         );
+    }
+}
+
+#[cfg(test)]
+mod hashed_fulfil_tests {
+    use super::{
+        fulfill_gas_formula, fulfill_job_hashed_calldata, FulfilCall, HashedFulfil,
+    };
+    use alloy::dyn_abi::{DynSolValue, JsonAbiExt};
+    use alloy::primitives::{keccak256, Address, Bytes, B256};
+    use alloy::sol_types::SolCall;
+    use zkminer_contracts::bindings::{IHemiProveFulfill, JobDescriptor};
+
+    /// A descriptor with a large, recognizable `inputData` (a witness-job envelope can be up to the
+    /// router's 64 KB), non-empty extras and a FIELDS binding.
+    fn descriptor(input_len: usize) -> JobDescriptor {
+        JobDescriptor {
+            programId: B256::repeat_byte(0x11),
+            proofSystemId: B256::repeat_byte(0x22),
+            callbackContract: Address::repeat_byte(0x33),
+            assignedProver: Address::repeat_byte(0x44),
+            tag: B256::repeat_byte(0x55),
+            inputData: (0..input_len).map(|i| (i % 251) as u8 ^ 0xa5).collect::<Vec<u8>>().into(),
+            callbackExtraData: Bytes::from_static(b"callback extra data"),
+            extraVerifierData: Bytes::from_static(b"extra verifier data, ignored by risc0"),
+            expectedJournalHash: B256::repeat_byte(0x66),
+            journalFields: B256::repeat_byte(0x77),
+        }
+    }
+
+    fn router_abi() -> alloy::json_abi::JsonAbi {
+        let path = format!(
+            "{}/../../hemiprove-abi/HemiProveRouter.abi.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the vendored ABI"))
+            .expect("parse the vendored ABI")
+    }
+
+    #[test]
+    fn the_hashed_calldata_matches_the_deployed_abi() {
+        let d = descriptor(4_096);
+        let f = HashedFulfil::from_descriptor(&d);
+        let job = B256::repeat_byte(0x99);
+        let journal = b"journal bytes".to_vec();
+        let seal = vec![0xe7u8; 260];
+        let calldata = fulfill_job_hashed_calldata(job, &f, &journal, &seal);
+        // An independent encoder: the vendored c8333aa ABI's own types, through dyn-abi.
+        let abi = router_abi();
+        let func = &abi.function("fulfillJobHashed").expect("fulfillJobHashed in the ABI")[0];
+        let fb = |b: B256| DynSolValue::FixedBytes(b, 32);
+        let want = func
+            .abi_encode_input(&[
+                fb(job),
+                DynSolValue::Tuple(vec![
+                    fb(d.programId),
+                    fb(d.proofSystemId),
+                    DynSolValue::Address(d.callbackContract),
+                    DynSolValue::Address(d.assignedProver),
+                    fb(d.tag),
+                    fb(keccak256(&d.inputData)),
+                    fb(d.expectedJournalHash),
+                    fb(d.journalFields),
+                ]),
+                DynSolValue::Bytes(d.callbackExtraData.to_vec()),
+                DynSolValue::Bytes(d.extraVerifierData.to_vec()),
+                DynSolValue::Bytes(journal.clone()),
+                DynSolValue::Bytes(seal.clone()),
+            ])
+            .expect("encode with the ABI");
+        assert_eq!(calldata.to_vec(), want);
+        assert_eq!(calldata[..4], func.selector().0);
+        // It round-trips through the binding, field for field.
+        let back = IHemiProveFulfill::fulfillJobHashedCall::abi_decode(&calldata).unwrap();
+        assert_eq!(back.jobId, job);
+        assert_eq!(back.hashedDesc, f.hashed);
+        assert_eq!(back.callbackExtraData, d.callbackExtraData);
+        assert_eq!(back.extraVerifierData, d.extraVerifierData);
+        assert_eq!(back.publicValues.to_vec(), journal);
+        assert_eq!(back.proofBytes.to_vec(), seal);
+        // The private dispatcher sends exactly this.
+        let pv = Bytes::from(journal);
+        let pb = Bytes::from(seal);
+        assert_eq!(FulfilCall::Hashed(f).calldata(job, &pv, &pb), calldata);
+    }
+
+    #[test]
+    fn input_data_is_not_in_the_hashed_calldata() {
+        let d = descriptor(65_000);
+        let f = HashedFulfil::from_descriptor(&d);
+        let job = B256::repeat_byte(0x99);
+        let (pv, pb) = (Bytes::from_static(b"journal"), Bytes::from(vec![0xe7u8; 260]));
+        let hashed = FulfilCall::Hashed(f.clone()).calldata(job, &pv, &pb);
+        let full = FulfilCall::Full(d.clone()).calldata(job, &pv, &pb);
+        let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+        // Not one 32-byte window of inputData appears in the hashed form; it does in the full one.
+        let probe = &d.inputData[1_000..1_032];
+        assert!(contains(&full, probe));
+        assert!(!contains(&hashed, probe));
+        for chunk in d.inputData.chunks(32).filter(|c| c.len() == 32) {
+            assert!(!contains(&hashed, chunk));
+        }
+        // Only its hash travels, in the hashed descriptor.
+        assert!(contains(&hashed, keccak256(&d.inputData).as_slice()));
+        assert_eq!(f.hashed.inputDataHash, keccak256(&d.inputData));
+        // The extras still travel raw: the router hashes them itself.
+        assert!(contains(&hashed, &d.callbackExtraData));
+        assert!(contains(&hashed, &d.extraVerifierData));
+        // ~65 KB less calldata: the gas formula's 16/byte term drops by the same amount.
+        assert!(full.len() - hashed.len() >= 65_000 - 64, "{} vs {}", full.len(), hashed.len());
+        let (gf, gh) = (
+            fulfill_gas_formula(0, full.len(), pv.len()),
+            fulfill_gas_formula(0, hashed.len(), pv.len()),
+        );
+        assert_eq!(gf - gh, 16 * (full.len() - hashed.len()) as u64);
+    }
+
+    /// `run.rs` spawns the fulfil and gate futures on tokio: they must be `Send` (no `std` mutex
+    /// guard of the DA book held across an await). Compile-time only.
+    #[allow(dead_code)]
+    fn the_da_futures_are_send(
+        c: &crate::client::ChainClient,
+        f: HashedFulfil,
+        da: &super::FulfilDa,
+        reader: &crate::da::BacklogReader,
+    ) {
+        fn send<T: Send>(_: T) {}
+        send(c.fulfill_job_hashed(B256::ZERO, f.clone(), Bytes::new(), Bytes::new(), None, None, Some(da)));
+        send(c.fulfill_job(B256::ZERO, descriptor(0), Bytes::new(), Bytes::new(), None, None));
+        send(reader.read(c));
+        send(crate::da::estimate_fulfil_da_bytes(
+            c,
+            B256::ZERO,
+            &f,
+            &[],
+            &crate::da::SealSpec::risc0_groth16(),
+        ));
+        send(c.claimability(B256::ZERO, Address::ZERO));
+        send(c.observe_pending());
+        send(c.replace_with_self_transfer(0));
+        send(c.fill_reserved_nonce(0));
+    }
+
+    #[test]
+    fn the_rebuilt_descriptor_hash_is_the_submitted_one() {
+        // `_hashDescriptorFields` from the hashed fields equals submit's hash of the full descriptor.
+        for len in [0usize, 1, 31, 32, 33, 4_096] {
+            let mut d = descriptor(len);
+            assert_eq!(
+                HashedFulfil::from_descriptor(&d).descriptor_hash(),
+                crate::descriptor::compute_descriptor_hash(&d),
+                "inputData of {len} bytes"
+            );
+            d.callbackExtraData = Bytes::new();
+            d.extraVerifierData = Bytes::new();
+            d.journalFields = B256::ZERO;
+            assert_eq!(
+                HashedFulfil::from_descriptor(&d).descriptor_hash(),
+                crate::descriptor::compute_descriptor_hash(&d)
+            );
+        }
+        // Every field is bound: changing any one changes the hash.
+        let d = descriptor(100);
+        let base = HashedFulfil::from_descriptor(&d);
+        let h0 = base.descriptor_hash();
+        let mut f = base.clone();
+        f.hashed.inputDataHash = B256::ZERO;
+        assert_ne!(f.descriptor_hash(), h0);
+        let mut f = base.clone();
+        f.callback_extra_data = Bytes::from_static(b"other");
+        assert_ne!(f.descriptor_hash(), h0);
+        let mut f = base.clone();
+        f.extra_verifier_data = Bytes::new();
+        assert_ne!(f.descriptor_hash(), h0);
+        let mut f = base;
+        f.hashed.journalFields = B256::ZERO;
+        assert_ne!(f.descriptor_hash(), h0);
     }
 }

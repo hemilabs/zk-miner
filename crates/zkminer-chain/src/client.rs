@@ -93,6 +93,10 @@ pub struct ChainClient {
     /// otherwise get a fresh nonce and queue behind the stuck fulfill → strand).
     abandoned_fulfill_nonces:
         Arc<std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, u64>>>,
+    /// This key's hashed fulfils as the DA throttle rules track them (witness-construction-jobs
+    /// §5.5): each accepted fulfil's estimated DA bytes and first-acceptance head, and the large
+    /// fulfils replaced by a self-transfer awaiting a re-send. Shared across clones.
+    da_book: Arc<std::sync::Mutex<crate::da::DaSendBook>>,
     /// Short-TTL cache of ProgramRegistry metadata keyed by programId. Shared across clones.
     pub(crate) program_info_cache: Arc<std::sync::Mutex<ProgramInfoCache>>,
     /// Counts every JSON-RPC request sent to the endpoint (total + rolling minute).
@@ -478,6 +482,7 @@ impl ChainClient {
             submit_tx_cache: Arc::new(std::sync::Mutex::new(SubmitTxCache::default())),
             nonce_mgr: Arc::new(crate::nonce::NonceManager::new()),
             abandoned_fulfill_nonces: Arc::new(std::sync::Mutex::new(Default::default())),
+            da_book: Arc::new(std::sync::Mutex::new(Default::default())),
             rpc_meter,
         })
     }
@@ -1329,6 +1334,87 @@ impl ChainClient {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .contains_key(&job_id)
+    }
+
+    // ── The DA nonce rule (witness-construction-jobs §5.5) ──────────────────────────────────
+    //
+    // Hemi's sequencer leaves a transaction above the batcher's per-transaction DA cap out of its
+    // blocks, and every later nonce of its sender with it. So a LARGE fulfil goes out only as this
+    // key's highest pending nonce, and one that stays unmined is replaced at its nonce by a minimal
+    // self-transfer so later nonces proceed (`jobs::fulfill_job_hashed` drives this; `crate::da`
+    // holds the decisions and the detector).
+
+    /// This key's DA bookkeeping (see [`crate::da::DaSendBook`]). Never hold the guard across an
+    /// `.await`.
+    pub fn da_book(&self) -> std::sync::MutexGuard<'_, crate::da::DaSendBook> {
+        self.da_book.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Whether `nonce` is the highest nonce this process has handed out: no transaction of ours can
+    /// be pending above it. Call it under [`Self::tx_lock`] right before the send — a sibling that
+    /// reserves later sends after us, behind the lock.
+    pub fn nonce_is_highest_reserved(&self, nonce: u64) -> bool {
+        self.nonce_mgr.peek_next() == Some(nonce.saturating_add(1))
+    }
+
+    /// Use up a nonce this task reserved but must not spend on a large fulfil (siblings already hold
+    /// nonces above it, so a large fulfil there would not be the highest pending one): a 0-value,
+    /// 21,000-gas self-transfer at the ordinary fees, lifted over anything already broadcast at it.
+    /// About 100 estimated DA bytes, so the throttle never holds it, and the siblings above proceed.
+    /// The nonce is spent on success; on a refused send it is recycled.
+    pub async fn fill_reserved_nonce(&self, nonce: u64) -> Result<alloy::primitives::B256> {
+        let (base_tip, base_max_fee) = self.base_fees().await;
+        let over = |v: u128| v.saturating_add((v / 8).max(1));
+        let (tip, max_fee) = match self.nonce_mgr.fee_floor_state(nonce) {
+            Some(st) => (
+                base_tip.max(over(st.broadcast.0)),
+                base_max_fee.max(over(st.broadcast.1)),
+            ),
+            None => (base_tip, base_max_fee),
+        };
+        let max_fee = max_fee.max(tip);
+        let tx = alloy::rpc::types::TransactionRequest::default()
+            .to(self.address)
+            .value(alloy::primitives::U256::ZERO)
+            .nonce(nonce)
+            .gas_limit(21_000)
+            .max_priority_fee_per_gas(tip)
+            .max_fee_per_gas(max_fee);
+        let sent = {
+            let _guard = self.tx_lock.lock().await;
+            self.provider.send_transaction(tx).await
+        };
+        match sent {
+            Ok(p) => {
+                self.nonce_mgr.note_broadcast(nonce, tip, max_fee, base_max_fee);
+                tracing::info!(
+                    "DA nonce rule: nonce {nonce} sits below other reserved nonces — spent it on a \
+                     self-transfer ({:?}) so the large fulfil goes out as the highest pending nonce",
+                    p.tx_hash()
+                );
+                Ok(*p.tx_hash())
+            }
+            Err(e) => {
+                self.nonce_mgr.abort(nonce);
+                anyhow::bail!("DA nonce rule: filler self-transfer at nonce {nonce} refused: {e:#}")
+            }
+        }
+    }
+
+    /// Replace OUR pending transaction at `nonce` (a large fulfil the DA throttle may be filtering)
+    /// by a minimal self-transfer at a bumped fee, so every later nonce of this key proceeds. This is
+    /// the gap healer's fill ([`Self::heal_nonce_gap_at`]): a 21,000-gas self-transfer lifted 12.5%
+    /// over the highest fee broadcast at the nonce, within the heal ceiling. `Ok(true)` once it is
+    /// mined (or plugged in the mempool, above the frontier); `Ok(false)` if sent but unconfirmed
+    /// (the nonce stays visible to the gap watchdog); `Err` if the send was refused (e.g. "nonce too
+    /// low": the transaction mined first) or no out-bid is possible within the heal ceiling (the
+    /// nonce is then marked undisplaceable, which shuts the claim gate via
+    /// [`Self::signer_is_jammed`]).
+    pub async fn replace_with_self_transfer(&self, nonce: u64) -> Result<bool> {
+        tracing::warn!(
+            "DA nonce rule: replacing our unmined transaction at nonce {nonce} with a self-transfer"
+        );
+        self.heal_nonce_gap_at(nonce).await
     }
 
     /// Base EIP-1559 fees used to SEED per-attempt fee escalation on tx re-broadcasts.
