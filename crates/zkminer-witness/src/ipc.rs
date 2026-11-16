@@ -161,6 +161,9 @@ pub struct BuilderSummary {
     pub transient: bool,
     pub fetches: u32,
     pub fetch_bytes: u64,
+    /// Fuel consumed, start function included; [`FUEL_USED_UNKNOWN`] when the runner cannot know it:
+    /// after the epoch interrupt (wasmtime does not save its fuel counter before that trap), and when
+    /// the waiting thread reports alone (a stuck or panicked execution thread).
     pub fuel_used: u64,
     pub witness_bytes: u64,
     pub compile_ms: u32,
@@ -169,6 +172,29 @@ pub struct BuilderSummary {
 
 pub const BUILDER_SUMMARY_MAGIC: [u8; 4] = *b"WBS1";
 pub const BUILDER_SUMMARY_BYTES: usize = 48;
+/// [`BuilderSummary::fuel_used`] when the fuel consumed is not known.
+pub const FUEL_USED_UNKNOWN: u64 = u64::MAX;
+/// The most a runner writes to its summary pipe: the marker and the summary. A reader stops there.
+pub const SUMMARY_PIPE_MAX_BYTES: usize = 1 + BUILDER_SUMMARY_BYTES;
+
+/// Writes [`abi::MODULE_STARTED_MARKER`](crate::abi::MODULE_STARTED_MARKER) to the summary pipe (the
+/// runner, once, just before instantiation).
+pub fn write_module_started(w: &mut impl Write) -> io::Result<()> {
+    w.write_all(&[crate::abi::MODULE_STARTED_MARKER])?;
+    w.flush()
+}
+
+/// Everything a runner wrote to its summary pipe, read to EOF (at most [`SUMMARY_PIPE_MAX_BYTES`]):
+/// whether the module started (the marker is the first byte), and the summary if exactly one
+/// well-formed summary follows. A missing or malformed summary (`None`) after the marker is still
+/// `started`: the module may have run.
+pub fn decode_summary_pipe(bytes: &[u8]) -> (bool, Option<BuilderSummary>) {
+    let (started, rest) = match bytes.split_first() {
+        Some((&crate::abi::MODULE_STARTED_MARKER, rest)) => (true, rest),
+        _ => (false, bytes),
+    };
+    (started, BuilderSummary::decode(rest))
+}
 
 impl BuilderSummary {
     pub fn encode(&self) -> [u8; BUILDER_SUMMARY_BYTES] {
@@ -296,11 +322,17 @@ pub enum ArtifactFailure {
     NotConfigured,
     EmptyManifest,
     /// Structural failure, permanent for the manifest address when read at or below the safe head.
-    ManifestInvalid { at_or_below_safe: bool },
+    ManifestInvalid {
+        at_or_below_safe: bool,
+    },
     IdMismatch,
-    ChunkInvalid { at_or_below_safe: bool },
+    ChunkInvalid {
+        at_or_below_safe: bool,
+    },
     /// The chunks assembled to bytes that do not hash to the manifest's own sha256.
-    HashMismatch { at_or_below_safe: bool },
+    HashMismatch {
+        at_or_below_safe: bool,
+    },
     TooLarge,
     Endpoint,
     Budget,
@@ -313,7 +345,9 @@ pub enum ArtifactFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlResponse {
-    Registered { job_key: B256 },
+    Registered {
+        job_key: B256,
+    },
     /// The broker's account of a job, sent in answer to `EndJob`. `transient` = some fetch returned
     /// status 2; `fetch_in_flight_at_end` = a fetch was still being served when the job ended.
     JobStats {
@@ -332,17 +366,31 @@ pub enum ControlResponse {
         #[serde(default)]
         cached: bool,
     },
-    ArtifactFailed { failure: ArtifactFailure },
-    SelfTest { ok: bool, checks: Vec<(SelfTestCheck, bool)> },
-    Error { code: ControlErrorCode },
+    ArtifactFailed {
+        failure: ArtifactFailure,
+    },
+    SelfTest {
+        ok: bool,
+        checks: Vec<(SelfTestCheck, bool)>,
+    },
+    Error {
+        code: ControlErrorCode,
+    },
     /// One entry per `CheckProvisioned` source, in order.
-    Provisioned { ok: Vec<bool> },
+    Provisioned {
+        ok: Vec<bool>,
+    },
     /// Interim answer to a `hemi-code` `FetchArtifact` (same id), sent after the manifest passed and
     /// before any chunk is read (plan §13.4 step 3): `length` bytes and `chunks` chunk reads (`chunks
     /// + 1` reads with the manifest). The broker waits for a `ChargeDecision`.
-    ArtifactCharge { length: u64, chunks: u32 },
+    ArtifactCharge {
+        length: u64,
+        chunks: u32,
+    },
     /// `RefreshPrefixes` applied: the number of prefixes now in the floor.
-    PrefixesRefreshed { count: u32 },
+    PrefixesRefreshed {
+        count: u32,
+    },
 }
 
 /// The broker's self-test checks (plan §10.3): a fixed set, no broker-supplied strings.
@@ -423,7 +471,16 @@ mod tests {
 
     #[test]
     fn summary_round_trip() {
-        let s = BuilderSummary { exit_code: exit::FUEL, transient: true, fetches: 7, fetch_bytes: 99, fuel_used: 5, witness_bytes: 3, compile_ms: 1, run_ms: 2 };
+        let s = BuilderSummary {
+            exit_code: exit::FUEL,
+            transient: true,
+            fetches: 7,
+            fetch_bytes: 99,
+            fuel_used: 5,
+            witness_bytes: 3,
+            compile_ms: 1,
+            run_ms: 2,
+        };
         assert_eq!(BuilderSummary::decode(&s.encode()), Some(s));
         let mut b = s.encode();
         b[8] = 7;
@@ -433,6 +490,29 @@ mod tests {
         assert_eq!(BuilderSummary::decode(&b), None, "reserved bytes must be zero");
         let neg = BuilderSummary { exit_code: -9, ..s };
         assert_eq!(BuilderSummary::decode(&neg.encode()), Some(neg));
+    }
+
+    #[test]
+    fn summary_pipe_with_and_without_the_marker() {
+        let s = BuilderSummary { exit_code: exit::TRAP, fuel_used: FUEL_USED_UNKNOWN, ..Default::default() };
+        let mut pipe = Vec::new();
+        write_module_started(&mut pipe).unwrap();
+        assert_eq!(pipe, [crate::abi::MODULE_STARTED_MARKER]);
+        assert_eq!(decode_summary_pipe(&pipe), (true, None), "started, then died before the summary");
+        pipe.extend_from_slice(&s.encode());
+        assert_eq!(pipe.len(), SUMMARY_PIPE_MAX_BYTES);
+        assert_eq!(decode_summary_pipe(&pipe), (true, Some(s)));
+        // A pre-pass or compile failure: the summary alone.
+        assert_eq!(decode_summary_pipe(&s.encode()), (false, Some(s)));
+        assert_eq!(decode_summary_pipe(&[]), (false, None));
+        // Anything else is malformed, but a leading marker still counts.
+        let mut twice = vec![crate::abi::MODULE_STARTED_MARKER; 2];
+        twice.extend_from_slice(&s.encode());
+        assert_eq!(decode_summary_pipe(&twice), (true, None));
+        let mut trailing = s.encode().to_vec();
+        trailing.push(crate::abi::MODULE_STARTED_MARKER);
+        assert_eq!(decode_summary_pipe(&trailing), (false, None));
+        assert_ne!(crate::abi::MODULE_STARTED_MARKER, BUILDER_SUMMARY_MAGIC[0]);
     }
 
     #[test]
@@ -453,7 +533,8 @@ mod tests {
         assert!(matches!(decode_control::<ControlRequest>(&big), Err(FrameError::TooLarge { .. })));
         let st = ControlResponse::SelfTest { ok: false, checks: vec![(SelfTestCheck::LoopbackDenied, false)] };
         assert_eq!(decode_control::<ControlResponse>(&encode_control(&st)).unwrap(), st);
-        assert!(decode_control::<ControlResponse>(br#"{"type":"self_test","ok":true,"checks":[["made_up",true]]}"#).is_err());
+        assert!(decode_control::<ControlResponse>(br#"{"type":"self_test","ok":true,"checks":[["made_up",true]]}"#)
+            .is_err());
     }
 
     #[test]
@@ -493,6 +574,8 @@ mod tests {
             decode_control::<ControlMessage<ControlResponse>>(a).unwrap().body,
             ControlResponse::Artifact { cached: false, .. }
         ));
-        assert!(decode_control::<ControlMessage<ControlRequest>>(br#"{"id":1,"body":{"type":"self_test"},"x":1}"#).is_err());
+        assert!(
+            decode_control::<ControlMessage<ControlRequest>>(br#"{"id":1,"body":{"type":"self_test"},"x":1}"#).is_err()
+        );
     }
 }

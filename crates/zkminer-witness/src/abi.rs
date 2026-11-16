@@ -27,11 +27,21 @@ pub const W_CHUNK_BYTES: usize = 1 << 20;
 pub const WITNESS_WRITE_OK: i32 = 0;
 pub const WITNESS_WRITE_OVER_LIMIT: i32 = 1;
 
+/// The byte the runner writes to its summary pipe after the module compiled and passed every check,
+/// immediately before instantiation (when the first module code, a start function, can run). It
+/// precedes the summary. A runner that reports INTERNAL after it may be a builder that escaped
+/// wasmtime and now controls the runner, so the miner treats that as a builder trap; a compromised
+/// runner cannot take back a byte written before any module code ran. (`W`, the summary's magic,
+/// is a different byte.)
+pub const MODULE_STARTED_MARKER: u8 = b'S';
+
 /// Runner fd numbers (the miner places them with the sandbox launcher's fd map).
 pub mod fd {
     /// Write end of the W pipe.
     pub const W: i32 = 3;
-    /// Write end of the summary pipe (`BuilderSummary`, 48 bytes).
+    /// Write end of the summary pipe: [`MODULE_STARTED_MARKER`](super::MODULE_STARTED_MARKER) once the
+    /// module is about to be instantiated, then the 48-byte `BuilderSummary` at exit (see
+    /// `ipc::decode_summary_pipe`).
     pub const SUMMARY: i32 = 4;
     /// The job's socket to the broker (fetch frames).
     pub const BROKER: i32 = 5;
