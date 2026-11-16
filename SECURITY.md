@@ -22,13 +22,46 @@ Every connection a requester can cause goes through one guard
   multicast, `240/4`, Azure's `168.63.129.16`; on IPv6 everything outside `2000::/3` (loopback,
   ULA `fc00::/7` with AWS's `fd00:ec2::254`, link-local, site-local, multicast, discard,
   SRv6), documentation, 6to4, Teredo and the IETF block `2001::/23` except IANA's globally
-  reachable entries. An IPv6 address that carries an IPv4 one (mapped, SIIT, the well-known
-  NAT64 prefix) is judged by that IPv4 address; IPv4-compatible addresses are refused.
-- **Not this host, not its neighbours:** the host's own addresses and every network its
-  interfaces are connected to (read from the interfaces, and read again once older than
-  30 s) are refused, so a hairpin to the host's public address or a NAS with a global IPv6
-  address on the same /64 is out of reach. A public address the host only has behind NAT is invisible to it: name it
-  in `[egress] deny_cidrs`, with the rest of your fleet.
+  reachable AMT (`2001:3::/32`), AS112-v6 (`2001:4:112::/48`) and DRIP (`2001:30::/28`)
+  ranges. All of `2001:1::/32` is refused, IANA's PCP, TURN and DNS-SD SRP anycast addresses
+  included: the nearest instance of an anycast service may be a box on your own network. An
+  IPv6 address that carries an IPv4 one (mapped, SIIT, the well-known NAT64 prefix) is judged
+  by that IPv4 address; IPv4-compatible addresses are refused. Deny CIDRs and the host's
+  prefixes match every such spelling too (`64:ff9b::808:808/128` denies `8.8.8.8`).
+- **Not this host, not its neighbours, not its site.** Refused, whatever the spelling:
+  - the host's own addresses, **including its public address behind NAT**: at startup and
+    every 5 minutes the miner asks two fixed DNS reflectors which address its query came from
+    (`o-o.myaddr.l.google.com` TXT, asked of Google's authoritative `ns1.google.com`; else
+    `whoami.cloudflare` CH TXT, asked of `1.1.1.1`), once over IPv4 and once over IPv6. The
+    names and servers are compiled in: nothing a requester sends chooses them, and an answer
+    can only add an address to refuse. If no reflector answers, a loud warning says so and the
+    miner carries on: list the public address in `[egress] deny_cidrs` then (or always).
+    `[egress] discover_public_addresses = false` turns the queries off;
+  - every network the host is connected to: each interface's network under its netmask, a
+    point-to-point peer, and **every on-link route** (no gateway, not on loopback, not a
+    default route) from the routing table, so a DHCPv6 host (a /128 address whose /64 is only
+    a route), an IPv4 /32 with its subnet as a route, and WireGuard, Docker or VPN networks are
+    covered;
+  - **any destination whose best route is not the default path.** For a destination, the
+    routes holding it with the longest prefix (the kernel's choice) must all be a default
+    route (`/0`, or a "split default" no longer than `/4`, as full-tunnel VPNs install; with a
+    gateway or without, as on PPPoE) or go through a default route's own gateway (a DHCP
+    option 121 route to a DNS server via your router reaches nothing the default route does
+    not). An on-link route, a route on loopback, or a route through any other gateway (a VPN's
+    pushed company ranges, a static route into a DMZ) refuses it. Every routing table is read
+    (netlink, no privileges needed) and they are merged: policy routing (`ip rule`) is not
+    modelled, which errs towards refusing. Linux only;
+  - **the site around each of the host's global IPv6 addresses**: its enclosing `/56`
+    (`[egress] ipv6_site_prefix_len`, 48 to 64), the usual delegation to a home or office,
+    whose other /64s hold your other machines;
+  - **the DNS servers the host uses**: the `nameserver`s of `/etc/resolv.conf` and of
+    systemd-resolved's `/run/systemd/resolve/resolv.conf` (the upstream servers behind its
+    `127.0.0.53` stub), which may answer only their own customers.
+
+  These facts are read again once they are a second old, and again before any refusal that
+  rests on them. **Run the miner on the host's network:** a containerized miner sees only the
+  container's interfaces and routes, so use host networking (`--network host`), or list the
+  host's networks and addresses in `[egress] deny_cidrs`.
 - **Host-name hygiene** before any lookup: single-label names, `localhost` and `*.localhost`,
   and names under `local`, `internal` (`metadata.google.internal`), `lan`, `home`, `arpa`
   (`home.arpa`), `corp`, `intranet`, `private`, `localdomain`, `svc`, `consul`, `test`,
@@ -36,7 +69,9 @@ Every connection a requester can cause goes through one guard
   `metadata.goog` are refused, as are trailing dots, non-ASCII names (write them in their
   `xn--` form), and IP addresses written other than as four decimal octets (`2130706433`,
   `0x7f.1`, `0177.0.0.1`, `127.1`). The full list is `INTERNAL_SUFFIXES` in
-  `crates/zkminer-netguard/src/host.rs`.
+  `crates/zkminer-netguard/src/host.rs`. Names are then looked up **absolute** (with a
+  trailing dot added), so the resolver's `search` domains and `ndots` never turn a requester's
+  `secrets.corp` into `secrets.corp.<your search domain>`.
 - **URL hygiene:** `http` and `https` only; no user information; nothing but printable ASCII
   (no whitespace or backslashes, which the URL standard would quietly rewrite); no IPv6 zone
   ids; and the URL must read the same — scheme, host and port — to a strict parser and to the
@@ -98,6 +133,7 @@ job there could then reach this host's private network.
 | Witness `blob/v1` fetches | the operator's `[[blob_mirror]]` templates; the hash from **the builder** | the broker's floor; the URL is built by the broker |
 | `hemi-code` artifact reads | the operator's `[artifacts]` endpoint and mirror; the address from **the job** | the broker's floor |
 | The broker's DNS resolver | the operator (`[dns] servers`, else `/etc/resolv.conf`) | dials only those servers; never a fetch destination |
+| Public-address discovery (miner and broker, at startup and every 5 minutes) | fixed in the build: `ns1.google.com` and `1.1.1.1` (and their IPv6 addresses), UDP port 53 | none needed: requesters cannot change them; `[egress] discover_public_addresses = false` turns it off |
 | The builder runner and the execute worker | none | seccomp denies `socket`, `socketpair` and `connect` |
 | The miner's witness host (pipeline, builder runs, store) | none | talks to the broker over a Unix socket pair only |
 
@@ -115,10 +151,21 @@ that node can reach. The broker therefore holds them to the same rule, with netg
 - **Public mode** (the default, and the only mode on mainnet): the broker's config is refused when
   it loads if any endpoint's explicit `cidrs` or IP-literal host is not **entirely** global
   (`0.0.0.0/0`, `::/0`, a `/8` holding private space and `::ffff:0:0/96` are refused), overlaps
-  the deny CIDRs or a DNS server, or — once the host's interfaces are read — holds one of the
-  host's addresses or overlaps a connected prefix; or if a URL host name fails the host-name
-  hygiene above. Every connection is checked against the same floor again, and the broker's
-  self-test fails (`RoleEntriesPublic`) if any role entry in force is not public.
+  the deny CIDRs or a DNS server, or — once the host's facts are read (the same facts as above:
+  own and public addresses, connected prefixes and on-link routes, the IPv6 site, routes off the
+  default path, the host's DNS servers; `[egress] ipv6_site_prefix_len` and
+  `discover_public_addresses` in the broker's own config) — holds one of the host's addresses
+  or overlaps one of its prefixes; or if a URL host name fails the host-name hygiene above. An
+  IP-literal host must lie inside the endpoint's own `cidrs` when it has them, and is judged
+  too. Every connection is checked against the same floor again, and the broker's self-test
+  fails (`RoleEntriesPublic`) if any role entry in force is not public. The sandboxed broker
+  cannot read the host itself, so the miner re-reads the host's facts every 5 seconds and
+  sends them whenever they change.
+- **Keys** (`key_file`) travel only over `https` in public mode. In developer mode they may also
+  go over `http` to a loopback IP literal or one inside the endpoint's own `cidrs`.
+- **Cached RPC answers are per requester.** Answers to pinned queries are cached by the job's
+  requester (its trust domain), so one requester's builder cannot tell, from how fast an answer
+  comes back, whether another requester asked the same query.
 - **Host names** resolve through the broker's own resolver, and only global answers outside the
   deny CIDRs, connected prefixes and own addresses become an endpoint's addresses, in both modes.
 - **DNS servers** are operator infrastructure the resolver dials, so a stub such as `127.0.0.53`
@@ -136,13 +183,23 @@ that node can reach. The broker therefore holds them to the same rule, with netg
 - **The miner is a timing oracle for public hosts.** Whether and how fast a public address
   answers is observable to the requester; the guard bounds where connections go, not what can
   be inferred from public ones.
-- **Global addresses inside your own network.** Connected prefixes come from the interfaces'
-  netmasks. A cloud instance whose IPv6 address shows as a /128 (AWS does this) does not reveal
-  its subnet, and other subnets of the same VPC hold global addresses too, so the guard cannot
-  tell them from the internet. Put your VPC's IPv6 range (and any public IPv4 range your
+- **Global addresses inside your own network, reached through the default route.** The guard
+  sees the host's interfaces, routes, IPv6 site and public address. Other subnets of the same
+  cloud VPC, a data centre's other public ranges, or a site delegated more than the configured
+  `ipv6_site_prefix_len` are reached through the default gateway like the internet, so the
+  guard cannot tell them from it. Put your VPC's IPv6 range (and any public IPv4 range your
   network uses internally) in `[egress] deny_cidrs`. On a cloud host, also block the metadata
   service inside the instance (IMDSv2 required, hop limit 1, or the endpoint off) as defense in
   depth.
+- **Policy routing is not modelled.** Routes of every table are merged and a specific route in
+  any of them refuses its destinations; an `ip rule` that sends some traffic elsewhere is not
+  followed. Routes are read on Linux only.
+- **Public-address discovery depends on two outside services.** If neither answers (a firewall
+  blocking outbound DNS to them, an outage), the NAT public address is unknown until one does:
+  list it in `[egress] deny_cidrs`. A host whose public address changes is caught at the next
+  discovery, at most 5 minutes later.
+- **The facts can be a second stale.** A host that just joined a network is judged on facts at
+  most a second old (a refusal re-reads them at once).
 - **NAT64 with a network-specific prefix.** Addresses under the well-known NAT64 prefix
   `64:ff9b::/96` are judged by the IPv4 address they carry; a DNS64 resolver that synthesizes
   under a prefix of your own network would hand out global-looking addresses for private IPv4
@@ -155,3 +212,10 @@ that node can reach. The broker therefore holds them to the same rule, with netg
 - **Your own endpoints are trusted.** The chain RPC and the fixed download URLs are not
   checked by the guard: requesters cannot change them, and a local chain node is a normal
   setup.
+- **What an escaped builder can still learn about the host.** The builder runner and the
+  execute worker open no files (Landlock), start in `/`, and may not call `uname`, `sysinfo`,
+  `readlink*`, `access`/`faccessat*`, `statfs`/`fstatfs`, the `*getxattr`/`*listxattr` family or
+  `chdir`/`fchdir`; `statx` fails as unimplemented. `stat` by path (`newfstatat`) stays open:
+  Rust and glibc need it, and only a mount namespace (the system mode, not implemented) hides
+  the filesystem from it, so a compromised builder can still tell whether a path exists and read
+  its size, owner, mode and times, though never its contents.

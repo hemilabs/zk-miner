@@ -203,7 +203,7 @@ max_concurrent_proofs = 0           # 0 = one proof per detected GPU
 skip_benchmark_gate   = true
 
 [egress]                            # optional
-deny_cidrs = ["203.0.113.7/32"]     # this host's public address if it is behind NAT
+deny_cidrs = ["203.0.113.0/24"]     # the rest of your fleet, your VPC's ranges
 ```
 
 `zkminer init` will scaffold a config, but **verify the contract addresses it writes
@@ -221,13 +221,22 @@ fix `[contracts]` and restart. On 743111 the live deployment is the 2026-11-16 o
 Anyone can register a program and post a job, so the URLs a miner downloads programs from
 are chosen by strangers. zkminer only ever connects to **public internet** addresses on
 their behalf: never loopback, the LAN, link-local or cloud metadata, this host's own
-addresses, a neighbour on a network it is connected to, or a name only a local resolver
-answers (`localhost`, `*.local`, `*.internal`, `*.lan`, single-label names, …). See
-[SECURITY.md](SECURITY.md) for exactly what is refused and why.
+addresses (its public address behind NAT included, which it learns from two fixed DNS
+reflectors), a neighbour on a network it is connected to or routes to other than through its
+default route, the rest of its IPv6 site, the DNS servers it uses, or a name only a local
+resolver answers (`localhost`, `*.local`, `*.internal`, `*.lan`, single-label names, …).
+Anycast addresses in `2001:1::/32` are refused too. See [SECURITY.md](SECURITY.md) for exactly
+what is refused and why.
+
+Run the miner with the host's network (`--network host` in a container): inside a container
+it sees only the container's interfaces and routes, so list the host's networks and addresses
+in `[egress] deny_cidrs` if it cannot.
 
 | key | default | meaning |
 |---|---|---|
-| `[egress] deny_cidrs` | `[]` | More addresses no requester-caused connection may reach: CIDRs (`"203.0.113.0/24"`, `"2001:db8::/32"`) or bare addresses. Name this host's public address if it sits behind NAT (its interfaces don't show it, so only this stops a connection to it), the rest of your fleet, and on a cloud host your VPC's IPv6 range (its other hosts have global addresses). Host bits must be zero. |
+| `[egress] deny_cidrs` | `[]` | More addresses no requester-caused connection may reach: CIDRs (`"203.0.113.0/24"`, `"2001:db8::/32"`) or bare addresses. Name the rest of your fleet, on a cloud host your VPC's IPv6 range (its other subnets have global addresses and are reached through the default route), and this host's public address behind NAT if discovering it fails or is off. Host bits must be zero. |
+| `[egress] ipv6_site_prefix_len` | `56` | The site refused around each of this host's global IPv6 addresses: its enclosing /N, 48 to 64. Use 48 if your site was delegated a /48. |
+| `[egress] discover_public_addresses` | `true` | Learn this host's public addresses (behind NAT) at startup and every 5 minutes by asking `ns1.google.com` and `1.1.1.1` which address a DNS query came from, and refuse them. Off: list them in `deny_cidrs`. |
 | `[dev] private_network` | `false` | **Developer mode.** Lets those connections reach private destinations, so a local test network can serve programs from this machine. The only way to turn the guard off (there is no environment variable or flag). Refused on Hemi mainnet (43111); while it is on, every start logs `DEV MODE: private network access enabled — never run on a public market`, `zkminer status` prints it, and the TUI's status bar shows a red `DEV MODE` badge. Never set it on a miner that serves a public market. |
 
 Unknown keys in `[dev]` and `[egress]` are errors, so a misspelt setting stops the miner
