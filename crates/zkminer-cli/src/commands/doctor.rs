@@ -89,13 +89,11 @@ fn free_bytes(path: &Path) -> Option<u64> {
             .output()
             .ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
-        let kb: u64 = text
-            .lines()
-            .nth(1)?
-            .split_whitespace()
-            .nth(3)?
-            .parse()
-            .ok()?;
+        // Available is the field before Capacity (`NN%`); counted from there, not from the left,
+        // because the filesystem name may contain spaces.
+        let fields: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
+        let cap = fields.iter().rposition(|f| f.ends_with('%'))?;
+        let kb: u64 = fields.get(cap.checked_sub(1)?)?.parse().ok()?;
         Some(kb * 1024)
     }
 }
@@ -300,38 +298,40 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
             Level::Warn,
             "stop request",
             format!(
-                "{} is waiting: the next miner start removes it unread",
+                "{} is waiting: a miner still starting up acts on it, the next start removes it \
+                 unread, and `rm` withdraws it",
                 super::run::stop_request_path().display()
             ),
         );
     }
     let journal = crate::journal::JobJournal::load();
-    let held = journal.iter().count();
-    if held > 0 {
-        let earliest = journal
-            .iter()
-            .map(|e| e.lock_deadline)
-            .filter(|d| *d > 0)
-            .min();
+    // Only locks a start can still finish or release: a breadcrumb past its cutoff is kept until a
+    // keeper slashes it, and nothing the operator does changes it.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let live: Vec<u64> = journal
+        .iter()
+        .filter(|e| e.lock_deadline == 0 || e.lock_deadline > now)
+        .map(|e| e.lock_deadline)
+        .collect();
+    if !live.is_empty() {
         report.say(
             if running { Level::Info } else { Level::Warn },
             "locks",
             format!(
-                "{held} recorded in the job journal{}{}",
-                earliest
-                    .map(|d| {
-                        format!(
-                            ", the earliest to be released by {} at the latest",
-                            zkminer_chain::exit::fmt_unix(
-                                d.saturating_sub(super::run::DEADLINE_RELEASE_MARGIN_SECS)
-                            )
-                        )
-                    })
-                    .unwrap_or_default(),
+                "{} recorded in the job journal{}",
+                live.len(),
                 if running {
-                    ""
+                    String::new()
                 } else {
-                    " — start the miner so it finishes or releases them"
+                    format!(
+                        " — start the miner {} so it finishes or releases them",
+                        super::run::start_by(live.iter().copied())
+                            .map(|t| format!("by {t}"))
+                            .unwrap_or_else(|| "soon".into())
+                    )
                 }
             ),
         );
@@ -345,8 +345,9 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
         .filter(|d| !fetched(d))
         .collect();
     match free_bytes(&user_home) {
+        // A warning: a host that proves only one zkVM downloads less.
         Some(free) if !missing.is_empty() && free < FIRST_RUN_DOWNLOAD_BYTES => report.say(
-            Level::Fail,
+            Level::Warn,
             "disk",
             format!(
                 "{:.1} GiB free in {}; the first run downloads about 16-20 GB into {}",
@@ -405,6 +406,7 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
     for row in &rows {
         let (level, word, why) = match &row.verdict {
             super::capability::Verdict::Ready(w) => (Level::Pass, "proves", w),
+            super::capability::Verdict::Risky(w) => (Level::Warn, "proves, at a risk", w),
             super::capability::Verdict::Idle(w) => (Level::Warn, "idle", w),
             super::capability::Verdict::Missing(w) => (Level::Warn, "not available", w),
         };

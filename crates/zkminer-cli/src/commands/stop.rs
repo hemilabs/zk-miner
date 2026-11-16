@@ -55,7 +55,8 @@ fn what_it_does(mode: StopMode) -> &'static str {
              they take, up to ~50 min)"
         }
         StopMode::KeepLocks => {
-            "keeping its locks: no new claims; it exits without releasing (exit code 75), and the \
+            "keeping its locks: no new claims; within minutes it exits without releasing (exit \
+             code 75), except a lock too close to its deadline for a restart to save it, and the \
              next start finishes the jobs held"
         }
         StopMode::Abandon => {
@@ -81,17 +82,9 @@ fn held_report(mode: StopMode) -> String {
     if live.is_empty() {
         return "No locks are recorded as held.".to_string();
     }
-    let earliest = live.iter().copied().filter(|d| *d > 0).min();
-    // The journal records each lock's cutoff; the next start must be up a release margin before it
-    // to release one in time.
-    let by = earliest
-        .map(|d| {
-            format!(
-                " well before {} (after that it cannot release the earliest one in time)",
-                zkminer_chain::exit::fmt_unix(
-                    d.saturating_sub(super::run::DEADLINE_RELEASE_MARGIN_SECS)
-                )
-            )
+    let by = super::run::start_by(live.iter().copied())
+        .map(|t| {
+            format!(" by {t} at the latest (a service with Restart=on-failure does that itself)")
         })
         .unwrap_or_default();
     let what = if mode == StopMode::KeepLocks {
@@ -126,14 +119,18 @@ pub fn run(mode: StopMode, wait: bool, timeout: Option<u64>) -> Result<()> {
     let past_deadline = || deadline.is_some_and(|d| Instant::now() >= d);
     // The miner removes the file when it takes the request.
     while path.exists() {
-        if started.elapsed() >= ACK_TIMEOUT && (!wait || past_deadline()) {
+        // Without --wait, a few seconds; with it, until --timeout (a miner still starting up
+        // takes the request once it is running).
+        if (!wait && started.elapsed() >= ACK_TIMEOUT) || (wait && past_deadline()) {
             bail!(
                 "the process holding {} has not taken the request in {}s. A miner still starting \
                  up takes it once it is running; a `zkminer benchmark` or a stake / unstake / \
-                 withdraw prompt never will. The request stays in {} (the next miner start \
-                 removes it unread).",
+                 withdraw prompt never will. The request stays in {}: a miner that finishes \
+                 starting up acts on it, the next miner start removes it unread, and `rm {}` \
+                 withdraws it.",
                 home.join("miner.lock").display(),
                 started.elapsed().as_secs(),
+                path.display(),
                 path.display()
             );
         }
@@ -141,22 +138,33 @@ pub fn run(mode: StopMode, wait: bool, timeout: Option<u64>) -> Result<()> {
     }
     // Then its answer: what it is doing, or why it will not (a keep-locks stop asked for while it
     // releases, an abandon after a keep-locks stop committed).
+    let taken = Instant::now();
     let answer = loop {
         match std::fs::read_to_string(&response) {
             Ok(text) => {
                 let _ = std::fs::remove_file(&response);
-                break Some(text);
+                break text;
             }
-            Err(_) if started.elapsed() < ACK_TIMEOUT + Duration::from_secs(5) => {
+            Err(_) if taken.elapsed() < ACK_TIMEOUT => {
                 std::thread::sleep(Duration::from_millis(100))
             }
-            Err(_) => break None,
+            Err(_) => bail!(
+                "the miner took the request but has not answered in {}s, so whether it is {} is \
+                 unknown: check its dashboard or output.",
+                ACK_TIMEOUT.as_secs(),
+                what_it_does(mode)
+            ),
         }
     };
-    if let Some(why) = answer.as_deref().and_then(|a| a.strip_prefix("refused: ")) {
+    if let Some(why) = answer.strip_prefix("refused: ") {
         bail!("the miner refused the request: {why}");
     }
-    println!("The miner took the request and is {}.", what_it_does(mode));
+    match answer.strip_prefix("ok: ") {
+        Some("already stopping") => {
+            println!("The miner is already stopping; this request changes nothing.")
+        }
+        _ => println!("The miner took the request and is {}.", what_it_does(mode)),
+    }
     if !wait {
         println!(
             "Follow it on its dashboard or in its output (a service: its journal); `zkminer stop \

@@ -112,15 +112,16 @@ enum Commands {
     /// flight are fulfilled.
     #[command(group(clap::ArgGroup::new("mode").args(["keep_locks", "abandon", "force_exit"])))]
     Stop {
-        /// Exit now without releasing (exit code 75, so `Restart=on-failure` starts it again);
-        /// the next start finishes the jobs held. For restarts and upgrades: start it again
-        /// before the earliest lock deadline.
+        /// Exit within minutes without releasing (exit code 75, so `Restart=on-failure` starts
+        /// it again); the next start finishes the jobs held. A lock too close to its deadline
+        /// for a restart to save it is released first. For restarts and upgrades.
         #[arg(long)]
         keep_locks: bool,
         /// Release every job held now (each pays a 5-30% release penalty), then exit
         #[arg(long)]
         abandon: bool,
-        /// Exit at once, releasing nothing
+        /// Exit at once, releasing nothing (exit code 130: a service is not restarted; start
+        /// it again before the earliest lock deadline)
         #[arg(long)]
         force_exit: bool,
         /// Wait until the miner has exited, then say what it left held

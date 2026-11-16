@@ -6,6 +6,15 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+/// Start `cmd` with a console of its own that has no window (`CREATE_NO_WINDOW`), so the console
+/// events of the one the miner runs in (Ctrl+C, Ctrl+Break, closing it) never reach it.
+#[cfg(windows)]
+pub fn isolate_from_console(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -677,6 +686,15 @@ impl WorkerHandle {
             env_overrides,
             RISC0_SYS_RAND_KEY.get(),
         ));
+
+        // Windows: a console delivers Ctrl+C, Ctrl+Break and a window close to EVERY process
+        // attached to it, and a worker sharing the miner's console has no handler, so it died at
+        // the operator's first Ctrl+C — the very key that starts a DRAIN, which then had no
+        // proofs left to finish. Its own hidden console keeps the miner's console events away
+        // from it (and from the sp1-gpu-server it starts, which inherits it); the miner still
+        // stops it, through its pipes and the reap.
+        #[cfg(windows)]
+        isolate_from_console(&mut cmd);
 
         // Kill worker if parent process dies (prevents orphan GPU processes after host crash).
         // PR_SET_PDEATHSIG is Linux-specific.
@@ -2402,6 +2420,93 @@ mod tests {
             live_group_members(Path::new("/nonexistent-proc-root"), 100),
             None,
             "an unreadable tree must be distinguishable from an empty one"
+        );
+    }
+}
+
+/// The miner's console events must not reach a worker: a Ctrl+C there starts a DRAIN, which needs
+/// the proofs in flight to keep running.
+#[cfg(all(test, windows))]
+mod console_isolation_tests {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    extern "system" {
+        fn GenerateConsoleCtrlEvent(event: u32, process_group: u32) -> i32;
+        fn GetConsoleWindow() -> *mut std::ffi::c_void;
+        fn SetConsoleCtrlHandler(handler: *const std::ffi::c_void, add: i32) -> i32;
+    }
+    const CTRL_C_EVENT: u32 = 0;
+    const CHILD: &str = "ZKMINER_TEST_CONSOLE_ISOLATION_CHILD";
+
+    /// Run as its own process (in a console of its own, by the test below): it ignores Ctrl+C
+    /// itself, starts one child sharing its console and one isolated child, sends Ctrl+C to its
+    /// console, and reports which children survived.
+    #[test]
+    #[ignore = "run by a_ctrl_c_on_the_miners_console_does_not_reach_a_worker"]
+    fn console_isolation_child() {
+        if std::env::var(CHILD).is_err() {
+            return;
+        }
+        let sleeper = || {
+            let mut c = Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            c
+        };
+        let mut shared = sleeper().spawn().unwrap();
+        let mut isolated = {
+            let mut c = sleeper();
+            super::isolate_from_console(&mut c);
+            c.spawn().unwrap()
+        };
+        // Only now ignore Ctrl+C here: the setting is inherited by children started after it, and
+        // the control child must keep the default (die), as a worker under the miner (whose
+        // handler is a function, not this inherited ignore) would.
+        // SAFETY: plain kernel32 calls; a NULL handler with TRUE makes this process ignore Ctrl+C.
+        assert!(unsafe { SetConsoleCtrlHandler(std::ptr::null(), 1) } != 0);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) } != 0);
+        std::thread::sleep(Duration::from_secs(2));
+        let shared_alive = shared.try_wait().unwrap().is_none();
+        let isolated_alive = isolated.try_wait().unwrap().is_none();
+        let _ = shared.kill();
+        let _ = isolated.kill();
+        println!("shared {shared_alive} isolated {isolated_alive}");
+    }
+
+    #[test]
+    fn a_ctrl_c_on_the_miners_console_does_not_reach_a_worker() {
+        // SAFETY: plain kernel32 call.
+        if unsafe { GetConsoleWindow() }.is_null() {
+            eprintln!("no console attached: console control events cannot be sent; skipped");
+            return;
+        }
+        // In a console of its own, so its Ctrl+C reaches nothing of ours.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "worker::console_isolation_tests::console_isolation_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("isolated true"),
+            "the isolated child died with the console's Ctrl+C:\n{text}"
+        );
+        // The control: a child sharing the console does get it (else the test proves nothing).
+        assert!(
+            text.contains("shared false"),
+            "the control child survived:\n{text}"
         );
     }
 }

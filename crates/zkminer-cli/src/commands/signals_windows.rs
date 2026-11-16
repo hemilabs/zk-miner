@@ -108,12 +108,15 @@ pub(crate) fn spawn(sig_tx: tokio::sync::watch::Sender<u8>, state: SharedState, 
             }
             match stage {
                 1 | 2 if supervised => {
-                    super::run::shutdown_say(
-                        &state,
-                        "\nWINDOW CLOSING / SHUTDOWN — releasing held jobs now (Windows ends the \
-                         process within seconds; no proof could finish).",
-                    )
-                    .await
+                    let closing = "\nWINDOW CLOSING / SHUTDOWN — releasing held jobs now (Windows \
+                                   ends the process within seconds; no proof could finish).";
+                    match stage {
+                        2 => match super::run::begin_abandon() {
+                            Ok(()) => super::run::shutdown_say(&state, closing).await,
+                            Err(why) => super::run::shutdown_say(&state, why).await,
+                        },
+                        _ => super::run::shutdown_say(&state, closing).await,
+                    }
                 }
                 1 => {
                     // On the dashboard Ctrl+C is a key, which does not escalate; Ctrl+Break does.
