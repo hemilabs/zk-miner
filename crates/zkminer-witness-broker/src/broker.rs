@@ -1,7 +1,6 @@
 //! The broker's shared state and capability provisioning (plan §11.1).
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -13,8 +12,9 @@ use crate::cache::{Lru, RpcKey};
 use crate::config::{BrokerConfig, EndpointSpec, EvmRpcEndpoint, HostFacts};
 use crate::hooks::Hooks;
 use crate::job::{Job, JobSource};
+use crate::dns::{Resolver, QUERY_TIMEOUT};
 use crate::lanes::ByteLanes;
-use crate::net::{build_policy, Endpoint, PolicyHandle};
+use crate::net::{build_policy, Endpoint, EndpointEnv, OwnHandle, PolicyHandle};
 use crate::spool::Spool;
 
 /// An `evm-rpc/v1` endpoint and what it is provisioned for.
@@ -27,7 +27,7 @@ pub(crate) struct Broker {
     pub cfg: BrokerConfig,
     pub hooks: Hooks,
     pub policy: PolicyHandle,
-    pub own_addresses: RwLock<Vec<IpAddr>>,
+    pub own_addresses: OwnHandle,
     pub evm: Vec<EvmEndpoint>,
     pub blob_mirrors: Vec<Arc<Endpoint>>,
     pub artifacts: ArtifactReader,
@@ -36,7 +36,8 @@ pub(crate) struct Broker {
     pub rpc_cache: Mutex<Lru<RpcKey, Vec<u8>>>,
     pub spool: Arc<Spool>,
     pub jobs: Mutex<HashMap<B256, Arc<Job>>>,
-    ids: AtomicU64,
+    /// The broker's own JSON-RPC ids.
+    pub ids: AtomicU64,
 }
 
 impl Broker {
@@ -47,15 +48,22 @@ impl Broker {
             &host.resolved,
             cfg.deny.clone(),
             host.connected.clone(),
+            &host.own_addresses,
         )));
+        let own: OwnHandle = Arc::new(RwLock::new(host.own_addresses.clone()));
+        if host.dns_servers.is_empty() && cfg.endpoints().any(|e| e.literal.is_none()) {
+            tracing::warn!("no DNS server ([dns] servers or /etc/resolv.conf): host-name endpoints cannot resolve");
+        }
+        let env = EndpointEnv {
+            policy: policy.clone(),
+            own: own.clone(),
+            egress: hooks.egress.clone(),
+            dns: Arc::new(Resolver::new(host.dns_servers.clone(), QUERY_TIMEOUT)),
+            reresolve: cfg.dns.reresolve,
+            held_lock_share: cfg.budget.held_lock_share,
+        };
         let mk = |spec: &EndpointSpec| {
-            Endpoint::new(
-                spec.clone(),
-                host.resolved.get(&spec.alias).cloned().unwrap_or_default(),
-                policy.clone(),
-                hooks.egress.clone(),
-                &cfg.timeouts,
-            )
+            Endpoint::new(spec.clone(), host.resolved.get(&spec.alias).cloned().unwrap_or_default(), &env, &cfg.timeouts)
         };
         let evm = cfg
             .evm_rpc
@@ -75,10 +83,10 @@ impl Broker {
                 bytes.clone(),
             ),
         };
-        let spool = Spool::new(&cfg.spool_dir, cfg.spool_quota_bytes)?;
+        let spool = Spool::new(&cfg.spool_dir, cfg.spool_quota_bytes, cfg.budget.held_lock_share)?;
         Ok(Arc::new(Self {
             rpc_cache: Mutex::new(Lru::new(cfg.cache.rpc_max_bytes, cfg.cache.rpc_max_entries)),
-            own_addresses: RwLock::new(host.own_addresses),
+            own_addresses: own,
             hooks,
             policy,
             evm,
@@ -95,6 +103,11 @@ impl Broker {
     /// `n` consecutive JSON-RPC ids of the broker's own.
     pub fn next_ids(&self, n: u64) -> u64 {
         self.ids.fetch_add(n.max(1), Ordering::Relaxed)
+    }
+
+    /// Every endpoint (evm-rpc, blob mirrors, the artifact endpoint and its mirror).
+    pub fn all_endpoints(&self) -> impl Iterator<Item = &Arc<Endpoint>> {
+        self.evm.iter().map(|e| &e.ep).chain(self.blob_mirrors.iter()).chain(self.artifacts.endpoints())
     }
 
     /// The source a `(class, config)` pair is served from, if this broker provisions it: for

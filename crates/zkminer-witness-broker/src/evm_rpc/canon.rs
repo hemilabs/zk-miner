@@ -126,10 +126,10 @@ pub(super) enum Body {
         canon: Vec<u8>,
         kind: Kind,
     },
-    /// `{"code":…}` or `{"code":…,"data":"0x…"}`; `lagging` per the module's heuristics.
+    /// `{"code":…}` or `{"code":…,"data":"0x…"}`; `hint` per the module's heuristics.
     Error {
         canon: Vec<u8>,
-        lagging: bool,
+        hint: super::ErrorHint,
     },
 }
 
@@ -542,7 +542,7 @@ impl<'a> Scanner<'a> {
         budget.charge(canon.len())?;
         Ok(Body::Error {
             canon,
-            lagging: super::is_lagging_error(code, &message.buf),
+            hint: super::error_hint(code, &message.buf),
         })
     }
 }

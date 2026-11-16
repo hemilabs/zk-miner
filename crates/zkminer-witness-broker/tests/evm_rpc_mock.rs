@@ -11,7 +11,7 @@ use common::*;
 use serde_json::Value;
 use zkminer_witness::envelope::{encode_evm_rpc_config, CLASS_EVM_RPC_V1, METHOD_SET_STATE_READ};
 use zkminer_witness::ipc::FetchStatus;
-use zkminer_witness_broker::testkit::{config_text, mock_node, test_hooks, TestRequest, TestResponse, TestServer};
+use zkminer_witness_broker::testkit::{config_text, mock_node, test_hooks, TestDns, TestRequest, TestResponse, TestServer};
 
 fn cap() -> (B256, Vec<u8>) {
     (CLASS_EVM_RPC_V1, encode_evm_rpc_config(8453, false, METHOD_SET_STATE_READ, 0))
@@ -67,7 +67,7 @@ async fn single_batch_and_tags_fixed_per_fetch() {
     let stats = client.end_job(B256::repeat_byte(1)).await.unwrap();
     assert_eq!(stats.fetches, 1 + 3 + 1 + 2, "one unit per call; one per refused request");
     assert_eq!(stats.denied, 2);
-    assert!(!stats.transient);
+    assert!(!stats.operator_failure);
 }
 
 #[tokio::test]
@@ -87,15 +87,15 @@ async fn failover_on_transport_errors_429_and_lagging_nodes() {
     assert_eq!(s(&body), r#"["safe@{\"safe\":5}","z@{\"safe\":5}"]"#);
     assert_eq!((limited.hits(), lagging.hits(), garbage.hits(), good.hits()), (2, 2, 2, 2));
     let stats = client.end_job(B256::repeat_byte(2)).await.unwrap();
-    assert!(!stats.transient);
+    assert!(!stats.operator_failure);
 
-    // With no good endpoint left: status 2, transient.
+    // With no good endpoint left: status 2, the operator's (refused, 429).
     let urls = ["http://127.0.0.1:1".to_string(), limited.url(), lagging.url()];
     let (client, _t) = start(dir.path(), &config_text(dir.path(), &endpoints(&urls, "")), test_hooks()).await;
     let mut b = register(&client, 3, vec![cap()], budget(100, 1 << 20, 1 << 20), false).await;
     assert_eq!(b.fetch(0, br#""z""#).await.0, FetchStatus::Failed);
     let stats = client.end_job(B256::repeat_byte(3)).await.unwrap();
-    assert!(stats.transient);
+    assert!(stats.operator_failure);
     assert_eq!(stats.fetches, 1, "retries are not the job's units");
 }
 
@@ -157,7 +157,7 @@ async fn job_budgets_are_status_3() {
     assert_eq!(b.fetch(0, br#""c""#).await.0, FetchStatus::Exhausted);
     let stats = client.end_job(B256::repeat_byte(8)).await.unwrap();
     assert_eq!(stats.fetch_bytes, 12);
-    assert!(!stats.transient);
+    assert!(!stats.operator_failure);
 }
 
 #[tokio::test]
@@ -170,7 +170,7 @@ async fn an_operator_budget_is_status_2() {
     assert_eq!(b.fetch(0, br#"["a","b"]"#).await.0, FetchStatus::Ok);
     assert_eq!(b.fetch(0, br#"["a","b"]"#).await.0, FetchStatus::Failed, "the endpoint's units are spent");
     let stats = client.end_job(B256::repeat_byte(9)).await.unwrap();
-    assert!(stats.transient);
+    assert!(stats.operator_failure);
 }
 
 #[tokio::test]
@@ -179,7 +179,10 @@ async fn keys_go_in_the_header_and_requests_carry_no_referer_or_redirects() {
     let key_path = dir.path().join("k");
     std::fs::write(&key_path, "Bearer sekrit\n").unwrap();
     std::fs::set_permissions(&key_path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
-    let redirecting = TestServer::start(|_| TestResponse::status(307).with_header("Location", "http://127.0.0.1:9/x")).await;
+    // A LIVE redirect target (it would answer), inside the endpoint's own role entry.
+    let target = TestServer::start(mock_node(1)).await;
+    let location = format!("{}/internal", target.url());
+    let redirecting = TestServer::start(move |_| TestResponse::status(307).with_header("Location", &location)).await;
     let node = TestServer::start(mock_node(1)).await;
     let text = config_text(
         dir.path(),
@@ -194,10 +197,15 @@ async fn keys_go_in_the_header_and_requests_carry_no_referer_or_redirects() {
     let mut b = register(&client, 10, vec![cap()], budget(100, 1 << 20, 1 << 20), false).await;
     assert_eq!(b.fetch(0, br#""a""#).await.0, FetchStatus::Ok);
     assert_eq!(redirecting.hits(), 1, "a redirect is not followed: it fails over");
+    assert_eq!(target.hits(), 0, "the live redirect target is never contacted");
     let req: TestRequest = node.requests.lock().unwrap()[0].clone();
     assert_eq!(req.path, "/v1");
     assert_eq!(req.header("authorization"), Some("Bearer sekrit"));
-    assert_eq!(req.header("referer"), None);
+    // No Referer on any request the broker sends (`net::tests` shows the client settings drop it
+    // even when a redirect is followed, where a stock client sends one).
+    for r in node.requests.lock().unwrap().iter().chain(redirecting.requests.lock().unwrap().iter()) {
+        assert_eq!(r.header("referer"), None);
+    }
     assert_eq!(req.header("user-agent"), Some("zkminer-witness-broker"));
     assert_eq!(req.header("accept-encoding"), None, "no decompression");
 }
@@ -215,11 +223,14 @@ async fn an_endpoint_outside_its_role_entry_is_never_contacted() {
     let mut b = register(&client, 11, vec![cap()], budget(100, 1 << 20, 1 << 20), false).await;
     assert_eq!(b.fetch(0, br#""a""#).await.0, FetchStatus::Failed);
     assert_eq!(node.hits(), 0);
-    // A host name resolves (once, at startup) and its address is pinned and checked the same way.
+    // A host name resolves (at startup, through the broker's own resolver) and its address is
+    // pinned and checked the same way: inside its explicit cidrs, a loopback answer is admitted.
+    let dns = TestDns::start(&[("node.test", &["127.0.0.1"])]).await;
     let text = config_text(
         dir.path(),
         &format!(
-            "[[evm_rpc]]\nalias = \"n\"\nurl = \"http://localhost:{}\"\nchain_id = 8453\nmethod_sets = [\"state-read\"]\ncidrs = [\"127.0.0.1/32\"]\n",
+            "{}[[evm_rpc]]\nalias = \"n\"\nurl = \"http://node.test:{}\"\nchain_id = 8453\nmethod_sets = [\"state-read\"]\ncidrs = [\"127.0.0.1/32\"]\n",
+            dns.config(),
             node.port()
         ),
     );

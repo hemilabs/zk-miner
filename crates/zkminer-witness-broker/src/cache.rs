@@ -4,7 +4,8 @@
 //! - [`RpcKey`]: answers to calls pinned to a block hash, keyed by chain and the broker's canonical
 //!   outgoing call (never errors);
 //! - [`ArtifactKey`]: builder artifacts by `(builder type, the broker's own sha256 of the bytes)`;
-//! - [`ManifestKey`] / [`ManifestPairKey`]: remembered bad `hemi-code` manifests (§13.4).
+//! - [`ManifestKey`] / [`ManifestPairKey`]: remembered bad `hemi-code` manifests (§13.4), and
+//!   [`PendingKey`]: failures read above the safe head, promoted once it passes their block.
 //!
 //! Lookups never change what a job is charged: every builder-visible budget is charged as if each
 //! request missed (the callers' rule), so cache state cannot be probed through budgets.
@@ -41,6 +42,14 @@ pub struct ManifestPairKey {
     pub chain_id: u64,
     pub manifest: Address,
     pub builder_id: B256,
+}
+
+/// What a pending (above-safe) `hemi-code` failure is about: a manifest address, or a manifest
+/// read for one builder id (an id mismatch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PendingKey {
+    Manifest(ManifestKey),
+    Pair(ManifestPairKey),
 }
 
 /// Fixed per-entry overhead charged against the byte cap.

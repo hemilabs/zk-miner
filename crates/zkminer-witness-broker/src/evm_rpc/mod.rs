@@ -86,6 +86,13 @@
 //!   available`, `state is not available`, `state unavailable`, `is pruned`, `pruned history`,
 //!   `node is syncing`), unless its code is 3 or its message contains `revert`: a reverted call's
 //!   reason is chosen by the contract and must not be able to fake a lagging node;
+//! - for a call pinned to a block (a number, a resolved tag or a hash: [`ParsedRequest::pin`]), an
+//!   error with the EIP-1474 code `-32001` ("resource not found") or whose message matches
+//!   `(header|block).*not found` (geth's "header for hash not found", erigon's "block 0x… not
+//!   found"), with the same revert exclusion;
+//! - any other non-revert error on a pinned call is marked [`CallAnswer::suspect`]: the broker asks
+//!   that endpoint whether it has the block (its head for a number, `eth_getBlockByHash` for a hash)
+//!   before taking the error as the answer (anvil's "BlockOutOfRangeError" is code `-32602`);
 //! - a `null` result for a call whose answer is never legitimately null when the node has the block:
 //!   everything except `eth_getTransactionByHash` / `eth_getTransactionReceipt` (unknown or pending
 //!   transaction), and `eth_getBlockByNumber` / `eth_getBlockReceipts` with an explicit number (a
@@ -274,6 +281,27 @@ pub enum ResponseError {
 pub struct CallAnswer {
     pub canonical: Vec<u8>,
     pub is_error: bool,
+    /// A non-revert error on a call pinned to a block that the heuristics did not call lagging: the
+    /// endpoint may lack the block, so the broker checks before taking it as the answer.
+    pub suspect: bool,
+}
+
+/// The block a call is pinned to (see [`ParsedRequest::pin`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockPin {
+    Number(u64),
+    Hash([u8; 32]),
+}
+
+/// What an error object's code and message say about the node (the message is never output).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ErrorHint {
+    /// Code 3 or a message containing `revert`: the contract's answer, never the node's state.
+    pub execution: bool,
+    /// [`LAGGING_MESSAGES`]: lagging for any call.
+    pub lagging: bool,
+    /// `-32001` or `(header|block).*not found`: lagging for a pinned call.
+    pub not_found: bool,
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1000,6 +1028,44 @@ impl Params {
         }
     }
 
+    /// The block the answer depends on: a number (a resolved tag included), a hash, or none (no
+    /// block parameter). An `eth_getLogs` range is pinned to its upper end.
+    fn pin(&self, resolve: Resolve<'_>) -> Option<BlockPin> {
+        let of = |b: &Block| match b {
+            Block::Num(n) => BlockPin::Number(*n),
+            Block::Tag(t) => BlockPin::Number(resolve(*t)),
+            Block::Hash { hash, .. } => BlockPin::Hash(*hash),
+        };
+        match self {
+            Params::BlockByHash { hash, .. } => Some(BlockPin::Hash(*hash)),
+            Params::Logs(Filter { range: LogRange::Hash(h), .. }) => Some(BlockPin::Hash(*h)),
+            Params::Logs(Filter { range: LogRange::Blocks { from, to }, .. }) => {
+                match (of(from), of(to)) {
+                    (BlockPin::Number(a), BlockPin::Number(b)) => Some(BlockPin::Number(a.max(b))),
+                    (_, p) => Some(p),
+                }
+            }
+            Params::None | Params::TxHash(_) => None,
+            p => p.blocks()[0].map(of),
+        }
+    }
+
+    fn pinned(&self) -> bool {
+        self.pin(&|_| 0).is_some()
+    }
+
+    /// The highest explicit block number among the params (not tags or hashes).
+    fn max_number(&self) -> Option<u64> {
+        self.blocks()
+            .into_iter()
+            .flatten()
+            .filter_map(|b| match b {
+                Block::Num(n) => Some(*n),
+                _ => None,
+            })
+            .max()
+    }
+
     /// Whether a `null` result is a real answer (see the module doc's lagging heuristics).
     fn null_is_an_answer(&self) -> bool {
         matches!(
@@ -1064,6 +1130,18 @@ impl ParsedRequest {
             }
         }
         Ok(())
+    }
+
+    /// The block call `i` is pinned to, with tags resolved by `resolve` (see the lagging
+    /// heuristics). `None` for calls without a block (`eth_chainId`, by-transaction lookups).
+    pub fn pin(&self, i: usize, resolve: &dyn Fn(BlockTag) -> u64) -> Option<BlockPin> {
+        self.calls.get(i)?.params.pin(resolve)
+    }
+
+    /// The highest explicit block number the request names (EIP-1898 `blockNumber` included; tags
+    /// and hashes are not numbers). The broker refuses a request whose number is above the head.
+    pub fn max_block_number(&self) -> Option<u64> {
+        self.calls.iter().filter_map(|c| c.params.max_number()).max()
     }
 
     /// Whether the request is framed as a JSON array (a batch, or anything but exactly one call).
@@ -1142,13 +1220,25 @@ pub const LAGGING_MESSAGES: &[&str] = &[
     "node is syncing",
 ];
 
-fn is_lagging_error(code: i64, message: &[u8]) -> bool {
-    if code == 3 {
-        return false;
-    }
+/// EIP-1474's "resource not found".
+pub const RESOURCE_NOT_FOUND: i64 = -32001;
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+pub(crate) fn error_hint(code: i64, message: &[u8]) -> ErrorHint {
     let m = message.to_ascii_lowercase();
-    let has = |needle: &str| m.windows(needle.len()).any(|w| w == needle.as_bytes());
-    !has("revert") && LAGGING_MESSAGES.iter().any(|p| has(p))
+    let has = |needle: &str| find(&m, needle.as_bytes()).is_some();
+    let execution = code == 3 || has("revert");
+    // `(header|block).*not found`: "not found" somewhere after the first "header" or "block".
+    let subject = [find(&m, b"header"), find(&m, b"block")].into_iter().flatten().min();
+    let not_found_msg = subject.is_some_and(|i| find(&m[i..], b"not found").is_some());
+    ErrorHint {
+        execution,
+        lagging: !execution && LAGGING_MESSAGES.iter().any(|p| has(p)),
+        not_found: !execution && (code == RESOURCE_NOT_FOUND || not_found_msg),
+    }
 }
 
 const ENVELOPE_HEAD: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":";
@@ -1253,14 +1343,17 @@ fn place(
     }
     let call = &req.calls[idx];
     let answer = match payload {
-        Body::Error { lagging: true, .. } => return Err(ResponseError::Lagging),
-        Body::Error {
-            canon,
-            lagging: false,
-        } => CallAnswer {
-            canonical: canon,
-            is_error: true,
-        },
+        Body::Error { hint, canon } => {
+            let pinned = call.params.pinned();
+            if hint.lagging || (hint.not_found && pinned) {
+                return Err(ResponseError::Lagging);
+            }
+            CallAnswer {
+                canonical: canon,
+                is_error: true,
+                suspect: pinned && !hint.execution,
+            }
+        }
         Body::Result {
             kind: Kind::Null, ..
         } if !call.params.null_is_an_answer() => return Err(ResponseError::Lagging),
@@ -1276,6 +1369,7 @@ fn place(
             CallAnswer {
                 canonical: canon,
                 is_error: false,
+                suspect: false,
             }
         }
     };
@@ -1342,8 +1436,8 @@ pub fn parse_tag_answer(body: &[u8], id: u64) -> Result<u64, ResponseError> {
         return Err(ResponseError::Mismatch);
     }
     match payload {
-        Body::Error { lagging: true, .. }
-        | Body::Result {
+        Body::Error { hint, .. } if hint.lagging || hint.not_found => Err(ResponseError::Lagging),
+        Body::Result {
             kind: Kind::Null, ..
         } => Err(ResponseError::Lagging),
         Body::Result {

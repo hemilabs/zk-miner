@@ -1,6 +1,6 @@
 //! End to end against anvil with the REAL `evm_rpc` codec and the REAL `egress` floor
-//! (`Hooks::real()`). Both modules are interface stubs (`todo!()`) on this branch, so these tests
-//! are ignored until max/witness-broker-rpc merges; they are written to pass after it.
+//! (`Hooks::real()`): state reads, tag resolution, `hemi-code` and the self-test, and failover
+//! between a node at height 0 and one ahead of it.
 
 mod common;
 
@@ -89,7 +89,7 @@ async fn state_reads_through_the_broker() {
     let stats = client.end_job(B256::repeat_byte(1)).await.unwrap();
     assert_eq!(stats.denied, 4);
     assert_eq!(stats.fetches, 1 + 2 + 1 + 1 + 1 + 4);
-    assert!(!stats.transient);
+    assert!(!stats.operator_failure && !stats.unanswerable);
 }
 
 #[tokio::test]

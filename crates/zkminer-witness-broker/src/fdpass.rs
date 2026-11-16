@@ -435,6 +435,51 @@ mod tests {
         assert!(matches!(recv_with_fd(&b, 10), Err(FrameError::Malformed)));
     }
 
+    /// More fds than the reader's control buffer holds: the kernel sets `MSG_CTRUNC` (and closes
+    /// what did not fit); the frame is refused and every fd that did arrive is closed. Checked
+    /// through a pipe: its read end sees EOF only once every copy of the write end is closed.
+    #[test]
+    fn truncated_ancillary_data_is_refused_and_every_fd_closed() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut p = [0 as RawFd; 2];
+        // SAFETY: pipe2 into a 2-int array.
+        assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) }, 0);
+        // SAFETY: both ends are fresh descriptors owned here.
+        let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) };
+        const N: usize = 64;
+        let copies: Vec<OwnedFd> = (0..N).map(|_| wr.try_clone().unwrap()).collect();
+        drop(wr);
+        let header = [1u8, 0, 0, 0, 0];
+        let mut iov = libc::iovec { iov_base: header.as_ptr() as *mut _, iov_len: 5 };
+        let mut cbuf = vec![0u64; 64];
+        // SAFETY: one SCM_RIGHTS message of N ints in a buffer of 512 bytes (CMSG_SPACE(256) fits).
+        unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cbuf.as_mut_ptr().cast();
+            msg.msg_controllen = libc::CMSG_SPACE((N * 4) as u32) as _;
+            let c = libc::CMSG_FIRSTHDR(&msg);
+            (*c).cmsg_level = libc::SOL_SOCKET;
+            (*c).cmsg_type = libc::SCM_RIGHTS;
+            (*c).cmsg_len = libc::CMSG_LEN((N * 4) as u32) as _;
+            let d = libc::CMSG_DATA(c).cast::<RawFd>();
+            for (i, f) in copies.iter().enumerate() {
+                std::ptr::write_unaligned(d.add(i), f.as_raw_fd());
+            }
+            assert_eq!(libc::sendmsg(a.as_raw_fd(), &msg, 0), 5);
+        }
+        drop(copies);
+        match recv_with_fd(&b, 10) {
+            Err(FrameError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            other => panic!("accepted a truncated control message: {other:?}"),
+        }
+        let mut byte = [0u8; 1];
+        // SAFETY: read into a 1-byte buffer from the pipe's read end.
+        let n = unsafe { libc::read(rd.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+        assert_eq!(n, 0, "EOF: no copy of the write end survived ({})", io::Error::last_os_error());
+    }
+
     #[tokio::test]
     async fn async_halves_interoperate_with_blocking_ones() {
         let (a, b) = UnixStream::pair().unwrap();

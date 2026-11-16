@@ -57,16 +57,23 @@ pub struct JobRegistration {
     pub held_lock: bool,
 }
 
-/// The broker's account of a finished job (`JobStats`).
+/// The broker's account of a finished job (`JobStats`; see `ControlResponse::JobStats` for the
+/// exact meaning of each flag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobStats {
     pub fetches: u32,
     pub fetch_bytes: u64,
-    /// Some fetch returned status 2.
-    pub transient: bool,
+    /// Some fetch failed (status 2) for an operator-side reason.
+    pub operator_failure: bool,
+    /// Some fetch failed (status 2) because every endpoint tried lacked what it asked for.
+    pub unanswerable: bool,
     /// A fetch was being served when the job ended or its socket closed.
     pub fetch_in_flight_at_end: bool,
+    /// ...and it was waiting on operator-side capacity or had met an operator-side failure.
+    pub in_flight_operator_wait: bool,
     pub denied: u32,
+    /// Fetch frames received after a builder-visible budget was spent.
+    pub frames_after_exhaustion: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -88,7 +95,9 @@ pub struct ArtifactCharge {
     pub chunks: u32,
 }
 
-/// A verified artifact: a sealed memfd of exactly `len` bytes (read it with `pread`/`mmap`).
+/// A verified artifact: a sealed memfd of exactly `len` bytes. Read it with `pread`/`mmap` only:
+/// a cache hit is a duplicate of the broker's cached descriptor, so its file offset is shared with
+/// the broker and with every other job served the same artifact, and is never meaningful.
 #[derive(Debug)]
 pub struct FetchedArtifact {
     pub memfd: File,
@@ -189,11 +198,29 @@ impl BrokerClient {
     /// `EndJob`: stops the broker serving the job and returns its account.
     pub async fn end_job(&self, job_key: B256) -> Result<JobStats, ClientError> {
         match self.call(ControlRequest::EndJob { job_key }, None).await? {
-            (ControlResponse::JobStats { job_key: k, fetches, fetch_bytes, transient, fetch_in_flight_at_end, denied }, None)
-                if k == job_key =>
-            {
-                Ok(JobStats { fetches, fetch_bytes, transient, fetch_in_flight_at_end, denied })
-            }
+            (
+                ControlResponse::JobStats {
+                    job_key: k,
+                    fetches,
+                    fetch_bytes,
+                    operator_failure,
+                    unanswerable,
+                    fetch_in_flight_at_end,
+                    in_flight_operator_wait,
+                    denied,
+                    frames_after_exhaustion,
+                },
+                None,
+            ) if k == job_key => Ok(JobStats {
+                fetches,
+                fetch_bytes,
+                operator_failure,
+                unanswerable,
+                fetch_in_flight_at_end,
+                in_flight_operator_wait,
+                denied,
+                frames_after_exhaustion,
+            }),
             _ => Err(ClientError::Protocol),
         }
     }

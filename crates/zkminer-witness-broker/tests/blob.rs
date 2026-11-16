@@ -52,13 +52,13 @@ async fn fetches_verified_blobs_and_reports_job_stats() {
     // Not 32 bytes, or a cap index out of range: refused.
     assert_eq!(b.fetch(0, &id[..31]).await.0, FetchStatus::Denied);
     assert_eq!(b.fetch(1, &id).await.0, FetchStatus::Denied);
-    // A blob no mirror has: status 2.
+    // A blob no mirror has: status 2, unanswerable (the builder can name any hash).
     assert_eq!(b.fetch(0, &[7u8; 32]).await.0, FetchStatus::Failed);
     let stats = client.end_job(B256::repeat_byte(1)).await.unwrap();
     assert_eq!(stats.fetches, 4, "every request is a unit, refused ones included");
     assert_eq!(stats.fetch_bytes, content.len() as u64);
     assert_eq!(stats.denied, 2);
-    assert!(stats.transient);
+    assert!(stats.unanswerable && !stats.operator_failure, "{stats:?}");
     assert!(!stats.fetch_in_flight_at_end);
     // The broker closed its end of the job socket.
     assert!(b.recv().await.is_none());
@@ -78,14 +78,15 @@ async fn hash_mismatch_and_errors_fail_over_to_the_next_mirror() {
     assert_eq!((s, body), (FetchStatus::Ok, content.clone()));
     assert_eq!((wrong.hits(), broken.hits(), good.hits()), (1, 1, 1));
     let stats = client.end_job(B256::repeat_byte(2)).await.unwrap();
-    assert!(!stats.transient, "a fetch that succeeded after failover is not transient");
+    assert!(!stats.operator_failure && !stats.unanswerable, "a fetch that succeeded after failover is not a failure");
 
     // Every mirror wrong: status 2, never the bytes.
     let text = config_text(dir.path(), &mirrors(&[&wrong, &broken], ""));
     let (client, _t) = start(dir.path(), &text, test_hooks()).await;
     let mut b = register(&client, 3, vec![blob(1 << 20)], budget(10, 1 << 20, 1 << 20), false).await;
     assert_eq!(b.fetch(0, &sha256(&content)).await, (FetchStatus::Failed, vec![]));
-    assert!(client.end_job(B256::repeat_byte(3)).await.unwrap().transient);
+    let stats = client.end_job(B256::repeat_byte(3)).await.unwrap();
+    assert!(stats.operator_failure && !stats.unanswerable, "a wrong body and a 500 are the operator's: {stats:?}");
 }
 
 #[tokio::test]
@@ -113,7 +114,7 @@ async fn oversize_bodies_are_the_jobs_limit() {
     assert_eq!(b.fetch(0, &id).await.0, FetchStatus::Ok);
     assert_eq!(b.fetch(0, &id).await.0, FetchStatus::Exhausted, "5,000 bytes left");
     let stats = client.end_job(B256::repeat_byte(6)).await.unwrap();
-    assert_eq!((stats.fetch_bytes, stats.transient), (10_000, false));
+    assert_eq!((stats.fetch_bytes, stats.operator_failure), (10_000, false));
 }
 
 #[tokio::test]
@@ -140,6 +141,7 @@ async fn spool_quota_is_operator_side() {
     let (client, _t) = start(dir.path(), &text, test_hooks()).await;
     let mut b = register(&client, 8, vec![blob(1 << 20)], budget(10, 1 << 20, 1 << 20), false).await;
     assert_eq!(b.fetch(0, &sha256(&content)).await.0, FetchStatus::Failed);
+    assert!(client.end_job(B256::repeat_byte(8)).await.unwrap().operator_failure);
 }
 
 #[tokio::test]
@@ -158,7 +160,8 @@ async fn a_fetch_in_flight_when_the_job_ends_is_recorded() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let stats = client.end_job(B256::repeat_byte(9)).await.unwrap();
     assert!(stats.fetch_in_flight_at_end);
-    assert!(!stats.transient);
+    assert!(!stats.in_flight_operator_wait, "waiting on the mirror's answer is not an operator-side wait");
+    assert!(!stats.operator_failure);
     assert!(b.recv().await.is_none(), "no result after EndJob");
 
     // The builder's socket closes (the runner was killed) while a fetch is served.

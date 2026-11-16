@@ -1,10 +1,13 @@
 //! `zkminer-witness-broker --config <path>`: the control socket is fd 3 (plan §10.1).
 //!
-//! Order matters: everything that needs the filesystem, netlink or a resolver without the sandbox
-//! happens first, single-threaded — the config and key files, the host facts (endpoint addresses,
-//! connected prefixes, own addresses), the spool directory — then `restrict_self` (which refuses a
-//! process that already has a second thread), and only then logging, the tokio runtime and the
-//! HTTP clients.
+//! Order matters: everything that needs the filesystem or netlink without the sandbox happens
+//! first, single-threaded — the config and key files, the host facts (the DNS servers from
+//! `/etc/resolv.conf` unless `[dns] servers` is set, endpoint addresses through the broker's own
+//! resolver, connected prefixes, own addresses), the spool directory — then `restrict_self` (which
+//! refuses a process that already has a second thread), and only then logging (every line
+//! redacted at the writer), the tokio runtime and the HTTP clients. The sandbox grants no file
+//! but the spool directory: no `/etc/hosts`, `/etc/nsswitch.conf` or `/etc/resolv.conf` (host names
+//! are resolved over UDP to the servers read before it).
 //!
 //! Threads: the main thread, [`WORKER_THREADS`] runtime workers and at most
 //! [`MAX_BLOCKING_THREADS`] blocking-pool threads: 13 in all, the broker cgroup's `pids.max` floor.
@@ -15,11 +18,9 @@ use std::process::ExitCode;
 
 use zkminer_witness::ipc::BROKER_CONTROL_FD;
 use zkminer_witness_broker::hooks::RealEgress;
+use zkminer_witness_broker::logging::{env_filter, Redacting};
 use zkminer_witness_broker::{serve, BrokerConfig, HostFacts, MAX_BLOCKING_THREADS, WORKER_THREADS};
 use zkminer_witness_sandbox::{restrict_self, Profile};
-
-/// Files the system resolver reads (each granted read-only if it exists).
-const RESOLVER_FILES: [&str; 4] = ["/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/gai.conf"];
 
 fn config_path() -> Result<PathBuf, String> {
     let mut args = std::env::args_os().skip(1);
@@ -62,10 +63,9 @@ fn main() -> ExitCode {
         eprintln!("zkminer-witness-broker: creating spool_dir: {e}");
         return ExitCode::from(2);
     }
-    let readable: Vec<PathBuf> = RESOLVER_FILES.iter().map(PathBuf::from).filter(|p| p.exists()).collect();
-    // blob/v1 spool files are created in spool_dir.
+    // No readable files; blob/v1 spool files are created in spool_dir.
     let profile = Profile::Broker {
-        readable,
+        readable: Vec::new(),
         writable: vec![config.spool_dir.clone()],
         tcp_connect_ports: config.tcp_connect_ports(),
     };
@@ -74,10 +74,9 @@ fn main() -> ExitCode {
         return ExitCode::from(3);
     }
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_writer(Redacting(std::io::stderr))
+        .with_ansi(false)
+        .with_env_filter(env_filter(std::env::var("RUST_LOG").ok().as_deref()))
         .init();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(WORKER_THREADS)

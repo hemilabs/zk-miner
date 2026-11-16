@@ -21,7 +21,7 @@ use zkminer_witness::ipc::{
 use crate::client::BrokerClient;
 use crate::config::{mask, BrokerConfig};
 use crate::egress::{Admit, DenyReason, EgressPolicy, Prefix, Role};
-use crate::evm_rpc::{BlockTag, CallAnswer, Denied, ResponseError};
+use crate::evm_rpc::{BlockPin, BlockTag, CallAnswer, Denied, ResponseError};
 use crate::hooks::{EgressHooks, Hooks, RpcCodec, RpcReq};
 
 // ---------------------------------------------------------------------------------------------
@@ -90,7 +90,16 @@ impl Drop for TestServer {
 
 impl TestServer {
     pub async fn start(handler: impl Fn(TestRequest) -> TestResponse + Send + Sync + 'static) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        Self::start_at("127.0.0.1:0".parse().expect("addr"), handler).await.expect("bind")
+    }
+
+    /// On a given address (another loopback address, or a port another server already has on
+    /// another address).
+    pub async fn start_at(
+        at: SocketAddr,
+        handler: impl Fn(TestRequest) -> TestResponse + Send + Sync + 'static,
+    ) -> std::io::Result<Self> {
+        let listener = tokio::net::TcpListener::bind(at).await?;
         let addr = listener.local_addr().expect("addr");
         let hits = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -105,7 +114,7 @@ impl TestServer {
                 });
             }
         });
-        Self { addr, hits, requests, task }
+        Ok(Self { addr, hits, requests, task })
     }
 
     /// `http://127.0.0.1:<port>`.
@@ -281,7 +290,7 @@ pub fn prefix(s: &str) -> Prefix {
 //
 // A request is a JSON string (one call) or an array of strings (a batch). A name starting with
 // "deny" is refused; "latest", "safe" and "finalized" need that tag; names starting with "h:" are
-// pinned (cacheable). The outgoing body is
+// pinned (cacheable); "n:<decimal>" names an explicit block number. The outgoing body is
 // `{"first_id":N,"calls":[…],"tags":{"latest":n,…}}`; an answer body is `{"lagging":true}` or
 // `{"answers":[{"id":N,"result":"…"}|{"id":N,"error":"…"},…]}`, whose canonical form per call is the
 // JSON string of the result (or `{"error":"…"}`). A tag query is `{"tag_query":"latest","id":N}`,
@@ -359,6 +368,13 @@ impl RpcReq for MockReq {
         }
         t
     }
+    /// Calls named `n:<decimal>` name that explicit block number.
+    fn max_block_number(&self) -> Option<u64> {
+        self.calls.iter().filter_map(|c| c.strip_prefix("n:")?.parse().ok()).max()
+    }
+    fn pin(&self, i: usize, _resolve: &dyn Fn(BlockTag) -> u64) -> Option<BlockPin> {
+        self.calls.get(i)?.strip_prefix("n:")?.parse().ok().map(BlockPin::Number)
+    }
     fn check_after_resolution(&self, _resolve: &dyn Fn(BlockTag) -> u64) -> Result<(), Denied> {
         Ok(())
     }
@@ -399,7 +415,7 @@ impl RpcReq for MockReq {
             if total > max_bytes {
                 return Err(ResponseError::TooLarge);
             }
-            out.push(CallAnswer { canonical, is_error });
+            out.push(CallAnswer { canonical, is_error, suspect: false });
         }
         Ok(out)
     }
@@ -514,4 +530,108 @@ pub fn config_text(dir: &std::path::Path, extra: &str) -> String {
         "chain_rpc_host = \"chain-rpc.invalid\"\nspool_dir = \"{}\"\n{extra}",
         dir.join("spool").display()
     )
+}
+
+// ---------------------------------------------------------------------------------------------
+// DNS.
+
+/// A UDP DNS server on 127.0.0.1 answering `A`/`AAAA` queries from a fixed table (lowercase names,
+/// no trailing dot); `NXDOMAIN` for other names. Counts the queries it answered.
+pub struct TestDns {
+    pub addr: SocketAddr,
+    pub queries: Arc<AtomicUsize>,
+    records: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<IpAddr>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TestDns {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl TestDns {
+    pub async fn start(records: &[(&str, &[&str])]) -> Self {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let addr = sock.local_addr().expect("addr");
+        let queries = Arc::new(AtomicUsize::new(0));
+        let table = Arc::new(std::sync::Mutex::new(
+            records.iter().map(|(n, ips)| (n.to_string(), ips.iter().map(|s| s.parse().expect("ip")).collect())).collect(),
+        ));
+        let (q, t) = (queries.clone(), table.clone());
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let Ok((n, peer)) = sock.recv_from(&mut buf).await else { return };
+                let answer = dns_answer(&buf[..n], &t.lock().unwrap());
+                if let Some(answer) = answer {
+                    q.fetch_add(1, Ordering::SeqCst);
+                    let _ = sock.send_to(&answer, peer).await;
+                }
+            }
+        });
+        Self { addr, queries, records: table, task }
+    }
+
+    /// `[dns]` for a broker config.
+    pub fn config(&self) -> String {
+        format!("[dns]\nservers = [\"{}\"]\n", self.addr)
+    }
+
+    /// Changes what `name` resolves to.
+    pub fn set(&self, name: &str, ips: &[&str]) {
+        self.records.lock().unwrap().insert(name.to_string(), ips.iter().map(|s| s.parse().expect("ip")).collect());
+    }
+
+    pub fn queries(&self) -> usize {
+        self.queries.load(Ordering::SeqCst)
+    }
+}
+
+fn dns_answer(q: &[u8], table: &std::collections::HashMap<String, Vec<IpAddr>>) -> Option<Vec<u8>> {
+    if q.len() < 12 {
+        return None;
+    }
+    let mut labels = Vec::new();
+    let mut i = 12;
+    loop {
+        let l = usize::from(*q.get(i)?);
+        if l == 0 {
+            i += 1;
+            break;
+        }
+        labels.push(String::from_utf8_lossy(q.get(i + 1..i + 1 + l)?).to_ascii_lowercase());
+        i += 1 + l;
+    }
+    let qtype = u16::from_be_bytes([*q.get(i)?, *q.get(i + 1)?]);
+    let question = q.get(12..i + 4)?;
+    let name = labels.join(".");
+    let ips: Vec<IpAddr> = table
+        .get(&name)
+        .map(|v| v.iter().copied().filter(|ip| (qtype == 1 && ip.is_ipv4()) || (qtype == 28 && ip.is_ipv6())).collect())
+        .unwrap_or_default();
+    let rcode = if table.contains_key(&name) { 0 } else { 3 };
+    let mut a = Vec::new();
+    a.extend_from_slice(&q[..2]);
+    a.extend_from_slice(&(0x8180u16 | rcode).to_be_bytes());
+    a.extend_from_slice(&1u16.to_be_bytes());
+    a.extend_from_slice(&(ips.len() as u16).to_be_bytes());
+    a.extend_from_slice(&[0, 0, 0, 0]);
+    a.extend_from_slice(question);
+    for ip in ips {
+        a.extend_from_slice(&[0xc0, 12]);
+        a.extend_from_slice(&qtype.to_be_bytes());
+        a.extend_from_slice(&[0, 1, 0, 0, 0, 30]);
+        match ip {
+            IpAddr::V4(v) => {
+                a.extend_from_slice(&4u16.to_be_bytes());
+                a.extend_from_slice(&v.octets());
+            }
+            IpAddr::V6(v) => {
+                a.extend_from_slice(&16u16.to_be_bytes());
+                a.extend_from_slice(&v.octets());
+            }
+        }
+    }
+    Some(a)
 }
