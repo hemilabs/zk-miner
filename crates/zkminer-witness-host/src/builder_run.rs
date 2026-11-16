@@ -147,6 +147,7 @@ pub fn runner_args(limits: &Limits) -> Vec<String> {
 
 /// The blocking core: spawn, stream, wait, kill on the outer deadline. `broker_fd` is the runner's end
 /// of the job socket (already registered with the broker).
+#[allow(clippy::too_many_arguments)]
 fn run_blocking<S: WitnessSink>(
     spawner: &Spawner,
     binary: PathBuf,
@@ -170,7 +171,7 @@ fn run_blocking<S: WitnessSink>(
         sink_error: None,
         spawn_error: None,
     };
-    let name = format!("builder-{}-{}", &hex_prefix(job_key), RUN_SEQ.fetch_add(1, Ordering::Relaxed));
+    let name = format!("builder-{}-{}", hex_prefix(job_key), RUN_SEQ.fetch_add(1, Ordering::Relaxed));
     let cgroup = match Cgroup::create(
         &cgroup_root,
         &CgroupSpec {
@@ -341,7 +342,8 @@ pub async fn run_builder<S: WitnessSink>(
     };
     let mut log = sanitize_log(&raw.log, MINER_LOG_CAP * 2);
     for e in [raw.spawn_error.as_deref(), raw.sink_error.as_deref()].into_iter().flatten() {
-        log.push_str(&format!("\n[miner] {e}"));
+        log.push_str("\n[miner] ");
+        log.push_str(e);
     }
     Ok((
         BuilderRunResult {

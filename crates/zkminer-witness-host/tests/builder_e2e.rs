@@ -135,7 +135,7 @@ fn start_anvil() -> Anvil {
         .expect("anvil on PATH");
     let a = Anvil { child, url: format!("http://127.0.0.1:{port}") };
     for _ in 0..100 {
-        if rpc(&a.url, "eth_chainId", "[]").get("result").is_some() {
+        if rpc(&a.url, "eth_chainId", "[]").contains_key("result") {
             return a;
         }
         std::thread::sleep(Duration::from_millis(100));
