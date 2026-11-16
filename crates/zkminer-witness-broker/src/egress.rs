@@ -235,6 +235,9 @@ pub enum DenyReason {
     ConnectedPrefix,
     NoRoleEntry,
     WrongPort,
+    /// A requester-derived connection to an operator endpoint's address: those are reachable only
+    /// through their role entries (plan §14.6).
+    RoleOnly,
 }
 
 /// The only port a requester-derived connection may use.
@@ -288,6 +291,8 @@ impl EgressPolicy {
                     Admit::Denied(DenyReason::DenyCidr)
                 } else if self.connected.iter().any(|p| p.contains(ip)) {
                     Admit::Denied(DenyReason::ConnectedPrefix)
+                } else if self.roles.iter().any(|e| e.prefixes.iter().any(|p| p.contains(ip))) {
+                    Admit::Denied(DenyReason::RoleOnly)
                 } else if addr.port() != REQUESTER_PORT {
                     Admit::Denied(DenyReason::WrongPort)
                 } else {
@@ -1154,8 +1159,12 @@ mod tests {
             p.admit(None, sa("[2606:4700:aaaa::1]:443")),
             Admit::Denied(DenyReason::ConnectedPrefix)
         );
-        // Requester-derived connections never come back as `Role`, even at a role entry's address.
-        assert_eq!(p.admit(None, sa("8.8.4.8:443")), Admit::Global);
+        // Requester-derived connections never reach a role entry's address: operator endpoints are
+        // reachable only through their roles.
+        assert_eq!(
+            p.admit(None, sa("8.8.4.8:443")),
+            Admit::Denied(DenyReason::RoleOnly)
+        );
         assert_eq!(
             p.admit(None, sa("203.0.113.7:443")),
             Admit::Denied(DenyReason::NotGlobal)
