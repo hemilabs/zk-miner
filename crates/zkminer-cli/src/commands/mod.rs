@@ -7,3 +7,4 @@ pub mod simulate;
 pub mod sp1_demo;
 pub mod stake;
 pub mod status;
+pub mod witness;
