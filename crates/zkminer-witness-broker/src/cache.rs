@@ -1,8 +1,8 @@
 //! The broker's caches (plan §11.4): LRU with byte and entry caps, in type-tagged namespaces. Each
 //! namespace has its own key type, so an RPC answer can never be looked up as an artifact:
 //!
-//! - [`RpcKey`]: answers to calls pinned to a block hash, keyed by chain and the broker's canonical
-//!   outgoing call (never errors);
+//! - [`RpcKey`]: answers to calls pinned to a block hash, keyed by the requester (its trust
+//!   domain, §11.4), chain and the broker's canonical outgoing call (never errors);
 //! - [`ArtifactKey`]: builder artifacts by `(builder type, the broker's own sha256 of the bytes)`;
 //! - [`ManifestKey`] / [`ManifestPairKey`]: remembered bad `hemi-code` manifests (§13.4), and
 //!   [`PendingKey`]: failures read above the safe head, promoted once it passes their block.
@@ -15,9 +15,16 @@ use std::hash::Hash;
 
 use alloy_primitives::{Address, B256};
 
-/// An RPC answer: the chain it is from and the canonical call (no id).
+/// An RPC answer: the requester whose job asked it, the chain it is from and the canonical call
+/// (no id).
+///
+/// Keyed by the requester (the job's `caller`, its trust domain, plan §11.4) because a cached
+/// answer comes back without the endpoint's latency: a cache shared across requesters would let
+/// one requester's builder learn, by timing, whether another requester's job asked the same query
+/// (review r1 broker F2). Jobs of the same requester share their answers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RpcKey {
+    pub caller: Address,
     pub chain_id: u64,
     pub call: Vec<u8>,
 }
@@ -176,9 +183,14 @@ mod tests {
     #[test]
     fn namespaces_are_distinct_types() {
         let mut rpc: Lru<RpcKey, Vec<u8>> = Lru::new(1 << 20, 10);
-        let k = RpcKey { chain_id: 1, call: b"x".to_vec() };
+        let alice = Address::repeat_byte(1);
+        let k = RpcKey { caller: alice, chain_id: 1, call: b"x".to_vec() };
         rpc.insert(k.clone(), b"1".to_vec(), 1);
-        assert!(!rpc.contains(&RpcKey { chain_id: 2, call: b"x".to_vec() }), "keyed by chain");
+        assert!(!rpc.contains(&RpcKey { caller: alice, chain_id: 2, call: b"x".to_vec() }), "keyed by chain");
+        assert!(
+            !rpc.contains(&RpcKey { caller: Address::repeat_byte(2), chain_id: 1, call: b"x".to_vec() }),
+            "keyed by requester"
+        );
         assert_eq!(rpc.get(&k), Some(&b"1".to_vec()));
     }
 }

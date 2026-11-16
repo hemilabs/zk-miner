@@ -296,7 +296,9 @@ pub(crate) async fn serve(
     }
 
     // Cache hits (calls pinned to a block hash only), charged to an operator budget as misses.
-    let keys: Vec<Option<RpcKey>> = (0..n).map(|i| req.cache_key(i).map(|call| RpcKey { chain_id, call })).collect();
+    // Per requester (trust domain): another requester's answers are never served from the cache.
+    let keys: Vec<Option<RpcKey>> =
+        (0..n).map(|i| req.cache_key(i).map(|call| RpcKey { caller: job.caller, chain_id, call })).collect();
     let mut answers: Vec<Option<CallAnswer>> = vec![None; n];
     {
         let mut cache = b.rpc_cache.lock().unwrap_or_else(|p| p.into_inner());
