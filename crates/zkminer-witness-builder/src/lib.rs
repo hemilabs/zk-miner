@@ -4,11 +4,12 @@
 //!
 //! # Pipeline
 //! 1. **Pre-pass** ([`prepass`]): a streaming wasmparser pass, before any compilation, validates the
-//!    module against exactly [`PROFILE_FEATURES`] and rejects oversized or over-numerous parts
-//!    (INVALID_MODULE), and any import other than `hemiprove_builder_v1`'s six functions with their
-//!    exact signatures (UNKNOWN_IMPORT). The module must export `memory` (32-bit) and `run: () -> i32`
-//!    (INVALID_MODULE otherwise). **Other exports are tolerated and ignored**: Rust's wasm32 cdylibs
-//!    export the globals `__heap_base` and `__data_end`, and the runner never calls anything but `run`.
+//!    module against exactly [`PROFILE_FEATURES`] and rejects oversized or over-numerous parts and
+//!    modules over the compile-cost budget ([`cost`]) (INVALID_MODULE), and any import other than
+//!    `hemiprove_builder_v1`'s six functions with their exact signatures (UNKNOWN_IMPORT). The module
+//!    must export `memory` (32-bit) and `run: () -> i32` (INVALID_MODULE otherwise). **Other exports
+//!    are tolerated and ignored**: Rust's wasm32 cdylibs export the globals `__heap_base` and
+//!    `__data_end`, and the runner never calls anything but `run`.
 //! 2. **Compilation** with [`engine::engine_config`], single-threaded, at `OptLevel::None`, on the
 //!    execution thread; the wall clock is already running.
 //! 3. **Instantiation and `run()`**, with fuel and the epoch deadline armed on the store before
@@ -34,6 +35,7 @@
 //! allocator or userfaultfd).
 
 pub mod cli;
+pub mod cost;
 pub mod engine;
 mod host;
 pub mod prepass;
@@ -41,6 +43,6 @@ mod runner;
 
 pub use cli::{main_with_fds, parse_args, Args, RunnerFds, MAX_CONTEXT_BYTES};
 pub use host::{FUEL_PER_BYTE, FUEL_PER_HOST_CALL};
-pub use prepass::{prepass, ModuleInfo, PrepassError, PROFILE_FEATURES};
+pub use prepass::{prepass, prepass_with_caps, CompileCost, CostCaps, ModuleInfo, PrepassError, PROFILE_FEATURES};
 pub use runner::{run, BrokerChannel, RunnerConfig, RunnerIo, DEADLINE_GRACE};
 pub use zkminer_witness::ipc::BuilderSummary;
