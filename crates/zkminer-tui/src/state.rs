@@ -592,6 +592,10 @@ pub struct MinerState {
     pub stop_prompt: Option<StopPrompt>,
     /// The shutdown under way, if any.
     pub shutdown: Option<ShutdownView>,
+    /// How long before a lock's cutoff a release must start to land in time (the miner's
+    /// `DEADLINE_RELEASE_MARGIN_SECS`): the quit prompt's "start it again before" is the earliest
+    /// cutoff less this. 0 until the miner sets it.
+    pub release_margin_secs: u64,
     pub connected: bool,
     pub block_number: u64,
     pub errors: Vec<String>,
@@ -1059,6 +1063,7 @@ impl Default for MinerState {
             stop_request: None,
             stop_prompt: None,
             shutdown: None,
+            release_margin_secs: 0,
             connected: false,
             block_number: 0,
             errors: Vec::new(),

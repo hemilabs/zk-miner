@@ -1743,11 +1743,12 @@ impl SlotCheck {
     /// The card's benchmark device id (`gpu0`, `gpu-rocm0`, ...; `cpu` for a slot with no card):
     /// its calibration row and its `[prover.risc0_job_po2]` size are keyed by it.
     pub fn device_id(&self) -> String {
-        match self.device_index {
-            Some(i) if self.gpu_tag != "generic" => {
-                WorkerPool::gpu_device_id(&self.gpu_tag, &i.to_string())
-            }
-            _ => "cpu".to_string(),
+        // As `WorkerPool::benchmark_device_id` maps a slot key: a vendor slot with no index (an
+        // explicit `-cuda` binary, say) is that vendor's card 0.
+        match (self.gpu_tag.as_str(), self.device_index) {
+            ("generic", _) => "cpu".to_string(),
+            (tag, Some(i)) => WorkerPool::gpu_device_id(tag, &i.to_string()),
+            (tag, None) => WorkerPool::gpu_device_id(tag, "0"),
         }
     }
 }

@@ -48,6 +48,24 @@ enum PostKeyAction {
     SetupStake,
 }
 
+/// Whether `run_tui` has the terminal (raw mode, alternate screen). Cleared however it ends,
+/// error and panic included, so a caller can tell the dashboard is gone.
+static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Held while drawing; `true` once [`restore_terminal`] has taken the terminal back, after which
+/// nothing draws again (a draw after it would scribble over the restored screen).
+static TERMINAL: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// Set once a `run_tui` that had the terminal has ended (however: quit, error, panic), or once
+/// [`restore_terminal`] took the terminal back from it.
+static ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the dashboard was up and is not any more: a caller still sending it messages should
+/// print them instead.
+pub fn dashboard_ended() -> bool {
+    ENDED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Run the full interactive TUI.
 ///
 /// If `chain_client` is provided, the setup wizard can perform on-chain actions
@@ -76,16 +94,23 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
     struct TermRestore;
     impl Drop for TermRestore {
         fn drop(&mut self) {
-            let _ = disable_raw_mode();
-            let _ = execute!(
-                io::stdout(),
-                LeaveAlternateScreen,
-                DisableMouseCapture,
-                crossterm::cursor::Show
-            );
+            RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+            ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Not again after `restore_terminal`: leaving the alternate screen a second time
+            // would move the cursor over what was printed since.
+            if !*TERMINAL.lock().unwrap_or_else(|p| p.into_inner()) {
+                let _ = disable_raw_mode();
+                let _ = execute!(
+                    io::stdout(),
+                    LeaveAlternateScreen,
+                    DisableMouseCapture,
+                    crossterm::cursor::Show
+                );
+            }
         }
     }
     let _restore = TermRestore;
+    RUNNING.store(true, std::sync::atomic::Ordering::SeqCst);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -95,6 +120,11 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
         // Draw
         {
             let state = state.read().await;
+            let taken = TERMINAL.lock().unwrap_or_else(|p| p.into_inner());
+            if *taken {
+                // `restore_terminal` took it back (a force exit): stop, drawing nothing more.
+                return Ok(());
+            }
             terminal.draw(|f| draw(f, &state))?;
         }
 
@@ -183,7 +213,10 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
         }
     }
 
-    // Cleanup terminal
+    // Cleanup terminal (unless `restore_terminal` already did)
+    if *TERMINAL.lock().unwrap_or_else(|p| p.into_inner()) {
+        return Ok(());
+    }
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -198,6 +231,13 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
 /// Put the terminal back the way `run_tui` found it, for a caller about to `process::exit` while
 /// the dashboard is still open (a force exit); harmless when it is not.
 pub fn restore_terminal() {
+    // Taken under the draw lock: a draw in progress finishes first, and none starts after.
+    let mut taken = TERMINAL.lock().unwrap_or_else(|p| p.into_inner());
+    if *taken || !RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    *taken = true;
+    ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = disable_raw_mode();
     let _ = execute!(
         io::stdout(),
