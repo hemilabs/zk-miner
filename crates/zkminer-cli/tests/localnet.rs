@@ -37,6 +37,12 @@
 //!   dispatched, nothing is sent); the paused one claims and fulfils after the lift.
 //! - `mines_the_claimable_jobs`: the replay test with the real risc0 worker on the fibonacci guest:
 //!   real GPU proofs. Runs only with `ZKMINER_LOCALNET_MINE=1`.
+//! - `serves_witness_jobs` (Linux): witness-construction jobs end to end with `[witness] enabled`,
+//!   the real broker, builder runner and CPU risc0 worker under the rootless sandbox, a builder
+//!   published on the fork as `hemi-code`: one job simulated, pinned, claimed, proven on the CPU,
+//!   fulfilled with `fulfillJobHashed` and its bundle deleted; one with a bad binding never claimed;
+//!   one from a caller not on `[witness] callers` never simulated. Needs a delegated cgroup: see the
+//!   witness section at the end of this file.
 //!
 //! All are ignored by default: they need anvil (Foundry), the workers, and the testnet RPC, which
 //! must serve state at the fork block (it does: it is an archive node). anvil caches what it
@@ -1190,8 +1196,12 @@ impl World {
     }
 
     /// Where the miner's backfill starts: the block of the Case::Full job's submit, the first job
-    /// submitted (see [`World::new`]). A backfill that started a block late would lose that job.
+    /// submitted (see [`World::new`]). A backfill that started a block late would lose that job. A
+    /// world with no inline cases (the witness test) starts at the first block after setup began.
     fn scan_from_block(&self) -> u64 {
+        if self.cases.is_empty() {
+            return self.from_block;
+        }
         self.jobs
             .iter()
             .find(|j| j.case == Case::Full)
@@ -3520,4 +3530,574 @@ fn occupancy_is_measured_while_work_waits() {
     assert!((o.all_busy - 10.0 / 12.0).abs() < 1e-6);
     // One proof is no window at all.
     assert!(occupancy(&spans[..1]).is_none());
+}
+
+// ── witness-construction jobs ─────────────────────────────────────────────────────────────────────
+//
+// `serves_witness_jobs`: the miner with `[witness] enabled` on the fork, end to end, with the real
+// broker, builder runner and CPU risc0 worker under the rootless sandbox. The SDK's `params-echo`
+// test builder is published on the fork as `hemi-code` (its chunks and manifest deployed with
+// `manifest::creation_code`); it writes its `builderParams` as `W`, and the fibonacci guest reads
+// `n` from `W` and commits `fib(n)`. Three witness jobs are submitted: one FULL-bound job from an
+// allowlisted caller (simulated, pinned, claimed, proven on the CPU, fulfilled with
+// `fulfillJobHashed`, its bundle deleted once Fulfilled), one whose binding names a journal the guest
+// does not commit (simulated and skipped, never claimed), and one from a caller not on
+// `[witness] callers` (never simulated, never claimed).
+//
+// Needs a delegated cgroup, anvil, the 743111 RPC and the SDK's pinned toolchain:
+//
+// ```text
+// systemd-run --user --scope -q -p Delegate=yes -- env ZKMINER_SANDBOX_TESTS_REQUIRED=1 \
+//     cargo test -p zkminer-cli --test localnet serves_witness_jobs -- --ignored --nocapture
+// ```
+//
+// It builds the builder runner, the broker, the sandbox probe and (unless
+// `ZKMINER_LOCALNET_RISC0_CPU_WORKER` names one) `zkminer-prove-risc0-cpu` into this test's target
+// dir. The miner runs in developer mode (`[dev] private_network`: anvil and the ELF server are on
+// 127.0.0.1) with a fixed DA backlog reading (`[dev] da_backlog_bytes`: anvil's receipts carry no
+// `l1GasUsed`). In this test the broker's endpoints are the miner's own chain RPC (one local anvil),
+// which its `chain_rpc_host` is told otherwise: a real deployment never shares them.
+
+#[cfg(target_os = "linux")]
+mod witness_support {
+    use super::*;
+    use zkminer_witness::envelope::{
+        encode_envelope, encode_evm_rpc_config, Capability, Limits, WitnessJobV1, CLASS_EVM_RPC_V1,
+        METHOD_SET_STATE_READ,
+    };
+    use zkminer_witness::manifest::{chunk_runtime_code, creation_code, manifest_runtime_code, sha256};
+
+    /// `<target>/debug`, where this test binary's workspace binaries are.
+    pub fn target_debug_dir() -> PathBuf {
+        std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    }
+
+    fn cargo_build(args: &[&str]) {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let target = target_debug_dir().parent().unwrap().to_path_buf();
+        let out = Command::new(cargo)
+            .current_dir(workspace_root())
+            .arg("build")
+            .args(args)
+            .arg("--target-dir")
+            .arg(&target)
+            .output()
+            .expect("run cargo");
+        assert!(
+            out.status.success(),
+            "cargo build {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    pub struct Bins {
+        pub builder: PathBuf,
+        pub broker: PathBuf,
+        pub probe: PathBuf,
+        pub cpu_worker: PathBuf,
+    }
+
+    /// The sandboxed binaries and the CPU risc0 worker (built here, one cargo at a time).
+    pub fn bins() -> Bins {
+        cargo_build(&[
+            "-p",
+            "zkminer-witness-builder",
+            "-p",
+            "zkminer-witness-broker",
+            "-p",
+            "zkminer-witness-sandbox",
+            "--bins",
+        ]);
+        let debug = target_debug_dir();
+        let cpu_worker = match std::env::var_os("ZKMINER_LOCALNET_RISC0_CPU_WORKER") {
+            Some(p) => PathBuf::from(p),
+            None => {
+                cargo_build(&[
+                    "-p",
+                    "zkminer-prove-risc0",
+                    "--features",
+                    "cpu",
+                    "--bin",
+                    "zkminer-prove-risc0-cpu",
+                ]);
+                debug.join("zkminer-prove-risc0-cpu")
+            }
+        };
+        Bins {
+            builder: debug.join("zkminer-witness-builder"),
+            broker: debug.join("zkminer-witness-broker"),
+            probe: debug.join("zkminer-witness-sandbox-probe"),
+            cpu_worker,
+        }
+    }
+
+    fn sdk_dir() -> PathBuf {
+        workspace_root().join("sdk").canonicalize().unwrap()
+    }
+
+    fn sdk_tool(tool: &str) -> std::ffi::OsString {
+        let out = Command::new("rustup")
+            .args(["which", tool])
+            .current_dir(sdk_dir())
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .output();
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8(o.stdout).unwrap().trim().into(),
+            _ => tool.into(),
+        }
+    }
+
+    /// The SDK's `params-echo` test builder, built with the SDK's pinned toolchain.
+    pub fn params_echo_wasm() -> Vec<u8> {
+        let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sdk-target-localnet-witness");
+        let mut cmd = Command::new(sdk_tool("cargo"));
+        cmd.current_dir(sdk_dir())
+            .args([
+                "build",
+                "--locked",
+                "--release",
+                "--target",
+                "wasm32-unknown-unknown",
+                "-p",
+                "params-echo",
+                "--target-dir",
+            ])
+            .arg(&target)
+            .env("RUSTC", sdk_tool("rustc"));
+        for v in [
+            "RUSTUP_TOOLCHAIN",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_BUILD_RUSTFLAGS",
+            "CARGO_TARGET_DIR",
+        ] {
+            cmd.env_remove(v);
+        }
+        let out = cmd.output().expect("run the SDK's cargo");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        std::fs::read(target.join("wasm32-unknown-unknown/release/params_echo.wasm")).unwrap()
+    }
+
+    impl World {
+        /// Deploys `runtime` verbatim (`creation_code`) from the submitter; the address and block.
+        async fn deploy_code(&self, runtime: &[u8]) -> (Address, u64) {
+            let tx = TransactionRequest {
+                from: Some(self.submitter),
+                to: Some(alloy::primitives::TxKind::Create),
+                input: alloy::rpc::types::TransactionInput::new(Bytes::from(creation_code(runtime))),
+                ..Default::default()
+            };
+            let receipt = tokio::time::timeout(SETUP_TX_TIMEOUT, async {
+                self.provider
+                    .send_transaction(tx)
+                    .await
+                    .expect("send a hemi-code deployment")
+                    .get_receipt()
+                    .await
+                    .expect("a hemi-code deployment's receipt")
+            })
+            .await
+            .expect("a hemi-code deployment mined in time");
+            assert!(receipt.status(), "a hemi-code deployment reverted");
+            (
+                receipt.contract_address.expect("a contract address"),
+                receipt.block_number.expect("a block"),
+            )
+        }
+
+        /// Publishes `bytes` as `hemi-code` on the fork (chunks, then the manifest) and waits until
+        /// the manifest is 40 blocks deep (the broker reads code at the safe head first). Returns the
+        /// locator.
+        pub async fn publish_hemi_code(&self, bytes: &[u8]) -> String {
+            let mut chunks = Vec::new();
+            for c in bytes.chunks(20_000) {
+                chunks.push(self.deploy_code(&chunk_runtime_code(c)).await.0);
+            }
+            let (manifest, block) = self
+                .deploy_code(&manifest_runtime_code(bytes.len() as u64, &sha256(bytes), &chunks))
+                .await;
+            let deadline = Instant::now() + Duration::from_secs(180);
+            while self.provider.get_block_number().await.unwrap() < block + 40 {
+                assert!(Instant::now() < deadline, "the fork stopped mining");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            format!("hemi-code://{}/{manifest:#x}", DEPLOYMENT.chain_id)
+        }
+
+        /// Gives `who` ETH and `amount` tHEMI, and lets the router take any of it.
+        pub async fn fund_caller(&self, who: Address, amount: U256) {
+            set_balance(&self.provider, who, 100 * HEMI).await;
+            let owner = owner_of(&self.provider, DEPLOYMENT.token).await;
+            mined!(
+                ITestnetToken::new(DEPLOYMENT.token, &self.provider)
+                    .mint(who, amount)
+                    .from(owner),
+                "mint tHEMI to a witness caller"
+            );
+            mined!(
+                IERC20::new(DEPLOYMENT.token, &self.provider)
+                    .approve(DEPLOYMENT.router, U256::MAX)
+                    .from(who),
+                "approve the router for a witness caller"
+            );
+        }
+
+        /// Submits `d` from `caller` directly to the router (`submitJob`, a fixed price); the jobId.
+        pub async fn submit_witness(&self, caller: Address, d: JobDescriptor, what: &str) -> B256 {
+            let core = IHemiProveCore::new(DEPLOYMENT.router, &self.provider);
+            let receipt = mined!(
+                core.submitJob(d.clone(), fixed_price(JOB_PRICE), no_cycles(), no_bidding())
+                    .from(caller),
+                what
+            );
+            receipt
+                .inner
+                .logs()
+                .iter()
+                .find_map(|l| l.log_decode::<IHemiProveCore::JobSubmitted>().ok())
+                .map(|l| l.inner.data.jobId)
+                .expect("JobSubmitted in the submit receipt")
+        }
+    }
+
+    /// A witness job for the fibonacci guest: `params-echo` writes `n` (4 little-endian bytes) as
+    /// `W`; FULL-bound to `journal`.
+    pub fn witness_descriptor(
+        program: &Program,
+        wasm: &[u8],
+        locator: &str,
+        n: u32,
+        journal: &[u8],
+        tag: &str,
+    ) -> JobDescriptor {
+        let envelope = WitnessJobV1 {
+            builderType: 1,
+            builderId: B256::from(sha256(wasm)),
+            builderURIs: vec![locator.to_string()],
+            builderParams: n.to_le_bytes().to_vec().into(),
+            sources: vec![Capability {
+                class: CLASS_EVM_RPC_V1,
+                config: encode_evm_rpc_config(DEPLOYMENT.chain_id, true, METHOD_SET_STATE_READ, 0).into(),
+            }],
+            limits: Limits {
+                maxFetches: 4,
+                maxFetchBytes: 1 << 20,
+                maxRequestBytes: 65_536,
+                maxResponseBytes: 1 << 20,
+                maxBuilderFuel: 1_000_000_000,
+                maxBuilderMemoryBytes: 64 << 20,
+                maxBuilderSeconds: 30,
+                maxWitnessBytes: 1 << 16,
+                maxGuestCycles: 1 << 24,
+            },
+        };
+        JobDescriptor {
+            programId: program.id,
+            proofSystemId: program.proof_system,
+            callbackContract: Address::ZERO,
+            assignedProver: Address::ZERO,
+            tag: keccak256(format!("zkminer localnet witness {tag}")),
+            inputData: encode_envelope(&envelope).into(),
+            callbackExtraData: Bytes::new(),
+            extraVerifierData: Bytes::new(),
+            expectedJournalHash: full_hash(program.proof_system, program.id, journal),
+            journalFields: B256::ZERO,
+        }
+    }
+
+    /// The broker's own config file: anvil as its `evm-rpc/v1` endpoint for 743111 and as its
+    /// `[artifacts]` endpoint.
+    pub fn write_broker_config(dir: &Path, rpc_url: &str) -> PathBuf {
+        let spool = dir.join("broker-spool");
+        std::fs::create_dir_all(&spool).unwrap();
+        let path = dir.join("broker.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "chain_rpc_host = \"chain-rpc.invalid\"\nspool_dir = \"{spool}\"\n\
+                 [[evm_rpc]]\nalias = \"fork\"\nurl = \"{rpc_url}\"\nchain_id = {chain}\narchive = true\n\
+                 max_proof_age = 1000000\nmethod_sets = [\"state-read\"]\ncidrs = [\"127.0.0.1/32\"]\n\
+                 [artifacts]\nalias = \"fork-artifacts\"\nurl = \"{rpc_url}\"\nchain_id = {chain}\n\
+                 max_requests_per_sec = 1000\nmax_builder_bytes = 4194304\ncidrs = [\"127.0.0.1/32\"]\n",
+                spool = spool.display(),
+                chain = DEPLOYMENT.chain_id,
+            ),
+        )
+        .unwrap();
+        path
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a delegated cgroup, anvil, the SDK toolchain and the 743111 RPC; see the witness section"]
+async fn serves_witness_jobs() {
+    use witness_support::*;
+    use zkminer_config::witness::{BrokerSection, RetentionConfig, SandboxModeConfig, UnitPrices};
+
+    let dir = RunDir::new("witness");
+    let bins = bins();
+    let wasm = params_echo_wasm();
+    let program = Program::fibonacci(&bins.cpu_worker, &dir.0);
+    let journal = program.journal.clone();
+    let mut wrong = journal.clone();
+    wrong[0] ^= 1;
+    let world = World::new(&dir.0, program, &[], Clock::Wall).await;
+    let locator = world.publish_hemi_code(&wasm).await;
+    eprintln!("localnet: params-echo published at {locator}");
+
+    // Three witness jobs: an allowlisted caller's good one and bad one, and an outsider's.
+    let outsider = Address::from_word(keccak256(b"zkminer localnet witness outsider"));
+    world.fund_deposits(U256::from(10 * JOB_PRICE)).await;
+    world.fund_caller(outsider, U256::from(10 * JOB_PRICE)).await;
+    let n = fib_n();
+    let good = world
+        .submit_witness(
+            world.submitter,
+            witness_descriptor(&world.program, &wasm, &locator, n, &journal, "good"),
+            "submit the good witness job",
+        )
+        .await;
+    let bad = world
+        .submit_witness(
+            world.submitter,
+            witness_descriptor(&world.program, &wasm, &locator, n, &wrong, "bad binding"),
+            "submit the bad-binding witness job",
+        )
+        .await;
+    let foreign = world
+        .submit_witness(
+            outsider,
+            witness_descriptor(&world.program, &wasm, &locator, n, &journal, "outsider"),
+            "submit the outsider's witness job",
+        )
+        .await;
+    eprintln!(
+        "localnet: witness jobs good {} bad {} outsider {}",
+        short_id(good),
+        short_id(bad),
+        short_id(foreign)
+    );
+
+    // The miner's config: the fork, witness serving with the allowlist, the store, the broker.
+    let config = world.write_config(&dir.0, &bins.cpu_worker, false);
+    let store_dir = dir.0.join("witness-store");
+    let segment_dir = dir.0.join("witness-segments");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let broker_config = write_broker_config(&dir.0, &world.rpc_url);
+    let mut c = ZkMinerConfig::load(Some(&config)).unwrap();
+    c.witness.enabled = true;
+    c.witness.sandbox_mode = SandboxModeConfig::Rootless;
+    c.witness.callers = vec![world.submitter];
+    c.witness.prover_address = Some(world.prover.address());
+    c.witness.hemi_per_eth = Some(1.0);
+    c.witness.hemi_per_eth_expires = Some((chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339());
+    c.witness.unit_prices = Some(UnitPrices {
+        cpu_second_hemi: 0.0,
+        gib_hour_retained_hemi: 0.0,
+        provider_overage_unit_hemi: 0.0,
+    });
+    c.witness.builder_binary = Some(bins.builder.clone());
+    c.witness.execute_binary = Some(bins.cpu_worker.clone());
+    c.witness.execute_memory_bytes = 4 << 30;
+    c.retention = Some(RetentionConfig {
+        dir: store_dir.clone(),
+        store_uuid: String::new(),
+        quota_bytes: 4 << 30,
+        quota_inodes: 100_000,
+        per_caller_bytes: 1 << 30,
+        free_floor_pct: 1.0,
+        segment_dir: segment_dir.clone(),
+        require_dedicated_mount: false,
+        allow_any_filesystem: false,
+    });
+    c.broker = Some(BrokerSection {
+        config: broker_config,
+        binary: Some(bins.broker.clone()),
+        memory_bytes: 512 << 20,
+    });
+    c.dev.da_backlog_bytes = Some(0);
+    // A CPU Groth16 proof (a debug-built worker, minutes) must not meet the 10-minute default
+    // watchdog meant for a wedged GPU.
+    c.prover.proving_timeout_secs = 1_800;
+    c.save(Some(&config)).unwrap();
+    // The probe the self-test runs is found next to zkminer (a link in the run directory).
+    let probe = dir.0.join("zkminer-witness-sandbox-probe");
+    let _ = std::fs::remove_file(&probe);
+    if std::fs::hard_link(&bins.probe, &probe).is_err() {
+        std::fs::copy(&bins.probe, &probe).unwrap();
+    }
+
+    // `zkminer witness init-store`, then its UUID into the config.
+    let out = Miner::command(&dir.0, &config, &[], "witness", &["init-store"], &[])
+        .output()
+        .expect("run zkminer witness init-store");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "init-store: {stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let uuid = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("store_uuid = \""))
+        .and_then(|l| l.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("init-store printed no store_uuid: {stdout}"))
+        .to_string();
+    let mut c = ZkMinerConfig::load(Some(&config)).unwrap();
+    c.retention.as_mut().unwrap().store_uuid = uuid;
+    c.save(Some(&config)).unwrap();
+
+    // `zkminer witness self-test`: the sandbox and the broker, as the miner runs them.
+    let out = Miner::command(&dir.0, &config, &[], "witness", &["self-test"], &[])
+        .output()
+        .expect("run zkminer witness self-test");
+    assert!(
+        out.status.success(),
+        "self-test: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let nonce_before = world.prover_nonce().await;
+    let mut miner = start_mining(&world, &dir, &config, Vec::new(), false);
+    let started = Instant::now();
+    let timeout = Duration::from_secs(1_200);
+    loop {
+        let fulfilled = world.jobs_with::<IHemiProveFulfill::JobFulfilled>().await;
+        if fulfilled.contains(&good) {
+            break;
+        }
+        if miner.exited() {
+            miner.fail("zkminer exited before the witness job was fulfilled");
+        }
+        if started.elapsed() > timeout {
+            miner.fail("the witness job was not fulfilled in time");
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    let (sg, sb, sf) = (short_id(good), short_id(bad), short_id(foreign));
+    if !wait_for_line(&mut miner, &format!("WITNESS-LOCK {sg}: bundle deleted"), Duration::from_secs(120)).await {
+        miner.fail("the fulfilled witness job's bundle was not deleted");
+    }
+    if !wait_for_line(&mut miner, &format!("witness job {sb}: skipped — BindingMismatch"), Duration::from_secs(300)).await {
+        miner.fail("the bad-binding witness job was not skipped for its binding");
+    }
+    tokio::time::sleep(SETTLE).await;
+    let stopped = miner.stop(DRAIN_GRACE);
+    let lines = miner.lines();
+
+    let mut failures: Vec<String> = stop_failure(stopped, DRAIN_GRACE).into_iter().collect();
+    let pos = |needle: &str| lines.iter().position(|l| l.contains(needle));
+    // The good job: simulated, pinned before the claim, claimed, proved, fulfilled, deleted.
+    let steps = [
+        format!("witness job {sg}: simulated"),
+        format!("WITNESS-LOCK {sg}: bundle v"),
+        format!("WITNESS-LOCK {sg}: claimed"),
+        format!("WITNESS-LOCK {sg}: proved"),
+        format!("WITNESS-LOCK {sg}: fulfilled with fulfillJobHashed"),
+        format!("WITNESS-LOCK {sg}: bundle deleted"),
+    ];
+    let mut last = None;
+    for step in &steps {
+        match pos(step) {
+            None => failures.push(format!("no `{step}` line")),
+            Some(i) => {
+                if last.is_some_and(|l| i < l) {
+                    failures.push(format!("`{step}` came out of order"));
+                }
+                last = Some(i);
+            }
+        }
+    }
+    let claims = world.logs::<IHemiProveCore::JobClaimed>().await;
+    let fulfils = world.logs::<IHemiProveFulfill::JobFulfilled>().await;
+    match (
+        claims.iter().find(|(j, _)| *j == good).map(|(_, l)| l),
+        fulfils.iter().find(|(j, _)| *j == good).map(|(_, l)| l),
+    ) {
+        (Some(c), Some(f)) => {
+            if c.block >= f.block || c.event.prover != world.prover.address() {
+                failures.push(format!(
+                    "the good job was claimed in block {} and fulfilled in block {}",
+                    c.block, f.block
+                ));
+            }
+            if f.event.publicValues.as_ref() != journal.as_slice() {
+                failures.push(format!("fulfilled with journal {}", f.event.publicValues));
+            }
+            let tx = world
+                .provider
+                .get_transaction_by_hash(f.tx)
+                .await
+                .unwrap()
+                .expect("the fulfil transaction");
+            use alloy::consensus::Transaction as _;
+            use alloy::sol_types::SolCall;
+            if tx.input()[..4] != IHemiProveFulfill::fulfillJobHashedCall::SELECTOR {
+                failures.push(format!(
+                    "fulfilled by selector 0x{}, not fulfillJobHashed",
+                    alloy::hex::encode(&tx.input()[..4])
+                ));
+            }
+        }
+        (c, f) => failures.push(format!(
+            "the good job: claimed {}, fulfilled {}",
+            c.is_some(),
+            f.is_some()
+        )),
+    }
+    // Its bundle and pin are gone from the store.
+    let hex_id = alloy::hex::encode(good);
+    if store_dir.join("bundles").join(&hex_id).exists() {
+        failures.push("the good job's bundles are still in the store".into());
+    }
+    let pins: Vec<String> = std::fs::read_dir(store_dir.join("pins"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    if pins.iter().any(|p| p.starts_with(&hex_id)) {
+        failures.push("the good job is still pinned".into());
+    }
+    // The bad binding: simulated, never claimed. The outsider's: never simulated, never claimed.
+    for (id, what) in [(bad, "the bad-binding job"), (foreign, "the outsider's job")] {
+        if claims.iter().any(|(j, _)| *j == id) {
+            failures.push(format!("{what} was claimed"));
+        }
+        let (status, prover) = world.job_state(id).await;
+        if status != zkminer_chain::jobs::JOB_STATUS_OPEN || prover != Address::ZERO {
+            failures.push(format!("{what} ends with status {status} prover {prover}"));
+        }
+    }
+    if pos(&format!("witness job {sf}: simulating")).is_some() {
+        failures.push("the outsider's job was simulated".into());
+    }
+    if pos(&format!("witness job {sb}: simulating")).is_none() {
+        failures.push("the bad-binding job was never simulated".into());
+    }
+    eprintln!(
+        "localnet: outsider recognised: {}",
+        pos(&format!("witness job {sf}: caller")).is_some()
+            || pos(&format!("job {sf} is a witness-construction job")).is_some()
+    );
+    // Exactly a claim and a fulfil were sent, and nothing is left locked.
+    let nonce_after = world.prover_nonce().await;
+    if nonce_after.checked_sub(nonce_before) != Some(2) {
+        failures.push(format!(
+            "the prover's nonce moved from {nonce_before} to {nonce_after}, not by a claim and a fulfil"
+        ));
+    }
+    let stake = world.stake().await;
+    if stake.lockedCollateral != 0 {
+        failures.push(format!("{} HEMI of collateral still locked", hemi(stake.lockedCollateral)));
+    }
+    report(&world, &dir, &miner, &failures).await;
+    drop(world);
+    dir.finish();
 }
