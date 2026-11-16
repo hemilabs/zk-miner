@@ -868,7 +868,10 @@ impl WorkerHandle {
                             );
                         }
                         if line.starts_with("[WITSUM]") || line.starts_with("[EVALCHECK_DIFF]") {
-                            eprintln!("[worker:{backend_name}] {line}");
+                            // Not `eprintln!`, which panics on a terminal gone away (a hung-up
+                            // session the miner now outlives), taking this drain thread with it.
+                            use std::io::Write;
+                            let _ = writeln!(std::io::stderr(), "[worker:{backend_name}] {line}");
                         }
                         tracing::warn!(target: "worker", "[worker:{backend_name}] {line}");
                     };

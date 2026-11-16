@@ -15,6 +15,9 @@ use super::run::{stop_mode_word, stop_request_path, stop_response_path, zkminer_
 /// How long to wait for the miner to pick up the request.
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The same with --wait: long enough for a miner still starting up.
+const WAIT_ACK_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Whether a process holds `~/.zkminer/miner.lock` (a miner, a benchmark, or a stake / unstake /
 /// withdraw at its prompt). Probes by taking the lock and dropping it at once.
 fn instance_running() -> Result<bool> {
@@ -134,11 +137,18 @@ pub fn run(mode: StopMode, wait: bool, timeout: Option<u64>) -> Result<()> {
         }
         // Without --wait, a few seconds; with it, until --timeout (a miner still starting up
         // takes the request once it is running).
-        if (!wait && started.elapsed() >= ACK_TIMEOUT) || (wait && past_deadline()) {
+        // Without --wait a few seconds; with it until --timeout, and at most 2 min: a miner still
+        // starting up takes it well within that, and one from before `zkminer stop` existed never
+        // does (a stop waiting forever on it would hold a systemd stop job for its whole timeout,
+        // with the miner still claiming).
+        let ack_limit = if wait { WAIT_ACK_TIMEOUT } else { ACK_TIMEOUT };
+        if started.elapsed() >= ack_limit || (wait && past_deadline()) {
             bail!(
                 "the process holding {} has not taken the request in {}s. A miner still starting \
                  up takes it once it is running; a `zkminer benchmark` or a stake / unstake / \
-                 withdraw prompt never will. The request stays in {}: a miner that finishes \
+                 withdraw prompt never will, nor a miner from a version before `zkminer stop` \
+                 (stop that one with Ctrl+C / SIGINT, then SIGKILL to keep its locks, or let it \
+                 drain). The request stays in {}: a miner that finishes \
                  starting up acts on it, the next miner start removes it unread, and `rm {}` \
                  withdraws it.",
                 home.join("miner.lock").display(),
@@ -160,6 +170,15 @@ pub fn run(mode: StopMode, wait: bool, timeout: Option<u64>) -> Result<()> {
             }
             Err(_) if taken.elapsed() < ACK_TIMEOUT => {
                 std::thread::sleep(Duration::from_millis(100))
+            }
+            // With --wait (ExecStop, scripts), a late answer is not a failure: a failed ExecStop
+            // would have systemd signal the miner, escalating a drain to an abandon. Wait for
+            // the exit instead.
+            Err(_) if wait => {
+                println!(
+                    "The miner took the request but has not answered yet; waiting for it to exit."
+                );
+                break format!("{} ok: unanswered", stop_mode_word(mode));
             }
             Err(_) => bail!(
                 "the miner took the request but has not answered in {}s, so whether it is {} is \

@@ -685,7 +685,7 @@ fn write_stop_response(word: &str, answer: &Result<String, String>) {
 
 /// Act on a stop asked for at the dashboard or by `zkminer stop`, advancing the same ladder the
 /// signals drive (`sig_tx`: 1 DRAIN, 2 ABANDON). Returns what it is doing, or why not.
-async fn apply_stop_request(
+pub(crate) async fn apply_stop_request(
     mode: zkminer_tui::state::StopMode,
     sig_tx: &tokio::sync::watch::Sender<u8>,
     state: &zkminer_tui::state::SharedState,
@@ -1027,6 +1027,12 @@ pub(crate) fn hold_instance_lock(role: &str) -> Result<()> {
         builder
             .create(&dir)
             .with_context(|| format!("create {}", dir.display()))?;
+        // Also when something else created it first (`zkminer init` makes it with the umask's
+        // 0755): the journal, stop requests and answers are this user's business.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
     #[cfg(windows)]
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -3096,12 +3102,14 @@ pub async fn run(
     config.validate_for_chain()?;
     if watch.is_none() {
         hold_instance_lock("miner")?;
-        let others = super::signer_guard::other_running_miners();
+        // Another miner of this user (another user's may well have its own key): a warning, as
+        // it may use another key of ours too.
+        let others = super::signer_guard::other_running_miners_of_this_user();
         if !others.is_empty() {
-            tracing::error!(
-                "PAGE: another `zkminer run` is running on this host (pid {others:?}), under another \
-                 home. If it uses this key, stop one of them now: two miners on one key replace \
-                 each other's transactions and drive (and release) each other's locks."
+            tracing::warn!(
+                "another `zkminer run` of this user is running on this host (pid {others:?}), \
+                 under another home. If it uses this key, stop one of them now: two miners on one \
+                 key replace each other's transactions and drive (and release) each other's locks."
             );
         }
         // A stop request left from before this start (one no miner picked up) must not stop this
@@ -3985,7 +3993,12 @@ pub async fn run(
             // `nohup` miner has stdout redirected, and keeps ignoring it.
             let mut sighup = {
                 use std::io::IsTerminal;
-                if std::io::stdout().is_terminal() {
+                // Any of the three: `run --headless | tee log` over SSH has stdout on a pipe but
+                // still dies with the session. `nohup` takes all three off the terminal.
+                if std::io::stdout().is_terminal()
+                    || std::io::stderr().is_terminal()
+                    || std::io::stdin().is_terminal()
+                {
                     signal(SignalKind::hangup()).ok()
                 } else {
                     None
@@ -4055,7 +4068,11 @@ pub async fn run(
                 }
                 if *sig_tx.borrow() >= 2 && n < 2 {
                     // ABANDON came from `zkminer stop --abandon`, the dashboard or the drain:
-                    // this is the first signal to see it, so it does not force an exit yet.
+                    // this is the first signal to see it, so it does not force an exit yet. A
+                    // supervisor's SIGTERM still shortens the release wait to its grace.
+                    if supervised {
+                        SUPERVISED_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     n = 2;
                     shutdown_say(&sig_state, ALREADY_RELEASING_MSG).await;
                     continue;

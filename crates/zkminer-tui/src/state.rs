@@ -406,7 +406,10 @@ impl ClaimOutlook {
         match &self.held {
             Some(why) => format!("held:{}", why.replace(|c: char| c.is_ascii_digit(), "")),
             None => {
-                let reasons: Vec<&str> = self.declined.iter().map(|(w, _)| w.as_str()).collect();
+                // Sorted: two reasons swapping rank as counts move is not news.
+                let mut reasons: Vec<&str> =
+                    self.declined.iter().map(|(w, _)| w.as_str()).collect();
+                reasons.sort_unstable();
                 format!(
                     "claiming:{} declined:{}",
                     self.claimed > 0,

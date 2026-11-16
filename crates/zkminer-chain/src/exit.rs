@@ -180,14 +180,10 @@ impl ExitTx {
 /// `eth_call` a built call from our own address: a revert becomes an [`ExitRefused`] in words.
 macro_rules! precheck {
     ($client:expr, $what:expr, $build:expr) => {{
-        // Against the pending block: an exit of ours still in the mempool counts (a rerun after
-        // an unseen receipt would otherwise pass here and revert on chain, costing gas).
-        match $build
-            .from($client.address)
-            .block(alloy::eips::BlockId::pending())
-            .call()
-            .await
-        {
+        // Against the latest block. (Not `pending`: op-geth answers it as latest unless told
+        // otherwise, and some RPCs refuse it; an exit of ours still in the mempool is caught by
+        // the command's mempool check instead.)
+        match $build.from($client.address).call().await {
             Ok(_) => Ok(()),
             Err(e) => match revert_data_of(&e) {
                 Some(data) => Err(anyhow::Error::new(ExitRefused {

@@ -268,7 +268,7 @@ Worth knowing:
     exit. That can take up to 50 minutes, after which whatever is still held is released.
   - **Keep locks**: stop claiming and exit without releasing (exit status 75), after any proof
     already being submitted lands; a lock too close to its deadline for a restart to release
-    it in time is released first. That takes seconds to a few minutes. The next start picks
+    it in time is released first. That takes seconds to several minutes. The next start picks
     the locks up from `~/.zkminer/job_journal.json`, re-proves each one that still has time,
     and releases the rest. Use it for restarts and upgrades, and start again by the time it
     prints (the earliest kept lock's cutoff less ~15 minutes for the restart and a release): a
@@ -286,7 +286,9 @@ Worth knowing:
 
   Signals, for headless and supervised runs: SIGINT (Ctrl+C) drains, a second one abandons,
   a third exits at once. A signal during a drain already under way counts as the second: a
-  `systemctl stop` (SIGINT) after `zkminer stop` abandons. During a keep-locks stop, signals
+  Ctrl+C after `zkminer stop` abandons (the contrib unit's `systemctl stop` does not: it asks
+  for a drain and waits). A signal never force-exits an abandon it did not start; the one after
+  does. During a keep-locks stop, signals
   never abandon (only `zkminer stop --abandon` or `a` does); the third still exits at once.
   Closing the dashboard's terminal (SIGHUP) starts a drain if no stop was chosen, and
   otherwise changes nothing. SIGTERM, the default stop signal of systemd, `docker stop` and
@@ -302,10 +304,10 @@ Worth knowing:
   `docker exec <container> zkminer stop --keep-locks` (not `--wait`, which ends with the
   container); for a new image, start the new container on the same volume promptly. On
   Windows, the workers have consoles of their own, so Ctrl+C reaches only the miner.
-  Closing the console window or shutting Windows down gives the miner only seconds: it
-  releases what it can in them (if Windows delivers the event to it), its workers end with it,
-  and what it doesn't finish stays held until the next start, so stop a long-running miner
-  with `zkminer stop` first.
+  Closing the console window or shutting Windows down gives the miner only seconds, so it
+  stops as keep-locks: the locks stay held for the next start (if Windows delivers the event,
+  a lock too close to its deadline is released), and its workers end with it. Start it again
+  soon, or stop it with `zkminer stop` first.
 
   Exit status 75 means it stopped with locks still held (or by keep-locks): start it again
   well before their deadlines. A miner killed outright (SIGKILL) picks its locks up the same way.
@@ -385,6 +387,38 @@ sizes, each card proves the job at its own size rather than releasing it. If no 
 a size, the job waits for one (switch a card back on, or give one a po2 under Settings →
 Advanced; a config size or a calibration applies only after a restart, which releases it) and
 is released before its deadline.
+
+## Upgrading from a version without `zkminer stop`
+
+The miner already running is the old binary, which never reads `zkminer stop` requests (they
+time out with that as a likely cause). For that one upgrade, stop it the old way: Ctrl+C or
+SIGINT to stop claiming (`systemctl kill -s INT --kill-whom=main zkminer` under systemd), then
+SIGKILL (`systemctl kill -s KILL zkminer`) to keep its locks for the next start, or let it
+drain. Then install the new miner and every worker, `contrib/zkminer.service` if you use it
+(`systemctl daemon-reload`), and start it promptly. What changes for an operator:
+
+- Quitting the dashboard with jobs held asks how to stop; a second `q` or Ctrl+C does nothing
+  (`k` is the quick restart that keeps the locks). The setup wizard's stake takes two presses.
+- `zkminer run` with no terminal (cron, `nohup`) runs headless instead of failing: check for
+  forgotten `@reboot` entries. A dropped SSH session (SIGHUP) now drains instead of killing the
+  miner: from a new session, `zkminer stop --keep-locks` or `--abandon` changes course.
+- On Windows, Ctrl+C no longer kills the workers (a drain now really finishes its proofs), the
+  workers end with the miner, and closing the window keeps the locks for the next start.
+- `stake`, `unstake` and `withdraw` refuse while a miner holds this home's lock, even with
+  `--force` (which now only overrides the cross-home and mempool checks), and `stake` refuses a
+  deployment that fails the check `run` makes (set the same `ZKMINER_ALLOW_UNKNOWN_DEPLOYMENT`
+  / `ZKMINER_SKIP_CODE_PINS` for it as for the miner, if you rely on them). A top-up script
+  that staked beside the running miner should stake from the dashboard, or stop with
+  `--keep-locks`, stake, and start again.
+- `zkminer status` prints `Network:`, `Deployment:`, `Unstake pending:` and `Payouts held:`
+  lines, and checks the deployment (more RPC reads per call). Exit 75 also means a keep-locks
+  stop, with or without locks held.
+- Logs: a `claims:` line (why open jobs are not claimed) at most every minute or on a change, a
+  per-card table at start, no colour codes when stderr is not a terminal, and some reworded
+  lines ("drain interrupted — abandoning", "another zkminer holds ...", stake amounts in HEMI).
+- `~/.zkminer` gains `stop-request`, `stop-response` and `miner.lock.holder`, and is made
+  private (0700) on Linux. `zkminer init --generate-key` refuses an existing key file others can
+  read on Linux.
 
 ## Simulate (measure jobs without mining)
 

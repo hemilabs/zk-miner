@@ -110,6 +110,26 @@ fn pids(p: &[i32]) -> String {
         .join(", ")
 }
 
+/// [`other_running_miners`] owned by this user (on Linux; empty elsewhere): another user's miner
+/// runs with its own config, and most likely its own key.
+pub(crate) fn other_running_miners_of_this_user() -> Vec<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(me) = std::fs::metadata("/proc/self").map(|m| m.uid()) else {
+            return Vec::new();
+        };
+        other_running_miners()
+            .into_iter()
+            .filter(|pid| std::fs::metadata(format!("/proc/{pid}")).is_ok_and(|m| m.uid() == me))
+            .collect()
+    }
+    #[cfg(not(unix))]
+    {
+        other_running_miners()
+    }
+}
+
 /// What [`ensure_key_is_free`] saw, for [`recheck_after_prompt`].
 pub(crate) struct KeyCheck {
     force: bool,
@@ -134,10 +154,12 @@ pub(crate) async fn ensure_key_is_free(client: &ChainClient, force: bool) -> Res
             return Err(e);
         }
         match super::run::instance_lock_holder().as_deref() {
-            // A benchmark signs nothing: no nonce to collide with, so no --force needed.
-            Some("benchmark") => eprintln!(
-                "Note: a `zkminer benchmark` holds the miner lock; it sends nothing, so this goes \
-                 ahead (a miner started meanwhile is still caught after the prompt)."
+            // A benchmark signs nothing, but going ahead without the lock would let a miner
+            // start (once the benchmark ends) and send on our nonces: say what to wait for.
+            Some("benchmark") => anyhow::bail!(
+                "a `zkminer benchmark` is running in this home: run this again once it has \
+                 finished (it holds the miner lock, which this needs, so that no miner can start \
+                 and send on the same nonces while this sends)"
             ),
             // A miner (or another signing command) in this very home is certain, not a guess:
             // --force, which overrides the heuristics below, does not override it.

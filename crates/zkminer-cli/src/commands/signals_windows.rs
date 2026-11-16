@@ -6,9 +6,9 @@
 //!   the dashboard, Ctrl+C is a key (raw mode) that asks how to stop, like `q`; Ctrl+Break is still
 //!   a signal, and starts DRAIN. During a keep-locks stop, stage 2 keeps the locks.
 //! - Closing the console window, or Windows shutting down: nobody is there to press anything, and
-//!   Windows ends the process seconds later (tokio's handler holds it until then). Like SIGTERM from
-//!   a supervisor: a supervised stop, which releases held jobs at once (giving a fulfil already being
-//!   sent its short grace) rather than start a drain no proof could finish.
+//!   Windows ends the process seconds later (tokio's handler holds it until then), enough for one
+//!   release at most. A keep-locks stop: the locks stay for the next start (as when a close killed
+//!   the miner outright), except one too close to its deadline to wait for it.
 //!
 //! Logoff is NOT handled: Windows sends it to every console process when ANY user logs off,
 //! including a miner running as a service, which must not stop because an administrator signed out.
@@ -96,10 +96,42 @@ pub(crate) fn spawn(sig_tx: tokio::sync::watch::Sender<u8>, state: SharedState) 
                 continue;
             }
             n = n.max(*sig_tx.borrow());
+            let supervised = event == Event::Close;
+            // Closing the window, or Windows shutting down (an update's reboot, a service stop):
+            // Windows ends the process within seconds, enough for one release at most, so
+            // abandoning would pay penalties for little. Keep the locks instead, as a keep-locks
+            // stop (which still releases a lock too close to its deadline to wait for the next
+            // start): the next start finishes them, as it did when the window close killed the
+            // miner outright. Once a stop is under way, a close changes nothing but the wait.
+            if supervised && *sig_tx.borrow() < 2 && !super::run::keep_in_progress() {
+                super::run::SUPERVISED_STOP.store(true, Ordering::SeqCst);
+                {
+                    let mut st = state.write().await;
+                    st.shutdown_requested = true;
+                    st.paused = true;
+                }
+                super::run::shutdown_say(
+                    &state,
+                    "\nWINDOW CLOSING / SHUTDOWN — keeping the locks for the next start (Windows \
+                     ends the process within seconds). Start the miner again soon.",
+                )
+                .await;
+                let _ = super::run::apply_stop_request(
+                    zkminer_tui::state::StopMode::KeepLocks,
+                    &sig_tx,
+                    &state,
+                )
+                .await;
+                n = n.max(1);
+                continue;
+            }
             let Some(stage) = next_stage(n, event) else {
+                // A close past ABANDON changes nothing but the release wait, now Windows' seconds.
+                if supervised {
+                    super::run::SUPERVISED_STOP.store(true, Ordering::SeqCst);
+                }
                 continue;
             };
-            let supervised = event == Event::Close;
             if supervised {
                 super::run::SUPERVISED_STOP.store(true, Ordering::SeqCst);
             }
