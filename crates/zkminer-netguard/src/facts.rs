@@ -17,19 +17,28 @@
 //! - **DNS servers:** the `nameserver`s of `/etc/resolv.conf` and of systemd-resolved's
 //!   `/run/systemd/resolve/resolv.conf` (the upstream servers behind its `127.0.0.53` stub), which
 //!   may answer only their own customers;
-//! - **the routing table**, for the best-route rule: a destination whose best route is not the
-//!   default path is refused ([`crate::routes::RouteTable::off_default_path`]).
+//! - **the routing table and the policy-routing rules**, for the best-route rule: a destination
+//!   whose best route is not the default path is refused, and so is one a `local`, `broadcast` or
+//!   `anycast` route delivers to this host (an AnyIP range) or a destination rule sends to another
+//!   table ([`crate::routes::RouteTable::off_default_path`]); and the kernel itself, asked per
+//!   destination how it would route a connection ([`crate::routes::RouteTable::judge`]).
+//!
+//! - **NAT64 prefixes**, configured or learned ([`crate::nat64`]): process-wide, read by the
+//!   address predicate itself.
 //!
 //! A miner in a container sees the container's network, not the host's: run it with host
 //! networking, or list the host's networks in `[egress] deny_cidrs`.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 use std::ops::RangeInclusive;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::ip::{is_global, Prefix};
-use crate::routes::{Route, RouteTable};
+use crate::policy::Denied;
+use crate::routes::{Route, RouteOracle, RouteRefusal, RouteTable, Rule};
 
 /// The default `[egress] ipv6_site_prefix_len`.
 pub const DEFAULT_IPV6_SITE_PREFIX_LEN: u8 = 56;
@@ -80,12 +89,17 @@ pub struct RawFacts {
     pub interface_prefixes: Vec<Prefix>,
     /// Every interface address.
     pub interface_addresses: Vec<IpAddr>,
-    /// Every unicast route of every table.
+    /// Every unicast, `local`, `broadcast` and `anycast` route of every table.
     pub routes: Vec<Route>,
+    /// The policy-routing rules, read for this process (none: a stock host's, [`Rule::stock`]).
+    pub rules: Vec<Rule>,
     /// The DNS servers the host uses.
     pub resolvers: Vec<IpAddr>,
-    /// The host's public addresses as reflectors see them.
+    /// The host's public addresses as reflectors see them (refused as its own).
     pub public_addresses: Vec<IpAddr>,
+    /// The public addresses both reflectors of their family reported alike: only these (and the
+    /// interface addresses) give an IPv6 site ([`crate::public`]).
+    pub public_confirmed: Vec<IpAddr>,
 }
 
 /// A snapshot of the host's facts (see the module doc).
@@ -97,7 +111,22 @@ pub struct HostFacts {
     resolvers: Vec<IpAddr>,
     routes: RouteTable,
     gathered_at: Instant,
+    /// Asked per destination by [`crate::admit`] ([`Self::with_route_oracle`]); the kernel for
+    /// facts read from this host.
+    oracle: Option<Arc<dyn RouteOracle>>,
+    /// The oracle's verdicts, per destination, for as long as these facts are in force.
+    verdicts: Arc<Mutex<HashMap<IpAddr, Result<(), KernelRefusal>>>>,
 }
+
+/// Why the kernel's answer refused a destination ([`HostFacts::kernel_verdict`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KernelRefusal {
+    Route(RouteRefusal),
+    QueryFailed(String),
+}
+
+/// Most per-destination verdicts one facts snapshot keeps (it lives about a second).
+const MAX_VERDICTS: usize = 4096;
 
 fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> {
     v.sort();
@@ -128,6 +157,8 @@ impl HostFacts {
             resolvers: Vec::new(),
             routes: RouteTable::default(),
             gathered_at: Instant::now(),
+            oracle: None,
+            verdicts: Arc::default(),
         }
     }
 
@@ -138,20 +169,99 @@ impl HostFacts {
 
     /// The facts `raw` amounts to under `opts` (see the module doc).
     pub fn assemble(raw: RawFacts, opts: &FactsOptions) -> Self {
-        let routes = RouteTable::new(raw.routes);
+        let routes = RouteTable::with_rules(raw.routes, raw.rules);
         let mut connected = raw.interface_prefixes;
         connected.extend(routes.on_link_prefixes());
+        // Review r2 R2-NG-7: a public address one reflector alone reported (or a forger) is
+        // refused as an own address, but gives no site: that would refuse a /48-/56 of whoever
+        // the forged address belongs to.
+        let mut site_from = raw.interface_addresses.clone();
+        site_from.extend(raw.public_confirmed.iter().filter(|a| is_global(**a)));
         let mut own = raw.interface_addresses;
-        own.extend(raw.public_addresses.into_iter().filter(|a| is_global(*a)));
+        own.extend(
+            raw.public_addresses
+                .into_iter()
+                .chain(raw.public_confirmed)
+                .filter(|a| is_global(*a)),
+        );
         let own = sorted(own);
         HostFacts {
             connected: sorted(connected),
-            site: site_prefixes(&own, opts.ipv6_site_prefix_len),
+            site: site_prefixes(&site_from, opts.ipv6_site_prefix_len),
             own,
             resolvers: sorted(raw.resolvers),
             routes,
             gathered_at: Instant::now(),
+            oracle: None,
+            verdicts: Arc::default(),
         }
+    }
+
+    /// These facts, with `oracle` asked how each destination is routed ([`crate::admit`] refuses
+    /// what [`RouteTable::judge`] refuses of its answer). [`Self::gather_with`] sets the kernel
+    /// itself ([`crate::KernelRoutes`]); tests stage answers.
+    pub fn with_route_oracle(mut self, oracle: Arc<dyn RouteOracle>) -> Self {
+        self.oracle = Some(oracle);
+        self.verdicts = Arc::default();
+        self
+    }
+
+    /// The oracle asked per destination, if any.
+    pub fn route_oracle(&self) -> Option<&Arc<dyn RouteOracle>> {
+        self.oracle.as_ref()
+    }
+
+    /// The route oracle's verdict on a connection to `ip` (admitted when there is no oracle):
+    /// asked once per destination for as long as these facts are in force (a snapshot lives
+    /// about a second, [`crate::FACTS_TTL`]). An IPv4-mapped address is asked as its IPv4
+    /// address, which is how a dual-stack socket connects to it.
+    pub(crate) fn kernel_verdict(&self, ip: IpAddr) -> Result<(), Denied> {
+        let Some(oracle) = &self.oracle else {
+            return Ok(());
+        };
+        let dst = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        };
+        let cached = self
+            .verdicts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&dst)
+            .cloned();
+        let verdict = match cached {
+            Some(v) => v,
+            None => {
+                let v = match oracle.route_to(dst) {
+                    Ok(answer) => self
+                        .routes
+                        .judge(answer.as_deref().unwrap_or_default())
+                        .map_err(KernelRefusal::Route),
+                    Err(e) => Err(KernelRefusal::QueryFailed(e.to_string())),
+                };
+                let mut cache = self.verdicts.lock().unwrap_or_else(|e| e.into_inner());
+                if cache.len() >= MAX_VERDICTS {
+                    cache.clear();
+                }
+                cache.insert(dst, v.clone());
+                v
+            }
+        };
+        verdict.map_err(|k| match k {
+            KernelRefusal::Route(r) => Denied::OffDefaultRoute {
+                ip,
+                route: if r.kind == crate::routes::RouteKind::NoRoute {
+                    Prefix::host(dst)
+                } else {
+                    r.prefix
+                },
+                kind: r.kind,
+            },
+            KernelRefusal::QueryFailed(why) => Denied::RouteQueryFailed {
+                ip,
+                why: crate::printable(&why, 200),
+            },
+        })
     }
 
     /// Reads the host's facts with the default options ([`FactsOptions::default`]).
@@ -163,27 +273,33 @@ impl HostFacts {
     /// its netmask or on-link prefix length — a connected prefix, plus the peer of a
     /// point-to-point link as a host route; an address without a netmask counts as a host route; a
     /// non-contiguous netmask counts its leading ones, which only widens the prefix), the routing
-    /// table, the DNS servers, and (if `opts` says so) the public addresses, then
-    /// [`Self::assemble`]s them. Fails if the interfaces or the routing table cannot be read: a
+    /// tables and rules, the DNS servers, (if `opts` says so) the public addresses, and the NAT64
+    /// prefixes the DNS servers reveal ([`crate::nat64`]), then [`Self::assemble`]s them, with the
+    /// kernel as the route oracle. Fails if the interfaces or the routing table cannot be read: a
     /// public-mode policy that does not know them cannot refuse what they name.
     pub fn gather_with(opts: &FactsOptions) -> io::Result<Self> {
         let (interface_prefixes, interface_addresses, loopback) = sys::interfaces()?;
-        let routes = crate::routes::read_routes(&loopback)?;
-        let public_addresses = if opts.discover_public_addresses {
-            crate::public::public_addresses()
+        // The NAT64 prefixes the host's DNS64 reveals (process-wide; the first call asks).
+        crate::nat64::ensure_discovered();
+        let (routes, rules) = crate::routes::read_routing(&loopback)?;
+        let public = if opts.discover_public_addresses {
+            crate::public::learned()
         } else {
-            Vec::new()
+            crate::public::Learned::default()
         };
         Ok(Self::assemble(
             RawFacts {
                 interface_prefixes,
                 interface_addresses,
                 routes,
+                rules,
                 resolvers: system_resolvers(),
-                public_addresses,
+                public_addresses: public.addresses,
+                public_confirmed: public.confirmed,
             },
             opts,
-        ))
+        )
+        .with_route_oracle(Arc::new(crate::routes::KernelRoutes)))
     }
 
     /// The connected prefixes (interfaces and on-link routes), sorted.
@@ -213,13 +329,29 @@ impl HostFacts {
 
     /// Every prefix these facts refuse, flattened for a consumer that knows only connected prefixes
     /// and own addresses (the sandboxed witness broker, which cannot read the host itself): the
-    /// connected and site prefixes, the prefixes of every route off the default path, and a host
-    /// route for every DNS server.
+    /// connected and site prefixes, the prefixes of every route off the default path, of every
+    /// route that delivers to this host and of every destination rule into another table, a host
+    /// route for every DNS server, and what the NAT64 network-specific prefixes in force imply
+    /// ([`crate::nat64::embedded_refusals`]).
     pub fn refused_prefixes(&self) -> Vec<Prefix> {
         let mut v = self.connected.clone();
         v.extend_from_slice(&self.site);
         v.extend(self.routes.off_default_prefixes());
         v.extend(self.resolvers.iter().map(|r| Prefix::host(*r)));
+        // Under each NAT64 network-specific prefix in force, the IPv4 ranges refused here and
+        // the non-global ones, embedded (the consumer may not know the prefix).
+        let mut v4: Vec<Prefix> = v
+            .iter()
+            .map(Prefix::canonical_prefix)
+            .filter(|p| p.addr.is_ipv4())
+            .collect();
+        v4.extend(
+            self.own
+                .iter()
+                .map(|a| Prefix::host(crate::canonical_ip(*a)))
+                .filter(|p| p.addr.is_ipv4()),
+        );
+        v.extend(crate::nat64::embedded_refusals(&v4));
         sorted(v)
     }
 
@@ -563,6 +695,7 @@ mod tests {
                 ip("::1"),
             ],
             public_addresses: vec![ip("2a01:4f8:1:2::9"), ip("10.0.0.1")],
+            public_confirmed: vec![ip("2a01:4f8:1:2::9")],
             ..RawFacts::default()
         };
         let f = HostFacts::assemble(raw.clone(), &offline());
@@ -596,6 +729,55 @@ mod tests {
             };
             assert!(o.validate().is_err(), "{bad}");
         }
+    }
+
+    /// Review r2 R2-NG-7 (PoC `a_forged_v6_reflector_answer_refuses_a_site`), inverted: one
+    /// reflector's answer (or a forged one) is refused as an own address, and gives no site, so
+    /// the rest of that /48 and an operator's role entry in it stay admitted. An answer both
+    /// reflectors gave, or one inside an interface address's site, gives its site.
+    #[test]
+    fn an_unconfirmed_public_answer_refuses_one_address_not_a_site() {
+        use crate::{admit, admit_prefix, NetMode};
+        let forged = ip("2606:4700:4700::64");
+        let raw = RawFacts {
+            interface_addresses: vec![ip("192.168.1.33")],
+            interface_prefixes: vec![p("192.168.1.0/24")],
+            public_addresses: vec![forged],
+            ..Default::default()
+        };
+        let opts = FactsOptions {
+            discover_public_addresses: false,
+            ipv6_site_prefix_len: 48,
+        };
+        let f = HostFacts::assemble(raw.clone(), &opts);
+        assert!(f.site_prefixes().is_empty(), "{:?}", f.site_prefixes());
+        assert!(admit(NetMode::Public, forged, &f, &[]).is_err());
+        assert_eq!(
+            admit(NetMode::Public, ip("2606:4700:4700::1111"), &f, &[]),
+            Ok(())
+        );
+        assert_eq!(
+            admit_prefix(NetMode::Public, p("2606:4700:4700:1::/64"), &f, &[]),
+            Ok(())
+        );
+        // Confirmed by both reflectors: the site is refused.
+        let f = HostFacts::assemble(
+            RawFacts {
+                public_confirmed: vec![forged],
+                ..raw.clone()
+            },
+            &opts,
+        );
+        assert_eq!(f.site_prefixes(), &[p("2606:4700:4700::/48")]);
+        // In an interface address's site: that site, from the interface address.
+        let f = HostFacts::assemble(
+            RawFacts {
+                interface_addresses: vec![ip("2606:4700:4700:9::2")],
+                ..raw
+            },
+            &opts,
+        );
+        assert_eq!(f.site_prefixes(), &[p("2606:4700:4700::/48")]);
     }
 
     #[test]

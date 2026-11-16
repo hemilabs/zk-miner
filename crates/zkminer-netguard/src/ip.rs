@@ -6,10 +6,13 @@
 //!
 //! - **IPv4:** everything except the ranges in `V4_NOT_GLOBAL` (this network, RFC 1918, CGNAT,
 //!   loopback, link-local and metadata, `192.0.0/24`, the three TEST-NETs, the 6to4 relay anycast,
-//!   benchmarking, multicast, `240/4` with the broadcast address, and Azure's `168.63.129.16`). All of
-//!   `192.0.0.0/24` is refused, including the two /32s IANA marks globally reachable (`192.0.0.9` PCP
-//!   anycast, `192.0.0.10` TURN anycast): no program store lives there, and the blocklist refuses
-//!   them.
+//!   the AMT relay anycast `192.52.193.0/24`, the AS112 sinks `192.31.196.0/24` and
+//!   `192.175.48.0/24`, benchmarking, multicast, `240/4` with the broadcast address, and Azure's
+//!   `168.63.129.16`). All of `192.0.0.0/24` is refused, including the two /32s IANA marks globally
+//!   reachable (`192.0.0.9` PCP anycast, `192.0.0.10` TURN anycast): no program store lives there,
+//!   and the blocklist refuses them. The AMT and AS112 blocks, which IANA also marks globally
+//!   reachable, are refused for the reason `2001:1::/32` is (below): anycast services answered by
+//!   the nearest instance, which may be a box on the operator's own network.
 //! - **IPv6:** only `2000::/3` is global unicast (every RIR allocation is inside it), so everything
 //!   else (`::/128`, `::1`, `100::/64`, `5f00::/16`, `fc00::/7` with `fd00:ec2::254`, `fe80::/10`,
 //!   `fec0::/10`, `ff00::/8`, and all of `64:ff9b::/32` except the well-known NAT64 /96) is refused,
@@ -19,14 +22,21 @@
 //!   `::a.b.c.d` (deprecated by RFC 4291; no host is reached at one, and a host with an automatic
 //!   `sit` tunnel carries it to its IPv4 address), 6to4 `2002::/16` and Teredo `2001::/32` (both
 //!   deprecated relay prefixes), and the local-use NAT64 `64:ff9b:1::/48` (outside `2000::/3`).
-//!   Inside `2000::/3`, also refused: `2001:db8::/32` and `3fff::/20` (documentation), and `2001::/23`
-//!   except IANA's globally reachable assignments in it: `2001:3::/32` (AMT), `2001:4:112::/48`
-//!   (AS112-v6) and `2001:30::/28` (DRIP DETs). All of `2001:1::/32` stays refused, IANA's three
-//!   globally reachable anycast addresses in it included (`2001:1::1` PCP, `2001:1::2` TURN,
-//!   `2001:1::3` DNS-SD SRP): an anycast service answers from whichever instance is nearest, which
-//!   on a network that runs one (a PCP-capable router, a site's TURN relay or SRP registrar) is a
-//!   local box, and no program store lives there. ORCHIDv2 `2001:20::/28`, globally reachable per
-//!   IANA, stays refused: its identifiers are not routable locators, and the blocklist refuses it.
+//!   Inside `2000::/3`, also refused: `2001:db8::/32` and `3fff::/20` (documentation), and **all of
+//!   the IETF protocol block `2001::/23`**, IANA's globally reachable assignments in it included.
+//!   `2001:1::/32` holds three anycast addresses (`2001:1::1` PCP, `2001:1::2` TURN, `2001:1::3`
+//!   DNS-SD SRP); `2001:3::/32` is AMT's relay discovery prefix (RFC 7450), an anycast prefix a
+//!   gateway uses to reach the nearest relay; `2001:4:112::/48` is AS112-v6 (RFC 7535), anycast DNS
+//!   sinks anyone may run locally. An anycast service answers from whichever instance is nearest,
+//!   which on a network that runs one (a PCP-capable router, a site's TURN relay, SRP registrar,
+//!   AMT relay or AS112 node) is a local box, and no program store lives there (review r2: AMT
+//!   had been admitted, against the `2001:1::/32` decision). ORCHIDv2 `2001:20::/28` and the DRIP
+//!   entity tags `2001:30::/28` (RFC 9374, ORCHIDv2-formatted) are identifiers, not routable
+//!   locators, and the blocklist refuses ORCHIDv2.
+//!
+//! - **NAT64 network-specific prefixes** ([`crate::nat64`]: `[egress] nat64_prefixes`, and what
+//!   the host's DNS64 reveals): an address under one is also judged by the IPv4 address it
+//!   carries (RFC 6052 layouts), and read as it by [`canonical_ip`].
 //!
 //! Ported from the witness broker's egress predicate (`zkminer-witness-broker/src/egress.rs` @
 //! bd9aabf), which a review already hardened; the one change is the IPv4-compatible form, refused
@@ -87,8 +97,9 @@ impl Prefix {
 
     /// The prefix as the address space it reaches: an IPv6 prefix of length 96 or more inside one of
     /// the embedded-IPv4 /96s [`canonical_ip`] reads (mapped, compatible, SIIT, the well-known
-    /// NAT64) is the IPv4 prefix it embeds; any other is itself, with host bits cleared. Like
-    /// [`canonical_ip`], `::/128` and `::1/128` stay themselves.
+    /// NAT64), or inside a NAT64 network-specific prefix in force ([`crate::nat64`]) with no
+    /// nonzero u-octet bit fixed, is the IPv4 prefix it embeds; any other is itself, with host
+    /// bits cleared. Like [`canonical_ip`], `::/128` and `::1/128` stay themselves.
     pub fn canonical_prefix(&self) -> Prefix {
         let p = Prefix::new(self.addr, self.len);
         if let (IpAddr::V6(v6), true) = (p.addr, p.len >= 96) {
@@ -103,19 +114,33 @@ impl Prefix {
                 );
             }
         }
+        if p.addr.is_ipv6() {
+            for n in crate::nat64::current().iter() {
+                if p.len >= n.len && in_prefix(*n, p.addr) {
+                    if let Some(q) = nsp_canonical(p, *n) {
+                        return q;
+                    }
+                }
+            }
+        }
         p
     }
 
-    /// Whether the two prefixes share an address, each read as [`Self::canonical_prefix`] (so
-    /// `::ffff:10.0.0.0/104` and `64:ff9b::a00:0/104` overlap `10.0.0.0/8`). Families never overlap
-    /// otherwise.
+    /// Whether the two prefixes share an address, as written or each read as
+    /// [`Self::canonical_prefix`] (so `::ffff:10.0.0.0/104` and `64:ff9b::a00:0/104` overlap
+    /// `10.0.0.0/8`, and `64:ff9b::/64` overlaps `64:ff9b::808:800/120`, which it holds as
+    /// written). Families never overlap otherwise.
     pub fn overlaps(&self, other: &Prefix) -> bool {
-        let (a, b) = (self.canonical_prefix(), other.canonical_prefix());
-        if a.addr.is_ipv4() != b.addr.is_ipv4() {
-            return false;
-        }
-        let len = a.len.min(b.len);
-        mask(a.addr, len) == mask(b.addr, len)
+        let raw = |a: Prefix, b: Prefix| {
+            a.addr.is_ipv4() == b.addr.is_ipv4() && {
+                let len = a.len.min(b.len);
+                mask(a.addr, len) == mask(b.addr, len)
+            }
+        };
+        raw(
+            Prefix::new(self.addr, self.len),
+            Prefix::new(other.addr, other.len),
+        ) || raw(self.canonical_prefix(), other.canonical_prefix())
     }
 }
 
@@ -196,14 +221,90 @@ pub(crate) fn mask(ip: IpAddr, len: u8) -> IpAddr {
 }
 
 /// `ip` with every embedded-IPv4 form replaced by that IPv4 address (mapped `::ffff:a.b.c.d`,
-/// compatible `::a.b.c.d`, SIIT `::ffff:0:a.b.c.d`, the well-known NAT64 `64:ff9b::a.b.c.d`), so deny
-/// CIDRs, connected prefixes and the host's own addresses match whichever spelling a connection
-/// uses. Used for those comparisons only: [`is_global`] judges the original address.
+/// compatible `::a.b.c.d`, SIIT `::ffff:0:a.b.c.d`, the well-known NAT64 `64:ff9b::a.b.c.d`, and
+/// an address under a NAT64 network-specific prefix in force, [`crate::nat64`]), so deny CIDRs,
+/// connected prefixes and the host's own addresses match whichever spelling a connection uses.
+/// Used for those comparisons only: [`is_global`] judges the original address.
 pub fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => embedded_v4(v6).map_or(ip, IpAddr::V4),
+        IpAddr::V6(v6) => embedded_v4(v6)
+            .or_else(|| nsp_v4(v6).map(|(v4, _)| v4))
+            .map_or(ip, IpAddr::V4),
         v4 => v4,
     }
+}
+
+/// The IPv6 bit (0 = the most significant) that holds bit `i` of the IPv4 address under an
+/// RFC 6052 prefix of length `len`: the bits right after the prefix, skipping bits 64–71 (the "u"
+/// octet); for a /96, the last 32 bits.
+fn nsp_bit(len: u8, i: u8) -> u8 {
+    if len == 96 {
+        96 + i
+    } else if len + i < 64 {
+        len + i
+    } else {
+        len + i + 8
+    }
+}
+
+/// The IPv4 address the IPv6 address `x` carries under an RFC 6052 prefix of length `len`, and
+/// whether its u octet (bits 64–71) is zero, as RFC 6052 requires (always true for a /96).
+pub(crate) fn nsp_extract(x: u128, len: u8) -> (Ipv4Addr, bool) {
+    let mut v4 = 0u32;
+    for i in 0..32u8 {
+        let bit = (x >> (127 - u32::from(nsp_bit(len, i)))) & 1;
+        v4 |= (bit as u32) << (31 - u32::from(i));
+    }
+    (Ipv4Addr::from(v4), len == 96 || (x >> 56) & 0xff == 0)
+}
+
+/// The IPv6 prefix under the NAT64 prefix `nsp` that holds every address carrying an address of
+/// the IPv4 prefix `v4` with a zero u octet (any suffix): the NSP, then the IPv4 prefix's bits
+/// laid out as RFC 6052 says, the u octet zero where they pass it.
+pub(crate) fn nsp_embed(nsp: Prefix, v4: Prefix) -> Prefix {
+    let (IpAddr::V6(n), IpAddr::V4(a)) = (nsp.addr, v4.addr) else {
+        return nsp;
+    };
+    let mut x = u128::from(n) & mask128(nsp.len);
+    let bits = u32::from(a);
+    let v4_len = v4.len.min(32);
+    for i in 0..v4_len {
+        if (bits >> (31 - u32::from(i))) & 1 == 1 {
+            x |= 1u128 << (127 - u32::from(nsp_bit(nsp.len, i)));
+        }
+    }
+    let len = if v4_len == 0 {
+        nsp.len
+    } else {
+        nsp_bit(nsp.len, v4_len - 1) + 1
+    };
+    Prefix::new(IpAddr::V6(Ipv6Addr::from(x)), len)
+}
+
+/// `p` (inside the NAT64 prefix `nsp`, at least as long) read as the IPv4 prefix it carries:
+/// `None` when it fixes a u-octet bit to one (such addresses are not global).
+fn nsp_canonical(p: Prefix, nsp: Prefix) -> Option<Prefix> {
+    let IpAddr::V6(v6) = p.addr else { return None };
+    let x = u128::from(v6);
+    if nsp.len < 96 && p.len > 64 {
+        let fixed = p.len.min(72) - 64;
+        let u = ((x >> 56) & 0xff) as u8;
+        if u & !(0xffu8.checked_shr(u32::from(fixed)).unwrap_or(0)) != 0 {
+            return None;
+        }
+    }
+    let k = (0..32u8).filter(|&i| nsp_bit(nsp.len, i) < p.len).count() as u8;
+    Some(Prefix::new(IpAddr::V4(nsp_extract(x, nsp.len).0), k))
+}
+
+/// The IPv4 address `a` carries under a NAT64 network-specific prefix in force (the first that
+/// holds it), and whether its u octet is zero.
+fn nsp_v4(a: Ipv6Addr) -> Option<(Ipv4Addr, bool)> {
+    let x = u128::from(a);
+    crate::nat64::current()
+        .iter()
+        .find(|n| in_prefix(**n, IpAddr::V6(a)))
+        .map(|n| nsp_extract(x, n.len))
 }
 
 fn mask32(len: u8) -> u32 {
@@ -239,6 +340,9 @@ const V4_NOT_GLOBAL: &[([u8; 4], u8)] = &[
     ([224, 0, 0, 0], 4),      // multicast
     ([240, 0, 0, 0], 4),      // reserved, incl. 255.255.255.255
     ([168, 63, 129, 16], 32), // Azure's platform endpoint (wireserver / DNS / DHCP)
+    ([192, 52, 193, 0], 24),  // AMT relay anycast (IANA global; refused, see the module doc)
+    ([192, 31, 196, 0], 24),  // AS112-v4 anycast (likewise)
+    ([192, 175, 48, 0], 24),  // AS112 direct delegation anycast (likewise)
 ];
 
 /// Inside `2000::/3`: ranges refused outright, as (network, length).
@@ -246,15 +350,7 @@ const V6_NOT_GLOBAL: &[(u128, u8)] = &[
     (0x2001_0db8 << 96, 32), // documentation
     (0x2002 << 112, 16),     // 6to4, whatever it embeds
     (0x3fff << 112, 20),     // documentation (RFC 9637)
-    (0x2001_0000 << 96, 23), // IETF protocol assignments (incl. Teredo), less the exceptions
-];
-
-/// IANA's globally reachable assignments inside `2001::/23` that are admitted (not ORCHIDv2, and
-/// not the anycast addresses in `2001:1::/32`: see the module doc).
-const V6_IANA_GLOBAL_EXCEPTIONS: &[(u128, u8)] = &[
-    (0x2001_0003 << 96, 32),      // AMT
-    (0x2001_0004_0112 << 80, 48), // AS112-v6
-    (0x2001_0030 << 96, 28),      // DRIP DETs
+    (0x2001_0000 << 96, 23), // IETF protocol assignments (incl. Teredo, AMT, AS112-v6): all
 ];
 
 fn in4(a: u32, net: [u8; 4], len: u8) -> bool {
@@ -270,6 +366,13 @@ fn in6(a: u128, net: u128, len: u8) -> bool {
 fn v4_is_global(a: Ipv4Addr) -> bool {
     let x = u32::from(a);
     !V4_NOT_GLOBAL.iter().any(|&(net, len)| in4(x, net, len))
+}
+
+/// The IPv4 ranges that are not global, as prefixes.
+pub(crate) fn v4_not_global() -> impl Iterator<Item = Prefix> {
+    V4_NOT_GLOBAL
+        .iter()
+        .map(|&(n, l)| Prefix::new(IpAddr::V4(Ipv4Addr::from(n)), l))
 }
 
 /// The IPv4 address an IPv6 address embeds, in the forms [`canonical_ip`] reads: mapped, compatible
@@ -298,13 +401,19 @@ fn v6_is_global(a: Ipv6Addr) -> bool {
     if !in6(x, 0x2000 << 112, 3) {
         return false;
     }
-    if V6_IANA_GLOBAL_EXCEPTIONS
-        .iter()
-        .any(|&(net, len)| in6(x, net, len))
-    {
-        return true;
+    if V6_NOT_GLOBAL.iter().any(|&(net, len)| in6(x, net, len)) {
+        return false;
     }
-    !V6_NOT_GLOBAL.iter().any(|&(net, len)| in6(x, net, len))
+    // Review r2 R2-NG-4: under every NAT64 network-specific prefix in force, also judged by the
+    // IPv4 address it carries (which only ever refuses more).
+    let a = IpAddr::V6(a);
+    crate::nat64::current()
+        .iter()
+        .filter(|n| in_prefix(**n, a))
+        .all(|n| {
+            let (v4, u_zero) = nsp_extract(x, n.len);
+            u_zero && v4_is_global(v4)
+        })
 }
 
 /// Allow-only-globally-routable unicast: see the module doc for the exact ranges and choices.
@@ -325,6 +434,35 @@ pub fn is_global(ip: IpAddr) -> bool {
 /// their number times the address width.
 pub fn prefix_is_global(p: Prefix) -> bool {
     let p = Prefix::new(p.addr, p.len);
+    // A prefix that meets a NAT64 network-specific prefix in force: holding all of it, it holds
+    // `<NSP>::10.0.0.1`; inside it, it must fix a zero u octet and carry a global IPv4 prefix.
+    if p.addr.is_ipv6() {
+        for n in crate::nat64::current().iter() {
+            let len = p.len.min(n.len);
+            if mask(p.addr, len) != mask(n.addr, len) {
+                continue;
+            }
+            if p.len <= n.len {
+                return false;
+            }
+            let u_fixed_zero = n.len == 96
+                || (p.len >= 72 && {
+                    let IpAddr::V6(a) = p.addr else {
+                        unreachable!()
+                    };
+                    (u128::from(a) >> 56) & 0xff == 0
+                });
+            match nsp_canonical(p, *n) {
+                Some(q) if u_fixed_zero && plain_prefix_is_global(q) => {}
+                _ => return false,
+            }
+        }
+    }
+    plain_prefix_is_global(p)
+}
+
+/// [`prefix_is_global`] by the fixed tables (see its doc); [`is_global`] judges each leaf.
+fn plain_prefix_is_global(p: Prefix) -> bool {
     let width = if p.addr.is_ipv4() { 32 } else { 128 };
     let split = p.len < width
         && boundaries().iter().any(|b| {
@@ -345,7 +483,7 @@ pub fn prefix_is_global(p: Prefix) -> bool {
         },
         p.len + 1,
     );
-    prefix_is_global(lower) && prefix_is_global(upper)
+    plain_prefix_is_global(lower) && plain_prefix_is_global(upper)
 }
 
 /// Every prefix whose membership [`is_global`] depends on (see [`prefix_is_global`]).
@@ -357,7 +495,6 @@ fn boundaries() -> &'static [Prefix] {
         let mut b: Vec<Prefix> = V4_NOT_GLOBAL.iter().map(|&(n, l)| v4(n, l)).collect();
         b.push(v6(0x2000 << 112, 3));
         b.extend(V6_NOT_GLOBAL.iter().map(|&(n, l)| v6(n, l)));
-        b.extend(V6_IANA_GLOBAL_EXCEPTIONS.iter().map(|&(n, l)| v6(n, l)));
         for base in EMBEDDED_V4_BASES {
             b.push(v6(base << 32, 96));
             // Inside a /96 judged by its IPv4 address, the IPv4 table's boundaries, embedded.
@@ -548,7 +685,18 @@ mod tests {
         "2001:4:113::1", // next to AS112-v6
         "2001:40::1",    // unassigned in 2001::/23
         "2001:1ff::1",   // the top of 2001::/23
-        "4000::1",       // outside 2000::/3
+        // Review r2: IANA-global anycast blocks, refused like 2001:1::/32; DRIP like ORCHIDv2.
+        "2001:3::1", // AMT relay discovery anycast
+        "2001:3:ffff::1",
+        "2001:4:112::1", // AS112-v6
+        "2001:4:112:ffff::1",
+        "2001:30::1", // DRIP DETs
+        "2001:3f:ffff::1",
+        "192.52.193.1", // AMT (IPv4)
+        "192.31.196.1", // AS112-v4
+        "192.175.48.1", // AS112 direct delegation
+        "::ffff:192.52.193.1",
+        "4000::1", // outside 2000::/3
         "1fff::1",
         "::ffff:0.0.0.0",
         "::2", // compatible 0.0.0.2
@@ -576,9 +724,12 @@ mod tests {
         "223.255.255.255", // just below multicast
         "168.63.129.15",
         "168.63.129.17",
-        "192.31.196.1", // AS112-v4 (IANA global)
-        "192.52.193.1", // AMT (IANA global)
-        "192.175.48.1", // AS112 direct delegation (IANA global)
+        "192.31.195.255", // next to AS112-v4
+        "192.31.197.0",
+        "192.52.192.255", // next to AMT
+        "192.52.194.0",
+        "192.175.47.255", // next to AS112 direct delegation
+        "192.175.49.0",
         "2606:4700:4700::1111",
         "2a00:1450:4001::1",
         "2001:200::1", // just above 2001::/23
@@ -586,13 +737,7 @@ mod tests {
         "2001:db9::1",
         "2003::1",
         "3ffe::1",
-        "3fff:1000::1", // just above 3fff::/20
-        "2001:3::1",    // IANA exceptions in 2001::/23
-        "2001:3:ffff::1",
-        "2001:4:112::1",
-        "2001:4:112:ffff::1",
-        "2001:30::1",
-        "2001:3f:ffff::1",
+        "3fff:1000::1",   // just above 3fff::/20
         "::ffff:8.8.8.8", // embedded forms of a public address
         "::ffff:0:808:808",
         "64:ff9b::808:808",
@@ -891,7 +1036,10 @@ mod tests {
             ("2a00::/8", true),
             ("2001::/16", false),
             ("2001:200::/23", true),
-            ("2001:3::/32", true), // AMT, an IANA-global exception
+            ("2001:3::/32", false), // AMT anycast: refused (review r2)
+            ("2001:4:112::/48", false),
+            ("192.52.193.0/24", false),
+            ("192.52.192.0/24", true),
             ("2001:2::/48", false),
             ("2001:1::/120", false), // the three anycast /128s and their neighbours
             ("2001:1::1/128", false),
@@ -925,6 +1073,10 @@ mod tests {
             ("2001:db8::/32", "2001:db9::/32", false),
             ("::/0", "10.0.0.0/8", false), // families never mix outside the embedded /96s
             ("2606:4700::/32", "8.8.8.8/32", false),
+            // Review r2 R2-NG-5: as written, too.
+            ("64:ff9b::/64", "64:ff9b::808:800/120", true),
+            ("64:ff9b::808:800/120", "64:ff9b::/64", true),
+            ("64:ff9b::/64", "8.8.8.0/24", false),
         ] {
             assert_eq!(pfx(a).overlaps(&pfx(b)), overlap, "{a} {b}");
         }
@@ -988,6 +1140,45 @@ mod tests {
                 prop_assert!(!is_global(q.addr), "{} judged not global, but descended to global {}", p, q.addr);
             }
         }
+    }
+
+    /// RFC 6052 §2.4's example: 192.0.2.33 under each prefix length.
+    #[test]
+    fn rfc6052_layouts() {
+        let v4 = Ipv4Addr::new(192, 0, 2, 33);
+        for (nsp, addr) in [
+            ("2001:db8::/32", "2001:db8:c000:221::"),
+            ("2001:db8:100::/40", "2001:db8:1c0:2:21::"),
+            ("2001:db8:122::/48", "2001:db8:122:c000:2:2100::"),
+            ("2001:db8:122:300::/56", "2001:db8:122:3c0:0:221::"),
+            ("2001:db8:122:344::/64", "2001:db8:122:344:c0:2:2100:0"),
+            ("2001:db8:122:344::/96", "2001:db8:122:344::192.0.2.33"),
+        ] {
+            let n = pfx(nsp);
+            let IpAddr::V6(a) = ip(addr) else { panic!() };
+            assert_eq!(nsp_extract(u128::from(a), n.len), (v4, true), "{nsp}");
+            let host = nsp_embed(n, Prefix::host(IpAddr::V4(v4)));
+            assert!(in_prefix(host, ip(addr)), "{nsp}: {host}");
+            assert_eq!(
+                nsp_canonical(host, n),
+                Some(Prefix::host(IpAddr::V4(v4))),
+                "{nsp}"
+            );
+            // A /24 of IPv4 addresses, embedded and read back.
+            let net = nsp_embed(n, pfx("192.0.2.0/24"));
+            assert!(in_prefix(net, ip(addr)), "{nsp}: {net}");
+            assert_eq!(nsp_canonical(net, n), Some(pfx("192.0.2.0/24")), "{nsp}");
+            // A nonzero u octet is seen (where there is one).
+            let x = u128::from(a) | (1 << 60);
+            assert_eq!(nsp_extract(x, n.len).1, n.len == 96, "{nsp}");
+        }
+        // A prefix that fixes a u-octet bit to one reads as nothing.
+        let n = pfx("2001:db8:122:344::/64");
+        assert_eq!(nsp_canonical(pfx("2001:db8:122:344:8000::/65"), n), None);
+        assert_eq!(
+            nsp_canonical(pfx("2001:db8:122:344::/65"), n),
+            Some(pfx("0.0.0.0/0"))
+        );
     }
 
     #[test]

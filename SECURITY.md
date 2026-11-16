@@ -19,38 +19,68 @@ Every connection a requester can cause goes through one guard
 - **Only globally routable unicast addresses** are connected to (`is_global`). Refused:
   `0/8`, RFC 1918, CGNAT `100.64/10` (which holds Alibaba's metadata address), loopback,
   link-local `169.254/16` (cloud metadata), `192.0.0/24`, the TEST-NETs, benchmarking,
-  multicast, `240/4`, Azure's `168.63.129.16`; on IPv6 everything outside `2000::/3` (loopback,
-  ULA `fc00::/7` with AWS's `fd00:ec2::254`, link-local, site-local, multicast, discard,
-  SRv6), documentation, 6to4, Teredo and the IETF block `2001::/23` except IANA's globally
-  reachable AMT (`2001:3::/32`), AS112-v6 (`2001:4:112::/48`) and DRIP (`2001:30::/28`)
-  ranges. All of `2001:1::/32` is refused, IANA's PCP, TURN and DNS-SD SRP anycast addresses
-  included: the nearest instance of an anycast service may be a box on your own network. An
-  IPv6 address that carries an IPv4 one (mapped, SIIT, the well-known NAT64 prefix) is judged
-  by that IPv4 address; IPv4-compatible addresses are refused. Deny CIDRs and the host's
-  prefixes match every such spelling too (`64:ff9b::808:808/128` denies `8.8.8.8`).
+  multicast, `240/4`, Azure's `168.63.129.16`, the AMT relay anycast `192.52.193.0/24` and the
+  AS112 anycast sinks `192.31.196.0/24` and `192.175.48.0/24`; on IPv6 everything outside
+  `2000::/3` (loopback, ULA `fc00::/7` with AWS's `fd00:ec2::254`, link-local, site-local,
+  multicast, discard, SRv6), documentation, 6to4, Teredo and **all of the IETF block
+  `2001::/23`**, IANA's globally reachable assignments in it included: the PCP, TURN and
+  DNS-SD SRP anycast addresses in `2001:1::/32`, AMT's relay anycast `2001:3::/32` and
+  AS112-v6 `2001:4:112::/48` (the nearest instance of an anycast service may be a box on your
+  own network), and the ORCHIDv2 and DRIP identifier prefixes (`2001:20::/28`,
+  `2001:30::/28`), which are not locators. An
+  IPv6 address that carries an IPv4 one (mapped, SIIT, the well-known NAT64 prefix, and a
+  **network-specific NAT64 prefix** — RFC 6052, any /32 to /96 a network picks for its
+  translator) is judged by that IPv4 address, which the translator would connect to from its
+  own IPv4 side; IPv4-compatible addresses are refused. The network-specific prefix is learned
+  at startup and every 5 minutes by asking the host's own DNS servers for `ipv4only.arpa`
+  (RFC 7050: a DNS64 resolver answers under its prefix), or named in `[egress]
+  nat64_prefixes`. Deny CIDRs and the host's prefixes match every such spelling too
+  (`64:ff9b::808:808/128` denies `8.8.8.8`, and a deny of `64:ff9b::/64` holds the addresses it
+  holds as written).
 - **Not this host, not its neighbours, not its site.** Refused, whatever the spelling:
   - the host's own addresses, **including its public address behind NAT**: at startup and
     every 5 minutes the miner asks two fixed DNS reflectors which address its query came from
-    (`o-o.myaddr.l.google.com` TXT, asked of Google's authoritative `ns1.google.com`; else
-    `whoami.cloudflare` CH TXT, asked of `1.1.1.1`), once over IPv4 and once over IPv6. The
-    names and servers are compiled in: nothing a requester sends chooses them, and an answer
-    can only add an address to refuse. If no reflector answers, a loud warning says so and the
-    miner carries on: list the public address in `[egress] deny_cidrs` then (or always).
+    (`o-o.myaddr.l.google.com` TXT, asked of Google's authoritative `ns1.google.com`, and
+    `whoami.cloudflare` CH TXT, asked of `1.1.1.1`), each over IPv4 and over IPv6, and refuses
+    every address either reports (a warning says when they disagree). The names and servers are
+    compiled in: nothing a requester sends chooses them, and an answer can only add an address
+    to refuse; only an address both reflectors report alike also gives its IPv6 site (below),
+    so one forged answer cannot refuse someone else's whole /48. Facts read while the first
+    discovery runs wait for it. If no reflector answers, a loud warning says so and the miner
+    carries on: list the public address in `[egress] deny_cidrs` then (or always).
     `[egress] discover_public_addresses = false` turns the queries off;
+  - **every address a `local`, `broadcast` or `anycast` route delivers to the host itself**, in
+    any routing table: an AnyIP range (`ip route add local 185.199.108.0/24 dev lo`, as
+    freebind, anycast and IPv6-proxy hosts install) is this host though no interface carries it.
+    A `local` route of length `/0` (a transparent proxy's catch-all, which only a `fwmark` rule
+    consults) is left alone; shorter local routes (`/1` to `/4`) refuse what they hold, and if
+    they leave no public address at all the miner refuses to start and says why;
   - every network the host is connected to: each interface's network under its netmask, a
     point-to-point peer, and **every on-link route** (no gateway, not on loopback, not a
     default route) from the routing table, so a DHCPv6 host (a /128 address whose /64 is only
     a route), an IPv4 /32 with its subnet as a route, and WireGuard, Docker or VPN networks are
     covered;
-  - **any destination whose best route is not the default path.** For a destination, the
-    routes holding it with the longest prefix (the kernel's choice) must all be a default
-    route (`/0`, or a "split default" no longer than `/4`, as full-tunnel VPNs install; with a
-    gateway or without, as on PPPoE) or go through a default route's own gateway (a DHCP
-    option 121 route to a DNS server via your router reaches nothing the default route does
-    not). An on-link route, a route on loopback, or a route through any other gateway (a VPN's
-    pushed company ranges, a static route into a DMZ) refuses it. Every routing table is read
-    (netlink, no privileges needed) and they are merged: policy routing (`ip rule`) is not
-    modelled, which errs towards refusing. Linux only;
+  - **any destination whose route is not the default path.** Every routing table and every
+    policy-routing rule (`ip rule`) is read (netlink, no privileges needed), each rule for the
+    miner's own connections (firewall mark 0, its uid, input interface `lo`, no output
+    interface, TCP). The default routes are those of the **ordinary tables**, the ones a rule
+    with no destination selector sends every such connection to (`main` on a stock host; a
+    wg-quick or Mullvad table reached by `not fwmark` too); a default route of any other table
+    — a VPN table only a `from` or `to` rule reaches — is not one, and its gateway does not make
+    other routes default-path. For a destination, the routes holding it with the longest
+    prefix must all be such a default route (`/0`, or a "split default" no longer than `/4`, as
+    full-tunnel VPNs install; with a gateway or without, as on PPPoE) or go through one's own
+    gateway (a DHCP option 121 route to a DNS server via your router reaches nothing the
+    default route does not). An on-link route, a route on loopback, a route through any other
+    gateway (a VPN's pushed company ranges, a static route into a DMZ), in any table, refuses
+    it, and so does a destination rule (`ip rule add to 52.95.0.0/16 lookup 100`) into a table
+    that is not ordinary, for its whole prefix. On top of that, **the kernel itself is asked**,
+    for every address a connection would go to: one unprivileged `RTM_GETROUTE` per
+    destination (with the miner's uid, TCP, and the "which routing entry matched" flag), which
+    applies every rule exactly; only a unicast route through a default route's gateway, or a
+    default route of an ordinary table, is admitted (a local route, no route, a default route
+    a selector picks, an on-link route or another gateway is refused). Answers are reused for
+    the life of one facts snapshot (about a second). Linux only;
   - **the site around each of the host's global IPv6 addresses**: its enclosing `/56`
     (`[egress] ipv6_site_prefix_len`, 48 to 64), the usual delegation to a home or office,
     whose other /64s hold your other machines;
@@ -153,14 +183,17 @@ that node can reach. The broker therefore holds them to the same rule, with netg
   (`0.0.0.0/0`, `::/0`, a `/8` holding private space and `::ffff:0:0/96` are refused), overlaps
   the deny CIDRs or a DNS server, or — once the host's facts are read (the same facts as above:
   own and public addresses, connected prefixes and on-link routes, the IPv6 site, routes off the
-  default path, the host's DNS servers; `[egress] ipv6_site_prefix_len` and
-  `discover_public_addresses` in the broker's own config) — holds one of the host's addresses
-  or overlaps one of its prefixes; or if a URL host name fails the host-name hygiene above. An
+  default path, local routes, destination policy rules, NAT64 prefixes, the host's DNS servers;
+  `[egress] ipv6_site_prefix_len` and `discover_public_addresses` in the broker's own config) —
+  holds one of the host's addresses or overlaps one of its prefixes; or if a URL host name fails the host-name hygiene above. An
   IP-literal host must lie inside the endpoint's own `cidrs` when it has them, and is judged
   too. Every connection is checked against the same floor again, and the broker's self-test
   fails (`RoleEntriesPublic`) if any role entry in force is not public. The sandboxed broker
   cannot read the host itself, so the miner re-reads the host's facts every 5 seconds and
-  sends them whenever they change.
+  sends them whenever they change, flattened into prefixes. The broker cannot ask the kernel
+  per destination either (its sandbox denies netlink): it judges by those prefixes alone, which
+  refuse every route off the default path, every destination rule's prefix and every local
+  route whole, so it refuses at least what the miner's prefix model refuses.
 - **Keys** (`key_file`) travel only over `https` in public mode. In developer mode they may also
   go over `http` to a loopback IP literal or one inside the endpoint's own `cidrs`.
 - **Cached RPC answers are per requester.** Answers to pinned queries are cached by the job's
@@ -191,19 +224,30 @@ that node can reach. The broker therefore holds them to the same rule, with netg
   network uses internally) in `[egress] deny_cidrs`. On a cloud host, also block the metadata
   service inside the instance (IMDSv2 required, hop limit 1, or the endpoint off) as defense in
   depth.
-- **Policy routing is not modelled.** Routes of every table are merged and a specific route in
-  any of them refuses its destinations; an `ip rule` that sends some traffic elsewhere is not
-  followed. Routes are read on Linux only.
+- **What the routing checks cannot see.** The kernel is asked as for a connection's first
+  route lookup: no source address yet, no ports, firewall mark 0. So a rule that selects by
+  source (`from`), by port (`dport`/`sport`) or by a mark that a firewall (nftables/iptables
+  `OUTPUT` mangle) sets on the miner's packets, a VRF the miner is run inside (`ip vrf
+  exec`), and eBPF or netfilter rerouting are not followed for that connection; the prefix
+  model still refuses every specific route of every table that is not the default path, and
+  every destination rule's prefix, but a default route that only such a rule selects is
+  treated as an internet path. If you route the miner's own traffic by source, port, mark or
+  cgroup, list what those paths reach in `[egress] deny_cidrs`. A destination rule into a table
+  that routes it out the same uplink is refused all the same (refusing too much). Routes and
+  rules are read on Linux only.
 - **Public-address discovery depends on two outside services.** If neither answers (a firewall
   blocking outbound DNS to them, an outage), the NAT public address is unknown until one does:
   list it in `[egress] deny_cidrs`. A host whose public address changes is caught at the next
   discovery, at most 5 minutes later.
 - **The facts can be a second stale.** A host that just joined a network is judged on facts at
   most a second old (a refusal re-reads them at once).
-- **NAT64 with a network-specific prefix.** Addresses under the well-known NAT64 prefix
-  `64:ff9b::/96` are judged by the IPv4 address they carry; a DNS64 resolver that synthesizes
-  under a prefix of your own network would hand out global-looking addresses for private IPv4
-  targets. On such a network, keep the miner off DNS64 or ask for support.
+- **NAT64 prefixes the host cannot learn.** A network-specific NAT64 prefix is learned from
+  the host's DNS servers (RFC 7050); a translator reached without DNS64 (a static route to a
+  NAT64 box, a DNS64 the host does not use) must be named in `[egress] nat64_prefixes`. The
+  witness broker learns the prefix itself at startup and also gets, from the miner, the
+  refusals it implies as prefixes; under a prefix shorter than `/64` that is the whole prefix
+  (its "u" octet sits inside the embedded address), so the broker reaches no IPv4-only
+  endpoint through such a translator.
 - **Plain `http` and any port** are still accepted for program URLs on public addresses, as
   before; content hashes, not the transport, protect the bytes.
 - **The broker's requester path is not in use yet.** Requester-chosen URLs (builder URIs, later

@@ -79,6 +79,14 @@ pub struct EgressConfig {
     /// and Cloudflare's, which address the query came from) and refuse them. Default true.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub discover_public_addresses: bool,
+    /// NAT64 network-specific prefixes this host's translator uses (RFC 6052: a /32, /40, /48,
+    /// /56, /64 or /96 of IPv6, e.g. `"2001:db8:64::/96"`). An address under one carries an IPv4
+    /// address the translator connects to from its own IPv4 side, so it is judged by that IPv4
+    /// address: a private or metadata address there is refused. The prefix a DNS64 resolver uses
+    /// is learned at startup by asking this host's DNS servers for `ipv4only.arpa` (RFC 7050);
+    /// name it here when that cannot work. The well-known `64:ff9b::/96` needs no entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nat64_prefixes: Vec<String>,
 }
 
 fn default_ipv6_site_prefix_len() -> u8 {
@@ -103,6 +111,7 @@ impl Default for EgressConfig {
             deny_cidrs: Vec::new(),
             ipv6_site_prefix_len: default_ipv6_site_prefix_len(),
             discover_public_addresses: true,
+            nat64_prefixes: Vec::new(),
         }
     }
 }
@@ -536,8 +545,30 @@ impl ZkMinerConfig {
             .collect()
     }
 
+    /// `[egress] nat64_prefixes`, parsed: IPv6 prefixes of an RFC 6052 length (/32, /40, /48,
+    /// /56, /64, /96), host bits zero.
+    pub fn egress_nat64_prefixes(&self) -> Result<Vec<zkminer_netguard::Prefix>> {
+        self.egress
+            .nat64_prefixes
+            .iter()
+            .map(|s| {
+                let p = s
+                    .parse::<zkminer_netguard::Prefix>()
+                    .map_err(|e| anyhow::anyhow!("egress.nat64_prefixes: {e}"))?;
+                zkminer_netguard::nat64::check_prefix(p)
+                    .map_err(|e| anyhow::anyhow!("egress.nat64_prefixes: {e}"))
+            })
+            .collect()
+    }
+
     /// The options the network guard gathers this host's facts with (`[egress]
-    /// ipv6_site_prefix_len`, `discover_public_addresses`). Refuses a site length outside 48..=64.
+    /// ipv6_site_prefix_len`, `discover_public_addresses`). Refuses a site length outside 48..=64
+    /// and a malformed `nat64_prefixes` entry.
+    ///
+    /// Also puts `[egress] nat64_prefixes` in force, process-wide
+    /// ([`zkminer_netguard::nat64::set_configured`]): the network guard's address predicate reads
+    /// them wherever it runs in this process, and every component that judges requester-caused
+    /// connections (the ELF fetch, the witness broker's host facts) builds its options here.
     pub fn egress_facts_options(&self) -> Result<zkminer_netguard::FactsOptions> {
         let o = zkminer_netguard::FactsOptions {
             ipv6_site_prefix_len: self.egress.ipv6_site_prefix_len,
@@ -545,6 +576,8 @@ impl ZkMinerConfig {
         };
         o.validate()
             .map_err(|e| anyhow::anyhow!("egress.{e}"))?;
+        zkminer_netguard::nat64::set_configured(&self.egress_nat64_prefixes()?)
+            .map_err(|e| anyhow::anyhow!("egress.nat64_prefixes: {e}"))?;
         Ok(o)
     }
 
@@ -553,8 +586,8 @@ impl ZkMinerConfig {
         (self.net_mode() == zkminer_netguard::NetMode::DevPrivate).then_some(DEV_MODE_BANNER)
     }
 
-    /// Refuses `[dev] private_network` on a production chain, malformed `[egress]` CIDRs and an
-    /// `[egress] ipv6_site_prefix_len` outside 48..=64.
+    /// Refuses `[dev] private_network` on a production chain, malformed `[egress]` CIDRs, an
+    /// `[egress] ipv6_site_prefix_len` outside 48..=64 and a malformed `nat64_prefixes` entry.
     pub fn validate_network(&self) -> Result<()> {
         if self.dev.private_network && is_production_chain(self.chain.chain_id) {
             anyhow::bail!(
@@ -814,6 +847,46 @@ mod validation_tests {
             }
         }
         assert!(parse("[egress]\nipv6_site_prefix_len = 300\n").is_err());
+    }
+
+    /// Review r2 R2-NG-4: `[egress] nat64_prefixes` parses strictly (RFC 6052 lengths, host bits
+    /// zero), round-trips, and is not written while empty.
+    #[test]
+    fn egress_nat64_prefixes() {
+        let c = parse("[chain]\nchain_id = 743111\n").unwrap();
+        assert!(c.egress_nat64_prefixes().unwrap().is_empty());
+        assert!(!toml::to_string_pretty(&c)
+            .unwrap()
+            .contains("nat64_prefixes"));
+        let c = parse(
+            "[chain]\nchain_id = 743111\n[egress]\nnat64_prefixes = [\"2001:db8:64::/96\", \"2001:db8:122:344::/64\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.egress_nat64_prefixes().unwrap(),
+            vec![
+                "2001:db8:64::/96".parse().unwrap(),
+                "2001:db8:122:344::/64".parse().unwrap()
+            ]
+        );
+        assert!(c.validate_network().is_ok());
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert_eq!(parse(&text).unwrap().egress, c.egress);
+        for bad in [
+            "10.0.0.0/8",
+            "2001:db8::/33",
+            "2001:db8::1/96",
+            "2001:db8::/128",
+            "nope",
+        ] {
+            let c = parse(&format!(
+                "[chain]\nchain_id = 743111\n[egress]\nnat64_prefixes = [\"{bad}\"]\n"
+            ))
+            .unwrap();
+            let err = c.validate_network().expect_err(bad).to_string();
+            assert!(err.contains("egress.nat64_prefixes"), "{bad}: {err}");
+            assert!(c.egress_facts_options().is_err(), "{bad}");
+        }
     }
 
     /// The guard must not reject a genuine value — it is easy to write one that rejects all.
