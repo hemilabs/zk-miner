@@ -1270,6 +1270,10 @@ impl World {
         c.contracts.hemi_prove_registry = DEPLOYMENT.registry.to_string();
         c.contracts.hemi_token = DEPLOYMENT.token.to_string();
         c.contracts.program_registry = DEPLOYMENT.program_registry.to_string();
+        // The programs are served from this machine (127.0.0.1), which the network guard refuses
+        // outside developer mode. The config file is the only switch: there is no environment
+        // variable for it, and the miner refuses it on mainnet (the fork is 743111).
+        c.dev.private_network = true;
         // A 5 HEMI job is the whole market here: claim anything that pays.
         c.prover.min_profit_threshold = 0.0;
         c.prover.skip_benchmark_gate = true;
@@ -1709,8 +1713,6 @@ impl Miner {
         }
         cmd.env("HOME", dir)
             .env("PATH", path_without_workers())
-            // The programs are served from this machine.
-            .env("ZKMINER_ELF_ALLOW_PRIVATE_URLS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

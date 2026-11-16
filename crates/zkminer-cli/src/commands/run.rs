@@ -11578,9 +11578,16 @@ pub(crate) async fn fetch_or_download_elf(
             ),
         );
     }
-    let elf = zkminer_chain::programs::download_elf(&info.storage_uris, integrity_hash)
-        .await
-        .context("ELF download failed")?;
+    // Through the network guard built from this config (`client.elf_fetcher()`): every storage URI
+    // and redirect is submitter-controlled, so only public destinations are reached unless
+    // `[dev] private_network` is on.
+    let elf = zkminer_chain::programs::download_elf(
+        client.elf_fetcher(),
+        &info.storage_uris,
+        integrity_hash,
+    )
+    .await
+    .context("ELF download failed")?;
     // Cache only bytes bound to a known hash. Unverified risc0 bytes (the measure bootstrap, a
     // recovery re-fetch) are cached by the measure path once the worker has image-id-verified them.
     if integrity_hash.is_none() && !honor_registry_hash {

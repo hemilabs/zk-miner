@@ -959,7 +959,7 @@ impl Simulator {
             return Ok(elf);
         }
         if let Some(h) = info.elf_hash {
-            match download_elf(&info.storage_uris, Some(h)).await {
+            match download_elf(self.client.elf_fetcher(), &info.storage_uris, Some(h)).await {
                 Ok(elf) => return Ok(elf),
                 Err(e) if e.downcast_ref::<NoStorageUris>().is_some() => return Err(e),
                 Err(e) => tracing::info!(
@@ -969,7 +969,7 @@ impl Simulator {
                 ),
             }
         }
-        download_elf(&info.storage_uris, None).await
+        download_elf(self.client.elf_fetcher(), &info.storage_uris, None).await
     }
 
     /// SP1: set up the measure worker the next request runs on (its CPU prover), outside that

@@ -17,6 +17,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 reqwest = "0.12"
+zkminer-netguard = { workspace = true, features = ["client"] }
 dirs = { workspace = true }
 tower = "0.4"
 alloy-json-rpc = "1"
@@ -24,3 +25,5 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 zkminer-prover = { workspace = true }
+# The test seam that lets a public-mode fetch be served from loopback (never in a release build).
+zkminer-netguard = { workspace = true, features = ["client", "test-util"] }
