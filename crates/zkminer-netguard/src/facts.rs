@@ -18,7 +18,8 @@
 //!   `/run/systemd/resolve/resolv.conf` (the upstream servers behind its `127.0.0.53` stub), which
 //!   may answer only their own customers;
 //! - **the routing table**, for the best-route rule: a destination whose best route is not the
-//!   default path is refused ([`crate::routes::RouteTable::off_default_path`]).
+//!   default path is refused, and so is one a `local`, `broadcast` or `anycast` route delivers to
+//!   this host (an AnyIP range) ([`crate::routes::RouteTable::off_default_path`]).
 //!
 //! A miner in a container sees the container's network, not the host's: run it with host
 //! networking, or list the host's networks in `[egress] deny_cidrs`.
@@ -80,7 +81,7 @@ pub struct RawFacts {
     pub interface_prefixes: Vec<Prefix>,
     /// Every interface address.
     pub interface_addresses: Vec<IpAddr>,
-    /// Every unicast route of every table.
+    /// Every unicast, `local`, `broadcast` and `anycast` route of every table.
     pub routes: Vec<Route>,
     /// The DNS servers the host uses.
     pub resolvers: Vec<IpAddr>,

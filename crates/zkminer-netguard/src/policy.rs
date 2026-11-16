@@ -23,14 +23,7 @@ pub enum NetMode {
     DevPrivate,
 }
 
-/// What [`Denied::OffDefaultRoute`] found about the route.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RouteKind {
-    /// No gateway: a network the host reaches directly.
-    OnLink,
-    /// Through a gateway that is not a default route's.
-    OtherGateway,
-}
+pub use crate::routes::RouteKind;
 
 /// Why a destination or URL was refused. The `Display` of each says so in the guard's own words
 /// (`refused by the network guard: …`), and prints only what is safe to log: addresses, prefixes,
@@ -157,6 +150,10 @@ impl Denied {
                     f,
                     "{ip} is routed by {route} through a gateway other than the default route's"
                 ),
+                RouteKind::Local => write!(
+                    f,
+                    "{ip} is delivered to this host itself (its local route {route})"
+                ),
             },
             Denied::DenyCidr { ip, prefix } => {
                 write!(f, "{ip} is in the operator's deny CIDR {prefix}")
@@ -262,15 +259,10 @@ pub fn admit(
         .off_default_path(ip)
         .or_else(|| (c != ip).then(|| routes.off_default_path(c)).flatten())
     {
-        let kind = if r.hop == crate::routes::Hop::OnLink {
-            RouteKind::OnLink
-        } else {
-            RouteKind::OtherGateway
-        };
         return Err(Denied::OffDefaultRoute {
             ip,
             route: r.prefix,
-            kind,
+            kind: r.kind,
         });
     }
     Ok(())
@@ -381,6 +373,25 @@ impl FactsCell {
     }
 }
 
+/// Refuses, at startup, facts under which every destination would be refused, with why (the
+/// host's local routes hold every public address it routes: [`crate::RouteTable::local_refuses_everything`]).
+fn usable(facts: &HostFacts) -> io::Result<()> {
+    let Some(local) = facts.routes().local_refuses_everything() else {
+        return Ok(());
+    };
+    let list: Vec<String> = local.iter().map(Prefix::to_string).collect();
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "this host's local routes ({}) deliver every public address to this host itself, so \
+             the network guard would refuse every destination. A transparent proxy's catch-all \
+             belongs in a routing table only a fwmark rule consults, as `local 0.0.0.0/0` / \
+             `local ::/0` (which the guard leaves alone)",
+            list.join(", ")
+        ),
+    ))
+}
+
 /// A network policy: the mode, the host's facts, and the operator's extra deny CIDRs. Cheap to clone
 /// (shared state). Every requester-caused connection is judged by one: [`NetPolicy::admit`] for an
 /// address, [`NetPolicy::check_url`] for a URL, and the guarded resolver and client built from it.
@@ -414,6 +425,9 @@ impl NetPolicy {
             NetMode::Public => (HostFacts::gather_with(&options)?, true),
             NetMode::DevPrivate => (HostFacts::empty(), false),
         };
+        if mode == NetMode::Public {
+            usable(&facts)?;
+        }
         Ok(Self::build(mode, facts, refresh, deny, options))
     }
 
@@ -831,6 +845,44 @@ mod tests {
             ..offline()
         };
         assert!(NetPolicy::with_options(NetMode::Public, Vec::new(), bad).is_err());
+    }
+
+    /// Review r2 R2-NG-1: local routes that hold every public address the host routes stop a
+    /// public-mode policy at startup, saying why, instead of refusing every fetch.
+    #[test]
+    fn local_routes_that_hold_everything_refuse_to_start() {
+        use crate::facts::RawFacts;
+        use crate::routes::Route;
+        let facts = |routes| {
+            HostFacts::assemble(
+                RawFacts {
+                    routes,
+                    ..RawFacts::default()
+                },
+                &offline(),
+            )
+        };
+        let default = Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 2);
+        let e = usable(&facts(vec![
+            default,
+            Route::local(pfx("0.0.0.0/1"), 1),
+            Route::local(pfx("128.0.0.0/1"), 1),
+        ]))
+        .unwrap_err();
+        assert!(
+            e.to_string().contains("0.0.0.0/1, 128.0.0.0/1")
+                && e.to_string().contains("every destination"),
+            "{e}"
+        );
+        // One half: refused where it holds, and the policy starts.
+        let f = facts(vec![default, Route::local(pfx("0.0.0.0/1"), 1)]);
+        assert!(usable(&f).is_ok());
+        assert!(admit(NetMode::Public, ip("8.8.8.8"), &f, &[]).is_err());
+        assert_eq!(admit(NetMode::Public, ip("200.1.1.1"), &f, &[]), Ok(()));
+        // A TPROXY catch-all is left alone.
+        let f = facts(vec![default, Route::local(pfx("0.0.0.0/0"), 1)]);
+        assert!(usable(&f).is_ok());
+        assert_eq!(admit(NetMode::Public, ip("8.8.8.8"), &f, &[]), Ok(()));
     }
 
     #[test]

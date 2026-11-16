@@ -28,6 +28,17 @@
 //! That errs towards refusing. A destination no route holds is admitted (the kernel will not
 //! connect to it either).
 //!
+//! **Routes that deliver to this host** (review r2, R2-NG-1): `local`, `broadcast` and `anycast`
+//! routes, of every table, refuse every address they hold, like the host's own addresses
+//! ([`RouteKind::Local`]). The kernel delivers such an address to the host itself, so an AnyIP
+//! range (`ip route add local 185.199.108.0/24 dev lo`, as freebind, anycast and IPv6-proxy hosts
+//! install) is this host, though no interface carries it. A `local` route of length `/0` is the
+//! exception: it is how a transparent proxy (TPROXY) catches marked traffic, in a table only a
+//! `fwmark` rule consults, and refusing every address for it would stop the miner outright. Any
+//! other length refuses what it holds, `/1` to `/4` included; when those leave no public address
+//! of any family the host routes, [`RouteTable::local_refuses_everything`] says so, and a
+//! public-mode policy refuses to start with that explanation rather than refuse every fetch.
+//!
 //! Only Linux (and Android) routing tables are read; elsewhere the table is empty and only the
 //! interfaces' own prefixes are known (put further ranges in `[egress] deny_cidrs`).
 
@@ -51,7 +62,23 @@ pub enum Hop {
     Unknown,
 }
 
-/// One unicast route (of any routing table).
+/// What a route does with the packets it holds (`rtm_type`). Routes of any other type
+/// (`blackhole`, `unreachable`, `prohibit`, `throw`, `multicast`, …) reach nothing and are not
+/// read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum RouteType {
+    /// Forwarded to a gateway or a neighbour.
+    #[default]
+    Unicast,
+    /// Delivered to this host itself: its own addresses, and AnyIP ranges.
+    Local,
+    /// A broadcast address, delivered to this host (and its link).
+    Broadcast,
+    /// An anycast address this host answers (IPv6 subnet-router anycast).
+    Anycast,
+}
+
+/// One route of any routing table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Route {
     /// The destination (`0.0.0.0/0` or `::/0` for a default route).
@@ -61,6 +88,8 @@ pub struct Route {
     pub ifindex: u32,
     /// Whether the outgoing interface is a loopback interface.
     pub loopback: bool,
+    /// [`RouteType::Unicast`] for the routes built by [`Route::on_link`] and [`Route::via`].
+    pub kind: RouteType,
 }
 
 impl Route {
@@ -71,6 +100,7 @@ impl Route {
             hop: Hop::OnLink,
             ifindex,
             loopback: false,
+            kind: RouteType::Unicast,
         }
     }
 
@@ -81,7 +111,22 @@ impl Route {
             hop: Hop::Via(gateway),
             ifindex,
             loopback: false,
+            kind: RouteType::Unicast,
         }
+    }
+
+    /// A `local` route on interface `ifindex`: every address in `prefix` is this host's
+    /// (`ip route add local 185.199.108.0/24 dev lo`).
+    pub fn local(prefix: Prefix, ifindex: u32) -> Self {
+        Route {
+            kind: RouteType::Local,
+            ..Route::on_link(prefix, ifindex)
+        }
+    }
+
+    /// Whether the route delivers to this host itself (`local`, `broadcast`, `anycast`).
+    pub fn delivers_locally(&self) -> bool {
+        self.kind != RouteType::Unicast
     }
 
     /// Whether the route counts as a default route (`/0`, or a split default up to
@@ -96,19 +141,66 @@ impl Route {
     }
 }
 
+/// Why the routing table refuses a destination ([`RouteRefusal`], and
+/// [`crate::Denied::OffDefaultRoute`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteKind {
+    /// No gateway: a network the host reaches directly.
+    OnLink,
+    /// Through a gateway that is not a default route's.
+    OtherGateway,
+    /// Delivered to this host itself by a `local`, `broadcast` or `anycast` route.
+    Local,
+}
+
+/// The route that refuses a destination, and why ([`RouteTable::off_default_path`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteRefusal {
+    /// The refusing route's prefix.
+    pub prefix: Prefix,
+    pub kind: RouteKind,
+}
+
+impl RouteRefusal {
+    fn of(r: &Route) -> Self {
+        let kind = if r.delivers_locally() {
+            RouteKind::Local
+        } else if r.hop == Hop::OnLink {
+            RouteKind::OnLink
+        } else {
+            RouteKind::OtherGateway
+        };
+        RouteRefusal {
+            prefix: r.prefix,
+            kind,
+        }
+    }
+}
+
 /// The routing table, with the default path worked out (see the module doc).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RouteTable {
+    /// The unicast routes.
     routes: Vec<Route>,
+    /// The routes that deliver to this host (`local`, `broadcast`, `anycast`), `/0` left out.
+    local: Vec<Route>,
     /// `(gateway, interface)` of every true default route (`/0`) that has a gateway.
     uplinks: Vec<(IpAddr, u32)>,
 }
 
 impl RouteTable {
-    pub fn new(mut routes: Vec<Route>) -> Self {
-        for r in &mut routes {
-            r.prefix = Prefix::new(r.prefix.addr, r.prefix.len);
-        }
+    pub fn new(routes: Vec<Route>) -> Self {
+        let (mut local, mut routes): (Vec<Route>, Vec<Route>) = routes
+            .into_iter()
+            .map(|mut r| {
+                r.prefix = Prefix::new(r.prefix.addr, r.prefix.len);
+                r
+            })
+            .partition(Route::delivers_locally);
+        // A `local default` is a transparent proxy's catch-all (see the module doc).
+        local.retain(|r| r.prefix.len > 0);
+        local.sort();
+        local.dedup();
         routes.sort();
         routes.dedup();
         let mut uplinks: Vec<(IpAddr, u32)> = routes
@@ -121,12 +213,21 @@ impl RouteTable {
             .collect();
         uplinks.sort();
         uplinks.dedup();
-        RouteTable { routes, uplinks }
+        RouteTable {
+            routes,
+            local,
+            uplinks,
+        }
     }
 
-    /// Every route, sorted.
+    /// Every unicast route, sorted.
     pub fn routes(&self) -> &[Route] {
         &self.routes
+    }
+
+    /// Every route that delivers to this host (`local`, `broadcast`, `anycast`; not `/0`), sorted.
+    pub fn local_routes(&self) -> &[Route] {
+        &self.local
     }
 
     /// Whether `r` takes the default path: it is a default route (or a split default), or it goes
@@ -141,10 +242,14 @@ impl RouteTable {
         }
     }
 
-    /// The route that refuses `ip`: among the routes holding `ip` with the longest prefix length
-    /// (the kernel's choice, up to policy routing), the first that does not take the default path.
-    /// `None` when every one of them does, or when no route holds `ip`.
-    pub fn off_default_path(&self, ip: IpAddr) -> Option<&Route> {
+    /// The route that refuses `ip`: a route that delivers it to this host, else, among the
+    /// unicast routes holding `ip` with the longest prefix length (the kernel's choice, up to
+    /// policy routing), the first that does not take the default path. `None` when every one of
+    /// them does, or when no route holds `ip`.
+    pub fn off_default_path(&self, ip: IpAddr) -> Option<RouteRefusal> {
+        if let Some(r) = self.local.iter().find(|r| r.holds(ip)) {
+            return Some(RouteRefusal::of(r));
+        }
         let best = self
             .routes
             .iter()
@@ -155,6 +260,7 @@ impl RouteTable {
             .iter()
             .filter(|r| r.prefix.len == best && r.holds(ip))
             .find(|r| !self.via_default_path(r))
+            .map(RouteRefusal::of)
     }
 
     /// The prefixes of the on-link routes: no gateway, not on a loopback interface, not a default
@@ -172,24 +278,86 @@ impl RouteTable {
     }
 
     /// The prefixes of every route that does not take the default path (on-link routes, routes on
-    /// a loopback interface, routes through another gateway): what a consumer that knows only
-    /// prefixes must refuse to refuse what [`Self::off_default_path`] refuses. Wider than the
-    /// rule itself where a more specific default-path route sits inside one of them.
+    /// a loopback interface, routes through another gateway, routes that deliver to this host):
+    /// what a consumer that knows only prefixes must refuse to refuse what
+    /// [`Self::off_default_path`] refuses. Wider than the rule itself where a more specific
+    /// default-path route sits inside one of them.
     pub fn off_default_prefixes(&self) -> Vec<Prefix> {
         let mut v: Vec<Prefix> = self
             .routes
             .iter()
             .filter(|r| !self.via_default_path(r))
+            .chain(&self.local)
             .map(|r| r.prefix)
             .collect();
         v.sort();
         v.dedup();
         v
     }
+
+    /// When the routes that deliver to this host hold every public address of every family the
+    /// host has a default route for (a `local 0.0.0.0/1` + `local 128.0.0.0/1` pair, say), those
+    /// routes: a policy over this table would refuse every destination. `None` otherwise, and
+    /// when the host has no default route at all.
+    pub fn local_refuses_everything(&self) -> Option<Vec<Prefix>> {
+        let mut families = 0;
+        for v6 in [false, true] {
+            if !self
+                .routes
+                .iter()
+                .any(|r| r.prefix.addr.is_ipv6() == v6 && r.prefix.len == 0)
+            {
+                continue;
+            }
+            families += 1;
+            let space = if v6 {
+                Prefix::new(
+                    IpAddr::V6(std::net::Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0)),
+                    3,
+                )
+            } else {
+                Prefix::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+            };
+            let local: Vec<Prefix> = self.local.iter().map(|r| r.prefix).collect();
+            if !covered(space, &local) {
+                return None;
+            }
+        }
+        (families > 0).then(|| self.local.iter().map(|r| r.prefix).collect())
+    }
 }
 
-/// Reads every unicast route of every table, IPv4 and IPv6. `loopback` is the set of loopback
-/// interface indexes (from the interface list).
+/// Whether the prefixes in `set` together hold every address of `p` (each family on its own).
+fn covered(p: Prefix, set: &[Prefix]) -> bool {
+    let same = |q: &Prefix| q.addr.is_ipv4() == p.addr.is_ipv4();
+    if set
+        .iter()
+        .any(|q| same(q) && q.len <= p.len && mask(p.addr, q.len) == q.addr)
+    {
+        return true;
+    }
+    let width = if p.addr.is_ipv4() { 32 } else { 128 };
+    // Nothing smaller inside `p`: not covered.
+    if p.len >= width
+        || !set
+            .iter()
+            .any(|q| same(q) && q.len > p.len && mask(q.addr, p.len) == p.addr)
+    {
+        return false;
+    }
+    let upper = match p.addr {
+        IpAddr::V4(a) => IpAddr::V4(std::net::Ipv4Addr::from(
+            u32::from(a) | (1u32 << (31 - u32::from(p.len))),
+        )),
+        IpAddr::V6(a) => IpAddr::V6(std::net::Ipv6Addr::from(
+            u128::from(a) | (1u128 << (127 - u32::from(p.len))),
+        )),
+    };
+    covered(Prefix::new(p.addr, p.len + 1), set) && covered(Prefix::new(upper, p.len + 1), set)
+}
+
+/// Reads every unicast, `local`, `broadcast` and `anycast` route of every table, IPv4 and IPv6.
+/// `loopback` is the set of loopback interface indexes (from the interface list).
 pub(crate) fn read_routes(loopback: &[u32]) -> std::io::Result<Vec<Route>> {
     let mut routes = sys::dump()?;
     for r in &mut routes {
@@ -206,7 +374,7 @@ mod sys {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    use super::{Hop, Route};
+    use super::{Hop, Route, RouteType};
     use crate::ip::Prefix;
 
     const NLMSG_HDRLEN: usize = 16;
@@ -218,6 +386,9 @@ mod sys {
     const NLM_F_REQUEST: u16 = 1;
     const NLM_F_DUMP: u16 = 0x300;
     const RTN_UNICAST: u8 = 1;
+    const RTN_LOCAL: u8 = 2;
+    const RTN_BROADCAST: u8 = 3;
+    const RTN_ANYCAST: u8 = 4;
     const RTM_F_CLONED: u32 = 0x200;
     const RTA_DST: u16 = 1;
     const RTA_OIF: u16 = 4;
@@ -462,7 +633,16 @@ mod sys {
         }
         let (family, dst_len, rtype) = (p[0], p[1], p[7]);
         let flags = u32_at(p, 8).ok_or_else(malformed)?;
-        if rtype != RTN_UNICAST || flags & RTM_F_CLONED != 0 {
+        let kind = match rtype {
+            RTN_UNICAST => RouteType::Unicast,
+            // Review r2 R2-NG-1: these deliver to this host; they were dropped, so an AnyIP
+            // range (`local 185.199.108.0/24 dev lo`) was admitted.
+            RTN_LOCAL => RouteType::Local,
+            RTN_BROADCAST => RouteType::Broadcast,
+            RTN_ANYCAST => RouteType::Anycast,
+            _ => return Ok(()),
+        };
+        if flags & RTM_F_CLONED != 0 {
             return Ok(());
         }
         let mut dst = None;
@@ -515,6 +695,7 @@ mod sys {
                 hop,
                 ifindex,
                 loopback: false,
+                kind,
             })
         };
         if !multipath.is_empty() {
@@ -599,11 +780,17 @@ mod sys {
                     ],
                 ),
             ));
-            // local 192.168.1.33 (type local): skipped
+            // local 192.168.1.33 (type local): kept, as a route that delivers to this host
             dgram.extend(msg(
                 RTM_NEWROUTE,
                 1,
-                &rt(v4, 32, 2, &[attr(RTA_DST, &[192, 168, 1, 33])]),
+                &rt(v4, 32, RTN_LOCAL, &[attr(RTA_DST, &[192, 168, 1, 33])]),
+            ));
+            // blackhole 10.66.0.0/16 (type 6): reaches nothing, skipped
+            dgram.extend(msg(
+                RTM_NEWROUTE,
+                1,
+                &rt(v4, 16, 6, &[attr(RTA_DST, &[10, 66, 0, 0])]),
             ));
             // 2606:4700:1::/64 dev 2 (on-link, proto ra)
             let mut d6 = [0u8; 16];
@@ -661,37 +848,50 @@ mod sys {
                         prefix: p("0.0.0.0/0"),
                         hop: Hop::Via(ip("192.168.1.1")),
                         ifindex: 2,
-                        loopback: false
+                        loopback: false,
+                        kind: RouteType::Unicast,
                     },
                     Route {
                         prefix: p("172.17.0.0/16"),
                         hop: Hop::OnLink,
                         ifindex: 3,
-                        loopback: false
+                        loopback: false,
+                        kind: RouteType::Unicast,
+                    },
+                    Route {
+                        prefix: p("192.168.1.33/32"),
+                        hop: Hop::OnLink,
+                        ifindex: 0,
+                        loopback: false,
+                        kind: RouteType::Local,
                     },
                     Route {
                         prefix: p("2606:4700:1::/64"),
                         hop: Hop::OnLink,
                         ifindex: 2,
-                        loopback: false
+                        loopback: false,
+                        kind: RouteType::Unicast,
                     },
                     Route {
                         prefix: p("::/0"),
                         hop: Hop::Unknown,
                         ifindex: 0,
-                        loopback: false
+                        loopback: false,
+                        kind: RouteType::Unicast,
                     },
                     Route {
                         prefix: p("10.9.0.0/16"),
                         hop: Hop::Via(ip("10.0.0.1")),
                         ifindex: 4,
-                        loopback: false
+                        loopback: false,
+                        kind: RouteType::Unicast,
                     },
                     Route {
                         prefix: p("10.9.0.0/16"),
                         hop: Hop::OnLink,
                         ifindex: 5,
-                        loopback: false
+                        loopback: false,
+                        kind: RouteType::Unicast,
                     },
                 ]
             );
@@ -763,6 +963,163 @@ mod sys {
             let mut d = default;
             d.extend(msg(NLMSG_DONE, 1, &[]));
             assert!(parse_messages(&d, 1, &mut Vec::new()).unwrap());
+        }
+
+        /// Review r2 R2-NG-1 (PoC `anyip_local_routes_are_dropped_and_admitted`), inverted: AnyIP
+        /// routes (`ip route add local 185.199.108.0/24 dev lo`, and its IPv6 form) are read, and
+        /// every address they hold is refused, by `admit` and in the broker's flattened view.
+        #[test]
+        fn anyip_local_routes_are_read_and_refused() {
+            use crate::{admit, FactsOptions, HostFacts, NetMode, RawFacts};
+            const RT_TABLE_LOCAL: u8 = 255;
+            let local_rt = |family: u8, dst_len: u8, attrs: &[Vec<u8>]| {
+                let mut v = rt(family, dst_len, RTN_LOCAL, attrs);
+                v[4] = RT_TABLE_LOCAL;
+                v[6] = 254; // scope host
+                v
+            };
+            let v4 = libc::AF_INET as u8;
+            let v6 = libc::AF_INET6 as u8;
+            let (lo, eth) = (1u32, 2u32);
+            let mut d = Vec::new();
+            d.extend(msg(
+                RTM_NEWROUTE,
+                1,
+                &rt(
+                    v4,
+                    0,
+                    RTN_UNICAST,
+                    &[
+                        attr(RTA_GATEWAY, &[192, 168, 1, 1]),
+                        attr(RTA_OIF, &eth.to_ne_bytes()),
+                    ],
+                ),
+            ));
+            d.extend(msg(
+                RTM_NEWROUTE,
+                1,
+                &rt(
+                    v4,
+                    24,
+                    RTN_UNICAST,
+                    &[
+                        attr(RTA_DST, &[192, 168, 1, 0]),
+                        attr(RTA_OIF, &eth.to_ne_bytes()),
+                    ],
+                ),
+            ));
+            d.extend(msg(
+                RTM_NEWROUTE,
+                1,
+                &local_rt(
+                    v4,
+                    24,
+                    &[
+                        attr(RTA_DST, &[185, 199, 108, 0]),
+                        attr(RTA_OIF, &lo.to_ne_bytes()),
+                    ],
+                ),
+            ));
+            let mut fe80 = [0u8; 16];
+            fe80[..2].copy_from_slice(&[0xfe, 0x80]);
+            fe80[15] = 1;
+            d.extend(msg(
+                RTM_NEWROUTE,
+                1,
+                &rt(
+                    v6,
+                    0,
+                    RTN_UNICAST,
+                    &[attr(RTA_GATEWAY, &fe80), attr(RTA_OIF, &eth.to_ne_bytes())],
+                ),
+            ));
+            let mut any6 = [0u8; 16];
+            any6[..6].copy_from_slice(&[0x2a, 0x01, 0x04, 0xf9, 0xaa, 0xaa]);
+            d.extend(msg(
+                RTM_NEWROUTE,
+                1,
+                &local_rt(
+                    v6,
+                    48,
+                    &[attr(RTA_DST, &any6), attr(RTA_OIF, &lo.to_ne_bytes())],
+                ),
+            ));
+            // A TPROXY catch-all: `local default dev lo table 100`.
+            let mut tproxy = local_rt(v4, 0, &[attr(RTA_OIF, &lo.to_ne_bytes())]);
+            tproxy[4] = 100;
+            d.extend(msg(RTM_NEWROUTE, 1, &tproxy));
+            let mut routes = Vec::new();
+            assert!(!parse_messages(&d, 1, &mut routes).unwrap());
+            let p = |s: &str| s.parse::<Prefix>().unwrap();
+            let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+            for (prefix, kind) in [
+                ("185.199.108.0/24", RouteType::Local),
+                ("2a01:4f9:aaaa::/48", RouteType::Local),
+                ("0.0.0.0/0", RouteType::Local),
+            ] {
+                assert!(
+                    routes
+                        .iter()
+                        .any(|r| r.prefix == p(prefix) && r.kind == kind),
+                    "{prefix} read: {routes:#?}"
+                );
+            }
+            let facts = HostFacts::assemble(
+                RawFacts {
+                    interface_prefixes: vec![
+                        p("127.0.0.0/8"),
+                        p("192.168.1.0/24"),
+                        p("::1/128"),
+                        p("2a01:4f8:c17:1234::/64"),
+                    ],
+                    interface_addresses: vec![
+                        ip("127.0.0.1"),
+                        ip("192.168.1.33"),
+                        ip("::1"),
+                        ip("2a01:4f8:c17:1234::2"),
+                    ],
+                    routes,
+                    resolvers: vec![ip("127.0.0.53")],
+                    ..RawFacts::default()
+                },
+                &FactsOptions {
+                    discover_public_addresses: false,
+                    ..FactsOptions::default()
+                },
+            );
+            for a in [
+                "185.199.108.10",
+                "2a01:4f9:aaaa::1",
+                "2a01:4f9:aaaa:1234::5",
+                "::ffff:185.199.108.10",
+            ] {
+                let r = admit(NetMode::Public, ip(a), &facts, &[]);
+                assert!(
+                    matches!(
+                        r,
+                        Err(crate::Denied::OffDefaultRoute {
+                            kind: super::super::RouteKind::Local,
+                            ..
+                        })
+                    ),
+                    "{a}: {r:?}"
+                );
+                assert!(r
+                    .unwrap_err()
+                    .to_string()
+                    .contains("delivered to this host"));
+                assert!(
+                    facts.refused_prefixes().iter().any(|q| q.contains(ip(a))),
+                    "{a} in the flattened view"
+                );
+                assert!(
+                    crate::admit_prefix(NetMode::Public, Prefix::host(ip(a)), &facts, &[]).is_err()
+                );
+            }
+            // The TPROXY `/0` is left alone: the internet stays reachable.
+            for a in ["8.8.8.8", "185.199.109.1", "2a01:4f9:aaab::1"] {
+                assert_eq!(admit(NetMode::Public, ip(a), &facts, &[]), Ok(()), "{a}");
+            }
         }
 
         /// This host's own table reads, and has what every running Linux host has.
@@ -931,16 +1288,12 @@ mod tests {
             Route::via(p("9.9.0.0/16"), ip("192.168.1.1"), 2),
             Route::on_link(p("9.9.0.0/16"), 4),
             Route {
-                prefix: p("8.8.0.0/16"),
                 hop: Hop::Unknown,
-                ifindex: 2,
-                loopback: false,
+                ..Route::on_link(p("8.8.0.0/16"), 2)
             },
             Route {
-                prefix: p("::/0"),
                 hop: Hop::Unknown,
-                ifindex: 2,
-                loopback: false,
+                ..Route::on_link(p("::/0"), 2)
             },
         ]);
         assert!(t.off_default_path(ip("9.9.1.1")).is_some());
@@ -956,5 +1309,80 @@ mod tests {
         assert!(RouteTable::default()
             .off_default_path(ip("8.8.8.8"))
             .is_none());
+    }
+
+    /// Review r2 R2-NG-1: a route that delivers to this host refuses what it holds, whatever its
+    /// length (`/1` included) and table, except a `/0` (a TPROXY catch-all). Local routes that
+    /// leave no public address of a routed family are reported, so a policy can refuse to start.
+    #[test]
+    fn local_routes_refuse_and_short_ones_are_reported() {
+        let default4 = Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 2);
+        let default6 = Route::via(p("::/0"), ip("fe80::1"), 2);
+        let bcast = Route {
+            kind: RouteType::Broadcast,
+            ..Route::on_link(p("203.0.114.255/32"), 2)
+        };
+        let any6 = Route {
+            kind: RouteType::Anycast,
+            ..Route::on_link(p("2606:a300:9024:184::/128"), 2)
+        };
+        let t = RouteTable::new(vec![
+            default4,
+            default6,
+            Route::local(p("0.0.0.0/0"), 1),
+            Route::local(p("0.0.0.0/1"), 1),
+            bcast,
+            any6,
+        ]);
+        for (a, refused) in [
+            ("8.8.8.8", true),              // the /1
+            ("200.1.1.1", false),           // outside it; the /0 is left alone
+            ("203.0.114.255", true),        // broadcast
+            ("203.0.114.254", false),       // next to it
+            ("2606:a300:9024:184::", true), // subnet-router anycast
+            ("2606:a300:9024:184::1", false),
+        ] {
+            let r = t.off_default_path(ip(a));
+            assert_eq!(r.is_some(), refused, "{a}: {r:?}");
+            if let Some(r) = r {
+                assert_eq!(r.kind, RouteKind::Local, "{a}");
+            }
+        }
+        assert_eq!(
+            t.off_default_prefixes(),
+            vec![
+                p("0.0.0.0/1"),
+                p("203.0.114.255/32"),
+                p("2606:a300:9024:184::/128")
+            ]
+        );
+        assert_eq!(t.local_refuses_everything(), None);
+        // Both IPv4 halves: nothing public is left over IPv4, and IPv6 has no default route.
+        let t = RouteTable::new(vec![
+            default4,
+            Route::local(p("0.0.0.0/1"), 1),
+            Route::local(p("128.0.0.0/1"), 1),
+        ]);
+        assert_eq!(
+            t.local_refuses_everything(),
+            Some(vec![p("0.0.0.0/1"), p("128.0.0.0/1")])
+        );
+        // IPv6 still routes: not everything.
+        let mut with6 = t.routes().to_vec();
+        with6.extend(t.local_routes());
+        with6.push(default6);
+        assert_eq!(
+            RouteTable::new(with6.clone()).local_refuses_everything(),
+            None
+        );
+        // Unless 2000::/3 is covered too (by two /4s).
+        with6.push(Route::local(p("2000::/4"), 1));
+        with6.push(Route::local(p("3000::/4"), 1));
+        assert!(RouteTable::new(with6).local_refuses_everything().is_some());
+        // No default route at all: nothing to report.
+        assert_eq!(
+            RouteTable::new(vec![Route::local(p("0.0.0.0/1"), 1)]).local_refuses_everything(),
+            None
+        );
     }
 }

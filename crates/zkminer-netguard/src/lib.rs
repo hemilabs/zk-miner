@@ -57,7 +57,7 @@ pub use policy::{
     admit, admit_prefix, Denied, NetMode, NetPolicy, RouteKind, UrlDenied, FACTS_TTL,
     FORCED_REFRESH_MIN_AGE,
 };
-pub use routes::{Hop, Route, RouteTable};
+pub use routes::{Hop, Route, RouteRefusal, RouteTable, RouteType};
 
 /// Chain ids zkminer treats as production markets, where developer mode
 /// ([`NetMode::DevPrivate`]) is refused: Hemi mainnet. The miner's config and the witness broker
