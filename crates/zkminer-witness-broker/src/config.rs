@@ -21,6 +21,10 @@
 //! [egress]
 //! deny_cidrs = ["203.0.113.7/32"]   # the host's and the fleet's public and NAT addresses
 //!
+//! [dns]
+//! servers = ["9.9.9.9", "[2620:fe::fe]:53"]   # default: the nameservers of /etc/resolv.conf
+//! reresolve_secs = 300                         # how long a host name's answer is pinned
+//!
 //! [timeouts]
 //! connect_secs = 5
 //! request_secs = 30
@@ -38,7 +42,7 @@
 //! method_sets = ["state-read"]
 //! key_file = "/etc/zkminer-broker/base.key"
 //! # key_header = "x-api-key"                    # ...or sent in this header instead
-//! cidrs = ["198.51.100.0/24"]                   # optional: the role entry (default: the resolved IPs)
+//! cidrs = ["198.51.100.0/24"]                   # optional: the role entry (default: below)
 //! max_concurrency = 8
 //! max_requests_per_sec = 50                     # optional pacing
 //! max_units_per_minute = 6000                   # optional operator budget (status 2 when spent)
@@ -59,10 +63,33 @@
 //! alias = "artifact-mirror"
 //! url_template = "https://mirror.example/artifacts/{type}/{id}"
 //! ```
+//!
+//! # Role entries: IP literals, `cidrs` and host names
+//!
+//! Each endpoint's role entry (the addresses the network floor admits for it, plan §14.2) is, in
+//! order of precedence:
+//!
+//! 1. its explicit `cidrs`: the operator's word, private addresses included. Whatever a host name
+//!    resolves to is used only if it falls inside them;
+//! 2. the IP literal of its URL (a host route);
+//! 3. otherwise, what its host name resolves to — **only the global addresses** outside the deny
+//!    CIDRs, the connected prefixes and the host's own addresses. A DNS answer is not the operator's
+//!    word (a split-horizon zone, a stale record or a spoofed answer can name anything), so a local
+//!    or LAN node (loopback, RFC 1918, ULA, link-local, a neighbour on a connected prefix) is
+//!    configured by IP literal or explicit `cidrs`, never by name alone. Names resolve through the
+//!    broker's own stub resolver ([`crate::dns`]: `[dns] servers`, never `/etc/hosts`), at startup
+//!    and again every `reresolve_secs`; each answer replaces the pinned addresses.
+//!
+//! The self-test counts only `cidrs` and IP literals as configured, and fails when a role prefix
+//! that is not a host route (/32, /128) covers loopback, the metadata service, an RFC 1918 probe,
+//! one of the host's own addresses or a connected prefix: configure local nodes as host routes.
+//!
+//! A key travels only over `https`, or over `http` to an IP literal that is loopback or inside the
+//! endpoint's own `cidrs` (a node on the operator's own wire).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -109,6 +136,8 @@ struct FileConfig {
     cache: CacheConfig,
     #[serde(default)]
     egress: EgressFile,
+    #[serde(default)]
+    dns: DnsFile,
     #[serde(default)]
     timeouts: TimeoutConfig,
     #[serde(default)]
@@ -167,6 +196,37 @@ impl Default for CacheConfig {
 struct EgressFile {
     #[serde(default)]
     deny_cidrs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DnsFile {
+    #[serde(default)]
+    servers: Vec<String>,
+    #[serde(default = "d_reresolve")]
+    reresolve_secs: u64,
+}
+
+impl Default for DnsFile {
+    fn default() -> Self {
+        Self { servers: Vec::new(), reresolve_secs: d_reresolve() }
+    }
+}
+
+/// `[dns]`: the broker's own resolver for endpoint host names (see [`crate::dns`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsConfig {
+    /// Explicit servers; empty = the nameservers of `/etc/resolv.conf` (read before the sandbox,
+    /// into [`HostFacts::dns_servers`]).
+    pub servers: Vec<SocketAddr>,
+    /// How long a host name's answer stays pinned before it is resolved again.
+    pub reresolve: Duration,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self { servers: Vec::new(), reresolve: Duration::from_secs(d_reresolve()) }
+    }
 }
 
 /// `[timeouts]`, in seconds.
@@ -328,6 +388,9 @@ fn d_artifact_rps() -> u32 {
 fn d_max_builder_bytes() -> u64 {
     4 << 20
 }
+fn d_reresolve() -> u64 {
+    300
+}
 
 // ---------------------------------------------------------------------------------------------
 // The validated configuration.
@@ -413,15 +476,19 @@ pub struct ArtifactsSpec {
     pub mirror: Option<EndpointSpec>,
 }
 
-/// Facts about the host the sandboxed broker cannot read itself: what each endpoint host resolved
-/// to at startup, the connected prefixes and the host's own addresses. `main` reads them before
-/// `restrict_self`; [`crate::serve`] reads them itself when they are absent (tests).
+/// Facts about the host the sandboxed broker cannot read itself: the DNS servers, what each
+/// endpoint host resolved to at startup, the connected prefixes and the host's own addresses.
+/// `main` reads them before `restrict_self`; [`crate::serve`] reads them itself when they are
+/// absent (tests).
 #[derive(Debug, Clone, Default)]
 pub struct HostFacts {
-    /// Endpoint alias → resolved addresses (empty when resolution failed; retried lazily).
+    /// Endpoint alias → resolved addresses, unfiltered (empty when resolution failed; retried
+    /// lazily). The floor filters them ([`crate::net::build_policy`]).
     pub resolved: HashMap<String, Vec<IpAddr>>,
     pub connected: Vec<Prefix>,
     pub own_addresses: Vec<IpAddr>,
+    /// The servers host names are resolved with: `[dns] servers`, else `/etc/resolv.conf`'s.
+    pub dns_servers: Vec<SocketAddr>,
 }
 
 #[derive(Debug, Clone)]
@@ -432,6 +499,7 @@ pub struct BrokerConfig {
     pub budget: BudgetConfig,
     pub cache: CacheConfig,
     pub deny: Vec<Prefix>,
+    pub dns: DnsConfig,
     pub timeouts: TimeoutConfig,
     pub evm_rpc: Vec<EvmRpcEndpoint>,
     pub blob_mirrors: Vec<EndpointSpec>,
@@ -477,6 +545,22 @@ impl BrokerConfig {
     pub fn held_lock_reserved_bytes(&self) -> u64 {
         ((self.budget.inflight_bytes as f64) * self.budget.held_lock_share) as u64
     }
+
+    /// What the operator configured each endpoint's role entry as, by alias: its explicit `cidrs`,
+    /// else its IP literal's host route, else nothing (a host name: DNS-derived, never counted as
+    /// configured by the self-test).
+    pub fn configured_prefixes(&self) -> HashMap<String, Vec<Prefix>> {
+        self.endpoints()
+            .map(|e| {
+                let p = if !e.cidrs.is_empty() {
+                    e.cidrs.clone()
+                } else {
+                    e.literal.map(host_prefix).into_iter().collect()
+                };
+                (e.alias.clone(), p)
+            })
+            .collect()
+    }
 }
 
 fn validate(f: FileConfig, base: &Path) -> Result<BrokerConfig, ConfigError> {
@@ -510,6 +594,18 @@ fn validate(f: FileConfig, base: &Path) -> Result<BrokerConfig, ConfigError> {
         .iter()
         .map(|s| parse_cidr(s).map_err(|e| ConfigError::Invalid(format!("egress.deny_cidrs: {e}"))))
         .collect::<Result<Vec<_>, _>>()?;
+    if f.dns.reresolve_secs == 0 {
+        return invalid("dns.reresolve_secs must be positive");
+    }
+    let dns = DnsConfig {
+        servers: f
+            .dns
+            .servers
+            .iter()
+            .map(|s| crate::dns::parse_server(s).map_err(|e| ConfigError::Invalid(format!("dns.servers: {e}"))))
+            .collect::<Result<Vec<_>, _>>()?,
+        reresolve: Duration::from_secs(f.dns.reresolve_secs),
+    };
 
     let mut aliases = HashSet::new();
     let mut check_alias = |alias: &str| -> Result<(), ConfigError> {
@@ -616,6 +712,7 @@ fn validate(f: FileConfig, base: &Path) -> Result<BrokerConfig, ConfigError> {
         budget: f.budget,
         cache: f.cache,
         deny,
+        dns,
         timeouts: f.timeouts,
         evm_rpc,
         blob_mirrors,
@@ -704,6 +801,19 @@ fn rpc_endpoint(
     if max_requests_per_sec == Some(0) || max_units_per_minute == Some(0) {
         return invalid(format!("{alias}: rate limits must be positive"));
     }
+    let cidrs = parse_cidrs(alias, cidrs)?;
+    // A key never crosses a network in clear text: http only to a loopback IP literal or one inside
+    // the endpoint's own explicit cidrs (a node on the operator's own wire); never to a host name.
+    if key.is_some() && parsed.scheme() == "http" {
+        let local = literal.is_some_and(|ip| {
+            crate::egress::canonical_ip(ip).is_loopback() || cidrs.iter().any(|p| p.contains(ip))
+        });
+        if !local {
+            return invalid(format!(
+                "{alias}: a key is sent only over https (or http to a loopback IP literal or one inside the endpoint's cidrs)"
+            ));
+        }
+    }
     Ok(EndpointSpec {
         role,
         alias: alias.to_string(),
@@ -713,7 +823,7 @@ fn rpc_endpoint(
         host,
         literal,
         port,
-        cidrs: parse_cidrs(alias, cidrs)?,
+        cidrs,
         max_concurrency,
         max_requests_per_sec,
         max_units_per_minute,
@@ -1091,6 +1201,77 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         assert!(err(&twice, d).contains("twice"));
         assert!(err("chain_rpc_host = \"x\"\nspool_dir = \"rel\"", d).contains("absolute"));
         assert!(err(&minimal("[artifacts]\nalias = \"a\"\nurl = \"https://a.example\"\nchain_id = 1\n[artifacts.mirror]\nalias = \"m\"\nurl_template = \"https://m.example/{id}\""), d).contains("{type}"));
+    }
+
+    #[test]
+    fn keys_cross_the_network_only_over_https() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        write_key(d, "k", "k1", 0o600);
+        let ep = |url: &str, extra: &str| {
+            minimal(&format!(
+                "[[evm_rpc]]\nalias = \"a\"\nurl = \"{url}\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\nkey_file = \"k\"\n{extra}"
+            ))
+        };
+        let hdr = "key_header = \"x-api-key\"";
+        for (url, extra) in [
+            ("http://node.example/v2/{key}", ""),
+            ("http://node.example/", hdr),
+            ("http://localhost:8545/", hdr),
+            ("http://10.0.0.5:8545/", hdr),
+            ("http://10.0.0.5:8545/", "key_header = \"x-api-key\"\ncidrs = [\"10.0.1.0/24\"]"),
+            ("http://node.example/", "key_header = \"x-api-key\"\ncidrs = [\"10.0.0.5/32\"]"),
+        ] {
+            assert!(err(&ep(url, extra), d).contains("only over https"), "{url} {extra}");
+        }
+        for (url, extra) in [
+            ("https://node.example/v2/{key}", ""),
+            ("http://127.0.0.1:8545/v2/{key}", ""),
+            ("http://[::1]:8545/", hdr),
+            ("http://10.0.0.5:8545/", "key_header = \"x-api-key\"\ncidrs = [\"10.0.0.5/32\"]"),
+        ] {
+            assert!(BrokerConfig::from_toml(&ep(url, extra), d).is_ok(), "{url} {extra}");
+        }
+        // Without a key, http to a host name is the operator's choice.
+        let open = minimal("[[evm_rpc]]\nalias = \"a\"\nurl = \"http://node.example/\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n");
+        assert!(BrokerConfig::from_toml(&open, d).is_ok());
+    }
+
+    #[test]
+    fn the_dns_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let c = BrokerConfig::from_toml(&minimal(""), d).unwrap();
+        assert_eq!(c.dns, DnsConfig::default());
+        assert_eq!(c.dns.reresolve, Duration::from_secs(300));
+        let c = BrokerConfig::from_toml(
+            &minimal("[dns]\nservers = [\"9.9.9.9\", \"127.0.0.1:5353\", \"[2620:fe::fe]:53\"]\nreresolve_secs = 60"),
+            d,
+        )
+        .unwrap();
+        assert_eq!(
+            c.dns.servers,
+            vec!["9.9.9.9:53".parse().unwrap(), "127.0.0.1:5353".parse().unwrap(), "[2620:fe::fe]:53".parse().unwrap()]
+        );
+        assert_eq!(c.dns.reresolve, Duration::from_secs(60));
+        assert!(err(&minimal("[dns]\nservers = [\"dns.example\"]"), d).contains("dns.servers"));
+        assert!(err(&minimal("[dns]\nreresolve_secs = 0"), d).contains("positive"));
+        assert!(err(&minimal("[dns]\nsearch = []"), d).contains("unknown field"));
+    }
+
+    #[test]
+    fn configured_prefixes_are_cidrs_or_literals_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = minimal(
+            "[[evm_rpc]]\nalias = \"named\"\nurl = \"https://node.example\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n\
+             [[evm_rpc]]\nalias = \"lit\"\nurl = \"http://10.0.0.5:8545\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n\
+             [[evm_rpc]]\nalias = \"both\"\nurl = \"https://node2.example\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\ncidrs = [\"192.168.4.0/24\"]\n",
+        );
+        let c = BrokerConfig::from_toml(&text, dir.path()).unwrap();
+        let p = c.configured_prefixes();
+        assert_eq!(p["named"], vec![]);
+        assert_eq!(p["lit"], vec![host_prefix("10.0.0.5".parse().unwrap())]);
+        assert_eq!(p["both"], vec![parse_cidr("192.168.4.0/24").unwrap()]);
     }
 
     #[test]

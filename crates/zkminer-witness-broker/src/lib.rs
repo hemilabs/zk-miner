@@ -36,7 +36,7 @@ pub use hooks::Hooks;
 
 /// The tokio worker threads `main` runs with.
 pub const WORKER_THREADS: usize = 4;
-/// The most blocking-pool threads (DNS lookups, artifact cache copies, spool reads).
+/// The most blocking-pool threads (spool file creation, writes and reads).
 pub const MAX_BLOCKING_THREADS: usize = 8;
 
 /// Serves the control channel `control` (a connected `AF_UNIX` stream socket) until the miner
@@ -63,7 +63,8 @@ pub async fn serve_with(mut config: BrokerConfig, control: OwnedFd, hooks: Hooks
         let want = broker.artifacts.chain_id();
         tokio::spawn(async move {
             let ids = std::sync::atomic::AtomicU64::new(1);
-            match (jsonrpc::RpcClient { ep: &ep, held: false, ids: &ids }).chain_id().await {
+            let wait = lanes::WaitFlag::default();
+            match (jsonrpc::RpcClient { ep: &ep, held: false, ids: &ids, wait: &wait }).chain_id().await {
                 Ok(got) if got == want => tracing::info!(endpoint = %ep.alias(), chain_id = got, "artifact endpoint chain id checked"),
                 Ok(got) => tracing::error!(endpoint = %ep.alias(), got, want, "PAGE: ARTIFACT-ENDPOINT wrong chain id"),
                 Err(e) => tracing::warn!(endpoint = %ep.alias(), error = %ep.redact(&e.to_string()), "artifact endpoint chain id check failed"),

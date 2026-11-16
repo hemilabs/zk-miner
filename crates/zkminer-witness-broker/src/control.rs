@@ -3,10 +3,12 @@
 //! [`crate::fdpass`]). Requests are served concurrently; one writer task sends every response, so a
 //! frame and its fd are never interleaved with another. A frame the broker cannot read in full (too
 //! large, cut short) ends the channel; a malformed one is answered `Error{Malformed}` with id 0 (or
-//! its own id when that much parsed). When the channel closes, every job is cancelled and
-//! [`run`] returns.
+//! its own id when that much parsed). A request whose id belongs to a request still being served
+//! (`EndJob`, `FetchArtifact`, `SelfTest`) is refused the same way, with id 0, so it cannot take
+//! over the pending request's answer or its `ChargeDecision`; an id may be reused once its request
+//! was answered. When the channel closes, every job is cancelled and [`run`] returns.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
@@ -24,6 +26,20 @@ use crate::fdpass::{recv_with_fd_async, send_with_fd_async};
 
 type Reply = (u64, ControlResponse, Option<OwnedFd>);
 type Decisions = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<bool>>>>;
+type InFlight = Arc<Mutex<HashSet<u64>>>;
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Removes an id from the in-flight set when its request is answered (or its task is dropped).
+struct Answering(InFlight, u64);
+
+impl Drop for Answering {
+    fn drop(&mut self) {
+        lock(&self.0).remove(&self.1);
+    }
+}
 
 pub(crate) async fn run(b: Arc<Broker>, sock: tokio::net::UnixStream) -> anyhow::Result<()> {
     let sock = Arc::new(sock);
@@ -41,6 +57,7 @@ pub(crate) async fn run(b: Arc<Broker>, sock: tokio::net::UnixStream) -> anyhow:
         })
     };
     let decisions: Decisions = Arc::default();
+    let in_flight: InFlight = Arc::default();
     let result = loop {
         let frame = match recv_with_fd_async(&sock, MAX_CONTROL_BYTES).await {
             Ok(Some(f)) => f,
@@ -62,7 +79,7 @@ pub(crate) async fn run(b: Arc<Broker>, sock: tokio::net::UnixStream) -> anyhow:
                 continue;
             }
         };
-        dispatch(&b, &tx, &decisions, msg, frame.fd).await;
+        dispatch(&b, &tx, &decisions, &in_flight, msg, frame.fd).await;
     };
     crate::job::cancel_all(&b);
     drop(tx);
@@ -78,6 +95,7 @@ async fn dispatch(
     b: &Arc<Broker>,
     tx: &mpsc::Sender<Reply>,
     decisions: &Decisions,
+    in_flight: &InFlight,
     msg: ControlMessage<ControlRequest>,
     fd: Option<OwnedFd>,
 ) {
@@ -87,6 +105,15 @@ async fn dispatch(
         let _ = tx.send((id, error(ControlErrorCode::Malformed), None)).await;
         return;
     }
+    // Requests served in their own task hold their id until they are answered.
+    let long = matches!(msg.body, ControlRequest::EndJob { .. } | ControlRequest::FetchArtifact { .. } | ControlRequest::SelfTest);
+    let busy = !matches!(msg.body, ControlRequest::ChargeDecision { .. }) && lock(in_flight).contains(&id);
+    if busy || (long && !lock(in_flight).insert(id)) {
+        tracing::warn!(id, "control request reuses the id of a request still being served");
+        let _ = tx.send((0, error(ControlErrorCode::Malformed), None)).await;
+        return;
+    }
+    let answering = || Answering(in_flight.clone(), id);
     match msg.body {
         ControlRequest::RegisterJob { job_key, caller, sources, budget, held_lock } => {
             let fd = fd.expect("checked above");
@@ -94,16 +121,17 @@ async fn dispatch(
             let _ = tx.send((id, r, None)).await;
         }
         ControlRequest::EndJob { job_key } => {
-            let (b, tx) = (b.clone(), tx.clone());
+            let (b, tx, done) = (b.clone(), tx.clone(), answering());
             tokio::spawn(async move {
                 let r = crate::job::end(&b, job_key).await;
+                drop(done);
                 let _ = tx.send((id, r, None)).await;
             });
         }
         ControlRequest::FetchArtifact { job_key, caller, source, builder_type, expected_sha256, max_bytes, held_lock } => {
             let req = ArtifactRequest { source, builder_type, expected_sha256, max_bytes, held_lock };
             let charge = charge_hook(id, tx.clone(), decisions.clone(), b.cfg.timeouts.charge_decision());
-            let (b, tx) = (b.clone(), tx.clone());
+            let (b, tx, done) = (b.clone(), tx.clone(), answering());
             tokio::spawn(async move {
                 let job = hex::encode(&job_key[..6]);
                 let reply = match b.artifacts.fetch(&req, charge).await {
@@ -116,11 +144,12 @@ async fn dispatch(
                         (id, ControlResponse::ArtifactFailed { failure }, None)
                     }
                 };
+                drop(done);
                 let _ = tx.send(reply).await;
             });
         }
         ControlRequest::ChargeDecision { proceed } => {
-            let waiter = decisions.lock().unwrap_or_else(|p| p.into_inner()).get(&id).cloned();
+            let waiter = lock(decisions).get(&id).cloned();
             match waiter {
                 Some(w) => {
                     let _ = w.send(proceed);
@@ -133,9 +162,10 @@ async fn dispatch(
             let _ = tx.send((id, ControlResponse::Provisioned { ok }, None)).await;
         }
         ControlRequest::SelfTest => {
-            let (b, tx) = (b.clone(), tx.clone());
+            let (b, tx, done) = (b.clone(), tx.clone(), answering());
             tokio::spawn(async move {
                 let r = crate::selftest::run(&b).await;
+                drop(done);
                 let _ = tx.send((id, r, None)).await;
             });
         }
@@ -165,6 +195,10 @@ fn refresh(b: &Broker, prefixes: &[zkminer_witness::ipc::IpPrefix], own: Vec<std
     let count = u32::try_from(parsed.len()).unwrap_or(u32::MAX);
     b.policy.write().unwrap_or_else(|p| p.into_inner()).connected = parsed;
     *b.own_addresses.write().unwrap_or_else(|p| p.into_inner()) = own;
+    // A host name's pinned answer may now name a connected or own address.
+    for ep in b.all_endpoints() {
+        ep.refilter();
+    }
     tracing::info!(count, "connected prefixes refreshed");
     ControlResponse::PrefixesRefreshed { count }
 }
@@ -176,13 +210,13 @@ fn charge_hook(id: u64, tx: mpsc::Sender<Reply>, decisions: Decisions, wait: std
         let (tx, decisions) = (tx.clone(), decisions.clone());
         Box::pin(async move {
             let (dtx, mut drx) = mpsc::unbounded_channel();
-            decisions.lock().unwrap_or_else(|p| p.into_inner()).insert(id, dtx);
+            lock(&decisions).insert(id, dtx);
             let proceed = if tx.send((id, ControlResponse::ArtifactCharge { length, chunks }, None)).await.is_ok() {
                 matches!(tokio::time::timeout(wait, drx.recv()).await, Ok(Some(true)))
             } else {
                 false
             };
-            decisions.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+            lock(&decisions).remove(&id);
             proceed
         })
     })

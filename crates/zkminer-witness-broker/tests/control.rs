@@ -93,7 +93,10 @@ async fn registration_errors() {
     let e = client.end_job(B256::repeat_byte(77)).await.unwrap_err();
     assert!(matches!(e, ClientError::Refused(ControlErrorCode::UnknownJob)), "{e:?}");
     let stats = client.end_job(B256::repeat_byte(2)).await.unwrap();
-    assert_eq!((stats.fetches, stats.fetch_bytes, stats.transient, stats.fetch_in_flight_at_end), (0, 0, false, false));
+    assert_eq!(
+        (stats.fetches, stats.fetch_bytes, stats.operator_failure, stats.unanswerable, stats.fetch_in_flight_at_end),
+        (0, 0, false, false, false)
+    );
 }
 
 /// Raw frames: an fd on a message that takes none, or none on `RegisterJob`, is malformed; junk is
@@ -138,6 +141,68 @@ async fn raw_control_frames() {
     .await
     .unwrap();
     drop(miner);
+}
+
+/// Control ids: many requests in flight at once are each answered once under their own id; a
+/// request reusing the id of one still being served is refused with id 0 and does not disturb it;
+/// the id is free again once its request was answered.
+#[tokio::test]
+async fn concurrent_and_reused_control_ids() {
+    use zkminer_witness::ipc::ControlResponse;
+    let dir = tempfile::tempdir().unwrap();
+    // A slow endpoint keeps a SelfTest in flight for a while.
+    let slow = TestServer::start(|req| {
+        let r = chain_id_node(8453)(req);
+        r.delayed(std::time::Duration::from_millis(1_500))
+    })
+    .await;
+    let text = config_text(
+        dir.path(),
+        &format!("[[evm_rpc]]\nalias = \"slow\"\nurl = \"{}\"\nchain_id = 8453\nmethod_sets = [\"state-read\"]\ncidrs = [\"127.0.0.1/32\"]\n", slow.url()),
+    );
+    let cfg = zkminer_witness_broker::BrokerConfig::from_toml(&text, dir.path()).unwrap();
+    let (miner, broker) = std::os::unix::net::UnixStream::pair().unwrap();
+    let _t = tokio::spawn(zkminer_witness_broker::serve_with(cfg, broker.into(), test_hooks()));
+    tokio::task::spawn_blocking(move || {
+        let send = |id: u64, body: ControlRequest| {
+            send_with_fd(&miner, KIND_CONTROL, &encode_control(&ControlMessage { id, body }), None).unwrap();
+        };
+        let recv = || {
+            let f = recv_with_fd(&miner, 1 << 16).unwrap().unwrap();
+            let m: ControlMessage<ControlResponse> = zkminer_witness::ipc::decode_control(&f.payload).unwrap();
+            (m.id, m.body)
+        };
+        let check = || ControlRequest::CheckProvisioned { sources: vec![evm(8453, false, METHOD_SET_STATE_READ, 0)] };
+        // The long request, then 20 quick ones interleaved.
+        send(7, ControlRequest::SelfTest);
+        for id in 100..120 {
+            send(id, check());
+        }
+        // Reusing 7 while the self-test runs: refused (id 0), whatever the request.
+        send(7, check());
+        send(7, ControlRequest::SelfTest);
+        // A charge decision for nothing pending is ignored (no answer).
+        send(8, ControlRequest::ChargeDecision { proceed: true });
+        let mut answers = std::collections::HashMap::new();
+        let mut refused = 0;
+        for _ in 0..23 {
+            let (id, body) = recv();
+            match (id, body) {
+                (0, ControlResponse::Error { code: ControlErrorCode::Malformed }) => refused += 1,
+                (id, body) => assert!(answers.insert(id, body).is_none(), "id {id} answered twice"),
+            }
+        }
+        assert_eq!(refused, 2);
+        for id in 100..120 {
+            assert_eq!(answers.get(&id), Some(&ControlResponse::Provisioned { ok: vec![true] }), "{id}");
+        }
+        assert!(matches!(answers.get(&7), Some(ControlResponse::SelfTest { .. })), "the pending request kept its answer");
+        // Answered: 7 may be used again.
+        send(7, check());
+        assert_eq!(recv(), (7, ControlResponse::Provisioned { ok: vec![true] }));
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

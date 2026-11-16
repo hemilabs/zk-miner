@@ -108,6 +108,10 @@ pub fn fetch_frame_max(max_request_bytes: u32) -> u32 {
     max_request_bytes.max(64 * 1024).saturating_add(4)
 }
 
+/// Fetch frames the broker answers (status 3, at no cost) after a job's builder-visible budget is
+/// spent; the next one closes the job's socket.
+pub const MAX_FRAMES_AFTER_EXHAUSTION: u32 = 1_000;
+
 /// The largest `KIND_FETCH_RESULT` payload: the status byte plus the response.
 pub fn fetch_result_frame_max(max_response_bytes: u32) -> u32 {
     max_response_bytes.saturating_add(1)
@@ -314,15 +318,33 @@ pub enum ArtifactFailure {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlResponse {
     Registered { job_key: B256 },
-    /// The broker's account of a job, sent in answer to `EndJob`. `transient` = some fetch returned
-    /// status 2; `fetch_in_flight_at_end` = a fetch was still being served when the job ended.
+    /// The broker's account of a job, sent in answer to `EndJob`.
+    ///
+    /// A status-2 fetch sets at most one of two flags:
+    /// - `operator_failure`: it failed for an operator-side reason — a transport error or connect
+    ///   timeout, a non-2xx other than 404, a malformed answer, an operator budget or the spool
+    ///   quota exhausted, the fetch deadline hitting a lane, pacer or concurrency wait;
+    /// - `unanswerable`: every endpoint it was allowed to try answered that it lacks the block or
+    ///   state (lagging or `null`), or every mirror answered 404 — a builder can ask for that on
+    ///   demand, so it is not the operator's failure.
+    ///
+    /// A status-2 fetch with neither flag failed on its own cost (a timeout once the request was
+    /// sent, or the fetch deadline while an endpoint worked on it). `fetch_in_flight_at_end` = a
+    /// fetch was still being served when the job ended or its socket closed;
+    /// `in_flight_operator_wait` = that fetch was then waiting on operator-side capacity or had
+    /// already met an operator-side failure. `frames_after_exhaustion` counts fetch frames received
+    /// after the job's builder-visible budget was spent; the broker closes the job's socket after
+    /// [`MAX_FRAMES_AFTER_EXHAUSTION`].
     JobStats {
         job_key: B256,
         fetches: u32,
         fetch_bytes: u64,
-        transient: bool,
+        operator_failure: bool,
+        unanswerable: bool,
         fetch_in_flight_at_end: bool,
+        in_flight_operator_wait: bool,
         denied: u32,
+        frames_after_exhaustion: u32,
     },
     /// The artifact is in the memfd sent with this frame. `sha256` is the broker's own hash of the
     /// bytes; `cached` = served from the broker's artifact cache, with no endpoint reads.

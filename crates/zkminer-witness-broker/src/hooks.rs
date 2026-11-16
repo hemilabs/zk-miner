@@ -10,7 +10,7 @@ use std::sync::Arc;
 use zkminer_witness::envelope::MethodSet;
 
 use crate::egress::{self, Admit, EgressPolicy, Prefix, Role};
-use crate::evm_rpc::{self, BlockTag, CallAnswer, Denied, ParsedRequest, ResponseError};
+use crate::evm_rpc::{self, BlockPin, BlockTag, CallAnswer, Denied, ParsedRequest, ResponseError};
 
 /// Longest log line built from untrusted bytes.
 pub const LOG_MAX: usize = 512;
@@ -59,6 +59,10 @@ pub trait RpcReq: Send + Sync {
         self.len() == 0
     }
     fn tags(&self) -> Vec<BlockTag>;
+    /// [`ParsedRequest::max_block_number`].
+    fn max_block_number(&self) -> Option<u64>;
+    /// [`ParsedRequest::pin`].
+    fn pin(&self, i: usize, resolve: &dyn Fn(BlockTag) -> u64) -> Option<BlockPin>;
     /// Checks that need the resolved tags (the `eth_getLogs` range).
     fn check_after_resolution(&self, resolve: &dyn Fn(BlockTag) -> u64) -> Result<(), Denied>;
     fn outgoing(&self, resolve: &dyn Fn(BlockTag) -> u64, first_id: u64) -> Vec<u8>;
@@ -90,6 +94,12 @@ impl RpcReq for ParsedRequest {
     }
     fn tags(&self) -> Vec<BlockTag> {
         ParsedRequest::tags(self)
+    }
+    fn max_block_number(&self) -> Option<u64> {
+        ParsedRequest::max_block_number(self)
+    }
+    fn pin(&self, i: usize, resolve: &dyn Fn(BlockTag) -> u64) -> Option<BlockPin> {
+        ParsedRequest::pin(self, i, resolve)
     }
     fn check_after_resolution(&self, resolve: &dyn Fn(BlockTag) -> u64) -> Result<(), Denied> {
         ParsedRequest::check_after_resolution(self, resolve)

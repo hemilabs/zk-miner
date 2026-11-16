@@ -2135,6 +2135,90 @@ fn lagging_errors() {
     assert_eq!(answer(&b, &body), Err(ResponseError::Lagging));
 }
 
+/// Review F5 (the reviewer's PoC, inverted): "I lack that block" errors that are not in
+/// `LAGGING_MESSAGES` — geth's unknown EIP-1898 hash, erigon's "block … not found", EIP-1474's
+/// -32001 — are lagging for a pinned call; any other non-revert error on a pinned call is suspect.
+#[test]
+fn not_found_errors_on_pinned_calls_are_lagging() {
+    let by_hash = ok("eth_getBalance", &format!(r#"["{}",{{"blockHash":"{}"}}]"#, a(1), h(0x11)));
+    let by_num = ok("eth_getBalance", &format!(r#"["{}","0x5"]"#, a(1)));
+    let by_tag = ok("eth_call", &format!(r#"[{{"to":"{}"}},"safe"]"#, a(1)));
+    let unpinned = ok("eth_getTransactionReceipt", &format!(r#"["{}"]"#, h(1)));
+    let with = |r: &ParsedRequest, code: i64, msg: &str| {
+        answer(r, &envelope("7", &format!(r#""error":{{"code":{code},"message":"{msg}"}}"#)))
+    };
+    for (code, msg) in [
+        (-32000, "header for hash not found"),
+        (-32000, "block 0x1111 not found"),
+        (-32001, "Resource not found"),
+        (-32001, ""),
+        (-32000, "Block with hash 0x11 was NOT FOUND"),
+    ] {
+        for r in [&by_hash, &by_num, &by_tag] {
+            assert_eq!(with(r, code, msg), Err(ResponseError::Lagging), "{code} {msg}");
+        }
+        let a = with(&unpinned, code, msg).unwrap();
+        assert!(a[0].is_error && !a[0].suspect, "not pinned: an answer ({msg})");
+        // A revert chooses its own reason: never lagging, never suspect.
+        for (c, m) in [(3, msg.to_string()), (-32000, format!("execution reverted: {msg}"))] {
+            let a = with(&by_hash, c, &m).unwrap();
+            assert!(a[0].is_error && !a[0].suspect, "{c} {m}");
+        }
+    }
+    // Any other error on a pinned call is suspect (the broker checks the endpoint's head).
+    let a = with(&by_num, -32602, "BlockOutOfRangeError: block height is 0 but requested was 5").unwrap();
+    assert!(a[0].is_error && a[0].suspect);
+    assert!(with(&by_hash, -32000, "out of gas").unwrap()[0].suspect);
+    assert!(with(&by_num, -32000, "not found: header").unwrap()[0].suspect, "the subject comes first");
+    assert!(!with(&unpinned, -32602, "x").unwrap()[0].suspect);
+    // Successful answers are never suspect.
+    assert!(!answer(&by_num, &envelope("7", r#""result":"0x0""#)).unwrap()[0].suspect);
+    // A tag query reads -32001 as lagging too.
+    assert_eq!(
+        parse_tag_answer(br#"{"jsonrpc":"2.0","id":9,"error":{"code":-32001,"message":"x"}}"#, 9),
+        Err(ResponseError::Lagging)
+    );
+}
+
+#[test]
+fn pins_and_explicit_numbers() {
+    let hash = |b: u8| [b; 32];
+    let r = raw(&format!(
+        "[{}]",
+        [
+            call_json("eth_chainId", "[]"),
+            call_json("eth_getBalance", &format!(r#"["{}","0x5"]"#, a(1))),
+            call_json("eth_getCode", &format!(r#"["{}",{{"blockHash":"{}"}}]"#, a(1), h(0x11))),
+            call_json("eth_call", &format!(r#"[{{"to":"{}"}}]"#, a(1))),
+            call_json("eth_getLogs", &format!(r#"[{{"fromBlock":"0x10","toBlock":"latest","address":"{}","topics":["{}"]}}]"#, a(1), h(1))),
+            call_json("eth_getBlockByHash", &format!(r#"["{}",false]"#, h(0x22))),
+            call_json("eth_getTransactionByHash", &format!(r#"["{}"]"#, h(3))),
+            call_json("eth_getStorageAt", &format!(r#"["{}","0x0",{{"blockNumber":"0x30"}}]"#, a(1))),
+            call_json("eth_getLogs", &format!(r#"[{{"blockHash":"{}","address":"{}","topics":["{}"]}}]"#, h(0x33), a(1), h(1))),
+        ]
+        .join(",")
+    ))
+    .unwrap();
+    let pins: Vec<_> = (0..r.calls.len()).map(|i| r.pin(i, &resolve)).collect();
+    assert_eq!(
+        pins,
+        vec![
+            None,
+            Some(BlockPin::Number(5)),
+            Some(BlockPin::Hash(hash(0x11))),
+            Some(BlockPin::Number(LATEST)),
+            Some(BlockPin::Number(LATEST)),
+            Some(BlockPin::Hash(hash(0x22))),
+            None,
+            Some(BlockPin::Number(0x30)),
+            Some(BlockPin::Hash(hash(0x33))),
+        ]
+    );
+    assert_eq!(r.max_block_number(), Some(0x30));
+    assert_eq!(ok("eth_getBalance", &format!(r#"["{}","latest"]"#, a(1))).max_block_number(), None);
+    assert_eq!(ok("eth_chainId", "[]").max_block_number(), None);
+}
+
 #[test]
 fn null_results() {
     let (a1, h1) = (a(1), h(1));

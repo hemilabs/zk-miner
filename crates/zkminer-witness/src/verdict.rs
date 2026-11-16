@@ -59,7 +59,9 @@ pub enum SkipReason {
     BuilderMemoryExhausted,
     BuilderNonZeroReturn,
     BuilderWitnessTooLarge,
-    /// A fetch returned status 2, or the wall clock expired while a fetch was in flight.
+    /// A fetch failed for an operator-side reason (`JobStats.operator_failure`), or the wall clock
+    /// expired while a fetch waited on operator-side capacity. Not: a fetch the builder made
+    /// unanswerable (unknown hashes, missing state), nor one in flight on its own cost.
     BuilderTransient,
     /// The wall clock expired with no fetch in flight.
     BuilderWallClock,
@@ -112,7 +114,7 @@ impl SkipReason {
             | GuestCyclesAboveLimit | JournalsDifferAcrossPo2 | JournalTooLarge => (Never, true),
             // A stale node can cause these: one rebuild on other endpoints, then the caller's.
             GuestFailed | BindingMismatch => (OnceJittered, true),
-            // Status 2 includes operator-budget exhaustion (§11.2), so never the caller's.
+            // Only operator-side failures (§11.2), so never the caller's.
             BuilderTransient => (OnceJittered, false),
             // What this host supports or is configured for: re-evaluated only when that changes.
             UnsupportedBuilderType | UnsupportedProofSystem | UnsupportedBinding | UnsupportedSubmission
@@ -132,8 +134,10 @@ impl SkipReason {
     }
 }
 
-/// Everything known about how a builder run ended. `any_status2` and `fetch_in_flight_at_end` come
-/// from the broker's `JobStats`, never from the sandboxed runner's own summary.
+/// Everything known about how a builder run ended. `operator_failure`, `fetch_in_flight_at_end`
+/// and `in_flight_operator_wait` come from the broker's `JobStats`, never from the sandboxed
+/// runner's own summary. (`JobStats.unanswerable` is deliberately absent: a fetch the builder made
+/// unanswerable never excuses its failure.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BuilderOutcome {
     /// The runner's exit code; `None` when it was killed by a signal.
@@ -142,8 +146,15 @@ pub struct BuilderOutcome {
     pub oom_killed: bool,
     /// The miner's wall clock (the outer deadline) expired and it killed the runner.
     pub wall_clock_hit: bool,
-    pub any_status2: bool,
+    /// Some fetch failed (status 2) for an operator-side reason.
+    pub operator_failure: bool,
+    /// A fetch was being served when the run ended.
     pub fetch_in_flight_at_end: bool,
+    /// ...and it was waiting on operator-side capacity, or had met an operator-side failure.
+    pub in_flight_operator_wait: bool,
+    /// The runner wrote its "module started" marker (before instantiation) on its summary pipe:
+    /// past it, the runner's own `INTERNAL` exit is the module's doing.
+    pub module_started: bool,
 }
 
 /// Classifies a builder run (plan §9.2, §16). `None` means success.
@@ -152,10 +163,11 @@ pub fn builder_verdict(o: &BuilderOutcome) -> Option<SkipReason> {
     if o.exit == Some(exit::OK) && !o.wall_clock_hit && !o.oom_killed {
         return None;
     }
-    if o.exit == Some(exit::INTERNAL) {
+    if o.exit == Some(exit::INTERNAL) && !o.module_started {
         return Some(RunnerInternal);
     }
-    if o.any_status2 || ((o.wall_clock_hit || o.exit == Some(exit::WALL_CLOCK)) && o.fetch_in_flight_at_end) {
+    let deadline = o.wall_clock_hit || o.exit == Some(exit::WALL_CLOCK);
+    if o.operator_failure || (deadline && o.fetch_in_flight_at_end && o.in_flight_operator_wait) {
         return Some(BuilderTransient);
     }
     if o.oom_killed {
@@ -172,6 +184,7 @@ pub fn builder_verdict(o: &BuilderOutcome) -> Option<SkipReason> {
         Some(exit::NONZERO_RETURN) => BuilderNonZeroReturn,
         Some(exit::WITNESS_TOO_LARGE) => BuilderWitnessTooLarge,
         Some(exit::WALL_CLOCK) | None => BuilderWallClock,
+        // Includes INTERNAL once the module started.
         _ => BuilderTrap,
     })
 }
@@ -259,15 +272,24 @@ mod tests {
 
     #[test]
     fn builder_classifier() {
-        let o = |exit, any_status2, fetch_in_flight_at_end, wall_clock_hit, oom_killed| BuilderOutcome {
-            exit, any_status2, fetch_in_flight_at_end, wall_clock_hit, oom_killed,
+        let o = |exit, operator_failure, fetch_in_flight_at_end, wall_clock_hit, oom_killed| BuilderOutcome {
+            exit,
+            operator_failure,
+            fetch_in_flight_at_end,
+            in_flight_operator_wait: fetch_in_flight_at_end,
+            wall_clock_hit,
+            oom_killed,
+            module_started: true,
         };
         assert_eq!(builder_verdict(&o(Some(exit::OK), false, false, false, false)), None);
-        assert_eq!(builder_verdict(&o(Some(exit::INTERNAL), true, false, false, false)), Some(RunnerInternal));
-        // A deterministic failure after a status-2 fetch is transient.
+        assert_eq!(
+            builder_verdict(&BuilderOutcome { module_started: false, ..o(Some(exit::INTERNAL), true, false, false, false) }),
+            Some(RunnerInternal)
+        );
+        // A deterministic failure after an operator-side fetch failure is transient.
         assert_eq!(builder_verdict(&o(Some(exit::NONZERO_RETURN), true, false, false, false)), Some(BuilderTransient));
         assert_eq!(builder_verdict(&o(Some(exit::NONZERO_RETURN), false, false, false, false)), Some(BuilderNonZeroReturn));
-        // The wall clock: transient only with a fetch in flight.
+        // The wall clock: transient only with a fetch in flight in an operator-side wait.
         assert_eq!(builder_verdict(&o(None, false, true, true, false)), Some(BuilderTransient));
         assert_eq!(builder_verdict(&o(None, false, false, true, false)), Some(BuilderWallClock));
         assert_eq!(builder_verdict(&o(Some(exit::WALL_CLOCK), false, false, false, false)), Some(BuilderWallClock));
@@ -275,5 +297,40 @@ mod tests {
         assert_eq!(builder_verdict(&o(Some(exit::TRAP), false, false, false, false)), Some(BuilderTrap));
         assert_eq!(builder_verdict(&o(Some(-5), false, false, false, false)), Some(BuilderTrap));
         assert_eq!(builder_verdict(&o(Some(exit::OK), false, false, true, false)), Some(BuilderWallClock));
+    }
+
+    /// Review F2: a builder that made its own fetches fail (unknown hashes, missing state: the
+    /// broker's `unanswerable`) or straddled its deadline with a fetch the endpoint was working on
+    /// is judged on its own exit; only operator-side failures and waits excuse it.
+    #[test]
+    fn only_operator_side_failures_are_transient() {
+        let base = BuilderOutcome { exit: Some(exit::TRAP), module_started: true, ..Default::default() };
+        // `unanswerable` is not an input at all: a trap after unanswerable fetches is a trap.
+        assert_eq!(builder_verdict(&base), Some(BuilderTrap));
+        // The deadline with a fetch in flight on its own cost: the wall clock is the builder's.
+        let straddle = BuilderOutcome { exit: None, wall_clock_hit: true, fetch_in_flight_at_end: true, ..base };
+        assert_eq!(builder_verdict(&straddle), Some(BuilderWallClock));
+        assert_eq!(builder_verdict(&BuilderOutcome { exit: Some(exit::WALL_CLOCK), wall_clock_hit: false, ..straddle }), Some(BuilderWallClock));
+        // ...in an operator-side wait: transient, not the caller's.
+        let waiting = BuilderOutcome { in_flight_operator_wait: true, ..straddle };
+        assert_eq!(builder_verdict(&waiting), Some(BuilderTransient));
+        assert!(!BuilderTransient.verdict().blames_caller);
+        // The operator wait without the deadline changes nothing.
+        assert_eq!(builder_verdict(&BuilderOutcome { fetch_in_flight_at_end: true, in_flight_operator_wait: true, ..base }), Some(BuilderTrap));
+        // An operator-side failure excuses any exit.
+        assert_eq!(builder_verdict(&BuilderOutcome { operator_failure: true, ..base }), Some(BuilderTransient));
+    }
+
+    /// The runner's "module started" marker: its own INTERNAL exit before the marker is the
+    /// runner's; after it, the module's (a trap).
+    #[test]
+    fn internal_exits_after_the_module_started_are_traps() {
+        let o = BuilderOutcome { exit: Some(exit::INTERNAL), ..Default::default() };
+        assert_eq!(builder_verdict(&o), Some(RunnerInternal));
+        assert_eq!(builder_verdict(&BuilderOutcome { module_started: true, ..o }), Some(BuilderTrap));
+        assert_eq!(
+            builder_verdict(&BuilderOutcome { module_started: true, operator_failure: true, ..o }),
+            Some(BuilderTransient)
+        );
     }
 }

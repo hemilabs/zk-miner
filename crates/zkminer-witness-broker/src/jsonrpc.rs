@@ -5,11 +5,12 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use serde::Deserialize;
 use serde_json::json;
 use zkminer_witness::manifest::MAX_CODE_BYTES;
 
+use crate::lanes::WaitFlag;
 use crate::net::{Endpoint, EndpointError};
 
 /// The largest JSON batch of `eth_getCode` reads (plan §13.4 step 4).
@@ -60,11 +61,13 @@ struct BlockResp<'a> {
     error: Option<ErrObj>,
 }
 
-/// A client bound to one endpoint, lane and id counter.
+/// A client bound to one endpoint, lane, id counter and wait flag.
 pub struct RpcClient<'a> {
     pub ep: &'a Endpoint,
     pub held: bool,
     pub ids: &'a AtomicU64,
+    /// Marked while a request waits for the pacer or a concurrency slot.
+    pub wait: &'a WaitFlag,
 }
 
 fn request(id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -104,7 +107,7 @@ impl RpcClient<'_> {
     async fn call_str(&self, method: &str, params: serde_json::Value, cap: u64) -> Result<Option<String>, RpcError> {
         let id = self.next_id(1);
         let body = serde_json::to_vec(&request(id, method, params)).expect("serializes");
-        let bytes = self.ep.post_json(self.held, body, cap).await?;
+        let bytes = self.ep.post_json(self.held, body, cap, self.wait).await?;
         let r: StrResp<'_> = serde_json::from_slice(&bytes).map_err(|_| RpcError::Malformed)?;
         if r.id != id {
             return Err(RpcError::Malformed);
@@ -130,7 +133,25 @@ impl RpcClient<'_> {
     pub async fn tag_number(&self, tag: &str) -> Result<Option<u64>, RpcError> {
         let id = self.next_id(1);
         let body = serde_json::to_vec(&request(id, "eth_getBlockByNumber", json!([tag, false]))).expect("serializes");
-        let bytes = self.ep.post_json(self.held, body, BLOCK_RESPONSE_CAP).await?;
+        let bytes = self.ep.post_json(self.held, body, BLOCK_RESPONSE_CAP, self.wait).await?;
+        let r: BlockResp<'_> = serde_json::from_slice(&bytes).map_err(|_| RpcError::Malformed)?;
+        if r.id != id {
+            return Err(RpcError::Malformed);
+        }
+        if let Some(e) = r.error {
+            return Err(RpcError::Rpc(e.code));
+        }
+        match r.result {
+            None => Ok(None),
+            Some(b) => quantity(b.number).map(Some).ok_or(RpcError::Malformed),
+        }
+    }
+
+    /// Whether the node has the block with hash `h` (its number, `None` for a null answer).
+    pub async fn block_by_hash(&self, h: B256) -> Result<Option<u64>, RpcError> {
+        let id = self.next_id(1);
+        let body = serde_json::to_vec(&request(id, "eth_getBlockByHash", json!([h.to_string(), false]))).expect("serializes");
+        let bytes = self.ep.post_json(self.held, body, BLOCK_RESPONSE_CAP, self.wait).await?;
         let r: BlockResp<'_> = serde_json::from_slice(&bytes).map_err(|_| RpcError::Malformed)?;
         if r.id != id {
             return Err(RpcError::Malformed);
@@ -167,7 +188,7 @@ impl RpcClient<'_> {
             .collect();
         let body = serde_json::to_vec(&batch).expect("serializes");
         let cap = n * (CODE_RESPONSE_CAP - 384) + 1024;
-        let bytes = self.ep.post_json(self.held, body, cap).await?;
+        let bytes = self.ep.post_json(self.held, body, cap, self.wait).await?;
         let answers: Vec<StrResp<'_>> = serde_json::from_slice(&bytes).map_err(|_| RpcError::Malformed)?;
         if answers.len() != addresses.len() {
             return Err(RpcError::Malformed);

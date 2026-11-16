@@ -5,13 +5,40 @@
 //!   budget ([`ByteLanes`]) and each endpoint's concurrency cap.
 //! - [`Pacer`]: a requests-per-second limiter that serves held-lock waiters first (the artifact
 //!   endpoint's `max_requests_per_sec`, and any endpoint's optional pacing).
-//! - [`TokenBucket`]: an operator/provider budget in cost units; spending it is status 2, never the
-//!   job's status 3 (§11.2).
+//! - [`TokenBucket`]: an operator/provider budget in cost units, with the same held-lock share kept
+//!   back for held-lock work; spending it is status 2, never the job's status 3 (§11.2).
+//! - [`WaitFlag`]: marks the spans in which a fetch waits on operator-side capacity (a lane, the
+//!   pacer, a concurrency slot), so a deadline that hits it there is not the builder's (§16).
 
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+
+/// Set while a fetch waits on operator-side capacity. A wait abandoned midway (its future
+/// dropped, e.g. by `EndJob`) leaves it set: the fetch ended in that wait.
+#[derive(Debug, Default)]
+pub struct WaitFlag(AtomicBool);
+
+impl WaitFlag {
+    /// Runs `f` with the flag set.
+    pub async fn during<F: Future>(&self, f: F) -> F::Output {
+        self.0.store(true, Ordering::SeqCst);
+        let r = f.await;
+        self.0.store(false, Ordering::SeqCst);
+        r
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    pub fn clear(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 /// A capacity of `total` units, `reserved` of which only held-lock work may take. Held-lock work
 /// takes whichever lane frees first; other work waits on the shared lane only. A request for more
@@ -30,6 +57,8 @@ pub struct LanePermit {
     _permit: OwnedSemaphorePermit,
     /// Whether the units came from the held-lock lane.
     pub reserved: bool,
+    /// The units actually held (a request is clamped to its lane's size).
+    pub units: u32,
 }
 
 impl Lanes {
@@ -56,16 +85,16 @@ impl Lanes {
         let ns = units.min(self.shared_cap);
         if !held || self.reserved_cap == 0 {
             let p = self.shared.clone().acquire_many_owned(ns).await.expect("lane semaphores are never closed");
-            return LanePermit { _permit: p, reserved: false };
+            return LanePermit { _permit: p, reserved: false, units: ns };
         }
         let nr = units.min(self.reserved_cap);
         tokio::select! {
             biased;
             p = self.reserved.clone().acquire_many_owned(nr) => {
-                LanePermit { _permit: p.expect("lane semaphores are never closed"), reserved: true }
+                LanePermit { _permit: p.expect("lane semaphores are never closed"), reserved: true, units: nr }
             }
             p = self.shared.clone().acquire_many_owned(ns) => {
-                LanePermit { _permit: p.expect("lane semaphores are never closed"), reserved: false }
+                LanePermit { _permit: p.expect("lane semaphores are never closed"), reserved: false, units: ns }
             }
         }
     }
@@ -73,6 +102,15 @@ impl Lanes {
     /// `(shared, reserved)` units free now.
     pub fn available(&self) -> (usize, usize) {
         (self.shared.available_permits(), self.reserved.available_permits())
+    }
+
+    /// The most units a request of this kind (`held` or not) can be granted at once.
+    pub fn largest(&self, held: bool) -> u32 {
+        if held {
+            self.shared_cap.max(self.reserved_cap)
+        } else {
+            self.shared_cap
+        }
     }
 }
 
@@ -85,7 +123,8 @@ impl ByteLanes {
         Self(Lanes::new(kib(total_bytes), kib(reserved_bytes)))
     }
 
-    /// Reserves `bytes` (clamped to the lane) for the life of the permit.
+    /// Reserves `bytes` (clamped to the lane) for the life of the permit; see [`permit_bytes`] for
+    /// what was granted.
     pub async fn acquire(&self, held: bool, bytes: u64) -> LanePermit {
         self.0.acquire(held, kib(bytes)).await
     }
@@ -93,6 +132,16 @@ impl ByteLanes {
     pub fn available_kib(&self) -> (usize, usize) {
         self.0.available()
     }
+
+    /// The most bytes one permit of this kind can hold.
+    pub fn largest(&self, held: bool) -> u64 {
+        u64::from(self.0.largest(held)) * 1024
+    }
+}
+
+/// The bytes a [`ByteLanes`] permit holds.
+pub fn permit_bytes(p: &LanePermit) -> u64 {
+    u64::from(p.units) * 1024
 }
 
 fn kib(bytes: u64) -> u32 {
@@ -144,28 +193,37 @@ async fn dispatch(
     }
 }
 
-/// An operator/provider budget: `capacity` cost units, refilled continuously over a minute.
+/// An operator/provider budget: `capacity` cost units, refilled continuously over a minute, of
+/// which `reserve_share × capacity` only held-lock work may spend: other work takes `n` only while
+/// `tokens − n ≥ reserve`, held-lock work may drain the bucket to zero.
 #[derive(Debug)]
 pub struct TokenBucket {
     capacity: f64,
+    reserve: f64,
     per_sec: f64,
     state: Mutex<(f64, Instant)>,
 }
 
 impl TokenBucket {
-    pub fn per_minute(units: u64) -> Self {
+    pub fn per_minute(units: u64, reserve_share: f64) -> Self {
         let capacity = units as f64;
-        Self { capacity, per_sec: capacity / 60.0, state: Mutex::new((capacity, Instant::now())) }
+        Self {
+            capacity,
+            reserve: capacity * reserve_share.clamp(0.0, 1.0),
+            per_sec: capacity / 60.0,
+            state: Mutex::new((capacity, Instant::now())),
+        }
     }
 
-    /// Takes `n` units if they are there.
-    pub fn try_take(&self, n: u64) -> bool {
+    /// Takes `n` units if they are there (for work that holds no lock, above the reserve).
+    pub fn try_take(&self, n: u64, held: bool) -> bool {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(s.1).as_secs_f64();
         s.0 = (s.0 + elapsed * self.per_sec).min(self.capacity);
         s.1 = now;
-        if s.0 >= n as f64 {
+        let floor = if held { 0.0 } else { self.reserve };
+        if s.0 - n as f64 >= floor {
             s.0 -= n as f64;
             true
         } else {
@@ -266,9 +324,44 @@ mod tests {
 
     #[test]
     fn token_bucket_spends_and_refuses() {
-        let b = TokenBucket::per_minute(60);
-        assert!(b.try_take(59));
-        assert!(b.try_take(1));
-        assert!(!b.try_take(1));
+        let b = TokenBucket::per_minute(60, 0.0);
+        assert!(b.try_take(59, false));
+        assert!(b.try_take(1, false));
+        assert!(!b.try_take(1, false));
+        assert!(!b.try_take(1, true));
+    }
+
+    /// Review F3: simulation work cannot spend the held-lock share; held-lock work can drain it.
+    #[test]
+    fn token_bucket_keeps_a_held_lock_reserve() {
+        let b = TokenBucket::per_minute(100, 0.25);
+        assert!(!b.try_take(76, false), "would leave 24 < 25");
+        assert!(b.try_take(75, false), "leaves exactly the reserve");
+        assert!(!b.try_take(1, false), "the reserve is held-lock work's");
+        assert!(b.try_take(25, true), "held-lock work drains it to zero");
+        assert!(!b.try_take(1, true));
+    }
+
+    #[tokio::test]
+    async fn permits_report_what_they_hold() {
+        let bytes = ByteLanes::new(4 << 20, 1 << 20);
+        assert_eq!((bytes.largest(false), bytes.largest(true)), (3 << 20, 3 << 20));
+        let p = bytes.acquire(false, 10 << 20).await;
+        assert_eq!(permit_bytes(&p), 3 << 20, "clamped to the shared lane");
+        let h = bytes.acquire(true, 10 << 20).await;
+        assert!(h.reserved);
+        assert_eq!(permit_bytes(&h), 1 << 20, "clamped to the reserved lane");
+    }
+
+    #[tokio::test]
+    async fn a_wait_flag_marks_its_span() {
+        let f = WaitFlag::default();
+        let inside = f.during(async { f.is_set() }).await;
+        assert!(inside && !f.is_set());
+        // Abandoned midway: left set.
+        let _ = tokio::time::timeout(Duration::from_millis(10), f.during(std::future::pending::<()>())).await;
+        assert!(f.is_set());
+        f.clear();
+        assert!(!f.is_set());
     }
 }

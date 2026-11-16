@@ -36,7 +36,7 @@ use crate::cache::{ArtifactKey, Lru, ManifestKey, ManifestPairKey};
 use crate::config::{BrokerConfig, TimeoutConfig};
 use crate::fdpass::{copy_sealed, memfd, seal};
 use crate::jsonrpc::{RpcClient, RpcError, MAX_CODE_BATCH};
-use crate::lanes::ByteLanes;
+use crate::lanes::{ByteLanes, WaitFlag};
 use crate::net::{Endpoint, EndpointError};
 
 const MEMFD_NAME: &std::ffi::CStr = c"zkminer-artifact";
@@ -126,6 +126,11 @@ impl ArtifactReader {
         self.endpoint.as_ref()
     }
 
+    /// The artifact endpoint and mirror, where configured.
+    pub fn endpoints(&self) -> impl Iterator<Item = &Arc<Endpoint>> {
+        self.endpoint.iter().chain(self.mirror.iter())
+    }
+
     pub fn chain_id(&self) -> u64 {
         self.chain_id
     }
@@ -183,7 +188,8 @@ impl ArtifactReader {
             }
         }
         let max = req.max_bytes.min(self.max_builder_bytes);
-        let rpc = RpcClient { ep, held: req.held_lock, ids: &self.ids };
+        let wait = WaitFlag::default();
+        let rpc = RpcClient { ep, held: req.held_lock, ids: &self.ids, wait: &wait };
         let mut charged: Option<(u64, u32)> = None;
         let mut last = String::new();
         for _attempt in 0..2 {
@@ -310,22 +316,26 @@ impl ArtifactReader {
         let _bytes = self.bytes.acquire(req.held_lock, max).await;
         let file = memfd(MEMFD_NAME).map_err(|_| ArtifactFailure::Endpoint)?;
         let mut hasher = Sha256::new();
-        let mut sink = &file;
-        let r = mirror
-            .get_into(&url, req.held_lock, max, &mut |chunk| {
-                hasher.update(chunk);
-                sink.write_all(chunk)
-            })
-            .await;
-        let len = match r {
-            Ok(0) | Err(EndpointError::Status(404 | 410)) => return Err(ArtifactFailure::MirrorMissing),
-            Ok(len) => len,
-            Err(EndpointError::TooLarge) => return Err(ArtifactFailure::TooLarge),
-            Err(e) => {
+        let wait = WaitFlag::default();
+        let failed = |e: EndpointError| match e {
+            EndpointError::Status(404 | 410) => ArtifactFailure::MirrorMissing,
+            EndpointError::TooLarge => ArtifactFailure::TooLarge,
+            e => {
                 mirror.log_failure("artifact mirror request failed", &e);
-                return Err(ArtifactFailure::Endpoint);
+                ArtifactFailure::Endpoint
             }
         };
+        let mut body = mirror.get(&url, req.held_lock, max, &wait).await.map_err(failed)?;
+        let mut buf = Vec::new();
+        while body.next_into(&mut buf).await.map_err(failed)? {
+            hasher.update(&buf);
+            (&file).write_all(&buf).map_err(|_| ArtifactFailure::Endpoint)?;
+            buf.clear();
+        }
+        let len = body.total();
+        if len == 0 {
+            return Err(ArtifactFailure::MirrorMissing);
+        }
         let sha256 = B256::from(<[u8; 32]>::from(hasher.finalize()));
         if req.expected_sha256.is_some_and(|exp| exp != sha256) {
             tracing::warn!(endpoint = %mirror.alias(), "artifact mirror body does not hash to the builder id");

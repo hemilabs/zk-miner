@@ -4,12 +4,19 @@
 //! credential. Its builder sends `KIND_FETCH` frames (`cap ‖ request`), one at a time; each gets a
 //! `KIND_FETCH_RESULT` (`status ‖ body`). Frames are read with the job's cap
 //! (`fetch_frame_max(maxRequestBytes)`), refused before allocating; once a frame's first byte has
-//! arrived the rest must follow within `partial_frame_secs`.
+//! arrived the rest must follow within `partial_frame_secs`, and so must the reader take the
+//! result: a builder that stops reading loses its socket, and with it the result's byte permit
+//! and spool file (both live until the result is written).
 //!
 //! Builder-visible budgets: one unit per request element (a batch of `k` calls is `k`; a refused
 //! request is 1) and the response bytes delivered, both charged as if every request missed the
-//! cache. A budget hit is status 3. Retries and failover are charged only to operator budgets, so
-//! operator exhaustion is status 2.
+//! cache. A budget hit is status 3. Once `maxFetches` or `maxFetchBytes` is spent, every further
+//! frame is status 3 at once, without a charge or an endpoint contact; after
+//! [`MAX_FRAMES_AFTER_EXHAUSTION`] of them the job's socket is closed. Retries and failover are
+//! charged only to operator budgets, so operator exhaustion is status 2.
+//!
+//! A status-2 fetch is classified ([`Failure`]) into `JobStats.operator_failure`,
+//! `JobStats.unanswerable` or neither (the request's own cost); see `zkminer_witness::ipc`.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,12 +30,16 @@ use tokio::task::JoinHandle;
 use zkminer_witness::envelope::MethodSet;
 use zkminer_witness::ipc::{
     decode_fetch, fetch_frame_max, ControlErrorCode, ControlResponse, FetchStatus, FrameError, JobBudget,
-    FRAME_HEADER_BYTES, KIND_FETCH, KIND_FETCH_RESULT,
+    FRAME_HEADER_BYTES, KIND_FETCH, KIND_FETCH_RESULT, MAX_FRAMES_AFTER_EXHAUSTION,
 };
 
 use crate::broker::Broker;
+use crate::lanes::{LanePermit, WaitFlag};
 use crate::net::Endpoint;
 use crate::spool::SpoolFile;
+
+/// Spool bytes read back per blocking-pool trip when a result is written.
+const SPOOL_READ_CHUNK: usize = 256 << 10;
 
 /// Where one of a job's capabilities is served from.
 pub(crate) enum JobSource {
@@ -36,13 +47,28 @@ pub(crate) enum JobSource {
     Blob { max_bytes: u64 },
 }
 
+/// Why a fetch ended with status 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Failure {
+    /// The operator's side: transport, connect timeouts, non-2xx (404 only for RPC endpoints), a
+    /// malformed answer, an operator budget or the spool quota, a lane or pacer wait at the deadline.
+    Operator,
+    /// Every endpoint tried lacked the block or state, or every mirror lacked the blob.
+    Unanswerable,
+    /// The request's own cost: a timeout once sent, the deadline while an endpoint worked on it.
+    Own,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct Account {
     fetches: u32,
     fetch_bytes: u64,
-    transient: bool,
+    operator_failure: bool,
+    unanswerable: bool,
     denied: u32,
     in_flight_at_close: bool,
+    operator_wait_at_close: bool,
+    frames_after_exhaustion: u32,
 }
 
 pub(crate) struct Job {
@@ -51,6 +77,10 @@ pub(crate) struct Job {
     pub held_lock: bool,
     pub budget: JobBudget,
     pub sources: Vec<JobSource>,
+    /// Set while the current fetch waits on operator-side capacity (lanes, pacer, slots).
+    pub wait: WaitFlag,
+    /// The current fetch met an operator-side failure (it may still succeed elsewhere).
+    operator_fault: AtomicBool,
     acct: Mutex<Account>,
     in_flight: AtomicBool,
     cancel: watch::Sender<bool>,
@@ -67,17 +97,26 @@ pub(crate) enum Body {
 pub(crate) struct Outcome {
     pub status: FetchStatus,
     pub body: Body,
+    /// For status 2.
+    pub failure: Option<Failure>,
+    /// The in-flight byte permit that covers `body`, held until the result is written (or its
+    /// write times out).
+    pub _permit: Option<LanePermit>,
 }
 
 impl Outcome {
     pub fn status(status: FetchStatus) -> Self {
-        Self { status, body: Body::Empty }
+        debug_assert!(status != FetchStatus::Failed, "status 2 needs a Failure");
+        Self { status, body: Body::Empty, failure: None, _permit: None }
     }
-    pub fn bytes(b: Vec<u8>) -> Self {
-        Self { status: FetchStatus::Ok, body: Body::Bytes(b) }
+    pub fn failed(f: Failure) -> Self {
+        Self { status: FetchStatus::Failed, body: Body::Empty, failure: Some(f), _permit: None }
     }
-    pub fn spool(f: SpoolFile) -> Self {
-        Self { status: FetchStatus::Ok, body: Body::Spool(f) }
+    pub fn bytes(b: Vec<u8>, permit: LanePermit) -> Self {
+        Self { status: FetchStatus::Ok, body: Body::Bytes(b), failure: None, _permit: Some(permit) }
+    }
+    pub fn spool(f: SpoolFile, permit: LanePermit) -> Self {
+        Self { status: FetchStatus::Ok, body: Body::Spool(f), failure: None, _permit: Some(permit) }
     }
 }
 
@@ -98,6 +137,12 @@ impl Job {
         }
     }
 
+    /// Gives back `n` units charged with [`Job::try_charge_units`].
+    pub fn refund_units(&self, n: u32) {
+        let mut a = self.acct();
+        a.fetches = a.fetches.saturating_sub(n);
+    }
+
     /// Charges one unit for a refused request, up to the budget.
     pub fn charge_refused(&self) {
         let mut a = self.acct();
@@ -112,6 +157,11 @@ impl Job {
         self.budget.max_fetch_bytes.saturating_sub(self.acct().fetch_bytes)
     }
 
+    /// Whether a builder-visible budget is spent (every further fetch is status 3).
+    fn spent(&self) -> bool {
+        self.units_left() == 0 || self.bytes_left() == 0
+    }
+
     /// Charges `n` delivered bytes if they fit the job's `maxFetchBytes`.
     pub fn try_charge_bytes(&self, n: u64) -> bool {
         let mut a = self.acct();
@@ -122,6 +172,16 @@ impl Job {
             }
             _ => false,
         }
+    }
+
+    /// The current fetch met an operator-side failure.
+    pub fn note_operator_fault(&self) {
+        self.operator_fault.store(true, Ordering::SeqCst);
+    }
+
+    /// The current fetch is in an operator-side wait or met an operator-side failure.
+    fn operator_side_now(&self) -> bool {
+        self.wait.is_set() || self.operator_fault.load(Ordering::SeqCst)
     }
 
     /// A short job id for logs.
@@ -162,6 +222,8 @@ pub(crate) fn register(
         held_lock,
         budget,
         sources: provisioned,
+        wait: WaitFlag::default(),
+        operator_fault: AtomicBool::new(false),
         acct: Mutex::new(Account::default()),
         in_flight: AtomicBool::new(false),
         cancel,
@@ -181,12 +243,15 @@ pub(crate) fn register(
 }
 
 /// `EndJob`: stops serving and reports the job's account. `fetch_in_flight_at_end` is whether a
-/// fetch was being served when `EndJob` arrived or when the builder's socket closed.
+/// fetch was being served when `EndJob` arrived or when the builder's socket closed;
+/// `in_flight_operator_wait` whether that fetch was then in an operator-side wait or had met an
+/// operator-side failure.
 pub(crate) async fn end(b: &Arc<Broker>, job_key: B256) -> ControlResponse {
     let Some(job) = b.jobs.lock().unwrap_or_else(|p| p.into_inner()).remove(&job_key) else {
         return ControlResponse::Error { code: ControlErrorCode::UnknownJob };
     };
     let in_flight = job.in_flight.load(Ordering::SeqCst);
+    let operator_wait = in_flight && job.operator_side_now();
     job.cancel.send_replace(true);
     let handle = job.task.lock().unwrap_or_else(|p| p.into_inner()).take();
     if let Some(h) = handle {
@@ -196,14 +261,27 @@ pub(crate) async fn end(b: &Arc<Broker>, job_key: B256) -> ControlResponse {
         }
     }
     let a = *job.acct();
-    tracing::info!(job = %job.tag(), caller = %job.caller, fetches = a.fetches, bytes = a.fetch_bytes, transient = a.transient, denied = a.denied, "job ended");
+    tracing::info!(
+        job = %job.tag(),
+        caller = %job.caller,
+        fetches = a.fetches,
+        bytes = a.fetch_bytes,
+        operator_failure = a.operator_failure,
+        unanswerable = a.unanswerable,
+        denied = a.denied,
+        frames_after_exhaustion = a.frames_after_exhaustion,
+        "job ended"
+    );
     ControlResponse::JobStats {
         job_key,
         fetches: a.fetches,
         fetch_bytes: a.fetch_bytes,
-        transient: a.transient,
+        operator_failure: a.operator_failure,
+        unanswerable: a.unanswerable,
         fetch_in_flight_at_end: in_flight || a.in_flight_at_close,
+        in_flight_operator_wait: operator_wait || a.operator_wait_at_close,
         denied: a.denied,
+        frames_after_exhaustion: a.frames_after_exhaustion,
     }
 }
 
@@ -270,7 +348,8 @@ async fn closed_or_pipelined(rd: &OwnedReadHalf) -> bool {
     }
 }
 
-async fn write_result(wr: &mut OwnedWriteHalf, o: Outcome) -> io::Result<()> {
+/// Writes one result frame. A spooled body is read back on the blocking pool, a chunk at a time.
+async fn write_result(wr: &mut OwnedWriteHalf, o: &Outcome) -> io::Result<()> {
     let body_len = match &o.body {
         Body::Empty => 0,
         Body::Bytes(b) => b.len() as u64,
@@ -282,21 +361,18 @@ async fn write_result(wr: &mut OwnedWriteHalf, o: Outcome) -> io::Result<()> {
     head[1..5].copy_from_slice(&len.to_be_bytes());
     head[5] = o.status as u8;
     wr.write_all(&head).await?;
-    match o.body {
+    match &o.body {
         Body::Empty => {}
-        Body::Bytes(b) => wr.write_all(&b).await?,
+        Body::Bytes(b) => wr.write_all(b).await?,
         Body::Spool(f) => {
-            use std::os::unix::fs::FileExt;
-            let mut buf = vec![0u8; 1 << 16];
             let mut off = 0u64;
             while off < body_len {
-                let want = buf.len().min((body_len - off) as usize);
-                let n = f.file().read_at(&mut buf[..want], off)?;
-                if n == 0 {
+                let chunk = f.read_at(off, SPOOL_READ_CHUNK).await?;
+                if chunk.is_empty() {
                     return Err(io::ErrorKind::UnexpectedEof.into());
                 }
-                wr.write_all(&buf[..n]).await?;
-                off += n as u64;
+                wr.write_all(&chunk).await?;
+                off += chunk.len() as u64;
             }
         }
     }
@@ -319,7 +395,7 @@ async fn run(b: Arc<Broker>, job: Arc<Job>, sock: tokio::net::UnixStream, mut ca
                 // Refused before allocating; the stream cannot be resynchronized.
                 job.acct().denied += 1;
                 job.charge_refused();
-                let _ = tokio::time::timeout(partial, write_result(&mut wr, Outcome::status(FetchStatus::Denied))).await;
+                let _ = tokio::time::timeout(partial, write_result(&mut wr, &Outcome::status(FetchStatus::Denied))).await;
                 return;
             }
             Err(e) => {
@@ -327,13 +403,33 @@ async fn run(b: Arc<Broker>, job: Arc<Job>, sock: tokio::net::UnixStream, mut ca
                 return;
             }
         };
+        if job.spent() {
+            // Status 3 at once, no charge, no endpoint; a builder spinning on it loses its socket.
+            let n = {
+                let mut a = job.acct();
+                a.frames_after_exhaustion = a.frames_after_exhaustion.saturating_add(1);
+                a.frames_after_exhaustion
+            };
+            if n > MAX_FRAMES_AFTER_EXHAUSTION {
+                tracing::info!(job = %job.tag(), "builder keeps fetching past its spent budget; closing its socket");
+                return;
+            }
+            match tokio::time::timeout(partial, write_result(&mut wr, &Outcome::status(FetchStatus::Exhausted))).await {
+                Ok(Ok(())) => continue,
+                _ => return,
+            }
+        }
+        job.wait.clear();
+        job.operator_fault.store(false, Ordering::SeqCst);
         job.in_flight.store(true, Ordering::SeqCst);
         let outcome = tokio::select! {
             o = serve_fetch(&b, &job, &payload) => Some(o),
             _ = cancelled(&mut cancel) => None,
             closed = closed_or_pipelined(&rd) => {
                 if closed {
-                    job.acct().in_flight_at_close = true;
+                    let mut a = job.acct();
+                    a.in_flight_at_close = true;
+                    a.operator_wait_at_close = job.operator_side_now();
                 } else {
                     job.acct().denied += 1;
                     tracing::debug!(job = %job.tag(), "builder pipelined a fetch; closing its socket");
@@ -343,26 +439,32 @@ async fn run(b: Arc<Broker>, job: Arc<Job>, sock: tokio::net::UnixStream, mut ca
         };
         job.in_flight.store(false, Ordering::SeqCst);
         let Some(o) = outcome else { return };
-        match o.status {
-            FetchStatus::Failed => job.acct().transient = true,
-            FetchStatus::Denied => job.acct().denied += 1,
+        match (o.status, o.failure) {
+            (FetchStatus::Failed, Some(Failure::Operator)) => job.acct().operator_failure = true,
+            (FetchStatus::Failed, Some(Failure::Unanswerable)) => job.acct().unanswerable = true,
+            (FetchStatus::Denied, _) => job.acct().denied += 1,
             _ => {}
         }
-        match tokio::time::timeout(partial, write_result(&mut wr, o)).await {
+        // `o` (its permit and spool file) lives until the write is done or abandoned.
+        match tokio::time::timeout(partial, write_result(&mut wr, &o)).await {
             Ok(Ok(())) => {}
-            _ => return,
+            _ => {
+                tracing::debug!(job = %job.tag(), "result not taken in time; closing the job's socket");
+                return;
+            }
         }
     }
 }
 
 /// Serves one fetch: the cap index, then the class's handler, within the fetch wall time (status 2
-/// past it).
+/// past it: the operator's when the fetch was in an operator-side wait or had met an operator-side
+/// failure, else the request's own).
 async fn serve_fetch(b: &Arc<Broker>, job: &Arc<Job>, payload: &[u8]) -> Outcome {
     let Ok((cap, request)) = decode_fetch(payload) else {
         job.charge_refused();
         return Outcome::status(FetchStatus::Denied);
     };
-    if job.units_left() == 0 {
+    if job.spent() {
         return Outcome::status(FetchStatus::Exhausted);
     }
     let Some(source) = job.sources.get(cap as usize) else {
@@ -378,7 +480,8 @@ async fn serve_fetch(b: &Arc<Broker>, job: &Arc<Job>, payload: &[u8]) -> Outcome
         }
     };
     tokio::time::timeout(b.cfg.timeouts.fetch(), fut).await.unwrap_or_else(|_| {
-        tracing::warn!(job = %job.tag(), cap, "fetch timed out");
-        Outcome::status(FetchStatus::Failed)
+        let operator = job.operator_side_now();
+        tracing::warn!(job = %job.tag(), cap, operator, "fetch timed out");
+        Outcome::failed(if operator { Failure::Operator } else { Failure::Own })
     })
 }
