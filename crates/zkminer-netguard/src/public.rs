@@ -15,14 +15,18 @@
 //! The names and server addresses are compiled in: nothing a requester supplies chooses them, and
 //! the answer only ever adds an address to refuse (a forged answer can make the miner refuse one
 //! more public address, nothing else). When every reflector fails for a family, a loud WARN says
-//! so and the miner carries on with what its interfaces show: name the public addresses in
-//! `[egress] deny_cidrs` then (or always, as a belt to these braces). `[egress]
-//! discover_public_addresses = false` turns the queries off.
+//! so (once per run of failures) and the miner carries on with what its interfaces show: name the
+//! public addresses in `[egress] deny_cidrs` then (or always, as a belt to these braces). A family
+//! the host has no route for at all is skipped quietly: there is no public address to learn, and
+//! no requester connection goes out over it either. `[egress] discover_public_addresses = false`
+//! turns the queries off.
 //!
-//! The answers are cached process-wide: the first call blocks (at most about two
-//! [`DISCOVERY_TIMEOUT`]s, both families at once), later calls return the cache and refresh it in
-//! the background once it is older than [`DISCOVERY_TTL`] (after a failure, retried at most every
-//! [`RETRY_AFTER_FAILURE`]). The last good answer of a family stays in force when a refresh fails.
+//! The answers are cached process-wide: the first call blocks (at most [`DISCOVERY_TIMEOUT`]:
+//! every reflector is asked at once, from the calling thread, which starts no other — the witness
+//! broker gathers its facts right before a sandbox that refuses a second thread), later calls
+//! return the cache and refresh it on a background thread once it is older than [`DISCOVERY_TTL`]
+//! (after a failure, retried at most every [`RETRY_AFTER_FAILURE`]). The last good answer of a
+//! family stays in force when a refresh fails.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
@@ -80,6 +84,8 @@ struct State {
     learned_at: Option<Instant>,
     attempted_at: Option<Instant>,
     running: bool,
+    /// Whether the current failure streak of a family has been warned about (once per streak).
+    warned: [bool; 2],
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -88,6 +94,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     learned_at: None,
     attempted_at: None,
     running: false,
+    warned: [false; 2],
 });
 
 fn state() -> std::sync::MutexGuard<'static, State> {
@@ -126,34 +133,45 @@ pub fn public_addresses() -> Vec<IpAddr> {
     s.v4.into_iter().chain(s.v6).collect()
 }
 
-/// What one round of discovery found, per family.
-type Found = (Result<IpAddr, String>, Result<IpAddr, String>);
+/// What one round of discovery found for a family: its public address, `None` when the host has
+/// no route for the family at all (nothing to learn, and nothing a requester could reach over it),
+/// or why every reflector failed.
+type FamilyFound = Result<Option<IpAddr>, String>;
 
-fn learn((v4, v6): Found) {
+fn learn((v4, v6): (FamilyFound, FamilyFound)) {
     let mut guard = state();
     let s = &mut *guard;
     s.running = false;
     let mut any = false;
-    for (slot, got, family) in [(&mut s.v4, v4, "IPv4"), (&mut s.v6, v6, "IPv6")] {
+    for (i, (slot, got, family)) in [(&mut s.v4, v4, "IPv4"), (&mut s.v6, v6, "IPv6")]
+        .into_iter()
+        .enumerate()
+    {
         match got {
-            Ok(ip) => {
+            Ok(Some(ip)) => {
                 if *slot != Some(ip) {
                     tracing::info!(
                         "network guard: this host's public {family} address is {ip}; refusing it"
                     );
                 }
                 *slot = Some(ip);
+                s.warned[i] = false;
                 any = true;
             }
-            Err(e) => {
-                if slot.is_none() {
-                    tracing::warn!(
-                        "network guard: could not learn this host's public {family} address ({e}). \
-                         If it sits behind NAT, a requester's URL at that address would reach this \
-                         host or its router: list it in [egress] deny_cidrs"
-                    );
-                }
+            Ok(None) => {
+                tracing::debug!("network guard: no {family} route, so no public {family} address");
+                any = true;
             }
+            Err(e) if !s.warned[i] => {
+                s.warned[i] = true;
+                tracing::warn!(
+                    "network guard: could not learn this host's public {family} address ({e}). \
+                     If it sits behind NAT, a requester's URL at that address would reach this \
+                     host or its router: list it in [egress] deny_cidrs. The last address learned \
+                     stays refused; retrying in the background"
+                );
+            }
+            Err(e) => tracing::debug!("network guard: public {family} address: {e}"),
         }
     }
     if any {
@@ -161,26 +179,105 @@ fn learn((v4, v6): Found) {
     }
 }
 
-fn discover() -> Found {
-    std::thread::scope(|scope| {
-        let v6 = scope.spawn(|| ask_family(true));
-        let v4 = ask_family(false);
-        let v6 = v6
-            .join()
-            .unwrap_or_else(|_| Err("the IPv6 discovery thread panicked".into()));
-        (v4, v6)
-    })
-}
-
-fn ask_family(v6: bool) -> Result<IpAddr, String> {
-    let mut errors = Vec::new();
-    for r in REFLECTORS.iter().filter(|r| r.server.is_ipv6() == v6) {
-        match ask(r, DISCOVERY_TIMEOUT) {
-            Ok(ip) => return Ok(ip),
-            Err(e) => errors.push(format!("{} @{}: {e}", r.name, r.server)),
+/// Asks every reflector at once, on this thread (no helper thread: the witness broker gathers its
+/// facts single-threaded, right before a sandbox that refuses a process with a second thread), and
+/// takes the first valid answer per family within [`DISCOVERY_TIMEOUT`].
+fn discover() -> (FamilyFound, FamilyFound) {
+    struct Pending {
+        sock: UdpSocket,
+        id: u16,
+        v6: bool,
+        what: String,
+    }
+    let mut found: [Option<IpAddr>; 2] = [None, None];
+    let mut errors: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+    // A family is unroutable when every one of its sends failed at once for want of a route.
+    let mut unroutable = [true, true];
+    let mut pending = Vec::new();
+    for r in REFLECTORS {
+        let fam = usize::from(r.server.is_ipv6());
+        let what = format!("{} @{}", r.name, r.server);
+        match send_query(r) {
+            Ok((sock, id)) => {
+                unroutable[fam] = false;
+                pending.push(Pending {
+                    sock,
+                    id,
+                    v6: r.server.is_ipv6(),
+                    what,
+                });
+            }
+            Err(e) => {
+                unroutable[fam] &= matches!(
+                    e.kind(),
+                    io::ErrorKind::NetworkUnreachable | io::ErrorKind::AddrNotAvailable
+                );
+                errors[fam].push(format!("{what}: {e}"));
+            }
         }
     }
-    Err(errors.join("; "))
+    let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+    let mut buf = [0u8; 1500];
+    while !pending.is_empty() && Instant::now() < deadline {
+        let mut progressed = false;
+        pending.retain(|p| {
+            let fam = usize::from(p.v6);
+            if found[fam].is_some() {
+                return false;
+            }
+            loop {
+                match p.sock.recv(&mut buf) {
+                    Ok(n) => match parse_answer(&buf[..n], p.id, p.v6) {
+                        Some(Ok(ip)) => {
+                            found[fam] = Some(ip);
+                            progressed = true;
+                            return false;
+                        }
+                        Some(Err(e)) => {
+                            errors[fam].push(format!("{}: {e}", p.what));
+                            return false;
+                        }
+                        None => continue, // not an answer to this query
+                    },
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return true,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        errors[fam].push(format!("{}: {e}", p.what));
+                        return false;
+                    }
+                }
+            }
+        });
+        if !progressed {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    for p in &pending {
+        errors[usize::from(p.v6)].push(format!("{}: no answer within the timeout", p.what));
+    }
+    let result = |fam: usize| -> FamilyFound {
+        match found[fam] {
+            Some(ip) => Ok(Some(ip)),
+            None if unroutable[fam] => Ok(None),
+            None => Err(errors[fam].join("; ")),
+        }
+    };
+    (result(0), result(1))
+}
+
+/// A non-blocking UDP socket connected to `r`'s server, with its query sent, and the query's id.
+fn send_query(r: &Reflector) -> io::Result<(UdpSocket, u16)> {
+    let local: SocketAddr = if r.server.is_ipv6() {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    let sock = UdpSocket::bind(local)?;
+    sock.connect((r.server, 53))?;
+    let id = query_id();
+    sock.send(&build_query(id, r.name, r.class)?)?;
+    sock.set_nonblocking(true)?;
+    Ok((sock, id))
 }
 
 /// One reflector query over UDP.
@@ -377,6 +474,22 @@ mod tests {
         let mut cut = answer(7, 0, &["203.0.114.9"]);
         cut.truncate(cut.len() - 3);
         assert!(matches!(a(&cut, false), Some(Err(_))));
+    }
+
+    /// Every reflector at once, on this thread: each family's answer is a global address of that
+    /// family (or the family is unroutable here, or failed with reasons), within the timeout.
+    #[test]
+    fn discovery_asks_everything_at_once_on_this_thread() {
+        let t = Instant::now();
+        let (v4, v6) = discover();
+        assert!(t.elapsed() < DISCOVERY_TIMEOUT + Duration::from_millis(500));
+        for (got, six) in [(v4, false), (v6, true)] {
+            match got {
+                Ok(Some(ip)) => assert!(ip.is_ipv6() == six && crate::is_global(ip), "{ip}"),
+                Ok(None) => eprintln!("no route for this family here"),
+                Err(e) => assert!(!e.is_empty()),
+            }
+        }
     }
 
     /// Against the real reflectors (public DNS): an answer is this host's public address of that
