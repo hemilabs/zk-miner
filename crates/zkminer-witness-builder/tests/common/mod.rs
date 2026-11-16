@@ -244,3 +244,53 @@ where
     let summary = run(module, b"", &cfg, RunnerIo { witness, broker, log, marker: marker.clone() });
     (summary, marker.take(), t.elapsed())
 }
+
+/// The SDK workspace (`sdk/`).
+pub fn sdk_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sdk").canonicalize().unwrap()
+}
+
+/// `tool` of the toolchain the SDK's `rust-toolchain.toml` pins (`rustup which`, run in the SDK without
+/// this process's `RUSTUP_TOOLCHAIN`), or plain `tool` without rustup.
+fn sdk_tool(tool: &str) -> std::ffi::OsString {
+    let out = std::process::Command::new("rustup")
+        .args(["which", tool])
+        .current_dir(sdk_dir())
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8(o.stdout).unwrap().trim().into(),
+        _ => tool.into(),
+    }
+}
+
+/// Builds `packages` of the SDK workspace for wasm32 from the SDK directory (so its
+/// `.cargo/config.toml` applies), into `target`, with the cargo and rustc its `rust-toolchain.toml`
+/// pins (`RUSTC` explicit: cargo runs rustc for registry crates from their own directories, where a
+/// rustup proxy would not see the SDK's toolchain file), and nothing inherited that would pick
+/// another toolchain or compiler or replace the pinned target features. Returns the release output
+/// directory.
+pub fn build_sdk(packages: &[&str], target: &std::path::Path) -> std::path::PathBuf {
+    let mut cmd = std::process::Command::new(sdk_tool("cargo"));
+    cmd.current_dir(sdk_dir()).args(["build", "--locked", "--release", "--target", "wasm32-unknown-unknown"]);
+    for p in packages {
+        cmd.args(["-p", p]);
+    }
+    cmd.arg("--target-dir").arg(target).env("RUSTC", sdk_tool("rustc"));
+    for var in [
+        "RUSTUP_TOOLCHAIN",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS",
+        "CARGO_BUILD_TARGET",
+        "CARGO_TARGET_DIR",
+    ] {
+        cmd.env_remove(var);
+    }
+    let out = cmd.output().expect("cargo runs");
+    assert!(out.status.success(), "building {packages:?} failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    target.join("wasm32-unknown-unknown/release")
+}

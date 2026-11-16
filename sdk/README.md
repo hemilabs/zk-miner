@@ -13,6 +13,7 @@ This directory is its own Cargo workspace (excluded from the zkminer workspace):
 | `hemiprove-builder-sdk/` | the SDK: `context()`, `fetch()`, `write_witness()`, `log()`, `entry!`, a `BuilderContextV1` decoder, minimal JSON extraction |
 | `examples/latest-block/` | example builder: `W = blockNumber (u64 BE) ‖ blockHash` of the finalized block behind capability 0 |
 | `test-builders/faults/` | a builder that panics or exhausts memory on request, for the runner's tests |
+| `test-builders/receipts-proof/`, `test-builders/storage-proof/` | realistic builders with heavy dependencies (serde_json, alloy-rlp, alloy-primitives, alloy-trie, alloy-sol-types, tiny-keccak, sha2) that calibrate and test the runner's compile-cost budget; built at `opt-level = 3` |
 | `.cargo/config.toml` | the pinned target-feature list (the WASM profile) |
 | `rust-toolchain.toml` | the pinned toolchain (1.97.1, with the wasm32-unknown-unknown target) |
 | `build-reproducible.sh` | the reproducible build |

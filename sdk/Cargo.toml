@@ -1,8 +1,15 @@
 # The builder SDK and its examples: their own workspace and lockfile, excluded from the zkminer
-# workspace (they target wasm32-unknown-unknown and have no dependencies). See README.md.
+# workspace (they target wasm32-unknown-unknown; the SDK and the example have no dependencies, the
+# realistic test builders have many). See README.md.
 [workspace]
 resolver = "2"
-members = ["hemiprove-builder-sdk", "examples/latest-block", "test-builders/faults"]
+members = [
+    "hemiprove-builder-sdk",
+    "examples/latest-block",
+    "test-builders/faults",
+    "test-builders/receipts-proof",
+    "test-builders/storage-proof",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,3 +30,11 @@ incremental = false
 
 [profile.dev]
 panic = "abort"
+
+# The realistic test builders are built for speed, as a builder that pays for fuel would be: bigger
+# functions with more locals, the heavier case for the runner's compile-cost budget.
+[profile.release.package.receipts-proof]
+opt-level = 3
+
+[profile.release.package.storage-proof]
+opt-level = 3

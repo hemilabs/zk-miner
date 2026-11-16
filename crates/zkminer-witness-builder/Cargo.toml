@@ -19,3 +19,5 @@ libc = "0.2"
 [dev-dependencies]
 hex = { workspace = true }
 wat = "1"
+sha2 = "0.10"
+alloy-primitives = { workspace = true }
