@@ -201,6 +201,9 @@ key_env_var = "ZKMINER_PRIVATE_KEY"
 [prover]
 max_concurrent_proofs = 0           # 0 = one proof per detected GPU
 skip_benchmark_gate   = true
+
+[egress]                            # optional
+deny_cidrs = ["203.0.113.7/32"]     # this host's public address if it is behind NAT
 ```
 
 `zkminer init` will scaffold a config, but **verify the contract addresses it writes
@@ -212,6 +215,24 @@ fix `[contracts]` and restart. On 743111 the live deployment is the 2026-11-16 o
 `0xD931725db336B57dBB9A3123F2238A4FE3c6Ed58`, risc0 3.1 verifier); a config written for the
 2026-10-29 stack (router `0xE1a492Dc…470e`) names an abandoned deployment, so rewrite it with
 `zkminer init --network testnet --force`.
+
+### Network guard: `[egress]` and `[dev]`
+
+Anyone can register a program and post a job, so the URLs a miner downloads programs from
+are chosen by strangers. zkminer only ever connects to **public internet** addresses on
+their behalf: never loopback, the LAN, link-local or cloud metadata, this host's own
+addresses, a neighbour on a network it is connected to, or a name only a local resolver
+answers (`localhost`, `*.local`, `*.internal`, `*.lan`, single-label names, …). See
+[SECURITY.md](SECURITY.md) for exactly what is refused and why.
+
+| key | default | meaning |
+|---|---|---|
+| `[egress] deny_cidrs` | `[]` | More addresses no requester-caused connection may reach: CIDRs (`"203.0.113.0/24"`, `"2001:db8::/32"`) or bare addresses. Name this host's public address if it sits behind NAT (its interfaces don't show it, so only this stops a connection to it), the rest of your fleet, and on a cloud host your VPC's IPv6 range (its other hosts have global addresses). Host bits must be zero. |
+| `[dev] private_network` | `false` | **Developer mode.** Lets those connections reach private destinations, so a local test network can serve programs from this machine. The only way to turn the guard off (there is no environment variable or flag). Refused on Hemi mainnet (43111); while it is on, every start logs `DEV MODE: private network access enabled — never run on a public market`, `zkminer status` prints it, and the TUI's status bar shows a red `DEV MODE` badge. Never set it on a miner that serves a public market. |
+
+Unknown keys in `[dev]` and `[egress]` are errors, so a misspelt setting stops the miner
+instead of being ignored. `ZKMINER_ELF_ALLOW_PRIVATE_URLS`, which older builds read, is no
+longer read: move a test setup that used it to `[dev] private_network = true`.
 
 ## Run
 
@@ -477,6 +498,7 @@ per process: a simulate measurement (an SP1 one stages gigabytes in `/dev/shm` a
 |---|---|
 | `zkminer-cli` | binary entry point: `status`, `benchmark`, `run`, `simulate`, `init` |
 | `zkminer-chain` | chain client, auction math, staking, monitor, tx/nonce layer, RPC metering |
+| `zkminer-netguard` | the network guard: what a requester-caused connection may reach (see SECURITY.md) |
 | `zkminer-contracts` | `sol!()` bindings — the source of truth for the on-chain ABI |
 | `zkminer-prover` | worker dispatcher, ELF registry, benchmarks, guest programs |
 | `zkminer-prover-protocol` | worker↔dispatcher IPC types |
@@ -525,7 +547,9 @@ the tests:
 Some jobs are submitted before the miner starts and some after, so both the startup backfill
 and the live monitor are covered; the backfill starts at the first job's block, so one that
 starts a block late loses it. Nothing touches the real chain, and no key of yours is involved;
-each miner runs with its own HOME and a cleaned environment.
+each miner runs with its own HOME and a cleaned environment. The programs are served from
+127.0.0.1, so each miner's config sets `[dev] private_network = true` (the fork is 743111,
+where developer mode is allowed).
 
 ```bash
 env NVCC=/usr/local/cuda/bin/nvcc HIPCC=off \

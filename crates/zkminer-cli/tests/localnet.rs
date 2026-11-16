@@ -1271,6 +1271,10 @@ impl World {
         c.contracts.hemi_prove_registry = DEPLOYMENT.registry.to_string();
         c.contracts.hemi_token = DEPLOYMENT.token.to_string();
         c.contracts.program_registry = DEPLOYMENT.program_registry.to_string();
+        // The programs are served from this machine (127.0.0.1), which the network guard refuses
+        // outside developer mode. The config file is the only switch: there is no environment
+        // variable for it, and the miner refuses it on mainnet (the fork is 743111).
+        c.dev.private_network = true;
         // A 5 HEMI job is the whole market here: claim anything that pays.
         c.prover.min_profit_threshold = 0.0;
         c.prover.skip_benchmark_gate = true;
@@ -1710,8 +1714,6 @@ impl Miner {
         }
         cmd.env("HOME", dir)
             .env("PATH", path_without_workers())
-            // The programs are served from this machine.
-            .env("ZKMINER_ELF_ALLOW_PRIVATE_URLS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1975,6 +1977,13 @@ async fn watch_only_reports_every_job() {
     // some other failure.
     if world.elf_hits.load(Ordering::SeqCst) == 0 {
         failures.push("the guest was never downloaded from its registry URI".into());
+    }
+    // Served from 127.0.0.1 because the config's `[dev] private_network` let it, and said so.
+    if !lines
+        .iter()
+        .any(|l| l.contains(zkminer_config::DEV_MODE_BANNER))
+    {
+        failures.push("the miner never announced developer mode".into());
     }
     if !lines
         .iter()
