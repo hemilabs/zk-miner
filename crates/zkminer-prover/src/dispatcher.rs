@@ -116,6 +116,52 @@ pub struct ProgramIdDerivation {
 /// (see `WorkerPool::prove_min_vram`).
 pub type SlotPo2<'a> = &'a dyn Fn(&str) -> Option<u8>;
 
+/// A witness proof's execution that did not reproduce its bundle (`WorkerResponse::JournalDiverged`,
+/// plan §15.3): it did not halt with exit code 0, or its journal is not the bundle's. Nothing was
+/// proven. Built only from the worker's typed response, never from text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalDivergence {
+    /// The slot whose worker executed it, e.g. `risc0:cuda:0`.
+    pub slot_key: String,
+    /// The journal it committed; empty when longer than `EXECUTE_JOURNAL_MAX_BYTES` or none.
+    pub journal: Vec<u8>,
+    pub journal_len: u32,
+    pub journal_sha256: [u8; 32],
+    /// One of the protocol's `GUEST_EXIT_*` constants.
+    pub exit_kind: u8,
+    pub exit_code: u32,
+    /// Sized cycles, in the unit of `ExecuteMeasurement::cycles`.
+    pub cycles: u64,
+}
+
+/// The outcome of [`WorkerPool::prove_witness_min_vram`]: a proof, or a typed divergence the caller
+/// decides on (re-run the binding and the claim-gate limits on the new journal; re-dispatch, hand
+/// back, or release). Every other failure is an `Err`, as for an inline proof.
+#[derive(Debug, Clone)]
+pub enum WitnessProveOutcome {
+    Proved(ProofOutput),
+    JournalDiverged(JournalDivergence),
+}
+
+/// A proof's progress callback: the fraction done and the slot proving it.
+pub type ProveProgress = Box<dyn Fn(f64, &str) + Send>;
+
+/// The input a proof is dispatched with.
+#[derive(Debug, Clone, Copy)]
+enum ProveInput<'a> {
+    /// The bytes themselves, in the frame.
+    Inline(&'a [u8]),
+    /// A witness job's bundle, which the worker reads itself.
+    Witness(&'a zkminer_prover_protocol::WitnessProve),
+}
+
+/// What a slot's worker answered a proof with.
+#[derive(Debug)]
+enum SlotProof {
+    Proved(ProofOutput),
+    JournalDiverged(JournalDivergence),
+}
+
 /// The journal an `ExecuteResult` reported, if it is the whole journal `journal_len` describes. The
 /// caller claims no journal-bound job on a measurement without one.
 fn whole_journal(journal: Option<Vec<u8>>, journal_len: u64) -> Option<Vec<u8>> {
@@ -5134,6 +5180,105 @@ impl WorkerPool {
         // to `prove_on_slot`, which charges the SP1 execute spike to the host ledger (finding RH2).
         execute_peak_bytes: u64,
     ) -> Result<ProofOutput> {
+        match self.dispatch_proof(
+            backend,
+            elf,
+            ProveInput::Inline(input_data),
+            po2,
+            timeout,
+            on_progress,
+            min_vram_bytes,
+            exclude,
+            disabled,
+            used_slot,
+            abort_at,
+            job_po2,
+            program_id,
+            preferred_device,
+            execute_peak_bytes,
+        )? {
+            SlotProof::Proved(proof) => Ok(proof),
+            // Only a witness proof can diverge; a worker that says so of an inline one is confused.
+            SlotProof::JournalDiverged(d) => {
+                bail!(
+                    "{} answered an inline proof with JournalDiverged",
+                    d.slot_key
+                )
+            }
+        }
+    }
+
+    /// [`prove_min_vram`](Self::prove_min_vram) for a witness-construction job (plan §15.3): the
+    /// worker reads `prefix ‖ W` from `witness.input_path` itself (refusing it on a length or hash
+    /// mismatch: `ErrorKind::InputMismatch`, see `WorkerProofError::is_input_mismatch`), executes it
+    /// once with its segments under `witness.segment_dir`, and proves that execution only if its
+    /// journal hashes to `witness.expect_journal_sha256`. A run that does not reproduce the bundle is
+    /// `Ok(WitnessProveOutcome::JournalDiverged)`, never an error and never retried here. Every other
+    /// parameter, and every other outcome, is `prove_min_vram`'s. risc0 only: other workers refuse it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_witness_min_vram(
+        &self,
+        backend: &str,
+        elf: &[u8],
+        witness: &zkminer_prover_protocol::WitnessProve,
+        po2: Option<u8>,
+        timeout: Option<Duration>,
+        on_progress: Option<ProveProgress>,
+        min_vram_bytes: Option<u64>,
+        exclude: &[String],
+        disabled: &[String],
+        used_slot: &mut Option<String>,
+        abort_at: Option<Instant>,
+        job_po2: Option<SlotPo2<'_>>,
+        program_id: Option<[u8; 32]>,
+        preferred_device: Option<&str>,
+        execute_peak_bytes: u64,
+    ) -> Result<WitnessProveOutcome> {
+        Ok(
+            match self.dispatch_proof(
+                backend,
+                elf,
+                ProveInput::Witness(witness),
+                po2,
+                timeout,
+                on_progress,
+                min_vram_bytes,
+                exclude,
+                disabled,
+                used_slot,
+                abort_at,
+                job_po2,
+                program_id,
+                preferred_device,
+                execute_peak_bytes,
+            )? {
+                SlotProof::Proved(proof) => WitnessProveOutcome::Proved(proof),
+                SlotProof::JournalDiverged(d) => WitnessProveOutcome::JournalDiverged(d),
+            },
+        )
+    }
+
+    /// The dispatch behind [`prove_min_vram`](Self::prove_min_vram) and
+    /// [`prove_witness_min_vram`](Self::prove_witness_min_vram).
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_proof(
+        &self,
+        backend: &str,
+        elf: &[u8],
+        input: ProveInput<'_>,
+        po2: Option<u8>,
+        timeout: Option<Duration>,
+        on_progress: Option<ProveProgress>,
+        min_vram_bytes: Option<u64>,
+        exclude: &[String],
+        disabled: &[String],
+        used_slot: &mut Option<String>,
+        abort_at: Option<Instant>,
+        job_po2: Option<SlotPo2<'_>>,
+        program_id: Option<[u8; 32]>,
+        preferred_device: Option<&str>,
+        execute_peak_bytes: u64,
+    ) -> Result<SlotProof> {
         let mut all_keys = self.keys_for_prefix(backend);
         if all_keys.is_empty() {
             bail!("No worker registered for backend '{backend}'");
@@ -5230,7 +5375,7 @@ impl WorkerPool {
             return self.prove_on_slot(
                 &keys[0],
                 elf,
-                input_data,
+                input,
                 po2,
                 timeout,
                 on_progress,
@@ -5304,7 +5449,7 @@ impl WorkerPool {
                         return self.prove_on_slot(
                             key,
                             elf,
-                            input_data,
+                            input,
                             po2,
                             timeout,
                             on_progress,
@@ -5364,7 +5509,7 @@ impl WorkerPool {
                         return self.prove_on_slot(
                             key,
                             elf,
-                            input_data,
+                            input,
                             po2,
                             timeout,
                             on_progress,
@@ -7398,7 +7543,7 @@ impl WorkerPool {
         &self,
         key: &str,
         elf: &[u8],
-        input_data: &[u8],
+        input: ProveInput<'_>,
         po2: Option<u8>,
         timeout: Option<Duration>,
         on_progress: Option<Box<dyn Fn(f64, &str) + Send>>,
@@ -7416,7 +7561,7 @@ impl WorkerPool {
         // other-backend proof is not admitted into memory the execute window will consume. 0 (older
         // path, non-SP1, or portable executor with no server-stacking) leaves the charge unchanged.
         execute_peak_bytes: u64,
-    ) -> Result<ProofOutput> {
+    ) -> Result<SlotProof> {
         // Resolve the segment size now that the card is known: a job's size on THIS slot, else the
         // caller's `po2`. A job never reaches a slot it has no size for (`prove_min_vram` filters
         // those out); refused here too, for a caller that names the slot itself.
@@ -7802,13 +7947,18 @@ impl WorkerPool {
         static REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request_id = REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        let (input_data, witness) = match input {
+            ProveInput::Inline(bytes) => (bytes.to_vec(), None),
+            // The worker reads a witness job's input from its bundle: nothing inline.
+            ProveInput::Witness(w) => (Vec::new(), Some(w.clone())),
+        };
         if let Err(e) = handle.send(&WorkerCommand::Prove {
             request_id,
             elf: elf.to_vec(),
-            input_data: input_data.to_vec(),
+            input_data,
             po2,
             program_id,
-            witness: None,
+            witness,
         }) {
             // Send failed (broken pipe = worker died before receiving the command).
             Self::mark_slot_failed(&mut slot, entry);
@@ -7960,12 +8110,37 @@ impl WorkerPool {
                     cycles,
                     duration_secs,
                 );
-                Ok(ProofOutput {
+                Ok(SlotProof::Proved(ProofOutput {
                     journal,
                     seal,
                     duration: Duration::from_secs_f64(duration_secs),
                     cycles,
-                })
+                }))
+            }
+            // A witness proof's execution that did not reproduce its bundle. The worker and its slot
+            // are fine: the outcome is the job's, and typed, so the caller never reads it from text.
+            WorkerResponse::JournalDiverged {
+                journal,
+                journal_len,
+                journal_sha256,
+                exit_kind,
+                exit_code,
+                cycles,
+                ..
+            } if matches!(input, ProveInput::Witness(_)) => {
+                tracing::warn!(
+                    "Witness proof on {key} diverged from its bundle (exit kind {exit_kind}, code \
+                     {exit_code}, {journal_len} journal bytes, {cycles} cycles): nothing proven"
+                );
+                Ok(SlotProof::JournalDiverged(JournalDivergence {
+                    slot_key: key.to_string(),
+                    journal,
+                    journal_len,
+                    journal_sha256,
+                    exit_kind,
+                    exit_code,
+                    cycles,
+                }))
             }
             WorkerResponse::Error { kind, message, .. } => {
                 // TYPED, carrying the worker's own `kind`, so the caller does not classify this by
@@ -8897,7 +9072,7 @@ mod tests {
             .prove_on_slot(
                 "risc0:cuda:0",
                 &[],
-                &[],
+                ProveInput::Inline(&[]),
                 Some(20),
                 Some(Duration::from_secs(1)),
                 None,

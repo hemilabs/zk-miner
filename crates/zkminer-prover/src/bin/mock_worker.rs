@@ -26,6 +26,9 @@
 //!   is held.
 //! - `MOCK_HOST_ENTROPY_READS`: what an Execute reports as `host_entropy_reads`: a number, or
 //!   `unknown` for `None`. Default: 0.
+//! - `MOCK_WITNESS_DIVERGE`: set to anything to answer a witness Prove with `JournalDiverged`: the
+//!   journal is the bundle's `input_path`, the hash the complement of the expected one, and the cycles
+//!   its `w_len`. Unset = a witness Prove is answered as an inline one.
 
 use std::io::{self, BufReader, BufWriter};
 use std::time::Duration;
@@ -111,7 +114,7 @@ fn main() {
                 input_data: _,
                 po2,
                 program_id: _,
-                witness: _,
+                witness,
             } => {
                 if std::env::var_os("MOCK_SERVER_OOM").is_some() {
                     if limit_own_cgroup_memory(256 * 1024 * 1024).is_err() {
@@ -131,6 +134,24 @@ fn main() {
                     }
                 }
                 std::thread::sleep(prove_delay);
+                // A witness proof whose run did not reproduce its bundle: what the run committed is the
+                // input path's bytes, so a test sees the bundle reached the worker.
+                if let Some(w) = witness
+                    .as_ref()
+                    .filter(|_| std::env::var_os("MOCK_WITNESS_DIVERGE").is_some())
+                {
+                    let resp = WorkerResponse::JournalDiverged {
+                        request_id,
+                        journal: w.input_path.as_bytes().to_vec(),
+                        journal_len: w.input_path.len() as u32,
+                        journal_sha256: w.expect_journal_sha256.map(|b| !b),
+                        exit_kind: zkminer_prover_protocol::GUEST_EXIT_HALTED,
+                        exit_code: 0,
+                        cycles: w.w_len,
+                    };
+                    write_message(&mut stdout, &resp).unwrap();
+                    continue;
+                }
                 // 1,000 cycles, plus the segment size asked for, so a test can see which arrived.
                 let resp = WorkerResponse::ProofResult {
                     request_id,
