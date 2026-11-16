@@ -20,6 +20,11 @@
 //! - only `A`/`AAAA` records of class `IN` owned by the queried name, or by a name a `CNAME` chain
 //!   (at most 8 hops) from it leads to, are taken; at most 32 addresses.
 //!
+//! **Names are absolute.** A query carries the endpoint's host name exactly as configured, in wire
+//! form, which is always fully qualified: no `search` list, `domain` or `ndots` rule is ever
+//! applied (that is a feature of the system stub, which the broker never calls), so a name cannot
+//! be answered from the operator's search domain. A trailing dot changes nothing.
+//!
 //! **Which hosts it dials.** Only the resolver's own server list, fixed when the broker starts (the
 //! configured `[dns] servers`, or `/etc/resolv.conf`'s, read before the sandbox): nothing a job,
 //! a builder or an answer supplies ever becomes a server. The sandbox cannot say as much — Landlock
@@ -509,6 +514,15 @@ mod tests {
         assert_eq!(&q[..12], &[0xbe, 0xef, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1]);
         assert_eq!(&q[12..22], b"\x01a\x02io\x00\x00\x1c\x00\x01");
         assert_eq!(&q[22..], &[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    /// Review r1 fetch F2, for the broker's resolver: the wire name is the configured name, never
+    /// a search-list expansion, with or without a trailing dot.
+    #[test]
+    fn queries_carry_the_absolute_name_only() {
+        let q = build_query(1, &encode_name("secrets.zzz").unwrap(), QType::A);
+        assert_eq!(&q[12..q.len() - 15], b"\x07secrets\x03zzz\x00");
+        assert_eq!(encode_name("secrets.zzz.").unwrap(), encode_name("secrets.zzz").unwrap());
     }
 
     #[test]
