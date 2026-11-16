@@ -239,6 +239,15 @@ in `[egress] deny_cidrs` if it cannot.
 | `[egress] discover_public_addresses` | `true` | Learn this host's public addresses (behind NAT) at startup and every 5 minutes by asking `ns1.google.com` and `1.1.1.1` which address a DNS query came from, and refuse them. Off: list them in `deny_cidrs`. |
 | `[dev] private_network` | `false` | **Developer mode.** Lets those connections reach private destinations, so a local test network can serve programs from this machine. The only way to turn the guard off (there is no environment variable or flag). Refused on Hemi mainnet (43111); while it is on, every start logs `DEV MODE: private network access enabled — never run on a public market`, `zkminer status` prints it, and the TUI's status bar shows a red `DEV MODE` badge. Never set it on a miner that serves a public market. |
 
+The prover workers that run requesters' guests are confined before the first one runs: no
+sockets of any kind, the filesystem limited by Landlock to what proving needs (nothing of your
+home directory but `~/.risc0`/`~/.sp1` and a private temporary directory), and no reaching the
+miner or other processes; `sp1-gpu-server` likewise, under a supervisor (its socket is now
+`/tmp/zkminer-confined-<server>-<device>.sock`). This needs Linux with Landlock ABI 6, and ABI 8
+(`TSYNC`) for the SP1 worker and GPU workers that start threads before their first guest; a worker
+that cannot confine itself refuses to run guests. The CPU risc0 worker's Docker Groth16
+wrap runs in a helper process with `--network none`. See [SECURITY.md](SECURITY.md#inline-workers-confined).
+
 Unknown keys in `[dev]` and `[egress]` are errors, so a misspelt setting stops the miner
 instead of being ignored. `ZKMINER_ELF_ALLOW_PRIVATE_URLS`, which older builds read, is no
 longer read: move a test setup that used it to `[dev] private_network = true`.

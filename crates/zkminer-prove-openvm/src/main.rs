@@ -52,34 +52,50 @@ fn main() {
     }
 }
 
-/// Workers that run requester guests have no network: before the first command that carries a
-/// requester's ELF (`Execute`, `Prove`, `ProgramId`), the worker denies itself, its threads and
-/// everything it starts any socket but a Unix one, for the rest of its life
-/// (`zkminer_witness_sandbox::netdeny`), as the risc0 and SP1 workers do. This worker parses no ELF
-/// yet (it declines all three), so this only keeps it so when it does. It has nothing to download.
+/// Workers that run requester guests are confined: before the first command that carries a
+/// requester's ELF (`Execute`, `Prove`, `ProgramId`), the worker confines itself, its threads and
+/// everything it starts, for the rest of its life (`zkminer_witness_sandbox::confine`: no socket of
+/// any kind, Landlock to the system's files and its own directory, no reaching other processes), as
+/// the risc0 and SP1 workers do. This worker parses no ELF yet (it declines all three), so this only
+/// keeps it so when it does. It has nothing to download.
 ///
 /// An error means the command must not run: the caller answers it with that.
 #[cfg(target_os = "linux")]
-fn deny_network() -> Result<(), String> {
-    zkminer_witness_sandbox::netdeny::deny_network_all_threads().map_err(|e| e.to_string())
-}
-
-/// No seccomp off Linux: nothing to deny with.
-#[cfg(not(target_os = "linux"))]
-fn deny_network() -> Result<(), String> {
+fn confine() -> Result<(), String> {
+    use zkminer_witness_sandbox::confine::{self, Confinement, Rights, Sockets};
+    if confine::report().is_some() {
+        return Ok(());
+    }
+    let mut c = Confinement::with_system(Sockets::None);
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(std::path::PathBuf::from))
+    {
+        c.allow(dir, Rights::READ);
+    }
+    for dir in confine::library_path_dirs() {
+        c.allow(dir, Rights::READ);
+    }
+    let report = confine::confine_all_threads(&c).map_err(|e| e.to_string())?;
+    tracing::info!("worker confined: {report}");
     Ok(())
 }
 
-/// [`deny_network`] before a command with a requester's ELF, or the answer refusing it.
+/// No Landlock or seccomp off Linux: nothing to confine with.
+#[cfg(not(target_os = "linux"))]
+fn confine() -> Result<(), String> {
+    Ok(())
+}
+
+/// [`confine`] before a command with a requester's ELF, or the answer refusing it.
 fn guest_may_run(request_id: u64) -> std::result::Result<(), WorkerResponse> {
-    deny_network().map_err(|e| {
-        tracing::error!("cannot deny this worker the network, so it runs no guest: {e}");
+    confine().map_err(|e| {
+        tracing::error!("cannot confine this worker, so it runs no guest: {e}");
         WorkerResponse::Error {
             request_id,
             kind: ErrorKind::Internal,
             message: format!(
-                "this worker could not deny itself the network, so it runs no requester's guest: \
-                 {e}"
+                "this worker could not confine itself, so it runs no requester's guest: {e}"
             ),
         }
     })

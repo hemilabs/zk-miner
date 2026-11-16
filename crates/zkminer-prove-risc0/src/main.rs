@@ -6,7 +6,9 @@
 use std::io::{self, BufReader, BufWriter};
 use std::time::Instant;
 
+mod confinement;
 mod groth16_component;
+mod groth16_wrap;
 mod witness;
 
 use anyhow::{Context, Result};
@@ -64,6 +66,13 @@ fn use_shipped_level_zero_driver() {
 }
 
 fn main() {
+    // `--groth16-docker-helper`: the Docker Groth16 wrap's helper process (groth16_wrap.rs), which
+    // never runs a guest. It does not return.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(groth16_wrap::HELPER_ARG))
+    {
+        groth16_wrap::helper_main();
+    }
+
     // `--witness-execute`: the one-shot sandboxed execute of a witness job (witness.rs). FIRST, before
     // anything can start a thread, read a file or set up logging: it restricts itself while the
     // process still has one thread, and never loads the `sys_rand` key. It does not return.
@@ -78,6 +87,10 @@ fn main() {
     #[cfg(feature = "intel")]
     use_shipped_level_zero_driver();
 
+    // A private temporary directory, named by TMPDIR from here on, while the process has one thread:
+    // the confinement lets the worker write there and almost nowhere else (confinement.rs).
+    confinement::prepare();
+
     // Direct benchmark mode runs the operator's own guests and prints a human table to the REAL
     // stdout, so it must come before the fd-1 redirect below. It speaks no IPC.
     if std::env::args().any(|a| a == "--benchmark") {
@@ -88,6 +101,11 @@ fn main() {
                     .unwrap_or_else(|_| "info".into()),
             )
             .init();
+        // The benchmark proves on the GPU, so it is confined like any proof (confinement.rs).
+        if let Err(e) = confinement::confine() {
+            eprintln!("cannot confine this worker, so it proves nothing: {e}");
+            std::process::exit(1);
+        }
         let results = run_benchmarks();
         for r in &results {
             println!(
@@ -187,48 +205,33 @@ fn main() {
     }
 }
 
-/// Workers that run requester guests have no network. The first command that runs one (`Execute`,
-/// `Prove`, `ProgramId`, all of which parse or execute a requester's ELF) first denies this process,
-/// its threads and everything it starts any socket but a Unix one, for the rest of its life
-/// (`zkminer_witness_sandbox::netdeny`). Defense in depth: nothing the worker needs after its
-/// one-time setup reaches the network. That setup (`Warmup`: the Groth16 component's download) runs
-/// before, as the miner warms a backend before it claims its jobs; a `Warmup` after refuses rather
-/// than download (`groth16_component::ensure_installed`), and the miner runs it on a fresh worker.
+/// Workers that run requester guests are confined: the first command that runs a guest or uses the
+/// GPU (`Execute`, `Prove`, `ProgramId`, `Benchmark`, `CalibrateSegmentLimit`, the Intel warm-up's
+/// proof) first confines this process, its threads and everything it starts, for the rest of its
+/// life (`confinement`: no sockets, Landlock, no reaching other processes). That setup (`Warmup`:
+/// the Groth16 component's download) runs before, as the miner warms a backend before it claims its
+/// jobs; a `Warmup` after refuses rather than download (`groth16_component::ensure_installed`), and
+/// the miner runs it on a fresh worker.
 ///
 /// An error means the guest must not run: the caller answers the command with it.
-#[cfg(target_os = "linux")]
-fn deny_network() -> Result<(), String> {
-    zkminer_witness_sandbox::netdeny::deny_network_all_threads().map_err(|e| e.to_string())
+fn confine() -> Result<(), String> {
+    confinement::confine()
 }
 
-/// No seccomp off Linux: nothing to deny with.
-#[cfg(not(target_os = "linux"))]
-fn deny_network() -> Result<(), String> {
-    Ok(())
-}
-
-/// Whether this worker has denied itself the network ([`deny_network`]).
+/// Whether this worker has confined itself ([`confine`]), and so has no network.
 fn network_denied() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        zkminer_witness_sandbox::netdeny::is_active()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
+    confinement::is_confined()
 }
 
-/// [`deny_network`] before a guest command, or the answer refusing it.
+/// [`confine`] before a guest or GPU command, or the answer refusing it.
 fn guest_may_run(request_id: u64) -> std::result::Result<(), WorkerResponse> {
-    deny_network().map_err(|e| {
-        tracing::error!("cannot deny this worker the network, so it runs no guest: {e}");
+    confine().map_err(|e| {
+        tracing::error!("cannot confine this worker, so it runs no guest: {e}");
         WorkerResponse::Error {
             request_id,
             kind: ErrorKind::Internal,
             message: format!(
-                "this worker could not deny itself the network, so it runs no requester's guest: \
-                 {e}"
+                "this worker could not confine itself, so it runs no requester's guest: {e}"
             ),
         }
     })
@@ -284,6 +287,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
 
             WorkerCommand::Benchmark { programs } => {
                 tracing::info!("Running benchmarks...");
+                if let Err(refused) = guest_may_run(0) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 let results = run_benchmarks_streaming(&mut stdout, &programs)?;
                 let resp = WorkerResponse::BenchmarkResult { results };
                 write_message(&mut stdout, &resp)?;
@@ -585,6 +592,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
 
             WorkerCommand::CalibrateSegmentLimit { request_id, po2 } => {
                 tracing::info!("Po2 calibration requested at po2={po2}");
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 match run_po2_calibration(request_id, po2) {
                     Ok(resp) => write_message(&mut stdout, &resp)?,
                     Err(e) => {
@@ -1546,8 +1557,6 @@ fn run_proof_once(
     po2: Option<u8>,
     seed: [u8; 32],
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
-    use risc0_zkvm::ProverOpts;
-
     // TEST-ONLY: RISC0_TEST_INJECT_INVALID=N makes the first N calls return a
     // synthetic invalid-proof error before proving, to exercise the retry-on-
     // invalid wrapper deterministically (and cheaply, on any guest/GPU).
@@ -1583,9 +1592,8 @@ fn run_proof_once(
     // producing a constant-size proof (~256 bytes seal) that the on-chain
     // RiscZeroVerifierAdapter can verify.
     let prover = local_prover();
-    let opts = ProverOpts::groth16().with_dev_mode(false);
     let start = Instant::now();
-    let proved = prover.prove_with_opts(env, elf, &opts);
+    let proved = groth16_wrap::prove(&prover, env, elf);
     release_groth16_cache_if_tight();
     let prove_info = proved?;
     let duration_secs = start.elapsed().as_secs_f64();
@@ -1821,10 +1829,7 @@ fn benchmark_stages(
     // (`~/.risc0/extensions/*-risc0-groth16/stark_verify_final.zkey`), so it does not depend on the
     // program at all — which is the reason to report it apart from the stages above.
     let started = Instant::now();
-    let wrapped = prover.compress(
-        &risc0_zkvm::ProverOpts::groth16().with_dev_mode(false),
-        &succinct,
-    );
+    let wrapped = groth16_wrap::compress(&prover, &succinct);
     let wrap_secs = started.elapsed().as_secs_f64();
     // Outside the stopwatch: the release is not part of the wrap, and on a card that releases, the NEXT
     // wrap pays the reload — which is that card's honest per-proof cost.
@@ -1916,6 +1921,9 @@ const CALIBRATION_ITERS: u32 = 6_000_000;
 #[cfg(feature = "intel")]
 fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<String> {
     let component = groth16_component::ensure_installed(report)?;
+    // The warm-up proof runs on the GPU and fills the kernel caches a confined worker reads, so it
+    // runs confined too (confinement.rs).
+    confine().map_err(|e| anyhow::anyhow!("cannot confine this worker: {e}"))?;
     report(
         "Preparing GPU kernels for this card (a first run can take several minutes)",
         None,
@@ -1926,8 +1934,7 @@ fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<Str
         .write_slice(&1000u32.to_le_bytes())
         .segment_limit_po2(RISC0_DEFAULT_JOB_PO2 as u32)
         .build()?;
-    let opts = risc0_zkvm::ProverOpts::groth16().with_dev_mode(false);
-    let proved = local_prover().prove_with_opts(env, FIBONACCI_ELF, &opts);
+    let proved = groth16_wrap::prove(&local_prover(), env, FIBONACCI_ELF);
     release_groth16_cache_if_tight();
     proved?
         .receipt
@@ -1971,8 +1978,7 @@ fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
     // where the real spread is 98%, leaving its argmax to be decided by noise. It also
     // under-reports MEMORY pressure: po2=21 completes composite-only but OOMs on the
     // real groth16 path, so a composite-derived max_feasible_po2 is too optimistic.
-    let opts = risc0_zkvm::ProverOpts::groth16().with_dev_mode(false);
-    let proved = prover.prove_with_opts(env, FIBONACCI_ELF, &opts);
+    let proved = groth16_wrap::prove(&prover, env, FIBONACCI_ELF);
     release_groth16_cache_if_tight();
     let prove_info = proved?;
     let duration = start.elapsed();

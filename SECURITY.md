@@ -127,7 +127,7 @@ job there could then reach this host's private network.
 | Chain JSON-RPC (`[chain] rpc_url`) | the operator | none needed: requesters cannot change it. It may be a local node. |
 | risc0 Groth16 component download (worker warm-up) | fixed in the build (RISC Zero's artifact store), SHA-256 pinned | none needed |
 | SP1 Groth16 circuit artifacts download and size probe (SP1 worker warm-up) | fixed in the build (the SP1 SDK's artifact URL) | none needed |
-| `sp1-gpu-server` | local IPC between the SP1 worker and its server | not a network destination |
+| `sp1-gpu-server` | local IPC between the SP1 worker and its server | not a network destination; both ends confined (below) |
 | `sp1-demo` (optional command) | serves an ELF on 127.0.0.1 for a local miner | the miner needs developer mode to fetch it |
 | Witness builder fetches (`evm-rpc/v1`) | the operator's `[[evm_rpc]]` endpoints; the request body from **the builder** | the witness broker's floor (below) |
 | Witness `blob/v1` fetches | the operator's `[[blob_mirror]]` templates; the hash from **the builder** | the broker's floor; the URL is built by the broker |
@@ -135,10 +135,80 @@ job there could then reach this host's private network.
 | The broker's DNS resolver | the operator (`[dns] servers`, else `/etc/resolv.conf`) | dials only those servers; never a fetch destination |
 | Public-address discovery (miner and broker, at startup and every 5 minutes) | fixed in the build: `ns1.google.com` and `1.1.1.1` (and their IPv6 addresses), UDP port 53 | none needed: requesters cannot change them; `[egress] discover_public_addresses = false` turns it off |
 | The builder runner and the execute worker | none | seccomp denies `socket`, `socketpair` and `connect` |
+| The inline measure and prove workers (risc0, SP1, OpenVM) and `sp1-gpu-server` | none | confined before their first guest: no sockets, Unix ones included; Landlock (below) |
 | The miner's witness host (pipeline, builder runs, store) | none | talks to the broker over a Unix socket pair only |
 
-Job inputs come from the chain (calldata), not from URLs, and zkVM guests have no network
-access.
+Job inputs come from the chain (calldata), not from URLs. A zkVM guest runs in a process that is
+confined before the guest runs, and assumed compromised if the guest escapes its executor: see
+the next section.
+
+## Inline workers: confined
+
+The inline measure and prove workers run requester guests in their own process, and the GPU
+stack they need (device nodes, ioctls, threads, helper processes) rules out the sandbox profiles
+of the builder runner and the execute worker. Workers that run requester guests are confined
+instead (`zkminer_witness_sandbox::confine`), on the assumption that a guest can escape its
+executor:
+
+- **When.** Before the first command that runs a guest or uses the GPU (`Execute`, `Prove`,
+  `ProgramId`, a benchmark or calibration, an Intel warm-up's proof), for the rest of the process's
+  life, on every thread at once (seccomp `TSYNC`, Landlock `RESTRICT_SELF_TSYNC`), and inherited by
+  everything it starts. No requester's bytes are parsed and no guest runs before it is in place.
+  The one-time setup that downloads (the Groth16 artifacts, in `Warmup`) runs before; a `Warmup`
+  after refuses to download, and the miner runs it on a fresh worker. Any failure fails closed:
+  the worker answers the command with an error and runs nothing.
+- **Sockets (seccomp).** The risc0 and OpenVM workers have none at all: no `socket` or
+  `socketpair` of any domain, Unix included, and no `connect`, `bind`, `listen` or `accept`. (The
+  CUDA driver opens a listening Unix socket at `cuInit`, so a CUDA worker initialises the driver
+  first; with `accept` gone, nothing comes in through it.) The SP1 worker likewise creates no
+  socket and connects nowhere, but it and its server may make Unix stream and seqpacket
+  `socketpair`s (the SDK's tokio runtime and Rust's `Command` use them), which connect only their
+  two ends: a seqpacket socket ignores any address `sendto` gives it, and datagram pairs, which
+  would not, are refused. A proving SP1 worker starts its server and connects to it first, then
+  keeps that one connection. A socket left open from before that the policy does not allow fails
+  the confinement.
+- **Files (Landlock).** Read the system's files (`/usr`, `/etc`, `/opt`, the `lib`/`bin`
+  directories, `/sys`, `/proc`), the worker's own directory, `LD_LIBRARY_PATH`, and what the
+  backend proves with (`~/.risc0` or `RISC0_HOME`, `~/.sp1`); for witness proofs, the retention
+  store (read) and the segment directories (write). Write only a private temporary directory
+  (`TMPDIR`, made per worker, mode 0700), the GPU caches the build needs (risc0's CUDA Groth16
+  cache; the Intel SYCL and compute-runtime kernel caches) and, for SP1, `/dev/shm`. Execute only
+  the dynamic loader and what the worker must start (SP1's executor runner in its temporary
+  directory, the server's own Groth16 helper). Open only the GPU device nodes. Nothing else in the
+  home directory is readable or writable: not the dotfiles, `~/.config` (autostart, `systemd
+  --user` units, `environment.d`), `~/.ssh`, `~/.zkminer` (keys, config, the provers); `~/.risc0`
+  and `~/.sp1` (the server binaries included) are read-only. TCP bind and connect are denied by
+  Landlock as well.
+- **Other processes.** Landlock's signal and abstract-socket scoping, and its `ptrace` rules: a
+  confined process cannot signal, trace or open `/proc/<pid>/mem`, `environ`, `maps` or `fd` of a
+  process outside its domain (the miner, other workers, their servers). The miner can still signal
+  its workers. seccomp also denies `ptrace`, `process_vm_*`, `pidfd_getfd`, `io_uring`, `bpf`, the
+  kernel keyrings, `mknod`, `TIOCSTI`, and a seccomp listener of the process's own.
+- **`sp1-gpu-server`** runs every SP1 proof's guest, so it is confined from its first
+  instruction. The SDK starts it as `~/.sp1/bin/zkminer-confined-<name>`, a link to the worker,
+  which starts the real server under a supervisor: the server's `socket`, `bind`, `listen` and
+  `accept` go to the supervisor (a seccomp user notification), which lets them through until the
+  server accepts its first connection (the first moment a requester's bytes can reach it) and
+  refuses `socket`, `bind` and `listen` from then on; `connect` and every socket but a Unix stream
+  or seqpacket one are refused outright. The decision rests on the syscall and that moment, never
+  on an argument in the server's memory. Landlock as for the worker, plus creating its socket under
+  `/tmp` and executing itself (its Groth16 CPU helper); stdin is `/dev/null`. The servers'
+  host-wide Groth16 queue moves from `/run/lock` to `/dev/shm` (`SP1_GROTH16_QUEUE_DIR`). The
+  supervisor kills the server when the worker exits, and the server dies with the supervisor. Its
+  socket is `/tmp/zkminer-confined-<name>-<device>.sock`.
+- **Docker.** The CPU risc0 worker (and an Intel worker with `RISC0_GROTH16_INTEL_PROVER=docker`)
+  wraps Groth16 in RISC Zero's prover image. A confined worker cannot reach the Docker daemon (its
+  socket is root-equivalent, with the host's network), so a helper process started before the
+  confinement does the wrap: it never runs a guest, receives only an `identity_p254` seal, and
+  runs the prover image with `--network none`. The supported GPU paths (CUDA, ROCm, Intel with the
+  `risc0-groth16` component) wrap in-process and use no Docker.
+- **The miner** holds the signing key and is not dumpable (`PR_SET_DUMPABLE 0`): its `/proc`
+  entries belong to root, so no process of the same uid can read its memory or environment,
+  whatever the host's `ptrace_scope`, and it leaves no core dump.
+
+Linux with Landlock ABI 6 or later is required; a worker with more than one thread at the moment
+it confines itself (the SP1 worker, a GPU runtime's threads) needs ABI 8
+(`LANDLOCK_RESTRICT_SELF_TSYNC`), or it refuses to run guests.
 
 ## Witness jobs: the broker
 
@@ -212,6 +282,26 @@ that node can reach. The broker therefore holds them to the same rule, with netg
 - **Your own endpoints are trusted.** The chain RPC and the fixed download URLs are not
   checked by the guard: requesters cannot change them, and a local chain node is a normal
   setup.
+- **What an escaped guest in an inline worker can still do.** It cannot open a socket or
+  connect anywhere, but it keeps what the GPU stack needs: the GPU device nodes and their ioctls
+  (a kernel driver bug is outside this model), reading the system's files and `/proc` (other
+  processes' command lines and status, not their memory or environment), and writing the caches
+  listed above, which other GPU programs of the same user also load (a confined worker could
+  poison an Intel kernel cache or risc0's CUDA Groth16 cache for them). An SP1 worker and its
+  server can read and write any POSIX shared memory object and semaphore of the uid in `/dev/shm`
+  (SP1's executor needs it), the shared memory of unconfined programs of the same user included.
+  A witness proof's worker can read every bundle in the retention store, other requesters'
+  included. Its results go back to the miner over its pipe, and a guest controls its journal, so
+  anything it can read it can publish: keep secrets out of the readable paths.
+- **Descriptors passed between confined processes.** `SCM_RIGHTS` over a Unix connection hands
+  over an open socket, network ones included. The only connection a confined process keeps is an
+  SP1 worker's to its own server, and both ends are confined from before either runs a guest, so
+  neither has a network socket to pass. A confined process has no way to obtain one from an
+  unconfined process: it cannot connect to one, and only its own worker connects to a server
+  (another local program of the user could, but would have to choose to hand it a socket).
+- **The server's socket.** Before its first connection the server may create Unix sockets and
+  bind them anywhere below `/tmp`; it runs only its own code then. Other local processes of the
+  user can connect to its socket, as before.
 - **What an escaped builder can still learn about the host.** The builder runner and the
   execute worker open no files (Landlock), start in `/`, and may not call `uname`, `sysinfo`,
   `readlink*`, `access`/`faccessat*`, `statfs`/`fstatfs`, the `*getxattr`/`*listxattr` family or

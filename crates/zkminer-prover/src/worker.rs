@@ -68,6 +68,18 @@ pub fn set_risc0_sys_rand_key(key: [u8; 32], ephemeral: bool) {
     let _ = RISC0_SYS_RAND_KEY.set((key, ephemeral));
 }
 
+/// The directories a risc0 worker's witness proofs use: the retention store (read) and the root of
+/// the segment directories (written). Passed to every risc0 worker spawned from now on
+/// (`WITNESS_READ_DIR_ENV`, `WITNESS_SEGMENT_DIR_ENV`), which confines itself to them before its
+/// first guest. Unset: a worker reads and writes neither (no witness jobs).
+static RISC0_WITNESS_DIRS: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+
+/// Set the directories passed to risc0 workers spawned from now on (see `RISC0_WITNESS_DIRS`). Once
+/// per process.
+pub fn set_risc0_witness_dirs(retention: PathBuf, segments: PathBuf) {
+    let _ = RISC0_WITNESS_DIRS.set((retention, segments));
+}
+
 /// Settings of the pinned risc0 and SP1 SDKs that hand proving or execution to someone else (a
 /// remote service, an external `r0vm`, a Docker image), fetch what they prove with from elsewhere, or
 /// put them in a developer mode whose proofs are not real. No worker of the miner's uses any of them:
@@ -129,6 +141,11 @@ fn worker_env(
     // anything that asks `default_prover` gets it too.
     env.push(("RISC0_PROVER".into(), "local".into()));
     if backend.starts_with("risc0") {
+        if let Some((retention, segments)) = RISC0_WITNESS_DIRS.get() {
+            use zkminer_prover_protocol::types::{WITNESS_READ_DIR_ENV, WITNESS_SEGMENT_DIR_ENV};
+            env.push((WITNESS_READ_DIR_ENV.into(), retention.into()));
+            env.push((WITNESS_SEGMENT_DIR_ENV.into(), segments.into()));
+        }
         if let Some((key, ephemeral)) = sys_rand_key {
             env.push((SYS_RAND_KEY_ENV.into(), encode_key(key).into()));
             if *ephemeral {
@@ -758,6 +775,10 @@ impl WorkerHandle {
                 // The raw-syscall details, and why they have to be raw here, live on
                 // `memory::volunteer_as_oom_victim`. Shared with the test that checks the value
                 // actually reaches the kernel, so that test cannot pass over a deleted call.
+                // The miner is not dumpable (it holds the signing key), and a child is not until it
+                // execs: its `/proc/self` files belong to root, and `oom_score_adj` cannot be
+                // written. It is about to exec the worker, which is dumpable again anyway.
+                libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
                 crate::memory::volunteer_as_oom_victim();
                 Ok(())
             });

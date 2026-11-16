@@ -746,6 +746,15 @@ pub const SP1_NO_AUTOTUNE_ENV: &str = "ZKMINER_SP1_NO_AUTOTUNE";
 /// watchdog SIGKILL (which group-kills the worker) can never tear down a proving worker's warm server.
 pub const SP1_MEASURE_ONLY_ENV: &str = "ZKMINER_SP1_MEASURE_ONLY";
 
+/// For a risc0 worker: the retention store's directory, which its witness proofs read their input
+/// from (`WitnessProve::input_path` is below it). A worker confines itself before its first guest
+/// (Landlock), and reads nothing of the home directory afterwards that it was not told of before.
+pub const WITNESS_READ_DIR_ENV: &str = "ZKMINER_WITNESS_READ_DIR";
+
+/// For a risc0 worker: the root of the witness proofs' segment directories
+/// (`WitnessProve::segment_dir` is below it), which its confinement lets it write.
+pub const WITNESS_SEGMENT_DIR_ENV: &str = "ZKMINER_WITNESS_SEGMENT_DIR";
+
 /// Set to `0` to stop the SP1 worker installing the `sp1-gpu-server` shipped beside it over
 /// `~/.sp1/bin/sp1-gpu-server`. Shared because the dispatcher has to know which of the two servers
 /// a worker will run, to check that the card can run its GPU code.

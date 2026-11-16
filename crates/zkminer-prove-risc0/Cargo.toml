@@ -58,6 +58,8 @@ risc0-groth16 = { version = "3.0" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 liblzma = { version = "0.4", features = ["parallel"] }
 tar = "0.4"
+# The Docker Groth16 helper reads the prover image's proof (`groth16_wrap`).
+serde_json = "1"
 
 # The one-shot sandboxed witness execute (`--witness-execute`, src/witness.rs) restricts itself with it.
 [target.'cfg(target_os = "linux")'.dependencies]

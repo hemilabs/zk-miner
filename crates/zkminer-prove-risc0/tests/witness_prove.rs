@@ -34,10 +34,17 @@ struct Worker {
 }
 
 impl Worker {
-    fn start(extra_env: &[(&str, &str)]) -> Worker {
+    /// A worker whose witness proofs read and write below `dir` (the store and the segments, as
+    /// the miner tells its workers).
+    fn start(dir: &Path, extra_env: &[(&str, &str)]) -> Worker {
         let home = tempfile::tempdir().unwrap();
         let mut cmd = Command::new(WORKER);
         cmd.env_clear()
+            .env(zkminer_prover_protocol::types::WITNESS_READ_DIR_ENV, dir)
+            .env(
+                zkminer_prover_protocol::types::WITNESS_SEGMENT_DIR_ENV,
+                dir.join("segments"),
+            )
             // A key of the test's own, so nothing reads or creates ~/.zkminer.
             .env(
                 sys_rand::SYS_RAND_KEY_ENV,
@@ -195,7 +202,7 @@ fn a_wrong_journal_hash_is_journal_diverged_and_nothing_is_proven() {
     let stale = segments(dir.path()).join("7.bincode");
     std::fs::write(&stale, b"left by a crashed worker").unwrap();
 
-    let mut worker = Worker::start(&[("RISC0_TEST_INJECT_INVALID", "100")]);
+    let mut worker = Worker::start(dir.path(), &[("RISC0_TEST_INJECT_INVALID", "100")]);
     let started = Instant::now();
     match worker.prove(1, &fibonacci().0, &[], Some(witness), 20) {
         WorkerResponse::JournalDiverged {
@@ -238,7 +245,7 @@ fn a_wrong_journal_hash_is_journal_diverged_and_nothing_is_proven() {
 fn a_tampered_w_is_input_mismatch() {
     let dir = tempfile::tempdir().unwrap();
     let witness = bundle(dir.path(), &10u32.to_le_bytes(), &[], &55u64.to_le_bytes());
-    let mut worker = Worker::start(&[]);
+    let mut worker = Worker::start(dir.path(), &[]);
 
     std::fs::write(&witness.input_path, 11u32.to_le_bytes()).unwrap();
     let kind = |r: WorkerResponse| match r {
@@ -293,7 +300,7 @@ fn a_matching_journal_is_proven_from_the_one_execution_across_retries() {
     let mut prefix = [0u8; 64];
     prefix[..4].copy_from_slice(&12u32.to_le_bytes());
     let witness = bundle(dir.path(), b"W", &prefix, &144u64.to_le_bytes());
-    let mut worker = Worker::start(&[("RISC0_TEST_INJECT_INVALID", "100")]);
+    let mut worker = Worker::start(dir.path(), &[("RISC0_TEST_INJECT_INVALID", "100")]);
     match worker.prove(8, &fibonacci().0, &[], Some(witness), 18) {
         WorkerResponse::Error { kind, message, .. } => {
             assert!(
@@ -332,7 +339,7 @@ fn a_matching_journal_is_proven_on_the_cpu() {
         &prefix,
         &55u64.to_le_bytes(),
     );
-    let mut worker = Worker::start(&[]);
+    let mut worker = Worker::start(dir.path(), &[]);
     let started = Instant::now();
     match worker.prove(9, &fibonacci().0, &[], Some(witness), 16) {
         WorkerResponse::ProofResult {

@@ -2554,6 +2554,11 @@ pub async fn run(
         }
         zkminer_prover::worker::set_risc0_sys_rand_key(key, err.is_some());
     }
+    // A risc0 worker confines itself before its first guest, to what it is told of now: for witness
+    // proofs, the retention store it reads `W` from and the segment directories it writes.
+    if let Some(r) = &config.retention {
+        zkminer_prover::worker::set_risc0_witness_dirs(r.dir.clone(), r.segment_dir.clone());
+    }
     // Watch-only proves nothing, and only measures what this build serves: no worker for another
     // backend (SP1's has host-wide startup effects: it installs its bundled `sp1-gpu-server` and
     // reaps orphaned servers' sockets, beside whatever miner runs on this host).

@@ -13,7 +13,7 @@
 //!   for it. Older servers prove Groth16 in-process and have nothing to build.
 //!
 //! The downloads here are the worker's only use of the network, and only before it runs any
-//! requester's guest or starts its server (see `deny_network` in main.rs). Their clients and
+//! requester's guest or starts its server (see `confine_worker` in main.rs). Their clients and
 //! runtimes are dropped before `warm_up` returns, so no connection outlives them.
 
 use std::fs::{self, File};
@@ -37,7 +37,7 @@ const DOWNLOAD_LEFTOVER: &str = "artifacts.tar.gz";
 /// The marker the SDK's installer writes once an install is complete
 /// (`sp1_prover::build::CIRCUIT_ARTIFACTS_COMPLETE_FILE`, private), and the only thing its
 /// `try_install_circuit_artifacts` checks before it downloads the artifacts again. `sp1-gpu-server`
-/// runs that check at every Groth16 proof, with no network (see `deny_network` in main.rs), so a
+/// runs that check at every Groth16 proof, with no network (see `confine_worker` in main.rs), so a
 /// directory the warm-up calls complete must have it too.
 const SDK_COMPLETE_MARKER: &str = ".complete";
 
@@ -132,11 +132,18 @@ pub(crate) fn server_path() -> Result<PathBuf> {
 
 /// The build of `sp1-gpu-server` this worker's SDK runs: `SP1_GPU_SERVER_NAME` (set by the dispatcher
 /// for an AMD or Intel card, hemilabs/sp1 #19), else the SDK's default, the CUDA build.
+///
+/// Once a proving worker routes the SDK through its confining shim (`confinement`), the variable
+/// names the shim, `zkminer-confined-<build>`: this is still the build's own name.
 pub(crate) fn server_name() -> String {
-    std::env::var("SP1_GPU_SERVER_NAME")
+    let name = std::env::var("SP1_GPU_SERVER_NAME")
         .ok()
         .filter(|name| !name.is_empty() && !name.contains('/'))
-        .unwrap_or_else(|| "sp1-gpu-server".to_string())
+        .unwrap_or_else(|| "sp1-gpu-server".to_string());
+    match name.strip_prefix(crate::confinement::SHIM_PREFIX) {
+        Some(real) if !real.is_empty() => real.to_string(),
+        _ => name,
+    }
 }
 
 /// Whether this worker drives a CUDA card (the default server), rather than the HIP or SYCL build.
