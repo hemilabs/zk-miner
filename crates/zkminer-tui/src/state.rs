@@ -378,6 +378,81 @@ impl HeadroomView {
     }
 }
 
+/// What the brain's most recent pass did with the open work: claimed some, held every claim for one
+/// reason, or looked at each job and declined it for its own. Published by the brain each pass so
+/// the operator can see why a miner with open jobs is not claiming them without reading debug logs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaimOutlook {
+    /// The pass stopped before looking at any job (paused, benchmark running, RPC rate-limited, no
+    /// ETH for gas...): why. `None` when jobs were evaluated.
+    pub held: Option<String>,
+    /// Jobs looked at and not claimed, by reason, most common first.
+    pub declined: Vec<(String, usize)>,
+    /// Jobs this pass claimed.
+    pub claimed: usize,
+    /// Open jobs this pass did not reach (already set aside, backing off, or past the claim limit).
+    pub not_evaluated: usize,
+}
+
+impl ClaimOutlook {
+    /// How many reasons the one-line summary names before folding the rest into "N other".
+    const SHOWN_REASONS: usize = 4;
+
+    /// What the summary says, without its counts (which move every pass): the headless log repeats
+    /// the line when this changes.
+    pub fn summary_key(&self) -> String {
+        match &self.held {
+            Some(why) => format!("held:{}", why.replace(|c: char| c.is_ascii_digit(), "")),
+            None => {
+                let reasons: Vec<&str> = self.declined.iter().map(|(w, _)| w.as_str()).collect();
+                format!(
+                    "claiming:{} declined:{}",
+                    self.claimed > 0,
+                    reasons.join("|")
+                )
+            }
+        }
+    }
+
+    /// One line for the dashboard and the headless log, e.g. "2 claiming · 6 below the profit
+    /// threshold, 3 measuring cycles".
+    pub fn summary(&self) -> String {
+        if let Some(why) = &self.held {
+            return format!("not claiming: {why}");
+        }
+        let mut parts = Vec::new();
+        if self.claimed > 0 {
+            // Handed to the claim path this pass; it can still drop or refuse them.
+            parts.push(format!("{} claiming", self.claimed));
+        }
+        let mut reasons: Vec<String> = self
+            .declined
+            .iter()
+            .take(Self::SHOWN_REASONS)
+            .map(|(why, n)| format!("{n} {why}"))
+            .collect();
+        let rest: usize = self
+            .declined
+            .iter()
+            .skip(Self::SHOWN_REASONS)
+            .map(|(_, n)| n)
+            .sum();
+        if rest > 0 {
+            reasons.push(format!("{rest} other"));
+        }
+        if !reasons.is_empty() {
+            parts.push(format!("not claimed: {}", reasons.join(", ")));
+        }
+        if self.not_evaluated > 0 {
+            parts.push(format!("{} not re-checked this pass", self.not_evaluated));
+        }
+        if parts.is_empty() {
+            return "waiting for jobs".to_string();
+        }
+        parts.join(" · ")
+    }
+}
+
 /// The complete miner state, shared between TUI and background tasks.
 #[derive(Debug)]
 pub struct MinerState {
@@ -394,6 +469,11 @@ pub struct MinerState {
     pub completed_jobs: Vec<TrackedJob>,
     pub selected_job_index: usize,
     pub selected_job_id: Option<alloy_primitives::B256>,
+    /// Why each open job was not claimed when the brain last evaluated it (see [`ClaimOutlook`]).
+    /// Jobs it has not evaluated yet have no entry.
+    pub job_why: std::collections::HashMap<alloy_primitives::B256, String>,
+    /// What the brain's most recent pass did with the open work, for the dashboard's claims line.
+    pub claim_outlook: ClaimOutlook,
 
     // Benchmark
     pub benchmark_results: Option<BenchmarkSuite>,
@@ -883,6 +963,8 @@ impl Default for MinerState {
             completed_jobs: Vec::new(),
             selected_job_index: 0,
             selected_job_id: None,
+            job_why: std::collections::HashMap::new(),
+            claim_outlook: ClaimOutlook::default(),
             benchmark_results: None,
             risc0_job_po2s: Vec::new(),
             benchmark_running: false,
@@ -989,6 +1071,37 @@ pub fn new_shared_state() -> SharedState {
 
 #[cfg(test)]
 mod benchmark_tracker_tests {
+    use super::ClaimOutlook;
+
+    #[test]
+    fn the_claims_summary_says_what_the_last_pass_did() {
+        assert_eq!(ClaimOutlook::default().summary(), "waiting for jobs");
+        let held = ClaimOutlook {
+            held: Some("paused (press p to resume)".into()),
+            declined: vec![("ignored".into(), 3)],
+            ..ClaimOutlook::default()
+        };
+        assert_eq!(held.summary(), "not claiming: paused (press p to resume)");
+        let o = ClaimOutlook {
+            held: None,
+            declined: vec![
+                ("below the profit threshold".into(), 6),
+                ("waiting for its cycle measurement".into(), 3),
+                ("a".into(), 1),
+                ("b".into(), 1),
+                ("c".into(), 1),
+                ("d".into(), 2),
+            ],
+            claimed: 2,
+            not_evaluated: 4,
+        };
+        assert_eq!(
+            o.summary(),
+            "2 claiming · not claimed: 6 below the profit threshold, 3 waiting for its cycle \
+             measurement, 1 a, 1 b, 3 other · 4 not re-checked this pass"
+        );
+    }
+
     use super::*;
 
     fn event(

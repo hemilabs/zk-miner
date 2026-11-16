@@ -32,6 +32,7 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(banner_height), // Readiness banner (0 if ready)
+            Constraint::Length(1),             // Claims line: what the miner is doing and why
             Constraint::Length(3),             // CPU + ZK Engines (compact, never shrink)
             Constraint::Min(gpu_ideal),        // GPUs (protected — shrinks last)
             Constraint::Max(8),                // Wallet & Staking + Performance (shrinks first)
@@ -44,6 +45,8 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
     if show_banner {
         render_readiness_banner(f, chunks[0], state);
     }
+    render_claims_line(f, chunks[1], state);
+    let chunks = &chunks[1..];
 
     let top_cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -89,6 +92,37 @@ fn render_readiness_banner(f: &mut Frame, area: Rect, state: &MinerState) {
     ]);
 
     let paragraph = Paragraph::new(line).style(Style::default().bg(theme::base()));
+    f.render_widget(paragraph, area);
+}
+
+/// One line under the banner saying what the brain's last pass did with the open work: claimed some,
+/// held every claim (and why), or declined each job (and why). See `ClaimOutlook`.
+fn render_claims_line(f: &mut Frame, area: Rect, state: &MinerState) {
+    let outlook = &state.claim_outlook;
+    let (badge, badge_bg) = if outlook.held.is_some() {
+        (" HELD ", theme::yellow())
+    } else if outlook.claimed > 0 {
+        (" CLAIMING ", theme::green())
+    } else if outlook.declined.is_empty() {
+        (" WAITING ", theme::blue())
+    } else {
+        (" DECLINING ", theme::blue())
+    };
+    let mut spans = vec![
+        Span::styled(
+            badge,
+            Style::default()
+                .fg(theme::base())
+                .bg(badge_bg)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::styled(format!(" {}", outlook.summary()), theme::dim()),
+    ];
+    if !outlook.declined.is_empty() && outlook.held.is_none() {
+        spans.push(Span::styled("  2", theme::accent()));
+        spans.push(Span::styled(":jobs for each job's reason", theme::dim()));
+    }
+    let paragraph = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::base()));
     f.render_widget(paragraph, area);
 }
 
@@ -1249,5 +1283,74 @@ mod card_job_tests {
             throttle_marker(&["PL1".to_string(), "THERMAL".to_string()]),
             " ▼ PL1,THERMAL"
         );
+    }
+}
+
+#[cfg(test)]
+mod claims_line_tests {
+    use super::*;
+    use crate::state::ClaimOutlook;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn rendered(state: &MinerState, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| render(f, f.area(), state)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The line an operator reads to learn why open work is not being claimed must be on the
+    /// dashboard at the smallest supported size, held or not.
+    #[test]
+    fn the_dashboard_says_why_it_is_not_claiming() {
+        let mut state = MinerState {
+            claim_outlook: ClaimOutlook {
+                held: None,
+                declined: vec![("below the profit threshold".into(), 5)],
+                claimed: 0,
+                not_evaluated: 0,
+            },
+            ..MinerState::default()
+        };
+        let out = rendered(&state, 80, 24);
+        assert!(out.contains("DECLINING"), "{out}");
+        assert!(out.contains("5 below the profit threshold"), "{out}");
+        state.claim_outlook = ClaimOutlook {
+            held: Some("the startup benchmark is still running".into()),
+            ..ClaimOutlook::default()
+        };
+        let out = rendered(&state, 80, 24);
+        assert!(out.contains("HELD"), "{out}");
+        assert!(out.contains("not claiming: the startup benchmark"), "{out}");
+        let out = rendered(&MinerState::default(), 80, 24);
+        assert!(
+            out.contains("WAITING") && out.contains("waiting for jobs"),
+            "{out}"
+        );
+    }
+
+    /// With the readiness banner up too, both lines show and the panels below keep their places
+    /// (the claims line shifted every panel down one row in the layout).
+    #[test]
+    fn the_claims_line_and_the_banner_both_show() {
+        let mut state = MinerState::default();
+        state.setup_status.checked = true; // not ready: no gas, no HEMI, no stake
+        state.claim_outlook = ClaimOutlook {
+            held: Some("the startup benchmark is still running".into()),
+            ..ClaimOutlook::default()
+        };
+        let out = rendered(&state, 100, 30);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("NOT READY"), "{out}");
+        assert!(lines[1].contains("HELD"), "{out}");
+        assert!(out.contains("Recent Activity"), "{out}");
+        assert!(out.contains("Wallet & Staking"), "{out}");
     }
 }

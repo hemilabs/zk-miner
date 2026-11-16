@@ -580,4 +580,46 @@ mod tests {
         let suite = BenchmarkSuite::default();
         assert!(!suite.is_simulated());
     }
+
+    /// `zkminer run` shows each declined job's reason by matching these words in `Skip.reason`
+    /// (`decline_reason` in zkminer-cli). Rewording a reason without them turns that into a bare
+    /// "not recommended" on the operator's screen.
+    #[test]
+    fn skip_reasons_keep_the_words_the_dashboard_matches() {
+        let reason = |suite: &BenchmarkSuite, job: JobParams, threshold: f64, margin: f64| {
+            match evaluate_job(suite, &CostParams::default(), &job, threshold, margin)
+                .recommendation
+            {
+                Recommendation::Skip { reason } => reason,
+                other => panic!("expected a Skip, got {other:?}"),
+            }
+        };
+        let real = real_suite(10_000_000.0);
+        let simulated = reason(&simulated_suite(), JobParams::default(), 0.0, 1.5);
+        assert!(simulated.contains("simulated"), "{simulated}");
+        let poor = JobParams {
+            available_collateral: 0,
+            ..Default::default()
+        };
+        assert!(reason(&real, poor, 0.0, 1.5).contains("collateral"));
+        let huge = JobParams {
+            estimated_cycles: u64::MAX / 4,
+            throughput: 1_000.0,
+            ..Default::default()
+        };
+        assert!(reason(&real, huge, 0.0, 1.5).contains("deadline"));
+        // 70% of the window at margin 1.0: feasible, but high risk.
+        let tight = JobParams {
+            estimated_cycles: 7_000_000,
+            throughput: 1_000.0,
+            time_remaining: 10_000,
+            ..Default::default()
+        };
+        assert!(reason(&real, tight, 0.0, 1.0).contains("Risk"));
+        let at_max = JobParams {
+            current_price: 20_000_000_000_000_000_000,
+            ..Default::default()
+        };
+        assert!(reason(&real, at_max, f64::MAX, 1.5).contains("Profit"));
+    }
 }

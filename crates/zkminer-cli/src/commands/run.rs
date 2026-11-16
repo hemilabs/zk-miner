@@ -18,7 +18,9 @@ use zkminer_prover::dispatcher::WorkerPool;
 use zkminer_prover::engine::{backend_sources, init_worker_pool, BackendSource};
 use zkminer_strategy::cost_model::CostParams;
 use zkminer_strategy::evaluator::{evaluate_job, JobParams, Recommendation};
-use zkminer_tui::state::{new_shared_state, LogLevel, MinerJobStatus, TrackedJob, WorkerStatus};
+use zkminer_tui::state::{
+    new_shared_state, ClaimOutlook, LogLevel, MinerJobStatus, SharedState, TrackedJob, WorkerStatus,
+};
 
 use crate::journal::JobJournal;
 
@@ -194,7 +196,8 @@ fn is_invalid_proof(msg: &str) -> bool {
 /// A drain that waits for a 1-5 minute proof therefore never reaches the release step, so
 /// a supervised stop would release NOTHING — strictly worse than the pre-drain code, which
 /// released within ~2s. Supervised stops get a short drain that auto-escalates.
-static SUPERVISED_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static SUPERVISED_STOP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Drain budget for a supervised (SIGTERM) stop. DERIVED, not picked: the smallest common
 /// grace period is `docker stop` = 10s, and the ABANDON stage needs essentially all of it.
@@ -244,7 +247,8 @@ const CLAIM_INTENT_MAX_AGE_SECS: u64 = 900;
 /// key toggles `paused` too (zkminer-tui/src/app.rs), and there it means only "stop claiming
 /// new work" — gating RECOVERY on it would let an operator pause silently disable the only
 /// path that still releases a job whose earlier release failed on RPC.
-static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// `zkminer run --watch-only`: every check up to the claim runs against the live market, and the
 /// claim itself is replaced by a read-only preview that is logged. Nothing is signed or sent, no
@@ -353,6 +357,17 @@ fn sp1_seal_prefix() -> [u8; 4] {
 /// (32 each), then the 256-byte Groth16 proof.
 const SP1_GROTH16_SEAL_LEN: usize = 4 + 3 * 32 + 256;
 
+/// [`hold_instance_lock`] found the lock held by another process (as opposed to failing to open it).
+#[derive(Debug)]
+pub(crate) struct InstanceLockBusy(pub String);
+
+impl std::fmt::Display for InstanceLockBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for InstanceLockBusy {}
+
 /// One miner per home directory: two would recover, prove and release the same locks, collide on
 /// nonces, and overwrite each other's job journal (`~/.zkminer/job_journal.json`) — e.g. a second
 /// one started while the first is still draining. An exclusive `flock` on `~/.zkminer/miner.lock`,
@@ -405,12 +420,14 @@ pub(crate) fn hold_instance_lock() -> Result<()> {
         .with_context(|| format!("open {}", path.display()))?;
     match file.try_lock() {
         Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-            "another zkminer is already running from {} (it holds {}) — two would drive the same \
-             locks; stop it first (a stopping miner may still be draining)",
-            dir.display(),
-            path.display()
-        ),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(anyhow::Error::new(InstanceLockBusy(format!(
+                "another zkminer holds {} (a miner, which may still be draining, a benchmark, or a \
+                 stake/unstake/withdraw waiting at its prompt) — two would drive the same locks; \
+                 stop it first",
+                path.display()
+            ))))
+        }
         Err(std::fs::TryLockError::Error(e)) => {
             return Err(e).with_context(|| format!("lock {}", path.display()))
         }
@@ -2385,6 +2402,23 @@ fn fmt_hemi(wei: u128) -> String {
     format!("{whole}.{cents:02}")
 }
 
+/// Render a wei amount as ETH with its unit, e.g. "0.0400 ETH" (gas balances are fractions of an
+/// ETH, so whole-ETH or raw-wei text tells the operator nothing): 4 decimals, 6 below 0.01 ETH so a
+/// small balance and a small need do not print the same. `up` rounds up (for an amount needed).
+fn fmt_eth(wei: u128, up: bool) -> String {
+    const ONE_ETH: u128 = 1_000_000_000_000_000_000;
+    let places: u32 = if wei < ONE_ETH / 100 { 6 } else { 4 };
+    let unit = ONE_ETH / 10u128.pow(places);
+    let units = wei / unit + u128::from(up && !wei.is_multiple_of(unit));
+    let scale = 10u128.pow(places);
+    format!(
+        "{}.{:0width$} ETH",
+        units / scale,
+        units % scale,
+        width = places as usize
+    )
+}
+
 /// Build the collateral-starvation warning.
 ///
 /// A FUNCTION, not two inline format! calls, because there are two output channels (the
@@ -3331,18 +3365,22 @@ pub async fn run(
         });
     }
 
+    // Windows: the console's control events drive the same ladder (see `signals_windows`).
+    #[cfg(windows)]
+    super::signals_windows::spawn(sig_tx.clone(), state.clone(), headless);
+
     if headless {
         println!("zkminer running in headless mode. Press Ctrl+C to stop.");
         // Wait for the FIRST signal.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         while *sig_rx.borrow() == 0 {
             if sig_rx.changed().await.is_err() {
                 break;
             }
         }
-        // Non-unix has no signal task; fall back to plain Ctrl-C so headless does not
+        // Elsewhere there is no signal task; fall back to plain Ctrl-C so headless does not
         // park forever waiting on a channel nothing ever sends to.
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             tokio::signal::ctrl_c().await?;
             println!("\nShutting down...");
@@ -4451,6 +4489,141 @@ impl std::fmt::Display for AdmissionTally {
     }
 }
 
+/// Why each job the brain looked at this pass was not claimed, in words an operator can act on. The
+/// skips themselves log at debug (`-v`), which the operator does not see; this is what the dashboard's
+/// claims line, the Jobs screen's "Why" column and the headless claims summary are built from.
+#[derive(Default)]
+struct DeclineTally {
+    counts: std::collections::BTreeMap<&'static str, usize>,
+    why: Vec<(B256, &'static str)>,
+    seen: std::collections::HashSet<B256>,
+}
+
+impl DeclineTally {
+    /// Records a job's reason, once per pass (the open list is not deduplicated).
+    fn note(&mut self, jid: B256, why: &'static str) {
+        if !self.seen.insert(jid) {
+            return;
+        }
+        *self.counts.entry(why).or_insert(0) += 1;
+        self.why.push((jid, why));
+    }
+
+    /// The pass as the TUI shows it: declines most common first (ties by name, so the line does not
+    /// reshuffle between identical passes).
+    /// `not_evaluated` is filled in by [`publish_claim_outlook`], from the open jobs it sees.
+    fn outlook(&self, claimed: usize) -> ClaimOutlook {
+        let mut declined: Vec<(String, usize)> = self
+            .counts
+            .iter()
+            .map(|(w, n)| (w.to_string(), *n))
+            .collect();
+        declined.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ClaimOutlook {
+            held: None,
+            declined,
+            claimed,
+            not_evaluated: 0,
+        }
+    }
+}
+
+/// The operator-facing reason for an evaluation that did not recommend a claim.
+fn decline_reason(rec: &Recommendation) -> &'static str {
+    match rec {
+        Recommendation::Claim | Recommendation::AtomicFastPath => "claimable",
+        Recommendation::WatchAndWait => "waiting for the price to rise",
+        Recommendation::Skip { reason } => {
+            if reason.contains("collateral") {
+                "not enough free stake"
+            } else if reason.contains("deadline") {
+                "cannot finish before the deadline"
+            } else if reason.contains("Risk") {
+                "too risky for its window"
+            } else if reason.contains("Profit") {
+                "below the profit threshold"
+            } else if reason.contains("simulated") {
+                "benchmarks are simulated"
+            } else {
+                "not recommended"
+            }
+        }
+    }
+}
+
+/// How often the headless log repeats an unchanged claims summary; a change is logged at once
+/// (at most once per [`CLAIM_SUMMARY_MIN_GAP`]).
+const CLAIM_SUMMARY_REPEAT: Duration = Duration::from_secs(600);
+const CLAIM_SUMMARY_MIN_GAP: Duration = Duration::from_secs(60);
+
+/// Publishes a pass's [`ClaimOutlook`] and logs its summary at INFO when it changes (throttled), so a
+/// headless operator sees why open work is not being claimed without `-v`. `not_evaluated` is counted
+/// here, against the open jobs as they are now (a job evicted this pass is no longer one).
+async fn publish_claim_outlook(
+    state: &SharedState,
+    mut outlook: ClaimOutlook,
+    why: &[(B256, &'static str)],
+    claimed: &[B256],
+    last_logged: &mut Option<(std::time::Instant, String)>,
+) {
+    {
+        let mut s = state.write().await;
+        for (jid, w) in why {
+            s.job_why.insert(*jid, (*w).to_string());
+        }
+        for jid in claimed {
+            s.job_why.remove(jid);
+        }
+        let open: std::collections::HashSet<B256> =
+            s.open_jobs.iter().map(|j| j.info.job_id).collect();
+        s.job_why.retain(|jid, _| open.contains(jid));
+        if outlook.held.is_none() {
+            let looked_at = why.iter().filter(|(j, _)| open.contains(j)).count();
+            outlook.not_evaluated = open.len().saturating_sub(looked_at);
+        }
+        s.claim_outlook = outlook.clone();
+    }
+    let key = outlook.summary_key();
+    if claim_summary_due(last_logged.as_ref(), &key, std::time::Instant::now()) {
+        tracing::info!("claims: {}", outlook.summary());
+        *last_logged = Some((std::time::Instant::now(), key));
+    }
+}
+
+/// Whether the claims summary is due in the log, by its [`ClaimOutlook::summary_key`] (the reasons,
+/// not their counts, which move every pass): always the first time, then a changed key once
+/// [`CLAIM_SUMMARY_MIN_GAP`] has passed and an unchanged one every [`CLAIM_SUMMARY_REPEAT`].
+fn claim_summary_due(
+    last: Option<&(std::time::Instant, String)>,
+    key: &str,
+    now: std::time::Instant,
+) -> bool {
+    match last {
+        None => true,
+        Some((at, prev)) => {
+            let since = now.saturating_duration_since(*at);
+            if prev == key {
+                since >= CLAIM_SUMMARY_REPEAT
+            } else {
+                since >= CLAIM_SUMMARY_MIN_GAP
+            }
+        }
+    }
+}
+
+/// Publishes a pass that held every claim before looking at a job.
+async fn publish_claim_hold(
+    state: &SharedState,
+    why: String,
+    last_logged: &mut Option<(std::time::Instant, String)>,
+) {
+    let outlook = ClaimOutlook {
+        held: Some(why),
+        ..ClaimOutlook::default()
+    };
+    publish_claim_outlook(state, outlook, &[], &[], last_logged).await;
+}
+
 /// `cpu_info` of the synthetic placeholder suite (`synthetic_conservative_benchmark`), which is how
 /// a suite read back from the shared state is told apart from a measured one.
 const SYNTHETIC_SUITE_CPU: &str = "(unbenchmarked placeholder)";
@@ -4916,6 +5089,8 @@ async fn miner_brain(
     // Whether the clock-skew claim gate is closed (to log its opening and closing once), and when it
     // last re-read a header to confirm a large skew.
     let mut clock_skew_held = false;
+    // The last claims summary logged (see `publish_claim_outlook`), for its throttle.
+    let mut last_claim_summary: Option<(std::time::Instant, String)> = None;
     let mut last_skew_reread: Option<std::time::Instant> = None;
     // Where the rotating quarter of the per-tick candidate cut resumes.
     let mut candidate_rotation: usize = 0;
@@ -5576,6 +5751,23 @@ async fn miner_brain(
         }
 
         if paused || open_jobs.is_empty() {
+            if paused {
+                let why = if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                    "shutting down"
+                } else {
+                    "paused (p in the dashboard resumes)"
+                };
+                publish_claim_hold(&state, why.into(), &mut last_claim_summary).await;
+            } else {
+                publish_claim_outlook(
+                    &state,
+                    ClaimOutlook::default(),
+                    &[],
+                    &[],
+                    &mut last_claim_summary,
+                )
+                .await;
+            }
             continue;
         }
         // The hard concurrency cap still applies: look-ahead queues CLAIMS, it does not run
@@ -5730,6 +5922,12 @@ async fn miner_brain(
                     stall_pct.unwrap_or(0.0),
                     avail_gib,
                 );
+                publish_claim_hold(
+                    &state,
+                    format!("host memory under pressure ({avail_gib:.1} GiB free)"),
+                    &mut last_claim_summary,
+                )
+                .await;
                 continue;
             }
             zkminer_prover::memory::PressureState::Critical => {
@@ -5747,6 +5945,12 @@ async fn miner_brain(
                     stall_pct.unwrap_or(0.0),
                     avail_gib,
                 );
+                publish_claim_hold(
+                    &state,
+                    format!("host memory critical ({avail_gib:.1} GiB free)"),
+                    &mut last_claim_summary,
+                )
+                .await;
                 continue;
             }
         }
@@ -5773,6 +5977,15 @@ async fn miner_brain(
             max_concurrent.saturating_mul(3)
         };
         if needing_card(&in_flight, &proved) >= claim_ceiling {
+            publish_claim_hold(
+                &state,
+                format!(
+                    "every slot is taken ({} job(s) held, limit {claim_ceiling})",
+                    needing_card(&in_flight, &proved)
+                ),
+                &mut last_claim_summary,
+            )
+            .await;
             continue;
         }
 
@@ -5800,6 +6013,15 @@ async fn miner_brain(
                     client.jammed_nonce()
                 );
             }
+            publish_claim_hold(
+                &state,
+                format!(
+                    "a transaction is stuck at nonce {:?}; held jobs continue",
+                    client.jammed_nonce()
+                ),
+                &mut last_claim_summary,
+            )
+            .await;
             continue;
         }
 
@@ -5831,6 +6053,12 @@ async fn miner_brain(
                 }
             }
             if pause_seen.is_some_and(|(_, p)| p) {
+                publish_claim_hold(
+                    &state,
+                    "the protocol is paused on-chain".into(),
+                    &mut last_claim_summary,
+                )
+                .await;
                 continue;
             }
         }
@@ -5893,6 +6121,12 @@ async fn miner_brain(
                         tracing::warn!("{msg}");
                     }
                     clock_skew_held = true;
+                    publish_claim_hold(
+                        &state,
+                        format!("clock skew — {why}"),
+                        &mut last_claim_summary,
+                    )
+                    .await;
                     continue;
                 }
                 None if clock_skew_held => {
@@ -5947,6 +6181,18 @@ async fn miner_brain(
                         in_flight.len()
                     );
                 }
+                publish_claim_hold(
+                    &state,
+                    format!(
+                        "not enough ETH for gas: have {}, need {} for {} held fulfil(s) plus one \
+                         claim",
+                        fmt_eth(eth, false),
+                        fmt_eth(need, true),
+                        in_flight.len()
+                    ),
+                    &mut last_claim_summary,
+                )
+                .await;
                 continue;
             }
         }
@@ -5996,6 +6242,12 @@ async fn miner_brain(
                         ),
                     );
                 }
+                publish_claim_hold(
+                    &state,
+                    "the RPC is rate-limiting this miner; backing off".into(),
+                    &mut last_claim_summary,
+                )
+                .await;
                 continue;
             }
         }
@@ -6030,12 +6282,27 @@ async fn miner_brain(
                         CLAIM_FRESHNESS_MAX.as_secs()
                     );
                 }
+                publish_claim_hold(
+                    &state,
+                    format!(
+                        "chain data is stale (no successful refresh in {}s; is the RPC failing?)",
+                        CLAIM_FRESHNESS_MAX.as_secs()
+                    ),
+                    &mut last_claim_summary,
+                )
+                .await;
                 continue;
             }
         }
 
         // The startup benchmark has the cards. Held-lock recovery is not behind this.
         if state.read().await.startup_benchmark_pending {
+            publish_claim_hold(
+                &state,
+                "the startup benchmark is still running".into(),
+                &mut last_claim_summary,
+            )
+            .await;
             continue;
         }
 
@@ -6064,6 +6331,12 @@ async fn miner_brain(
             }
             None => {
                 // No benchmarks yet — evaluator can't make a safe decision.
+                publish_claim_hold(
+                    &state,
+                    "no benchmark results yet (run `zkminer benchmark`)".into(),
+                    &mut last_claim_summary,
+                )
+                .await;
                 continue;
             }
         };
@@ -6188,13 +6461,29 @@ async fn miner_brain(
         }
         other_backend_in_flight.retain(|j| in_flight.contains_key(j));
         sp1_in_flight.retain(|j| in_flight.contains_key(j));
+        // Why each job looked at this pass was not claimed (see `DeclineTally`), starting with the
+        // ones this filter sets aside before the loop.
+        let mut declines = DeclineTally::default();
         let mut candidates: Vec<_> = open_jobs
             .iter()
             .filter(|j| !in_flight.contains_key(&j.info.job_id))
             .filter(|j| !undecodable_now.contains(&j.info.job_id))
-            .filter(|j| !claim_backing_off(j.info.job_id))
-            .filter(|j| claim_predicate_now || !job_is_bound(j.info.job_id))
-            .filter(|j| !program_has_no_elf_source(j.info.program_id))
+            .filter(|j| {
+                let jid = j.info.job_id;
+                let why = if claim_backing_off(jid) {
+                    Some("backing off after a refused claim")
+                } else if !claim_predicate_now && job_is_bound(jid) {
+                    Some("bound job (claim_predicate_jobs is off)")
+                } else if program_has_no_elf_source(j.info.program_id) {
+                    Some("its program has no ELF download")
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    declines.note(jid, why);
+                }
+                why.is_none()
+            })
             .collect();
         candidates.sort_by_key(|j| std::cmp::Reverse(j.current_price));
         cut_candidates(&mut candidates, &mut candidate_rotation);
@@ -6262,6 +6551,7 @@ async fn miner_brain(
                         "Skipping {}: no status in batch (revert/RPC miss)",
                         short_id(jid)
                     );
+                    declines.note(jid, "its status could not be read");
                     continue;
                 }
             };
@@ -6288,6 +6578,7 @@ async fn miner_brain(
                     .saturating_sub(zkminer_chain::client::chain_now_floor());
                 tracing::debug!("Skipping {}: a bid is live for {left}s more", short_id(jid));
                 note_job_retry_after(jid, Duration::from_secs(left.clamp(30, 3600)));
+                declines.note(jid, "a bid is live");
                 continue;
             }
             // EVICT a descriptor whose fulfill payload a prior measurement found to be over the
@@ -6358,6 +6649,7 @@ async fn miner_brain(
                      pending)",
                     short_id(jid)
                 );
+                declines.note(jid, "SP1 program has no ELF hash yet");
                 continue;
             }
             // SKIP (not evict) a program whose NON-predicate pre-fulfill simulation reverted recently.
@@ -6374,6 +6666,7 @@ async fn miner_brain(
                      revert, so not evicted)",
                     short_id(jid)
                 );
+                declines.note(jid, "fulfil simulation reverted recently");
                 continue;
             }
             // EVICT a job at MAX_REOPEN_COUNT (10) reopens: the router refuses every further claim
@@ -6387,17 +6680,20 @@ async fn miner_brain(
             // below our high-water floor, a live bid, a pause, a free-stake shortfall): re-quote it after
             // a short back-off rather than every tick.
             if claim_backing_off(jid) {
+                declines.note(jid, "backing off after a refused claim");
                 continue;
             }
             // A submitter whose job measured clean and then faulted after the claim, or the global
             // divergence breaker (see `note_post_claim_divergence`): no measure slot, no claim.
             if let Some(b) = resolve_backend(snapshot.proof_system_id) {
                 if divergence_blocks_claim(job.info.caller, job.info.program_id, b) {
+                    declines.note(jid, "held by the divergence breaker");
                     continue;
                 }
             }
             // FULL/FIELDS-bound with bound-job claiming off: settled by its one descriptor fetch.
             if !claim_predicate_now && job_is_bound(jid) {
+                declines.note(jid, "bound job (claim_predicate_jobs is off)");
                 continue;
             }
             // Proving-time budget if we claim now. getJobStatusView.timeRemaining is
@@ -6427,6 +6723,7 @@ async fn miner_brain(
                     "Skipping {}: the deployment is not verified right now",
                     short_id(jid)
                 );
+                declines.note(jid, "the deployment is not verified");
                 continue;
             }
             match resolve_backend(snapshot.proof_system_id) {
@@ -6436,6 +6733,7 @@ async fn miner_brain(
                         short_id(jid),
                         snapshot.proof_system_id
                     );
+                    declines.note(jid, "unsupported proof system");
                     continue;
                 }
                 Some("risc0") if !risc0_claimable() => {
@@ -6446,6 +6744,7 @@ async fn miner_brain(
                         "Skipping {}: risczero.groth16.v1 is not verified claimable right now",
                         short_id(jid)
                     );
+                    declines.note(jid, "risc0 verifier not verified");
                     continue;
                 }
                 Some("sp1") if !sp1_claimable() => {
@@ -6454,6 +6753,7 @@ async fn miner_brain(
                         "Skipping {}: sp1.groth16.v1 is not verified claimable right now",
                         short_id(jid)
                     );
+                    declines.note(jid, "SP1 verifier not verified");
                     continue;
                 }
                 Some(backend) => {
@@ -6478,6 +6778,7 @@ async fn miner_brain(
                             time_remaining,
                             min_deadline_floor
                         );
+                        declines.note(jid, "window too short to claim");
                         continue;
                     }
                     // Snapshot the backend sources ONCE so `available` and `sim_mode`
@@ -6509,6 +6810,7 @@ async fn miner_brain(
                             "Skipping {}: {backend} is disabled in settings",
                             short_id(jid)
                         );
+                        declines.note(jid, "proof system disabled in settings");
                         continue;
                     }
                     // And a backend whose every DEVICE is switched off is just as unclaimable, even
@@ -6524,6 +6826,7 @@ async fn miner_brain(
                                     "Skipping {}: every {backend} device is disabled in settings",
                                     short_id(jid)
                                 );
+                                declines.note(jid, "its cards are disabled in settings");
                                 continue;
                             }
                         }
@@ -6558,6 +6861,7 @@ async fn miner_brain(
                                          done"
                                     );
                                 }
+                                declines.note(jid, "prover setup still running");
                                 continue;
                             }
                         }
@@ -6588,6 +6892,7 @@ async fn miner_brain(
                                 .await
                                 .add_log(LogLevel::Warn, detail.to_string());
                         }
+                        declines.note(jid, "no card has a risc0 job size");
                         continue;
                     }
                     if !sim_mode {
@@ -6617,6 +6922,7 @@ async fn miner_brain(
                                     .count();
                                 let room = pool.sp1_concurrent_capacity().unwrap_or(usize::MAX);
                                 if waiting > room.max(1) {
+                                    declines.note(jid, "SP1 jobs already queued");
                                     continue;
                                 }
                             }
@@ -6653,6 +6959,7 @@ async fn miner_brain(
                                     // showed "Queued (waiting for GPU)" about idle cards.
                                     state.write().await.add_log(LogLevel::Warn, detail);
                                 }
+                                declines.note(jid, "not enough host RAM");
                                 continue;
                             }
                         }
@@ -6663,6 +6970,7 @@ async fn miner_brain(
                             short_id(jid),
                             backend
                         );
+                        declines.note(jid, "no worker here proves it");
                         continue;
                     }
                 }
@@ -6714,6 +7022,7 @@ async fn miner_brain(
                     short_id(jid),
                     adapter_info.status
                 );
+                declines.note(jid, "proof system not active on-chain");
                 continue;
             }
 
@@ -6824,6 +7133,7 @@ async fn miner_brain(
                                 peak as f64 / (1024.0 * 1024.0 * 1024.0),
                             );
                         }
+                        declines.note(jid, "too heavy for this host's RAM");
                         continue;
                     }
                 }
@@ -6929,6 +7239,7 @@ async fn miner_brain(
                          guaranteed-revert fulfill",
                         short_id(jid)
                     );
+                    declines.note(jid, "fulfil over the on-chain size cap");
                     continue;
                 }
             }
@@ -6952,6 +7263,7 @@ async fn miner_brain(
                         "Skipping {} this tick: its collateral terms are not read yet",
                         short_id(jid)
                     );
+                    declines.note(jid, "collateral terms not read yet");
                     continue;
                 }
             };
@@ -7137,6 +7449,7 @@ async fn miner_brain(
                         // too — so set the job aside rather than let it hold a slot of the per-tick
                         // candidate cut on every tick.
                         set_job_aside(jid, UNMEASURABLE_RETRY_TTL);
+                        declines.note(jid, "too large for proving_timeout_secs");
                         continue;
                     }
                 }
@@ -7422,6 +7735,29 @@ async fn miner_brain(
                     deadline_safety_margin,
                 );
             }
+            if !(would_commit && matches!(eval.recommendation, Recommendation::Claim)) {
+                use zkminer_strategy::queue::Rejection;
+                let why = if !matches!(eval.recommendation, Recommendation::Claim) {
+                    decline_reason(&eval.recommendation)
+                } else if !measurable {
+                    if backend_measurable {
+                        "measuring its cycles"
+                    } else {
+                        "its cycles cannot be measured here"
+                    }
+                } else if let Some(r) = plan_rejection.as_ref() {
+                    match r {
+                        Rejection::HorizonFull => "the look-ahead queue is full",
+                        Rejection::DeadlineInfeasible => "would miss its deadline in the queue",
+                        Rejection::NoUsableDevice => "no card can take it",
+                    }
+                } else if planner_active && !model_complete {
+                    "queue model catching up"
+                } else {
+                    "every card is busy"
+                };
+                declines.note(jid, why);
+            }
             if would_commit && matches!(eval.recommendation, Recommendation::Claim) {
                 claimed_this_tick = true;
                 // Reserve the slot + collateral NOW (like the single-claim path always
@@ -7481,6 +7817,19 @@ async fn miner_brain(
                     break;
                 }
             }
+        }
+
+        // Why each job looked at this pass was not claimed, for the dashboard and the headless log.
+        {
+            let claimed: Vec<B256> = batch.iter().map(|(j, _, _)| j.info.job_id).collect();
+            publish_claim_outlook(
+                &state,
+                declines.outlook(claimed.len()),
+                &declines.why,
+                &claimed,
+                &mut last_claim_summary,
+            )
+            .await;
         }
 
         // What admission saw this pass: why work that was offered was or was not claimed, and how
@@ -15229,6 +15578,173 @@ mod r2_sizing_tests {
         let mut measured = zkminer_prover::benchmark::BenchmarkSuite::default();
         measured.cpu_info = "AMD Ryzen Threadripper 3970X 32-Core Processor".to_string();
         assert!(!is_synthetic_suite(&measured));
+    }
+
+    /// Declines are counted per reason, most common first (ties by name, so identical passes give
+    /// an identical line), and each job keeps its own reason for the Jobs screen.
+    #[test]
+    fn the_decline_tally_counts_reasons_and_keeps_each_jobs() {
+        let mut t = DeclineTally::default();
+        let (a, b, c) = (
+            B256::repeat_byte(1),
+            B256::repeat_byte(2),
+            B256::repeat_byte(3),
+        );
+        t.note(a, "below the profit threshold");
+        t.note(b, "a bid is live");
+        t.note(c, "below the profit threshold");
+        t.note(a, "a different reason, same job, same pass");
+        let o = t.outlook(1);
+        assert_eq!(
+            o.declined,
+            vec![
+                ("below the profit threshold".to_string(), 2),
+                ("a bid is live".to_string(), 1)
+            ],
+            "a job is counted once per pass"
+        );
+        assert_eq!((o.claimed, o.held), (1, None));
+        assert_eq!(
+            t.why,
+            vec![
+                (a, "below the profit threshold"),
+                (b, "a bid is live"),
+                (c, "below the profit threshold"),
+            ]
+        );
+    }
+
+    /// The evaluator's free-text reasons map onto the operator's words.
+    #[test]
+    fn evaluator_skips_read_as_operator_reasons() {
+        let skip = |r: &str| Recommendation::Skip {
+            reason: r.to_string(),
+        };
+        assert_eq!(
+            decline_reason(&skip("Insufficient collateral")),
+            "not enough free stake"
+        );
+        assert_eq!(
+            decline_reason(&skip("Cannot finish before deadline")),
+            "cannot finish before the deadline"
+        );
+        assert_eq!(
+            decline_reason(&skip("Risk level too high")),
+            "too risky for its window"
+        );
+        assert_eq!(
+            decline_reason(&skip(
+                "Profit rate 1.0 HEMI/day below threshold 2.0 HEMI/day"
+            )),
+            "below the profit threshold"
+        );
+        assert_eq!(
+            decline_reason(&skip(
+                "Benchmarks are simulated — cannot reliably estimate proving time"
+            )),
+            "benchmarks are simulated"
+        );
+        assert_eq!(
+            decline_reason(&Recommendation::WatchAndWait),
+            "waiting for the price to rise"
+        );
+    }
+
+    /// The headless claims line: logged at once the first time, a change at most once a minute,
+    /// an unchanged one every ten minutes — "changed" meaning the reasons, not their counts.
+    #[test]
+    fn the_claims_summary_is_logged_on_change_and_throttled() {
+        let t0 = std::time::Instant::now();
+        let key = |claimed, n| {
+            ClaimOutlook {
+                declined: vec![("below the profit threshold".to_string(), n)],
+                claimed,
+                ..ClaimOutlook::default()
+            }
+            .summary_key()
+        };
+        let last = (t0, key(0, 37));
+        assert!(claim_summary_due(None, "x", t0));
+        let later = |s| t0 + Duration::from_secs(s);
+        assert!(
+            !claim_summary_due(Some(&last), &key(0, 41), later(120)),
+            "counts moved only"
+        );
+        assert!(claim_summary_due(
+            Some(&last),
+            &key(0, 41),
+            t0 + CLAIM_SUMMARY_REPEAT
+        ));
+        assert!(!claim_summary_due(Some(&last), &key(2, 37), later(30)));
+        assert!(claim_summary_due(
+            Some(&last),
+            &key(2, 37),
+            t0 + CLAIM_SUMMARY_MIN_GAP
+        ));
+    }
+
+    #[test]
+    fn eth_amounts_read_in_eth() {
+        assert_eq!(fmt_eth(40_000_000_000_000_000, false), "0.0400 ETH");
+        assert_eq!(fmt_eth(1_234_500_000_000_000_000, false), "1.2345 ETH");
+        assert_eq!(fmt_eth(0, false), "0.000000 ETH");
+        // Small amounts keep their difference: have 0.00012, need 0.00018.
+        assert_eq!(fmt_eth(120_000_000_000_000, false), "0.000120 ETH");
+        assert_eq!(fmt_eth(180_000_000_000_000, true), "0.000180 ETH");
+        // A need is never shown below itself.
+        assert_eq!(fmt_eth(180_000_000_000_001, true), "0.000181 ETH");
+        assert_eq!(fmt_eth(180_000_000_000_001, false), "0.000180 ETH");
+    }
+
+    /// Publishing a pass records each job's reason, drops claimed jobs and jobs no longer open.
+    #[tokio::test]
+    async fn a_published_pass_reaches_the_jobs_screen() {
+        let state = new_shared_state();
+        let (open, claimed, gone) = (
+            B256::repeat_byte(7),
+            B256::repeat_byte(9),
+            B256::repeat_byte(8),
+        );
+        {
+            let mut s = state.write().await;
+            for id in [open, claimed] {
+                s.open_jobs.push(TrackedJob {
+                    info: zkminer_chain::jobs::JobInfo {
+                        job_id: id,
+                        ..Default::default()
+                    },
+                    status: MinerJobStatus::Open,
+                    current_price: 0,
+                    gpu_bus_id: None,
+                    prover_backend: String::new(),
+                    estimated_cycles: 0,
+                });
+            }
+            s.job_why.insert(gone, "stale".into());
+            s.job_why.insert(claimed, "earlier reason".into());
+        }
+        let mut last = None;
+        let mut t = DeclineTally::default();
+        t.note(open, "a bid is live");
+        t.note(gone, "evicted later this pass");
+        publish_claim_outlook(&state, t.outlook(1), &t.why, &[claimed], &mut last).await;
+        let s = state.read().await;
+        // Two open: `open` was looked at; `claimed` was not (it is the claim); `gone` is no longer
+        // open, so it is not counted either way.
+        assert_eq!(s.claim_outlook.not_evaluated, 1);
+        assert_eq!(
+            s.job_why.get(&open).map(String::as_str),
+            Some("a bid is live")
+        );
+        assert!(
+            !s.job_why.contains_key(&claimed),
+            "a claimed job keeps no decline reason"
+        );
+        assert!(
+            !s.job_why.contains_key(&gone),
+            "a job no longer open keeps no reason"
+        );
+        assert!(last.is_some(), "the first summary is logged");
     }
 
     /// Each candidate lands under its first reason, and the summary names only what happened.

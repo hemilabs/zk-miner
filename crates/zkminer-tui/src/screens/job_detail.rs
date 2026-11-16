@@ -11,9 +11,19 @@ use crate::state::{MinerJobStatus, MinerState};
 use crate::theme;
 
 pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
+    // The job Enter picked, by id: the open list reorders by price every pass, so its index alone
+    // would show a different job a moment later.
+    let by_id = |id| {
+        state
+            .open_jobs
+            .iter()
+            .chain(state.active_jobs.iter())
+            .find(|j| j.info.job_id == id)
+    };
     let selected = state
-        .open_jobs
-        .get(state.selected_job_index)
+        .selected_job_id
+        .and_then(by_id)
+        .or_else(|| state.open_jobs.get(state.selected_job_index))
         .or_else(|| state.active_jobs.first());
 
     let block = Block::default()
@@ -58,12 +68,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
         ]),
         Line::from(vec![
             Span::styled("Status:        ", theme::dim()),
-            Span::raw(
-                format!("{:?}", job.status)
-                    .chars()
-                    .take(30)
-                    .collect::<String>(),
-            ),
+            Span::raw(super::jobs::job_status_text(job, state)),
         ]),
         Line::from(vec![
             Span::styled("Descriptor:    ", theme::dim()),

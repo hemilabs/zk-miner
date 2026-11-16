@@ -272,6 +272,8 @@ fn handle_key(state: &mut MinerState, key: crossterm::event::KeyEvent) -> PostKe
         KeyCode::Up | KeyCode::Char('k') => match state.current_screen {
             Screen::Jobs => {
                 state.selected_job_index = state.selected_job_index.saturating_sub(1);
+                // Job Detail then follows the highlight, not the job Enter picked earlier.
+                state.selected_job_id = None;
             }
             Screen::Logs => {
                 state.log_scroll = state.log_scroll.saturating_add(1);
@@ -288,6 +290,7 @@ fn handle_key(state: &mut MinerState, key: crossterm::event::KeyEvent) -> PostKe
             Screen::Jobs => {
                 let max = state.open_jobs.len().saturating_sub(1);
                 state.selected_job_index = (state.selected_job_index + 1).min(max);
+                state.selected_job_id = None;
             }
             Screen::Logs => {
                 state.log_scroll = state.log_scroll.saturating_sub(1);

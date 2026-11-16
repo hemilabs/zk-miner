@@ -33,15 +33,16 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PageToDashboard {
 #[derive(Parser)]
 #[command(
     name = "zkminer",
+    version,
     about = "ZK Miner — HemiProve proving marketplace client"
 )]
 struct Cli {
     /// Path to config file (default: ~/.zkminer/config.toml)
-    #[arg(long, short)]
+    #[arg(long, short, global = true)]
     config: Option<String>,
 
-    /// Verbosity level
-    #[arg(long, short, action = clap::ArgAction::Count)]
+    /// Verbosity level (-v debug, -vv more, -vvv trace)
+    #[arg(long, short, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
     #[command(subcommand)]
@@ -67,6 +68,42 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Request stake back out (it can be withdrawn 7 days later with `zkminer withdraw`), or
+    /// cancel a pending request
+    #[command(group(clap::ArgGroup::new("what").required(true).args(["amount", "all", "cancel"])))]
+    Unstake {
+        /// Amount in HEMI (e.g. `100`, or `4.25`). NOT wei.
+        amount: Option<String>,
+        /// Request all free stake (stake locked in jobs stays until they settle)
+        #[arg(long)]
+        all: bool,
+        /// Cancel the pending request, counting it back as stake
+        #[arg(long)]
+        cancel: bool,
+        /// Check it against the contract and send nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Send even though the miner may be running with this key. Risks displacing a pending
+        /// fulfillJob and getting it slashed.
+        #[arg(long)]
+        force: bool,
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Withdraw a matured unstake and any payouts the router holds for this account
+    Withdraw {
+        /// Check it against the contract and send nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Send even though the miner may be running with this key. Risks displacing a pending
+        /// fulfillJob and getting it slashed.
+        #[arg(long)]
+        force: bool,
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Run benchmarks to measure proving performance
     Benchmark {
         /// Output results as JSON instead of a formatted table
@@ -81,7 +118,8 @@ enum Commands {
     },
     /// Start the miner
     Run {
-        /// Run in headless mode (no TUI, log to console)
+        /// Run in headless mode (no TUI, log to console). Chosen automatically when stdout is not a
+        /// terminal (a service, `nohup`, or a container started without `-t`).
         #[arg(long)]
         headless: bool,
         /// Run in mock mode (simulated marketplace, no chain/wallet needed)
@@ -154,7 +192,8 @@ enum Commands {
         /// Target network: "testnet" (default) or "mainnet"
         #[arg(long, default_value = "testnet")]
         network: String,
-        /// Generate a fresh private key and save to ~/.zkminer/key
+        /// Generate a private key into ~/.zkminer/key (readable by you only; an existing key there
+        /// is kept, never overwritten) and point the config at it
         #[arg(long)]
         generate_key: bool,
     },
@@ -166,9 +205,14 @@ async fn main() -> Result<()> {
 
     // Only setup stderr tracing for headless/CLI modes.
     // In TUI mode, any stderr output (from any thread) corrupts the alternate screen.
-    let is_tui = matches!(&cli.command,
+    let tui_requested = matches!(&cli.command,
         Commands::Run { headless, watch_only, .. } if !headless && !watch_only
     );
+    // The TUI draws on stdout. Without a terminal there (a systemd unit, `nohup`, `docker run`
+    // without `-t`) it cannot start, and the miner used to come up, fail to enter raw mode, log that
+    // to a file and shut down. Run headless instead, and say so.
+    let no_terminal = tui_requested && !stdout_is_terminal();
+    let is_tui = tui_requested && !no_terminal;
     // Hold the log guard until main() returns so the non-blocking writer flushes on shutdown.
     let mut _log_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
 
@@ -231,7 +275,15 @@ async fn main() -> Result<()> {
             .with_env_filter(EnvFilter::new(filter))
             .with_writer(std::io::stderr)
             .with_target(false)
+            // Colour codes only for a terminal: journald and `docker logs` show them as text.
+            .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
             .init();
+    }
+    if no_terminal {
+        tracing::warn!(
+            "stdout is not a terminal, so the dashboard cannot start: running headless (logs on \
+             stderr). Pass --headless to make this explicit."
+        );
     }
 
     let config_path = cli.config.as_deref().map(std::path::Path::new);
@@ -244,10 +296,33 @@ async fn main() -> Result<()> {
             force,
             yes,
         } => commands::stake::run(config_path, amount, dry_run, force, yes).await,
+        Commands::Unstake {
+            amount,
+            all,
+            cancel,
+            dry_run,
+            force,
+            yes,
+        } => {
+            let action = match (amount, all, cancel) {
+                (_, _, true) => commands::unstake::UnstakeAction::Cancel,
+                (_, true, _) => commands::unstake::UnstakeAction::All,
+                (Some(a), _, _) => commands::unstake::UnstakeAction::Amount(a),
+                (None, false, false) => unreachable!("clap requires one of them"),
+            };
+            commands::unstake::run_unstake(config_path, action, dry_run, force, yes).await
+        }
+        Commands::Withdraw {
+            dry_run,
+            force,
+            yes,
+        } => commands::unstake::run_withdraw(config_path, dry_run, force, yes).await,
         Commands::Benchmark { json, calibrate } => {
             commands::benchmark::run(config_path, json, calibrate).await
         }
-        Commands::Run { headless, mock, .. } if mock => commands::mock::run(headless).await,
+        Commands::Run { headless, mock, .. } if mock => {
+            commands::mock::run(headless || no_terminal).await
+        }
         Commands::Run {
             headless,
             watch_only,
@@ -255,7 +330,7 @@ async fn main() -> Result<()> {
             ..
         } => {
             let watch = watch_only.then_some(commands::run::WatchOnly { address });
-            commands::run::run(config_path, headless || watch_only, watch).await
+            commands::run::run(config_path, headless || watch_only || no_terminal, watch).await
         }
         Commands::Simulate {
             jobs,
@@ -297,6 +372,11 @@ async fn main() -> Result<()> {
             generate_key,
         } => commands::init::run(config_path, force, &network, generate_key),
     }
+}
+
+/// Whether the TUI can draw: it renders on stdout.
+fn stdout_is_terminal() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdout())
 }
 
 /// A `simulate` bound in seconds, clamped to `MIN_BOUND_SECS..=86400`: below the minimum a request's
@@ -369,6 +449,32 @@ mod tests {
         assert!(
             Cli::try_parse_from(["zkminer", "run", "--watch-only", "--address", "0x12"]).is_err()
         );
+    }
+
+    #[test]
+    fn unstake_takes_exactly_one_of_an_amount_all_or_cancel() {
+        assert!(Cli::try_parse_from(["zkminer", "unstake", "100"]).is_ok());
+        assert!(Cli::try_parse_from(["zkminer", "unstake", "--all", "--dry-run"]).is_ok());
+        assert!(Cli::try_parse_from(["zkminer", "unstake", "--cancel", "-y"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["zkminer", "unstake"]).is_err(),
+            "nothing to do"
+        );
+        assert!(Cli::try_parse_from(["zkminer", "unstake", "100", "--all"]).is_err());
+        assert!(Cli::try_parse_from(["zkminer", "unstake", "--all", "--cancel"]).is_err());
+        assert!(Cli::try_parse_from(["zkminer", "withdraw", "--dry-run"]).is_ok());
+    }
+
+    #[test]
+    fn global_flags_work_after_the_subcommand() {
+        let cli = Cli::try_parse_from(["zkminer", "run", "-v", "-v", "--headless", "-c", "x.toml"])
+            .unwrap();
+        assert_eq!(cli.verbose, 2);
+        assert_eq!(cli.config.as_deref(), Some("x.toml"));
+        let cli = Cli::try_parse_from(["zkminer", "-v", "status"]).unwrap();
+        assert_eq!(cli.verbose, 1);
+        let e = Cli::try_parse_from(["zkminer", "--version"]).err().unwrap();
+        assert_eq!(e.kind(), clap::error::ErrorKind::DisplayVersion);
     }
 
     #[test]

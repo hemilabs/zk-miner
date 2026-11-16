@@ -269,7 +269,11 @@ impl ChainClient {
         if !receipt.status() {
             anyhow::bail!("Stake transaction reverted");
         }
-        tracing::info!("Staked {} HEMI: {:?}", amount, receipt.transaction_hash);
+        tracing::info!(
+            "Staked {} HEMI: {:?}",
+            fmt_hemi_ceil(amount),
+            receipt.transaction_hash
+        );
         Ok(())
     }
 
@@ -398,9 +402,9 @@ impl ChainClient {
             .context("Failed to read HEMI balance before staking")?;
         if balance < amount_u256 {
             anyhow::bail!(
-                "Insufficient HEMI balance: have {}, need {} (no approval sent)",
-                balance,
-                amount_u256,
+                "Insufficient HEMI balance: have {} HEMI, need {} HEMI (no approval sent)",
+                fmt_hemi_floor(balance),
+                fmt_hemi_ceil(amount),
             );
         }
 
@@ -408,7 +412,10 @@ impl ChainClient {
             .get_hemi_allowance(self.address, self.hemi_prove_staking)
             .await?;
         let did_approve_here = if current_allowance < amount_u256 {
-            tracing::info!("Approving {} HEMI for staking contract...", amount);
+            tracing::info!(
+                "Approving {} HEMI for the staking contract...",
+                fmt_hemi_ceil(amount)
+            );
             self.approve_hemi_token(self.hemi_prove_staking, amount_u256)
                 .await?;
             true
@@ -502,6 +509,13 @@ impl std::error::Error for StakeUnobserved {}
 // ─────────────────────────────────────────────────────────────────────────────
 // Collateral headroom — "can I actually feed all my GPUs?"
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// A balance in HEMI with 2 decimals, rounded down (what you have, never overstated).
+fn fmt_hemi_floor(wei: U256) -> String {
+    let wei = u128::try_from(wei).unwrap_or(u128::MAX);
+    const ONE: u128 = 1_000_000_000_000_000_000;
+    format!("{}.{:02}", wei / ONE, (wei % ONE) / (ONE / 100))
+}
 
 /// Render a wei amount as HEMI with 2 decimals, rounded UP.
 ///
