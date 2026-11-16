@@ -111,6 +111,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 input_data: _,
                 po2: _,         // OpenVM does not use segment sizing
                 program_id: _,  // for risc0 this is the image id; OpenVM has no such binding
+                witness: _,     // witness jobs are risc0-only; every Prove is refused below
             } => {
                 tracing::info!("Proving request {request_id} ({} bytes ELF)", elf.len());
                 // OpenVM SDK compiles guests at runtime, so proving is handled differently.

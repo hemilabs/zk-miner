@@ -111,6 +111,7 @@ fn main() {
                 input_data: _,
                 po2,
                 program_id: _,
+                witness: _,
             } => {
                 if std::env::var_os("MOCK_SERVER_OOM").is_some() {
                     if limit_own_cgroup_memory(256 * 1024 * 1024).is_err() {

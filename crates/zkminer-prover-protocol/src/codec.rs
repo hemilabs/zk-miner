@@ -286,6 +286,234 @@ mod tests {
         const _: () = assert!(PROTOCOL_VERSION >= 11);
     }
 
+    fn witness() -> crate::types::WitnessProve {
+        crate::types::WitnessProve {
+            input_path: "/retention/job/v1/w.bin".to_string(),
+            prefix: (0..64).collect(),
+            input_sha256: [0x11; 32],
+            w_len: 1 << 20,
+            expect_journal_sha256: [0x22; 32],
+            segment_dir: "/segments/risc0-cuda-0".to_string(),
+        }
+    }
+
+    /// v13 appended `witness` to `Prove`: it round-trips both ways, the fields before it keep their
+    /// places (a `None` frame is a v12 frame plus one byte), and a v12 frame no longer decodes, which
+    /// is why the version moved.
+    #[test]
+    fn a_witness_prove_round_trips_and_appends_last() {
+        use crate::types::WitnessProve;
+        for w in [None, Some(witness())] {
+            let cmd = WorkerCommand::Prove {
+                request_id: 5,
+                elf: vec![0x7f, b'E'],
+                input_data: vec![],
+                po2: Some(19),
+                program_id: Some([3u8; 32]),
+                witness: w.clone(),
+            };
+            let mut buf = Vec::new();
+            write_message(&mut buf, &cmd).unwrap();
+            assert_eq!(
+                &buf[4..8],
+                &3u32.to_le_bytes(),
+                "Prove is still the 4th command"
+            );
+            match read_message::<_, WorkerCommand>(&mut Cursor::new(buf)).unwrap() {
+                WorkerCommand::Prove {
+                    request_id,
+                    po2,
+                    program_id,
+                    witness,
+                    ..
+                } => {
+                    assert_eq!(
+                        (request_id, po2, program_id),
+                        (5, Some(19), Some([3u8; 32]))
+                    );
+                    assert_eq!(witness, w);
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+
+        #[derive(serde::Serialize)]
+        enum V12Command {
+            _Hello,
+            _Capabilities,
+            _Benchmark,
+            Prove {
+                request_id: u64,
+                elf: Vec<u8>,
+                input_data: Vec<u8>,
+                po2: Option<u8>,
+                program_id: Option<[u8; 32]>,
+            },
+        }
+        let v12 = bincode::serialize(&V12Command::Prove {
+            request_id: 5,
+            elf: vec![1],
+            input_data: vec![2],
+            po2: None,
+            program_id: None,
+        })
+        .unwrap();
+        let v13 = bincode::serialize(&WorkerCommand::Prove {
+            request_id: 5,
+            elf: vec![1],
+            input_data: vec![2],
+            po2: None,
+            program_id: None,
+            witness: None,
+        })
+        .unwrap();
+        assert_eq!(
+            &v13[..v12.len()],
+            &v12[..],
+            "every earlier field keeps its place"
+        );
+        assert_eq!(
+            &v13[v12.len()..],
+            &[0u8],
+            "and `witness: None` is one trailing byte"
+        );
+        assert!(
+            bincode::deserialize::<WorkerCommand>(&v12).is_err(),
+            "a v12 Prove must not decode as v13"
+        );
+        // The struct round-trips on its own too (the dispatcher clones it into the frame).
+        let w: WitnessProve =
+            bincode::deserialize(&bincode::serialize(&witness()).unwrap()).unwrap();
+        assert_eq!(w, witness());
+        const _: () = assert!(PROTOCOL_VERSION >= 13);
+    }
+
+    /// v13's `JournalDiverged` is appended after `SetupProgress`, and `InputMismatch` after
+    /// `Internal`: no older index moved.
+    #[test]
+    fn journal_diverged_and_input_mismatch_are_appended() {
+        use crate::types::{ErrorKind, GUEST_EXIT_PAUSED};
+        let resp = WorkerResponse::JournalDiverged {
+            request_id: 8,
+            journal: vec![1, 2, 3],
+            journal_len: 3,
+            journal_sha256: [9u8; 32],
+            exit_kind: GUEST_EXIT_PAUSED,
+            exit_code: 7,
+            cycles: 3 << 20,
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &resp).unwrap();
+        assert_eq!(
+            &buf[4..8],
+            &13u32.to_le_bytes(),
+            "JournalDiverged is the 14th response"
+        );
+        match read_message::<_, WorkerResponse>(&mut Cursor::new(buf)).unwrap() {
+            WorkerResponse::JournalDiverged {
+                request_id,
+                journal,
+                journal_len,
+                journal_sha256,
+                exit_kind,
+                exit_code,
+                cycles,
+            } => {
+                assert_eq!((request_id, journal, journal_len), (8, vec![1, 2, 3], 3));
+                assert_eq!(journal_sha256, [9u8; 32]);
+                assert_eq!(
+                    (exit_kind, exit_code, cycles),
+                    (GUEST_EXIT_PAUSED, 7, 3 << 20)
+                );
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let index = |resp: &WorkerResponse| {
+            let mut b = Vec::new();
+            write_message(&mut b, resp).unwrap();
+            u32::from_le_bytes(b[4..8].try_into().unwrap())
+        };
+        assert_eq!(
+            index(&WorkerResponse::SetupProgress {
+                request_id: 1,
+                status: String::new(),
+                done_bytes: None,
+                total_bytes: None,
+            }),
+            12
+        );
+
+        let kind = |k: ErrorKind| bincode::serialize(&k).unwrap();
+        assert_eq!(kind(ErrorKind::Internal), 5u32.to_le_bytes());
+        assert_eq!(kind(ErrorKind::InputMismatch), 6u32.to_le_bytes());
+        let mut buf = Vec::new();
+        write_message(
+            &mut buf,
+            &WorkerResponse::Error {
+                request_id: 4,
+                kind: ErrorKind::InputMismatch,
+                message: "sha256 mismatch".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            &buf[4..8],
+            &8u32.to_le_bytes(),
+            "Error is still the 9th response"
+        );
+        match read_message::<_, WorkerResponse>(&mut Cursor::new(buf)).unwrap() {
+            WorkerResponse::Error {
+                request_id, kind, ..
+            } => {
+                assert_eq!(request_id, 4);
+                assert!(matches!(kind, ErrorKind::InputMismatch));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// The sandboxed execute's request and response are single frames of their own.
+    #[test]
+    fn a_witness_execute_request_and_response_round_trip() {
+        use crate::types::{
+            WitnessExecutePo2, WitnessExecuteRequest, WitnessExecuteResponse, GUEST_EXIT_HALTED,
+        };
+        let req = WitnessExecuteRequest {
+            elf: vec![0x7f, b'E', b'L', b'F'],
+            prefix: vec![],
+            w_len: 12,
+            input_sha256: [1; 32],
+            sys_rand_seed: [2; 32],
+            po2s: vec![16, 20, 22],
+            keccak_po2: 17,
+            max_cycles: Some(1 << 30),
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &req).unwrap();
+        let got: WitnessExecuteRequest = read_message(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(got, req);
+
+        let po2 = |p: u8| WitnessExecutePo2 {
+            po2: p,
+            cycles: 1 << p,
+            journal: vec![p; 8],
+            journal_len: 8,
+            journal_sha256: [p; 32],
+            exit_kind: GUEST_EXIT_HALTED,
+            exit_code: 0,
+            segment_bytes: 4096,
+            peak_host_bytes: 1 << 28,
+        };
+        let resp = WitnessExecuteResponse {
+            image_id: [3; 32],
+            results: vec![po2(16), po2(20)],
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &resp).unwrap();
+        let got: WitnessExecuteResponse = read_message(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(got, resp);
+    }
+
     #[test]
     fn round_trip_response() {
         let resp = WorkerResponse::HelloAck {

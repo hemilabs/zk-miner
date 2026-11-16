@@ -225,12 +225,27 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
+            // Witness-construction jobs (protocol v13) are refused until this worker proves them.
+            WorkerCommand::Prove {
+                request_id,
+                witness: Some(_),
+                ..
+            } => {
+                let resp = WorkerResponse::Error {
+                    request_id,
+                    kind: ErrorKind::ProtocolError,
+                    message: "this worker does not prove witness jobs".to_string(),
+                };
+                write_message(&mut stdout, &resp)?;
+            }
+
             WorkerCommand::Prove {
                 request_id,
                 elf,
                 input_data,
                 po2,
                 program_id,
+                witness: None,
             } => {
                 tracing::info!(
                     "Proving request {request_id} ({} bytes ELF, po2={po2:?})",

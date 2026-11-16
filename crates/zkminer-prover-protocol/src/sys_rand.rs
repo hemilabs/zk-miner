@@ -92,6 +92,27 @@ pub fn encode_key(key: &[u8; 32]) -> String {
     key.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The domain tag of [`risc0_seed`].
+pub const RISC0_SEED_TAG: &[u8] = b"zkminer/risc0/sys_rand/v2";
+
+/// The guest's `sys_rand` seed for one (program, input): `HMAC-SHA256(key, RISC0_SEED_TAG ‖
+/// image_id ‖ input_sha256)`, where `input_sha256` is `sha256` of the guest's whole input (for a
+/// witness job, the bundle's `sha256(prefix ‖ W)`).
+///
+/// The risc0 prove workers derive the same seed from the key they hold (`sys_rand_seed` in
+/// zkminer-prove-risc0); the miner derives it here and hands the SEED, never the key, to a sandboxed
+/// witness execute (`WitnessExecuteRequest::sys_rand_seed`), so the execute and every later proof
+/// of the bundle run the guest alike.
+pub fn risc0_seed(key: &[u8; 32], image_id: &[u8; 32], input_sha256: &[u8; 32]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    let mut mac =
+        <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(RISC0_SEED_TAG);
+    mac.update(image_id);
+    mac.update(input_sha256);
+    mac.finalize().into_bytes().into()
+}
+
 /// The key from [`SYS_RAND_KEY_ENV`]'s value; `None` unless it is exactly 64 hex digits.
 pub fn decode_key(s: &str) -> Option<[u8; 32]> {
     let s = s.as_bytes();
@@ -143,6 +164,21 @@ mod tests {
         std::fs::write(&path, [0u8; 31]).unwrap();
         assert!(load_or_create_key(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), [0u8; 31]);
+    }
+
+    #[test]
+    fn the_seed_is_fixed_by_key_image_id_and_input_hash() {
+        let (key, image, input) = ([1u8; 32], [7u8; 32], [9u8; 32]);
+        let seed = risc0_seed(&key, &image, &input);
+        assert_eq!(risc0_seed(&key, &image, &input), seed);
+        assert_ne!(risc0_seed(&[2u8; 32], &image, &input), seed);
+        assert_ne!(risc0_seed(&key, &[8u8; 32], &input), seed);
+        assert_ne!(risc0_seed(&key, &image, &[10u8; 32]), seed);
+        // RFC 2104 over the documented message, computed independently of the function.
+        use hmac::{Hmac, Mac};
+        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&key).unwrap();
+        mac.update(&[RISC0_SEED_TAG, &image[..], &input[..]].concat());
+        assert_eq!(<[u8; 32]>::from(mac.finalize().into_bytes()), seed);
     }
 
     #[test]

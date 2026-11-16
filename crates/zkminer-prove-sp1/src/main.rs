@@ -1797,8 +1797,20 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 input_data,
                 po2: _, // SP1 does not use segment sizing
                 program_id,
+                witness,
             } => {
                 tracing::info!("Proving request {request_id} ({} bytes ELF)", elf.len());
+                // Witness-construction jobs are risc0-only (plan §5.3): proving the empty inline
+                // input of one would prove the wrong statement.
+                if witness.is_some() {
+                    let resp = WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::ProtocolError,
+                        message: "the SP1 worker does not prove witness jobs".to_string(),
+                    };
+                    write_message(&mut stdout, &resp)?;
+                    continue;
+                }
                 if sp1_measure_only() {
                     // Proving builds the CudaProver (forks sp1-gpu-server) — exactly what a
                     // measure-only worker must never do. Refuse on the protocol; the dispatcher never

@@ -7808,6 +7808,7 @@ impl WorkerPool {
             input_data: input_data.to_vec(),
             po2,
             program_id,
+            witness: None,
         }) {
             // Send failed (broken pipe = worker died before receiving the command).
             Self::mark_slot_failed(&mut slot, entry);
