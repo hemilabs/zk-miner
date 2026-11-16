@@ -17,6 +17,9 @@
 //! - `MOCK_HOLD_SHM`: a `/dev/shm` name to create and map before hanging on an Execute, as SP1's native
 //!   executor stages a guest there, and leaves it behind if killed.
 //! - `MOCK_BACKEND`: backend name for the HelloAck response. Default: `"mock"`.
+//! - `MOCK_SDK_VERSION` / `MOCK_PROTOCOL_VERSION`: the HelloAck's `sdk_version` (default
+//!   `"mock 0.1.0"`) and `protocol_version` (default this build's), to stand in for a worker built on
+//!   another risc0 or protocol (P31-19).
 //! - `MOCK_JOURNAL_HEX` / `MOCK_SEAL_HEX`: replay a fixed receipt. Execute reports the journal, and
 //!   Prove returns the journal and the seal, whatever the ELF and input. With a real receipt (the
 //!   contract suite's RISC Zero fixture), the miner can claim and fulfil on a chain whose verifier
@@ -72,9 +75,13 @@ fn main() {
                 protocol_version: _,
             } => {
                 let resp = WorkerResponse::HelloAck {
-                    protocol_version: PROTOCOL_VERSION,
+                    protocol_version: std::env::var("MOCK_PROTOCOL_VERSION")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(PROTOCOL_VERSION),
                     backend: backend.clone(),
-                    sdk_version: "mock 0.1.0".to_string(),
+                    sdk_version: std::env::var("MOCK_SDK_VERSION")
+                        .unwrap_or_else(|_| "mock 0.1.0".to_string()),
                     worker_version: "0.1.0".to_string(),
                 };
                 write_message(&mut stdout, &resp).unwrap();

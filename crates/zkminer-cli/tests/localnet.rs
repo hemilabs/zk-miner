@@ -44,7 +44,9 @@
 //! 0x73c457ba, `zkminer_chain::deployment::pins`), so:
 //! - the replay tests stay meaningful: they exercise the chain side with the contract suite's 3.0
 //!   receipt, so their miner is configured with that receipt's selector
-//!   (`prover.risc0_groth16_selector`, [`FIXTURE_SELECTOR`]);
+//!   (`prover.risc0_groth16_selector`, [`FIXTURE_SELECTOR`]) and acknowledged with
+//!   `ZKMINER_RISC0_SELECTOR_OVERRIDE_UNSAFE=1` (without it a miner refuses risc0 claims under an
+//!   override that differs from its linked risc0's selector);
 //! - `refuses_to_claim_without_a_matching_verifier` is the negative case: a miner with the build's
 //!   own selector against that verifier must refuse every risc0 claim (its startup check reads the
 //!   verifier's `SELECTOR()`);
@@ -1754,6 +1756,15 @@ impl Miner {
                     cmd.env("RISC0_HOME", risc0);
                 }
             }
+        }
+        // A config that replays the 3.0 fixture receipt sets its selector (FIXTURE_SELECTOR), which
+        // differs from this build's: the miner refuses risc0 claims under such an override unless it
+        // is acknowledged (P31-19). Here the fork's verifier does accept that receipt.
+        if std::fs::read_to_string(config)
+            .map(|c| c.contains("risc0_groth16_selector"))
+            .unwrap_or(false)
+        {
+            cmd.env("ZKMINER_RISC0_SELECTOR_OVERRIDE_UNSAFE", "1");
         }
         cmd.env("HOME", dir)
             .env("PATH", path_without_workers())

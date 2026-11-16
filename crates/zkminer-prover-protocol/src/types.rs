@@ -31,7 +31,37 @@ use serde::{Deserialize, Serialize};
 /// (Low Power Mode, battery, thermal state), so the host can mark a benchmark taken throttled
 /// (W7-M11). Last field, bincode-positional as for v4: a v11 entry is one field short, so the
 /// handshake refuses a v11 worker instead of the decoder failing mid-benchmark.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// 13: risc0 3.1 (P31-19). The wire is unchanged, but the host prefixes every risc0 Groth16 proof
+/// with the seal selector of the risc0 IT links (0xe71e6620 for 3.1, 0x73c457ba for 3.0), and a proof
+/// verifies only under the selector of the risc0 the worker proved with. A v12 worker (risc0 3.0)
+/// under a v13 host, or a v13 worker under a v12 host, would have every fulfil revert after the
+/// collateral-locking claim, so the handshake refuses both. [`risc0_sdk_mismatch`] guards the same
+/// skew within one protocol version.
+pub const PROTOCOL_VERSION: u32 = 13;
+
+/// The risc0-zkvm `major.minor` a risc0 worker must report (`HelloAck.sdk_version`, "risc0-zkvm
+/// X.Y.Z") for this host: the risc0 whose Groth16 verifier parameters give the host's seal selector.
+/// The risc0 worker and the CLI each test that their linked risc0-zkvm has this `major.minor`.
+pub const RISC0_ZKVM_MAJOR_MINOR: &str = "3.1";
+
+/// Why a worker's handshake `sdk_version` cannot serve this host's risc0 seals, if it cannot: a
+/// "risc0-zkvm X.Y.Z" whose `X.Y` is not [`RISC0_ZKVM_MAJOR_MINOR`]. Other SDK strings (SP1, OpenVM,
+/// the test mock) are not risc0 proofs and pass.
+pub fn risc0_sdk_mismatch(sdk_version: &str) -> Option<String> {
+    let v = sdk_version.strip_prefix("risc0-zkvm ")?;
+    let mut parts = v.trim().split('.');
+    let major_minor = match (parts.next(), parts.next()) {
+        (Some(a), Some(b)) => format!("{a}.{b}"),
+        _ => String::new(),
+    };
+    (major_minor != RISC0_ZKVM_MAJOR_MINOR).then(|| {
+        format!(
+            "worker proves with {sdk_version}, but this host prefixes risc0-zkvm \
+             {RISC0_ZKVM_MAJOR_MINOR}'s Groth16 seal selector: every fulfil would revert. Install the \
+             worker built with this zkminer"
+        )
+    })
+}
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///

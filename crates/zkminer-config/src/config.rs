@@ -238,7 +238,9 @@ pub struct ProverConfig {
     /// (first 4 bytes of its default Groth16 verifier parameters digest):
     /// 0xe71e6620 for risc0 3.1 (3.0 was 0x73c457ba). An override does not change
     /// the proofs the worker makes, only the prefix: use it only for a chain whose
-    /// verifier accepts this risc0's receipts under another selector.
+    /// verifier accepts this risc0's receipts under another selector. An override
+    /// that differs from the linked risc0's selector refuses every risc0 claim
+    /// (a startup PAGE) unless `ZKMINER_RISC0_SELECTOR_OVERRIDE_UNSAFE=1` is set.
     #[serde(default)]
     pub risc0_groth16_selector: Option<String>,
     /// The segment size (po2) a card measures and proves risc0 jobs at, keyed by its benchmark device

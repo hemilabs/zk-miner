@@ -163,14 +163,64 @@ fn risc0_groth16_default_selector() -> [u8; 4] {
 /// The resolved seal selector for this run (config override, else the default).
 static SEAL_SELECTOR: std::sync::OnceLock<[u8; 4]> = std::sync::OnceLock::new();
 
-/// Parse a 4-byte hex selector like "0xe71e6620" (or "e71e6620").
+/// Parse a 4-byte hex selector like "0xe71e6620" (or "e71e6620"). Anything but exactly 8 hex digits
+/// is refused (an odd length or a non-ASCII byte used to panic on the slice).
 fn parse_seal_selector(s: &str) -> Option<[u8; 4]> {
     let h = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = (0..h.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&h[i..i + 2], 16));
-    let v: Result<Vec<u8>, _> = bytes.collect();
-    v.ok().and_then(|b| <[u8; 4]>::try_from(b.as_slice()).ok())
+    if h.len() != 8 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut sel = [0u8; 4];
+    for (i, b) in sel.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&h[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(sel)
+}
+
+/// Set to `1` to let `prover.risc0_groth16_selector` differ from the linked risc0's selector and
+/// still claim risc0 jobs. Only for a chain whose verifier really accepts this risc0's receipts under
+/// another selector (the localnet replay of a 3.0 fixture receipt sets it); see
+/// [`risc0_selector_refusal`].
+const RISC0_SELECTOR_OVERRIDE_ACK_ENV: &str = "ZKMINER_RISC0_SELECTOR_OVERRIDE_UNSAFE";
+
+/// Why risczero.groth16.v1 claims are refused for this run's seal selector, if they are (set once at
+/// startup from [`risc0_selector_refusal`]; [`reverify_risc0`] then never verifies the adapter).
+static RISC0_SELECTOR_REFUSAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The startup policy for a configured selector. A stock `RiscZeroGroth16Verifier`'s `SELECTOR()` is
+/// the digest of its own verifier parameters, and the worker proves under the linked risc0's
+/// parameters, so a seal prefixed with any other selector cannot verify there: an override that
+/// differs from `linked` (e.g. the 3.0 value 0x73c457ba left in a config on a 3.1 build) would still
+/// pass the SELECTOR() check against a verifier of that other version, and then every fulfil would
+/// revert after the collateral-locking claim. Refused (no risc0 claims) unless `acknowledged`.
+fn risc0_selector_refusal(
+    configured: Option<[u8; 4]>,
+    linked: [u8; 4],
+    acknowledged: bool,
+) -> Option<String> {
+    let sel = configured?;
+    if sel == linked || acknowledged {
+        return None;
+    }
+    Some(format!(
+        "prover.risc0_groth16_selector 0x{} differs from the linked risc0's selector 0x{} (risc0-zkvm \
+         {}): the worker's proofs verify only under 0x{}, so a seal prefixed with 0x{} would revert \
+         every fulfil. Remove the override, or set {RISC0_SELECTOR_OVERRIDE_ACK_ENV}=1 if this chain's \
+         verifier really accepts these receipts under 0x{}",
+        alloy::hex::encode(sel),
+        alloy::hex::encode(linked),
+        risc0_zkvm::VERSION,
+        alloy::hex::encode(linked),
+        alloy::hex::encode(sel),
+        alloy::hex::encode(sel),
+    ))
+}
+
+fn risc0_selector_override_acknowledged() -> bool {
+    matches!(
+        std::env::var(RISC0_SELECTOR_OVERRIDE_ACK_ENV).as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 /// The RISC Zero seal selector to prefix onto seals (config override or default).
@@ -475,6 +525,12 @@ async fn reverify_deployment(client: &ChainClient) -> Result<Vec<String>> {
 
 /// Run `verify_proof_system` for risc0 and record the outcome (see [`RISC0_VERIFIED_ADAPTER`]).
 async fn reverify_risc0(client: &ChainClient) -> Result<alloy::primitives::Address> {
+    if let Some(why) = RISC0_SELECTOR_REFUSAL.get() {
+        *RISC0_VERIFIED_ADAPTER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        anyhow::bail!("{why}");
+    }
     let r = client
         .verify_proof_system(
             zkminer_chain::auction::ProofSystem::Risc0Groth16,
@@ -2476,6 +2532,24 @@ pub async fn run(
         None => risc0_groth16_default_selector(),
     };
     let _ = SEAL_SELECTOR.set(sel);
+    if let Some(why) = risc0_selector_refusal(
+        config
+            .prover
+            .risc0_groth16_selector
+            .is_some()
+            .then_some(sel),
+        risc0_groth16_default_selector(),
+        risc0_selector_override_acknowledged(),
+    ) {
+        let _ = RISC0_SELECTOR_REFUSAL.set(why);
+    } else if sel != risc0_groth16_default_selector() {
+        tracing::warn!(
+            "prover.risc0_groth16_selector 0x{} differs from the linked risc0's 0x{}; claiming anyway \
+             ({RISC0_SELECTOR_OVERRIDE_ACK_ENV} is set)",
+            alloy::hex::encode(sel),
+            alloy::hex::encode(risc0_groth16_default_selector())
+        );
+    }
     // NOT fatal: a held lock must still be recovered (fulfilled, kept through a Disabled window, or
     // released) when the adapter is disabled, swapped, or fails a pin. Exiting here would leave every
     // lock to a 100% slash. Claims for the proof system stay off until a re-check passes.
@@ -12774,6 +12848,42 @@ mod tests {
             Some([0xe7, 0x1e, 0x66, 0x20])
         );
         assert_eq!(parse_seal_selector("0xe71e66"), None);
+        // Odd lengths and non-ASCII used to panic on the slice.
+        assert_eq!(parse_seal_selector("0xe71e662"), None);
+        assert_eq!(parse_seal_selector("0xe71e66206"), None);
+        assert_eq!(parse_seal_selector("0xé71e662"), None);
+        assert_eq!(parse_seal_selector("0xg71e6620"), None);
+    }
+
+    /// The risc0 this CLI derives its selector from is the one the protocol makes a risc0 worker
+    /// report, so a worker on another risc0 is refused at the handshake (P31-19).
+    #[test]
+    fn the_linked_risc0_is_the_protocols() {
+        let sdk = format!("risc0-zkvm {}", risc0_zkvm::VERSION);
+        assert_eq!(
+            zkminer_prover_protocol::risc0_sdk_mismatch(&sdk),
+            None,
+            "{sdk}"
+        );
+    }
+
+    /// A 3.0 selector left in the config of a 3.1 build passes the SELECTOR() check against the
+    /// live 3.0 verifier, yet every 3.1 proof would revert there: refused unless acknowledged.
+    #[test]
+    fn a_stale_selector_override_refuses_risc0_claims() {
+        let linked = risc0_groth16_default_selector();
+        let v30 = parse_seal_selector("0x73c457ba").unwrap();
+        let why = risc0_selector_refusal(Some(v30), linked, false).expect("refused");
+        assert!(
+            why.contains("0x73c457ba") && why.contains("0xe71e6620"),
+            "{why}"
+        );
+        assert!(why.contains(RISC0_SELECTOR_OVERRIDE_ACK_ENV), "{why}");
+        // Acknowledged (localnet's 3.0 fixture replay), no override, or an override equal to the
+        // linked selector: claims allowed.
+        assert_eq!(risc0_selector_refusal(Some(v30), linked, true), None);
+        assert_eq!(risc0_selector_refusal(None, linked, false), None);
+        assert_eq!(risc0_selector_refusal(Some(linked), linked, false), None);
     }
 
     /// The fulfilled seal is selector ++ the worker's 256-byte proof: 260 bytes.

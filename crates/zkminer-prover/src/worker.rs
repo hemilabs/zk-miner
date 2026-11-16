@@ -1137,6 +1137,11 @@ impl WorkerHandle {
                         self.backend
                     );
                 }
+                // risc0 3.1 (P31-19): the host's seal selector is its own risc0's; a worker on
+                // another risc0 makes proofs no such seal verifies.
+                if let Some(why) = zkminer_prover_protocol::risc0_sdk_mismatch(&sdk_version) {
+                    bail!("Worker {}: {why}", self.backend);
+                }
                 if backend != self.backend {
                     tracing::warn!(
                         "Worker reports backend '{backend}' but expected '{}'",

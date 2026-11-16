@@ -31,6 +31,53 @@ fn mock_env(hang_on: &str, crash_on: &str) -> HashMap<String, String> {
     env
 }
 
+// ---- risc0 version skew (P31-19) ----
+
+/// The host prefixes its own risc0's Groth16 seal selector to every risc0 proof, so a worker built on
+/// another risc0 (a stale 3.0 worker in ~/.zkminer/provers under a 3.1 host) or on another protocol
+/// version must fail the handshake: never advertised, so no job is claimed for it.
+#[test]
+fn a_worker_on_another_risc0_or_protocol_is_refused_at_the_handshake() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(5)));
+    let skewed = |sdk: &str, proto: Option<u32>| {
+        let mut env = mock_env("", "");
+        env.insert("MOCK_BACKEND".to_string(), "risc0".to_string());
+        env.insert("MOCK_SDK_VERSION".to_string(), sdk.to_string());
+        if let Some(p) = proto {
+            env.insert("MOCK_PROTOCOL_VERSION".to_string(), p.to_string());
+        }
+        env
+    };
+    let this = format!(
+        "risc0-zkvm {}.0",
+        zkminer_prover_protocol::RISC0_ZKVM_MAJOR_MINOR
+    );
+    let err = pool
+        .insert_test_worker(
+            "risc0:a",
+            "risc0",
+            mock_worker_path(),
+            skewed("risc0-zkvm 3.0.6", None),
+        )
+        .expect_err("a risc0 3.0 worker must be refused");
+    assert!(format!("{err:#}").contains("risc0-zkvm 3.0.6"), "{err:#}");
+    let old = zkminer_prover_protocol::PROTOCOL_VERSION - 1;
+    let err = pool
+        .insert_test_worker(
+            "risc0:b",
+            "risc0",
+            mock_worker_path(),
+            skewed(&this, Some(old)),
+        )
+        .expect_err("a previous-protocol worker must be refused");
+    assert!(
+        format!("{err:#}").contains("Protocol version mismatch"),
+        "{err:#}"
+    );
+    pool.insert_test_worker("risc0:c", "risc0", mock_worker_path(), skewed(&this, None))
+        .expect("this build's risc0 on this protocol is accepted");
+}
+
 // ---- Benchmark timeout tests ----
 
 #[test]

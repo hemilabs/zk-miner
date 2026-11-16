@@ -3023,3 +3023,14 @@ mod mac_footprint_tests {
         assert_eq!(status.code(), Some(FOOTPRINT_EXIT_CODE), "{status:?}");
     }
 }
+
+#[cfg(test)]
+mod sdk_version_tests {
+    /// The sdk_version this worker reports at its handshake ("risc0-zkvm {VERSION}") is the one the
+    /// host's protocol crate accepts: the risc0 whose seal selector the host prefixes (P31-19).
+    #[test]
+    fn the_handshake_sdk_version_is_the_hosts_risc0() {
+        let sdk = format!("risc0-zkvm {}", risc0_zkvm::VERSION);
+        assert_eq!(zkminer_prover_protocol::risc0_sdk_mismatch(&sdk), None, "{sdk}");
+    }
+}

@@ -541,6 +541,13 @@ const KECCAK_PIPELINES_RESERVE: u64 = 32 << 20;
 /// read what they allocated.
 const KECCAK_PREWARM_TIGHT_MARGIN: u64 = 512 << 20;
 
+/// The Groth16 prover's planned footprint assumed while it cannot be read (the v0.2.0 component not
+/// installed yet: a host upgraded from risc0 3.0 gets it from the first Warmup, after this decision
+/// is latched): what risc0 3.1's prover plans under a 4 GiB limit (4235118872 B, its smallest plan,
+/// P31-19). Assuming it defers keccak on a tight host instead of building it and then refusing every
+/// wrap; a roomy limit is unaffected.
+const GROTH16_PLAN_FALLBACK: u64 = 4_235_118_872;
+
 /// Why the worker-start keccak pipeline build must not run, or `None` when it should. `limit` is
 /// the working-set limit, `allocated` the device allocation after the other circuits' pipelines,
 /// `groth16` the Groth16 prover's planned footprint (`None`: unknown, e.g. no component yet).
@@ -560,7 +567,7 @@ fn keccak_prewarm_refusal(
         Some("on" | "1" | "true") => return None,
         _ => {}
     }
-    let (limit, groth16) = (limit?, groth16?);
+    let (limit, groth16) = (limit?, groth16.unwrap_or(GROTH16_PLAN_FALLBACK));
     let need = allocated
         .saturating_add(groth16)
         .saturating_add(KECCAK_PIPELINES_RESERVE);
@@ -602,6 +609,17 @@ pub fn warm_up_pipelines() -> &'static str {
             }
         };
         let knob = std::env::var(KECCAK_PREWARM_ENV).ok();
+        if let Some(v) = knob.as_deref() {
+            let v = v.trim().to_ascii_lowercase();
+            if !matches!(
+                v.as_str(),
+                "auto" | "" | "on" | "1" | "true" | "off" | "0" | "false"
+            ) {
+                tracing::warn!(
+                    "{KECCAK_PREWARM_ENV}={v:?} is not auto, on or off: treated as auto"
+                );
+            }
+        }
         let limit = risc0_groth16_sys::effective_working_set_limit();
         let groth16_plan = groth16_planned_bytes();
         // Decide now when the answer cannot depend on what the other builds allocate.
@@ -613,8 +631,14 @@ pub fn warm_up_pipelines() -> &'static str {
             Some("off" | "0" | "false") | Some("on" | "1" | "true") => Some(
                 keccak_prewarm_refusal(knob.as_deref(), limit, 0, groth16_plan),
             ),
-            _ => match (limit, groth16_plan) {
-                (Some(l), Some(g)) if l < g.saturating_add(KECCAK_PREWARM_TIGHT_MARGIN) => None,
+            _ => match limit {
+                Some(l)
+                    if l < groth16_plan
+                        .unwrap_or(GROTH16_PLAN_FALLBACK)
+                        .saturating_add(KECCAK_PREWARM_TIGHT_MARGIN) =>
+                {
+                    None
+                }
                 _ => Some(None),
             },
         };
@@ -794,13 +818,16 @@ mod tests {
             keccak_prewarm_refusal(None, Some(4 * GIB + 100 * MIB), 46 * MIB, Some(g16)),
             None
         );
-        // Unknown limit or prover footprint: built (wave 7's behaviour).
+        // Unknown limit: built (wave 7's behaviour).
         assert_eq!(
             keccak_prewarm_refusal(None, None, 46 * MIB, Some(g16)),
             None
         );
+        // Unknown prover footprint (a host upgraded from 3.0, the v0.2.0 component not installed
+        // yet when the decision is latched): the 4 GiB tier defers keccak, a roomy limit builds it.
+        assert!(keccak_prewarm_refusal(None, Some(4 * GIB), 46 * MIB, None).is_some());
         assert_eq!(
-            keccak_prewarm_refusal(None, Some(4 * GIB), 46 * MIB, None),
+            keccak_prewarm_refusal(None, Some(8 * GIB), 46 * MIB, None),
             None
         );
         // The knob wins either way.

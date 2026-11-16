@@ -327,6 +327,44 @@ mod tests {
         );
     }
 
+    /// v13 (P31-19, risc0 3.1): a v12 worker proves risc0 3.0 receipts, which no 3.1 seal selector
+    /// verifies; its HelloAck still decodes, and the version check (and the sdk check) refuse it.
+    #[test]
+    fn a_risc0_3_0_worker_is_refused() {
+        const _: () = assert!(PROTOCOL_VERSION >= 13);
+        let hello = bincode::serialize(&WorkerResponse::HelloAck {
+            protocol_version: 12,
+            backend: "risc0".to_string(),
+            sdk_version: "risc0-zkvm 3.0.5".to_string(),
+            worker_version: "0.1.0".to_string(),
+        })
+        .unwrap();
+        let mut framed = (hello.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&hello);
+        match read_message::<_, WorkerResponse>(&mut Cursor::new(framed)).unwrap() {
+            WorkerResponse::HelloAck {
+                protocol_version,
+                sdk_version,
+                ..
+            } => {
+                assert_ne!(protocol_version, PROTOCOL_VERSION);
+                assert!(crate::types::risc0_sdk_mismatch(&sdk_version).is_some());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        use crate::types::risc0_sdk_mismatch as m;
+        assert_eq!(m("risc0-zkvm 3.1.0"), None);
+        assert_eq!(m("risc0-zkvm 3.1.7"), None);
+        assert!(m("risc0-zkvm 3.0.6").is_some());
+        assert!(m("risc0-zkvm 3.2.0").is_some());
+        assert!(m("risc0-zkvm 31.0").is_some());
+        assert!(m("risc0-zkvm garbage").is_some());
+        // Not risc0 proofs: SP1, OpenVM, the test mock.
+        assert_eq!(m("sp1-sdk v5.0.0"), None);
+        assert_eq!(m("openvm-sdk 1.5.0-rc.1"), None);
+        assert_eq!(m("mock 0.1.0"), None);
+    }
+
     #[test]
     fn the_worse_power_reading_wins() {
         use crate::types::BenchPowerState as P;
