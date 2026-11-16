@@ -21,9 +21,14 @@ use crate::{
 };
 
 const MIB: u64 = 1 << 20;
-/// The probe's fd layout: a ready pipe and a go pipe, like the runner's fixed fds.
+/// The probe's fd layout: a ready pipe and a go pipe, like the runner's fixed fds, and a read-only
+/// fd of a file the parent owns (like the execute worker's W file).
 const READY_FD: i32 = 3;
 const GO_FD: i32 = 4;
+const META_FD: i32 = 5;
+/// The inherited file's mode, which must survive the probe.
+const META_MODE: u32 = 0o640;
+const META_XATTR: &str = "user.zkminer-probe";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -127,6 +132,72 @@ impl Drop for BrokerFixture {
     }
 }
 
+/// A private directory with one file (mode [`META_MODE`]) the probe inherits read-only at
+/// [`META_FD`], removed on drop.
+struct MetaFixture {
+    dir: PathBuf,
+    file: PathBuf,
+    fd: OwnedFd,
+}
+
+impl MetaFixture {
+    fn new() -> std::io::Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(unique("inherited"));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        let file = dir.join("w");
+        std::fs::write(
+            &file,
+            b"zkminer sandbox self-test: an inherited read-only file\n",
+        )?;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(META_MODE))?;
+        let fd = std::fs::File::open(&file)?.into();
+        Ok(MetaFixture { dir, file, fd })
+    }
+
+    /// What changed about the file since it was created, if anything: mode, owner, the probe's
+    /// xattr.
+    fn changes(&self) -> Vec<String> {
+        use std::os::unix::fs::MetadataExt;
+        let mut bad = Vec::new();
+        match std::fs::metadata(&self.file) {
+            Ok(m) => {
+                if m.mode() & 0o7777 != META_MODE {
+                    bad.push(format!("mode {:o}, was {META_MODE:o}", m.mode() & 0o7777));
+                }
+                // SAFETY: geteuid cannot fail.
+                if m.uid() != unsafe { libc::geteuid() } {
+                    bad.push(format!("owner uid {}", m.uid()));
+                }
+            }
+            Err(e) => bad.push(e.to_string()),
+        }
+        let path =
+            std::ffi::CString::new(self.file.as_os_str().as_encoded_bytes()).unwrap_or_default();
+        let name = std::ffi::CString::new(META_XATTR).unwrap_or_default();
+        let mut buf = [0u8; 16];
+        // SAFETY: valid NUL-terminated strings and a buffer of the length passed.
+        let n = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if n >= 0 {
+            bad.push(format!("xattr {META_XATTR} set"));
+        }
+        bad
+    }
+}
+
+impl Drop for MetaFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Runs the self-test for one profile, in three fresh cgroups under [`delegated_root`]:
 ///
 /// 1. **checks**: the probe applies `profile` with [`crate::restrict_self`] and tries the
@@ -134,8 +205,9 @@ impl Drop for BrokerFixture {
 ///    outside that `/proc/<pid>/status` shows `Seccomp: 2` and `NoNewPrivs: 1`, that the probe sits
 ///    in its job cgroup (joined before exec), that its `/proc/<pid>/environ` is unreadable even to
 ///    its parent (`PR_SET_DUMPABLE(0)`), and that the cgroup limits read back as written. The
-///    parent hands the probe its fds 3 and 4 through [`prepare_command`] and holds an inheritable
-///    (non-`CLOEXEC`) pipe the probe must not receive;
+///    parent hands the probe its fds 3, 4 and 5 (a read-only fd of a file it owns, whose mode,
+///    owner and xattrs must be unchanged afterwards) through [`prepare_command`] and holds an
+///    inheritable (non-`CLOEXEC`) pipe the probe must not receive;
 /// 2. **oom**: under a 64 MiB `memory.max` the probe touches 512 MiB and must be OOM-killed
 ///    (`SIGKILL`, `memory.events` `oom_kill`), not swap (`memory.swap.max=0`);
 /// 3. **pids**: under `pids.max=16` the probe must fail to `fork` (seccomp) and then start threads
@@ -425,6 +497,7 @@ fn checks_probe(
     let (ready_r, ready_w, go_r, go_w): (OwnedFd, OwnedFd, OwnedFd, OwnedFd) =
         (ready_r.into(), ready_w.into(), go_r.into(), go_w.into());
     let leak = inheritable_pipe().map_err(s)?;
+    let meta = MetaFixture::new().map_err(|e| format!("creating the inherited file: {e}"))?;
 
     let mut args = base.clone();
     args.listen_port = Some(listen_port);
@@ -433,7 +506,8 @@ fn checks_probe(
         args.ports.push(listen_port);
     }
     args.abstract_name = Some(abstract_name);
-    args.expect_fds = vec![0, 1, 2, READY_FD, GO_FD];
+    args.meta_fd = Some(META_FD);
+    args.expect_fds = vec![0, 1, 2, READY_FD, GO_FD, META_FD];
     args.ready_fd = Some(READY_FD);
     args.go_fd = Some(GO_FD);
     args.tag = unique("t");
@@ -442,7 +516,11 @@ fn checks_probe(
     prepare_command(
         &mut cmd,
         cg,
-        &[(ready_w.as_fd(), READY_FD), (go_r.as_fd(), GO_FD)],
+        &[
+            (ready_w.as_fd(), READY_FD),
+            (go_r.as_fd(), GO_FD),
+            (meta.fd.as_fd(), META_FD),
+        ],
     )
     .map_err(|e| e.to_string())?;
     let running = Running::spawn(cmd);
@@ -528,6 +606,16 @@ fn checks_probe(
         },
     );
     drop((listen, deny, unix));
+    let changes = meta.changes();
+    r.check(
+        "inherited_file_unchanged",
+        changes.is_empty(),
+        if changes.is_empty() {
+            format!("mode {META_MODE:o}, owner and xattrs as before")
+        } else {
+            changes.join(", ")
+        },
+    );
 
     let mut seen = Vec::new();
     let mut done = None;

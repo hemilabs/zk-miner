@@ -74,12 +74,25 @@ const COMMON_CHECKS: &[&str] = &[
     "write_dev_shm",
     "landlock_mkdir_tmp",
     "chmod_secret",
+    "fchmod_inherited",
+    "fchown_inherited",
+    "fsetxattr_inherited",
+    "fremovexattr_inherited",
+    "flock_inherited",
+    "fcntl_setlease_inherited",
+    "fcntl_notify_dir",
+    "file_getattr_inherited",
+    "file_setattr_inherited",
+    "ioctl_setflags_inherited",
+    "sysv_shmget",
+    "sysv_msgget",
+    "sysv_semget",
     "socket_unix",
     "socket_netlink",
     "abstract_unix_connect",
     "kill_parent",
-    "ptrace_attach_parent",
-    "process_vm_readv_parent",
+    "ptrace_attach_child",
+    "process_vm_readv_child",
     "setpriority_parent",
     "sched_setaffinity_parent",
     "prlimit_parent",
@@ -88,6 +101,8 @@ const COMMON_CHECKS: &[&str] = &[
     #[cfg(target_arch = "x86_64")]
     "x32_syscall",
     "pdeathsig_locked",
+    "prctl_set_dumpable",
+    "prctl_set_ptracer",
     "ioctl_tiocsti",
     "seccomp_denylist",
     "execve",
@@ -98,13 +113,45 @@ const NO_NETWORK_CHECKS: &[&str] = &["socket_inet", "socket_inet6", "tcp_connect
 const BROKER_CHECKS: &[&str] = &[
     "socket_inet_allowed",
     "socket_inet6_allowed",
-    "socket_udp_allowed",
+    "socket_inet_tcp_allowed",
+    "socket_udp",
+    "socket_mptcp",
+    "socket_icmp",
+    "socket_raw",
+    "socketpair_unix_stream_allowed",
+    "socketpair_unix_dgram",
+    "socketpair_unix_seqpacket",
     "tcp_connect_allowed_port",
     "tcp_connect_denied_port",
     "tcp_bind",
     "read_readable",
     "readable_not_writable",
     "write_writable",
+];
+
+/// Checks that something the profile *allows* still works: they pass without the sandbox too.
+pub const POSITIVE_CHECKS: &[&str] = &[
+    "socket_inet_allowed",
+    "socket_inet6_allowed",
+    "socket_inet_tcp_allowed",
+    "socketpair_unix_stream_allowed",
+    "tcp_connect_allowed_port",
+    "read_readable",
+    "write_writable",
+];
+
+/// Checks that cannot tell the sandbox from an unprivileged process without it, with the reason;
+/// every other check fails in an `--unrestricted` run (the negative control).
+pub const UNSANDBOXED_EXEMPT: &[(&str, &str)] = &[
+    (
+        "inherited_fds",
+        "a property of prepare_command, which the negative control does not use",
+    ),
+    (
+        "socket_raw",
+        "without CAP_NET_RAW the kernel refuses a raw socket with EPERM too; the seccomp rule \
+         itself is proven by restrict.rs's BPF interpreter test",
+    ),
 ];
 
 /// Every check a `checks` run must print for `kind`.
@@ -132,6 +179,10 @@ pub struct ProbeArgs {
     pub deny_port: Option<u16>,
     /// An abstract Unix socket name the parent listens on.
     pub abstract_name: Option<String>,
+    /// An inherited read-only fd of a regular file the parent owns, for the metadata checks
+    /// (`fchmod`, `fsetxattr`, `flock`, leases, ...). The parent checks afterwards that the file
+    /// did not change.
+    pub meta_fd: Option<RawFd>,
     /// The fds the probe must have, and only those, at startup.
     pub expect_fds: Vec<RawFd>,
     /// Written one byte (`R`) once restricted.
@@ -160,6 +211,7 @@ impl ProbeArgs {
             listen_port: None,
             deny_port: None,
             abstract_name: None,
+            meta_fd: None,
             expect_fds: vec![0, 1, 2],
             ready_fd: None,
             go_fd: None,
@@ -212,6 +264,9 @@ impl ProbeArgs {
         if let Some(n) = &self.abstract_name {
             flag("--abstract", n.into());
         }
+        if let Some(f) = self.meta_fd {
+            flag("--meta-fd", f.to_string().into());
+        }
         let fds: Vec<String> = self.expect_fds.iter().map(|f| f.to_string()).collect();
         flag("--expect-fds", fds.join(",").into());
         if let Some(f) = self.ready_fd {
@@ -259,6 +314,7 @@ impl ProbeArgs {
                 "--abstract" => {
                     a.abstract_name = Some(v.to_str().ok_or("bad --abstract")?.to_string())
                 }
+                "--meta-fd" => a.meta_fd = Some(num(k, v)?),
                 "--expect-fds" => {
                     let s = v.to_str().ok_or("bad --expect-fds")?;
                     a.expect_fds = s
@@ -333,6 +389,12 @@ fn errname(e: i32) -> String {
         libc::EIO => "EIO",
         libc::EEXIST => "EEXIST",
         libc::EOPNOTSUPP => "EOPNOTSUPP",
+        libc::ENODATA => "ENODATA",
+        libc::ENOTDIR => "ENOTDIR",
+        libc::ENOPROTOOPT => "ENOPROTOOPT",
+        libc::EPROTONOSUPPORT => "EPROTONOSUPPORT",
+        libc::ESOCKTNOSUPPORT => "ESOCKTNOSUPPORT",
+        libc::EISCONN => "EISCONN",
         _ => return format!("errno {e}"),
     };
     n.to_string()
@@ -447,13 +509,56 @@ impl Out {
 // ---------------------------------------------------------------------------------------------
 // checks
 
+/// Read by `process_vm_readv_child` from the tracee's copy of this process's memory.
+static TRACEE_MARK: [u8; 8] = *b"zkminer!";
+
+/// A child forked before the sandbox, the target of the ptrace and `process_vm_readv` checks: the
+/// most permissive target there is (Yama's `ptrace_scope` 1 lets a process trace its own
+/// descendants, and the child predates the probe's Landlock domain), so without the sandbox those
+/// checks fail instead of passing on Yama's say-so. It holds none of the probe's fds and dies with
+/// it (`PR_SET_PDEATHSIG`; the self-test also kills the cgroup).
+fn spawn_tracee() -> Result<libc::pid_t, i32> {
+    // SAFETY: getpid cannot fail.
+    let parent = unsafe { libc::getpid() };
+    let _ = io::stdout().flush();
+    // SAFETY: the child only makes async-signal-safe syscalls and never returns.
+    match unsafe { libc::fork() } {
+        -1 => Err(errno()),
+        0 => unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+            if libc::getppid() != parent {
+                libc::_exit(0);
+            }
+            libc::syscall(libc::SYS_close_range, 0u32, u32::MAX, 0u32);
+            loop {
+                libc::pause();
+            }
+        },
+        pid => Ok(pid),
+    }
+}
+
+/// The missing-argument detail, the same everywhere (the negative control looks for it).
+fn missing(flag: &str) -> String {
+    format!("missing {flag}")
+}
+
 fn run_checks(a: &ProbeArgs) -> i32 {
     // Before restricting: what we inherited, and sockets to try connecting with afterwards (a
-    // sandboxed process cannot create them, but must not be able to use them either).
+    // sandboxed process cannot create them, but must not be able to use them either), a directory
+    // fd for the dnotify check, and the tracee.
     let fds_at_start = open_fds();
     let (unix_sock, _) = new_socket(libc::AF_UNIX, libc::SOCK_STREAM);
     let (inet_sock, _) = new_socket(libc::AF_INET, libc::SOCK_STREAM);
     let (unix_sock, inet_sock) = (unix_sock as RawFd, inet_sock as RawFd);
+    // SAFETY: a constant path.
+    let root_dir = unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    let tracee = spawn_tracee();
 
     let profile = a.profile();
     let mut out = Out::default();
@@ -523,7 +628,7 @@ fn run_checks(a: &ProbeArgs) -> i32 {
     let fs_denied = [libc::EPERM, libc::EACCES];
     match &a.secret {
         Some(secret) => out.result("read_secret", denied_io(std::fs::read(secret), &fs_denied)),
-        None => out.check("read_secret", false, "no --secret given"),
+        None => out.check("read_secret", false, missing("--secret")),
     }
     out.result(
         "proc_self_status",
@@ -534,8 +639,18 @@ fn run_checks(a: &ProbeArgs) -> i32 {
         ("open_dri_render", "/dev/dri/renderD128"),
     ] {
         if a.unrestricted {
-            // Never touch a GPU node outside the sandbox.
-            out.check(name, false, "skipped (--unrestricted)");
+            // Never touch a GPU node outside the sandbox: the same open of a harmless device
+            // shows the check failing when nothing denies it.
+            let r = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null");
+            let (ok, d) = denied_io(r, &fs_denied);
+            out.check(
+                name,
+                ok,
+                format!("{d} (/dev/null standing in for {dev} outside the sandbox)"),
+            );
         } else if Path::new(dev).exists() {
             let r = std::fs::OpenOptions::new().read(true).write(true).open(dev);
             out.result(name, denied_io(r, &fs_denied));
@@ -575,8 +690,10 @@ fn run_checks(a: &ProbeArgs) -> i32 {
             let (r, e) = sys(|| unsafe { libc::chmod(c.as_ptr(), mode) } as libc::c_long);
             out.result("chmod_secret", denied(r, e, &[libc::EPERM]));
         }
-        None => out.check("chmod_secret", false, "no --secret given"),
+        None => out.check("chmod_secret", false, missing("--secret")),
     }
+    inherited_fd_checks(a, root_dir, &mut out);
+    sysv_checks(&mut out);
 
     let is_broker = a.kind == ProfileKind::Broker;
     let (r, e) = new_socket(libc::AF_UNIX, libc::SOCK_STREAM);
@@ -601,7 +718,7 @@ fn run_checks(a: &ProbeArgs) -> i32 {
             };
             out.check("abstract_unix_connect", ok, format!("{d} ({layer})"));
         }
-        (None, _) => out.check("abstract_unix_connect", false, "no --abstract given"),
+        (None, _) => out.check("abstract_unix_connect", false, missing("--abstract")),
         (_, false) => out.check(
             "abstract_unix_connect",
             false,
@@ -617,34 +734,7 @@ fn run_checks(a: &ProbeArgs) -> i32 {
         let (ok, d) = denied(r, e, &[libc::EPERM]);
         out.check("kill_parent", ok, format!("{d} (Landlock signal scope)"));
     }
-    if a.unrestricted {
-        // Without a sandbox these would really attach to / read the parent.
-        out.check("ptrace_attach_parent", false, "skipped (--unrestricted)");
-        out.check("process_vm_readv_parent", false, "skipped (--unrestricted)");
-    } else {
-        // SAFETY: integer arguments; detached again below if it ever succeeded.
-        let (r, e) = sys(|| unsafe { libc::ptrace(libc::PTRACE_ATTACH, ppid, 0usize, 0usize) });
-        if r >= 0 {
-            // SAFETY: as above.
-            unsafe { libc::ptrace(libc::PTRACE_DETACH, ppid, 0usize, 0usize) };
-        }
-        out.result("ptrace_attach_parent", denied(r, e, &[libc::EPERM]));
-
-        let mut buf = [0u8; 8];
-        let local = libc::iovec {
-            iov_base: buf.as_mut_ptr().cast(),
-            iov_len: buf.len(),
-        };
-        let remote = libc::iovec {
-            iov_base: 0x1000 as *mut libc::c_void,
-            iov_len: 8,
-        };
-        // SAFETY: `local` points at `buf`; the remote address is only read by the kernel.
-        let (r, e) = sys(
-            || unsafe { libc::process_vm_readv(ppid, &local, 1, &remote, 1, 0) } as libc::c_long,
-        );
-        out.result("process_vm_readv_parent", denied(r, e, &[libc::EPERM]));
-    }
+    tracee_checks(tracee, &mut out);
     {
         // Re-apply the parent's current values, so even a missing filter changes nothing.
         // SAFETY: integer arguments.
@@ -706,10 +796,11 @@ fn run_checks(a: &ProbeArgs) -> i32 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // The x32 alias of getpid.
+        // The x32 alias of getpid: the filter's EPERM, never the kernel's ENOSYS (a kernel without
+        // CONFIG_X86_X32_ABI says ENOSYS whether or not the filter is there).
         // SAFETY: getpid takes no arguments.
         let (r, e) = sys(|| unsafe { libc::syscall(0x4000_0000 | libc::SYS_getpid) });
-        out.result("x32_syscall", denied(r, e, &[libc::EPERM, libc::ENOSYS]));
+        out.result("x32_syscall", denied(r, e, &[libc::EPERM]));
     }
     {
         // SAFETY: re-arming the same parent-death signal; harmless even if allowed.
@@ -718,6 +809,24 @@ fn run_checks(a: &ProbeArgs) -> i32 {
                 as libc::c_long,
         );
         out.result("pdeathsig_locked", denied(r, e, &[libc::EPERM]));
+    }
+    {
+        // SAFETY: getter/setter prctls with integer arguments; the old value is put back if the
+        // set ever succeeded.
+        let before = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+        let (r, e) =
+            sys(|| unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) } as libc::c_long);
+        if r == 0 && before >= 0 {
+            // SAFETY: as above.
+            unsafe { libc::prctl(libc::PR_SET_DUMPABLE, before, 0, 0, 0) };
+        }
+        out.result("prctl_set_dumpable", denied(r, e, &[libc::EPERM]));
+        // 0 clears any ptracer: harmless even if allowed.
+        // SAFETY: integer arguments.
+        let (r, e) = sys(
+            || unsafe { libc::prctl(crate::restrict::PR_SET_PTRACER, 0, 0, 0, 0) } as libc::c_long,
+        );
+        out.result("prctl_set_ptracer", denied(r, e, &[libc::EPERM]));
     }
     {
         let c: libc::c_char = b'x' as libc::c_char;
@@ -764,24 +873,233 @@ fn run_checks(a: &ProbeArgs) -> i32 {
     }
     close(unix_sock);
     close(inet_sock);
+    close(root_dir);
 
     // Last: if exec worked, this process is gone and DONE never prints.
-    if a.unrestricted {
-        out.check("execve", false, "skipped (--unrestricted)");
+    let _ = io::stdout().flush();
+    // Outside the sandbox, a path that does not exist exercises the same check without replacing
+    // the process (ENOENT, not the filter's EPERM).
+    let target = if a.unrestricted {
+        "/nonexistent/zkminer-probe-exec"
     } else {
-        let _ = io::stdout().flush();
-        let path = CString::new("/bin/true").unwrap_or_default();
-        let argv = [path.as_ptr(), std::ptr::null()];
-        let envp = [std::ptr::null::<libc::c_char>()];
-        // SAFETY: NULL-terminated argv/envp of valid C strings.
-        let (r, e) = sys(
-            || unsafe { libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) } as libc::c_long,
-        );
-        out.result("execve", denied(r, e, &[libc::EPERM]));
-    }
+        "/bin/true"
+    };
+    let path = CString::new(target).unwrap_or_default();
+    let argv = [path.as_ptr(), std::ptr::null()];
+    let envp = [std::ptr::null::<libc::c_char>()];
+    // SAFETY: NULL-terminated argv/envp of valid C strings.
+    let (r, e) = sys(
+        || unsafe { libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) } as libc::c_long,
+    );
+    let (ok, d) = denied(r, e, &[libc::EPERM]);
+    out.check("execve", ok, format!("{d} ({target})"));
 
     out.done();
     0
+}
+
+/// ptrace and `process_vm_readv` against the pre-sandbox child.
+fn tracee_checks(tracee: Result<libc::pid_t, i32>, out: &mut Out) {
+    let pid = match tracee {
+        Ok(pid) => pid,
+        Err(e) => {
+            let d = format!(
+                "could not fork the tracee before restricting: {}",
+                errname(e)
+            );
+            out.check("ptrace_attach_child", false, d.clone());
+            out.check("process_vm_readv_child", false, d);
+            return;
+        }
+    };
+    // SAFETY: integer arguments; a successful attach is waited for and detached again.
+    let (r, e) = sys(|| unsafe { libc::ptrace(libc::PTRACE_ATTACH, pid, 0usize, 0usize) });
+    if r >= 0 {
+        let mut st = 0;
+        // SAFETY: waits for the attach stop of our own child, then detaches.
+        unsafe {
+            libc::waitpid(pid, &mut st, libc::__WALL);
+            libc::ptrace(libc::PTRACE_DETACH, pid, 0usize, 0usize);
+        }
+    }
+    let (ok, d) = denied(r, e, &[libc::EPERM]);
+    out.check(
+        "ptrace_attach_child",
+        ok,
+        format!("{d} (PTRACE_ATTACH to own child {pid})"),
+    );
+
+    let mut buf = [0u8; 8];
+    let local = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let remote = libc::iovec {
+        iov_base: TRACEE_MARK.as_ptr() as *mut libc::c_void,
+        iov_len: TRACEE_MARK.len(),
+    };
+    // SAFETY: `local` points at `buf`; the remote address is only read by the kernel.
+    let (r, e) =
+        sys(|| unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) } as libc::c_long);
+    let (ok, d) = denied(r, e, &[libc::EPERM]);
+    let got = if r > 0 {
+        format!(", read {:?}", String::from_utf8_lossy(&buf))
+    } else {
+        String::new()
+    };
+    out.check(
+        "process_vm_readv_child",
+        ok,
+        format!("{d} (own child {pid}{got})"),
+    );
+}
+
+/// Metadata writes, locks, leases and notifications through an fd the sandbox inherited (the W
+/// file, a memfd), which Landlock does not see: it checks rights when a path is opened.
+fn inherited_fd_checks(a: &ProbeArgs, root_dir: RawFd, out: &mut Out) {
+    const NAMES: [&str; 9] = [
+        "fchmod_inherited",
+        "fchown_inherited",
+        "fsetxattr_inherited",
+        "fremovexattr_inherited",
+        "flock_inherited",
+        "fcntl_setlease_inherited",
+        "file_getattr_inherited",
+        "file_setattr_inherited",
+        "ioctl_setflags_inherited",
+    ];
+    let eperm = [libc::EPERM];
+    match a.meta_fd {
+        None => {
+            for n in NAMES {
+                out.check(n, false, missing("--meta-fd"));
+            }
+        }
+        Some(fd) => {
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: fstat writes into `st`.
+            let mode = if unsafe { libc::fstat(fd, st.as_mut_ptr()) } == 0 {
+                // SAFETY: fstat succeeded.
+                unsafe { st.assume_init() }.st_mode & 0o7777
+            } else {
+                0o600
+            };
+            // Each call re-applies what is there (mode, owner -1/-1, flags) or is undone at once,
+            // so even a missing filter leaves the parent's file as it was.
+            // SAFETY (all calls below): integer arguments, or pointers to valid local buffers and
+            // NUL-terminated constants.
+            let (r, e) = sys(|| unsafe { libc::fchmod(fd, mode) } as libc::c_long);
+            out.result("fchmod_inherited", denied(r, e, &eperm));
+            let (r, e) = sys(|| unsafe { libc::fchown(fd, u32::MAX, u32::MAX) } as libc::c_long);
+            out.result("fchown_inherited", denied(r, e, &eperm));
+            let name = c"user.zkminer-probe";
+            let (r, e) =
+                sys(
+                    || unsafe { libc::fsetxattr(fd, name.as_ptr(), b"1".as_ptr().cast(), 1, 0) }
+                        as libc::c_long,
+                );
+            if r == 0 {
+                unsafe { libc::fremovexattr(fd, name.as_ptr()) };
+            }
+            out.result("fsetxattr_inherited", denied(r, e, &eperm));
+            let (r, e) =
+                sys(
+                    || unsafe { libc::fremovexattr(fd, c"user.zkminer-probe-absent".as_ptr()) }
+                        as libc::c_long,
+                );
+            out.result("fremovexattr_inherited", denied(r, e, &eperm));
+            let (r, e) =
+                sys(|| unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) } as libc::c_long);
+            if r == 0 {
+                unsafe { libc::flock(fd, libc::LOCK_UN) };
+            }
+            out.result("flock_inherited", denied(r, e, &eperm));
+            let (r, e) =
+                sys(|| unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_RDLCK) } as libc::c_long);
+            if r == 0 {
+                unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_UNLCK) };
+            }
+            out.result("fcntl_setlease_inherited", denied(r, e, &eperm));
+            // struct file_attr (FILE_ATTR_SIZE_VER0): fa_xflags u64, then four u32s.
+            let mut attr = [0u64; 3];
+            let size = std::mem::size_of_val(&attr);
+            let (r, e) = sys(|| unsafe {
+                libc::syscall(
+                    468,
+                    fd,
+                    c"".as_ptr(),
+                    attr.as_mut_ptr(),
+                    size,
+                    libc::AT_EMPTY_PATH,
+                )
+            });
+            out.result("file_getattr_inherited", denied(r, e, &eperm));
+            let (r, e) = sys(|| unsafe {
+                libc::syscall(
+                    469,
+                    fd,
+                    c"".as_ptr(),
+                    attr.as_mut_ptr(),
+                    size,
+                    libc::AT_EMPTY_PATH,
+                )
+            });
+            out.result("file_setattr_inherited", denied(r, e, &eperm));
+            let mut flags: libc::c_long = 0;
+            unsafe { libc::ioctl(fd, 0x8008_6601, &mut flags) }; // FS_IOC_GETFLAGS
+            let (r, e) =
+                sys(
+                    || unsafe { libc::ioctl(fd, crate::restrict::FS_IOC_SETFLAGS as _, &flags) }
+                        as libc::c_long,
+                );
+            out.result("ioctl_setflags_inherited", denied(r, e, &eperm));
+        }
+    }
+    if root_dir < 0 {
+        out.check(
+            "fcntl_notify_dir",
+            false,
+            "could not open / before restricting",
+        );
+    } else {
+        // DN_DELETE on /: the rarest event, and the notification is removed at once if it was set.
+        // SAFETY: integer arguments.
+        let (r, e) = sys(|| unsafe {
+            libc::fcntl(root_dir, libc::F_NOTIFY, 0x8 /* DN_DELETE */)
+        } as libc::c_long);
+        if r == 0 {
+            unsafe { libc::fcntl(root_dir, libc::F_NOTIFY, 0) };
+        }
+        let (ok, d) = denied(r, e, &eperm);
+        out.check(
+            "fcntl_notify_dir",
+            ok,
+            format!("{d} (F_NOTIFY on a directory fd held from before)"),
+        );
+    }
+}
+
+/// SysV IPC: a private segment, queue and semaphore set. Anything created (no sandbox) is removed
+/// again at once.
+fn sysv_checks(out: &mut Out) {
+    let eperm = [libc::EPERM];
+    let flags = libc::IPC_CREAT | 0o600;
+    // SAFETY (all): integer arguments; IPC_RMID with a NULL buffer.
+    let (r, e) = sys(|| unsafe { libc::shmget(libc::IPC_PRIVATE, 4096, flags) } as libc::c_long);
+    if r >= 0 {
+        unsafe { libc::shmctl(r as i32, libc::IPC_RMID, std::ptr::null_mut()) };
+    }
+    out.result("sysv_shmget", denied(r, e, &eperm));
+    let (r, e) = sys(|| unsafe { libc::msgget(libc::IPC_PRIVATE, flags) } as libc::c_long);
+    if r >= 0 {
+        unsafe { libc::msgctl(r as i32, libc::IPC_RMID, std::ptr::null_mut()) };
+    }
+    out.result("sysv_msgget", denied(r, e, &eperm));
+    let (r, e) = sys(|| unsafe { libc::semget(libc::IPC_PRIVATE, 1, flags) } as libc::c_long);
+    if r >= 0 {
+        unsafe { libc::semctl(r as i32, 0, libc::IPC_RMID) };
+    }
+    out.result("sysv_semget", denied(r, e, &eperm));
 }
 
 fn no_network_checks(a: &ProbeArgs, inet_sock: RawFd, out: &mut Out) {
@@ -811,13 +1129,96 @@ fn no_network_checks(a: &ProbeArgs, inet_sock: RawFd, out: &mut Out) {
                 format!("{d} to 127.0.0.1:{port} (a listening port)"),
             );
         }
-        (None, _) => out.check("tcp_connect_loopback", false, "no --listen-port given"),
+        (None, _) => out.check("tcp_connect_loopback", false, missing("--listen-port")),
         (_, false) => out.check(
             "tcp_connect_loopback",
             false,
             "could not create a socket before restricting",
         ),
     }
+}
+
+/// How a socket the broker must not have was tried.
+enum Reach {
+    /// `connect` to 127.0.0.1:port.
+    Connect(u16),
+    /// `sendto` 127.0.0.1:port.
+    SendTo(u16, &'static [u8]),
+}
+
+/// Pass iff `socket(domain, ty, proto)` fails with `EPERM`. If it is created (no sandbox), it is
+/// pointed at a port not in `tcp_connect_ports` and the detail says whether that got through.
+fn denied_socket(
+    domain: libc::c_int,
+    ty: libc::c_int,
+    proto: libc::c_int,
+    reach: Option<Reach>,
+) -> (bool, String) {
+    // SAFETY: socket takes integers.
+    let (fd, e) =
+        sys(|| unsafe { libc::socket(domain, ty | libc::SOCK_CLOEXEC, proto) } as libc::c_long);
+    if fd < 0 {
+        return denied(fd, e, &[libc::EPERM]);
+    }
+    let fd = fd as RawFd;
+    let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let detail =
+        match reach {
+            None => "created".to_string(),
+            Some(Reach::Connect(port)) => {
+                let addr = loopback(port);
+                // SAFETY: `addr` is a valid sockaddr_in of `len` bytes.
+                let (r, e) = sys(|| unsafe {
+                    libc::connect(fd, (&addr as *const libc::sockaddr_in).cast(), len)
+                } as libc::c_long);
+                format!(
+                    "created; connect to 127.0.0.1:{port}: {}",
+                    if r == 0 {
+                        "connected".into()
+                    } else {
+                        errname(e)
+                    }
+                )
+            }
+            Some(Reach::SendTo(port, payload)) => {
+                let addr = loopback(port);
+                // SAFETY: `payload` and `addr` are valid for the lengths passed.
+                let (r, e) = sys(|| unsafe {
+                    libc::sendto(
+                        fd,
+                        payload.as_ptr().cast(),
+                        payload.len(),
+                        0,
+                        (&addr as *const libc::sockaddr_in).cast(),
+                        len,
+                    )
+                } as libc::c_long);
+                format!(
+                    "created; sendto 127.0.0.1:{port}: {}",
+                    if r >= 0 {
+                        format!("{r} bytes sent")
+                    } else {
+                        errname(e)
+                    }
+                )
+            }
+        };
+    close(fd);
+    (false, detail)
+}
+
+/// Pass iff `socketpair(AF_UNIX, ty)` fails with `EPERM`.
+fn denied_pair(ty: libc::c_int) -> (bool, String) {
+    let mut sv = [-1 as RawFd; 2];
+    // SAFETY: socketpair writes two fds into `sv`.
+    let (r, e) = sys(|| unsafe {
+        libc::socketpair(libc::AF_UNIX, ty | libc::SOCK_CLOEXEC, 0, sv.as_mut_ptr())
+    } as libc::c_long);
+    if r == 0 {
+        close(sv[0]);
+        close(sv[1]);
+    }
+    denied(r, e, &[libc::EPERM])
 }
 
 fn broker_checks(a: &ProbeArgs, out: &mut Out) {
@@ -836,12 +1237,87 @@ fn broker_checks(a: &ProbeArgs, out: &mut Out) {
         r >= 0 || e != libc::EPERM,
         if r >= 0 { "ok".into() } else { errname(e) },
     );
-    let (r, e) = new_socket(libc::AF_INET, libc::SOCK_DGRAM);
-    close(r as RawFd);
-    out.check(
-        "socket_udp_allowed",
-        r >= 0,
-        if r >= 0 { "ok".into() } else { errname(e) },
+    {
+        // How hyper (socket2) asks: protocol IPPROTO_TCP, with SOCK_NONBLOCK | SOCK_CLOEXEC.
+        // SAFETY: socket takes integers.
+        let (r, e) = sys(|| unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                libc::IPPROTO_TCP,
+            )
+        } as libc::c_long);
+        close(r as RawFd);
+        out.check(
+            "socket_inet_tcp_allowed",
+            r >= 0,
+            if r >= 0 { "ok".into() } else { errname(e) },
+        );
+    }
+    // Landlock restricts TCP only: every other socket the broker could make reaches any port.
+    let deny = a.deny_port;
+    let need = |out: &mut Out, name: &str| out.check(name, false, missing("--deny-port"));
+    match deny {
+        Some(port) => {
+            let (ok, d) = denied_socket(
+                libc::AF_INET,
+                libc::SOCK_DGRAM,
+                0,
+                Some(Reach::SendTo(port, b"zkminer-probe-udp")),
+            );
+            out.check("socket_udp", ok, d);
+            let (ok, d) = denied_socket(
+                libc::AF_INET,
+                libc::SOCK_STREAM,
+                libc::IPPROTO_MPTCP,
+                Some(Reach::Connect(port)),
+            );
+            out.check("socket_mptcp", ok, d);
+        }
+        None => {
+            need(out, "socket_udp");
+            need(out, "socket_mptcp");
+        }
+    }
+    // An ICMP echo request (type 8) to 127.0.0.1; ping sockets have no port.
+    const ECHO: &[u8] = &[8, 0, 0, 0, 0, 0, 0, 1, b'z', b'k'];
+    let (ok, d) = denied_socket(
+        libc::AF_INET,
+        libc::SOCK_DGRAM,
+        libc::IPPROTO_ICMP,
+        Some(Reach::SendTo(0, ECHO)),
+    );
+    out.check("socket_icmp", ok, d);
+    let (ok, d) = denied_socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_TCP, None);
+    out.check("socket_raw", ok, d);
+
+    {
+        let mut sv = [-1 as RawFd; 2];
+        // SAFETY: socketpair writes two fds into `sv`.
+        let (r, e) = sys(|| unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                sv.as_mut_ptr(),
+            )
+        } as libc::c_long);
+        close(sv[0]);
+        close(sv[1]);
+        out.check(
+            "socketpair_unix_stream_allowed",
+            r == 0,
+            if r == 0 {
+                "ok (tokio's signal driver)".into()
+            } else {
+                errname(e)
+            },
+        );
+    }
+    out.result("socketpair_unix_dgram", denied_pair(libc::SOCK_DGRAM));
+    out.result(
+        "socketpair_unix_seqpacket",
+        denied_pair(libc::SOCK_SEQPACKET),
     );
 
     match a.listen_port {
@@ -853,7 +1329,7 @@ fn broker_checks(a: &ProbeArgs, out: &mut Out) {
             };
             out.check("tcp_connect_allowed_port", r.is_ok(), d);
         }
-        None => out.check("tcp_connect_allowed_port", false, "no --listen-port given"),
+        None => out.check("tcp_connect_allowed_port", false, missing("--listen-port")),
     }
     match a.deny_port {
         Some(port) => {
@@ -866,7 +1342,7 @@ fn broker_checks(a: &ProbeArgs, out: &mut Out) {
                 ),
             );
         }
-        None => out.check("tcp_connect_denied_port", false, "no --deny-port given"),
+        None => out.check("tcp_connect_denied_port", false, missing("--deny-port")),
     }
     out.result(
         "tcp_bind",
@@ -890,7 +1366,9 @@ fn broker_checks(a: &ProbeArgs, out: &mut Out) {
     out.check(
         "read_readable",
         problems.is_empty() && !a.readable.is_empty(),
-        if problems.is_empty() {
+        if a.readable.is_empty() {
+            missing("--readable")
+        } else if problems.is_empty() {
             format!("{} paths readable", a.readable.len())
         } else {
             problems.join("; ")
@@ -920,7 +1398,9 @@ fn broker_checks(a: &ProbeArgs, out: &mut Out) {
     out.check(
         "readable_not_writable",
         problems.is_empty() && !a.readable.is_empty(),
-        if problems.is_empty() {
+        if a.readable.is_empty() {
+            missing("--readable")
+        } else if problems.is_empty() {
             "EACCES".to_string()
         } else {
             problems.join("; ")
@@ -949,7 +1429,9 @@ fn broker_checks(a: &ProbeArgs, out: &mut Out) {
     out.check(
         "write_writable",
         problems.is_empty() && !a.writable.is_empty(),
-        if problems.is_empty() {
+        if a.writable.is_empty() {
+            missing("--writable")
+        } else if problems.is_empty() {
             format!("{} spool dirs writable", a.writable.len())
         } else {
             problems.join("; ")
@@ -1072,7 +1554,8 @@ mod tests {
         a.listen_port = Some(4000);
         a.deny_port = Some(4001);
         a.abstract_name = Some("zk-1".into());
-        a.expect_fds = vec![0, 1, 2, 3, 4];
+        a.meta_fd = Some(5);
+        a.expect_fds = vec![0, 1, 2, 3, 4, 5];
         a.ready_fd = Some(3);
         a.go_fd = Some(4);
         a.bytes = 1 << 29;

@@ -13,10 +13,14 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::linux::net::SocketAddrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use zkminer_witness_sandbox::probe::{
+    expected_checks, ProbeArgs, ProfileKind, POSITIVE_CHECKS, UNSANDBOXED_EXEMPT,
+};
 use zkminer_witness_sandbox::{
     delegated_root, landlock_abi, prepare_command, self_test, self_test_profile, Cgroup,
     CgroupSpec, Profile, SandboxError, SandboxMode, SelfTestReport, MIN_LANDLOCK_ABI,
@@ -117,6 +121,24 @@ fn builder_runner_self_test() {
         "builder_runner/oom_kill",
         "builder_runner/pids_max",
         "builder_runner/probe_output",
+        "builder_runner/sysv_shmget",
+        "builder_runner/sysv_msgget",
+        "builder_runner/sysv_semget",
+        "builder_runner/fchmod_inherited",
+        "builder_runner/fchown_inherited",
+        "builder_runner/fsetxattr_inherited",
+        "builder_runner/fremovexattr_inherited",
+        "builder_runner/flock_inherited",
+        "builder_runner/fcntl_setlease_inherited",
+        "builder_runner/fcntl_notify_dir",
+        "builder_runner/file_getattr_inherited",
+        "builder_runner/file_setattr_inherited",
+        "builder_runner/ioctl_setflags_inherited",
+        "builder_runner/prctl_set_dumpable",
+        "builder_runner/prctl_set_ptracer",
+        "builder_runner/ptrace_attach_child",
+        "builder_runner/process_vm_readv_child",
+        "builder_runner/inherited_file_unchanged",
     ] {
         assert!(n.contains(&c), "missing {c}");
     }
@@ -168,6 +190,18 @@ fn broker_self_test() {
         "broker/read_readable",
         "broker/write_writable",
         "broker/read_secret",
+        "broker/socket_inet_tcp_allowed",
+        "broker/socket_udp",
+        "broker/socket_mptcp",
+        "broker/socket_icmp",
+        "broker/socket_raw",
+        "broker/socketpair_unix_stream_allowed",
+        "broker/socketpair_unix_dgram",
+        "broker/socketpair_unix_seqpacket",
+        "broker/sysv_shmget",
+        "broker/fchmod_inherited",
+        "broker/prctl_set_dumpable",
+        "broker/inherited_file_unchanged",
     ] {
         assert!(n.contains(&c), "missing {c}");
     }
@@ -198,46 +232,177 @@ fn system_mode_is_not_implemented() {
     assert_eq!(names(&report), vec!["system_mode"]);
 }
 
-/// Negative control: the same checks, with `restrict_self` skipped, must fail. Otherwise a passing
-/// self-test would prove nothing. Needs no cgroup.
+/// Owned SysV objects of this uid, from `/proc/sysvipc/{shm,msg,sem}` (the negative control's
+/// probe creates and removes one of each).
+fn sysv_objects() -> usize {
+    let uid = unsafe { libc::geteuid() }.to_string();
+    ["shm", "msg", "sem"]
+        .iter()
+        .map(|t| {
+            let text = std::fs::read_to_string(format!("/proc/sysvipc/{t}")).unwrap_or_default();
+            let header: Vec<&str> = text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .collect();
+            let col = header
+                .iter()
+                .position(|h| *h == "cuid")
+                .expect("cuid column");
+            text.lines()
+                .skip(1)
+                .filter(|l| l.split_whitespace().nth(col) == Some(uid.as_str()))
+                .count()
+        })
+        .sum()
+}
+
+/// Negative control: the same checks, with `restrict_self` skipped, must fail — for every profile.
+/// Otherwise a passing self-test would prove nothing. Every check runs its real logic here (no
+/// argument is missing, nothing is skipped but `restrict_self` itself): checks of operations the
+/// profile allows must pass, the few in `UNSANDBOXED_EXEMPT` (which an unprivileged process cannot
+/// tell from the sandbox) are only reported. Needs no cgroup.
 #[test]
 fn checks_fail_without_the_sandbox() {
     if !landlock_ok("checks_fail_without_the_sandbox") {
         return;
     }
+    for kind in [
+        ProfileKind::BuilderRunner,
+        ProfileKind::ExecuteWorker,
+        ProfileKind::Broker,
+    ] {
+        negative_control(kind);
+    }
+}
+
+fn negative_control(kind: ProfileKind) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::process::CommandExt;
+    let label = kind.label();
     let s = secret();
-    let out = Command::new(PROBE)
-        .args([
-            "checks",
-            "--profile",
-            "builder_runner",
-            "--unrestricted",
-            "1",
-            "--listen-port",
-            "9",
-            "--abstract",
-            "zkminer-test-nonexistent",
-            "--secret",
-        ])
-        .arg(s.path())
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // Everything the checks reach for exists and answers, so a check fails because the operation
+    // worked, not because its target was missing.
+    let listen = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let deny = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let abstract_name = format!("zkminer-negative-{}-{label}", std::process::id());
+    let addr =
+        std::os::unix::net::SocketAddr::from_abstract_name(abstract_name.as_bytes()).unwrap();
+    let _unix = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+    let meta_path = dir.path().join("w");
+    std::fs::write(&meta_path, b"inherited\n").unwrap();
+    std::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let meta = std::fs::File::open(&meta_path).unwrap();
+
+    let mut a = ProbeArgs::new(kind);
+    a.unrestricted = true;
+    a.secret = Some(s.path().to_path_buf());
+    a.listen_port = Some(listen.local_addr().unwrap().port());
+    a.deny_port = Some(deny.local_addr().unwrap().port());
+    a.abstract_name = Some(abstract_name);
+    a.meta_fd = Some(5);
+    a.expect_fds = vec![0, 1, 2, 5];
+    a.tag = format!("negative-{}-{label}", std::process::id());
+    if kind == ProfileKind::Broker {
+        let endpoints = dir.path().join("endpoints.toml");
+        std::fs::write(&endpoints, "# test\n").unwrap();
+        let spool = dir.path().join("spool");
+        std::fs::create_dir(&spool).unwrap();
+        a.readable = vec![endpoints];
+        a.writable = vec![spool];
+        a.ports = vec![a.listen_port.unwrap()];
+    }
+    let sysv_before = sysv_objects();
+    let mut cmd = Command::new(PROBE);
+    cmd.args(a.to_args("checks"))
+        .env_clear()
+        .stdin(Stdio::null());
+    let raw = meta.as_raw_fd();
+    // SAFETY: dup2/fcntl only, between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if raw == 5 {
+                if libc::fcntl(5, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::dup2(raw, 5) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("\nDONE "), "{text}");
-    // Not properties of restrict_self (inherited_fds), or kernel-dependent (x32 may be absent).
-    let exempt = ["inherited_fds", "x32_syscall"];
-    let mut checked = 0;
+    assert!(text.contains("\nDONE "), "{label}: {text}");
+
+    let mut seen = Vec::new();
+    let mut failed_as_expected = 0;
     for line in text.lines().filter_map(|l| l.strip_prefix("CHECK ")) {
         let mut it = line.splitn(3, ' ');
-        let (name, verdict) = (it.next().unwrap(), it.next().unwrap());
-        if exempt.contains(&name) {
+        let (name, verdict, detail) = (
+            it.next().unwrap(),
+            it.next().unwrap(),
+            it.next().unwrap_or(""),
+        );
+        seen.push(name.to_string());
+        assert!(
+            !detail.contains("missing --"),
+            "{label}/{name} did not run: {line}"
+        );
+        assert!(
+            name == "restrict_self" || !detail.starts_with("skipped"),
+            "{label}/{name} was skipped: {line}"
+        );
+        if let Some((_, why)) = UNSANDBOXED_EXEMPT.iter().find(|(n, _)| *n == name) {
+            say(&format!(
+                "  {label}/{name} {verdict} (exempt: {why}): {detail}"
+            ));
             continue;
         }
-        assert_eq!(verdict, "FAIL", "{name} passes without any sandbox: {line}");
-        checked += 1;
+        if POSITIVE_CHECKS.contains(&name) {
+            assert_eq!(
+                verdict, "PASS",
+                "{label}/{name}: an allowed operation fails without any sandbox: {line}"
+            );
+        } else {
+            assert_eq!(
+                verdict, "FAIL",
+                "{label}/{name} passes without any sandbox: {line}"
+            );
+            failed_as_expected += 1;
+        }
     }
-    assert!(checked >= 25, "only {checked} checks: {text}");
+    for c in expected_checks(kind) {
+        assert!(
+            seen.iter().any(|s| s == c),
+            "{label}: {c} not printed: {text}"
+        );
+    }
+    let want = expected_checks(kind).len()
+        - POSITIVE_CHECKS
+            .iter()
+            .filter(|c| expected_checks(kind).contains(c))
+            .count()
+        - UNSANDBOXED_EXEMPT
+            .iter()
+            .filter(|(c, _)| expected_checks(kind).contains(c))
+            .count();
+    assert_eq!(failed_as_expected, want, "{label}: {text}");
+    // What the unrestricted probe did to the parent's things, it undid.
+    let m = std::fs::metadata(&meta_path).unwrap();
+    assert_eq!(
+        m.mode() & 0o7777,
+        0o640,
+        "{label}: the inherited file's mode changed"
+    );
+    assert_eq!(
+        sysv_objects(),
+        sysv_before,
+        "{label}: SysV objects left behind"
+    );
+    say(&format!("checks_fail_without_the_sandbox: {label}: {failed_as_expected} denial checks fail unsandboxed"));
 }
 
 #[test]
