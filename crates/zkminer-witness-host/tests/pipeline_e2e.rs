@@ -548,7 +548,7 @@ impl Env {
             prover: self.prover,
             chain_id: ANVIL_CHAIN,
             router: self.router,
-            elf: &fibonacci().0,
+            elf: Some(&fibonacci().0),
             current_block: block,
         };
         let r = simulate_witness_job(&self.ctx, &job, hooks).await;
@@ -620,7 +620,16 @@ fn a_full_binding_job_publishes_a_bundle_the_store_reads_back_verified() {
         assert_eq!((b.prover, b.caller, b.builder_id), (env.prover, Address::repeat_byte(0xca), env.echo_id));
         assert_eq!((b.image_id, b.keccak_po2, b.submit_tx_hash), (env.image_id(), 17, B256::repeat_byte(0x7c)));
         assert_eq!(b.sys_rand_key_fingerprint, key_fingerprint(&KEY));
-        assert_eq!(b.worker_builds, vec!["test-worker-build".to_string()]);
+        // The prove workers' builds and the execute worker's own, as its response named it.
+        assert!(sim.execute_build.starts_with("risc0/risc0-zkvm "), "{}", sim.execute_build);
+        let mut want = vec!["test-worker-build".to_string(), sim.execute_build.clone()];
+        want.sort();
+        assert_eq!(b.worker_builds, want);
+        assert!(b.execute_ms_per_po2.is_some());
+        assert_eq!(b.elf_sha256, Some(B256::from(<[u8; 32]>::from(Sha256::digest(&fibonacci().0)))));
+        // The ELF reads back by its digest, with no image-id derivation.
+        let (_, elf_back) = env.ctx.store.verify_with_elf(&sim.bundle, &descriptor_hash_of_abi, &|_| None).unwrap();
+        assert_eq!(elf_back, fibonacci().0);
         assert!(b.created_at_block > 0);
         assert_eq!(b.version, sim.bundle.version);
         assert_eq!(b.po2_results.len(), 2);

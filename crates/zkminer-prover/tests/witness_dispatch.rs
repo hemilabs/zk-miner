@@ -108,3 +108,26 @@ fn a_witness_proof_comes_back_as_a_proof() {
         other => panic!("{other:?}"),
     }
 }
+
+/// A witness bundle records the build of every worker that may prove it, read at simulation and at
+/// the lock. It is published when a worker starts, outside the slot's mutex: a slot that is busy
+/// proving still names its build (it once read as "none", and every revalidation flapped).
+#[test]
+fn a_busy_slot_still_names_its_build() {
+    let pool = std::sync::Arc::new(pool(&[("MOCK_PROVE_DELAY_SECS", "3")]));
+    let named = vec![("mock:generic".to_string(), Some(("mock 0.1.0".to_string(), "0.1.0".to_string())))];
+    assert_eq!(pool.worker_builds("mock"), named);
+    let busy = {
+        let pool = pool.clone();
+        std::thread::spawn(move || {
+            let mut used = None;
+            prove(&pool, &mut used)
+        })
+    };
+    // While the proof holds the slot.
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(pool.worker_info("mock").is_none(), "the slot is busy (its info needs the slot)");
+    assert_eq!(pool.worker_builds("mock"), named, "the build does not");
+    busy.join().unwrap().expect("the proof");
+    assert!(pool.worker_builds("other").is_empty());
+}

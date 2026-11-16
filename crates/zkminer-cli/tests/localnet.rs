@@ -3794,7 +3794,10 @@ mod witness_support {
                 maxBuilderMemoryBytes: 64 << 20,
                 maxBuilderSeconds: 30,
                 maxWitnessBytes: 1 << 16,
-                maxGuestCycles: 1 << 24,
+                // Within the CPU slot's derived maximum: what one attempt can prove inside the
+                // configured 1,800 s watchdog beside the CPU Groth16 allowance (about 6M sized
+                // cycles at the CPU floor rate); the guest uses 32,768.
+                maxGuestCycles: 1 << 22,
             },
         };
         JobDescriptor {
@@ -3923,8 +3926,12 @@ async fn serves_witness_jobs() {
         memory_bytes: 512 << 20,
     });
     c.dev.da_backlog_bytes = Some(0);
-    // A CPU Groth16 proof (a debug-built worker, minutes) must not meet the 10-minute default
-    // watchdog meant for a wedged GPU.
+    // The host proves on a CPU slot with no benchmark row: the claim gate budgets its Groth16 path
+    // (minutes on a CPU) at the CPU allowance, and an estimate at or over the per-attempt watchdog is
+    // refused, as the inline gate refuses one. The default 10-minute watchdog (meant for a wedged
+    // GPU) cannot hold that estimate, so this host runs with a watchdog sized for CPU proofs, and the
+    // gate checks that the estimate fits it (asserted below, with the estimate at least the proof's
+    // real time).
     c.prover.proving_timeout_secs = 1_800;
     c.save(Some(&config)).unwrap();
     // The probe the self-test runs is found next to zkminer (a link in the run directory).
@@ -4015,6 +4022,27 @@ async fn serves_witness_jobs() {
                 last = Some(i);
             }
         }
+    }
+    // The claim gate's estimate was realistic: at least what the CPU proof took, and inside the
+    // watchdog it was checked against.
+    let secs_after = |needle: &str, marker: &str| -> Option<f64> {
+        let line = lines.iter().find(|l| l.contains(needle))?;
+        let rest = &line[line.find(marker)? + marker.len()..];
+        rest.split(|c: char| !(c.is_ascii_digit() || c == '.')).find(|t| !t.is_empty())?.parse().ok()
+    };
+    let estimated = secs_after(&format!("witness job {sg}: claim gate passed"), "~");
+    let proved = secs_after(&format!("WITNESS-LOCK {sg}: proved ("), " cycles, ");
+    eprintln!("localnet: the claim gate estimated {estimated:?} s; the CPU proof took {proved:?} s");
+    match (estimated, proved) {
+        (Some(e), Some(p)) => {
+            if e < p {
+                failures.push(format!("the claim gate estimated {e} s, the proof took {p} s"));
+            }
+            if e >= 1_800.0 {
+                failures.push(format!("the claim gate admitted a {e} s estimate at a 1,800 s watchdog"));
+            }
+        }
+        _ => failures.push("no claim-gate estimate or proof time in the log".into()),
     }
     let claims = world.logs::<IHemiProveCore::JobClaimed>().await;
     let fulfils = world.logs::<IHemiProveFulfill::JobFulfilled>().await;

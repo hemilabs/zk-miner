@@ -46,8 +46,14 @@ pub(super) use stub::WitnessRuntime;
 pub(super) enum Route {
     /// An inline job (or not known yet to be anything else): the inline path as before.
     Inline,
-    /// A witness job (or one being classified): not the inline path's.
+    /// A witness job the witness path serves (being classified, simulated or locked, or waiting
+    /// for a card): not the inline path's.
     Witness,
+    /// A witness job this host does not serve now (no runtime, serving off, its caller not admitted,
+    /// journal-bound jobs off, a verdict that holds): the brain sets it aside for `wait`, as the
+    /// inline path sets aside a job it cannot claim, so it neither keeps its price rank in the
+    /// capped Open set nor takes a slot of the per-tick cut.
+    WitnessUnserved { wait: std::time::Duration },
 }
 
 /// What a job's `inputData` says it is.
@@ -90,8 +96,8 @@ pub(super) fn known_class(job_id: B256) -> Option<Class> {
 /// The brain's routing of one candidate (§18 "Classify and route"). With a runtime, a known witness
 /// job is offered to it, and an unknown job from an allowlisted caller is classified first (one
 /// descriptor read) and held off the inline path meanwhile. Without one (witness serving off or not
-/// available here), a known witness job is skipped, and everything else is inline: the inline path's
-/// own descriptor read recognises a witness job and stops there.
+/// available here), a known witness job is set aside, and everything else is inline: the inline
+/// path's own descriptor read recognises a witness job and stops there.
 pub(super) fn route(
     rt: Option<&std::sync::Arc<WitnessRuntime>>,
     job: &zkminer_tui::state::TrackedJob,
@@ -101,7 +107,7 @@ pub(super) fn route(
     match rt {
         Some(rt) => rt.route(job, descriptor_hash, claim_predicate_jobs),
         None => match known_class(job.info.job_id) {
-            Some(Class::Witness) => Route::Witness,
+            Some(Class::Witness) => Route::WitnessUnserved { wait: policy::UNSERVED_SET_ASIDE },
             _ => Route::Inline,
         },
     }
@@ -130,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn without_a_runtime_only_known_witness_jobs_leave_the_inline_path() {
+    fn without_a_runtime_known_witness_jobs_are_set_aside() {
         let job = |id: B256| zkminer_tui::state::TrackedJob {
             info: zkminer_chain::jobs::JobInfo { job_id: id, ..Default::default() },
             status: zkminer_tui::state::MinerJobStatus::Open,
@@ -141,7 +147,11 @@ mod tests {
         };
         let (w, i) = (B256::repeat_byte(0xa1), B256::repeat_byte(0xa2));
         note_class(w, Class::Witness);
-        assert_eq!(route(None, &job(w), B256::ZERO, true), Route::Witness);
+        assert_eq!(
+            route(None, &job(w), B256::ZERO, true),
+            Route::WitnessUnserved { wait: policy::UNSERVED_SET_ASIDE },
+            "unserved: set aside, as the inline path set it aside before witness jobs were served"
+        );
         assert_eq!(route(None, &job(i), B256::ZERO, true), Route::Inline, "unknown: inline, which catches it");
     }
 }

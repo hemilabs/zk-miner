@@ -10,6 +10,8 @@
 //!    host's maxima (§7.1: `maxWitnessBytes` and `maxGuestCycles` reject, the builder-side limits
 //!    clamp); every capability provisioned by the broker; then run.rs's chain gates through
 //!    [`PipelineHooks::claimable`] (claimability `eth_call`, submission form, deployment, admission).
+//!    Only then the guest ELF ([`PipelineHooks::guest_elf`], unless [`JobInput::elf`] carries it):
+//!    nothing is downloaded for a job the static gates refuse.
 //! 2. **The builder artifact** (§13.4): the operator mirror, then the job's `hemi-code` locators in
 //!    envelope order, at most one of them read past its manifest. The broker answers from its
 //!    artifact cache before any read (on the mirror request only when a mirror is configured) and
@@ -115,7 +117,9 @@ pub struct HostContext {
     /// `RISC0_KECCAK_PO2` of the provers (guest-visible, §5.4).
     pub keccak_po2: u8,
     pub sys_rand_key: [u8; 32],
-    /// The build id of every worker binary that may prove a bundle (§15.1).
+    /// The build id of every prove worker that may prove a bundle (§15.1), as
+    /// [`risc0_build_id`] names it. The bundle records these and the execute worker's own (from its
+    /// response).
     pub worker_builds: Vec<String>,
     /// `memory.max` of one execute (`[witness] execute_memory_bytes`).
     pub execute_memory_bytes: u64,
@@ -152,8 +156,9 @@ pub struct JobInput<'a> {
     /// locators for another chain are ignored).
     pub chain_id: u64,
     pub router: Address,
-    /// The guest ELF, fetched by today's ELF path with its image id checked against `programId`.
-    pub elf: &'a [u8],
+    /// The guest ELF, with its image id checked against `programId`; `None` to have
+    /// [`PipelineHooks::guest_elf`] fetch it once the static gates have passed.
+    pub elf: Option<&'a [u8]>,
     /// The current block number (the bundle's `created_at_block`).
     pub current_block: u64,
 }
@@ -174,6 +179,19 @@ pub trait PipelineHooks: Send + Sync {
     /// Fired by run.rs on `JobCancelled`, `JobClaimed` by another prover, `BidSubmitted` and the
     /// governance events that end an attempt.
     fn abort_token(&self) -> &AbortToken;
+
+    /// §5.2 step 3: the guest ELF (today's ELF path), its image id checked against `programId`.
+    /// Called once, after the static gates passed and before the artifact, when [`JobInput::elf`] is
+    /// `None`; `Err` skips the job with that verdict.
+    fn guest_elf(&self) -> HookFuture<'_, Result<Vec<u8>, (SkipReason, String)>> {
+        Box::pin(async { Err((SkipReason::HostInternal, "no guest ELF source".to_string())) })
+    }
+}
+
+/// The build id a witness bundle records for a risc0 worker: its SDK and worker versions as its
+/// `Hello` (or a witness execute's response) names them.
+pub fn risc0_build_id(sdk_version: &str, worker_version: &str) -> String {
+    format!("risc0/{sdk_version}/{worker_version}")
 }
 
 /// Where in the pipeline a job was skipped.
@@ -294,6 +312,9 @@ pub struct Simulated {
     pub limits: Limits,
     pub builder: BuilderStats,
     pub timings: Timings,
+    /// The execute worker's build ([`risc0_build_id`]), which the bundle records with the prove
+    /// workers'.
+    pub execute_build: String,
 }
 
 /// `abi.encode(descriptor)`: what a bundle records as `descriptor_hex`.
@@ -786,6 +807,16 @@ pub async fn simulate_witness_job(
     // 1. Static gates.
     check_abort(token, Step::StaticGates)?;
     let Gated { envelope, limits, prefix, po2s } = static_gates(ctx, job, hooks).await?;
+    let fetched_elf;
+    let elf: &[u8] = match job.elf {
+        Some(e) => e,
+        None => {
+            fetched_elf = abortable(token, Step::StaticGates, hooks.guest_elf())
+                .await?
+                .map_err(|(r, d)| Skip::new(r, Step::StaticGates, format!("the guest ELF: {d}")))?;
+            &fetched_elf
+        }
+    };
     timings.static_gates = started.elapsed();
     let job_key = attempt_key(job);
     tracing::info!(job = %job.job_id, attempt = %short(job_key), ?po2s, prefix = prefix.is_some(), "witness job: static gates passed");
@@ -893,7 +924,7 @@ pub async fn simulate_witness_job(
     }
     let seed = sys_rand::risc0_seed(&ctx.sys_rand_key, &program_id.0, &input.0);
     let req = WitnessExecuteRequest {
-        elf: job.elf.to_vec(),
+        elf: elf.to_vec(),
         prefix: prefix.map(|p| p.to_vec()).unwrap_or_default(),
         w_len,
         input_sha256: input.0,
@@ -905,6 +936,11 @@ pub async fn simulate_witness_job(
     let resp = execute(ctx, token, req, w_file, format!("wexec-{}", short(job_key))).await?;
     let journal = check_execution(&resp, &po2s, program_id, limits.maxGuestCycles).map_err(|(r, d)| Skip::new(r, E, d))?;
     timings.execute = t.elapsed();
+    let execute_build = risc0_build_id(&resp.sdk_version, &resp.worker_version);
+    let mut worker_builds: Vec<String> = ctx.worker_builds.iter().cloned().chain([execute_build.clone()]).collect();
+    worker_builds.sort();
+    worker_builds.dedup();
+    let execute_ms_per_po2 = (timings.execute.as_millis() as u64).div_ceil(po2s.len().max(1) as u64);
 
     // 5. The binding at every po2, as the router judges it, with the real prover.
     const BI: Step = Step::Binding;
@@ -918,7 +954,7 @@ pub async fn simulate_witness_job(
     check_abort(token, P)?;
     let t = Instant::now();
     let hold = {
-        let (store, image_id_fn, elf) = (ctx.store.clone(), ctx.image_id_fn.clone(), job.elf.to_vec());
+        let (store, image_id_fn, elf) = (ctx.store.clone(), ctx.image_id_fn.clone(), elf.to_vec());
         blocking(P, move || store.put_elf(program_id, &elf, &*image_id_fn)).await?.map_err(|e| match e {
             StoreError::Rejected(Reject::Record(_)) => {
                 Skip::new(SkipReason::HostInternal, P, format!("the image-id function refused the verified ELF: {e}"))
@@ -964,10 +1000,12 @@ pub async fn simulate_witness_job(
         w_len,
         sys_rand_key_fingerprint: key_fingerprint(&ctx.sys_rand_key),
         keccak_po2: u32::from(ctx.keccak_po2),
-        worker_builds: ctx.worker_builds.clone(),
+        worker_builds,
         created_at_block: job.current_block,
         builder_id: envelope.job.builderId,
         caller: job.caller,
+        execute_ms_per_po2: Some(execute_ms_per_po2),
+        elf_sha256: Some(hold.sha256()),
     };
     let bundle = {
         let record = record.clone();
@@ -997,6 +1035,7 @@ pub async fn simulate_witness_job(
         limits,
         builder: builder_stats,
         timings,
+        execute_build,
     })
 }
 
@@ -1085,7 +1124,12 @@ mod tests {
     #[test]
     fn execution_checks() {
         let id = B256::repeat_byte(5);
-        let resp = |results| WitnessExecuteResponse { image_id: id.0, results };
+        let resp = |results| WitnessExecuteResponse {
+            image_id: id.0,
+            results,
+            sdk_version: "risc0-zkvm 3.1.0".into(),
+            worker_version: "0.1.0".into(),
+        };
         let ok = resp(vec![po2(16, b"j", 100), po2(18, b"j", 120)]);
         assert_eq!(check_execution(&ok, &[16, 18], id, 120).unwrap(), b"j");
         assert_eq!(check_execution(&ok, &[16, 18], id, 119).unwrap_err().0, SkipReason::GuestCyclesAboveLimit);

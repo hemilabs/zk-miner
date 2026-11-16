@@ -635,6 +635,8 @@ mod execute {
                 .try_into()
                 .expect("a digest is 32 bytes"),
             results,
+            sdk_version: format!("risc0-zkvm {}", risc0_zkvm::VERSION),
+            worker_version: env!("CARGO_PKG_VERSION").to_string(),
         };
         let mut out = BufWriter::new(response);
         write_message(&mut out, &resp)

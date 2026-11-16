@@ -37,7 +37,9 @@ use serde::{Deserialize, Serialize};
 /// worker answers with the new `WorkerResponse::JournalDiverged`. A v12 worker cannot decode the
 /// field, so the handshake refuses it. The one-shot sandboxed execute
 /// ([`WitnessExecuteRequest`] / [`WitnessExecuteResponse`]) is not part of the IPC stream, but ships
-/// in the same version.
+/// in the same version; so does its response's `sdk_version` / `worker_version` (in the same
+/// unreleased version: no handshake covers the one-shot execute, and a response from a binary built
+/// without them fails to decode rather than pass for one).
 pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
@@ -518,6 +520,10 @@ pub struct WitnessExecuteResponse {
     /// guest did not halt with code 0 (no later po2 can make the job claimable), so that result is
     /// then the last one and there are fewer results than po2s.
     pub results: Vec<WitnessExecutePo2>,
+    /// The executor's build, as the binary's `Hello` names it to a pool (`WorkerResponse::Hello`):
+    /// a witness bundle records the build of every executor its journals came from (plan §15.1).
+    pub sdk_version: String,
+    pub worker_version: String,
 }
 
 /// How a sandboxed witness execute failed, as its exit code: never parsed from text (its stderr can

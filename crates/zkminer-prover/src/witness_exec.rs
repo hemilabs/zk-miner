@@ -312,10 +312,26 @@ fn parse_response(
 /// Whether `resp` is a response the worker can have given to `req`: a result per po2, in order, up to
 /// and including the first that did not halt with code 0 (and only then fewer than requested); each
 /// journal carried exactly when it fits the cap, and hashing to its hash; some cycles each.
+/// The longest `sdk_version` / `worker_version` a response may name.
+const MAX_BUILD_FIELD_BYTES: usize = 64;
+
+/// A build field a bundle may record: short, and only letters, digits and ` .+-_` (the response
+/// comes from a process that ran a requester's guest, and the bundle keeps no free text of it).
+fn build_field_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_BUILD_FIELD_BYTES
+        && s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b' ' | b'.' | b'+' | b'-' | b'_'))
+}
+
 fn validate_response(
     req: &WitnessExecuteRequest,
     resp: &WitnessExecuteResponse,
 ) -> Result<(), String> {
+    if !build_field_ok(&resp.sdk_version) || !build_field_ok(&resp.worker_version) {
+        return Err("the response names no usable executor build".to_string());
+    }
     if resp.results.is_empty() || resp.results.len() > req.po2s.len() {
         return Err(format!(
             "{} results for {} po2s",
@@ -408,8 +424,30 @@ mod tests {
             &WitnessExecuteResponse {
                 image_id: [0; 32],
                 results,
+                sdk_version: "risc0-zkvm 3.1.0".into(),
+                worker_version: "0.1.0".into(),
             },
         )
+    }
+
+    #[test]
+    fn a_response_names_a_plain_executor_build() {
+        let req = request(&[16]);
+        let with = |sdk: &str, worker: &str| {
+            validate_response(
+                &req,
+                &WitnessExecuteResponse {
+                    image_id: [0; 32],
+                    results: vec![result(16, b"j")],
+                    sdk_version: sdk.into(),
+                    worker_version: worker.into(),
+                },
+            )
+        };
+        assert!(with("risc0-zkvm 3.1.0", "0.1.0").is_ok());
+        assert!(with("", "0.1.0").is_err());
+        assert!(with("risc0-zkvm 3.1.0", "0.1.0\nPAGE: x").is_err());
+        assert!(with(&"a".repeat(MAX_BUILD_FIELD_BYTES + 1), "0.1.0").is_err());
     }
 
     #[test]
@@ -462,6 +500,8 @@ mod tests {
         let resp = WitnessExecuteResponse {
             image_id: [1; 32],
             results: vec![result(16, b"j")],
+            sdk_version: "risc0-zkvm 3.1.0".into(),
+            worker_version: "0.1.0".into(),
         };
         let mut frame = Vec::new();
         write_message(&mut frame, &resp).unwrap();

@@ -174,6 +174,8 @@ impl Spec {
             created_at_block: self.block,
             builder_id: B256::repeat_byte(9),
             caller: self.caller,
+            execute_ms_per_po2: Some(5),
+            elf_sha256: Some(sha256(&elf(self.elf))),
         }
     }
 }
