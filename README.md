@@ -271,7 +271,7 @@ Worth knowing:
     it in time is released first. That takes seconds to a few minutes. The next start picks
     the locks up from `~/.zkminer/job_journal.json`, re-proves each one that still has time,
     and releases the rest. Use it for restarts and upgrades, and start again by the time it
-    prints (the earliest lock's deadline less ~25 minutes for the restart and a release): a
+    prints (the earliest kept lock's cutoff less ~15 minutes for the restart and a release): a
     lock left past its deadline is slashed.
   - **Abandon**: release everything now, then exit.
 
@@ -285,7 +285,11 @@ Worth knowing:
   the miner running under the same home directory, so run it as the same user.
 
   Signals, for headless and supervised runs: SIGINT (Ctrl+C) drains, a second one abandons,
-  a third exits at once. SIGTERM, the default stop signal of systemd, `docker stop` and
+  a third exits at once. A signal during a drain already under way counts as the second: a
+  `systemctl stop` (SIGINT) after `zkminer stop` abandons. During a keep-locks stop, signals
+  never abandon (only `zkminer stop --abandon` or `a` does); the third still exits at once.
+  Closing the dashboard's terminal (SIGHUP) starts a drain if no stop was chosen, and
+  otherwise changes nothing. SIGTERM, the default stop signal of systemd, `docker stop` and
   Kubernetes, releases every held lock at once, because a supervisor kills the process
   before any drain could finish. [`contrib/zkminer.service`](contrib/zkminer.service) sets
   `KillSignal=SIGINT`, `KillMode=mixed` and a long `TimeoutStopSec`, so `systemctl stop`
@@ -299,8 +303,9 @@ Worth knowing:
   container); for a new image, start the new container on the same volume promptly. On
   Windows, the workers have consoles of their own, so Ctrl+C reaches only the miner.
   Closing the console window or shutting Windows down gives the miner only seconds: it
-  releases what it can in them, and what it doesn't finish stays held until the next start,
-  so stop a long-running miner with `zkminer stop` first.
+  releases what it can in them (if Windows delivers the event to it), its workers end with it,
+  and what it doesn't finish stays held until the next start, so stop a long-running miner
+  with `zkminer stop` first.
 
   Exit status 75 means it stopped with locks still held (or by keep-locks): start it again
   well before their deadlines. A miner killed outright (SIGKILL) picks its locks up the same way.

@@ -7,14 +7,6 @@ use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-/// Start `cmd` with a console of its own that has no window (`CREATE_NO_WINDOW`), so the console
-/// events of the one the miner runs in (Ctrl+C, Ctrl+Break, closing it) never reach it.
-#[cfg(windows)]
-pub fn isolate_from_console(cmd: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
-}
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -740,6 +732,10 @@ impl WorkerHandle {
         let child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn worker {backend} at {}", path.display()))?;
+        // It runs in a console of its own, so the miner's console no longer takes it down with
+        // the miner: a job does, however the miner ends (see `windows_job`).
+        #[cfg(windows)]
+        crate::windows_job::end_with_this_process(&child);
 
         // From here until the `WorkerHandle` owns it, the child is held by a plain local and
         // `std::process::Child::drop` neither kills nor reaps. Everything between this point and the
@@ -2433,7 +2429,6 @@ mod console_isolation_tests {
 
     extern "system" {
         fn GenerateConsoleCtrlEvent(event: u32, process_group: u32) -> i32;
-        fn GetConsoleWindow() -> *mut std::ffi::c_void;
         fn SetConsoleCtrlHandler(handler: *const std::ffi::c_void, add: i32) -> i32;
     }
     const CTRL_C_EVENT: u32 = 0;
@@ -2448,6 +2443,10 @@ mod console_isolation_tests {
         if std::env::var(CHILD).is_err() {
             return;
         }
+        // The default handling, whatever this process inherited (a CI agent may have started it
+        // ignoring Ctrl+C, which the control child would inherit and survive).
+        // SAFETY: plain kernel32 call.
+        assert!(unsafe { SetConsoleCtrlHandler(std::ptr::null(), 0) } != 0);
         let sleeper = || {
             let mut c = Command::new("ping");
             c.args(["-n", "30", "127.0.0.1"])
@@ -2478,12 +2477,8 @@ mod console_isolation_tests {
 
     #[test]
     fn a_ctrl_c_on_the_miners_console_does_not_reach_a_worker() {
-        // SAFETY: plain kernel32 call.
-        if unsafe { GetConsoleWindow() }.is_null() {
-            eprintln!("no console attached: console control events cannot be sent; skipped");
-            return;
-        }
-        // In a console of its own, so its Ctrl+C reaches nothing of ours.
+        // In a console of its own (made for it, so this needs none), so its Ctrl+C reaches
+        // nothing of ours.
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
         let out = Command::new(std::env::current_exe().unwrap())
@@ -2509,4 +2504,13 @@ mod console_isolation_tests {
             "the control child survived:\n{text}"
         );
     }
+}
+
+/// Start `cmd` with a console of its own that has no window (`CREATE_NO_WINDOW`), so the console
+/// events of the one the miner runs in (Ctrl+C, Ctrl+Break, closing it) never reach it.
+#[cfg(windows)]
+pub(crate) fn isolate_from_console(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
 }

@@ -22,7 +22,9 @@
 #       finishes the jobs held. A lock still held at its deadline is slashed, so don't leave it
 #       stopped. To upgrade, `install -m755` the new miner and every worker first (all of them:
 #       a worker from another build is refused). During a `systemctl stop`, a keep-locks stop
-#       is not restarted (the stop job wins): start it again yourself.
+#       is not restarted (the stop job wins): start it again yourself. Signals never turn a
+#       keep-locks stop into an abandon, but `systemctl stop` after a `zkminer stop` drain
+#       does (its SIGINT counts as the second): use --keep-locks --wait, then systemctl stop.
 #   sudo -u zkminer -H zkminer stop --abandon
 #       Releases everything now (penalties apply), then exits. Use it, not `systemctl kill`, to
 #       cut a drain short: `systemctl kill` signals the proving workers too (unless
@@ -37,8 +39,8 @@
 # Shutting the machine down (poweroff, reboot) stops this unit like `systemctl stop`: it drains,
 # holding the shutdown for up to TimeoutStopSec (70 min); a hypervisor or a cloud stop rarely
 # waits that long, and what is cut off keeps its locks. Run `systemctl stop zkminer` first and let
-# it finish, or `zkminer stop --abandon`; or, for maintenance you'll be back from before the
-# earliest deadline, `sudo -u zkminer -H zkminer stop --keep-locks --wait && sudo systemctl stop
+# it finish, or `zkminer stop --abandon`; or, for maintenance you'll be back from by the start-by
+# time it prints, `sudo -u zkminer -H zkminer stop --keep-locks --wait && sudo systemctl stop
 # zkminer` (within the 10 s before it is restarted).
 #
 # Run `zkminer stop` as the user the unit runs as, with its home: the request goes to that

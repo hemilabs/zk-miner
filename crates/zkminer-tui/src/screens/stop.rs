@@ -36,6 +36,8 @@ pub struct HeldJobs {
     /// Queued or proving jobs whose cutoff is too close for a restart to save them: a keep-locks
     /// stop releases these first.
     pub too_close_to_keep: usize,
+    /// The earliest cutoff among the locks a keep-locks stop would keep.
+    pub earliest_kept: Option<u64>,
 }
 
 impl HeldJobs {
@@ -76,10 +78,16 @@ pub fn held_jobs(state: &MinerState, now: u64) -> HeldJobs {
             job.status,
             MinerJobStatus::Queued | MinerJobStatus::Proving { .. }
         ) && job.info.lock_deadline > 0
-            && state.release_margin_secs > 0
-            && job.info.lock_deadline <= now.saturating_add(state.release_margin_secs + 120)
+            && state.keep_horizon_secs > 0
         {
-            held.too_close_to_keep += 1;
+            if job.info.lock_deadline <= now.saturating_add(state.keep_horizon_secs) {
+                held.too_close_to_keep += 1;
+            } else {
+                held.earliest_kept = Some(
+                    held.earliest_kept
+                        .map_or(job.info.lock_deadline, |d| d.min(job.info.lock_deadline)),
+                );
+            }
         }
         if job.info.lock_deadline > 0 {
             held.earliest_deadline = Some(
@@ -246,12 +254,17 @@ pub fn render_prompt(f: &mut Frame, area: Rect, state: &MinerState) {
     let Some(prompt) = state.stop_prompt else {
         return;
     };
+    if prompt == StopPrompt::Quit && state.shutdown.is_some() {
+        // A stop began elsewhere while the question was open: it no longer applies (the next key
+        // clears it), and the panel must show.
+        return;
+    }
     let held = held_jobs(state, now_secs());
     // The last moment the next start can still release the earliest lock in time: its cutoff
     // less the margin a release and a restart need (the miner publishes it). Finishing it needs
     // earlier still.
     let restart_by = held
-        .earliest_deadline
+        .earliest_kept
         .filter(|_| state.release_margin_secs > 0)
         .map(|d| {
             format!(
@@ -311,9 +324,10 @@ pub fn render_prompt(f: &mut Frame, area: Rect, state: &MinerState) {
         StopPrompt::Confirm(StopMode::KeepLocks) => (
             " Keep locks? ",
             vec![Line::from(format!(
-                " Stop the proofs and exit now, leaving {} lock(s) for the next start{restart_by}? \
-                 A lock nobody finishes or releases before its deadline is slashed.",
-                held.proving
+                " Stop claiming and exit within minutes, leaving {} lock(s) for the next start\
+                 {restart_by}{too_close}? A lock nobody finishes or releases before its deadline \
+                 is slashed.",
+                held.proving.saturating_sub(held.too_close_to_keep)
             ))],
         ),
         StopPrompt::Confirm(StopMode::Force) => (
@@ -577,6 +591,28 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// The keep-locks choice counts the locks too close to keep (released first) and gives the
+    /// start-by time of the earliest lock it keeps, not of one it releases.
+    #[test]
+    fn the_keep_locks_choice_names_what_it_keeps_and_by_when() {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let mut s = miner();
+        s.release_margin_secs = 930;
+        s.keep_horizon_secs = 1050;
+        s.active_jobs
+            .push(job(MinerJobStatus::Queued, 0, now + 600));
+        s.active_jobs
+            .push(job(MinerJobStatus::Queued, 0, now + 7200));
+        let held = held_jobs(&s, now);
+        assert_eq!(held.too_close_to_keep, 1);
+        assert_eq!(held.earliest_kept, Some(now + 7200));
+        s.stop_prompt = Some(StopPrompt::Quit);
+        let out = rendered(&s);
+        let by = fmt_time(now + 7200 - 930);
+        assert!(out.contains(&by), "start-by {by} missing:\n{out}");
+        assert!(out.contains("1 too close"), "{out}");
     }
 
     #[test]

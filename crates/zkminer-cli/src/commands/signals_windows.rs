@@ -3,8 +3,8 @@
 //!
 //! - Ctrl+C / Ctrl+Break: a person at the console, who can escalate. 1st DRAIN (stop claiming,
 //!   let in-flight proofs finish), 2nd ABANDON (release what can be released), 3rd force exit. In
-//!   the dashboard, Ctrl+C is a key (raw mode) and quits into DRAIN like `q`; Ctrl+Break is still a
-//!   signal, and starts DRAIN too.
+//!   the dashboard, Ctrl+C is a key (raw mode) that asks how to stop, like `q`; Ctrl+Break is still
+//!   a signal, and starts DRAIN. During a keep-locks stop, stage 2 keeps the locks.
 //! - Closing the console window, or Windows shutting down: nobody is there to press anything, and
 //!   Windows ends the process seconds later (tokio's handler holds it until then). Like SIGTERM from
 //!   a supervisor: a supervised stop, which releases held jobs at once (giving a fulfil already being
@@ -32,9 +32,7 @@ enum Event {
 }
 
 /// The ladder stage after `event`, given the stage `n` already reached; `None` leaves it unchanged.
-/// `draining` is true once the dashboard's quit key has started the drain without a signal.
-fn next_stage(n: u8, event: Event, draining: bool) -> Option<u8> {
-    let n = if draining { n.max(1) } else { n };
+fn next_stage(n: u8, event: Event) -> Option<u8> {
     match event {
         Event::Interrupt => Some(n.saturating_add(1)),
         // A close never force-exits: Windows ends the process itself, and the seconds it leaves are
@@ -59,7 +57,7 @@ macro_rules! recv_opt {
 }
 
 /// Install the console handlers now and drive the shutdown ladder on `sig_tx`.
-pub(crate) fn spawn(sig_tx: tokio::sync::watch::Sender<u8>, state: SharedState, headless: bool) {
+pub(crate) fn spawn(sig_tx: tokio::sync::watch::Sender<u8>, state: SharedState) {
     use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
     // Registered here, synchronously, so an event that arrives before the task first polls is
     // still seen (a listener created after the event never observes it).
@@ -89,11 +87,10 @@ pub(crate) fn spawn(sig_tx: tokio::sync::watch::Sender<u8>, state: SharedState, 
                 _ = recv_opt!(close) => Event::Close,
                 _ = recv_opt!(shutdown) => Event::Close,
             };
-            let draining = !headless && super::run::SHUTTING_DOWN.load(Ordering::SeqCst);
             // From the stage the ladder is at, however it got there (the dashboard's quit prompt
             // and `zkminer stop` advance it too).
             n = n.max(*sig_tx.borrow());
-            let Some(stage) = next_stage(n, event, draining) else {
+            let Some(stage) = next_stage(n, event) else {
                 continue;
             };
             let supervised = event == Event::Close;
@@ -111,6 +108,9 @@ pub(crate) fn spawn(sig_tx: tokio::sync::watch::Sender<u8>, state: SharedState, 
                     let closing = "\nWINDOW CLOSING / SHUTDOWN — releasing held jobs now (Windows \
                                    ends the process within seconds; no proof could finish).";
                     match stage {
+                        2 if super::run::keep_in_progress() => {
+                            super::run::shutdown_say(&state, super::run::KEEP_SIGNAL_MSG).await
+                        }
                         2 => match super::run::begin_abandon() {
                             Ok(()) => super::run::shutdown_say(&state, closing).await,
                             Err(why) => super::run::shutdown_say(&state, why).await,
@@ -123,7 +123,7 @@ pub(crate) fn spawn(sig_tx: tokio::sync::watch::Sender<u8>, state: SharedState, 
                     let again = if super::run::tui_up() {
                         "Press Ctrl+Break again (or [a] on the dashboard)"
                     } else {
-                        "Press Ctrl+C again"
+                        "Press Ctrl+C again (or run `zkminer stop --abandon`)"
                     };
                     super::run::shutdown_say(
                         &state,
@@ -133,6 +133,9 @@ pub(crate) fn spawn(sig_tx: tokio::sync::watch::Sender<u8>, state: SharedState, 
                         ),
                     )
                     .await
+                }
+                2 if super::run::keep_in_progress() => {
+                    super::run::shutdown_say(&state, super::run::KEEP_SIGNAL_MSG).await
                 }
                 2 => match super::run::begin_abandon() {
                     Ok(()) => {
@@ -172,21 +175,16 @@ mod tests {
     fn stages_match_the_unix_ladder() {
         use Event::*;
         // Headless: drain, abandon, force.
-        assert_eq!(next_stage(0, Interrupt, false), Some(1));
-        assert_eq!(next_stage(1, Interrupt, false), Some(2));
-        assert_eq!(next_stage(2, Interrupt, false), Some(3));
+        assert_eq!(next_stage(0, Interrupt), Some(1));
+        assert_eq!(next_stage(1, Interrupt), Some(2));
+        assert_eq!(next_stage(2, Interrupt), Some(3));
         // Headless close: a supervised drain (stage 1, like SIGTERM), then never past 2.
-        assert_eq!(next_stage(0, Close, false), Some(1));
-        assert_eq!(next_stage(1, Close, false), Some(2));
-        assert_eq!(
-            next_stage(2, Close, false),
-            None,
-            "a close never force-exits"
-        );
-        // Dashboard quit with `q` (draining, nothing sent yet): the next Ctrl+C abandons...
-        assert_eq!(next_stage(0, Interrupt, true), Some(2));
-        // ...and a close then is a supervised abandon, as SIGTERM after the TUI.
-        assert_eq!(next_stage(0, Close, true), Some(2));
+        assert_eq!(next_stage(0, Close), Some(1));
+        assert_eq!(next_stage(1, Close), Some(2));
+        assert_eq!(next_stage(2, Close), None, "a close never force-exits");
+        // A stop begun elsewhere (the dashboard's quit prompt, `zkminer stop`) set stage 1: the
+        // caller passes that in, and the next Ctrl+C abandons.
+        assert_eq!(next_stage(1, Interrupt), Some(2));
     }
 
     /// The child half of `ctrl_break_walks_the_ladder`: install the handlers and print each stage.
@@ -197,7 +195,7 @@ mod tests {
             return;
         }
         let (tx, mut rx) = tokio::sync::watch::channel(0u8);
-        super::spawn(tx, zkminer_tui::state::new_shared_state(), true);
+        super::spawn(tx, zkminer_tui::state::new_shared_state());
         println!("ready");
         loop {
             rx.changed().await.unwrap();

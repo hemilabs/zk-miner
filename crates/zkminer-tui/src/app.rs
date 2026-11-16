@@ -1027,7 +1027,6 @@ mod stop_view_tests {
                 "2 job(s) still in flight",
                 "[a] abandon",
                 "[k] keep locks",
-                " STOPPING ",
             ] {
                 assert!(
                     out.contains(want),
@@ -1035,6 +1034,7 @@ mod stop_view_tests {
                 );
             }
             let status_bar = out.lines().last().unwrap_or_default();
+            assert!(status_bar.contains(" STOPPING "), "the badge: {status_bar}");
             assert!(!status_bar.contains("q:quit"), "{status_bar}");
             state.stop_prompt = Some(StopPrompt::Confirm(crate::state::StopMode::Abandon));
             let out = screen(&state, 100, 30);
@@ -1052,6 +1052,6 @@ mod stop_view_tests {
             ..MinerState::default()
         };
         let out = screen(&state, 40, 10);
-        assert!(out.contains("STOPPING"), "{out}");
+        assert!(out.contains("RELEASING"), "the panel itself: {out}");
     }
 }

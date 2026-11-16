@@ -113,7 +113,7 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
     let signer = match zkminer_config::wallet::load_signer(&config.wallet) {
         Ok(s) => s,
         Err(e) => {
-            report.say(Level::Fail, "key", format!("{e:#}"));
+            report.say(Level::Fail, "key", redact(&e));
             return;
         }
     };
@@ -173,7 +173,10 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
         Err(e) => report.say(
             Level::Fail,
             "deployment",
-            format!("NOT verified, so `zkminer run` claims nothing and `stake` refuses: {e:#}"),
+            format!(
+                "NOT verified, so `zkminer run` claims nothing and `stake` refuses: {}",
+                redact(&e)
+            ),
         ),
     }
     // What the miner's own gas gate needs for one claim and its fulfil (see its ETH funds gate).
@@ -209,7 +212,11 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
                 )
             }
         }
-        Err(e) => report.say(Level::Warn, "gas", format!("balance unreadable: {e:#}")),
+        Err(e) => report.say(
+            Level::Warn,
+            "gas",
+            format!("balance unreadable: {}", redact(&e)),
+        ),
     }
     let min_claim = client.get_min_collateral_amount().await.unwrap_or(0);
     match client.get_stake_info(client.address).await {
@@ -254,7 +261,7 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
                 super::stake::fmt_hemi(min_claim)
             ),
         ),
-        Err(e) => report.say(Level::Warn, "stake", format!("unreadable: {e:#}")),
+        Err(e) => report.say(Level::Warn, "stake", format!("unreadable: {}", redact(&e))),
     }
     if let Ok(exit) = client.get_exit_state(client.address).await {
         for line in super::unstake::describe_exit(&exit) {
@@ -424,6 +431,12 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
             "nothing on this host can prove a job the miner claims, so it will claim none",
         );
     }
+    report.say(
+        Level::Info,
+        "workers",
+        "found and matched to the cards above; whether each one's build matches this miner is \
+         checked when the miner starts it (rebuild or reinstall them all together)",
+    );
     if suite.is_none() {
         report.say(
             Level::Info,
@@ -461,14 +474,14 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
             Some(c)
         }
         Err(e) => {
-            report.say(Level::Fail, "config", format!("{e:#}"));
+            report.say(Level::Fail, "config", redact(&e));
             None
         }
     };
     if let Some(c) = &config {
         match c.validate_for_chain() {
             Ok(()) => chain_checks(&mut report, c).await,
-            Err(e) => report.say(Level::Fail, "config", format!("{e:#}")),
+            Err(e) => report.say(Level::Fail, "config", redact(&e)),
         }
     }
     let host_config = config.clone().unwrap_or_default();
