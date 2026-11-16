@@ -176,8 +176,10 @@ async fn dispatch(
     }
 }
 
-/// Replaces the connected prefixes and own addresses. Every prefix must be valid with no host
-/// bits set beyond its length; otherwise nothing changes.
+/// Replaces the miner's part of the connected prefixes and own addresses: the floor holds the
+/// union of the broker's own startup facts and this refresh (review r2 B2: a refresh never takes
+/// away what the broker's own `[egress]` options found). Every prefix must be valid; otherwise
+/// nothing changes.
 fn refresh(b: &Broker, prefixes: &[zkminer_witness::ipc::IpPrefix], own: Vec<std::net::IpAddr>) -> ControlResponse {
     let mut parsed: Vec<Prefix> = Vec::with_capacity(prefixes.len());
     for p in prefixes {
@@ -192,15 +194,23 @@ fn refresh(b: &Broker, prefixes: &[zkminer_witness::ipc::IpPrefix], own: Vec<std
             Err(_) => return error(ControlErrorCode::Malformed),
         }
     }
-    // The site around each own IPv6 address, at this broker's `[egress] ipv6_site_prefix_len` (the
-    // miner sends its own; the union holds both).
-    parsed.extend(zkminer_netguard::site_prefixes(&own, b.cfg.facts_options.ipv6_site_prefix_len));
+    let mut own = own;
+    for ip in &b.startup.own_addresses {
+        if !own.contains(ip) {
+            own.push(*ip);
+        }
+    }
+    for p in &b.startup.connected {
+        if !parsed.contains(p) {
+            parsed.push(*p);
+        }
+    }
+    // No site prefix is derived here: the miner's refused prefixes already carry its IPv6 sites
+    // (netguard derives one only around an interface address, or a public address both reflectors
+    // agree on), and the startup prefixes carry the broker's own. Deriving one around every own
+    // address sent would let a single forged reflector answer refuse an operator's role entry.
     let count = u32::try_from(parsed.len()).unwrap_or(u32::MAX);
     b.policy.write().unwrap_or_else(|p| p.into_inner()).facts = zkminer_netguard::HostFacts::new(parsed, own);
-    // A host name's pinned answer may now name a connected or own address.
-    for ep in b.all_endpoints() {
-        ep.refilter();
-    }
     tracing::info!(count, "connected prefixes refreshed");
     ControlResponse::PrefixesRefreshed { count }
 }

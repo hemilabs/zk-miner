@@ -106,7 +106,8 @@ async fn raw_control_frames() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = zkminer_witness_broker::BrokerConfig::from_toml(&config_text(dir.path(), EVM), dir.path(), zkminer_witness_broker::egress::NetMode::DevPrivate).unwrap();
     let (miner, broker) = std::os::unix::net::UnixStream::pair().unwrap();
-    let _t = tokio::spawn(zkminer_witness_broker::serve_with(cfg, broker.into(), test_hooks()));
+    let conn = zkminer_witness_broker::testkit::connector_end(&cfg, &test_hooks()).await;
+    let _t = tokio::spawn(zkminer_witness_broker::serve_with(cfg, broker.into(), conn, test_hooks()));
     let miner = tokio::task::spawn_blocking(move || {
         let ask = |id: u64, body: ControlRequest, fd: Option<std::os::fd::BorrowedFd<'_>>| {
             send_with_fd(&miner, KIND_CONTROL, &encode_control(&ControlMessage { id, body }), fd).unwrap();
@@ -162,7 +163,8 @@ async fn concurrent_and_reused_control_ids() {
     );
     let cfg = zkminer_witness_broker::BrokerConfig::from_toml(&text, dir.path(), zkminer_witness_broker::egress::NetMode::DevPrivate).unwrap();
     let (miner, broker) = std::os::unix::net::UnixStream::pair().unwrap();
-    let _t = tokio::spawn(zkminer_witness_broker::serve_with(cfg, broker.into(), test_hooks()));
+    let conn = zkminer_witness_broker::testkit::connector_end(&cfg, &test_hooks()).await;
+    let _t = tokio::spawn(zkminer_witness_broker::serve_with(cfg, broker.into(), conn, test_hooks()));
     tokio::task::spawn_blocking(move || {
         let send = |id: u64, body: ControlRequest| {
             send_with_fd(&miner, KIND_CONTROL, &encode_control(&ControlMessage { id, body }), None).unwrap();
@@ -249,40 +251,35 @@ chain_id = 743111
     ] {
         assert_eq!(checks.get(&c), Some(&true), "{c:?}: {r:?}");
     }
-    // This test broker is not sandboxed, so its in-process sandbox checks fail and with them `ok`;
-    // nothing else does.
+    assert_eq!(checks.get(&SelfTestCheck::ConnectorRefusesBadIndex), Some(&true), "{r:?}");
+    // This test broker is not sandboxed, so its in-process sandbox and no-network checks fail and
+    // with them `ok`; nothing else does.
     let failing: Vec<_> = r.checks.iter().filter(|(_, p)| !p).map(|(c, _)| *c).collect();
     for c in &failing {
-        assert!(
-            matches!(c, SelfTestCheck::SeccompActive | SelfTestCheck::NoNewPrivs | SelfTestCheck::LandlockActive
-                | SelfTestCheck::GpuNodeUnopenable),
-            "{c:?}: {r:?}"
-        );
+        assert!(in_process_only(c), "{c:?}: {r:?}");
     }
     assert!(failing.contains(&SelfTestCheck::SeccompActive));
+    assert!(failing.contains(&SelfTestCheck::InetSocketDenied) && failing.contains(&SelfTestCheck::ConnectDenied));
     assert!(!r.ok);
 
     // The miner reports a global own address outside every connected prefix. The broker's old
     // floor refused own addresses only through their prefix, so this self-test used to fail;
     // netguard's floor refuses the host's own addresses themselves.
-    let n = client.refresh_prefixes(vec![], vec!["8.8.8.8".parse().unwrap()]).await.unwrap();
-    assert_eq!(n, 0);
+    // Review r2 B2: a refresh adds to the broker's own startup facts and never takes them away.
+    let base = client.refresh_prefixes(vec![], vec!["8.8.8.8".parse().unwrap()]).await.unwrap();
+    assert!(base as usize >= own_addresses().unwrap().len(), "the startup prefixes stay: {base}");
     let r = client.self_test().await.unwrap();
     assert!(!r.ok, "the in-process sandbox checks still fail here");
     assert!(r.checks.contains(&(SelfTestCheck::OwnAddressDenied, true)), "{r:?}");
+    assert!(r.checks.contains(&(SelfTestCheck::ConnectedPrefixDenied, true)), "{r:?}");
     // Refreshed with its prefix, it passes again; deny CIDRs count too.
     let n = client
         .refresh_prefixes(vec![IpPrefix { addr: "8.8.8.8".parse().unwrap(), len: 24 }], vec!["8.8.8.8".parse().unwrap(), "8.8.4.4".parse().unwrap()])
         .await
         .unwrap();
-    assert_eq!(n, 1);
+    assert_eq!(n, base + 1);
     let r = client.self_test().await.unwrap();
-    assert!(
-        r.checks.iter().all(|(c, p)| *p
-            || matches!(c, SelfTestCheck::SeccompActive | SelfTestCheck::NoNewPrivs | SelfTestCheck::LandlockActive
-                | SelfTestCheck::GpuNodeUnopenable)),
-        "only the in-process sandbox checks may fail here: {r:?}"
-    );
+    assert!(r.checks.iter().all(|(c, p)| *p || in_process_only(c)), "only the in-process sandbox checks may fail here: {r:?}");
     let e = client.refresh_prefixes(vec![IpPrefix { addr: "1.2.3.4".parse().unwrap(), len: 40 }], vec![]).await.unwrap_err();
     assert!(matches!(e, ClientError::Refused(ControlErrorCode::Malformed)));
 
@@ -293,4 +290,17 @@ chain_id = 743111
     let r = client.self_test().await.unwrap();
     assert!(r.checks.contains(&(SelfTestCheck::ArtifactEndpointChainId, false)));
     assert!(!r.ok);
+}
+
+/// The checks an unsandboxed, in-process broker fails by construction.
+fn in_process_only(c: &SelfTestCheck) -> bool {
+    matches!(
+        c,
+        SelfTestCheck::SeccompActive
+            | SelfTestCheck::NoNewPrivs
+            | SelfTestCheck::LandlockActive
+            | SelfTestCheck::GpuNodeUnopenable
+            | SelfTestCheck::InetSocketDenied
+            | SelfTestCheck::ConnectDenied
+    )
 }

@@ -14,10 +14,12 @@
 //!   environment reaches the child;
 //! - the **child side** (the sandboxed binary itself, at startup, before it starts threads or reads
 //!   any untrusted input): [`restrict_self`] applies Landlock (no filesystem access, no TCP
-//!   bind/connect except the profile's ports, scoped signals and abstract Unix sockets), a seccomp
-//!   denylist (including SysV IPC, metadata writes through inherited fds, and for the broker every
-//!   socket but TCP and Unix stream pairs), `NO_NEW_PRIVS`, `PR_SET_DUMPABLE(0)` (locked) and
-//!   `RLIMIT_CORE=0`.
+//!   bind/connect, scoped signals and abstract Unix sockets), a seccomp denylist (no `socket`,
+//!   `connect`, `bind`, `listen` or `accept*` for any profile; SysV IPC; metadata writes through
+//!   inherited fds; for the runner and the worker, host metadata), `NO_NEW_PRIVS`,
+//!   `PR_SET_DUMPABLE(0)` (locked) and `RLIMIT_CORE=0`. The broker, whose only socket calls are
+//!   `socketpair(AF_UNIX, SOCK_STREAM)` for its runtime, then calls [`seal_socket_creation`] once
+//!   its runtime is up. Its network connections are made for it by the miner's connector.
 //!
 //! [`self_test`] checks the resulting *properties* (plan §10.3) by running the
 //! `zkminer-witness-sandbox-probe` binary inside each sandbox profile, not just that calls
@@ -44,7 +46,7 @@ mod selftest;
 mod spawn;
 
 pub use cgroup::{delegated_root, Cgroup};
-pub use restrict::{landlock_abi, restrict_self, MIN_LANDLOCK_ABI};
+pub use restrict::{landlock_abi, restrict_self, seal_socket_creation, MIN_LANDLOCK_ABI};
 pub use selftest::{self_test, self_test_profile};
 pub use spawn::prepare_command;
 
@@ -65,18 +67,19 @@ pub enum Profile {
     BuilderRunner,
     /// The CPU-only risc0 execute worker: no filesystem, no network, no new processes.
     ExecuteWorker,
-    /// The broker: no filesystem except read-only `readable` paths (its endpoints file, and anything
-    /// its resolver or TLS stack reads after [`restrict_self`]) and read-write `writable` directories
-    /// (its quota'd spool), outbound TCP only to `tcp_connect_ports` (Landlock: to *any* host on
-    /// those ports; which hosts is the broker's own business), no new processes. Its only sockets
-    /// are TCP (`AF_INET`/`AF_INET6`, `SOCK_STREAM`, protocol 0 or `IPPROTO_TCP`) and `AF_UNIX`
-    /// `SOCK_STREAM` socketpairs: Landlock restricts TCP alone, so UDP, ICMP, raw, SCTP and MPTCP
-    /// sockets (and datagram socketpairs, which reach pathname sockets) are refused by seccomp.
-    /// Every listed path must exist when [`restrict_self`] runs.
+    /// The broker: no filesystem except read-only `readable` paths and read-write `writable`
+    /// directories (its quota'd spool), and **no network of its own**: `socket`, `connect`,
+    /// `bind`, `listen` and `accept*` are denied outright, as for the runner and the worker, and
+    /// Landlock handles TCP bind and connect with no rule. It keeps the fds it was started with:
+    /// its control socket (fd 3) and its socket to the miner's connector (fd 4), which hands it
+    /// already-connected TCP sockets to the operator's endpoints by `SCM_RIGHTS`. Its only way to
+    /// make a socket is `socketpair(AF_UNIX, SOCK_STREAM, ..)` (a connected pair reaches nothing;
+    /// tokio's signal driver makes one when the runtime starts), which
+    /// [`seal_socket_creation`] then denies too. Every listed path must exist when
+    /// [`restrict_self`] runs.
     Broker {
         readable: Vec<PathBuf>,
         writable: Vec<PathBuf>,
-        tcp_connect_ports: Vec<u16>,
     },
 }
 

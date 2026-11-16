@@ -179,6 +179,8 @@ struct Serving {
     spawner: Spawner,
     broker: Mutex<BrokerProcess>,
     broker_client: Arc<BrokerClient>,
+    /// The miner's connector: every connection the broker makes (review r2 F5).
+    connector: Arc<zkminer_witness_broker::connector::Connector>,
     cgroup_root: PathBuf,
     builder_binary: PathBuf,
     execute_binary: PathBuf,
@@ -487,7 +489,8 @@ impl WitnessRuntime {
             Err(e) => return self.disable(format!("starting the broker: {e:#}")),
         };
         let broker_client = broker.client.clone();
-        if let Err(why) = broker_self_test(&broker_client).await {
+        let connector = broker.connector.clone();
+        if let Err(why) = broker_self_test(&broker_client, &connector).await {
             return self.disable(format!("the broker self-test failed: {why}"));
         }
         tracing::info!("{}", effective_summary(w, config.retention.as_ref(), config.broker.as_ref()));
@@ -495,6 +498,7 @@ impl WitnessRuntime {
             spawner,
             broker: Mutex::new(broker),
             broker_client,
+            connector,
             cgroup_root: root,
             builder_binary,
             execute_binary,
@@ -534,12 +538,18 @@ impl WitnessRuntime {
         loop {
             tokio::time::sleep(SELF_TEST_EVERY).await;
             let Some(s) = lock(&self.serving).clone() else { continue };
-            let exited = lock(&s.broker).exited();
+            let (exited, cut_off) = {
+                let mut b = lock(&s.broker);
+                (b.exited(), b.cut_off())
+            };
             let result = match exited {
+                _ if cut_off => Err("the connector cut the broker off (it broke the connector protocol) and killed it".into()),
                 Some(status) => Err(format!("the broker exited ({status})")),
                 None => match self.sandbox_self_test(&s.spawner, &s.probe_binary).await {
                     Err(why) => Err(format!("the sandbox self-test failed: {why}")),
-                    Ok(()) => broker_self_test(&s.broker_client).await.map_err(|why| format!("the broker self-test failed: {why}")),
+                    Ok(()) => broker_self_test(&s.broker_client, &s.connector)
+                        .await
+                        .map_err(|why| format!("the broker self-test failed: {why}")),
                 },
             };
             match result {
@@ -554,11 +564,17 @@ impl WitnessRuntime {
     }
 
     fn serving(&self) -> Option<Arc<Serving>> {
-        if self.enabled.load(Ordering::SeqCst) {
-            lock(&self.serving).clone()
-        } else {
-            None
+        if !self.enabled.load(Ordering::SeqCst) {
+            return None;
         }
+        let s = lock(&self.serving).clone()?;
+        // A broker the connector cut off is treated as compromised: no more witness work until
+        // the next self-test (which then fails) or a restart.
+        if lock(&s.broker).cut_off() {
+            self.disable("the connector cut the broker off (it broke the connector protocol) and killed it".into());
+            return None;
+        }
+        Some(s)
     }
 
     fn serving_enabled(&self) -> bool {
@@ -2444,8 +2460,10 @@ fn free_bytes(dir: &Path) -> std::io::Result<u64> {
     Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
 }
 
-async fn broker_self_test(client: &BrokerClient) -> Result<(), String> {
-    match client.self_test().await {
+/// The broker's self-test from inside its sandbox and its connector's in this process (both must
+/// pass).
+async fn broker_self_test(client: &BrokerClient, connector: &Arc<zkminer_witness_broker::connector::Connector>) -> Result<(), String> {
+    match zkminer_witness_host::broker_proc::self_test(client, connector).await {
         Ok(r) if r.ok => Ok(()),
         Ok(r) => Err(r
             .checks

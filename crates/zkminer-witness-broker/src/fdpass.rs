@@ -47,7 +47,7 @@ const RECV_CMSG_WORDS: usize = 16;
 
 /// One `sendmsg` of `data`, with `fd` as `SCM_RIGHTS` ancillary data if given. `MSG_NOSIGNAL`: a
 /// closed peer is `EPIPE`, never `SIGPIPE`.
-fn sendmsg_once(sock: RawFd, data: &[u8], fd: Option<RawFd>) -> io::Result<usize> {
+pub(crate) fn sendmsg_once(sock: RawFd, data: &[u8], fd: Option<RawFd>) -> io::Result<usize> {
     let mut iov = libc::iovec { iov_base: data.as_ptr() as *mut libc::c_void, iov_len: data.len() };
     // u64 words keep the control buffer aligned for cmsghdr.
     let mut cbuf = [0u64; 4];
@@ -81,7 +81,7 @@ fn sendmsg_once(sock: RawFd, data: &[u8], fd: Option<RawFd>) -> io::Result<usize
 
 /// One `recvmsg` into `buf`; every `SCM_RIGHTS` fd that arrives is pushed to `fds` (owned, so
 /// closed if the caller drops it). Truncated ancillary data is an error.
-fn recvmsg_once(sock: RawFd, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Result<usize> {
+pub(crate) fn recvmsg_once(sock: RawFd, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Result<usize> {
     let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
     let mut cbuf = [0u64; RECV_CMSG_WORDS];
     // SAFETY: an all-zero msghdr is a valid empty message.
@@ -116,7 +116,7 @@ fn recvmsg_once(sock: RawFd, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Resu
     Ok(n as usize)
 }
 
-fn retry_eintr<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+pub(crate) fn retry_eintr<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     loop {
         match f() {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,

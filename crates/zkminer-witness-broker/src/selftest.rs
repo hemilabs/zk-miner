@@ -9,10 +9,16 @@
 //! nodes are configured as host routes. Only in developer mode can an operator have configured a
 //! private address on purpose, so only there does a configured host route vouch for a probe.
 //!
-//! In public mode one more check, [`SelfTestCheck::RoleEntriesPublic`]: every prefix of every role
-//! entry in force (configured, or pinned from a DNS answer) passes netguard's
-//! [`zkminer_netguard::admit_prefix`] against the host's current facts and the deny CIDRs. With it
-//! failing, `ok` is false.
+//! In public mode one more check, [`SelfTestCheck::RoleEntriesPublic`]: every prefix of every
+//! configured role entry passes netguard's [`zkminer_netguard::admit_prefix`] against the host's
+//! current facts and the deny CIDRs. With it failing, `ok` is false.
+//!
+//! These are checks of the broker's own, second-layer floor. Its first layer is that it has no
+//! network (review r2 F5): [`SelfTestCheck::InetSocketDenied`] and [`SelfTestCheck::ConnectDenied`]
+//! check, from inside the sandbox, that it can make no socket and call no `connect`, `bind`,
+//! `listen` or `accept4`; [`SelfTestCheck::ConnectorRefusesBadIndex`] that the miner's connector
+//! refuses an endpoint index past the configuration. The connector's own checks run in the miner
+//! ([`crate::connector::Connector::self_test`]).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -100,6 +106,12 @@ pub(crate) async fn run(b: &Broker) -> ControlResponse {
     // The sandbox as this process sees it. Unreadable secrets are proven by the sandbox crate's
     // probe-based self-test for the broker profile, which the miner runs at startup and hourly.
     checks.extend(in_process_sandbox_checks());
+    checks.extend(no_network_checks());
+    let bad = b.connector.connect(u32::MAX, crate::egress::Role::EvmRpc, 443).await;
+    checks.push((
+        SelfTestCheck::ConnectorRefusesBadIndex,
+        bad.as_ref().err() == Some(&crate::connector::ConnectError::Refused(crate::connector::Status::NoSuchEndpoint)),
+    ));
     let ok = checks.iter().all(|(_, passed)| *passed);
     ControlResponse::SelfTest { ok, checks }
 }
@@ -131,6 +143,36 @@ fn in_process_sandbox_checks() -> Vec<(SelfTestCheck, bool)> {
         (SelfTestCheck::LandlockActive, landlock),
         (SelfTestCheck::GpuNodeUnopenable, gpu),
     ]
+}
+
+/// The broker's first layer (review r2 F5): no socket of its own, and no `connect`, `bind`,
+/// `listen` or `accept4` (each on fd -1, so the filter's `EPERM` is told from `EBADF`).
+fn no_network_checks() -> Vec<(SelfTestCheck, bool)> {
+    let eperm = || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    let socket_denied = [libc::AF_INET, libc::AF_INET6].into_iter().all(|family| {
+        // SAFETY: socket takes integers; a created socket is closed at once.
+        let fd = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+            return false;
+        }
+        eperm()
+    });
+    // SAFETY: a valid sockaddr_in for 127.0.0.1:80 and fd -1: each call fails without a side
+    // effect.
+    let connect_denied = unsafe {
+        let mut a: libc::sockaddr_in = std::mem::zeroed();
+        a.sin_family = libc::AF_INET as libc::sa_family_t;
+        a.sin_port = 80u16.to_be();
+        a.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+        let p = (&a as *const libc::sockaddr_in).cast::<libc::sockaddr>();
+        let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        (libc::connect(-1, p, len) < 0 && eperm())
+            && (libc::bind(-1, p, len) < 0 && eperm())
+            && (libc::listen(-1, 1) < 0 && eperm())
+            && (libc::accept4(-1, std::ptr::null_mut(), std::ptr::null_mut(), 0) < 0 && eperm())
+    };
+    vec![(SelfTestCheck::InetSocketDenied, socket_denied), (SelfTestCheck::ConnectDenied, connect_denied)]
 }
 
 #[cfg(test)]
@@ -186,6 +228,13 @@ mod tests {
         let pol = in_mode(NetMode::Public, vec![p("127.0.0.0/8")]);
         assert!(!floor_denies(&pol, &configured(vec![p("127.0.0.0/8")]), loopback));
         assert!(pol.first_non_public_role().is_some());
+    }
+
+    #[test]
+    fn no_network_checks_fail_outside_the_sandbox() {
+        for (c, passed) in no_network_checks() {
+            assert!(!passed, "{c:?} passed outside the sandbox");
+        }
     }
 
     #[test]

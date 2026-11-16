@@ -1,17 +1,17 @@
-//! A minimal DNS stub resolver for operator endpoint host names (plan §14.7).
+//! A minimal DNS stub resolver for operator endpoint host names (plan §14.7). It runs in the
+//! **miner**, inside the connector ([`crate::connector`]): the sandboxed broker resolves nothing and
+//! has no socket to resolve with (review r2 F5).
 //!
-//! The broker does not use the system resolver: `getaddrinfo` reads `/etc/hosts` and
-//! `/etc/nsswitch.conf` and may load NSS modules (mDNS, LLMNR, split-horizon), none of which the
-//! sandbox grants. Instead it asks the servers of `[dns] servers` (default: the `nameserver` lines
-//! of `/etc/resolv.conf`, read before the sandbox) directly, over **TCP** (RFC 1035 §4.2.2,
-//! RFC 7766):
+//! It does not use the system resolver: `getaddrinfo` reads `/etc/hosts` and `/etc/nsswitch.conf`
+//! and may load NSS modules (mDNS, LLMNR, split-horizon). Instead it asks the servers of `[dns]
+//! servers` (default: the `nameserver` lines of `/etc/resolv.conf`, read when the connector starts)
+//! directly, over **TCP** (RFC 1035 §4.2.2, RFC 7766):
 //!
 //! - one `A` and one `AAAA` query per resolution, recursion desired, EDNS(0) with no options (no
 //!   client subnet);
-//! - a fresh connection per query, made with `socket(SOCK_STREAM)` and `connect` only (the sandbox
-//!   denies `bind`, and every socket but TCP: Landlock restricts TCP connects by port and nothing
-//!   else, so the broker may not have UDP sockets at all); each message carries its 2-byte length
-//!   prefix; a random 16-bit id; the connection is closed after the one answer;
+//! - a fresh connection per query, made with `socket(SOCK_STREAM)` and `connect` only (no `bind`);
+//!   each message carries its 2-byte length prefix; a random 16-bit id; the connection is closed
+//!   after the one answer;
 //! - every answer is validated: the id, `QR`, opcode 0, one question echoing ours exactly, record
 //!   bounds, compression pointers that only point backwards; over our own connection an answer
 //!   with another id or question is an error, as is one with `TC` set (TCP has no truncation: the
@@ -22,22 +22,21 @@
 //!
 //! **Names are absolute.** A query carries the endpoint's host name exactly as configured, in wire
 //! form, which is always fully qualified: no `search` list, `domain` or `ndots` rule is ever
-//! applied (that is a feature of the system stub, which the broker never calls), so a name cannot
-//! be answered from the operator's search domain. A trailing dot changes nothing.
+//! applied (that is a feature of the system stub, which is never called), so a name cannot be
+//! answered from the operator's search domain. A trailing dot changes nothing.
 //!
-//! **Which hosts it dials.** Only the resolver's own server list, fixed when the broker starts (the
-//! configured `[dns] servers`, or `/etc/resolv.conf`'s, read before the sandbox): nothing a job,
-//! a builder or an answer supplies ever becomes a server. The sandbox cannot say as much — Landlock
-//! admits a TCP port to *any* host, so with port 53 in the broker's `tcp_connect_ports` (see
-//! [`crate::config::BrokerConfig::tcp_connect_ports`]) the kernel lets the process reach every host
-//! on port 53 — so this module is where that guarantee lives: connections to a server are made
-//! here and nowhere else, never through the HTTP clients or the network floor.
+//! **Which hosts it dials.** Only the resolver's own server list, fixed when the connector starts:
+//! nothing a job, a builder, the broker or an answer supplies ever becomes a server, and the names
+//! it asks for are only the operator's endpoint host names. The connector rate-limits resolution
+//! (an answer is refreshed once `reresolve_secs` old, an unresolved name retried at most every ten
+//! seconds).
 //!
-//! What the answers are allowed to become is the network floor's business ([`crate::net`]): a
-//! DNS-derived address is admitted only when it is global and outside the deny CIDRs, the connected
-//! prefixes and the host's own addresses. With `127.0.0.53` (systemd-resolved, which also answers
-//! on TCP) as the server, that daemon's own `/etc/hosts`, LLMNR and mDNS handling still applies;
-//! configure `[dns] servers` to a dedicated resolver to avoid it.
+//! What the answers are allowed to become is the connector's business: a DNS-derived address is
+//! admitted only when it is global and outside the deny CIDRs, the connected prefixes and the
+//! host's own addresses (netguard's public floor, in either mode). With `127.0.0.53`
+//! (systemd-resolved, which also answers on TCP) as the server, that daemon's own `/etc/hosts`,
+//! LLMNR and mDNS handling still applies; configure `[dns] servers` to a dedicated resolver to
+//! avoid it.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};

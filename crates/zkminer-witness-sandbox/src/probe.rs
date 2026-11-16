@@ -136,10 +136,10 @@ const METADATA_CHECKS: &[&str] = &[
     "fchdir",
 ];
 
+/// The broker's checks, on top of [`NO_NETWORK_CHECKS`] (review r2 F5: the broker makes no
+/// socket and no connection of its own; the miner's connector hands it connected ones).
 const BROKER_CHECKS: &[&str] = &[
-    "socket_inet_allowed",
-    "socket_inet6_allowed",
-    "socket_inet_tcp_allowed",
+    "socket_inet_tcp",
     "socket_udp",
     "socket_mptcp",
     "socket_icmp",
@@ -147,9 +147,13 @@ const BROKER_CHECKS: &[&str] = &[
     "socketpair_unix_stream_allowed",
     "socketpair_unix_dgram",
     "socketpair_unix_seqpacket",
-    "tcp_connect_allowed_port",
-    "tcp_connect_denied_port",
+    "connect_syscall",
+    "listen_syscall",
+    "accept_syscall",
+    "reconnect_inherited_tcp",
+    "fastopen_inherited_tcp",
     "tcp_bind",
+    "seal_socket_creation",
     "read_readable",
     "readable_not_writable",
     "write_writable",
@@ -157,11 +161,7 @@ const BROKER_CHECKS: &[&str] = &[
 
 /// Checks that something the profile *allows* still works: they pass without the sandbox too.
 pub const POSITIVE_CHECKS: &[&str] = &[
-    "socket_inet_allowed",
-    "socket_inet6_allowed",
-    "socket_inet_tcp_allowed",
     "socketpair_unix_stream_allowed",
-    "tcp_connect_allowed_port",
     "read_readable",
     "write_writable",
 ];
@@ -188,12 +188,10 @@ pub const UNSANDBOXED_EXEMPT: &[(&str, &str)] = &[
 /// Every check a `checks` run must print for `kind`.
 pub fn expected_checks(kind: ProfileKind) -> Vec<&'static str> {
     let mut v = COMMON_CHECKS.to_vec();
+    v.extend_from_slice(NO_NETWORK_CHECKS);
     match kind {
         ProfileKind::Broker => v.extend_from_slice(BROKER_CHECKS),
-        _ => {
-            v.extend_from_slice(NO_NETWORK_CHECKS);
-            v.extend_from_slice(METADATA_CHECKS);
-        }
+        _ => v.extend_from_slice(METADATA_CHECKS),
     }
     v
 }
@@ -204,12 +202,12 @@ pub struct ProbeArgs {
     pub kind: ProfileKind,
     pub readable: Vec<PathBuf>,
     pub writable: Vec<PathBuf>,
-    pub ports: Vec<u16>,
     /// A file the probe must not read.
     pub secret: Option<PathBuf>,
-    /// A loopback TCP port the parent listens on (in `ports` for the broker).
+    /// A loopback TCP port the parent listens on (the broker probe also connects to it before
+    /// restricting, standing in for a socket from the connector).
     pub listen_port: Option<u16>,
-    /// Broker: a loopback TCP port the parent listens on that is not in `ports`.
+    /// Broker: another loopback TCP port the parent listens on, which nothing may reach.
     pub deny_port: Option<u16>,
     /// An abstract Unix socket name the parent listens on.
     pub abstract_name: Option<String>,
@@ -240,7 +238,6 @@ impl ProbeArgs {
             kind,
             readable: Vec::new(),
             writable: Vec::new(),
-            ports: Vec::new(),
             secret: None,
             listen_port: None,
             deny_port: None,
@@ -264,7 +261,6 @@ impl ProbeArgs {
             ProfileKind::Broker => Profile::Broker {
                 readable: self.readable.clone(),
                 writable: self.writable.clone(),
-                tcp_connect_ports: self.ports.clone(),
             },
         }
     }
@@ -282,9 +278,6 @@ impl ProbeArgs {
         }
         for p in &self.writable {
             flag("--writable", p.into());
-        }
-        for p in &self.ports {
-            flag("--port", p.to_string().into());
         }
         if let Some(p) = &self.secret {
             flag("--secret", p.into());
@@ -341,7 +334,6 @@ impl ProbeArgs {
                 }
                 "--readable" => a.readable.push(v.into()),
                 "--writable" => a.writable.push(v.into()),
-                "--port" => a.ports.push(num(k, v)?),
                 "--secret" => a.secret = Some(v.into()),
                 "--listen-port" => a.listen_port = Some(num(k, v)?),
                 "--deny-port" => a.deny_port = Some(num(k, v)?),
@@ -587,6 +579,13 @@ fn run_checks(a: &ProbeArgs) -> i32 {
     let (unix_sock, _) = new_socket(libc::AF_UNIX, libc::SOCK_STREAM);
     let (inet_sock, _) = new_socket(libc::AF_INET, libc::SOCK_STREAM);
     let (unix_sock, inet_sock) = (unix_sock as RawFd, inet_sock as RawFd);
+    // The broker's stand-in for a socket the connector handed it: connected before restricting.
+    let conn_sock = match (a.kind, a.listen_port) {
+        (ProfileKind::Broker, Some(port)) => TcpStream::connect(("127.0.0.1", port))
+            .map(|s| std::os::fd::IntoRawFd::into_raw_fd(s))
+            .unwrap_or(-1),
+        _ => -1,
+    };
     // SAFETY: a constant path.
     let root_dir = unsafe {
         libc::open(
@@ -902,14 +901,15 @@ fn run_checks(a: &ProbeArgs) -> i32 {
         out.check("seccomp_denylist", wrong.is_empty() && tried > 0, detail);
     }
 
+    no_network_checks(a, inet_sock, &mut out);
     if is_broker {
-        broker_checks(a, &mut out);
+        broker_checks(a, conn_sock, &mut out);
     } else {
-        no_network_checks(a, inet_sock, &mut out);
         metadata_checks(root_dir, &mut out);
     }
     close(unix_sock);
     close(inet_sock);
+    close(conn_sock);
     close(root_dir);
 
     // Last: if exec worked, this process is gone and DONE never prints.
@@ -1334,7 +1334,7 @@ enum Reach {
 }
 
 /// Pass iff `socket(domain, ty, proto)` fails with `EPERM`. If it is created (no sandbox), it is
-/// pointed at a port not in `tcp_connect_ports` and the detail says whether that got through.
+/// pointed at a listening port and the detail says whether that got through.
 fn denied_socket(
     domain: libc::c_int,
     ty: libc::c_int,
@@ -1408,24 +1408,9 @@ fn denied_pair(ty: libc::c_int) -> (bool, String) {
     denied(r, e, &[libc::EPERM])
 }
 
-fn broker_checks(a: &ProbeArgs, out: &mut Out) {
-    let (r, e) = new_socket(libc::AF_INET, libc::SOCK_STREAM);
-    close(r as RawFd);
-    out.check(
-        "socket_inet_allowed",
-        r >= 0,
-        if r >= 0 { "ok".into() } else { errname(e) },
-    );
-    let (r, e) = new_socket(libc::AF_INET6, libc::SOCK_STREAM);
-    close(r as RawFd);
-    // A kernel without IPv6 says EAFNOSUPPORT: still not the filter.
-    out.check(
-        "socket_inet6_allowed",
-        r >= 0 || e != libc::EPERM,
-        if r >= 0 { "ok".into() } else { errname(e) },
-    );
+fn broker_checks(a: &ProbeArgs, conn_sock: RawFd, out: &mut Out) {
+    // How hyper (socket2) asked, when the broker still dialled for itself.
     {
-        // How hyper (socket2) asks: protocol IPPROTO_TCP, with SOCK_NONBLOCK | SOCK_CLOEXEC.
         // SAFETY: socket takes integers.
         let (r, e) = sys(|| unsafe {
             libc::socket(
@@ -1435,13 +1420,9 @@ fn broker_checks(a: &ProbeArgs, out: &mut Out) {
             )
         } as libc::c_long);
         close(r as RawFd);
-        out.check(
-            "socket_inet_tcp_allowed",
-            r >= 0,
-            if r >= 0 { "ok".into() } else { errname(e) },
-        );
+        out.result("socket_inet_tcp", denied(r, e, &[libc::EPERM]));
     }
-    // Landlock restricts TCP only: every other socket the broker could make reaches any port.
+    // Every other kind of socket, each aimed at a listening port if it were created.
     let deny = a.deny_port;
     let need = |out: &mut Out, name: &str| out.check(name, false, missing("--deny-port"));
     match deny {
@@ -1495,7 +1476,7 @@ fn broker_checks(a: &ProbeArgs, out: &mut Out) {
             "socketpair_unix_stream_allowed",
             r == 0,
             if r == 0 {
-                "ok (tokio's signal driver)".into()
+                "ok (tokio's signal driver, until seal_socket_creation)".into()
             } else {
                 errname(e)
             },
@@ -1507,35 +1488,97 @@ fn broker_checks(a: &ProbeArgs, out: &mut Out) {
         denied_pair(libc::SOCK_SEQPACKET),
     );
 
-    match a.listen_port {
-        Some(port) => {
-            let r = TcpStream::connect(("127.0.0.1", port));
-            let d = match &r {
-                Ok(_) => format!("connected to allowed 127.0.0.1:{port}"),
-                Err(e) => format!("{e} to allowed 127.0.0.1:{port}"),
-            };
-            out.check("tcp_connect_allowed_port", r.is_ok(), d);
+    // The syscalls themselves, on fd -1: the filter says EPERM, a missing filter EBADF.
+    let addr = loopback(a.deny_port.unwrap_or(9));
+    let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: `addr` is a valid sockaddr_in of `len` bytes; fd -1 fails harmlessly.
+    let (r, e) = sys(|| unsafe {
+        libc::connect(-1, (&addr as *const libc::sockaddr_in).cast(), len)
+    } as libc::c_long);
+    out.result("connect_syscall", denied(r, e, &[libc::EPERM]));
+    // SAFETY: integer arguments.
+    let (r, e) = sys(|| unsafe { libc::listen(-1, 1) } as libc::c_long);
+    out.result("listen_syscall", denied(r, e, &[libc::EPERM]));
+    // SAFETY: null address pointers are allowed.
+    let (r, e) = sys(|| unsafe {
+        libc::accept4(-1, std::ptr::null_mut(), std::ptr::null_mut(), 0)
+    } as libc::c_long);
+    out.result("accept_syscall", denied(r, e, &[libc::EPERM]));
+
+    // A connected TCP socket like the ones the connector hands over: it cannot be disconnected
+    // (`connect(AF_UNSPEC)`) and aimed elsewhere, nor re-aimed by TCP Fast Open.
+    if conn_sock < 0 {
+        let why = match a.listen_port {
+            None => missing("--listen-port"),
+            Some(p) => format!("could not connect to 127.0.0.1:{p} before restricting"),
+        };
+        out.check("reconnect_inherited_tcp", false, why.clone());
+        out.check("fastopen_inherited_tcp", false, why);
+    } else {
+        // SAFETY: an all-zero sockaddr with family AF_UNSPEC.
+        let mut unspec: libc::sockaddr = unsafe { std::mem::zeroed() };
+        unspec.sa_family = libc::AF_UNSPEC as libc::sa_family_t;
+        // SAFETY: `unspec` is a valid sockaddr.
+        let (r, e) = sys(|| unsafe {
+            libc::connect(
+                conn_sock,
+                &unspec,
+                std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
+            )
+        } as libc::c_long);
+        let (ok, d) = denied(r, e, &[libc::EPERM]);
+        let mut detail = format!("connect(AF_UNSPEC): {d}");
+        // Only if the disconnect worked (no sandbox): show where it leads.
+        if r == 0 {
+            // SAFETY: as above.
+            let (r2, e2) = sys(|| unsafe {
+                libc::connect(conn_sock, (&addr as *const libc::sockaddr_in).cast(), len)
+            } as libc::c_long);
+            detail.push_str(&format!(
+                "; then connect to 127.0.0.1:{}: {}",
+                a.deny_port.unwrap_or(9),
+                if r2 == 0 { "connected".into() } else { errname(e2) }
+            ));
         }
-        None => out.check("tcp_connect_allowed_port", false, missing("--listen-port")),
-    }
-    match a.deny_port {
-        Some(port) => {
-            let (ok, d) = denied_io(TcpStream::connect(("127.0.0.1", port)), &[libc::EACCES]);
-            out.check(
-                "tcp_connect_denied_port",
-                ok,
-                format!(
-                    "{d} to listening 127.0.0.1:{port} not in tcp_connect_ports (Landlock layer)"
-                ),
-            );
-        }
-        None => out.check("tcp_connect_denied_port", false, missing("--deny-port")),
+        out.check("reconnect_inherited_tcp", ok, detail);
+        // SAFETY: a valid buffer and sockaddr_in.
+        let (r, e) = sys(|| unsafe {
+            libc::sendto(
+                conn_sock,
+                b"x".as_ptr().cast(),
+                1,
+                libc::MSG_FASTOPEN | libc::MSG_NOSIGNAL,
+                (&addr as *const libc::sockaddr_in).cast(),
+                len,
+            )
+        } as libc::c_long);
+        // A connected socket refuses a Fast Open to another address: Landlock's TCP connect
+        // rule (EACCES, which this kernel checks first), else EISCONN.
+        out.check(
+            "fastopen_inherited_tcp",
+            r < 0 && [libc::EISCONN, libc::EPERM, libc::EACCES].contains(&e) && ok,
+            if r < 0 { errname(e) } else { format!("{r} bytes sent") },
+        );
     }
     out.result(
         "tcp_bind",
         denied_io(
             TcpListener::bind("127.0.0.1:0"),
             &[libc::EPERM, libc::EACCES],
+        ),
+    );
+    // The broker's second step once its runtime is up: no socket of any kind after it.
+    let sealed = crate::seal_socket_creation();
+    let (pair_ok, pair_d) = denied_pair(libc::SOCK_STREAM);
+    out.check(
+        "seal_socket_creation",
+        sealed.is_ok() && pair_ok,
+        format!(
+            "{}; then socketpair(AF_UNIX, SOCK_STREAM): {pair_d}",
+            match &sealed {
+                Ok(()) => "sealed".to_string(),
+                Err(e) => e.to_string(),
+            }
         ),
     );
 
@@ -1763,7 +1806,6 @@ mod tests {
         let mut a = ProbeArgs::new(ProfileKind::Broker);
         a.readable = vec!["/a b/endpoints".into()];
         a.writable = vec!["/spool".into()];
-        a.ports = vec![443, 8545];
         a.secret = Some("/tmp/secret".into());
         a.listen_port = Some(4000);
         a.deny_port = Some(4001);
@@ -1800,7 +1842,10 @@ mod tests {
         let runner = expected_checks(ProfileKind::BuilderRunner);
         let broker = expected_checks(ProfileKind::Broker);
         assert!(runner.contains(&"socket_inet") && !runner.contains(&"socket_inet_allowed"));
-        assert!(broker.contains(&"tcp_connect_denied_port") && !broker.contains(&"socket_inet"));
+        assert!(broker.contains(&"socket_inet") && !broker.contains(&"socket_inet_allowed"));
+        for c in ["tcp_connect_loopback", "connect_syscall", "reconnect_inherited_tcp", "seal_socket_creation"] {
+            assert!(broker.contains(&c) && !runner.contains(&c) || c == "tcp_connect_loopback", "{c}");
+        }
         for c in ["uname", "sysinfo", "statx_enosys", "chdir", "cwd_root"] {
             assert!(runner.contains(&c) && !broker.contains(&c), "{c}");
             assert!(

@@ -209,21 +209,27 @@ fn broker_self_test() {
     let profile = Profile::Broker {
         readable: vec![endpoints],
         writable: vec![spool],
-        tcp_connect_ports: vec![443],
     };
     let report = self_test_profile(SandboxMode::Rootless, &profile, Path::new(PROBE), s.path());
     assert_passed(test, &report);
     let n = names(&report);
     for c in [
-        "broker/socket_inet_allowed",
-        "broker/tcp_connect_allowed_port",
-        "broker/tcp_connect_denied_port",
+        "broker/socket_inet",
+        "broker/socket_inet6",
+        "broker/tcp_connect_loopback",
+        "broker/connect_syscall",
+        "broker/listen_syscall",
+        "broker/accept_syscall",
+        "broker/reconnect_inherited_tcp",
+        "broker/fastopen_inherited_tcp",
+        "broker/seal_socket_creation",
+        "broker/listeners_untouched",
         "broker/socket_unix",
         "broker/abstract_unix_connect",
         "broker/read_readable",
         "broker/write_writable",
         "broker/read_secret",
-        "broker/socket_inet_tcp_allowed",
+        "broker/socket_inet_tcp",
         "broker/socket_udp",
         "broker/socket_mptcp",
         "broker/socket_icmp",
@@ -349,7 +355,6 @@ fn negative_control(kind: ProfileKind) {
         std::fs::create_dir(&spool).unwrap();
         a.readable = vec![endpoints];
         a.writable = vec![spool];
-        a.ports = vec![a.listen_port.unwrap()];
     }
     let sysv_before = sysv_objects();
     let mut cmd = Command::new(PROBE);

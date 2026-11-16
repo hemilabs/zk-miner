@@ -1,5 +1,6 @@
 //! Test support, not for production: a minimal HTTP/1.1 server, a test network floor, a mock
-//! `evm-rpc` codec, a fake builder, and a broker started in-process (no sandbox).
+//! `evm-rpc` codec, a fake builder, and a broker started in-process (no sandbox) with the real
+//! connector ([`crate::connector::Connector`]) beside it, over the same test facts.
 //!
 //! [`TestEgress`] injects the host's connected prefixes and a simple redaction; admission is always
 //! the real floor ([`crate::egress::EgressPolicy::admit`], zkminer-netguard's predicate).
@@ -20,6 +21,7 @@ use zkminer_witness::ipc::{
 
 use crate::client::BrokerClient;
 use crate::config::{mask, BrokerConfig};
+use crate::connector::{Connector, SessionEnd};
 use crate::egress::Prefix;
 use crate::evm_rpc::{BlockPin, BlockTag, CallAnswer, Denied, ResponseError};
 use crate::hooks::{EgressHooks, Hooks, RpcCodec, RpcReq};
@@ -418,11 +420,54 @@ pub fn test_egress_real_codec() -> Hooks {
     Hooks { egress: Arc::new(TestEgress::default()), codec: Arc::new(crate::hooks::RealCodec) }
 }
 
-/// Starts a broker in-process on a socketpair and returns the miner's client.
+/// The connector the miner would run for `config` (in `config.net_mode`), over the test's facts:
+/// `config.host`'s when set, else what `hooks` report; the DNS servers likewise (else `[dns]
+/// servers`, else `/etc/resolv.conf`'s). Admission is the real floor.
+pub async fn test_connector(config: &BrokerConfig, hooks: &Hooks) -> Arc<Connector> {
+    let dns_servers = match &config.host {
+        Some(h) => h.dns_servers.clone(),
+        None if !config.dns.servers.is_empty() => config.dns.servers.clone(),
+        None => crate::dns::system_servers(),
+    };
+    let (facts, deny) = match &config.host {
+        Some(h) => (zkminer_netguard::HostFacts::new(h.connected.clone(), h.own_addresses.clone()), config.effective_deny_for(h)),
+        None => {
+            let (e, o) = (hooks.egress.clone(), config.facts_options);
+            let facts = tokio::task::spawn_blocking(move || e.host_facts(&o)).await.expect("facts task").expect("host facts");
+            (facts, config.effective_deny(&dns_servers))
+        }
+    };
+    let floor = zkminer_netguard::NetPolicy::with_facts(zkminer_netguard::NetMode::Public, facts, deny);
+    Connector::with_floor(config, dns_servers, floor).expect("connector")
+}
+
+/// A [`test_connector`] session for `config`: returns the broker's end of its socket (the
+/// broker's fd 4).
+pub async fn connector_end(config: &BrokerConfig, hooks: &Hooks) -> std::os::fd::OwnedFd {
+    let connector = test_connector(config, hooks).await;
+    let (conn_miner, conn_broker) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    tokio::spawn(connector.serve(conn_miner));
+    conn_broker.into()
+}
+
+/// Starts a broker in-process on a socketpair, with [`test_connector`] serving its connector
+/// socket, and returns the miner's client.
 pub async fn spawn_broker(config: BrokerConfig, hooks: Hooks) -> (BrokerClient, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    let (client, task, _) = spawn_broker_with_connector(config, hooks).await;
+    (client, task)
+}
+
+/// [`spawn_broker`], also returning the connector and its session.
+pub async fn spawn_broker_with_connector(
+    config: BrokerConfig,
+    hooks: Hooks,
+) -> (BrokerClient, tokio::task::JoinHandle<anyhow::Result<()>>, (Arc<Connector>, tokio::task::JoinHandle<SessionEnd>)) {
+    let connector = test_connector(&config, &hooks).await;
+    let (conn_miner, conn_broker) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let session = tokio::spawn(connector.clone().serve(conn_miner));
     let (miner, broker) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-    let task = tokio::spawn(crate::serve_with(config, std::os::fd::OwnedFd::from(broker), hooks));
-    (BrokerClient::new(miner).expect("client"), task)
+    let task = tokio::spawn(crate::serve_with(config, std::os::fd::OwnedFd::from(broker), std::os::fd::OwnedFd::from(conn_broker), hooks));
+    (BrokerClient::new(miner).expect("client"), task, (connector, session))
 }
 
 /// The builder's side of a job socket.

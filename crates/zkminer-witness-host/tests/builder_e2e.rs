@@ -196,7 +196,8 @@ fn anvil_broker_config(dir: &Path, url: &str) -> String {
 }
 
 /// The same config in public mode, as a miner without `[dev] private_network` starts its broker:
-/// the broker refuses the loopback endpoint and exits with status 2 before it serves anything.
+/// the miner's own load of the file (for the broker's connector) refuses the loopback endpoint, so
+/// no broker is spawned; and the broker binary, given the file anyway, refuses it too (status 2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_same_broker_config_is_refused_in_public_mode() {
     let Some(root) = delegated("the_same_broker_config_is_refused_in_public_mode") else { return };
@@ -205,17 +206,13 @@ async fn the_same_broker_config_is_refused_in_public_mode() {
     let config = dir.path().join("broker.toml");
     std::fs::write(&config, anvil_broker_config(dir.path(), "http://127.0.0.1:8545")).unwrap();
     let spawner = Spawner::new().unwrap();
-    let mut broker = BrokerProcess::start(&spawner, &broker_bin, &config, &root, 512 << 20, &public_miner()).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let status = loop {
-        if let Some(status) = broker.exited() {
-            break status;
-        }
-        assert!(std::time::Instant::now() < deadline, "the broker accepted a loopback endpoint in public mode");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let e = match BrokerProcess::start(&spawner, &broker_bin, &config, &root, 512 << 20, &public_miner()) {
+        Ok(_) => panic!("a loopback endpoint was accepted in public mode"),
+        Err(e) => format!("{e:#}"),
     };
-    assert_eq!(status.code(), Some(2), "{status:?}");
-    assert!(broker.client.self_test().await.is_err(), "nothing answers");
+    assert!(e.contains("anvil: role entry 127.0.0.1/32") && e.contains("not on the public internet"), "{e}");
+    let out = std::process::Command::new(&broker_bin).arg("--config").arg(&config).env_clear().output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

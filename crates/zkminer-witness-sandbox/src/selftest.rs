@@ -90,7 +90,6 @@ pub fn self_test(mode: SandboxMode, probe_binary: &Path, secret_path: &Path) -> 
             let profile = Profile::Broker {
                 readable: vec![fx.endpoints.clone()],
                 writable: vec![fx.spool.clone()],
-                tcp_connect_ports: vec![],
             };
             checks.extend(self_test_profile(mode, &profile, probe_binary, secret_path).checks);
         }
@@ -214,10 +213,11 @@ impl Drop for MetaFixture {
 ///    until `pids.max` refuses with `EAGAIN` (`pids.events` `max`).
 ///
 /// Each cgroup must then be removable (`cgroup.kill`, empty, `rmdir`). For a broker profile the
-/// probe also connects to a loopback port the parent listens on that is added to
-/// `tcp_connect_ports` (must succeed) and to another listening port that is not (must fail with
-/// Landlock's `EACCES`), and reads/writes its `readable`/`writable` paths. Note that in rootless
-/// mode nothing below the port level is checked: there is no kernel egress floor for addresses.
+/// probe also checks that it has no network of its own: no socket, no `connect` (also not to
+/// re-aim a TCP socket it was handed, connected before restricting, with `AF_UNSPEC` or TCP Fast
+/// Open), no `bind`, `listen` or `accept`, no socket pair after `seal_socket_creation`; and it
+/// reads/writes its `readable`/`writable` paths. Its connections come from the miner's
+/// connector, whose own checks are the broker crate's.
 pub fn self_test_profile(
     mode: SandboxMode,
     profile: &Profile,
@@ -259,15 +259,9 @@ pub fn self_test_profile(
         ),
     }
     let mut base = ProbeArgs::new(kind);
-    if let Profile::Broker {
-        readable,
-        writable,
-        tcp_connect_ports,
-    } = profile
-    {
+    if let Profile::Broker { readable, writable } = profile {
         base.readable = readable.clone();
         base.writable = writable.clone();
-        base.ports = tcp_connect_ports.clone();
     }
     base.secret = Some(secret_path.to_path_buf());
 
@@ -468,13 +462,11 @@ fn checks_probe(
     let s = |e: std::io::Error| e.to_string();
     let is_broker = base.kind == ProfileKind::Broker;
 
-    // Loopback listeners: one allowed (for the broker), one not.
+    // Loopback listeners: `listen` (the broker probe connects to it before restricting, standing
+    // in for a socket from the connector) and `deny`, which nothing may reach.
     let listen = TcpListener::bind("127.0.0.1:0").map_err(s)?;
     let listen_port = listen.local_addr().map_err(s)?.port();
-    let mut deny = TcpListener::bind("127.0.0.1:0").map_err(s)?;
-    while base.ports.contains(&deny.local_addr().map_err(s)?.port()) {
-        deny = TcpListener::bind("127.0.0.1:0").map_err(s)?;
-    }
+    let deny = TcpListener::bind("127.0.0.1:0").map_err(s)?;
     let deny_port = deny.local_addr().map_err(s)?.port();
 
     // An abstract Unix socket the parent listens on, reachable from outside the sandbox.
@@ -502,9 +494,6 @@ fn checks_probe(
     let mut args = base.clone();
     args.listen_port = Some(listen_port);
     args.deny_port = Some(deny_port);
-    if is_broker {
-        args.ports.push(listen_port);
-    }
     args.abstract_name = Some(abstract_name);
     args.meta_fd = Some(META_FD);
     args.expect_fds = vec![0, 1, 2, READY_FD, GO_FD, META_FD];
@@ -604,6 +593,24 @@ fn checks_probe(
             Some(s) => format!("{s}"),
             None => format!("no exit within {PROBE_TIMEOUT:?}; cgroup killed"),
         },
+    );
+    // Nothing the probe did after restricting reached either listener: `deny` has no connection;
+    // `listen` has only the broker probe's one from before.
+    let pending = |l: &TcpListener| -> usize {
+        if l.set_nonblocking(true).is_err() {
+            return usize::MAX;
+        }
+        std::iter::from_fn(|| l.accept().ok()).take(64).count()
+    };
+    let (on_deny, on_listen) = (pending(&deny), pending(&listen));
+    let want_listen = usize::from(is_broker);
+    r.check(
+        "listeners_untouched",
+        on_deny == 0 && on_listen == want_listen,
+        format!(
+            "127.0.0.1:{deny_port} accepted {on_deny} connections (want 0), 127.0.0.1:{listen_port} \
+             accepted {on_listen} (want {want_listen})"
+        ),
     );
     drop((listen, deny, unix));
     let changes = meta.changes();

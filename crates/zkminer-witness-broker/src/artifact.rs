@@ -207,11 +207,6 @@ impl ArtifactReader {
         self.endpoint.as_ref()
     }
 
-    /// The artifact endpoint and mirror, where configured.
-    pub fn endpoints(&self) -> impl Iterator<Item = &Arc<Endpoint>> {
-        self.endpoint.iter().chain(self.mirror.iter())
-    }
-
     pub fn chain_id(&self) -> u64 {
         self.chain_id
     }

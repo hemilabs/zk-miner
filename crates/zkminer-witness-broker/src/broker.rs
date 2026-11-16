@@ -11,8 +11,8 @@ use crate::artifact::ArtifactReader;
 use crate::cache::{Lru, RpcKey};
 use crate::config::{BrokerConfig, EndpointSpec, EvmRpcEndpoint, HostFacts};
 use crate::hooks::Hooks;
+use crate::connector::ConnectorClient;
 use crate::job::{Job, JobSource};
-use crate::dns::{Resolver, QUERY_TIMEOUT};
 use crate::lanes::ByteLanes;
 use crate::net::{build_policy, Endpoint, EndpointEnv, PolicyHandle};
 use crate::spool::Spool;
@@ -26,8 +26,13 @@ pub(crate) struct EvmEndpoint {
 pub(crate) struct Broker {
     pub cfg: BrokerConfig,
     pub hooks: Hooks,
-    /// The network floor, with the host's connected prefixes and own addresses.
+    /// The broker's own (second-layer) floor, with the host's connected prefixes and own
+    /// addresses.
     pub policy: PolicyHandle,
+    /// The host's facts as the broker read them at startup: every refresh is unioned with them.
+    pub startup: HostFacts,
+    /// Every connection comes from the miner's connector.
+    pub connector: Arc<ConnectorClient>,
     pub evm: Vec<EvmEndpoint>,
     pub blob_mirrors: Vec<Arc<Endpoint>>,
     pub artifacts: ArtifactReader,
@@ -41,35 +46,38 @@ pub(crate) struct Broker {
 }
 
 impl Broker {
-    /// Builds every endpoint client and the network floor. Needs a tokio runtime.
-    pub fn new(cfg: BrokerConfig, host: HostFacts, hooks: Hooks) -> anyhow::Result<Arc<Self>> {
+    /// Builds every endpoint client and the broker's own floor. Needs a tokio runtime.
+    pub fn new(cfg: BrokerConfig, host: HostFacts, hooks: Hooks, connector: Arc<ConnectorClient>) -> anyhow::Result<Arc<Self>> {
         let policy: PolicyHandle = Arc::new(RwLock::new(build_policy(
             cfg.net_mode,
             cfg.endpoints(),
-            &host.resolved,
             cfg.effective_deny_for(&host),
             host.connected.clone(),
             &host.own_addresses,
         )));
-        if host.dns_servers.is_empty() && cfg.endpoints().any(|e| e.literal.is_none()) {
-            tracing::warn!("no DNS server ([dns] servers or /etc/resolv.conf): host-name endpoints cannot resolve");
-        }
         let env = EndpointEnv {
             policy: policy.clone(),
             egress: hooks.egress.clone(),
-            dns: Arc::new(Resolver::new(host.dns_servers.clone(), QUERY_TIMEOUT)),
-            reresolve: cfg.dns.reresolve,
+            connector: connector.clone(),
             held_lock_share: cfg.budget.held_lock_share,
         };
-        let mk = |spec: &EndpointSpec| {
-            Endpoint::new(spec.clone(), host.resolved.get(&spec.alias).cloned().unwrap_or_default(), &env, &cfg.timeouts)
+        // Each endpoint's index in `cfg.endpoints()`: what the connector knows it by.
+        let index_of = |spec: &EndpointSpec| -> anyhow::Result<u32> {
+            let i = cfg
+                .endpoints()
+                .position(|e| e.role == spec.role && e.alias == spec.alias)
+                .ok_or_else(|| anyhow::anyhow!("endpoint {} is not in the configuration", spec.alias))?;
+            Ok(u32::try_from(i)?)
+        };
+        let mk = |spec: &EndpointSpec| -> anyhow::Result<Arc<Endpoint>> {
+            Ok(Endpoint::new(spec.clone(), index_of(spec)?, &env, &cfg.timeouts))
         };
         let evm = cfg
             .evm_rpc
             .iter()
             .map(|e| Ok(EvmEndpoint { info: e.clone(), ep: mk(&e.spec)? }))
-            .collect::<Result<Vec<_>, reqwest::Error>>()?;
-        let blob_mirrors = cfg.blob_mirrors.iter().map(&mk).collect::<Result<Vec<_>, _>>()?;
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let blob_mirrors = cfg.blob_mirrors.iter().map(&mk).collect::<anyhow::Result<Vec<_>>>()?;
         let bytes = Arc::new(ByteLanes::new(cfg.budget.inflight_bytes, cfg.held_lock_reserved_bytes()));
         let artifacts = match &cfg.artifacts {
             None => ArtifactReader::new(None, None, 0, 0, &cfg, bytes.clone()),
@@ -87,6 +95,8 @@ impl Broker {
             rpc_cache: Mutex::new(Lru::new(cfg.cache.rpc_max_bytes, cfg.cache.rpc_max_entries)),
             hooks,
             policy,
+            startup: host,
+            connector,
             evm,
             blob_mirrors,
             artifacts,
@@ -101,11 +111,6 @@ impl Broker {
     /// `n` consecutive JSON-RPC ids of the broker's own.
     pub fn next_ids(&self, n: u64) -> u64 {
         self.ids.fetch_add(n.max(1), Ordering::Relaxed)
-    }
-
-    /// Every endpoint (evm-rpc, blob mirrors, the artifact endpoint and its mirror).
-    pub fn all_endpoints(&self) -> impl Iterator<Item = &Arc<Endpoint>> {
-        self.evm.iter().map(|e| &e.ep).chain(self.blob_mirrors.iter()).chain(self.artifacts.endpoints())
     }
 
     /// The source a `(class, config)` pair is served from, if this broker provisions it: for

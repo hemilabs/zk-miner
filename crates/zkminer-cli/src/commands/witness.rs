@@ -100,7 +100,7 @@ pub async fn self_test(config_path: Option<&Path>, probe: Option<PathBuf>) -> Re
     if let Some(b) = &config.broker {
         let binary = paths::binary(b.binary.as_deref(), paths::BROKER_BINARY)?;
         let broker = BrokerProcess::start(&spawner, &binary, &b.config, &root, b.memory_bytes, &config)?;
-        match broker.client.self_test().await {
+        match zkminer_witness_host::broker_proc::self_test(&broker.client, &broker.connector).await {
             Ok(r) => {
                 for (check, ok) in &r.checks {
                     println!("{} broker/{check:?}", if *ok { "PASS" } else { "FAIL" });
