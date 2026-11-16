@@ -24,6 +24,9 @@ use crate::journal::JobJournal;
 
 use zkminer_chain::adapter::AdapterInfo;
 
+/// Witness-construction jobs: routing, the witness runtime and its pure policy (see its docs).
+mod witness;
+
 /// Safety margin (seconds) before lock_deadline beyond which we will not start
 /// or continue work, to leave room for the fulfill tx to land before slashing.
 const DEADLINE_FULFILL_MARGIN_SECS: u64 = 60;
@@ -2407,6 +2410,15 @@ pub async fn run(
     if watch.is_none() {
         hold_instance_lock()?;
     }
+    // The lock journal, read before anything starts: a journal this build must not rewrite (a newer
+    // format) or cannot read refuses the start. A watch-only run holds nothing, and the journal on
+    // disk belongs to the miner that may be running beside it: it starts empty and never saves (see
+    // `save_journal_or_warn`).
+    let loaded_journal = if watch.is_none() {
+        JobJournal::load_checked()?
+    } else {
+        JobJournal::default()
+    };
     let splash = zkminer_tui::splash::Splash::start(!headless);
     splash.status("Connecting to the chain");
     let queue_horizon_secs = config.prover.queue_horizon_secs;
@@ -3127,15 +3139,16 @@ pub async fn run(
     // Miner brain: evaluates open jobs, claims, proves, and fulfills.
     let brain_client = client.clone();
     let brain_state = state.clone();
-    // A watch-only run holds nothing, and the journal on disk belongs to the miner that may be
-    // running beside it: start empty and never save (see `save_journal_or_warn`).
-    let journal: SharedJournal = Arc::new(Mutex::new(if watch_only() {
-        JobJournal::default()
-    } else {
-        JobJournal::load()
-    }));
+    // Read at the start (see `loaded_journal`).
+    let journal: SharedJournal = Arc::new(Mutex::new(loaded_journal));
     let brain_journal = journal.clone();
     let proving_timeout = Duration::from_secs(config.prover.proving_timeout_secs.max(60));
+    // Witness-construction jobs (docs/witness-construction-jobs.md §18): the retention store, the
+    // sandbox and broker self-tests and the broker, before the brain can see a witness job. Any
+    // failure leaves witness serving off with a page; inline jobs are unaffected.
+    let witness_rt =
+        witness::WitnessRuntime::start(&config, config_path, &client, &state, &journal, proving_timeout).await;
+    let brain_witness = witness_rt.clone();
     let cost_params = CostParams {
         electricity_cost_kwh: config.prover.electricity_cost_kwh,
         // The OVERHEAD only; `evaluate_job` adds the measured CPU and card.
@@ -3160,6 +3173,7 @@ pub async fn run(
             recovery_lookback,
             brain_journal,
             std::time::Duration::from_secs(queue_horizon_secs),
+            brain_witness,
         )
         .await;
     });
@@ -3370,6 +3384,11 @@ pub async fn run(
     // Distinct from `paused` (which the TUI's `p` key also sets, meaning only "stop
     // claiming"): the shutdown-only gates below key off THIS flag.
     SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Running witness simulations are abandoned (nothing of theirs is on chain); witness locks are
+    // drained like every other lock.
+    if let Some(w) = &witness_rt {
+        w.shutdown();
+    }
     monitor_handle.abort();
     event_handle.abort();
     hw_handle.abort();
@@ -4789,6 +4808,7 @@ fn spawn_sp1_warmup() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn miner_brain(
     client: ChainClient,
     state: zkminer_tui::state::SharedState,
@@ -4805,6 +4825,8 @@ async fn miner_brain(
     // Startup value, for the banner only. The loop reads the LIVE setting each tick so the
     // settings screen can change it — do not use this for decisions.
     initial_queue_horizon: Duration,
+    // The witness runtime, when witness jobs are served (or witness locks may be held) here.
+    witness_rt: Option<Arc<witness::WitnessRuntime>>,
 ) {
     // Journal is owned by `run()` so the shutdown path can read it. Recovery
     // reconciles the on-disk journal AND scans the chain for locked positions the
@@ -4827,6 +4849,14 @@ async fn miner_brain(
     // (with no collateral: theirs is already in the on-chain figures).
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<B256>();
     let mut in_flight: HashMap<B256, u128> = HashMap::new();
+    // Witness locks join `in_flight` when they are locked (or recovered), with their collateral and
+    // sized cycles, and leave it through `done_tx` like every other lock.
+    let (witness_held_tx, mut witness_held_rx) = mpsc::unbounded_channel::<(B256, u128, u64)>();
+    if let Some(w) = &witness_rt {
+        w.attach_brain(witness_held_tx, done_tx.clone());
+    } else {
+        drop(witness_held_tx);
+    }
     // The jobs in `in_flight` known to be of a backend other than risc0, so the rest can be held to
     // the risc0 cards (see `risc0_bypass_room`). Pruned to `in_flight` each tick; a job of unknown backend (a
     // recovered lock) counts as risc0, the safe direction.
@@ -4864,8 +4894,12 @@ async fn miner_brain(
             &client,
             &journal,
             recovery_lookback,
-            &std::collections::HashSet::new(),
+            &witness_rt
+                .as_ref()
+                .map(|w| w.owned_jobs())
+                .unwrap_or_default(),
             None,
+            witness_rt.as_ref(),
         )
         .await
     };
@@ -4879,6 +4913,7 @@ async fn miner_brain(
         &journal,
         &done_tx,
         proving_timeout,
+        witness_rt.as_ref(),
     );
 
     // Per-proof-system adapter cache. Populated lazily; adapter parameters change
@@ -5149,6 +5184,12 @@ async fn miner_brain(
             }
         }
 
+        // Witness locks taken (or recovered) since the last tick hold a slot like any lock. Before the
+        // reap below, so a lock that already ended is counted and then reaped in the same pass.
+        while let Ok((jid, collateral, cycles)) = witness_held_rx.try_recv() {
+            in_flight.insert(jid, collateral);
+            inflight_work.insert(jid, (cycles, zkminer_prover_protocol::BACKEND_RISC0));
+        }
         // Reap finished job tasks before re-evaluating the concurrency budget.
         while let Ok(jid) = done_rx.try_recv() {
             in_flight.remove(&jid);
@@ -5449,13 +5490,17 @@ async fn miner_brain(
                         inflight_work.remove(&jid);
                         queue_model.settle(&jid.0);
                     }
-                    let owned: std::collections::HashSet<B256> = in_flight.keys().copied().collect();
+                    let mut owned: std::collections::HashSet<B256> = in_flight.keys().copied().collect();
+                    if let Some(w) = &witness_rt {
+                        owned.extend(w.owned_jobs());
+                    }
                     let pass = recover_claimed_jobs(
                         &client,
                         &journal,
                         recovery_lookback,
                         &owned,
                         recovery_scan.take(),
+                        witness_rt.as_ref(),
                     )
                     .await;
                     recovery_deferred = pass.deferred;
@@ -5482,6 +5527,7 @@ async fn miner_brain(
                         &journal,
                         &done_tx,
                         proving_timeout,
+                        witness_rt.as_ref(),
                     );
                 }
                 // Escalate the back-off on repeated deferrals; reset once a pass completes.
@@ -6279,6 +6325,18 @@ async fn miner_brain(
                     .saturating_sub(zkminer_chain::client::chain_now_floor());
                 tracing::debug!("Skipping {}: a bid is live for {left}s more", short_id(jid));
                 note_job_retry_after(jid, Duration::from_secs(left.clamp(30, 3600)));
+                continue;
+            }
+            // A witness-construction job (`inputData` starts with WITNESS_JOB_TAG_V1) takes the witness
+            // path: simulated in the sandbox, locked and proven from its retained bundle. It never
+            // reaches the measure path, the inline caches or the inline claim below.
+            if witness::route(
+                witness_rt.as_ref(),
+                job,
+                snapshot.descriptor_hash,
+                claim_predicate_now,
+            ) == witness::Route::Witness
+            {
                 continue;
             }
             // EVICT a descriptor whose fulfill payload a prior measurement found to be over the
@@ -8235,6 +8293,14 @@ async fn watch_inspect(
         describe_binding(&d),
         d.inputData.len()
     );
+    // Watch-only never runs builders (plan §18): a witness job is reported, not simulated.
+    if witness::policy::is_witness_input(&d.inputData) {
+        witness::note_class(job_id, witness::Class::Witness);
+        return Inspected::Done(
+            "witness job",
+            format!("{head}: witness job, not simulated in watch-only"),
+        );
+    }
     let Some(backend) = resolve_backend(view.proofSystemId) else {
         return Inspected::Done("not served", format!("{head}: not served by this build"));
     };
@@ -8657,6 +8723,14 @@ async fn process_job_lifecycle(
                 return Ok(());
             }
         };
+        // A witness-construction job reaching the inline lifecycle (classified only now): never claimed
+        // here. The witness path serves it (its prefix marker included) from the next tick.
+        if witness::policy::is_witness_input(&d.inputData) {
+            witness::note_class(job_id, witness::Class::Witness);
+            skip("a witness-construction job: served only by the witness path".into(), false).await;
+            requeue_open_job(state, requeue_job.clone()).await;
+            return Ok(());
+        }
         // A binding MARKER in journalFields slot 0 (0xffffffff journal prefix `jobId ‖ prover`,
         // 0xfffffffe SP1 proof nonce) needs a guest input / patched prover this build does not have.
         let marker = u32::from_be_bytes(d.journalFields.0[..4].try_into().unwrap());
@@ -9156,6 +9230,17 @@ async fn process_job_lifecycle(
     };
     verify_descriptor_hash(&descriptor, view.descriptorHash)
         .map_err(|e| anyhow::anyhow!("descriptor hash mismatch: {e:#}"))?;
+    // A witness lock is never proven inline (its `inputData` is the envelope, not the guest's input):
+    // keep it, and let recovery hand it to the witness runtime, which proves it from its bundle.
+    if witness::policy::is_witness_input(&descriptor.inputData) {
+        witness::note_class(job_id, witness::Class::Witness);
+        request_recovery();
+        return Err(HandBack(
+            "a witness-construction lock: proven from its retained bundle by the witness runtime, never inline"
+                .into(),
+        )
+        .into());
+    }
     // programId in descriptor must match what the JobSubmitted event told us.
     if descriptor.programId != program_id {
         return Err(anyhow::anyhow!(
@@ -10728,6 +10813,19 @@ async fn measure_cycles(
             return;
         }
     };
+    // A witness-construction job is never measured on its `inputData` (the envelope, not the guest's
+    // input) and enters no inline cache: recorded so the brain routes it to the witness path (or, with
+    // witness serving off or its caller not allowlisted, skips it) from now on.
+    if witness::policy::is_witness_input(&descriptor.inputData) {
+        witness::note_class(job_id, witness::Class::Witness);
+        tracing::info!(
+            "measure {}: job {} is a witness-construction job — not measured (served only by the witness \
+             path, to callers on [witness] callers)",
+            short_id(program_id),
+            short_id(job_id)
+        );
+        return;
+    }
     // (Pre-claim strikes are cleared only once this job's measurement OUTCOME is final — below — never
     // on a descriptor success alone: a job that fetches fine and then fails later in this path, every
     // time, must keep escalating its back-off.)
@@ -12141,6 +12239,9 @@ enum RecoveryAction {
     /// Too little room left (or a permanent defect): release it (or keep it, if a governance hold
     /// says so — `release_and_clean` decides).
     Release(B256),
+    /// A witness-construction lock: re-driven by the witness runtime from its retained bundle (the
+    /// store's pin names it), never from the chain's descriptor and never inline.
+    Witness(B256),
 }
 
 /// The outcome of one [`recover_claimed_jobs`] pass.
@@ -12178,6 +12279,7 @@ async fn recover_claimed_jobs(
     lookback_blocks: u64,
     skip: &std::collections::HashSet<B256>,
     scan: Option<RecoveryScan>,
+    witness_rt: Option<&Arc<witness::WitnessRuntime>>,
 ) -> RecoveryPass {
     // Reconcile everything the journal is tracking, PLUS any job this miner has
     // locked on-chain that the journal doesn't know about (crash before the
@@ -12544,6 +12646,28 @@ async fn recover_claimed_jobs(
             continue;
         }
 
+        // A witness lock (its breadcrumb names a bundle, or the retention store pins one): the store,
+        // not the chain's descriptor or the journal, is its authoritative index (plan §15.2). It is
+        // immune to the program-wide marks below. Without a witness runtime here (serving off and no
+        // store), it is kept: the room rule above releases it as its window closes.
+        let witness_lock = journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .witness_bundle(jid)
+            .is_some()
+            || witness_rt.is_some_and(|w| w.is_witness_lock(jid));
+        if witness_lock {
+            match witness_rt {
+                Some(_) => actions.push((jid, RecoveryAction::Witness(jid))),
+                None => tracing::error!(
+                    "PAGE: RETENTION-UNAVAILABLE {} is a witness lock and no retention store is open here \
+                     (configure [retention]): kept, released only as its window closes",
+                    short_id(jid)
+                ),
+            }
+            continue;
+        }
+
         // Reconstruct a TrackedJob from the view.
         let job_info = zkminer_chain::jobs::JobInfo {
             job_id: jid,
@@ -12607,6 +12731,21 @@ async fn recover_claimed_jobs(
             actions.push((jid, RecoveryAction::Release(jid)));
             continue;
         }
+        // A witness lock with no breadcrumb and no pin (adopted): never proven inline (its input is
+        // the envelope, not the guest's). The witness runtime pages it BUNDLE-MISSING and keeps it;
+        // the room rule releases it as its window closes.
+        if witness::policy::is_witness_input(&descriptor.inputData) {
+            witness::note_class(jid, witness::Class::Witness);
+            match witness_rt {
+                Some(_) => actions.push((jid, RecoveryAction::Witness(jid))),
+                None => tracing::error!(
+                    "PAGE: BUNDLE-MISSING {} is a witness lock with no retention store here: kept, released \
+                     only as its window closes",
+                    short_id(jid)
+                ),
+            }
+            continue;
+        }
 
         let mut tracked = TrackedJob {
             info: job_info,
@@ -12668,9 +12807,18 @@ fn spawn_recovery_actions(
     journal: &SharedJournal,
     done_tx: &mpsc::UnboundedSender<B256>,
     proving_timeout: Duration,
+    witness_rt: Option<&Arc<witness::WitnessRuntime>>,
 ) {
     for (jid, action) in pass_actions {
         if in_flight.contains_key(&jid) || SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            continue;
+        }
+        // A witness lock's task takes its `in_flight` slot itself once its bundle is found (see
+        // `WitnessRuntime::run_locked`); a lock it cannot drive yet stays out of it, for the room rule.
+        if let RecoveryAction::Witness(jid) = action {
+            if let Some(w) = witness_rt {
+                w.drive_recovered(jid);
+            }
             continue;
         }
         in_flight.insert(jid, 0);
@@ -12698,6 +12846,7 @@ fn spawn_recovery_actions(
                     release_and_clean(&c, &st, &jr, jid).await;
                 });
             }
+            RecoveryAction::Witness(_) => unreachable!("handled above"),
         }
     }
 }

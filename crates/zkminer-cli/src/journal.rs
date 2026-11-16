@@ -8,13 +8,46 @@
 //!
 //! Writes are atomic (tmp + rename) so a crash mid-write cannot leave an
 //! unparseable journal.
+//!
+//! # Format versions
+//!
+//! - **1**: the original format, with no `format_version` field (a file without one is version 1).
+//! - **2** ([`JOURNAL_FORMAT_VERSION`]): adds `format_version` and, per entry, `witness`: the
+//!   retention-store bundle a witness-construction lock is proven from (plan §15.2). Version 1 files
+//!   load unchanged; they are written back as version 2.
+//!
+//! Loading never silently drops anything: an entry that does not parse is kept verbatim (and written
+//! back) and reported with a `PAGE: JOURNAL-ENTRY-UNREADABLE`; a file that does not parse at all is
+//! moved aside, never overwritten, with a `PAGE: JOURNAL-CORRUPT`; a file from a NEWER format, or one
+//! that cannot be read, refuses the start ([`JobJournal::load_checked`]): an older build must not
+//! rewrite a newer build's record of the locks it holds. The journal is not the authoritative index
+//! of witness locks (the retention store's pins are), and the chain scan finds every lock either way.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
-use alloy::primitives::B256;
+use alloy::primitives::{Address, B256};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+/// The format this build writes (see the module docs).
+pub const JOURNAL_FORMAT_VERSION: u32 = 2;
+
+/// The format of a journal written before versions existed.
+fn format_v1() -> u32 {
+    1
+}
+
+/// The retention-store bundle a witness lock is proven from: the store key and version. Recovery
+/// does not depend on it (the store's pins are the authoritative index); it tells the journal's
+/// readers, and an operator, that the lock is a witness lock and where its bundle is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessBundleRef {
+    pub job_id: B256,
+    pub descriptor_hash: B256,
+    pub prover: Address,
+    pub version: u32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalState {
@@ -55,6 +88,10 @@ pub struct JournalEntry {
     /// proves it on a card at one of them: a guest can tell the size it runs at. Empty for SP1, and
     /// in a breadcrumb written before sizes were recorded.
     pub measured_po2s: Vec<u8>,
+    /// For a witness-construction lock, the bundle it is proven from (format 2). `None` for an
+    /// inline job and in every format-1 entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness: Option<WitnessBundleRef>,
 }
 
 impl Default for JournalEntry {
@@ -69,14 +106,116 @@ impl Default for JournalEntry {
             lock_block: 0,
             lock_reopens: None,
             measured_po2s: Vec::new(),
+            witness: None,
         }
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobJournal {
+    /// The format the file was read in (1 when it has no such field); always written as
+    /// [`JOURNAL_FORMAT_VERSION`].
+    #[serde(default = "format_v1")]
+    pub format_version: u32,
+    #[serde(default)]
     pub entries: HashMap<B256, JournalEntry>,
+    /// Entries that did not parse, by their key as written, kept verbatim and written back so that
+    /// nothing is lost (an operator, or a newer build, can still read them).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unparsed: BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for JobJournal {
+    fn default() -> Self {
+        Self {
+            format_version: JOURNAL_FORMAT_VERSION,
+            entries: HashMap::new(),
+            unparsed: BTreeMap::new(),
+        }
+    }
+}
+
+/// Why a journal refused to load ([`JobJournal::load_checked`]).
+#[derive(Debug)]
+pub enum JournalLoadError {
+    /// Written by a newer build (a later format): this build must not rewrite it.
+    NewerFormat { path: PathBuf, found: u32 },
+    /// The file exists but could not be read.
+    Unreadable { path: PathBuf, error: std::io::Error },
+}
+
+impl std::fmt::Display for JournalLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NewerFormat { path, found } => write!(
+                f,
+                "the job journal at {} is format {found}, newer than this build's \
+                 {JOURNAL_FORMAT_VERSION}: a newer zkminer wrote it (perhaps holding witness locks this \
+                 build cannot prove). Run that release, or move the file aside after settling its locks",
+                path.display()
+            ),
+            Self::Unreadable { path, error } => {
+                write!(f, "the job journal at {} cannot be read: {error}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for JournalLoadError {}
+
+/// What a load found, besides the journal.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LoadReport {
+    /// The file did not parse and was moved here (never overwritten).
+    pub moved_aside: Option<PathBuf>,
+    /// Keys of entries that did not parse (kept in [`JobJournal::unparsed`]).
+    pub unparsed: Vec<String>,
+}
+
+/// Parses journal text. `Err` with the parse error when the text is not a journal at all; an entry
+/// that does not parse lands in `unparsed`.
+fn parse_journal(content: &str) -> std::result::Result<(JobJournal, Vec<String>), String> {
+    let v: serde_json::Value = serde_json::from_str(content).map_err(|e| e.to_string())?;
+    let obj = v.as_object().ok_or("not a JSON object")?;
+    let format_version = match obj.get("format_version") {
+        None => format_v1(),
+        Some(f) => f
+            .as_u64()
+            .and_then(|f| u32::try_from(f).ok())
+            .ok_or("format_version is not a number")?,
+    };
+    let mut j = JobJournal {
+        format_version,
+        ..JobJournal::default()
+    };
+    match obj.get("entries") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Object(entries)) => {
+            for (k, e) in entries {
+                let parsed = k
+                    .parse::<B256>()
+                    .ok()
+                    .zip(serde_json::from_value::<JournalEntry>(e.clone()).ok());
+                match parsed {
+                    Some((id, e)) => {
+                        j.entries.insert(id, e);
+                    }
+                    None => {
+                        j.unparsed.insert(k.clone(), e.clone());
+                    }
+                }
+            }
+        }
+        Some(_) => return Err("entries is not an object".into()),
+    }
+    // Entries an earlier load could not parse stay with the file.
+    if let Some(serde_json::Value::Object(u)) = obj.get("unparsed") {
+        for (k, e) in u {
+            j.unparsed.entry(k.clone()).or_insert_with(|| e.clone());
+        }
+    }
+    let unparsed = j.unparsed.keys().cloned().collect();
+    Ok((j, unparsed))
 }
 
 impl JobJournal {
@@ -88,26 +227,80 @@ impl JobJournal {
             .join("job_journal.json")
     }
 
-    /// Load the journal from disk. Returns an empty journal if the file
-    /// does not exist or fails to parse (logs a warning on parse failure).
-    pub fn load() -> Self {
-        Self::load_from(&Self::default_path())
+    /// Load the journal from disk ([`Self::load_checked_from`] at the default path).
+    pub fn load_checked() -> std::result::Result<Self, JournalLoadError> {
+        Self::load_checked_from(&Self::default_path())
     }
 
-    pub fn load_from(path: &std::path::Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(content) => match serde_json::from_str::<Self>(&content) {
-                Ok(j) => j,
-                Err(e) => {
-                    tracing::warn!(
-                        "Job journal at {} is corrupt ({}); starting with empty journal",
-                        path.display(),
-                        e,
-                    );
-                    Self::default()
-                }
-            },
-            Err(_) => Self::default(),
+    /// Load the journal from `path`. A missing file is an empty journal. A file that does not parse
+    /// is moved aside (`<path>.corrupt-<unix seconds>`) and paged, and the journal starts empty: the
+    /// chain scan still finds every lock this prover holds, and the retention store every witness
+    /// lock. Entries that do not parse are kept and paged. A newer format, or a file that cannot be
+    /// read, is an error: refuse to start rather than lose or rewrite it.
+    pub fn load_checked_from(path: &Path) -> std::result::Result<Self, JournalLoadError> {
+        let (j, report) = Self::load_reporting(path)?;
+        if let Some(aside) = &report.moved_aside {
+            tracing::error!(
+                "PAGE: JOURNAL-CORRUPT: the job journal at {} did not parse; it was moved to {} and \
+                 the miner starts with an empty journal (recovery still finds every lock on chain)",
+                path.display(),
+                aside.display()
+            );
+        }
+        for k in &report.unparsed {
+            tracing::error!(
+                "PAGE: JOURNAL-ENTRY-UNREADABLE: entry {} of the job journal at {} did not parse; it is \
+                 kept in the file as written (recovery still finds its lock on chain)",
+                zkminer_chain::programs::sanitize_log(k),
+                path.display()
+            );
+        }
+        Ok(j)
+    }
+
+    /// [`Self::load_checked_from`] without the logging, for tests.
+    pub fn load_reporting(path: &Path) -> std::result::Result<(Self, LoadReport), JournalLoadError> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Self::default(), LoadReport::default()))
+            }
+            Err(error) => {
+                return Err(JournalLoadError::Unreadable {
+                    path: path.to_path_buf(),
+                    error,
+                })
+            }
+        };
+        match parse_journal(&content) {
+            Ok((j, _)) if j.format_version > JOURNAL_FORMAT_VERSION => Err(JournalLoadError::NewerFormat {
+                path: path.to_path_buf(),
+                found: j.format_version,
+            }),
+            Ok((j, unparsed)) => Ok((
+                j,
+                LoadReport {
+                    moved_aside: None,
+                    unparsed,
+                },
+            )),
+            Err(_) => {
+                let stamp = chrono::Utc::now().timestamp();
+                let mut aside = path.as_os_str().to_owned();
+                aside.push(format!(".corrupt-{stamp}"));
+                let aside = PathBuf::from(aside);
+                std::fs::rename(path, &aside).map_err(|error| JournalLoadError::Unreadable {
+                    path: path.to_path_buf(),
+                    error,
+                })?;
+                Ok((
+                    Self::default(),
+                    LoadReport {
+                        moved_aside: Some(aside),
+                        unparsed: Vec::new(),
+                    },
+                ))
+            }
         }
     }
 
@@ -122,7 +315,9 @@ impl JobJournal {
                 .with_context(|| format!("Failed to create journal dir {}", parent.display()))?;
         }
         let tmp = path.with_extension("json.tmp");
-        let content = serde_json::to_string_pretty(self).context("Failed to serialize journal")?;
+        let mut out = self.clone();
+        out.format_version = JOURNAL_FORMAT_VERSION;
+        let content = serde_json::to_string_pretty(&out).context("Failed to serialize journal")?;
         std::fs::write(&tmp, content)
             .with_context(|| format!("Failed to write journal tmp {}", tmp.display()))?;
         std::fs::rename(&tmp, path)
@@ -145,6 +340,7 @@ impl JobJournal {
             lock_block: 0,
             lock_reopens: None,
             measured_po2s: Vec::new(),
+            witness: None,
         });
         // A new claim: whatever was seen of an earlier lock on this job says nothing about it (a
         // read showing the new claim pending, at a higher reopen count, would look like proof that
@@ -185,6 +381,7 @@ impl JobJournal {
             lock_block: 0,
             lock_reopens: None,
             measured_po2s: Vec::new(),
+            witness: None,
         });
         if claim_tx.is_some() {
             e.claim_tx = claim_tx;
@@ -227,6 +424,19 @@ impl JobJournal {
         }
     }
 
+    /// Record the bundle a witness lock is (about to be) proven from. Only on an existing entry:
+    /// written right after the claim intent, and again when a journal divergence re-versions it.
+    pub fn record_witness_bundle(&mut self, job_id: B256, bundle: WitnessBundleRef) {
+        if let Some(e) = self.entries.get_mut(&job_id) {
+            e.witness = Some(bundle);
+        }
+    }
+
+    /// The bundle a witness lock is proven from, if the entry records one.
+    pub fn witness_bundle(&self, job_id: B256) -> Option<WitnessBundleRef> {
+        self.entries.get(&job_id).and_then(|e| e.witness)
+    }
+
     pub fn remove(&mut self, job_id: B256) {
         self.entries.remove(&job_id);
     }
@@ -260,7 +470,7 @@ mod tests {
         j.mark_claimed(jid, Some(B256::repeat_byte(0xCD)), 12345);
         j.save_to(&path).unwrap();
 
-        let loaded = JobJournal::load_from(&path);
+        let loaded = JobJournal::load_checked_from(&path).unwrap();
         assert_eq!(loaded.entries.len(), 1);
         let e = loaded.entries.get(&jid).unwrap();
         assert_eq!(e.state, JournalState::Claimed);
@@ -270,11 +480,100 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_file_yields_empty_journal() {
+    fn corrupt_file_is_moved_aside_never_overwritten() {
         let path = tmp_path("corrupt");
         std::fs::write(&path, "not valid json {{{").unwrap();
-        let loaded = JobJournal::load_from(&path);
+        let (loaded, report) = JobJournal::load_reporting(&path).unwrap();
         assert!(loaded.entries.is_empty());
+        let aside = report.moved_aside.expect("moved aside");
+        assert!(!path.exists(), "the corrupt file is no longer where a save would overwrite it");
+        assert_eq!(std::fs::read_to_string(&aside).unwrap(), "not valid json {{{");
+        std::fs::remove_file(&aside).unwrap();
+    }
+
+    /// A format-1 journal (no `format_version`, no `witness`) loads unchanged and is written back as
+    /// format 2 with every entry.
+    #[test]
+    fn a_format_1_journal_loads_and_is_rewritten_as_format_2() {
+        let path = tmp_path("v1");
+        let jid = B256::repeat_byte(0x11);
+        let v1 = format!(
+            r#"{{"entries":{{"{jid}":{{"job_id":"{jid}","claimed_at":5,"claim_tx":null,"submit_tx":null,"lock_deadline":77,"state":"Proving","lock_block":3,"lock_reopens":1,"measured_po2s":[20]}}}}}}"#
+        );
+        std::fs::write(&path, &v1).unwrap();
+        let (j, report) = JobJournal::load_reporting(&path).unwrap();
+        assert_eq!(report, LoadReport::default());
+        assert_eq!(j.format_version, 1);
+        let e = &j.entries[&jid];
+        assert_eq!((e.state, e.lock_deadline, e.lock_block, e.witness), (JournalState::Proving, 77, 3, None));
+        j.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"format_version\": 2"), "{text}");
+        assert!(!text.contains("witness"), "an inline entry writes no witness field: {text}");
+        let back = JobJournal::load_checked_from(&path).unwrap();
+        assert_eq!(back.format_version, JOURNAL_FORMAT_VERSION);
+        assert_eq!(back.entries[&jid].measured_po2s, vec![20]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// An entry that does not parse (a state this build does not know) is kept and written back,
+    /// never dropped; the rest load.
+    #[test]
+    fn an_unreadable_entry_is_kept_verbatim() {
+        let path = tmp_path("unparsed");
+        let (good, bad) = (B256::repeat_byte(0x21), B256::repeat_byte(0x22));
+        let text = format!(
+            r#"{{"format_version":2,"entries":{{"{good}":{{"job_id":"{good}","state":"Claimed"}},"{bad}":{{"job_id":"{bad}","state":"Teleporting"}},"not-a-job-id":{{"state":"Claimed"}}}}}}"#
+        );
+        std::fs::write(&path, &text).unwrap();
+        let (j, report) = JobJournal::load_reporting(&path).unwrap();
+        assert_eq!(j.entries.len(), 1);
+        assert!(j.entries.contains_key(&good));
+        let mut unparsed = report.unparsed.clone();
+        unparsed.sort();
+        assert_eq!(unparsed, vec![bad.to_string(), "not-a-job-id".to_string()]);
+        j.save_to(&path).unwrap();
+        let (again, report) = JobJournal::load_reporting(&path).unwrap();
+        assert_eq!(again.unparsed.len(), 2, "written back");
+        assert_eq!(again.unparsed[&bad.to_string()]["state"], "Teleporting");
+        assert_eq!(report.unparsed.len(), 2);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_newer_format_refuses_to_load() {
+        let path = tmp_path("newer");
+        std::fs::write(&path, r#"{"format_version":3,"entries":{}}"#).unwrap();
+        match JobJournal::load_checked_from(&path) {
+            Err(JournalLoadError::NewerFormat { found: 3, .. }) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(path.exists(), "left in place");
+        std::fs::remove_file(&path).unwrap();
+        // A missing file is an empty journal of the current format.
+        let j = JobJournal::load_checked_from(&path).unwrap();
+        assert!(j.entries.is_empty());
+        assert_eq!(j.format_version, JOURNAL_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn a_witness_bundle_reference_round_trips() {
+        let path = tmp_path("witness");
+        let mut j = JobJournal::default();
+        let jid = B256::repeat_byte(0x31);
+        let r = WitnessBundleRef {
+            job_id: jid,
+            descriptor_hash: B256::repeat_byte(0x32),
+            prover: Address::repeat_byte(0x33),
+            version: 4,
+        };
+        j.record_witness_bundle(jid, r);
+        assert_eq!(j.witness_bundle(jid), None, "no entry, nothing recorded");
+        j.record_claim_intent(jid, 0, None);
+        j.record_witness_bundle(jid, r);
+        j.save_to(&path).unwrap();
+        let back = JobJournal::load_checked_from(&path).unwrap();
+        assert_eq!(back.witness_bundle(jid), Some(r));
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -358,7 +657,7 @@ mod tests {
         assert_eq!(j.measured_po2s(jid), vec![19, 20, 21]);
         j.save_to(&path).unwrap();
         assert_eq!(
-            JobJournal::load_from(&path).measured_po2s(jid),
+            JobJournal::load_checked_from(&path).unwrap().measured_po2s(jid),
             vec![19, 20, 21]
         );
         std::fs::remove_file(&path).unwrap();

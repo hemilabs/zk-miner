@@ -41,11 +41,18 @@ pub struct DevConfig {
     /// Refused on Hemi mainnet (43111); announced by a warning at every start. Default false.
     #[serde(default)]
     pub private_network: bool,
+    /// A fixed DA backlog reading, in estimated bytes, for witness-job claim gates and fulfils
+    /// (docs/witness-construction-jobs.md §5.5), in place of reading the chain. For a local test
+    /// network whose node serves no `l1GasUsed` in its receipts (anvil), where the reading is
+    /// otherwise always unknown and every witness job is held. Refused on Hemi mainnet. Default:
+    /// unset (read the chain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub da_backlog_bytes: Option<u64>,
 }
 
 impl DevConfig {
     fn is_off(&self) -> bool {
-        !self.private_network
+        !self.private_network && self.da_backlog_bytes.is_none()
     }
 }
 
@@ -505,8 +512,22 @@ impl ZkMinerConfig {
                 self.chain.chain_id
             );
         }
+        if self.dev.da_backlog_bytes.is_some() && is_production_chain(self.chain.chain_id) {
+            anyhow::bail!(
+                "[dev] da_backlog_bytes is refused on chain {} (a production market): the DA \
+                 backlog must be read from the chain there",
+                self.chain.chain_id
+            );
+        }
         self.egress_deny()?;
         Ok(())
+    }
+
+    /// `[dev] da_backlog_bytes`, honoured only off production chains (where validation refuses it).
+    pub fn dev_da_backlog_bytes(&self) -> Option<u64> {
+        self.dev
+            .da_backlog_bytes
+            .filter(|_| !is_production_chain(self.chain.chain_id))
     }
 
     /// Validate that required fields are set for production use.
@@ -647,6 +668,27 @@ mod validation_tests {
             parse(&text).unwrap().net_mode(),
             zkminer_netguard::NetMode::DevPrivate
         );
+    }
+
+    #[test]
+    fn a_fixed_da_backlog_is_a_test_network_setting() {
+        let c = parse("[chain]\nchain_id = 743111\n[dev]\nda_backlog_bytes = 0\n").unwrap();
+        assert!(c.validate_network().is_ok());
+        assert_eq!(c.dev_da_backlog_bytes(), Some(0));
+        // Alone, it does not turn on private-network access.
+        assert_eq!(c.net_mode(), zkminer_netguard::NetMode::Public);
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("da_backlog_bytes = 0"), "{text}");
+        for mainnet in ["[dev]\nda_backlog_bytes = 5\n", "[chain]\nchain_id = 43111\n[dev]\nda_backlog_bytes = 5\n"] {
+            let c = parse(mainnet).unwrap();
+            let err = c.validate_for_chain().expect_err(mainnet).to_string();
+            assert!(err.contains("da_backlog_bytes"), "{err}");
+            assert_eq!(c.dev_da_backlog_bytes(), None, "never honoured on mainnet");
+        }
+        // Unset by default, and not written.
+        let c = parse("[chain]\nchain_id = 743111\n").unwrap();
+        assert_eq!(c.dev_da_backlog_bytes(), None);
+        assert!(!toml::to_string_pretty(&c).unwrap().contains("[dev]"));
     }
 
     #[test]
