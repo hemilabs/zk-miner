@@ -109,7 +109,10 @@ pub struct EgressConfig {
     /// The ranges of your own network that this host reaches by the same route as the internet
     /// (a campus's or data centre's public ranges, your VPC's, what a full-tunnel VPN leads to):
     /// refused like `deny_cidrs`. Required (`[]` if there are none) on a host with a global IPv4
-    /// address on an interface or a default route through a tunnel interface.
+    /// address on an interface or an uplink that is not plainly physical (a tunnel, a VPN's `ppp`,
+    /// a default route in a table other than `main`, …): judged at startup and again whenever the
+    /// host's network changes, and while it is required and unset, no requester-caused
+    /// connection is made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal_ranges: Option<Vec<String>>,
     /// The hop limit of the probe sent right before every requester-caused connection: a

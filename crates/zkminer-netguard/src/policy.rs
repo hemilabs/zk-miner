@@ -77,6 +77,10 @@ pub enum Denied {
     /// This host's public address on the path a connection to `ip` takes is not known (see
     /// [`HostFacts::unknown_paths`]): it could be this host or its router, reached by hairpin.
     PublicAddressUnknown { ip: IpAddr, path: EgressPath },
+    /// The host's facts now need `[egress] internal_ranges` (a tunnel became the uplink, a global
+    /// IPv4 address appeared: [`HostFacts::needs_internal_ranges`]), which the configuration does
+    /// not state: every connection is refused until it does, or the condition clears.
+    InternalRangesUnstated { ip: IpAddr, why: String },
     /// The destination answered within `hops` hops of this host ([`crate::nearhop`]), or the
     /// probe that asks failed: `what` says which.
     NearHop {
@@ -229,6 +233,13 @@ impl Denied {
                     )
                 }
             }
+            Denied::InternalRangesUnstated { ip, why } => write!(
+                f,
+                "{ip} is not connected to: {why}, so this host now needs `internal_ranges = \
+                 [\"<cidr>\", ...]` in [egress] (the ranges of your own network that route reaches; \
+                 `[]` if there are none), which the config does not state. Every connection is \
+                 refused until it does"
+            ),
             Denied::NearHop { addr, hops, what } => write!(
                 f,
                 "{addr} is within {hops} hops of this host, on its own network (a probe limited \
@@ -263,6 +274,7 @@ impl Denied {
                 | Denied::OffDefaultRoute { .. }
                 | Denied::RouteQueryFailed { .. }
                 | Denied::PublicAddressUnknown { .. }
+                | Denied::InternalRangesUnstated { .. }
         )
     }
 }
@@ -279,7 +291,8 @@ impl Denied {
 /// kernel, asked how it would route a connection to `ip`, answers with the default path
 /// ([`crate::routes::RouteTable::judge`]; one netlink round trip per destination and facts
 /// snapshot). Last, the host's public address on the path the connection takes must be known
-/// ([`HostFacts::unknown_paths`]).
+/// ([`HostFacts::unknown_paths`]), and the facts must not need `[egress] internal_ranges` the
+/// configuration does not state ([`HostFacts::config_gaps`]).
 pub fn admit(
     mode: NetMode,
     ip: IpAddr,
@@ -349,7 +362,17 @@ fn admit_inner(
     facts.kernel_verdict(ip, dport)?;
     facts
         .path_known(ip)
-        .map_err(|path| Denied::PublicAddressUnknown { ip, path })
+        .map_err(|path| Denied::PublicAddressUnknown { ip, path })?;
+    // Re-judged with every snapshot: a tunnel that became the uplink after startup is refused
+    // like one there at startup.
+    let gaps = facts.config_gaps();
+    if !gaps.is_empty() {
+        return Err(Denied::InternalRangesUnstated {
+            ip,
+            why: crate::printable(&gaps.join("; "), 400),
+        });
+    }
+    Ok(())
 }
 
 /// [`admit`] for every address of a prefix at once (an operator's role entry, which admits
@@ -426,6 +449,8 @@ struct FactsCell {
     options: FactsOptions,
     /// The paths last warned about as unknown ([`HostFacts::unknown_paths`]).
     warned: std::sync::Mutex<Vec<EgressPath>>,
+    /// The configuration gaps last warned about ([`HostFacts::config_gaps`]).
+    warned_gaps: std::sync::Mutex<Vec<String>>,
 }
 
 impl FactsCell {
@@ -537,6 +562,27 @@ impl FactsCell {
             tracing::info!("network guard: this host's public addresses are known again");
         }
         *last = now;
+        drop(last);
+        let gaps = facts.config_gaps();
+        let mut last = self.warned_gaps.lock().unwrap_or_else(|e| e.into_inner());
+        if *last == gaps {
+            return;
+        }
+        if !gaps.is_empty() {
+            tracing::warn!(
+                "network guard: {}. This host now needs `internal_ranges = [\"<cidr>\", ...]` in \
+                 [egress] (the ranges of your own network that route reaches; `[]` if there are \
+                 none), which the config does not state: every requester-caused connection is \
+                 refused until it does, or this clears",
+                gaps.join("; ")
+            );
+        } else {
+            tracing::info!(
+                "network guard: this host no longer needs [egress] internal_ranges; connections \
+                 are admitted again"
+            );
+        }
+        *last = gaps;
     }
 }
 
@@ -614,6 +660,7 @@ impl NetPolicy {
                 refresh,
                 options,
                 warned: std::sync::Mutex::new(Vec::new()),
+                warned_gaps: std::sync::Mutex::new(Vec::new()),
             }),
             deny: deny.into(),
             probe: Arc::new(TtlProbe),
@@ -1317,7 +1364,9 @@ mod tests {
         }
         assert_eq!(
             p.admit(ip("1.0.0.1")).is_ok(),
-            !f.resolvers().contains(&ip("1.0.0.1"))
+            !f.resolvers().contains(&ip("1.0.0.1")),
+            "{:?}",
+            p.admit(ip("1.0.0.1"))
         );
     }
 

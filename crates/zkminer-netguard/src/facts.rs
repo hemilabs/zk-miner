@@ -21,8 +21,9 @@
 //! - **public-address knowledge:** per family the host routes, whether its public address is
 //!   known (learned reliably or configured); a family whose is not refuses every connection
 //!   ([`HostFacts::unknown_paths`]);
-//! - **tunnel uplinks and global IPv4 interface addresses**, which make a public-mode start need
-//!   `[egress] internal_ranges` ([`HostFacts::needs_internal_ranges`]);
+//! - **uplinks that are not plainly physical and global IPv4 interface addresses**, which make a
+//!   public-mode host need `[egress] internal_ranges` ([`HostFacts::needs_internal_ranges`]):
+//!   re-judged with every snapshot ([`HostFacts::config_gaps`]);
 //! - **DNS servers:** the `nameserver`s of `/etc/resolv.conf` and of systemd-resolved's
 //!   `/run/systemd/resolve/resolv.conf` (the upstream servers behind its `127.0.0.53` stub), which
 //!   may answer only their own customers;
@@ -242,9 +243,15 @@ pub struct RawFacts {
     pub public_via_nat64: Vec<Prefix>,
     /// Every network interface, with its kind.
     pub links: Vec<crate::routes::Link>,
-    /// The interfaces the kernel sends internet traffic out of (for default routes through a
-    /// nexthop object, whose interface the route dump does not show).
+    /// The interfaces the kernel sends internet traffic out of (its answer for a fixed public
+    /// address of each family).
     pub internet_interfaces: Vec<u32>,
+    /// Every nexthop object (for default routes through one, whose interface the route dump does
+    /// not show).
+    pub nexthops: Vec<crate::routes::Nexthop>,
+    /// How many PPPoE sessions the host has (`/proc/net/pppoe`): a `ppp` uplink is an ordinary
+    /// PPPoE uplink only when every `ppp` interface can be one of them.
+    pub pppoe_sessions: usize,
 }
 
 /// A snapshot of the host's facts (see the module doc).
@@ -264,10 +271,12 @@ pub struct HostFacts {
     /// What is known about the host's public addresses, for facts read from a host (`None` for
     /// facts given by the caller, which say nothing about it).
     egress: Option<EgressState>,
-    /// `(name, kind)` of every tunnel interface a default route goes out of.
-    tunnel_uplinks: Vec<(String, String)>,
+    /// Why the host's uplinks are not plainly physical (see [`Self::needs_internal_ranges`]).
+    uplink_reasons: Vec<String>,
     /// The global IPv4 addresses on the host's interfaces.
     global_v4_interfaces: Vec<IpAddr>,
+    /// Whether `[egress] internal_ranges` is stated (facts given by the caller: true).
+    internal_ranges_stated: bool,
 }
 
 /// Why the kernel's answer refused a destination ([`HostFacts::kernel_verdict`]).
@@ -287,6 +296,109 @@ fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> {
     v.sort();
     v.dedup();
     v
+}
+
+/// Why the uplinks of `routes` are not plainly physical (see [`HostFacts::needs_internal_ranges`]):
+/// every default route of an ordinary table, by its interface (or its nexthop object's), and the
+/// interfaces in `internet` (the kernel's own answer for internet traffic).
+fn uplink_reasons(
+    routes: &RouteTable,
+    links: &[crate::routes::Link],
+    nexthops: &[crate::routes::Nexthop],
+    internet: &[u32],
+    pppoe_sessions: usize,
+) -> Vec<String> {
+    use crate::routes::{RT_TABLE_DEFAULT, RT_TABLE_MAIN};
+    let mut why = Vec::new();
+    let mut uplinks: Vec<u32> = internet.to_vec();
+    for r in routes.routes().iter().filter(|r| r.is_default_like()) {
+        if r.table != RT_TABLE_MAIN && r.table != RT_TABLE_DEFAULT {
+            why.push(format!(
+                "routing table {} holds the default route {}, and a policy rule sends every \
+                 connection to that table (a VPN's or a policy-based IPsec's, such as \
+                 strongSwan's table 220)",
+                r.table, r.prefix
+            ));
+        }
+        if r.ifindex != 0 {
+            uplinks.push(r.ifindex);
+        } else if r.nexthop != 0 {
+            match crate::routes::nexthop_interfaces(nexthops, r.nexthop) {
+                Some(ifs) => uplinks.extend(ifs),
+                None => why.push(format!(
+                    "the default route {} goes through nexthop object {}, whose interface cannot \
+                     be read",
+                    r.prefix, r.nexthop
+                )),
+            }
+        } else {
+            why.push(format!("the default route {} names no interface", r.prefix));
+        }
+    }
+    uplinks.sort();
+    uplinks.dedup();
+    if links.is_empty() {
+        // Facts given without an interface list (a host's always has `lo`): nothing to judge
+        // the interfaces by.
+        why.sort();
+        why.dedup();
+        return why;
+    }
+    let ppp_links = links.iter().filter(|l| l.is_ppp()).count();
+    for i in uplinks {
+        let Some(l) = links.iter().find(|l| l.index == i) else {
+            why.push(format!(
+                "this host's default route goes out of interface {i}, which the interface list \
+                 does not show"
+            ));
+            continue;
+        };
+        if l.is_physical() {
+            continue;
+        }
+        if l.is_ppp() {
+            if ppp_links <= pppoe_sessions {
+                continue; // a PPPoE uplink
+            }
+            why.push(format!(
+                "this host's default route goes out of {}, a ppp link that is not a PPPoE \
+                 session (a VPN: L2TP, PPTP, SSTP, openfortivpn)",
+                l.name
+            ));
+            continue;
+        }
+        let kind = l.kind.as_deref().unwrap_or_default();
+        why.push(if l.is_tunnel() {
+            format!(
+                "this host's default route goes out of {}, a {kind} tunnel",
+                l.name
+            )
+        } else {
+            format!(
+                "this host's default route goes out of {}, an interface of kind {kind}, which \
+                 the network guard does not know to be physical",
+                l.name
+            )
+        });
+    }
+    why.sort();
+    why.dedup();
+    why
+}
+
+/// A value that changes when the host's uplink does: its default routes (prefix, gateway,
+/// interface, table; not a nexthop object's id, which a router advertisement can renew without
+/// changing anything) and the interfaces the kernel sends internet traffic out of.
+/// Public addresses confirmed under another uplink are not this one's
+/// ([`crate::public::learned_on`]).
+fn uplink_signature(routes: &RouteTable, internet: &[u32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for r in routes.routes().iter().filter(|r| r.is_default_like()) {
+        (r.prefix, r.hop, r.ifindex, r.table).hash(&mut h);
+    }
+    internet.hash(&mut h);
+    h.finish()
 }
 
 /// The enclosing /`len` of every global IPv6 address in `own` (`len` clamped to
@@ -329,8 +441,9 @@ impl HostFacts {
             oracle: None,
             verdicts: Arc::default(),
             egress: None,
-            tunnel_uplinks: Vec::new(),
+            uplink_reasons: Vec::new(),
             global_v4_interfaces: Vec::new(),
+            internal_ranges_stated: true,
         }
     }
 
@@ -382,17 +495,12 @@ impl HostFacts {
             nat64: sorted(raw.public_via_nat64.clone()),
             v4_configured: configured.iter().any(IpAddr::is_ipv4),
         };
-        // The interfaces internet traffic leaves by: those of the default routes, and the
-        // kernel's answer where a route names a nexthop object instead.
-        let mut uplink_ifs = routes.default_interfaces();
-        uplink_ifs.retain(|i| *i != 0);
-        uplink_ifs.extend(&raw.internet_interfaces);
-        let tunnel_uplinks = sorted(
-            raw.links
-                .iter()
-                .filter(|l| uplink_ifs.contains(&l.index) && l.is_tunnel())
-                .map(|l| (l.name.clone(), l.kind.clone().unwrap_or_default()))
-                .collect(),
+        let uplink_reasons = uplink_reasons(
+            &routes,
+            &raw.links,
+            &raw.nexthops,
+            &raw.internet_interfaces,
+            raw.pppoe_sessions,
         );
         let mut own = raw.interface_addresses;
         own.extend(
@@ -413,8 +521,9 @@ impl HostFacts {
             oracle: None,
             verdicts: Arc::default(),
             egress: Some(egress),
-            tunnel_uplinks,
+            uplink_reasons,
             global_v4_interfaces,
+            internal_ranges_stated: opts.internal_ranges.is_some(),
         }
     }
 
@@ -474,20 +583,36 @@ impl HostFacts {
         Ok(())
     }
 
-    /// Why this host may not start in public mode without `[egress] internal_ranges`: each
-    /// global IPv4 address on its interfaces (its network is numbered from public space, and its
-    /// other subnets are reached through the default gateway), and each tunnel a default route
-    /// goes out of (the far side's own hosts look like the internet). Empty when neither holds.
+    /// Why this host needs `[egress] internal_ranges` in public mode: each global IPv4 address on
+    /// its interfaces (its network is numbered from public space, and its other subnets are
+    /// reached through the default gateway), and each way its uplink is not plainly physical
+    /// (the far side's own hosts would look like the internet): a default route out of an
+    /// interface whose kind is not known to be physical ([`crate::routes::PHYSICAL_KINDS`]: a
+    /// tunnel, a `ppp` link that is not PPPoE, a kind the guard does not know), a default route in
+    /// an ordinary routing table other than `main` and `default` (a VPN's, a policy-based IPsec's
+    /// table 220), or one through a nexthop object or an interface that cannot be resolved.
+    /// Empty when nothing holds.
     pub fn needs_internal_ranges(&self) -> Vec<String> {
         let mut why: Vec<String> = self
             .global_v4_interfaces
             .iter()
             .map(|a| format!("this host has the global IPv4 address {a} on an interface"))
             .collect();
-        why.extend(self.tunnel_uplinks.iter().map(|(name, kind)| {
-            format!("this host's default route goes out of {name}, a {kind} tunnel")
-        }));
+        why.extend(self.uplink_reasons.iter().cloned());
         why
+    }
+
+    /// What these facts need that the configuration does not state: the reasons of
+    /// [`Self::needs_internal_ranges`] when `[egress] internal_ranges` is not set. Re-read with
+    /// the facts, so a tunnel that comes up (or a global IPv4 address that appears) after the miner
+    /// started refuses every connection until the operator states the ranges ([`crate::admit`]:
+    /// [`crate::Denied::InternalRangesUnstated`]); empty when nothing is missing.
+    pub fn config_gaps(&self) -> Vec<String> {
+        if self.internal_ranges_stated {
+            Vec::new()
+        } else {
+            self.needs_internal_ranges()
+        }
     }
 
     /// These facts, with `oracle` asked how each destination is routed ([`crate::admit`] refuses
@@ -577,8 +702,17 @@ impl HostFacts {
         crate::nat64::ensure_discovered();
         let (routes, rules) = crate::routes::read_routing(&loopback)?;
         let links = crate::routes::read_links()?;
+        let nexthops = if routes.iter().any(|r| r.nexthop != 0) {
+            crate::routes::read_nexthops()?
+        } else {
+            Vec::new()
+        };
+        let internet_interfaces = crate::routes::internet_interfaces();
         let public = if opts.discover_public_addresses {
-            crate::public::learned()
+            // Addresses confirmed under another uplink (a new default gateway, a VPN that came
+            // up) are not this one's: discovery runs again, and meanwhile they are not known.
+            let table = RouteTable::with_rules(routes.clone(), rules.clone());
+            crate::public::learned_on(uplink_signature(&table, &internet_interfaces))
         } else {
             crate::public::Learned::default()
         };
@@ -593,7 +727,9 @@ impl HostFacts {
                 public_confirmed: public.confirmed,
                 public_via_nat64: public.via_nat64,
                 links,
-                internet_interfaces: crate::routes::internet_interfaces(),
+                internet_interfaces,
+                nexthops,
+                pppoe_sessions: crate::routes::pppoe_sessions(),
             },
             opts,
         )
