@@ -144,8 +144,61 @@ pub fn check_journal_binding(
     }
 }
 
+/// `keccak256("HemiProve.ProofBinding.v1")`.
+pub const PROOF_BINDING_DOMAIN_V1: B256 =
+    b256!("d9d0b06eb5709bf8ec053d0c242bcb55e68556ff65978aa7ecadc92fd79cde4a");
+
+/// The SP1 proof nonce of `job_id` locked by `prover` on `router` (handoff §8; the router's pure
+/// view `getProofNonce`): `B = keccak256(abi.encode(DOMAIN, chainid, router, jobId, prover))`,
+/// `limb_i = (B >> (96 - 32 i)) & 0x3fffffff`, `nonce = Σ limb_i << (31 (3 - i))`. `router` is the
+/// router PROXY's address. zkminer serves no nonce-marker job yet (`NonceUnchecked`); this is the
+/// pre-check a nonce-bound seal (`seal[68..100]`) would be held to, and pins the derivation.
+pub fn proof_nonce(
+    chain_id: u64,
+    router: Address,
+    job_id: B256,
+    prover: Address,
+) -> (alloy::primitives::U256, [u32; 4]) {
+    use alloy::primitives::U256;
+    use alloy::sol_types::SolValue;
+    let b = keccak256(
+        (PROOF_BINDING_DOMAIN_V1, U256::from(chain_id), router, job_id, prover).abi_encode_params(),
+    );
+    let b = U256::from_be_bytes(b.0);
+    let mut limbs = [0u32; 4];
+    let mut nonce = U256::ZERO;
+    for (i, limb) in limbs.iter_mut().enumerate() {
+        *limb = ((b >> (96 - 32 * i)) & U256::from(0x3fff_ffffu32)).to::<u32>();
+        nonce |= U256::from(*limb) << (31 * (3 - i));
+    }
+    (nonce, limbs)
+}
+
 #[cfg(test)]
 mod tests {
+    /// Handoff §8's test vector (chain 743111, router 0x1111…, jobId 0x2222…, prover 0x3333…),
+    /// and three vectors read from the live 2026-11-16 router's `getProofNonce` on 2026-11-17
+    /// (router 0xD931…Ed58, block ~7234362): the derivation matches the deployed code.
+    #[test]
+    fn the_proof_nonce_matches_the_handoff_vector_and_the_live_router() {
+        use alloy::primitives::{address, U256};
+        let job = B256::repeat_byte(0x22);
+        let prover = Address::repeat_byte(0x33);
+        let (n, l) = super::proof_nonce(743111, Address::repeat_byte(0x11), job, prover);
+        assert_eq!(l, [0x18d1097b, 0x28ce9cf6, 0x1e4353ab, 0x166b4653]);
+        assert_eq!(n, U256::from(0x31a212f6a33a73d8f21a9d5966b4653u128));
+        let live = address!("D931725db336B57dBB9A3123F2238A4FE3c6Ed58");
+        let aa = Address::left_padding_from(&[0xaa]);
+        for (job, prover, nonce, limbs) in [
+            (job, prover, 8157429966494166312767719768175514302u128, [823689931, 469517864, 201939907, 12948158]),
+            (job, aa, 6238643415755799344764758572637723246, [629942002, 461581846, 743445732, 599890542]),
+            (keccak256("b"), aa, 8640352386461366598656625975475374548, [872452634, 518816459, 157039485, 198773204]),
+        ] {
+            assert_eq!(super::proof_nonce(743111, live, job, prover), (U256::from(nonce), limbs));
+        }
+        assert_eq!(super::PROOF_BINDING_DOMAIN_V1, keccak256("HemiProve.ProofBinding.v1"));
+    }
+
     use super::*;
     use alloy::primitives::address;
 

@@ -1,1 +1,25 @@
-Vendored from github.com/max-sanchez/zkmarket @ c8333aac41b315281ebb99afeffba5b8b22a83cf (branch testnet-deploy), the HemiProve v2 stack deployed on Hemi testnet 743111 on 2026-10-29. Regenerate from that commit; do not hand-edit. zkminer's bindings are pinned against these files by tests in crates/zkminer-contracts.
+The HemiProve stack deployed on Hemi testnet 743111 on 2026-11-16: github.com/max-sanchez/hemi-prove-contracts
+@ 8e1808b (main; the same files as hemilabs/hemiprove-contracts master 3bc441d apart from LICENSE).
+
+How these files were produced (B9-CHAIN, 2026-11-17; docs/metal-port-notes/B9-CHAIN.md): the contracts repo was not
+readable from the build host (private, no credentials), so the ABIs of the contracts deployed on 743111 were taken
+from the Hemi testnet explorer's verified sources (testnet.explorer.hemi.xyz, api/v2/smart-contracts/<address>; every
+contract verified, solc 0.8.38) and put in forge's `abi/*.abi.json` layout by a canonicaliser that reproduces the
+previous c8333aa files byte for byte from the explorer ABIs of the 8 contracts whose ABI did not change.
+HemiProveRouter.abi.json is the union of HemiProve and its facets keyed by (type, signature), first occurrence in the
+order HemiProve, Core, Fulfill, FulfillCycle, Aux, AuxGov (the rule that reproduces the c8333aa file byte for byte).
+
+Changed from c8333aa: HemiProve, HemiProveCore, HemiProveFulfill, HemiProveAux, HemiProveFulfillCycle (jobLaxCallbackMode
+removed), HemiProveAuxGov (also markFormerBurnDestination removed, error ZeroEwmaKey added), HemiProveRouter (their
+union), ProgramRegistry, BatchCycleCommittee.
+Unchanged (byte-identical to the explorer's): HemiProveStaking, HemiProveRegistry, the three adapter ABIs (the RISC Zero,
+SP1 Groth16 and SP1 PLONK adapters), ProofResultStore, GovernanceTimelock, GuardianPauseRelay.
+Still c8333aa, not deployed or not checkable this way: HashChainConsumer, IHemiProveCallback, MockERC20 (the live
+TestHemiToken's ABI is a superset of its ERC-20 part), MockRiscZeroVerifier, MockSP1Verifier,
+OpenVmHalo2VerifierAdapter, and the two documents INTERACTION_GUIDE.md and CHANGELOG_ABI.md (their 2026-11-16
+editions could not be fetched; the handoff of 2026-11-16 is the prover-facing summary until they are re-vendored).
+
+To re-vendor from the repo: copy abi/*.abi.json and the two .md files from a checkout at 8e1808b; the tests in
+crates/zkminer-contracts and crates/zkminer-chain/tests/abi_pins.rs then pin zkminer against them, and
+`ZKMINER_CONTRACTS_REPO=<checkout> cargo test -p zkminer-chain --lib the_pins_match_the_contracts_repo` checks the code
+pins against script/lib/ReleaseCorePins.sol and VerifierPins.sol.

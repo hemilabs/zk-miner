@@ -437,6 +437,8 @@ fn sp1_seal_prefix() -> [u8; 4] {
 /// An SP1 Groth16 seal: the verifier hash prefix (4), the exit code, the vk root and the proof nonce
 /// (32 each), then the 256-byte Groth16 proof.
 const SP1_GROTH16_SEAL_LEN: usize = 4 + 3 * 32 + 256;
+/// A RISC Zero Groth16 seal on chain: the 4-byte selector, then the 256-byte proof (8 words).
+const RISC0_GROTH16_SEAL_LEN: usize = 4 + 256;
 
 /// One miner per home directory: two would recover, prove and release the same locks, collide on
 /// nonces, and overwrite each other's job journal (`~/.zkminer/job_journal.json`) — e.g. a second
@@ -6605,8 +6607,10 @@ async fn miner_brain(
                     // Not before the backend's one-time setup is done. SP1's first proof would
                     // otherwise download ~8 GB of circuit artifacts inside its 90 s watchdog, be
                     // killed mid-way, and leave an install that fails every later proof. See
-                    // `spawn_sp1_warmup`.
-                    if !sim_mode {
+                    // `spawn_sp1_warmup`. Not when watching either: a watch-only run proves
+                    // nothing and never warms up (`spawn_sp1_warmup` is not started), so this gate
+                    // would hold every job's verdict forever (B9-CHAIN).
+                    if !sim_mode && !watch_only() {
                         if let Some(pool) = zkminer_prover::engine::worker_pool() {
                             if !pool.backend_warmed(backend) {
                                 if memory_skips_this_tick.insert(format!("{backend}:warmup")) {
@@ -10082,6 +10086,23 @@ async fn process_job_lifecycle(
             alloy::hex::encode(&seal_bytes[..seal_bytes.len().min(4)]),
             SP1_GROTH16_SEAL_LEN,
             alloy::hex::encode(sp1_seal_prefix())
+        ));
+    }
+
+    // A RISC Zero seal goes on chain as `selector ++ 256-byte proof` (risc0-ethereum-contracts 3.1.0
+    // `encode_seal`, handoff §3 and §7 step 6): any other length or prefix would revert
+    // VerifierCallFailed after the fulfil's gas, so release instead of publishing it (B9-CHAIN).
+    if backend == zkminer_prover_protocol::BACKEND_RISC0
+        && (seal_bytes.len() != RISC0_GROTH16_SEAL_LEN || seal_bytes[..4] != risc0_seal_selector())
+    {
+        return Err(anyhow::anyhow!(
+            "RISC Zero seal for {} is {} bytes prefixed 0x{} — not a Groth16 seal for this \
+             verifier ({} bytes prefixed 0x{}); releasing instead of publishing it",
+            short_id(job_id),
+            seal_bytes.len(),
+            alloy::hex::encode(&seal_bytes[..seal_bytes.len().min(4)]),
+            RISC0_GROTH16_SEAL_LEN,
+            alloy::hex::encode(risc0_seal_selector())
         ));
     }
 

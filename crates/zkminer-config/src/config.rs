@@ -68,7 +68,7 @@ pub struct ChainConfig {
     pub fee_ceiling_gwei: Option<f64>,
     /// First block of every HemiProve log scan (job discovery, lock recovery, descriptor
     /// reconstruction): the deployment's `fromBlock`. None = the known deployment's value for this
-    /// chain (743111: 7095745), else no floor.
+    /// chain (743111: 7226094, the 2026-11-16 deployment), else no floor.
     #[serde(default)]
     pub scan_from_block: Option<u64>,
     /// Whether to claim journal-bound jobs: a non-zero `expectedJournalHash` (FULL or FIELDS
