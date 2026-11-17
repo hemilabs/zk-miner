@@ -833,7 +833,11 @@ Worth knowing:
   needs 15.2 GiB free, so a smaller one gets no SP1 jobs; `ZKMINER_MIN_AVAILABLE_VRAM_MB` lowers
   that, untested: a larger job can run out part-way and lose its lock. A 12–16 GB NVIDIA card
   gets none either while `SP1_GPU_DROP_LDES` or `SP1_GPU_RECOMPUTE_FIRST_LAYER` is set to `0`:
-  that switches off the server memory savers the figures above were measured with. RISC Zero
+  that switches off the server memory savers the figures above were measured with. An SP1 proof
+  that runs out of GPU memory is retried one shard size smaller, and the card keeps that smaller
+  size in later runs too (`~/.zkminer/sp1_shard_caps.json`; `zkminer doctor` lists it, deleting
+  the file lifts it). Under Windows this needs "Prefer No Sysmem Fallback" (below): by default
+  the proof spills into system memory and slows down rather than running out. RISC Zero
   proves at po2 19 on a 12 GB card, 20 from 14 GiB, and benchmarks at that size. A 12 GB card
   benchmarked by an earlier version (at 20, which doesn't fit) has saved rates far too low:
   re-benchmark it with `b` on the Benchmark screen, or `zkminer benchmark --calibrate` with the

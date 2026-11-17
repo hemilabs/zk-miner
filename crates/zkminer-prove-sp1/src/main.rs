@@ -1798,11 +1798,17 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>, total_vr
             ),
         }
     });
-    let Some(threshold) = zkminer_prover_protocol::types::sp1_element_threshold_cap(
+    // A card whose SP1 proof once ran out of GPU memory carries a cap from the dispatcher
+    // (`sp1_shard_caps`), which it also applies when it predicts this worker's tier (`SizingCap`).
+    let card_cap = std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_CAP_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let computed = zkminer_prover_protocol::types::sp1_element_threshold_cap(
         scale,
         available_vram,
         total_vram,
-    ) else {
+    );
+    let Some(threshold) = [computed, card_cap].into_iter().flatten().min() else {
         return;
     };
     // Only say so when it lowers the fork's own default. With today's tables every computed value
@@ -1814,11 +1820,14 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>, total_vr
     }
     tracing::info!(
         "SP1 tuning: SP1_GPU_ELEMENT_THRESHOLD={threshold} (default {DEFAULT_THRESHOLD}) — \
-         host budget allows {}, free VRAM allows {}",
+         host budget allows {}, free VRAM allows {}{}",
         from_host
             .map(|t| t.to_string())
             .unwrap_or_else(|| "no limit".into()),
         from_vram.unwrap_or_else(|| "unknown".into()),
+        card_cap
+            .map(|c| format!(", this card's record allows {c} (a proof here ran out of GPU memory)"))
+            .unwrap_or_default(),
     );
     // SAFETY: single-threaded startup, before any prover, server or thread exists.
     unsafe {

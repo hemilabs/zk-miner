@@ -3454,6 +3454,8 @@ pub async fn run(
             .collect(),
         benchmark_timeout,
     );
+    // Each card's SP1 shard-size cap, recorded when a proof there ran out of GPU memory.
+    pool.use_sp1_shard_caps(zkminer_prover::sp1_shard_caps::default_path());
     // A risc0 worker confines itself before its first guest, to what it is told of now: for witness
     // proofs, the retention store it reads `W` from and the segment directories it writes.
     if let Some(r) = &config.retention {

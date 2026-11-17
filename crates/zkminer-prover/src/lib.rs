@@ -9,6 +9,7 @@ pub mod gpu_code;
 pub mod memory;
 pub mod metal_sizing;
 pub mod registry;
+pub mod sp1_shard_caps;
 #[cfg(windows)]
 mod windows_gpu_memory;
 #[cfg(windows)]
