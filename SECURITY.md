@@ -394,6 +394,11 @@ executor:
   BN254's scalar field for a digest) — and writes the prover's input from the numbers it checked.
   Anything else, or anything larger than such an input, is refused before Docker runs; a request
   that makes the helper fail is answered as an error and the helper serves the next one. The
+  helper works below the temporary directory the worker was started with (its own private
+  directory there, mode 0700), never below the worker's own `TMPDIR`, which the confined worker may
+  write, so nothing the worker runs can change an input after the helper checked it. The container
+  sees its input read-only (`/mnt`), may write only the proof file bound over `/mnt/proof.json`,
+  and the helper reads that back as a regular file without following a link. The
   prover image is pinned by digest
   (`risczero/risc0-groth16-prover@sha256:e8c2068fb34bbc41447255aa980a89cbb7d6e5a80c0d66041264431f2a955e47`,
   the tag the pinned `risc0-groth16` runs) and runs with `--network none`. The supported GPU paths

@@ -31,10 +31,22 @@ mod imp {
 
     /// The private temporary directory [`prepare`] made.
     static TMPDIR: OnceLock<PathBuf> = OnceLock::new();
+    /// The temporary directory before [`prepare`] pointed `TMPDIR` at the private one.
+    static ORIGINAL_TMPDIR: OnceLock<PathBuf> = OnceLock::new();
+
+    /// The temporary directory this process was started with: outside every path the confined
+    /// worker may write (the Docker Groth16 helper works there).
+    pub fn original_tmpdir() -> PathBuf {
+        ORIGINAL_TMPDIR
+            .get()
+            .cloned()
+            .unwrap_or_else(std::env::temp_dir)
+    }
 
     /// At startup, while the process has one thread: a private temporary directory, which `TMPDIR`
     /// then names for everything in this process (risc0's Groth16 work directories, SYCL's).
     pub fn prepare() {
+        let _ = ORIGINAL_TMPDIR.set(std::env::temp_dir());
         match confine::private_tmpdir("risc0") {
             Ok(dir) => {
                 // SAFETY: called from `main` before any thread exists.
@@ -198,7 +210,7 @@ mod imp {
 }
 
 #[cfg(target_os = "linux")]
-pub use imp::{confine, is_confined, prepare};
+pub use imp::{confine, is_confined, original_tmpdir, prepare};
 
 /// No Landlock or seccomp off Linux: nothing to confine with.
 #[cfg(not(target_os = "linux"))]
@@ -213,3 +225,8 @@ pub fn is_confined() -> bool {
 
 #[cfg(not(target_os = "linux"))]
 pub fn prepare() {}
+
+#[cfg(not(target_os = "linux"))]
+pub fn original_tmpdir() -> std::path::PathBuf {
+    std::env::temp_dir()
+}
