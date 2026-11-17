@@ -1954,6 +1954,50 @@ fn spawn_refusal(
             ));
         }
     }
+
+    // A 12-16 GB NVIDIA card with the SP1 server's memory savers switched off: nothing has measured
+    // what it then takes (the 16 GB figures have them on, the larger card's run on a card with room
+    // to spare), so no floor bounds it.
+    if let Some(have) = vram_bytes {
+        let savers_off =
+            zkminer_prover_protocol::types::sp1_small_card_savers_off(|v| std::env::var(v).ok());
+        if backend == zkminer_prover_protocol::BACKEND_SP1
+            && gpu_tag == "cuda"
+            && savers_off
+            && zkminer_prover_protocol::types::sp1_savers_are_the_default(have)
+        {
+            return Some(format!(
+                "SP1_GPU_DROP_LDES or SP1_GPU_RECOMPUTE_FIRST_LAYER is set to 0, which switches off \
+                 the memory savers sp1-gpu-server needs on a {:.1} GiB card; nothing has measured \
+                 it without them, so the slot is not advertised. Unset them to prove SP1 here.",
+                have as f64 / (1u64 << 30) as f64,
+            ));
+        }
+    }
+
+    // A card whose whole VRAM is under the free VRAM its backend needs before every proof
+    // (`check_vram_budget`) would be advertised, take claims, and refuse each one: SP1 on a 12 GB
+    // AMD or Intel card, or on a 12 GB NVIDIA one with the server's memory savers switched off,
+    // where only the larger card's figures apply. The same floor and total as that check.
+    if let Some(have) = vram_bytes {
+        if let Some(need) = crate::discovery::min_available_vram_bytes_for_backend(
+            backend,
+            sizing_total_for_tag(gpu_tag, have),
+        ) {
+            if need > have {
+                const GIB: f64 = (1u64 << 30) as f64;
+                return Some(format!(
+                    "{backend} needs {:.1} GiB of this card free before each proof and the card \
+                     has {:.1} GiB in all, so the slot is not advertised and {backend} jobs will \
+                     be routed to a larger card ({} lowers the requirement, at the risk of a \
+                     proof that runs out part-way).",
+                    need as f64 / GIB,
+                    have as f64 / GIB,
+                    crate::discovery::MIN_AVAILABLE_VRAM_MB_ENV,
+                ));
+            }
+        }
+    }
     None
 }
 
@@ -3071,9 +3115,14 @@ fn vram_tier_shrank(
 /// (`sp1_small_card_savers_off`): the worker and its server inherit it, and the 16 GB table assumes
 /// them on.
 fn sizing_total(key: &str, total: u64) -> Option<u64> {
+    sizing_total_for_tag(key.split(':').nth(1).unwrap_or(""), total)
+}
+
+/// `sizing_total` for a card of vendor `gpu_tag`.
+fn sizing_total_for_tag(gpu_tag: &str, total: u64) -> Option<u64> {
     let savers_off =
         zkminer_prover_protocol::types::sp1_small_card_savers_off(|v| std::env::var(v).ok());
-    (key.split(':').nth(1) == Some("cuda") && !savers_off).then_some(total)
+    (gpu_tag == "cuda" && !savers_off).then_some(total)
 }
 
 /// What one card's VRAM looks like to ONE slot at a moment in time.
@@ -12339,6 +12388,28 @@ mod tests {
         let pool = pool_with_keys(&["risc0:cuda:0"]);
         let keys = pool.keys_for_prefix("sp1");
         assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn an_sp1_card_that_can_never_free_enough_vram_is_not_advertised() {
+        let path = std::path::Path::new("zkminer-prove-sp1");
+        const GIB: u64 = 1 << 30;
+        let refuse = |tag: &str, vram: u64| spawn_refusal("sp1", tag, None, None, path, Some(vram));
+        // A 12 GB NVIDIA card runs SP1 (its server's small-card tiers).
+        assert_eq!(refuse("cuda", 12 * GIB), None);
+        // A 12 GB AMD or Intel card is held to the larger card's 15.2 GiB, which it never has.
+        // (A 12-16 GB NVIDIA card with the server's savers off is refused too; not set here, as the
+        // environment is the process's.)
+        let why = refuse("intel", 12 * GIB).expect("refused");
+        assert!(why.contains("not advertised"), "{why}");
+        assert!(refuse("rocm", 12 * GIB).is_some());
+        // 16 GiB holds it.
+        assert_eq!(refuse("rocm", 16 * GIB), None);
+        // risc0 has no such floor.
+        assert_eq!(
+            spawn_refusal("risc0", "intel", None, None, path, Some(12 * GIB)),
+            None
+        );
     }
 
     #[test]

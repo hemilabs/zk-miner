@@ -125,14 +125,34 @@ fn running_verdict(
                         (None, false) => "",
                     }
                 )),
-                None => Verdict::Idle(format!(
-                    "no segment size for a card under {:.1} GiB, so it proves no RISC Zero job. \
-                     Run `zkminer benchmark --calibrate` with the miner stopped to measure one, or \
-                     set one (`[prover.risc0_job_po2]` {device} = {}; untested on cards this \
-                     size).",
-                    zkminer_prover::benchmark::risc0_job_min_vram_bytes(&slot.gpu_tag) as f64 / GIB,
-                    if slot.gpu_tag == "cuda" { 18 } else { 19 },
-                )),
+                // A size to suggest: on NVIDIA the smallest measured one, if the card holds its
+                // peak at all; elsewhere one nothing has measured.
+                None => {
+                    let smallest = zkminer_prover::benchmark::RISC0_GPU_MEASURED_PEAK_MIB[0];
+                    let suggestion = match (slot.gpu_tag.as_str(), slot.vram_bytes) {
+                        ("cuda", Some(v)) if smallest.1 << 20 >= v => None,
+                        ("cuda", _) => Some(smallest.0),
+                        _ => Some(19),
+                    };
+                    let min = zkminer_prover::benchmark::risc0_job_min_vram_bytes(&slot.gpu_tag);
+                    Verdict::Idle(match suggestion {
+                        Some(po2) => format!(
+                        "no segment size for a card under {:.1} GiB, so it proves no RISC Zero \
+                         job. Run `zkminer benchmark --calibrate` with the miner stopped to \
+                         measure one, or set one (`[prover.risc0_job_po2]` {device} = {po2}; \
+                         untested on cards this size).",
+                        min as f64 / GIB,
+                    ),
+                        None => format!(
+                        "no segment size for a card under {:.1} GiB, so it proves no RISC Zero \
+                         job: even the smallest measured one (2^{}) needs {:.1} GiB, more than \
+                         this card has.",
+                        min as f64 / GIB,
+                        smallest.0,
+                        (smallest.1 << 20) as f64 / GIB,
+                    ),
+                    })
+                }
             }
         }
         BACKEND_SP1 => {
@@ -432,6 +452,18 @@ mod tests {
             verdict(&rows, "GPU 2", "RISC Zero"),
             &Verdict::Ready("segment size 2^18 (set in the config)".into())
         );
+        // A card that cannot hold even the smallest measured size is not told to set it.
+        let survey = WorkerSurvey {
+            gpus: vec![gpu(3, "GTX 1650")],
+            slots: vec![slot(BACKEND_RISC0, 3, 4, SlotOutcome::Started)],
+            searched: vec![],
+        };
+        let rows = super::rows(&survey, &[BACKEND_RISC0], &HashMap::new(), None);
+        let Verdict::Idle(why) = verdict(&rows, "GPU 3", "RISC Zero") else {
+            panic!("{rows:#?}")
+        };
+        assert!(!why.contains("gpu3 ="), "{why}");
+        assert!(why.contains("more than this card has"), "{why}");
     }
 
     /// A card with no worker says where the binary was looked for; a refused one says why.
