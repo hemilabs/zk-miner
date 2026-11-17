@@ -240,9 +240,18 @@ executor:
 - **Docker.** The CPU risc0 worker (and an Intel worker with `RISC0_GROTH16_INTEL_PROVER=docker`)
   wraps Groth16 in RISC Zero's prover image. A confined worker cannot reach the Docker daemon (its
   socket is root-equivalent, with the host's network), so a helper process started before the
-  confinement does the wrap: it never runs a guest, receives only an `identity_p254` seal, and
-  runs the prover image with `--network none`. The supported GPU paths (CUDA, ROCm, Intel with the
-  `risc0-groth16` component) wrap in-process and use no Docker.
+  confinement does the wrap. It never runs a guest, and since it is not confined it trusts nothing
+  the worker sends (a guest that escaped into the worker may send it anything): the worker turns
+  its `identity_p254` seal into the prover's input itself, and the helper accepts only that
+  input's exact shape — the fixed JSON form RISC Zero's converter writes, one canonical decimal per
+  element of an `identity_p254` seal, each below its field's modulus (BabyBear for a field element,
+  BN254's scalar field for a digest) — and writes the prover's input from the numbers it checked.
+  Anything else, or anything larger than such an input, is refused before Docker runs; a request
+  that makes the helper fail is answered as an error and the helper serves the next one. The
+  prover image is pinned by digest
+  (`risczero/risc0-groth16-prover@sha256:e8c2068fb34bbc41447255aa980a89cbb7d6e5a80c0d66041264431f2a955e47`,
+  the tag the pinned `risc0-groth16` runs) and runs with `--network none`. The supported GPU paths
+  (CUDA, ROCm, Intel with the `risc0-groth16` component) wrap in-process and use no Docker.
 - **The miner** holds the signing key and is not dumpable (`PR_SET_DUMPABLE 0`): its `/proc`
   entries belong to root, so no process of the same uid can read its memory or environment,
   whatever the host's `ptrace_scope`, and it leaves no core dump.

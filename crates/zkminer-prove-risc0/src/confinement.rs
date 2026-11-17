@@ -17,7 +17,8 @@
 //! `Warmup`) runs before; a `Warmup` after refuses rather than download, and the miner runs it on a
 //! fresh worker. Where the Groth16 wrap needs Docker (the CPU build, or Intel with
 //! `RISC0_GROTH16_INTEL_PROVER=docker`), a helper process started before the confinement does it
-//! (`groth16_wrap`): it never runs a guest.
+//! (`groth16_wrap`): it never runs a guest, and accepts from the worker only a strictly checked
+//! prover input, which the worker makes from its seal.
 //!
 //! An error means no guest may run: the caller answers the command with it.
 
