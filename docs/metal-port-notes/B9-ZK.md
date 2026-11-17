@@ -36,14 +36,17 @@ No Metal kernel and no risc0 file changed, so R17 (`ir_scan.py`, `run_stress.sh`
 ## (1) Changes
 
 - `metal_host::log_groth16_release(before, after)`, called by `release_groth16_cache_if_tight` around
-  `release_srs` (the worker's per-proof release, below 20 GiB, and on the Metal default here too). It
+  `release_srs` (the worker's per-proof release whenever `metal_sizing::keep_groth16_cache` says no:
+  below about 29.5 GiB at po2 20, so on the Metal default of this 36 GB Mac too). It
   logs one line per release:
   `Groth16 proving key released: 3882.3 MiB of device memory freed (prover layout split_h + tw_lent, tw_prefault on; planned whole 4141.0, split_h 4010.9, whole + tw_lent 4013.0, split_h + tw_lent 3885.0 MiB), device allocation now 61.9 MiB`.
   - The layout comes from the freed size: the nearest of the four forced-layout plans
     (`risc0_groth16_sys::metal::prover::planned_bytes` with `split_h` / `tw_lent` forced, header
     reads only). They are read once in `warm_up_pipelines`, so no proof waits for them.
   - Two layouts within 8 MiB of each other are both named. That only happens between split_h and
-    whole + tw_lent, which `auto` never chooses.
+    whole + tw_lent. Since fix round 1 only the layouts `choose_layout` can take under the process's
+    switches are candidates, so under `auto` (where whole + tw_lent is never taken) a split_h release
+    is named split_h alone.
   - The cost is two `currentAllocatedSize` reads per proof.
   - The line is not hidden behind a knob because it is a log line. A/B below: no change.
 - `GROTH16_PLAN_FALLBACK` (the plan assumed while the component is not installed yet) changed from
@@ -61,13 +64,14 @@ No Metal kernel and no risc0 file changed, so R17 (`ir_scan.py`, `run_stress.sh`
 | 4 GiB | `split_h + tw_lent, tw_prefault on` | 3882.3 MiB | 61.9 MiB | every wrap of the IPC sequence (5/5, three runs) and of 8 `--benchmark` runs |
 | 8 GiB | `whole` | 4138.1 MiB | 62.0-62.2 MiB | every wrap of the IPC sequence (5/5, two runs) and of 8 `--benchmark` runs |
 | default (28.1 GiB) | `whole` | 4138.1 MiB | 61.9 MiB | `--benchmark` (this Mac's tier releases the key there too) |
+| 4300 MiB (round 1) | `split_h` | 4008.0 MiB | 61.9 MiB | IPC sequence 5/5 (round 0 build logged `split_h or whole + tw_lent, tw_prefault on`) |
 
 At 8 GiB the worker never fell into B9-4G's 4141-4269 MiB split window in these runs, keccak jobs
 included. The line will show it in the field if it ever does.
 
 ### IPC sequence test (new): `metal_worker::a_tight_worker_wraps_after_keccak_and_releases_the_key_between_jobs`
 
-- One worker at `RISC0_METAL_MAX_WORKING_SET_BYTES` = 4 GiB. `ZKMINER_B9_BUDGET=<bytes>` selects another tier below 20 GiB.
+- One worker at `RISC0_METAL_MAX_WORKING_SET_BYTES` = 4 GiB. `ZKMINER_B9_BUDGET=<bytes>` selects any other limit at which the worker releases the key (the test asserts that with `metal_sizing::keep_groth16_cache`).
 - Sequence: Warmup (all pipelines including keccak, then a verified Groth16 proof), then four jobs, each wrapped:
   - fibonacci 100000;
   - keccak: the fork's `multi_test.bin` with `KeccakUnion(1)` (serde words `[16, 1, 0]`; override with `ZKMINER_B9_KECCAK_ELF`);
@@ -82,7 +86,7 @@ included. The line will show it in the field if it ever does.
   - 4 GiB, pass, 3 runs (`ipc/ipcB_4294967296.log`, `ipc/ipc_all_final.log`). Jobs 4.03 / 4.88 / 3.78 / 1.92 s.
   - 8 GiB, pass, 2 runs (`ipc/ipcB_8589934592.log`, `ipc/ipc_8g_final.log`).
   - Worker A runs the same jobs. Its release checks are skipped because A does not log releases.
-- This confirms P31-14 open issue 2 as far as zk-miner is concerned: the worker releases the key between jobs at 4 and 8 GiB. Two wraps with the key kept still do not fit at 4 GiB (B9-4G). The worker never does that below 20 GiB.
+- This confirms P31-14 open issue 2 as far as zk-miner is concerned: the worker releases the key between jobs at 4 and 8 GiB. Two wraps with the key kept still do not fit at 4 GiB (B9-4G). The worker never does that below the keep threshold (about 29.5 GiB at po2 20).
 
 ## A/B (interleaved, A = metal-3.1 unmodified, B = this item, one discarded launch per arm, 7 pairs, order alternating)
 
@@ -148,6 +152,80 @@ Medians [min-max]; B-A per pair, with the count of pairs where B > A.
 - The adapter pin (`RISC0_GROTH16_ADAPTER`, immutables zeroed) is unchanged. A 3.1 deployment that
   reuses the audited adapter code passes it. A new adapter contract would need its own pin.
 
+## Fix round 1 (review findings)
+
+Base for the round: adae4e0 (round 0). Logs: `scratch/w9/B9-ZK/r1/`.
+
+- **Blocking: README claimed the Metal worker keeps the Groth16 key from 20 GiB up.** Wrong: the
+  worker keeps it only when `metal_sizing::keep_groth16_cache(limit, po2)` holds, i.e.
+  `limit >= stark_peak_bytes(po2) + GROTH16_RESIDENT_BYTES + KEEP_HEADROOM_BYTES` (12 GiB + 5.52 GiB +
+  12 GiB, about 29.5 GiB at po2 20). The 20 GiB figure is the CUDA `RELEASE_GROTH16_CACHE_BELOW_BYTES`
+  path. Evidence it was wrong: this note's own release table (the 28.1 GiB default releases the key),
+  and every round-1 unbudgeted A/B run logs a release. Fixed: README "Performance" paragraph and the
+  Groth16 paragraph now state the real rule and name `keep_groth16_cache`; 36 GB Macs and smaller
+  release the key after every proof. The IPC test's doc and its guard no longer say 20 GiB: the guard
+  now calls `zkminer_prover::metal_sizing::keep_groth16_cache(budget, job_po2_for_limit(budget))`, the
+  same rule the worker applies, so it can no longer drift from the code.
+- README: the "six-program benchmark takes ~19 minutes" line now says about 3 minutes (177-180 s of
+  wall per BASELINES '3.1', 169.6 s STARK plus six wraps).
+- **Release line tie (non-blocking finding, reproduced first).** At a 4300 MiB budget
+  (`ZKMINER_B9_BUDGET=4508876800`) the round-0 worker logged `split_h or whole + tw_lent, tw_prefault
+  on` and the IPC test failed on its layout assertion. Reproduced with the round-0 worker binary under
+  the new test (`r1/ipc_4300_oldB.log`: panics "one named layout expected", 6 such lines). Fix: the
+  candidate plans are only the layouts `choose_layout` can build under the process's switches
+  (`groth16_layout_reachable`: a forced switch admits only its side; under auto/auto whole + tw_lent
+  is never taken, because its plan (4013.0) is above split_h's (4010.9), which is tried first). The
+  `tw_prefault` suffix is printed only when every named layout lends the twiddles. Unit tests
+  `a_released_prover_is_named_by_its_size` (extended) and `a_forced_layout_switch_admits_only_its_side`.
+  Round-1 worker at 4300 MiB: 5/5 releases named `split_h`, 4008.0 MiB freed, test passes
+  (`r1/ipc_4508876800.log`).
+- **IPC test at budgets other than 4 / 8 GiB.** The expected layout was picked by `budget <= 5 GiB`. It
+  now names the layout only at exactly 4 GiB (split_h + tw_lent) and 8 GiB (whole); at any other
+  budget each release must name exactly one layout (not a tie, not `unidentified`). Passes at 4 GiB,
+  4300 MiB and 8 GiB.
+- **`GROTH16_PLAN_FALLBACK` assumed the default switches.** With `RISC0_G16_METAL_SPLIT_H` /
+  `RISC0_G16_METAL_TW_LENT` forced (or `RISC0_G16_METAL_G10=0`) the real plan can be up to whole's
+  4141.0 MiB. `groth16_plan_fallback()` now takes 3886 MiB under auto/auto and
+  `GROTH16_PLAN_FALLBACK_FORCED` = 4142 MiB otherwise, so a 4 GiB host with a forced layout and no
+  component yet defers keccak. Unit test `the_keccak_fallback_plan_follows_the_layout_switches`. Not
+  exercised end to end with the component absent (that run would download the 2.4 GB component).
+- **localnet gate followed the 3.0 selector.** `risc0_proofs_verify_on_the_fork` now gates on
+  `deployment::risc0_verifier_pin(build_selector()).is_ok()`, so it opens by itself once
+  `RISC0_V3_1_GROTH16_VERIFIER` is filled. The stale doc comments (refusal "from the verifier's
+  `SELECTOR()`") now say that while the 3.1 pin is empty the refusal comes from the empty pin, before
+  any eth_call. Compiles (`--no-run`); the suite still cannot run here (no anvil/forge).
+- Not changed, on purpose: reading the real `BuildStats` instead of inferring the layout needs risc0
+  to expose the cached prover's stats through `risc0-groth16`; that is a fork change outside this item
+  (open issue 8). The test's parsing of the log text and the unlocked read-only run.rs test are as the
+  review accepted.
+
+### Round 1 gates
+
+| gate | result |
+|---|---|
+| `gpu-run -- cargo test --locked -p zkminer-prove-risc0 --features metal` x2 | 63 passed, 4 ignored, both (`r1/prove_risc0_{1,2}.log`) |
+| `gpu-run -- cargo test -p zkminer-prover --features testing --test worker_lifecycle` x2 | 27 passed, 3 ignored, both |
+| `gpu-run -- cargo test -p zkminer-prover --lib` x2 | 291 passed, 1 ignored, both |
+| `cargo test -p zkminer-cli --bin zkminer` x2 / `zkminer-chain --lib` x2 / `zkminer-prover-protocol` x2 | 142 / 152 (1 ignored) / 42, both |
+| `cargo build --release --locked` (worker `--features metal`, zkminer-cli) | clean (pre-existing never-used warning only) |
+| IPC sequence (release, `--ignored`) at 4 GiB / 4300 MiB / 8 GiB | pass: 5/5 releases `split_h + tw_lent` 3882.3 / `split_h` 4008.0 / `whole` 4138.1 MiB, 61.9 MiB left |
+
+One earlier `zkminer-prover-protocol` run in this round failed 8 of 42 tests; its log was overwritten
+before I read it, so the cause is unknown. The same command then passed 7 times in a row (logs
+`r1/proto_{1..5}.log` and two more). It runs no code this round changed.
+
+### Round 1 A/B (A = metal-3.1 0e57ab4 unmodified worker, B1 = this round; one discarded launch per arm, 7 pairs, order alternating, `memory-merkle --benchmark`)
+
+| budget | STARK s A | STARK s B1 | B1-A median [min, max] | wrap A / B1 | footprint A / B1 | load |
+|---|---|---|---|---|---|---|
+| 4 GiB | 13.900 [13.880-13.930] | 13.910 [13.880-13.930] | +0.010 [-0.030, +0.050], 4/7 | 1.72 / 1.72 s | 4.925 / 4.925 GB | 1.6-3.1 |
+| 8 GiB | 10.220 [10.210-10.260] | 10.230 [10.170-10.280] | -0.010 [-0.040, +0.040], 3/7 | 1.74 / 1.74 s | 7.326 / 7.325 GB | 2.1-3.4 |
+| 16 GiB (gpu-run's default budget now) | 8.410 [8.370-8.430] | 8.390 [8.350-8.440] | -0.040 [-0.060, +0.040], 3/7 | 1.74 / 1.74 s | 12.374 / 12.374 GB | 2.0-2.9 |
+| none (`--no-budget`, 28.1 GiB) | 8.350 [8.340-8.370] | 8.340 [8.330-8.390] | -0.010 [-0.040, +0.030], 3/7 | 1.58 / 1.58 s | 13.204 / 13.203 GB | 1.6-1.9 |
+
+No change at any budget; all 56 runs verified. Against BASELINES '3.1': 4 GiB 603K c/s (603K), 8 GiB
+769K (767-770K), unbudgeted 8.34 s / wrap 1.58 s (8.35 s / 1.57-1.59 s). No peak rises.
+
 ## Knobs
 
 - New: none.
@@ -173,3 +251,11 @@ Medians [min-max]; B-A per pair, with the count of pairs where B > A.
    the beta (`w7` default). That is a separate zk-miner decision.
 7. The P31-19 open issues closed here are: 4 (dispatcher comment), 7 (README), 8 (capture test), and
    2 (deployment pins: the 3.1 slot is ready but empty).
+8. The release line infers the layout from the freed size; the exact `BuildStats` (`split_h`,
+   `tw_lent`, `tw_prefault`) live on groth16-sys's cached prover and are not exposed through
+   `risc0-groth16`. Exposing them is a risc0 fork change. The `tw_prefault` suffix reports the knob.
+9. Already present before this item: at a 3963 MiB budget Warmup verifies a Groth16 proof but every
+   Prove is refused as ResourceExhausted (po2 18 needs ~4.0 GiB), so such a Mac passes warm-up and
+   takes no jobs (review observation).
+10. The run.rs startup PAGE about the missing 3.1 verifier is logged even when no risc0 worker is
+    configured, as the existing `reverify_risc0` PAGE is.

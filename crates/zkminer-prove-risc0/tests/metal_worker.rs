@@ -199,12 +199,14 @@ const FORK_MULTI_TEST_BIN: &str = concat!(
 const KECCAK_UNION_1_WORDS: [u32; 3] = [16, 1, 0];
 
 /// B9-ZK: one worker at a tight budget (default the 4 GiB tier; `ZKMINER_B9_BUDGET` = bytes for
-/// another tier below 20 GiB) through the job order that used to break the 4 GiB tier (P31-14 /
+/// any other limit at which the worker releases the key, i.e. below
+/// `zkminer_prover::metal_sizing::keep_groth16_cache`'s ~29.5 GiB at po2 20) through the job order that used to break the 4 GiB tier (P31-14 /
 /// P31-19): Warmup (every pipeline, keccak's included, then a verified Groth16 proof), fibonacci,
 /// a keccak job, an rv32im job (memory-merkle) and fibonacci again, each wrapped in Groth16 (the
-/// worker verifies every receipt before answering). Below 20 GiB the worker releases the Groth16 key
-/// after every proof; its stderr must show one release per wrap, each freeing a whole prover of the
-/// layout the tier needs (4 GiB: split_h + tw_lent; 8 GiB: whole), back to the pipelines alone.
+/// worker verifies every receipt before answering). Under such a limit the worker releases the
+/// Groth16 key after every proof; its stderr must show one release per wrap, each freeing a whole
+/// prover of one named layout (exactly 4 GiB: split_h + tw_lent; 8 GiB: whole; any other budget:
+/// whichever single layout the worker identified), back to the pipelines alone.
 ///
 ///   cargo test --release -p zkminer-prove-risc0 --features metal --test metal_worker --no-run
 ///   gpu-run --tag <who> -- <that test binary> --ignored --nocapture --test-threads=1 a_tight_worker
@@ -219,10 +221,15 @@ fn a_tight_worker_wraps_after_keccak_and_releases_the_key_between_jobs() {
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(4 * GIB);
-    assert!(
-        budget < 20 * GIB,
-        "the key is kept from 20 GiB up: nothing to release"
-    );
+    {
+        use zkminer_prover::metal_sizing::{job_po2_for_limit, keep_groth16_cache};
+        let po2 = job_po2_for_limit(budget);
+        assert!(
+            !keep_groth16_cache(budget, po2),
+            "a {budget} B limit keeps the Groth16 key at po2 {po2} (metal_sizing::keep_groth16_cache): \
+             nothing to release"
+        );
+    }
     // `ZKMINER_B9_WORKER`: another worker binary (e.g. one built before B9-ZK, which proves the same
     // jobs but does not log its releases; the release checks are then skipped).
     let other_worker = std::env::var("ZKMINER_B9_WORKER").ok();
@@ -347,17 +354,32 @@ fn a_tight_worker_wraps_after_keccak_and_releases_the_key_between_jobs() {
         return;
     }
     assert_eq!(releases.len(), 1 + jobs.len(), "{releases:#?}");
-    let want = if budget <= 5 * GIB {
-        "prover layout split_h + tw_lent"
-    } else {
-        "prover layout whole"
+    // The two measured tiers name their layout; any other budget must name exactly one layout
+    // (not a tie, not unidentified), whichever choose_layout took there.
+    let want = match budget {
+        b if b == 4 * GIB => Some("prover layout split_h + tw_lent"),
+        b if b == 8 * GIB => Some("prover layout whole"),
+        _ => None,
     };
     let number_before = |l: &str, tail: &str| -> f64 {
         let head = &l[..l.find(tail).unwrap_or_else(|| panic!("{tail:?} in {l}"))];
         head.rsplit(' ').next().unwrap().parse().unwrap()
     };
     for l in &releases {
-        assert!(l.contains(want), "expected {want}: {l}");
+        match want {
+            Some(want) => assert!(l.contains(want), "expected {want}: {l}"),
+            None => {
+                let layout = l
+                    .split("prover layout ")
+                    .nth(1)
+                    .and_then(|t| t.split([';', ',']).next())
+                    .unwrap_or_else(|| panic!("no layout in {l}"));
+                assert!(
+                    layout != "unidentified" && !layout.contains(" or "),
+                    "one named layout expected: {l}"
+                );
+            }
+        }
         let freed = number_before(l, " MiB of device memory freed");
         assert!(freed > 3800.0, "a whole Groth16 prover is freed: {l}");
         let now: f64 = l

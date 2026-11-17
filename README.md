@@ -240,10 +240,12 @@ phase, segments / recursion / Groth16 wrap; process peak footprint):
 
 (The footprint model can keep a smaller po2 than the limit allows on a Mac with little RAM: a
 simulated 18 GB Mac proves at po2 19.) The full six-program `--benchmark` at po2 20 proves 154.5M
-cycles in 169.6 s of STARK (911K c/s) and wraps each program in 1.57-1.59 s. Below a 20 GiB limit
-the worker loads the Groth16 proving key for each wrap and frees it after (it logs `Groth16 proving
-key released: ... MiB of device memory freed (prover layout ...)` per proof); from 20 GiB up it keeps
-the key loaded. A po2 larger than the limit allows is refused as ResourceExhausted instead of being
+cycles in 169.6 s of STARK (911K c/s) and wraps each program in 1.57-1.59 s. The worker keeps the
+Groth16 proving key loaded between proofs only when the working-set limit holds the largest STARK
+phase, the resident key and 12 GiB of host headroom (`keep_groth16_cache` in
+`crates/zkminer-prover/src/metal_sizing.rs`: about 29.5 GiB at po2 20), so 36 GB Macs and smaller,
+the M5 Max above included, load the key for each wrap and free it after (it logs `Groth16 proving
+key released: ... MiB of device memory freed (prover layout ...)` per proof). A po2 larger than the limit allows is refused as ResourceExhausted instead of being
 swapped through (`ZKMINER_METAL_NO_PO2_CEILING=1` disables that, for diagnostics only).
 
 ### Prerequisites
@@ -338,7 +340,7 @@ workers (`~/.risc0/extensions/v0.2.0-risc0-groth16`, or `RISC0_GROTH16_DIR`). A 
 1.58 s on the M5 Max (1.72-1.74 s under a 4 or 8 GiB budget) and peaks at 5.6 GB of GPU memory
 (3.9 GB under a 4 GiB budget, where the prover takes its smallest layout); the worker keeps the
 ~4.1 GB proving key loaded between proofs only when the working-set limit has room for it beside a
-full STARK and the host's own state (20 GiB and up). `RISC0_GROTH16_METAL_PROVER=docker` switches to RISC Zero's Docker prover. The
+full STARK and 12 GiB of host state (about 29.5 GiB at po2 20, so not on 36 GB Macs and smaller). `RISC0_GROTH16_METAL_PROVER=docker` switches to RISC Zero's Docker prover. The
 CPU-only worker (`--features cpu`) has no native wrap and needs Docker for it.
 
 ### Environment knobs
@@ -373,7 +375,8 @@ Read at run time by the worker (they pass through the miner's environment):
 - **Beta.** The Mac build is a beta: unsigned (no Developer ID, not notarized), so macOS may ask
   before running a downloaded binary; building it yourself avoids that.
 - The rv32im GPU witness generation is disabled by default (see the knob above).
-- The six-program benchmark takes ~19 minutes at po2 20 on an M5 Max, longer on smaller Macs.
+- The six-program benchmark takes about 3 minutes at po2 20 on an M5 Max (177-180 s of wall time:
+  169.6 s of STARK plus six wraps), longer on smaller Macs.
 - GPU power is not read on macOS; the miner's cost model assumes its 300 W default.
 
 ## Configure
