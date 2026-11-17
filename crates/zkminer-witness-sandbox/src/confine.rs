@@ -20,7 +20,8 @@
 //!   `fd`) to, a process outside its Landlock domain (the miner, other workers); no abstract Unix
 //!   socket of another domain. The miner can still signal it;
 //! - **kernel surface**: no namespace and no mount, no `userfaultfd`, `perf_event_open` or file
-//!   handles (see [`crate::netdeny`]).
+//!   handles, and no metadata writes (mode, owner, extended attributes, times; see
+//!   [`crate::netdeny`]).
 //!
 //! Since Landlock does not govern the path walk (a `stat` or a lookup reaches any directory), a
 //! process confines itself only where no filesystem it can reach is a network or FUSE filesystem or

@@ -626,7 +626,40 @@ fn build_prover(
 ///
 /// An error means no guest may run: the caller answers the command with it.
 fn confine_worker(keep_server: bool) -> Result<(), String> {
+    if !confinement::is_confined() {
+        unpack_executor_runner();
+    }
     confinement::confine(keep_server)
+}
+
+/// The SDK's executor runs every guest in a runner it unpacks into `TMPDIR` on first use and makes
+/// executable with a `chmod`, which a confined worker may not make (no metadata writes:
+/// `zkminer_witness_sandbox::netdeny`). So, before the confinement, the worker executes its own
+/// embedded fibonacci guest once on a CPU prover, which unpacks the runner; the SDK reuses it for
+/// the rest of the process. No requester's bytes are involved. A failure is only logged: the first
+/// guest's execution then reports it. (The server's executor unpacks its own runner, which its
+/// supervisor makes executable: `zkminer_witness_sandbox::supervise`.)
+fn unpack_executor_runner() {
+    if FIBONACCI_SP1_GUEST_ELF.is_empty() {
+        return;
+    }
+    let started = Instant::now();
+    let outcome = std::panic::catch_unwind(|| {
+        let cpu = sp1_sdk::blocking::ProverClient::builder().cpu().build();
+        run_execute_sp1(&cpu, FIBONACCI_SP1_GUEST_ELF, &10u32.to_le_bytes()).map(|_| ())
+    });
+    match outcome {
+        Ok(Ok(())) => tracing::info!(
+            "executor runner unpacked before the confinement ({:.1}s)",
+            started.elapsed().as_secs_f64()
+        ),
+        Ok(Err(e)) => {
+            tracing::warn!("could not unpack the executor runner before confining: {e:#}")
+        }
+        Err(_) => {
+            tracing::warn!("could not unpack the executor runner before confining: a panic")
+        }
+    }
 }
 
 /// Whether this worker has confined itself ([`confine_worker`]), and so has no network.

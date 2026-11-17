@@ -23,6 +23,11 @@
 //! `/dev/null` for stdin. The server's socket is therefore `/tmp/zkminer-confined-<name>-<id>.sock`.
 //! The server ends when the worker does.
 //!
+//! Neither may change a file's mode. The SDK's executor unpacks its runner into `TMPDIR` and makes
+//! it executable: the worker does so before it confines itself (`unpack_executor_runner`, in
+//! `main`), and the server's supervisor does it for the server (the runner directory given to
+//! `run_supervised`).
+//!
 //! The one-time setup that needs the network (`Warmup`: the Groth16 circuit download) runs before;
 //! a `Warmup` after refuses rather than download. A server the SDK would download (absent, or another
 //! version) is refused (`server_needs_no_download`).
@@ -275,7 +280,9 @@ mod imp {
         }
         let c = server_policy(real, &tmp);
         let args: Vec<OsString> = Vec::new();
-        match zkminer_witness_sandbox::supervise::run_supervised(real, &args, &c) {
+        // The executor in the server unpacks its runner into `TMPDIR` and makes it executable,
+        // which the supervisor does for it (the server may not change a file's mode itself).
+        match zkminer_witness_sandbox::supervise::run_supervised(real, &args, &c, Some(&tmp)) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("zkminer: cannot run sp1-gpu-server confined: {e}");

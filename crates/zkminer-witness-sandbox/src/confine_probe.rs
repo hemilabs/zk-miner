@@ -360,6 +360,254 @@ fn signal_checks(pid: libc::pid_t, who: &str, mut report: impl FnMut(&str, bool,
     report(&format!("pidfd_send_signal_{who}"), ok, detail);
 }
 
+/// The name an SP1 executor gives the runner it unpacks, for a pid.
+fn runner_temp_name(pid: u32) -> String {
+    format!("sp1-native-runner-bin-{}.tmp.{pid}", "ab".repeat(32))
+}
+
+/// Before the confinement: a scratch file in `dir` (which the test owns and the confinement makes
+/// writable), mode 0644, with a `user.zkminer` attribute where the filesystem keeps one, so that
+/// every metadata write [`metadata_checks`] tries would succeed unconfined.
+fn prepare_scratch(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = dir.join("scratch");
+    let _ = std::fs::write(&scratch, b"scratch\n");
+    let _ = std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o644));
+    let c = cpath(&scratch);
+    // SAFETY: a NUL-terminated path, name and a one-byte value.
+    let rc = unsafe {
+        libc::setxattr(
+            c.as_ptr(),
+            c"user.zkminer".as_ptr(),
+            b"1".as_ptr().cast(),
+            1,
+            0,
+        )
+    };
+    note(
+        "scratch_xattr",
+        if rc == 0 {
+            "set".to_string()
+        } else {
+            format!("errno {}", errno())
+        },
+    );
+    scratch
+}
+
+/// What a scratch file's metadata is: mode, owner, mtime and its `user.zkminer` attribute.
+fn metadata_of(p: &Path) -> (u32, u32, i64, i64, isize) {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(p).expect("the scratch file");
+    let c = cpath(p);
+    let mut buf = [0u8; 8];
+    // SAFETY: a NUL-terminated path and name; `buf` has room for the value.
+    let x = unsafe {
+        libc::getxattr(
+            c.as_ptr(),
+            c"user.zkminer".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    (m.mode() & 0o7777, m.uid(), m.mtime(), m.mtime_nsec(), x)
+}
+
+/// Metadata writes (mode, owner, extended attributes, times) on `scratch`, by path and through an
+/// fd: arguments with which each would succeed unconfined. Each must fail with `EPERM`, and the
+/// file must be as it was. Then the same on `key` (a file outside every writable path).
+fn metadata_checks(scratch: &Path, key: &Path, mut report: impl FnMut(&str, bool, String)) {
+    let before = metadata_of(scratch);
+    let p = cpath(scratch);
+    let pp = p.as_ptr();
+    let name = c"user.zkminer".as_ptr();
+    let value = b"2".as_ptr();
+    let null = std::ptr::null::<libc::c_void>();
+    let m1 = -1 as libc::c_long;
+    let at = libc::AT_FDCWD as libc::c_long;
+    // struct xattr_args { u64 value; u32 size; u32 flags; } for setxattrat.
+    let xargs: [u64; 2] = [value as u64, 1];
+    // SAFETY (every call): NUL-terminated paths and names, a one-byte value, NULL times (now).
+    let mut calls: Vec<(&str, libc::c_long, i32)> = vec![];
+    let mut add = |name: &'static str, f: &dyn Fn() -> libc::c_long| {
+        let (r, e) = sys(f);
+        calls.push((name, r, e));
+    };
+    add("fchmodat", &|| unsafe {
+        libc::syscall(libc::SYS_fchmodat, at, pp, 0o600)
+    });
+    add("fchmodat2", &|| unsafe {
+        libc::syscall(libc::SYS_fchmodat2, at, pp, 0o600, 0)
+    });
+    add("fchownat", &|| unsafe {
+        libc::syscall(libc::SYS_fchownat, at, pp, m1, m1, 0)
+    });
+    add("setxattr", &|| unsafe {
+        libc::syscall(libc::SYS_setxattr, pp, name, value, 1, 0)
+    });
+    add("lsetxattr", &|| unsafe {
+        libc::syscall(libc::SYS_lsetxattr, pp, name, value, 1, 0)
+    });
+    add("setxattrat", &|| unsafe {
+        libc::syscall(
+            crate::restrict::SYS_SETXATTRAT,
+            at,
+            pp,
+            0,
+            name,
+            xargs.as_ptr(),
+            16,
+        )
+    });
+    add("removexattr", &|| unsafe {
+        libc::syscall(libc::SYS_removexattr, pp, name)
+    });
+    add("lremovexattr", &|| unsafe {
+        libc::syscall(libc::SYS_lremovexattr, pp, name)
+    });
+    add("removexattrat", &|| unsafe {
+        libc::syscall(crate::restrict::SYS_REMOVEXATTRAT, at, pp, 0, name)
+    });
+    add("utimensat_path", &|| unsafe {
+        libc::syscall(libc::SYS_utimensat, at, pp, null, 0)
+    });
+    #[cfg(target_arch = "x86_64")]
+    {
+        add("chmod", &|| unsafe {
+            libc::syscall(libc::SYS_chmod, pp, 0o600)
+        });
+        add("chown", &|| unsafe {
+            libc::syscall(libc::SYS_chown, pp, m1, m1)
+        });
+        add("lchown", &|| unsafe {
+            libc::syscall(libc::SYS_lchown, pp, m1, m1)
+        });
+        add("utime", &|| unsafe {
+            libc::syscall(libc::SYS_utime, pp, null)
+        });
+        add("utimes", &|| unsafe {
+            libc::syscall(libc::SYS_utimes, pp, null)
+        });
+        add("futimesat", &|| unsafe {
+            libc::syscall(libc::SYS_futimesat, at, pp, null)
+        });
+    }
+    // Through an fd of the file, opened for writing (which the confinement allows here).
+    // SAFETY: opening the scratch file; the fd is closed below.
+    let fd = unsafe { libc::open(pp, libc::O_RDWR | libc::O_CLOEXEC) } as libc::c_long;
+    if fd < 0 {
+        report("metadata_fd_open", false, format!("errno {}", errno()));
+    } else {
+        add("fchmod", &|| unsafe {
+            libc::syscall(libc::SYS_fchmod, fd, 0o600)
+        });
+        add("fchown", &|| unsafe {
+            libc::syscall(libc::SYS_fchown, fd, m1, m1)
+        });
+        add("fsetxattr", &|| unsafe {
+            libc::syscall(libc::SYS_fsetxattr, fd, name, value, 1, 0)
+        });
+        add("fremovexattr", &|| unsafe {
+            libc::syscall(libc::SYS_fremovexattr, fd, name)
+        });
+        add("futimens", &|| unsafe {
+            libc::syscall(libc::SYS_utimensat, fd, null, null, 0)
+        });
+        // SAFETY: closing the fd opened above.
+        unsafe { libc::close(fd as libc::c_int) };
+    }
+    for (name, r, e) in calls {
+        let (ok, detail) = refused_with(r, e, libc::EPERM);
+        report(&format!("meta_{name}"), ok, detail);
+    }
+    let after = metadata_of(scratch);
+    report(
+        "metadata_unchanged",
+        after == before,
+        format!("before {before:?} after {after:?}"),
+    );
+    // A key file outside every writable path: its mode stays.
+    let k = cpath(key);
+    let key_before = metadata_of(key).0;
+    // SAFETY: a NUL-terminated path.
+    let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_fchmodat, at, k.as_ptr(), 0o644) });
+    let key_after = metadata_of(key).0;
+    let (ok, detail) = refused_with(r, e, libc::EPERM);
+    report(
+        "meta_chmod_key",
+        ok && key_before == key_after,
+        format!("{detail}, mode {key_before:o} -> {key_after:o}"),
+    );
+}
+
+/// Links, renames, removals, new directories and symlinks, and truncation outside the writable
+/// path `write`, into `home` or out of it: Landlock's to refuse (`EACCES`, or `EXDEV` for a link or
+/// rename that would cross into other rights). Each would succeed unconfined on these files.
+fn namespace_checks(write: &Path, home: &Path, mut report: impl FnMut(&str, bool, String)) {
+    let c = |p: PathBuf| cpath(&p);
+    let _ = std::fs::write(write.join("to-move"), b"x");
+    let bashrc = c(home.join(".bashrc"));
+    let refused = |r: libc::c_long, e: i32| r < 0 && (e == libc::EACCES || e == libc::EXDEV);
+    let detail = |r: libc::c_long, e: i32| {
+        if r < 0 {
+            format!("errno {e}")
+        } else {
+            "SUCCEEDED".to_string()
+        }
+    };
+    let (src_w, dst_h) = (c(write.join("to-move")), c(home.join(".config/moved")));
+    let (dst_w, sym_h) = (
+        c(write.join("from-home")),
+        c(home.join(".config/autostart/zk.desktop")),
+    );
+    let (dir_h, empty_h) = (
+        c(home.join(".config/new-dir")),
+        c(home.join(".config/systemd/user")),
+    );
+    // SAFETY (every call): NUL-terminated paths.
+    let calls: Vec<(&str, (libc::c_long, i32))> = vec![
+        (
+            "link_into_home",
+            sys(|| unsafe { libc::link(src_w.as_ptr(), dst_h.as_ptr()) } as libc::c_long),
+        ),
+        (
+            "link_out_of_home",
+            sys(|| unsafe { libc::link(bashrc.as_ptr(), dst_w.as_ptr()) } as libc::c_long),
+        ),
+        (
+            "symlink_into_home",
+            sys(|| unsafe { libc::symlink(c"/bin/sh".as_ptr(), sym_h.as_ptr()) } as libc::c_long),
+        ),
+        (
+            "rename_into_home",
+            sys(|| unsafe { libc::rename(src_w.as_ptr(), dst_h.as_ptr()) } as libc::c_long),
+        ),
+        (
+            "rename_out_of_home",
+            sys(|| unsafe { libc::rename(bashrc.as_ptr(), dst_w.as_ptr()) } as libc::c_long),
+        ),
+        (
+            "unlink_home",
+            sys(|| unsafe { libc::unlink(bashrc.as_ptr()) } as libc::c_long),
+        ),
+        (
+            "rmdir_home",
+            sys(|| unsafe { libc::rmdir(empty_h.as_ptr()) } as libc::c_long),
+        ),
+        (
+            "mkdir_home",
+            sys(|| unsafe { libc::mkdir(dir_h.as_ptr(), 0o700) } as libc::c_long),
+        ),
+        (
+            "truncate_home",
+            sys(|| unsafe { libc::truncate(bashrc.as_ptr(), 0) } as libc::c_long),
+        ),
+    ];
+    for (name, (r, e)) in calls {
+        report(&format!("ns_{name}"), refused(r, e), detail(r, e));
+    }
+}
+
 static GOT_SIGUSR1: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_sigusr1(_: libc::c_int) {
@@ -515,6 +763,9 @@ pub fn run_confined(args: &[OsString]) -> i32 {
         let fd = unsafe { libc::socket(domain, kind, 0) };
         note("leaked", format!("{leak} fd {fd}"));
     }
+    let scratch = prepare_scratch(&a.write);
+    let runner = a.write.join(runner_temp_name(std::process::id()));
+    let _ = std::fs::write(&runner, b"runner\n");
     let mut c = Confinement::with_system(a.sockets);
     c.allow(&a.write, Rights::WRITE);
     if let Some(exec) = &a.exec {
@@ -703,6 +954,17 @@ pub fn run_confined(args: &[OsString]) -> i32 {
     let e = errno();
     check("io_uring", rc < 0 && e == libc::EPERM, format!("errno {e}"));
     kernel_surface_checks(a.exec.as_deref(), |n, ok, d| check(n, ok, d));
+    metadata_checks(&scratch, &a.home.join(".ssh/id_ed25519"), |n, ok, d| {
+        check(n, ok, d)
+    });
+    // No supervisor here: even the executor's runner may not be made executable.
+    let rc = cpath(&runner);
+    // SAFETY: a NUL-terminated path.
+    let (r, e) =
+        sys(|| unsafe { libc::syscall(libc::SYS_fchmodat, libc::AT_FDCWD, rc.as_ptr(), 0o755) });
+    let (ok, detail) = refused_with(r, e, libc::EPERM);
+    check("runner_chmod_refused", ok, detail);
+    namespace_checks(&a.write, &a.home, |n, ok, d| check(n, ok, d));
 
     // The thread from before.
     go_tx.send(home.clone()).unwrap();
@@ -766,6 +1028,16 @@ pub fn run_supervised_parent(args: &[OsString]) -> i32 {
             return 1;
         }
     };
+    // What the server's checks work on, made while nothing is confined: a scratch file, a runner
+    // file as SP1's executor unpacks one, and a file that is not one.
+    let write_dir = Path::new(write);
+    prepare_scratch(write_dir);
+    for f in [runner_temp_name(1), "not-a-runner".to_string()] {
+        use std::os::unix::fs::PermissionsExt;
+        let f = write_dir.join(f);
+        let _ = std::fs::write(&f, b"x");
+        let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644));
+    }
     let mut c = Confinement::with_system(Sockets::Supervised);
     c.allow(dir, Rights::MAKE_SOCK);
     c.allow(write, Rights::WRITE);
@@ -778,8 +1050,10 @@ pub fn run_supervised_parent(args: &[OsString]) -> i32 {
             "supervised-child".into(),
             socket.into_os_string(),
             home.clone(),
+            write.clone(),
         ],
         &c,
+        Some(Path::new(write)),
     ) {
         Ok(code) => code,
         Err(e) => {
@@ -789,14 +1063,16 @@ pub fn run_supervised_parent(args: &[OsString]) -> i32 {
     }
 }
 
-/// `supervised-child <socket> <home>`: the server's part. Listens at `<socket>`, accepts one
-/// connection, then tries its way out and reports each check on stdout and on the connection.
+/// `supervised-child <socket> <home> <write>`: the server's part. Listens at `<socket>`, accepts
+/// one connection, then tries its way out and reports each check on stdout and on the connection.
+/// `<write>` is its writable directory, where its supervisor makes runner files executable.
 pub fn run_supervised_child(args: &[OsString]) -> i32 {
-    let [socket, home] = args else {
+    let [socket, home, write] = args else {
         return 64;
     };
     let socket = PathBuf::from(socket);
     let home = PathBuf::from(home);
+    let write = PathBuf::from(write);
     // SAFETY: getpid has no arguments.
     println!("SERVER {}", unsafe { libc::getpid() });
     // Before the first connection: a CUDA-style seqpacket listener, then its own.
@@ -978,6 +1254,51 @@ pub fn run_supervised_child(args: &[OsString]) -> i32 {
         format!("{r:?}"),
     );
     kernel_surface_checks(None, &mut report);
+    // Mode changes go to the supervisor: a runner file the executor unpacked becomes executable,
+    // nothing else does, and no other mode is given.
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = |p: &Path| {
+            std::fs::symlink_metadata(p)
+                .map(|m| m.mode() & 0o7777)
+                .unwrap_or(0)
+        };
+        let runner = write.join(runner_temp_name(1));
+        let other = write.join("not-a-runner");
+        let (rp, op) = (cpath(&runner), cpath(&other));
+        // SAFETY: NUL-terminated paths.
+        let (r, e) = sys(|| unsafe {
+            libc::syscall(libc::SYS_fchmodat, libc::AT_FDCWD, rp.as_ptr(), 0o755)
+        });
+        report(
+            "runner_made_executable_by_supervisor",
+            r == 0 && mode(&runner) == 0o755,
+            format!("rc {r} errno {e} mode {:o}", mode(&runner)),
+        );
+        let (r, e) = sys(|| unsafe {
+            libc::syscall(libc::SYS_fchmodat, libc::AT_FDCWD, op.as_ptr(), 0o755)
+        });
+        report(
+            "other_file_not_made_executable",
+            mode(&other) == 0o644,
+            format!("rc {r} errno {e} mode {:o}", mode(&other)),
+        );
+        let (r, e) = sys(|| unsafe {
+            libc::syscall(libc::SYS_fchmodat, libc::AT_FDCWD, rp.as_ptr(), 0o666)
+        });
+        let (ok, detail) = refused_with(r, e, libc::EPERM);
+        report(
+            "runner_other_mode_refused",
+            ok && mode(&runner) == 0o755,
+            detail,
+        );
+    }
+    metadata_checks(
+        &write.join("scratch"),
+        &home.join(".ssh/id_ed25519"),
+        &mut report,
+    );
+    namespace_checks(&write, &home, &mut report);
     let r = try_open(
         &home.join(".config/autostart/zk.desktop"),
         libc::O_WRONLY | libc::O_CREAT,

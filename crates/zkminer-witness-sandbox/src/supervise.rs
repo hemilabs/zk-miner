@@ -75,18 +75,146 @@ const SECCOMP_SET_MODE_FILTER: libc::c_ulong = 1;
 /// The exit code of a supervised child that could not be confined (it never ran the program).
 pub const EXIT_NOT_CONFINED: i32 = 125;
 
-/// What the supervisor answers to one notified syscall, given whether the server has accepted a
-/// connection yet (`armed`, which this updates).
-pub(crate) fn decide(nr: i64, armed: &mut bool) -> bool {
+/// What the supervisor does with one notified syscall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// The kernel runs it as the server asked.
+    Continue,
+    /// It fails with `EPERM`.
+    Refuse,
+    /// A mode change to `0755` by path: the supervisor makes the executor's runner files in the
+    /// runner directory executable itself ([`make_runners_executable`]) and answers for the call.
+    /// The kernel never runs the server's call, so the path it named does not matter.
+    MakeRunnersExecutable,
+}
+
+/// What the supervisor answers to one notified syscall `nr` with arguments `args` (registers, never
+/// the server's memory), given whether the server has accepted a connection yet (`armed`, which
+/// this updates).
+pub(crate) fn decide(nr: i64, args: &[u64; 6], armed: &mut bool) -> Answer {
     if nr == libc::SYS_accept || nr == libc::SYS_accept4 {
         // The first moment requester bytes can arrive: from here on, no new socket.
         *armed = true;
-        true
+        Answer::Continue
     } else if nr == libc::SYS_socket || nr == libc::SYS_bind || nr == libc::SYS_listen {
-        !*armed
+        if *armed {
+            Answer::Refuse
+        } else {
+            Answer::Continue
+        }
+    } else if requested_mode(nr, args) == Some(0o755) {
+        Answer::MakeRunnersExecutable
     } else {
-        false
+        Answer::Refuse
     }
+}
+
+/// The mode a mode change by path asks for, from its registers: `chmod(path, mode)`,
+/// `fchmodat(dirfd, path, mode)`, `fchmodat2(dirfd, path, mode, 0)`. `None` for anything else
+/// (`fchmodat2` with flags included).
+fn requested_mode(nr: i64, args: &[u64; 6]) -> Option<u32> {
+    #[cfg(target_arch = "x86_64")]
+    if nr == libc::SYS_chmod {
+        return Some(args[1] as u32);
+    }
+    if nr == libc::SYS_fchmodat || (nr == libc::SYS_fchmodat2 && args[3] as u32 == 0) {
+        return Some(args[2] as u32);
+    }
+    None
+}
+
+/// Whether `name` is a runner file as SP1's executor unpacks it: written as
+/// `sp1-native-runner-bin-<64 hex digits>.tmp.<pid>` into the temporary directory, made executable
+/// (`chmod 0755`), then renamed to `sp1-native-runner-bin-<64 hex digits>`.
+pub(crate) fn is_runner_temp_name(name: &[u8]) -> bool {
+    let Some(rest) = name.strip_prefix(b"sp1-native-runner-bin-") else {
+        return false;
+    };
+    if rest.len() < 64 {
+        return false;
+    }
+    let (hex, tail) = rest.split_at(64);
+    let Some(pid) = tail.strip_prefix(b".tmp.") else {
+        return false;
+    };
+    hex.iter()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+        && !pid.is_empty()
+        && pid.len() <= 10
+        && pid.iter().all(u8::is_ascii_digit)
+}
+
+/// Makes every runner file ([`is_runner_temp_name`]) in `dir` executable (`0755`), on the server's
+/// behalf: only a regular file directly in `dir`, reached without following a link, owned by this
+/// user and with no other link to it; `dir` itself must be this user's and closed to others (the
+/// private temporary directory). How many such files there are.
+pub(crate) fn make_runners_executable(dir: &Path) -> std::io::Result<usize> {
+    let dir_c = CString::new(dir.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: plain syscalls on a NUL-terminated path and the fds they return, closed below.
+    let dirfd = unsafe {
+        libc::open(
+            dir_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if dirfd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = (|| {
+        // SAFETY: geteuid takes no arguments; fstat fills a zeroed buffer.
+        let me = unsafe { libc::geteuid() };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(dirfd, &mut st) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if st.st_uid != me || st.st_mode & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{} is not a private directory of this user", dir.display()),
+            ));
+        }
+        let mut found = 0;
+        for entry in std::fs::read_dir(format!("/proc/self/fd/{dirfd}"))? {
+            let name = entry?.file_name();
+            if !is_runner_temp_name(name.as_bytes()) {
+                continue;
+            }
+            let Ok(name_c) = CString::new(name.as_bytes()) else {
+                continue;
+            };
+            // SAFETY: openat relative to the directory fd, with a name holding no `/`.
+            let fd = unsafe {
+                libc::openat(
+                    dirfd,
+                    name_c.as_ptr(),
+                    libc::O_RDONLY
+                        | libc::O_NOFOLLOW
+                        | libc::O_NONBLOCK
+                        | libc::O_NOCTTY
+                        | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                continue;
+            }
+            // SAFETY: fstat and fchmod on the fd just opened, then closed.
+            let mut f: libc::stat = unsafe { std::mem::zeroed() };
+            let ok = unsafe { libc::fstat(fd, &mut f) } == 0
+                && f.st_mode & libc::S_IFMT == libc::S_IFREG
+                && f.st_uid == me
+                && f.st_nlink == 1
+                && (f.st_mode & 0o7777 == 0o755 || unsafe { libc::fchmod(fd, 0o755) } == 0);
+            unsafe { libc::close(fd) };
+            if ok {
+                found += 1;
+            }
+        }
+        Ok(found)
+    })();
+    // SAFETY: closing the directory fd opened above.
+    unsafe { libc::close(dirfd) };
+    result
 }
 
 fn errno() -> i32 {
@@ -103,6 +231,11 @@ fn os_err(what: &str) -> SandboxError {
 /// does (then it is killed). `confinement` must have [`Sockets::Supervised`]. The child's stdin is
 /// `/dev/null` and it inherits no file descriptor but stdout and stderr.
 ///
+/// The server's mode changes by path (it may not make them itself: see [`crate::netdeny`]) are
+/// answered here: a change to `0755` makes the executor's runner files in `runner_dir` executable
+/// ([`make_runners_executable`]), and nothing else; every other one fails with `EPERM`, as all do
+/// when `runner_dir` is `None`.
+///
 /// Call it from a single-threaded process (it forks). Fails before starting anything if the
 /// confinement cannot be built or a filesystem in reach is not local ([`crate::localfs`]); a child
 /// that cannot be confined exits with [`EXIT_NOT_CONFINED`] without running `program`.
@@ -110,6 +243,7 @@ pub fn run_supervised(
     program: &Path,
     args: &[OsString],
     confinement: &Confinement,
+    runner_dir: Option<&Path>,
 ) -> Result<i32, SandboxError> {
     if confinement.sockets() != Sockets::Supervised {
         return Err(SandboxError::InvalidArgument(
@@ -136,7 +270,7 @@ pub fn run_supervised(
     let ruleset = confinement.landlock_ruleset(false)?;
     let filters = netdeny::filters(Sockets::Supervised)?;
     let notify = netdeny::notify_filter();
-    let own_filters = netdeny::filters(Sockets::None)?;
+    let own_filters = netdeny::supervisor_filters()?;
     let cstr = |b: &[u8]| {
         CString::new(b).map_err(|e| SandboxError::InvalidArgument(format!("NUL in argument: {e}")))
     };
@@ -250,7 +384,7 @@ pub fn run_supervised(
             return Err(SandboxError::Seccomp(e.to_string()));
         }
     }
-    Ok(supervise(notif_fd, parent_fd, child, child_fd))
+    Ok(supervise(notif_fd, parent_fd, child, child_fd, runner_dir))
 }
 
 /// The child's side: confine itself, hand the notification listener to the supervisor. 0 on
@@ -441,13 +575,23 @@ fn syscall_name(nr: i64) -> &'static str {
         n if n == libc::SYS_listen => "listen",
         n if n == libc::SYS_accept => "accept",
         n if n == libc::SYS_accept4 => "accept4",
+        n if n == libc::SYS_fchmodat => "fchmodat",
+        n if n == libc::SYS_fchmodat2 => "fchmodat2",
+        #[cfg(target_arch = "x86_64")]
+        n if n == libc::SYS_chmod => "chmod",
         _ => "a syscall",
     }
 }
 
 /// The supervisor's loop: answers the child's notifications until it exits, or kills it when
 /// `parent_fd`'s process (whoever started the supervisor) exits.
-fn supervise(notif_fd: RawFd, parent_fd: RawFd, child: libc::pid_t, child_fd: RawFd) -> i32 {
+fn supervise(
+    notif_fd: RawFd,
+    parent_fd: RawFd,
+    child: libc::pid_t,
+    child_fd: RawFd,
+    runner_dir: Option<&Path>,
+) -> i32 {
     let mut armed = false;
     let mut refused = 0u64;
     let mut fds = [
@@ -498,12 +642,22 @@ fn supervise(notif_fd: RawFd, parent_fd: RawFd, child: libc::pid_t, child_fd: Ra
                 continue;
             }
             let nr = i64::from(req.data.nr);
-            let allow = decide(nr, &mut armed);
+            let answer = decide(nr, &req.data.args, &mut armed);
+            // `error` is the negated errno; `val` the call's result when it is 0.
+            let error = match answer {
+                Answer::Continue => 0,
+                Answer::Refuse => -libc::EPERM,
+                Answer::MakeRunnersExecutable => match runner_dir.map(make_runners_executable) {
+                    Some(Ok(n)) if n > 0 => 0,
+                    Some(Err(e)) => -e.raw_os_error().unwrap_or(libc::EPERM),
+                    _ => -libc::EPERM,
+                },
+            };
             let resp = SeccompNotifResp {
                 id: req.id,
                 val: 0,
-                error: if allow { 0 } else { -libc::EPERM },
-                flags: if allow {
+                error,
+                flags: if answer == Answer::Continue {
                     SECCOMP_USER_NOTIF_FLAG_CONTINUE
                 } else {
                     0
@@ -511,14 +665,18 @@ fn supervise(notif_fd: RawFd, parent_fd: RawFd, child: libc::pid_t, child_fd: Ra
             };
             // SAFETY: a valid response buffer. ENOENT (the caller is gone) needs nothing more.
             unsafe { libc::ioctl(notif_fd, SECCOMP_IOCTL_NOTIF_SEND as _, &resp) };
-            if !allow {
+            if answer == Answer::Refuse {
                 refused += 1;
                 if refused <= 8 {
                     eprintln!(
-                        "zkminer: refused {}() in sp1-gpu-server (pid {}): it has taken its first \
-                         connection",
+                        "zkminer: refused {}() in sp1-gpu-server (pid {}){}",
                         syscall_name(nr),
-                        req.pid
+                        req.pid,
+                        if netdeny::mode_changes().iter().any(|(_, m)| *m == nr) {
+                            ""
+                        } else {
+                            ": it has taken its first connection"
+                        }
                     );
                 }
             }
@@ -547,28 +705,141 @@ mod tests {
     #[test]
     fn sockets_until_the_first_connection_never_after() {
         use libc::*;
+        let none = [0u64; 6];
         let mut armed = false;
+        let go = |nr, armed: &mut bool| decide(nr, &none, armed) == Answer::Continue;
         for nr in [
             SYS_socket, SYS_bind, SYS_listen, SYS_socket, SYS_bind, SYS_listen,
         ] {
-            assert!(decide(nr, &mut armed), "{nr} before the first accept");
+            assert!(go(nr, &mut armed), "{nr} before the first accept");
         }
-        assert!(decide(SYS_accept4, &mut armed));
+        assert!(go(SYS_accept4, &mut armed));
         assert!(armed);
         for nr in [SYS_socket, SYS_bind, SYS_listen] {
-            assert!(!decide(nr, &mut armed), "{nr} after the first accept");
+            assert!(!go(nr, &mut armed), "{nr} after the first accept");
         }
+        assert!(go(SYS_accept4, &mut armed), "the server keeps accepting");
+        assert!(go(SYS_accept, &mut armed));
         assert!(
-            decide(SYS_accept4, &mut armed),
-            "the server keeps accepting"
-        );
-        assert!(decide(SYS_accept, &mut armed));
-        assert!(
-            !decide(SYS_connect, &mut armed),
+            !go(SYS_connect, &mut armed),
             "never notified, never allowed"
         );
         let mut fresh = false;
-        assert!(!decide(SYS_connect, &mut fresh));
-        assert!(!decide(SYS_execve, &mut fresh));
+        assert!(!go(SYS_connect, &mut fresh));
+        assert!(!go(SYS_execve, &mut fresh));
+    }
+
+    #[test]
+    fn only_a_0755_mode_change_is_answered_and_never_run_by_the_kernel() {
+        use libc::*;
+        let mut armed = false;
+        let path = 0x7f00_0000_1000u64;
+        let mut calls = vec![
+            (SYS_fchmodat, [AT_FDCWD as u64, path, 0o755, 0, 0, 0]),
+            (SYS_fchmodat2, [AT_FDCWD as u64, path, 0o755, 0, 0, 0]),
+        ];
+        #[cfg(target_arch = "x86_64")]
+        calls.push((SYS_chmod, [path, 0o755, 0, 0, 0, 0]));
+        for (nr, args) in &calls {
+            for a in [false, true] {
+                armed = a;
+                assert_eq!(
+                    decide(*nr, args, &mut armed),
+                    Answer::MakeRunnersExecutable,
+                    "{nr}"
+                );
+            }
+        }
+        let mut refused = vec![
+            (SYS_fchmodat, [AT_FDCWD as u64, path, 0o644, 0, 0, 0]),
+            (SYS_fchmodat, [AT_FDCWD as u64, path, 0o4755, 0, 0, 0]),
+            (SYS_fchmodat, [AT_FDCWD as u64, path, 0o777, 0, 0, 0]),
+            // AT_SYMLINK_NOFOLLOW, or any flag.
+            (SYS_fchmodat2, [AT_FDCWD as u64, path, 0o755, 0x100, 0, 0]),
+            (SYS_fchmod, [3, 0o755, 0, 0, 0, 0]),
+            (SYS_fchownat, [AT_FDCWD as u64, path, 0, 0, 0, 0]),
+        ];
+        #[cfg(target_arch = "x86_64")]
+        refused.push((SYS_chmod, [path, 0o666, 0, 0, 0, 0]));
+        for (nr, args) in &refused {
+            assert_eq!(
+                decide(*nr, args, &mut armed),
+                Answer::Refuse,
+                "{nr} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn runner_names() {
+        let hex = "039fc830c760cfbf00882fec49bd88bb05b1891e42c20dd600e8093099efbaac";
+        assert!(is_runner_temp_name(
+            format!("sp1-native-runner-bin-{hex}.tmp.1522603").as_bytes()
+        ));
+        for bad in [
+            format!("sp1-native-runner-bin-{hex}"),
+            format!("sp1-native-runner-bin-{hex}.tmp."),
+            format!("sp1-native-runner-bin-{hex}.tmp.12345678901"),
+            format!("sp1-native-runner-bin-{hex}.tmp.1/x"),
+            format!("sp1-native-runner-bin-{}.tmp.1", hex.to_uppercase()),
+            format!("sp1-native-runner-bin-{}.tmp.1", &hex[1..]),
+            format!("sp1-native-runner-bin-../{}.tmp.1", &hex[3..]),
+            format!("x-sp1-native-runner-bin-{hex}.tmp.1"),
+            ".bashrc".to_string(),
+        ] {
+            assert!(!is_runner_temp_name(bad.as_bytes()), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_supervisor_makes_runner_files_executable_and_nothing_else() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        // Private, as the worker's temporary directory is.
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().mode() & 0o7777;
+        let hex = "88200a963af2d9b0d8c13aeb3ce37072e65c1185dc7bea81a053c38a289e9b5e";
+        let runner = d.join(format!("sp1-native-runner-bin-{hex}.tmp.42"));
+        let other = d.join("other");
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim");
+        for f in [&runner, &other, &victim] {
+            std::fs::write(f, b"x").unwrap();
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        // A link named like a runner, to a file elsewhere: never followed.
+        std::os::unix::fs::symlink(
+            &victim,
+            d.join(format!("sp1-native-runner-bin-{hex}.tmp.43")),
+        )
+        .unwrap();
+        // A second name for a file of the directory: not changed through it.
+        let twice = d.join("twice");
+        std::fs::write(&twice, b"x").unwrap();
+        std::fs::set_permissions(&twice, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(
+            &twice,
+            d.join(format!("sp1-native-runner-bin-{hex}.tmp.44")),
+        )
+        .unwrap();
+        // A directory named like one.
+        std::fs::create_dir(d.join(format!("sp1-native-runner-bin-{hex}.tmp.45"))).unwrap();
+
+        assert_eq!(make_runners_executable(d).unwrap(), 1);
+        assert_eq!(mode(&runner), 0o755);
+        assert_eq!(mode(&other), 0o644);
+        assert_eq!(mode(&victim), 0o644);
+        assert_eq!(mode(&twice), 0o600);
+        // Again: already executable, still one.
+        assert_eq!(make_runners_executable(d).unwrap(), 1);
+        // A directory open to others is not the private one.
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(make_runners_executable(d).is_err());
+        // Nor is a link to one.
+        let link = outside.path().join("link");
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(d, &link).unwrap();
+        assert!(make_runners_executable(&link).is_err());
     }
 }

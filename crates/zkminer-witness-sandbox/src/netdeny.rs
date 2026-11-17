@@ -40,6 +40,18 @@
 //! live in memory, out of a filter's sight, and libc then falls back to `clone`, whose flags the
 //! filter reads (threads, `fork`, `vfork` and `posix_spawn` keep working).
 //!
+//! Landlock has no right for a file's metadata, and a confined process runs as the miner's uid,
+//! which owns most of what it can name by path (keys, configuration, the provers, git hooks). So
+//! every policy also refuses metadata writes, by path and through an fd alike: mode (`chmod`,
+//! `fchmodat`, `fchmodat2`, `fchmod`), owner (`chown`, `lchown`, `fchownat`, `fchown`), extended
+//! attributes (`setxattr`, `lsetxattr`, `fsetxattr`, `setxattrat`, `removexattr`, `lremovexattr`,
+//! `fremovexattr`, `removexattrat`), times (`utime`, `utimes`, `futimesat`, `utimensat` with a
+//! path or without) and `file_setattr`; no GPU runtime makes these calls. The one exception is
+//! the supervised server's mode changes, which go to its supervisor ([`crate::supervise`]): the
+//! SP1 executor in it unpacks its runner into the private temporary directory and makes it
+//! executable. Links, renames, removals, directories, symlinks and truncation are Landlock's to
+//! refuse outside the writable paths.
+//!
 //! The filters are installed with `SECCOMP_FILTER_FLAG_TSYNC` after `NO_NEW_PRIVS`: every thread
 //! the process has, and every thread and process it creates afterwards (across `exec` too),
 //! carries them.
@@ -52,7 +64,10 @@ use seccompiler::{
     SeccompRule, TargetArch,
 };
 
-use crate::restrict::{PR_SET_PTRACER, SOCK_TYPE_MASK, SYS_OPEN_TREE_ATTR};
+use crate::restrict::{
+    PR_SET_PTRACER, SOCK_TYPE_MASK, SYS_FILE_SETATTR, SYS_OPEN_TREE_ATTR, SYS_REMOVEXATTRAT,
+    SYS_SETXATTRAT,
+};
 use crate::SandboxError;
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -130,6 +145,45 @@ fn always_denied() -> Vec<(&'static str, i64)> {
     v
 }
 
+/// Metadata writes that every policy refuses (see the module docs), by path and through an fd.
+fn metadata_writes() -> Vec<(&'static str, i64)> {
+    use libc::*;
+    let mut v = vec![
+        ("fchmod", SYS_fchmod),
+        ("fchownat", SYS_fchownat),
+        ("fchown", SYS_fchown),
+        ("setxattr", SYS_setxattr),
+        ("lsetxattr", SYS_lsetxattr),
+        ("fsetxattr", SYS_fsetxattr),
+        ("setxattrat", SYS_SETXATTRAT),
+        ("removexattr", SYS_removexattr),
+        ("lremovexattr", SYS_lremovexattr),
+        ("fremovexattr", SYS_fremovexattr),
+        ("removexattrat", SYS_REMOVEXATTRAT),
+        ("utimensat", SYS_utimensat),
+        ("file_setattr", SYS_FILE_SETATTR),
+    ];
+    #[cfg(target_arch = "x86_64")]
+    v.extend([
+        ("chown", SYS_chown),
+        ("lchown", SYS_lchown),
+        ("utime", SYS_utime),
+        ("utimes", SYS_utimes),
+        ("futimesat", SYS_futimesat),
+    ]);
+    v
+}
+
+/// Mode changes by path: refused, except under [`Sockets::Supervised`], where they go to the
+/// supervisor ([`supervised_syscalls`]).
+pub(crate) fn mode_changes() -> Vec<(&'static str, i64)> {
+    use libc::*;
+    let mut v = vec![("fchmodat", SYS_fchmodat), ("fchmodat2", SYS_fchmodat2)];
+    #[cfg(target_arch = "x86_64")]
+    v.push(("chmod", SYS_chmod));
+    v
+}
+
 /// Every `CLONE_NEW*` flag. `clone` reads its low byte as the child's exit signal, so it cannot
 /// ask for a time namespace (`CLONE_NEWTIME` is that byte's top bit, which no valid signal sets);
 /// the filter refuses the bit all the same.
@@ -151,6 +205,10 @@ pub(crate) const ENOSYS_SYSCALLS: [(&str, i64); 1] = [("clone3", libc::SYS_clone
 fn denied_for(sockets: Sockets) -> Vec<(&'static str, i64)> {
     use libc::*;
     let mut v = always_denied();
+    v.extend(metadata_writes());
+    if sockets != Sockets::Supervised {
+        v.extend(mode_changes());
+    }
     match sockets {
         Sockets::None => v.extend([
             ("socket", SYS_socket),
@@ -266,9 +324,12 @@ fn target_arch() -> Result<TargetArch, SandboxError> {
 }
 
 /// The denylist (seccompiler; its architecture check kills the process on a foreign-ABI syscall).
-fn denylist(sockets: Sockets) -> Result<BpfProgram, SandboxError> {
+fn denylist(sockets: Sockets, except: &[i64]) -> Result<BpfProgram, SandboxError> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-    for (_, nr) in denied_for(sockets) {
+    for (_, nr) in denied_for(sockets)
+        .into_iter()
+        .filter(|(_, nr)| !except.contains(nr))
+    {
         // An empty rule list matches whatever the arguments.
         rules.insert(nr, Vec::new());
     }
@@ -344,15 +405,18 @@ fn raw_filter() -> BpfProgram {
     }
 }
 
-/// The syscalls [`Sockets::Supervised`] hands to the supervisor.
-pub(crate) fn supervised_syscalls() -> [i64; 5] {
-    [
+/// The syscalls [`Sockets::Supervised`] hands to the supervisor: its socket calls, and its mode
+/// changes by path ([`mode_changes`]), which the supervisor answers itself.
+pub(crate) fn supervised_syscalls() -> Vec<i64> {
+    let mut v = vec![
         libc::SYS_socket,
         libc::SYS_bind,
         libc::SYS_listen,
         libc::SYS_accept,
         libc::SYS_accept4,
-    ]
+    ];
+    v.extend(mode_changes().into_iter().map(|(_, nr)| nr));
+    v
 }
 
 /// [`Sockets::Supervised`]'s notifying filter: [`supervised_syscalls`] go to the supervisor
@@ -381,7 +445,17 @@ pub(crate) fn notify_filter() -> BpfProgram {
 /// The filters for `sockets`, in the order they are installed (the notifying filter of
 /// [`Sockets::Supervised`] is not among them: [`crate::supervise`] installs it itself).
 pub(crate) fn filters(sockets: Sockets) -> Result<Vec<BpfProgram>, SandboxError> {
-    Ok(vec![raw_filter(), denylist(sockets)?])
+    Ok(vec![raw_filter(), denylist(sockets, &[])?])
+}
+
+/// The supervisor's own filters: those of [`Sockets::None`], but with `fchmod`, which it uses to
+/// answer the server's mode changes ([`crate::supervise`]). The supervisor runs nothing of a
+/// requester's.
+pub(crate) fn supervisor_filters() -> Result<Vec<BpfProgram>, SandboxError> {
+    Ok(vec![
+        raw_filter(),
+        denylist(Sockets::None, &[libc::SYS_fchmod])?,
+    ])
 }
 
 /// Checks, in a process the filters are on, that no namespace can be made: `unshare(0)` (a no-op
@@ -960,6 +1034,80 @@ pub(crate) mod tests {
                 "x32 clone3"
             );
         }
+    }
+
+    #[test]
+    fn no_metadata_writes_and_the_servers_mode_changes_go_to_its_supervisor() {
+        use libc::*;
+        let named: Vec<&str> = metadata_writes()
+            .iter()
+            .chain(mode_changes().iter())
+            .map(|(n, _)| *n)
+            .collect();
+        let mut expected = vec![
+            "fchmodat",
+            "fchmodat2",
+            "fchmod",
+            "fchownat",
+            "fchown",
+            "setxattr",
+            "lsetxattr",
+            "fsetxattr",
+            "setxattrat",
+            "removexattr",
+            "lremovexattr",
+            "fremovexattr",
+            "removexattrat",
+            "utimensat",
+            "file_setattr",
+        ];
+        #[cfg(target_arch = "x86_64")]
+        expected.extend(["chmod", "chown", "lchown", "utime", "utimes", "futimesat"]);
+        for name in expected {
+            assert!(named.contains(&name), "{name} is not refused");
+        }
+        let path = 0x7f00_0000_1000u64;
+        for policy in POLICIES {
+            for (name, nr) in metadata_writes() {
+                for args in [
+                    [AT_FDCWD as u64, path, 0o755, 0, 0, 0],
+                    // utimensat's fd form (futimens): a NULL path.
+                    [3, 0, 0, 0, 0, 0],
+                    [u64::MAX; 6],
+                ] {
+                    assert_eq!(
+                        call(policy, nr, args),
+                        RET_EPERM,
+                        "{policy:?} {name} {args:x?}"
+                    );
+                }
+            }
+            for (name, nr) in mode_changes() {
+                let want = if policy == Sockets::Supervised {
+                    RET_NOTIFY
+                } else {
+                    RET_EPERM
+                };
+                for args in [
+                    [AT_FDCWD as u64, path, 0o755, 0, 0, 0],
+                    [path, 0o755, 0, 0, 0, 0],
+                ] {
+                    assert_eq!(call(policy, nr, args), want, "{policy:?} {name}");
+                }
+            }
+        }
+        // The supervisor itself keeps `fchmod` (it answers the server's mode changes with it),
+        // and nothing else of these.
+        let sup = supervisor_filters().unwrap();
+        let verdict = |nr: i64| verdict_of(&sup, &seccomp_data(ARCH, nr, [3, 0o755, 0, 0, 0, 0]));
+        assert_eq!(verdict(SYS_fchmod), RET_ALLOW);
+        for (name, nr) in metadata_writes().into_iter().chain(mode_changes()) {
+            if nr != SYS_fchmod {
+                assert_eq!(verdict(nr), RET_EPERM, "supervisor {name}");
+            }
+        }
+        assert_eq!(verdict(SYS_socket), RET_EPERM);
+        assert_eq!(verdict(SYS_unshare), RET_EPERM);
     }
 
     #[test]

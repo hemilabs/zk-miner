@@ -235,6 +235,22 @@ executor:
   `rt_sigqueueinfo`, `rt_tgsigqueueinfo` and `pidfd_send_signal` alike. The miner can still signal
   its workers. seccomp also denies `ptrace`, `process_vm_*`, `pidfd_getfd`, `io_uring`, `bpf`, the
   kernel keyrings, `mknod`, `TIOCSTI`, and a seccomp listener of the process's own.
+- **File metadata.** Landlock has no right for a file's mode, owner, extended attributes or
+  times, and a confined process runs as the miner's uid, which owns most of what it can name by
+  path (keys, the miner's configuration, the provers, git hooks). So seccomp refuses every such
+  write, by path and through an fd: `chmod`, `fchmodat`, `fchmodat2`, `fchmod`, `chown`, `lchown`,
+  `fchownat`, `fchown`, `setxattr`, `lsetxattr`, `fsetxattr`, `setxattrat`, `removexattr`,
+  `lremovexattr`, `fremovexattr`, `removexattrat`, `utime`, `utimes`, `futimesat`, `utimensat`
+  (with a path or without) and `file_setattr`. Traced, the CUDA, ROCm and Intel workers make none
+  of these calls, kernel caches cold or warm included. SP1's executor unpacks a runner into the
+  private temporary directory and makes it executable with `chmod`: the worker does that before it
+  confines itself (it executes its own embedded test program once), and the server's mode changes
+  go to its supervisor, which makes the runner files in that directory executable itself — a
+  regular file named as SP1 names it, opened without following a link, owned by the user, with a
+  single link, in a directory closed to others — and refuses every other mode change. It decides
+  on the call's registers (the syscall and the mode `0755`), never on the server's memory, and the
+  kernel never runs the server's own call. Links, renames, removals, new directories and symlinks,
+  and truncation outside the writable paths are Landlock's to refuse.
 - **Kernel surface.** No namespaces and no mounts: seccomp denies `unshare`, `setns`, `clone` with
   any `CLONE_NEW*` flag, `mount`, `umount2`, `pivot_root`, `chroot` and the new mount API
   (`fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `open_tree_attr`,
@@ -415,17 +431,17 @@ no second one):
   checked by the guard: requesters cannot change them, and a local chain node is a normal
   setup.
 - **What an escaped guest in an inline worker can still do.** It cannot open a socket or connect
-  anywhere, make a namespace or mount anything, but it keeps what the GPU stack needs: the GPU
-  device nodes and their ioctls (a kernel driver bug is outside this model), reading the
-  system's files and `/proc` (other processes' command lines and status, not their memory or
-  environment), and writing the caches listed above, which other GPU programs of the same user
-  also load (a confined worker could poison an Intel kernel cache or risc0's CUDA Groth16 cache
-  for them). An SP1 worker and its server can read and write any POSIX shared memory object and
-  semaphore of the uid in `/dev/shm` (SP1's executor needs it), the shared memory of unconfined
-  programs of the same user included. A witness proof's worker can read every bundle in the
-  retention store, other requesters' included. Its results go back to the miner over its pipe,
-  and a guest controls its journal, so anything it can read it can publish: keep secrets out of
-  the readable paths.
+  anywhere, make a namespace, mount anything or change a file's metadata, but it keeps what the
+  GPU stack needs: the GPU device nodes and their ioctls (a kernel driver bug is outside this
+  model), reading the system's files and `/proc` (other processes' command lines and status, not
+  their memory or environment), and writing the caches listed above, which other GPU programs of
+  the same user also load (a confined worker could poison an Intel kernel cache or risc0's CUDA
+  Groth16 cache for them). An SP1 worker and its server can read and write any POSIX shared
+  memory object and semaphore of the uid in `/dev/shm` (SP1's executor needs it), the shared
+  memory of unconfined programs of the same user included. A witness proof's worker can read
+  every bundle in the retention store, other requesters' included. Its results go back to the
+  miner over its pipe, and a guest controls its journal, so anything it can read it can publish:
+  keep secrets out of the readable paths.
 - **Filesystems mounted later, or remote underneath.** The check of the filesystems within reach
   runs when a process confines itself, and the process stays confined for the rest of its life. A
   network or FUSE filesystem mounted after that (by the operator, by a desktop session, a direct

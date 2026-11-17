@@ -261,7 +261,8 @@ to run guests while **any network or FUSE filesystem, or an automount map, is mo
 user can reach it** (NFS, SMB, sshfs, rclone, a desktop's gvfs, autofs `/net`, ...): Landlock
 cannot stop a path lookup, which would query that filesystem's server. Unmount it, or run the miner
 as a dedicated user (another user's FUSE mount without `allow_other` is closed to it) or in a
-container or mount namespace that leaves it out. The CPU risc0 worker's Docker Groth16 wrap runs in
+container or mount namespace that leaves it out. Confined workers also change no file's mode,
+owner, attributes or times. The CPU risc0 worker's Docker Groth16 wrap runs in
 a helper process that accepts only a strictly checked prover input, with the image pinned by digest
 and `--network none`. See [SECURITY.md](SECURITY.md#inline-workers-confined).
 
