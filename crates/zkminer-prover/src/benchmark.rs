@@ -646,6 +646,7 @@ pub const PO2_MIN: u8 = 18;
 pub const PO2_MAX: u8 = 24;
 
 /// Peak VRAM, in MiB, of a risc0 Groth16 proof on a CUDA card at each MEASURED segment size (po2).
+/// The largest is the last a card's free VRAM can cap it at (`find_optimal_gpu_po2`).
 ///
 /// 18 and 19: a 62M-cycle job on a 12,282 MiB RTX 4070 under Windows, driving no display, from
 /// `zkminer benchmark --calibrate` (2026-11-16): 4,709 MiB in 75 s and 8,179 MiB in 52 s, neither
@@ -694,9 +695,30 @@ pub fn estimate_gpu_po2_memory(po2: u8, backend: &str, gpu_tag: &str) -> u64 {
     estimate_po2_memory(po2, backend, true)
 }
 
-/// Sweep po2 from 18..=24 and find the largest that fits in the memory budget of a GPU of vendor
-/// `gpu_tag`, by [`estimate_gpu_po2_memory`]. Returns `(optimal_po2, memory_at_optimal)`.
+/// The largest po2 a GPU of vendor `gpu_tag` with `device_memory_bytes` is expected to hold, and
+/// that size's estimate: the cap on a card's sizes (`max_feasible_po2`) and on a calibration sweep.
+///
+/// risc0 on a CUDA card is capped only by a MEASURED size: the largest of
+/// [`RISC0_GPU_MEASURED_PEAK_MIB`] that fits 90% of the memory, and when even the largest measured
+/// size fits, no cap at all ([`PO2_MAX`]) — sizes past the measured ones are found by proving them,
+/// whose failure is what sets a card's ceiling, with a step of headroom (`sweep_po2`). An
+/// extrapolated figure never caps: a cap is no observed limit, so a sweep that stops at one keeps
+/// its top, and a 4090 capped at 21 by an extrapolation would then have proved jobs at 21, where
+/// a real one ran out of memory. Anything else: [`estimate_po2_memory`]'s guess, as before.
 pub fn find_optimal_gpu_po2(device_memory_bytes: u64, backend: &str, gpu_tag: &str) -> (u8, u64) {
+    if backend == "risc0" && gpu_tag == "cuda" {
+        let table = RISC0_GPU_MEASURED_PEAK_MIB;
+        let (largest, _) = table[table.len() - 1];
+        let (po2, _) = largest_po2_within(device_memory_bytes, |po2| {
+            if po2 <= largest {
+                risc0_gpu_peak(po2)
+            } else {
+                u64::MAX
+            }
+        });
+        let po2 = if po2 >= largest { PO2_MAX } else { po2 };
+        return (po2, risc0_gpu_peak(po2));
+    }
     largest_po2_within(device_memory_bytes, |po2| {
         estimate_gpu_po2_memory(po2, backend, gpu_tag)
     })
@@ -2588,10 +2610,11 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
 ///   "failed to run groth16 prove operation: cudaMallocAsync ... out of memory".
 /// The calibration sweep and a live job do not see the same memory state (fragmentation, buffer pools,
 /// a second worker on the card), so the very top of the measured range is marginal. Each po2 step
-/// doubles the segment, so backing off one step buys ~2x headroom. A sweep that ran clean to its top
-/// backs off too: that top is `RISC0_JOB_PO2_MAX`, past which no failure can be seen, or one set by
-/// what the card's free VRAM is estimated to hold, which is not an observed limit either. When no
-/// sample lies at or below the ceiling, the ceiling itself is proved too.
+/// doubles the segment, so backing off one step buys ~2x headroom. A sweep that ran clean to a top set
+/// by the card's memory needs no backoff (that top is a measured size with 10% to spare, see
+/// `find_optimal_gpu_po2`); one that reached `RISC0_JOB_PO2_MAX`, which no failure could show the
+/// card's limit at, does. When no sample lies at or below the ceiling, the ceiling itself is proved
+/// too.
 ///
 /// `prove(p)` proves the calibration workload at `p` and returns its sample.
 fn sweep_po2(
@@ -2606,6 +2629,7 @@ fn sweep_po2(
         }
     }
     let mut samples = Vec::new();
+    let mut failed = false;
     for po2 in start..=top {
         match prove(po2) {
             Some(s) => {
@@ -2615,7 +2639,10 @@ fn sweep_po2(
                     break;
                 }
             }
-            None => break,
+            None => {
+                failed = true;
+                break;
+            }
         }
     }
     if samples.is_empty() {
@@ -2629,12 +2656,14 @@ fn sweep_po2(
     let Some(highest) = samples.iter().map(|s| s.po2).max() else {
         return (Vec::new(), None);
     };
-    // One step of headroom, always. After a failure, below it; at the top of the range, because no
-    // failure above could be seen — and that top is either the job range's, which the prover refuses
-    // past, or one set by what the card's free VRAM is ESTIMATED to hold (a measured peak, or one
-    // extrapolated from them), never by an observed failure. A 4090 capped at 21 that way proved 21
-    // in calibration, and a real job at 21 then ran out of memory.
-    let ceiling = highest.saturating_sub(1);
+    // Reaching the job range's top proves nothing about headroom: the prover refuses anything larger,
+    // so no failure above it could be seen. A top set by the card's memory is a MEASURED size that fit
+    // with 10% to spare (`find_optimal_gpu_po2` never caps at an extrapolated one), so it keeps.
+    let ceiling = if failed || highest >= zkminer_prover_protocol::RISC0_JOB_PO2_MAX {
+        highest.saturating_sub(1)
+    } else {
+        highest
+    };
     if ceiling < RISC0_JOB_PO2_MIN {
         return (Vec::new(), None);
     }
@@ -3880,10 +3909,13 @@ mod tests {
         assert_eq!(find_optimal_po2(8 * 1024 * MIB, "risc0", true).0, 18);
         // An idle RTX 4070 (12,010 MiB free to us): 19, the size measured fastest there; 20 spilled.
         assert_eq!(find_optimal_po2(12_010 * MIB, "risc0", true).0, 19);
-        // An idle RTX 5080 (15,880): 20, measured at 12,436 MiB.
-        assert_eq!(find_optimal_po2(15_880 * MIB, "risc0", true).0, 20);
-        // An idle RTX 4090 (24,109): 21, which it proved; 22 failed there.
-        assert_eq!(find_optimal_po2(24_109 * MIB, "risc0", true).0, 21);
+        // An idle RTX 5080 (15,880) holds the largest measured size, 20 (12,436 MiB): uncapped.
+        assert_eq!(find_optimal_po2(15_880 * MIB, "risc0", true).0, PO2_MAX);
+        // Nor does a 5080 with a desktop on it (12 GiB free) reach 20.
+        assert_eq!(find_optimal_po2(12 * 1024 * MIB, "risc0", true).0, 19);
+        // An idle RTX 4090 (24,109): the largest measured size fits, so no cap — never one from an
+        // extrapolated figure, which a sweep would keep as its ceiling.
+        assert_eq!(find_optimal_po2(24_109 * MIB, "risc0", true).0, PO2_MAX);
         // Below the smallest size there is nothing smaller to offer.
         assert_eq!(find_optimal_po2(2 * 1024 * MIB, "risc0", true).0, PO2_MIN);
         // An AMD or Intel card keeps the old estimate, so its calibration still sweeps high: a 12 GB
@@ -4711,11 +4743,12 @@ mod tests {
 
     #[test]
     fn gpu_po2_is_sized_from_vram_not_hardcoded() {
-        // 32 GB card: budget 28.8 GiB, po2=21 needs 20.5 GiB → fits; 22 (37.1 GiB) does not.
+        // 32 GB card: the largest measured size fits, so nothing caps it; calibration finds its
+        // limit by proving.
         let big =
             build_gpu_device_benchmarks_from_workers(&[gpu_slot(Some(32 << 30))], &BTreeMap::new());
-        assert_eq!(big[0].optimal_po2, 21);
-        assert_eq!(big[0].max_feasible_po2, 21);
+        assert_eq!(big[0].optimal_po2, PO2_MAX);
+        assert_eq!(big[0].max_feasible_po2, PO2_MAX);
         assert!(
             big[0].memory_usage_bytes > 0,
             "memory must be derived, got {}",
@@ -5193,26 +5226,27 @@ mod tests {
         // Nothing in the job range with headroom: no size.
         assert_eq!(sweep(18, 22, Some(16)).1, None);
         assert_eq!(sweep(18, 22, None), (vec![], None, vec![18, 17, 16]));
-        // Clean to a top set by what the card's free VRAM is estimated to hold: one step back, as a
-        // 4090 capped at 21 that way proved 21 in calibration and then ran a real job out of memory...
+        // Clean to a top set by the card's memory (a measured size): no step back...
         assert_eq!(
             sweep(18, 20, Some(22)),
-            (vec![18, 19], Some(19), vec![18, 19, 20])
+            (vec![18, 19, 20], Some(20), vec![18, 19, 20])
         );
-        // ...and clean to the job range's top, beyond which the prover refuses: one.
+        // ...but clean to the job range's top, beyond which the prover refuses: one.
         assert_eq!(
             sweep(18, 22, Some(22)),
             (vec![18, 19, 20, 21, 22], Some(21), vec![18, 19, 20, 21, 22])
         );
-        // A sample at a smaller size than asked (free VRAM short) ends the sweep without a failure, at a
-        // size the estimate set: one step back from it too.
+        // A sample at a smaller size than asked (free VRAM short) ends the sweep without a failure.
         let mut asked = Vec::new();
         let (samples, ceiling) = sweep_po2(18, 22, |p| {
             asked.push(p);
             Some(sample(p.min(19), 4, 1e6))
         });
-        assert_eq!(samples.iter().map(|s| s.po2).collect::<Vec<_>>(), vec![18]);
-        assert_eq!((ceiling, asked), (Some(18), vec![18, 19, 20]));
+        assert_eq!(
+            samples.iter().map(|s| s.po2).collect::<Vec<_>>(),
+            vec![18, 19]
+        );
+        assert_eq!((ceiling, asked), (Some(19), vec![18, 19, 20]));
     }
 
     #[test]

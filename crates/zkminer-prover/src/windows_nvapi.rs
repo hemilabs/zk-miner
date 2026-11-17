@@ -71,8 +71,8 @@ impl std::fmt::Display for SysmemFallback {
     }
 }
 
-/// The policy in the global profile, and for each program asked about that has a profile of its
-/// own: what that program runs with (its profile's value if it sets one, else the global).
+/// The policy in the global profile, and for each program asked about, what that program runs
+/// with: its own profile's value if it has one that sets it, else the global.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SysmemFallbackPolicy {
     pub global: SysmemFallback,

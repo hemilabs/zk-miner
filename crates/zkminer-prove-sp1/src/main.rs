@@ -1909,8 +1909,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     }
     // Scale SP1's memory appetite to the machine it is actually on.
     //
-    // WHAT THIS DOES AND DOES NOT FIX. It does NOT lower `sp1-gpu-server`'s hard VRAM floor (16 GB in
-    // the fork this repo pins, 24 GB upstream — see `min_vram_bytes_for_backend` in the dispatcher):
+    // WHAT THIS DOES AND DOES NOT FIX. It does NOT lower `sp1-gpu-server`'s hard VRAM floor (more than
+    // 11 GiB in the fork this repo pins, 24 GB upstream — see `min_vram_bytes_for_backend`):
     // that is a tier check on the device, made before any proving option exists, and
     // `SP1CoreOpts` never even crosses into the server crate. A card below the floor is refused
     // whatever we set, which is why the dispatcher declines to create a slot there at all.

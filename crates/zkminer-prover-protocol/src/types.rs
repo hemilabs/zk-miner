@@ -848,7 +848,8 @@ pub const CUDA_VRAM_AVAILABLE_BYTES_ENV: &str = "ZKMINER_CUDA_VRAM_AVAILABLE_BYT
 /// MiB, as `nvidia-smi` reports it.
 const MIB: u64 = 1024 * 1024;
 
-/// Measured `(element threshold, peak VRAM)` for SP1 on a card of MORE than 16 GiB, largest first.
+/// Measured `(element threshold, peak VRAM)` for SP1 on a card of MORE than 16 GiB, largest first,
+/// and the table for any card whose total is not given: an AMD or Intel card, or an unknown total.
 ///
 /// Both figures measured on this box with a 1,912,954,963-cycle `sha256-chain` proof
 /// through to a compact Groth16 seal: 17,766 MiB of a 24,564 MiB RTX 4090 at the 268M threshold, and
@@ -2092,11 +2093,11 @@ mod tests {
             .to_string()
         };
         let msgs = [
-            // 0: a desktop on the 4090 (24,564 less 455 reserved and 2,444 held).
+            // 0: a display holding 2,444 MiB of a 4090 (24,564 less 455 reserved).
             gpu("sp1:cuda:1", 2444, 0, 21665, Some(18278), 24564, false),
             // 1: our risc0 worker on the 5080 was busy (2 MiB of driver bookkeeping is not "foreign").
             gpu("sp1:cuda:0", 2, 1806, 14072, Some(15604), 16303, true),
-            // 2: both a desktop and a busy sibling.
+            // 2: both a display and a busy sibling.
             gpu("sp1:cuda:1", 2444, 7134, 14531, Some(15604), 24564, true),
             // 3: risc0, whose requirement is unmeasured, behind an idle SP1 arena.
             gpu("risc0:cuda:0", 2, 15124, 754, None, 16303, true),

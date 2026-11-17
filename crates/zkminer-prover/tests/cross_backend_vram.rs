@@ -17,7 +17,7 @@
 //! still held at least 1 GiB of its own — so a run where nothing needed recycling cannot pass
 //! vacuously.
 //!
-//! A card with more room than that is first made to look like a 16 GB one: a separate process, not
+//! A card with more room than that is first held to SP1's floor plus 1.5 GiB: a separate process, not
 //! ours, holds device memory until what is allocatable is SP1's floor plus 1.5 GiB (or
 //! `ZKMINER_TEST_VRAM_TARGET_MIB`), whatever else the card already carries. To the miner it is
 //! foreign, like a display or another program, so nothing can reclaim it; on a 32 GB card the idle risc0
@@ -220,8 +220,6 @@ fn risc0_and_sp1_alternate_on_one_card() {
     }
 }
 
-/// What the card has free to allocate, in MiB: its capacity less the driver's reservation and
-/// everything in use.
 /// The card's `memory.total`, in MiB.
 fn card_total_mib(card: &str) -> Option<u64> {
     let out = std::process::Command::new("nvidia-smi")
@@ -236,6 +234,8 @@ fn card_total_mib(card: &str) -> Option<u64> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
+/// What the card has free to allocate, in MiB: its capacity less the driver's reservation and
+/// everything in use.
 fn allocatable_mib(card: &str) -> Option<u64> {
     let out = std::process::Command::new("nvidia-smi")
         .args([
