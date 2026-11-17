@@ -49,10 +49,14 @@ pub(crate) fn claims_held_reason(held_locks_only: bool, paused: bool, risc0_off:
     }
 }
 
+/// The longest single set-aside: a verdict that lasts longer (a post-lock verdict lasts until its
+/// job is terminal) sets its job aside again when this one ends.
+pub(crate) const MAX_SET_ASIDE: Duration = Duration::from_secs(24 * 3600);
+
 /// The set-aside for a job whose verdict holds until `until` (unix seconds) at `now`: the rest of
-/// the verdict.
+/// the verdict, at most [`MAX_SET_ASIDE`] (an `Instant` cannot hold "until the job is terminal").
 pub(crate) fn verdict_set_aside(until: u64, now: u64) -> Duration {
-    Duration::from_secs(until.saturating_sub(now))
+    Duration::from_secs(until.saturating_sub(now)).min(MAX_SET_ASIDE)
 }
 
 // ── verdicts (§15.2, §16) ─────────────────────────────────────────────────────
@@ -120,6 +124,28 @@ pub(crate) fn verdict_plan(reason: SkipReason, prior_attempts: u8, jitter: f64) 
             final_verdict: false,
         },
     }
+}
+
+/// The `expires_at` of a verdict that lasts until its job is terminal on chain: a post-lock verdict.
+/// An Open job never expires on chain (only a fulfil, a cancel or the reopen limit end it), so a TTL
+/// would lapse while the job can still be locked again. Never dropped by expiry; the store pass drops
+/// it once an authoritative read shows the job terminal (with the job's bundles).
+pub(crate) const VERDICT_UNTIL_TERMINAL: u64 = u64::MAX;
+
+/// When a verdict of `reason` recorded at `now` under a plan of `ttl_secs` expires: a post-lock
+/// verdict lasts until its job is terminal, every other one its plan's TTL.
+pub(crate) fn verdict_expires_at(reason: SkipReason, ttl_secs: u64, now: u64) -> u64 {
+    if reason == SkipReason::PostLockFailure {
+        VERDICT_UNTIL_TERMINAL
+    } else {
+        now.saturating_add(ttl_secs)
+    }
+}
+
+/// Whether a stored verdict record is a job's post-lock verdict, which lasts until the job is
+/// terminal (the post-lock tallies share its reason, never its expiry).
+pub(crate) fn lasts_until_terminal(reason: SkipReason, expires_at: u64) -> bool {
+    reason == SkipReason::PostLockFailure && expires_at == VERDICT_UNTIL_TERMINAL
 }
 
 /// The `expires_at` at or below which a persisted verdict is deleted, at `now`: only verdicts expired
@@ -493,8 +519,10 @@ impl Blame {
 /// Post-lock witness failures of one caller (within [`POST_LOCK_TALLY_TTL_SECS`] of the latest)
 /// from which its witness jobs are no longer admitted.
 pub(crate) const POST_LOCK_CALLER_LIMIT: u8 = 3;
-/// Post-lock witness failures of one class on one device from which the device proves no witness
-/// lock (§16: "a device with ≥ 2 is quarantined").
+/// Distinct callers with a post-lock witness failure of one class on one device from which the
+/// device takes no new witness lock (§16: "a device with ≥ 2 is quarantined"): one caller whose guest
+/// reliably fails could otherwise quarantine a one-card host by itself, and every other caller's
+/// jobs with it.
 pub(crate) const POST_LOCK_DEVICE_LIMIT: u8 = 2;
 /// How long a post-lock tally lasts after its latest failure.
 pub(crate) const POST_LOCK_TALLY_TTL_SECS: u64 = 7 * 24 * 3600;
@@ -509,6 +537,43 @@ pub(crate) fn caller_tally_key(caller: Address) -> B256 {
 /// the card (its PCI bus id, or the slot), never anything a job supplies.
 pub(crate) fn device_tally_key(device: &str, class: PostLockFailureClass) -> B256 {
     keccak256([b"zkminer/witness/post-lock/device/v1".as_slice(), device.as_bytes(), &[class as u8]].concat())
+}
+
+/// The store key recording that `caller` had a post-lock failure of `class` on `device`: the device
+/// tally counts a caller once ([`device_tally_after`]).
+pub(crate) fn device_caller_tally_key(device: &str, class: PostLockFailureClass, caller: Address) -> B256 {
+    keccak256(
+        [b"zkminer/witness/post-lock/device-caller/v1".as_slice(), caller.as_slice(), &[class as u8], device.as_bytes()]
+            .concat(),
+    )
+}
+
+/// A device tally (distinct callers with a failure of its class) after one more failure: one more
+/// only for a caller not counted yet (`caller_counted`: its [`device_caller_tally_key`] record lasts).
+pub(crate) fn device_tally_after(prior: u8, caller_counted: bool) -> u8 {
+    if caller_counted {
+        prior
+    } else {
+        prior.saturating_add(1)
+    }
+}
+
+/// The cards (slot, its job po2) a held witness lock is proven on, each at its size
+/// ([`witness_prove_sizes`]): the cards not `quarantined` when any of them proves it, else every
+/// card. The quarantine applies to new locks only (§16): a lock held when its device was quarantined
+/// keeps proving there rather than wait out its window for a card it will never get.
+pub(crate) fn held_lock_prove_sizes(
+    cards: &[(String, u8)],
+    quarantined: &std::collections::HashSet<String>,
+    executed: &[u32],
+) -> HashMap<String, u8> {
+    let healthy: Vec<(String, u8)> = cards.iter().filter(|(s, _)| !quarantined.contains(s)).cloned().collect();
+    let sizes = witness_prove_sizes(&healthy, executed);
+    if sizes.is_empty() {
+        witness_prove_sizes(cards, executed)
+    } else {
+        sizes
+    }
 }
 
 /// Every post-lock failure class, for the quarantine check.
@@ -907,6 +972,69 @@ mod tests {
             assert!(p.final_verdict);
             assert!(p.ttl_secs >= 7 * 24 * 3600 + 3600, "outlives the window and the cooldown");
         }
+    }
+
+    /// An Open job never expires on chain, so the 8-day post-lock verdict lapsed and the job could
+    /// be locked again. It now lasts until the job is terminal (the store pass drops it then), and
+    /// its set-aside stays representable as an `Instant`.
+    #[test]
+    fn a_post_lock_verdict_lasts_until_the_job_is_terminal() {
+        let now = 1_800_000_000u64;
+        let p = verdict_plan(PostLockFailure, 0, 0.5);
+        let at = verdict_expires_at(PostLockFailure, p.ttl_secs, now);
+        assert_eq!(at, VERDICT_UNTIL_TERMINAL);
+        assert!(lasts_until_terminal(PostLockFailure, at));
+        assert!(at > verdict_drop_cutoff(u64::MAX - 1), "never dropped by expiry");
+        // A tally shares the reason, never the expiry.
+        assert!(!lasts_until_terminal(PostLockFailure, now + POST_LOCK_TALLY_TTL_SECS));
+        assert_eq!(verdict_expires_at(HostInternal, 30, now), now + 30);
+        assert!(!lasts_until_terminal(HostInternal, VERDICT_UNTIL_TERMINAL));
+        // The set-aside is capped (an Instant plus u64::MAX seconds panics).
+        assert_eq!(verdict_set_aside(at, now), MAX_SET_ASIDE);
+        let _ = std::time::Instant::now() + verdict_set_aside(at, now);
+        assert_eq!(verdict_set_aside(now + 60, now), Duration::from_secs(60));
+    }
+
+    /// One caller whose guest reliably fails during proving quarantined a one-card host for 7 days
+    /// by itself (two failures of a class). The device tally now counts distinct callers.
+    #[test]
+    fn a_device_is_quarantined_by_two_callers_not_one() {
+        let (a, b) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let mut device = 0u8;
+        let mut counted: std::collections::HashSet<Address> = Default::default();
+        for caller in [a, a, a] {
+            device = device_tally_after(device, !counted.insert(caller));
+        }
+        assert_eq!(device, 1);
+        assert!(device < POST_LOCK_DEVICE_LIMIT, "one caller never quarantines a device");
+        device = device_tally_after(device, !counted.insert(b));
+        assert!(device >= POST_LOCK_DEVICE_LIMIT, "a second caller does");
+        let gpu = PostLockFailureClass::Gpu;
+        assert_ne!(device_caller_tally_key("0000:01:00.0", gpu, a), device_caller_tally_key("0000:01:00.0", gpu, b));
+        assert_ne!(device_caller_tally_key("0000:01:00.0", gpu, a), device_tally_key("0000:01:00.0", gpu));
+        assert_ne!(
+            device_caller_tally_key("0000:01:00.0", gpu, a),
+            device_caller_tally_key("0000:01:00.0", PostLockFailureClass::ProverCrash, a)
+        );
+        assert_eq!(device_tally_after(u8::MAX, false), u8::MAX);
+    }
+
+    /// The quarantine applies to new locks: a lock held on a host whose only card was quarantined
+    /// (by another lock's failures) waited out its window and was released at a penalty. It now
+    /// prefers the cards not quarantined and keeps proving on a quarantined one otherwise.
+    #[test]
+    fn a_held_lock_keeps_proving_on_a_quarantined_card() {
+        let one = vec![("gpu0".to_string(), 20u8)];
+        let q: std::collections::HashSet<String> = ["gpu0".to_string()].into();
+        assert_eq!(held_lock_prove_sizes(&one, &q, &[20]).get("gpu0"), Some(&20));
+        assert_eq!(held_lock_prove_sizes(&one, &Default::default(), &[20]).get("gpu0"), Some(&20));
+        let two = vec![("gpu0".to_string(), 20u8), ("gpu1".to_string(), 20u8)];
+        let sizes = held_lock_prove_sizes(&two, &q, &[20]);
+        assert_eq!(sizes.keys().collect::<Vec<_>>(), vec!["gpu1"], "a healthy card first");
+        // Only the quarantined card executes the bundle's po2 that fits: it proves there.
+        let mixed = vec![("gpu0".to_string(), 20u8), ("gpu1".to_string(), 16u8)];
+        assert_eq!(held_lock_prove_sizes(&mixed, &q, &[20]).keys().collect::<Vec<_>>(), vec!["gpu0"]);
+        assert!(held_lock_prove_sizes(&mixed, &q, &[21]).is_empty(), "never at an unexecuted size");
     }
 
     #[test]
