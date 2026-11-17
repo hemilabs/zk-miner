@@ -411,11 +411,14 @@ mod tests {
     }
 
     proptest! {
-        /// Anything accepted re-encodes to the same bytes, and agrees with alloy-rlp.
+        /// Anything accepted all the way down re-encodes to the same bytes, and agrees with
+        /// alloy-rlp. (`decode_exact` checks a list's own framing; its items are decoded when they
+        /// are read, and an item that does not decode is an error then.)
         #[test]
         fn decode_then_encode_is_identity(bytes in proptest::collection::vec(any::<u8>(), 0..200)) {
-            if let Ok(item) = decode_exact(&bytes) {
-                prop_assert_eq!(reencode(&item), bytes.clone());
+            if let Some(again) = decode_exact(&bytes).ok().as_ref().and_then(reencode) {
+                prop_assert_eq!(again, bytes.clone());
+                let item = decode_exact(&bytes).unwrap();
                 if !item.is_list() {
                     let mut buf = &bytes[..];
                     let a = alloy_primitives::Bytes::decode(&mut buf);
@@ -445,17 +448,29 @@ mod tests {
         }
     }
 
-    fn reencode(item: &Item<'_>) -> Vec<u8> {
+    /// The canonical encoding of `item`, or `None` if an item inside it does not decode.
+    fn reencode(item: &Item<'_>) -> Option<Vec<u8>> {
         let mut out = Vec::new();
         if item.is_list() {
             let mut payload = Vec::new();
-            for i in item.to_vec().unwrap() {
-                payload.extend(reencode(&i));
+            for i in item.to_vec().ok()? {
+                payload.extend(reencode(&i)?);
             }
             encode_list(&mut out, &payload);
         } else {
-            encode_bytes(&mut out, item.bytes().unwrap());
+            encode_bytes(&mut out, item.bytes().ok()?);
         }
-        out
+        Some(out)
+    }
+
+    #[test]
+    fn a_list_framing_is_checked_first_and_its_items_when_read() {
+        // 27 bytes of payload: 26 one-byte strings, then a string header with no byte after it.
+        let mut bytes = vec![0xdb];
+        bytes.extend([0u8; 26]);
+        bytes.push(0x81);
+        let item = decode_exact(&bytes).unwrap();
+        assert_eq!(item.to_vec().err(), Some(RlpError::Truncated));
+        assert_eq!(item.items::<27>().err(), Some(RlpError::Truncated));
     }
 }
