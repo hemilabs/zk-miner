@@ -116,6 +116,10 @@ zkminer-config = { path = "crates/zkminer-config" }
 zkminer-witness = { path = "crates/zkminer-witness" }
 zkminer-witness-store = { path = "crates/zkminer-witness-store" }
 zkminer-witness-sandbox = { path = "crates/zkminer-witness-sandbox" }
+# The reference guest library and plan §12's statement (no_std; also built by risc0 guests and wasm32
+# builders in workspaces of their own, which name them by path).
+hemiprove-eth-prelude = { path = "reference/eth-prelude" }
+hemiprove-proxy-slots = { path = "reference/proxy-slots/statement" }
 
 # Patch risc0 crates to use hemilabs fork (AMD + NVIDIA GPU support)
 #
