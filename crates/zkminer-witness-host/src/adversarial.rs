@@ -334,7 +334,10 @@ pub fn generic_mutations(w: &[u8], seed: u64, flips: usize) -> Vec<Mutation> {
     };
     let mut rng = SplitMix::new(seed);
     if !w.is_empty() {
-        let mut offsets: Vec<usize> = vec![0, w.len() - 1];
+        let mut offsets: Vec<usize> = vec![0];
+        if w.len() > 1 {
+            offsets.push(w.len() - 1);
+        }
         let mut tries = 0;
         while offsets.len() < flips.min(w.len()) && tries < 16 * flips {
             let o = rng.below(w.len());
@@ -673,6 +676,9 @@ mod tests {
         assert!(a.iter().any(|m| m.id == "truncate@0") && a.iter().any(|m| m.id == "truncate@199"));
         assert!(a.iter().any(|m| m.id == "append:32x00" && m.w.len() == 232));
         assert_ne!(generic_mutations(&w, 8, 16), a, "another seed samples other offsets");
+        // A one-byte W: one flip, never two of the same byte.
+        let one = generic_mutations(&[9], 3, 16);
+        assert_eq!(one.iter().filter(|m| m.kind == "flip").count(), 1);
         // An empty W: only the appends.
         let e = generic_mutations(&[], 1, 16);
         assert_eq!(e.iter().map(|m| m.kind.as_str()).collect::<Vec<_>>(), ["append", "append", "append"]);
