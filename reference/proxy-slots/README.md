@@ -7,7 +7,7 @@
 |---|---|
 | `statement/` | `hemiprove-proxy-slots`: the statement as one function, `run(input) -> journal`, plus the requester's helpers. `no_std`; shared by the guest, the builder and tooling. |
 | `guest/` | the risc0 guest: reads its input, runs the statement, commits the journal with one `commit_slice` or panics. Its own workspace and lockfile, like every guest in this repository, on risc0-zkvm 3.1.0 (see "The risc0 version"). |
-| `methods/` | builds the guests with risc0-build; the executor, end-to-end, lint, keccak-batch and `simulate --adversarial` tests. |
+| `methods/` | builds the guests with risc0-build; the executor, end-to-end, lint, keccak-batch and `simulate --adversarial` tests; `examples/export-guest.rs` writes a guest's program binary and prints its image id. |
 | `lint-control/` | a guest that does everything the lints forbid, so the lint checks are shown to catch it. Never deployed. |
 | `hostdep/` | a test guest whose journal depends on host inputs (`sys_rand`, the keccak po2) or echoes `W`, for `simulate --adversarial`'s tests, and runs keccak through the batcher. Never deployed. |
 | `keccak-3-0/` | a control still on risc0-zkvm 3.0.5, which the miner must refuse (see "The risc0 version"). Never deployed. |
@@ -144,6 +144,10 @@ systemd-run --user --scope -q -p Delegate=yes -- env ZKMINER_SANDBOX_TESTS_REQUI
 cargo test -p hemiprove-proxy-slots-methods --test keccak_batches
 cargo test -p hemiprove-proxy-slots-methods --test keccak_batches -- --ignored --test-threads=1
 ```
+
+On the miner, claimed and proven, on a local fork of 743111 with a second anvil as the `evm-rpc`
+chain: `serves_the_proxy_slots_witness_job` (CPU) and `serves_the_proxy_slots_witness_job_on_a_gpu`
+in `crates/zkminer-cli/tests/localnet.rs` (see its witness section).
 
 Cycles on the risc0 3.1 executor (padded to segments of 2^20): Ethereum (k = 3, `W` 17 KB) 3.1 M,
 Base (k = 6, `W` 26 KB) 4.7 M, Hemi (k = 6, `W` 18 KB) 3.2 M, anvil (`W` 3 KB) 1.0 M; about 180

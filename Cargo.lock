@@ -10595,6 +10595,7 @@ dependencies = [
  "clap",
  "ctr",
  "dirs 6.0.0",
+ "hemiprove-proxy-slots",
  "hex",
  "hmac",
  "libc",
