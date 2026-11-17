@@ -3738,6 +3738,54 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hemiprove-eth-prelude"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
+ "hex",
+ "proptest",
+ "serde_json",
+ "tiny-keccak",
+]
+
+[[package]]
+name = "hemiprove-proxy-slots"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-trie",
+ "hemiprove-eth-prelude",
+ "hex",
+ "serde_json",
+]
+
+[[package]]
+name = "hemiprove-proxy-slots-methods"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "hemiprove-eth-prelude",
+ "hemiprove-proxy-slots",
+ "hex",
+ "risc0-binfmt",
+ "risc0-build",
+ "risc0-zkvm",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zkminer-config",
+ "zkminer-netguard",
+ "zkminer-witness",
+ "zkminer-witness-broker",
+ "zkminer-witness-host",
+ "zkminer-witness-sandbox",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

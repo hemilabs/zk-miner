@@ -26,7 +26,10 @@
 use core::fmt;
 
 pub mod context;
+#[cfg(feature = "eth")]
+pub mod eth;
 pub mod json;
+pub mod rpc;
 pub mod sys;
 
 pub use context::{Capability, Context, DecodeError, EvmRpcConfig, Limits};

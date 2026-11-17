@@ -1,0 +1,27 @@
+# Host inputs a guest must never let reach its journal or a selection (plan §8.2, §21.1 item 4):
+# randomness (sys_rand, getrandom, and the standard hash maps it seeds), cycle counts, the
+# environment and arguments, and early exits. `../check-guest-lints.sh` runs clippy with them denied
+# (for the zkVM target, with the risc0 toolchain); `methods/tests/guest_lints.rs` checks the sources
+# of everything the guest links from this repository and the call graph of the built ELF as well.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order seeded by sys_rand; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order seeded by sys_rand; use BTreeSet" },
+    { path = "std::hash::RandomState", reason = "seeded by sys_rand" },
+    { path = "std::collections::hash_map::RandomState", reason = "seeded by sys_rand" },
+]
+disallowed-methods = [
+    { path = "risc0_zkvm::guest::env::exit", reason = "a guest ends only by returning from main after finish()" },
+    { path = "risc0_zkvm::guest::env::pause", reason = "a guest ends only by returning from main after finish()" },
+    { path = "risc0_zkvm::guest::env::cycle_count", reason = "the prover chooses the segment size; never bound work by cycles" },
+    { path = "risc0_zkvm_platform::syscall::sys_cycle_count", reason = "the prover chooses the segment size" },
+    { path = "risc0_zkvm_platform::syscall::sys_rand", reason = "the prover's host answers it" },
+    { path = "risc0_zkvm_platform::syscall::sys_getenv", reason = "the prover's host answers it" },
+    { path = "risc0_zkvm_platform::syscall::sys_argv", reason = "the prover's host answers it" },
+    { path = "risc0_zkvm_platform::syscall::sys_argc", reason = "the prover's host answers it" },
+    { path = "std::env::var", reason = "the prover's host answers it" },
+    { path = "std::env::var_os", reason = "the prover's host answers it" },
+    { path = "std::env::args", reason = "the prover's host answers it" },
+    { path = "std::process::exit", reason = "a guest ends only by returning from main after finish()" },
+    { path = "getrandom::getrandom", reason = "the prover's host answers it", allow-invalid = true },
+    { path = "getrandom::fill", reason = "the prover's host answers it", allow-invalid = true },
+]

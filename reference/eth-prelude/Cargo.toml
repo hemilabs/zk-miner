@@ -1,0 +1,29 @@
+[package]
+name = "hemiprove-eth-prelude"
+description = "Reference guest library for HemiProve eth-block witness jobs (scheme 1): strict RLP, headers, Merkle-Patricia proofs, accounts, storage, receipts, transactions, the Pinned/Authenticated guards and the scheme-1 witness format"
+# Explicit, not inherited from the zkminer workspace: risc0 guests and wasm32 builders in workspaces
+# of their own depend on this crate by path, and a requester may vendor it.
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[features]
+# Host-only conveniences (std::error::Error impls). Guests and builders build without it.
+std = []
+
+# One dependency, no_std: everything else (RLP, the trie walk, the codecs) is in this crate, so an
+# audit covers it whole.
+[dependencies]
+tiny-keccak = { version = "2", default-features = false, features = ["keccak"] }
+
+# Independent implementations to cross-check against, on the host only.
+[dev-dependencies]
+alloy-primitives = { version = "1", features = ["rlp"] }
+alloy-rlp = "0.3"
+alloy-trie = "0.9"
+alloy-consensus = "1"
+alloy-eips = "1"
+proptest = "1"
+serde_json = "1"
+hex = "0.4"
