@@ -45,8 +45,8 @@ use zkminer_witness_broker::client::ArtifactCharge;
 use zkminer_witness_host::abort::{AbortReason, AbortToken};
 use zkminer_witness_host::broker_proc::BrokerProcess;
 use zkminer_witness_host::pipeline::{
-    descriptor_hash_of_abi, eviction_by_age, key_fingerprint, simulate_witness_job, ArtifactOrigin, HookFuture,
-    HostContext, ImageIdFn, JobInput, PipelineHooks, Simulated, Skip, Step,
+    descriptor_hash_of_abi, eviction_by_age, execute_worker_build, key_fingerprint, simulate_witness_job,
+    ArtifactOrigin, HookFuture, HostContext, ImageIdFn, JobInput, PipelineHooks, Simulated, Skip, Step,
 };
 use zkminer_witness_host::spawner::Spawner;
 use zkminer_witness_sandbox::{delegated_root, landlock_abi, SandboxError, MIN_LANDLOCK_ABI};
@@ -423,6 +423,9 @@ impl Env {
 
         let known = elf.clone();
         let image_id_fn: ImageIdFn = Arc::new(move |b: &[u8]| (b == known.as_slice()).then_some(image_id));
+        // The execute worker's build, from its handshake before any guest ran in it, as the runtime
+        // asks when serving starts.
+        let execute_build = execute_worker_build(&bins.worker, &root, Duration::from_secs(60)).await.unwrap();
         let ctx = HostContext {
             spawner,
             broker: broker.client.clone(),
@@ -435,6 +438,7 @@ impl Env {
             keccak_po2: 17,
             sys_rand_key: KEY,
             worker_builds: vec!["test-worker-build".into()],
+            execute_build,
             execute_memory_bytes: 512 << 20,
             execute_timeout: Duration::from_secs(120),
             max_artifact_bytes: 4 << 20,
@@ -621,8 +625,10 @@ fn a_full_binding_job_publishes_a_bundle_the_store_reads_back_verified() {
         assert_eq!((b.prover, b.caller, b.builder_id), (env.prover, Address::repeat_byte(0xca), env.echo_id));
         assert_eq!((b.image_id, b.keccak_po2, b.submit_tx_hash), (env.image_id(), 17, B256::repeat_byte(0x7c)));
         assert_eq!(b.sys_rand_key_fingerprint, key_fingerprint(&KEY));
-        // The prove workers' builds and the execute worker's own, as its response named it.
+        // The prove workers' builds and the execute worker's own, as its handshake named it (and its
+        // response agreed).
         assert!(sim.execute_build.starts_with("risc0/risc0-zkvm "), "{}", sim.execute_build);
+        assert_eq!(sim.execute_build, env.ctx.execute_build);
         let mut want = vec!["test-worker-build".to_string(), sim.execute_build.clone()];
         want.sort();
         assert_eq!(b.worker_builds, want);
@@ -648,6 +654,24 @@ fn a_full_binding_job_publishes_a_bundle_the_store_reads_back_verified() {
         assert_eq!(hooks.charges().len(), 1);
         assert!(again.bundle.version > sim.bundle.version);
         assert_eq!(again.journal, journal);
+        assert!(env.leftover_sandboxes().is_empty(), "{:?}", env.leftover_sandboxes());
+    })
+}
+
+/// The bundle records the execute worker's build from its handshake, made before any guest ran in it,
+/// never what the process that ran the requester's guest says of itself: a response naming another
+/// build (here, a handshake recorded for another binary) skips the job and publishes nothing.
+#[test]
+fn a_response_naming_another_build_than_the_handshake_publishes_nothing() {
+    serial(|| async {
+        let Some(mut env) = Env::start("build").await else { return };
+        env.ctx.execute_build = "risc0/risc0-zkvm 0.0.0/0.0.0".into();
+        let spec = env.full(1000);
+        let (d, r) = env.run(&spec, &Hooks::new()).await;
+        let (reason, step, detail) = verdict(&r);
+        assert_eq!((reason, step), (SkipReason::HostInternal, Step::Execute), "{detail}");
+        assert!(detail.contains("handshake"), "{detail}");
+        env.assert_no_bundle(&spec, &d);
         assert!(env.leftover_sandboxes().is_empty(), "{:?}", env.leftover_sandboxes());
     })
 }

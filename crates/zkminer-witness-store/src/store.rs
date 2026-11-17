@@ -1,7 +1,7 @@
 //! The store: init and open (filesystem, mount, lock, identity, `tmp/` cleanup, usage), the
 //! in-memory index, quota admission, poisoning, bundle reads and the recovery scan.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
@@ -292,8 +292,29 @@ pub(crate) enum PinState {
     /// A readable pin: read back from disk at open or a scan, or (`durable_here`) written and
     /// fsynced by this `Store`. Only the latter lets an identical `pin` return without writing.
     Readable { rec: PinRecord, durable_here: bool },
-    /// The file does not parse, or a write or removal of it failed: protects every version.
-    Unknown,
+    /// The file does not parse, or a write or removal of it failed: protects every version. `last`
+    /// is the pin that was readable before a failed write or removal (`None` for a file that does
+    /// not parse): what a crash leaves on disk is it or the new one, both naming published versions,
+    /// so it stays readable ([`PinState::readable`]) and a held lock is still proven from its
+    /// version, a poisoned store included.
+    Unknown { last: Option<PinRecord> },
+}
+
+impl PinState {
+    /// The pin reads go through: a readable one, or the last readable one of a key whose later write
+    /// or removal failed.
+    pub(crate) fn readable(&self) -> Option<&PinRecord> {
+        match self {
+            PinState::Readable { rec, .. } => Some(rec),
+            PinState::Unknown { last } => last.as_ref(),
+        }
+    }
+
+    /// The state after a write or removal of this pin failed: unknown, keeping the pin that was
+    /// readable.
+    pub(crate) fn after_failure(prior: Option<&PinState>) -> PinState {
+        PinState::Unknown { last: prior.and_then(PinState::readable).cloned() }
+    }
 }
 
 #[derive(Default)]
@@ -316,6 +337,8 @@ pub(crate) struct State {
     pub next_version: u32,
     pub scan_complete: bool,
     pub anomalies: Vec<Anomaly>,
+    /// Jobs whose versions eviction leaves alone, whatever their pins ([`Store::spare_jobs`]).
+    pub spared: HashSet<B256>,
 }
 
 impl State {
@@ -327,22 +350,16 @@ impl State {
         match self.pins.get(k) {
             None => PinStatus::Unpinned,
             Some(PinState::Readable { rec, .. }) => PinStatus::Pinned { version: rec.bundle_version },
-            Some(PinState::Unknown) => PinStatus::Unreadable,
+            Some(PinState::Unknown { .. }) => PinStatus::Unreadable,
         }
     }
 
     pub(crate) fn readable_pins(&self) -> Vec<PinRecord> {
-        self.pins
-            .values()
-            .filter_map(|p| match p {
-                PinState::Readable { rec, .. } => Some(rec.clone()),
-                PinState::Unknown => None,
-            })
-            .collect()
+        self.pins.values().filter_map(|p| p.readable().cloned()).collect()
     }
 
     pub(crate) fn unknown_pins(&self) -> Vec<BundleKey> {
-        self.pins.iter().filter(|(_, p)| **p == PinState::Unknown).map(|(k, _)| *k).collect()
+        self.pins.iter().filter(|(_, p)| matches!(p, PinState::Unknown { .. })).map(|(k, _)| *k).collect()
     }
 
     pub(crate) fn key_versions(&self, k: &BundleKey) -> impl DoubleEndedIterator<Item = (&BundleRef, &VersionInfo)> {
@@ -481,17 +498,20 @@ impl Inner {
     }
 
     /// A read of version `r` may go ahead: as [`Inner::check_usable`], except that a poisoned store
-    /// still serves the version a readable pin names. Poisoning means the store no longer knows the
-    /// disk holds what it promised; a read of a pinned version re-checks every byte it returns
-    /// (`bundle.json` against the pin, `W` against the record, the ELF against its digest or image
-    /// id), so what it hands out is what was published, and a held lock is proven from it instead of
-    /// waiting for a restart.
+    /// still serves the version a readable pin names (or the last readable pin of a key whose re-pin
+    /// failed, which is what poisoned it). Poisoning means the store no longer knows the disk holds
+    /// what it promised; a read of a pinned version re-checks every byte it returns (`bundle.json`
+    /// against the pin, `W` against the record, the ELF against its digest or image id), so what it
+    /// hands out is what was published, and a held lock is proven from it instead of waiting for a
+    /// restart.
     pub(crate) fn check_readable(&self, r: &BundleRef) -> Result<(), StoreError> {
         if self.is_poisoned() {
-            let pinned = matches!(
-                self.state().pins.get(&r.key()),
-                Some(PinState::Readable { rec, .. }) if rec.bundle_version == r.version
-            );
+            let pinned = self
+                .state()
+                .pins
+                .get(&r.key())
+                .and_then(PinState::readable)
+                .is_some_and(|rec| rec.bundle_version == r.version);
             if !pinned {
                 return Err(StoreError::unavailable(UnavailableKind::Poisoned, &self.root));
             }
@@ -648,7 +668,7 @@ impl Inner {
         json_sha256: B256,
         path: &Path,
     ) -> Result<(), StoreError> {
-        if let Some(PinState::Readable { rec, .. }) = pins.get(&r.key()) {
+        if let Some(rec) = pins.get(&r.key()).and_then(PinState::readable) {
             if rec.bundle_version == r.version
                 && (rec.input_sha256 != b.input_sha256 || rec.bundle_json_sha256 != json_sha256)
             {
@@ -951,7 +971,7 @@ impl Inner {
                 Some(rec) => PinState::Readable { rec, durable_here: false },
                 None => {
                     l.anomalies.push(Anomaly { path: p, kind: AnomalyKind::UnreadablePin });
-                    PinState::Unknown
+                    PinState::Unknown { last: None }
                 }
             };
             l.pins.insert(key, state);

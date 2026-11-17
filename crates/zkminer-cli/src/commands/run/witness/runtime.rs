@@ -29,10 +29,12 @@
 //!   **terminal cleanup** (unpin, delete).
 //! - **Recovery**: the store's pins are the index of witness locks; a periodic pass re-drives the
 //!   held ones from their bundles, unpins locks that provably ended (a terminal read, a risen reopen
-//!   count, a read at or after the lock block showing another prover, or a claim that never landed
-//!   by chain time), deletes bundles of terminal jobs, and, once a full pass has completed and the
-//!   brain's first complete recovery pass has handed every witness lock over and each is pinned,
-//!   enables eviction. A lock with no readable pin is found by the brain's chain scan and re-pinned
+//!   count, a read at or after the lock block showing another prover, or a claim that never landed:
+//!   a read from a block mined past the claim-intent age since the pin), deletes bundles of terminal
+//!   jobs, and, once a full pass has completed and the
+//!   brain's first recovery pass with a complete chain scan has handed over every witness lock it
+//!   decided and each is pinned, enables eviction (sparing the bundles of the jobs that pass left
+//!   undecided). A lock with no readable pin is found by the brain's chain scan and re-pinned
 //!   from the store's latest version for it.
 //! - **Post-lock failures** (§16): a lock released after it failed records a final verdict for its
 //!   job, a tally for its caller (admission stops at a limit) and one for the device and failure
@@ -84,8 +86,8 @@ use zkminer_witness_host::abort::{AbortReason, AbortToken};
 use zkminer_witness_host::broker_proc::BrokerProcess;
 use zkminer_witness_host::paths;
 use zkminer_witness_host::pipeline::{
-    descriptor_hash_of_abi, eviction_by_age, key_fingerprint, risc0_build_id, simulate_witness_job, HookFuture,
-    HostContext, ImageIdFn, JobInput, PipelineHooks, Simulated, Skip,
+    descriptor_hash_of_abi, eviction_by_age, execute_worker_build, key_fingerprint, risc0_build_id,
+    simulate_witness_job, HookFuture, HostContext, ImageIdFn, JobInput, PipelineHooks, Simulated, Skip,
 };
 use zkminer_witness_host::spawner::Spawner;
 use zkminer_witness_host::store_open::open_store;
@@ -95,13 +97,15 @@ use zkminer_witness_store::{
 
 use super::super as run;
 use super::policy::{
-    caller_admitted, caller_tally_key, card_room, deadline_fits, device_tally_key, divergence_reusable,
-    estimate_prove_secs, fixed_allowance_secs, funds_cover, gate_refusal_reason, host_max_guest_cycles,
-    is_witness_input, not_claimable_reason, parse_session_cap, pin_lock_gone, proving_cutoff, rate_secs_left,
-    reservation_wei, segment_need, segments_fit, session_cap_admits, short, tally_count, verdict_plan,
-    verdict_set_aside, watchdog_admits, witness_prove_sizes, ArtifactBudget, Blame, PinFacts, PinRead, ProvePlan,
-    ReservationInputs, POST_LOCK_CALLER_LIMIT, POST_LOCK_CLASSES, POST_LOCK_DEVICE_LIMIT,
-    POST_LOCK_TALLY_TTL_SECS, RISC0_CPU_CONSERVATIVE_CPS, SERVING_OFF_SET_ASIDE, UNSERVED_SET_ASIDE,
+    caller_admitted, caller_tally_key, card_room, claims_held_reason, deadline_fits, device_caller_tally_key,
+    device_tally_key, divergence_reusable, elf_image_id_outcome, estimate_prove_secs, fixed_allowance_secs,
+    fulfils_besides, funds_cover, gate_refusal_reason, held_lock_prove_sizes, host_max_guest_cycles,
+    is_witness_input, lasts_until_terminal, not_claimable_reason, parse_session_cap, pin_lock_gone,
+    pin_read_needs_time, proving_cutoff, rate_secs_left, reservation_wei, segment_need, segments_fit, session_cap_admits, short,
+    tally_count, verdict_expires_at, verdict_plan, verdict_set_aside, watchdog_admits, ArtifactBudget, Blame,
+    PinFacts, PinRead, ProvePlan, ReservationInputs, POST_LOCK_CALLER_LIMIT, POST_LOCK_CLASSES,
+    POST_LOCK_DEVICE_LIMIT, POST_LOCK_TALLY_TTL_SECS, RISC0_CPU_CONSERVATIVE_CPS, SERVING_OFF_SET_ASIDE,
+    UNSERVED_SET_ASIDE, VERDICT_UNTIL_TERMINAL,
 };
 use super::{known_class, note_class, Class, Route};
 use crate::journal::WitnessBundleRef;
@@ -111,8 +115,13 @@ use crate::journal::WitnessBundleRef;
 const MAX_ARTIFACT_BYTES: u64 = 4 << 20;
 /// Wall clock of one sandboxed execute (every po2 of the host's set).
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(600);
-/// How often the sandbox and broker self-tests run again.
+/// Wall clock of the execute worker's build handshake (it loads its binary and answers).
+const EXECUTE_BUILD_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often the sandbox and broker self-tests run again (and a serving start that failed is tried
+/// again).
 const SELF_TEST_EVERY: Duration = Duration::from_secs(3600);
+/// How often the configuration file is read again for `[witness] enabled` (the kill switch, §20.4).
+const CONFIG_CHECK_EVERY: Duration = Duration::from_secs(15);
 /// Bound on one self-test (sandbox or broker): one that does not finish is a failure, so a wedged
 /// broker or spawner never holds serving (or the miner's start) hostage.
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -175,13 +184,112 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 enum Phase {
     /// Before the lock: aborted by the governance watcher's events and by shutdown.
     Simulating,
+    /// Between the card check right before the claim intent and the claim: the task has taken a
+    /// card for its proof (it counts against the cards like a held lock), and is still aborted like
+    /// a simulation until the claim is sent. Back to `Simulating` when it does not claim.
+    Claiming,
     /// A lock is held (or being recovered): never aborted, driven to a terminal state or released.
     Locked,
+    /// The brain's recovery is releasing the lock ([`WitnessRuntime::claim_release`]): nothing else
+    /// drives it meanwhile. Holds no card.
+    Releasing,
+}
+
+impl Phase {
+    /// Whether the task holds a card: a lock held or being claimed.
+    fn holds_card(self) -> bool {
+        matches!(self, Phase::Claiming | Phase::Locked)
+    }
+
+    /// Whether an abort token still reaches the task (nothing of its claim is on chain yet).
+    fn abortable(self) -> bool {
+        matches!(self, Phase::Simulating | Phase::Claiming)
+    }
 }
 
 struct Task {
     token: AbortToken,
     phase: Phase,
+}
+
+/// Takes a card for `jid`'s claim, in one step with the check that one is free: under the tasks
+/// lock, a task that is simulating becomes `Claiming` only while the inline jobs needing a card
+/// (`cards`, the brain's latest view) and every task already holding one leave room under the cap.
+/// Two simulations that finish together can then never both claim the host's last card. `true` also
+/// when the task already holds one; `false` when no card is free, the brain has not said yet, or
+/// `jid` has no task.
+fn take_card(tasks: &mut HashMap<B256, Task>, cards: Option<(usize, usize)>, jid: B256) -> bool {
+    match tasks.get(&jid).map(|t| t.phase) {
+        None => return false,
+        Some(p) if p.holds_card() => return true,
+        Some(_) => {}
+    }
+    let held = tasks.values().filter(|t| t.phase.holds_card()).count();
+    if !cards.is_some_and(|(inline, max)| card_room(inline, held, max)) {
+        return false;
+    }
+    if let Some(t) = tasks.get_mut(&jid) {
+        t.phase = Phase::Claiming;
+    }
+    true
+}
+
+/// Gives back the card [`take_card`] took for `jid` when its claim is not sent (a held lock keeps
+/// its card).
+fn give_back_card(tasks: &mut HashMap<B256, Task>, jid: B256) {
+    if let Some(t) = tasks.get_mut(&jid) {
+        if t.phase == Phase::Claiming {
+            t.phase = Phase::Simulating;
+        }
+    }
+}
+
+/// What a release of a lock by the brain's recovery finds in the witness runtime
+/// ([`WitnessRuntime::claim_release`]).
+pub(crate) enum ReleaseClaim {
+    /// A witness task owns the job (it drives the lock, or a store pass just took it up): no release
+    /// beside it.
+    Owned,
+    /// Not a witness lock this runtime knows of.
+    NotWitness,
+    /// A witness lock, now the release's: until it is dropped no store pass re-drives the job.
+    Witness(WitnessRelease),
+}
+
+/// A witness lock the brain's recovery is releasing; its job's task entry goes when this is dropped.
+pub(crate) struct WitnessRelease {
+    rt: Arc<WitnessRuntime>,
+    jid: B256,
+}
+
+impl WitnessRelease {
+    /// Records the job's post-lock verdict, before the release is sent (§16): the job is not locked
+    /// here again until it is terminal, a restart included.
+    pub(crate) async fn record_verdict(&self, why: &str) {
+        self.rt.record_release_verdict(self.jid, why).await;
+    }
+}
+
+impl Drop for WitnessRelease {
+    fn drop(&mut self) {
+        let mut tasks = lock(&self.rt.tasks);
+        if tasks.get(&self.jid).is_some_and(|t| t.phase == Phase::Releasing) {
+            tasks.remove(&self.jid);
+        }
+    }
+}
+
+/// Gives back the card a claim took ([`take_card`]) when the claim is not sent, however
+/// [`WitnessRuntime::lock`] returns.
+struct CardTaken<'a> {
+    rt: &'a WitnessRuntime,
+    jid: B256,
+}
+
+impl Drop for CardTaken<'_> {
+    fn drop(&mut self) {
+        self.rt.give_back_card(self.jid);
+    }
 }
 
 /// Removes a job's task entry when its task ends, however it ends (a panic included), so a job is
@@ -273,8 +381,49 @@ struct LockCtx {
     lock_deadline: u64,
     locked_collateral: u128,
     cycles: u64,
-    /// The slot of the last proof attempt that failed, and how (for the post-lock tallies).
-    failure: Option<(Option<String>, PostLockFailureClass)>,
+    /// How the lock failed, for the post-lock tallies (set before every `Err` that is not a hand-back).
+    failure: Option<LockFailure>,
+}
+
+/// A held witness lock's proof, and where it ran.
+struct Proved {
+    proof: ProofOutput,
+    slot: Option<String>,
+    /// Its device was quarantined then (no other card proved the lock).
+    on_quarantined: bool,
+}
+
+/// How a held witness lock failed (§16): the class, the device it failed on, and whether the caller's
+/// tally counts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockFailure {
+    /// The slot the failing proof attempt (or the rejected proof) ran on: its device is tallied.
+    slot: Option<String>,
+    class: PostLockFailureClass,
+    /// Whether the caller's tally counts it: only when a proof attempt of the caller's guest ran on a
+    /// device that was not quarantined then. Not when no attempt ran (no card proved it, the window
+    /// had no room left), when the device was quarantined (the device's doing), or when a pending
+    /// verifier swap's `readyAt` cut the lock short (governance's).
+    caller: bool,
+}
+
+impl LockFailure {
+    /// A failure on `slot` (quarantined or not when the attempt ran) of the caller's guest.
+    fn on(slot: Option<String>, class: PostLockFailureClass, quarantined: &HashSet<String>) -> Self {
+        let caller = slot.as_ref().is_some_and(|s| !quarantined.contains(s));
+        Self { slot, class, caller }
+    }
+
+    /// A failure no device or caller caused: this host's (no card, no time left) or governance's.
+    fn host(class: PostLockFailureClass) -> Self {
+        Self { slot: None, class, caller: false }
+    }
+
+    /// A failure on the chain side after a proof (gas, RPC, blockspace), counted for the caller as
+    /// every post-lock failure was.
+    fn chain() -> Self {
+        Self { slot: None, class: PostLockFailureClass::GasOrRpc, caller: true }
+    }
 }
 
 /// The chain gates' inputs for one job (§5.3).
@@ -325,20 +474,39 @@ pub(crate) struct WitnessRuntime {
     /// Jobs a one-off notice was logged for (not admitted, needs claim_predicate_jobs).
     noticed: Mutex<HashSet<(B256, &'static str)>>,
     store_pass_running: AtomicBool,
-    /// The execute worker's build, from its latest response here (`None` until one ran).
+    /// The execute worker's build, from its handshake when serving started, before any guest ran in
+    /// it (`None` until serving started): never from a response of a process that ran a guest.
     execute_build: Mutex<Option<String>>,
     /// The brain's view of the cards, each tick: inline jobs still needing a card, and the cap.
     cards: Mutex<Option<(usize, usize)>>,
-    /// The brain's first complete recovery pass has handed over every witness lock it found.
+    /// A brain recovery pass with a complete chain scan has handed over every witness lock it decided.
     brain_recovered: AtomicBool,
     /// Witness locks recovery handed over whose bundle is not pinned yet: eviction waits for them.
     unpinned_recoveries: Mutex<HashSet<B256>>,
+    /// Jobs the brain's latest complete recovery pass left undecided: their bundles are spared from
+    /// eviction (re-applied to a store opened later).
+    undecided: Mutex<HashSet<B256>>,
     /// Image-id derivations that could not run (no measure worker free within the bound).
     image_id_unavailable: Arc<AtomicU64>,
     /// Callers' post-lock failure counts as last read or written here, with when they expire.
     post_lock_callers: Mutex<HashMap<Address, (u8, u64)>>,
     /// Post-lock tallies when no store is open (counted for this process only).
     tallies: Mutex<HashMap<B256, (u8, u64)>>,
+    /// The miner is shutting down ([`Self::shutdown`]): held locks are the drain's, nothing re-drives one.
+    stopping: AtomicBool,
+    /// What a serving start needs, kept for a retry: the configuration the miner started with (when it
+    /// enables serving) and why its `sys_rand` key is unusable, if it is.
+    serve: Mutex<Option<(Arc<ZkMinerConfig>, Option<String>)>>,
+    /// A serving start is running.
+    starting: AtomicBool,
+    /// The configuration file says `[witness] enabled = false` now (the kill switch): serving stays
+    /// off whatever the self-tests say, until it says `true` again.
+    switched_off: AtomicBool,
+    /// A sandbox self-test thread is running (one that did not finish in its bound keeps it).
+    sandbox_test_running: Arc<AtomicBool>,
+    /// Held across one post-lock failure's tally updates (each a read and a write of store records),
+    /// so two failures recorded at once never both count the same caller as new on a device.
+    tally_updates: tokio::sync::Mutex<()>,
 }
 
 impl WitnessRuntime {
@@ -403,14 +571,65 @@ impl WitnessRuntime {
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
             .unwrap_or(DEFAULT_KECCAK_PO2);
-        let rt = Arc::new(Self {
+        let rt = Arc::new(Self::new(
+            client,
+            state,
+            journal,
+            config,
+            config_path.map(PathBuf::from).unwrap_or_else(ZkMinerConfig::default_path),
+            gov,
+            backlog,
+            da_policy,
+            proving_timeout,
+            sys_rand_key,
+            keccak_po2,
+        ));
+        rt.open_store().await;
+        if w.enabled {
+            // §19: the effective configuration, whether or not serving then starts.
+            tracing::info!("{}", effective_summary(w, config.retention.as_ref(), config.broker.as_ref()));
+            // In the background: the self-tests and the broker start take seconds (minutes, bounded,
+            // when something is wedged), and the brain and every inline job go on meanwhile. A start
+            // that fails is tried again with the hourly self-tests.
+            *lock(&rt.serve) = Some((Arc::new(config.clone()), key_err.map(|e| e.to_string())));
+            let rt2 = rt.clone();
+            tokio::spawn(async move { rt2.try_start_serving().await });
+        } else {
+            tracing::info!(
+                "witness serving is off ([witness] enabled = false): witness jobs are not simulated; \
+                 witness locks already held are still proven from the retention store"
+            );
+        }
+        tokio::spawn(rt.clone().abort_loop());
+        tokio::spawn(rt.clone().self_test_loop());
+        tokio::spawn(rt.clone().config_watch_loop());
+        Some(rt)
+    }
+
+    /// The runtime's state before anything starts: no store open, serving off, no task.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        client: &ChainClient,
+        state: &SharedState,
+        journal: &run::SharedJournal,
+        config: &ZkMinerConfig,
+        secret_path: PathBuf,
+        gov: GovernanceView,
+        backlog: BacklogSource,
+        da_policy: DaCapPolicy,
+        proving_timeout: Duration,
+        sys_rand_key: [u8; 32],
+        keccak_po2: u8,
+    ) -> Self {
+        let w = &config.witness;
+        Self {
             client: client.clone(),
             state: state.clone(),
             journal: journal.clone(),
             witness: w.clone(),
             retention: config.retention.clone(),
             rate_expires: w.hemi_per_eth_expires.as_deref().and_then(|s| rate_expiry(s).ok()),
-            secret_path: config_path.map(PathBuf::from).unwrap_or_else(ZkMinerConfig::default_path),
+            secret_path,
             store: Mutex::new(None),
             serving: Mutex::new(None),
             enabled: AtomicBool::new(false),
@@ -437,27 +656,17 @@ impl WitnessRuntime {
             cards: Mutex::new(None),
             brain_recovered: AtomicBool::new(false),
             unpinned_recoveries: Mutex::new(HashSet::new()),
+            undecided: Mutex::new(HashSet::new()),
             image_id_unavailable: Arc::new(AtomicU64::new(0)),
             post_lock_callers: Mutex::new(HashMap::new()),
             tallies: Mutex::new(HashMap::new()),
-        });
-        rt.open_store().await;
-        if w.enabled {
-            // §19: the effective configuration, whether or not serving then starts.
-            tracing::info!("{}", effective_summary(w, config.retention.as_ref(), config.broker.as_ref()));
-            // In the background: the self-tests and the broker start take seconds (minutes, bounded,
-            // when something is wedged), and the brain and every inline job go on meanwhile.
-            let (rt2, config) = (rt.clone(), config.clone());
-            tokio::spawn(async move { rt2.start_serving(&config, key_err).await });
-        } else {
-            tracing::info!(
-                "witness serving is off ([witness] enabled = false): witness jobs are not simulated; \
-                 witness locks already held are still proven from the retention store"
-            );
+            stopping: AtomicBool::new(false),
+            serve: Mutex::new(None),
+            starting: AtomicBool::new(false),
+            switched_off: AtomicBool::new(false),
+            sandbox_test_running: Arc::new(AtomicBool::new(false)),
+            tally_updates: tokio::sync::Mutex::new(()),
         }
-        tokio::spawn(rt.clone().abort_loop());
-        tokio::spawn(rt.clone().self_test_loop());
-        Some(rt)
     }
 
     /// Opens the retention store (never creating it). Unavailable: every witness lock is kept,
@@ -474,6 +683,7 @@ impl WitnessRuntime {
                     s.identity().store_uuid,
                     report.tmp_entries_removed
                 );
+                s.spare_jobs(lock(&self.undecided).iter().copied());
                 *lock(&self.store) = Some(Arc::new(s));
             }
             Ok(Err(e)) => tracing::error!(
@@ -499,13 +709,25 @@ impl WitnessRuntime {
     /// Fires every running simulation's abort token (a held lock's task is never aborted).
     fn abort_simulations(&self, reason: AbortReason) {
         for (jid, t) in lock(&self.tasks).iter() {
-            if t.phase == Phase::Simulating && t.token.abort(reason) {
+            if t.phase.abortable() && t.token.abort(reason) {
                 tracing::info!("witness job {}: simulation aborted ({reason:?})", short(*jid));
             }
         }
     }
 
-    async fn start_serving(self: &Arc<Self>, config: &ZkMinerConfig, key_err: Option<std::io::Error>) {
+    /// Starts serving from the configuration the miner started with, unless a start is running, the
+    /// configuration file switched serving off, or it was never enabled. `true` when it ran.
+    async fn try_start_serving(self: &Arc<Self>) -> bool {
+        let Some((config, key_err)) = lock(&self.serve).clone() else { return false };
+        if self.switched_off.load(Ordering::SeqCst) || self.starting.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        self.start_serving(&config, key_err).await;
+        self.starting.store(false, Ordering::SeqCst);
+        true
+    }
+
+    async fn start_serving(self: &Arc<Self>, config: &ZkMinerConfig, key_err: Option<String>) {
         let w = &config.witness;
         if let Err(e) = validate(w, config.retention.as_ref(), config.broker.as_ref(), chrono::Utc::now().timestamp()) {
             return self.disable(e.to_string());
@@ -564,8 +786,18 @@ impl WitnessRuntime {
             Ok(b) => b,
             Err(e) => return self.disable(e),
         };
-        if let Err(why) = bounded_self_test("sandbox", self.sandbox_self_test(&spawner, &probe_binary)).await {
+        if let Err(why) = bounded_self_test("sandbox", self.sandbox_self_test(&probe_binary)).await {
             return self.disable(why);
+        }
+        // The execute worker's build, asked before any requester's guest runs in it: what every bundle
+        // records as the build its journals came from, and what a retained bundle is revalidated
+        // against (so one published before a restart is reused, not simulated again).
+        match execute_worker_build(&execute_binary, &root, EXECUTE_BUILD_TIMEOUT).await {
+            Ok(build) => {
+                tracing::info!("witness: the execute worker is {build}");
+                *lock(&self.execute_build) = Some(build);
+            }
+            Err(e) => return self.disable(format!("the execute worker's build handshake: {e}")),
         }
         let broker = match BrokerProcess::start(
             &spawner,
@@ -582,6 +814,10 @@ impl WitnessRuntime {
         let connector = broker.connector.clone();
         if let Err(why) = bounded_self_test("broker", broker_self_test(&broker_client, &connector)).await {
             return self.disable(why);
+        }
+        if self.switched_off.load(Ordering::SeqCst) {
+            tracing::warn!("witness serving did not start: [witness] enabled = false in the configuration now");
+            return;
         }
         *lock(&self.serving) = Some(Arc::new(Serving {
             spawner,
@@ -600,16 +836,30 @@ impl WitnessRuntime {
         );
     }
 
-    async fn sandbox_self_test(&self, spawner: &Spawner, probe: &Path) -> Result<(), String> {
+    /// The sandbox self-test, on a thread of its own (its probes die with that thread, which lives
+    /// until they are reaped): one that does not finish in its bound never holds the spawner thread,
+    /// which every builder, execute and broker start needs. While a test that did not finish still
+    /// runs, the next one fails at once instead of piling threads up.
+    async fn sandbox_self_test(&self, probe: &Path) -> Result<(), String> {
         let mode = match self.witness.sandbox_mode {
             SandboxModeConfig::System => zkminer_witness_sandbox::SandboxMode::System,
             SandboxModeConfig::Rootless => zkminer_witness_sandbox::SandboxMode::Rootless,
         };
-        let (probe, secret) = (probe.to_path_buf(), self.secret_path.clone());
-        let report = spawner
-            .run_async(move || zkminer_witness_sandbox::self_test(mode, &probe, &secret))
-            .await
-            .map_err(|e| format!("the spawner thread: {e}"))?;
+        if self.sandbox_test_running.swap(true, Ordering::SeqCst) {
+            return Err("the previous sandbox self-test has not finished".into());
+        }
+        let (probe, secret, running) = (probe.to_path_buf(), self.secret_path.clone(), self.sandbox_test_running.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let spawned = std::thread::Builder::new().name("witness-sandbox-self-test".into()).spawn(move || {
+            let report = zkminer_witness_sandbox::self_test(mode, &probe, &secret);
+            running.store(false, Ordering::SeqCst);
+            let _ = tx.send(report);
+        });
+        if let Err(e) = spawned {
+            self.sandbox_test_running.store(false, Ordering::SeqCst);
+            return Err(format!("the sandbox self-test thread: {e}"));
+        }
+        let report = rx.await.map_err(|_| "the sandbox self-test thread is gone".to_string())?;
         if report.passed() {
             tracing::info!("witness: sandbox self-test passed ({} checks)", report.checks.len());
             Ok(())
@@ -622,32 +872,135 @@ impl WitnessRuntime {
         }
     }
 
-    /// Re-runs both self-tests every hour; serving follows their result (§10.3).
+    /// Every hour, a [`Self::self_test_round`] (§10.3).
     async fn self_test_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(SELF_TEST_EVERY).await;
-            let Some(s) = lock(&self.serving).clone() else { continue };
-            let (exited, cut_off) = {
-                let mut b = lock(&s.broker);
-                (b.exited(), b.cut_off())
-            };
-            let result = match exited {
-                _ if cut_off => Err("the connector cut the broker off (it broke the connector protocol) and killed it".into()),
-                Some(status) => Err(format!("the broker exited ({status})")),
-                None => match bounded_self_test("sandbox", self.sandbox_self_test(&s.spawner, &s.probe_binary)).await {
-                    Err(why) => Err(why),
-                    Ok(()) => bounded_self_test("broker", broker_self_test(&s.broker_client, &s.connector)).await,
-                },
-            };
-            match result {
-                Ok(()) => {
-                    if !self.enabled.swap(true, Ordering::SeqCst) {
-                        tracing::warn!("witness serving is back on: the hourly self-tests passed");
+            if self.stopping() {
+                return;
+            }
+            self.self_test_round().await;
+        }
+    }
+
+    /// Serving follows the self-tests: a start that failed (or never finished) is tried again; once
+    /// started, both self-tests run again and switch serving off or back on with their result.
+    /// Nothing while the configuration file switched serving off.
+    async fn self_test_round(self: &Arc<Self>) -> SelfTestRound {
+        if self.switched_off.load(Ordering::SeqCst) {
+            return SelfTestRound::SwitchedOff;
+        }
+        let Some(s) = lock(&self.serving).clone() else {
+            if lock(&self.serve).is_none() {
+                return SelfTestRound::NotEnabled;
+            }
+            tracing::warn!("witness serving did not start: trying again");
+            return if self.try_start_serving().await { SelfTestRound::StartRetried } else { SelfTestRound::Starting };
+        };
+        let (exited, cut_off) = {
+            let mut b = lock(&s.broker);
+            (b.exited(), b.cut_off())
+        };
+        let result = match exited {
+            _ if cut_off => Err("the connector cut the broker off (it broke the connector protocol) and killed it".into()),
+            Some(status) => Err(format!("the broker exited ({status})")),
+            None => match bounded_self_test("sandbox", self.sandbox_self_test(&s.probe_binary)).await {
+                Err(why) => Err(why),
+                Ok(()) => bounded_self_test("broker", broker_self_test(&s.broker_client, &s.connector)).await,
+            },
+        };
+        // The execute worker's build again (its binary may have been replaced in place): new bundles
+        // record it, and retained ones are revalidated against it.
+        let result = match result {
+            Ok(()) => match execute_worker_build(&s.execute_binary, &s.cgroup_root, EXECUTE_BUILD_TIMEOUT).await {
+                Ok(build) => {
+                    let before = lock(&self.execute_build).replace(build.clone());
+                    if before.is_some_and(|b| b != build) {
+                        tracing::warn!("witness: the execute worker is now {build}");
                     }
+                    Ok(())
                 }
-                Err(why) => self.disable(why),
+                Err(e) => Err(format!("the execute worker's build handshake: {e}")),
+            },
+            Err(why) => Err(why),
+        };
+        match result {
+            Ok(()) => {
+                // Not over a kill switch thrown while the tests ran.
+                if !self.switched_off.load(Ordering::SeqCst) && !self.enabled.swap(true, Ordering::SeqCst) {
+                    tracing::warn!("witness serving is back on: the self-tests passed");
+                }
+                SelfTestRound::Passed
+            }
+            Err(why) => {
+                self.disable(why);
+                SelfTestRound::Failed
             }
         }
+    }
+
+    /// Reads `[witness] enabled` from the configuration file again every [`CONFIG_CHECK_EVERY`]
+    /// (§20.4: the kill switch is hot). A file that is gone or does not parse changes nothing.
+    async fn config_watch_loop(self: Arc<Self>) {
+        let mut warned = false;
+        loop {
+            tokio::time::sleep(CONFIG_CHECK_EVERY).await;
+            if self.stopping() {
+                return;
+            }
+            let path = self.secret_path.clone();
+            match blocking(move || configured_witness_enabled(&path)).await {
+                Ok(Ok(enabled)) => {
+                    warned = false;
+                    self.apply_enabled(enabled);
+                }
+                Ok(Err(e)) => {
+                    if !warned {
+                        warned = true;
+                        tracing::warn!(
+                            "witness: the configuration file cannot be read again ({e:#}); [witness] enabled keeps \
+                             its last value"
+                        );
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// `[witness] enabled` as the configuration file says it now. `false` switches serving off at once
+    /// (no new admission, running simulations aborted, held locks continue) and keeps it off; `true`
+    /// again runs the self-tests (or the start) now and serves on their result, for a miner started
+    /// with serving enabled (one started with it off needs a restart).
+    fn apply_enabled(self: &Arc<Self>, enabled: bool) {
+        if !enabled {
+            if !self.switched_off.swap(true, Ordering::SeqCst) && lock(&self.serve).is_some() {
+                self.enabled.store(false, Ordering::SeqCst);
+                tracing::warn!(
+                    "witness serving switched off ([witness] enabled = false): no new witness job is admitted, \
+                     running simulations are aborted, held witness locks continue"
+                );
+                self.abort_simulations(AbortReason::Disabled);
+            }
+            return;
+        }
+        if !self.switched_off.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if lock(&self.serve).is_none() {
+            if self.notice(B256::ZERO, "enable-needs-restart") {
+                tracing::warn!(
+                    "[witness] enabled = true in the configuration, but this miner started with witness serving \
+                     off: restart it to serve witness jobs"
+                );
+            }
+            return;
+        }
+        tracing::warn!("witness serving switched back on ([witness] enabled = true): running the self-tests first");
+        let rt = self.clone();
+        tokio::spawn(async move {
+            rt.self_test_round().await;
+        });
     }
 
     fn serving(&self) -> Option<Arc<Serving>> {
@@ -705,23 +1058,46 @@ impl WitnessRuntime {
         *lock(&self.cards) = Some((inline_needing, max_concurrent));
     }
 
-    /// Witness locks held (or being recovered) here.
+    /// Witness locks held (or being recovered) or being claimed here: each holds a card.
     fn witness_locks(&self) -> usize {
-        lock(&self.tasks).values().filter(|t| t.phase == Phase::Locked).count()
+        lock(&self.tasks).values().filter(|t| t.phase.holds_card()).count()
     }
 
-    /// Whether a card is free for one more witness lock (false until the brain has said).
+    /// Whether a card is free for one more witness lock (false until the brain has said). Advisory
+    /// (whether to start a simulation): the claim takes its card with [`Self::take_card`].
     fn card_free(&self) -> bool {
         let witness_locks = self.witness_locks();
         lock(&self.cards).is_some_and(|(inline, max)| card_room(inline, witness_locks, max))
     }
 
-    /// The brain finished a recovery pass (`deferred`: cut short). After its first complete one,
-    /// every witness lock it found has been handed to [`Self::drive_recovered`]; eviction then waits
-    /// only for those to be pinned (§15.2: nothing is evicted before one full recovery scan).
-    pub(crate) fn note_recovery_pass(&self, deferred: bool) {
-        if !deferred && !self.brain_recovered.swap(true, Ordering::SeqCst) {
-            tracing::info!("witness: the brain's recovery pass handed over every witness lock it found");
+    /// [`take_card`] on this runtime's tasks and the brain's latest view of the cards.
+    fn take_card(&self, jid: B256) -> bool {
+        let cards = *lock(&self.cards);
+        take_card(&mut lock(&self.tasks), cards, jid)
+    }
+
+    /// [`give_back_card`] on this runtime's tasks.
+    fn give_back_card(&self, jid: B256) {
+        give_back_card(&mut lock(&self.tasks), jid);
+    }
+
+    /// The brain finished a recovery pass. `scan_complete`: its chain scan covered the whole lookback
+    /// window, so every lock of ours was either decided by it (each witness lock handed to
+    /// [`Self::drive_recovered`]) or is among `undecided` (unreadable just now, a claim that may still
+    /// be pending, the pass cut short). After the first such pass eviction waits only for the
+    /// handed-over locks to be pinned (§15.2: nothing is evicted before one full recovery scan), and
+    /// it spares the bundles of the undecided jobs until a later pass decides them: a pass deferred
+    /// over one unreadable job no longer holds eviction back for every other bundle.
+    pub(crate) fn note_recovery_pass(&self, scan_complete: bool, undecided: Vec<B256>) {
+        if !scan_complete {
+            return;
+        }
+        if let Some(store) = self.store() {
+            store.spare_jobs(undecided.iter().copied());
+        }
+        *lock(&self.undecided) = undecided.into_iter().collect();
+        if !self.brain_recovered.swap(true, Ordering::SeqCst) {
+            tracing::info!("witness: the brain's recovery pass handed over every witness lock it decided");
         }
     }
 
@@ -734,9 +1110,55 @@ impl WitnessRuntime {
         self.store().is_some_and(|s| s.pins().iter().any(|p| p.job_id == job_id))
     }
 
-    /// Fires every simulation's abort token (shutdown). Held locks are left to the drain.
+    /// Takes a lock the brain's recovery is about to release (its room rule: too close to the deadline
+    /// to drive) away from every other witness path, in one step with the check that no task owns it,
+    /// so a store pass that re-drives it and the release never both go: whichever comes first wins.
+    pub(crate) fn claim_release(self: &Arc<Self>, jid: B256) -> ReleaseClaim {
+        let witness = self.is_witness_lock(jid) || known_class(jid) == Some(Class::Witness);
+        let mut tasks = lock(&self.tasks);
+        if tasks.contains_key(&jid) {
+            return ReleaseClaim::Owned;
+        }
+        if !witness {
+            return ReleaseClaim::NotWitness;
+        }
+        tasks.insert(jid, Task { token: AbortToken::new(), phase: Phase::Releasing });
+        ReleaseClaim::Witness(WitnessRelease { rt: self.clone(), jid })
+    }
+
+    /// Before a lock of `jid` is released other than by its own failure (the brain's room rule, a
+    /// shutdown): a witness lock's job gets its post-lock verdict, so this host never locks it again
+    /// until it is terminal (what ended the lock, a lost store or bundle or a held fulfil, may recur;
+    /// each job is released here at most once). Nothing for an inline lock.
+    pub(crate) async fn note_release(&self, jid: B256, why: &str) {
+        if self.is_witness_lock(jid) || known_class(jid) == Some(Class::Witness) {
+            self.record_release_verdict(jid, why).await;
+        }
+    }
+
+    /// The post-lock verdict of a witness lock released without a failure of its proof: final for
+    /// the job, counted against no caller or device. Once per job (a verdict already lasting until
+    /// the job is terminal stays as it is).
+    async fn record_release_verdict(&self, jid: B256, why: &str) {
+        if let Some(s) = self.store() {
+            let held = blocking(move || s.verdict(jid)).await.ok().and_then(|r| r.ok()).flatten();
+            if held.is_some_and(|v| lasts_until_terminal(v.reason, v.expires_at)) {
+                return;
+            }
+        }
+        self.record_verdict(jid, Address::ZERO, SkipReason::PostLockFailure, why).await;
+    }
+
+    /// Fires every simulation's abort token (shutdown). Held locks are left to the drain: from here no
+    /// store pass or recovery re-drives one beside it.
     pub(crate) fn shutdown(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
         self.abort_simulations(AbortReason::Shutdown);
+    }
+
+    /// Shutdown has begun (this runtime's [`Self::shutdown`], or the miner's flag).
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst) || shutting_down()
     }
 
     /// See [`super::route`].
@@ -845,7 +1267,9 @@ impl WitnessRuntime {
             }
             return unserved(UNSERVED_SET_ASIDE);
         }
-        if !self.serving_enabled() {
+        // Not served while the operator holds new work back (risc0 switched off): set aside like a job
+        // with serving off, instead of starting a task that only finds this out.
+        if !self.serving_enabled() || self.claims_held_now().is_some() {
             return unserved(SERVING_OFF_SET_ASIDE);
         }
         if shutting_down() {
@@ -915,7 +1339,7 @@ impl WitnessRuntime {
     /// Fires a running simulation's abort token (the governance watcher's events).
     fn abort_simulation(&self, jid: B256, reason: AbortReason) {
         if let Some(t) = lock(&self.tasks).get(&jid) {
-            if t.phase == Phase::Simulating && t.token.abort(reason) {
+            if t.phase.abortable() && t.token.abort(reason) {
                 tracing::info!("witness job {}: simulation aborted ({reason:?})", short(jid));
             }
         }
@@ -1001,8 +1425,8 @@ impl WitnessRuntime {
         (!builds.is_empty()).then_some(builds)
     }
 
-    /// [`Self::prove_worker_builds`] and the execute worker's build once one ran here (its journals
-    /// are the bundle's): what revalidation compares a bundle with (§15.2).
+    /// [`Self::prove_worker_builds`] and the execute worker's build (its handshake's; its journals are
+    /// the bundle's): what revalidation compares a bundle with (§15.2).
     fn worker_builds(&self) -> Option<Vec<String>> {
         let mut builds = self.prove_worker_builds()?;
         builds.extend(lock(&self.execute_build).clone());
@@ -1080,6 +1504,7 @@ impl WitnessRuntime {
         po2s: Vec<u8>,
         plan: &ProvePlan,
         worker_builds: Vec<String>,
+        execute_build: String,
     ) -> HostContext {
         let w = &self.witness;
         let c = &w.builder_clamps;
@@ -1107,6 +1532,7 @@ impl WitnessRuntime {
             keccak_po2: self.keccak_po2,
             sys_rand_key: self.sys_rand_key,
             worker_builds,
+            execute_build,
             execute_memory_bytes: w.execute_memory_bytes,
             execute_timeout: EXECUTE_TIMEOUT,
             max_artifact_bytes: MAX_ARTIFACT_BYTES,
@@ -1145,7 +1571,7 @@ impl WitnessRuntime {
         };
         let plan = verdict_plan(reason, prior, rand::random::<f64>());
         let now = now_unix();
-        let expires_at = now.saturating_add(plan.ttl_secs);
+        let expires_at = verdict_expires_at(reason, plan.ttl_secs, now);
         {
             let mut v = lock(&self.verdict_until);
             if v.len() >= PER_JOB_CAP {
@@ -1170,11 +1596,14 @@ impl WitnessRuntime {
         }
         let blamed = lock(&self.blame).note_verdict(caller, reason, &plan);
         tracing::info!(
-            "witness job {}: skipped — {reason:?} (attempt {}, {} for {} s){}: {}",
+            "witness job {}: skipped — {reason:?} (attempt {}, {}){}: {}",
             short(jid),
             plan.attempts,
-            if plan.final_verdict { "final" } else { "retried" },
-            plan.ttl_secs,
+            match (plan.final_verdict, expires_at == VERDICT_UNTIL_TERMINAL) {
+                (_, true) => "final until the job is terminal".to_string(),
+                (true, false) => format!("final for {} s", plan.ttl_secs),
+                (false, false) => format!("retried in {} s", plan.ttl_secs),
+            },
             blamed.map_or(String::new(), |n| format!("; caller {caller} now has {n} failed job(s)")),
             zkminer_chain::programs::sanitize_log(detail)
         );
@@ -1278,9 +1707,10 @@ impl WitnessRuntime {
     }
 
     /// A bundle already published for this job and prover that is current on this host: reused
-    /// instead of simulating again (§15.2 single flight; re-locks reuse their bundle). Not before the
-    /// execute worker's build is known here (a simulation in this process learns it), and never one
-    /// that does not record its execute time (the prove's execute allowance).
+    /// instead of simulating again (§15.2 single flight; re-locks and restarts reuse their bundle; no
+    /// builder or data source runs again). Not before the execute worker's build is known (its
+    /// handshake when serving starts), and never one that does not record its execute time (the
+    /// prove's execute allowance).
     async fn retained_candidate(&self, store: &Arc<Store>, jid: B256, dh: B256, po2s: &[u8]) -> Option<Candidate> {
         lock(&self.execute_build).as_ref()?;
         let profile = self.host_profile(po2s)?;
@@ -1311,17 +1741,23 @@ impl WitnessRuntime {
     /// Why new witness work must not start now, though nothing is wrong with any job: the operator
     /// paused claiming (or the miner drives held locks only), or switched risc0 off.
     async fn claims_held(&self) -> Option<&'static str> {
-        if run::held_locks_only() {
-            return Some("the miner drives held locks only");
-        }
         let st = self.state.read().await;
-        if st.paused {
-            return Some("claiming is paused");
-        }
-        if st.runtime_settings.disabled_backends.contains(zkminer_prover_protocol::BACKEND_RISC0) {
-            return Some("risc0 is switched off");
-        }
-        None
+        claims_held_reason(
+            run::held_locks_only(),
+            st.paused,
+            st.runtime_settings.disabled_backends.contains(zkminer_prover_protocol::BACKEND_RISC0),
+        )
+    }
+
+    /// [`Self::claims_held`] for the brain's routing, without waiting on the state: `None` while it
+    /// is being written just now (the task's own check then decides).
+    fn claims_held_now(&self) -> Option<&'static str> {
+        let st = self.state.try_read().ok()?;
+        claims_held_reason(
+            run::held_locks_only(),
+            st.paused,
+            st.runtime_settings.disabled_backends.contains(zkminer_prover_protocol::BACKEND_RISC0),
+        )
     }
 
     /// Everything before a witness lock (§5.2 steps 0–9). `None` when the job is not locked now.
@@ -1415,6 +1851,7 @@ impl WitnessRuntime {
             tracing::debug!("witness job {}: no risc0 prove worker has named its build yet", short(jid));
             return None;
         };
+        let execute_build = lock(&self.execute_build).clone()?;
         let gate_input = ChainGateInput {
             job_id: jid,
             proof_system_id: d.proofSystemId,
@@ -1436,7 +1873,7 @@ impl WitnessRuntime {
                 }
             }
             None => {
-                let ctx = self.host_context(&serving, &store, po2s.clone(), &plan, prove_builds);
+                let ctx = self.host_context(&serving, &store, po2s.clone(), &plan, prove_builds, execute_build);
                 let hooks = Hooks {
                     rt: self.clone(),
                     gate: gate_input.clone(),
@@ -1469,7 +1906,6 @@ impl WitnessRuntime {
                             tracing::error!("witness job {}: simulated without a claimability quote or its ELF", short(jid));
                             return None;
                         };
-                        *lock(&self.execute_build) = Some(sim.execute_build.clone());
                         tracing::info!(
                             "witness job {}: simulated — bundle v{}, |W| {} bytes, journal {} bytes",
                             short(jid),
@@ -1535,7 +1971,7 @@ impl WitnessRuntime {
                 .max(self.client.fulfill_gas_limit);
             let (_, max_fee) = self.client.base_fees().await;
             if let Ok(bal) = self.client.get_eth_balance().await {
-                if !funds_cover(bal, fulfil_gas, max_fee, self.held_locks()) {
+                if !funds_cover(bal, fulfil_gas, max_fee, self.held_locks_besides(jid)) {
                     return Err((
                         SkipReason::NotAdmitted,
                         format!("ETH balance {bal} wei does not fund this claim and every held fulfil"),
@@ -1631,10 +2067,11 @@ impl WitnessRuntime {
         .await
     }
 
-    /// Locks held here, inline and witness, besides any being claimed now: the journal's entries
-    /// (each a claim of ours, pending or held).
-    fn held_locks(&self) -> usize {
-        lock(&self.journal).entries.len()
+    /// Locks held here, inline and witness, other than `jid`'s: the journal's entries (each a claim
+    /// of ours, pending or held) except its own, which this claim's intent (or an earlier claim of it
+    /// still unresolved) has put there. Its fulfil is counted once, as this claim's.
+    fn held_locks_besides(&self, jid: B256) -> usize {
+        fulfils_besides(lock(&self.journal).entries.keys().copied(), jid)
     }
 
     // ── the lock (§5.2 step 9) ────────────────────────────────────────────────
@@ -1655,8 +2092,10 @@ impl WitnessRuntime {
 
     /// Why a witness lock must not be taken right now, though the job passed every gate: re-checked
     /// right before the claim intent and again before the claim, as the inline path re-checks before
-    /// it bonds collateral (a pause, a jammed signer, funds, a card, serving switched off).
-    async fn lock_held_back(&self, fulfil_gas: u64) -> Option<String> {
+    /// it bonds collateral (a pause, a jammed signer, funds, a card, serving switched off). The card
+    /// is taken for `jid` here, in one step with its check ([`take_card`]); the caller gives it back
+    /// when it does not claim.
+    async fn lock_held_back(&self, jid: B256, fulfil_gas: u64) -> Option<String> {
         if let Some(why) = self.claims_held().await {
             return Some(why.to_string());
         }
@@ -1671,18 +2110,19 @@ impl WitnessRuntime {
         }
         let (_, max_fee) = self.client.base_fees().await;
         match self.client.get_eth_balance().await {
-            Ok(bal) if !funds_cover(bal, fulfil_gas, max_fee, self.held_locks()) => {
+            Ok(bal) if !funds_cover(bal, fulfil_gas, max_fee, self.held_locks_besides(jid)) => {
                 return Some(format!("ETH balance {bal} wei does not fund this claim and every held fulfil"));
             }
             Ok(_) => {}
             Err(e) => return Some(format!("the ETH balance is unreadable ({e:#})")),
         }
-        if !self.card_free() {
-            return Some("no card is free for its proof (inline work or witness locks fill them)".into());
-        }
         let slots: Vec<String> = run::current_risc0_cards(&self.state, true).await.into_iter().map(|c| c.slot).collect();
         if !slots.is_empty() && self.quarantined(&slots).await.len() == slots.len() {
             return Some("every risc0 card is quarantined for witness proofs (post-lock failures)".into());
+        }
+        // Last, with nothing awaited after it: the card, checked and taken at once.
+        if !self.take_card(jid) {
+            return Some("no card is free for its proof (inline work or witness locks fill them)".into());
         }
         None
     }
@@ -1733,7 +2173,10 @@ impl WitnessRuntime {
         if token.is_aborted() || shutting_down() {
             return None;
         }
-        if let Some(why) = self.lock_held_back(gate.fulfil_gas).await {
+        // The card this claim takes (below) goes back however the claim is not sent; a lock held
+        // keeps it (`Phase::Locked`).
+        let _card = CardTaken { rt: &**self, jid };
+        if let Some(why) = self.lock_held_back(jid, gate.fulfil_gas).await {
             // Not the job's doing: a short, deferred verdict, and the bundle stays for the next try.
             tracing::info!("witness job {}: not locked now — {}", short(jid), zkminer_chain::programs::sanitize_log(&why));
             self.record_verdict(jid, caller, SkipReason::NotAdmitted, &why).await;
@@ -1755,7 +2198,9 @@ impl WitnessRuntime {
                 return None;
             }
         };
-        let pinned_at_unix = zkminer_chain::client::chain_now_floor();
+        // From above: the never-confirmed rule counts the claim-intent age from here, so it must
+        // never start early.
+        let pinned_at_unix = zkminer_chain::client::chain_now();
         let (s, b) = (store.clone(), c.bundle);
         let pinned = blocking(move || {
             let mut rec = s.pin_record(&b, head)?;
@@ -1814,7 +2259,7 @@ impl WitnessRuntime {
             self.abandon_intent(jid, c.bundle, prior).await;
             return None;
         }
-        if let Some(why) = self.lock_held_back(gate.fulfil_gas).await {
+        if let Some(why) = self.lock_held_back(jid, gate.fulfil_gas).await {
             self.abandon_intent(jid, c.bundle, prior).await;
             tracing::info!("witness job {}: not locked now — {}", short(jid), zkminer_chain::programs::sanitize_log(&why));
             self.record_verdict(jid, caller, SkipReason::NotAdmitted, &why).await;
@@ -1880,6 +2325,10 @@ impl WitnessRuntime {
             Ok(v) if run::effective_cutoff(&v) != 0 => v,
             _ => {
                 tracing::warn!("witness job {}: locked at block {lock_block}, deadline unreadable; recovery drives it", short(jid));
+                // The receipt proved the lock: its pin and journal entry learn where, so neither ever
+                // takes this lock for a claim that did not land.
+                self.note_pin_lock(&store, pin, lock_block, reopen_count).await;
+                run::journal_update(&self.journal, |j| j.note_lock_seen(jid, Some(lock_block), reopen_count));
                 run::request_recovery();
                 return None;
             }
@@ -1971,11 +2420,11 @@ impl WitnessRuntime {
             }
             Err(e) => {
                 let msg = zkminer_chain::programs::sanitize_log(&format!("{e:#}"));
-                let (slot, class) = l.failure.clone().unwrap_or_else(|| (None, failure_class(&e)));
+                let failure = l.failure.clone().unwrap_or(LockFailure { slot: None, class: failure_class(&e), caller: true });
                 tracing::error!("witness lock {} failed after the lock ({msg}); releasing", short(jid));
                 self.state.write().await.add_log(LogLevel::Error, format!("Witness job {} failed: {msg}", short(jid)));
                 // Before the release: a restart between the two must not lock the job again.
-                self.record_post_lock_failure(jid, caller, slot.as_deref().map(device_of_slot), class).await;
+                self.record_post_lock_failure(jid, caller, &failure).await;
                 if run::journal_has(&self.journal, jid) {
                     with_lane(Lane::HeldLock, run::release_and_clean(&self.client, &self.state, &self.journal, jid)).await;
                 } else {
@@ -1993,78 +2442,99 @@ impl WitnessRuntime {
     }
 
     /// A witness lock of `jid` failed after the lock (§16): a final verdict for the job (its bundle
-    /// is never locked again, across restarts), and the caller's and the device's tallies, kept in
-    /// the store. Never fed to the host-wide program marks.
-    async fn record_post_lock_failure(&self, jid: B256, caller: Address, device: Option<String>, class: PostLockFailureClass) {
+    /// is never locked again, across restarts, until the job is terminal on chain), the caller's tally
+    /// when the failure counts against it, and the device's: the distinct callers with a failure of
+    /// its class there (a device reaching [`POST_LOCK_DEVICE_LIMIT`] takes no new witness lock). All
+    /// kept in the store. Never fed to the host-wide program marks.
+    async fn record_post_lock_failure(&self, jid: B256, caller: Address, f: &LockFailure) {
+        let class = f.class;
+        let device = f.slot.as_deref().map(device_of_slot);
         self.record_verdict(jid, caller, SkipReason::PostLockFailure, &format!("{class:?}")).await;
-        let n = self.bump_tally(caller_tally_key(caller)).await;
-        lock(&self.post_lock_callers).insert(caller, (n, now_unix().saturating_add(POST_LOCK_TALLY_TTL_SECS)));
+        let _updating = self.tally_updates.lock().await;
+        let counted = if f.caller {
+            let (n, until) = self.bump_tally(caller_tally_key(caller), true).await;
+            lock(&self.post_lock_callers).insert(caller, (n, until));
+            format!(
+                "caller {caller} has {n} in the last {} days{}",
+                POST_LOCK_TALLY_TTL_SECS / 86_400,
+                if n >= POST_LOCK_CALLER_LIMIT { "; its witness jobs are no longer admitted" } else { "" }
+            )
+        } else {
+            format!("not counted against caller {caller} (this host's, a quarantined device's or governance's)")
+        };
         tracing::error!(
-            "witness lock {}: post-lock failure ({class:?}{}) — caller {caller} has {n} in the last {} days{}",
+            "witness lock {}: post-lock failure ({class:?}{}) — {counted}",
             short(jid),
             device.as_deref().map_or(String::new(), |d| format!(" on {d}")),
-            POST_LOCK_TALLY_TTL_SECS / 86_400,
-            if n >= POST_LOCK_CALLER_LIMIT { "; its witness jobs are no longer admitted" } else { "" }
         );
         if let Some(d) = device {
-            let k = self.bump_tally(device_tally_key(&d, class)).await;
+            // Each caller counts once per device and class: one caller's guest alone never
+            // quarantines a device for everyone.
+            let marker = device_caller_tally_key(&d, class, caller);
+            let counted_before = self.tally(marker).await.0 > 0;
+            self.bump_tally(marker, true).await;
+            let (k, _) = self.bump_tally(device_tally_key(&d, class), !counted_before).await;
             if k >= POST_LOCK_DEVICE_LIMIT {
                 tracing::error!(
-                    "PAGE: WITNESS-DEVICE-QUARANTINED {d}: {k} post-lock witness failures of class {class:?} in the \
-                     last {} days — it proves no witness lock until they age out (inline jobs are unaffected)",
+                    "PAGE: WITNESS-DEVICE-QUARANTINED {d}: post-lock witness failures of class {class:?} from {k}                      callers in the last {} days — it takes no new witness lock until they age out (locks held                      keep proving; inline jobs are unaffected)",
                     POST_LOCK_TALLY_TTL_SECS / 86_400
                 );
             }
         }
     }
 
-    /// Adds one to a post-lock tally (a store verdict record under a key that is never a job id) and
-    /// returns the count. An expired tally starts again. Without a store, counted in memory.
-    async fn bump_tally(&self, key: B256) -> u8 {
+    /// Counts one more post-lock failure in a tally (a store verdict record under a key that is never
+    /// a job id; `increment` false only renews it) and returns the count and when it expires: 7 days
+    /// from the latest. An expired tally starts again. Without a store, counted in memory.
+    async fn bump_tally(&self, key: B256, increment: bool) -> (u8, u64) {
         let now = now_unix();
+        let until = now.saturating_add(POST_LOCK_TALLY_TTL_SECS);
+        let step = move |prior: u8| if increment { prior.saturating_add(1) } else { prior };
         let Some(store) = self.store() else {
             let mut m = lock(&self.tallies);
             let e = m.entry(key).or_insert((0, 0));
-            let n = tally_count(e.0, e.1, now).saturating_add(1);
-            *e = (n, now.saturating_add(POST_LOCK_TALLY_TTL_SECS));
-            return n;
+            let n = step(tally_count(e.0, e.1, now));
+            *e = (n, until);
+            return (n, until);
         };
         let result = blocking(move || {
             let prior = store.verdict(key).ok().flatten().map_or(0, |v| tally_count(v.attempts, v.expires_at, now));
-            let n = prior.saturating_add(1);
+            let n = step(prior);
             let rec = VerdictRecord {
                 job_id: key,
                 reason: SkipReason::PostLockFailure,
                 attempts: n,
                 recorded_at: now,
-                expires_at: now.saturating_add(POST_LOCK_TALLY_TTL_SECS),
+                expires_at: until,
                 wasmtime_version: None,
             };
             store.put_verdict(&rec).map(|()| n).map_err(|e| (n, e))
         })
         .await;
         match result {
-            Ok(Ok(n)) => n,
+            Ok(Ok(n)) => (n, until),
             Ok(Err((n, e))) => {
                 tracing::warn!("witness: a post-lock failure tally was not persisted: {e}");
-                n
+                (n, until)
             }
             Err(e) => {
                 tracing::warn!("witness: a post-lock failure tally was not persisted: {e:#}");
-                1
+                (u8::from(increment), until)
             }
         }
     }
 
-    /// A post-lock tally's count now (0 when there is none, or it expired).
-    async fn tally(&self, key: B256) -> u8 {
+    /// A post-lock tally's count now and when it expires (0 when there is none, or it expired).
+    async fn tally(&self, key: B256) -> (u8, u64) {
         let now = now_unix();
         let Some(store) = self.store() else {
-            return lock(&self.tallies).get(&key).map_or(0, |(n, t)| tally_count(*n, *t, now));
+            return lock(&self.tallies).get(&key).map_or((0, 0), |(n, t)| (tally_count(*n, *t, now), *t));
         };
-        blocking(move || store.verdict(key).ok().flatten().map_or(0, |v| tally_count(v.attempts, v.expires_at, now)))
-            .await
-            .unwrap_or(0)
+        blocking(move || {
+            store.verdict(key).ok().flatten().map_or((0, 0), |v| (tally_count(v.attempts, v.expires_at, now), v.expires_at))
+        })
+        .await
+        .unwrap_or((0, 0))
     }
 
     /// The caller's post-lock failures as last read here (`None` when not read yet).
@@ -2073,25 +2543,26 @@ impl WitnessRuntime {
         lock(&self.post_lock_callers).get(&caller).map(|(n, t)| tally_count(*n, *t, now))
     }
 
-    /// The caller's post-lock failures read from the store (and remembered for routing).
+    /// The caller's post-lock failures read from the store, remembered for routing until the
+    /// tally's own expiry.
     async fn caller_post_lock_failures_now(&self, caller: Address) -> u8 {
-        let n = self.tally(caller_tally_key(caller)).await;
+        let (n, until) = self.tally(caller_tally_key(caller)).await;
         let mut m = lock(&self.post_lock_callers);
         if m.len() >= PER_JOB_CAP {
             m.clear();
         }
-        m.insert(caller, (n, now_unix().saturating_add(POST_LOCK_TALLY_TTL_SECS)));
+        m.insert(caller, (n, until));
         n
     }
 
-    /// The slots among `slots` whose device is quarantined: a post-lock witness failure tally of
-    /// some class at [`POST_LOCK_DEVICE_LIMIT`] (§16).
+    /// The slots among `slots` whose device is quarantined: post-lock witness failures of some class
+    /// from [`POST_LOCK_DEVICE_LIMIT`] distinct callers (§16).
     async fn quarantined(&self, slots: &[String]) -> HashSet<String> {
         let mut out = HashSet::new();
         for slot in slots {
             let device = device_of_slot(slot);
             for class in POST_LOCK_CLASSES {
-                if self.tally(device_tally_key(&device, class)).await >= POST_LOCK_DEVICE_LIMIT {
+                if self.tally(device_tally_key(&device, class)).await.0 >= POST_LOCK_DEVICE_LIMIT {
                     out.insert(slot.clone());
                     break;
                 }
@@ -2118,15 +2589,17 @@ impl WitnessRuntime {
             if self.client.job_clock_stopped(l.descriptor.proofSystemId).await {
                 return Err(run::HandBack(format!("{e:#} while the job's clock is stopped")).into());
             }
-            l.failure = Some((None, PostLockFailureClass::ProveTimeEstimate));
+            // No room left before any attempt ran (a lock recovered late): not the caller's.
+            l.failure = Some(LockFailure::host(PostLockFailureClass::ProveTimeEstimate));
             return Err(e);
         }
         run::journal_update(&self.journal, |j| j.mark_proving(jid));
         self.state.write().await.add_log(LogLevel::Info, format!("Proving witness job {}...", short(jid)));
-        let (proof, slot) = self.prove(&store, l).await?;
+        let proved = self.prove(&store, l).await?;
         card.release();
+        let proof = &proved.proof;
         tracing::info!("WITNESS-LOCK {}: proved ({} cycles, {:.1} s)", short(jid), proof.cycles, proof.duration.as_secs_f64());
-        self.fulfil(l, proof, slot).await
+        self.fulfil(l, proved).await
     }
 
     /// A bundle problem on a held lock (§15.2): unavailable keeps the lock; missing or corrupt pages
@@ -2158,10 +2631,12 @@ impl WitnessRuntime {
         root.join(format!("{:x}", jid).trim_start_matches("0x").chars().take(16).collect::<String>())
     }
 
-    /// Execute, compare, prove (§15.3), only on a card at an executed po2 and never on a quarantined
-    /// device. Returns the proof and the slot it ran on. Before every `Err` that is not a hand-back,
-    /// `l.failure` says on which slot and how it failed (the post-lock tallies).
-    async fn prove(self: &Arc<Self>, store: &Arc<Store>, l: &mut LockCtx) -> Result<(ProofOutput, Option<String>)> {
+    /// Execute, compare, prove (§15.3), only on a card at an executed po2: one whose device is not
+    /// quarantined when any such card proves it, else a quarantined one (the quarantine applies to
+    /// new locks, §16; a held lock keeps proving). Returns the proof and where it ran. Before every
+    /// `Err` that is not a hand-back, `l.failure` says on which slot and how it failed, and whether
+    /// the caller's tally counts it (the post-lock tallies).
+    async fn prove(self: &Arc<Self>, store: &Arc<Store>, l: &mut LockCtx) -> Result<Proved> {
         use zkminer_prover_protocol::types::{GpuMemoryShortage, HostMemoryShortage, ProofDeadlineReached, WorkerProofError};
         let jid = l.job_id;
         let pool = zkminer_prover::engine::worker_pool().ok_or_else(|| anyhow!("no worker pool available"))?;
@@ -2171,6 +2646,9 @@ impl WitnessRuntime {
         let mut excluded: Vec<String> = Vec::new();
         let mut diverged = false;
         let mut warned_no_card = false;
+        let mut warned_quarantined = false;
+        // Whether a proof attempt of the guest ran on a card (else a release is the host's).
+        let mut ran = false;
         // After a divergence, the re-versioned bundle is proven on the slot that diverged: it is the
         // one whose execution the new version records.
         let mut only_slot: Option<String> = None;
@@ -2186,7 +2664,13 @@ impl WitnessRuntime {
                         attempt = attempt.saturating_sub(1);
                         continue;
                     }
-                    l.failure = Some((None, PostLockFailureClass::ProveTimeEstimate));
+                    // Out of time: the caller's guest only if an attempt of it ran, and never when a
+                    // verifier swap's readyAt (governance) is what ends the budget.
+                    l.failure = Some(LockFailure {
+                        slot: None,
+                        class: PostLockFailureClass::ProveTimeEstimate,
+                        caller: ran && cutoff == l.lock_deadline,
+                    });
                     bail!(
                         "abandoning witness lock {} before its {}: only {} s of proving budget left",
                         short(jid),
@@ -2206,10 +2690,18 @@ impl WitnessRuntime {
                 .collect();
             let slots: Vec<String> = all.iter().map(|(s, _)| s.clone()).collect();
             let quarantined = self.quarantined(&slots).await;
-            let cards: Vec<(String, u8)> = all.into_iter().filter(|(s, _)| !quarantined.contains(s)).collect();
             let executed: Vec<u32> =
                 l.record.po2_results.iter().filter(|r| r.exit == GuestExit::Halted(0)).map(|r| r.po2).collect();
-            let sizes = witness_prove_sizes(&cards, &executed);
+            let sizes = held_lock_prove_sizes(&all, &quarantined, &executed);
+            if sizes.keys().any(|s| quarantined.contains(s)) && !warned_quarantined {
+                warned_quarantined = true;
+                tracing::warn!(
+                    "witness lock {} is proven on a quarantined device ({:?}): no other card proves it at an \
+                     executed po2, and the quarantine stops new locks only",
+                    short(jid),
+                    sizes.keys().collect::<Vec<_>>()
+                );
+            }
             if sizes.is_empty() {
                 if shutting_down() {
                     return Err(run::HandBack(format!("no enabled card proves at an executed po2 {executed:?}")).into());
@@ -2217,11 +2709,10 @@ impl WitnessRuntime {
                 if !warned_no_card {
                     warned_no_card = true;
                     tracing::warn!(
-                        "witness lock {} waits for a card at an executed po2 {executed:?}{}{} (it is never proven \
+                        "witness lock {} waits for a card at an executed po2 {executed:?}{} (it is never proven \
                          at another size); released before its deadline otherwise",
                         short(jid),
                         only_slot.as_ref().map_or(String::new(), |s| format!(" on {s}, where it diverged")),
-                        if quarantined.is_empty() { String::new() } else { format!(", not on quarantined {quarantined:?}") }
                     );
                 }
                 attempt = attempt.saturating_sub(1);
@@ -2279,8 +2770,13 @@ impl WitnessRuntime {
             })
             .await
             .map_err(|e| anyhow!("prove task panicked: {e}"))?;
+            ran = true;
+            let on = |class| Some(LockFailure::on(used.clone(), class, &quarantined));
             match res {
-                Ok(WitnessProveOutcome::Proved(p)) => return Ok((p, used)),
+                Ok(WitnessProveOutcome::Proved(p)) => {
+                    let on_quarantined = used.as_ref().is_some_and(|s| quarantined.contains(s));
+                    return Ok(Proved { proof: p, slot: used, on_quarantined });
+                }
                 Ok(WitnessProveOutcome::JournalDiverged(dv)) => {
                     let po2 = used.as_ref().and_then(|s| sizes.get(s)).copied();
                     tracing::error!(
@@ -2290,13 +2786,13 @@ impl WitnessRuntime {
                         dv.journal_len
                     );
                     if diverged {
-                        l.failure = Some((used, PostLockFailureClass::JournalDiverged));
+                        l.failure = on(PostLockFailureClass::JournalDiverged);
                         bail!("a second journal divergence on witness lock {}: releasing", short(jid));
                     }
                     diverged = true;
                     if let Err(e) = self.reversion(store, l, &dv, po2).await {
                         if e.downcast_ref::<run::HandBack>().is_none() {
-                            l.failure = Some((used, PostLockFailureClass::JournalDiverged));
+                            l.failure = on(PostLockFailureClass::JournalDiverged);
                         }
                         return Err(e);
                     }
@@ -2314,7 +2810,10 @@ impl WitnessRuntime {
                             attempt = attempt.saturating_sub(1);
                             continue;
                         }
-                        l.failure = Some((used, PostLockFailureClass::ProveTimeEstimate));
+                        let mut f = LockFailure::on(used.clone(), PostLockFailureClass::ProveTimeEstimate, &quarantined);
+                        // A verifier swap's readyAt that ended the budget is governance's.
+                        f.caller &= self.proving_cutoff(l) == l.lock_deadline;
+                        l.failure = Some(f);
                         bail!("proving stopped for witness lock {} (deadline): {msg}", short(jid));
                     }
                     if let Some(shortage) = e.downcast_ref::<GpuMemoryShortage>() {
@@ -2342,7 +2841,7 @@ impl WitnessRuntime {
                         if let Err(se) = blocking(move || s.verify(&b, &descriptor_hash_of_abi, &*idf)).await? {
                             return Err(self.bundle_trouble(jid, l.lock_deadline, &se, false));
                         }
-                        l.failure = Some((used, PostLockFailureClass::ProverCrash));
+                        l.failure = on(PostLockFailureClass::ProverCrash);
                         bail!("the worker refused the bundle's input although it verifies: {msg}");
                     } else if let Some(k) = used.clone() {
                         if !excluded.contains(&k) {
@@ -2353,7 +2852,7 @@ impl WitnessRuntime {
                         tracing::warn!("witness lock {}: proof attempt {attempt} failed ({msg}); retrying", short(jid));
                         continue;
                     }
-                    l.failure = Some((used, failure_class(&e)));
+                    l.failure = on(failure_class(&e));
                     bail!("proving witness lock {} failed after {attempt} attempt(s): {msg}", short(jid));
                 }
             }
@@ -2456,11 +2955,12 @@ impl WitnessRuntime {
         let (s, head) = (store.clone(), self.client.head_block_cached().await.unwrap_or(0));
         let old_pin = self.pin_of(store, &l.bundle);
         let (reopen_count, lock_block) = (old_pin.as_ref().and_then(|p| p.reopen_count), l.lock_block);
+        let pinned_at_unix = old_pin.as_ref().map_or_else(zkminer_chain::client::chain_now, |p| p.pinned_at_unix);
         let pinned = blocking(move || {
             let mut rec = s.pin_record(&new_ref, head)?;
             rec.reopen_count = reopen_count;
             rec.lock_block = lock_block;
-            rec.pinned_at_unix = zkminer_chain::client::chain_now_floor();
+            rec.pinned_at_unix = pinned_at_unix;
             s.pin(&rec)
         })
         .await?;
@@ -2489,14 +2989,19 @@ impl WitnessRuntime {
     }
 
     /// `fulfillJobHashed` under the DA rules (§5.5), retried by class until the job settles or its
-    /// window closes, as the inline fulfil is.
-    async fn fulfil(self: &Arc<Self>, l: &mut LockCtx, proof: ProofOutput, proved_on: Option<String>) -> Result<()> {
+    /// window closes, as the inline fulfil is, and never past a pending verifier swap's `readyAt` for
+    /// its proof system (a proof for the old verifier can then only be released): every attempt is
+    /// budgeted by [`Self::proving_cutoff`], as the proof was.
+    async fn fulfil(self: &Arc<Self>, l: &mut LockCtx, proved: Proved) -> Result<()> {
         use zkminer_chain::revert::{FulfilClass, FulfilFailure};
         let jid = l.job_id;
-        // A proof the router would refuse is the proving device's failure; a fulfil that cannot land
-        // in time is the chain's (gas, RPC, blockspace).
-        let proof_defect = Some((proved_on.clone(), PostLockFailureClass::Gpu));
-        let chain = Some((None, PostLockFailureClass::GasOrRpc));
+        let Proved { proof, slot: proved_on, on_quarantined } = proved;
+        // A proof the router would refuse is the proving device's failure (the caller's guest's
+        // unless that device was quarantined); a fulfil that cannot land in time is the chain's (gas,
+        // RPC, blockspace).
+        let proof_defect =
+            Some(LockFailure { slot: proved_on.clone(), class: PostLockFailureClass::Gpu, caller: !on_quarantined });
+        let chain = Some(LockFailure::chain());
         if proof.journal.len() > MAX_JOURNAL_BYTES {
             l.failure = proof_defect;
             bail!("the proof's journal is {} bytes, over the cap", proof.journal.len());
@@ -2531,11 +3036,25 @@ impl WitnessRuntime {
         let psid = l.descriptor.proofSystemId;
         let public_values = Bytes::from(proof.journal.clone());
         let seal = Bytes::from(seal);
+        // A release because a verifier swap's readyAt comes first is governance's: no caller's.
+        let swap_cut = Some(LockFailure::host(PostLockFailureClass::GasOrRpc));
         loop {
             run::refresh_lock_deadline(&self.client, &self.journal, jid, &mut l.lock_deadline).await;
             let min = Duration::from_secs(run::MIN_ATTEMPT_BUDGET_SECS);
-            let budget = match run::deadline_proof_budget(l.lock_deadline) {
+            let cutoff = self.proving_cutoff(l);
+            let swap = cutoff < l.lock_deadline;
+            let budget = match run::deadline_proof_budget(cutoff) {
                 None => None,
+                Some(b) if b < min && swap => {
+                    clear_submitting("verifier swap pending — releasing").await;
+                    l.failure = swap_cut.clone();
+                    bail!(
+                        "a verifier swap for witness lock {}'s proof system is ready in {} s: its proof can only be \
+                         released then; releasing",
+                        short(jid),
+                        b.as_secs()
+                    );
+                }
                 Some(b) if b < min && run::clock_stopped_or_unknown(&self.client, psid, b).await => {
                     if self.client.job_clock_stopped(psid).await {
                         Some(min * 2)
@@ -2605,6 +3124,14 @@ impl WitnessRuntime {
             if shutting_down() && matches!(class, FulfilClass::Keep | FulfilClass::VerifierFailed) {
                 clear_submitting("shutdown during a held fulfil").await;
                 return Err(run::HandBack(format!("shutdown while the fulfil is held: {reason}")).into());
+            }
+            let cutoff = self.proving_cutoff(l);
+            if cutoff < l.lock_deadline
+                && run::deadline_proof_budget(cutoff).is_some_and(|b| b <= run::FULFIL_RETRY_WAIT + min)
+            {
+                clear_submitting("verifier swap pending — releasing").await;
+                l.failure = swap_cut.clone();
+                bail!("a verifier swap for witness lock {}'s proof system is ready before a retry could land; releasing", short(jid));
             }
             match run::deadline_proof_budget(l.lock_deadline) {
                 Some(b) if b <= run::FULFIL_RETRY_WAIT + min => {
@@ -2695,9 +3222,13 @@ impl WitnessRuntime {
 
     // ── recovery ──────────────────────────────────────────────────────────────
 
-    /// Re-drives a witness lock of ours from its bundle (single flight). `false` when a task owns it.
-    /// Until its bundle is found and pinned, eviction waits for it (§15.2).
+    /// Re-drives a witness lock of ours from its bundle (single flight). `false` when a task owns it,
+    /// or once shutdown has begun (held locks are then the drain's: a lock re-driven during the drain
+    /// would race its release). Until its bundle is found and pinned, eviction waits for it (§15.2).
     pub(crate) fn drive_recovered(self: &Arc<Self>, jid: B256) -> bool {
+        if self.stopping() {
+            return false;
+        }
         {
             let mut t = lock(&self.tasks);
             if t.contains_key(&jid) {
@@ -2812,7 +3343,7 @@ impl WitnessRuntime {
         if needs_pin {
             let (s, b) = (store.clone(), bref);
             let reopen = rec.reopen_count;
-            let pinned_at_unix = pin.as_ref().map_or_else(zkminer_chain::client::chain_now_floor, |p| p.pinned_at_unix);
+            let pinned_at_unix = pin.as_ref().map_or_else(zkminer_chain::client::chain_now, |p| p.pinned_at_unix);
             let res = blocking(move || {
                 let mut r = s.pin_record(&b, at)?;
                 r.reopen_count = Some(reopen);
@@ -2888,14 +3419,14 @@ impl WitnessRuntime {
 
     async fn store_pass_loop(self: Arc<Self>) {
         loop {
+            if self.stopping() {
+                return;
+            }
             if !self.store_pass_running.swap(true, Ordering::SeqCst) {
                 self.store_pass().await;
                 self.store_pass_running.store(false, Ordering::SeqCst);
             }
             tokio::time::sleep(STORE_PASS_EVERY).await;
-            if shutting_down() {
-                return;
-            }
         }
     }
 
@@ -2981,9 +3512,18 @@ impl WitnessRuntime {
                     pinned_at_block: pin.pinned_at_block,
                     pinned_at_unix: pin.pinned_at_unix,
                 };
-                let read = PinRead { status: rec.status, prover: rec.prover, reopen_count: rec.reopen_count, at_block: at };
-                let now = zkminer_chain::client::chain_now_floor();
-                if pin_lock_gone(&facts, &read, us, now, run::CLAIM_INTENT_MAX_AGE_SECS) {
+                let mut read = PinRead {
+                    status: rec.status,
+                    prover: rec.prover,
+                    reopen_count: rec.reopen_count,
+                    at_block: at,
+                    at_timestamp: None,
+                };
+                // A claim never confirmed: the read counts only if its own block was mined late enough.
+                if pin_read_needs_time(&facts, &read, us) {
+                    read.at_timestamp = with_lane(Lane::HeldLock, self.client.block_timestamp(at)).await.ok();
+                }
+                if pin_lock_gone(&facts, &read, us, run::CLAIM_INTENT_MAX_AGE_SECS) {
                     let (s, p) = (store.clone(), pin.clone());
                     if let Ok(Ok(true)) = blocking(move || s.unpin(p.job_id, p.descriptor_hash, p.prover)).await {
                         tracing::info!(
@@ -3025,6 +3565,34 @@ impl WitnessRuntime {
                 }
             }
         }
+        // Post-lock verdicts last until their job is terminal (an Open job never expires on chain, and
+        // its bundle may be evicted long before): read each such job (bounded per pass, starting at a
+        // random one so none waits forever) and drop its records with its bundles once it is.
+        let s = store.clone();
+        if let Ok(Ok(verdicts)) = blocking(move || s.verdicts()).await {
+            let mut lasting: Vec<B256> = verdicts
+                .iter()
+                .filter(|v| lasts_until_terminal(v.reason, v.expires_at))
+                .map(|v| v.job_id)
+                .filter(|j| !owned.contains(j) && !pinned_jobs.contains(j))
+                .collect();
+            if !lasting.is_empty() {
+                let start = rand::random::<u64>() as usize % lasting.len();
+                lasting.rotate_left(start);
+            }
+            for jid in lasting {
+                if reads >= STORE_PASS_MAX_READS {
+                    break;
+                }
+                reads += 1;
+                if let Ok((rec, at)) = with_lane(Lane::PreClaim, self.client.read_job_record(jid, None)).await {
+                    if let Some(state) = terminal_state(&rec) {
+                        self.delete_terminal(&store, jid, state, at).await;
+                        lock(&self.verdict_until).remove(&jid);
+                    }
+                }
+            }
+        }
         // A handed-over lock that recovery could not pin, and that provably ended since (a terminal
         // read, or the journal's evidence: a risen reopen count, another prover at or after the lock
         // block), has nothing left to protect. An unpinned read alone may lag: it keeps waiting.
@@ -3045,8 +3613,9 @@ impl WitnessRuntime {
             }
         }
         // Eviction (§15.2: "nothing is evicted until this process has completed one full recovery
-        // scan"): this pass read every pin, the brain's recovery has handed over every witness lock
-        // it found on chain or in the journal, and each of those is pinned.
+        // scan"): this pass read every pin, a brain recovery pass with a complete chain scan has
+        // handed over every witness lock it decided (the jobs it left undecided are spared in the
+        // store), and each of those is pinned.
         let handed = self.brain_recovered.load(Ordering::SeqCst);
         let waiting = lock(&self.unpinned_recoveries).len();
         if complete && handed && waiting == 0 && !self.scan_complete.swap(true, Ordering::SeqCst) {
@@ -3152,18 +3721,10 @@ impl PipelineHooks for Hooks {
             let (idf, bytes) = (rt.image_id_fn(), elf.clone());
             let before = rt.image_id_unavailable.load(Ordering::SeqCst);
             let id = blocking(move || idf(&bytes)).await.map_err(|e| (SkipReason::HostInternal, format!("{e:#}")))?;
-            match id {
-                Some(id) if id == self.program_id => {
-                    *lock(&self.elf) = Some(elf.clone());
-                    Ok(elf)
-                }
-                Some(id) => Err((SkipReason::ElfImageIdMismatch, format!("the ELF's image id is {id}"))),
-                None if rt.image_id_unavailable.load(Ordering::SeqCst) != before => Err((
-                    SkipReason::HostInternal,
-                    "the ELF's image id could not be derived now (no risc0 measure worker came free)".into(),
-                )),
-                None => Err((SkipReason::ElfImageIdMismatch, "the ELF is not one risc0 derives an image id for".into())),
-            }
+            let unavailable = rt.image_id_unavailable.load(Ordering::SeqCst) != before;
+            elf_image_id_outcome(id, self.program_id, unavailable)?;
+            *lock(&self.elf) = Some(elf.clone());
+            Ok(elf)
         })
     }
 }
@@ -3227,6 +3788,31 @@ fn free_bytes(dir: &Path) -> std::io::Result<u64> {
     Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
 }
 
+/// What one [`WitnessRuntime::self_test_round`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfTestRound {
+    /// The configuration file switched serving off.
+    SwitchedOff,
+    /// The miner did not start with serving enabled.
+    NotEnabled,
+    /// Serving had not started: the start was tried again.
+    StartRetried,
+    /// Serving had not started, and a start is running.
+    Starting,
+    Passed,
+    Failed,
+}
+
+/// `[witness] enabled` as the configuration file at `path` says it now; an error when the file is gone
+/// or does not parse (a missing file is not "the defaults": the kill switch never flips on a file
+/// that is merely absent).
+fn configured_witness_enabled(path: &Path) -> Result<bool> {
+    if !path.is_file() {
+        bail!("{} is not a file", path.display());
+    }
+    Ok(ZkMinerConfig::load(Some(path))?.witness.enabled)
+}
+
 /// A self-test bounded by [`SELF_TEST_TIMEOUT`]: one that does not finish is a failure.
 async fn bounded_self_test(name: &str, test: impl std::future::Future<Output = Result<(), String>>) -> Result<(), String> {
     match tokio::time::timeout(SELF_TEST_TIMEOUT, test).await {
@@ -3255,6 +3841,347 @@ async fn broker_self_test(client: &BrokerClient, connector: &Arc<zkminer_witness
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use zkminer_witness_store::{ExpectedIdentity, StoreIdentityInit, StoreOptions};
+
+    const TEST_CHAIN: u64 = 31_337;
+
+    /// A JSON-RPC endpoint that answers `eth_chainId` (all a `ChainClient` reads to connect) and
+    /// refuses everything else: these tests exercise the runtime's own bookkeeping, with no chain.
+    async fn chainless_client() -> ChainClient {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    loop {
+                        let mut chunk = [0u8; 4096];
+                        let n = match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                        let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
+                        let len: usize = head
+                            .split("content-length:")
+                            .nth(1)
+                            .and_then(|v| v.split("\r\n").next())
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        if buf.len() < end + 4 + len {
+                            continue;
+                        }
+                        let req: serde_json::Value = serde_json::from_slice(&buf[end + 4..end + 4 + len]).unwrap();
+                        let answer = |r: &serde_json::Value| match r["method"].as_str() {
+                            Some("eth_chainId") => {
+                                serde_json::json!({"jsonrpc": "2.0", "id": r["id"], "result": format!("{TEST_CHAIN:#x}")})
+                            }
+                            _ => serde_json::json!({"jsonrpc": "2.0", "id": r["id"], "error": {"code": -32601, "message": "no chain here"}}),
+                        };
+                        let resp = match &req {
+                            serde_json::Value::Array(rs) => serde_json::Value::Array(rs.iter().map(answer).collect()),
+                            r => answer(r),
+                        };
+                        let body = serde_json::to_vec(&resp).unwrap();
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        if sock.write_all(hdr.as_bytes()).await.is_err() || sock.write_all(&body).await.is_err() {
+                            return;
+                        }
+                        buf.drain(..end + 4 + len);
+                    }
+                });
+            }
+        });
+        let mut c = ZkMinerConfig::default();
+        c.chain.rpc_url = url;
+        c.chain.chain_id = TEST_CHAIN;
+        c.chain.max_requests_per_sec = Some(1000);
+        c.contracts.hemi_prove = format!("{:#x}", Address::repeat_byte(0x11));
+        c.contracts.hemi_prove_registry = format!("{:#x}", Address::repeat_byte(0x12));
+        c.contracts.hemi_prove_staking = format!("{:#x}", Address::repeat_byte(0x13));
+        c.contracts.hemi_token = format!("{:#x}", Address::repeat_byte(0x14));
+        ChainClient::new_watch_only(&c, Address::repeat_byte(0x77)).await.unwrap()
+    }
+
+    /// A retention store in a fresh directory, removed when dropped.
+    struct TestStore {
+        dir: PathBuf,
+        store: Arc<Store>,
+    }
+
+    impl Drop for TestStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn test_store(client: &ChainClient) -> TestStore {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir()
+            .join(format!("zkminer-witness-rt-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (chain_id, router, prover) = (client.chain_id, client.hemi_prove, client.address);
+        let id = Store::init(
+            &dir,
+            &StoreIdentityInit { chain_id, router, prover, require_dedicated_mount: false, allow_any_filesystem: true },
+        )
+        .unwrap();
+        let store = Store::open(
+            &dir,
+            &ExpectedIdentity { chain_id, router, prover, store_uuid: id.store_uuid },
+            StoreOptions {
+                quota_bytes: 1 << 30,
+                quota_inodes: 100_000,
+                free_space_floor_bytes: 0,
+                require_dedicated_mount: false,
+                allow_any_filesystem: true,
+            },
+        )
+        .unwrap();
+        TestStore { dir, store: Arc::new(store) }
+    }
+
+    /// A runtime as `start` builds it (no serving, no tasks), with `store` open.
+    async fn test_runtime(store: bool) -> (Arc<WitnessRuntime>, Option<TestStore>) {
+        let client = chainless_client().await;
+        let gov = GovernanceWatcher::new(client.clone(), GovernanceConfig::new(client.address, vec![])).view();
+        let rt = WitnessRuntime::new(
+            &client,
+            &zkminer_tui::state::new_shared_state(),
+            &Arc::new(Mutex::new(Default::default())),
+            &ZkMinerConfig::default(),
+            PathBuf::new(),
+            gov,
+            BacklogSource::Fixed(BacklogReading::fixed(Backlog::Known(0), Some(0))),
+            DaCapPolicy::default(),
+            Duration::from_secs(600),
+            [7; 32],
+            DEFAULT_KECCAK_PO2,
+        );
+        let ts = store.then(|| test_store(&client));
+        *lock(&rt.store) = ts.as_ref().map(|t| t.store.clone());
+        (Arc::new(rt), ts)
+    }
+
+    fn gpu_failure(slot: &str) -> LockFailure {
+        LockFailure::on(Some(slot.into()), PostLockFailureClass::Gpu, &HashSet::new())
+    }
+
+    /// The brain's room rule released a witness lock it found too close to its deadline, with no
+    /// verdict: the job reopened, and after a restart it could be locked again. And a store pass that
+    /// re-drove the lock just as the brain spawned that release could not see it. The release now
+    /// takes the job in the runtime first (a store pass then leaves it alone, and one that took it
+    /// first wins), and records the job's verdict before the release is sent.
+    #[tokio::test]
+    async fn a_room_rule_release_owns_the_lock_and_records_a_verdict() {
+        let (rt, s) = test_runtime(true).await;
+        let jid = B256::repeat_byte(0x51);
+        note_class(jid, Class::Witness);
+        let ReleaseClaim::Witness(release) = rt.claim_release(jid) else { panic!("a witness lock") };
+        assert!(rt.owns(jid));
+        assert!(!rt.drive_recovered(jid), "the store pass cannot re-drive it meanwhile");
+        assert!(matches!(rt.claim_release(jid), ReleaseClaim::Owned), "nor a second release");
+        assert_eq!(rt.witness_locks(), 0, "a release holds no card");
+        release.record_verdict("released by the recovery room rule").await;
+        let v = s.as_ref().unwrap().store.verdict(jid).unwrap().unwrap();
+        assert_eq!((v.reason, v.expires_at), (SkipReason::PostLockFailure, VERDICT_UNTIL_TERMINAL));
+        assert_eq!(rt.caller_post_lock_failures_now(Address::ZERO).await, 0, "no caller is counted");
+        drop(release);
+        assert!(!rt.owns(jid));
+        // The other way round: a store pass that took the lock first keeps it, and no release goes.
+        let other = B256::repeat_byte(0x52);
+        note_class(other, Class::Witness);
+        lock(&rt.tasks).insert(other, task(Phase::Locked));
+        assert!(matches!(rt.claim_release(other), ReleaseClaim::Owned));
+        // An inline lock is not the runtime's.
+        assert!(matches!(rt.claim_release(B256::repeat_byte(0x53)), ReleaseClaim::NotWitness));
+        // A shutdown release records it too, once.
+        let third = B256::repeat_byte(0x54);
+        note_class(third, Class::Witness);
+        rt.note_release(third, "released at shutdown").await;
+        rt.note_release(third, "released at shutdown").await;
+        assert_eq!(s.as_ref().unwrap().store.verdict(third).unwrap().unwrap().attempts, 1);
+    }
+
+    /// A brain pass that stayed deferred over one unreadable job (or a claim that might still be
+    /// pending) never enabled eviction, so the store filled. A pass whose chain scan was complete now
+    /// enables it, sparing only the bundles of the jobs it left undecided; a pass whose scan failed
+    /// still does not (a lock of ours could be anywhere).
+    #[tokio::test]
+    async fn an_undecided_job_no_longer_holds_eviction_back() {
+        let (rt, _s) = test_runtime(true).await;
+        rt.note_recovery_pass(false, vec![]);
+        assert!(!rt.brain_recovered.load(Ordering::SeqCst), "a failed chain scan hands over nothing");
+        let undecided = B256::repeat_byte(0x81);
+        rt.note_recovery_pass(true, vec![undecided]);
+        assert!(rt.brain_recovered.load(Ordering::SeqCst));
+        assert!(lock(&rt.undecided).contains(&undecided));
+        rt.note_recovery_pass(true, vec![]);
+        assert!(lock(&rt.undecided).is_empty(), "decided by a later pass");
+    }
+
+    /// `[witness] enabled = false` was read only at startup, although §20.4 calls it a hot kill
+    /// switch. The configuration file is read again: `false` switches serving off at once (running
+    /// simulations aborted) and keeps it off through the self-tests; `true` again resumes; a file that
+    /// is gone changes nothing.
+    #[tokio::test]
+    async fn the_kill_switch_is_hot() {
+        let (rt, _s) = test_runtime(false).await;
+        *lock(&rt.serve) = Some((Arc::new(ZkMinerConfig::default()), None));
+        rt.enabled.store(true, Ordering::SeqCst);
+        let sim = AbortToken::new();
+        lock(&rt.tasks).insert(B256::repeat_byte(0x91), Task { token: sim.clone(), phase: Phase::Simulating });
+        let held = AbortToken::new();
+        lock(&rt.tasks).insert(B256::repeat_byte(0x92), Task { token: held.clone(), phase: Phase::Locked });
+
+        let dir = std::env::temp_dir().join(format!("zkminer-killswitch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[witness]\nenabled = false\n").unwrap();
+        assert!(!configured_witness_enabled(&path).unwrap());
+        rt.apply_enabled(configured_witness_enabled(&path).unwrap());
+        assert!(!rt.enabled.load(Ordering::SeqCst), "switched off at once");
+        assert!(sim.is_aborted(), "a running simulation is aborted");
+        assert!(!held.is_aborted(), "a held lock continues");
+        assert_eq!(rt.self_test_round().await, SelfTestRound::SwitchedOff, "the self-tests do not switch it back on");
+        assert!(!rt.try_start_serving().await, "nor does a start");
+        std::fs::write(&path, "[witness]\nenabled = true\n").unwrap();
+        rt.apply_enabled(configured_witness_enabled(&path).unwrap());
+        assert!(!rt.switched_off.load(Ordering::SeqCst));
+        std::fs::remove_file(&path).unwrap();
+        assert!(configured_witness_enabled(&path).is_err(), "a missing file is not the defaults");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A serving start whose self-test timed out left serving off until a restart: the hourly loop
+    /// skipped while nothing was serving. It now tries the start again.
+    #[tokio::test]
+    async fn the_hourly_round_retries_a_failed_start() {
+        let (rt, _s) = test_runtime(false).await;
+        assert_eq!(rt.self_test_round().await, SelfTestRound::NotEnabled);
+        // A start that fails at once (this configuration does not validate): tried again each round.
+        *lock(&rt.serve) = Some((Arc::new(ZkMinerConfig::default()), None));
+        assert_eq!(rt.self_test_round().await, SelfTestRound::StartRetried);
+        assert!(!rt.enabled.load(Ordering::SeqCst));
+        assert_eq!(rt.self_test_round().await, SelfTestRound::StartRetried, "and again");
+        rt.starting.store(true, Ordering::SeqCst);
+        assert_eq!(rt.self_test_round().await, SelfTestRound::Starting, "never two starts at once");
+    }
+
+    /// A sandbox self-test that did not finish held the one spawner thread, so every later builder,
+    /// execute and broker start queued behind it. It runs on a thread of its own, and while one that
+    /// did not finish still runs, the next fails at once.
+    #[tokio::test]
+    async fn a_stuck_sandbox_self_test_holds_nothing_else() {
+        let (rt, _s) = test_runtime(false).await;
+        rt.sandbox_test_running.store(true, Ordering::SeqCst);
+        let r = tokio::time::timeout(Duration::from_secs(5), rt.sandbox_self_test(Path::new("/nonexistent"))).await;
+        assert_eq!(r.expect("returns at once"), Err("the previous sandbox self-test has not finished".to_string()));
+        rt.sandbox_test_running.store(false, Ordering::SeqCst);
+        // A probe that does not exist fails the test on its own thread, and frees it.
+        let r = rt.sandbox_self_test(Path::new("/nonexistent/zkminer-witness-sandbox-probe")).await;
+        assert!(r.is_err());
+        assert!(!rt.sandbox_test_running.load(Ordering::SeqCst));
+    }
+
+    /// A store pass running as shutdown began re-drove held locks beside the drain's releases. Once
+    /// shutdown has begun nothing re-drives a lock.
+    #[tokio::test]
+    async fn nothing_re_drives_a_lock_once_shutdown_began() {
+        let (rt, _s) = test_runtime(false).await;
+        rt.shutdown();
+        assert!(!rt.drive_recovered(B256::repeat_byte(0x61)));
+        assert!(rt.owned_jobs().is_empty());
+    }
+
+    /// One caller whose guest reliably fails during proving quarantined a one-card host for 7 days
+    /// with two failures, and with it every other caller's witness jobs. A device is now quarantined
+    /// by failures of a class from two distinct callers.
+    #[tokio::test]
+    async fn one_callers_failures_never_quarantine_a_device() {
+        let (rt, _s) = test_runtime(true).await;
+        let (a, b) = (Address::repeat_byte(0xa1), Address::repeat_byte(0xb1));
+        let slots = vec!["gpu0".to_string()];
+        for j in 1..=3u8 {
+            rt.record_post_lock_failure(B256::repeat_byte(j), a, &gpu_failure("gpu0")).await;
+        }
+        assert!(rt.quarantined(&slots).await.is_empty(), "one caller alone");
+        assert_eq!(rt.caller_post_lock_failures_now(a).await, 3, "the caller's own tally counts every one");
+        rt.record_post_lock_failure(B256::repeat_byte(9), b, &gpu_failure("gpu0")).await;
+        assert_eq!(rt.quarantined(&slots).await, slots.iter().cloned().collect(), "a second caller");
+        assert!(rt.quarantined(&["gpu1".to_string()]).await.is_empty(), "another device");
+    }
+
+    /// A failure no attempt of the caller's guest caused (no card proved the lock, the window had no
+    /// room, a quarantined device, a verifier swap) is not counted against the caller.
+    #[tokio::test]
+    async fn failures_the_caller_did_not_cause_are_not_its_strikes() {
+        let (rt, _s) = test_runtime(true).await;
+        let c = Address::repeat_byte(0xc1);
+        rt.record_post_lock_failure(B256::repeat_byte(1), c, &LockFailure::host(PostLockFailureClass::ProveTimeEstimate))
+            .await;
+        let quarantined: HashSet<String> = ["gpu0".to_string()].into();
+        let on_quarantined = LockFailure::on(Some("gpu0".into()), PostLockFailureClass::Gpu, &quarantined);
+        assert!(!on_quarantined.caller);
+        rt.record_post_lock_failure(B256::repeat_byte(2), c, &on_quarantined).await;
+        assert_eq!(rt.caller_post_lock_failures_now(c).await, 0);
+        // Each job still gets its final verdict.
+        let store = rt.store().unwrap();
+        for j in [1u8, 2] {
+            let v = store.verdict(B256::repeat_byte(j)).unwrap().unwrap();
+            assert_eq!((v.reason, v.expires_at), (SkipReason::PostLockFailure, VERDICT_UNTIL_TERMINAL));
+        }
+        rt.record_post_lock_failure(B256::repeat_byte(3), c, &gpu_failure("gpu1")).await;
+        assert_eq!(rt.caller_post_lock_failures_now(c).await, 1);
+    }
+
+    /// The job's post-lock verdict lasted 8 days, and an Open job can be locked long after: it now
+    /// lasts until the job is terminal, across restarts (it is in the store).
+    #[tokio::test]
+    async fn a_post_lock_verdict_holds_until_the_job_is_terminal() {
+        let (rt, s) = test_runtime(true).await;
+        let jid = B256::repeat_byte(0x42);
+        rt.record_post_lock_failure(jid, Address::repeat_byte(1), &gpu_failure("gpu0")).await;
+        let store = s.as_ref().unwrap().store.clone();
+        assert_eq!(store.verdict(jid).unwrap().unwrap().expires_at, VERDICT_UNTIL_TERMINAL);
+        lock(&rt.verdict_until).clear();
+        assert!(rt.verdict_holds(&store, jid).await, "read back from the store, as after a restart");
+        assert_eq!(
+            verdict_set_aside(*lock(&rt.verdict_until).get(&jid).unwrap(), now_unix()),
+            super::super::policy::MAX_SET_ASIDE
+        );
+    }
+
+    /// The caller tally read for routing was remembered for 7 days from the read, whatever its own
+    /// expiry: a caller stayed refused up to 7 days longer than its tally. It is now remembered until
+    /// the tally's own expiry.
+    #[tokio::test]
+    async fn a_caller_tally_is_remembered_until_its_own_expiry() {
+        let (rt, s) = test_runtime(true).await;
+        let c = Address::repeat_byte(0xc2);
+        let store = s.as_ref().unwrap().store.clone();
+        let expires_at = now_unix() + 100;
+        store
+            .put_verdict(&VerdictRecord {
+                job_id: caller_tally_key(c),
+                reason: SkipReason::PostLockFailure,
+                attempts: POST_LOCK_CALLER_LIMIT,
+                recorded_at: now_unix(),
+                expires_at,
+                wasmtime_version: None,
+            })
+            .unwrap();
+        assert_eq!(rt.caller_post_lock_failures_now(c).await, POST_LOCK_CALLER_LIMIT);
+        assert_eq!(lock(&rt.post_lock_callers).get(&c).copied(), Some((POST_LOCK_CALLER_LIMIT, expires_at)));
+        // Once that expiry passes, routing admits the caller again.
+        lock(&rt.post_lock_callers).insert(c, (POST_LOCK_CALLER_LIMIT, now_unix()));
+        assert_eq!(rt.caller_post_lock_failures(c), Some(0));
+    }
 
     #[test]
     fn terminal_states_are_authoritative_reads_only() {
@@ -3264,6 +4191,69 @@ mod tests {
         assert_eq!(terminal_state(&rec(JOB_STATUS_OPEN, MAX_REOPEN_COUNT)), Some(TerminalState::ReopenLimit));
         assert_eq!(terminal_state(&rec(JOB_STATUS_OPEN, 1)), None, "a risen reopen count only unpins");
         assert_eq!(terminal_state(&rec(JOB_STATUS_LOCKED, 0)), None);
+    }
+
+    fn task(phase: Phase) -> Task {
+        Task { token: AbortToken::new(), phase }
+    }
+
+    /// Two simulations finished at once on a one-card host: both passed the advisory card check,
+    /// and both used to claim (the check and the mark were apart, with awaits between). The card is
+    /// now checked and taken in one step, so only one claims; the other gets it once the first gives
+    /// it back (its claim not sent) or its lock ends.
+    #[test]
+    fn two_simulations_cannot_both_claim_the_last_card() {
+        let (a, b) = (B256::repeat_byte(0xa), B256::repeat_byte(0xb));
+        let one_card = Some((0, 1));
+        let mut tasks: HashMap<B256, Task> = [(a, task(Phase::Simulating)), (b, task(Phase::Simulating))].into();
+        assert!(take_card(&mut tasks, one_card, a));
+        assert_eq!(tasks[&a].phase, Phase::Claiming);
+        assert!(!take_card(&mut tasks, one_card, b), "the card is taken");
+        assert!(take_card(&mut tasks, one_card, a), "the claim's second check keeps its own card");
+        give_back_card(&mut tasks, a);
+        assert_eq!(tasks[&a].phase, Phase::Simulating);
+        assert!(take_card(&mut tasks, one_card, b), "given back: the other claims");
+        tasks.get_mut(&b).unwrap().phase = Phase::Locked;
+        give_back_card(&mut tasks, b);
+        assert_eq!(tasks[&b].phase, Phase::Locked, "a held lock keeps its card");
+        assert!(!take_card(&mut tasks, one_card, a));
+        tasks.remove(&b);
+        assert!(take_card(&mut tasks, one_card, a), "the lock ended");
+        // Inline work needing a card, and no word from the brain yet.
+        assert!(!take_card(&mut tasks, Some((1, 2)), b), "no task for it");
+        tasks.insert(b, task(Phase::Simulating));
+        assert!(!take_card(&mut tasks, Some((1, 2)), b), "a's claim and one inline job fill two cards");
+        assert!(!take_card(&mut tasks, None, b));
+    }
+
+    /// The same race with real threads: of many simulations finishing together on a one-card host,
+    /// exactly one takes the card.
+    #[test]
+    fn concurrent_claims_take_one_card_once() {
+        let jobs: Vec<B256> = (1..=8u8).map(B256::repeat_byte).collect();
+        let tasks = Arc::new(Mutex::new(jobs.iter().map(|j| (*j, task(Phase::Simulating))).collect::<HashMap<_, _>>()));
+        let barrier = Arc::new(std::sync::Barrier::new(jobs.len()));
+        let won: usize = jobs
+            .iter()
+            .map(|j| {
+                let (tasks, barrier, j) = (tasks.clone(), barrier.clone(), *j);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    take_card(&mut lock(&tasks), Some((0, 1)), j)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| usize::from(h.join().unwrap()))
+            .sum();
+        assert_eq!(won, 1);
+        assert_eq!(lock(&tasks).values().filter(|t| t.phase == Phase::Claiming).count(), 1);
+    }
+
+    #[test]
+    fn a_claiming_task_is_still_aborted_and_holds_a_card() {
+        assert!(Phase::Claiming.abortable() && Phase::Simulating.abortable() && !Phase::Locked.abortable());
+        assert!(Phase::Claiming.holds_card() && Phase::Locked.holds_card() && !Phase::Simulating.holds_card());
     }
 
     #[test]

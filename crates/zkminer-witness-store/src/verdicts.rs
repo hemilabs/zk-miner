@@ -3,7 +3,7 @@
 //! when the job is deleted as terminal or once it expires.
 
 use alloy_primitives::B256;
-use zkminer_witness::verdict::VerdictRecord;
+use zkminer_witness::verdict::{SkipReason, VerdictRecord};
 
 use crate::error::{Defect, StoreError};
 use crate::fsutil::{is_enoent, read_capped, Kind, ReadError};
@@ -19,7 +19,11 @@ impl Inner {
 }
 
 impl Store {
-    /// Records (or replaces) a job's verdict, durably. Counted against the quota.
+    /// Records (or replaces) a job's verdict, durably. Counted against the quota, except a
+    /// post-lock failure's records ([`SkipReason::PostLockFailure`]: the verdict that keeps a job
+    /// whose lock failed from being locked again, and the per-caller and per-device tallies): like
+    /// pins, they protect stake, so only a full filesystem refuses them. They are few (one per
+    /// released lock, caller and device class) and small.
     pub fn put_verdict(&self, v: &VerdictRecord) -> Result<(), StoreError> {
         let inner = &self.inner;
         inner.check_usable()?;
@@ -34,7 +38,9 @@ impl Store {
             Ok(None) => Usage::new(json.len() as u64, 1),
             Err(e) => return Err(StoreError::io(e, &verdicts.child(&name))),
         };
-        inner.admit(&st, add)?;
+        if v.reason != SkipReason::PostLockFailure {
+            inner.admit(&st, add)?;
+        }
         inner.write_atomic(&mut st, &verdicts, &name, &json, 0o600)
     }
 
@@ -58,6 +64,33 @@ impl Store {
             Ok(_) => Err(StoreError::corrupt(Defect::KeyMismatch, &p)),
             Err(_) => Err(StoreError::corrupt(Defect::Unparseable, &p)),
         }
+    }
+
+    /// Every verdict that reads back as a record for its job (an unreadable one is skipped:
+    /// [`Store::expire_verdicts`] drops it). For a caller that keeps some verdicts until an event
+    /// rather than a time (`expires_at = u64::MAX`) and must find them again.
+    pub fn verdicts(&self) -> Result<Vec<VerdictRecord>, StoreError> {
+        let inner = &self.inner;
+        inner.check_usable()?;
+        let verdicts = inner.verdicts()?;
+        let mut out = Vec::new();
+        for e in verdicts.entries().map_err(|e| StoreError::io(e, verdicts.path()))? {
+            let Some(name) = e.utf8() else { continue };
+            let Some(job_id) = parse_verdict_name(name) else { continue };
+            match read_capped(&verdicts, name, MAX_SMALL_RECORD_BYTES) {
+                Ok(b) => {
+                    if let Ok(v) = serde_json::from_slice::<VerdictRecord>(&b) {
+                        if v.job_id == job_id {
+                            out.push(v);
+                        }
+                    }
+                }
+                Err(ReadError::Io(err)) if is_enoent(&err) => {}
+                Err(ReadError::Io(err)) => return Err(StoreError::io(err, &verdicts.child(name))),
+                Err(ReadError::TooLarge | ReadError::NotRegular) => {}
+            }
+        }
+        Ok(out)
     }
 
     /// Drops every verdict with `expires_at <= now_unix`, and every verdict file that does not read

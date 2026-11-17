@@ -34,12 +34,12 @@ pub(super) mod policy;
 #[cfg(target_os = "linux")]
 mod runtime;
 #[cfg(target_os = "linux")]
-pub(super) use runtime::WitnessRuntime;
+pub(super) use runtime::{ReleaseClaim, WitnessRuntime};
 
 #[cfg(not(target_os = "linux"))]
 mod stub;
 #[cfg(not(target_os = "linux"))]
-pub(super) use stub::WitnessRuntime;
+pub(super) use stub::{ReleaseClaim, WitnessRuntime};
 
 /// How the brain treats a candidate job this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

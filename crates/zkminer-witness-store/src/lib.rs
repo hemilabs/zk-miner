@@ -65,11 +65,12 @@
 //!   after a mkdir), or a metadata call fails with EIO, the store no longer knows that the disk
 //!   holds what it promised, and a retried fsync can falsely succeed (fsyncgate). The store is then
 //!   *poisoned*: every later call is [`UnavailableKind::Poisoned`] until it is reopened, except the
-//!   verified reads of a version a readable pin names ([`Store::read`], [`Store::open_w`],
+//!   verified reads of a version a readable pin names (or the last readable pin of a key whose
+//!   re-pin failed) ([`Store::read`], [`Store::open_w`],
 //!   [`Store::w_path`], [`Store::verify`]) and of a bundle's ELF ([`Store::open_bundle_elf`]),
 //!   which re-check every byte they return, so a held lock is still proven. A publish whose final fsync fails is renamed back
 //!   into `tmp/` and never indexed; a pin whose write fails leaves its key's pin unknown, protecting
-//!   every version of the key.
+//!   every version of the key, while the pin it had stays readable.
 //!
 //! # Admission
 //!

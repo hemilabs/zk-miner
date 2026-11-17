@@ -767,6 +767,56 @@ fn verdicts_persist_expire_and_stay_fixed() {
     assert_accounting(&s);
 }
 
+/// A job whose witness lock failed gets a post-lock verdict so that it is never locked again, and
+/// its caller and device get tallies; a full store refused them like any verdict, so after a
+/// restart the job could be locked again. Like pins, they are never refused for the quota (only a
+/// full filesystem refuses them); every other verdict still is.
+#[test]
+fn post_lock_records_are_written_on_a_full_store() {
+    let d = tmpdir();
+    let s = open_with(d.path(), StoreOptions { quota_bytes: 1, ..opts() });
+    let mk = |j: u8, reason| VerdictRecord {
+        job_id: job(j),
+        reason,
+        attempts: 1,
+        recorded_at: 100,
+        expires_at: u64::MAX,
+        wasmtime_version: None,
+    };
+    assert!(matches!(s.put_verdict(&mk(1, SkipReason::HostInternal)).unwrap_err(), StoreError::RetentionFull(_)));
+    s.put_verdict(&mk(2, SkipReason::PostLockFailure)).unwrap();
+    s.put_verdict(&VerdictRecord { attempts: 2, ..mk(2, SkipReason::PostLockFailure) }).unwrap();
+    drop(s);
+    let s = open_with(d.path(), StoreOptions { quota_bytes: 1, ..opts() });
+    assert_eq!(s.verdict(job(2)).unwrap().map(|v| (v.reason, v.attempts)), Some((SkipReason::PostLockFailure, 2)));
+    assert_eq!(s.verdict(job(1)).unwrap(), None);
+    // A verdict kept until an event, not a time, is found again by listing; expiry never drops it.
+    assert_eq!(s.verdicts().unwrap(), vec![VerdictRecord { attempts: 2, ..mk(2, SkipReason::PostLockFailure) }]);
+    assert_eq!(s.expire_verdicts(u64::MAX - 1).unwrap(), 0);
+    // A terminal delete of its job drops it.
+    s.delete_job(job(2), &terminal(job(2))).unwrap();
+    assert!(s.verdicts().unwrap().is_empty());
+    s.scan().unwrap();
+    assert_accounting(&s);
+}
+
+/// Jobs the miner's recovery could not decide about yet (a lock of ours whose state it could not
+/// read) are spared by eviction, pinned or not, until it says otherwise; a scan keeps the set.
+#[test]
+fn eviction_spares_the_jobs_recovery_has_not_decided() {
+    let d = tmpdir();
+    let s = open(d.path());
+    let a = put_and_publish(&s, &Spec::new(job(0x71)), &witness(1, 4000));
+    let b = put_and_publish(&s, &Spec::new(job(0x72)), &witness(2, 4000));
+    s.mark_recovery_scan_complete();
+    s.spare_jobs([a.job_id]);
+    s.scan().unwrap();
+    let rep = s.evict_to(u64::MAX, &|_| 0).unwrap();
+    assert_eq!(rep.evicted, vec![b], "the undecided job's bundle stays");
+    s.spare_jobs([]);
+    assert_eq!(s.evict_to(u64::MAX, &|_| 0).unwrap().evicted, vec![a]);
+}
+
 #[test]
 fn scan_reports_layout_anomalies_pins_and_callers() {
     let d = tmpdir();

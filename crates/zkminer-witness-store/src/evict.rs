@@ -73,11 +73,19 @@ impl Store {
         self.inner.state().scan_complete
     }
 
+    /// Replaces the set of jobs whose versions eviction leaves alone, pinned or not: jobs the
+    /// caller's recovery could not yet decide about (a lock of ours it could not read), which may be
+    /// held locks whose pin was lost. Everything else follows the usual rules.
+    pub fn spare_jobs(&self, jobs: impl IntoIterator<Item = B256>) {
+        self.inner.state().spared = jobs.into_iter().collect();
+    }
+
     /// Frees space until [`Store::headroom`] reaches `target_free_bytes`: first ELFs nothing
     /// references or holds, then unprotected versions in ascending `value_fn` order (ties: older
     /// block, then lower version). Never a pinned version, never the latest version of a pinned
-    /// key, never any version of a key whose pin is unreadable or unknown; protection is re-checked
-    /// under the lock before each removal, so a pin taken while `value_fn` ran is honoured.
+    /// key, never any version of a key whose pin is unreadable or unknown, never a version of a
+    /// spared job ([`Store::spare_jobs`]); protection is re-checked under the lock before each
+    /// removal, so a pin taken while `value_fn` ran is honoured.
     /// `value_fn` runs without the store lock held. [`StoreError::EvictionDisabled`] until
     /// [`Store::mark_recovery_scan_complete`].
     ///
@@ -92,7 +100,7 @@ impl Store {
     ) -> Result<EvictReport, StoreError> {
         let inner = &self.inner;
         inner.check_usable()?;
-        let metas = {
+        let (metas, spared) = {
             let st = inner.state();
             if !st.scan_complete {
                 return Err(StoreError::EvictionDisabled);
@@ -101,11 +109,11 @@ impl Store {
             if headroom >= target_free_bytes {
                 return Ok(EvictReport { headroom, reached: true, ..Default::default() });
             }
-            st.metas()
+            (st.metas(), st.spared.clone())
         };
         let mut ranked: Vec<(u64, u64, BundleRef)> = metas
             .iter()
-            .filter(|m| !m.protected())
+            .filter(|m| !m.protected() && !spared.contains(&m.bundle.job_id))
             .map(|m| (value_fn(m), m.record.as_ref().map_or(0, |s| s.created_at_block), m.bundle))
             .collect();
         ranked.sort();
@@ -121,7 +129,7 @@ impl Store {
                 break;
             }
             let Some(info) = st.versions.get(&r) else { continue };
-            if st.meta(&r, info).protected() {
+            if st.meta(&r, info).protected() || st.spared.contains(&r.job_id) {
                 continue;
             }
             let (info, removed) = inner.remove_version(&mut st, &r)?;

@@ -3797,9 +3797,9 @@ mod witness_support {
                 maxBuilderSeconds: 30,
                 maxWitnessBytes: 1 << 16,
                 // Within the CPU slot's derived maximum: what one attempt can prove inside the
-                // configured 1,800 s watchdog beside the CPU Groth16 allowance (about 6M sized
-                // cycles at the CPU floor rate); the guest uses 32,768.
-                maxGuestCycles: 1 << 22,
+                // configured 1,800 s watchdog beside the CPU Groth16 allowance, both with the 1.5
+                // safety margin (about 3M sized cycles at the CPU floor rate); the guest uses 32,768.
+                maxGuestCycles: 1 << 21,
             },
         };
         JobDescriptor {

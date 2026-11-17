@@ -133,6 +133,66 @@ fn a_pin_whose_directory_fsync_fails_poisons_and_protects() {
     s.verify(&r, &desc_hash, &image_id).unwrap();
 }
 
+/// A held lock's re-pin (its lock block recorded in its pin) whose `pins/` fsync fails poisons the
+/// store. The pin it replaced is the last durable one for the key, and what a crash leaves is it or
+/// the new one (both name the same published version): it stays readable, so the lock is still
+/// proven from its version while the store waits for a restart, and every version of the key stays
+/// protected.
+#[test]
+fn a_failed_re_pin_keeps_the_last_durable_pin_readable() {
+    let d = tmpdir();
+    let s = open(d.path());
+    let r = put_and_publish(&s, &Spec::new(job(7)), &witness(7, 4000));
+    let first = pin_rec(&s, &r);
+    s.pin(&first).unwrap();
+    let mut again = first.clone();
+    again.lock_block = 77;
+    again.reopen_count = Some(1);
+
+    let f = faults::install();
+    f.fail(Op::Fsync, "/pins", libc::EIO, 0, 1);
+    assert_eq!(unavailable(s.pin(&again).unwrap_err()), UnavailableKind::Eio);
+    assert!(s.is_poisoned());
+    assert_eq!(s.pin_status(&r.key()), PinStatus::Unreadable, "every version protected");
+    assert_eq!(s.unreadable_pins(), vec![r.key()]);
+    assert_eq!(s.pins(), vec![first.clone()], "the last durable pin stays readable");
+    assert_all_refused(&s, &f, &r, &again, true);
+    drop(f);
+    drop(s);
+    let s = open(d.path());
+    assert_eq!(s.pins(), vec![again], "the new pin had reached the disk");
+    s.verify(&r, &desc_hash, &image_id).unwrap();
+}
+
+/// A re-pin to a new version that fails before its rename leaves the old pin on disk: it stays
+/// readable (its version served), and the key is protected until a pin or a scan settles it.
+#[test]
+fn a_re_pin_to_a_new_version_that_fails_keeps_the_old_pin_readable() {
+    let d = tmpdir();
+    let s = open(d.path());
+    let spec = Spec::new(job(8));
+    let r1 = put_and_publish(&s, &spec, &witness(8, 3000));
+    let rec1 = pin_rec(&s, &r1);
+    s.pin(&rec1).unwrap();
+    let r2 = put_and_publish(&s, &spec, &witness(9, 3000));
+    let f = faults::install();
+    f.fail(Op::Write, ".part", libc::ENOSPC, 0, 1);
+    assert!(s.pin(&pin_rec(&s, &r2)).is_err());
+    drop(f);
+    assert!(!s.is_poisoned());
+    assert_eq!(s.pins(), vec![rec1.clone()]);
+    assert_eq!(s.pin_status(&r1.key()), PinStatus::Unreadable);
+    s.verify(&r1, &desc_hash, &image_id).unwrap();
+    s.mark_recovery_scan_complete();
+    assert!(s.evict_to(u64::MAX, &|_| 0).unwrap().evicted.is_empty(), "both versions protected");
+    // An unpin that fails keeps it too.
+    let f = faults::install();
+    f.fail(Op::Fsync, "/pins", libc::EIO, 0, 1);
+    assert!(s.unpin(r1.job_id, r1.descriptor_hash, r1.prover).is_err());
+    assert_eq!(s.pins(), vec![rec1]);
+    drop(f);
+}
+
 /// A pin whose write fails before anything is visible does not poison, but its key is protected
 /// until the pin succeeds or a scan reads the old state back.
 #[test]
