@@ -144,6 +144,9 @@ fn metadata_and_namespace_checks() -> Vec<String> {
         "lremovexattr",
         "removexattrat",
         "utimensat_path",
+        "ioctl_setflags",
+        "ioctl_fssetxattr",
+        "ioctl_enable_verity",
         "fchmod",
         "fchown",
         "fsetxattr",
@@ -172,17 +175,27 @@ fn metadata_and_namespace_checks() -> Vec<String> {
     names
 }
 
-/// Signals by every syscall but `kill` (`signal_checks`), to `who`.
+/// Signals by every syscall but `kill` (`signal_checks`), and limits, priorities and scheduling
+/// (`process_control_checks`), aimed at `who`; leaving the session or process group.
 fn signal_checks(who: &str) -> Vec<String> {
-    [
+    let mut v: Vec<String> = [
         "tgkill",
         "rt_sigqueueinfo",
         "rt_tgsigqueueinfo",
         "pidfd_send_signal",
+        "prlimit64",
+        "setpriority",
+        "ioprio_set",
+        "sched_setaffinity",
+        "sched_setscheduler",
+        "sched_setparam",
+        "sched_setattr",
     ]
     .iter()
     .map(|s| format!("{s}_{who}"))
-    .collect()
+    .collect();
+    v.extend(["setsid", "setpgid", "setpriority_self"].map(String::from));
+    v
 }
 
 struct Killed(Child);

@@ -338,6 +338,15 @@ executor:
   on the call's registers (the syscall and the mode `0755`), never on the server's memory, and the
   kernel never runs the server's own call. Links, renames, removals, new directories and symlinks,
   and truncation outside the writable paths are Landlock's to refuse.
+- **Process control.** A confined process cannot leave its session or process group (`setsid`,
+  `setpgid`: the miner ends a worker and everything it started by killing the worker's process
+  group), nor change another process's limits, priority, I/O priority or scheduling
+  (`prlimit64` with a new limit, `setpriority`, `ioprio_set`, `sched_setaffinity`,
+  `sched_setscheduler`, `sched_setparam`, `sched_setattr`; `PRIO_PGRP`, `PRIO_USER` and their I/O
+  twins too), which Landlock does not scope: a CPU-time limit set on the miner would kill it. Its
+  own stay open (pid 0). The ioctl forms of metadata writes (`FS_IOC_SETFLAGS`,
+  `FS_IOC_FSSETXATTR`, `FS_IOC_SETVERSION`, their 32-bit twins, `FS_IOC_ENABLE_VERITY`) are
+  refused like the rest.
 - **Kernel surface.** No namespaces and no mounts: seccomp denies `unshare`, `setns`, `clone` with
   any `CLONE_NEW*` flag, `mount`, `umount2`, `pivot_root`, `chroot` and the new mount API
   (`fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `open_tree_attr`,
