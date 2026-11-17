@@ -1693,7 +1693,7 @@ mod tests {
         }
         // The broker sets no timeout.
         assert_eq!(call(&b, SYS_setsockopt, [5, u(SOL_SOCKET), u(SO_RCVTIMEO), 0x1000, 16, 0]), ERRNO_EPERM);
-        // The list covers what the review named, and nothing in it is the broker's option.
+        // The list holds the options that re-route a connected socket, and not the broker's own.
         for name in [
             "IPV6_RTHDR",
             "IPV6_2292RTHDR",
