@@ -481,6 +481,8 @@ pub(crate) struct WitnessRuntime {
     post_lock_callers: Mutex<HashMap<Address, (u8, u64)>>,
     /// Post-lock tallies when no store is open (counted for this process only).
     tallies: Mutex<HashMap<B256, (u8, u64)>>,
+    /// The miner is shutting down ([`Self::shutdown`]): held locks are the drain's, nothing re-drives one.
+    stopping: AtomicBool,
 }
 
 impl WitnessRuntime {
@@ -630,6 +632,7 @@ impl WitnessRuntime {
             image_id_unavailable: Arc::new(AtomicU64::new(0)),
             post_lock_callers: Mutex::new(HashMap::new()),
             tallies: Mutex::new(HashMap::new()),
+            stopping: AtomicBool::new(false),
         }
     }
 
@@ -958,9 +961,16 @@ impl WitnessRuntime {
         self.record_verdict(jid, Address::ZERO, SkipReason::PostLockFailure, why).await;
     }
 
-    /// Fires every simulation's abort token (shutdown). Held locks are left to the drain.
+    /// Fires every simulation's abort token (shutdown). Held locks are left to the drain: from here no
+    /// store pass or recovery re-drives one beside it.
     pub(crate) fn shutdown(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
         self.abort_simulations(AbortReason::Shutdown);
+    }
+
+    /// Shutdown has begun (this runtime's [`Self::shutdown`], or the miner's flag).
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst) || shutting_down()
     }
 
     /// See [`super::route`].
@@ -2989,9 +2999,13 @@ impl WitnessRuntime {
 
     // ── recovery ──────────────────────────────────────────────────────────────
 
-    /// Re-drives a witness lock of ours from its bundle (single flight). `false` when a task owns it.
-    /// Until its bundle is found and pinned, eviction waits for it (§15.2).
+    /// Re-drives a witness lock of ours from its bundle (single flight). `false` when a task owns it,
+    /// or once shutdown has begun (held locks are then the drain's: a lock re-driven during the drain
+    /// would race its release). Until its bundle is found and pinned, eviction waits for it (§15.2).
     pub(crate) fn drive_recovered(self: &Arc<Self>, jid: B256) -> bool {
+        if self.stopping() {
+            return false;
+        }
         {
             let mut t = lock(&self.tasks);
             if t.contains_key(&jid) {
@@ -3182,14 +3196,14 @@ impl WitnessRuntime {
 
     async fn store_pass_loop(self: Arc<Self>) {
         loop {
+            if self.stopping() {
+                return;
+            }
             if !self.store_pass_running.swap(true, Ordering::SeqCst) {
                 self.store_pass().await;
                 self.store_pass_running.store(false, Ordering::SeqCst);
             }
             tokio::time::sleep(STORE_PASS_EVERY).await;
-            if shutting_down() {
-                return;
-            }
         }
     }
 
@@ -3734,6 +3748,16 @@ mod tests {
         rt.note_release(third, "released at shutdown").await;
         rt.note_release(third, "released at shutdown").await;
         assert_eq!(s.as_ref().unwrap().store.verdict(third).unwrap().unwrap().attempts, 1);
+    }
+
+    /// A store pass running as shutdown began re-drove held locks beside the drain's releases. Once
+    /// shutdown has begun nothing re-drives a lock.
+    #[tokio::test]
+    async fn nothing_re_drives_a_lock_once_shutdown_began() {
+        let (rt, _s) = test_runtime(false).await;
+        rt.shutdown();
+        assert!(!rt.drive_recovered(B256::repeat_byte(0x61)));
+        assert!(rt.owned_jobs().is_empty());
     }
 
     /// One caller whose guest reliably fails during proving quarantined a one-card host for 7 days
