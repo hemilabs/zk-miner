@@ -359,12 +359,13 @@ Worth knowing:
   that, untested: a larger job can run out part-way and lose its lock. A 12–16 GB NVIDIA card
   gets none either while `SP1_GPU_DROP_LDES` or `SP1_GPU_RECOMPUTE_FIRST_LAYER` is set to `0`:
   that switches off the server memory savers the figures above were measured with. RISC Zero
-  proves at po2 19 on a 12 GB card, 20 from 14 GiB, and benchmarks at that size. A 12 GB card benchmarked by an earlier version (at 20, which
-  doesn't fit) has saved rates far too low: re-benchmark it with `b` on the Benchmark screen, or
-  `zkminer benchmark --calibrate` with the miner stopped (a plain `zkminer benchmark` saves
-  nothing). Under Windows, a proof that outgrows the card doesn't fail: the driver moves part of it
-  into system memory and it runs several times slower, which can cost a lock, so leave the card
-  the room these figures say.
+  proves at po2 19 on a 12 GB card, 20 from 14 GiB, and benchmarks at that size. A 12 GB card
+  benchmarked by an earlier version (at 20, which doesn't fit) has saved rates far too low:
+  re-benchmark it with `b` on the Benchmark screen, or `zkminer benchmark --calibrate` with the
+  miner stopped (a plain `zkminer benchmark` saves nothing). Under Windows, by default (the
+  driver's CUDA - Sysmem Fallback Policy, which `zkminer doctor` shows), a proof that outgrows the
+  card doesn't fail: the driver moves part of it into system memory and it runs several times
+  slower, which can cost a lock, so leave the card the room these figures say.
 
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for
