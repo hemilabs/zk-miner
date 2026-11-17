@@ -394,7 +394,7 @@ pub(crate) fn deadline_fits(window_secs: u64, prove_secs: u64, fulfil_margin_sec
 /// job can be proven here, and every one is refused at the static gates rather than simulated. The
 /// claim gate then checks each job's measured cycles and execute.
 pub(crate) fn host_max_guest_cycles(plan: &ProvePlan, proving_timeout_secs: u64) -> u64 {
-    const MAX: u64 = 1 << 34;
+    const MAX: u64 = 1 << 34; // `zkminer_witness_host::pipeline::MAX_HOST_GUEST_CYCLES` (a Linux-only crate)
     let cps = if plan.cps.is_finite() && plan.cps > 0.0 { plan.cps } else { 0.0 };
     // The watchdog admits an estimate strictly below it: (cycles / cps + fixed) x margin <= T - 1.
     let room = proving_timeout_secs.saturating_sub(1) as f64 / plan_margin(plan) - plan.fixed_secs as f64;
@@ -922,6 +922,8 @@ mod tests {
         // At most an hour of proving, at most 2^34.
         assert_eq!(host_max_guest_cycles(&plan(400_000.0, 0, 1.0), 1_000_000), 1_440_000_000);
         assert_eq!(host_max_guest_cycles(&plan(1e12, 0, 1.0), 1_000_000), 1 << 34);
+        #[cfg(target_os = "linux")]
+        assert_eq!(1u64 << 34, zkminer_witness_host::pipeline::MAX_HOST_GUEST_CYCLES, "simulate's default cap");
         // A fixed allowance that fills the watchdog: nothing can be proven here.
         assert_eq!(host_max_guest_cycles(&plan(RISC0_CPU_CONSERVATIVE_CPS, 600, 1.5), 600), 0);
     }

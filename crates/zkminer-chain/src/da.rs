@@ -481,14 +481,14 @@ impl BacklogReading {
     }
 }
 
-/// What one block contributes.
+/// What one block contributes to the backlog.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BlockDa {
+pub struct BlockDa {
     /// From the receipts' `blockHash` (`None` for a block without receipts).
-    hash: Option<B256>,
-    bytes: u64,
+    pub hash: Option<B256>,
+    pub bytes: u64,
     /// Why this block cannot be counted, if it cannot.
-    unreadable: Option<String>,
+    pub unreadable: Option<String>,
 }
 
 /// Reads the backlog, caching each unposted block's contribution by number and hash, so a reading
@@ -645,7 +645,7 @@ fn qty(v: &serde_json::Value) -> Option<u64> {
 /// One block's DA bytes from its receipts, as `check-l2-lag.sh` counts them: system types skipped
 /// whatever their fields; a user type without `l1GasUsed` makes the block unreadable (the endpoint is
 /// not an OP Stack Fjord node); another type counts when it carries `l1GasUsed`.
-fn block_da(receipts: &[serde_json::Value], number: u64) -> BlockDa {
+pub fn block_da(receipts: &[serde_json::Value], number: u64) -> BlockDa {
     let mut out = BlockDa {
         hash: None,
         bytes: 0,

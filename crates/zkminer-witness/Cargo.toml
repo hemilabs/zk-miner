@@ -15,3 +15,4 @@ hex = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
+toml = { workspace = true }

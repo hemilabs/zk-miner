@@ -6,11 +6,18 @@ resolver = "2"
 members = [
     "hemiprove-builder-sdk",
     "examples/latest-block",
+    "examples/proxy-slots",
     "test-builders/faults",
     "test-builders/params-echo",
     "test-builders/receipts-proof",
     "test-builders/storage-proof",
 ]
+# `reference` is a symlink to the zkminer repository's reference/ directory: the eth prelude and the
+# statements builders share with their guests. Through it those crates sit inside this workspace's
+# directory, so cargo identifies them by a path relative to it and a builder's bytes do not depend on
+# where the checkout is. Excluded, so they are path dependencies and not members (their host-only
+# dev-dependencies stay out of this lockfile).
+exclude = ["reference"]
 
 [workspace.package]
 version = "0.1.0"

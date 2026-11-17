@@ -321,6 +321,33 @@ impl GuardedClient {
         }
         Err(FetchError::TooManyRedirects)
     }
+
+    /// POSTs a JSON `body` to `raw` (a JSON-RPC endpoint an operator or a requester names, such as
+    /// `zkminer artifact publish --rpc-url`), with the URL checked and each address vetted and
+    /// pinned exactly as for [`Self::get_following_redirects`]'s first hop. No redirect is followed:
+    /// the response is returned whatever its status (a redirect is a non-2xx the caller refuses), so
+    /// a POST body never travels to a second host. `budget` bounds the whole exchange up to the
+    /// response head; the caller bounds its read of the body.
+    pub async fn post_json(&self, raw: &str, body: Vec<u8>, budget: Duration) -> Result<reqwest::Response, FetchError> {
+        let deadline = Instant::now() + budget.min(Duration::from_secs(7 * 24 * 3600));
+        let url = self.policy().check_url(raw).map_err(FetchError::Denied)?;
+        let (name, pinned) = tokio::time::timeout(budget, self.pin(&url))
+            .await
+            .map_err(|_| FetchError::TimedOut)??;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(FetchError::TimedOut);
+        }
+        hop_client(name.as_deref(), &pinned, self.options)
+            .map_err(|e| FetchError::Http(e.without_url()))?
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .timeout(remaining)
+            .send()
+            .await
+            .map_err(FetchError::from_reqwest)
+    }
 }
 
 /// What follows the scheme of an absolute URL reference (`scheme:`, the scheme a letter then
@@ -589,6 +616,34 @@ mod tests {
                 ["elfs.example.com"],
                 "{target} was connected to"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_json_post_is_guarded_like_a_get_and_never_redirected() {
+        let ok = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let server = canned_server(&[ok]);
+        let c = public_client(public_names());
+        let r = c
+            .post_json(&start(&server, "elfs.example.com"), b"{\"id\":1}".to_vec(), BUDGET)
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let head = server.requests.lock().unwrap()[0].clone();
+        assert!(head.starts_with("post /elf http/1.1\r\n"), "{head}");
+        assert!(head.contains("\r\ncontent-type: application/json\r\n"), "{head}");
+        // A redirect is handed back, not followed: the body never reaches a second host.
+        let server = canned_server(&[&redirect_to("http://cdn.example.net:{port}/x"), ok]);
+        let r = c.post_json(&start(&server, "elfs.example.com"), b"{}".to_vec(), BUDGET).await.unwrap();
+        assert_eq!(r.status(), 302);
+        assert_eq!(server.hosts(), ["elfs.example.com"]);
+        // Local and private targets are refused before any connection, as for a GET.
+        for target in ["http://localhost:{port}/", "http://127.0.0.1:{port}/", "http://private.example.com:{port}/"] {
+            let server = canned_server(&[ok]);
+            let url = target.replace("{port}", &server.port.to_string());
+            let e = c.post_json(&url, b"{}".to_vec(), BUDGET).await.expect_err("refused");
+            assert!(e.is_denied(), "{target}: {e:?}");
+            assert!(server.hosts().is_empty(), "{target} was connected to");
         }
     }
 

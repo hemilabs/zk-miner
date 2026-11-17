@@ -267,6 +267,8 @@ job there could then reach this host's private network.
 | The broker itself | none | seccomp denies `socket`, `connect`, `bind`, `listen`, `accept*` (and `socketpair` once its runtime is up), and every `setsockopt` but `TCP_NODELAY`; Landlock grants no TCP port |
 | The inline measure and prove workers (risc0, SP1, OpenVM) and `sp1-gpu-server` | none | confined before their first guest: no sockets, Unix ones included; Landlock (below) |
 | The miner's witness host (pipeline, builder runs, store) | none | talks to the broker over a Unix socket pair only |
+| `zkminer simulate --descriptor` (a requester's dry run) | the broker configuration given (`--broker-config`); the chain RPC of the configuration for the fulfil's DA estimate and, without `--elf`, the ProgramRegistry | the same broker and connector as the miner, under the configuration's `[egress]` and `[dev]`; the ELF download through the guard as above |
+| `zkminer artifact publish` | **the publisher** (`--rpc-url`) | every JSON-RPC request through the guard (`post_json`: no proxy, no redirect followed, each address vetted and pinned); a node on loopback or the LAN only with `[dev] private_network` for that very chain; never the miner's `[chain] rpc_url` while a miner runs |
 
 Job inputs come from the chain (calldata), not from URLs. A zkVM guest runs in a process that is
 confined before the guest runs, and assumed compromised if the guest escapes its executor: see

@@ -554,11 +554,153 @@ Reading the counts:
 per process: a simulate measurement (an SP1 one stages gigabytes in `/dev/shm` and may hold up to
 24 GiB) is invisible to a miner beside it, and the two can together OOM or SIGBUS its proofs.
 
+## Witness jobs: requester tools
+
+A witness-construction job carries an envelope in `inputData` instead of the guest input: the miner
+runs the requester's builder (a WASM module) in a sandbox to construct the witness `W`, executes the
+guest on `W` and checks the journal against the binding before it claims (see
+`docs/witness-construction-jobs.md`). These commands are for the requester; none of them needs a
+miner's key.
+
+**The envelope.** `zkminer witness envelope encode SPEC` writes `inputData = WITNESS_JOB_TAG_V1 ‖
+abi.encode(WitnessJobV1)` as 0x hex from a TOML (by its extension) or JSON spec, and checks it with
+the miner's own strict decoder (a spec the miner would skip is refused with its reason). With
+`--builder b.wasm` the builder id is the module's sha256 (and must equal a given one). A *job* spec
+adds the program, the binding and the envelope, and with `--descriptor-out` also writes the
+descriptor file `zkminer simulate --descriptor` reads:
+
+```toml
+program_id = "0x…"                 # the guest's risc0 image id
+# assigned_prover = "0x…"          # needed for a NONE binding
+[binding]
+prefix = true                      # the journal-prefix marker (the default for open witness jobs)
+header = ["uint:1", "bytes32:0x…", "address:0x…", "keccak:my-layout-rule", "uint:3"]   # FIELDS
+# full_statement = "0x…"           # or FULL, for a journal known in full at submit
+[envelope]
+builder_uris = ["hemi-code://743111/0x…"]
+builder_params_abi = ["uint64:8453", "bytes32:0x…", "address:0x…"]   # abi.encode of static values
+[[envelope.sources]]
+class = "evm-rpc/v1"
+chain_id = 8453
+archive = true
+method_set = "state-read"
+max_proof_age = 300
+[envelope.limits]                  # every limit explicit: 0 means none allowed
+max_fetches = 64
+max_fetch_bytes = 16777216
+max_request_bytes = 65536
+max_response_bytes = 4194304
+max_builder_fuel = 10000000000
+max_builder_memory_bytes = 268435456
+max_builder_seconds = 60
+max_witness_bytes = 1048576
+max_guest_cycles = 67108864
+```
+
+`zkminer witness envelope decode 0x…|FILE [--chain-id N]` explains an existing `inputData`: the
+decoder's verdict, each builder URI as a miner on that chain reads it (usable, or why it is
+ignored), size warnings, and the envelope as an editable spec. It exits non-zero when the miner
+would skip the job.
+
+**The binding.** `zkminer witness binding compute --word TYPE:VALUE …` derives `journalFields` and
+`expectedJournalHash` from your own parameters, FIELDS over the whole header (`H = 32 × words`,
+pinned at statement offset 0, with the journal-prefix marker unless `--no-prefix`); `--full-statement
+0x… --program-id …` is FULL, `--none` is NONE. Never take these from a prover's journal. Word types:
+`uintN`, `bool`, `address`, `bytesN`, `bytes32`, `word` (raw), `keccak:<text>`.
+`zkminer witness binding check` is the mutation check: give the binding (`--journal-fields`,
+`--expected-journal-hash`, or `--descriptor`) and the statement (`--word …`, `--statement 0x…`, or a
+whole `--journal`), and it changes each byte in turn, recomputes the router's hash, and reports the
+pinned and free byte ranges, the free bytes of each header word, and whether the expected hash
+matches. It exits non-zero when a header byte is free (`--header-bytes` when not given as words), a
+range ends past the statement, or the hash does not match.
+
+**Simulate a job before submitting it.** `zkminer simulate --descriptor d.json` runs the job through
+the miner's own pre-claim pipeline: the static gates, the builder (from `--builder`, or fetched by
+the broker from the envelope's `hemi-code` locators exactly as a miner fetches it), the sandboxed
+builder and execute at every `--po2` (default `16..=22`; one size, a range or a list), the router's
+binding check, and a bundle published to a throwaway retention store under `--cache-dir` (removed at
+the end; it must not be tmpfs). The guest ELF is `--elf`, else the ProgramRegistry's. The broker uses
+your own endpoints: `--broker-config` (the broker's TOML; default `[broker] config`). The
+configuration's `[witness]` limits apply, and `[witness] sandbox_mode = "rootless"` on a host
+without root; the sandbox and broker self-tests must pass first. Run it in a delegated cgroup:
+
+```bash
+systemd-run --user --scope -q -p Delegate=yes -- \
+    zkminer -c simulate.toml simulate --descriptor d.json --builder b.wasm --elf guest.elf \
+    --prover 0x… --out report.json
+```
+
+The report (one JSON document, `"kind": "witness"`) has the outcome (`simulated`, or `skipped` with
+the verdict, the step and its retry class, or `aborted`), the builder's fuel, fetches, fetched
+bytes, compile and run time and peak memory, `|W|` and its hashes, cycles per po2 in the
+`maxGuestCycles` unit, the journal, the pinned bytes and the binding's mutation check, the fulfil's
+estimated DA size (by the chain's `GasPriceOracle` when `[chain] rpc_url` answers, else an upper
+bound), this configuration's admission parameters, and `notChecked`: what only an on-chain job can
+be checked for (claimability, submission form, deployment pins, admission, reservation, deadline,
+prove resources). The `sys_rand` key is the run's own, and a journal-prefix job is reproduced
+exactly only with the real `jobId` (the file's `jobId`) and `--prover`. It exits non-zero when a
+miner with this configuration would skip the job. In `--job`/`--stdin` mode a witness job on chain
+is reported `not_served`: its proven input is the builder's `W`, not its `inputData`.
+
+**`--adversarial`** then attacks the witness and the host inputs, within `--adversarial-secs`
+(default 600):
+
+- **mutations of `W`**, each re-executed by the same sandboxed worker: byte flips at `--flips`
+  sampled offsets (default 32; the first and last byte always), truncations, trailing bytes, and
+  the drop, duplication and reordering of items in every length-delimited framing `W` parses as
+  (u32/u64 length prefixes, risc0's word-padded `Vec<u8>`, a top-level RLP list), plus, first, the
+  structured mutations of the job's scheme, by the scheme id in the header's first word (or
+  `--scheme`). Scheme 1 (`eth-block`) is registered, from the reference prelude's codec
+  (`reference/eth-prelude`): byte flips in header words, headers and trie nodes, nodes dropped,
+  duplicated and appended, proof kinds flipped (inclusion for exclusion), proofs truncated,
+  dropped, duplicated and swapped (another slot's proof), and the block header replaced by its
+  parent's and the next block's, fetched through the job's own `evm-rpc/v1` source. At most
+  `--max-mutations` run (default 256). Each must fail in the guest, give the same journal byte for
+  byte, or change pinned bytes (which the router refuses); a changed journal that still satisfies
+  the binding is a **soundness failure**, reported with the mutation that caused it;
+- **host inputs**: the same `W` under two `sys_rand` keys, two po2s and two keccak po2s; any journal
+  change is a dependence on an input the prover controls;
+- **providers**: the whole pipeline against two `[[evm_rpc]]` endpoints of the broker configuration
+  (`--providers a,b`, default the first two serving the job's chain), each alone; different
+  journals that both satisfy the binding are a soundness failure.
+
+`adversarial.verdict` is `pass`, `fail`, or `incomplete` (something not run in time or
+inconclusive); the command exits non-zero unless it is `pass`.
+
+**Publish a builder.** `zkminer artifact publish FILE --kind builder|elf --rpc-url URL --chain-id N
+--keystore KEY.json` stores the file on the HemiProve chain as contract code (`hemi-code`): chunks
+of at most 24,575 bytes as `0x00`-prefixed data contracts, then a manifest. It is permanent and
+public. The rules it follows are the format's own (§13.5 of the design):
+
+- the key is an encrypted keystore of its own (password from the terminal, or `--password-fd N`
+  for N ≥ 3), never the miner's key file, the environment or argv; it is refused when it is
+  `[witness] prover_address`, staked as a prover, authorized as a prover's operator (read from the
+  chain), or has pending transactions it did not send. A stuck chunk blocks every later nonce of its
+  sender, so a prover key would stall its fulfils;
+- every request goes through the network guard with a rate limit of its own
+  (`--max-requests-per-sec`, default 4); a node on loopback or the LAN needs a configuration with
+  `[dev] private_network` for that very chain; `--rpc-url` may not be the miner's `[chain] rpc_url`
+  while a miner runs;
+- a cost preview (L2 gas at the chosen tip, the L1 data fee from `GasPriceOracle`, the balance one
+  in-flight chunk needs) comes first, confirmed on the terminal or with `--yes`;
+- one chunk in flight, at most one send per block, and only while the DA backlog plus its own
+  unmined estimates is under 250 KB, the safe head lags at most 300 s, the router is not paused and
+  the head is at most 60 s old: about twenty minutes per MiB. Each chunk's transaction estimates at
+  most 19,500 DA bytes. A chunk unmined for 3 blocks with the gate open is replaced at its nonce
+  with both fee fields raised (never past 64 times the measured tip floor); a failed creation is
+  redeployed at a new nonce;
+- it waits until every deploying block is at or below the safe head with its hash unchanged, reads
+  the artifact back there with the miner's manifest, chunk and assembly checks, and only then
+  prints the locator, sha256, length, addresses, total cost, and the `builderId` (or, for an ELF,
+  the `addStorageURI` arguments). Submit the job only after that. `--json` prints it as JSON.
+
+The router is the known deployment's on the chain, else `--router`.
+
 ## Layout
 
 | crate | role |
 |---|---|
-| `zkminer-cli` | binary entry point: `status`, `benchmark`, `run`, `simulate`, `init` |
+| `zkminer-cli` | binary entry point: `status`, `benchmark`, `run`, `simulate`, `witness`, `artifact`, `init` |
 | `zkminer-chain` | chain client, auction math, staking, monitor, tx/nonce layer, RPC metering |
 | `zkminer-netguard` | the network guard: what a requester-caused connection may reach (see SECURITY.md) |
 | `zkminer-contracts` | `sol!()` bindings — the source of truth for the on-chain ABI |
@@ -589,6 +731,23 @@ The zkVM suite is **fail-closed**: a missing worker or guest ELF fails the test 
 than skipping, so a half-installed box can't look green. Set `ZKVM_ALLOW_SKIP=1` to skip
 instead. Run it single-threaded to avoid GPU contention, and log to a file rather than
 piping to `tail`, which buffers and can hide a hang.
+
+### Witness requester tools end to end
+
+`crates/zkminer-cli/tests/simulate_witness.rs` runs `zkminer witness envelope encode`, `zkminer
+simulate --descriptor` (with `--adversarial`) and `zkminer artifact publish` on anvil with the real
+sandboxed runner, broker and CPU risc0 worker, and checks that a builder published with `artifact
+publish` is fetched by the broker's own `hemi-code` reader. It needs a delegated cgroup, anvil and
+the SDK's pinned toolchain:
+
+```bash
+systemd-run --user --scope -q -p Delegate=yes -- env ZKMINER_SANDBOX_TESTS_REQUIRED=1 \
+    cargo test -p zkminer-cli --test simulate_witness -- --test-threads=1
+```
+
+The publisher's own tests (pacing, a chunk dropped from the pool and replaced at its nonce, an
+out-of-gas creation redeployed, the key refusals) run against anvil in `cargo test -p zkminer-cli
+--bin zkminer artifact::` (skipped without anvil unless `ZKMINER_ANVIL_TESTS_REQUIRED` is set).
 
 ### Localnet end-to-end test
 

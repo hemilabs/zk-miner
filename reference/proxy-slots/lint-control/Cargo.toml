@@ -1,0 +1,13 @@
+[package]
+name = "lint-control"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# A negative control for the guest lints (methods/tests/guest_lints.rs): it reaches every host input
+# a guest must not use, so the checks are shown to catch them. Never deployed.
+[workspace]
+
+[dependencies]
+risc0-zkvm = { version = "3.0", default-features = false, features = ["std"] }

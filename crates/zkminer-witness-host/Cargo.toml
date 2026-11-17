@@ -24,6 +24,10 @@ sha2 = "0.10"
 hex = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Scheme 1's witness codec and structural mutations, for `simulate --adversarial`.
+hemiprove-eth-prelude = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 libc = "0.2"
@@ -31,5 +35,4 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 wat = "1"
-serde_json = { workspace = true }
 reqwest = { version = "0.12", default-features = false }

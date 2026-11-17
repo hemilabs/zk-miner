@@ -1,0 +1,31 @@
+[package]
+name = "hemiprove-proxy-slots-methods"
+description = "Builds the proxy-slots reference guest (and the lint control guest) with risc0-build, and tests them on the risc0 executor"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[package.metadata.risc0]
+methods = ["../guest", "../lint-control"]
+
+[build-dependencies]
+risc0-build = "3.0"
+
+[dev-dependencies]
+risc0-zkvm = { version = "3.0", default-features = false, features = ["prove"] }
+# The user ELF inside a program binary, for the guest lints.
+risc0-binfmt = "3.0"
+hemiprove-eth-prelude = { path = "../../eth-prelude", features = ["std"] }
+hemiprove-proxy-slots = { path = "../statement", features = ["std"] }
+alloy-primitives = { workspace = true }
+serde_json = { workspace = true }
+hex = "0.4"
+tokio = { workspace = true }
+tempfile = "3"
+zkminer-config = { workspace = true }
+zkminer-netguard = { workspace = true }
+zkminer-witness = { workspace = true }
+zkminer-witness-broker = { path = "../../../crates/zkminer-witness-broker" }
+zkminer-witness-host = { path = "../../../crates/zkminer-witness-host" }
+zkminer-witness-sandbox = { workspace = true }

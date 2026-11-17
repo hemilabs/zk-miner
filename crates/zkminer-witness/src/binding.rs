@@ -141,6 +141,86 @@ pub fn expected_journal_hash(header: &[u8]) -> B256 {
     keccak256(header)
 }
 
+/// One used FIELDS slot: `(offset, length)` into the statement, in slot order (a marker in slot 0
+/// is not a slot; pass `journalFields` as the job carries it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct FieldsSlot {
+    /// The slot's index in `journalFields` (0–7).
+    pub index: usize,
+    pub offset: usize,
+    pub length: usize,
+}
+
+impl FieldsSlot {
+    pub fn end(&self) -> usize {
+        self.offset + self.length
+    }
+}
+
+/// The used slots of `journal_fields`, in slot order, a slot-0 marker skipped.
+pub fn fields_slots(journal_fields: B256) -> Vec<FieldsSlot> {
+    let fields = clear_marker(journal_fields);
+    fields
+        .0
+        .chunks_exact(4)
+        .enumerate()
+        .filter_map(|(index, s)| {
+            let offset = u16::from_be_bytes([s[0], s[1]]) as usize;
+            let length = u16::from_be_bytes([s[2], s[3]]) as usize;
+            (length != 0).then_some(FieldsSlot { index, offset, length })
+        })
+        .collect()
+}
+
+/// The statement's bytes, `true` where the router's FIELDS hash covers them, judged by changing each
+/// byte in turn and recomputing the hash exactly as the router does (`statement` is the journal after
+/// any prefix). An analytic reading of the slots would say the same; this is what a mutation check
+/// means, so the tool never trusts its own reading of the encoding. `None` when a used range ends past
+/// the statement (the router's mismatch: no journal of this length satisfies the binding).
+pub fn pinned_by_mutation(statement: &[u8], journal_fields: B256) -> Option<Vec<bool>> {
+    let fields = clear_marker(journal_fields);
+    let base = fields_hash(statement, fields);
+    if base == B256::ZERO {
+        return None;
+    }
+    // Only bytes inside some range can change the hash: everything else is free without hashing.
+    let mut candidate = vec![false; statement.len()];
+    for s in fields_slots(journal_fields) {
+        candidate[s.offset..s.end()].iter_mut().for_each(|c| *c = true);
+    }
+    let mut work = statement.to_vec();
+    let mut pinned = vec![false; statement.len()];
+    for (i, c) in candidate.iter().enumerate() {
+        if !c {
+            continue;
+        }
+        work[i] ^= 0xff;
+        pinned[i] = fields_hash(&work, fields) != base;
+        work[i] ^= 0xff;
+    }
+    Some(pinned)
+}
+
+/// Maximal runs of `value` in `mask`, as half-open byte ranges.
+pub fn runs(mask: &[bool], value: bool) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for (i, &m) in mask.iter().enumerate() {
+        match (m == value, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                out.push(s..i);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push(s..mask.len());
+    }
+    out
+}
+
 /// Why the mutation check failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationFailure {
@@ -259,5 +339,37 @@ mod tests {
         // A range past the statement fails rather than passing vacuously.
         let fields96 = journal_fields_for_header(96, true).unwrap();
         assert_eq!(mutation_check(&params, fields96, header_from_words), Err(MutationFailure::RangePastEnd));
+    }
+
+    #[test]
+    fn slots_skip_the_marker_and_unused_entries() {
+        let f = journal_fields_for_header(160, true).unwrap();
+        assert_eq!(fields_slots(f), vec![FieldsSlot { index: 1, offset: 0, length: 160 }]);
+        let mut w = [0u8; 32];
+        w[0..4].copy_from_slice(&((8u32 << 16) | 4).to_be_bytes());
+        w[12..16].copy_from_slice(&((40u32 << 16) | 2).to_be_bytes());
+        let s = fields_slots(B256::from(w));
+        assert_eq!(s, vec![FieldsSlot { index: 0, offset: 8, length: 4 }, FieldsSlot { index: 3, offset: 40, length: 2 }]);
+        assert_eq!(s[1].end(), 42);
+        assert!(fields_slots(B256::ZERO).is_empty());
+    }
+
+    #[test]
+    fn the_mutation_mask_is_exactly_the_pinned_ranges() {
+        let mut w = [0u8; 32];
+        w[0..4].copy_from_slice(&((8u32 << 16) | 4).to_be_bytes());
+        w[4..8].copy_from_slice(&((10u32 << 16) | 4).to_be_bytes()); // overlaps the first
+        let statement: Vec<u8> = (0..40u8).collect();
+        let mask = pinned_by_mutation(&statement, B256::from(w)).unwrap();
+        assert_eq!(runs(&mask, true), vec![8..14]);
+        assert_eq!(runs(&mask, false), vec![0..8, 14..40]);
+        // The header layout: everything after the header is free.
+        let f = journal_fields_for_header(64, true).unwrap();
+        let mask = pinned_by_mutation(&[7u8; 100], f).unwrap();
+        assert_eq!(runs(&mask, true), vec![0..64]);
+        assert_eq!(runs(&mask, false), vec![64..100]);
+        // A range past the end: no journal of that length satisfies it.
+        assert_eq!(pinned_by_mutation(&[0u8; 63], f), None);
+        assert!(runs(&[], true).is_empty());
     }
 }

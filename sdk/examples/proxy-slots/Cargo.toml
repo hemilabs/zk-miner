@@ -1,0 +1,18 @@
+[package]
+name = "proxy-slots-builder"
+description = "Reference witness builder for plan §12: a proxy's EIP-1967 implementation and the slots a rule names, as a scheme-1 witness for the proxy-slots guest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# The statement and the prelude are the guest's own code: the builder derives the slot set with the
+# rule the guest applies, writes W with the codec the guest reads, and runs the statement over its
+# own W before writing it.
+[dependencies]
+hemiprove-builder-sdk = { path = "../../hemiprove-builder-sdk", features = ["eth"] }
+hemiprove-eth-prelude = { path = "../../reference/eth-prelude" }
+hemiprove-proxy-slots = { path = "../../reference/proxy-slots/statement" }
