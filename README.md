@@ -245,8 +245,8 @@ Groth16 proving key loaded between proofs only when the working-set limit holds 
 phase, the resident key and 12 GiB of host headroom (`keep_groth16_cache` in
 `crates/zkminer-prover/src/metal_sizing.rs`: about 29.5 GiB at po2 20), so 36 GB Macs and smaller,
 the M5 Max above included, load the key for each wrap and free it after (it logs `Groth16 proving
-key released: ... MiB of device memory freed (prover layout ...)` per proof). A po2 larger than the limit allows is refused as ResourceExhausted instead of being
-swapped through (`ZKMINER_METAL_NO_PO2_CEILING=1` disables that, for diagnostics only).
+key released: ... MiB of device memory freed (prover layout ...)` per proof). A po2 larger than
+the limit allows is refused as ResourceExhausted instead of being swapped through (`ZKMINER_METAL_NO_PO2_CEILING=1` disables that, for diagnostics only).
 
 ### Prerequisites
 
@@ -308,9 +308,9 @@ make -f Makefile.mac mac-bench BENCH_ONLY=fibonacci
 | `mac-check` | prerequisite checks (the worker's own refusal rules, the Metal compiler, rzup toolchains, the Groth16 component, the fork), then `cargo check` of the Metal worker and the CLI | ~4.5 min from an empty target dir |
 | `mac-build-worker` | `cargo build --release` of `zkminer-prove-risc0-metal` (`--features metal`) and `zkminer-cli` | ~6 min from an empty target dir (with the compiled Metal libraries already in the risc0 build cache, `~/Library/Caches/com.risczero.RISC-Zero.risc0`; a machine's first build also compiles those); ~35 s with nothing changed (the worker's build script always reruns) |
 | `mac-install-worker` | copies the worker into `PROVERS_DIR` (default `~/.zkminer/provers`; copy then rename, so a running worker is never modified in place), then proves fibonacci once with it to warm the pipelines (`WARM=0` skips) | ~1 min warm; add the cold warm-up below on a new machine |
-| `mac-test-miner` | the worker's unit tests (20), `zkminer-prover` `discovery::`/`dispatcher::` (114), and the real worker over its IPC protocol: Capabilities, Warmup (pipelines + a verified Groth16 proof), one Prove (`MINER_IPC=0` skips this one) | ~4 min |
-| `mac-test-risc0` | in `RISC0_DIR`: `risc0-zkp` `hal::metal` (138), `risc0-circuit-rv32im` `prove::` (74), `risc0-circuit-recursion` (42), `risc0-circuit-keccak` (23), `risc0-groth16-sys` (46) and `risc0-groth16` (9); each also alone as `mac-test-risc0-{zkp,rv32im,recursion,keccak,groth16}` | ~5 min once built |
-| `mac-bench` | builds, then `zkminer-prove-risc0-metal --benchmark` (all six programs, ~19 min at po2 20; `BENCH_ONLY=<program>` for one) | ~1 min for fibonacci |
+| `mac-test-miner` | the worker's unit tests, `zkminer-prover` `discovery::`/`dispatcher::`, and the real worker over its IPC protocol: Capabilities, Warmup (pipelines + a verified Groth16 proof), one Prove (`MINER_IPC=0` skips this one) | ~4 min |
+| `mac-test-risc0` | in `RISC0_DIR`: `risc0-zkp` `hal::metal`, `risc0-circuit-rv32im` `prove::`, `risc0-circuit-recursion`, `risc0-circuit-keccak`, `risc0-groth16-sys` and `risc0-groth16`; each also alone as `mac-test-risc0-{zkp,rv32im,recursion,keccak,groth16}` | ~5 min once built |
+| `mac-bench` | builds, then `zkminer-prove-risc0-metal --benchmark` (all six programs, about 3 min at po2 20; `BENCH_ONLY=<program>` for one) | ~1 min for fibonacci |
 
 Every target sources `env.sh`, sets `NVCC=off HIPCC=off`, passes `--locked` (never `cargo update`,
 see [Layout](#layout)), and builds with `-j` = `CARGO_BUILD_JOBS` if set, else the number of
@@ -340,8 +340,9 @@ workers (`~/.risc0/extensions/v0.2.0-risc0-groth16`, or `RISC0_GROTH16_DIR`). A 
 1.58 s on the M5 Max (1.72-1.74 s under a 4 or 8 GiB budget) and peaks at 5.6 GB of GPU memory
 (3.9 GB under a 4 GiB budget, where the prover takes its smallest layout); the worker keeps the
 ~4.1 GB proving key loaded between proofs only when the working-set limit has room for it beside a
-full STARK and 12 GiB of host state (about 29.5 GiB at po2 20, so not on 36 GB Macs and smaller). `RISC0_GROTH16_METAL_PROVER=docker` switches to RISC Zero's Docker prover. The
-CPU-only worker (`--features cpu`) has no native wrap and needs Docker for it.
+full STARK and 12 GiB of host state (about 29.5 GiB at po2 20, so not on 36 GB Macs and
+smaller). `RISC0_GROTH16_METAL_PROVER=docker` switches to RISC Zero's Docker prover. The CPU-only
+worker (`--features cpu`) has no native wrap and needs Docker for it.
 
 ### Environment knobs
 

@@ -200,12 +200,13 @@ const KECCAK_UNION_1_WORDS: [u32; 3] = [16, 1, 0];
 
 /// B9-ZK: one worker at a tight budget (default the 4 GiB tier; `ZKMINER_B9_BUDGET` = bytes for
 /// any other limit at which the worker releases the key, i.e. below
-/// `zkminer_prover::metal_sizing::keep_groth16_cache`'s ~29.5 GiB at po2 20) through the job order that used to break the 4 GiB tier (P31-14 /
-/// P31-19): Warmup (every pipeline, keccak's included, then a verified Groth16 proof), fibonacci,
+/// `zkminer_prover::metal_sizing::keep_groth16_cache`'s ~29.5 GiB at po2 20) through the job
+/// order that used to break the 4 GiB tier (P31-14 / P31-19): Warmup (every pipeline, keccak's included, then a verified Groth16 proof), fibonacci,
 /// a keccak job, an rv32im job (memory-merkle) and fibonacci again, each wrapped in Groth16 (the
 /// worker verifies every receipt before answering). Under such a limit the worker releases the
 /// Groth16 key after every proof; its stderr must show one release per wrap, each freeing a whole
-/// prover of one named layout (exactly 4 GiB: split_h + tw_lent; 8 GiB: whole; any other budget:
+/// prover of one named layout (under the default layout switches, exactly 4 GiB: split_h + tw_lent;
+/// 8 GiB: whole; any other budget or any `RISC0_G16_METAL_{G10,G10_OFF,SPLIT_H,TW_LENT}` set:
 /// whichever single layout the worker identified), back to the pipelines alone.
 ///
 ///   cargo test --release -p zkminer-prove-risc0 --features metal --test metal_worker --no-run
@@ -354,9 +355,20 @@ fn a_tight_worker_wraps_after_keccak_and_releases_the_key_between_jobs() {
         return;
     }
     assert_eq!(releases.len(), 1 + jobs.len(), "{releases:#?}");
-    // The two measured tiers name their layout; any other budget must name exactly one layout
-    // (not a tie, not unidentified), whichever choose_layout took there.
+    // The two measured tiers name their layout under the default switches; any other budget, or
+    // any Groth16 layout revert knob set, must name exactly one layout (not a tie, not
+    // unidentified), whichever choose_layout took there (round-2 review: with
+    // RISC0_G16_METAL_SPLIT_H=off at 4 GiB it is whole + tw_lent).
+    let default_switches = [
+        "RISC0_G16_METAL_G10",
+        "RISC0_G16_METAL_G10_OFF",
+        "RISC0_G16_METAL_SPLIT_H",
+        "RISC0_G16_METAL_TW_LENT",
+    ]
+    .iter()
+    .all(|k| std::env::var_os(k).is_none());
     let want = match budget {
+        _ if !default_switches => None,
         b if b == 4 * GIB => Some("prover layout split_h + tw_lent"),
         b if b == 8 * GIB => Some("prover layout whole"),
         _ => None,

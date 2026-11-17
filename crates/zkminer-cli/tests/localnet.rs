@@ -49,8 +49,8 @@
 //!   override that differs from its linked risc0's selector);
 //! - `refuses_to_claim_without_a_matching_verifier` is the negative case: a miner with the build's
 //!   own selector against that verifier must refuse every risc0 claim (while no 3.1 verifier is
-//!   pinned its startup check refuses from the empty pin, before any eth_call; once one is, from
-//!   the verifier's `SELECTOR()`);
+//!   pinned its startup check refuses from the empty pin, after reading the registry's adapter
+//!   but before calling the verifier's `SELECTOR()`; once one is, from that `SELECTOR()`);
 //! - the tests that prove with the real risc0 worker (`watch_only_reports_every_job`,
 //!   `mines_the_claimable_jobs`, `mines_on_every_gpu`) report SKIPPED until the deployment carries a
 //!   verifier for this build's selector (and zkminer-chain pins it); set
@@ -2729,10 +2729,10 @@ async fn refuses_to_claim_while_its_adapter_is_disabled() {
 /// P31-19, the negative case of the 3.0 fixture: a miner whose seals carry this build's selector
 /// (risc0 3.1, 0xe71e6620) against the fork's risc0 3.0 verifier (0x73c457ba). Its startup check
 /// refuses risczero.groth16.v1 (while `pins::RISC0_V3_1_GROTH16_VERIFIER` is empty, from that empty
-/// pin via `risc0_verifier_pin`, before any eth_call; once filled, from the verifier's
-/// `SELECTOR()`, which differs from the seal's), so the brain
-/// holds the job and nothing is sent: a claim would lock collateral for a fulfil that can only
-/// revert. Runs only while the two selectors differ.
+/// pin via `risc0_verifier_pin`, after the registry/adapter reads but before the verifier's
+/// `SELECTOR()` call; once filled, from that `SELECTOR()`, which differs from the seal's), so the
+/// brain holds the job and nothing is sent: a claim would lock collateral for a fulfil that can
+/// only revert. Runs only while the two selectors differ.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs anvil, the mock worker and the 743111 RPC; see the module docs"]
 async fn refuses_to_claim_without_a_matching_verifier() {

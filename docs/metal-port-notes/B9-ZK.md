@@ -226,6 +226,85 @@ before I read it, so the cause is unknown. The same command then passed 7 times 
 No change at any budget; all 56 runs verified. Against BASELINES '3.1': 4 GiB 603K c/s (603K), 8 GiB
 769K (767-770K), unbudgeted 8.34 s / wrap 1.58 s (8.35 s / 1.57-1.59 s). No peak rises.
 
+## Fix round 2 (review findings)
+
+### Blocking: the keccak prewarm unit test depended on the layout revert knobs (fixed)
+
+Round 1 made `keccak_prewarm_refusal(.., None)` resolve the unknown Groth16 plan through
+`groth16_plan_fallback()`, which reads `MemOptions::from_env()`. With `RISC0_G16_METAL_SPLIT_H=on`,
+`RISC0_G16_METAL_TW_LENT=off` or `RISC0_G16_METAL_G10=0` the fallback becomes
+`GROTH16_PLAN_FALLBACK_FORCED` (4142 MiB), and the test's
+`keccak_prewarm_refusal(None, Some(4 GiB), 46 MiB, None) == None` fails (46 + 4142 + 32 > 4096).
+
+- Reproduced first, on the round-1 debug test binary: each of the three knobs fails exactly
+  `the_keccak_prewarm_yields_to_the_groth16_prover_under_a_tight_limit` (62 passed, 1 failed;
+  `r2/repro_{RISC0_G16_METAL_SPLIT_H,RISC0_G16_METAL_G10,RISC0_G16_METAL_TW_LENT}.log`).
+- Fix at the root: `keccak_prewarm_refusal` is pure again. It takes the fallback as an explicit
+  argument (`fallback: u64`); both production call sites in `warm_up_pipelines` pass
+  `groth16_plan_fallback()`, so behaviour is unchanged. The test names the default fallback
+  (`GROTH16_PLAN_FALLBACK`) explicitly. `the_keccak_fallback_plan_follows_the_layout_switches` now
+  also checks that an unknown plan with the forced fallback defers keccak at 4 GiB and the default
+  one builds it.
+- The env-reading path keeps its own test, `the_process_fallback_plan_reads_the_layout_knobs`: with
+  none of `RISC0_G16_METAL_{G10,G10_OFF,SPLIT_H,TW_LENT}` set it must be `GROTH16_PLAN_FALLBACK`;
+  with any set, one of the two; and the 4 GiB decision must follow whichever it is.
+- After the fix the suite (64 tests) passes with no knob and with each of `RISC0_G16_METAL_SPLIT_H=on`,
+  `RISC0_G16_METAL_G10=0`, `RISC0_G16_METAL_TW_LENT=off` and `RISC0_G16_METAL_G10_OFF=compact`
+  (`r2/fixed_*.log`).
+
+### Non-blocking items addressed
+
+- `GROTH16_PLAN_FALLBACK_FORCED`'s doc comment now says it covers the split_h/tw_lent switches only:
+  with compact, mmap or alias off (`RISC0_G16_METAL_G10=0`, the G9 layout, or
+  `RISC0_G16_METAL_G10_OFF=compact|alias`) the real plan is about 1.3 GB larger and both fallbacks
+  understate it. That matters only before the component is installed and with a debug knob set, so
+  no code change.
+- IPC test `a_tight_worker_wraps_after_keccak_and_releases_the_key_between_jobs`: the per-tier layout
+  name (4 GiB: split_h + tw_lent, 8 GiB: whole) is checked only under the default switches. With any
+  `RISC0_G16_METAL_{G10,G10_OFF,SPLIT_H,TW_LENT}` set, every release must still name exactly one
+  layout. The reviewer's failing case, `RISC0_G16_METAL_SPLIT_H=off` at 4 GiB, now passes: 5/5
+  releases `whole + tw_lent`, 4010.3 MiB freed (`r2/ipc_4g_splitoff.log`).
+- README: the two long lines from round 1 are wrapped; the Makefile table's `mac-bench` says about 3
+  minutes instead of ~19; the stale test counts in the `mac-test-miner` / `mac-test-risc0` rows are
+  removed (they went stale with every item).
+- localnet.rs doc comments: while the 3.1 pin is empty, the refusal comes after the registry/adapter
+  reads and before the verifier's `SELECTOR()` call, not "before any eth_call".
+- `rustfmt` on `metal_host.rs` also removed two pre-existing format drifts in that file.
+- Still open (needs a risc0 fork change): reading the real `BuildStats` for the release line.
+
+How to run the IPC test (for the beta checklist):
+
+    cargo test --release --locked -p zkminer-prove-risc0 --features metal --test metal_worker --no-run
+    gpu-run --tag <who> --budget 4294967296 -- <metal_worker binary> --ignored --nocapture --test-threads=1 a_tight_worker
+    gpu-run --tag <who> --budget 8589934592 -- env ZKMINER_B9_BUDGET=8589934592 <metal_worker binary> --ignored --nocapture --test-threads=1 a_tight_worker
+
+The worker's budget comes from `ZKMINER_B9_BUDGET` (default 4 GiB), not from gpu-run's `--budget`.
+A run with only `--budget 8589934592` proves at 4 GiB (`r2/ipc_8g_wrongenv_ran4g.log`).
+
+### Round 2 gates (logs in `scratch/w9/B9-ZK/r2/`)
+
+| gate | result |
+|---|---|
+| `gpu-run -- cargo test --locked -p zkminer-prove-risc0 --features metal` x2 | 64 passed, 4 ignored, both (`prove_risc0_{1,2}.log`) |
+| the same unit binary under each of 4 Groth16 layout knobs | 64 passed each (`fixed_*.log`) |
+| `gpu-run -- cargo test -p zkminer-prover --features testing --test worker_lifecycle` x2 | 27 passed, 3 ignored, both |
+| `gpu-run -- cargo test -p zkminer-prover --lib` x2 | 291 passed, 1 ignored, both |
+| `cargo build --release --locked` (worker `--features metal`, zkminer-cli) | clean (pre-existing warnings only) |
+| `cargo test -p zkminer-cli --test localnet --no-run` | compiles (anvil/forge not installed) |
+| IPC sequence at 4 GiB / 8 GiB / 4 GiB with `RISC0_G16_METAL_SPLIT_H=off` | pass: 5/5 releases `split_h + tw_lent` 3882.3 / `whole` 4138.1 / `whole + tw_lent` 4010.3 MiB |
+
+### Round 2 A/B (A = metal-3.1 0e57ab4 unmodified worker, B2 = this round; one discarded launch per arm, 7 pairs, order alternating, `memory-merkle --benchmark`)
+
+| budget | STARK s A | STARK s B2 | B2-A median [min, max] | wrap A / B2 | footprint A / B2 | load |
+|---|---|---|---|---|---|---|
+| 4 GiB | 13.910 [13.890-13.910] | 13.910 [13.890-13.940] | +0.010 [-0.020, +0.030], 4/7 | 1.73 / 1.72 s | 4.926 / 4.928 GB | 1.9-2.8 |
+| 8 GiB | 10.240 [10.210-10.280] | 10.240 [10.210-10.280] | +0.000 [-0.030, +0.030], 2/7 | 1.74 / 1.74 s | 7.326 / 7.326 GB | 1.7-2.6 |
+| none (`--no-budget`, 28.1 GiB) | 8.340 [8.320-8.360] | 8.340 [8.310-8.390] | +0.000 [-0.040, +0.050], 3/7 | 1.59 / 1.59 s | 13.203 / 13.203 GB | 1.6-2.2 |
+
+No change at any budget; all 42 runs verified. Against BASELINES '3.1': 4 GiB ~603K c/s (603K),
+8 GiB 765-768K (767K), unbudgeted 8.34 s / wrap 1.59 s (8.35 s / 1.57-1.59 s). No peak rises. The
+round's only product-code change is an argument passed at worker start, off every proof's path.
+
 ## Knobs
 
 - New: none.
@@ -259,3 +338,10 @@ No change at any budget; all 56 runs verified. Against BASELINES '3.1': 4 GiB 60
    takes no jobs (review observation).
 10. The run.rs startup PAGE about the missing 3.1 verifier is logged even when no risc0 worker is
     configured, as the existing `reverify_risc0` PAGE is.
+11. The IPC sequence test is `#[ignore]` (it proves on the GPU), so it is not in the default gate; its
+    run commands are in "Fix round 2". It hard-codes the default-switch layouts at exactly 4 and 8 GiB.
+12. `GROTH16_PLAN_FALLBACK` / `_FORCED` are the v0.2.0 key's measured plans; they go stale if the key
+    or the layouts change, and they understate the plan with compact/mmap/alias off (see round 2).
+13. The `zkminer-prover-protocol` 8/42 failure from round 1 was not reproduced by the reviewer
+    (14 runs) or since; the lost log may have been a harness quoting mistake like the
+    `r1/repro_zkminer-{cli,chain}.log` ones.
