@@ -371,7 +371,11 @@ Worth knowing:
   miner stopped (a plain `zkminer benchmark` saves nothing). Under Windows, by default (the
   driver's CUDA - Sysmem Fallback Policy, which `zkminer doctor` shows), a proof that outgrows the
   card doesn't fail: the driver moves part of it into system memory and it runs several times
-  slower, which can cost a lock, so leave the card the room these figures say.
+  slower, which can cost a lock, so leave the card the room these figures say. The miner helps:
+  a RISC Zero proof on an NVIDIA card starts only with its segment size's measured peak plus
+  512 MiB free (else it waits, or goes to another card), and under Windows a card that another
+  program also uses (a display) keeps 1 GiB more back, for that program to grow into.
+  `ZKMINER_MIN_AVAILABLE_VRAM_MB=0` turns the free-VRAM checks off.
 
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for

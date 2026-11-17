@@ -650,6 +650,33 @@ pub fn terminate_if_our_worker(pid: u32, expected_starttime: Option<u64>) -> boo
     process.creation_time() == Some(expected) && process.terminate()
 }
 
+/// Windows: `root` and every process it started, directly or not, each with its creation time:
+/// what Linux finds by process group, which Windows does not have. A process counts as a child only
+/// if it started after its recorded parent (a recorded parent pid may since belong to another
+/// process), and one whose creation time cannot be read is left out, with what it started.
+#[cfg(windows)]
+pub fn process_tree(root: u32) -> Vec<(u32, u64)> {
+    let Some(root_started) = pid_starttime(root) else {
+        return Vec::new();
+    };
+    let parents = win32::recorded_parents();
+    let mut tree = vec![(root, root_started)];
+    let mut next = 0;
+    while next < tree.len() {
+        let (parent, parent_started) = tree[next];
+        next += 1;
+        for &(pid, recorded) in &parents {
+            if recorded != parent || pid == parent || tree.iter().any(|(p, _)| *p == pid) {
+                continue;
+            }
+            if let Some(started) = pid_starttime(pid).filter(|s| *s >= parent_started) {
+                tree.push((pid, started));
+            }
+        }
+    }
+    tree
+}
+
 /// Windows: the process that started `pid`, which Linux reads from `/proc/<pid>/stat`.
 ///
 /// Windows records the parent's pid at creation and keeps it after the parent exits, by which time
@@ -721,6 +748,34 @@ mod win32 {
         pri_class_base: i32,
         flags: u32,
         exe_file: [u16; 260],
+    }
+
+    /// Every process's `(pid, recorded parent pid)`, from one snapshot.
+    pub fn recorded_parents() -> Vec<(u32, u32)> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot.is_null() || snapshot as isize == -1 {
+            return Vec::new();
+        }
+        let snapshot = Process(snapshot);
+        let mut entry = ProcessEntry32W {
+            size: std::mem::size_of::<ProcessEntry32W>() as u32,
+            usage: 0,
+            process_id: 0,
+            default_heap_id: 0,
+            module_id: 0,
+            threads: 0,
+            parent_process_id: 0,
+            pri_class_base: 0,
+            flags: 0,
+            exe_file: [0; 260],
+        };
+        let mut all = Vec::new();
+        let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
+        while more {
+            all.push((entry.process_id, entry.parent_process_id));
+            more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
+        }
+        all
     }
 
     /// The parent pid Windows recorded when `pid` was created, from a process snapshot.

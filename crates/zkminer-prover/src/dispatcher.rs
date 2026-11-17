@@ -1068,6 +1068,42 @@ fn retire_group(pgid: u32) {
     let mut groups = RETIRED_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
     groups.retain(|(_, at)| at.elapsed() < RETIRED_GROUP_WINDOW);
     groups.push(((pgid, boot_ticks_now()), Instant::now()));
+    drop(groups);
+    #[cfg(windows)]
+    retire_tree(pgid);
+}
+
+/// Windows' stand-in for a retired process group, which it does not have: the processes of a worker
+/// being torn down, each by pid and creation time, recorded while the worker is still alive. Its
+/// `sp1-gpu-server` outlives it by moments, its parent gone, and by parentage alone its memory
+/// would read as somebody else's: a slot's retry would then be refused, or sent to another card,
+/// over memory of ours on its way back.
+#[cfg(windows)]
+static RETIRED_PROCESSES: Mutex<Vec<((u32, u64), Instant)>> = Mutex::new(Vec::new());
+
+/// Record `worker`'s process tree as retired. See `RETIRED_PROCESSES`.
+#[cfg(windows)]
+fn retire_tree(worker: u32) {
+    let tree = crate::memory::process_tree(worker);
+    let mut retired = RETIRED_PROCESSES.lock().unwrap_or_else(|e| e.into_inner());
+    retired.retain(|(_, at)| at.elapsed() < RETIRED_GROUP_WINDOW);
+    let now = Instant::now();
+    retired.extend(tree.into_iter().map(|p| (p, now)));
+}
+
+/// Whether `pid` is a process of a worker retired within the window: the same pid, created at the
+/// same time (a reused number is a stranger).
+#[cfg(windows)]
+fn in_retired_tree(pid: u32) -> bool {
+    let retired = RETIRED_PROCESSES.lock().unwrap_or_else(|e| e.into_inner());
+    let recorded: Vec<u64> = retired
+        .iter()
+        .filter(|((p, _), at)| *p == pid && at.elapsed() < RETIRED_GROUP_WINDOW)
+        .map(|((_, started), _)| *started)
+        .collect();
+    drop(retired);
+    !recorded.is_empty()
+        && crate::memory::pid_starttime(pid).is_some_and(|started| recorded.contains(&started))
 }
 
 /// Groups retired within the window, for attributing what they still hold.
@@ -1242,6 +1278,9 @@ struct CardOccupancy {
     unattributed: u64,
     /// Held by workers retired moments ago and on its way back. See `PidOwner::Draining`.
     draining: u64,
+    /// Kept back from what a worker may be sized or admitted against: on Windows, room for another
+    /// program sharing the card to grow into (`with_windows_growth_margin`). 0 elsewhere.
+    growth_margin: u64,
 }
 
 impl CardOccupancy {
@@ -1323,11 +1362,13 @@ impl CardOccupancy {
         self.used.saturating_sub(self.held_by(key))
     }
 
-    /// What `key` could allocate right now without anything else on the card giving memory back.
+    /// What `key` could allocate right now without anything else on the card giving memory back,
+    /// less `growth_margin`.
     fn available_to(&self, key: &str) -> u64 {
         self.total
             .saturating_sub(self.reserved)
             .saturating_sub(self.held_elsewhere(key))
+            .saturating_sub(self.growth_margin)
     }
 
     /// What a worker on this card could have if every worker of ours made room: everything except
@@ -1342,6 +1383,7 @@ impl CardOccupancy {
         self.total
             .saturating_sub(self.reserved)
             .saturating_sub(self.foreign())
+            .saturating_sub(self.growth_margin)
     }
 }
 
@@ -1371,10 +1413,13 @@ fn owner_of(
                 })
             };
             if !retired.is_empty() && proc_group(pid).is_some_and(retired_by) {
-                PidOwner::Draining
-            } else {
-                other
+                return PidOwner::Draining;
             }
+            #[cfg(windows)]
+            if in_retired_tree(pid) {
+                return PidOwner::Draining;
+            }
+            other
         }
     }
 }
@@ -1438,13 +1483,35 @@ fn read_card_occupancy(
     let retired = retired_groups();
     let owner = |pid: u32| owner_of(pid, miner, slot_pids, &retired);
     let known = apps_we_can_attribute(apps, &owner)?;
-    Some(CardOccupancy::from_readings(
-        used_mib,
-        total_mib,
-        reserved_mib,
-        &known,
-        owner,
-    ))
+    let card = CardOccupancy::from_readings(used_mib, total_mib, reserved_mib, &known, owner);
+    #[cfg(windows)]
+    let card = with_windows_growth_margin(card);
+    Some(card)
+}
+
+/// Headroom kept on a Windows card that another program shares (`CardOccupancy::growth_margin`).
+///
+/// What another program holds is read once, before a proof; what it holds a minute later is not. A
+/// display's use grows with what it shows, and on Windows growing into memory a proof needs does
+/// not fail anything: the driver moves part of the proof's memory, or the program's, into system
+/// memory (measured on the RTX 4070: a second process filling the card pushed 2.5 GiB of the first
+/// one out), and the proof runs several times slower and may miss its deadline. A card nothing else
+/// uses keeps its whole figure; one that shares with anything over `WINDOWS_SHARED_CARD_THRESHOLD`
+/// keeps this back from what our workers are sized and admitted against.
+#[cfg(windows)]
+const WINDOWS_SHARED_CARD_MARGIN: u64 = 1024 * 1024 * 1024;
+
+/// Less than this held by other programs is noise, not a program that may grow (the 4070, driving
+/// no display, reads 0).
+#[cfg(windows)]
+const WINDOWS_SHARED_CARD_THRESHOLD: u64 = 64 * 1024 * 1024;
+
+#[cfg(windows)]
+fn with_windows_growth_margin(mut card: CardOccupancy) -> CardOccupancy {
+    if card.foreign() > WINDOWS_SHARED_CARD_THRESHOLD {
+        card.growth_margin = WINDOWS_SHARED_CARD_MARGIN;
+    }
+    card
 }
 
 /// How many charges of `each` bytes fit in `room` (all of it when a charge is 0).
@@ -3579,7 +3646,7 @@ impl WorkerPool {
         // Only ever downward. A sweep is calibration: raising po2 above what the caller asked for
         // would invent a sample it never requested, and `calibrate_po2_for_suite` reads the returned
         // `po2` to decide what succeeded.
-        let po2 = match self.check_vram_budget(key, None)? {
+        let po2 = match self.check_vram_budget(key, None, None)? {
             Some(budget) => {
                 let backend = key.split(':').next().unwrap_or(key);
                 let gpu_tag = key.split(':').nth(1).unwrap_or("");
@@ -4057,7 +4124,7 @@ impl WorkerPool {
         // See `check_vram_budget`. Unlike `calibrate_slot_po2` there is no parameter to clamp: the
         // suite's sizing is chosen inside the worker from its spawn environment, which is where the
         // available-VRAM figure is handed to it.
-        let _vram_budget = self.check_vram_budget(key, None)?;
+        let _vram_budget = self.check_vram_budget(key, None, None)?;
 
         let entry = self
             .workers
@@ -4457,7 +4524,7 @@ impl WorkerPool {
         // See `check_vram_budget`. Unlike `calibrate_slot_po2` there is no parameter to clamp: the
         // suite's sizing is chosen inside the worker from its spawn environment, which is where the
         // available-VRAM figure is handed to it.
-        let _vram_budget = self.check_vram_budget(key, None)?;
+        let _vram_budget = self.check_vram_budget(key, None, None)?;
 
         let entry = self
             .workers
@@ -7710,6 +7777,10 @@ impl WorkerPool {
         &self,
         key: &str,
         abort_at: Option<Instant>,
+        // The segment size of the risc0 proof about to run here, for its free-VRAM floor
+        // (`min_available_vram_bytes_for_risc0_proof`). `None`: no floor (a benchmark or
+        // calibration, which pick their own sizes, or another backend).
+        risc0_po2: Option<u8>,
     ) -> Result<Option<VramBudget>> {
         let backend = key.split(':').next().unwrap_or(key);
         let Some(mut card) = self.read_card(key) else {
@@ -7728,7 +7799,16 @@ impl WorkerPool {
         if !own.dispatchable || self.closing.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        let floor = crate::discovery::min_available_vram_bytes_for_backend(backend, total);
+        let floor = match risc0_po2 {
+            Some(po2) if backend == zkminer_prover_protocol::BACKEND_RISC0 => {
+                crate::discovery::min_available_vram_bytes_for_risc0_proof(
+                    po2,
+                    key.split(':').nth(1).unwrap_or(""),
+                    Some(card.total),
+                )
+            }
+            _ => crate::discovery::min_available_vram_bytes_for_backend(backend, total),
+        };
         let this_card = physical_gpu_id(key);
         // What of OURS stands on this card and could move: same-card siblings' workers — only they are
         // behind the guard we hold; a slot pinned to another card holding a context here is not — and
@@ -7957,7 +8037,11 @@ impl WorkerPool {
 
         // Is enough of this card's VRAM free for this backend? See `check_vram_budget`, which also
         // explains why this must come after the guard and before the slot mutex.
-        let _vram_budget = self.check_vram_budget(key, abort_at)?;
+        // A risc0 proof's floor is its segment size's measured peak: the worker proves at `po2`, or
+        // at its default when none is named.
+        let risc0_po2 = (key.split(':').next() == Some(zkminer_prover_protocol::BACKEND_RISC0))
+            .then(|| po2.unwrap_or(zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2));
+        let _vram_budget = self.check_vram_budget(key, abort_at, risc0_po2)?;
 
         let entry = self
             .workers
@@ -9358,6 +9442,123 @@ mod tests {
             .contains_key(t::SP1_ELEMENT_THRESHOLD_CAP_ENV));
         drop(slot);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_risc0_proof_needs_its_sizes_measured_peak_free_on_a_cuda_card() {
+        const MIB: u64 = 1 << 20;
+        let floor = crate::discovery::min_available_vram_bytes_for_risc0_proof;
+        let margin = crate::discovery::RISC0_PROOF_VRAM_MARGIN;
+        // A 12 GB card at its own 19, a 16 GB one at 20.
+        assert_eq!(
+            floor(19, "cuda", Some(12_282 * MIB)),
+            Some(8_179 * MIB + margin)
+        );
+        assert_eq!(
+            floor(20, "cuda", Some(16_303 * MIB)),
+            Some(12_436 * MIB + margin)
+        );
+        // A size the card could never hold gets no floor (it proves slowly, as before, and is
+        // priced so), nor does a card of unknown size or another vendor's.
+        assert_eq!(floor(20, "cuda", Some(12_282 * MIB)), None);
+        assert_eq!(floor(19, "cuda", None), None);
+        assert_eq!(floor(19, "rocm", Some(16_303 * MIB)), None);
+        // With a floor, room-making frees only what that floor needs, or refuses when it cannot.
+        let need = 8_179 * MIB + margin;
+        assert_eq!(
+            room_needed(
+                SizingCap::NotSized,
+                "risc0",
+                11_000 * MIB,
+                None,
+                Some(need),
+                None
+            ),
+            RoomNeeded::Bytes(need)
+        );
+        assert_eq!(
+            room_needed(
+                SizingCap::NotSized,
+                "risc0",
+                8_000 * MIB,
+                None,
+                Some(need),
+                None
+            ),
+            RoomNeeded::Hopeless
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_card_shared_with_another_program_keeps_room_for_it_to_grow() {
+        const MIB: u64 = 1 << 20;
+        let ours = |pid: u32| match pid {
+            200 => PidOwner::Slot("risc0:cuda:1".into()),
+            _ => PidOwner::Outside,
+        };
+        // Idle and headless: the whole figure.
+        let alone =
+            with_windows_growth_margin(CardOccupancy::from_readings(0, 12_282, 272, &[], ours));
+        assert_eq!(alone.available_to("risc0:cuda:1"), (12_282 - 272) * MIB);
+        // Only our own worker on it: still the whole figure.
+        let ours_only = with_windows_growth_margin(CardOccupancy::from_readings(
+            1_806,
+            12_282,
+            272,
+            &[(200, 1_806)],
+            ours,
+        ));
+        assert_eq!(ours_only.available_to("risc0:cuda:1"), (12_282 - 272) * MIB);
+        // A display holding 300 MiB: 1 GiB more is kept back, so SP1 sizes for 134M there.
+        let shared =
+            with_windows_growth_margin(CardOccupancy::from_readings(300, 12_282, 272, &[], ours));
+        assert_eq!(
+            shared.available_to("sp1:cuda:1"),
+            (12_282 - 272 - 300) * MIB - WINDOWS_SHARED_CARD_MARGIN
+        );
+        assert_eq!(
+            shared.available_if_ours_made_room(),
+            (12_282 - 272 - 300) * MIB - WINDOWS_SHARED_CARD_MARGIN
+        );
+        assert_eq!(
+            zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(
+                shared.available_to("sp1:cuda:1"),
+                Some(12_282 * MIB)
+            ),
+            Some(134_217_728)
+        );
+        // Noise is not a program that may grow.
+        let noise =
+            with_windows_growth_margin(CardOccupancy::from_readings(40, 12_282, 272, &[], ours));
+        assert_eq!(noise.available_to("sp1:cuda:1"), (12_282 - 272 - 40) * MIB);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_retired_workers_processes_stay_ours_on_windows() {
+        // A child of this test process stands in for a worker's `sp1-gpu-server`.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("start a child");
+        let me = std::process::id();
+        let tree = crate::memory::process_tree(me);
+        assert!(tree.iter().any(|(p, _)| *p == me), "{tree:?}");
+        assert!(tree.iter().any(|(p, _)| *p == child.id()), "{tree:?}");
+        assert!(!in_retired_tree(child.id()));
+        retire_tree(child.id());
+        assert!(in_retired_tree(child.id()));
+        // Its memory then reads as ours, draining, not as somebody else's.
+        assert_eq!(
+            owner_of(child.id(), 1, &HashMap::new(), &[]),
+            PidOwner::Draining
+        );
+        // A process never retired is not.
+        assert!(!in_retired_tree(4));
+        child.kill().ok();
+        child.wait().ok();
     }
 
     /// Helper to create a WorkerPool with stub entries (no real workers).

@@ -1739,7 +1739,34 @@ pub const MIN_AVAILABLE_VRAM_MB_ENV: &str = "ZKMINER_MIN_AVAILABLE_VRAM_MB";
 /// (`benchmark::risc0_job_po2`), and one too small for any proves none.
 ///
 /// `total` is the card's capacity, which picks SP1's measured table (a 16 GB card's server runs
-/// differently, see `sp1_min_available_vram_bytes`); `None` when unknown.
+/// differently, see `sp1_min_available_vram_bytes`); `None` when unknown. The VRAM a risc0 proof at
+/// segment size `po2` needs free on a card of vendor `gpu_tag` and `total` bytes before it starts:
+/// the size's measured peak (`benchmark::estimate_gpu_po2_memory`) plus
+/// [`RISC0_PROOF_VRAM_MARGIN`]. `None` — no floor — where nothing has measured the peak (another
+/// vendor), where the card could never hold it (refusing would release every job such a card
+/// claims, where today it proves them slowly; the planner already prices it so, see
+/// `benchmark::risc0_largest_fitting_po2`), and when the operator set [`MIN_AVAILABLE_VRAM_MB_ENV`]
+/// to 0, which turns every floor off.
+pub fn min_available_vram_bytes_for_risc0_proof(
+    po2: u8,
+    gpu_tag: &str,
+    total: Option<u64>,
+) -> Option<u64> {
+    if gpu_tag != "cuda" {
+        return None;
+    }
+    if std::env::var(MIN_AVAILABLE_VRAM_MB_ENV).is_ok_and(|v| v.trim() == "0") {
+        return None;
+    }
+    let need = crate::benchmark::estimate_gpu_po2_memory(po2, "risc0", gpu_tag)
+        .saturating_add(RISC0_PROOF_VRAM_MARGIN);
+    (need <= total?).then_some(need)
+}
+
+/// Headroom over a risc0 segment size's measured peak before a proof may start: as SP1's
+/// (`SP1_VRAM_MARGIN`), for what another workload of the same size holds over the measured one.
+pub const RISC0_PROOF_VRAM_MARGIN: u64 = 512 * 1024 * 1024;
+
 pub fn min_available_vram_bytes_for_backend(backend: &str, total: Option<u64>) -> Option<u64> {
     let default = match backend {
         // Derived from the MEASURED tier table rather than from the installed-VRAM floor, so this and
