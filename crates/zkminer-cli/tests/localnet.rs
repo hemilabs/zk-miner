@@ -3098,8 +3098,8 @@ async fn every_gpu(name: &str) -> EveryGpu {
         "SP1_GROTH16_CIRCUIT_PATH",
         "XDG_CACHE_HOME",
         "ZKMINER_MIN_AVAILABLE_VRAM_MB",
-        // To steer jobs onto particular NVIDIA cards: one SP1 proof at a time fits this host's
-        // `/dev/shm` (each may stage 24 GiB), so it lands on the same card unless others are hidden.
+        // To steer jobs onto particular NVIDIA cards: the host's RAM may hold one SP1 proof at a
+        // time (each may stage 24 GiB), so it lands on the same card unless others are hidden.
         "ZKMINER_GPU_NAME_FILTER",
     ]
     .into_iter()
