@@ -79,6 +79,8 @@ if [ -n "$min" ] && older "$have" "$min"; then
   die "this build needs macOS $min or later; this Mac runs $have (Software Update, then run install.sh again)"
 fi
 mem=$(sysctl -n hw.memsize)
+# 12 GiB: the worker's MIN_HOST_MEMORY_BYTES (crates/zkminer-prove-risc0/src/metal_host.rs), below
+# which it refuses to prove; keep the two equal.
 if [ "$mem" -lt $((12 << 30)) ]; then
   msg="this Mac has $((mem >> 30)) GiB of RAM; the Metal worker needs a Mac with at least 16 GB and refuses to prove on this one"
   [ $force = 1 ] && say "warning: $msg (--force: installing anyway)" || die "$msg (--force installs anyway)"
@@ -88,11 +90,16 @@ fi
 say "checking the kit ($(info version), commit $(info commit | cut -c1-12))"
 (cd "$kit" && shasum -a 256 -c --quiet SHA256SUMS) || die "the kit's files do not match its SHA256SUMS: download it again"
 
+# Partial files to remove if the script stops (a failed cp on a full disk, ^C, a failed unpack).
+cleanup=()
+trap 'for c in ${cleanup[@]+"${cleanup[@]}"}; do rm -rf "$c"; done' EXIT
+
 # Copy, then rename into place: a running worker keeps its old (unlinked) file, and macOS never
 # sees a signed binary modified in place (it kills such a process).
 place() { # <src> <dest>
   local tmp
   tmp="$(dirname "$2")/.$(basename "$2").tmp.$$"
+  cleanup+=("$tmp")
   cp "$1" "$tmp"
   chmod 0755 "$tmp"
   xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
@@ -133,37 +140,52 @@ fi
 # --- risc0-groth16 component ----------------------------------------------------------------
 # The same blob the worker downloads at its first warm-up (crates/zkminer-prove-risc0/src/
 # groth16_component.rs), into the same place, checked against the same SHA-256; curl resumes a cut
-# download.
+# download. Under the worker's lock file ($RISC0_HOME/tmp/.risc0-groth16-<version>.lock, flock(2),
+# taken through perl, which every Mac has), so a worker installing at the same time and this script
+# never both replace the directory; whoever comes second finds it complete.
 g16_home=${RISC0_HOME:-$HOME/.risc0}
 g16_dir=${RISC0_GROTH16_DIR:-$g16_home/extensions/v$(info groth16_version)-risc0-groth16}
 g16_files="stark_verify_graph.bin stark_verify_final.zkey fuzzed_msm_results.bin preprocessed_coeffs.bin"
 g16_complete() { local f; for f in $g16_files; do [ -s "$1/$f" ] || return 1; done; }
+g16_install() { # under the lock
+  if g16_complete "$g16_dir"; then
+    say "risc0-groth16 component in $g16_dir (installed meanwhile)"
+    return
+  fi
+  sha=$(info groth16_sha256); url=$(info groth16_url)
+  part=$tmp/risc0-groth16-$(info groth16_version).tar.xz.part
+  say "downloading the risc0-groth16 component v$(info groth16_version) (2.4 GB) to $tmp"
+  curl -fL -# --retry 5 --retry-delay 5 -C - -o "$part" "$url" || die "the download failed (run install.sh --with-groth16 again to resume)"
+  got=$(shasum -a 256 "$part" | cut -d' ' -f1)
+  if [ "$got" != "$sha" ]; then
+    rm -f "$part"
+    die "the risc0-groth16 archive has SHA-256 $got, not $sha: removed it"
+  fi
+  staging=$tmp/risc0-groth16-$(info groth16_version).$$
+  cleanup+=("$staging")
+  rm -rf "$staging"; mkdir -p "$staging"
+  tar -xJf "$part" -C "$staging" || { rm -rf "$staging"; die "cannot unpack $part"; }
+  g16_complete "$staging" || { rm -rf "$staging"; die "the archive does not hold $g16_files"; }
+  mkdir -p "$(dirname "$g16_dir")"
+  rm -rf "$g16_dir"
+  mv "$staging" "$g16_dir"
+  rm -f "$part"
+  say "installed the risc0-groth16 component in $g16_dir"
+}
 if [ $groth16 = 1 ]; then
   if g16_complete "$g16_dir"; then
     say "risc0-groth16 component already in $g16_dir"
   elif [ -n "${RISC0_GROTH16_DIR:-}" ]; then
     die "RISC0_GROTH16_DIR=$RISC0_GROTH16_DIR does not hold the risc0-groth16 component"
   else
-    sha=$(info groth16_sha256); url=$(info groth16_url)
     tmp=$g16_home/tmp
     mkdir -p "$tmp"
-    part=$tmp/risc0-groth16-$(info groth16_version).tar.xz.part
-    say "downloading the risc0-groth16 component v$(info groth16_version) (2.4 GB) to $tmp"
-    curl -fL -# --retry 5 --retry-delay 5 -C - -o "$part" "$url" || die "the download failed (run install.sh --with-groth16 again to resume)"
-    got=$(shasum -a 256 "$part" | cut -d' ' -f1)
-    if [ "$got" != "$sha" ]; then
-      rm -f "$part"
-      die "the risc0-groth16 archive has SHA-256 $got, not $sha: removed it"
-    fi
-    staging=$tmp/risc0-groth16-$(info groth16_version).$$
-    rm -rf "$staging"; mkdir -p "$staging"
-    tar -xJf "$part" -C "$staging" || { rm -rf "$staging"; die "cannot unpack $part"; }
-    g16_complete "$staging" || { rm -rf "$staging"; die "the archive does not hold $g16_files"; }
-    mkdir -p "$(dirname "$g16_dir")"
-    rm -rf "$g16_dir"
-    mv "$staging" "$g16_dir"
-    rm -f "$part"
-    say "installed the risc0-groth16 component in $g16_dir"
+    exec 9>"$tmp/.risc0-groth16-$(info groth16_version).lock"
+    say "taking the risc0-groth16 install lock (waits while a worker installs it)"
+    perl -e 'use Fcntl qw(:flock); open(my $f, ">&=", 9) or die "$!\n"; flock($f, LOCK_EX) or die "$!\n"' \
+      || die "cannot lock $tmp/.risc0-groth16-$(info groth16_version).lock"
+    g16_install
+    exec 9>&-
   fi
 fi
 

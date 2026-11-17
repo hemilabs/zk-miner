@@ -21,7 +21,8 @@ The script runs these steps in order:
    with the minimum-macOS settings below.
 2. **Check the build.** Both binaries must be arm64, have LC_BUILD_VERSION `minos` = the minimum,
    link only system libraries, and carry a valid signature. Every metallib the worker embeds must
-   target the minimum.
+   target the minimum. (With `ZKMINER_MACOS_MIN=sdk` the script instead reads the binaries' minos
+   and the metallibs' target, which must each be one value, and takes the newer as the minimum.)
 3. **Archive set.** `make mac-build-aot` builds the offline Metal archive set for `AOT_ARCHES`, with
    macOS key `macos<major of the minimum>`.
 4. **Stage.** It lays out `zkminer-<version>-macos-arm64/` (layout below), writes `BUILDINFO` and the
@@ -35,7 +36,7 @@ Settings (environment):
 
 | variable | default | |
 |---|---|---|
-| `ZKMINER_MACOS_MIN` | `27.0` | minimum macOS; `sdk` = old behaviour (minos 11.0, metallibs for the build SDK) |
+| `ZKMINER_MACOS_MIN` | `27.0` | minimum macOS; `sdk` = no target flags (revert knob): minos 11.0 and metallibs for the build SDK, so the kit's `min_macos` is the SDK's version (27.2 here) |
 | `AOT_ARCHES` | `applegpu_g17s` | GPU families of the archive set; `none` = no set |
 | `AOT_VALIDATED` | `applegpu_g17s` | families `install.sh` installs archives for (written to `BUILDINFO`) |
 | `AOT_SRC` | | a prebuilt set for this exact worker (digests are checked) |
@@ -58,7 +59,8 @@ zkminer-<version>-macos-arm64/
 ├── tools/build-metal-aot.sh             scripts/mac (its --worker-digests)
 ├── README.md                            packaging/macos/README.md
 ├── LICENSE
-├── BUILDINFO                            version, commit, risc0 rev, min_macos, Metal compiler,
+├── BUILDINFO                            version, commit, risc0 rev, min_macos (the newer of
+│                                        binaries_minos and metal_target), Metal compiler,
 │                                        aot_arches, aot_validated, groth16_{version,sha256,url}
 └── SHA256SUMS                           every file above
 ```
@@ -116,7 +118,13 @@ How the build sets it (`assemble-macos.sh`):
   that flag. risc0's kernel cache (`~/Library/Caches/com.risczero.RISC-Zero.risc0`) is keyed by that
   line (and not by any deployment target), so kit metallibs and default metallibs never share a cache
   entry. The AOT dump tests build with the same compiler, so their metallibs equal the worker's.
-- **Revert knob:** `ZKMINER_MACOS_MIN=sdk`.
+- **Revert knob:** `ZKMINER_MACOS_MIN=sdk`. It sets no target flag, so the binaries keep minos 11.0
+  and the metallibs target the build SDK (27.2 with the CLT 27.2 SDK). A Mac must meet both, so the
+  kit's minimum is the newer one: `BUILDINFO` records `binaries_minos`, `metal_target` and
+  `min_macos` = the newer of the two (which `install.sh` enforces), and the archive key is
+  `macos<major of min_macos>`. `check-macos-release.sh` checks all three on every kit.
+  `scripts/ci/test-assemble-macos.sh` assembles kits in both modes from prebuilt binaries (no build,
+  no GPU) and checks that a BUILDINFO stating any other minimum is rejected.
 
 ## Supported Macs and memory tiers
 
@@ -131,13 +139,18 @@ macOS 27 runs only on Apple Silicon. The worker refuses Intel, Rosetta and Macs 
 | 24 GB | 16 GiB, 20 | 8 GiB, 19 |
 | 36 GB+ | 28 GiB, 20 | 20 GiB, 20 |
 
+The limit is min(`recommendedMaxWorkingSetSize`, `hw.memsize` − 8 GiB) (`host_working_set_limit`);
+above 36 GB it grows with RAM and po2 stays 20. The owner-active column applies only with
+`ZKMINER_OWNER_ACTIVE=auto` (or `1`); by default the miner keeps the idle limit (`metal_sizing.rs`,
+`OWNER_ACTIVE_ENV`).
+
 Only a 36 GB M5 Max has been measured. The smaller rows come from runs on it under
 `RISC0_METAL_MAX_WORKING_SET_BYTES` (BASELINES '3.1': memory-merkle ~767K c/s at 8 GiB, ~603K at
 4 GiB).
 
 ## Offline archives: which families
 
-- **Ship `applegpu_g17s` (M5 Pro / M5 Max) only.** It is the only family validated on hardware (risc0
+- **Ship `applegpu_g17s` only** (the M5 Max here reports it; the M5 Pro's family was not checked). It is the only family validated on hardware (risc0
   `tools/metal_aot/README.md`: unit suites, seal equality, stress). `metal-tt` can build g13g-g17g as
   well, but no GPU of those families has run their output, and a GPU binary from the offline compiler
   differs from the OS compiler's. Per-family bit-exactness is a validation item: run the README's
@@ -161,7 +174,11 @@ Only a 36 GB M5 Max has been measured. The smaller rows come from runs on it und
   lock file.
 - **`install.sh --with-groth16`** fetches the same URL ahead of time (`BUILDINFO` `groth16_url`, which
   the check script verifies is the string pinned in the worker binary). curl resumes a cut download.
-  The script checks the SHA-256 before it unpacks and installs into the same directory by rename.
+  The script checks the SHA-256 before it unpacks and installs into the same directory by rename,
+  holding the worker's lock file (`~/.risc0/tmp/.risc0-groth16-0.2.0.lock`, flock(2) taken through
+  perl), so it and a worker installing at the same moment never both replace the directory; the one
+  that comes second finds it complete (`test-assemble-macos.sh` case 6). A failed copy or unpack
+  leaves no partial file (case 7).
 - **`worker --benchmark` run by hand does not fetch it.** The README tells users to install it first.
 
 ## Unsigned beta: quarantine
@@ -190,6 +207,10 @@ The workflow files are not part of this item. A macOS job would run:
       - uses: actions/upload-artifact@<pinned sha>
         with: { name: dist-macos, path: dist/macos }
 ```
+
+`scripts/ci/test-assemble-macos.sh <sdk worker> <sdk CLI> [<27.0 worker> <27.0 CLI>]` tests the
+script's minimum-macOS handling, the kit checks and `install.sh` from prebuilt binaries, with no
+build and no GPU (about a minute), so it can run on that runner too.
 
 Caveats for that runner (macOS 26, 5 cores, 14 GB, 14 GB disk, likely a VM):
 

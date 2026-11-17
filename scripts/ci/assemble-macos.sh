@@ -25,7 +25,10 @@
 # Settings (environment):
 # - ZKMINER_MACOS_MIN    the minimum macOS: the binaries' LC_BUILD_VERSION minos and the Metal
 #                        libraries' target (default 27.0; docs/macos-beta.md says why). `sdk` changes
-#                        nothing: minos 11.0 and Metal libraries for the build SDK (revert knob).
+#                        no build flag (revert knob): the binaries keep minos 11.0 and the Metal
+#                        libraries target the build SDK, so the kit's minimum (BUILDINFO min_macos,
+#                        which install.sh enforces, and the archives' macos<major> key) is the newer
+#                        of the two, the SDK's version (27.2 with the CLT 27.2 SDK).
 # - AOT_ARCHES           GPU families of the archive set (default applegpu_g17s; `none`: no set)
 # - AOT_VALIDATED        families install.sh installs archives for (default applegpu_g17s: the only one
 #                        validated on hardware); other Macs compile their pipelines at first start
@@ -128,14 +131,19 @@ fi
 [ -x "$worker" ] && [ -x "$cli" ] || die "missing $worker or $cli"
 
 # The build's minimum macOS: LC_BUILD_VERSION of both binaries and the target OS of every metallib
-# the worker embeds. check-macos-release.sh repeats this on the tarball.
+# the worker embeds; a Mac must satisfy both (dyld refuses an older macOS than minos, Metal a library
+# for a newer macOS than the Mac's). check-macos-release.sh repeats this on the tarball.
 if [ "$macos_min" != sdk ]; then
-  expect_os=$macos_min
-  "$ci/check-macos-release.sh" --binaries "$expect_os" "$worker" "$cli" \
-    || die "the build is not for macOS $expect_os (ASSEMBLE_SKIP_BUILD=1 with a build of other settings?)"
+  "$ci/check-macos-release.sh" --binaries "$macos_min" "$worker" "$cli" \
+    || die "the build is not for macOS $macos_min (ASSEMBLE_SKIP_BUILD=1 with a build of other settings?)"
+  bin_minos=$macos_min metal_target=$macos_min
 else
-  expect_os=$(otool -l "$worker" | awk '/LC_BUILD_VERSION/{f=1} f&&$1=="minos"{print $2; exit}')
+  read -r bin_minos metal_target < <("$ci/check-macos-release.sh" --requirements "$worker" "$cli") \
+    || die "cannot read the build's minos and metallib target"
+  [ "$metal_target" != none ] || die "$worker embeds no metallib"
 fi
+expect_os=$(printf '%s\n' "$bin_minos" "$metal_target" | sort -t. -k1,1n -k2,2n | tail -1)
+echo "== minimum macOS $expect_os (binaries: minos $bin_minos; Metal libraries: macOS $metal_target)"
 
 echo "== offline Metal archives ($aot_arches)"
 aot=$work/metal-aot
@@ -170,7 +178,10 @@ g16_sha=$(sed -n 's/^const ARCHIVE_SHA256: &str = "\([0-9a-f]\{64\}\)";/\1/p' "$
 [ -n "$g16_version" ] && [ -n "$g16_sha" ] || die "cannot read the risc0-groth16 pin from $g16"
 g16_url=https://risc0-artifacts.s3.us-west-2.amazonaws.com/rzup/components/risc0-groth16/sha256/$g16_sha
 
-metal_version=$( (xcrun --sdk macosx metal --version 2>/dev/null || true) | head -1)
+# The compiler that built the metallibs: the wrapper's real compiler, else what risc0-build-kernel
+# finds (METAL_TC from env.sh, else xcrun).
+metal_bin=${real_metal:-${METAL_TC:+$METAL_TC/usr/bin/metal}}
+metal_version=$( ( ${metal_bin:-xcrun --sdk macosx metal} --version 2>/dev/null || true) | head -1)
 commit=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)
 dirty=$( [ -z "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ] && echo no || echo yes)
 risc0_rev=$(sed -n 's/^risc0-zkvm = { git = "https:\/\/github.com\/hemilabs\/risc0", rev = "\([0-9a-f]*\)" }.*/\1/p' "$repo/Cargo.toml")
@@ -182,6 +193,8 @@ commit_dirty=$dirty
 risc0_rev=$risc0_rev
 risc0_src=$risc0_src
 min_macos=$expect_os
+binaries_minos=$bin_minos
+metal_target=$metal_target
 metal_compiler=$metal_version
 build_macos=$(sw_vers -productVersion) ($(sw_vers -buildVersion))
 aot_arches=$built_arches

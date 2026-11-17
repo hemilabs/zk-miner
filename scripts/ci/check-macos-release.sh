@@ -2,15 +2,22 @@
 # Checks the macOS beta kit without a GPU (the macOS counterpart of check-release-libs.sh):
 #
 #   check-macos-release.sh <zkminer-<version>-macos-arm64.tar.gz>
-#   check-macos-release.sh --binaries <min macOS> <Mach-O file>...   (just the binary checks)
+#   check-macos-release.sh --binaries <min macOS> <Mach-O file>...   (just the binary checks: minos
+#                          and every embedded metallib's target equal to <min macOS>)
+#   check-macos-release.sh --requirements <Mach-O file>...  prints "<minos> <metallib target>" of the
+#                          files (`none` without metallibs); fails if they disagree among themselves
 #
 # On the tarball:
 # - it unpacks as one directory, zkminer-<version>-macos-arm64/, and its SHA256SUMS hold;
 # - every Mach-O file (the CLI, the worker) is arm64 only, links only /usr/lib and /System
 #   libraries (otool -L: a Mac needs nothing installed), has LC_BUILD_VERSION minos = BUILDINFO's
-#   min_macos, and carries a valid (ad hoc, linker) signature, without which arm64 macOS kills it;
-# - every metallib the worker embeds targets that same macOS (the Metal compiler's target, which
-#   decides on which macOS Metal loads the library);
+#   binaries_minos, and carries a valid (ad hoc, linker) signature, without which arm64 macOS kills it;
+# - every metallib the worker embeds targets BUILDINFO's metal_target (the Metal compiler's target,
+#   which decides on which macOS Metal loads the library);
+# - BUILDINFO's min_macos (what install.sh enforces) is the newer of the two: the kit's binaries
+#   start and its kernels load on every macOS install.sh accepts, and on no older one it rejects
+#   needlessly. (A default kit has all three equal; a ZKMINER_MACOS_MIN=sdk kit has minos 11.0 and
+#   metallibs for the build SDK, so its min_macos is the SDK's version.)
 # - the offline archive set: its SHA256SUMS hold, every archive is of a metallib the worker embeds
 #   (digest field), of a family BUILDINFO lists, and has the macos<major> key of min_macos;
 # - no risc0-groth16 component file is in the kit, and the worker pins the Groth16 blob BUILDINFO
@@ -44,11 +51,15 @@ while p >= 0:
 PY
 }
 
-check_binary() { # <min macOS> <file>
-  local want=$1 f=$2 archs minos libs bad_libs
+# The newest of dotted versions (27.2 > 27.0 > 11.0).
+vmax() { printf '%s\n' "$@" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1; }
+minos_of() { otool -l "$1" | awk '/LC_BUILD_VERSION/{f=1} f&&$1=="minos"{print $2; exit}'; }
+
+check_binary() { # <minos> <metallib target> <file>
+  local want=$1 want_metal=$2 f=$3 archs minos libs bad_libs
   archs=$(lipo -archs "$f" 2>/dev/null || echo "?")
   [ "$archs" = arm64 ] || bad "$f: architectures '$archs', want arm64 only"
-  minos=$(otool -l "$f" | awk '/LC_BUILD_VERSION/{f=1} f&&$1=="minos"{print $2; exit}')
+  minos=$(minos_of "$f")
   [ "$minos" = "$want" ] || bad "$f: LC_BUILD_VERSION minos ${minos:-none}, want $want"
   libs=$(otool -L "$f" | tail -n +2 | awk '{print $1}')
   bad_libs=$(grep -vE '^(/usr/lib/|/System/Library/)' <<<"$libs" || true)
@@ -57,17 +68,28 @@ check_binary() { # <min macOS> <file>
   local targets wrong
   targets=$(metallib_targets "$f")
   if [ -n "$targets" ]; then
-    wrong=$(awk -v w="$want" '$2 != w || $3 != "0x8001/0x81"' <<<"$targets")
-    [ -z "$wrong" ] || bad "$f embeds metallibs for another macOS than $want: $(echo $wrong)"
+    wrong=$(awk -v w="$want_metal" '$2 != w || $3 != "0x8001/0x81"' <<<"$targets")
+    [ -z "$wrong" ] || bad "$f embeds metallibs for another macOS than $want_metal: $(echo $wrong)"
   fi
-  echo "  $(basename "$f"): arm64, minos $minos, $(wc -l <<<"$libs" | tr -d ' ') system libraries, $(grep -c . <<<"$targets" || true) metallibs for macOS $want"
+  echo "  $(basename "$f"): arm64, minos $minos, $(wc -l <<<"$libs" | tr -d ' ') system libraries, $(grep -c . <<<"$targets" || true) metallibs for macOS $want_metal"
 }
 
 if [ "${1:-}" = --binaries ]; then
   want=${2:?usage: $0 --binaries <min macOS> <file>...}
   shift 2
-  for f in "$@"; do check_binary "$want" "$f"; done
+  for f in "$@"; do check_binary "$want" "$want" "$f"; done
   exit $fail
+fi
+
+if [ "${1:-}" = --requirements ]; then
+  shift
+  [ $# -gt 0 ] || { echo "usage: $0 --requirements <file>..." >&2; exit 2; }
+  minos=$(for f in "$@"; do minos_of "$f"; done | sort -u)
+  metal=$(for f in "$@"; do metallib_targets "$f"; done | awk '{print $2}' | sort -u)
+  [ "$(grep -c . <<<"$minos")" = 1 ] || { echo "FAIL the binaries have different (or no) minos: $(echo $minos)" >&2; exit 1; }
+  [ "$(grep -c . <<<"$metal" || true)" -le 1 ] || { echo "FAIL the metallibs target different macOS versions: $(echo $metal)" >&2; exit 1; }
+  echo "$minos ${metal:-none}"
+  exit 0
 fi
 
 tarball=${1:?usage: $0 <tarball>}
@@ -95,10 +117,14 @@ done
 info() { sed -n "s/^$1=//p" "$k/BUILDINFO"; }
 min=$(info min_macos)
 [ -n "$min" ] || bad "BUILDINFO has no min_macos"
+bin_minos=$(info binaries_minos); metal_target=$(info metal_target)
+[ -n "$bin_minos" ] && [ -n "$metal_target" ] || bad "BUILDINFO has no binaries_minos or metal_target"
+newest=$(vmax "$bin_minos" "$metal_target")
+[ "$min" = "$newest" ] || bad "BUILDINFO min_macos $min is not the newer of binaries_minos $bin_minos and metal_target $metal_target ($newest): install.sh would accept a macOS the kit does not run on, or refuse one it runs on"
 
 echo "binaries:"
 while IFS= read -r f; do
-  if file -b "$f" | grep -q '^Mach-O'; then check_binary "$min" "$f"; fi
+  if file -b "$f" | grep -q '^Mach-O'; then check_binary "$bin_minos" "$metal_target" "$f"; fi
 done < <(find "$k" -type f ! -name '*.binarchive')
 
 echo "offline Metal archives:"
@@ -140,5 +166,5 @@ echo "  parse"
 size=$(stat -f %z "$tarball")
 [ "$size" -lt $((1 << 30)) ] || bad "the tarball is $size bytes (over 1 GiB: something large got in)"
 
-[ $fail = 0 ] && echo "ok: $name ($(du -h "$tarball" | cut -f1)) is a self-contained arm64 kit for macOS $min and later"
+[ $fail = 0 ] && echo "ok: $name ($(du -h "$tarball" | cut -f1)) is a self-contained arm64 kit for macOS $min and later (minos $bin_minos, Metal libraries for $metal_target)"
 exit $fail

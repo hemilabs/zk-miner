@@ -19,16 +19,21 @@ quarantines a downloaded copy, and Gatekeeper blocks the programs until the quar
 
 ### Memory tiers
 
-The prover picks its segment size (po2) from the GPU memory it may use. That figure is about 75 % of
-RAM (macOS's `recommendedMaxWorkingSetSize`), minus an 8 GiB reserve for macOS. While you use the Mac
-yourself (the owner-active tier) the miner lowers it further:
+The prover picks its segment size (po2) from the GPU memory it may use. That limit is the smaller
+of two figures: what macOS recommends for the GPU (`recommendedMaxWorkingSetSize`, about 75 % of
+RAM), and the RAM minus an 8 GiB reserve for macOS and your apps. On a 16 GB Mac the second one
+decides (8 GiB); from 36 GB up the first one does.
 
-| Mac | idle: GPU limit, po2 | while you use it: limit, po2 |
+The miner can also lower the limit while you use the Mac yourself (the owner-active tier). That is
+off by default: set `ZKMINER_OWNER_ACTIVE=auto` in the miner's environment to turn it on.
+
+| Mac | GPU limit, po2 (default) | with `ZKMINER_OWNER_ACTIVE=auto`, while you use it |
 |---|---|---|
 | 16 GB | 8 GiB, 19 | 4 GiB, 18 |
 | 18 GB | 10 GiB, 19 | 4 GiB, 18 |
 | 24 GB | 16 GiB, 20 | 8 GiB, 19 |
-| 36 GB and more | 28 GiB, 20 | 20 GiB, 20 |
+| 36 GB | 28 GiB, 20 | 20 GiB, 20 |
+| 48 GB and more | about 75 % of RAM, 20 | 8 GiB less, 20 |
 
 You can set a lower cap yourself with `RISC0_METAL_MAX_WORKING_SET_BYTES` (for example `4G`). A run
 that would go over the cap fails early with "Metal working-set budget exceeded" and does not swap.
@@ -55,7 +60,7 @@ cd zkminer-<version>-macos-arm64
    replaces the old file by a rename, so a running prover is never changed under it.
 4. Removes `com.apple.quarantine` from those installed files, and only from them.
 5. Installs the **offline GPU pipeline archives** (`metal-aot/`) for this Mac's GPU family. It does
-   this only for a family validated on hardware (this beta: `applegpu_g17s`, M5 Pro / M5 Max).
+   this only for a family validated on hardware (this beta: `applegpu_g17s`, seen on an M5 Max).
 
 Options: `--prefix DIR`, `--no-aot`, `--with-groth16` (download the Groth16 component now),
 `--warm` (prove one small program now), `--uninstall`. `./install.sh --help` explains each one.
@@ -75,9 +80,11 @@ Metal compiles every GPU kernel the first time a process uses it. For this prove
 takes about a minute on an M5 Max (52-58 s measured), and longer with fewer CPU cores. The result is cached, so later
 starts take ~0.1 s.
 
-- **M5 Pro / M5 Max** (`applegpu_g17s`): the kit ships pre-compiled archives. The first start then
+- **GPU family `applegpu_g17s`** (the M5 Max this beta was tested on; whether the M5 Pro reports
+  the same family has not been checked): the kit ships pre-compiled archives. The first start then
   takes about 2.3 s.
-- **Other Macs** (M1 to M4, M5): no archives are installed, because none were validated on such a GPU.
+- **Other GPU families** (M1 to M4, the base M5): no archives are installed, because none were
+  validated on such a GPU.
   The first start compiles the kernels, once.
 - **Mismatches:** an archive for another GPU family or another macOS major version is never used.
   The prover compiles that kernel instead.
