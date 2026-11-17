@@ -5994,6 +5994,7 @@ checksum = "3df6368f71f205ff9c33c076d170dd56ebf68e8161c733c0caa07a7a5509ed53"
 [[package]]
 name = "risc0-binfmt"
 version = "3.0.6"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "anyhow",
  "borsh",
@@ -6014,6 +6015,7 @@ dependencies = [
 [[package]]
 name = "risc0-build"
 version = "3.0.7"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "anyhow",
  "cargo_metadata 0.19.2",
@@ -6036,6 +6038,7 @@ dependencies = [
 [[package]]
 name = "risc0-build-kernel"
 version = "2.1.0"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "cc",
  "directories",
@@ -6049,6 +6052,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-keccak"
 version = "4.1.0"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -6070,6 +6074,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-keccak-sys"
 version = "4.1.0"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "cc",
  "cust",
@@ -6084,6 +6089,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-recursion"
 version = "4.1.0"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -6109,6 +6115,8 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-recursion-control-zkrs"
 version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc7f8b264ea4dea2909c2dea39fd1952b835d4688a45ac7b0eed07c642df1667"
 dependencies = [
  "liblzma",
  "phf",
@@ -6118,6 +6126,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-recursion-sys"
 version = "4.1.0"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "cc",
  "glob",
@@ -6131,6 +6140,8 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-recursion-zkrs"
 version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "667665b4fafafeb5b589aaf2cc825ec688bdb2b6cddad5ce9d28001d5366fb5d"
 dependencies = [
  "liblzma",
  "phf",
@@ -6140,6 +6151,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-rv32im"
 version = "4.1.0"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "anyhow",
  "bit-vec",
@@ -6174,6 +6186,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-rv32im-sys"
 version = "4.1.0"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "cc",
  "cust",
@@ -6189,6 +6202,7 @@ dependencies = [
 [[package]]
 name = "risc0-core"
 version = "3.0.2"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "bytemuck",
  "nvtx",
@@ -6199,6 +6213,7 @@ dependencies = [
 [[package]]
 name = "risc0-groth16"
 version = "3.0.6"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "anyhow",
  "ark-bn254",
@@ -6229,6 +6244,7 @@ dependencies = [
 [[package]]
 name = "risc0-groth16-sys"
 version = "0.1.0"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "anyhow",
  "ark-bn254",
@@ -6248,6 +6264,7 @@ dependencies = [
 [[package]]
 name = "risc0-sys"
 version = "1.5.1"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "anyhow",
  "blst",
@@ -6260,6 +6277,7 @@ dependencies = [
 [[package]]
 name = "risc0-zkos-v1compat"
 version = "2.2.3"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "include_bytes_aligned",
  "no_std_strings",
@@ -6269,6 +6287,7 @@ dependencies = [
 [[package]]
 name = "risc0-zkp"
 version = "3.0.6"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "anyhow",
  "blake2",
@@ -6299,6 +6318,7 @@ dependencies = [
 [[package]]
 name = "risc0-zkvm"
 version = "3.1.0"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "addr2line 0.24.2",
  "anyhow",
@@ -6346,6 +6366,7 @@ dependencies = [
 [[package]]
 name = "risc0-zkvm-platform"
 version = "2.2.3"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -6625,6 +6646,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "rzup"
 version = "0.5.2"
+source = "git+https://github.com/hemilabs/risc0?rev=d94ef65015f4753c5496ad7302f15c44513370f3#d94ef65015f4753c5496ad7302f15c44513370f3"
 dependencies = [
  "hex",
  "rsa",

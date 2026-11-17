@@ -1,0 +1,29 @@
+# Local-development override (B9-DEP): build zk-miner against a risc0 checkout at ../deps/risc0-3.1
+# instead of the hemilabs/risc0 git rev that Cargo.toml pins. Never loaded implicitly (this is not
+# .cargo/config.toml); pass it explicitly:
+#
+#     make -f Makefile.mac RISC0_SRC=local <target>                 (recommended: keeps Cargo.lock clean)
+#     cargo --config .cargo/risc0-local.toml build ...              (rewrites Cargo.lock's risc0 entries)
+#
+# Paths are relative to the directory that holds .cargo/ (this repository), exactly like the path
+# patches Cargo.toml used to carry. Makefile.mac passes RISC0_DIR=<dir> as absolute `--config` values
+# instead of this file, so any checkout location works there. RELEASE-DEPS.md describes both modes,
+# and why the committed Cargo.lock always records the git rev.
+[patch.crates-io]
+risc0-zkvm = { path = "../deps/risc0-3.1/risc0/zkvm" }
+risc0-build = { path = "../deps/risc0-3.1/risc0/build" }
+risc0-zkp = { path = "../deps/risc0-3.1/risc0/zkp" }
+risc0-sys = { path = "../deps/risc0-3.1/risc0/sys" }
+risc0-core = { path = "../deps/risc0-3.1/risc0/core" }
+risc0-binfmt = { path = "../deps/risc0-3.1/risc0/binfmt" }
+risc0-build-kernel = { path = "../deps/risc0-3.1/risc0/build_kernel" }
+risc0-groth16 = { path = "../deps/risc0-3.1/risc0/groth16" }
+risc0-groth16-sys = { path = "../deps/risc0-3.1/risc0/groth16-sys" }
+risc0-circuit-rv32im = { path = "../deps/risc0-3.1/risc0/circuit/rv32im" }
+risc0-circuit-rv32im-sys = { path = "../deps/risc0-3.1/risc0/circuit/rv32im-sys" }
+risc0-circuit-recursion = { path = "../deps/risc0-3.1/risc0/circuit/recursion" }
+risc0-circuit-recursion-sys = { path = "../deps/risc0-3.1/risc0/circuit/recursion-sys" }
+risc0-circuit-keccak = { path = "../deps/risc0-3.1/risc0/circuit/keccak" }
+risc0-circuit-keccak-sys = { path = "../deps/risc0-3.1/risc0/circuit/keccak-sys" }
+risc0-zkos-v1compat = { path = "../deps/risc0-3.1/risc0/zkos/v1compat" }
+risc0-zkvm-platform = { path = "../deps/risc0-3.1/risc0/zkvm/platform" }
