@@ -527,7 +527,11 @@ fn a_published_builder_is_fetched_by_the_miners_hemi_code_reader() {
     // SAFETY: only async-signal-safe calls between fork and exec.
     unsafe {
         publish.pre_exec(move || {
-            if libc::dup2(read_end, 3) < 0 {
+            // `dup2` onto itself, when the read end already is 3, would leave it close-on-exec.
+            if read_end != 3 && libc::dup2(read_end, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
