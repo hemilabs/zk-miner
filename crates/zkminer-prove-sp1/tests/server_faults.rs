@@ -44,6 +44,9 @@ fn fake_server(mode: &str) {
         println!("{}", sp1_primitives::SP1_CRATE_VERSION);
         return;
     }
+    if mode.starts_with("probe-shm:") {
+        probe_dev_shm();
+    }
     let name = std::env::var("SP1_GPU_SERVER_NAME").unwrap_or_default();
     let base = if name.is_empty() { "sp1-cuda" } else { &name };
     let device = std::env::var("CUDA_VISIBLE_DEVICES").expect("the SDK sets this");
@@ -68,7 +71,7 @@ fn fake_server(mode: &str) {
             }
             let mut reply = Vec::new();
             match mode.split_once(':').unwrap_or((mode, "")) {
-                ("err", text) => {
+                ("err" | "probe-shm", text) => {
                     reply.extend(RESPONSE_INTERNAL_ERROR.to_le_bytes());
                     reply.extend((text.len() as u64).to_le_bytes());
                     reply.extend(text.as_bytes());
@@ -84,6 +87,90 @@ fn fake_server(mode: &str) {
             let _ = stream.write_all(&reply);
         }
     }
+}
+
+/// From inside the stand-in, which the worker's shim runs confined as it runs a real server: what
+/// each way into `/dev/shm` answers, and each way to another process's descriptors (where SP1's
+/// executor now keeps the memory it shares), a `<what> <errno>` line each (0 where it worked), into
+/// `FAKE_SERVER_SHM_PROBE`. `FAKE_SHM_VICTIM` is a file in `/dev/shm` that the test made.
+fn probe_dev_shm() {
+    use std::ffi::CString;
+    let errno = || std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+    let victim = std::env::var("FAKE_SHM_VICTIM").expect("FAKE_SHM_VICTIM");
+    let tag = format!("zkminer-server-faults-{}", std::process::id());
+    let open = |path: &str, flags: libc::c_int| {
+        let path = CString::new(path).unwrap();
+        // SAFETY: a NUL-terminated path; the descriptor is closed at once.
+        let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC, 0o600) };
+        if fd < 0 {
+            return errno();
+        }
+        unsafe { libc::close(fd) };
+        0
+    };
+    let mut lines = vec![
+        format!(
+            "create {}",
+            open(
+                &format!("/dev/shm/{tag}-new"),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR
+            )
+        ),
+        format!("read_existing {}", open(&victim, libc::O_RDONLY)),
+        format!("write_existing {}", open(&victim, libc::O_RDWR)),
+    ];
+    let shm = CString::new(format!("/{tag}-shm")).unwrap();
+    // SAFETY: a NUL-terminated name; the descriptor is closed at once.
+    let fd = unsafe { libc::shm_open(shm.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
+    lines.push(format!("shm_open {}", if fd < 0 { errno() } else { 0 }));
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+    }
+    let sem = CString::new(format!("/{tag}-sem")).unwrap();
+    // SAFETY: a NUL-terminated name; a semaphore that opened is closed at once.
+    let s = unsafe { libc::sem_open(sem.as_ptr(), libc::O_CREAT, 0o600, 0) };
+    lines.push(format!(
+        "sem_open {}",
+        if s == libc::SEM_FAILED { errno() } else { 0 }
+    ));
+    if s != libc::SEM_FAILED {
+        unsafe { libc::sem_close(s) };
+    }
+    let path = CString::new(victim.as_str()).unwrap();
+    // SAFETY: a NUL-terminated path.
+    let rc = unsafe { libc::unlink(path.as_ptr()) };
+    lines.push(format!(
+        "unlink_existing {}",
+        if rc < 0 { errno() } else { 0 }
+    ));
+    lines.push(format!(
+        "list {}",
+        open("/dev/shm", libc::O_RDONLY | libc::O_DIRECTORY)
+    ));
+    // The shim (its parent) and the worker (the shim's parent), by their stdin.
+    // SAFETY: getppid has no arguments.
+    let shim = unsafe { libc::getppid() };
+    let worker = std::fs::read_to_string(format!("/proc/{shim}/stat"))
+        .ok()
+        .and_then(|s| {
+            s.rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse::<i32>()
+                .ok()
+        })
+        .unwrap_or(-1);
+    lines.push(format!(
+        "proc_fd_shim {}",
+        open(&format!("/proc/{shim}/fd/0"), libc::O_RDONLY)
+    ));
+    lines.push(format!(
+        "proc_fd_worker {}",
+        open(&format!("/proc/{worker}/fd/0"), libc::O_RDONLY)
+    ));
+    let out = std::env::var("FAKE_SERVER_SHM_PROBE").expect("FAKE_SERVER_SHM_PROBE");
+    std::fs::write(out, lines.join("\n") + "\n").expect("write the probe's answers");
 }
 
 // ---- The rig ----
@@ -397,6 +484,72 @@ const FORGED: [&str; 3] = [
     "CudaClientError: Failed to write the request: Os { code: 32 }",
     "CudaClientError: The server returned an unexpected response: \"Ok\"",
 ];
+
+/// The server runs confined, as the worker's shim runs it: nothing in `/dev/shm` can be opened,
+/// created or removed from it, nor a descriptor of the shim or the worker through `/proc`. Nor does
+/// the worker need `/dev/shm`: it executes the guest before it asks the server, with SP1's executor
+/// sharing the guest's memory with its runner by descriptor.
+fn a_confined_server_reaches_nothing_in_dev_shm(elf: &[u8]) -> Result<(), String> {
+    let victim = format!(
+        "/dev/shm/zkminer-server-faults-{}-victim",
+        std::process::id()
+    );
+    std::fs::write(&victim, b"not the server's").map_err(|e| format!("{victim}: {e}"))?;
+    let mut rig = Rig::new("dev-shm", CUDA_SERVER, "probe-shm:probed");
+    let probe = rig.dir.join("queue").join("shm-probe");
+    rig.env
+        .push(("FAKE_SHM_VICTIM".to_string(), victim.clone()));
+    rig.env.push((
+        "FAKE_SERVER_SHM_PROBE".to_string(),
+        probe.display().to_string(),
+    ));
+    let mut worker = rig.start();
+    let answered = worker.prove(elf, 10, None);
+    let code = worker.shutdown();
+    let probed = std::fs::read_to_string(&probe).unwrap_or_default();
+    let victim_after = std::fs::read(&victim).ok();
+    let _ = std::fs::remove_file(&victim);
+    let answer = |what: &str| {
+        probed
+            .lines()
+            .find_map(|l| l.strip_prefix(what)?.strip_prefix(' '))
+            .and_then(|e| e.parse::<i32>().ok())
+    };
+    match &answered {
+        Some(WorkerResponse::Error { message, .. }) if message.contains("probed") => {}
+        other => return Err(format!("answered {other:?}")),
+    }
+    expect(code == 0, format!("exit {code}"))?;
+    for what in [
+        "create",
+        "read_existing",
+        "write_existing",
+        "shm_open",
+        "sem_open",
+        "unlink_existing",
+        "proc_fd_shim",
+        "proc_fd_worker",
+    ] {
+        expect(
+            answer(what) == Some(libc::EACCES),
+            format!(
+                "{what} answered {:?}, not EACCES:\n{probed}",
+                answer(what)
+            ),
+        )?;
+    }
+    expect(
+        victim_after.as_deref() == Some(&b"not the server's"[..]),
+        "the file the server could not open changed",
+    )?;
+    // Listing `/dev` is the system's to allow, and only names what is there.
+    println!(
+        "  (listing /dev/shm from the server: errno {:?})",
+        answer("list")
+    );
+    rig.no_panic()?;
+    no_server_left()
+}
 
 fn prove_error_keeps_the_worker(elf: &[u8]) -> Result<(), String> {
     let rig = Rig::new("prove-error", CUDA_SERVER, "err:boom");
@@ -723,6 +876,10 @@ fn main() {
         (
             "only an orphan's socket is removed",
             Box::new(only_an_orphans_socket_is_removed),
+        ),
+        (
+            "a confined server reaches nothing in /dev/shm, and its worker needs nothing there",
+            Box::new(|| a_confined_server_reaches_nothing_in_dev_shm(&elf)),
         ),
     ];
     let mut failed = 0;

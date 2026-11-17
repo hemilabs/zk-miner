@@ -115,6 +115,33 @@ fn sockets(pid: u32) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// What `pid` holds open or maps under `/dev/shm`, and its memfds.
+fn shm_use(pid: u32) -> (Vec<String>, Vec<String>) {
+    let (mut dev_shm, mut memfds) = (Vec::new(), Vec::new());
+    for fd in std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if let Ok(target) = std::fs::read_link(fd.path()) {
+            let target = target.to_string_lossy().into_owned();
+            if target.starts_with("/dev/shm/") {
+                dev_shm.push(format!("fd {target}"));
+            } else if target.starts_with("/memfd:") {
+                memfds.push(format!("fd {target}"));
+            }
+        }
+    }
+    for line in read(format!("/proc/{pid}/maps")).lines() {
+        if line.contains("/dev/shm/") {
+            dev_shm.push(format!("map {line}"));
+        } else if line.contains("/memfd:") {
+            memfds.push(format!("map {line}"));
+        }
+    }
+    (dev_shm, memfds)
+}
+
 #[test]
 #[ignore = "a real SP1 Groth16 proof on a GPU"]
 fn a_confined_worker_and_server_prove() {
@@ -277,6 +304,19 @@ fn a_confined_worker_and_server_prove() {
         std::fs::read_link(format!("/proc/{server}/fd/0")).unwrap(),
         std::path::Path::new("/dev/null")
     );
+    // Nothing of theirs is in `/dev/shm`: SP1's executor shares its memory with its runner through
+    // descriptors (memfds), and the final wrap's files are in the worker's private directory.
+    for (what, p) in [("worker", pid), ("shim", shim), ("server", server)]
+        .into_iter()
+        .chain(children(server).into_iter().map(|c| ("server's child", c)))
+    {
+        let (dev_shm, memfds) = shm_use(p);
+        eprintln!("{what} {p}: {} memfd fd(s) or mapping(s)", memfds.len());
+        assert!(
+            dev_shm.is_empty(),
+            "the {what} {p} uses /dev/shm: {dev_shm:#?}"
+        );
+    }
     // Shut down: the server goes with the worker.
     drop(w);
     let deadline = Instant::now() + std::time::Duration::from_secs(30);
