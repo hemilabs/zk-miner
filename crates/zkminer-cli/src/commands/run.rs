@@ -14332,7 +14332,7 @@ mod r2_sizing_tests {
             "the inline path's set-aside for a verdict that lasts"
         );
         // No witness runtime here: a job classified as a witness job is unserved.
-        let decoy = job(0xC1);
+        let decoy = job(0xC9);
         witness::note_class(decoy.info.job_id, witness::Class::Witness);
         let route = witness::route(None, &decoy, B256::ZERO, true);
         assert!(matches!(route, witness::Route::WitnessUnserved { .. }), "{route:?}");
