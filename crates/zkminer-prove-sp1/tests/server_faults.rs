@@ -246,6 +246,7 @@ impl Worker {
         // The suite a host sends.
         self.send(&WorkerCommand::Benchmark {
             programs: zkminer_prover_protocol::benchmark_suite(zkminer_prover_protocol::BACKEND_SP1),
+            po2: None,
         });
         self.answer()
     }

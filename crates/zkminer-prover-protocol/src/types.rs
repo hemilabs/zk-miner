@@ -30,7 +30,10 @@ use serde::{Deserialize, Serialize};
 /// 12: `Benchmark` carries the programs to run (`BenchmarkProgramSpec`): the suite is the host's, and
 /// the zkOP/s scoring proofs are requests of their own. A v11 worker ran its own list. And
 /// `SetupProgress`, what a `Warmup` is doing (both in the same unreleased version).
-pub const PROTOCOL_VERSION: u32 = 12;
+/// 13: `Benchmark` gained `po2`, the segment size a risc0 worker proves the suite at: the card's
+/// own job size, so its rate describes the jobs it proves (a 12 GB card benchmarked at 20 spills
+/// into shared memory and records a rate several times too low). A v12 worker would prove at 20.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -160,7 +163,13 @@ pub enum WorkerCommand {
     /// Prove each of `programs`, in order, sending a `BenchmarkProgress` after each and then one
     /// `BenchmarkResult` with a row per program that proved. A program this worker has no guest for
     /// is skipped with a warning.
-    Benchmark { programs: Vec<BenchmarkProgramSpec> },
+    Benchmark {
+        programs: Vec<BenchmarkProgramSpec>,
+        /// The segment size (po2) to prove at: risc0 only, other backends ignore it. `None` =
+        /// [`RISC0_DEFAULT_JOB_PO2`]. Within [`RISC0_JOB_PO2_MIN`]..=[`RISC0_JOB_PO2_MAX`].
+        #[serde(default)]
+        po2: Option<u8>,
+    },
     /// Generate a proof for the given ELF and input data.
     Prove {
         request_id: u64,

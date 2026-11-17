@@ -98,7 +98,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Benchmark { programs } => {
+            WorkerCommand::Benchmark { programs, .. } => {
                 tracing::info!("Running benchmarks...");
                 let results = run_benchmarks(&programs);
                 let resp = WorkerResponse::BenchmarkResult { results };

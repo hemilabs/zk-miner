@@ -218,12 +218,22 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Benchmark { programs } => {
-                tracing::info!("Running benchmarks...");
-                let results = run_benchmarks_streaming(&mut stdout, &programs)?;
-                let resp = WorkerResponse::BenchmarkResult { results };
-                write_message(&mut stdout, &resp)?;
-            }
+            WorkerCommand::Benchmark { programs, po2 } => match job_segment_po2(po2) {
+                Ok(po2) => {
+                    tracing::info!("Running benchmarks at po2 {po2}...");
+                    let results = run_benchmarks_streaming(&mut stdout, &programs, po2)?;
+                    let resp = WorkerResponse::BenchmarkResult { results };
+                    write_message(&mut stdout, &resp)?;
+                }
+                Err(e) => {
+                    let resp = WorkerResponse::Error {
+                        request_id: 0,
+                        message: format!("{e:#}"),
+                        kind: ErrorKind::InvalidInput,
+                    };
+                    write_message(&mut stdout, &resp)?;
+                }
+            },
 
             WorkerCommand::Prove {
                 request_id,
@@ -1477,16 +1487,17 @@ fn benchmark_guest(name: &str) -> Option<&'static [u8]> {
     (!elf.is_empty()).then_some(elf)
 }
 
-/// Prove each of `programs`, sending a `BenchmarkProgress` after each one that proved. The suite is
-/// the host's; see `zkminer_prover_protocol::suite`.
+/// Prove each of `programs` at segment size `po2`, sending a `BenchmarkProgress` after each one
+/// that proved. The suite is the host's; see `zkminer_prover_protocol::suite`.
 fn run_benchmarks_streaming<W: std::io::Write>(
     stdout: &mut W,
     programs: &[BenchmarkProgramSpec],
+    po2: u8,
 ) -> anyhow::Result<Vec<BenchmarkEntry>> {
     let mut results = Vec::new();
     let total = programs.len() as u32;
     for (idx, spec) in programs.iter().enumerate() {
-        if let Some(entry) = benchmark_spec(spec) {
+        if let Some(entry) = benchmark_spec(spec, po2) {
             let progress = WorkerResponse::BenchmarkProgress {
                 entry: entry.clone(),
                 program_index: idx as u32 + 1,
@@ -1499,8 +1510,8 @@ fn run_benchmarks_streaming<W: std::io::Write>(
     Ok(results)
 }
 
-/// Prove one requested program, if this build has its guest.
-fn benchmark_spec(spec: &BenchmarkProgramSpec) -> Option<BenchmarkEntry> {
+/// Prove one requested program at segment size `po2`, if this build has its guest.
+fn benchmark_spec(spec: &BenchmarkProgramSpec, po2: u8) -> Option<BenchmarkEntry> {
     let Some(elf) = benchmark_guest(&spec.name) else {
         tracing::warn!("{}: no guest for it in this build; skipped", spec.name);
         return None;
@@ -1512,6 +1523,7 @@ fn benchmark_spec(spec: &BenchmarkProgramSpec) -> Option<BenchmarkEntry> {
         spec.weight,
         spec.precompile,
         spec.measure_wrap,
+        po2,
     )
 }
 
@@ -1521,17 +1533,19 @@ fn run_benchmarks() -> Vec<BenchmarkEntry> {
     use zkminer_prover_protocol::{
         benchmark_suite, measure_zkop_mix, warmup_spec, zkop_mix_spec, BENCH_ZKOP_MIX,
     };
+    // At the size a host sends a card it knows nothing about.
+    let po2 = RISC0_DEFAULT_JOB_PO2;
     // Discarded, as under a host: see `warmup_spec`.
-    benchmark_spec(&warmup_spec(BACKEND_RISC0));
+    benchmark_spec(&warmup_spec(BACKEND_RISC0), po2);
     let only = std::env::var("BENCH_ONLY").ok();
     let wanted = |name: &str| only.as_ref().map_or(true, |o| name.eq_ignore_ascii_case(o));
     let mut results: Vec<BenchmarkEntry> = benchmark_suite(BACKEND_RISC0)
         .iter()
         .filter(|spec| wanted(&spec.name))
-        .filter_map(benchmark_spec)
+        .filter_map(|spec| benchmark_spec(spec, po2))
         .collect();
     if wanted(BENCH_ZKOP_MIX) {
-        match measure_zkop_mix(|iterations| benchmark_spec(&zkop_mix_spec(iterations))) {
+        match measure_zkop_mix(|iterations| benchmark_spec(&zkop_mix_spec(iterations), po2)) {
             Some(entry) => results.push(entry),
             None => tracing::error!("{BENCH_ZKOP_MIX}: proving failed; no zkOP/s score"),
         }
@@ -1548,13 +1562,14 @@ fn benchmark_stages(
     weight: f64,
     precompile: bool,
     measure_wrap: bool,
+    po2: u8,
 ) -> Option<BenchmarkEntry> {
-    // At the size an uncalibrated card proves jobs at, so its throughput and host peak describe them.
-    // (Its first stage is a composite proof, for which the SDK never picks a size of its own, so this
-    // only says what the executor default already was.)
+    // At the size the host names: the one this card proves jobs at before any calibration, so its
+    // throughput and host peak describe them. On a 12 GB card that is 19; at 20 its proofs spill
+    // into shared memory and run several times slower than any job it proves.
     let env = risc0_zkvm::ExecutorEnv::builder()
         .write_slice(input)
-        .segment_limit_po2(RISC0_DEFAULT_JOB_PO2 as u32)
+        .segment_limit_po2(po2 as u32)
         .build()
         .ok()?;
 

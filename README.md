@@ -357,7 +357,10 @@ Worth knowing:
   On NVIDIA cards above 16 GiB, and on AMD and Intel cards of any size (not yet measured), SP1
   needs 15.2 GiB free; `ZKMINER_MIN_AVAILABLE_VRAM_MB` lowers that, untested: a larger job can
   run out part-way and lose its lock. RISC Zero proves at po2 19 on a 12 GB card, 20 from 14
-  GiB. Under Windows, a proof that outgrows the card doesn't fail: the driver moves part of it
+  GiB, and benchmarks at that size. A 12 GB card benchmarked by an earlier version (at 20, which
+  doesn't fit) has saved rates far too low: re-benchmark it with `b` on the Benchmark screen, or
+  `zkminer benchmark --calibrate` with the miner stopped (a plain `zkminer benchmark` saves
+  nothing). Under Windows, a proof that outgrows the card doesn't fail: the driver moves part of it
   into system memory and it runs several times slower, which can cost a lock, so leave the card
   the room these figures say.
 

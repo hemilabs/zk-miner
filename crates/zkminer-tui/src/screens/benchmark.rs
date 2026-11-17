@@ -1149,6 +1149,7 @@ mod tests {
             pci_bus_id: format!("0000:0{i}:00.0"),
             po2_samples: Vec::new(),
             host_peak_bytes: None,
+            benchmark_po2: None,
         };
         let mut state = MinerState::default();
         state.benchmark_selected_device = 7;
