@@ -45,6 +45,8 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# The near-hop probe's test seam (a staged probe, so no packet leaves the host).
+zkminer-netguard = { workspace = true, features = ["test-util"] }
 # Test clients only (anvil, the redirect control); the broker itself has no reqwest.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tempfile = "3"

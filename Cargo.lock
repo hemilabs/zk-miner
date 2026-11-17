@@ -10514,9 +10514,12 @@ dependencies = [
  "libc",
  "proptest",
  "reqwest",
+ "rustls",
+ "socket2 0.6.2",
  "tokio",
  "tracing",
  "url",
+ "webpki-roots 1.0.6",
  "windows-sys 0.59.0",
 ]
 

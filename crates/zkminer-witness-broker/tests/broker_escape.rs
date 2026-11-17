@@ -300,7 +300,13 @@ async fn public_mode(root: &std::path::Path) {
         ),
         NetMode::Public,
     );
-    let facts = zkminer_netguard::FactsOptions { discover_public_addresses: false, ..Default::default() };
+    // Without discovery, the host's public addresses as an operator states them (documentation-
+    // like stand-ins: no connection goes anywhere in this test).
+    let facts = zkminer_netguard::FactsOptions {
+        discover_public_addresses: false,
+        public_addresses: vec!["198.51.99.7".parse().unwrap(), "2a02:db8:99::7".parse().unwrap()],
+        ..Default::default()
+    };
     let connector = Connector::for_miner(&cfg, &[], facts).unwrap();
     let (stdout, end) = run_probe(root, connector.clone(), "public", port, other_port).await;
     for want in [

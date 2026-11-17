@@ -1283,8 +1283,10 @@ impl World {
         c.contracts.program_registry = DEPLOYMENT.program_registry.to_string();
         // The programs are served from this machine (127.0.0.1), which the network guard refuses
         // outside developer mode. The config file is the only switch: there is no environment
-        // variable for it, and the miner refuses it on mainnet (the fork is 743111).
+        // variable for it, and the miner refuses it on mainnet (the fork is 743111). It names the
+        // chain it is meant for, which the RPC confirms at startup.
         c.dev.private_network = true;
+        c.dev.chain_id = Some(c.chain.chain_id);
         // A 5 HEMI job is the whole market here: claim anything that pays.
         c.prover.min_profit_threshold = 0.0;
         c.prover.skip_benchmark_gate = true;

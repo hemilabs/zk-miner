@@ -1,11 +1,16 @@
 //! The guarded HTTP client for requester-controlled URLs.
 //!
-//! [`guarded_client`] builds a reqwest client that:
+//! [`guarded_client`] builds a client that:
 //!
-//! - resolves every name through the [`GuardedResolver`] (one lookup per connection, only admitted
-//!   addresses handed to the connector), and refuses every URL that fails [`crate::check_url`]
-//!   before a request is built: the raw reqwest client is never handed out, so no request skips the
-//!   check (an IP-literal host never reaches a resolver);
+//! - refuses every URL that fails [`crate::check_url`] before anything else happens;
+//! - resolves every name itself, once per hop, through the [`GuardedResolver`] (in public mode
+//!   over DNS-over-HTTPS to fixed public resolvers, [`crate::doh`]; the system resolver in
+//!   developer mode), keeping only the admitted addresses;
+//! - **vets each address right before connecting** ([`NetPolicy::vet_connection`]): its route
+//!   asked of the kernel with the destination port, then the near-hop probe
+//!   ([`crate::nearhop`]), and connects only to the addresses that pass: each hop gets an HTTP
+//!   client pinned to exactly those addresses (reqwest resolves nothing itself, and an IP-literal
+//!   host is vetted the same way);
 //! - ignores proxies, from the environment or the system (a proxy resolves the name itself and
 //!   would reach whatever it can);
 //! - follows no redirect itself: [`GuardedClient::get_following_redirects`] follows them by hand,
@@ -18,13 +23,14 @@
 //! - bounds connecting and every read ([`ClientOptions`]); callers bound the whole request.
 
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_ENCODING, LOCATION};
 use reqwest::StatusCode;
 
-use crate::policy::{Denied, NetPolicy, UrlDenied};
+use crate::policy::{Denied, NetMode, NetPolicy, UrlDenied};
 use crate::resolve::{GuardedResolver, Lookup, ResolveError, SystemLookup};
 
 /// The `User-Agent` of every guarded request. Constant and versionless, so it says nothing about
@@ -34,7 +40,7 @@ pub const USER_AGENT: &str = "zkminer";
 /// Timeouts of a guarded client.
 #[derive(Debug, Clone, Copy)]
 pub struct ClientOptions {
-    /// For connecting, the lookup included.
+    /// For connecting.
     pub connect_timeout: Duration,
     /// For each read of the response.
     pub read_timeout: Duration,
@@ -52,21 +58,26 @@ impl Default for ClientOptions {
 /// An HTTP client for requester-controlled URLs: see the module doc.
 #[derive(Clone)]
 pub struct GuardedClient {
-    inner: reqwest::Client,
-    policy: NetPolicy,
+    resolver: GuardedResolver,
+    options: ClientOptions,
 }
 
 impl fmt::Debug for GuardedClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GuardedClient")
-            .field("mode", &self.policy.mode())
+            .field("mode", &self.resolver.policy().mode())
             .finish_non_exhaustive()
     }
 }
 
-/// The guarded client for `policy`, resolving through the system resolver.
+/// The guarded client for `policy`: in public mode it resolves names over DNS-over-HTTPS
+/// ([`crate::doh::DohLookup`]), in developer mode through the system resolver.
 pub fn guarded_client(policy: &NetPolicy) -> Result<GuardedClient, reqwest::Error> {
-    guarded_client_with(policy, Arc::new(SystemLookup), ClientOptions::default())
+    let lookup: Arc<dyn Lookup> = match policy.mode() {
+        NetMode::Public => Arc::new(crate::doh::DohLookup::new(policy)?),
+        NetMode::DevPrivate => Arc::new(SystemLookup),
+    };
+    guarded_client_with(policy, lookup, ClientOptions::default())
 }
 
 /// [`guarded_client`] with a lookup of the caller's (a fake, in tests) and its own timeouts.
@@ -79,7 +90,8 @@ pub fn guarded_client_with(
 }
 
 /// [`guarded_client_with`] whose resolver connects to `map(ip)` for each admitted `ip`, so a server
-/// on loopback can stand in for a public address in a public-mode test. Test builds only (the
+/// on loopback can stand in for a public address in a public-mode test (the policy's near-hop
+/// probe should then be a fake one too: [`NetPolicy::with_near_probe`]). Test builds only (the
 /// `test-util` feature, which only `[dev-dependencies]` enable).
 #[cfg(any(test, feature = "test-util"))]
 pub fn guarded_client_for_test(
@@ -98,11 +110,34 @@ fn build(
     resolver: GuardedResolver,
     options: ClientOptions,
 ) -> Result<GuardedClient, reqwest::Error> {
-    let policy = resolver.policy().clone();
+    // Built once here so a configuration error shows now rather than at the first fetch.
+    hop_client(None, &[], options)?;
+    Ok(GuardedClient { resolver, options })
+}
+
+/// reqwest's resolver for a hop's client: the hop's name is pinned to its vetted addresses, so
+/// any name that reaches this is refused.
+struct NoNames;
+
+impl reqwest::dns::Resolve for NoNames {
+    fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async {
+            Err::<reqwest::dns::Addrs, _>("a guarded hop resolves no other name".into())
+        })
+    }
+}
+
+/// The client of one hop: `name` (when the hop's host is a name) pinned to `pinned`, every other
+/// name refused.
+fn hop_client(
+    name: Option<&str>,
+    pinned: &[SocketAddr],
+    options: ClientOptions,
+) -> Result<reqwest::Client, reqwest::Error> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    let inner = reqwest::Client::builder()
-        .dns_resolver(Arc::new(resolver))
+    let mut b = reqwest::Client::builder()
+        .dns_resolver(Arc::new(NoNames))
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .use_rustls_tls()
@@ -116,21 +151,77 @@ fn build(
         .referer(false)
         .pool_max_idle_per_host(0)
         .connect_timeout(options.connect_timeout)
-        .read_timeout(options.read_timeout)
-        .build()?;
-    Ok(GuardedClient { inner, policy })
+        .read_timeout(options.read_timeout);
+    if let Some(name) = name {
+        b = b.resolve_to_addrs(name, pinned);
+    }
+    b.build()
 }
 
 impl GuardedClient {
     pub fn policy(&self) -> &NetPolicy {
-        &self.policy
+        self.resolver.policy()
     }
 
-    /// A GET of a requester URL: [`crate::check_url`] first, then a request whose URL is fixed (the
-    /// caller may add headers and a timeout). Its connection is still judged by the resolver.
-    pub fn get(&self, raw: &str) -> Result<reqwest::RequestBuilder, Denied> {
-        let url = self.policy.check_url(raw)?;
-        Ok(self.inner.get(url))
+    /// The addresses one hop to `url` connects to: its host resolved through the guarded
+    /// resolver (an IP literal as it is), each address vetted for the URL's port right before
+    /// the connection ([`NetPolicy::vet_connection`]; concurrently), the ones that pass in answer
+    /// order. Also the name to pin them to (`None` for an IP literal).
+    async fn pin(&self, url: &url::Url) -> Result<(Option<String>, Vec<SocketAddr>), FetchError> {
+        let port = url
+            .port_or_known_default()
+            .ok_or(FetchError::Denied(Denied::Url(UrlDenied::BadPort)))?;
+        let (name, ips) = match url.host() {
+            Some(url::Host::Domain(d)) => (
+                Some(d.to_string()),
+                self.resolver
+                    .resolve_admitted(d)
+                    .await
+                    .map_err(FetchError::from_resolve)?,
+            ),
+            Some(url::Host::Ipv4(a)) => (None, vec![IpAddr::V4(a)]),
+            Some(url::Host::Ipv6(a)) => (None, vec![IpAddr::V6(a)]),
+            None => return Err(FetchError::Denied(Denied::Url(UrlDenied::BadAuthority))),
+        };
+        let mut checks = tokio::task::JoinSet::new();
+        for (i, ip) in ips.iter().enumerate() {
+            let policy = self.policy().clone();
+            let addr = SocketAddr::new(*ip, port);
+            checks.spawn_blocking(move || (i, policy.vet_connection(addr)));
+        }
+        let mut verdicts: Vec<(usize, Result<(), Denied>)> = Vec::new();
+        while let Some(r) = checks.join_next().await {
+            match r {
+                Ok(v) => verdicts.push(v),
+                Err(_) => return Err(FetchError::BadRedirect("a connection check failed")),
+            }
+        }
+        verdicts.sort_by_key(|(i, _)| *i);
+        let mut pinned = Vec::new();
+        let mut refused = Vec::new();
+        for (i, v) in verdicts {
+            match v {
+                Ok(()) => pinned.push(SocketAddr::new(self.resolver.connect_ip(ips[i]), port)),
+                Err(d) => refused.push(d),
+            }
+        }
+        if pinned.is_empty() {
+            return Err(FetchError::Denied(match (name.as_deref(), refused.len()) {
+                (None, 1) => refused.remove(0),
+                (host, _) => Denied::NoAdmittedAddress {
+                    host: crate::printable(host.unwrap_or(url.host_str().unwrap_or("")), 128),
+                    refused,
+                },
+            }));
+        }
+        if !refused.is_empty() {
+            tracing::debug!(
+                "network guard: {} of {}'s addresses refused right before connecting",
+                refused.len(),
+                crate::printable(url.host_str().unwrap_or(""), 128)
+            );
+        }
+        Ok((name, pinned))
     }
 
     /// GETs `raw`, following up to `max_redirects` redirects (301, 302, 303, 307, 308) by hand: each
@@ -146,14 +237,21 @@ impl GuardedClient {
     ) -> Result<reqwest::Response, FetchError> {
         // Bounded: `Instant + Duration` panics past what an Instant holds.
         let deadline = Instant::now() + budget.min(Duration::from_secs(7 * 24 * 3600));
-        let mut url = self.policy.check_url(raw).map_err(FetchError::Denied)?;
+        let mut url = self.policy().check_url(raw).map_err(FetchError::Denied)?;
         for hop in 0..=max_redirects {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(FetchError::TimedOut);
             }
-            let response = self
-                .inner
+            let (name, pinned) = tokio::time::timeout(remaining, self.pin(&url))
+                .await
+                .map_err(|_| FetchError::TimedOut)??;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(FetchError::TimedOut);
+            }
+            let response = hop_client(name.as_deref(), &pinned, self.options)
+                .map_err(|e| FetchError::Http(e.without_url()))?
                 .get(url.clone())
                 .timeout(remaining)
                 .send()
@@ -206,12 +304,12 @@ impl GuardedClient {
                 None
             };
             url = match raw_target {
-                Some(raw) => self.policy.check_url(&raw).map_err(FetchError::Denied)?,
+                Some(raw) => self.policy().check_url(&raw).map_err(FetchError::Denied)?,
                 None => {
                     let next = url.join(location).map_err(|_| {
                         FetchError::BadRedirect("a redirect to an invalid Location")
                     })?;
-                    self.policy
+                    self.policy()
                         .check_url(next.as_str())
                         .map_err(FetchError::Denied)?
                 }
@@ -243,6 +341,8 @@ fn after_scheme(reference: &str) -> Option<&str> {
 pub enum FetchError {
     /// The network guard refused a URL, a name or every address (no connection was made to it).
     Denied(Denied),
+    /// The name did not resolve (no such name, no resolver answered).
+    Lookup(String),
     /// The request failed (connection, TLS, protocol, timeout). Carries no URL.
     Http(reqwest::Error),
     TooManyRedirects,
@@ -265,6 +365,15 @@ impl FetchError {
         FetchError::Http(e.without_url())
     }
 
+    /// A resolution failure as a [`FetchError`]: [`FetchError::Denied`] when the guard refused the
+    /// name or every address, else [`FetchError::Lookup`].
+    pub fn from_resolve(e: ResolveError) -> Self {
+        match e {
+            ResolveError::Denied(d) => FetchError::Denied(d),
+            ResolveError::Lookup(e) => FetchError::Lookup(e.to_string()),
+        }
+    }
+
     /// Whether the network guard refused it.
     pub fn is_denied(&self) -> bool {
         matches!(self, FetchError::Denied(_))
@@ -275,6 +384,7 @@ impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FetchError::Denied(d) => fmt::Display::fmt(d, f),
+            FetchError::Lookup(e) => write!(f, "DNS lookup failed: {e}"),
             FetchError::Http(e) => {
                 write!(f, "{e}")?;
                 let mut source = std::error::Error::source(e);
@@ -392,7 +502,7 @@ mod tests {
     fn public_client(lookup: FakeLookup) -> GuardedClient {
         let to_loopback: crate::resolve::ConnectMap = Arc::new(|_| IpAddr::from([127, 0, 0, 1]));
         guarded_client_for_test(
-            &public_policy(),
+            &public_policy().with_near_probe(crate::nearhop::FixedProbe::far()),
             Arc::new(lookup),
             to_loopback,
             ClientOptions::default(),
@@ -513,7 +623,10 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(e.is_denied(), "{raw}: {e}");
-            assert!(c.get(&raw).is_err() || raw.contains("rebind"), "{raw}");
+            assert!(
+                c.policy().check_url(&raw).is_err() || raw.contains("rebind"),
+                "{raw}"
+            );
         }
         assert!(server.requests.lock().unwrap().is_empty());
     }

@@ -4,27 +4,46 @@
 //! Behind NAT the host's public IPv4 address (and, behind NAT66 or NPTv6, its public IPv6 address)
 //! is on no interface, so a requester URL at it would hairpin through the router to this host or
 //! to whatever the router forwards. So the host asks, at startup and again every
-//! [`DISCOVERY_TTL`]: one DNS query over UDP, per address family, to a **fixed** reflector that
-//! answers with the address the query came from:
+//! [`DISCOVERY_TTL`], fixed reflectors that answer with the address the query came from, per
+//! address family:
 //!
-//! - `o-o.myaddr.l.google.com` `TXT`, asked of Google's authoritative server `ns1.google.com`
-//!   (`216.239.32.10`, `2001:4860:4802:32::a`) directly (through a recursive resolver it would name
-//!   the resolver);
-//! - else `whoami.cloudflare` `CH TXT`, asked of `1.1.1.1` / `2606:4700:4700::1111`.
+//! - `o-o.myaddr.l.google.com` `TXT`, one DNS query over UDP to Google's authoritative server
+//!   `ns1.google.com` (`216.239.32.10`, `2001:4860:4802:32::a`) directly (through a recursive
+//!   resolver it would name the resolver);
+//! - `whoami.cloudflare` `CH TXT`, one DNS query over UDP to `1.1.1.1` / `2606:4700:4700::1111`;
+//! - with the `client` feature, Cloudflare's `/cdn-cgi/trace` over HTTPS at `1.1.1.1` /
+//!   `[2606:4700:4700::1111]` (an IP literal, so no name is looked up; the certificate is
+//!   verified for that address with the compiled-in web roots): the one answer a box that
+//!   intercepts or redirects DNS cannot forge, and one a network that filters DNS still lets
+//!   through.
 //!
 //! The names and server addresses are compiled in: nothing a requester supplies chooses them, and
-//! an answer only ever adds an address to refuse. **Both reflectors** of a family are asked, and
-//! every address either reports is refused (their union; when they disagree, a WARN says so). An
-//! address both report alike is **confirmed**, and only a confirmed address (or one in an
-//! interface address's own site) gives the IPv6 site around it ([`crate::FactsOptions`]'s
-//! `ipv6_site_prefix_len`): an answer forged by one reflector or by a box that redirects DNS to
-//! itself can then make the miner refuse one more address, not a whole /48–/56 of someone else's
-//! (review r2, R2-NG-7). When every reflector fails for a family, a loud WARN says so (once per
-//! run of failures) and the miner carries on with what its interfaces show: name the public
-//! addresses in `[egress] deny_cidrs` then (or always, as a belt to these braces). A family the
-//! host has no route for at all is skipped quietly: there is no public address to learn, and no
-//! requester connection goes out over it either. `[egress] discover_public_addresses = false`
-//! turns the queries off.
+//! an answer only ever adds an address to refuse. **Every reflector** of a family is asked, and
+//! every address any reports is refused (their union; when they disagree, a WARN says so). An
+//! address is **confirmed** when the HTTPS reflector reports it, or when the two DNS reflectors
+//! report it alike (a DNS answer equal to one of the host's own DNS servers does not count: an
+//! intercepting resolver reports itself). Only a confirmed address (or one in an interface
+//! address's own site) gives the IPv6 site around it ([`crate::FactsOptions`]'s
+//! `ipv6_site_prefix_len`): an answer forged by one DNS reflector or by a box that redirects DNS to
+//! itself can then make the miner refuse one more address, not a whole site of someone else's
+//! (review r2, R2-NG-7). And only a confirmed address makes the family **known**: a family the
+//! host routes whose public address is not known refuses every requester connection
+//! ([`crate::HostFacts::unknown_paths`], fail closed) until one is, or until `[egress]
+//! public_addresses` names one.
+//!
+//! **IPv6-only hosts behind NAT64.** When the host has no IPv4 route, an IPv4 address is reached
+//! through a NAT64 translator, from the translator's own IPv4 address, which a URL at
+//! `<prefix>::<that address>` would hairpin to. So with a NAT64 prefix in force (`[egress]
+//! nat64_prefixes`, or learned from the host's DNS64: [`crate::nat64`]) the IPv4 reflectors are
+//! asked at their addresses under it (what a DNS64 resolver would synthesize), and what they
+//! report is the translator's address: refused as an own address, and confirmed as above it
+//! opens IPv4 through that prefix ([`Learned::via_nat64`]).
+//!
+//! When every reflector fails for a family, a loud WARN says so (once per run of failures) and
+//! names what to set. A family the host has no route for at all is skipped quietly: there is no
+//! public address to learn, and no requester connection goes out over it either. `[egress]
+//! discover_public_addresses = false` turns the queries off (and then `[egress] public_addresses`
+//! must name the address of every family the host routes).
 //!
 //! The answers are cached process-wide. The first call runs discovery on the calling thread (at
 //! most [`DISCOVERY_TIMEOUT`] and [`AGREEMENT_GRACE`]: every reflector is asked at once, from the
@@ -41,17 +60,22 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::ip::Prefix;
+
 /// How long one reflector query may take.
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
-/// Once one reflector of a family has answered, how much longer the other gets (within
+/// Once one reflector of a family has answered, how much longer the others get (within
 /// [`DISCOVERY_TIMEOUT`]).
 pub const AGREEMENT_GRACE: Duration = Duration::from_millis(500);
 /// How long a call waits for a first discovery another thread is running.
 pub const FIRST_DISCOVERY_WAIT: Duration = Duration::from_secs(3);
 /// How long learned public addresses are trusted before they are learned again.
 pub const DISCOVERY_TTL: Duration = Duration::from_secs(300);
-/// How soon a failed discovery is tried again.
-pub const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
+/// How soon a failed discovery is tried again (a family whose address is unknown refuses every
+/// connection meanwhile).
+pub const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(15);
+/// Most NAT64 prefixes the IPv4 reflectors are asked through.
+const MAX_NAT64_PREFIXES: usize = 2;
 
 /// A reflector: a fixed DNS server asked a fixed name, answering with the asker's address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +90,7 @@ const CLASS_IN: u16 = 1;
 const CLASS_CH: u16 = 3;
 const TYPE_TXT: u16 = 16;
 
-/// Every reflector: two operators, each asked over IPv4 and over IPv6.
+/// Every DNS reflector: two operators, each asked over IPv4 and over IPv6.
 pub const REFLECTORS: &[Reflector] = &[
     Reflector {
         name: "o-o.myaddr.l.google.com",
@@ -90,14 +114,26 @@ pub const REFLECTORS: &[Reflector] = &[
     },
 ];
 
-/// What discovery learned: every public address a reflector reported, and those both reflectors
-/// of their family reported alike.
+/// The HTTPS reflector's servers (Cloudflare's `/cdn-cgi/trace`), one per family.
+pub const TLS_REFLECTORS: &[IpAddr] = &[
+    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+];
+
+/// The name the HTTPS reflector's answers are counted under.
+const TLS_NAME: &str = "https://1.1.1.1/cdn-cgi/trace";
+
+/// What discovery learned: every public address a reflector reported, the confirmed ones, and
+/// the NAT64 prefixes the IPv4 one was confirmed through.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Learned {
     /// Every reported address (refused as the host's own).
     pub addresses: Vec<IpAddr>,
-    /// The confirmed ones (they also give their IPv6 site).
+    /// The confirmed ones (see the module doc): they make their family known and give their
+    /// IPv6 site.
     pub confirmed: Vec<IpAddr>,
+    /// The NAT64 prefixes through which an IPv4 address was confirmed (an IPv6-only host's).
+    pub via_nat64: Vec<Prefix>,
 }
 
 /// One family's last good answer.
@@ -105,6 +141,7 @@ pub struct Learned {
 struct FamilyAnswer {
     addresses: Vec<IpAddr>,
     confirmed: Vec<IpAddr>,
+    via_nat64: Vec<Prefix>,
 }
 
 #[derive(Debug)]
@@ -124,10 +161,12 @@ static STATE: Mutex<State> = Mutex::new(State {
         FamilyAnswer {
             addresses: Vec::new(),
             confirmed: Vec::new(),
+            via_nat64: Vec::new(),
         },
         FamilyAnswer {
             addresses: Vec::new(),
             confirmed: Vec::new(),
+            via_nat64: Vec::new(),
         },
     ],
     learned_at: None,
@@ -195,6 +234,7 @@ pub fn learned() -> Learned {
     for f in &s.families {
         out.addresses.extend(&f.addresses);
         out.confirmed.extend(&f.confirmed);
+        out.via_nat64.extend(&f.via_nat64);
     }
     out
 }
@@ -220,6 +260,16 @@ fn learn((v4, v6): (FamilyFound, FamilyFound)) {
                         "network guard: this host's public {family} address is {}; refusing it",
                         list.join(" and ")
                     );
+                    if answer.confirmed.is_empty() {
+                        tracing::warn!(
+                            "network guard: no two reflectors confirm this host's public {family} \
+                             address (and the HTTPS reflector did not answer), so it counts as \
+                             not known and requester connections over {family} are refused. If \
+                             outbound DNS or HTTPS to the reflectors is filtered or intercepted \
+                             here, name this host's public {family} address in [egress] \
+                             public_addresses"
+                        );
+                    }
                 }
                 s.families[i] = answer;
                 s.warned[i] = false;
@@ -233,9 +283,10 @@ fn learn((v4, v6): (FamilyFound, FamilyFound)) {
                 s.warned[i] = true;
                 tracing::warn!(
                     "network guard: could not learn this host's public {family} address ({e}). \
-                     If it sits behind NAT, a requester's URL at that address would reach this \
-                     host or its router: list it in [egress] deny_cidrs. The last address learned \
-                     stays refused; retrying in the background"
+                     Until it is known, every requester connection over {family} is refused: \
+                     behind NAT one at that address would reach this host or its router. Name it \
+                     in [egress] public_addresses if the reflectors cannot be reached from here. \
+                     The last address learned stays refused; retrying in the background"
                 );
             }
             Err(e) => tracing::debug!("network guard: public {family} address: {e}"),
@@ -248,115 +299,257 @@ fn learn((v4, v6): (FamilyFound, FamilyFound)) {
     FIRST_DONE.notify_all();
 }
 
-/// One family's answers, `(reflector name, address)`, as [`FamilyAnswer`]: the union, and what
-/// every reflector that answered reported alike when at least two did. Warns when they disagree.
-fn agree(family: &str, answers: &[(&'static str, IpAddr)]) -> FamilyAnswer {
-    let mut addresses: Vec<IpAddr> = answers.iter().map(|(_, a)| *a).collect();
+/// Who reported an address: a DNS reflector (by name) or the HTTPS one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Dns(&'static str),
+    Tls,
+}
+
+/// One answer: its source, the NAT64 prefix it came through (an IPv4 reflector asked from an
+/// IPv6-only host), and the address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Answer {
+    source: Source,
+    via: Option<Prefix>,
+    ip: IpAddr,
+}
+
+/// One family's answers as a [`FamilyAnswer`]: the union; confirmed, what the HTTPS reflector
+/// reported and what both DNS reflectors reported alike (a DNS answer that is one of `dns_servers`
+/// left out of the agreement); and the NAT64 prefixes something was confirmed through. Warns when
+/// they disagree.
+fn agree(family: &str, answers: &[Answer], dns_servers: &[IpAddr]) -> FamilyAnswer {
+    let mut addresses: Vec<IpAddr> = answers.iter().map(|a| a.ip).collect();
     addresses.sort();
     addresses.dedup();
-    let mut names: Vec<&str> = answers.iter().map(|(n, _)| *n).collect();
-    names.sort();
-    names.dedup();
-    let confirmed = if names.len() >= 2 && addresses.len() == 1 {
-        addresses.clone()
-    } else {
-        Vec::new()
-    };
+    let mut confirmed = Vec::new();
+    let mut via_nat64 = Vec::new();
+    let mut groups: Vec<Option<Prefix>> = answers.iter().map(|a| a.via).collect();
+    groups.sort();
+    groups.dedup();
+    for via in groups {
+        let mut sure: Vec<IpAddr> = answers
+            .iter()
+            .filter(|a| a.via == via && a.source == Source::Tls)
+            .map(|a| a.ip)
+            .collect();
+        let dns: Vec<&Answer> = answers
+            .iter()
+            .filter(|a| a.via == via && matches!(a.source, Source::Dns(_)))
+            .filter(|a| !dns_servers.contains(&a.ip))
+            .collect();
+        let mut names: Vec<Source> = dns.iter().map(|a| a.source).collect();
+        names.sort_by_key(|s| format!("{s:?}"));
+        names.dedup();
+        let mut dns_ips: Vec<IpAddr> = dns.iter().map(|a| a.ip).collect();
+        dns_ips.sort();
+        dns_ips.dedup();
+        if names.len() >= 2 && dns_ips.len() == 1 {
+            sure.extend(dns_ips);
+        }
+        if !sure.is_empty() {
+            if let Some(p) = via {
+                via_nat64.push(p);
+            }
+        }
+        confirmed.extend(sure);
+    }
+    confirmed.sort();
+    confirmed.dedup();
     if addresses.len() > 1 {
         let list: Vec<String> = answers
             .iter()
-            .map(|(n, a)| format!("{n} says {a}"))
+            .map(|a| match a.source {
+                Source::Dns(n) => format!("{n} says {}", a.ip),
+                Source::Tls => format!("{TLS_NAME} says {}", a.ip),
+            })
             .collect();
         tracing::warn!(
             "network guard: the public-address reflectors disagree about this host's {family} \
-             address ({}); refusing every one, deriving no IPv6 site from them. A box that \
-             redirects DNS, or a multi-homed uplink, does this",
+             address ({}); refusing every one, deriving no IPv6 site from an unconfirmed one. A \
+             box that redirects DNS, or a multi-homed uplink, does this",
             list.join(", ")
         );
     }
     FamilyAnswer {
         addresses,
         confirmed,
+        via_nat64,
     }
+}
+
+/// A query in flight.
+enum Pending {
+    Dns {
+        sock: UdpSocket,
+        id: u16,
+        name: &'static str,
+    },
+    #[cfg(feature = "client")]
+    Tls(Box<tls::TlsQuery>),
+}
+
+/// One query: in flight, for family `fam` (0 = IPv4, 1 = IPv6), through `via`.
+struct Query {
+    pending: Pending,
+    fam: usize,
+    via: Option<Prefix>,
+    what: String,
 }
 
 /// Asks every reflector at once, on this thread (no helper thread: the witness broker gathers its
 /// facts single-threaded, right before a sandbox that refuses a process with a second thread), and
-/// takes every valid answer per family within [`DISCOVERY_TIMEOUT`] — a family's other reflector
-/// gets [`AGREEMENT_GRACE`] once the first has answered.
+/// takes every valid answer per family within [`DISCOVERY_TIMEOUT`] — a family's other reflectors
+/// get [`AGREEMENT_GRACE`] once the first has answered. Without an IPv4 route, the IPv4
+/// reflectors are asked through the NAT64 prefixes in force (see the module doc).
 fn discover() -> (FamilyFound, FamilyFound) {
-    struct Pending {
-        sock: UdpSocket,
-        id: u16,
-        v6: bool,
-        name: &'static str,
-        what: String,
-    }
-    let mut found: [Vec<(&'static str, IpAddr)>; 2] = [Vec::new(), Vec::new()];
+    let mut found: [Vec<Answer>; 2] = [Vec::new(), Vec::new()];
     let mut errors: [Vec<String>; 2] = [Vec::new(), Vec::new()];
     // A family is unroutable when every one of its sends failed at once for want of a route.
     let mut unroutable = [true, true];
-    let mut pending = Vec::new();
-    for r in REFLECTORS {
-        let fam = usize::from(r.server.is_ipv6());
-        let what = format!("{} @{}", r.name, r.server);
-        match send_query(r) {
-            Ok((sock, id)) => {
-                unroutable[fam] = false;
-                pending.push(Pending {
-                    sock,
-                    id,
-                    v6: r.server.is_ipv6(),
-                    name: r.name,
-                    what,
-                });
+    let mut queries: Vec<Query> = Vec::new();
+    let unroutable_error = |e: &io::Error| {
+        matches!(
+            e.kind(),
+            io::ErrorKind::NetworkUnreachable | io::ErrorKind::AddrNotAvailable
+        )
+    };
+    // (server to connect to, the reflector's own address, family, through)
+    let start = |queries: &mut Vec<Query>,
+                 errors: &mut [Vec<String>; 2],
+                 unroutable: &mut [bool; 2],
+                 via: Option<Prefix>| {
+        let at = |server: IpAddr| -> IpAddr {
+            match (via, server) {
+                (Some(p), IpAddr::V4(v4)) => IpAddr::V6(crate::nat64::synthesize(p, v4)),
+                _ => server,
             }
-            Err(e) => {
-                unroutable[fam] &= matches!(
-                    e.kind(),
-                    io::ErrorKind::NetworkUnreachable | io::ErrorKind::AddrNotAvailable
-                );
-                errors[fam].push(format!("{what}: {e}"));
+        };
+        for r in REFLECTORS
+            .iter()
+            .filter(|r| via.is_none() || r.server.is_ipv4())
+        {
+            let fam = usize::from(r.server.is_ipv6());
+            let to = at(r.server);
+            let what = format!("{} @{to}", r.name);
+            match send_query_to(r, to) {
+                Ok((sock, id)) => {
+                    if via.is_none() {
+                        unroutable[fam] = false;
+                    }
+                    queries.push(Query {
+                        pending: Pending::Dns {
+                            sock,
+                            id,
+                            name: r.name,
+                        },
+                        fam,
+                        via,
+                        what,
+                    });
+                }
+                Err(e) => {
+                    if via.is_none() {
+                        unroutable[fam] &= unroutable_error(&e);
+                    }
+                    errors[fam].push(format!("{what}: {e}"));
+                }
             }
+        }
+        #[cfg(feature = "client")]
+        for server in TLS_REFLECTORS
+            .iter()
+            .filter(|s| via.is_none() || s.is_ipv4())
+        {
+            let fam = usize::from(server.is_ipv6());
+            let to = at(*server);
+            let what = format!("{TLS_NAME} @{to}");
+            match tls::TlsQuery::start(SocketAddr::new(to, 443), *server) {
+                Ok(q) => {
+                    if via.is_none() {
+                        unroutable[fam] = false;
+                    }
+                    queries.push(Query {
+                        pending: Pending::Tls(Box::new(q)),
+                        fam,
+                        via,
+                        what,
+                    });
+                }
+                Err(e) => {
+                    if via.is_none() {
+                        unroutable[fam] &= unroutable_error(&e);
+                    }
+                    errors[fam].push(format!("{what}: {e}"));
+                }
+            }
+        }
+    };
+    start(&mut queries, &mut errors, &mut unroutable, None);
+    let mut nat64_asked = false;
+    if unroutable[0] && !unroutable[1] {
+        for p in crate::nat64::in_force()
+            .into_iter()
+            .take(MAX_NAT64_PREFIXES)
+        {
+            nat64_asked = true;
+            start(&mut queries, &mut errors, &mut unroutable, Some(p));
         }
     }
     let deadline = Instant::now() + DISCOVERY_TIMEOUT;
     // Per family: when its first answer came.
     let mut first_answer: [Option<Instant>; 2] = [None, None];
     let mut buf = [0u8; 1500];
-    while !pending.is_empty() {
+    while !queries.is_empty() {
         let now = Instant::now();
         if now >= deadline {
             break;
         }
         let mut progressed = false;
-        pending.retain(|p| {
-            let fam = usize::from(p.v6);
+        queries.retain_mut(|q| {
+            let fam = q.fam;
             if first_answer[fam].is_some_and(|t| now >= t + AGREEMENT_GRACE) {
-                errors[fam].push(format!("{}: no answer within the grace", p.what));
+                errors[fam].push(format!("{}: no answer within the grace", q.what));
                 return false;
             }
-            loop {
-                match p.sock.recv(&mut buf) {
-                    Ok(n) => match parse_answer(&buf[..n], p.id, p.v6) {
-                        Some(Ok(ip)) => {
-                            found[fam].push((p.name, ip));
-                            first_answer[fam].get_or_insert(Instant::now());
-                            progressed = true;
-                            return false;
-                        }
-                        Some(Err(e)) => {
-                            errors[fam].push(format!("{}: {e}", p.what));
-                            return false;
-                        }
-                        None => continue, // not an answer to this query
-                    },
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return true,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        errors[fam].push(format!("{}: {e}", p.what));
-                        return false;
+            // The address family the reflector reports: the asked family's, IPv4 through NAT64.
+            let want_v6 = fam == 1;
+            let got: Option<io::Result<IpAddr>> = match &mut q.pending {
+                Pending::Dns { sock, id, .. } => loop {
+                    match sock.recv(&mut buf) {
+                        Ok(n) => match parse_answer(&buf[..n], *id, want_v6) {
+                            Some(r) => break Some(r),
+                            None => continue, // not an answer to this query
+                        },
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break None,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => break Some(Err(e)),
                     }
+                },
+                #[cfg(feature = "client")]
+                Pending::Tls(t) => t.poll(want_v6),
+            };
+            match got {
+                None => true,
+                Some(Ok(ip)) => {
+                    let source = match &q.pending {
+                        Pending::Dns { name, .. } => Source::Dns(name),
+                        #[cfg(feature = "client")]
+                        Pending::Tls(_) => Source::Tls,
+                    };
+                    found[fam].push(Answer {
+                        source,
+                        via: q.via,
+                        ip,
+                    });
+                    first_answer[fam].get_or_insert(Instant::now());
+                    progressed = true;
+                    false
+                }
+                Some(Err(e)) => {
+                    errors[fam].push(format!("{}: {e}", q.what));
+                    false
                 }
             }
         });
@@ -364,13 +557,14 @@ fn discover() -> (FamilyFound, FamilyFound) {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    for p in &pending {
-        errors[usize::from(p.v6)].push(format!("{}: no answer within the timeout", p.what));
+    for q in &queries {
+        errors[q.fam].push(format!("{}: no answer within the timeout", q.what));
     }
+    let dns_servers = crate::system_resolvers();
     let result = |fam: usize, family: &str| -> FamilyFound {
         if !found[fam].is_empty() {
-            Ok(Some(agree(family, &found[fam])))
-        } else if unroutable[fam] {
+            Ok(Some(agree(family, &found[fam], &dns_servers)))
+        } else if unroutable[fam] && !(fam == 0 && nat64_asked) {
             Ok(None)
         } else {
             Err(errors[fam].join("; "))
@@ -379,19 +573,180 @@ fn discover() -> (FamilyFound, FamilyFound) {
     (result(0, "IPv4"), result(1, "IPv6"))
 }
 
-/// A non-blocking UDP socket connected to `r`'s server, with its query sent, and the query's id.
-fn send_query(r: &Reflector) -> io::Result<(UdpSocket, u16)> {
-    let local: SocketAddr = if r.server.is_ipv6() {
+/// A non-blocking UDP socket connected to `to` (`r`'s server, or its NAT64 synthesis), with `r`'s
+/// query sent, and the query's id.
+fn send_query_to(r: &Reflector, to: IpAddr) -> io::Result<(UdpSocket, u16)> {
+    let local: SocketAddr = if to.is_ipv6() {
         (Ipv6Addr::UNSPECIFIED, 0).into()
     } else {
         (Ipv4Addr::UNSPECIFIED, 0).into()
     };
     let sock = UdpSocket::bind(local)?;
-    sock.connect((r.server, 53))?;
+    sock.connect((to, 53))?;
     let id = query_id();
     sock.send(&build_query(id, r.name, r.class)?)?;
     sock.set_nonblocking(true)?;
     Ok((sock, id))
+}
+
+/// Cloudflare's `/cdn-cgi/trace` over HTTPS, without blocking: one query driven by
+/// [`TlsQuery::poll`] from the discovery loop.
+#[cfg(feature = "client")]
+mod tls {
+    use std::io::{self, Read, Write};
+    use std::net::{IpAddr, SocketAddr, TcpStream};
+    use std::sync::{Arc, OnceLock};
+
+    /// The most of a response read.
+    const MAX_RESPONSE: usize = 16 * 1024;
+
+    fn config() -> io::Result<Arc<rustls::ClientConfig>> {
+        static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+        if let Some(c) = CONFIG.get() {
+            return Ok(c.clone());
+        }
+        let roots =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let c = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(io::Error::other)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        Ok(CONFIG.get_or_init(|| Arc::new(c)).clone())
+    }
+
+    pub(super) struct TlsQuery {
+        stream: TcpStream,
+        conn: rustls::ClientConnection,
+        connected: bool,
+        response: Vec<u8>,
+    }
+
+    impl TlsQuery {
+        /// Starts connecting to `to` (the reflector, or its NAT64 synthesis); the certificate must
+        /// be valid for `server`, the reflector's own address.
+        pub(super) fn start(to: SocketAddr, server: IpAddr) -> io::Result<Self> {
+            use socket2::{Domain, Socket, Type};
+            let domain = if to.is_ipv4() {
+                Domain::IPV4
+            } else {
+                Domain::IPV6
+            };
+            let sock = Socket::new(domain, Type::STREAM, None)?;
+            sock.set_nonblocking(true)?;
+            match sock.connect(&to.into()) {
+                Ok(()) => {}
+                #[cfg(unix)]
+                Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+            let name = rustls::pki_types::ServerName::from(server);
+            let mut conn =
+                rustls::ClientConnection::new(config()?, name).map_err(io::Error::other)?;
+            let host = match server {
+                IpAddr::V4(a) => a.to_string(),
+                IpAddr::V6(a) => format!("[{a}]"),
+            };
+            // Sent once the handshake is done (rustls buffers it).
+            write!(
+                conn.writer(),
+                "GET /cdn-cgi/trace HTTP/1.0\r\nHost: {host}\r\nUser-Agent: {}\r\n\
+                 Accept: text/plain\r\n\r\n",
+                crate::USER_AGENT
+            )?;
+            Ok(TlsQuery {
+                stream: sock.into(),
+                conn,
+                connected: false,
+                response: Vec::new(),
+            })
+        }
+
+        /// Drives the query as far as it goes without blocking: `None` while it waits, else the
+        /// global address of the wanted family the trace reports (`ip=`), or why there is none.
+        pub(super) fn poll(&mut self, want_v6: bool) -> Option<io::Result<IpAddr>> {
+            if !self.connected {
+                match self.stream.peer_addr() {
+                    Ok(_) => self.connected = true,
+                    Err(_) => {
+                        return match self.stream.take_error() {
+                            Ok(Some(e)) | Err(e) => Some(Err(e)),
+                            Ok(None) => None,
+                        }
+                    }
+                }
+            }
+            let mut eof = false;
+            loop {
+                let mut progressed = false;
+                while self.conn.wants_write() {
+                    match self.conn.write_tls(&mut self.stream) {
+                        Ok(_) => progressed = true,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                if self.conn.wants_read() {
+                    match self.conn.read_tls(&mut self.stream) {
+                        Ok(0) => eof = true,
+                        Ok(_) => {
+                            progressed = true;
+                            if let Err(e) = self.conn.process_new_packets() {
+                                return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
+                            }
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                let mut buf = [0u8; 4096];
+                loop {
+                    match self.conn.reader().read(&mut buf) {
+                        Ok(0) => {
+                            eof = true;
+                            break;
+                        }
+                        Ok(n) => {
+                            self.response.extend_from_slice(&buf[..n]);
+                            progressed = true;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            eof = true;
+                            break;
+                        }
+                    }
+                }
+                if let Some(ip) = trace_address(&self.response, want_v6) {
+                    return Some(Ok(ip));
+                }
+                if self.response.len() > MAX_RESPONSE || eof {
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "no public address in the trace",
+                    )));
+                }
+                if !progressed {
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// The `ip=` line of a trace response's body, when it is complete and holds a global address
+    /// of the wanted family.
+    pub(super) fn trace_address(response: &[u8], want_v6: bool) -> Option<IpAddr> {
+        let text = std::str::from_utf8(response).ok()?;
+        let body = &text[text.find("\r\n\r\n")? + 4..];
+        let line = body.lines().find_map(|l| l.strip_prefix("ip="))?;
+        // Complete only once its newline arrived.
+        body.contains(&format!("ip={line}\n")).then_some(())?;
+        let ip: IpAddr = line.trim().parse().ok()?;
+        (ip.is_ipv6() == want_v6 && crate::is_global(ip)).then_some(ip)
+    }
 }
 
 /// One reflector query over UDP.
@@ -625,22 +980,155 @@ mod tests {
         }
     }
 
-    /// Review r2 R2-NG-7: both reflectors' answers are kept (their union), and an address is
-    /// confirmed only when two reflectors report it alike.
+    fn dns(name: &'static str, ip: &str) -> Answer {
+        Answer {
+            source: Source::Dns(name),
+            via: None,
+            ip: ip.parse().unwrap(),
+        }
+    }
+
+    fn tls(ip: &str) -> Answer {
+        Answer {
+            source: Source::Tls,
+            via: None,
+            ip: ip.parse().unwrap(),
+        }
+    }
+
+    const G: &str = "o-o.myaddr.l.google.com";
+    const C: &str = "whoami.cloudflare";
+
+    /// Review r2 R2-NG-7: every reflector's answers are kept (their union), and an address is
+    /// confirmed only when the HTTPS reflector reports it or both DNS reflectors report it alike.
     #[test]
-    fn answers_are_united_and_confirmed_only_by_agreement() {
-        let g = "o-o.myaddr.l.google.com";
-        let c = "whoami.cloudflare";
+    fn answers_are_united_and_confirmed_only_by_agreement_or_tls() {
         let a = |s: &str| s.parse::<IpAddr>().unwrap();
-        let both = agree("IPv6", &[(g, a("2606:a300::5")), (c, a("2606:a300::5"))]);
+        let both = agree(
+            "IPv6",
+            &[dns(G, "2606:a300::5"), dns(C, "2606:a300::5")],
+            &[],
+        );
         assert_eq!(both.addresses, vec![a("2606:a300::5")]);
         assert_eq!(both.confirmed, vec![a("2606:a300::5")]);
-        let one = agree("IPv6", &[(c, a("2606:4700:4700::64"))]);
+        let one = agree("IPv6", &[dns(C, "2606:4700:4700::64")], &[]);
         assert_eq!(one.addresses, vec![a("2606:4700:4700::64")]);
         assert!(one.confirmed.is_empty());
-        let split = agree("IPv4", &[(g, a("203.0.114.9")), (c, a("198.51.99.7"))]);
+        let split = agree("IPv4", &[dns(G, "203.0.114.9"), dns(C, "198.51.99.7")], &[]);
         assert_eq!(split.addresses, vec![a("198.51.99.7"), a("203.0.114.9")]);
         assert!(split.confirmed.is_empty());
+        // The HTTPS reflector alone confirms; with a disagreeing DNS answer, both are refused and
+        // only its answer is confirmed.
+        let t = agree("IPv4", &[tls("81.2.69.160")], &[]);
+        assert_eq!(t.confirmed, vec![a("81.2.69.160")]);
+        let t = agree("IPv4", &[dns(G, "203.0.114.9"), tls("81.2.69.160")], &[]);
+        assert_eq!(t.addresses, vec![a("81.2.69.160"), a("203.0.114.9")]);
+        assert_eq!(t.confirmed, vec![a("81.2.69.160")]);
+    }
+
+    /// A box that intercepts DNS answers for the reflectors with its resolver's address (one of
+    /// this host's DNS servers): refused, but it confirms nothing, so the family stays unknown.
+    #[test]
+    fn a_dns_answer_naming_a_host_dns_server_confirms_nothing() {
+        let a = |s: &str| s.parse::<IpAddr>().unwrap();
+        let resolver = [a("203.0.114.53")];
+        let r = agree(
+            "IPv4",
+            &[dns(G, "203.0.114.53"), dns(C, "203.0.114.53")],
+            &resolver,
+        );
+        assert_eq!(r.addresses, vec![a("203.0.114.53")]);
+        assert!(r.confirmed.is_empty());
+    }
+
+    /// An IPv4 answer through a NAT64 prefix is confirmed by the same rules, and names the prefix.
+    #[test]
+    fn a_nat64_answer_names_its_prefix() {
+        let a = |s: &str| s.parse::<IpAddr>().unwrap();
+        let p: Prefix = "64:ff9b::/96".parse().unwrap();
+        let via = |x: Answer| Answer { via: Some(p), ..x };
+        let r = agree(
+            "IPv4",
+            &[via(dns(G, "81.2.69.160")), via(dns(C, "81.2.69.160"))],
+            &[],
+        );
+        assert_eq!(r.confirmed, vec![a("81.2.69.160")]);
+        assert_eq!(r.via_nat64, vec![p]);
+        let r = agree("IPv4", &[via(dns(G, "81.2.69.160"))], &[]);
+        assert!(r.confirmed.is_empty() && r.via_nat64.is_empty());
+    }
+
+    /// Against the real HTTPS reflector (its certificate checked for its IP address): an answer
+    /// is this host's public address of that family. Skipped quietly where it is unreachable.
+    #[cfg(feature = "client")]
+    #[test]
+    fn the_https_reflector_answers_when_reachable() {
+        for server in TLS_REFLECTORS {
+            let mut q = match tls::TlsQuery::start(SocketAddr::new(*server, 443), *server) {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!("{server} unreachable here: {e}");
+                    continue;
+                }
+            };
+            let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+            let got = loop {
+                if let Some(r) = q.poll(server.is_ipv6()) {
+                    break Some(r);
+                }
+                if Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            match got {
+                Some(Ok(ip)) => {
+                    assert_eq!(ip.is_ipv6(), server.is_ipv6());
+                    assert!(crate::is_global(ip));
+                    eprintln!("{TLS_NAME} @{server}: {ip}");
+                }
+                other => eprintln!("{server}: {other:?}"),
+            }
+        }
+        // A certificate that does not name the reflector's address is refused: 8.8.8.8 presents
+        // Google's, which does not name 1.1.1.1.
+        if let Ok(mut q) = tls::TlsQuery::start("8.8.8.8:443".parse().unwrap(), TLS_REFLECTORS[0]) {
+            let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+            loop {
+                match q.poll(false) {
+                    Some(r) => {
+                        assert!(r.is_err(), "{r:?}");
+                        break;
+                    }
+                    None if Instant::now() >= deadline => break,
+                    None => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        }
+    }
+
+    /// The trace's `ip=` line, once complete, global and of the wanted family.
+    #[cfg(feature = "client")]
+    #[test]
+    fn the_trace_reports_the_address() {
+        let r = |body: &str| format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n{body}");
+        let t = |s: &str, v6| tls::trace_address(r(s).as_bytes(), v6);
+        assert_eq!(
+            t("fl=1\nh=1.1.1.1\nip=81.2.69.160\nts=1\n", false),
+            Some("81.2.69.160".parse().unwrap())
+        );
+        assert_eq!(t("fl=1\nip=81.2.69.1", false), None, "incomplete");
+        assert_eq!(t("ip=10.0.0.1\n", false), None, "not global");
+        assert_eq!(t("ip=81.2.69.160\n", true), None, "the other family");
+        assert_eq!(
+            t("ip=2606:a300::5\n", true),
+            Some("2606:a300::5".parse().unwrap())
+        );
+        assert_eq!(
+            tls::trace_address(b"ip=81.2.69.160\n", false),
+            None,
+            "no body"
+        );
     }
 
     /// Review r2 R2-NG-6 (PoC `pubrace`), inverted: a call that arrives while the first discovery

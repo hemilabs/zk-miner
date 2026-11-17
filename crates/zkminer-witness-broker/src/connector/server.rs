@@ -171,10 +171,10 @@ impl std::fmt::Debug for Connector {
 impl Connector {
     /// The miner's connector for `cfg` — the broker file **as the miner loaded it**, in the
     /// miner's network mode ([`BrokerConfig::load_for_connector`]) — with the miner's `[egress]`
-    /// `deny_cidrs` and facts options. The floor's facts are gathered with the stricter of the
-    /// miner's and the file's `[egress]` options (the shorter IPv6 site, discovery if either asks)
-    /// and re-read as netguard does. The DNS servers are `[dns] servers`, else
-    /// `/etc/resolv.conf`'s, read now.
+    /// `deny_cidrs` and options (its IPv4 site, stated public addresses, internal ranges and
+    /// near-hop limit). The floor's facts are gathered with the stricter of the miner's and the
+    /// file's `[egress]` options (the shorter IPv6 site, discovery if either asks) and re-read as
+    /// netguard does. The DNS servers are `[dns] servers`, else `/etc/resolv.conf`'s, read now.
     pub fn for_miner(
         cfg: &BrokerConfig,
         miner_deny: &[Prefix],
@@ -184,6 +184,7 @@ impl Connector {
         let options = zkminer_netguard::FactsOptions {
             ipv6_site_prefix_len: miner_facts.ipv6_site_prefix_len.min(cfg.facts_options.ipv6_site_prefix_len),
             discover_public_addresses: miner_facts.discover_public_addresses || cfg.facts_options.discover_public_addresses,
+            ..miner_facts
         };
         let floor = NetPolicy::with_options(NetMode::Public, Self::deny_for(cfg, miner_deny, &dns_servers), options)?;
         Self::with_floor(cfg, dns_servers, floor)
@@ -429,6 +430,24 @@ impl Connector {
             }
             let share = (connect_until - now) / (n - i as u32);
             let addr = SocketAddr::new(ip, st.ep.port);
+            // Right before connecting, wherever the floor applies: the kernel's route with the
+            // port, and the near-hop probe (a destination within a few hops is this host's own
+            // network).
+            if self.mode == NetMode::Public || st.ep.dns_derived() {
+                let floor = self.floor.clone();
+                match tokio::time::timeout(share, tokio::task::spawn_blocking(move || floor.vet_connection(addr))).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(d))) => {
+                        tracing::warn!(endpoint = %st.ep.alias, address = %addr, refusal = %d, "connector: address refused right before connecting");
+                        continue;
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        tracing::debug!(endpoint = %st.ep.alias, address = %addr, "connector: the check before connecting did not finish");
+                        continue;
+                    }
+                }
+            }
+            let share = share.saturating_sub(now.elapsed());
             self.stats.attempts.fetch_add(1, Ordering::Relaxed);
             match tokio::time::timeout(share, connect_tcp(addr)).await {
                 Ok(Ok(fd)) => return (Response { id, status: Status::Connected, peer: Some(addr) }, Some(fd)),

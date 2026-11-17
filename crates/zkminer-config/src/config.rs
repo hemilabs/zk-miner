@@ -38,9 +38,17 @@ pub struct DevConfig {
     /// reach non-public destinations: loopback, the LAN, link-local, the host's own addresses.
     /// For local test networks and test scripts only, which serve programs from this machine.
     /// The ONLY way to turn the network guard off: there is no environment variable or flag.
-    /// Refused on Hemi mainnet (43111); announced by a warning at every start. Default false.
+    /// Needs [`Self::chain_id`] equal to `[chain] chain_id` (which the RPC confirms at startup);
+    /// refused on Hemi mainnet (43111) whatever it says; announced by a warning at every start.
+    /// Default false.
     #[serde(default)]
     pub private_network: bool,
+    /// The test network `private_network` is meant for: it takes effect only on a config whose
+    /// `[chain] chain_id` is this id. A config copied to another network (or a production
+    /// deployment under a new chain id) then refuses to start instead of opening the guard there.
+    /// Default: unset (and `private_network = true` without it is refused).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<u64>,
     /// A fixed DA backlog reading, in estimated bytes, for witness-job claim gates and fulfils
     /// (docs/witness-construction-jobs.md §5.5), in place of reading the chain. For a local test
     /// network whose node serves no `l1GasUsed` in its receipts (anvil), where the reading is
@@ -52,7 +60,7 @@ pub struct DevConfig {
 
 impl DevConfig {
     fn is_off(&self) -> bool {
-        !self.private_network && self.da_backlog_bytes.is_none()
+        !self.private_network && self.chain_id.is_none() && self.da_backlog_bytes.is_none()
     }
 }
 
@@ -68,17 +76,54 @@ pub struct EgressConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_cidrs: Vec<String>,
     /// The site around each of this host's own global IPv6 addresses that is refused: its
-    /// enclosing /N, 48..=64 (default 56, the usual delegation to a home or office, whose other
-    /// networks hold the operator's other machines).
+    /// enclosing /N, 32..=64 (default 48, the most a home, office or small site is usually
+    /// delegated; its other networks hold the operator's other machines). Set it shorter when
+    /// your organisation holds more (a campus /32).
     #[serde(
         default = "default_ipv6_site_prefix_len",
         skip_serializing_if = "is_default_ipv6_site_prefix_len"
     )]
     pub ipv6_site_prefix_len: u8,
-    /// Learn this host's public addresses behind NAT (asking two fixed DNS reflectors, Google's
-    /// and Cloudflare's, which address the query came from) and refuse them. Default true.
+    /// The site around each global IPv4 address on one of this host's interfaces that is
+    /// refused: its enclosing /N, 8..=32 (default 16). A host numbered from public IPv4 space sits
+    /// in a network (a campus, a data centre) whose other subnets the default gateway reaches.
+    #[serde(
+        default = "default_ipv4_site_prefix_len",
+        skip_serializing_if = "is_default_ipv4_site_prefix_len"
+    )]
+    pub ipv4_site_prefix_len: u8,
+    /// Learn this host's public addresses behind NAT (asking fixed reflectors — Google's and
+    /// Cloudflare's DNS ones, and Cloudflare's over HTTPS — which address the query came from)
+    /// and refuse them. Default true. While a family this host routes has no known public
+    /// address, requester connections over it are refused; off, `public_addresses` must name one
+    /// per family.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub discover_public_addresses: bool,
+    /// This host's public addresses (behind NAT, its router's; on an IPv6-only host behind NAT64,
+    /// the translator's IPv4 address), as you know them: refused as its own, and a family named
+    /// here counts as known when discovery cannot reach the reflectors (DNS filtered or
+    /// intercepted, HTTPS to 1.1.1.1 blocked).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_addresses: Vec<String>,
+    /// The ranges of your own network that this host reaches by the same route as the internet
+    /// (a campus's or data centre's public ranges, your VPC's, what a full-tunnel VPN leads to):
+    /// refused like `deny_cidrs`. Required (`[]` if there are none) on a host with a global IPv4
+    /// address on an interface or a default route through a tunnel interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_ranges: Option<Vec<String>>,
+    /// The hop limit of the probe sent right before every requester-caused connection: a
+    /// destination that answers within this many hops is this host's own network and is refused.
+    /// 2..=16, default 2.
+    #[serde(
+        default = "default_near_hop_limit",
+        skip_serializing_if = "is_default_near_hop_limit"
+    )]
+    pub near_hop_limit: u8,
+    /// The DNS-over-HTTPS resolvers requester host names are resolved with (never the system
+    /// resolver), as `https://` URLs whose host is a public IP literal
+    /// (`"https://9.9.9.9/dns-query"`). Default: Cloudflare's, Google's and Quad9's, built in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub doh_resolvers: Vec<String>,
     /// NAT64 network-specific prefixes this host's translator uses (RFC 6052: a /32, /40, /48,
     /// /56, /64 or /96 of IPv6, e.g. `"2001:db8:64::/96"`). An address under one carries an IPv4
     /// address the translator connects to from its own IPv4 side, so it is judged by that IPv4
@@ -97,6 +142,22 @@ fn is_default_ipv6_site_prefix_len(n: &u8) -> bool {
     *n == zkminer_netguard::DEFAULT_IPV6_SITE_PREFIX_LEN
 }
 
+fn default_ipv4_site_prefix_len() -> u8 {
+    zkminer_netguard::DEFAULT_IPV4_SITE_PREFIX_LEN
+}
+
+fn is_default_ipv4_site_prefix_len(n: &u8) -> bool {
+    *n == zkminer_netguard::DEFAULT_IPV4_SITE_PREFIX_LEN
+}
+
+fn default_near_hop_limit() -> u8 {
+    zkminer_netguard::DEFAULT_NEAR_HOP_LIMIT
+}
+
+fn is_default_near_hop_limit(n: &u8) -> bool {
+    *n == zkminer_netguard::DEFAULT_NEAR_HOP_LIMIT
+}
+
 fn default_true() -> bool {
     true
 }
@@ -110,7 +171,12 @@ impl Default for EgressConfig {
         EgressConfig {
             deny_cidrs: Vec::new(),
             ipv6_site_prefix_len: default_ipv6_site_prefix_len(),
+            ipv4_site_prefix_len: default_ipv4_site_prefix_len(),
             discover_public_addresses: true,
+            public_addresses: Vec::new(),
+            internal_ranges: None,
+            near_hop_limit: default_near_hop_limit(),
+            doh_resolvers: Vec::new(),
             nat64_prefixes: Vec::new(),
         }
     }
@@ -120,6 +186,16 @@ impl EgressConfig {
     fn is_empty(&self) -> bool {
         *self == EgressConfig::default()
     }
+}
+
+/// `[egress] <key>` CIDRs (or bare addresses), parsed; host bits must be zero.
+fn parse_cidrs(key: &str, v: &[String]) -> Result<Vec<zkminer_netguard::Prefix>> {
+    v.iter()
+        .map(|s| {
+            s.parse::<zkminer_netguard::Prefix>()
+                .map_err(|e| anyhow::anyhow!("egress.{key}: {e}"))
+        })
+        .collect()
 }
 
 /// Chain ids zkminer treats as production markets, where `[dev] private_network` is refused
@@ -519,28 +595,71 @@ impl ZkMinerConfig {
     }
 
     /// The network guard's mode for connections a requester causes: [`NetMode::DevPrivate`] only
-    /// with `[dev] private_network = true` on a chain that is not a production market. On one,
-    /// this is [`NetMode::Public`] whatever the config says ([`Self::validate_for_chain`] refuses
-    /// that config outright; this holds even where validation was skipped).
+    /// with `[dev] private_network = true` and `[dev] chain_id` equal to `[chain] chain_id`, on a
+    /// chain that is not a production market. Otherwise this is [`NetMode::Public`] whatever the
+    /// config says ([`Self::validate_for_chain`] refuses such a config outright; this holds even
+    /// where validation was skipped).
     ///
     /// [`NetMode::DevPrivate`]: zkminer_netguard::NetMode::DevPrivate
     /// [`NetMode::Public`]: zkminer_netguard::NetMode::Public
     pub fn net_mode(&self) -> zkminer_netguard::NetMode {
-        if self.dev.private_network && !is_production_chain(self.chain.chain_id) {
+        if self.dev.private_network
+            && self.dev.chain_id == Some(self.chain.chain_id)
+            && !is_production_chain(self.chain.chain_id)
+        {
             zkminer_netguard::NetMode::DevPrivate
         } else {
             zkminer_netguard::NetMode::Public
         }
     }
 
-    /// `[egress] deny_cidrs`, parsed. Host bits must be zero (`10.0.0.1/8` is an error).
+    /// `[egress] deny_cidrs` and `internal_ranges`, parsed: what every requester-caused
+    /// connection is refused besides the host's own facts. Host bits must be zero (`10.0.0.1/8`
+    /// is an error).
     pub fn egress_deny(&self) -> Result<Vec<zkminer_netguard::Prefix>> {
+        let mut deny = parse_cidrs("deny_cidrs", &self.egress.deny_cidrs)?;
+        for p in self.egress_internal_ranges()?.into_iter().flatten() {
+            if !deny.contains(&p) {
+                deny.push(p);
+            }
+        }
+        Ok(deny)
+    }
+
+    /// `[egress] internal_ranges`, parsed (`None` when the key is absent).
+    pub fn egress_internal_ranges(&self) -> Result<Option<Vec<zkminer_netguard::Prefix>>> {
         self.egress
-            .deny_cidrs
+            .internal_ranges
+            .as_ref()
+            .map(|v| parse_cidrs("internal_ranges", v))
+            .transpose()
+    }
+
+    /// `[egress] public_addresses`, parsed: bare addresses, each a public internet address.
+    pub fn egress_public_addresses(&self) -> Result<Vec<std::net::IpAddr>> {
+        self.egress
+            .public_addresses
             .iter()
             .map(|s| {
-                s.parse::<zkminer_netguard::Prefix>()
-                    .map_err(|e| anyhow::anyhow!("egress.deny_cidrs: {e}"))
+                let ip: std::net::IpAddr = s.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("egress.public_addresses: {s:?} is not an IP address")
+                })?;
+                if !zkminer_netguard::is_global(ip) {
+                    anyhow::bail!("egress.public_addresses: {ip} is not a public internet address");
+                }
+                Ok(ip)
+            })
+            .collect()
+    }
+
+    /// `[egress] doh_resolvers`, parsed ([`zkminer_netguard::DohServer::parse`]).
+    pub fn egress_doh_resolvers(&self) -> Result<Vec<zkminer_netguard::DohServer>> {
+        self.egress
+            .doh_resolvers
+            .iter()
+            .map(|s| {
+                zkminer_netguard::DohServer::parse(s)
+                    .map_err(|e| anyhow::anyhow!("egress.doh_resolvers: {e}"))
             })
             .collect()
     }
@@ -561,9 +680,10 @@ impl ZkMinerConfig {
             .collect()
     }
 
-    /// The options the network guard gathers this host's facts with (`[egress]
-    /// ipv6_site_prefix_len`, `discover_public_addresses`). Refuses a site length outside 48..=64
-    /// and a malformed `nat64_prefixes` entry.
+    /// The options the network guard runs with (`[egress]` `ipv6_site_prefix_len`,
+    /// `ipv4_site_prefix_len`, `discover_public_addresses`, `public_addresses`,
+    /// `internal_ranges`, `near_hop_limit`, `doh_resolvers`). Refuses a length or limit outside
+    /// its range and a malformed or non-public entry.
     ///
     /// Also puts `[egress] nat64_prefixes` in force, process-wide
     /// ([`zkminer_netguard::nat64::set_configured`]): the network guard's address predicate reads
@@ -572,7 +692,12 @@ impl ZkMinerConfig {
     pub fn egress_facts_options(&self) -> Result<zkminer_netguard::FactsOptions> {
         let o = zkminer_netguard::FactsOptions {
             ipv6_site_prefix_len: self.egress.ipv6_site_prefix_len,
+            ipv4_site_prefix_len: self.egress.ipv4_site_prefix_len,
             discover_public_addresses: self.egress.discover_public_addresses,
+            public_addresses: self.egress_public_addresses()?,
+            internal_ranges: self.egress_internal_ranges()?,
+            near_hop_limit: self.egress.near_hop_limit,
+            doh_resolvers: self.egress_doh_resolvers()?,
         };
         o.validate()
             .map_err(|e| anyhow::anyhow!("egress.{e}"))?;
@@ -586,8 +711,11 @@ impl ZkMinerConfig {
         (self.net_mode() == zkminer_netguard::NetMode::DevPrivate).then_some(DEV_MODE_BANNER)
     }
 
-    /// Refuses `[dev] private_network` on a production chain, malformed `[egress]` CIDRs, an
-    /// `[egress] ipv6_site_prefix_len` outside 48..=64 and a malformed `nat64_prefixes` entry.
+    /// Refuses `[dev] private_network` on a production chain or without a matching `[dev]
+    /// chain_id`, and a malformed `[egress]` (CIDRs, addresses, resolvers, lengths and limits out
+    /// of range: [`Self::egress_facts_options`], `nat64_prefixes`). What needs the host's facts
+    /// (`internal_ranges` required, `public_addresses` with discovery off) is checked when the
+    /// network guard starts.
     pub fn validate_network(&self) -> Result<()> {
         if self.dev.private_network && is_production_chain(self.chain.chain_id) {
             anyhow::bail!(
@@ -596,6 +724,24 @@ impl ZkMinerConfig {
                  test network",
                 self.chain.chain_id
             );
+        }
+        if self.dev.private_network {
+            match self.dev.chain_id {
+                None => anyhow::bail!(
+                    "[dev] private_network = true also needs `chain_id = {}` in [dev], naming the \
+                     test network it is meant for (this config's [chain] chain_id): developer mode \
+                     lets requesters reach this host's private network, so it takes effect only on \
+                     the network it names",
+                    self.chain.chain_id
+                ),
+                Some(id) if id != self.chain.chain_id => anyhow::bail!(
+                    "[dev] chain_id = {id} does not match [chain] chain_id = {}: [dev] \
+                     private_network = true is meant for chain {id} only. Point the config at that \
+                     network, or remove [dev] private_network",
+                    self.chain.chain_id
+                ),
+                Some(_) => {}
+            }
         }
         if self.dev.da_backlog_bytes.is_some() && is_production_chain(self.chain.chain_id) {
             anyhow::bail!(
@@ -740,7 +886,8 @@ mod validation_tests {
 
     #[test]
     fn dev_mode_on_a_test_network_is_announced() {
-        let c = parse("[chain]\nchain_id = 743111\n[dev]\nprivate_network = true\n").unwrap();
+        let c = parse("[chain]\nchain_id = 743111\n[dev]\nprivate_network = true\nchain_id = 743111\n")
+            .unwrap();
         assert!(c.validate_network().is_ok());
         assert_eq!(c.net_mode(), zkminer_netguard::NetMode::DevPrivate);
         let banner = c.dev_mode_banner().expect("a banner");
@@ -749,11 +896,54 @@ mod validation_tests {
         assert!(banner.contains("never run on a public market"));
         // It round-trips through the file, which is how the localnet test turns it on.
         let text = toml::to_string_pretty(&c).unwrap();
-        assert!(text.contains("[dev]\nprivate_network = true"), "{text}");
+        assert!(
+            text.contains("[dev]\nprivate_network = true\nchain_id = 743111"),
+            "{text}"
+        );
         assert_eq!(
             parse(&text).unwrap().net_mode(),
             zkminer_netguard::NetMode::DevPrivate
         );
+    }
+
+    /// Developer mode names the test network it is for: without `[dev] chain_id`, or with one
+    /// that is not the config's chain, the config is refused and the mode stays public (a
+    /// production deployment under a chain id zkminer does not know as one included).
+    #[test]
+    fn dev_mode_needs_the_chain_id_it_is_meant_for() {
+        for (text, why) in [
+            (
+                "[chain]\nchain_id = 743111\n[dev]\nprivate_network = true\n",
+                "chain_id = 743111",
+            ),
+            (
+                "[chain]\nchain_id = 743111\n[dev]\nprivate_network = true\nchain_id = 31337\n",
+                "does not match",
+            ),
+            (
+                "[chain]\nchain_id = 999\n[dev]\nprivate_network = true\nchain_id = 743111\n",
+                "does not match",
+            ),
+        ] {
+            let c = parse(text).unwrap();
+            let err = c.validate_network().expect_err(text).to_string();
+            assert!(err.contains(why), "{text}: {err}");
+            assert_eq!(c.net_mode(), zkminer_netguard::NetMode::Public, "{text}");
+            assert_eq!(c.dev_mode_banner(), None, "{text}");
+        }
+        // Mainnet stays refused even when the ids agree.
+        let c = parse("[chain]\nchain_id = 43111\n[dev]\nprivate_network = true\nchain_id = 43111\n")
+            .unwrap();
+        assert!(c.validate_network().unwrap_err().to_string().contains("43111"));
+        assert_eq!(c.net_mode(), zkminer_netguard::NetMode::Public);
+        // A chain id alone changes nothing.
+        let c = parse("[chain]\nchain_id = 31337\n[dev]\nchain_id = 31337\n").unwrap();
+        assert!(c.validate_network().is_ok());
+        assert_eq!(c.net_mode(), zkminer_netguard::NetMode::Public);
+        let c = parse("[chain]\nchain_id = 31337\n[dev]\nprivate_network = true\nchain_id = 31337\n")
+            .unwrap();
+        assert!(c.validate_network().is_ok());
+        assert_eq!(c.net_mode(), zkminer_netguard::NetMode::DevPrivate);
     }
 
     #[test]
@@ -811,7 +1001,7 @@ mod validation_tests {
         }
     }
 
-    /// Review r1 (fetch F1b/F1c): `[egress] ipv6_site_prefix_len` (48..=64, default 56) and
+    /// Review r1 (fetch F1b/F1c): `[egress] ipv6_site_prefix_len` (32..=64, default 48) and
     /// `discover_public_addresses` (default true) reach netguard's facts options, and are not
     /// written while they hold their defaults.
     #[test]
@@ -821,21 +1011,24 @@ mod validation_tests {
             c.egress_facts_options().unwrap(),
             zkminer_netguard::FactsOptions::default()
         );
-        assert_eq!(c.egress.ipv6_site_prefix_len, 56);
+        assert_eq!(c.egress.ipv6_site_prefix_len, 48);
+        assert_eq!(c.egress.ipv4_site_prefix_len, 16);
+        assert_eq!(c.egress.near_hop_limit, 2);
         assert!(c.egress.discover_public_addresses);
+        assert_eq!(c.egress.internal_ranges, None);
         let c = parse(
-            "[chain]\nchain_id = 743111\n[egress]\nipv6_site_prefix_len = 48\ndiscover_public_addresses = false\n",
+            "[chain]\nchain_id = 743111\n[egress]\nipv6_site_prefix_len = 56\ndiscover_public_addresses = false\n",
         )
         .unwrap();
         let o = c.egress_facts_options().unwrap();
-        assert_eq!(o.ipv6_site_prefix_len, 48);
+        assert_eq!(o.ipv6_site_prefix_len, 56);
         assert!(!o.discover_public_addresses);
         assert!(c.validate_network().is_ok());
         let text = toml::to_string_pretty(&c).unwrap();
-        assert!(text.contains("ipv6_site_prefix_len = 48"), "{text}");
+        assert!(text.contains("ipv6_site_prefix_len = 56"), "{text}");
         assert!(text.contains("discover_public_addresses = false"), "{text}");
         assert_eq!(parse(&text).unwrap().egress, c.egress);
-        for (len, ok) in [(47, false), (48, true), (56, true), (64, true), (65, false), (0, false)] {
+        for (len, ok) in [(31, false), (32, true), (48, true), (56, true), (64, true), (65, false), (0, false)] {
             let c = parse(&format!(
                 "[chain]\nchain_id = 743111\n[egress]\nipv6_site_prefix_len = {len}\n"
             ))
@@ -847,6 +1040,65 @@ mod validation_tests {
             }
         }
         assert!(parse("[egress]\nipv6_site_prefix_len = 300\n").is_err());
+    }
+
+    /// The `[egress]` keys the guard's host checks run with: the IPv4 site, the stated public
+    /// addresses, the internal ranges (refused like deny CIDRs; absent and empty differ), the
+    /// near-hop limit and the DNS-over-HTTPS resolvers, each parsed strictly and round-tripped.
+    #[test]
+    fn egress_host_keys_parse_strictly() {
+        let c = parse(
+            "[chain]\nchain_id = 743111\n[egress]\nipv4_site_prefix_len = 12\n\
+             public_addresses = [\"81.2.69.160\", \"2a02:8070::5\"]\n\
+             internal_ranges = [\"128.112.0.0/16\", \"2620:c4::/32\"]\nnear_hop_limit = 3\n\
+             doh_resolvers = [\"https://9.9.9.9/dns-query\", \"https://[2620:fe::fe]\"]\n",
+        )
+        .unwrap();
+        assert!(c.validate_network().is_ok());
+        let o = c.egress_facts_options().unwrap();
+        assert_eq!(o.ipv4_site_prefix_len, 12);
+        assert_eq!(
+            o.public_addresses,
+            vec![
+                "81.2.69.160".parse::<std::net::IpAddr>().unwrap(),
+                "2a02:8070::5".parse().unwrap()
+            ]
+        );
+        assert_eq!(
+            o.internal_ranges,
+            Some(vec![
+                "128.112.0.0/16".parse().unwrap(),
+                "2620:c4::/32".parse().unwrap()
+            ])
+        );
+        assert_eq!(o.near_hop_limit, 3);
+        assert_eq!(o.doh_resolvers.len(), 2);
+        assert_eq!(o.doh_resolvers[1].addr, "[2620:fe::fe]:443".parse().unwrap());
+        // Internal ranges are refused like deny CIDRs.
+        let deny = c.egress_deny().unwrap();
+        assert!(deny.contains(&"128.112.0.0/16".parse().unwrap()));
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert_eq!(parse(&text).unwrap().egress, c.egress);
+        // `internal_ranges = []` is a statement; its absence is none.
+        let empty = parse("[chain]\nchain_id = 743111\n[egress]\ninternal_ranges = []\n").unwrap();
+        assert_eq!(empty.egress_facts_options().unwrap().internal_ranges, Some(vec![]));
+        let text = toml::to_string_pretty(&empty).unwrap();
+        assert!(text.contains("internal_ranges = []"), "{text}");
+        for bad in [
+            "ipv4_site_prefix_len = 7\n",
+            "ipv4_site_prefix_len = 33\n",
+            "near_hop_limit = 1\n",
+            "near_hop_limit = 17\n",
+            "public_addresses = [\"192.168.1.1\"]\n",
+            "public_addresses = [\"81.2.69.0/24\"]\n",
+            "internal_ranges = [\"10.0.0.1/8\"]\n",
+            "doh_resolvers = [\"https://dns.google/dns-query\"]\n",
+            "doh_resolvers = [\"https://192.168.1.1/dns-query\"]\n",
+            "doh_resolvers = [\"http://9.9.9.9/dns-query\"]\n",
+        ] {
+            let c = parse(&format!("[chain]\nchain_id = 743111\n[egress]\n{bad}")).unwrap();
+            assert!(c.validate_network().is_err(), "{bad}");
+        }
     }
 
     /// Review r2 R2-NG-4: `[egress] nat64_prefixes` parses strictly (RFC 6052 lengths, host bits
