@@ -803,7 +803,7 @@ fn execute_reason(e: &WitnessExecError) -> SkipReason {
         // memory is this host's resources, not the job.
         WitnessExecError::Timeout { .. } | WitnessExecError::OomKilled { .. } => SkipReason::ProveResources,
         WitnessExecError::Exit { failure: Some(f), .. } => match f {
-            F::InvalidElf | F::GuestFault | F::Unprovable | F::Panicked => SkipReason::GuestFailed,
+            F::InvalidElf | F::GuestFault | F::Unprovable | F::OldRisc0Guest | F::Panicked => SkipReason::GuestFailed,
             F::CycleLimit => SkipReason::GuestCyclesAboveLimit,
             F::BadRequest | F::InputMismatch | F::Sandbox | F::Internal | F::Unsupported => SkipReason::HostInternal,
         },
@@ -1337,6 +1337,16 @@ mod tests {
         assert_eq!(execute_reason(&exit(WitnessExecuteFailure::GuestFault)), SkipReason::GuestFailed);
         assert_eq!(execute_reason(&exit(WitnessExecuteFailure::CycleLimit)), SkipReason::GuestCyclesAboveLimit);
         assert_eq!(execute_reason(&exit(WitnessExecuteFailure::InputMismatch)), SkipReason::HostInternal);
+        // A guest built with risc0-zkvm 3.0 is the job's to fix, and the detail says how, in the
+        // host's words (the log tail, which the guest can write, comes after).
+        let old = exit(WitnessExecuteFailure::OldRisc0Guest);
+        assert_eq!(execute_reason(&old), SkipReason::GuestFailed);
+        let detail = execute_detail(&old);
+        assert!(
+            detail.starts_with("the witness execute worker exited with code 90: the guest was built with risc0-zkvm older than 3.1")
+                && detail.contains("Rebuild the guest with risc0-zkvm 3.1.0"),
+            "{detail}"
+        );
         assert_eq!(
             execute_reason(&WitnessExecError::OomKilled { memory_max: 1, log_tail: String::new() }),
             SkipReason::ProveResources

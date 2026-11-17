@@ -91,11 +91,13 @@ the host side).
 It matters for any guest that hashes with keccak through risc0's accelerator (the batcher): two or
 more batches are rooted under risc0-circuit-recursion's `ALLOWED_CONTROL_ROOT`, and a guest built
 with risc0-zkvm 3.0 names 4.0's (`0xa54dc85a…`), which the 3.1 prover cannot resolve. Such a guest
-executes cleanly and fails every proof ("no receipt available for unresolved assumption"), and the
-miner refuses it before any claim. One batch (about 655 permutations at the miner's keccak po2, 17)
-is assumed under the keccak circuit's root, which both share. This guest hashes in software (the
-prelude's keccak), so it was never affected; `keccak-3-0` and `hostdep` show both sides
-(`methods/tests/keccak_batches.rs`).
+executes cleanly and fails every proof ("no receipt available for unresolved assumption"); the miner
+refuses it before any claim, and `zkminer simulate` says why: "the guest was built with risc0-zkvm
+older than 3.1 … Rebuild the guest with risc0-zkvm 3.1.0". One batch (about 655 permutations at the
+miner's keccak po2, 17) is assumed under the keccak circuit's root, which both share. This guest
+hashes in software (the prelude's keccak), so it was never affected; `keccak-3-0` and `hostdep` show
+both sides (`methods/tests/keccak_batches.rs`, and `simulate_adversarial.rs`'s
+`a_guest_built_with_risc0_3_0_is_refused_by_name`).
 
 ## The guest lints (plan §21.1 item 4)
 
