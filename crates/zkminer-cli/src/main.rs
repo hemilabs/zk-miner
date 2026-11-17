@@ -146,7 +146,8 @@ enum Commands {
         #[arg(long, default_value_t = 42)]
         input: u32,
     },
-    /// Witness-construction jobs: set up and check what serving them needs
+    /// Witness-construction jobs: set up and check what serving them needs, and requester tooling
+    /// (envelope, binding)
     Witness {
         #[command(subcommand)]
         command: WitnessCommand,
@@ -187,6 +188,113 @@ enum WitnessCommand {
         /// The sandbox probe binary (default: `zkminer-witness-sandbox-probe` next to zkminer).
         #[arg(long)]
         probe: Option<std::path::PathBuf>,
+    },
+    /// Requester tooling: write a witness-job envelope (`inputData`) from a spec, or explain one
+    Envelope {
+        #[command(subcommand)]
+        command: EnvelopeCommand,
+    },
+    /// Requester tooling: compute a job's journal binding from its own parameters, or check which
+    /// journal bytes a binding leaves free
+    Binding {
+        #[command(subcommand)]
+        command: BindingCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum EnvelopeCommand {
+    /// Encode `inputData = WITNESS_JOB_TAG_V1 ‖ abi.encode(WitnessJobV1)` from a TOML (`.toml`) or
+    /// JSON spec and print it as 0x hex. A bare envelope spec has the envelope's fields; a job spec
+    /// has `program_id`, a `[binding]` and an `[envelope]` table and also yields the descriptor file
+    /// `zkminer simulate --descriptor` reads. The result is checked with the miner's own decoder.
+    Encode {
+        /// The spec file.
+        spec: std::path::PathBuf,
+        /// The builder artifact (WASM): its sha256 is the builderId (and must equal a given one).
+        #[arg(long)]
+        builder: Option<std::path::PathBuf>,
+        /// Write the 0x hex inputData here instead of stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Write the descriptor file here (job specs only).
+        #[arg(long)]
+        descriptor_out: Option<std::path::PathBuf>,
+        /// Print one JSON document (inputData, its hash, the descriptor and binding).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explain an inputData: what the miner's decoder makes of it, each builderURI as a miner on
+    /// `--chain-id` reads it, and the envelope as an editable spec. Exits non-zero when the miner
+    /// would skip it.
+    Decode {
+        /// 0x hex, or a file of 0x hex or raw bytes.
+        input: String,
+        /// The HemiProve chain the job is on (decides which hemi-code locators are usable).
+        #[arg(long, default_value_t = 743111)]
+        chain_id: u64,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BindingCommand {
+    /// `journalFields` and `expectedJournalHash` from the requester's own parameters: FIELDS over
+    /// the whole header (one `--word` per header word, in order), FULL over a statement known in full
+    /// at submit (`--full-statement`), or NONE (`--none`, assigned jobs only). Never take these from a
+    /// prover's journal.
+    Compute {
+        /// A header word, `type:value`: uintN, bool, address, bytesN, bytes32, keccak:<text>, word.
+        #[arg(long = "word", value_name = "TYPE:VALUE")]
+        words: Vec<String>,
+        /// FULL: the whole statement (the journal after any prefix), 0x hex.
+        #[arg(long, conflicts_with_all = ["words", "none"])]
+        full_statement: Option<String>,
+        /// NONE: nothing bound (only with an assigned prover).
+        #[arg(long, conflicts_with = "words")]
+        none: bool,
+        /// Without the journal-prefix marker (the marker is the default for open witness jobs).
+        #[arg(long)]
+        no_prefix: bool,
+        /// FULL hashes the program id.
+        #[arg(long)]
+        program_id: Option<alloy::primitives::B256>,
+        /// `risc0` or a 0x proof-system id.
+        #[arg(long, default_value = "risc0")]
+        proof_system: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The mutation check: change each byte of a statement in turn, recompute the router's hash, and
+    /// report which bytes the binding leaves free; non-zero exit when a header byte is free, a range
+    /// ends past the statement, or the expected hash does not match.
+    Check {
+        /// A descriptor file (its journalFields, expectedJournalHash and programId).
+        #[arg(long)]
+        descriptor: Option<std::path::PathBuf>,
+        #[arg(long)]
+        journal_fields: Option<alloy::primitives::B256>,
+        #[arg(long)]
+        expected_journal_hash: Option<alloy::primitives::B256>,
+        #[arg(long)]
+        program_id: Option<alloy::primitives::B256>,
+        #[arg(long, default_value = "risc0")]
+        proof_system: String,
+        /// The header words, as `compute` takes them: the statement is their concatenation.
+        #[arg(long = "word", value_name = "TYPE:VALUE")]
+        words: Vec<String>,
+        /// A whole journal (prefix included for a journal-prefix job): 0x hex or a file.
+        #[arg(long, conflicts_with = "statement")]
+        journal: Option<String>,
+        /// The statement (the journal after any prefix): 0x hex or a file.
+        #[arg(long)]
+        statement: Option<String>,
+        /// The header's length in bytes (default: 32 × the words given).
+        #[arg(long)]
+        header_bytes: Option<usize>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -350,6 +458,62 @@ async fn main() -> Result<()> {
             WitnessCommand::SelfTest { probe } => {
                 commands::witness::self_test(config_path, probe).await
             }
+            WitnessCommand::Envelope { command } => match command {
+                EnvelopeCommand::Encode { spec, builder, out, descriptor_out, json } => {
+                    commands::witness_tools::envelope_encode(
+                        &spec,
+                        builder.as_deref(),
+                        out.as_deref(),
+                        descriptor_out.as_deref(),
+                        json,
+                    )
+                }
+                EnvelopeCommand::Decode { input, chain_id, json } => {
+                    commands::witness_tools::envelope_decode(&input, chain_id, json)
+                }
+            },
+            WitnessCommand::Binding { command } => match command {
+                BindingCommand::Compute {
+                    words,
+                    full_statement,
+                    none,
+                    no_prefix,
+                    program_id,
+                    proof_system,
+                    json,
+                } => {
+                    let spec = commands::witness_tools::BindingSpec {
+                        prefix: !no_prefix,
+                        header: (!words.is_empty()).then_some(words),
+                        full_statement,
+                        none,
+                    };
+                    commands::witness_tools::binding_compute(&spec, &proof_system, program_id, json)
+                }
+                BindingCommand::Check {
+                    descriptor,
+                    journal_fields,
+                    expected_journal_hash,
+                    program_id,
+                    proof_system,
+                    words,
+                    journal,
+                    statement,
+                    header_bytes,
+                    json,
+                } => commands::witness_tools::binding_check(commands::witness_tools::CheckArgs {
+                    descriptor,
+                    journal_fields,
+                    expected_journal_hash,
+                    program_id,
+                    proof_system,
+                    words,
+                    journal,
+                    statement,
+                    header_bytes,
+                    json,
+                }),
+            },
         },
     }
 }
@@ -427,6 +591,23 @@ mod tests {
             }
         ));
         assert!(Cli::try_parse_from(["zkminer", "witness"]).is_err());
+        let cli = Cli::try_parse_from([
+            "zkminer", "witness", "binding", "compute", "--word", "uint:1", "--word", "uint:2", "--no-prefix",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Witness {
+                command: WitnessCommand::Binding { command: BindingCommand::Compute { words, no_prefix, none, .. } },
+            } => {
+                assert_eq!(words, ["uint:1", "uint:2"]);
+                assert!(no_prefix && !none);
+            }
+            _ => panic!("not witness binding compute"),
+        }
+        // One binding form at a time.
+        assert!(Cli::try_parse_from(["zkminer", "witness", "binding", "compute", "--word", "uint:1", "--none"]).is_err());
+        assert!(Cli::try_parse_from(["zkminer", "witness", "envelope", "encode", "job.toml", "--descriptor-out", "d.json"]).is_ok());
+        assert!(Cli::try_parse_from(["zkminer", "witness", "envelope", "decode", "0x00", "--chain-id", "31337"]).is_ok());
     }
 
     #[test]

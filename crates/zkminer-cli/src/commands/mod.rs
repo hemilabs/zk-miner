@@ -8,3 +8,4 @@ pub mod sp1_demo;
 pub mod stake;
 pub mod status;
 pub mod witness;
+pub mod witness_tools;

@@ -13,6 +13,7 @@ pub mod envelope;
 pub mod ipc;
 pub mod locator;
 pub mod manifest;
+pub mod requester;
 pub mod verdict;
 
 pub use envelope::{

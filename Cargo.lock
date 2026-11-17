@@ -10448,7 +10448,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "sp1-sdk",
+ "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-appender",
  "tracing-subscriber 0.3.22",
@@ -10662,6 +10664,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]
