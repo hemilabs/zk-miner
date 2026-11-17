@@ -212,9 +212,19 @@ executor:
   Landlock as well.
 - **Other processes.** Landlock's signal and abstract-socket scoping, and its `ptrace` rules: a
   confined process cannot signal, trace or open `/proc/<pid>/mem`, `environ`, `maps` or `fd` of a
-  process outside its domain (the miner, other workers, their servers). The miner can still signal
+  process outside its domain (the miner, other workers, their servers): `kill`, `tgkill`,
+  `rt_sigqueueinfo`, `rt_tgsigqueueinfo` and `pidfd_send_signal` alike. The miner can still signal
   its workers. seccomp also denies `ptrace`, `process_vm_*`, `pidfd_getfd`, `io_uring`, `bpf`, the
   kernel keyrings, `mknod`, `TIOCSTI`, and a seccomp listener of the process's own.
+- **Kernel surface.** No namespaces and no mounts: seccomp denies `unshare`, `setns`, `clone` with
+  any `CLONE_NEW*` flag, `mount`, `umount2`, `pivot_root`, `chroot` and the new mount API
+  (`fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `open_tree_attr`,
+  `mount_setattr`), so even where unprivileged user namespaces are allowed a confined process
+  cannot make one (and reach the kernel code a namespace's capabilities open up). Also denied:
+  `userfaultfd`, `perf_event_open` and file handles (`name_to_handle_at`, `open_by_handle_at`).
+  `clone3` fails as unimplemented (`ENOSYS`), since a filter cannot see its flags; libc then falls
+  back to `clone`, so threads, `fork` and `posix_spawn` keep working. The worker and the
+  supervised server check that `unshare` and `clone3` are refused before they run anything.
 - **`sp1-gpu-server`** runs every SP1 proof's guest, so it is confined from its first
   instruction. The SDK starts it as `~/.sp1/bin/zkminer-confined-<name>`, a link to the worker,
   which starts the real server under a supervisor: the server's `socket`, `bind`, `listen` and
@@ -377,7 +387,7 @@ no second one):
   checked by the guard: requesters cannot change them, and a local chain node is a normal
   setup.
 - **What an escaped guest in an inline worker can still do.** It cannot open a socket or
-  connect anywhere, but it keeps what the GPU stack needs: the GPU device nodes and their ioctls
+  connect anywhere, make a namespace or mount anything, but it keeps what the GPU stack needs: the GPU device nodes and their ioctls
   (a kernel driver bug is outside this model), reading the system's files and `/proc` (other
   processes' command lines and status, not their memory or environment), and writing the caches
   listed above, which other GPU programs of the same user also load (a confined worker could

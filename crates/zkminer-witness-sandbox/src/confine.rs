@@ -18,7 +18,9 @@
 //!   connect are refused by Landlock too;
 //! - **other processes**: no signal to, and no `ptrace`-class access (`/proc/<pid>/mem`, `environ`,
 //!   `fd`) to, a process outside its Landlock domain (the miner, other workers); no abstract Unix
-//!   socket of another domain. The miner can still signal it.
+//!   socket of another domain. The miner can still signal it;
+//! - **kernel surface**: no namespace and no mount, no `userfaultfd`, `perf_event_open` or file
+//!   handles (see [`crate::netdeny`]).
 //!
 //! Landlock is applied to every thread at once with `LANDLOCK_RESTRICT_SELF_TSYNC` (ABI 8). On an
 //! older kernel the process must still be single-threaded, or confinement fails. Everything fails
@@ -277,7 +279,8 @@ impl std::fmt::Display for ConfinementReport {
 ///
 /// After applying it checks the result rather than the calls: `PR_GET_SECCOMP == 2`,
 /// `PR_GET_NO_NEW_PRIVS == 1`, every thread in seccomp filter mode, sockets of every kind refused,
-/// the root directory unreadable (Landlock is on), the parent process unreachable by signal. Then it
+/// `unshare` refused and `clone3` unimplemented (no namespace), the root directory unreadable
+/// (Landlock is on), the parent process unreachable by signal. Then it
 /// fails if a socket the policy does not let the process keep is still open, which no filter can
 /// take back: the caller must not run a guest then.
 ///
@@ -444,6 +447,10 @@ fn verify(c: &Confinement) -> Result<Vec<&'static str>, SandboxError> {
         return fail("a datagram socketpair still succeeds".into());
     }
     passed.push("datagram socketpair refused");
+    if let Err(what) = netdeny::namespaces_refused() {
+        return fail(what);
+    }
+    passed.push("namespaces refused");
     if !c.rules.iter().any(|(p, _)| p == Path::new("/")) {
         // SAFETY: a NUL-terminated path; an fd it returns is closed below.
         let fd = unsafe {

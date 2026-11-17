@@ -312,7 +312,7 @@ fn confine_child(
             return fail(&format!("seccomp: {e}"));
         }
     }
-    // Checked, not assumed: filter mode, no new privileges, no network socket.
+    // Checked, not assumed: filter mode, no new privileges, no network socket, no namespace.
     // SAFETY: getter prctls and a socket call whose fd is closed.
     unsafe {
         if libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) != 2
@@ -324,6 +324,9 @@ fn confine_child(
         if fd >= 0 || errno() != libc::EPERM {
             return fail("socket(AF_INET) still succeeds");
         }
+    }
+    if let Err(what) = netdeny::namespaces_refused() {
+        return fail(&what);
     }
     if !send_fd(sock, notif_fd) {
         return fail("cannot hand the listener to the supervisor");
