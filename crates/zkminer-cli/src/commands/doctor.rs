@@ -482,7 +482,14 @@ fn sysmem_fallback_check(report: &mut Report) {
     } else {
         format!("{} globally, {}", policy.global, own.join(", "))
     };
-    let detail = if policy.programs.iter().any(|(_, v)| v.falls_back()) {
+    let falls_back: Vec<Option<bool>> = policy
+        .programs
+        .iter()
+        .map(|(_, v)| v.falls_back())
+        .collect();
+    let detail = if falls_back.contains(&None) {
+        format!("{setting}: a value this build does not know, so what it does is not said here")
+    } else if falls_back.contains(&Some(true)) {
         format!(
             "{setting}. A proof that outgrows its card (something took VRAM after it started) then \
              moves into system memory and runs several times slower: it may still finish, or miss \

@@ -6114,7 +6114,9 @@ fn risc0_slot_sizes(
                     .find(|d| d.device_id == *device && d.prover_backend == risc0)
             });
             let over = overrides.get(device).copied();
-            let po2 = zkminer_prover::benchmark::risc0_slot_job_po2(device, over, row, *vram);
+            let gpu_tag = slot.split(':').nth(1).unwrap_or("");
+            let po2 =
+                zkminer_prover::benchmark::risc0_slot_job_po2(device, gpu_tag, over, row, *vram);
             (slot.clone(), device.clone(), po2)
         })
         .collect()
@@ -8376,7 +8378,8 @@ async fn miner_brain(
                         }
                     }
                     // No card here proves risc0 jobs: none has a size known to fit it (a card under
-                    // 6.5 GiB needs calibrating, or a size set for it), or each one that has is
+                    // 6.5 GiB, or an AMD or Intel one under 14, needs calibrating or a size set for
+                    // it), or each one that has is
                     // switched off. The job could only be released. (With no risc0 card at all, the
                     // availability check below says so.)
                     if !sim_mode
@@ -8390,7 +8393,8 @@ async fn miner_brain(
                         {
                             last_no_risc0_card_warn = Some(now);
                             let detail = "Not claiming risc0 jobs: no enabled card here has a risc0 \
-                                          job size. A card with under 6.5 GiB of VRAM needs one: a \
+                                          job size. A card with under 6.5 GiB of VRAM (14 GiB on \
+                                          AMD and Intel) needs one: a \
                                           po2 under Settings → Advanced for this session, or \
                                           `prover.risc0_job_po2` in the config or, on an NVIDIA \
                                           card, `zkminer benchmark --calibrate`, each read when the \
@@ -10251,7 +10255,8 @@ async fn watch_inspect(
         return Inspected::Done(
             "no card",
             format!(
-                "{head}: no enabled card here proves risc0 jobs (one with under 6.5 GiB of VRAM needs \
+                "{head}: no enabled card here proves risc0 jobs (one with under 6.5 GiB of VRAM, 14 \
+                 GiB on AMD and Intel, needs \
                  a size: `prover.risc0_job_po2` in the config, or a calibration on an NVIDIA card)"
             ),
         );

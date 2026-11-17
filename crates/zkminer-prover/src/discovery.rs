@@ -2216,13 +2216,13 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
 ///
 /// **hemilabs/sp1 #19 (6.8.1):** its server, on every backend, refuses only below
 /// `ceil(GiB) + 4 = 16`, so a 12 GB card (11.x GiB) runs, in the same element tier as a 16 GB one; an
-/// RTX 4070 and an Arc B580 proved SP1 Groth16 fibonacci on it. The floor is therefore 11 GB, the
-/// server's own. Whether a card has ROOM for a job is still [`min_available_vram_bytes_for_backend`]'s
-/// measured question, answered for 12-16 GB cards from an RTX 4070's peaks (2026-11-16); it also
-/// refuses a card of 11 GiB or less, which passes this decimal floor but not the server's.
+/// RTX 4070 and an Arc B580 proved SP1 Groth16 fibonacci on it. The floor is therefore the server's
+/// own: more than 11 GiB (an 11,264 MiB card is `11 + 4 = 15` and refused), in bytes as the card
+/// totals are read. Whether a card has ROOM for a job is still [`min_available_vram_bytes_for_backend`]'s
+/// measured question, answered for 12-16 GB CUDA cards from an RTX 4070's peaks (2026-11-16).
 pub fn min_vram_bytes_for_backend(backend: &str) -> Option<u64> {
     match backend {
-        "sp1" => Some(11_000_000_000),
+        "sp1" => Some(11 * 1024 * 1024 * 1024 + 1),
         _ => None,
     }
 }

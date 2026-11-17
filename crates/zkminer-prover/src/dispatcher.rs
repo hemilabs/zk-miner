@@ -2791,8 +2791,9 @@ impl SizingCap {
     /// Two stages, as in the processes themselves. The worker caps itself (`apply_sp1_element_threshold`
     /// → `sp1_element_threshold_cap`): the host's tier and the free-VRAM tier, the smaller winning, or
     /// the operator's value instead of both. Then `sp1-gpu-server` takes the minimum of that and its own
-    /// tier from the card's total (`sp1_fork_threshold_for_total_vram`) — so on a 16 GB card nothing
-    /// runs above 134M, whatever it was told.
+    /// tier from the card's total (`sp1_fork_threshold_for_total_vram`) — so on a 16 GB CUDA card
+    /// nothing runs above 268M, whatever it was told. `total` is `sizing_total`'s: `None` for a card
+    /// whose server tier is not modelled.
     fn tier_at(self, backend: &str, available: Option<u64>, total: Option<u64>) -> Option<u64> {
         use zkminer_prover_protocol::types as t;
         let told = match self {
@@ -3052,6 +3053,16 @@ fn vram_tier_shrank(
     };
     cap.tier_at(backend, assumed, total)
         .is_some_and(|then| then > now)
+}
+
+/// The card total `key`'s VRAM sizing is given: a CUDA card's, and none for an AMD or Intel card.
+///
+/// SP1's measured tables and the server-tier mirror are CUDA measurements: on a 16 GB SYCL card the
+/// server keeps the memory a CUDA one drops (an A770 peaks around 14 GB at 134M), and nothing has
+/// measured a HIP one. With no total, those cards are sized as the larger card's table says and the
+/// server's tier is not assumed — the room predicted is never smaller than the worker's.
+fn sizing_total(key: &str, total: u64) -> Option<u64> {
+    (key.split(':').nth(1) == Some("cuda")).then_some(total)
 }
 
 /// What one card's VRAM looks like to ONE slot at a moment in time.
@@ -4661,7 +4672,9 @@ impl WorkerPool {
         let po2 = match self.check_vram_budget(key, None)? {
             Some(budget) => {
                 let backend = key.split(':').next().unwrap_or(key);
-                let (fits, _) = crate::benchmark::find_optimal_po2(budget.available, backend, true);
+                let gpu_tag = key.split(':').nth(1).unwrap_or("");
+                let (fits, _) =
+                    crate::benchmark::find_optimal_gpu_po2(budget.available, backend, gpu_tag);
                 if fits < po2 {
                     tracing::info!(
                         "{key}: calibrating at po2={fits} instead of {po2} — only {:.1} GiB of this \
@@ -9438,7 +9451,7 @@ impl WorkerPool {
         let Some(mut card) = self.read_card(key) else {
             return Ok(None);
         };
-        let total = Some(card.total);
+        let total = sizing_total(key, card.total);
         // Compute the deadline cutoff BEFORE the first slot-taking call (own_slot), and
         // thread it through own_slot AND the resize, so neither can block unboundedly behind a cycle
         // measurement with the GPU guard held. A `None` abort (benchmark/calibration) means no cutoff.
@@ -12870,7 +12883,7 @@ mod tests {
     /// arithmetic expects, which a unit test cannot.
     #[test]
     fn the_clamp_would_fire_on_a_real_occupied_card() {
-        use crate::benchmark::find_optimal_po2;
+        use crate::benchmark::find_optimal_gpu_po2;
         let Some(gpus) = crate::discovery::detect_nvidia_via_smi_for_test() else {
             eprintln!("no card — skipping");
             return;
@@ -12883,8 +12896,8 @@ mod tests {
             };
             let total = card.total;
             let free = card.available_to("risc0:cuda:probe");
-            let (by_capacity, _) = find_optimal_po2(total, "risc0", true);
-            let (by_free, _) = find_optimal_po2(free, "risc0", true);
+            let (by_capacity, _) = find_optimal_gpu_po2(total, "risc0", "cuda");
+            let (by_free, _) = find_optimal_gpu_po2(free, "risc0", "cuda");
             eprintln!(
                 "cuda:{idx}: {:.0} MiB free of {:.0} MiB -> po2 {by_free} (capacity would allow \
                  {by_capacity})",
@@ -13028,12 +13041,12 @@ mod tests {
     /// adaptation for risc0: a card with a display gets a smaller segment, not a refusal.
     #[test]
     fn the_segment_shrinks_as_free_vram_shrinks() {
-        use crate::benchmark::{find_optimal_po2, PO2_MIN};
+        use crate::benchmark::{find_optimal_gpu_po2, PO2_MIN};
         const GIB: u64 = 1024 * 1024 * 1024;
 
-        let (full, _) = find_optimal_po2(24 * GIB, "risc0", true);
-        let (half, _) = find_optimal_po2(12 * GIB, "risc0", true);
-        let (tiny, _) = find_optimal_po2(GIB, "risc0", true);
+        let (full, _) = find_optimal_gpu_po2(24 * GIB, "risc0", "cuda");
+        let (half, _) = find_optimal_gpu_po2(12 * GIB, "risc0", "cuda");
+        let (tiny, _) = find_optimal_gpu_po2(GIB, "risc0", "cuda");
         assert!(
             full > half && half > tiny,
             "a smaller budget must pick a smaller segment: 24GiB->{full}, 12GiB->{half}, 1GiB->{tiny}"
@@ -13042,7 +13055,7 @@ mod tests {
         // non-monotonic `fits` would make the clamp jump about as a display is resized.
         let mut prev = 0u8;
         for gib in 1..=48u64 {
-            let (fits, _) = find_optimal_po2(gib * GIB, "risc0", true);
+            let (fits, _) = find_optimal_gpu_po2(gib * GIB, "risc0", "cuda");
             assert!(
                 fits >= prev,
                 "po2 fell as VRAM grew at {gib} GiB: {fits} < {prev}"

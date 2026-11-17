@@ -1888,7 +1888,13 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             .map(|b| format!("{:.1} GB", b as f64 / 1e9))
             .unwrap_or_else(|| "unknown".into()),
     );
-    apply_sp1_worker_tuning(sp1_scale, available_vram, vram_bytes);
+    // The measured tables are CUDA measurements, so another vendor's server is sized by the larger
+    // card's table, as the dispatcher sizes it (`sizing_total`).
+    apply_sp1_worker_tuning(
+        sp1_scale,
+        available_vram,
+        vram_bytes.filter(|_| warmup::drives_cuda()),
+    );
     #[cfg(windows)]
     windows_tuning::apply_sycl_wrap_persistent_pk(vram_bytes);
     #[cfg(windows)]

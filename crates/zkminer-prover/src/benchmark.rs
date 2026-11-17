@@ -272,12 +272,27 @@ impl Po2Profile {
 /// and an 8 GB one 18.
 pub const RISC0_JOB_VRAM_MARGIN: u64 = 1_900 * 1024 * 1024;
 
-/// The smallest card that proves risc0 jobs by default: [`RISC0_GPU_MEASURED_PEAK_MIB`]'s smallest
-/// size plus [`RISC0_JOB_VRAM_MARGIN`]. A smaller one needs a size set for it, or a calibration.
+/// The smallest CUDA card that proves risc0 jobs by default: [`RISC0_GPU_MEASURED_PEAK_MIB`]'s
+/// smallest size plus [`RISC0_JOB_VRAM_MARGIN`]. A smaller one needs a size set for it, or a
+/// calibration.
 pub const RISC0_JOB_MIN_VRAM_BYTES: u64 =
     RISC0_GPU_MEASURED_PEAK_MIB[0].1 * 1024 * 1024 + RISC0_JOB_VRAM_MARGIN;
 
-/// The default segment size for a card of `vram` bytes: the largest MEASURED size, up to
+/// The smallest AMD or Intel card that proves risc0 jobs by default, at the default size: nothing
+/// has measured those vendors' cards per size, so a smaller one needs a size set for it or a
+/// calibration, as every card under this did before the CUDA sizes were measured.
+pub const RISC0_JOB_MIN_VRAM_BYTES_UNMEASURED: u64 = 14 * 1024 * 1024 * 1024;
+
+/// The smallest card of vendor `gpu_tag` that proves risc0 jobs by default.
+pub fn risc0_job_min_vram_bytes(gpu_tag: &str) -> u64 {
+    if gpu_tag == "cuda" {
+        RISC0_JOB_MIN_VRAM_BYTES
+    } else {
+        RISC0_JOB_MIN_VRAM_BYTES_UNMEASURED
+    }
+}
+
+/// The default segment size for a CUDA card of `vram` bytes: the largest MEASURED size, up to
 /// [`RISC0_DEFAULT_JOB_PO2`], whose peak plus [`RISC0_JOB_VRAM_MARGIN`] fits, or `None` when even the
 /// smallest does not. Never an extrapolated size: a card is only given what something has proved.
 ///
@@ -296,8 +311,9 @@ pub fn risc0_default_job_po2_for_vram(vram: u64) -> Option<u8> {
 ///
 /// In order: the operator's size for the card (config or Settings); else, by default,
 /// [`RISC0_DEFAULT_JOB_PO2`] on a card whose VRAM is unknown (what every card proved at before), or the
-/// largest measured size that fits (`risc0_default_job_po2_for_vram`: 20 from 14 GiB, 19 on a 12 GB
-/// card, 18 on an 8 GB one), or nothing on a card too small for any; a calibration (real
+/// largest measured size that fits on a CUDA card (`risc0_default_job_po2_for_vram`: 20 from 14
+/// GiB, 19 on a 12 GB card, 18 on an 8 GB one), 20 on an AMD or Intel card from
+/// [`RISC0_JOB_MIN_VRAM_BYTES_UNMEASURED`], or nothing on a card too small; a calibration (real
 /// Groth16 proofs at each size, see `calibrate_po2_for_suite`) can raise that default to its
 /// measured-fastest size or give a smaller card one, but never lowers it below a size it proved: its
 /// ceiling keeps a step of headroom below the highest size that succeeded, which on the 16 GB 5080 is
@@ -313,6 +329,7 @@ pub fn risc0_job_po2(
     override_po2: Option<u8>,
     row: Option<&DeviceBenchmark>,
     vram_bytes: Option<u64>,
+    gpu_tag: &str,
 ) -> Option<u8> {
     use zkminer_prover_protocol::{RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
     let in_range = |p: u8| p.clamp(RISC0_JOB_PO2_MIN, RISC0_JOB_PO2_MAX);
@@ -320,8 +337,9 @@ pub fn risc0_job_po2(
         return Some(in_range(p));
     }
     let default = match vram_bytes {
-        Some(v) => risc0_default_job_po2_for_vram(v),
-        None => Some(RISC0_DEFAULT_JOB_PO2),
+        Some(v) if gpu_tag == "cuda" => risc0_default_job_po2_for_vram(v),
+        Some(v) if v < RISC0_JOB_MIN_VRAM_BYTES_UNMEASURED => None,
+        _ => Some(RISC0_DEFAULT_JOB_PO2),
     };
     match row.filter(|db| db.prover_backend == "risc0" && !db.po2_samples.is_empty()) {
         Some(db) => {
@@ -346,15 +364,18 @@ pub fn risc0_job_po2(
 /// 18), and 20 to any figure of at least [`RISC0_JOB_MIN_VRAM_BYTES`], which only agrees with the
 /// table since M8. A calibrated Metal row is honoured as for any card, and
 /// raised only to the table's size. An operator override still wins. Every other device: unchanged.
+/// `gpu_tag` is the slot's GPU backend (`cuda`, `rocm`, `intel`, `metal`), as [`risc0_job_po2`]
+/// takes it.
 pub fn risc0_slot_job_po2(
     device_id: &str,
+    gpu_tag: &str,
     override_po2: Option<u8>,
     row: Option<&DeviceBenchmark>,
     vram_bytes: Option<u64>,
 ) -> Option<u8> {
     use zkminer_prover_protocol::{RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
     if !is_metal_device_id(device_id) {
-        return risc0_job_po2(override_po2, row, vram_bytes);
+        return risc0_job_po2(override_po2, row, vram_bytes, gpu_tag);
     }
     let in_range = |p: u8| p.clamp(RISC0_JOB_PO2_MIN, RISC0_JOB_PO2_MAX);
     if let Some(p) = override_po2 {
@@ -636,7 +657,7 @@ pub const PO2_MAX: u8 = 24;
 /// about 1.2 GiB is fixed, and what grows grew 3.4 then 4.2 GiB a step.
 pub const RISC0_GPU_MEASURED_PEAK_MIB: &[(u8, u64)] = &[(18, 4_709), (19, 8_179), (20, 12_436)];
 
-/// [`RISC0_GPU_MEASURED_PEAK_MIB`] at `po2`, in bytes: measured where it was, the 18 figure below that
+/// [`RISC0_GPU_MEASURED_PEAK_MIB`] at `po2`, in bytes, for a CUDA card: measured where it was, the 18 figure below that
 /// (a smaller segment needs no more), and above 20 each step's growth doubled from the last measured
 /// one — 20,950 MiB at 21 and 37,978 at 22, which agrees with what is known there: a 24 GB RTX 4090
 /// proved 21 and failed 22 on a single 13.2 GiB allocation, and a 16 GB card spilled at 21.
@@ -659,15 +680,32 @@ fn risc0_gpu_peak(po2: u8) -> u64 {
     peak.saturating_mul(MIB)
 }
 
-/// Estimate memory usage for a given po2, backend, and device type.
+/// Estimate memory usage on a GPU of vendor `gpu_tag` for a given po2 and backend.
 ///
-/// risc0 on a GPU: [`RISC0_GPU_MEASURED_PEAK_MIB`]. Everything else is a guess: base memory at
-/// po2=18 of 512 MB on a CPU and 256 MB on a GPU, doubling each po2 step, with the backend's
-/// multiplier on top.
-pub fn estimate_po2_memory(po2: u8, backend: &str, is_gpu: bool) -> u64 {
-    if is_gpu && backend == "risc0" {
+/// risc0 on a CUDA card: [`RISC0_GPU_MEASURED_PEAK_MIB`]. Anything else: [`estimate_po2_memory`]'s
+/// guess, which is far below a risc0 CUDA card's real figures — AMD and Intel cards keep it because
+/// nothing has measured them per size, and their memory use differs (a 12 GB Arc B580 proved po2 20
+/// without spilling, which a 12 GB RTX 4070 cannot), so their calibration still sweeps as high as it
+/// did and finds out.
+pub fn estimate_gpu_po2_memory(po2: u8, backend: &str, gpu_tag: &str) -> u64 {
+    if backend == "risc0" && gpu_tag == "cuda" {
         return risc0_gpu_peak(po2);
     }
+    estimate_po2_memory(po2, backend, true)
+}
+
+/// Sweep po2 from 18..=24 and find the largest that fits in the memory budget of a GPU of vendor
+/// `gpu_tag`, by [`estimate_gpu_po2_memory`]. Returns `(optimal_po2, memory_at_optimal)`.
+pub fn find_optimal_gpu_po2(device_memory_bytes: u64, backend: &str, gpu_tag: &str) -> (u8, u64) {
+    largest_po2_within(device_memory_bytes, |po2| {
+        estimate_gpu_po2_memory(po2, backend, gpu_tag)
+    })
+}
+
+/// Estimate memory usage for a given po2, backend, and device type: a guess, base memory at po2=18
+/// of 512 MB on a CPU and 256 MB on a GPU, doubling each po2 step, with the backend's multiplier on
+/// top. For a GPU, [`estimate_gpu_po2_memory`] is the better figure.
+pub fn estimate_po2_memory(po2: u8, backend: &str, is_gpu: bool) -> u64 {
     let base: u64 = if is_gpu {
         256 * 1024 * 1024 // 256 MB
     } else {
@@ -694,12 +732,20 @@ pub fn po2_throughput_factor(po2: u8) -> f64 {
 ///
 /// Returns `(optimal_po2, memory_at_optimal)`.
 pub fn find_optimal_po2(device_memory_bytes: u64, backend: &str, is_gpu: bool) -> (u8, u64) {
+    largest_po2_within(device_memory_bytes, |po2| {
+        estimate_po2_memory(po2, backend, is_gpu)
+    })
+}
+
+/// The largest po2 whose `estimate` fits 90% of `device_memory_bytes`, and that estimate; `PO2_MIN`
+/// when none does.
+fn largest_po2_within(device_memory_bytes: u64, estimate: impl Fn(u8) -> u64) -> (u8, u64) {
     let budget = (device_memory_bytes as f64 * 0.90) as u64;
     let mut best_po2 = PO2_MIN;
-    let mut best_mem = estimate_po2_memory(PO2_MIN, backend, is_gpu);
+    let mut best_mem = estimate(PO2_MIN);
 
     for po2 in PO2_MIN..=PO2_MAX {
-        let mem = estimate_po2_memory(po2, backend, is_gpu);
+        let mem = estimate(po2);
         if mem <= budget {
             best_po2 = po2;
             best_mem = mem;
@@ -868,7 +914,7 @@ pub fn add_gpu_device_benchmarks(suite: &mut BenchmarkSuite, gpus: &[GpuDesc]) {
             };
 
             let (optimal_po2, memory_usage_bytes) =
-                find_optimal_po2(gpu.vram_bytes, profile.name, true);
+                find_optimal_gpu_po2(gpu.vram_bytes, profile.name, "cuda");
             // Only apply po2 throughput factor for risc0 — SP1/OpenVM have their
             // own segmentation that ignores the risc0 po2 parameter.
             let po2_factor = if profile.name == "risc0" {
@@ -2238,7 +2284,7 @@ fn build_gpu_device_benchmarks_with(
                 let po2 = metal_job_po2(vram_bytes);
                 (po2, crate::metal_sizing::stark_peak_bytes(po2))
             }
-            Some(vram) if vram > 0 => find_optimal_po2(vram, backend, true),
+            Some(vram) if vram > 0 => find_optimal_gpu_po2(vram, backend, &r.gpu_tag),
             _ => {
                 tracing::warn!(
                     "{slot_key}: VRAM unknown — leaving po2 at {PO2_MAX} (unsized). \
@@ -2390,7 +2436,7 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
         pool.settle_vram(&key);
         let free_po2 = match pool.vram_budget_for_slot(&key) {
             Some(budget) if budget.total > 0 => {
-                let (fits, _) = find_optimal_po2(budget.available, "risc0", true);
+                let (fits, _) = find_optimal_gpu_po2(budget.available, "risc0", gpu_tag);
                 Some(fits)
             }
             _ => None,
@@ -2464,7 +2510,7 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
                  headroom, so this card keeps its default size (none under {:.1} GiB of VRAM) \
                  unless it is given one",
                 zkminer_prover_protocol::RISC0_JOB_PO2_MIN,
-                RISC0_JOB_MIN_VRAM_BYTES as f64 / (1u64 << 30) as f64,
+                risc0_job_min_vram_bytes(gpu_tag) as f64 / (1u64 << 30) as f64,
             );
             continue;
         };
@@ -2510,7 +2556,7 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
                 );
                 db.optimal_po2 = best;
             }
-            db.memory_usage_bytes = estimate_po2_memory(best, backend, true);
+            db.memory_usage_bytes = estimate_gpu_po2_memory(best, backend, gpu_tag);
         }
         if usable {
             tracing::info!("{key}: adopting {} po2 calibration samples", samples.len());
@@ -2542,10 +2588,10 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
 ///   "failed to run groth16 prove operation: cudaMallocAsync ... out of memory".
 /// The calibration sweep and a live job do not see the same memory state (fragmentation, buffer pools,
 /// a second worker on the card), so the very top of the measured range is marginal. Each po2 step
-/// doubles the segment, so backing off one step buys ~2x headroom. A sweep that ran clean to a top set
-/// by the card's memory needs no backoff; one that reached `RISC0_JOB_PO2_MAX`, which no failure
-/// could show the card's limit at, does. When no sample lies at or below the ceiling, the ceiling
-/// itself is proved too.
+/// doubles the segment, so backing off one step buys ~2x headroom. A sweep that ran clean to its top
+/// backs off too: that top is `RISC0_JOB_PO2_MAX`, past which no failure can be seen, or one set by
+/// what the card's free VRAM is estimated to hold, which is not an observed limit either. When no
+/// sample lies at or below the ceiling, the ceiling itself is proved too.
 ///
 /// `prove(p)` proves the calibration workload at `p` and returns its sample.
 fn sweep_po2(
@@ -2560,7 +2606,6 @@ fn sweep_po2(
         }
     }
     let mut samples = Vec::new();
-    let mut failed = false;
     for po2 in start..=top {
         match prove(po2) {
             Some(s) => {
@@ -2570,10 +2615,7 @@ fn sweep_po2(
                     break;
                 }
             }
-            None => {
-                failed = true;
-                break;
-            }
+            None => break,
         }
     }
     if samples.is_empty() {
@@ -2587,13 +2629,12 @@ fn sweep_po2(
     let Some(highest) = samples.iter().map(|s| s.po2).max() else {
         return (Vec::new(), None);
     };
-    // Reaching the job range's top proves nothing about headroom: the prover refuses anything larger,
-    // so no failure above it could be seen.
-    let ceiling = if failed || highest >= zkminer_prover_protocol::RISC0_JOB_PO2_MAX {
-        highest.saturating_sub(1)
-    } else {
-        highest
-    };
+    // One step of headroom, always. After a failure, below it; at the top of the range, because no
+    // failure above could be seen — and that top is either the job range's, which the prover refuses
+    // past, or one set by what the card's free VRAM is ESTIMATED to hold (a measured peak, or one
+    // extrapolated from them), never by an observed failure. A 4090 capped at 21 that way proved 21
+    // in calibration, and a real job at 21 then ran out of memory.
+    let ceiling = highest.saturating_sub(1);
     if ceiling < RISC0_JOB_PO2_MIN {
         return (Vec::new(), None);
     }
@@ -3832,6 +3873,8 @@ mod tests {
     #[test]
     fn find_optimal_po2_gpu_follows_the_measured_peaks() {
         const MIB: u64 = 1024 * 1024;
+        let find_optimal_po2 =
+            |vram, backend, _gpu: bool| find_optimal_gpu_po2(vram, backend, "cuda");
         // 90% of what is available must hold the size's measured peak.
         // An 8 GB card: 7.2 GiB holds 18 (4,709 MiB), not 19 (8,179).
         assert_eq!(find_optimal_po2(8 * 1024 * MIB, "risc0", true).0, 18);
@@ -3843,11 +3886,16 @@ mod tests {
         assert_eq!(find_optimal_po2(24_109 * MIB, "risc0", true).0, 21);
         // Below the smallest size there is nothing smaller to offer.
         assert_eq!(find_optimal_po2(2 * 1024 * MIB, "risc0", true).0, PO2_MIN);
+        // An AMD or Intel card keeps the old estimate, so its calibration still sweeps high: a 12 GB
+        // Arc B580 proves po2 20.
+        assert!(find_optimal_gpu_po2(12 * 1024 * MIB, "risc0", "intel").0 >= 20);
     }
 
     #[test]
     fn the_risc0_gpu_estimate_is_the_measured_peak() {
         const MIB: u64 = 1024 * 1024;
+        let estimate_po2_memory =
+            |po2, backend, _gpu: bool| estimate_gpu_po2_memory(po2, backend, "cuda");
         for (po2, mib) in RISC0_GPU_MEASURED_PEAK_MIB {
             assert_eq!(estimate_po2_memory(*po2, "risc0", true), mib * MIB);
         }
@@ -4907,13 +4955,13 @@ mod tests {
         let mac24 = Some(16 * GIB);
         let mac36 = Some(28 * GIB);
         // The rule the host used before: wrong for both small Macs.
-        assert_eq!(risc0_job_po2(None, None, mac24), Some(20));
-        assert_eq!(risc0_job_po2(None, None, mac16), None);
+        assert_eq!(risc0_job_po2(None, None, mac24, "metal"), Some(20));
+        assert_eq!(risc0_job_po2(None, None, mac16, "metal"), None);
         // Per slot: what the table says for the host figure and this process's budget, if any
         // (the budget runs set RISC0_METAL_MAX_WORKING_SET_BYTES for the whole process).
         for vram in [mac16, mac24, mac36] {
             assert_eq!(
-                risc0_slot_job_po2("gpu-metal0", None, None, vram),
+                risc0_slot_job_po2("gpu-metal0", "metal", None, None, vram),
                 Some(metal_job_po2(vram))
             );
         }
@@ -4930,11 +4978,11 @@ mod tests {
         );
         // An override still wins; a discrete card is unchanged.
         assert_eq!(
-            risc0_slot_job_po2("gpu-metal0", Some(17), None, mac36),
+            risc0_slot_job_po2("gpu-metal0", "metal", Some(17), None, mac36),
             Some(17)
         );
-        assert_eq!(risc0_slot_job_po2("gpu0", None, None, mac24), Some(20));
-        assert_eq!(risc0_slot_job_po2("gpu-rocm0", None, None, mac16), None);
+        assert_eq!(risc0_slot_job_po2("gpu0", "cuda", None, None, mac24), Some(20));
+        assert_eq!(risc0_slot_job_po2("gpu-rocm0", "rocm", None, None, mac16), None);
         // A calibrated Mac: its measured size stands below the table's (the table's size failed
         // there), and is raised to the table's when the calibration proved it.
         let calibrated = |ceiling: u8| {
@@ -4950,11 +4998,11 @@ mod tests {
             return;
         }
         assert_eq!(
-            risc0_slot_job_po2("gpu-metal0", None, Some(&calibrated(d - 2)), mac36),
+            risc0_slot_job_po2("gpu-metal0", "metal", None, Some(&calibrated(d - 2)), mac36),
             Some(d - 2)
         );
         assert_eq!(
-            risc0_slot_job_po2("gpu-metal0", None, Some(&calibrated(d - 1)), mac36),
+            risc0_slot_job_po2("gpu-metal0", "metal", None, Some(&calibrated(d - 1)), mac36),
             Some(d)
         );
     }
@@ -4983,6 +5031,9 @@ mod tests {
 
     #[test]
     fn a_card_proves_risc0_jobs_at_its_override_else_its_default_raised_by_calibration() {
+        fn cuda_job_po2(o: Option<u8>, r: Option<&DeviceBenchmark>, v: Option<u64>) -> Option<u8> {
+            risc0_job_po2(o, r, v, "cuda")
+        }
         use zkminer_prover_protocol::{RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
         const GIB: u64 = 1 << 30;
         let calibrated = |ceiling: u8| {
@@ -4996,75 +5047,83 @@ mod tests {
 
         // By default: 20, unless the card is known too small for it, which gets the largest measured
         // size that fits.
-        assert_eq!(risc0_job_po2(None, None, None), Some(20));
-        assert_eq!(risc0_job_po2(None, None, Some(16 * GIB)), Some(20));
-        assert_eq!(risc0_job_po2(None, None, Some(14 * GIB)), Some(20));
-        assert_eq!(risc0_job_po2(None, None, Some(14 * GIB - 1)), Some(19));
-        assert_eq!(risc0_job_po2(None, None, Some(12_282 << 20)), Some(19));
-        assert_eq!(risc0_job_po2(None, None, Some(8 * GIB)), Some(18));
+        assert_eq!(cuda_job_po2(None, None, None), Some(20));
+        assert_eq!(cuda_job_po2(None, None, Some(16 * GIB)), Some(20));
+        assert_eq!(cuda_job_po2(None, None, Some(14 * GIB)), Some(20));
+        assert_eq!(cuda_job_po2(None, None, Some(14 * GIB - 1)), Some(19));
+        assert_eq!(cuda_job_po2(None, None, Some(12_282 << 20)), Some(19));
+        assert_eq!(cuda_job_po2(None, None, Some(8 * GIB)), Some(18));
         assert_eq!(
-            risc0_job_po2(None, None, Some(RISC0_JOB_MIN_VRAM_BYTES)),
+            cuda_job_po2(None, None, Some(RISC0_JOB_MIN_VRAM_BYTES)),
             Some(18)
         );
         assert_eq!(
-            risc0_job_po2(None, None, Some(RISC0_JOB_MIN_VRAM_BYTES - 1)),
+            cuda_job_po2(None, None, Some(RISC0_JOB_MIN_VRAM_BYTES - 1)),
             None
         );
-        assert_eq!(risc0_job_po2(None, None, Some(4 * GIB)), None);
+        assert_eq!(cuda_job_po2(None, None, Some(4 * GIB)), None);
         assert_eq!(
-            risc0_job_po2(None, Some(&heuristic), Some(80 * GIB)),
+            cuda_job_po2(None, Some(&heuristic), Some(80 * GIB)),
             Some(20)
         );
-        assert_eq!(risc0_job_po2(None, Some(&heuristic), Some(4 * GIB)), None);
+        assert_eq!(cuda_job_po2(None, Some(&heuristic), Some(4 * GIB)), None);
         // A calibration gives a card too small for any default its measured size...
         assert_eq!(
-            risc0_job_po2(None, Some(&calibrated(18)), Some(6 * GIB)),
+            cuda_job_po2(None, Some(&calibrated(18)), Some(6 * GIB)),
             Some(18)
         );
         // ...and a 12 GB card keeps its default 19 when the calibration proved 19 (a ceiling of 18).
         assert_eq!(
-            risc0_job_po2(None, Some(&calibrated(18)), Some(12 * GIB)),
+            cuda_job_po2(None, Some(&calibrated(18)), Some(12 * GIB)),
             Some(19)
         );
         // ...raises a big one above the default...
         assert_eq!(
-            risc0_job_po2(None, Some(&calibrated(21)), Some(32 * GIB)),
+            cuda_job_po2(None, Some(&calibrated(21)), Some(32 * GIB)),
             Some(21)
         );
         // ...but never lowers it (its ceiling keeps a step below the highest size that proved).
         assert_eq!(
-            risc0_job_po2(None, Some(&calibrated(19)), Some(16 * GIB)),
+            cuda_job_po2(None, Some(&calibrated(19)), Some(16 * GIB)),
             Some(20)
         );
-        assert_eq!(risc0_job_po2(None, Some(&calibrated(19)), None), Some(20));
+        assert_eq!(cuda_job_po2(None, Some(&calibrated(19)), None), Some(20));
         // A calibration that saw the default size fail (a ceiling of 18: 19 was its highest
         // success) stands, whatever the card's VRAM (a display held some; the read failed).
         assert_eq!(
-            risc0_job_po2(None, Some(&calibrated(18)), Some(16 * GIB)),
+            cuda_job_po2(None, Some(&calibrated(18)), Some(16 * GIB)),
             Some(18)
         );
-        assert_eq!(risc0_job_po2(None, Some(&calibrated(18)), None), Some(18));
+        assert_eq!(cuda_job_po2(None, Some(&calibrated(18)), None), Some(18));
         // Never above its ceiling, and within the job range (a cache from before the range).
         let mut over = calibrated(19);
         over.optimal_po2 = 21;
-        assert_eq!(risc0_job_po2(None, Some(&over), Some(12 * GIB)), Some(19));
+        assert_eq!(cuda_job_po2(None, Some(&over), Some(12 * GIB)), Some(19));
         let mut huge = calibrated(21);
         (huge.optimal_po2, huge.max_feasible_po2) = (24, 24);
         assert_eq!(
-            risc0_job_po2(None, Some(&huge), None),
+            cuda_job_po2(None, Some(&huge), None),
             Some(RISC0_JOB_PO2_MAX)
         );
         // Another backend's row is not this card's risc0 calibration.
         let mut sp1 = calibrated(19);
         sp1.prover_backend = "sp1".to_string();
-        assert_eq!(risc0_job_po2(None, Some(&sp1), Some(4 * GIB)), None);
+        assert_eq!(cuda_job_po2(None, Some(&sp1), Some(4 * GIB)), None);
         // An override wins, held to the job range.
         assert_eq!(
-            risc0_job_po2(Some(18), Some(&calibrated(21)), Some(8 * GIB)),
+            cuda_job_po2(Some(18), Some(&calibrated(21)), Some(8 * GIB)),
             Some(18)
         );
-        assert_eq!(risc0_job_po2(Some(23), None, None), Some(RISC0_JOB_PO2_MAX));
-        assert_eq!(risc0_job_po2(Some(14), None, None), Some(RISC0_JOB_PO2_MIN));
+        assert_eq!(cuda_job_po2(Some(23), None, None), Some(RISC0_JOB_PO2_MAX));
+        assert_eq!(cuda_job_po2(Some(14), None, None), Some(RISC0_JOB_PO2_MIN));
+        // An AMD or Intel card keeps the rule from before the CUDA sizes were measured: 20 from 14 GiB,
+        // nothing under it unless calibrated or set.
+        assert_eq!(risc0_job_po2(None, None, Some(16 * GIB), "rocm"), Some(20));
+        assert_eq!(risc0_job_po2(None, None, Some(12 * GIB), "intel"), None);
+        assert_eq!(
+            risc0_job_po2(None, Some(&calibrated(20)), Some(12 * GIB), "intel"),
+            Some(20)
+        );
     }
 
     #[test]
@@ -5134,27 +5193,26 @@ mod tests {
         // Nothing in the job range with headroom: no size.
         assert_eq!(sweep(18, 22, Some(16)).1, None);
         assert_eq!(sweep(18, 22, None), (vec![], None, vec![18, 17, 16]));
-        // Clean to a top set by the card's memory: no step back...
+        // Clean to a top set by what the card's free VRAM is estimated to hold: one step back, as a
+        // 4090 capped at 21 that way proved 21 in calibration and then ran a real job out of memory...
         assert_eq!(
             sweep(18, 20, Some(22)),
-            (vec![18, 19, 20], Some(20), vec![18, 19, 20])
+            (vec![18, 19], Some(19), vec![18, 19, 20])
         );
-        // ...but clean to the job range's top, beyond which the prover refuses: one.
+        // ...and clean to the job range's top, beyond which the prover refuses: one.
         assert_eq!(
             sweep(18, 22, Some(22)),
             (vec![18, 19, 20, 21, 22], Some(21), vec![18, 19, 20, 21, 22])
         );
-        // A sample at a smaller size than asked (free VRAM short) ends the sweep without a failure.
+        // A sample at a smaller size than asked (free VRAM short) ends the sweep without a failure, at a
+        // size the estimate set: one step back from it too.
         let mut asked = Vec::new();
         let (samples, ceiling) = sweep_po2(18, 22, |p| {
             asked.push(p);
             Some(sample(p.min(19), 4, 1e6))
         });
-        assert_eq!(
-            samples.iter().map(|s| s.po2).collect::<Vec<_>>(),
-            vec![18, 19]
-        );
-        assert_eq!((ceiling, asked), (Some(19), vec![18, 19, 20]));
+        assert_eq!(samples.iter().map(|s| s.po2).collect::<Vec<_>>(), vec![18]);
+        assert_eq!((ceiling, asked), (Some(18), vec![18, 19, 20]));
     }
 
     #[test]

@@ -111,7 +111,12 @@ fn running_verdict(
                     .find(|d| d.device_id == device && d.prover_backend == BACKEND_RISC0)
             });
             let over = risc0_sizes.get(&device).copied();
-            match zkminer_prover::benchmark::risc0_job_po2(over, row, slot.vram_bytes) {
+            match zkminer_prover::benchmark::risc0_job_po2(
+                over,
+                row,
+                slot.vram_bytes,
+                &slot.gpu_tag,
+            ) {
                 Some(po2) => Verdict::Ready(format!(
                     "segment size 2^{po2}{}",
                     match (over, row.is_some_and(|r| !r.po2_samples.is_empty())) {
@@ -125,18 +130,17 @@ fn running_verdict(
                      Run `zkminer benchmark --calibrate` with the miner stopped to measure one, or \
                      set one (`[prover.risc0_job_po2]` {device} = 18; untested on cards this \
                      size).",
-                    zkminer_prover::benchmark::RISC0_JOB_MIN_VRAM_BYTES as f64 / GIB
+                    zkminer_prover::benchmark::risc0_job_min_vram_bytes(&slot.gpu_tag) as f64 / GIB
                 )),
             }
         }
         BACKEND_SP1 => {
-            let floor = zkminer_prover::discovery::min_available_vram_bytes_for_backend(
-                BACKEND_SP1,
-                slot.vram_bytes,
-            );
+            // The tables are CUDA measurements; another vendor's card is held to the larger one's.
+            let total = slot.vram_bytes.filter(|_| slot.gpu_tag == "cuda");
+            let floor =
+                zkminer_prover::discovery::min_available_vram_bytes_for_backend(BACKEND_SP1, total);
             // What SP1's smallest measured configuration needs free, whatever the override.
-            let measured =
-                zkminer_prover_protocol::types::sp1_min_available_vram_bytes(slot.vram_bytes);
+            let measured = zkminer_prover_protocol::types::sp1_min_available_vram_bytes(total);
             if measured == u64::MAX {
                 return Verdict::Idle(
                     "SP1's GPU server refuses cards of 11 GiB or less, so it gets no SP1 work"

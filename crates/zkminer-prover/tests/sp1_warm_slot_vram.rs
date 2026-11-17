@@ -72,11 +72,16 @@ fn our_own_device_memory_is_never_counted_as_foreign() {
 
     // The rule is now "the backend's floor must be FREE", so what this test must show is that our
     // own server's VRAM does not count against that floor. See `min_available_vram_bytes_for_backend`.
-    let needed = zkminer_prover::discovery::min_available_vram_bytes_for_backend("sp1", None)
+    // The floor for this card's own total, as the gate reads it (CUDA cards only; see
+    // `sizing_total`).
+    let total = pool
+        .vram_budget_for_slot(&key)
+        .map(|b| b.total)
+        .filter(|_| key.split(':').nth(1) == Some("cuda"));
+    let needed = zkminer_prover::discovery::min_available_vram_bytes_for_backend("sp1", total)
         .expect("sp1 must require free VRAM for this test to mean anything");
 
-    // What the card holds for others before the proof: a display (1.3 GB of a desktop's RTX 5090
-    // under Windows), the other backend's idle worker. That is rightly charged against the slot, so the
+    // What the card holds for others before the proof: a display, the other backend's idle worker. That is rightly charged against the slot, so the
     // bound below is on what is charged beyond it. Unreadable: 0, which bounds the absolute figure.
     let baseline_elsewhere = pool
         .vram_budget_for_slot(&key)
