@@ -223,12 +223,33 @@ executor:
   `overlay`, `squashfs`, `proc`, `sysfs`, ...); anything else is refused, unknown types included.
   Every path it is granted must be on a local filesystem by `statfs`, and so must its working
   directory and every file or directory it holds open. The error names each mount, its type and
-  its source. Two exceptions, where the kernel itself keeps the process out: another user's FUSE
-  mount without `allow_other` (the kernel refuses this user's lookups before the daemon sees them;
-  a `statx` of its root must fail to confirm it), and a direct automount point whose target is local (systemd's for `binfmt_misc` or the EFI
-  partition; an idle one is triggered once to see what it mounts). The check runs again once the
-  confinement is on, and the builder runner, the execute worker and the broker make it too, before
-  their sandbox is applied (the broker's paths by `statfs` as well).
+  its source. The exceptions:
+  - another user's FUSE mount without `allow_other`: the kernel refuses this user's lookups before
+    the daemon sees them (a `statx` of its root must fail to confirm it);
+  - FUSE filesystems whose daemon serves only what is on this host, by construction, each
+    recognised by its subtype together with its owner (only root or this user can mount one under
+    their own id) and its source: xdg-document-portal (`fuse.portal`, this user's, at
+    `/run/user/<uid>/doc`: the documents the user handed to sandboxed apps, by id — a name it
+    does not know it answers itself, and the documents are the user's own files, whose
+    filesystems are judged in their own right); lxcfs (`fuse.lxcfs`, root's: containers' views of
+    `/proc` and `/sys` computed from this kernel's data); a FUSE driver of a block device
+    (`fuseblk`, whose source must be a block device: ntfs-3g, exfat-fuse; only root mounts one);
+    squashfuse (`fuse.squashfuse`, `fuse.squashfuse_ll`, this user's or root's: a read-only image
+    file) and an AppImage this user runs (its runtime mounts the image embedded in the file as
+    `fuse.<file name>` at `<tmp>/.mount_*`). Every FUSE filesystem that can stand for a remote
+    stays refused — gvfs (`gvfsd-fuse`), sshfs, rclone, s3fs, davfs, smbnetfs, curlftpfs, and the
+    encrypted views of a directory that may itself be remote (gocryptfs, encfs) — and so does any
+    other subtype;
+  - a direct automount point whose target is local (systemd's for `binfmt_misc` or the EFI
+    partition; an idle one is triggered once to see what it mounts).
+
+  9p and virtiofs (a VM host's shares, WSL's drives) are refused: they carry lookups to another
+  machine. On such a host, unmount the shares (WSL: `[automount] enabled = false` in
+  `/etc/wsl.conf`) or run the miner in a mount namespace or container without them. A GNOME
+  session's gvfs mount is refused too: run the miner as a dedicated user (another user's FUSE
+  mount without `allow_other` is closed to it), or without gvfs's FUSE bridge. The check runs again
+  once the confinement is on, and the builder runner, the execute worker and the broker make it
+  too, before their sandbox is applied (the broker's paths by `statfs` as well).
 - **Other processes.** Landlock's signal and abstract-socket scoping, and its `ptrace` rules: a
   confined process cannot signal, trace or open `/proc/<pid>/mem`, `environ`, `maps` or `fd` of a
   process outside its domain (the miner, other workers, their servers): `kill`, `tgkill`,
