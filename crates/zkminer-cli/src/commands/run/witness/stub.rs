@@ -18,6 +18,21 @@ pub(crate) struct WitnessRuntime {
     _private: (),
 }
 
+/// See the Linux runtime's `ReleaseClaim`: elsewhere no lock is a witness lock.
+pub(crate) enum ReleaseClaim {
+    #[allow(dead_code)]
+    Owned,
+    NotWitness,
+    #[allow(dead_code)]
+    Witness(WitnessRelease),
+}
+
+pub(crate) struct WitnessRelease;
+
+impl WitnessRelease {
+    pub(crate) async fn record_verdict(&self, _why: &str) {}
+}
+
 impl WitnessRuntime {
     pub(crate) async fn start(
         config: &ZkMinerConfig,
@@ -60,4 +75,18 @@ impl WitnessRuntime {
     }
 
     pub(crate) fn shutdown(&self) {}
+
+    pub(crate) fn owns(&self, _job_id: B256) -> bool {
+        false
+    }
+
+    pub(crate) fn note_cards(&self, _inline_needing: usize, _max_concurrent: usize) {}
+
+    pub(crate) fn note_recovery_pass(&self, _deferred: bool) {}
+
+    pub(crate) fn claim_release(self: &Arc<Self>, _job_id: B256) -> ReleaseClaim {
+        ReleaseClaim::NotWitness
+    }
+
+    pub(crate) async fn note_release(&self, _job_id: B256, _why: &str) {}
 }

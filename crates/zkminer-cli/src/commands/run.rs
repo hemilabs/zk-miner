@@ -3666,8 +3666,11 @@ pub async fn run(
                 short_id(jid)
             );
             drain_released.insert(jid, std::time::Instant::now());
-            let (c, st, jr) = (client.clone(), state.clone(), journal.clone());
+            let (c, st, jr, w) = (client.clone(), state.clone(), journal.clone(), witness_rt.clone());
             tokio::spawn(async move {
+                if let Some(w) = &w {
+                    w.note_release(jid, "released by the shutdown drain at its release margin").await;
+                }
                 release_and_clean(&c, &st, &jr, jid).await;
             });
         }
@@ -3852,10 +3855,13 @@ pub async fn run(
             // (In-memory fast path once the allocator is synced; a recycled gap is handed out
             // first, which only ever LOWERS the urgent job's nonce.)
             let pre_nonce = client.reserve_nonce().await.ok();
-            let (c, st, jr) = (client.clone(), state.clone(), journal.clone());
+            let (c, st, jr, w) = (client.clone(), state.clone(), journal.clone(), witness_rt.clone());
             releasing.push((
                 jid,
                 tokio::spawn(async move {
+                    if let Some(w) = &w {
+                        w.note_release(jid, "released at shutdown").await;
+                    }
                     release_and_clean_with_nonce(&c, &st, &jr, jid, pre_nonce).await;
                 }),
             ));
@@ -3880,10 +3886,13 @@ pub async fn run(
                  deadline before giving it up",
                 short_id(jid)
             );
-            let (c, st, jr) = (client.clone(), state.clone(), journal.clone());
+            let (c, st, jr, w) = (client.clone(), state.clone(), journal.clone(), witness_rt.clone());
             releasing.push((
                 jid,
                 tokio::spawn(async move {
+                    if let Some(w) = &w {
+                        w.note_release(jid, "released at shutdown").await;
+                    }
                     release_and_clean(&c, &st, &jr, jid).await;
                 }),
             ));
@@ -12927,6 +12936,17 @@ fn spawn_recovery_actions(
             }
             continue;
         }
+        // A witness lock's release is taken in the witness runtime first, in one step with the check
+        // that no witness task owns it: a store pass re-driving it at the same moment and this release
+        // never both go. The job's verdict is recorded before the release is sent.
+        let witness_release = match (&action, witness_rt) {
+            (RecoveryAction::Release(_), Some(w)) => match w.claim_release(jid) {
+                witness::ReleaseClaim::Owned => continue,
+                witness::ReleaseClaim::NotWitness => None,
+                witness::ReleaseClaim::Witness(r) => Some(r),
+            },
+            _ => None,
+        };
         in_flight.insert(jid, 0);
         match action {
             RecoveryAction::Drive {
@@ -12949,7 +12969,12 @@ fn spawn_recovery_actions(
                 let (c, st, jr, done) = (client.clone(), state.clone(), journal.clone(), done_tx.clone());
                 tokio::spawn(async move {
                     let _slot = SlotGuard(jid, done);
+                    if let Some(r) = &witness_release {
+                        r.record_verdict("released by the recovery room rule (too close to its deadline to drive)")
+                            .await;
+                    }
                     release_and_clean(&c, &st, &jr, jid).await;
+                    drop(witness_release);
                 });
             }
             RecoveryAction::Witness(_) => unreachable!("handled above"),

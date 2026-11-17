@@ -183,6 +183,9 @@ enum Phase {
     Claiming,
     /// A lock is held (or being recovered): never aborted, driven to a terminal state or released.
     Locked,
+    /// The brain's recovery is releasing the lock ([`WitnessRuntime::claim_release`]): nothing else
+    /// drives it meanwhile. Holds no card.
+    Releasing,
 }
 
 impl Phase {
@@ -230,6 +233,41 @@ fn give_back_card(tasks: &mut HashMap<B256, Task>, jid: B256) {
     if let Some(t) = tasks.get_mut(&jid) {
         if t.phase == Phase::Claiming {
             t.phase = Phase::Simulating;
+        }
+    }
+}
+
+/// What a release of a lock by the brain's recovery finds in the witness runtime
+/// ([`WitnessRuntime::claim_release`]).
+pub(crate) enum ReleaseClaim {
+    /// A witness task owns the job (it drives the lock, or a store pass just took it up): no release
+    /// beside it.
+    Owned,
+    /// Not a witness lock this runtime knows of.
+    NotWitness,
+    /// A witness lock, now the release's: until it is dropped no store pass re-drives the job.
+    Witness(WitnessRelease),
+}
+
+/// A witness lock the brain's recovery is releasing; its job's task entry goes when this is dropped.
+pub(crate) struct WitnessRelease {
+    rt: Arc<WitnessRuntime>,
+    jid: B256,
+}
+
+impl WitnessRelease {
+    /// Records the job's post-lock verdict, before the release is sent (§16): the job is not locked
+    /// here again until it is terminal, a restart included.
+    pub(crate) async fn record_verdict(&self, why: &str) {
+        self.rt.record_release_verdict(self.jid, why).await;
+    }
+}
+
+impl Drop for WitnessRelease {
+    fn drop(&mut self) {
+        let mut tasks = lock(&self.rt.tasks);
+        if tasks.get(&self.jid).is_some_and(|t| t.phase == Phase::Releasing) {
+            tasks.remove(&self.jid);
         }
     }
 }
@@ -879,6 +917,45 @@ impl WitnessRuntime {
             return true;
         }
         self.store().is_some_and(|s| s.pins().iter().any(|p| p.job_id == job_id))
+    }
+
+    /// Takes a lock the brain's recovery is about to release (its room rule: too close to the deadline
+    /// to drive) away from every other witness path, in one step with the check that no task owns it,
+    /// so a store pass that re-drives it and the release never both go: whichever comes first wins.
+    pub(crate) fn claim_release(self: &Arc<Self>, jid: B256) -> ReleaseClaim {
+        let witness = self.is_witness_lock(jid) || known_class(jid) == Some(Class::Witness);
+        let mut tasks = lock(&self.tasks);
+        if tasks.contains_key(&jid) {
+            return ReleaseClaim::Owned;
+        }
+        if !witness {
+            return ReleaseClaim::NotWitness;
+        }
+        tasks.insert(jid, Task { token: AbortToken::new(), phase: Phase::Releasing });
+        ReleaseClaim::Witness(WitnessRelease { rt: self.clone(), jid })
+    }
+
+    /// Before a lock of `jid` is released other than by its own failure (the brain's room rule, a
+    /// shutdown): a witness lock's job gets its post-lock verdict, so this host never locks it again
+    /// until it is terminal (what ended the lock, a lost store or bundle or a held fulfil, may recur;
+    /// each job is released here at most once). Nothing for an inline lock.
+    pub(crate) async fn note_release(&self, jid: B256, why: &str) {
+        if self.is_witness_lock(jid) || known_class(jid) == Some(Class::Witness) {
+            self.record_release_verdict(jid, why).await;
+        }
+    }
+
+    /// The post-lock verdict of a witness lock released without a failure of its proof: final for
+    /// the job, counted against no caller or device. Once per job (a verdict already lasting until
+    /// the job is terminal stays as it is).
+    async fn record_release_verdict(&self, jid: B256, why: &str) {
+        if let Some(s) = self.store() {
+            let held = blocking(move || s.verdict(jid)).await.ok().and_then(|r| r.ok()).flatten();
+            if held.is_some_and(|v| lasts_until_terminal(v.reason, v.expires_at)) {
+                return;
+            }
+        }
+        self.record_verdict(jid, Address::ZERO, SkipReason::PostLockFailure, why).await;
     }
 
     /// Fires every simulation's abort token (shutdown). Held locks are left to the drain.
@@ -3621,6 +3698,42 @@ mod tests {
 
     fn gpu_failure(slot: &str) -> LockFailure {
         LockFailure::on(Some(slot.into()), PostLockFailureClass::Gpu, &HashSet::new())
+    }
+
+    /// The brain's room rule released a witness lock it found too close to its deadline, with no
+    /// verdict: the job reopened, and after a restart it could be locked again. And a store pass that
+    /// re-drove the lock just as the brain spawned that release could not see it. The release now
+    /// takes the job in the runtime first (a store pass then leaves it alone, and one that took it
+    /// first wins), and records the job's verdict before the release is sent.
+    #[tokio::test]
+    async fn a_room_rule_release_owns_the_lock_and_records_a_verdict() {
+        let (rt, s) = test_runtime(true).await;
+        let jid = B256::repeat_byte(0x51);
+        note_class(jid, Class::Witness);
+        let ReleaseClaim::Witness(release) = rt.claim_release(jid) else { panic!("a witness lock") };
+        assert!(rt.owns(jid));
+        assert!(!rt.drive_recovered(jid), "the store pass cannot re-drive it meanwhile");
+        assert!(matches!(rt.claim_release(jid), ReleaseClaim::Owned), "nor a second release");
+        assert_eq!(rt.witness_locks(), 0, "a release holds no card");
+        release.record_verdict("released by the recovery room rule").await;
+        let v = s.as_ref().unwrap().store.verdict(jid).unwrap().unwrap();
+        assert_eq!((v.reason, v.expires_at), (SkipReason::PostLockFailure, VERDICT_UNTIL_TERMINAL));
+        assert_eq!(rt.caller_post_lock_failures_now(Address::ZERO).await, 0, "no caller is counted");
+        drop(release);
+        assert!(!rt.owns(jid));
+        // The other way round: a store pass that took the lock first keeps it, and no release goes.
+        let other = B256::repeat_byte(0x52);
+        note_class(other, Class::Witness);
+        lock(&rt.tasks).insert(other, task(Phase::Locked));
+        assert!(matches!(rt.claim_release(other), ReleaseClaim::Owned));
+        // An inline lock is not the runtime's.
+        assert!(matches!(rt.claim_release(B256::repeat_byte(0x53)), ReleaseClaim::NotWitness));
+        // A shutdown release records it too, once.
+        let third = B256::repeat_byte(0x54);
+        note_class(third, Class::Witness);
+        rt.note_release(third, "released at shutdown").await;
+        rt.note_release(third, "released at shutdown").await;
+        assert_eq!(s.as_ref().unwrap().store.verdict(third).unwrap().unwrap().attempts, 1);
     }
 
     /// One caller whose guest reliably fails during proving quarantined a one-card host for 7 days
