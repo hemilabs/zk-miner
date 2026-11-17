@@ -95,13 +95,14 @@ use zkminer_witness_store::{
 
 use super::super as run;
 use super::policy::{
-    caller_admitted, caller_tally_key, card_room, claims_held_reason, deadline_fits, device_tally_key, divergence_reusable,
-    estimate_prove_secs, fixed_allowance_secs, fulfils_besides, funds_cover, gate_refusal_reason, host_max_guest_cycles,
-    is_witness_input, not_claimable_reason, parse_session_cap, pin_lock_gone, proving_cutoff, rate_secs_left,
-    reservation_wei, segment_need, segments_fit, session_cap_admits, short, tally_count, verdict_plan,
-    verdict_set_aside, watchdog_admits, witness_prove_sizes, ArtifactBudget, Blame, PinFacts, PinRead, ProvePlan,
-    ReservationInputs, POST_LOCK_CALLER_LIMIT, POST_LOCK_CLASSES, POST_LOCK_DEVICE_LIMIT,
-    POST_LOCK_TALLY_TTL_SECS, RISC0_CPU_CONSERVATIVE_CPS, SERVING_OFF_SET_ASIDE, UNSERVED_SET_ASIDE,
+    caller_admitted, caller_tally_key, card_room, claims_held_reason, deadline_fits, device_tally_key,
+    divergence_reusable, elf_image_id_outcome, estimate_prove_secs, fixed_allowance_secs, fulfils_besides,
+    funds_cover, gate_refusal_reason, host_max_guest_cycles, is_witness_input, not_claimable_reason,
+    parse_session_cap, pin_lock_gone, proving_cutoff, rate_secs_left, reservation_wei, segment_need, segments_fit,
+    session_cap_admits, short, tally_count, verdict_plan, verdict_set_aside, watchdog_admits, witness_prove_sizes,
+    ArtifactBudget, Blame, PinFacts, PinRead, ProvePlan, ReservationInputs, POST_LOCK_CALLER_LIMIT,
+    POST_LOCK_CLASSES, POST_LOCK_DEVICE_LIMIT, POST_LOCK_TALLY_TTL_SECS, RISC0_CPU_CONSERVATIVE_CPS,
+    SERVING_OFF_SET_ASIDE, UNSERVED_SET_ASIDE,
 };
 use super::{known_class, note_class, Class, Route};
 use crate::journal::WitnessBundleRef;
@@ -3240,18 +3241,10 @@ impl PipelineHooks for Hooks {
             let (idf, bytes) = (rt.image_id_fn(), elf.clone());
             let before = rt.image_id_unavailable.load(Ordering::SeqCst);
             let id = blocking(move || idf(&bytes)).await.map_err(|e| (SkipReason::HostInternal, format!("{e:#}")))?;
-            match id {
-                Some(id) if id == self.program_id => {
-                    *lock(&self.elf) = Some(elf.clone());
-                    Ok(elf)
-                }
-                Some(id) => Err((SkipReason::ElfImageIdMismatch, format!("the ELF's image id is {id}"))),
-                None if rt.image_id_unavailable.load(Ordering::SeqCst) != before => Err((
-                    SkipReason::HostInternal,
-                    "the ELF's image id could not be derived now (no risc0 measure worker came free)".into(),
-                )),
-                None => Err((SkipReason::ElfImageIdMismatch, "the ELF is not one risc0 derives an image id for".into())),
-            }
+            let unavailable = rt.image_id_unavailable.load(Ordering::SeqCst) != before;
+            elf_image_id_outcome(id, self.program_id, unavailable)?;
+            *lock(&self.elf) = Some(elf.clone());
+            Ok(elf)
         })
     }
 }

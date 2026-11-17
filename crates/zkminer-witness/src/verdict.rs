@@ -93,6 +93,10 @@ pub enum SkipReason {
     /// a sandbox, cgroup or spawn failure, the broker's control channel lost, the execute worker's
     /// own error or malformed answer. Never the caller's.
     HostInternal,
+    /// This host's capacity was busy just now, not the job: no risc0 measure worker came free in time
+    /// to derive the guest ELF's image id. Deferred (looked at again soon), never final, never the
+    /// caller's.
+    HostBusy,
     // After a lock.
     /// A witness lock of this job failed after the lock and was released (§16 "post-lock witness
     /// failure"). Final for the job: its bundle is never locked again. Counted per caller and per
@@ -102,7 +106,7 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
-    pub const ALL: [SkipReason; 44] = {
+    pub const ALL: [SkipReason; 45] = {
         use SkipReason::*;
         [
             EnvelopeMalformed, EnvelopeOutOfRange, UnsupportedBuilderType, UnsupportedProofSystem,
@@ -114,7 +118,7 @@ impl SkipReason {
             BuilderClampedByProbation, RunnerInternal, BuilderCrashed, RunnerCrashed, GuestFailed, GuestCyclesAboveLimit,
             BindingMismatch, JournalsDifferAcrossPo2, JournalTooLarge, FulfilDaTooLarge,
             BelowReservation, DeadlineMargin, ProveResources, VerifierSelectorMismatch,
-            OperatorEndpoint, OperatorBudget, RetentionFull, HostInternal, PostLockFailure,
+            OperatorEndpoint, OperatorBudget, RetentionFull, HostInternal, HostBusy, PostLockFailure,
         ]
     };
 
@@ -150,7 +154,7 @@ impl SkipReason {
             // A lock of the job already failed here: never locked again (the post-lock counts are
             // kept separately).
             PostLockFailure => (Never, false),
-            NotAdmitted | BuilderClampedByProbation => (Deferred, false),
+            NotAdmitted | BuilderClampedByProbation | HostBusy => (Deferred, false),
         };
         Verdict { retry, blames_caller }
     }
@@ -299,6 +303,7 @@ mod tests {
         assert_eq!(v(CapabilityNotProvisioned).retry, Retry::OnHostChange);
         assert_eq!(v(ArtifactUnavailable).retry, Retry::Backoff { max_attempts: 3 });
         assert_eq!(v(BuilderClampedByProbation).retry, Retry::Deferred);
+        assert_eq!(v(HostBusy), Verdict { retry: Retry::Deferred, blames_caller: false });
         assert_eq!(v(PostLockFailure), Verdict { retry: Retry::Never, blames_caller: false });
         // ALL lists each reason once (`verdict`'s match is exhaustive, so every reason has a policy).
         let set: std::collections::HashSet<_> = SkipReason::ALL.iter().collect();

@@ -131,6 +131,26 @@ pub(crate) fn verdict_drop_cutoff(now: u64) -> u64 {
     now.saturating_sub(VERDICT_FINAL_TTL_SECS)
 }
 
+/// What deriving the guest ELF's image id before a simulation says about the job (§5.2 step 3): the
+/// id equals `program_id`, or a verdict. `derivation_unavailable`: the derivation could not run just
+/// now (no measure worker came free in time), which is this host's busy capacity, a deferred
+/// verdict that never becomes final (the job is looked at again soon), never a judgement of the ELF.
+pub(crate) fn elf_image_id_outcome(
+    derived: Option<B256>,
+    program_id: B256,
+    derivation_unavailable: bool,
+) -> Result<(), (SkipReason, String)> {
+    match derived {
+        Some(id) if id == program_id => Ok(()),
+        Some(id) => Err((SkipReason::ElfImageIdMismatch, format!("the ELF's image id is {id}"))),
+        None if derivation_unavailable => Err((
+            SkipReason::HostBusy,
+            "the ELF's image id could not be derived now (no risc0 measure worker came free)".into(),
+        )),
+        None => Err((SkipReason::ElfImageIdMismatch, "the ELF is not one risc0 derives an image id for".into())),
+    }
+}
+
 /// A claimability refusal as a §16 verdict. Every refusal is state that moves on its own (a pause,
 /// a window, a cooldown, stake), so all are `NotClaimable` (retried with back-off); a read that
 /// failed is the operator's endpoint.
@@ -665,6 +685,27 @@ mod tests {
         let post = verdict_plan(PostLockFailure, 0, 0.0);
         assert!(post.final_verdict);
         assert_eq!(b.note_verdict(c, PostLockFailure, &post), None);
+    }
+
+    /// On a host whose measure workers stay busy measuring inline jobs, an honest job's image id
+    /// could not be derived before its simulation, and that was recorded as `HostInternal`: final
+    /// after eight tries. It is the host's busy capacity: deferred, never final, never the caller's.
+    #[test]
+    fn a_busy_measure_pool_never_makes_a_final_verdict() {
+        let p = B256::repeat_byte(7);
+        assert_eq!(elf_image_id_outcome(Some(p), p, false), Ok(()));
+        assert_eq!(elf_image_id_outcome(Some(B256::ZERO), p, false).unwrap_err().0, ElfImageIdMismatch);
+        assert_eq!(elf_image_id_outcome(None, p, false).unwrap_err().0, ElfImageIdMismatch, "risc0 refused the bytes");
+        let (busy, _) = elf_image_id_outcome(None, p, true).unwrap_err();
+        assert_eq!(busy, HostBusy);
+        let mut attempts = 0u8;
+        for _ in 0..300 {
+            let plan = verdict_plan(busy, attempts, 0.5);
+            assert!(!plan.final_verdict && plan.ttl_secs == VERDICT_DEFERRED_TTL_SECS, "{plan:?}");
+            attempts = plan.attempts;
+        }
+        let mut b = Blame::default();
+        assert_eq!(b.note_verdict(Address::ZERO, busy, &verdict_plan(busy, 254, 0.0)), None);
     }
 
     #[test]
