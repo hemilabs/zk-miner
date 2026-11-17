@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::facts::{EgressPath, FactsOptions, HostFacts};
 use crate::host::HostDenied;
 use crate::ip::{canonical_ip, is_global, prefix_is_global, Prefix};
-use crate::nearhop::{NearProbe, TtlProbe, Verdict, PROBE_TIMEOUT};
+use crate::nearhop::{NearProbe, TtlProbe, Verdict};
 
 /// Whether connections a requester causes may reach non-public destinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -685,9 +685,10 @@ impl NetPolicy {
 
     /// The last check before a connection to `addr` is made, right before it (public mode;
     /// developer mode admits everything): [`Self::admit_to`], then the near-hop probe
-    /// ([`crate::nearhop`]): refused when the destination answers within `[egress]
-    /// near_hop_limit` hops, or the probe fails. Blocking (up to the probe's
-    /// [`PROBE_TIMEOUT`]): call it off an async runtime's worker threads.
+    /// ([`crate::nearhop::decide`]): refused when the destination answers within `[egress]
+    /// near_hop_limit` hops — to the probe, or, when the probe had no answer, to a check
+    /// connection's hop-limited FIN — or the probe fails. Blocking (up to the probe's timeout, plus
+    /// a check connection when it had no answer): call it off an async runtime's worker threads.
     pub fn vet_connection(&self, addr: SocketAddr) -> Result<(), Denied> {
         if self.mode == NetMode::DevPrivate {
             return Ok(());
@@ -701,7 +702,7 @@ impl NetPolicy {
             IpAddr::V4(_) => addr,
         };
         let hops = self.near_hop_limit();
-        match self.probe.probe(target, hops, PROBE_TIMEOUT).verdict() {
+        match crate::nearhop::decide(&*self.probe, target, hops) {
             Verdict::Far => Ok(()),
             Verdict::Near(how) => Err(Denied::NearHop {
                 addr,
@@ -712,6 +713,11 @@ impl NetPolicy {
                 addr,
                 hops,
                 what: format!("the probe failed: {why}"),
+            }),
+            Verdict::Undecided => Err(Denied::NearHop {
+                addr,
+                hops,
+                what: "no answer either way".into(),
             }),
         }
     }
