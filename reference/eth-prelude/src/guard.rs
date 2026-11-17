@@ -54,6 +54,14 @@ impl<T> Pinned<T> {
     }
 }
 
+impl<T> Pinned<T> {
+    /// The same word, its value parsed further (a rule id and parameter from a raw word); the word
+    /// and its position stay as they were.
+    pub fn try_map<U, E>(self, f: fn(T) -> Result<U, E>) -> Result<Pinned<U>, E> {
+        Ok(Pinned { index: self.index, word: self.word, value: f(self.value)? })
+    }
+}
+
 impl<T: Clone> Pinned<T> {
     /// The value as an authenticated input: the binding fixes it to the requester's.
     pub fn authenticated(&self) -> Authenticated<T> {
@@ -121,6 +129,13 @@ macro_rules! constant {
         const VALUE: $ty = $value;
         $crate::guard::Authenticated::<$ty>::__from_guest_constant(VALUE)
     }};
+}
+
+impl<T> Authenticated<alloc::vec::Vec<T>> {
+    /// The elements of an authenticated list, each authenticated.
+    pub fn into_items(self) -> impl Iterator<Item = Authenticated<T>> {
+        self.0.into_iter().map(Authenticated)
+    }
 }
 
 /// `0, 1, …, count − 1` as authenticated counters, for loops whose bound is pinned or proven.

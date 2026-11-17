@@ -3700,6 +3700,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hemiprove-proxy-slots"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-trie",
+ "hemiprove-eth-prelude",
+ "hex",
+ "serde_json",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
