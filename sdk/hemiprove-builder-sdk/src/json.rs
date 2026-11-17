@@ -141,6 +141,29 @@ pub fn get<'a>(obj: &'a [u8], key: &str) -> Result<Option<&'a [u8]>, JsonError> 
     }
 }
 
+/// The raw bytes of each element of the array `arr`, in order.
+pub fn elements(arr: &[u8]) -> Result<Vec<&[u8]>, JsonError> {
+    let mut i = ws(arr, 0);
+    if arr.get(i) != Some(&b'[') {
+        return Err(JsonError::Syntax(i));
+    }
+    let mut out = Vec::new();
+    i = ws(arr, i + 1);
+    if arr.get(i) == Some(&b']') {
+        return if ws(arr, i + 1) == arr.len() { Ok(out) } else { Err(JsonError::Syntax(i + 1)) };
+    }
+    loop {
+        let end = skip_value(arr, i)?;
+        out.push(&arr[i..end]);
+        i = ws(arr, end);
+        match arr.get(i) {
+            Some(b',') => i = ws(arr, i + 1),
+            Some(b']') if ws(arr, i + 1) == arr.len() => return Ok(out),
+            _ => return Err(JsonError::Syntax(i)),
+        }
+    }
+}
+
 /// Member `key`, required and not `null`.
 pub fn required<'a>(obj: &'a [u8], key: &str) -> Result<&'a [u8], JsonError> {
     match get(obj, key)? {
@@ -188,6 +211,32 @@ pub fn quantity_u64(s: &str) -> Result<u64, JsonError> {
         return Err(JsonError::NotHex);
     }
     digits.iter().try_fold(0u64, |acc, &c| Ok((acc << 4) | u64::from(nibble(c)?)))
+}
+
+/// A hex quantity of at most 256 bits, as 32 big-endian bytes. Also accepts zero-padded 32-byte
+/// data (`eth_getProof` storage keys come back in either form).
+pub fn quantity_u256(s: &str) -> Result<[u8; 32], JsonError> {
+    let digits = s.strip_prefix("0x").ok_or(JsonError::NotHex)?.as_bytes();
+    if digits.is_empty() || digits.len() > 64 {
+        return Err(JsonError::NotHex);
+    }
+    let mut out = [0u8; 32];
+    for (i, &c) in digits.iter().rev().enumerate() {
+        out[31 - i / 2] |= nibble(c)? << (4 * (i % 2));
+    }
+    Ok(out)
+}
+
+/// `0x`-prefixed lower-case hex of `bytes`.
+pub fn to_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(2 + 2 * bytes.len());
+    s.push_str("0x");
+    for b in bytes {
+        s.push(DIGITS[usize::from(b >> 4)] as char);
+        s.push(DIGITS[usize::from(b & 0x0f)] as char);
+    }
+    s
 }
 
 /// Hex data (`"0x…"`, an even number of digits).
@@ -264,7 +313,26 @@ mod tests {
     }
 
     #[test]
+    fn arrays() {
+        assert_eq!(elements(br#"[]"#).unwrap(), Vec::<&[u8]>::new());
+        assert_eq!(elements(br#" [ "0xaa" , {"a":[1,2]}, 3 ] "#.trim_ascii()).unwrap(), vec![&br#""0xaa""#[..], br#"{"a":[1,2]}"#, b"3"]);
+        for bad in [&b"[1,]"[..], b"[1 2]", b"[1", b"{}", b"[1]x", b"[,1]"] {
+            assert!(elements(bad).is_err(), "{:?}", core::str::from_utf8(bad));
+        }
+    }
+
+    #[test]
     fn hex() {
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        assert_eq!(quantity_u256("0x1"), Ok(one));
+        assert_eq!(quantity_u256(&format!("0x{}", "0".repeat(63) + "1")), Ok(one));
+        assert_eq!(quantity_u256(&format!("0x{}", "f".repeat(64))), Ok([0xff; 32]));
+        assert_eq!(quantity_u256(&format!("0x1{}", "0".repeat(64))), Err(JsonError::NotHex));
+        assert_eq!(quantity_u256("0x"), Err(JsonError::NotHex));
+        assert_eq!(quantity_u256("0x1ab").unwrap()[30..], [0x01, 0xab]);
+        assert_eq!(to_hex(&[0x00, 0xab, 0x10]), "0x00ab10");
+        assert_eq!(to_hex(&[]), "0x");
         assert_eq!(quantity_u64("0x0"), Ok(0));
         assert_eq!(quantity_u64("0xffffffffffffffff"), Ok(u64::MAX));
         for bad in ["0x", "1b4", "0x1ffffffffffffffff", "0xg"] {

@@ -10,8 +10,10 @@ This directory is its own Cargo workspace (excluded from the zkminer workspace):
 
 | Path | What |
 |---|---|
-| `hemiprove-builder-sdk/` | the SDK: `context()`, `fetch()`, `write_witness()`, `log()`, `entry!`, a `BuilderContextV1` decoder, minimal JSON extraction |
+| `hemiprove-builder-sdk/` | the SDK: `context()`, `fetch()`, `write_witness()`, `log()`, `entry!`, a `BuilderContextV1` decoder, minimal JSON extraction, a JSON-RPC client over `fetch` (`rpc`); with feature `eth`, JSON-RPC results as headers, `eth_getProof` proofs and receipts with their RLP encoders (`eth`, from the reference prelude) |
 | `examples/latest-block/` | example builder: `W = blockNumber (u64 BE) ‖ blockHash` of the finalized block behind capability 0 |
+| `examples/proxy-slots/` | the reference builder of plan §12: a proxy's EIP-1967 implementation and the slots a rule names, as the scheme-1 witness the `proxy-slots` guest proves over (`../reference/proxy-slots/README.md`) |
+| `reference` | a symlink to the zkminer repository's `reference/` (the eth prelude and the statements builders share with their guests); see "Shared code" below |
 | `test-builders/faults/` | a builder that panics or exhausts memory on request, for the runner's tests |
 | `test-builders/receipts-proof/`, `test-builders/storage-proof/` | realistic builders with heavy dependencies (serde_json, alloy-rlp, alloy-primitives, alloy-trie, alloy-sol-types, tiny-keccak, sha2) that calibrate and test the runner's compile-cost budget; built at `opt-level = 3` |
 | `.cargo/config.toml` | the pinned target-feature list (the WASM profile) |
@@ -111,19 +113,45 @@ all of those variables, and checks the hash below.
 A builder with its own repository should copy `.cargo/config.toml`, `rust-toolchain.toml`, the
 release profile and the script, and commit its `Cargo.lock`.
 
-### Recorded on this host (2026-11-16)
+**One builder per invocation.** Build each builder with its own `-p NAME`: cargo unifies the
+features of a crate across everything one invocation builds, so building `latest-block` together
+with `proxy-slots` compiles the SDK with feature `eth` for both, and `latest-block`'s bytes differ.
+
+### Shared code
+
+A builder may share code with its guest (the reference builder links the eth prelude and its
+statement, so it derives the slot set with the guest's own rule and writes `W` with the guest's own
+codec). Cargo identifies a path dependency outside the workspace's directory by its absolute path,
+which reaches the module's bytes through symbol names and the optimiser's choices, so such a builder
+would rebuild to different bytes in another checkout. The shared crates therefore come in through the
+`reference` symlink: inside this directory, cargo identifies them by a path relative to it, and the
+script's `$PWD=/sdk` remapping covers their panic locations. The workspace excludes `reference`, so
+those crates are path dependencies, not members, and their host-only dev-dependencies stay out of
+this lockfile.
+
+### Recorded on this host (2026-11-17)
 
 Toolchain `rustc 1.97.1 (8bab26f4f 2026-07-14)`, LLVM 22.1.6, x86_64-unknown-linux-gnu.
 
-| Build | sha256 of `latest_block.wasm` (31,317 bytes) |
+| Build | sha256 of `latest_block.wasm` (31,478 bytes) |
 |---|---|
-| `./build-reproducible.sh -p latest-block`, clean target dir #1 | `ec41c077833f209353a019615fb11a45cd6147d7ce079b47f8c8130162a4f64e` |
-| same, clean target dir #2 | `ec41c077833f209353a019615fb11a45cd6147d7ce079b47f8c8130162a4f64e` |
-| same, from a copy of `sdk/` in another directory | `ec41c077833f209353a019615fb11a45cd6147d7ce079b47f8c8130162a4f64e` |
+| `./build-reproducible.sh -p latest-block`, clean target dir #1 | `b4ccd93af62c0445f4de53e1c2e0495885fc88788a5fd07bc2502c3dc83c382b` |
+| same, clean target dir #2 | `b4ccd93af62c0445f4de53e1c2e0495885fc88788a5fd07bc2502c3dc83c382b` |
+| same, from a copy of `sdk/` and `reference/` in another directory | `b4ccd93af62c0445f4de53e1c2e0495885fc88788a5fd07bc2502c3dc83c382b` |
+
+(It was `ec41c077…4f64e`, 31,317 bytes, until the SDK's JSON module gained `elements`: a new caller
+of the scanner changes how the optimiser inlines it into the example, though the example does not
+call the new function.)
+
+| Build | sha256 of `proxy_slots_builder.wasm` (98,683 bytes) |
+|---|---|
+| `./build-reproducible.sh -p proxy-slots-builder`, clean target dir #1 | `9e9ca9692b6310792a18fc557315cf39d423a3b02df075dfcd799dceb788f2e4` |
+| same, clean target dir #2 | `9e9ca9692b6310792a18fc557315cf39d423a3b02df075dfcd799dceb788f2e4` |
+| same, from a copy of `sdk/` and `reference/` in another directory | `9e9ca9692b6310792a18fc557315cf39d423a3b02df075dfcd799dceb788f2e4` |
 
 A plain `cargo build --locked --release --target wasm32-unknown-unknown -p latest-block` (no
-remapping) was also identical across two clean target dirs and the copy, at
-`a2325169cbc2dab544948c4b3f3a29c68e8f36e931e35bac29149a98eaa82fb6` (31,353 bytes), but that module
+remapping) was also identical across two clean target dirs, at
+`2cc8700ed1cb856208b54bb96c304ed3d64f585fb8063405411da17c0b221e5d` (31,514 bytes), but that module
 embeds this host's `rust-src` path; the script's bytes are the ones to publish.
 
 The module has 17 initial memory pages (1.06 MiB, mostly Rust's 1 MiB shadow stack), so it needs
@@ -131,8 +159,9 @@ The module has 17 initial memory pages (1.06 MiB, mostly Rust's 1 MiB shadow sta
 
 ## Testing
 
-- `cargo test` here runs the SDK's host-side unit tests (the context decoder and the JSON
-  extraction; the ABI imports exist only on wasm32).
+- `cargo test -p hemiprove-builder-sdk --features eth` here runs the SDK's host-side unit tests (the
+  context decoder, the JSON extraction, the JSON-RPC requests, and the `eth` parsers on the
+  prelude's real-chain fixtures; the ABI imports exist only on wasm32).
 - `cargo test -p zkminer-witness-builder` from the zkminer root builds every builder here for wasm32
   with this configuration and runs them through the runner against a fake broker; checks that
   `receipts-proof` and `storage-proof` pass the pre-pass with at least 10× headroom under every
