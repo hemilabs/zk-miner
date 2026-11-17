@@ -42,8 +42,8 @@ use zkminer_chain::revert::{decode, Decoded, FulfilClass, FulfilFailure};
 use zkminer_contracts::bindings::IHemiProveErrors::IHemiProveErrorsErrors as E;
 use zkminer_contracts::bindings::{
     AuctionConfig, CompetitiveBidConfig, CycleConfig, IGasPriceOracle, IHemiProveAux,
-    IHemiProveCore, IHemiProveFulfill, IHemiProveRegistry, IHemiProveStaking, ITestnetToken,
-    IVerifierAdapter, JobDescriptor, GAS_PRICE_ORACLE, IERC20,
+    IHemiProveCore, IHemiProveFulfill, IHemiProveStaking, ITestnetToken, JobDescriptor,
+    GAS_PRICE_ORACLE, IERC20,
 };
 
 /// localnet.rs's fork block (after the 2026-11-16 deployment's setup: its router exists from block
@@ -631,13 +631,18 @@ async fn fulfill_job_hashed_and_the_da_nonce_rule_on_the_fork() {
         "the hashed descriptor rebuilds the stored hash"
     );
 
-    // 4. Locked: the descriptor hash rebuilt from the hashed fields and the FULL binding both pass —
-    //    the call reaches the verifier, which refuses the fixture (this fork's verifier is not
-    //    risc0-ethereum v3.1's). A wrong inputData hash stops at the descriptor check instead.
-    match router_revert(&p, prover.address(), calldata.clone()).await {
-        Decoded::Hemi(E::VerifierCallFailed(_)) => {}
-        other => panic!("fulfillJobHashed on our lock: {}", other.name()),
-    }
+    // 4. Locked: the descriptor hash rebuilt from the hashed fields, the FULL binding and the real
+    //    verifier (risc0-ethereum v3.1, whose test receipt the fixture is) all pass, so the call
+    //    succeeds. A wrong inputData hash stops at the descriptor check instead.
+    p.call(
+        TransactionRequest::default()
+            .from(prover.address())
+            .to(DEPLOYMENT.router)
+            .gas_limit(12_000_000)
+            .input(calldata.clone().into()),
+    )
+    .await
+    .expect("fulfillJobHashed on our lock passes every check");
     let mut wrong = f.clone();
     wrong.hashed.inputDataHash = keccak256(b"not the input");
     match router_revert(
@@ -650,20 +655,6 @@ async fn fulfill_job_hashed_and_the_da_nonce_rule_on_the_fork() {
         Decoded::Hemi(E::InvalidDescriptorHash(e)) => assert_eq!(e.expected, rec.descriptor_hash),
         other => panic!("a wrong inputDataHash: {}", other.name()),
     }
-    let adapter = IHemiProveRegistry::new(DEPLOYMENT.registry, &p)
-        .getAdapter(risc_zero_groth16_v1_id())
-        .call()
-        .await
-        .unwrap()
-        .adapter;
-    let native = IVerifierAdapter::new(adapter, &p)
-        .nativeVerifier()
-        .call()
-        .await
-        .unwrap();
-    // From here on, a stub verifier (code: STOP — every call returns) stands in for the real one, so
-    // the fixture settles. The router's own checks are untouched.
-    let _: serde_json::Value = rpc(&p, "anvil_setCode", serde_json::json!([native, "0x00"])).await;
 
     // 5. The DA nonce rule. Mining is stopped; the large fulfil is sent and pooled; then the block gas
     //    limit drops below the fulfil's 10M gas, so blocks keep coming without it — the shape of the
