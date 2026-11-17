@@ -5,11 +5,13 @@ use std::time::Duration;
 
 pub const DEFAULT_ADVERSARIAL_SECS: u64 = 600;
 pub const DEFAULT_FLIPS: usize = 32;
+pub const MAX_MUTATIONS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct AdversarialOptions {
     pub budget: Duration,
     pub flips: usize,
+    pub max_mutations: usize,
     pub scheme: Option<u64>,
     pub providers: Option<Vec<String>>,
 }

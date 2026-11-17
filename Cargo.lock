@@ -10882,6 +10882,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
  "anyhow",
+ "hemiprove-eth-prelude",
  "hex",
  "libc",
  "reqwest",

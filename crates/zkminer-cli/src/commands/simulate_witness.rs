@@ -56,8 +56,8 @@ use zkminer_witness::verdict::SkipReason;
 use zkminer_witness_broker::client::ArtifactCharge;
 use zkminer_witness_host::abort::{AbortReason, AbortToken};
 use zkminer_witness_host::adversarial::{
-    framings, generic_mutations, host_input_checks, run_mutations, scheme_id_of, seed_for, Baseline, HostInputResult,
-    Judge, MutationOutcome, MutationResult, SchemeContext, SchemeRegistry,
+    fetch_through_job, framings, generic_mutations, host_input_checks, run_mutations, scheme_id_of, seed_for, Baseline,
+    HostInputResult, Judge, MutationOutcome, MutationResult, RpcCall, SchemeContext, SchemeRegistry,
 };
 use zkminer_witness_host::broker_proc::BrokerProcess;
 use zkminer_witness_host::paths;
@@ -78,10 +78,11 @@ pub const WITNESS_REPORT_SCHEMA: u32 = 1;
 pub const DEFAULT_ADVERSARIAL_SECS: u64 = 600;
 /// The default `--flips`: byte flips at sampled offsets of `W`.
 pub const DEFAULT_FLIPS: usize = 32;
-/// The most mutations one run executes (generic and scheme together).
+/// The most mutations one run executes (generic and scheme together), and the default of
+/// `--max-mutations`.
 pub const MAX_MUTATIONS: usize = 256;
-/// The scheme mutations asked of a registered scheme.
-const SCHEME_MUTATIONS: usize = 64;
+/// The scheme mutations asked of a registered scheme (structural ones first).
+const SCHEME_MUTATIONS: usize = 160;
 /// Bound on each self-test and on the execute worker's build handshake.
 const SETUP_BOUND: Duration = Duration::from_secs(120);
 /// Bound on the registry read and the ELF download when no `--elf` is given.
@@ -94,6 +95,8 @@ const STORE_QUOTA_BYTES: u64 = 4 << 30;
 pub struct AdversarialOptions {
     pub budget: Duration,
     pub flips: usize,
+    /// The most mutations executed (the scheme's first, then the generic ones).
+    pub max_mutations: usize,
     pub scheme: Option<u64>,
     /// Two `[[evm_rpc]]` aliases of the broker configuration.
     pub providers: Option<Vec<String>>,
@@ -289,6 +292,8 @@ pub struct AdversarialReport {
     pub differential: DifferentialReport,
     /// One line per failure, naming what caused it.
     pub soundness_failures: Vec<String>,
+    /// Findings that are not failures (a guest that ignores trailing bytes of `W`).
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -463,6 +468,9 @@ impl SimHost {
             Some(d) => d.clone(),
             None => dirs::home_dir().context("no home directory: pass --cache-dir")?.join(".zkminer").join("simulate"),
         };
+        // Absolute: the store and every derived broker configuration name paths the sandboxed
+        // processes (which run in `/`) must find.
+        let cache = std::path::absolute(&cache).with_context(|| format!("{}", cache.display()))?;
         let work = cache.join("witness-runs").join(format!("{}-{}", std::process::id(), chrono::Utc::now().timestamp_millis()));
         std::fs::create_dir_all(work.join("store")).with_context(|| format!("creating {}", work.display()))?;
         let store_dir = work.join("store");
@@ -1006,10 +1014,10 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
     Ok(())
 }
 
-/// The scheme mutators this build knows, by scheme id. Scheme 1 (`eth-block`) is registered once
-/// the reference prelude's witness codec is part of the build.
+/// The scheme mutators this build knows, by scheme id: scheme 1 (`eth-block`), from the reference
+/// prelude's witness codec.
 pub fn scheme_registry() -> SchemeRegistry {
-    SchemeRegistry::new()
+    zkminer_witness_host::adversarial::default_registry()
 }
 
 /// One adversarial run's shared state.
@@ -1048,31 +1056,45 @@ impl Adversary<'_> {
         let statement = if prefix.is_some() { &s.journal[PREFIX_BYTES.min(s.journal.len())..] } else { &s.journal[..] };
         let seed = seed_for(&w, 0x7a6b_6d69_6e65_7231);
 
-        // The mutations: generic, then the scheme's.
-        let mut mutations = generic_mutations(&w, seed, adv.flips);
+        // The mutations: the scheme's structured ones first (they say the most), then the generic.
+        let mut mutations = Vec::new();
         let registry = scheme_registry();
         let scheme_id = adv.scheme.or_else(|| scheme_id_of(statement));
         let scheme = match scheme_id {
             None => SchemeReport { id: None, name: None, status: "no scheme id in the header (pass --scheme)".into() },
             Some(id) => match registry.get(id) {
                 None => SchemeReport { id: Some(id), name: None, status: "no structured mutations registered for this scheme".into() },
-                Some(m) => match m.mutations(&w, &SchemeContext { statement, seed }, SCHEME_MUTATIONS) {
-                    Ok(ms) => {
-                        let n = ms.len();
-                        mutations.extend(ms);
-                        SchemeReport { id: Some(id), name: Some(m.name().into()), status: format!("{n} structured mutations") }
+                Some(m) => {
+                    // What the scheme needs from outside W (a parent header), through the job's own
+                    // evm-rpc source, as a builder's fetches go.
+                    let answers = match m.requests(&w) {
+                        Ok(calls) if !calls.is_empty() => self.scheme_answers(&calls).await,
+                        _ => Vec::new(),
+                    };
+                    let fetched = answers.iter().filter(|a| a.is_some()).count();
+                    match m.mutations(&w, &SchemeContext { statement, seed, answers: &answers }, SCHEME_MUTATIONS) {
+                        Ok(ms) => {
+                            let n = ms.len();
+                            mutations.extend(ms);
+                            SchemeReport {
+                                id: Some(id),
+                                name: Some(m.name().into()),
+                                status: format!("{n} structured mutations ({fetched} of {} fetched answers used)", answers.len()),
+                            }
+                        }
+                        Err(e) => SchemeReport { id: Some(id), name: Some(m.name().into()), status: e },
                     }
-                    Err(e) => SchemeReport {
-                        id: Some(id),
-                        name: Some(m.name().into()),
-                        status: format!("W does not decode as this scheme's witness: {e}"),
-                    },
-                },
+                }
             },
         };
+        // The generic ones keep at least a quarter of the room, so neither kind crowds the other out.
+        let max = adv.max_mutations.min(MAX_MUTATIONS);
+        let generic = generic_mutations(&w, seed, adv.flips);
+        mutations.truncate(max.saturating_sub(generic.len().min(max / 4)));
+        mutations.extend(generic);
         let mut seen = std::collections::HashSet::new();
         mutations.retain(|m| seen.insert(m.w.clone()));
-        mutations.truncate(MAX_MUTATIONS);
+        mutations.truncate(max);
         let judge = Judge { descriptor: &p.descriptor, job_id: p.job_id, prover: p.prover, baseline_journal: &s.journal };
         let baseline = Baseline {
             ctx: self.ctx,
@@ -1110,6 +1132,14 @@ impl Adversary<'_> {
         if differential.soundness_failure {
             failures.push("differential: two providers gave different journals that both satisfy the binding".into());
         }
+        let mut notes = Vec::new();
+        if results.iter().any(|m| m.kind == "append" && m.outcome == MutationOutcome::IdenticalJournal) {
+            notes.push(
+                "the guest accepted W with trailing bytes and committed the same journal: sound, but a prelude's \
+                 finish() asserting W was consumed in full (plan §8.3) would refuse it"
+                    .to_string(),
+            );
+        }
         let verdict = adversarial_verdict(&results, &host_inputs, &differential).to_string();
         Ok(AdversarialReport {
             verdict,
@@ -1123,7 +1153,18 @@ impl Adversary<'_> {
             host_inputs,
             differential,
             soundness_failures: failures,
+            notes,
         })
+    }
+
+    /// The answers to a scheme's calls, through the job's first `evm-rpc/v1` capability.
+    async fn scheme_answers(&self, calls: &[RpcCall]) -> Vec<Option<serde_json::Value>> {
+        let Ok(env) = decode(&self.p.descriptor.inputData) else { return vec![None; calls.len()] };
+        let Some(cap) = env.capabilities.iter().position(|c| matches!(c, CapabilityKind::EvmRpcV1 { .. })) else {
+            return vec![None; calls.len()];
+        };
+        let sources = env.job.sources.iter().map(|c| (c.class, c.config.to_vec())).collect();
+        fetch_through_job(&self.ctx.broker, self.p.caller, sources, cap as u32, calls).await
     }
 
     /// The whole pipeline against each of two providers (one po2: the journals are compared, not the

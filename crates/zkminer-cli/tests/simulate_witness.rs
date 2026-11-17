@@ -352,6 +352,7 @@ fn a_descriptor_job_runs_the_miners_pipeline_and_survives_the_attacks() {
     assert!(a["counts"]["bindingRejects"].as_u64().unwrap() >= 1, "a changed n changes fib(n)");
     assert!(a["counts"]["rejectedInGuest"].as_u64().unwrap() >= 1, "a truncated W fails in the guest");
     assert!(a["counts"]["identicalJournal"].as_u64().unwrap() >= 1, "trailing bytes are never read");
+    assert!(a["notes"][0].as_str().unwrap().contains("trailing bytes"), "{:#}", a["notes"]);
     assert_eq!(a["hostInputs"].as_array().unwrap().len(), 3);
     assert!(a["hostInputs"].as_array().unwrap().iter().all(|h| h["dependent"] == false && h["ran"] == true));
     assert_eq!(a["differential"]["journalSame"], true);

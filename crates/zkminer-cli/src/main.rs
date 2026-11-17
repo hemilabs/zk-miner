@@ -143,6 +143,9 @@ enum Commands {
         /// Byte flips at sampled offsets of W.
         #[arg(long, default_value_t = commands::simulate_witness::DEFAULT_FLIPS, requires = "adversarial")]
         flips: usize,
+        /// The most mutations executed: the scheme's structured ones first, then the generic ones.
+        #[arg(long, default_value_t = commands::simulate_witness::MAX_MUTATIONS, requires = "adversarial")]
+        max_mutations: usize,
         /// The scheme id whose structured mutations apply (default: the journal header's first word).
         #[arg(long, requires = "adversarial")]
         scheme: Option<u64>,
@@ -524,6 +527,7 @@ async fn main() -> Result<()> {
             adversarial,
             adversarial_secs,
             flips,
+            max_mutations,
             scheme,
             providers,
             po2,
@@ -549,6 +553,7 @@ async fn main() -> Result<()> {
                 adversarial: adversarial.then(|| commands::simulate_witness::AdversarialOptions {
                     budget: std::time::Duration::from_secs(adversarial_secs),
                     flips,
+                    max_mutations,
                     scheme,
                     providers,
                 }),

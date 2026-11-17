@@ -648,11 +648,16 @@ is reported `not_served`: its proven input is the builder's `W`, not its `inputD
 - **mutations of `W`**, each re-executed by the same sandboxed worker: byte flips at `--flips`
   sampled offsets (default 32; the first and last byte always), truncations, trailing bytes, and
   the drop, duplication and reordering of items in every length-delimited framing `W` parses as
-  (u32/u64 length prefixes, risc0's word-padded `Vec<u8>`, a top-level RLP list), plus the
-  structured mutations of the job's scheme when one is registered for the scheme id in the header's
-  first word (or `--scheme`). Each must fail in the guest, give the same journal byte for byte, or
-  change pinned bytes (which the router refuses); a changed journal that still satisfies the
-  binding is a **soundness failure**, reported with the mutation that caused it;
+  (u32/u64 length prefixes, risc0's word-padded `Vec<u8>`, a top-level RLP list), plus, first, the
+  structured mutations of the job's scheme, by the scheme id in the header's first word (or
+  `--scheme`). Scheme 1 (`eth-block`) is registered, from the reference prelude's codec
+  (`reference/eth-prelude`): byte flips in header words, headers and trie nodes, nodes dropped,
+  duplicated and appended, proof kinds flipped (inclusion for exclusion), proofs truncated,
+  dropped, duplicated and swapped (another slot's proof), and the block header replaced by its
+  parent's and the next block's, fetched through the job's own `evm-rpc/v1` source. At most
+  `--max-mutations` run (default 256). Each must fail in the guest, give the same journal byte for
+  byte, or change pinned bytes (which the router refuses); a changed journal that still satisfies
+  the binding is a **soundness failure**, reported with the mutation that caused it;
 - **host inputs**: the same `W` under two `sys_rand` keys, two po2s and two keccak po2s; any journal
   change is a dependence on an input the prover controls;
 - **providers**: the whole pipeline against two `[[evm_rpc]]` endpoints of the broker configuration

@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use alloy_primitives::{Address, B256};
+use hemiprove_eth_prelude::scheme1::{judge_with, Verdict};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zkminer_chain::binding::check_journal_binding;
@@ -58,6 +59,15 @@ impl Mutation {
     }
 }
 
+/// One JSON-RPC call a scheme's mutator wants answered through the job's own `evm-rpc/v1` source
+/// (§21.1: the parent or a sibling header to swap in), sent as a builder's fetch through the
+/// broker ([`fetch_through_job`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcCall {
+    pub method: String,
+    pub params: serde_json::Value,
+}
+
 /// What a scheme's mutator may read about the job besides `W`.
 #[derive(Debug, Clone)]
 pub struct SchemeContext<'a> {
@@ -65,6 +75,9 @@ pub struct SchemeContext<'a> {
     pub statement: &'a [u8],
     /// The run's seed, for any sampling the mutator does.
     pub seed: u64,
+    /// The answers to [`SchemeMutator::requests`], in its order: each call's `result`, or `None`
+    /// when it failed or was not sent.
+    pub answers: &'a [Option<serde_json::Value>],
 }
 
 /// Structured mutations of one scheme's `W` (§8.1, §21.1). A scheme's reference codec knows where
@@ -75,9 +88,103 @@ pub trait SchemeMutator: Send + Sync {
     fn scheme_id(&self) -> u64;
     /// A short name for reports.
     fn name(&self) -> &'static str;
+    /// Calls whose answers [`Self::mutations`] uses, sent through the job's first `evm-rpc/v1`
+    /// source before it is asked. `Err` when `w` does not decode as this scheme's witness.
+    fn requests(&self, _w: &[u8]) -> Result<Vec<RpcCall>, String> {
+        Ok(Vec::new())
+    }
     /// At most `max` mutations of `w`. `Err` when `w` does not decode as this scheme's witness (a
     /// report line, not a failure of the run: the guest may use another layout).
     fn mutations(&self, w: &[u8], ctx: &SchemeContext<'_>, max: usize) -> Result<Vec<Mutation>, String>;
+}
+
+pub mod scheme1;
+
+/// The scheme mutators this build knows: scheme 1 (`eth-block`), from the reference prelude's
+/// codec ([`scheme1::Scheme1`]).
+pub fn default_registry() -> SchemeRegistry {
+    let mut r = SchemeRegistry::new();
+    r.register(Box::new(scheme1::Scheme1::default()));
+    r
+}
+
+/// Sends `calls` through `broker` as a builder's fetches would go (a job registered with the
+/// envelope's `sources` and a budget of exactly these calls, the request on the job socket naming
+/// capability `cap`), so they reach only the operator's endpoints for that source, through the
+/// miner's connector and network guard. Each answer is the call's `result`, `None` when the fetch
+/// or the call failed.
+pub async fn fetch_through_job(
+    broker: &zkminer_witness_broker::client::BrokerClient,
+    caller: Address,
+    sources: Vec<(B256, Vec<u8>)>,
+    cap: u32,
+    calls: &[RpcCall],
+) -> Vec<Option<serde_json::Value>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use zkminer_witness::ipc::{
+        decode_fetch_result, encode_fetch, fetch_result_frame_max, FetchStatus, FRAME_HEADER_BYTES, KIND_FETCH,
+        KIND_FETCH_RESULT,
+    };
+    const MAX_RESPONSE: u32 = 4 << 20;
+    const PER_CALL: std::time::Duration = std::time::Duration::from_secs(60);
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut out = vec![None; calls.len()];
+    if calls.is_empty() {
+        return out;
+    }
+    let job_key = alloy_primitives::keccak256(
+        [b"zkminer/adversarial/fetch".as_slice(), &std::process::id().to_be_bytes(), &N.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_be_bytes()]
+            .concat(),
+    );
+    let Ok((ours, broker_end)) = zkminer_witness_broker::client::job_socketpair() else { return out };
+    let reg = zkminer_witness_broker::client::JobRegistration {
+        job_key,
+        caller,
+        sources,
+        budget: zkminer_witness::ipc::JobBudget {
+            max_fetches: calls.len() as u32,
+            max_fetch_bytes: u64::from(MAX_RESPONSE) * calls.len() as u64,
+            max_request_bytes: 65_536,
+            max_response_bytes: MAX_RESPONSE,
+        },
+        held_lock: false,
+    };
+    if broker.register_job(reg, broker_end).await.is_err() {
+        return out;
+    }
+    let sock = ours.set_nonblocking(true).ok().and_then(|()| tokio::net::UnixStream::from_std(ours).ok());
+    if let Some(mut sock) = sock {
+        for (i, c) in calls.iter().enumerate() {
+            let body = serde_json::json!({"jsonrpc": "2.0", "id": i + 1, "method": c.method, "params": c.params});
+            let payload = encode_fetch(cap, body.to_string().as_bytes());
+            let mut frame = vec![KIND_FETCH];
+            frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&payload);
+            let exchange = async {
+                sock.write_all(&frame).await.ok()?;
+                let mut h = [0u8; FRAME_HEADER_BYTES];
+                sock.read_exact(&mut h).await.ok()?;
+                let len = u32::from_be_bytes(h[1..].try_into().ok()?);
+                if h[0] != KIND_FETCH_RESULT || len > fetch_result_frame_max(MAX_RESPONSE) {
+                    return None;
+                }
+                let mut p = vec![0u8; len as usize];
+                sock.read_exact(&mut p).await.ok()?;
+                let (status, body) = decode_fetch_result(&p).ok()?;
+                if status != FetchStatus::Ok {
+                    return None;
+                }
+                let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+                v.get("result").filter(|r| !r.is_null()).cloned()
+            };
+            match tokio::time::timeout(PER_CALL, exchange).await {
+                Ok(answer) => out[i] = answer,
+                Err(_) => break,
+            }
+        }
+    }
+    let _ = broker.end_job(job_key).await;
+    out
 }
 
 /// Scheme mutators by scheme id.
@@ -447,15 +554,18 @@ pub fn classify(judge: &Judge<'_>, result: Result<WitnessExecuteResponse, Skip>,
         }
         Err((r, d)) => return MutationOutcome::Inconclusive { why: format!("{r:?}: {d}") },
     };
-    if journal == judge.baseline_journal {
-        return MutationOutcome::IdenticalJournal;
-    }
-    match check_journal_binding(judge.descriptor, &journal, judge.job_id, judge.prover) {
-        Ok(()) => MutationOutcome::SoundnessFailure {
+    // The reference prelude's judgement, under the job's real binding as the router checks it.
+    let verdict = judge_with(judge.baseline_journal, Some(&journal), |j| {
+        check_journal_binding(judge.descriptor, j, judge.job_id, judge.prover).is_ok()
+    });
+    match verdict {
+        Verdict::Identical => MutationOutcome::IdenticalJournal,
+        Verdict::BindingRejects => MutationOutcome::BindingRejects { journal_sha256: sha(&journal) },
+        Verdict::Unsound => MutationOutcome::SoundnessFailure {
             journal_sha256: sha(&journal),
             first_difference: first_difference(&journal, judge.baseline_journal),
         },
-        Err(_) => MutationOutcome::BindingRejects { journal_sha256: sha(&journal) },
+        Verdict::Rejected => MutationOutcome::RejectedInGuest { why: "no journal".into() },
     }
 }
 
@@ -765,7 +875,7 @@ mod tests {
         assert!(r.get(1).is_none());
         r.register(Box::new(Fake));
         assert_eq!(r.ids(), vec![1]);
-        let m = r.get(1).unwrap().mutations(b"w", &SchemeContext { statement: &[], seed: 0 }, 2).unwrap();
+        let m = r.get(1).unwrap().mutations(b"w", &SchemeContext { statement: &[], seed: 0, answers: &[] }, 2).unwrap();
         assert_eq!(m.len(), 2);
     }
 
