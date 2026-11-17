@@ -52,7 +52,8 @@
 //! [`MISUSE_WINDOW`] (checked before the refusal is answered), an answer the broker leaves unread
 //! for longer than [`request_budget`], or a failed answer write while the broker keeps sending (it
 //! shut its reading side) **cuts the broker off**: the connector closes the socket and aborts the
-//! requests it is still serving, the miner pages and kills the broker. An honest broker can produce none of these (its client keeps the same
+//! requests it is still serving, the miner pages and kills the broker and the builder runners
+//! registered with it (`zkminer-witness-host`). An honest broker can produce none of these (its client keeps the same
 //! in-flight bound and reads every answer). A request stays in flight until its answer is handed
 //! to the socket, so a broker that stops reading cannot make the miner hold more than
 //! [`MAX_INFLIGHT`] connected sockets (and the one being written); the socket's send buffer is the

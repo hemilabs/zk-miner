@@ -286,7 +286,12 @@ connected TCP socket (`SCM_RIGHTS`) or a refusal. The connector:
   12 seconds), or an answer that cannot be written while the broker keeps sending (it shut the
   reading side of its socket) **cut the broker off** — the socket is closed, the requests still
   being served are aborted (nothing more is connected for it), the miner pages
-  `WITNESS-BROKER-CUT-OFF`, kills the broker's cgroup and stops witness serving;
+  `WITNESS-BROKER-CUT-OFF`, kills the broker's cgroup and stops witness serving. So does a broker
+  that closes its connector socket and is still running 5 seconds later (an honest broker closes
+  it only by exiting). However the session ends, every builder runner registered with the broker
+  is killed with it, and one registered afterwards at once: the broker can pass a runner any
+  descriptor it holds over the runner's job socket, a TCP socket from the connector included, and
+  such a socket must not outlive the broker in the runner;
 - holds at most 64 sockets for a broker that stops reading: a request counts as in flight until
   its answer is handed to the socket, and the socket's send buffer is the kernel's minimum (about
   six written answers the broker has not read).

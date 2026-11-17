@@ -119,12 +119,80 @@ pub fn job_socketpair() -> io::Result<(UnixStream, OwnedFd)> {
     Ok((a, OwnedFd::from(b)))
 }
 
+/// The cgroups of the builder runners that hold a job socket to this broker.
+///
+/// The broker can pass any descriptor it holds over a job socket (`SCM_RIGHTS`), a TCP socket the
+/// connector handed it included, and a passed socket lives on in the runner after the broker is
+/// killed. So when the broker's connector session ends — a cut-off above all — the miner kills
+/// every runner registered here with it, and closes the set: a runner registered afterwards (one
+/// spawned with a socket already queued on its job socket) is killed at once.
+#[derive(Debug, Default)]
+pub struct RunnerCgroups {
+    inner: Mutex<RunnerSet>,
+}
+
+#[derive(Debug, Default)]
+struct RunnerSet {
+    closed: bool,
+    next: u64,
+    cgroups: HashMap<u64, std::path::PathBuf>,
+}
+
+fn kill_cgroup(path: &std::path::Path) -> io::Result<()> {
+    std::fs::write(path.join("cgroup.kill"), "1")
+}
+
+impl RunnerCgroups {
+    /// Registers the cgroup at `path`, which a runner holding a job socket of this broker is
+    /// already in. `None` if the set is closed: the cgroup was killed instead.
+    pub fn add(&self, path: &std::path::Path) -> Option<u64> {
+        let mut set = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if set.closed {
+            drop(set);
+            if let Err(e) = kill_cgroup(path) {
+                tracing::error!(cgroup = %path.display(), error = %e, "killing a builder runner registered after its broker's end");
+            }
+            return None;
+        }
+        set.next += 1;
+        let id = set.next;
+        set.cgroups.insert(id, path.to_path_buf());
+        Some(id)
+    }
+
+    /// Forgets a runner that is done.
+    pub fn remove(&self, id: u64) {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).cgroups.remove(&id);
+    }
+
+    /// Whether the set is closed (the broker's session ended).
+    pub fn closed(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).closed
+    }
+
+    /// Closes the set and kills every registered cgroup; returns how many were registered.
+    pub fn close_and_kill(&self) -> usize {
+        let mut set = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        set.closed = true;
+        let cgroups: Vec<_> = set.cgroups.drain().map(|(_, p)| p).collect();
+        // Killed under the lock: a registration waits, then finds the set closed.
+        for path in &cgroups {
+            if let Err(e) = kill_cgroup(path) {
+                // A runner that finished and removed its cgroup in the meantime.
+                tracing::debug!(cgroup = %path.display(), error = %e, "killing a builder runner with its broker");
+            }
+        }
+        cgroups.len()
+    }
+}
+
 pub struct BrokerClient {
     sock: Arc<tokio::net::UnixStream>,
     write: tokio::sync::Mutex<()>,
     next_id: AtomicU64,
     pending: Pending,
     reader: tokio::task::JoinHandle<()>,
+    runners: Arc<RunnerCgroups>,
 }
 
 impl Drop for BrokerClient {
@@ -140,7 +208,19 @@ impl BrokerClient {
         let sock = Arc::new(tokio::net::UnixStream::from_std(sock)?);
         let pending: Pending = Arc::default();
         let reader = tokio::spawn(read_loop(sock.clone(), pending.clone()));
-        Ok(Self { sock, write: tokio::sync::Mutex::new(()), next_id: AtomicU64::new(1), pending, reader })
+        Ok(Self {
+            sock,
+            write: tokio::sync::Mutex::new(()),
+            next_id: AtomicU64::new(1),
+            pending,
+            reader,
+            runners: Arc::default(),
+        })
+    }
+
+    /// The builder runners holding a job socket of this broker ([`RunnerCgroups`]).
+    pub fn runners(&self) -> &Arc<RunnerCgroups> {
+        &self.runners
     }
 
     async fn send(&self, id: u64, body: ControlRequest, fd: Option<std::os::fd::BorrowedFd<'_>>) -> Result<(), ClientError> {

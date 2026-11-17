@@ -333,3 +333,91 @@ async fn a_builder_fetches_through_the_broker_and_w_reaches_the_sink() {
     assert!(sink.0.is_empty());
     drop(broker);
 }
+
+/// A builder runner holds its job socket to the broker, over which a compromised broker could pass
+/// it a socket. When the connector cuts the broker off, the runner registered with it is killed
+/// with it, through the production path (`run_builder` registers the runner's cgroup with the
+/// broker's client): the run ends at once with `SIGKILL`, as the miner's own failure.
+///
+/// The broker is the real binary behind a wrapper whose background shell keeps a copy of the
+/// connector socket (fd 4) and sends a malformed frame on it three seconds in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broker_cut_off_kills_the_builder_runner_registered_with_it() {
+    let Some(root) = delegated("a_broker_cut_off_kills_the_builder_runner_registered_with_it") else { return };
+    let (runner_bin, broker_bin) = binaries();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let config = dir.path().join("broker.toml");
+    std::fs::write(&config, anvil_broker_config(dir.path(), "http://127.0.0.1:9")).unwrap();
+    let wrapper = dir.path().join("broker-wrapper.sh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n( /usr/bin/sleep 3; printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' >&4 ) &\nexec {} \"$@\"\n",
+            broker_bin.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let spawner = Spawner::new().unwrap();
+    let broker = BrokerProcess::start(&spawner, &wrapper, &config, &root, 512 << 20, &dev_miner()).unwrap();
+
+    let source = Capability {
+        class: CLASS_EVM_RPC_V1,
+        config: encode_evm_rpc_config(ANVIL_CHAIN, true, METHOD_SET_STATE_READ, 0).into(),
+    };
+    // A module that spins for as long as its 60 s and its fuel allow.
+    let spin = wat::parse_str(
+        r#"(module (memory (export "memory") 1) (func (export "run") (result i32) (loop $l (br $l)) (i32.const 0)))"#,
+    )
+    .unwrap();
+    let limits = Limits {
+        maxFetches: 1,
+        maxFetchBytes: 1,
+        maxRequestBytes: 65_536,
+        maxResponseBytes: 1,
+        maxBuilderFuel: 1 << 50,
+        maxBuilderMemoryBytes: 64 << 20,
+        maxBuilderSeconds: 60,
+        maxWitnessBytes: 1 << 20,
+        maxGuestCycles: 1 << 26,
+    };
+    let job = WitnessJobV1 {
+        builderType: 1,
+        builderId: B256::ZERO,
+        builderURIs: vec![],
+        builderParams: vec![].into(),
+        sources: vec![source.clone()],
+        limits: limits.clone(),
+    };
+    let d = DescriptorFields {
+        program_id: B256::repeat_byte(1),
+        proof_system_id: B256::repeat_byte(2),
+        expected_journal_hash: B256::repeat_byte(3),
+        journal_fields: B256::repeat_byte(4),
+    };
+    let context = encode_context(&build_context(743_111, Address::repeat_byte(5), &d, &job));
+    let job_key = B256::repeat_byte(0x44);
+    let (result, sink) = run_builder(
+        &spawner,
+        &broker.client,
+        &BuilderRun { binary: &runner_bin, cgroup_root: &root, job_key, module: &spin, context: &context, limits: &limits },
+        JobRegistration {
+            job_key,
+            caller: Address::repeat_byte(6),
+            sources: vec![(source.class, source.config.to_vec())],
+            budget: JobBudget { max_fetches: 1, max_fetch_bytes: 1, max_request_bytes: 65_536, max_response_bytes: 1 },
+            held_lock: false,
+        },
+        VecSink::default(),
+    )
+    .await
+    .unwrap();
+    assert!(broker.cut_off(), "the connector cut the broker off");
+    assert_eq!(result.outcome.signal, Some(libc::SIGKILL), "{:?}\n{}", result.outcome, result.log);
+    assert!(result.elapsed < Duration::from_secs(20), "the runner ran {:?}: not killed with its broker", result.elapsed);
+    assert!(result.outcome.miner_side_failure && !result.aborted);
+    assert_eq!(result.verdict, Some(SkipReason::RunnerInternal), "never the builder's fault");
+    assert!(sink.0.is_empty());
+    drop(broker);
+}
