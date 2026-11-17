@@ -482,3 +482,52 @@ fn mutations_of_real_witnesses_never_change_the_answer() {
         assert!(counts["Rejected"] > 500, "{name}: {counts:?}");
     }
 }
+
+/// Every byte of a real witness flipped (every third position; all of the first 300, where the
+/// magic, the header words and the first counts sit), and truncations: never a panic, never a
+/// different answer under the same header.
+#[test]
+fn byte_flips_across_a_whole_real_witness() {
+    let f = fixture("hemi");
+    let (_, w, _) = real_witness(&f, 6);
+    let enc = w.encode().unwrap();
+    let honest = run(&input(&enc)).unwrap();
+    let pinned = PREFIX_BYTES + HEADER_BYTES;
+    let mut tried = 0;
+    for i in (0..enc.len()).filter(|i| *i < 300 || i % 3 == 0) {
+        for mask in [0x01u8, 0x80] {
+            let mut m = enc.clone();
+            m[i] ^= mask;
+            let verdict = judge(&honest, run(&input(&m)).ok().as_deref(), pinned);
+            assert_ne!(verdict, Verdict::Unsound, "byte {i} mask {mask:#x}");
+            tried += 1;
+        }
+    }
+    for len in (0..enc.len()).step_by(97) {
+        assert!(run(&input(&enc[..len])).is_err(), "truncated to {len}");
+    }
+    assert!(tried > 10_000, "{tried}");
+}
+
+/// Arbitrary inputs: never a panic.
+#[test]
+fn arbitrary_inputs_never_panic() {
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for n in 0..3000usize {
+        let len = n % 700;
+        let mut b = Vec::with_capacity(len);
+        for _ in 0..len {
+            // xorshift: deterministic, no rand crate.
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            b.push(x as u8);
+        }
+        if n % 2 == 0 && b.len() > 100 {
+            // Half of them start like a scheme-1 witness behind a valid prefix.
+            b[..64].copy_from_slice(&PREFIX);
+            b[64..69].copy_from_slice(b"HPW\x01\x01");
+        }
+        let _ = run(&b);
+    }
+}
