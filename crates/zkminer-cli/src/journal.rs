@@ -55,6 +55,10 @@ pub struct JournalEntry {
     /// proves it on a card at one of them: a guest can tell the size it runs at. Empty for SP1, and
     /// in a breadcrumb written before sizes were recorded.
     pub measured_po2s: Vec<u8>,
+    /// The `sys_rand` rule the risc0 sizes above were measured under, so a restart on a build with
+    /// another rule can say that this lock's guest may now commit something else. `None` in a
+    /// breadcrumb written before the rule was recorded.
+    pub sys_rand_rule: Option<String>,
 }
 
 impl Default for JournalEntry {
@@ -69,6 +73,7 @@ impl Default for JournalEntry {
             lock_block: 0,
             lock_reopens: None,
             measured_po2s: Vec::new(),
+            sys_rand_rule: None,
         }
     }
 }
@@ -145,6 +150,7 @@ impl JobJournal {
             lock_block: 0,
             lock_reopens: None,
             measured_po2s: Vec::new(),
+            sys_rand_rule: None,
         });
         // A new claim: whatever was seen of an earlier lock on this job says nothing about it (a
         // read showing the new claim pending, at a higher reopen count, would look like proof that
@@ -185,6 +191,7 @@ impl JobJournal {
             lock_block: 0,
             lock_reopens: None,
             measured_po2s: Vec::new(),
+            sys_rand_rule: None,
         });
         if claim_tx.is_some() {
             e.claim_tx = claim_tx;
@@ -204,7 +211,28 @@ impl JobJournal {
                 }
             }
             e.measured_po2s.sort_unstable();
+            if !po2s.is_empty() {
+                e.sys_rand_rule = Some(zkminer_prover_protocol::sys_rand::SYS_RAND_RULE.to_string());
+            }
         }
+    }
+
+    /// The jobs held or being proved that were measured at risc0 sizes under a `sys_rand` rule other
+    /// than `rule`, or before rules were recorded (see [`JournalEntry::sys_rand_rule`]). SP1 locks
+    /// record no sizes and have no host seed, so never appear; nor does a claim that never landed.
+    pub fn measured_under_another_sys_rand_rule(&self, rule: &str) -> Vec<B256> {
+        let mut ids: Vec<B256> = self
+            .entries
+            .values()
+            .filter(|e| {
+                e.state != JournalState::Claiming
+                    && !e.measured_po2s.is_empty()
+                    && e.sys_rand_rule.as_deref() != Some(rule)
+            })
+            .map(|e| e.job_id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// The sizes recorded for a job (see [`JournalEntry::measured_po2s`]).
@@ -248,6 +276,43 @@ mod tests {
             std::process::id()
         ));
         p
+    }
+
+    #[test]
+    fn a_lock_measured_under_another_rule_is_named_and_an_sp1_one_never() {
+        const RULE: &str = zkminer_prover_protocol::sys_rand::SYS_RAND_RULE;
+        let (now, old, unsized_, sp1, unlanded) = (
+            B256::repeat_byte(1),
+            B256::repeat_byte(2),
+            B256::repeat_byte(3),
+            B256::repeat_byte(4),
+            B256::repeat_byte(5),
+        );
+        let mut j = JobJournal::default();
+        for id in [now, old, unsized_, sp1, unlanded] {
+            j.record_claim_intent(id, 1, None);
+        }
+        for id in [now, old, unsized_, sp1] {
+            j.mark_claimed(id, Some(B256::repeat_byte(9)), 1);
+        }
+        j.note_measured_po2s(now, &[20]);
+        j.note_measured_po2s(old, &[20]);
+        j.note_measured_po2s(sp1, &[]);
+        j.note_measured_po2s(unlanded, &[20]);
+        assert_eq!(j.measured_under_another_sys_rand_rule(RULE), Vec::<B256>::new());
+        assert_eq!(j.measured_under_another_sys_rand_rule("risc0-public-v4"), vec![now, old]);
+        // A breadcrumb from a build before the rule was recorded: sizes, no rule.
+        j.entries.get_mut(&old).unwrap().sys_rand_rule = None;
+        assert_eq!(j.measured_under_another_sys_rand_rule(RULE), vec![old]);
+        // And an old file still loads, the field absent.
+        let path = tmp_path("rule");
+        j.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap().replace("\"sys_rand_rule\"", "\"ignored_field\"");
+        std::fs::write(&path, text).unwrap();
+        let loaded = JobJournal::load_from(&path);
+        assert_eq!(loaded.entries.len(), 5);
+        assert!(loaded.entries.values().all(|e| e.sys_rand_rule.is_none()));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
