@@ -114,10 +114,8 @@ impl Rig {
             ("ZKMINER_CUDA_DEVICE_ID".to_string(), DEVICE.to_string()),
             ("ZKMINER_SP1_SERVER_INSTALL".to_string(), "0".to_string()),
             ("FAKE_SERVER_MODE".to_string(), mode.to_string()),
-            (
-                "FAKE_SERVER_LOG".to_string(),
-                dir.join("reached").display().to_string(),
-            ),
+            // Where the server, which runs confined (Landlock), may write: /dev/shm.
+            ("FAKE_SERVER_LOG".to_string(), Self::reached_marker(name)),
         ];
         if server != CUDA_SERVER {
             env.push(("SP1_GPU_SERVER_NAME".to_string(), server.to_string()));
@@ -186,18 +184,34 @@ impl Rig {
     }
 
     fn server_was_reached(&self) -> bool {
-        self.dir.join("reached").exists()
+        self.env
+            .iter()
+            .find(|(k, _)| k == "FAKE_SERVER_LOG")
+            .is_some_and(|(_, v)| Path::new(v).exists())
+    }
+
+    /// The marker the stand-in server writes when a worker reaches it.
+    fn reached_marker(name: &str) -> String {
+        format!(
+            "/dev/shm/zkminer-server-faults-{}-{name}-reached",
+            std::process::id()
+        )
     }
 }
 
 impl Drop for Rig {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+        if let Some((_, marker)) = self.env.iter().find(|(k, _)| k == "FAKE_SERVER_LOG") {
+            let _ = std::fs::remove_file(marker);
+        }
         // A killed server leaves its socket, as a real one does.
         for socket in [
             format!("/tmp/sp1-cuda-{DEVICE}.sock"),
             format!("/tmp/{HIP_SERVER}-{DEVICE}.sock"),
             format!("/tmp/{HIP_SERVER}-3.sock"),
+            format!("/tmp/zkminer-confined-{CUDA_SERVER}-{DEVICE}.sock"),
+            format!("/tmp/zkminer-confined-{HIP_SERVER}-{DEVICE}.sock"),
         ] {
             let _ = std::fs::remove_file(socket);
         }
@@ -528,12 +542,9 @@ fn benchmark_by_hand_reports_and_cleans_up() -> Result<(), String> {
 fn an_orphan_is_waited_for(elf: &[u8]) -> Result<(), String> {
     for server in [CUDA_SERVER, HIP_SERVER] {
         let rig = Rig::new(&format!("orphan-{server}"), server, "err:boom");
-        let base = if server == CUDA_SERVER {
-            "sp1-cuda"
-        } else {
-            server
-        };
-        let socket = format!("/tmp/{base}-{DEVICE}.sock");
+        // The socket the worker's SDK connects to: its server runs confined, through the shim it
+        // names `zkminer-confined-<server>` (and the socket after it).
+        let socket = format!("/tmp/zkminer-confined-{server}-{DEVICE}.sock");
         orphan(&rig.dir, server, DEVICE, &socket, 8);
         let started = Instant::now();
         let mut worker = rig.start();

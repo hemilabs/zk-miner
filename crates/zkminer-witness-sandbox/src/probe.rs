@@ -382,6 +382,14 @@ pub fn main() -> i32 {
         eprintln!("usage: {PROBE_BINARY} <checks|oom|pids|fds|threaded> --profile <builder_runner|execute_worker|broker> [flags]");
         return 64;
     };
+    // The inline workers' confinement (crate::confine), which takes no profile.
+    match command {
+        "confined" => return crate::confine_probe::run_confined(&args[1..]),
+        "supervised" => return crate::confine_probe::run_supervised_parent(&args[1..]),
+        "supervised-child" => return crate::confine_probe::run_supervised_child(&args[1..]),
+        "noop" => return 0,
+        _ => {}
+    }
     let parsed = match ProbeArgs::parse(&args[1..]) {
         Ok(a) => a,
         Err(e) => {

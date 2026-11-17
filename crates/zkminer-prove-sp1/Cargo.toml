@@ -42,6 +42,8 @@ sp1-build = "6.0"
 # For the error and socket path the SDK does not re-export, which this worker reads the text of and
 # mirrors: the tests hold those to the pinned SDK. sp1-sdk depends on it already.
 sp1-cuda = "6.0"
+# tests/gpu_confined.rs: a directory for the exported guest.
+tempfile = "3"
 
 [[test]]
 name = "server_faults"

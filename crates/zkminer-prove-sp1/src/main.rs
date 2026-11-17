@@ -286,6 +286,7 @@ use zkminer_prover_protocol::{
 };
 
 mod bundled_server;
+mod confinement;
 mod warmup;
 #[cfg(windows)]
 mod windows_job;
@@ -327,6 +328,11 @@ fn dup_cloexec(fd: std::os::unix::io::RawFd) -> std::io::Result<std::os::unix::i
 }
 
 fn main() {
+    // Started by the SDK as `~/.sp1/bin/zkminer-confined-<server>`: the shim that runs the real
+    // `sp1-gpu-server` confined (confinement.rs). Before anything else; it does not return.
+    #[cfg(target_os = "linux")]
+    confinement::run_if_shim();
+
     // `--export-guest <name> <path>`: write one of the embedded guests to `path` and print its vkey
     // hash (`bytes32()`), which is the `programId` of an SP1 job for it. For harnesses that submit
     // jobs this worker can serve (crates/zkminer-cli/tests/localnet.rs). Runs SP1's setup on the CPU
@@ -448,6 +454,22 @@ fn main() {
         }
     }
 
+    // Workers that run requester guests are confined, and so is their server (confinement.rs): a
+    // private temporary directory, named by TMPDIR from here on, and for a worker that proves, the
+    // SDK's server started through the confining shim. While the process has one thread.
+    #[cfg(target_os = "linux")]
+    {
+        confinement::prepare();
+        if !sp1_measure_only() {
+            if let Err(e) = confinement::route_server_through_shim() {
+                tracing::error!(
+                    "cannot start sp1-gpu-server through its confinement ({e}): this worker will \
+                     start no server"
+                );
+            }
+        }
+    }
+
     // Direct benchmark mode: run benchmarks and print results to stderr (stdout is redirected).
     if std::env::args().any(|a| a == "--benchmark") {
         // Honour the assigned device here too. Without this, benchmarking card 1 by hand silently
@@ -482,6 +504,10 @@ fn run_benchmarks_by_hand(device: Option<u32>) -> i32 {
             return 1;
         }
     };
+    if let Err(e) = confine_worker(true) {
+        tracing::error!("cannot confine this worker, so it proves nothing: {e}");
+        return 1;
+    }
     // Discarded, as under a host: see `warmup_spec`.
     let warmup = [zkminer_prover_protocol::warmup_spec(BACKEND_SP1)];
     run_benchmarks(prover, &mut held.benchmark_keys, &warmup, &mut |_, _, _| {});
@@ -541,17 +567,24 @@ const ORPHAN_EXIT_WAIT: Duration = Duration::from_secs(10);
 /// prover slot is still `None` (we only assign on success), and the SDK's own state dies with the
 /// server it failed to reach.
 ///
-/// The worker denies itself the network first ([`deny_network`]): the server it starts here runs
-/// requester guests (every proof executes its guest there), and inherits the filter only if it starts
-/// after it. It needs none: it speaks to this worker over a Unix socket, and the Groth16 artifacts it
-/// proves with were installed by the warm-up. So no server of this worker's ever has the network,
-/// even one started for a benchmark. A server the SDK would download first (absent, or another
-/// version) cannot be: that is refused here, in so many words.
+/// The server runs requester guests (every proof executes its guest there), so it is never started
+/// unconfined: the SDK starts it through the confining shim (`confinement`), and this refuses to
+/// build a prover otherwise. It is built before the worker confines itself (which takes `connect`
+/// away), so a worker that is already confined cannot start one: a fresh worker does. A server the SDK
+/// would download first (absent, or another version) is refused too, in so many words.
 fn build_prover(
     cuda_device_id: Option<u32>,
 ) -> std::result::Result<sp1_sdk::blocking::CudaProver, String> {
-    deny_network().map_err(|e| {
-        format!("could not deny this worker the network, so it starts no sp1-gpu-server: {e}")
+    if network_denied() {
+        return Err(
+            "this worker is confined (it has run a requester's guest), so it can start no \
+             sp1-gpu-server: a fresh worker does"
+                .to_string(),
+        );
+    }
+    #[cfg(target_os = "linux")]
+    confinement::server_routed_through_shim().map_err(|e| {
+        format!("sp1-gpu-server would not run confined, so this worker starts none: {e}")
     })?;
     server_needs_no_download()?;
     reap_orphaned_gpu_servers(cuda_device_id, ORPHAN_EXIT_WAIT);
@@ -582,49 +615,34 @@ fn build_prover(
     })
 }
 
-/// Workers that run requester guests have no network. Before the first command that runs one
-/// (`Execute` and `ProgramId` on the CPU prover, `Prove`) and before it starts `sp1-gpu-server`
-/// ([`build_prover`]), the worker denies itself, its threads and everything it starts from then on
-/// any socket but a Unix one, for the rest of its life (`zkminer_witness_sandbox::netdeny`). Defense
-/// in depth: nothing the worker or its server needs after the one-time setup reaches the network.
-/// That setup (`Warmup`: the Groth16 circuit download) runs before, as the miner warms a backend
-/// before it claims or benchmarks; a `Warmup` after refuses rather than download (`warmup::warm_up`),
-/// and the miner runs it on a fresh worker.
+/// Workers that run requester guests are confined. Before the first command that runs one or reaches
+/// the server (`Execute` and `ProgramId` on the CPU prover, `Prove`, `Benchmark`), the worker confines
+/// itself, its threads and everything it starts from then on, for the rest of its life
+/// (`confinement`): no new socket (a proving worker keeps the connection to its own server, which
+/// it makes first), Landlock, no reaching other processes. The server is confined from its start
+/// (`build_prover`). That setup (`Warmup`: the Groth16 circuit download) runs before, as the miner
+/// warms a backend before it claims or benchmarks; a `Warmup` after refuses rather than download
+/// (`warmup::warm_up`), and the miner runs it on a fresh worker.
 ///
 /// An error means no guest may run: the caller answers the command with it.
-#[cfg(target_os = "linux")]
-fn deny_network() -> Result<(), String> {
-    zkminer_witness_sandbox::netdeny::deny_network_all_threads().map_err(|e| e.to_string())
+fn confine_worker(keep_server: bool) -> Result<(), String> {
+    confinement::confine(keep_server)
 }
 
-/// No seccomp off Linux: nothing to deny with.
-#[cfg(not(target_os = "linux"))]
-fn deny_network() -> Result<(), String> {
-    Ok(())
-}
-
-/// Whether this worker has denied itself the network ([`deny_network`]).
+/// Whether this worker has confined itself ([`confine_worker`]), and so has no network.
 pub(crate) fn network_denied() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        zkminer_witness_sandbox::netdeny::is_active()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
+    confinement::is_confined()
 }
 
-/// [`deny_network`] before a guest command, or the answer refusing it.
-fn guest_may_run(request_id: u64) -> std::result::Result<(), WorkerResponse> {
-    deny_network().map_err(|e| {
-        tracing::error!("cannot deny this worker the network, so it runs no guest: {e}");
+/// [`confine_worker`] before a guest command, or the answer refusing it.
+fn guest_may_run(request_id: u64, keep_server: bool) -> std::result::Result<(), WorkerResponse> {
+    confine_worker(keep_server).map_err(|e| {
+        tracing::error!("cannot confine this worker, so it runs no guest: {e}");
         WorkerResponse::Error {
             request_id,
             kind: ErrorKind::Internal,
             message: format!(
-                "this worker could not deny itself the network, so it runs no requester's guest: \
-                 {e}"
+                "this worker could not confine itself, so it runs no requester's guest: {e}"
             ),
         }
     })
@@ -896,7 +914,9 @@ fn reap_orphaned_gpu_servers(our_device: Option<u32>, wait: Duration) {
         // measure-only worker has none. It starts no server, and it has no device of its own: its
         // default of 0 would name the live socket of whichever worker proves on card 0.
         if !sp1_measure_only() {
-            if let Some(own) = server_socket_path(&warmup::server_name(), our_device.unwrap_or(0)) {
+            if let Some(own) =
+                server_socket_path(&confinement::sdk_server_name(), our_device.unwrap_or(0))
+            {
                 let _ = std::fs::remove_file(own);
             }
         }
@@ -1832,6 +1852,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 }
                 match get_prover!(held.prover) {
                     Ok(p) => {
+                        if let Err(refused) = guest_may_run(0, true) {
+                            write_message(&mut stdout, &refused)?;
+                            continue;
+                        }
                         let run = run_benchmarks(
                             p,
                             &mut held.benchmark_keys,
@@ -1919,19 +1943,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     write_message(&mut stdout, &resp)?;
                     continue;
                 }
-                if let Err(refused) = guest_may_run(request_id) {
-                    write_message(&mut stdout, &refused)?;
-                    continue;
-                }
-                // Announce proof START so the miner can move the job from Queued to Proving.
-                // Without this the job displays "Queued (waiting for GPU)" for the whole proof.
-                let started = WorkerResponse::Progress {
-                    request_id,
-                    fraction: 0.0,
-                    elapsed_secs: 0.0,
-                    segments: None,
-                };
-                write_message(&mut stdout, &started)?;
+                // The server first, then the confinement: once confined, this worker can start none.
                 let prover_for_proof = match get_prover!(held.prover) {
                     Ok(p) => p,
                     Err(message) => {
@@ -1947,6 +1959,19 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         continue;
                     }
                 };
+                if let Err(refused) = guest_may_run(request_id, true) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
+                // Announce proof START so the miner can move the job from Queued to Proving.
+                // Without this the job displays "Queued (waiting for GPU)" for the whole proof.
+                let started = WorkerResponse::Progress {
+                    request_id,
+                    fraction: 0.0,
+                    elapsed_secs: 0.0,
+                    segments: None,
+                };
+                write_message(&mut stdout, &started)?;
                 // `run_proof`'s prove-only SDK calls — `setup` (vkey/pk derivation) and
                 // the GPU `prove` — run on the fully attacker-controlled ELF and are NOT exercised by
                 // the Execute measurement gate, so a crafted ELF that executes cleanly (hence measures
@@ -2059,7 +2084,24 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // submitter-declared `expectedCycles`. Runs on a lazily-built CPU executor (no
                 // gpu-server), so it is as cheap as risc0's sizing path.
                 tracing::info!("Execute (sizing) request {request_id} ({} bytes ELF)", elf.len());
-                if let Err(refused) = guest_may_run(request_id) {
+                // A worker that proves starts its server before it confines itself (which takes
+                // `connect` away); one that only measures keeps no socket at all.
+                let keep_server = !sp1_measure_only();
+                if keep_server {
+                    if let Err(message) = get_prover!(held.prover) {
+                        tracing::error!("{message}");
+                        write_message(
+                            &mut stdout,
+                            &WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::Internal,
+                                message,
+                            },
+                        )?;
+                        continue;
+                    }
+                }
+                if let Err(refused) = guest_may_run(request_id, keep_server) {
                     write_message(&mut stdout, &refused)?;
                     continue;
                 }
@@ -2142,7 +2184,24 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     "ProgramId request {request_id} ({} bytes ELF): SP1 setup on the CPU",
                     elf.len()
                 );
-                if let Err(refused) = guest_may_run(request_id) {
+                // A worker that proves starts its server before it confines itself (which takes
+                // `connect` away); one that only measures keeps no socket at all.
+                let keep_server = !sp1_measure_only();
+                if keep_server {
+                    if let Err(message) = get_prover!(held.prover) {
+                        tracing::error!("{message}");
+                        write_message(
+                            &mut stdout,
+                            &WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::Internal,
+                                message,
+                            },
+                        )?;
+                        continue;
+                    }
+                }
+                if let Err(refused) = guest_may_run(request_id, keep_server) {
                     write_message(&mut stdout, &refused)?;
                     continue;
                 }
@@ -3158,18 +3217,22 @@ mod orphan_exit_tests {
             wait < start,
             "the wait must come before the SDK starts a server"
         );
-        let deny = build
-            .find("deny_network()")
-            .expect("build_prover denies the network");
+        let refused = build
+            .find("if network_denied()")
+            .expect("a confined worker starts no server");
+        let shim = build
+            .find("confinement::server_routed_through_shim()")
+            .expect("build_prover checks the server runs confined");
         assert!(
-            deny < start,
-            "the server must start after the filter, to inherit it"
+            refused < start && shim < start,
+            "the server must only ever start through the confining shim"
         );
     }
 
-    /// Every arm that hands a requester's ELF to the SDK denies the network first.
+    /// Every arm that hands a requester's ELF to the SDK confines the worker first (after starting
+    /// the server, for a worker that proves).
     #[test]
-    fn every_guest_command_denies_the_network_first() {
+    fn every_guest_command_confines_the_worker_first() {
         let source = include_str!("main.rs");
         let worker_loop = source.split_once("\nfn run_worker_loop(").unwrap().1;
         let worker_loop = &worker_loop[..worker_loop.find("\nfn ").unwrap()];
@@ -3179,11 +3242,14 @@ mod orphan_exit_tests {
             ("WorkerCommand::Prove {", "run_proof("),
         ] {
             let body = worker_loop.split_once(arm).unwrap().1;
-            let deny = body.find("guest_may_run(request_id)").expect(arm);
+            let confine = body.find("guest_may_run(request_id,").expect(arm);
             let cpu = body.find("cpu_prover(").unwrap_or(usize::MAX);
-            let gpu = body.find("get_prover!(").unwrap_or(usize::MAX);
             let call = body.find(sdk_call).expect(sdk_call);
-            assert!(deny < cpu.min(gpu).min(call), "{arm}");
+            assert!(confine < cpu.min(call), "{arm}");
+            // The server is started (`get_prover!`) before, never after: once confined, the worker
+            // could not connect to it.
+            let gpu = body.find("get_prover!(").expect(arm);
+            assert!(gpu < confine, "{arm}");
         }
     }
 }

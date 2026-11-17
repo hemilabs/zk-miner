@@ -1,118 +1,317 @@
-//! No network for a process that runs requester code outside the sandbox profiles
-//! ([`deny_network_all_threads`]).
+//! The seccomp half of the confinement of the processes that run requester guests outside the
+//! sandbox profiles: the miner's inline measuring and proving workers and the `sp1-gpu-server` an
+//! SP1 worker starts. [`crate::confine`] installs it, together with Landlock.
 //!
-//! The miner's inline proving and measuring workers run requester guests in their own process, and
-//! cannot take a [`crate::Profile`]: the GPU stack needs device files, a writable home, ioctls,
-//! `mmap`, threads and helper processes. What they do not need, once their one-time setup (downloads
-//! of proving keys and circuit artifacts) is done, is the network. So the first time such a worker
-//! is about to run a requester's guest, it calls [`deny_network_all_threads`]: defense in depth, so
-//! that workers that run requester guests have no network, whatever happens inside them.
+//! Those processes cannot take a [`crate::Profile`]: the GPU stack needs device files, ioctls,
+//! `mmap`, threads and helper processes. What they do not need, once their one-time setup is done,
+//! is any socket. So their filter takes every socket away, Unix ones included ([`Sockets`]):
 //!
-//! The filter allows everything except, with `EPERM`:
-//! - `socket` and `socketpair` of any domain but `AF_UNIX` (a GPU server or helper the worker talks
-//!   to over a Unix socket keeps working; `AF_INET`, `AF_INET6`, `AF_PACKET`, `AF_NETLINK`,
-//!   `AF_VSOCK`, ... do not);
-//! - `io_uring_setup`, `io_uring_enter`, `io_uring_register` (io_uring operations, socket creation
-//!   and connects included, bypass seccomp);
-//! - `bpf`;
-//! - `ptrace`, `process_vm_readv`, `process_vm_writev` and `pidfd_getfd`: another process of the same
-//!   uid (the miner, which holds network connections) must not be driven, read, written, or have its
-//!   connected sockets copied out;
-//! - on x86_64, every x32 syscall (a denylist keyed by 64-bit numbers would miss their aliases);
+//! - [`Sockets::None`] (the risc0 and OpenVM workers): no `socket` or `socketpair` of any domain,
+//!   no `connect`, `bind`, `listen`, `accept` or `accept4`.
+//!   The only socket such a process may hold when the filter goes on is a listening Unix socket
+//!   (the CUDA driver opens one at `cuInit`); with `accept` gone, nothing can come in through it.
+//! - [`Sockets::KeepConnected`] (the SP1 worker): the same, except that a Unix stream or seqpacket
+//!   `socketpair` stays allowed (the SDK's tokio runtime makes a stream pair, and Rust's
+//!   `Command::spawn` reports a failed `exec` over a seqpacket pair; a connected pair reaches nothing
+//!   outside the process), and the process may keep the connected Unix stream sockets it holds to
+//!   processes it started itself (a proving worker's connection to its own `sp1-gpu-server`, which
+//!   is confined too).
+//! - [`Sockets::Supervised`] (`sp1-gpu-server`, see [`crate::supervise`]): Unix stream and seqpacket
+//!   sockets, `bind`, `listen` and `accept*` reach a supervisor process, which lets them through
+//!   until the server takes its first connection and refuses `socket`, `bind` and `listen` from then
+//!   on; `connect` and every other socket are refused outright.
 //!
-//! and kills the process on a syscall of a foreign ABI (e.g. `int 0x80` on x86_64), as the sandbox
-//! profiles' filters do. `NO_NEW_PRIVS` is set first, so no setuid program run afterwards regains
-//! what the filter takes away. The filter is installed with `SECCOMP_FILTER_FLAG_TSYNC`: it covers
-//! every thread the process already has, and every thread and child process it creates afterwards
-//! inherits it (across `exec` too).
-//!
-//! It cannot close what is already open: [`deny_network_all_threads`] therefore fails if the process
-//! still holds a network socket ([`open_network_sockets`]), so a connection kept alive by an earlier
-//! download is caught rather than handed to the guest.
+//! Every policy also refuses, with `EPERM`: `io_uring_*` (its operations, socket creation and
+//! connects included, bypass seccomp), `bpf`, `ptrace`, `process_vm_readv`, `process_vm_writev` and
+//! `pidfd_getfd` (another process of the uid, such as the miner, must not be driven, read, written,
+//! or have its sockets copied out), `mknod`/`mknodat`, the kernel keyrings (`add_key`, `keyctl`,
+//! `request_key`: the uid's keys are not the worker's), a seccomp filter with a user-notification
+//! listener of its own, `TIOCSTI`/`TIOCLINUX` (keystrokes into an inherited terminal), and
+//! `PR_SET_PTRACER`; on x86_64, every x32 syscall. A syscall of a foreign ABI (`int 0x80` on
+//! x86_64) kills the process. The filters are installed with `SECCOMP_FILTER_FLAG_TSYNC` after
+//! `NO_NEW_PRIVS`: every thread the process has, and every thread and process it creates afterwards
+//! (across `exec` too), carries them.
 
 use std::collections::BTreeMap;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
     SeccompRule, TargetArch,
 };
 
+use crate::restrict::{PR_SET_PTRACER, SOCK_TYPE_MASK};
 use crate::SandboxError;
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("zkminer-witness-sandbox's network filter covers x86_64 and aarch64 only");
 
-/// Set once this process has installed the filter.
-static INSTALLED: AtomicBool = AtomicBool::new(false);
-/// Serialises installs, so two threads never stack two filters.
-static INSTALL: Mutex<()> = Mutex::new(());
-
-/// Syscalls denied whatever their arguments.
-const DENIED: [(&str, i64); 8] = [
-    ("io_uring_setup", libc::SYS_io_uring_setup),
-    ("io_uring_enter", libc::SYS_io_uring_enter),
-    ("io_uring_register", libc::SYS_io_uring_register),
-    ("bpf", libc::SYS_bpf),
-    ("ptrace", libc::SYS_ptrace),
-    ("process_vm_readv", libc::SYS_process_vm_readv),
-    ("process_vm_writev", libc::SYS_process_vm_writev),
-    ("pidfd_getfd", libc::SYS_pidfd_getfd),
-];
-
-/// Denies this process, all of its threads and everything it starts from now on any network: see
-/// the [module docs](self) for the filter. Idempotent: the filter is installed once per process,
-/// and a later call only checks again.
-///
-/// After installing it checks the result rather than the calls: `PR_GET_SECCOMP == 2`,
-/// `PR_GET_NO_NEW_PRIVS == 1`, every thread in `/proc/self/task` in seccomp filter mode, and
-/// `socket(AF_INET)` and `socket(AF_INET6)` failing with `EPERM`. Then it fails if a network socket
-/// (anything but `AF_UNIX` and `AF_NETLINK`) is still open in the process, which the filter cannot
-/// take back; the caller must drop it (or exit) and call again.
-///
-/// Fails closed: on any error the caller must not run the guest. Once the filter is installed it
-/// stays installed, error or not ([`is_active`]).
-pub fn deny_network_all_threads() -> Result<(), SandboxError> {
-    {
-        let _install = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
-        if !INSTALLED.load(Ordering::Acquire) {
-            // Everything that allocates happens before any filter is applied.
-            let filters = filters()?;
-            // SAFETY: plain prctl with valid arguments.
-            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            for filter in &filters {
-                seccompiler::apply_filter_all_threads(filter)
-                    .map_err(|e| SandboxError::Seccomp(e.to_string()))?;
-                // Set as soon as one filter is in: from then on the process has lost something.
-                INSTALLED.store(true, Ordering::Release);
-            }
-        }
-    }
-    verify()?;
-    let open = open_network_sockets()?;
-    if !open.is_empty() {
-        let list: Vec<String> = open.iter().map(ToString::to_string).collect();
-        return Err(SandboxError::Seccomp(format!(
-            "the network filter is on, but {} network socket{} opened before it {} still open ({}): \
-             a filter stops new sockets, not these",
-            open.len(),
-            if open.len() == 1 { "" } else { "s" },
-            if open.len() == 1 { "is" } else { "are" },
-            list.join(", ")
-        )));
-    }
-    Ok(())
+/// What a confined process may still do with sockets. See the [module docs](self).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sockets {
+    /// No socket at all.
+    None,
+    /// No new socket but Unix stream and seqpacket pairs; Unix stream connections to its own
+    /// children, made before, stay usable.
+    KeepConnected,
+    /// `sp1-gpu-server` under its supervisor ([`crate::supervise`]).
+    Supervised,
 }
 
-/// Whether this process has installed the network filter ([`deny_network_all_threads`]), so it can
-/// no longer open a network socket. A filter inherited from the parent does not count: only one
-/// this process installed.
-pub fn is_active() -> bool {
-    INSTALLED.load(Ordering::Acquire)
+impl std::fmt::Display for Sockets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Sockets::None => "no sockets",
+            Sockets::KeepConnected => {
+                "no sockets but stream pairs, keeps connections to its own children"
+            }
+            Sockets::Supervised => "its own listener only (supervised)",
+        })
+    }
+}
+
+/// `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
+pub(crate) const SECCOMP_FILTER_FLAG_NEW_LISTENER: u64 = 1 << 3;
+/// `SECCOMP_RET_USER_NOTIF`.
+pub(crate) const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
+
+/// Syscalls denied whatever their arguments, under every policy.
+fn always_denied() -> Vec<(&'static str, i64)> {
+    use libc::*;
+    let mut v = vec![
+        ("io_uring_setup", SYS_io_uring_setup),
+        ("io_uring_enter", SYS_io_uring_enter),
+        ("io_uring_register", SYS_io_uring_register),
+        ("bpf", SYS_bpf),
+        ("ptrace", SYS_ptrace),
+        ("process_vm_readv", SYS_process_vm_readv),
+        ("process_vm_writev", SYS_process_vm_writev),
+        ("pidfd_getfd", SYS_pidfd_getfd),
+        ("connect", SYS_connect),
+        ("mknodat", SYS_mknodat),
+        ("add_key", SYS_add_key),
+        ("keyctl", SYS_keyctl),
+        ("request_key", SYS_request_key),
+    ];
+    #[cfg(target_arch = "x86_64")]
+    v.push(("mknod", SYS_mknod));
+    v
+}
+
+/// Further syscalls denied whatever their arguments under `sockets`.
+fn denied_for(sockets: Sockets) -> Vec<(&'static str, i64)> {
+    use libc::*;
+    let mut v = always_denied();
+    match sockets {
+        Sockets::None => v.extend([
+            ("socket", SYS_socket),
+            ("socketpair", SYS_socketpair),
+            ("bind", SYS_bind),
+            ("listen", SYS_listen),
+            ("accept", SYS_accept),
+            ("accept4", SYS_accept4),
+        ]),
+        Sockets::KeepConnected => v.extend([
+            ("socket", SYS_socket),
+            ("bind", SYS_bind),
+            ("listen", SYS_listen),
+            ("accept", SYS_accept),
+            ("accept4", SYS_accept4),
+        ]),
+        // `bind`, `listen`, `accept*` and the Unix `socket`s go to the supervisor.
+        Sockets::Supervised => {}
+    }
+    v
+}
+
+/// The syscalls [`Sockets::None`] denies whatever their arguments, for probes and tests.
+pub fn denied_without_sockets() -> Vec<(&'static str, i64)> {
+    denied_for(Sockets::None)
+}
+
+fn cond(arg: u8, op: SeccompCmpOp, value: u64) -> Result<SeccompCondition, SandboxError> {
+    // `Dword`: these arguments are `int`s (or an `unsigned int` of flags), whose upper 32 bits the
+    // kernel ignores, and so does this comparison.
+    SeccompCondition::new(arg, SeccompCmpArgLen::Dword, op, value)
+        .map_err(|e| SandboxError::Seccomp(e.to_string()))
+}
+
+fn rule(conds: Vec<SeccompCondition>) -> Result<SeccompRule, SandboxError> {
+    SeccompRule::new(conds).map_err(|e| SandboxError::Seccomp(e.to_string()))
+}
+
+/// Argument-filtered denials under `sockets`: a call matching any of a syscall's rules fails with
+/// `EPERM`.
+fn conditional_denials(sockets: Sockets) -> Result<Vec<(i64, Vec<SeccompRule>)>, SandboxError> {
+    use SeccompCmpOp::{Eq, MaskedEq, Ne};
+    let mut v = vec![
+        // A seccomp filter of the process's own that notifies a listener: the kernel lets the
+        // newest notifier answer for every filter before it, which would let it continue what a
+        // supervisor refuses. (A second listener in one filter chain already fails with EBUSY.)
+        (
+            libc::SYS_seccomp,
+            vec![rule(vec![cond(
+                1,
+                MaskedEq(SECCOMP_FILTER_FLAG_NEW_LISTENER),
+                SECCOMP_FILTER_FLAG_NEW_LISTENER,
+            )?])?],
+        ),
+        (
+            libc::SYS_ioctl,
+            vec![
+                // Keystrokes into a terminal the process inherited (a worker run by hand).
+                rule(vec![cond(1, Eq, libc::TIOCSTI)?])?,
+                rule(vec![cond(1, Eq, libc::TIOCLINUX)?])?,
+            ],
+        ),
+        (
+            libc::SYS_prctl,
+            vec![rule(vec![cond(0, Eq, PR_SET_PTRACER as u64)?])?],
+        ),
+    ];
+    match sockets {
+        Sockets::None => {}
+        Sockets::KeepConnected | Sockets::Supervised => {
+            // A connected AF_UNIX stream or seqpacket pair reaches nothing outside the process:
+            // tokio's signal driver makes a stream pair, and Rust's `Command::spawn` a seqpacket
+            // one (on Linux, for a child that runs code before its `exec`), and `sendmsg` on a
+            // seqpacket socket ignores any address it is given. A *datagram* pair would not:
+            // `sendto` on either end reaches any pathname datagram socket of the host.
+            let mut pair = vec![rule(vec![cond(0, Ne, libc::AF_UNIX as u64)?])?];
+            for t in 0..=SOCK_TYPE_MASK {
+                if t != libc::SOCK_STREAM as u64 && t != libc::SOCK_SEQPACKET as u64 {
+                    pair.push(rule(vec![cond(1, MaskedEq(SOCK_TYPE_MASK), t)?])?);
+                }
+            }
+            v.push((libc::SYS_socketpair, pair));
+        }
+    }
+    if sockets == Sockets::Supervised {
+        // Unix stream and seqpacket sockets only (the CUDA driver's own listener is a seqpacket
+        // one), and those go to the supervisor too. Without `connect`, neither reaches anything:
+        // `sendto` with an address fails on both unless they are connected.
+        let mut socket = vec![rule(vec![cond(0, Ne, libc::AF_UNIX as u64)?])?];
+        for t in 0..=SOCK_TYPE_MASK {
+            if t != libc::SOCK_STREAM as u64 && t != libc::SOCK_SEQPACKET as u64 {
+                socket.push(rule(vec![cond(1, MaskedEq(SOCK_TYPE_MASK), t)?])?);
+            }
+        }
+        v.push((libc::SYS_socket, socket));
+    }
+    Ok(v)
+}
+
+fn target_arch() -> Result<TargetArch, SandboxError> {
+    std::env::consts::ARCH
+        .try_into()
+        .map_err(|e: seccompiler::BackendError| SandboxError::Seccomp(e.to_string()))
+}
+
+/// The denylist (seccompiler; its architecture check kills the process on a foreign-ABI syscall).
+fn denylist(sockets: Sockets) -> Result<BpfProgram, SandboxError> {
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    for (_, nr) in denied_for(sockets) {
+        // An empty rule list matches whatever the arguments.
+        rules.insert(nr, Vec::new());
+    }
+    for (nr, conds) in conditional_denials(sockets)? {
+        if rules.insert(nr, conds).is_some() {
+            return Err(SandboxError::Seccomp(format!(
+                "syscall {nr} both denied and filtered"
+            )));
+        }
+    }
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        target_arch()?,
+    )
+    .map_err(|e| SandboxError::Seccomp(e.to_string()))?;
+    filter
+        .try_into()
+        .map_err(|e: seccompiler::BackendError| SandboxError::Seccomp(e.to_string()))
+}
+
+const BPF_LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
+const BPF_JEQ_K: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
+#[cfg(target_arch = "x86_64")]
+const BPF_JGE_K: u16 = 0x35; // BPF_JMP | BPF_JGE | BPF_K
+const BPF_RET_K: u16 = 0x06; // BPF_RET | BPF_K
+const ARCH_OFFSET: u32 = 4;
+const NR_OFFSET: u32 = 0;
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH: u32 = 62 | 0x8000_0000 | 0x4000_0000;
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH: u32 = 183 | 0x8000_0000 | 0x4000_0000;
+
+fn insn(code: u16, jt: u8, jf: u8, k: u32) -> seccompiler::sock_filter {
+    seccompiler::sock_filter { code, jt, jf, k }
+}
+
+/// On x86_64, a hand-written filter for what a denylist keyed by 64-bit syscall numbers misses: every
+/// x32 syscall (`nr >= 0x40000000`, the same architecture to seccomp) fails with `EPERM`. It checks
+/// the architecture too, killing on a foreign one. On aarch64 there is no such alias.
+fn x32_filter() -> Option<BpfProgram> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let eperm = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        Some(vec![
+            /* 0 */ insn(BPF_LD_W_ABS, 0, 0, ARCH_OFFSET),
+            /* 1 */ insn(BPF_JEQ_K, 0, 4, AUDIT_ARCH), // else -> 6 (kill)
+            /* 2 */ insn(BPF_LD_W_ABS, 0, 0, NR_OFFSET),
+            /* 3 */ insn(BPF_JGE_K, 1, 0, 0x4000_0000), // x32 -> 5 (EPERM)
+            /* 4 */ insn(BPF_RET_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+            /* 5 */ insn(BPF_RET_K, 0, 0, eperm),
+            /* 6 */ insn(BPF_RET_K, 0, 0, libc::SECCOMP_RET_KILL_PROCESS),
+        ])
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        None
+    }
+}
+
+/// The syscalls [`Sockets::Supervised`] hands to the supervisor.
+pub(crate) fn supervised_syscalls() -> [i64; 5] {
+    [
+        libc::SYS_socket,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_accept,
+        libc::SYS_accept4,
+    ]
+}
+
+/// [`Sockets::Supervised`]'s notifying filter: [`supervised_syscalls`] go to the supervisor
+/// (`SECCOMP_RET_USER_NOTIF`), everything else is the other filters' business. The denylist's
+/// `EPERM` (for `socket` of another domain or type) takes precedence over a notification.
+pub(crate) fn notify_filter() -> BpfProgram {
+    let nrs = supervised_syscalls();
+    let n = nrs.len() as u8;
+    // 0 ld arch; 1 arch?; 2 ld nr; 3..3+n nr? -> notify; 3+n allow; 4+n notify; 5+n kill.
+    let mut f = vec![
+        insn(BPF_LD_W_ABS, 0, 0, ARCH_OFFSET),
+        insn(BPF_JEQ_K, 0, 3 + n, AUDIT_ARCH), // else -> kill
+        insn(BPF_LD_W_ABS, 0, 0, NR_OFFSET),
+    ];
+    for (j, nr) in nrs.iter().enumerate() {
+        f.push(insn(BPF_JEQ_K, n - j as u8, 0, *nr as u32)); // -> notify
+    }
+    f.extend([
+        insn(BPF_RET_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+        insn(BPF_RET_K, 0, 0, SECCOMP_RET_USER_NOTIF),
+        insn(BPF_RET_K, 0, 0, libc::SECCOMP_RET_KILL_PROCESS),
+    ]);
+    f
+}
+
+/// The filters for `sockets`, in the order they are installed (the notifying filter of
+/// [`Sockets::Supervised`] is not among them: [`crate::supervise`] installs it itself).
+pub(crate) fn filters(sockets: Sockets) -> Result<Vec<BpfProgram>, SandboxError> {
+    let mut v: Vec<BpfProgram> = x32_filter().into_iter().collect();
+    v.push(denylist(sockets)?);
+    Ok(v)
 }
 
 /// One socket open in this process.
@@ -121,6 +320,12 @@ pub struct OpenSocket {
     pub fd: RawFd,
     /// `SO_DOMAIN` (an `AF_*` value); `None` if the socket would not say.
     pub family: Option<i32>,
+    /// `SO_TYPE` (`SOCK_STREAM`, ...); `None` if the socket would not say.
+    pub kind: Option<i32>,
+    /// `SO_ACCEPTCONN`: a listening socket.
+    pub listening: bool,
+    /// The pid of the connected peer (`SO_PEERCRED`), for a connected Unix socket.
+    pub peer: Option<i32>,
     /// The socket's inode, as `/proc/<pid>/fd/<fd>` shows it (`socket:[inode]`).
     pub inode: u64,
 }
@@ -128,21 +333,44 @@ pub struct OpenSocket {
 impl std::fmt::Display for OpenSocket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let family = match self.family {
+            Some(libc::AF_UNIX) => "AF_UNIX".to_string(),
             Some(libc::AF_INET) => "AF_INET".to_string(),
             Some(libc::AF_INET6) => "AF_INET6".to_string(),
+            Some(libc::AF_NETLINK) => "AF_NETLINK".to_string(),
             Some(libc::AF_PACKET) => "AF_PACKET".to_string(),
             Some(libc::AF_VSOCK) => "AF_VSOCK".to_string(),
             Some(other) => format!("family {other}"),
             None => "unknown family".to_string(),
         };
-        write!(f, "fd {} ({family}, socket:[{}])", self.fd, self.inode)
+        write!(f, "fd {} ({family}", self.fd)?;
+        if self.listening {
+            write!(f, ", listening")?;
+        }
+        if let Some(peer) = self.peer {
+            write!(f, ", peer pid {peer}")?;
+        }
+        write!(f, ", socket:[{}])", self.inode)
     }
 }
 
-/// The sockets open in this process that can reach a network: every socket but `AF_UNIX` (a local
-/// endpoint, which the filter allows too) and `AF_NETLINK` (the kernel). From `/proc/self/fd`,
-/// asking each socket its domain (`SO_DOMAIN`); one whose domain cannot be read is listed too.
-pub fn open_network_sockets() -> std::io::Result<Vec<OpenSocket>> {
+fn int_sockopt(fd: RawFd, opt: libc::c_int) -> Option<i32> {
+    let mut v: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `v` and `len` are valid for the kernel to write an int into.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt,
+            (&mut v as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(v)
+}
+
+/// Every socket open in this process, from `/proc/self/fd`, with what each says about itself.
+pub fn open_sockets() -> std::io::Result<Vec<OpenSocket>> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir("/proc/self/fd")? {
         let Some(fd) = entry?
@@ -158,70 +386,83 @@ pub fn open_network_sockets() -> std::io::Result<Vec<OpenSocket>> {
         if unsafe { libc::fstat(fd, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
             continue;
         }
-        let mut domain: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: `domain` and `len` are valid for the kernel to write an int into.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_DOMAIN,
-                (&mut domain as *mut libc::c_int).cast(),
-                &mut len,
-            )
+        let family = int_sockopt(fd, libc::SO_DOMAIN);
+        let peer = if family == Some(libc::AF_UNIX) {
+            let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            // SAFETY: `cred` and `len` describe a valid ucred buffer.
+            let rc = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERCRED,
+                    (&mut cred as *mut libc::ucred).cast(),
+                    &mut len,
+                )
+            };
+            (rc == 0 && cred.pid > 0).then_some(cred.pid)
+        } else {
+            None
         };
-        let family = (rc == 0).then_some(domain);
-        if !matches!(family, Some(libc::AF_UNIX | libc::AF_NETLINK)) {
-            found.push(OpenSocket {
-                fd,
-                family,
-                inode: st.st_ino,
-            });
-        }
+        found.push(OpenSocket {
+            fd,
+            family,
+            kind: int_sockopt(fd, libc::SO_TYPE),
+            listening: int_sockopt(fd, libc::SO_ACCEPTCONN) == Some(1),
+            peer,
+            inode: st.st_ino,
+        });
     }
     Ok(found)
 }
 
-/// Checks what [`deny_network_all_threads`] promises, not that its calls returned.
-fn verify() -> Result<(), SandboxError> {
-    let fail = |what: String| Err(SandboxError::Seccomp(format!("network filter: {what}")));
-    // SAFETY: getter prctls take no pointers.
-    let (mode, nnp) = unsafe {
-        (
-            libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0),
-            libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0),
-        )
-    };
-    if mode != 2 || nnp != 1 {
-        return fail(format!(
-            "PR_GET_SECCOMP is {mode}, PR_GET_NO_NEW_PRIVS {nnp}"
-        ));
-    }
-    if let Some(tid) = threads_not_in_filter_mode()?.first() {
-        return fail(format!("thread {tid} is not in seccomp filter mode"));
-    }
-    for (name, domain, kind) in [
-        ("AF_INET", libc::AF_INET, libc::SOCK_STREAM),
-        ("AF_INET6", libc::AF_INET6, libc::SOCK_DGRAM),
-    ] {
-        // SAFETY: socket takes no pointers; an fd it returns is closed below.
-        let fd = unsafe { libc::socket(domain, kind | libc::SOCK_CLOEXEC, 0) };
-        let errno = std::io::Error::last_os_error().raw_os_error();
-        if fd >= 0 {
-            // SAFETY: closing the fd just opened.
-            unsafe { libc::close(fd) };
-            return fail(format!("socket({name}) still succeeds"));
+/// The parent pid of `pid`, from `/proc/<pid>/stat` (after the last `)`: a `comm` may hold any
+/// byte).
+fn parent_of(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit_once(')')?.1;
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Whether `pid` is this process or one it started (at most a few generations down: the SP1 worker's
+/// server runs under a supervisor the worker started).
+fn is_self_or_descendant(pid: i32) -> bool {
+    // SAFETY: getpid takes no arguments.
+    let me = unsafe { libc::getpid() };
+    let mut cur = pid;
+    for _ in 0..4 {
+        if cur == me {
+            return true;
         }
-        if errno != Some(libc::EPERM) {
-            return fail(format!("socket({name}) failed with {errno:?}, not EPERM"));
+        match parent_of(cur) {
+            Some(p) if p > 1 => cur = p,
+            _ => return false,
         }
     }
-    Ok(())
+    false
+}
+
+/// The sockets of `open` that `sockets` does not let a confined process keep, and why.
+pub(crate) fn sockets_not_allowed(sockets: Sockets, open: &[OpenSocket]) -> Vec<String> {
+    open.iter()
+        .filter(|s| {
+            let unix = s.family == Some(libc::AF_UNIX);
+            // A listening Unix socket is inert once `accept` is gone (the CUDA driver's).
+            let inert_listener = unix && s.listening && sockets != Sockets::Supervised;
+            let own_connection = sockets == Sockets::KeepConnected
+                && unix
+                && !s.listening
+                && s.kind == Some(libc::SOCK_STREAM)
+                && s.peer.is_some_and(is_self_or_descendant);
+            !(inert_listener || own_connection)
+        })
+        .map(ToString::to_string)
+        .collect()
 }
 
 /// Threads of this process whose `/proc/self/task/<tid>/status` does not say `Seccomp: 2`. A thread
 /// that exited while being read is skipped.
-fn threads_not_in_filter_mode() -> std::io::Result<Vec<String>> {
+pub(crate) fn threads_not_in_filter_mode() -> std::io::Result<Vec<String>> {
     let mut out = Vec::new();
     for task in std::fs::read_dir("/proc/self/task")? {
         let task = task?;
@@ -239,96 +480,17 @@ fn threads_not_in_filter_mode() -> std::io::Result<Vec<String>> {
     Ok(out)
 }
 
-fn cond(arg: u8, op: SeccompCmpOp, value: u64) -> Result<SeccompCondition, SandboxError> {
-    // `Dword`: socket's arguments are `int`s, whose upper 32 bits the kernel ignores, and so does
-    // this comparison.
-    SeccompCondition::new(arg, SeccompCmpArgLen::Dword, op, value)
-        .map_err(|e| SandboxError::Seccomp(e.to_string()))
-}
-
-fn target_arch() -> Result<TargetArch, SandboxError> {
-    std::env::consts::ARCH
-        .try_into()
-        .map_err(|e: seccompiler::BackendError| SandboxError::Seccomp(e.to_string()))
-}
-
-/// The denylist (seccompiler; its architecture check kills the process on a foreign-ABI syscall).
-fn denylist() -> Result<BpfProgram, SandboxError> {
-    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-    for (_, nr) in DENIED {
-        // An empty rule list matches whatever the arguments.
-        rules.insert(nr, Vec::new());
-    }
-    for nr in [libc::SYS_socket, libc::SYS_socketpair] {
-        let not_unix = SeccompRule::new(vec![cond(0, SeccompCmpOp::Ne, libc::AF_UNIX as u64)?])
-            .map_err(|e| SandboxError::Seccomp(e.to_string()))?;
-        rules.insert(nr, vec![not_unix]);
-    }
-    let filter = SeccompFilter::new(
-        rules,
-        SeccompAction::Allow,
-        SeccompAction::Errno(libc::EPERM as u32),
-        target_arch()?,
-    )
-    .map_err(|e| SandboxError::Seccomp(e.to_string()))?;
-    filter
-        .try_into()
-        .map_err(|e: seccompiler::BackendError| SandboxError::Seccomp(e.to_string()))
-}
-
-/// On x86_64, a hand-written filter for what a denylist keyed by 64-bit syscall numbers misses: every
-/// x32 syscall (`nr >= 0x40000000`, the same architecture to seccomp) fails with `EPERM`. It checks
-/// the architecture too, killing on a foreign one. On aarch64 there is no such alias.
-fn x32_filter() -> Option<BpfProgram> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        const BPF_LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
-        const BPF_JEQ_K: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
-        const BPF_JGE_K: u16 = 0x35; // BPF_JMP | BPF_JGE | BPF_K
-        const BPF_RET_K: u16 = 0x06; // BPF_RET | BPF_K
-        const ARCH_OFFSET: u32 = 4;
-        const NR_OFFSET: u32 = 0;
-        const AUDIT_ARCH_X86_64: u32 = 62 | 0x8000_0000 | 0x4000_0000;
-        let insn = |code, jt, jf, k| seccompiler::sock_filter { code, jt, jf, k };
-        let eperm = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
-        Some(vec![
-            /* 0 */ insn(BPF_LD_W_ABS, 0, 0, ARCH_OFFSET),
-            /* 1 */ insn(BPF_JEQ_K, 0, 4, AUDIT_ARCH_X86_64), // else -> 6 (kill)
-            /* 2 */ insn(BPF_LD_W_ABS, 0, 0, NR_OFFSET),
-            /* 3 */ insn(BPF_JGE_K, 1, 0, 0x4000_0000), // x32 -> 5 (EPERM)
-            /* 4 */ insn(BPF_RET_K, 0, 0, libc::SECCOMP_RET_ALLOW),
-            /* 5 */ insn(BPF_RET_K, 0, 0, eperm),
-            /* 6 */ insn(BPF_RET_K, 0, 0, libc::SECCOMP_RET_KILL_PROCESS),
-        ])
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        None
-    }
-}
-
-/// The filters [`deny_network_all_threads`] installs, in order.
-fn filters() -> Result<Vec<BpfProgram>, SandboxError> {
-    let mut v: Vec<BpfProgram> = x32_filter().into_iter().collect();
-    v.push(denylist()?);
-    Ok(v)
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use std::process::Command;
 
-    const RET_ALLOW: u32 = libc::SECCOMP_RET_ALLOW;
-    const RET_EPERM: u32 = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
-    const RET_KILL: u32 = libc::SECCOMP_RET_KILL_PROCESS;
-    #[cfg(target_arch = "x86_64")]
-    const ARCH: u32 = 62 | 0x8000_0000 | 0x4000_0000;
-    #[cfg(target_arch = "aarch64")]
-    const ARCH: u32 = 183 | 0x8000_0000 | 0x4000_0000;
+    pub(crate) const RET_ALLOW: u32 = libc::SECCOMP_RET_ALLOW;
+    pub(crate) const RET_EPERM: u32 = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+    pub(crate) const RET_KILL: u32 = libc::SECCOMP_RET_KILL_PROCESS;
+    pub(crate) const RET_NOTIFY: u32 = SECCOMP_RET_USER_NOTIF;
 
     /// `struct seccomp_data`: nr, arch, instruction pointer, six 64-bit arguments.
-    fn seccomp_data(arch: u32, nr: i64, args: [u64; 6]) -> [u8; 64] {
+    pub(crate) fn seccomp_data(arch: u32, nr: i64, args: [u64; 6]) -> [u8; 64] {
         let mut d = [0u8; 64];
         d[0..4].copy_from_slice(&(nr as u32).to_ne_bytes());
         d[4..8].copy_from_slice(&arch.to_ne_bytes());
@@ -339,9 +501,10 @@ mod tests {
         d
     }
 
-    /// A classic-BPF interpreter for exactly the instructions seccompiler and [`x32_filter`] emit;
-    /// anything else panics, so a seccompiler upgrade that emits more cannot pass silently.
-    fn run_bpf(prog: &[seccompiler::sock_filter], data: &[u8; 64]) -> u32 {
+    /// A classic-BPF interpreter for exactly the instructions seccompiler and the hand-written
+    /// filters emit; anything else panics, so a seccompiler upgrade that emits more cannot pass
+    /// silently.
+    pub(crate) fn run_bpf(prog: &[seccompiler::sock_filter], data: &[u8; 64]) -> u32 {
         let (mut a, mut pc) = (0u32, 0usize);
         for _ in 0..=prog.len() {
             let i = &prog[pc];
@@ -358,6 +521,7 @@ mod tests {
                 0x15 => pc += jump(a == i.k),
                 0x25 => pc += jump(a > i.k),
                 0x35 => pc += jump(a >= i.k),
+                0x45 => pc += jump(a & i.k != 0),
                 0x06 => return i.k,
                 c => panic!("unexpected BPF opcode {c:#06x} at {}", pc - 1),
             }
@@ -365,70 +529,229 @@ mod tests {
         panic!("BPF program did not return");
     }
 
+    /// The kernel's precedence of seccomp actions: the lowest action value wins, `KILL_PROCESS`
+    /// (whose top bit makes it negative as an `i32`) first.
+    fn precedence(ret: u32) -> i64 {
+        let action = ret & 0xffff_0000;
+        if action == libc::SECCOMP_RET_KILL_PROCESS {
+            -1
+        } else {
+            i64::from(action)
+        }
+    }
+
     /// Every filter runs and the most restrictive action wins, as in the kernel.
-    fn verdict(data: &[u8; 64]) -> u32 {
+    pub(crate) fn verdict_of(filters: &[BpfProgram], data: &[u8; 64]) -> u32 {
         let mut ret = RET_ALLOW;
-        for f in filters().unwrap().iter().rev() {
+        for f in filters.iter().rev() {
             let cur = run_bpf(f, data);
-            if ((cur & 0xffff_0000) as i32) < ((ret & 0xffff_0000) as i32) {
+            if precedence(cur) < precedence(ret) {
                 ret = cur;
             }
         }
         ret
     }
 
-    fn call(nr: i64, args: [u64; 6]) -> u32 {
-        verdict(&seccomp_data(ARCH, nr, args))
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) const ARCH: u32 = 62 | 0x8000_0000 | 0x4000_0000;
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) const ARCH: u32 = 183 | 0x8000_0000 | 0x4000_0000;
+
+    fn all(sockets: Sockets) -> Vec<BpfProgram> {
+        let mut f = filters(sockets).unwrap();
+        if sockets == Sockets::Supervised {
+            f.push(notify_filter());
+        }
+        f
+    }
+
+    fn call(sockets: Sockets, nr: i64, args: [u64; 6]) -> u32 {
+        verdict_of(&all(sockets), &seccomp_data(ARCH, nr, args))
+    }
+
+    const POLICIES: [Sockets; 3] = [Sockets::None, Sockets::KeepConnected, Sockets::Supervised];
+
+    #[test]
+    fn no_socket_at_all_without_sockets() {
+        use libc::*;
+        for domain in [
+            AF_UNIX, AF_INET, AF_INET6, AF_PACKET, AF_NETLINK, AF_VSOCK, AF_UNSPEC, 4095,
+        ] {
+            for kind in [
+                SOCK_STREAM,
+                SOCK_DGRAM,
+                SOCK_RAW,
+                SOCK_SEQPACKET | SOCK_CLOEXEC,
+            ] {
+                for policy in [Sockets::None, Sockets::KeepConnected] {
+                    assert_eq!(
+                        call(policy, SYS_socket, [domain as u64, kind as u64, 0, 0, 0, 0]),
+                        RET_EPERM,
+                        "{policy:?} socket({domain}, {kind})"
+                    );
+                }
+                assert_eq!(
+                    call(
+                        Sockets::None,
+                        SYS_socketpair,
+                        [domain as u64, kind as u64, 0, 0, 0, 0]
+                    ),
+                    RET_EPERM,
+                    "socketpair({domain}, {kind})"
+                );
+            }
+        }
+        for nr in [SYS_connect, SYS_bind, SYS_listen, SYS_accept, SYS_accept4] {
+            for policy in [Sockets::None, Sockets::KeepConnected] {
+                for args in [[3, 0, 0, 0, 0, 0], [u64::MAX; 6]] {
+                    assert_eq!(call(policy, nr, args), RET_EPERM, "{policy:?} {nr}");
+                }
+            }
+        }
     }
 
     #[test]
-    fn sockets_other_than_unix_are_refused() {
+    fn only_unix_stream_and_seqpacket_pairs_where_pairs_are_kept() {
         use libc::*;
-        for (nr, name) in [(SYS_socket, "socket"), (SYS_socketpair, "socketpair")] {
-            for domain in [
-                AF_INET,
-                AF_INET6,
-                AF_PACKET,
-                AF_NETLINK,
-                AF_VSOCK,
-                AF_UNSPEC,
-                AF_BLUETOOTH,
-                4095,
-            ] {
-                for kind in [SOCK_STREAM, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET] {
+        for policy in [Sockets::KeepConnected, Sockets::Supervised] {
+            for flags in [0, SOCK_CLOEXEC, SOCK_CLOEXEC | SOCK_NONBLOCK] {
+                for kind in [SOCK_STREAM, SOCK_SEQPACKET] {
                     assert_eq!(
-                        call(nr, [domain as u64, kind as u64, 0, 0, 0, 0]),
-                        RET_EPERM,
-                        "{name}({domain}, {kind})"
+                        call(
+                            policy,
+                            SYS_socketpair,
+                            [AF_UNIX as u64, (kind | flags) as u64, 0, 0, 0, 0]
+                        ),
+                        RET_ALLOW,
+                        "{policy:?}"
                     );
                 }
             }
-            for kind in [SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET | SOCK_CLOEXEC] {
+            for kind in [SOCK_DGRAM, SOCK_RAW, 4, 0, 15] {
                 assert_eq!(
-                    call(nr, [AF_UNIX as u64, kind as u64, 0, 0, 0, 0]),
-                    RET_ALLOW,
-                    "{name}(AF_UNIX, {kind})"
+                    call(
+                        policy,
+                        SYS_socketpair,
+                        [AF_UNIX as u64, kind as u64, 0, 0, 0, 0]
+                    ),
+                    RET_EPERM,
+                    "{policy:?} unix pair of type {kind}"
                 );
             }
-            // The kernel reads the domain as an int: upper bits do not turn AF_INET into AF_UNIX
-            // or the reverse.
             assert_eq!(
-                call(nr, [(1 << 32) | AF_INET as u64, 1, 0, 0, 0, 0]),
+                call(
+                    policy,
+                    SYS_socketpair,
+                    [AF_INET as u64, SOCK_STREAM as u64, 0, 0, 0, 0]
+                ),
                 RET_EPERM
             );
+            // The kernel reads the domain as an int: upper bits do not turn AF_INET into AF_UNIX.
             assert_eq!(
-                call(nr, [(1 << 32) | AF_UNIX as u64, 1, 0, 0, 0, 0]),
-                RET_ALLOW
+                call(
+                    policy,
+                    SYS_socketpair,
+                    [(1 << 32) | AF_INET as u64, 1, 0, 0, 0, 0]
+                ),
+                RET_EPERM
             );
         }
     }
 
     #[test]
-    fn listed_syscalls_are_refused_whatever_their_arguments() {
-        for (name, nr) in DENIED {
-            for args in [[0; 6], [u64::MAX; 6], [1, 2, 3, 4, 5, 6]] {
-                assert_eq!(call(nr, args), RET_EPERM, "{name} with {args:x?}");
+    fn a_supervised_server_asks_for_unix_stream_and_seqpacket_sockets_and_nothing_else() {
+        use libc::*;
+        let s = Sockets::Supervised;
+        for kind in [
+            SOCK_STREAM,
+            SOCK_SEQPACKET,
+            SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+        ] {
+            assert_eq!(
+                call(s, SYS_socket, [AF_UNIX as u64, kind as u64, 0, 0, 0, 0]),
+                RET_NOTIFY,
+                "socket(AF_UNIX, {kind})"
+            );
+        }
+        for kind in [SOCK_DGRAM, SOCK_RAW, SOCK_DGRAM | SOCK_CLOEXEC, 0, 15] {
+            assert_eq!(
+                call(s, SYS_socket, [AF_UNIX as u64, kind as u64, 0, 0, 0, 0]),
+                RET_EPERM,
+                "socket(AF_UNIX, {kind})"
+            );
+        }
+        for domain in [AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_VSOCK, 4095] {
+            for kind in [SOCK_STREAM, SOCK_SEQPACKET, SOCK_DGRAM] {
+                assert_eq!(
+                    call(s, SYS_socket, [domain as u64, kind as u64, 0, 0, 0, 0]),
+                    RET_EPERM,
+                    "socket({domain}, {kind})"
+                );
             }
+        }
+        assert_eq!(
+            call(
+                s,
+                SYS_socket,
+                [(1 << 32) | AF_INET as u64, SOCK_STREAM as u64, 0, 0, 0, 0]
+            ),
+            RET_EPERM
+        );
+        for nr in [SYS_bind, SYS_listen, SYS_accept, SYS_accept4] {
+            assert_eq!(call(s, nr, [3, 0, 0, 0, 0, 0]), RET_NOTIFY, "{nr}");
+        }
+        assert_eq!(call(s, SYS_connect, [3, 0, 0, 0, 0, 0]), RET_EPERM);
+    }
+
+    #[test]
+    fn listed_syscalls_are_refused_whatever_their_arguments() {
+        for policy in POLICIES {
+            for (name, nr) in always_denied() {
+                for args in [[0; 6], [u64::MAX; 6], [1, 2, 3, 4, 5, 6]] {
+                    assert_eq!(
+                        call(policy, nr, args),
+                        RET_EPERM,
+                        "{policy:?} {name} {args:x?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_listener_of_its_own_no_keystrokes_no_ptracer() {
+        use libc::*;
+        for policy in POLICIES {
+            // seccomp(SET_MODE_FILTER, flags): NEW_LISTENER in any combination is refused...
+            for flags in [8u64, 8 | 1, 8 | 2 | 4, u64::MAX] {
+                assert_eq!(call(policy, SYS_seccomp, [1, flags, 0, 0, 0, 0]), RET_EPERM);
+            }
+            // ...other filters (which can only take more away) are not.
+            for flags in [0u64, 1, 2, 4] {
+                assert_eq!(call(policy, SYS_seccomp, [1, flags, 0, 0, 0, 0]), RET_ALLOW);
+            }
+            assert_eq!(call(policy, SYS_ioctl, [0, TIOCSTI, 0, 0, 0, 0]), RET_EPERM);
+            assert_eq!(
+                call(policy, SYS_ioctl, [2, TIOCLINUX, 0, 0, 0, 0]),
+                RET_EPERM
+            );
+            assert_eq!(
+                call(policy, SYS_ioctl, [3, 0x5401, 0, 0, 0, 0]),
+                RET_ALLOW,
+                "TCGETS"
+            );
+            assert_eq!(
+                call(
+                    policy,
+                    SYS_prctl,
+                    [PR_SET_PTRACER as u64, u64::MAX, 0, 0, 0, 0]
+                ),
+                RET_EPERM
+            );
+            assert_eq!(
+                call(policy, SYS_prctl, [PR_SET_NAME as u64, 0, 0, 0, 0, 0]),
+                RET_ALLOW
+            );
         }
     }
 
@@ -437,10 +760,10 @@ mod tests {
     fn everything_else_is_allowed() {
         use libc::*;
         let mut allowed = vec![
-            SYS_connect,
             SYS_sendto,
             SYS_recvfrom,
-            SYS_ioctl,
+            SYS_sendmsg,
+            SYS_recvmsg,
             SYS_mmap,
             SYS_munmap,
             SYS_clone,
@@ -452,318 +775,91 @@ mod tests {
             SYS_futex,
             SYS_getpid,
             SYS_pidfd_open,
+            SYS_kill,
         ];
         #[cfg(target_arch = "x86_64")]
         allowed.extend([SYS_fork, SYS_vfork, SYS_open]);
-        for nr in allowed {
-            assert_eq!(
-                call(nr, [3, 0x1000, 16, 0, 0, 0]),
-                RET_ALLOW,
-                "syscall {nr}"
-            );
+        for policy in POLICIES {
+            for nr in &allowed {
+                assert_eq!(
+                    call(policy, *nr, [3, 0x1000, 16, 0, 0, 0]),
+                    RET_ALLOW,
+                    "{nr}"
+                );
+            }
         }
     }
 
     #[test]
     fn foreign_abis_are_killed_and_x32_refused() {
-        // Another architecture (`int 0x80` on x86_64, AArch32 on aarch64): the process is killed.
-        let i386 = 3 | 0x4000_0000;
-        assert_eq!(
-            verdict(&seccomp_data(i386, 102, [0; 6])),
-            RET_KILL,
-            "i386 socketcall"
-        );
-        assert_eq!(verdict(&seccomp_data(i386, 20, [0; 6])), RET_KILL);
-        #[cfg(target_arch = "x86_64")]
-        {
-            // x32 aliases of an allowed or a filtered call alike: EPERM, never the 64-bit verdict.
-            let x32 = |nr: i64| 0x4000_0000 | nr;
-            assert_eq!(call(x32(libc::SYS_getpid), [0; 6]), RET_EPERM);
+        for policy in POLICIES {
+            let filters = all(policy);
+            // Another architecture (`int 0x80` on x86_64, AArch32 on aarch64): the process is killed.
+            let foreign = 3 | 0x4000_0000;
             assert_eq!(
-                call(x32(libc::SYS_socket), [libc::AF_INET as u64, 1, 0, 0, 0, 0]),
-                RET_EPERM
+                verdict_of(&filters, &seccomp_data(foreign, 102, [0; 6])),
+                RET_KILL,
+                "i386 socketcall"
             );
-            assert_eq!(
-                call(x32(libc::SYS_socket), [libc::AF_UNIX as u64, 1, 0, 0, 0, 0]),
-                RET_EPERM
-            );
+            #[cfg(target_arch = "x86_64")]
+            {
+                // x32 aliases of an allowed or a supervised call alike: EPERM, never the 64-bit verdict.
+                let x32 = |nr: i64| 0x4000_0000 | nr;
+                assert_eq!(call(policy, x32(libc::SYS_getpid), [0; 6]), RET_EPERM);
+                assert_eq!(
+                    call(
+                        policy,
+                        x32(libc::SYS_socket),
+                        [libc::AF_UNIX as u64, 1, 0, 0, 0, 0]
+                    ),
+                    RET_EPERM
+                );
+                assert_eq!(
+                    call(policy, x32(libc::SYS_bind), [3, 0, 0, 0, 0, 0]),
+                    RET_EPERM
+                );
+            }
         }
     }
 
-    // --- The live filter, in a child process: a test process with the filter on would deny every
-    // test after it.
-
-    /// Set in the child that installs the filter.
-    const CHILD_ENV: &str = "ZKMINER_NETDENY_TEST_CHILD";
-    /// Set in a process that child starts, which only checks what it inherited.
-    const PROBE_ENV: &str = "ZKMINER_NETDENY_TEST_PROBE";
-
-    /// Runs one test of this binary, by its exact name, in a new process with `env` set.
-    fn run_test_in_child(name: &str, env: &str) -> std::process::Output {
-        Command::new(std::env::current_exe().unwrap())
-            .args([name, "--exact", "--nocapture", "--test-threads=1"])
-            .env(env, "1")
-            .output()
-            .unwrap()
-    }
-
-    fn errno() -> i32 {
-        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-    }
-
-    /// `socket(domain, kind)`: Ok(fd) or Err(errno).
-    fn socket(domain: i32, kind: i32) -> Result<RawFd, i32> {
-        // SAFETY: no pointers.
-        let fd = unsafe { libc::socket(domain, kind | libc::SOCK_CLOEXEC, 0) };
-        if fd >= 0 {
-            Ok(fd)
-        } else {
-            Err(errno())
-        }
-    }
-
-    fn close(fd: RawFd) {
-        // SAFETY: an fd this test opened.
-        unsafe { libc::close(fd) };
-    }
-
-    /// `Seccomp:` and `NoNewPrivs:` of a `/proc/<pid>[/task/<tid>]/status`.
-    fn seccomp_status(status_path: &str) -> (String, String) {
-        let status = std::fs::read_to_string(status_path).unwrap();
-        let field = |name: &str| {
-            status
-                .lines()
-                .find_map(|l| l.strip_prefix(name))
-                .map(|v| v.trim().to_string())
-                .unwrap_or_default()
+    #[test]
+    fn a_listener_is_kept_a_connection_only_to_ones_own() {
+        let me = std::process::id() as i32;
+        let sock = |family, kind, listening, peer| OpenSocket {
+            fd: 9,
+            family: Some(family),
+            kind: Some(kind),
+            listening,
+            peer,
+            inode: 1,
         };
-        (field("Seccomp:"), field("NoNewPrivs:"))
-    }
-
-    #[test]
-    fn the_live_filter_covers_every_thread_and_child() {
-        let out = run_test_in_child("netdeny::tests::live_filter_child", CHILD_ENV);
-        let log = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(out.status.success(), "{log}");
-        assert!(log.contains("LIVE FILTER CHECKS PASSED"), "{log}");
-    }
-
-    /// The child side of [`the_live_filter_covers_every_thread_and_child`]; a no-op elsewhere.
-    #[test]
-    fn live_filter_child() {
-        if std::env::var_os(CHILD_ENV).is_none() {
-            return;
-        }
-        use std::sync::mpsc;
-
-        // A thread started BEFORE the filter, which tries sockets when told to, then lives until
-        // told to exit (so its /proc entry can still be read).
-        let (go_tx, go_rx) = mpsc::channel::<()>();
-        let (res_tx, res_rx) = mpsc::channel();
-        let early = std::thread::spawn(move || {
-            // SAFETY: gettid takes no arguments.
-            let tid = unsafe { libc::syscall(libc::SYS_gettid) };
-            go_rx.recv().unwrap();
-            let inet = socket(libc::AF_INET, libc::SOCK_STREAM);
-            let unix = socket(libc::AF_UNIX, libc::SOCK_STREAM);
-            res_tx.send((tid, inet, unix)).unwrap();
-            go_rx.recv().unwrap();
-        });
-
-        assert!(!is_active());
-        // Without the filter, an inet socket opens (no network needed for that).
-        close(socket(libc::AF_INET, libc::SOCK_DGRAM).expect("AF_INET before the filter"));
-
-        // A socket left open from before (a download's connection, say) fails the call...
-        let leftover = socket(libc::AF_INET, libc::SOCK_DGRAM).unwrap();
-        let mut pair = [-1; 2];
-        // SAFETY: `pair` holds the two fds.
+        let listener = sock(libc::AF_UNIX, libc::SOCK_SEQPACKET, true, None);
+        let to_self = sock(libc::AF_UNIX, libc::SOCK_STREAM, false, Some(me));
+        // Our parent (the test harness) is no child of ours.
+        let parent = unsafe { libc::getppid() };
+        let to_parent = sock(libc::AF_UNIX, libc::SOCK_STREAM, false, Some(parent));
+        let inet = sock(libc::AF_INET, libc::SOCK_STREAM, false, None);
+        let dgram = sock(libc::AF_UNIX, libc::SOCK_DGRAM, false, Some(me));
+        assert!(sockets_not_allowed(Sockets::None, std::slice::from_ref(&listener)).is_empty());
         assert_eq!(
-            unsafe {
-                libc::socketpair(
-                    libc::AF_UNIX,
-                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-                    0,
-                    pair.as_mut_ptr(),
-                )
-            },
-            0
+            sockets_not_allowed(Sockets::None, std::slice::from_ref(&to_self)).len(),
+            1
         );
-        let open = open_network_sockets().unwrap();
-        assert_eq!(open.len(), 1, "{open:?}");
-        assert_eq!(
-            (open[0].fd, open[0].family),
-            (leftover, Some(libc::AF_INET))
-        );
-        let err = deny_network_all_threads().unwrap_err().to_string();
-        assert!(err.contains(&format!("fd {leftover} (AF_INET")), "{err}");
-        // ...with the filter on all the same...
-        assert!(is_active());
-        assert_eq!(socket(libc::AF_INET, libc::SOCK_STREAM), Err(libc::EPERM));
-        // ...and passes once it is closed. Calling again installs nothing more.
-        close(leftover);
-        deny_network_all_threads().unwrap();
-        deny_network_all_threads().unwrap();
-        let status = std::fs::read_to_string("/proc/self/status").unwrap();
-        let filters_installed = status
-            .lines()
-            .find_map(|l| l.strip_prefix("Seccomp_filters:"))
-            .map(|v| v.trim().to_string());
-        if let Some(n) = filters_installed {
-            assert_eq!(n, filters().unwrap().len().to_string(), "installed once");
-        }
         assert!(
-            open_network_sockets().unwrap().is_empty(),
-            "the unix pair is no network"
+            sockets_not_allowed(Sockets::KeepConnected, &[listener.clone(), to_self]).is_empty()
         );
-        close(pair[0]);
-        close(pair[1]);
-
-        // This thread: no socket of any other domain, AF_UNIX as before.
-        for domain in [
-            libc::AF_INET,
-            libc::AF_INET6,
-            libc::AF_NETLINK,
-            libc::AF_PACKET,
-        ] {
-            for kind in [libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_RAW] {
-                assert_eq!(socket(domain, kind), Err(libc::EPERM), "{domain}/{kind}");
+        for bad in [to_parent, inet, dgram] {
+            for policy in POLICIES {
+                assert_eq!(
+                    sockets_not_allowed(policy, std::slice::from_ref(&bad)).len(),
+                    1,
+                    "{policy:?} {bad}"
+                );
             }
         }
-        // SAFETY: `pair` holds the two fds; the other calls take no pointers the kernel reads
-        // (null and zero lengths).
-        unsafe {
-            assert_eq!(
-                libc::socketpair(libc::AF_INET, libc::SOCK_STREAM, 0, pair.as_mut_ptr()),
-                -1
-            );
-            assert_eq!(errno(), libc::EPERM);
-            close(socket(libc::AF_UNIX, libc::SOCK_STREAM).expect("AF_UNIX stream"));
-            close(socket(libc::AF_UNIX, libc::SOCK_DGRAM).expect("AF_UNIX datagram"));
-            assert_eq!(
-                libc::socketpair(
-                    libc::AF_UNIX,
-                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-                    0,
-                    pair.as_mut_ptr()
-                ),
-                0
-            );
-            close(pair[0]);
-            close(pair[1]);
-            for (name, nr, args) in [
-                ("io_uring_setup", libc::SYS_io_uring_setup, [0i64; 6]),
-                (
-                    "io_uring_enter",
-                    libc::SYS_io_uring_enter,
-                    [-1, 0, 0, 0, 0, 0],
-                ),
-                (
-                    "io_uring_register",
-                    libc::SYS_io_uring_register,
-                    [-1, 0, 0, 0, 0, 0],
-                ),
-                ("bpf", libc::SYS_bpf, [-1, 0, 0, 0, 0, 0]),
-                // An invalid request on pid 0: ESRCH or EIO without the filter.
-                ("ptrace", libc::SYS_ptrace, [0xffff, 0, 0, 0, 0, 0]),
-                // Reading nothing from ourselves: 0 without the filter.
-                (
-                    "process_vm_readv",
-                    libc::SYS_process_vm_readv,
-                    [libc::getpid() as i64, 0, 0, 0, 0, 0],
-                ),
-                (
-                    "process_vm_writev",
-                    libc::SYS_process_vm_writev,
-                    [libc::getpid() as i64, 0, 0, 0, 0, 0],
-                ),
-                // EBADF without the filter.
-                ("pidfd_getfd", libc::SYS_pidfd_getfd, [-1, 0, 0, 0, 0, 0]),
-            ] {
-                let r = libc::syscall(nr, args[0], args[1], args[2], args[3], args[4], args[5]);
-                assert_eq!((r, errno()), (-1, libc::EPERM), "{name}");
-            }
-        }
-        let (seccomp, nnp) = seccomp_status("/proc/self/status");
-        assert_eq!((seccomp.as_str(), nnp.as_str()), ("2", "1"));
-
-        // The thread that existed before the filter has it too (TSYNC).
-        go_tx.send(()).unwrap();
-        let (tid, inet, unix) = res_rx.recv().unwrap();
-        assert_eq!(inet, Err(libc::EPERM), "a thread started before the filter");
-        close(unix.expect("AF_UNIX in that thread"));
-        let (seccomp, _) = seccomp_status(&format!("/proc/self/task/{tid}/status"));
-        assert_eq!(seccomp, "2");
-        go_tx.send(()).unwrap();
-        early.join().unwrap();
-        // And one started after.
-        let late = std::thread::spawn(|| socket(libc::AF_INET6, libc::SOCK_STREAM))
-            .join()
-            .unwrap();
-        assert_eq!(late, Err(libc::EPERM));
-
-        // A forked child (no exec), which only makes raw calls before `_exit`.
-        // SAFETY: the child calls only async-signal-safe functions.
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0);
-        if pid == 0 {
-            unsafe {
-                let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-                let code = if fd < 0 && *libc::__errno_location() == libc::EPERM {
-                    0
-                } else {
-                    1
-                };
-                libc::_exit(code);
-            }
-        }
-        let mut st = 0;
-        // SAFETY: waiting for the child just forked.
-        assert_eq!(unsafe { libc::waitpid(pid, &mut st, 0) }, pid);
-        assert!(
-            libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0,
-            "forked child: {st:#x}"
-        );
-
-        // Programs started after: they run, and inherit the filter across exec.
-        assert!(Command::new("/bin/true").status().unwrap().success());
-        let mut sleeper = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-        let (seccomp, nnp) = seccomp_status(&format!("/proc/{}/status", sleeper.id()));
-        let _ = sleeper.kill();
-        let _ = sleeper.wait();
         assert_eq!(
-            (seccomp.as_str(), nnp.as_str()),
-            ("2", "1"),
-            "an exec'd child"
+            sockets_not_allowed(Sockets::Supervised, &[listener]).len(),
+            1
         );
-        let probe = run_test_in_child("netdeny::tests::inherited_filter_probe", PROBE_ENV);
-        assert!(
-            probe.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&probe.stdout),
-            String::from_utf8_lossy(&probe.stderr)
-        );
-        assert!(String::from_utf8_lossy(&probe.stdout).contains("PROBE: INHERITED"));
-        println!("LIVE FILTER CHECKS PASSED");
-    }
-
-    /// Started by [`live_filter_child`] after its filter is on; a no-op elsewhere.
-    #[test]
-    fn inherited_filter_probe() {
-        if std::env::var_os(PROBE_ENV).is_none() {
-            return;
-        }
-        // Not installed by this process: inherited across fork and exec.
-        assert!(!is_active());
-        assert_eq!(socket(libc::AF_INET, libc::SOCK_STREAM), Err(libc::EPERM));
-        assert_eq!(socket(libc::AF_INET6, libc::SOCK_DGRAM), Err(libc::EPERM));
-        close(socket(libc::AF_UNIX, libc::SOCK_STREAM).expect("AF_UNIX"));
-        let (seccomp, nnp) = seccomp_status("/proc/self/status");
-        assert_eq!((seccomp.as_str(), nnp.as_str()), ("2", "1"));
-        println!("PROBE: INHERITED");
     }
 }

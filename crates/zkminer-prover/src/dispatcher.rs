@@ -3474,8 +3474,8 @@ impl WorkerPool {
         };
 
         self.ensure_alive(&mut slot, entry)?;
-        // A worker that has run a requester's guest has no network (it denies itself it first; see
-        // `zkminer_witness_sandbox::netdeny`), and this warm-up may download: it would only refuse.
+        // A worker that has run a requester's guest has no network (it confines itself first; see
+        // `zkminer_witness_sandbox::confine`), and this warm-up may download: it would only refuse.
         // That happens where the slot measured a job before its backend was warmed (a risc0 slot
         // with no measure pool) or benchmarked first. Run it on a fresh worker, whose first command
         // it is, under this same lock.

@@ -1,6 +1,8 @@
 //! The CPU worker has the network until it runs a requester's guest, and never after: its first
-//! `Execute` installs the network filter (`zkminer_witness_sandbox::netdeny`) on every thread, with no
-//! network socket left open, and a `Warmup` after it refuses to download rather than try.
+//! `Execute` confines it (`zkminer_witness_sandbox::confine`: no socket of any kind, Landlock, no
+//! signals out) on every thread, with no socket left open, and a `Warmup` after it refuses to
+//! download rather than try. The confinement's own checks (`socket()` refused, the filesystem
+//! restricted, the parent unreachable by signal) are in the worker's log line.
 //!
 //! `cargo test -p zkminer-prove-risc0 --features cpu --test network_denied`. CPU only: the guest is
 //! executed, never proven, and nothing is downloaded.
@@ -262,6 +264,27 @@ fn the_first_execute_takes_the_network_away_for_good() {
         Vec::<u64>::new(),
         "no network socket is open in the worker"
     );
+    assert_eq!(
+        socket_fds(pid),
+        0,
+        "no socket of any kind is open in the CPU worker"
+    );
+    let log = worker.log();
+    let confined = log
+        .lines()
+        .find(|l| l.contains("worker confined:"))
+        .unwrap_or_else(|| panic!("no confinement report:\n{log}"));
+    for promise in [
+        "seccomp: no sockets",
+        "every thread filtered",
+        "socket() refused",
+        "filesystem restricted",
+        "parent unreachable by signal",
+    ] {
+        assert!(confined.contains(promise), "{promise}: {confined}");
+    }
+    // The miner (here, the test) can still signal its worker.
+    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
 
     // The warm-up's download is refused in words, not attempted.
     worker.send(&WorkerCommand::Warmup { request_id: 2 });
@@ -292,10 +315,23 @@ fn the_first_execute_takes_the_network_away_for_good() {
         let n: u32 = n.trim().parse().unwrap();
         assert!(n <= 2, "{n} filters: one install, not one per command");
     }
-    assert!(!worker.log().contains("could not deny"), "{}", worker.log());
+    assert!(
+        !worker.log().contains("could not confine"),
+        "{}",
+        worker.log()
+    );
 }
 
-/// A program-id derivation parses the requester's ELF: the same filter goes on first.
+/// How many sockets `pid` holds.
+fn socket_fds(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+        .filter(|t| t.to_string_lossy().starts_with("socket:"))
+        .count()
+}
+
+/// A program-id derivation parses the requester's ELF: the same confinement goes on first.
 #[test]
 fn a_program_id_derivation_takes_the_network_away_too() {
     let mut worker = Worker::start();

@@ -74,11 +74,23 @@ pub fn risc0_sys_rand_key() -> Option<([u8; 32], bool)> {
     RISC0_SYS_RAND_KEY.get().copied()
 }
 
+/// The directories a risc0 worker's witness proofs use: the retention store (read) and the root of
+/// the segment directories (written). Passed to every risc0 worker spawned from now on
+/// (`WITNESS_READ_DIR_ENV`, `WITNESS_SEGMENT_DIR_ENV`), which confines itself to them before its
+/// first guest. Unset: a worker reads and writes neither (no witness jobs).
+static RISC0_WITNESS_DIRS: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+
+/// Set the directories passed to risc0 workers spawned from now on (see `RISC0_WITNESS_DIRS`). Once
+/// per process.
+pub fn set_risc0_witness_dirs(retention: PathBuf, segments: PathBuf) {
+    let _ = RISC0_WITNESS_DIRS.set((retention, segments));
+}
+
 /// Settings of the pinned risc0 and SP1 SDKs that hand proving or execution to someone else (a
 /// remote service, an external `r0vm`, a Docker image), fetch what they prove with from elsewhere, or
 /// put them in a developer mode whose proofs are not real. No worker of the miner's uses any of them:
 /// every one proves and executes locally with real proofs, and has no network once it runs a guest
-/// (see `zkminer_witness_sandbox::netdeny`). So none reaches a worker, from the miner's environment
+/// (see `zkminer_witness_sandbox::confine`). So none reaches a worker, from the miner's environment
 /// or the dispatcher's overrides, and every worker gets `RISC0_PROVER=local`.
 const REMOTE_PROVER_AND_DEV_ENV: &[&str] = &[
     // risc0-zkvm: `default_prover` / `default_executor` (Bonsai, an `r0vm` over IPC, the actor
@@ -135,6 +147,11 @@ fn worker_env(
     // anything that asks `default_prover` gets it too.
     env.push(("RISC0_PROVER".into(), "local".into()));
     if backend.starts_with("risc0") {
+        if let Some((retention, segments)) = RISC0_WITNESS_DIRS.get() {
+            use zkminer_prover_protocol::types::{WITNESS_READ_DIR_ENV, WITNESS_SEGMENT_DIR_ENV};
+            env.push((WITNESS_READ_DIR_ENV.into(), retention.into()));
+            env.push((WITNESS_SEGMENT_DIR_ENV.into(), segments.into()));
+        }
         if let Some((key, ephemeral)) = sys_rand_key {
             env.push((SYS_RAND_KEY_ENV.into(), encode_key(key).into()));
             if *ephemeral {
@@ -599,8 +616,8 @@ pub struct WorkerHandle {
     oom_kills_at_spawn: Option<u64>,
     /// Whether this worker has been sent a command that may have cost it its network: one that runs
     /// a requester's guest, or a benchmark or calibration (which on SP1 starts the GPU server, under
-    /// the same filter). A worker denies itself the network before it runs a guest, for good (see
-    /// `zkminer_witness_sandbox::netdeny`), so a setup that downloads must run on a fresh worker.
+    /// the same filter). A worker confines itself before it runs a guest, for good, with no network
+    /// (see `zkminer_witness_sandbox::confine`), so a setup that downloads must run on a fresh worker.
     may_lack_network: bool,
 }
 
@@ -764,6 +781,10 @@ impl WorkerHandle {
                 // The raw-syscall details, and why they have to be raw here, live on
                 // `memory::volunteer_as_oom_victim`. Shared with the test that checks the value
                 // actually reaches the kernel, so that test cannot pass over a deleted call.
+                // The miner is not dumpable (it holds the signing key), and a child is not until it
+                // execs: its `/proc/self` files belong to root, and `oom_score_adj` cannot be
+                // written. It is about to exec the worker, which is dumpable again anyway.
+                libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
                 crate::memory::volunteer_as_oom_victim();
                 Ok(())
             });

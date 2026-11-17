@@ -434,11 +434,8 @@ fn witness_prove_once(
             );
         }
     }
-    let opts = risc0_zkvm::ProverOpts::groth16().with_dev_mode(false);
-    let ctx = risc0_zkvm::VerifierContext::default().with_dev_mode(opts.dev_mode());
     let start = Instant::now();
-    let proved =
-        risc0_zkvm::get_prover_server(&opts).and_then(|prover| prover.prove_session(&ctx, session));
+    let proved = crate::groth16_wrap::prove_session(session);
     release_groth16_cache_if_tight();
     let prove_info = proved?;
     groth16_proof_output(prove_info, image_id, start.elapsed().as_secs_f64())

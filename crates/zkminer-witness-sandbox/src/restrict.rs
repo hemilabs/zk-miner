@@ -396,7 +396,7 @@ pub(crate) const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
 pub(crate) const FS_IOC32_SETFLAGS: u64 = 0x4004_6602;
 pub(crate) const FS_IOC_FSSETXATTR: u64 = 0x401c_5820;
 /// `type & SOCK_TYPE_MASK` is the socket type; the bits above it are `SOCK_NONBLOCK`/`SOCK_CLOEXEC`.
-const SOCK_TYPE_MASK: u64 = 0xf;
+pub(crate) const SOCK_TYPE_MASK: u64 = 0xf;
 
 /// Syscalls that open files by path; the broker may use them (Landlock confines the paths).
 fn path_opens() -> Vec<Denied> {

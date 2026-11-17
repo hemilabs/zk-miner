@@ -21,6 +21,11 @@
 //!   `socketpair(AF_UNIX, SOCK_STREAM)` for its runtime, then calls [`seal_socket_creation`] once
 //!   its runtime is up. Its network connections are made for it by the miner's connector.
 //!
+//! The miner's inline measuring and proving workers, which run requester guests outside these
+//! profiles (the GPU stack needs files, devices and threads a profile does not allow), confine
+//! themselves with [`confine`] before their first guest: Landlock and seccomp, no sockets. An SP1
+//! worker's `sp1-gpu-server` runs under [`supervise`].
+//!
 //! [`self_test`] checks the resulting *properties* (plan §10.3) by running the
 //! `zkminer-witness-sandbox-probe` binary inside each sandbox profile, not just that calls
 //! succeeded.
@@ -38,12 +43,16 @@
 use std::path::PathBuf;
 
 mod cgroup;
+pub mod confine;
+#[doc(hidden)]
+pub mod confine_probe;
 pub mod netdeny;
 #[doc(hidden)]
 pub mod probe;
 mod restrict;
 mod selftest;
 mod spawn;
+pub mod supervise;
 
 pub use cgroup::{delegated_root, Cgroup};
 pub use restrict::{landlock_abi, restrict_self, seal_socket_creation, MIN_LANDLOCK_ABI};

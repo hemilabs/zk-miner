@@ -192,6 +192,16 @@ enum WitnessCommand {
 
 #[tokio::main(worker_threads = 4)]
 async fn main() -> Result<()> {
+    // The miner holds the operator's signing key. Non-dumpable, its `/proc/<pid>` entries belong to
+    // root, so no other process of this uid can read its memory or environment (`mem`, `environ`,
+    // `maps`, `fd`), whatever the host's `ptrace_scope`, and it leaves no core dump. Its own reads of
+    // `/proc/self` it needs are world-readable files; the processes it starts are dumpable again
+    // once they exec (the workers, whose `/proc` entries the dispatcher reads).
+    #[cfg(target_os = "linux")]
+    // SAFETY: a plain prctl.
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+    }
     let cli = Cli::parse();
 
     // Only setup stderr tracing for headless/CLI modes.
