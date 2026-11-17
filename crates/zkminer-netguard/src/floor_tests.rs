@@ -309,6 +309,48 @@ fn a_default_route_through_a_tunnel_needs_internal_ranges() {
     assert!(split.needs_internal_ranges().is_empty());
 }
 
+/// An organisation with private IPv4 (NAT) and a /32 of global IPv6: the default site is that
+/// /32, so its other /48s are refused; a host that does not want that sets a longer site.
+#[test]
+fn an_ipv6_organisation_wider_than_a_48_is_refused_by_default() {
+    let r = RawFacts {
+        interface_prefixes: vec![pfx("10.20.5.0/24"), pfx("2001:620:0:5::/64")],
+        interface_addresses: vec![ip("10.20.5.10"), ip("2001:620:0:5::10")],
+        routes: vec![
+            Route::via(pfx("0.0.0.0/0"), ip("10.20.5.1"), 2),
+            Route::on_link(pfx("10.20.5.0/24"), 2),
+            Route::via(pfx("::/0"), ip("fe80::1"), 2),
+            Route::on_link(pfx("2001:620:0:5::/64"), 2),
+        ],
+        public_addresses: vec![ip("130.59.1.1"), ip("2001:620:0:5::10")],
+        public_confirmed: vec![ip("130.59.1.1"), ip("2001:620:0:5::10")],
+        ..RawFacts::default()
+    };
+    let f = HostFacts::assemble(r.clone(), &FactsOptions::default());
+    assert_eq!(f.site_prefixes(), &[pfx("2001:620::/32")]);
+    for a in ["2001:620:0:9::5", "2001:620:8:1::5", "2001:620:ff::5"] {
+        assert!(
+            matches!(
+                admit(NetMode::Public, ip(a), &f, &[]),
+                Err(Denied::SitePrefix { .. })
+            ),
+            "{a}"
+        );
+    }
+    assert_eq!(admit(NetMode::Public, ip("2001:621::5"), &f, &[]), Ok(()));
+    let narrow = HostFacts::assemble(
+        r,
+        &FactsOptions {
+            ipv6_site_prefix_len: 48,
+            ..FactsOptions::default()
+        },
+    );
+    assert_eq!(
+        admit(NetMode::Public, ip("2001:620:8:1::5"), &narrow, &[]),
+        Ok(())
+    );
+}
+
 /// On this host: a public-mode start needs `[egress] internal_ranges` exactly when the host has a
 /// global IPv4 interface address or a tunnel uplink, and the listed ranges are refused like deny
 /// CIDRs.

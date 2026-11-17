@@ -11,9 +11,11 @@
 //! - **connected prefixes:** every interface address under its netmask, the peer of a
 //!   point-to-point link, and every on-link route (no gateway, not on loopback, not a default
 //!   route): a DHCPv6 address is a /128 whose /64 is only a route ([`crate::routes`]);
-//! - **site prefixes:** the enclosing /`ipv6_site_prefix_len` (default /48) of every own global
-//!   IPv6 address. A home or office is delegated a /56 or a /48 and numbers its other networks
-//!   from it, none of which the host's own /64 shows; and the enclosing /`ipv4_site_prefix_len`
+//! - **site prefixes:** the enclosing /`ipv6_site_prefix_len` (default /32) of every own global
+//!   IPv6 address. A home or office is delegated a /56 or a /48, an organisation holds up to a
+//!   /32, and numbers its other networks from it, none of which the host's own /64 shows (the
+//!   default also refuses the rest of the host's own ISP's /32 over IPv6); and the enclosing
+//!   /`ipv4_site_prefix_len`
 //!   (default /16) of every global IPv4 address on an interface (a campus or data centre numbered
 //!   from public space reaches its other subnets through the default gateway);
 //! - **public-address knowledge:** per family the host routes, whether its public address is
@@ -47,10 +49,12 @@ use crate::ip::{is_global, Prefix};
 use crate::policy::Denied;
 use crate::routes::{Route, RouteOracle, RouteRefusal, RouteTable, Rule};
 
-/// The default `[egress] ipv6_site_prefix_len`: a /48, the most a site is usually delegated.
-pub const DEFAULT_IPV6_SITE_PREFIX_LEN: u8 = 48;
+/// The default `[egress] ipv6_site_prefix_len`: a /32, what an organisation (a campus, a
+/// company, an ISP's own customers' allocation) usually holds. It also refuses the rest of the
+/// miner's own ISP's /32 over IPv6; a dual-stack name there still connects over IPv4.
+pub const DEFAULT_IPV6_SITE_PREFIX_LEN: u8 = 32;
 /// The lengths `[egress] ipv6_site_prefix_len` may take.
-pub const IPV6_SITE_PREFIX_LENS: RangeInclusive<u8> = 32..=64;
+pub const IPV6_SITE_PREFIX_LENS: RangeInclusive<u8> = 16..=64;
 /// The default `[egress] ipv4_site_prefix_len`.
 pub const DEFAULT_IPV4_SITE_PREFIX_LEN: u8 = 16;
 /// The lengths `[egress] ipv4_site_prefix_len` may take.
@@ -992,11 +996,11 @@ mod tests {
             public_confirmed: vec![ip("2a01:4f8:1:2::9")],
             ..RawFacts::default()
         };
-        // The default: a /48, the most a site is usually delegated.
+        // The default: a /32, what an organisation usually holds.
         let f = HostFacts::assemble(raw.clone(), &offline());
         assert_eq!(
             f.site_prefixes(),
-            &[p("2606:a300:9024::/48"), p("2a01:4f8:1::/48")]
+            &[p("2606:a300::/32"), p("2a01:4f8::/32")]
         );
         // A public address is an own address; a non-global "public" answer is dropped.
         assert!(f.own_addresses().contains(&ip("2a01:4f8:1:2::9")));
@@ -1012,23 +1016,31 @@ mod tests {
             f56.site_prefixes(),
             &[p("2606:a300:9024:100::/56"), p("2a01:4f8:1::/56")]
         );
-        let f32 = HostFacts::assemble(
-            raw,
+        let f48 = HostFacts::assemble(
+            raw.clone(),
             &FactsOptions {
-                ipv6_site_prefix_len: 32,
+                ipv6_site_prefix_len: 48,
                 ..offline()
             },
         );
         assert_eq!(
-            f32.site_prefixes(),
-            &[p("2606:a300::/32"), p("2a01:4f8::/32")]
+            f48.site_prefixes(),
+            &[p("2606:a300:9024::/48"), p("2a01:4f8:1::/48")]
         );
+        let f16 = HostFacts::assemble(
+            raw,
+            &FactsOptions {
+                ipv6_site_prefix_len: 16,
+                ..offline()
+            },
+        );
+        assert_eq!(f16.site_prefixes(), &[p("2606::/16"), p("2a01::/16")]);
         assert_eq!(
             site_prefixes(&[ip("2606:a300::1")], 99),
             vec![p("2606:a300::/64")]
         );
         assert!(FactsOptions::default().validate().is_ok());
-        for bad in [31u8, 65, 0, 128] {
+        for bad in [15u8, 65, 0, 128] {
             let o = FactsOptions {
                 ipv6_site_prefix_len: bad,
                 ..offline()
@@ -1125,7 +1137,7 @@ mod tests {
                 p("9.9.9.9/32"),
                 p("192.168.1.0/24"),
                 p("198.51.100.0/24"),
-                p("2606:a300:9024::/48"),
+                p("2606:a300::/32"),
                 p("2606:a300:9024:184::/64"),
             ]
         );

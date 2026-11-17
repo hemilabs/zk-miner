@@ -20,7 +20,7 @@
 //!
 //! [egress]
 //! deny_cidrs = ["203.0.113.7/32"]   # the fleet's addresses, the VPC's ranges
-//! ipv6_site_prefix_len = 48         # the site refused around each own IPv6 address (32..=64)
+//! ipv6_site_prefix_len = 32         # the site refused around each own IPv6 address (16..=64)
 //! discover_public_addresses = true  # learn the NAT public addresses from fixed reflectors
 //!
 //! [dns]
@@ -1695,7 +1695,7 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         let c = dev_toml(&minimal("[egress]\nipv6_site_prefix_len = 56\ndiscover_public_addresses = false"), d).unwrap();
         assert_eq!(c.facts_options.ipv6_site_prefix_len, 56);
         assert!(!c.facts_options.discover_public_addresses);
-        for bad in ["31", "65", "0"] {
+        for bad in ["15", "65", "0"] {
             let e = err(&minimal(&format!("[egress]\nipv6_site_prefix_len = {bad}")), d);
             assert!(e.contains("ipv6_site_prefix_len"), "{e}");
         }

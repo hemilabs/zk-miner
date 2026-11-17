@@ -974,7 +974,7 @@ mod tests {
             a("2606:4700:1:5::1"),
             Err(Denied::SitePrefix { .. })
         ));
-        assert_eq!(a("2606:4700:2::1"), Ok(()));
+        assert_eq!(a("2606:4701::1"), Ok(()));
         // The NAT public address (learned) is the host's own.
         assert!(matches!(a("168.1.2.57"), Err(Denied::OwnAddress(_))));
         // The upstream DNS servers behind the stub.
@@ -1346,7 +1346,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(fixed.facts().gathered_at(), t);
         let bad = FactsOptions {
-            ipv6_site_prefix_len: 30,
+            ipv6_site_prefix_len: 15,
             ..offline()
         };
         assert!(NetPolicy::with_options(NetMode::Public, Vec::new(), bad).is_err());

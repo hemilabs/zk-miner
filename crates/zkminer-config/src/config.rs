@@ -76,9 +76,10 @@ pub struct EgressConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_cidrs: Vec<String>,
     /// The site around each of this host's own global IPv6 addresses that is refused: its
-    /// enclosing /N, 32..=64 (default 48, the most a home, office or small site is usually
-    /// delegated; its other networks hold the operator's other machines). Set it shorter when
-    /// your organisation holds more (a campus /32).
+    /// enclosing /N, 16..=64 (default 32: what an organisation — a campus, a company — usually
+    /// holds, whose other networks hold its other machines). The default also refuses the rest of
+    /// this host's own ISP's /32 over IPv6 (a name there that also has an IPv4 address still
+    /// connects over IPv4); set it longer (48, 56) if that is in the way and your site is no wider.
     #[serde(
         default = "default_ipv6_site_prefix_len",
         skip_serializing_if = "is_default_ipv6_site_prefix_len"
@@ -1001,7 +1002,7 @@ mod validation_tests {
         }
     }
 
-    /// Review r1 (fetch F1b/F1c): `[egress] ipv6_site_prefix_len` (32..=64, default 48) and
+    /// Review r1 (fetch F1b/F1c): `[egress] ipv6_site_prefix_len` (16..=64, default 32) and
     /// `discover_public_addresses` (default true) reach netguard's facts options, and are not
     /// written while they hold their defaults.
     #[test]
@@ -1011,7 +1012,7 @@ mod validation_tests {
             c.egress_facts_options().unwrap(),
             zkminer_netguard::FactsOptions::default()
         );
-        assert_eq!(c.egress.ipv6_site_prefix_len, 48);
+        assert_eq!(c.egress.ipv6_site_prefix_len, 32);
         assert_eq!(c.egress.ipv4_site_prefix_len, 16);
         assert_eq!(c.egress.near_hop_limit, 2);
         assert!(c.egress.discover_public_addresses);
@@ -1028,7 +1029,7 @@ mod validation_tests {
         assert!(text.contains("ipv6_site_prefix_len = 56"), "{text}");
         assert!(text.contains("discover_public_addresses = false"), "{text}");
         assert_eq!(parse(&text).unwrap().egress, c.egress);
-        for (len, ok) in [(31, false), (32, true), (48, true), (56, true), (64, true), (65, false), (0, false)] {
+        for (len, ok) in [(15, false), (16, true), (32, true), (48, true), (56, true), (64, true), (65, false), (0, false)] {
             let c = parse(&format!(
                 "[chain]\nchain_id = 743111\n[egress]\nipv6_site_prefix_len = {len}\n"
             ))
