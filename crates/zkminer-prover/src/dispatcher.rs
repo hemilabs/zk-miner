@@ -2652,9 +2652,18 @@ const WINDOWS_SHARED_CARD_MARGIN: u64 = 1024 * 1024 * 1024;
 #[cfg(windows)]
 const WINDOWS_SHARED_CARD_THRESHOLD: u64 = 64 * 1024 * 1024;
 
+///
+/// Not on a reading that has memory of ours on its way in or out (`draining`, `unattributed`): the
+/// separate queries a reading is made of can then put some of ours under "foreign" for a moment,
+/// and a worker sized on that moment would stay smaller until its next recycle. Nor with the
+/// free-VRAM checks off (`discovery::free_vram_checks_off`).
 #[cfg(windows)]
 fn with_windows_growth_margin(mut card: CardOccupancy) -> CardOccupancy {
-    if card.foreign() > WINDOWS_SHARED_CARD_THRESHOLD {
+    if card.foreign() > WINDOWS_SHARED_CARD_THRESHOLD
+        && card.draining == 0
+        && card.unattributed == 0
+        && !crate::discovery::free_vram_checks_off()
+    {
         card.growth_margin = WINDOWS_SHARED_CARD_MARGIN;
     }
     card
@@ -2946,6 +2955,10 @@ struct PendingSp1Cap {
     retry_here: bool,
 }
 
+/// How long a card another program's memory kept a risc0 proof off claims no risc0 job
+/// (`WorkerPool::risc0_card_short`). The next proof there re-checks, and clears it if it fits.
+pub const RISC0_SHORT_FOR: Duration = Duration::from_secs(300);
+
 /// A program's identity for `PendingSp1Cap`: a hash of its ELF.
 fn program_hash(elf: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -3234,6 +3247,10 @@ pub struct VramBudget {
     pub total: u64,
     /// What this slot may plan to use.
     pub available: u64,
+    /// Held back from `available` for another program on the card to grow into (Windows, see
+    /// `CardOccupancy::growth_margin`): `available` plus this is what physically fits now. Sizing
+    /// keeps it back; a floor, or calibration's own 10%, does not.
+    pub growth_margin: u64,
 }
 
 /// How long to wait, after recycling a sibling worker to make room, for its VRAM to show as free.
@@ -3399,6 +3416,9 @@ pub struct WorkerPool {
     /// SP1 slots lowered a tier this run, by slot key, until the program that ran out proves at the
     /// lower tier there (`confirm_sp1_shard_cap`), which is when the cap is recorded.
     sp1_caps_pending: Mutex<HashMap<String, PendingSp1Cap>>,
+    /// risc0 slots whose card another program's memory kept a proof off, until when: the claim side
+    /// claims no risc0 job for them meanwhile (`risc0_card_short`).
+    risc0_short: Mutex<HashMap<String, Instant>>,
     /// Set by `close` when the process is exiting: from then on no worker is spawned and no room is
     /// made. Without it, a dispatch in flight could respawn a worker after `shutdown_all` had swept
     /// the slots — and that window is up to tens of seconds, because
@@ -3517,6 +3537,7 @@ impl WorkerPool {
             gpu_locks: Mutex::new(HashMap::new()),
             sp1_shard_caps: Mutex::new(None),
             sp1_caps_pending: Mutex::new(HashMap::new()),
+            risc0_short: Mutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
             last_measure_eviction: Mutex::new(None),
             inflight_measures: Mutex::new(HashMap::new()),
@@ -3737,6 +3758,36 @@ impl WorkerPool {
             return t::sp1_rate_factor_for_cap(cap, sizing);
         }
         1.0
+    }
+
+    /// Whether risc0 jobs should not be claimed for `key`'s card for now: a proof there was refused
+    /// within [`RISC0_SHORT_FOR`] because another program holds the memory it needs. Each job
+    /// claimed meanwhile would wait for that memory and, on a single card, be released.
+    pub fn risc0_card_short(&self, key: &str) -> bool {
+        let mut short = self.risc0_short.lock().unwrap_or_else(|e| e.into_inner());
+        match short.get(key) {
+            Some(until) if Instant::now() < *until => true,
+            Some(_) => {
+                short.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn note_risc0_card_short(&self, key: &str) {
+        let was = self
+            .risc0_short
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), Instant::now() + RISC0_SHORT_FOR);
+        if was.is_none() {
+            tracing::warn!(
+                "{key}: another program holds the VRAM a risc0 proof needs here; claiming no risc0 \
+                 job for this card for {} minutes",
+                RISC0_SHORT_FOR.as_secs() / 60
+            );
+        }
     }
 
     /// Calls `report` with a short description of each step `discover_and_spawn` starts.
@@ -5051,8 +5102,11 @@ impl WorkerPool {
             Some(budget) => {
                 let backend = key.split(':').next().unwrap_or(key);
                 let gpu_tag = key.split(':').nth(1).unwrap_or("");
-                let (fits, _) =
-                    crate::benchmark::find_optimal_gpu_po2(budget.available, backend, gpu_tag);
+                let (fits, _) = crate::benchmark::find_optimal_gpu_po2(
+                    budget.available.saturating_add(budget.growth_margin),
+                    backend,
+                    gpu_tag,
+                );
                 if fits < po2 {
                     tracing::info!(
                         "{key}: calibrating at po2={fits} instead of {po2} — only {:.1} GiB of this \
@@ -9231,6 +9285,7 @@ impl WorkerPool {
             used: card.used,
             total: card.total,
             available: card.available_to(key),
+            growth_margin: card.growth_margin,
         })
     }
 
@@ -9876,15 +9931,24 @@ impl WorkerPool {
         if !own.dispatchable || self.closing.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        let floor = match risc0_po2 {
-            Some(po2) if backend == zkminer_prover_protocol::BACKEND_RISC0 => {
-                crate::discovery::min_available_vram_bytes_for_risc0_proof(
+        // A risc0 proof's room is made as for any need nothing sized (every idle sibling holding
+        // `MIN_EVICTABLE_HOLDING` goes, which also covers what a measured peak leaves out); its
+        // measured size only decides the refusal below. The Windows growth margin is room-making's
+        // and sizing's, never a refusal's: a floor is what must physically fit.
+        let risc0_proof = backend == zkminer_prover_protocol::BACKEND_RISC0 && risc0_po2.is_some();
+        let (room_floor, floor) = match risc0_po2 {
+            Some(po2) if risc0_proof => (
+                None,
+                crate::discovery::risc0_proof_vram_bytes(
                     po2,
                     key.split(':').nth(1).unwrap_or(""),
                     Some(card.total),
-                )
+                ),
+            ),
+            _ => {
+                let floor = crate::discovery::min_available_vram_bytes_for_backend(backend, total);
+                (floor.map(|f| f.saturating_sub(card.growth_margin)), floor)
             }
-            _ => crate::discovery::min_available_vram_bytes_for_backend(backend, total),
         };
         let this_card = physical_gpu_id(key);
         // What of OURS stands on this card and could move: same-card siblings' workers — only they are
@@ -9927,7 +9991,7 @@ impl WorkerPool {
             let ceiling = movable
                 .iter()
                 .fold(available, |acc, (_, held)| acc.saturating_add(*held));
-            let room = room_needed(own.cap, backend, ceiling, own.live, floor, total);
+            let room = room_needed(own.cap, backend, ceiling, own.live, room_floor, total);
             let plan = plan_room(room, available, &movable);
             if !plan.is_empty() {
                 let recyclable: Vec<String> =
@@ -10004,6 +10068,7 @@ impl WorkerPool {
             used: card.used,
             total: card.total,
             available: card.available_to(key),
+            growth_margin: card.growth_margin,
         };
         // A live worker is sized from the figure it was SPAWNED with, so a display attached since
         // then leaves it committed to more VRAM than is free. The floor check below cannot see this:
@@ -10016,7 +10081,8 @@ impl WorkerPool {
         let Some(needed) = floor else {
             return Ok(Some(budget));
         };
-        if budget.available < needed {
+        let free = budget.available.saturating_add(budget.growth_margin);
+        if free < needed {
             // A TYPED error: the caller must not read this as worker ill-health — the card and the
             // worker are both fine — and must not be able to have it forged by guest text. It costs
             // no attempt, so the retry tries another card and then waits; foreign VRAM is often
@@ -10026,13 +10092,30 @@ impl WorkerPool {
                 slot_key: key.to_string(),
                 foreign_bytes: foreign,
                 sibling_bytes: budget.held_elsewhere - foreign,
-                available_bytes: budget.available,
+                available_bytes: free,
                 needed_bytes: Some(needed),
                 ours_in_the_way: false,
                 total_bytes: budget.total,
             };
             tracing::warn!("not putting work on {key}: {shortage}");
+            // Another program's memory alone keeps a risc0 proof off this card: claim no more risc0
+            // jobs for it a while (`risc0_card_short`), as each would wait here and be released.
+            if risc0_proof
+                && card
+                    .total
+                    .saturating_sub(card.reserved)
+                    .saturating_sub(card.foreign())
+                    < needed
+            {
+                self.note_risc0_card_short(key);
+            }
             return Err(anyhow::Error::new(shortage));
+        }
+        if risc0_proof {
+            self.risc0_short
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(key);
         }
         Ok(Some(budget))
     }
@@ -12750,48 +12833,38 @@ mod tests {
     }
 
     #[test]
-    fn a_risc0_proof_needs_its_sizes_measured_peak_free_on_a_cuda_card() {
+    fn a_risc0_proof_needs_what_its_size_takes_on_a_cuda_card_and_no_more() {
         const MIB: u64 = 1 << 20;
-        let floor = crate::discovery::min_available_vram_bytes_for_risc0_proof;
-        let margin = crate::discovery::RISC0_PROOF_VRAM_MARGIN;
-        // A 12 GB card at its own 19, a 16 GB one at 20.
-        assert_eq!(
-            floor(19, "cuda", Some(12_282 * MIB)),
-            Some(8_179 * MIB + margin)
+        let need = crate::discovery::risc0_proof_vram_bytes;
+        // The measured peak: a 12 GB card at its own 19, a 16 GB one at 20. No margin on top: a
+        // proof that fits is never refused.
+        assert_eq!(need(19, "cuda", Some(12_282 * MIB)), Some(8_179 * MIB));
+        assert_eq!(need(20, "cuda", Some(16_303 * MIB)), Some(12_436 * MIB));
+        assert_eq!(need(18, "cuda", Some(8_188 * MIB)), Some(4_709 * MIB));
+        // A card that keeps its Groth16 cache (20 GiB and up) needs it too: 15,834 MiB at 20.
+        assert_eq!(need(20, "cuda", Some(24_564 * MIB)), Some(15_834 * MIB));
+        // Nothing for a size not measured (16, 17: bounded only; 21, 22: extrapolated), one the
+        // card could never hold, an unknown card, or another vendor's.
+        assert_eq!(need(17, "cuda", Some(6_144 * MIB)), None);
+        assert_eq!(need(21, "cuda", Some(24_564 * MIB)), None);
+        assert_eq!(need(20, "cuda", Some(12_282 * MIB)), None);
+        assert_eq!(need(19, "cuda", None), None);
+        assert_eq!(need(19, "rocm", Some(16_303 * MIB)), None);
+    }
+
+    #[test]
+    fn a_card_short_for_risc0_claims_none_until_the_window_ends() {
+        let pool = pool_with_keys(&["risc0:cuda:1"]);
+        assert!(!pool.risc0_card_short("risc0:cuda:1"));
+        pool.note_risc0_card_short("risc0:cuda:1");
+        assert!(pool.risc0_card_short("risc0:cuda:1"));
+        assert!(!pool.risc0_card_short("risc0:cuda:0"));
+        // Expired: claims resume (and the next proof there re-checks).
+        pool.risc0_short.lock().unwrap().insert(
+            "risc0:cuda:1".into(),
+            Instant::now() - Duration::from_secs(1),
         );
-        assert_eq!(
-            floor(20, "cuda", Some(16_303 * MIB)),
-            Some(12_436 * MIB + margin)
-        );
-        // A size the card could never hold gets no floor (it proves slowly, as before, and is
-        // priced so), nor does a card of unknown size or another vendor's.
-        assert_eq!(floor(20, "cuda", Some(12_282 * MIB)), None);
-        assert_eq!(floor(19, "cuda", None), None);
-        assert_eq!(floor(19, "rocm", Some(16_303 * MIB)), None);
-        // With a floor, room-making frees only what that floor needs, or refuses when it cannot.
-        let need = 8_179 * MIB + margin;
-        assert_eq!(
-            room_needed(
-                SizingCap::NotSized,
-                "risc0",
-                11_000 * MIB,
-                None,
-                Some(need),
-                None
-            ),
-            RoomNeeded::Bytes(need)
-        );
-        assert_eq!(
-            room_needed(
-                SizingCap::NotSized,
-                "risc0",
-                8_000 * MIB,
-                None,
-                Some(need),
-                None
-            ),
-            RoomNeeded::Hopeless
-        );
+        assert!(!pool.risc0_card_short("risc0:cuda:1"));
     }
 
     #[cfg(windows)]

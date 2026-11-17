@@ -2551,7 +2551,13 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
         pool.settle_vram(&key);
         let free_po2 = match pool.vram_budget_for_slot(&key) {
             Some(budget) if budget.total > 0 => {
-                let (fits, _) = find_optimal_gpu_po2(budget.available, "risc0", gpu_tag);
+                // What physically fits: calibration's own 10% is its headroom, not the Windows
+                // growth margin, which would cap a display card a size down for good.
+                let (fits, _) = find_optimal_gpu_po2(
+                    budget.available.saturating_add(budget.growth_margin),
+                    "risc0",
+                    gpu_tag,
+                );
                 Some(fits)
             }
             _ => None,

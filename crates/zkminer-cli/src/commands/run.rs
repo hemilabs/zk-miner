@@ -7840,11 +7840,16 @@ async fn miner_brain(
         // Collapsed to the job's own backend at each use site instead.
         // The risc0 cards that prove jobs, each at its own segment size, and the sizes every risc0 job
         // is measured at before it is claimed (see `risc0_job_sizes`).
-        let risc0_cards = risc0_job_cards(
+        let mut risc0_cards = risc0_job_cards(
             &risc0_slot_sizes_now,
             &disabled_slots_by_backend,
             disabled_backends.contains(zkminer_prover_protocol::BACKEND_RISC0),
         );
+        // Not a card another program's memory is keeping risc0 proofs off right now: a job claimed
+        // for it would wait there and be released (see `WorkerPool::risc0_card_short`).
+        if let Some(pool) = zkminer_prover::engine::worker_pool() {
+            risc0_cards.retain(|card| !pool.risc0_card_short(&card.slot));
+        }
         let risc0_sizes = risc0_job_sizes(&risc0_cards);
 
         let device_backend_throughputs: Vec<(String, String, f64)> = {
