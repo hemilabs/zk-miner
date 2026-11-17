@@ -482,56 +482,79 @@ impl Connector {
         let stall = request_budget(self.connect_timeout);
         let mut writer = tokio::spawn(write_answers(sock.clone(), rx, in_flight.clone(), stall));
         let mut writer_end: Option<Result<WriterEnd, tokio::task::JoinError>> = None;
+        // Once the writer is gone (a failed write), when: from then on requests are still judged
+        // as ever but nothing is connected or answered, and the broker's end must reach
+        // end-of-file within EXITED_WITHIN (it exited) or it is cut off.
+        let mut writer_gone_at: Option<Instant> = None;
         // The requests being served: aborted when the session ends, so nothing is connected for
         // a broker that is gone or cut off.
         let mut tasks = JoinSet::new();
         let mut misuse: VecDeque<Instant> = VecDeque::new();
-        enum Exit {
-            End(SessionEnd),
-            /// The answer writer stopped (its result is in `writer_end`, or it is about to be).
-            WriterGone,
-        }
-        let exit = loop {
+        let mut frames = FrameReader::default();
+        let end = loop {
             while tasks.try_join_next().is_some() {}
-            // Reading first: a broker that exited is at end-of-file here before a failed write
-            // is looked at.
-            let read = tokio::select! {
-                biased;
-                r = read_request(&sock) => r,
-                w = &mut writer => {
-                    writer_end = Some(w);
-                    break Exit::WriterGone;
+            let read = match writer_gone_at {
+                None => {
+                    // Reading first: a broker that exited is at end-of-file here before a failed
+                    // write is looked at.
+                    tokio::select! {
+                        biased;
+                        r = frames.read(&sock) => r,
+                        w = &mut writer => {
+                            if matches!(w, Ok(WriterEnd::Stalled)) {
+                                break SessionEnd::CutOff(CutOff::AnswersStalled);
+                            }
+                            if let Ok(WriterEnd::Failed(e)) = &w {
+                                tracing::debug!(error = %e, "connector: writing an answer failed");
+                            }
+                            writer_end = Some(w);
+                            writer_gone_at = Some(Instant::now());
+                            continue;
+                        }
+                    }
                 }
+                Some(at) => match tokio::time::timeout_at(at + EXITED_WITHIN, frames.read(&sock)).await {
+                    Ok(r) => r,
+                    // Still sending, no longer taking answers: it shut its reading side.
+                    Err(_) => break SessionEnd::CutOff(CutOff::AnswersRefused),
+                },
             };
             let frame = match read {
                 Ok(Some(f)) => f,
-                Ok(None) => break Exit::End(SessionEnd::Closed),
-                Err(ReadError::FdAttached) => break Exit::End(SessionEnd::CutOff(CutOff::FdAttached)),
+                Ok(None) => break SessionEnd::Closed,
+                Err(ReadError::FdAttached) => break SessionEnd::CutOff(CutOff::FdAttached),
                 Err(ReadError::Io(e)) => {
                     tracing::debug!(error = %e, "connector: reading a request failed");
-                    break Exit::End(SessionEnd::Closed);
+                    break SessionEnd::Closed;
                 }
             };
             let req = match Request::decode(&frame) {
                 Ok(r) => r,
-                Err(m) => break Exit::End(SessionEnd::CutOff(CutOff::Malformed(m))),
+                Err(m) => break SessionEnd::CutOff(CutOff::Malformed(m)),
             };
             self.stats.requests.fetch_add(1, Ordering::Relaxed);
             {
                 let mut f = lock(&in_flight);
                 if f.contains(&req.id) {
-                    break Exit::End(SessionEnd::CutOff(CutOff::DuplicateId));
+                    break SessionEnd::CutOff(CutOff::DuplicateId);
                 }
                 if f.len() >= MAX_INFLIGHT {
-                    break Exit::End(SessionEnd::CutOff(CutOff::Flood));
+                    break SessionEnd::CutOff(CutOff::Flood);
                 }
                 f.insert(req.id);
             }
-            // The answer's slot, before anything is done for the request.
-            let slot = match tx.clone().try_reserve_owned() {
-                Ok(p) => p,
-                Err(TrySendError::Full(_)) => break Exit::End(SessionEnd::CutOff(CutOff::Flood)),
-                Err(TrySendError::Closed(_)) => break Exit::WriterGone,
+            // The answer's slot, before anything is done for the request (none once the writer is
+            // gone: the request is judged, never served).
+            let slot = match writer_gone_at {
+                Some(_) => None,
+                None => match tx.clone().try_reserve_owned() {
+                    Ok(p) => Some(p),
+                    Err(TrySendError::Full(_)) => break SessionEnd::CutOff(CutOff::Flood),
+                    Err(TrySendError::Closed(_)) => {
+                        writer_gone_at = Some(Instant::now());
+                        None
+                    }
+                },
             };
             let index = usize::try_from(req.endpoint).ok().filter(|i| *i < self.endpoints.len());
             let refusal = match index {
@@ -550,11 +573,14 @@ impl Connector {
                 // The bound before the answer: past it the broker is cut off whether or not it
                 // still reads.
                 if misuse.len() > MAX_MISUSE {
-                    break Exit::End(SessionEnd::CutOff(CutOff::Misuse));
+                    break SessionEnd::CutOff(CutOff::Misuse);
                 }
-                slot.send((Response::refused(req.id, status), None));
+                if let Some(slot) = slot {
+                    slot.send((Response::refused(req.id, status), None));
+                }
                 continue;
             }
+            let Some(slot) = slot else { continue };
             let me = self.clone();
             let index = index.unwrap_or_default();
             tasks.spawn(async move {
@@ -571,18 +597,12 @@ impl Connector {
         // Requests still being served are aborted (a socket one already made is closed, never
         // delivered), and gone before the session's end is reported.
         tasks.shutdown().await;
-        let end = match exit {
-            Exit::End(end) => end,
-            Exit::WriterGone => {
-                let w = match writer_end.take() {
-                    Some(w) => w,
-                    None => (&mut writer).await,
-                };
-                let end = writer_gone(&sock, w).await;
-                writer_end = Some(Ok(WriterEnd::Done));
-                end
-            }
-        };
+        if writer_gone_at.is_some() && writer_end.is_none() {
+            writer_end = Some((&mut writer).await);
+        }
+        if let Some(Err(e)) = &writer_end {
+            tracing::error!(error = %e, "connector: the answer writer failed");
+        }
         match &end {
             SessionEnd::CutOff(why) => {
                 // Closed on the broker at once, whatever else still holds the socket.
@@ -747,57 +767,8 @@ async fn write_answers(
     WriterEnd::Done
 }
 
-/// How a session ends once its answer writer stopped: a stall is a cut-off; a failed write is
-/// the broker closing its end (it exited: its requests end at end-of-file within
-/// [`EXITED_WITHIN`]) or a cut-off (it shut only its reading side and kept sending, or sent a
-/// descriptor).
-async fn writer_gone(sock: &tokio::net::UnixStream, w: Result<WriterEnd, tokio::task::JoinError>) -> SessionEnd {
-    match w {
-        Ok(WriterEnd::Stalled) => SessionEnd::CutOff(CutOff::AnswersStalled),
-        Ok(WriterEnd::Failed(e)) => {
-            tracing::debug!(error = %e, "connector: writing an answer failed");
-            if read_side_ends(sock, EXITED_WITHIN).await {
-                SessionEnd::Closed
-            } else {
-                SessionEnd::CutOff(CutOff::AnswersRefused)
-            }
-        }
-        // Not while the session holds a sender.
-        Ok(WriterEnd::Done) => SessionEnd::Closed,
-        Err(e) => {
-            tracing::error!(error = %e, "connector: the answer writer failed");
-            SessionEnd::Closed
-        }
-    }
-}
-
-/// How soon after a failed write the requests of a broker that exited reach end-of-file.
+/// How soon after a failed answer write the requests of a broker that exited reach end-of-file.
 const EXITED_WITHIN: Duration = Duration::from_secs(1);
-
-/// Reads and discards what the broker still sends until end-of-file (`true`) or `within` passes,
-/// or it sends a descriptor (`false`).
-async fn read_side_ends(sock: &tokio::net::UnixStream, within: Duration) -> bool {
-    let drain = async {
-        let mut buf = [0u8; 4096];
-        loop {
-            let mut fds = Vec::new();
-            let n = sock
-                .async_io(Interest::READABLE, || retry_eintr(|| recvmsg_once(sock.as_raw_fd(), &mut buf, &mut fds)))
-                .await;
-            if !fds.is_empty() {
-                return false;
-            }
-            match n {
-                Ok(0) => return true,
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::InvalidData => return false,
-                // A reset is a closed end.
-                Err(_) => return true,
-            }
-        }
-    };
-    tokio::time::timeout(within, drain).await.unwrap_or(false)
-}
 
 /// Sets the socket's send buffer to the kernel's minimum (`SO_SNDBUF` 1 is raised to it).
 fn shrink_send_buffer(sock: &tokio::net::UnixStream) -> io::Result<()> {
@@ -824,29 +795,43 @@ enum ReadError {
     Io(io::Error),
 }
 
-/// Reads exactly one request frame; `None` at a clean end of stream. Ancillary data is received
-/// (so a file descriptor is noticed and closed) and is a protocol violation; a stream that ends
-/// inside a frame is a closed socket.
-async fn read_request(sock: &tokio::net::UnixStream) -> Result<Option<[u8; REQUEST_LEN]>, ReadError> {
-    let mut buf = [0u8; REQUEST_LEN];
-    let mut off = 0;
-    while off < REQUEST_LEN {
-        let mut fds = Vec::new();
-        let n = sock
-            .async_io(Interest::READABLE, || retry_eintr(|| recvmsg_once(sock.as_raw_fd(), &mut buf[off..], &mut fds)))
-            .await;
-        if !fds.is_empty() {
-            return Err(ReadError::FdAttached);
+/// Reads request frames, keeping a partial frame between calls: [`FrameReader::read`] is
+/// cancel-safe (the session races it against its answer writer and a deadline; bytes already read
+/// are never lost, so the stream never falls out of frame).
+#[derive(Default)]
+struct FrameReader {
+    buf: [u8; REQUEST_LEN],
+    off: usize,
+}
+
+impl FrameReader {
+    /// Reads exactly one request frame; `None` at a clean end of stream. Ancillary data is
+    /// received (so a file descriptor is noticed and closed) and is a protocol violation; a stream
+    /// that ends inside a frame is a closed socket.
+    async fn read(&mut self, sock: &tokio::net::UnixStream) -> Result<Option<[u8; REQUEST_LEN]>, ReadError> {
+        while self.off < REQUEST_LEN {
+            let mut fds = Vec::new();
+            let off = self.off;
+            let buf = &mut self.buf;
+            // The only await: a cancellation there has consumed nothing; once `recvmsg` returned,
+            // its bytes are counted below before anything else can run.
+            let n = sock
+                .async_io(Interest::READABLE, || retry_eintr(|| recvmsg_once(sock.as_raw_fd(), &mut buf[off..], &mut fds)))
+                .await;
+            if !fds.is_empty() {
+                return Err(ReadError::FdAttached);
+            }
+            match n {
+                Ok(0) if self.off == 0 => return Ok(None),
+                Ok(0) => return Err(ReadError::Io(io::ErrorKind::UnexpectedEof.into())),
+                Ok(n) => self.off += n,
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => return Err(ReadError::FdAttached),
+                Err(e) => return Err(ReadError::Io(e)),
+            }
         }
-        match n {
-            Ok(0) if off == 0 => return Ok(None),
-            Ok(0) => return Err(ReadError::Io(io::ErrorKind::UnexpectedEof.into())),
-            Ok(n) => off += n,
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => return Err(ReadError::FdAttached),
-            Err(e) => return Err(ReadError::Io(e)),
-        }
+        self.off = 0;
+        Ok(Some(self.buf))
     }
-    Ok(Some(buf))
 }
 
 /// Writes one response frame, with `fd` attached to its first byte.

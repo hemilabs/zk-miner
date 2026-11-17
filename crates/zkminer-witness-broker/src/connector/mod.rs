@@ -57,9 +57,11 @@
 //! in-flight bound and reads every answer). A request stays in flight until its answer is handed
 //! to the socket, so a broker that stops reading cannot make the miner hold more than
 //! [`MAX_INFLIGHT`] connected sockets (and the one being written); the socket's send buffer is the
-//! kernel's minimum, so the kernel holds only a few written answers it has not read either. A
-//! broker that exits ends its session closed (its requests end at end-of-file), and requests still
-//! being served are aborted then too. Connection attempts are paced by a token bucket ([`RATE_BURST`] at once,
+//! kernel's minimum, so the kernel holds only a few written answers it has not read either. After a
+//! failed answer write the broker's requests are still judged by every rule above but nothing is
+//! connected or answered: a broker that exited reaches end-of-file within a second and its session
+//! ends closed; one that keeps its end open is cut off. Requests still being served when a session
+//! ends are aborted. Connection attempts are paced by a token bucket ([`RATE_BURST`] at once,
 //! [`RATE_PER_SEC`] a second — a hard budget of `RATE_BURST + RATE_PER_SEC × t` attempts in any
 //! interval `t`) and at most the endpoint's `max_concurrency` are in flight per endpoint; past them
 //! a request waits, and is answered [`Status::RateLimited`] when its time runs out. A request is

@@ -424,33 +424,39 @@ async fn a_stalled_answer_cuts_the_broker_off_after_the_request_budget() {
 }
 
 /// A broker that shuts only the reading side of its socket: the first answer fails to write, and
-/// the session ends in a cut-off (never quietly closed), before any later request is connected or
-/// counted — misuse after it included.
+/// the session ends in a cut-off, never quietly closed. Requests it sends afterwards are still
+/// judged (misuse past the bound is a misuse cut-off) but never connected; if it just keeps its
+/// end open, it is cut off for refusing answers.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_broker_that_shuts_its_reading_side_is_cut_off() {
     let ep = Endpoint::start();
     let port = ep.port;
-    let (c, _d) = connector_for(&evm("n", &format!("http://127.0.0.1:{port}"), "cidrs = [\"127.0.0.1/32\"]"), NetMode::DevPrivate, vec![]);
-    let (b, s) = session(&c);
-    let b = blocking(move || {
-        b.shutdown(std::net::Shutdown::Read).unwrap();
-        let mut w = &b;
-        w.write_all(&req(1, 0, port).encode()).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        // More connections, then misuse past the bound.
-        for id in 2..7 {
-            let _ = w.write_all(&req(id, 0, port).encode());
-        }
-        for id in 100..100 + MAX_MISUSE as u64 + 3 {
-            let _ = w.write_all(&req(id, 999, port).encode());
-        }
-        b
-    })
-    .await;
-    let end = tokio::time::timeout(Duration::from_secs(10), s).await.expect("ended in time").unwrap();
-    assert_eq!(end, SessionEnd::CutOff(CutOff::AnswersRefused));
-    assert_eq!(c.stats.attempts.load(Ordering::Relaxed), 1, "only the first request was connected");
-    drop(b);
+    for misuse_after in [true, false] {
+        let (c, _d) = connector_for(&evm("n", &format!("http://127.0.0.1:{port}"), "cidrs = [\"127.0.0.1/32\"]"), NetMode::DevPrivate, vec![]);
+        let (b, s) = session(&c);
+        let b = blocking(move || {
+            b.shutdown(std::net::Shutdown::Read).unwrap();
+            let mut w = &b;
+            w.write_all(&req(1, 0, port).encode()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            if misuse_after {
+                // More requests for the endpoint, then misuse past the bound.
+                for id in 2..7 {
+                    let _ = w.write_all(&req(id, 0, port).encode());
+                }
+                for id in 100..100 + MAX_MISUSE as u64 + 3 {
+                    let _ = w.write_all(&req(id, 999, port).encode());
+                }
+            }
+            b
+        })
+        .await;
+        let end = tokio::time::timeout(Duration::from_secs(10), s).await.expect("ended in time").unwrap();
+        let want = if misuse_after { CutOff::Misuse } else { CutOff::AnswersRefused };
+        assert_eq!(end, SessionEnd::CutOff(want), "misuse after the shut: {misuse_after}");
+        assert_eq!(c.stats.attempts.load(Ordering::Relaxed), 1, "only the first request was connected");
+        drop(b);
+    }
     assert_eq!(ep.still_open(Duration::from_secs(2)), 0);
 }
 
@@ -511,4 +517,29 @@ async fn requests_in_flight_at_a_cut_off_are_aborted() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(c.stats.attempts.load(Ordering::Relaxed), 1, "the request in flight at the cut-off was connected");
     assert_eq!(ep.count(), 1);
+}
+
+/// The session races its frame reader against the answer writer and a deadline: a read cancelled
+/// in the middle of a frame keeps the bytes it had, so the next read completes the same frame
+/// (losing them would put every later frame out of step).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_read_keeps_the_partial_frame() {
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    ours.set_nonblocking(true).unwrap();
+    let ours = tokio::net::UnixStream::from_std(ours).unwrap();
+    let mut frames = FrameReader::default();
+    let first = req(7, 0, 9).encode();
+    let second = req(8, 0, 9).encode();
+    theirs.write_all(&first[..13]).unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(100), frames.read(&ours)).await.is_err(), "half a frame is not a frame");
+    theirs.write_all(&first[13..20]).unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(100), frames.read(&ours)).await.is_err());
+    theirs.write_all(&first[20..]).unwrap();
+    theirs.write_all(&second).unwrap();
+    for want in [first, second] {
+        let got = tokio::time::timeout(Duration::from_secs(1), frames.read(&ours)).await.unwrap();
+        assert!(matches!(got, Ok(Some(f)) if f == want));
+    }
+    drop(theirs);
+    assert!(matches!(frames.read(&ours).await, Ok(None)));
 }
