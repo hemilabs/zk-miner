@@ -16,7 +16,7 @@
 //!   any untrusted input): [`restrict_self`] applies Landlock (no filesystem access, no TCP
 //!   bind/connect, scoped signals and abstract Unix sockets), a seccomp denylist (no `socket`,
 //!   `connect`, `bind`, `listen` or `accept*` for any profile; no socket option but the broker's
-//!   `TCP_NODELAY`; SysV IPC; metadata writes through inherited fds; for the runner and the
+//!   `TCP_NODELAY` and the runner's and worker's socket timeouts; SysV IPC; metadata writes through inherited fds; for the runner and the
 //!   worker, host metadata), `NO_NEW_PRIVS`, `PR_SET_DUMPABLE(0)` (locked), `RLIMIT_CORE=0` and no
 //!   capabilities. The broker, whose only socket calls are
 //!   `socketpair(AF_UNIX, SOCK_STREAM)` for its runtime, then calls [`seal_socket_creation`] once
@@ -58,7 +58,7 @@ pub mod supervise;
 pub use cgroup::{delegated_root, Cgroup};
 pub use restrict::{
     landlock_abi, restrict_self, seal_socket_creation, set_socket_option, SocketOption, BROKER_SOCKET_OPTION,
-    MIN_LANDLOCK_ABI, REFUSED_SOCKET_OPTIONS,
+    MIN_LANDLOCK_ABI, REFUSED_SOCKET_OPTIONS, SOCKET_TIMEOUT_OPTIONS,
 };
 pub use selftest::{self_test, self_test_profile};
 pub use spawn::prepare_command;

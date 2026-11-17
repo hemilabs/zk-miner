@@ -164,7 +164,7 @@ job there could then reach this host's private network.
 | `hemi-code` artifact reads | the operator's `[artifacts]` endpoint and mirror; the address from **the job** | the connector |
 | The connector's DNS resolver (in the miner) | the operator (`[dns] servers`, else `/etc/resolv.conf`) | dials only those servers, for the operator's endpoint names only; never a fetch destination |
 | Public-address discovery (miner and broker, at startup and every 5 minutes) | fixed in the build: `ns1.google.com` and `1.1.1.1` (and their IPv6 addresses), UDP port 53 | none needed: requesters cannot change them; `[egress] discover_public_addresses = false` turns it off |
-| The builder runner and the execute worker | none | seccomp denies `socket`, `socketpair`, `connect` and `setsockopt` |
+| The builder runner and the execute worker | none | seccomp denies `socket`, `socketpair`, `connect`, and every `setsockopt` but the socket timeouts |
 | The broker itself | none | seccomp denies `socket`, `connect`, `bind`, `listen`, `accept*` (and `socketpair` once its runtime is up), and every `setsockopt` but `TCP_NODELAY`; Landlock grants no TCP port |
 | The inline measure and prove workers (risc0, SP1, OpenVM) and `sp1-gpu-server` | none | confined before their first guest: no sockets, Unix ones included; Landlock (below) |
 | The miner's witness host (pipeline, builder runs, store) | none | talks to the broker over a Unix socket pair only |
@@ -257,8 +257,9 @@ routing; `SO_BINDTODEVICE`/`SO_BINDTOIFINDEX`, `IP_UNICAST_IF`/`IPV6_UNICAST_IF`
 around it: TCP ignores `IPPROTO_IP` and `IPPROTO_IPV6` control messages (routing headers,
 `PKTINFO` interfaces, next hops, IP options), and the one `SOL_SOCKET` message that selects a
 route, a per-packet `SO_MARK`, needs `CAP_NET_ADMIN`; every sandbox drops all capabilities when it
-starts, whoever runs the miner. The builder runner and the execute worker may not call
-`setsockopt` at all.
+starts, whoever runs the miner. The builder runner and the execute worker may set only the socket
+timeouts (`SO_RCVTIMEO`/`SO_SNDTIMEO`, which the runner uses on its job socket), so a socket that
+reached one of them (passed over the runner's job socket) cannot be re-routed there either.
 
 Every connection the broker uses is made by the **connector**, in the miner
 (`crates/zkminer-witness-broker/src/connector`, run by `zkminer-witness-host`): the broker sends a

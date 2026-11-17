@@ -117,8 +117,8 @@ const NO_NETWORK_CHECKS: &[&str] = &[
     "setsockopt_refused",
 ];
 
-/// The runner's and the worker's own socket checks: no socket option at all.
-const RUNNER_WORKER_SOCKET_CHECKS: &[&str] = &["setsockopt_nodelay_refused"];
+/// The runner's and the worker's own socket checks: no socket option but the timeouts.
+const RUNNER_WORKER_SOCKET_CHECKS: &[&str] = &["setsockopt_only_timeouts"];
 
 /// The runner's and the worker's host-metadata checks (review r1 broker F3): what an escaped
 /// builder could read about the host without opening anything.
@@ -1253,15 +1253,26 @@ fn no_network_checks(a: &ProbeArgs, inet_sock: RawFd, out: &mut Out) {
     );
 }
 
-/// The runner and the worker set no socket option at all, the broker's `TCP_NODELAY` included.
+/// The runner and the worker set no socket option but the timeouts: the broker's `TCP_NODELAY`
+/// fails with the filter's `EPERM` on fd -1, the timeouts reach the kernel (`EBADF`).
 fn runner_worker_socket_checks(out: &mut Out) {
-    let r = crate::set_socket_option(-1, &crate::BROKER_SOCKET_OPTION);
+    let show = |r: Result<(), i32>| r.map(|()| "ok".to_string()).unwrap_or_else(errname);
+    let nodelay = crate::set_socket_option(-1, &crate::BROKER_SOCKET_OPTION);
+    let timeouts: Vec<_> = crate::SOCKET_TIMEOUT_OPTIONS
+        .iter()
+        .map(|o| (o.name, crate::set_socket_option(-1, o)))
+        .collect();
     out.check(
-        "setsockopt_nodelay_refused",
-        r == Err(libc::EPERM),
+        "setsockopt_only_timeouts",
+        nodelay == Err(libc::EPERM) && timeouts.iter().all(|(_, r)| *r == Err(libc::EBADF)),
         format!(
-            "TCP_NODELAY on fd -1: {}",
-            r.map(|()| "ok".to_string()).unwrap_or_else(errname)
+            "on fd -1: TCP_NODELAY {}, {}",
+            show(nodelay),
+            timeouts
+                .iter()
+                .map(|(n, r)| format!("{n} {}", show(*r)))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     );
 }
@@ -2013,7 +2024,7 @@ mod tests {
         }
         assert!(runner.contains(&"listmount") && !broker.contains(&"listmount"));
         assert!(runner.contains(&"setsockopt_refused") && broker.contains(&"setsockopt_refused"));
-        assert!(runner.contains(&"setsockopt_nodelay_refused") && !broker.contains(&"setsockopt_nodelay_refused"));
+        assert!(runner.contains(&"setsockopt_only_timeouts") && !broker.contains(&"setsockopt_only_timeouts"));
         for c in ["setsockopt_inherited_tcp", "setsockopt_nodelay_allowed"] {
             assert!(broker.contains(&c) && !runner.contains(&c), "{c}");
         }

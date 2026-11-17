@@ -92,7 +92,9 @@ pub(crate) fn thread_count() -> std::io::Result<usize> {
 ///    (`listmount`/`statmount`), the LSMs (`lsm_list_modules`, `lsm_get_self_attr`), `ustat` and
 ///    `sysfs`, and `statx` fails with `ENOSYS` (std and glibc fall back to `fstat`/`newfstatat`,
 ///    which stay: a path's existence, size, owner and times remain readable without a mount
-///    namespace). Runner and worker also set no socket option (`setsockopt`). The broker
+///    namespace). Runner and worker also set no socket option but the timeouts
+///    `SO_RCVTIMEO`/`SO_SNDTIMEO` (the runner bounds its job socket's reads and writes with them;
+///    they change no destination or route). The broker
 ///    additionally may `socketpair(AF_UNIX, SOCK_STREAM, ..)` (a connected
 ///    stream pair reaches nothing; tokio's signal driver needs one; a datagram pair could `sendto`
 ///    any pathname socket, which Landlock ABI 8 cannot restrict) until it calls
@@ -524,12 +526,11 @@ fn socketpair() -> Vec<Denied> {
     vec![d("socketpair", libc::SYS_socketpair)]
 }
 
-/// `setsockopt`: denied to the runner and the worker (they set no option on anything; a socket
-/// that reached one could otherwise be re-routed with it); argument-filtered for the broker
-/// (`IPPROTO_TCP`/`TCP_NODELAY` only, see [`conditional_denials`]).
-fn socket_options() -> Vec<Denied> {
-    vec![d("setsockopt", libc::SYS_setsockopt)]
-}
+/// The socket timeouts at `SOL_SOCKET`, both `timeval` spellings (`SO_RCVTIMEO_OLD`,
+/// `SO_SNDTIMEO_OLD`, `SO_RCVTIMEO_NEW`, `SO_SNDTIMEO_NEW`): the only options the runner and the
+/// worker may set (std's `set_read_timeout`/`set_write_timeout`, which the runner uses on its job
+/// socket). They bound blocking calls and change no destination or route.
+pub(crate) const SOCKET_TIMEOUTS: [libc::c_int; 4] = [20, 21, 66, 67];
 
 /// A socket option as the self-tests and the escape tests try it: level, name, and a value that
 /// would take effect if nothing refused it.
@@ -597,6 +598,22 @@ pub const REFUSED_SOCKET_OPTIONS: &[SocketOption] = &[
     SocketOption { name: "TCP_ULP", level: libc::IPPROTO_TCP, option: libc::TCP_ULP, value: b"tls\0" },
     SocketOption { name: "TCP_MAXSEG", level: libc::IPPROTO_TCP, option: libc::TCP_MAXSEG, value: &ne_int(536) },
 ];
+
+/// A socket timeout as the runner and the worker set it: 5 s, as a 64-bit `timeval`.
+pub const SOCKET_TIMEOUT_OPTIONS: [SocketOption; 2] = [
+    SocketOption { name: "SO_RCVTIMEO", level: libc::SOL_SOCKET, option: SOCKET_TIMEOUTS[0], value: &TIMEVAL_5S },
+    SocketOption { name: "SO_SNDTIMEO", level: libc::SOL_SOCKET, option: SOCKET_TIMEOUTS[1], value: &TIMEVAL_5S },
+];
+const TIMEVAL_5S: [u8; 16] = {
+    let mut t = [0u8; 16];
+    let s = 5i64.to_ne_bytes();
+    let mut i = 0;
+    while i < 8 {
+        t[i] = s[i];
+        i += 1;
+    }
+    t
+};
 
 /// The one socket option the broker may set (on the sockets the connector hands it).
 pub const BROKER_SOCKET_OPTION: SocketOption =
@@ -754,7 +771,6 @@ pub(crate) fn denied_syscalls(profile: &Profile) -> Vec<Denied> {
     if !matches!(profile, Profile::Broker { .. }) {
         v.extend(path_opens());
         v.extend(socketpair());
-        v.extend(socket_options());
         v.extend(host_metadata());
     }
     v
@@ -891,6 +907,17 @@ fn conditional_denials(profile: &Profile) -> Result<Vec<(i64, Vec<SeccompRule>)>
             vec![
                 rule(vec![cond(1, Dword, Ne, libc::IPPROTO_TCP as u64)?])?,
                 rule(vec![cond(2, Dword, Ne, libc::TCP_NODELAY as u64)?])?,
+            ],
+        ));
+    } else {
+        // The runner and the worker hold no network socket; one that reached them (passed over
+        // the runner's job socket) must not be re-routed either. Only the socket timeouts:
+        // `level != SOL_SOCKET`, or an `optname` that is none of them, fails.
+        v.push((
+            libc::SYS_setsockopt,
+            vec![
+                rule(vec![cond(1, Dword, Ne, libc::SOL_SOCKET as u64)?])?,
+                rule(SOCKET_TIMEOUTS.iter().map(|&t| cond(2, Dword, Ne, t as u64)).collect::<Result<_, _>>()?)?,
             ],
         ));
     }
@@ -1621,8 +1648,8 @@ mod tests {
         }
     }
 
-    /// The broker sets `IPPROTO_TCP`/`TCP_NODELAY` and nothing else; the runner and the worker set
-    /// no socket option at all, before or after the broker's seal.
+    /// The broker sets `IPPROTO_TCP`/`TCP_NODELAY` and nothing else, before or after its seal; the
+    /// runner and the worker set the socket timeouts and nothing else.
     #[test]
     fn socket_options_per_profile() {
         use libc::*;
@@ -1645,14 +1672,27 @@ mod tests {
             // Reading options stays.
             assert_eq!(call(f, SYS_getsockopt, [5, u(SOL_SOCKET), u(SO_TYPE), 0x1000, 0x2000, 0]), ALLOW);
         }
+        // std's timeouts are the ones the runner and the worker may set.
+        assert!(SOCKET_TIMEOUTS.contains(&SO_RCVTIMEO) && SOCKET_TIMEOUTS.contains(&SO_SNDTIMEO));
         for p in [Profile::BuilderRunner, Profile::ExecuteWorker] {
             let f = seccomp_filters(&p).unwrap();
-            assert!(denied_syscalls(&p).iter().any(|s| s.name == "setsockopt"), "{p:?}");
             assert_eq!(call(&f, SYS_setsockopt, nodelay), ERRNO_EPERM, "{p:?}");
             for o in REFUSED_SOCKET_OPTIONS {
                 assert_eq!(call(&f, SYS_setsockopt, [5, u(o.level), u(o.option), 0x1000, 4, 0]), ERRNO_EPERM, "{p:?} {}", o.name);
             }
+            for t in SOCKET_TIMEOUTS {
+                assert_eq!(call(&f, SYS_setsockopt, [5, u(SOL_SOCKET), u(t), 0x1000, 16, 0]), ALLOW, "{p:?} timeout {t}");
+                // The same numbers at another level.
+                for level in [IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP] {
+                    assert_eq!(call(&f, SYS_setsockopt, [5, u(level), u(t), 0x1000, 16, 0]), ERRNO_EPERM, "{p:?} {level}/{t}");
+                }
+            }
+            for opt in [SO_SNDBUF, SO_RCVBUF, SO_KEEPALIVE, SO_REUSEADDR, SO_PASSCRED, SO_ATTACH_FILTER] {
+                assert_eq!(call(&f, SYS_setsockopt, [5, u(SOL_SOCKET), u(opt), 0x1000, 4, 0]), ERRNO_EPERM, "{p:?} {opt}");
+            }
         }
+        // The broker sets no timeout.
+        assert_eq!(call(&b, SYS_setsockopt, [5, u(SOL_SOCKET), u(SO_RCVTIMEO), 0x1000, 16, 0]), ERRNO_EPERM);
         // The list covers what the review named, and nothing in it is the broker's option.
         for name in [
             "IPV6_RTHDR",
