@@ -1520,6 +1520,17 @@ impl ChainClient {
         (tip, max_fee, from_header)
     }
 
+    /// The timestamp of block `number`: when a read made at that block was true on chain (a read at
+    /// the head of a lagging replica is as old as that head, whatever the wall clock says).
+    pub async fn block_timestamp(&self, number: u64) -> Result<u64> {
+        self.provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(number))
+            .await
+            .with_context(|| format!("block {number} header"))?
+            .map(|b| b.header.timestamp)
+            .ok_or_else(|| anyhow::anyhow!("the node has no block {number}"))
+    }
+
     /// Read the latest block header and record its timestamp (see [`chain_now`]). Best-effort: a
     /// failed read keeps the previous skew.
     pub async fn refresh_chain_time(&self) {

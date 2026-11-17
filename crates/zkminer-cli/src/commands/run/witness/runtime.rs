@@ -29,8 +29,9 @@
 //!   **terminal cleanup** (unpin, delete).
 //! - **Recovery**: the store's pins are the index of witness locks; a periodic pass re-drives the
 //!   held ones from their bundles, unpins locks that provably ended (a terminal read, a risen reopen
-//!   count, a read at or after the lock block showing another prover, or a claim that never landed
-//!   by chain time), deletes bundles of terminal jobs, and, once a full pass has completed and the
+//!   count, a read at or after the lock block showing another prover, or a claim that never landed:
+//!   a read from a block mined past the claim-intent age since the pin), deletes bundles of terminal
+//!   jobs, and, once a full pass has completed and the
 //!   brain's first complete recovery pass has handed every witness lock over and each is pinned,
 //!   enables eviction. A lock with no readable pin is found by the brain's chain scan and re-pinned
 //!   from the store's latest version for it.
@@ -99,7 +100,7 @@ use super::policy::{
     device_tally_key, divergence_reusable, elf_image_id_outcome, estimate_prove_secs, fixed_allowance_secs,
     fulfils_besides, funds_cover, gate_refusal_reason, held_lock_prove_sizes, host_max_guest_cycles,
     is_witness_input, lasts_until_terminal, not_claimable_reason, parse_session_cap, pin_lock_gone,
-    proving_cutoff, rate_secs_left, reservation_wei, segment_need, segments_fit, session_cap_admits, short,
+    pin_read_needs_time, proving_cutoff, rate_secs_left, reservation_wei, segment_need, segments_fit, session_cap_admits, short,
     tally_count, verdict_expires_at, verdict_plan, verdict_set_aside, watchdog_admits, ArtifactBudget, Blame,
     PinFacts, PinRead, ProvePlan, ReservationInputs, POST_LOCK_CALLER_LIMIT, POST_LOCK_CLASSES,
     POST_LOCK_DEVICE_LIMIT, POST_LOCK_TALLY_TTL_SECS, RISC0_CPU_CONSERVATIVE_CPS, SERVING_OFF_SET_ASIDE,
@@ -2007,7 +2008,9 @@ impl WitnessRuntime {
                 return None;
             }
         };
-        let pinned_at_unix = zkminer_chain::client::chain_now_floor();
+        // From above: the never-confirmed rule counts the claim-intent age from here, so it must
+        // never start early.
+        let pinned_at_unix = zkminer_chain::client::chain_now();
         let (s, b) = (store.clone(), c.bundle);
         let pinned = blocking(move || {
             let mut rec = s.pin_record(&b, head)?;
@@ -2132,6 +2135,10 @@ impl WitnessRuntime {
             Ok(v) if run::effective_cutoff(&v) != 0 => v,
             _ => {
                 tracing::warn!("witness job {}: locked at block {lock_block}, deadline unreadable; recovery drives it", short(jid));
+                // The receipt proved the lock: its pin and journal entry learn where, so neither ever
+                // takes this lock for a claim that did not land.
+                self.note_pin_lock(&store, pin, lock_block, reopen_count).await;
+                run::journal_update(&self.journal, |j| j.note_lock_seen(jid, Some(lock_block), reopen_count));
                 run::request_recovery();
                 return None;
             }
@@ -2757,11 +2764,12 @@ impl WitnessRuntime {
         let (s, head) = (store.clone(), self.client.head_block_cached().await.unwrap_or(0));
         let old_pin = self.pin_of(store, &l.bundle);
         let (reopen_count, lock_block) = (old_pin.as_ref().and_then(|p| p.reopen_count), l.lock_block);
+        let pinned_at_unix = old_pin.as_ref().map_or_else(zkminer_chain::client::chain_now, |p| p.pinned_at_unix);
         let pinned = blocking(move || {
             let mut rec = s.pin_record(&new_ref, head)?;
             rec.reopen_count = reopen_count;
             rec.lock_block = lock_block;
-            rec.pinned_at_unix = zkminer_chain::client::chain_now_floor();
+            rec.pinned_at_unix = pinned_at_unix;
             s.pin(&rec)
         })
         .await?;
@@ -3120,7 +3128,7 @@ impl WitnessRuntime {
         if needs_pin {
             let (s, b) = (store.clone(), bref);
             let reopen = rec.reopen_count;
-            let pinned_at_unix = pin.as_ref().map_or_else(zkminer_chain::client::chain_now_floor, |p| p.pinned_at_unix);
+            let pinned_at_unix = pin.as_ref().map_or_else(zkminer_chain::client::chain_now, |p| p.pinned_at_unix);
             let res = blocking(move || {
                 let mut r = s.pin_record(&b, at)?;
                 r.reopen_count = Some(reopen);
@@ -3289,9 +3297,18 @@ impl WitnessRuntime {
                     pinned_at_block: pin.pinned_at_block,
                     pinned_at_unix: pin.pinned_at_unix,
                 };
-                let read = PinRead { status: rec.status, prover: rec.prover, reopen_count: rec.reopen_count, at_block: at };
-                let now = zkminer_chain::client::chain_now_floor();
-                if pin_lock_gone(&facts, &read, us, now, run::CLAIM_INTENT_MAX_AGE_SECS) {
+                let mut read = PinRead {
+                    status: rec.status,
+                    prover: rec.prover,
+                    reopen_count: rec.reopen_count,
+                    at_block: at,
+                    at_timestamp: None,
+                };
+                // A claim never confirmed: the read counts only if its own block was mined late enough.
+                if pin_read_needs_time(&facts, &read, us) {
+                    read.at_timestamp = with_lane(Lane::HeldLock, self.client.block_timestamp(at)).await.ok();
+                }
+                if pin_lock_gone(&facts, &read, us, run::CLAIM_INTENT_MAX_AGE_SECS) {
                     let (s, p) = (store.clone(), pin.clone());
                     if let Ok(Ok(true)) = blocking(move || s.unpin(p.job_id, p.descriptor_hash, p.prover)).await {
                         tracing::info!(

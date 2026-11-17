@@ -598,13 +598,15 @@ pub(crate) fn tally_count(attempts: u8, expires_at: u64, now: u64) -> u8 {
 
 // ── pin evidence (§15.2) ──────────────────────────────────────────────────────
 
-/// A read of a pinned job's record: its state and the block it was read at.
+/// A read of a pinned job's record: its state, the block it was read at, and that block's timestamp
+/// when known (read only when the rule needs it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PinRead {
     pub status: u8,
     pub prover: Address,
     pub reopen_count: u8,
     pub at_block: u64,
+    pub at_timestamp: Option<u64>,
 }
 
 /// What a pin records about the lock it was taken for.
@@ -615,7 +617,7 @@ pub(crate) struct PinFacts {
     /// A block the job read Locked by us at (0: the claim was never confirmed).
     pub lock_block: u64,
     pub pinned_at_block: u64,
-    /// Chain time when the pin was taken (0: unknown).
+    /// Chain time when the pin was taken, estimated from above (0: unknown).
     pub pinned_at_unix: u64,
 }
 
@@ -627,13 +629,13 @@ pub(crate) struct PinFacts {
 ///   lock instance ended, whoever held it (a read never shows a count above the chain's, however far
 ///   it lags);
 /// - a read at or after our lock block shows another prover, or no one;
-/// - the claim was never confirmed, chain time is past the claim-intent age since the pin, and a read
-///   at or after the pin's block shows the job not ours: every claim attempt of ours has ended
-///   (zkminer's breadcrumb rule), and none landed.
+/// - the claim was never confirmed, and a read at a block mined at least the claim-intent age after
+///   the pin shows the job not ours: every claim attempt of ours has ended by then (zkminer's
+///   breadcrumb rule), and none landed. The read's own block must be that late: a lagging replica's
+///   head can be after the pin's block yet before the claim mined, however late the chain is now.
 ///
-/// A read showing the job Locked by us is never evidence that a lock of ours is gone. `chain_now` is
-/// the lower chain-time estimate (`chain_now_floor`), so the age is never overstated.
-pub(crate) fn pin_lock_gone(pin: &PinFacts, read: &PinRead, us: Address, chain_now: u64, claim_intent_max_age: u64) -> bool {
+/// A read showing the job Locked by us is never evidence that a lock of ours is gone.
+pub(crate) fn pin_lock_gone(pin: &PinFacts, read: &PinRead, us: Address, claim_intent_max_age: u64) -> bool {
     const LOCKED: u8 = 1;
     if read.prover == us && read.status == LOCKED {
         return false;
@@ -645,7 +647,18 @@ pub(crate) fn pin_lock_gone(pin: &PinFacts, read: &PinRead, us: Address, chain_n
         return read.at_block >= pin.lock_block;
     }
     pin.pinned_at_unix != 0
-        && chain_now >= pin.pinned_at_unix.saturating_add(claim_intent_max_age)
+        && read.at_block >= pin.pinned_at_block
+        && read.at_timestamp.is_some_and(|t| t >= pin.pinned_at_unix.saturating_add(claim_intent_max_age))
+}
+
+/// Whether [`pin_lock_gone`] needs the read block's timestamp to decide: only the never-confirmed
+/// rule does, and only when nothing else decided first.
+pub(crate) fn pin_read_needs_time(pin: &PinFacts, read: &PinRead, us: Address) -> bool {
+    const LOCKED: u8 = 1;
+    !(read.prover == us && read.status == LOCKED)
+        && !pin.reopen_count.is_some_and(|r| read.reopen_count > r)
+        && pin.lock_block == 0
+        && pin.pinned_at_unix != 0
         && read.at_block >= pin.pinned_at_block
 }
 
@@ -1056,31 +1069,54 @@ mod tests {
     fn a_pin_goes_only_on_evidence() {
         let us = Address::repeat_byte(0xaa);
         let other = Address::repeat_byte(0xbb);
-        let read = |status, prover, reopen_count, at_block| PinRead { status, prover, reopen_count, at_block };
+        let read = |status, prover, reopen_count, at_block| PinRead { status, prover, reopen_count, at_block, at_timestamp: None };
+        let at = |r: PinRead, t: u64| PinRead { at_timestamp: Some(t), ..r };
         const AGE: u64 = 900;
         // Pinned at block 100 / t=10_000 for reopen 1; the claim never confirmed.
         let pending = PinFacts { reopen_count: Some(1), lock_block: 0, pinned_at_block: 100, pinned_at_unix: 10_000 };
-        // A lagging or early read showing it Open keeps the pin, however old it is by wall clock.
-        assert!(!pin_lock_gone(&pending, &read(0, Address::ZERO, 1, 120), us, 10_100, AGE));
-        assert!(!pin_lock_gone(&pending, &read(0, Address::ZERO, 1, 99), us, 20_000, AGE), "a read below the pin");
-        // Past the claim-intent age by chain time, a read at or after the pin: never landed.
-        assert!(pin_lock_gone(&pending, &read(0, Address::ZERO, 1, 120), us, 10_900, AGE));
-        assert!(pin_lock_gone(&pending, &read(1, other, 1, 120), us, 10_900, AGE));
+        // A read showing it Open from a block mined before the claim-intent age keeps the pin.
+        assert!(!pin_lock_gone(&pending, &at(read(0, Address::ZERO, 1, 120), 10_100), us, AGE));
+        assert!(!pin_lock_gone(&pending, &at(read(0, Address::ZERO, 1, 99), 20_000), us, AGE), "a read below the pin");
+        assert!(!pin_lock_gone(&pending, &read(0, Address::ZERO, 1, 120), us, AGE), "its block's time unknown");
+        // A read from a block mined past the claim-intent age since the pin: never landed.
+        assert!(pin_lock_gone(&pending, &at(read(0, Address::ZERO, 1, 120), 10_900), us, AGE));
+        assert!(pin_lock_gone(&pending, &at(read(1, other, 1, 120), 10_900), us, AGE));
         // Ours and Locked: held, never gone.
-        assert!(!pin_lock_gone(&pending, &read(1, us, 1, 120), us, 99_999, AGE));
+        assert!(!pin_lock_gone(&pending, &at(read(1, us, 1, 120), 99_999), us, AGE));
         // A risen reopen count ends the instance on any read, unless the job reads Locked by us.
-        assert!(pin_lock_gone(&pending, &read(0, Address::ZERO, 2, 50), us, 0, AGE));
-        assert!(pin_lock_gone(&pending, &read(1, other, 2, 50), us, 0, AGE));
-        assert!(!pin_lock_gone(&pending, &read(1, us, 2, 50), us, 0, AGE), "ours and Locked: never gone");
+        assert!(pin_lock_gone(&pending, &read(0, Address::ZERO, 2, 50), us, AGE));
+        assert!(pin_lock_gone(&pending, &read(1, other, 2, 50), us, AGE));
+        assert!(!pin_lock_gone(&pending, &read(1, us, 2, 50), us, AGE), "ours and Locked: never gone");
         // A confirmed lock: gone only on a read at or after the lock block.
         let held = PinFacts { lock_block: 200, ..pending };
-        assert!(!pin_lock_gone(&held, &read(0, Address::ZERO, 1, 199), us, 99_999, AGE), "lags our lock");
-        assert!(pin_lock_gone(&held, &read(1, other, 1, 200), us, 0, AGE));
-        assert!(!pin_lock_gone(&held, &read(1, us, 1, 300), us, 99_999, AGE));
+        assert!(!pin_lock_gone(&held, &at(read(0, Address::ZERO, 1, 199), 99_999), us, AGE), "lags our lock");
+        assert!(pin_lock_gone(&held, &read(1, other, 1, 200), us, AGE));
+        assert!(!pin_lock_gone(&held, &read(1, us, 1, 300), us, AGE));
         // A pin with no evidence recorded (an older pin): only the reopen count can end it, and
         // without a count, nothing.
         let bare = PinFacts { pinned_at_block: 100, ..Default::default() };
-        assert!(!pin_lock_gone(&bare, &read(0, Address::ZERO, 5, 500), us, 99_999, AGE));
+        assert!(!pin_lock_gone(&bare, &at(read(0, Address::ZERO, 5, 500), 99_999), us, AGE));
+        // Only the never-confirmed rule reads a block's time, and only when nothing else decided.
+        assert!(pin_read_needs_time(&pending, &read(0, Address::ZERO, 1, 120), us));
+        assert!(!pin_read_needs_time(&pending, &read(0, Address::ZERO, 2, 120), us));
+        assert!(!pin_read_needs_time(&pending, &read(1, us, 1, 120), us));
+        assert!(!pin_read_needs_time(&held, &read(0, Address::ZERO, 1, 220), us));
+        assert!(!pin_read_needs_time(&pending, &read(0, Address::ZERO, 1, 99), us));
+    }
+
+    /// The claim was pending while a lagging replica (head after the pin's block, before the claim
+    /// mined) showed the job Open; chain time was already past the claim-intent age since the pin, so
+    /// the pin went, while the claim then landed: a held lock with no pin. The read's own block must
+    /// now have been mined that late.
+    #[test]
+    fn a_lagging_read_never_proves_a_claim_did_not_land() {
+        let us = Address::repeat_byte(0xaa);
+        let pending = PinFacts { reopen_count: Some(0), lock_block: 0, pinned_at_block: 1_000, pinned_at_unix: 50_000 };
+        let lagging =
+            PinRead { status: 0, prover: Address::ZERO, reopen_count: 0, at_block: 1_001, at_timestamp: Some(50_012) };
+        assert!(!pin_lock_gone(&pending, &lagging, us, 900), "chain time now is no evidence about that read");
+        let late = PinRead { at_block: 1_450, at_timestamp: Some(50_900), ..lagging };
+        assert!(pin_lock_gone(&pending, &late, us, 900));
     }
 
     #[test]
