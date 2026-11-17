@@ -550,9 +550,9 @@ Reading the counts:
   hundred cycles of guest work and is charged 2^20), so it bounds what one job adds to a sum. The
   default, 1e9, is ten times the largest proof seen on this market.
 
-**Never run `simulate` on a host that runs a miner.** The miner's host-RAM and `/dev/shm` ledgers are
-per process: a simulate measurement (an SP1 one stages gigabytes in `/dev/shm` and may hold up to
-24 GiB) is invisible to a miner beside it, and the two can together OOM or SIGBUS its proofs.
+**Never run `simulate` on a host that runs a miner.** The miner's host-RAM ledger is per process: a
+simulate measurement (an SP1 one stages gigabytes of shared memory and may hold up to 24 GiB) is
+invisible to a miner beside it, and the two can together run the host out of memory under its proofs.
 
 ## Witness jobs: requester tools
 

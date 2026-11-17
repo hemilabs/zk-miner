@@ -311,7 +311,11 @@ executor:
   backend proves with (`~/.risc0` or `RISC0_HOME`, `~/.sp1`); for witness proofs, the retention
   store (read) and the segment directories (write). Write only a private temporary directory
   (`TMPDIR`, made per worker, mode 0700), the GPU caches the build needs (risc0's CUDA Groth16
-  cache; the Intel SYCL and compute-runtime kernel caches) and, for SP1, `/dev/shm`. Execute only
+  cache; the Intel SYCL and compute-runtime kernel caches) and, for an SP1 server, its host-wide
+  Groth16 queue (below). Nothing in `/dev/shm`: SP1's executor shares the guest's memory and trace
+  ring with its runner process through file descriptors (memfds, handed over a Unix socket), which
+  no path reaches, and whatever SP1's final-wrap provers would put in `/dev/shm` goes to the
+  private temporary directory (`SP1_SHM_DIR`). Execute only
   the dynamic loader and what the worker must start (SP1's executor runner in its temporary
   directory, the server's own Groth16 helper). Open only the GPU device nodes. Nothing else in the
   home directory is readable or writable: not the dotfiles, `~/.config` (autostart, `systemd
@@ -428,10 +432,13 @@ executor:
   refuses `socket`, `bind` and `listen` from then on; `connect` and every socket but a Unix stream
   or seqpacket one are refused outright. The decision rests on the syscall and that moment, never
   on an argument in the server's memory. Landlock as for the worker, plus creating its socket under
-  `/tmp` and executing itself (its Groth16 CPU helper); stdin is `/dev/null`. The servers'
-  host-wide Groth16 queue moves from `/run/lock` to `/dev/shm` (`SP1_GROTH16_QUEUE_DIR`). The
-  supervisor kills the server when the worker exits, and the server dies with the supervisor. Its
-  socket is `/tmp/zkminer-confined-<name>-<device>.sock`.
+  `/tmp` and executing itself (its Groth16 CPU helper), and writing the servers' host-wide Groth16
+  queue (lock files in `~/.zkminer/locks`, which the worker makes private to the user, mode 0700,
+  or in `SP1_GROTH16_QUEUE_DIR`, rather than SP1's own `/run/lock` or `/dev/shm`; a queue
+  directory that is, is in, or holds `/dev/shm` is refused, and SP1 is not offered); stdin is
+  `/dev/null`. The supervisor kills the server when the
+  worker exits, and the server dies with the supervisor. Its socket is
+  `/tmp/zkminer-confined-<name>-<device>.sock`.
 - **Docker.** The CPU risc0 worker (and an Intel worker with `RISC0_GROTH16_INTEL_PROVER=docker`)
   wraps Groth16 in RISC Zero's prover image. A confined worker cannot reach the Docker daemon (its
   socket is root-equivalent, with the host's network), so a helper process started before the
@@ -657,22 +664,29 @@ no second one):
   reading the system's files and its own `/proc` entries (an SP1 worker or server all of `/proc`:
   other processes' command lines and status, not their memory or environment), and writing the
   caches listed above, which other GPU programs of the same user also load (a confined worker could
-  poison an Intel kernel cache or risc0's CUDA Groth16 cache for them). An SP1 worker, its
-  executor's runner and its server can read, write, create and remove anything of the uid in
-  `/dev/shm`, pending a change to SP1's executor (the grant goes when that lands). SP1 needs it for
-  the named shared memory between its executor and the runner child (`/<id>_m` for the guest's
-  memory, `/<id>_t` for the trace, the `_filled` and `_empty` semaphores), and the server for its
-  Groth16 files (the GPU proving key cache, about 9 GB, each proof's witness directory, the
-  host-wide Groth16 queue). So a guest that escaped in one SP1 process can read or change the guest
-  memory and traces of another SP1 proof running at the same time (its result or its failure, not
-  the network), the server's Groth16 files, and whatever other programs of the same user keep there:
-  ROCm SMI's process-shared mutexes (`rocm_smi_renderD*`, mode 0777, which `rocm-smi`, `amd-smi` and
-  other ROCm SMI users lock, so they can be made to hang; the miner's own `rocm-smi` query at
-  discovery is bounded by a timeout), other programs' shared memory and semaphores (browsers,
-  PulseAudio and PipeWire, Python `multiprocessing`). Run SP1 under a user that runs nothing else. A
-  witness proof's worker can read every bundle in the retention store, other requesters' included.
+  poison an Intel kernel cache or risc0's CUDA Groth16 cache for them). An SP1 server can write the
+  Groth16 queue's lock files, which every SP1 server of the user on the host shares: it can hold a
+  slot, and so delay the others' final wraps. Nothing of the uid's in `/dev/shm` can be opened (the
+  system's listing of `/dev` still shows the names there). A witness
+  proof's worker can read every bundle in the retention store, other requesters' included.
   Its results go back to the miner over its pipe, and a guest controls its journal, so anything it
   can read it can publish: keep secrets out of the readable paths.
+- **SP1's shared memory.** SP1's executor shares the guest's memory and trace ring with its runner
+  process through memfds, which have no name. That hides them from confined processes only: an
+  unconfined process of the same uid (the miner, a worker before it confines itself, `rocm-smi`, or
+  anything else the user runs) can still open them through `/proc/<pid>/fd`, as it could the named
+  `/dev/shm` objects before. Run SP1 under a user that runs nothing else. The memory a process
+  allocates through such a descriptor is bounded by the worker's cgroup (`MemoryMax`) and the host's
+  RAM, not by the size of `/dev/shm`, and SP1's memory limit, which watches the runner's resident
+  memory, does not see pages written through a descriptor and never mapped. Like every process that
+  runs a guest, the runner is confined, and memfds of its own were already open to it (its seccomp
+  filter does not refuse `memfd_create`), so sharing memory this way gives it nothing new. A worker
+  offers SP1 only with a server whose executor shares memory this way (`sp1-gpu-server
+  --capabilities` lists `fd-shared-memory`), and gives SP1 up on its slot if its own executor cannot
+  run a small guest once confined. A declined slot is tried again with a fresh worker after ten
+  minutes, then after twice the last wait, up to an hour, so a passing condition of the host does
+  not take SP1 off it for good; a worker that still cannot run declines again before any job reaches
+  it (an old server at its handshake), or before its first guest runs (the canary).
 - **Workers without a cgroup of their own.** With neither a delegated cgroup nor a systemd user
   manager (a container without systemd, another init), the miner logs that a worker is in no cgroup
   of its own, and the worker and what it starts end by process group, which a confined process

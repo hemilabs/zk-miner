@@ -468,6 +468,8 @@ fn main() {
                     "cannot start sp1-gpu-server through its confinement ({e}): this worker will \
                      start no server"
                 );
+                // So the handshake declines SP1 (`sp1_usability`), before any job is claimed.
+                let _ = SERVER_ROUTE_FAILURE.set(e);
             }
         }
     }
@@ -510,6 +512,7 @@ fn run_benchmarks_by_hand(device: Option<u32>) -> i32 {
         tracing::error!("cannot confine this worker, so it proves nothing: {e}");
         return 1;
     }
+    canary_or_decline(&*prover);
     // Discarded, as under a host: see `warmup_spec`.
     let warmup = [zkminer_prover_protocol::warmup_spec(BACKEND_SP1)];
     run_benchmarks(prover, &mut held.benchmark_keys, &warmup, &mut |_, _, _| {});
@@ -660,6 +663,132 @@ fn guest_may_run(request_id: u64, keep_server: bool) -> std::result::Result<(), 
     })
 }
 
+/// The executor canary's input: fibonacci(300), a few thousand cycles.
+const CANARY_FIB_N: u32 = 300;
+
+/// What the fibonacci guest commits for `n`: fibonacci(n) as it computes it (wrapping `u64`), in the
+/// encoding `sp1_zkvm::io::commit` writes (bincode: eight bytes, little-endian).
+fn canary_public_values(n: u32) -> Vec<u8> {
+    let (mut a, mut b) = (0u64, 1u64);
+    for _ in 0..n {
+        (a, b) = (b, a.wrapping_add(b));
+    }
+    a.to_le_bytes().to_vec()
+}
+
+/// The text of a caught panic.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic with no message".to_string())
+}
+
+/// Runs the embedded fibonacci guest (fibonacci(300)) through `prover`'s executor, the path every
+/// requester's guest takes in this worker: the executor's runner process, and the memory it shares
+/// with it. `Ok` if it ran and committed what fibonacci(300) is.
+fn run_executor_canary<P: sp1_sdk::blocking::Prover>(prover: &P) -> Result<(), String> {
+    use sp1_sdk::blocking::{Elf, SP1Stdin};
+    if FIBONACCI_SP1_GUEST_ELF.is_empty() {
+        // A build with its guests stubbed (`SP1_SKIP_PROGRAM_BUILD`) has nothing to run.
+        return Ok(());
+    }
+    let mut stdin = SP1Stdin::new();
+    stdin.write_slice(&CANARY_FIB_N.to_le_bytes());
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        prover
+            .execute(Elf::from(FIBONACCI_SP1_GUEST_ELF), stdin)
+            .run()
+    }));
+    match run {
+        Ok(Ok((public_values, _)))
+            if public_values.to_vec() == canary_public_values(CANARY_FIB_N) =>
+        {
+            Ok(())
+        }
+        Ok(Ok((public_values, _))) => Err(format!(
+            "it committed {} bytes that are not fibonacci({CANARY_FIB_N})",
+            public_values.to_vec().len()
+        )),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(panic) => Err(format!("the executor panicked: {}", panic_text(&*panic))),
+    }
+}
+
+/// The executor canary's verdict, once per worker: [`run_executor_canary`] the first time a guest
+/// command reaches the point where its guest would run, once the worker is confined
+/// ([`confine_worker`]), with that command's prover. A worker that cannot run it cannot run any
+/// requester's guest either, and says so ([`decline_executor`]) before it runs one.
+fn executor_canary<P: sp1_sdk::blocking::Prover>(prover: &P) -> Result<(), String> {
+    static VERDICT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    VERDICT
+        .get_or_init(|| {
+            let started = Instant::now();
+            let verdict = run_executor_canary(prover);
+            match &verdict {
+                Ok(()) => tracing::info!(
+                    "executor canary: fibonacci({CANARY_FIB_N}) ran confined in {:.2}s",
+                    started.elapsed().as_secs_f64()
+                ),
+                Err(e) => tracing::error!("executor canary failed: {e}"),
+            }
+            verdict
+        })
+        .clone()
+}
+
+/// The canary before a requester's guest runs: [`executor_canary`], and [`decline_executor`] if it
+/// failed. Returns only if it ran.
+fn canary_or_decline<P: sp1_sdk::blocking::Prover>(prover: &P) {
+    if let Err(reason) = executor_canary(prover) {
+        decline_executor(&reason);
+    }
+}
+
+/// Whether an SP1 execution failed setting up its executor's shared memory or handing it to the
+/// runner process: before any guest instruction ran, so this host's fault, not the program's. Matched
+/// on the messages of hemilabs/sp1's `sp1-core-executor-runner` (`native.rs`), which no guest
+/// writes; a match only makes the worker run its canary again ([`environment_fault_or_decline`]).
+fn is_executor_environment_fault(text: &str) -> bool {
+    const SETUP: [&str; 4] = [
+        "create shm file for",
+        "failed to create the child's stdin",
+        "failed to spawn child process",
+        "the executor runner exited before reading its input",
+    ];
+    SETUP.iter().any(|m| text.contains(m))
+}
+
+/// After an execution failed setting up its executor ([`is_executor_environment_fault`]): the canary
+/// again, now. If that fails too, this host cannot run guests any more ([`decline_executor`]);
+/// otherwise the failure was passing, and is reported as the worker's (`Internal`), never the job's.
+fn environment_fault_or_decline<P: sp1_sdk::blocking::Prover>(prover: &P, failure: &str) {
+    if let Err(reason) = run_executor_canary(prover) {
+        decline_executor(&format!("{failure}; and the canary again: {reason}"));
+    }
+    tracing::warn!(
+        "an SP1 execution could not set up its executor ({failure}), though the canary runs again: \
+         reporting it as this worker's fault, not the job's"
+    );
+}
+
+/// Ends a worker whose executor cannot run guests here: no answer to the command that found it,
+/// and the exit code [`WORKER_EXIT_DECLINED`], on which the dispatcher declines this slot as it does
+/// a worker that declines its handshake. An environment fault (the executor cannot share memory with
+/// its runner under the confinement, say), so neither the job nor its program is blamed.
+///
+/// [`WORKER_EXIT_DECLINED`]: zkminer_prover_protocol::types::WORKER_EXIT_DECLINED
+fn decline_executor(reason: &str) -> ! {
+    tracing::error!(
+        "{}: SP1's executor cannot run guests in this worker ({reason}); exiting with code {}, \
+         which declines SP1 on this slot",
+        zkminer_prover_protocol::types::WORKER_DECLINED,
+        zkminer_prover_protocol::types::WORKER_EXIT_DECLINED,
+    );
+    std::process::exit(zkminer_prover_protocol::types::WORKER_EXIT_DECLINED)
+}
+
 /// Refuses, before the SDK would try, a server the SDK would download first: none at its path, or
 /// one whose `--version` is not the SDK's (`maybe_download_server` replaces it then). With no network
 /// that download fails inside `build()` as a panic that reads like a GPU fault. A probe that cannot
@@ -686,6 +815,22 @@ fn server_needs_no_download() -> std::result::Result<(), String> {
             server.display(),
             stdout.trim()
         )),
+        // And it must share memory through descriptors (`SERVER_CAPABILITY`), checked again here,
+        // with a full budget, for a handshake that could not tell: unsettled is a no here.
+        #[cfg(target_os = "linux")]
+        _ => match server_capability(&server, PROBE_TIMEOUT) {
+            Capability::Present => Ok(()),
+            Capability::Absent(why) => Err(format!(
+                "{}: {why}",
+                zkminer_prover_protocol::types::WORKER_DECLINED
+            )),
+            Capability::Unknown(why) => Err(format!(
+                "could not tell whether {} shares memory through descriptors ({why}), so this \
+                 worker starts no server",
+                server.display()
+            )),
+        },
+        #[cfg(not(target_os = "linux"))]
         _ => Ok(()),
     }
 }
@@ -993,6 +1138,10 @@ const SP1_SHM_ORPHAN_MIN_AGE: Duration = Duration::from_secs(30);
 /// from unlinking another uid's file) and independent of whether we can read that uid's `/proc/*/maps`.
 ///
 /// Mirrors `reap_orphaned_gpu_servers`: same /proc-walk, same "only touch what is provably orphaned".
+///
+/// TO REMOVE a release after the SP1 pin whose executor shares memory through descriptors (memfds):
+/// that executor leaves nothing in `/dev/shm`, so this only still sweeps what an older worker on the
+/// same host left there. It runs unconfined, at startup, before the worker confines itself.
 #[cfg(target_os = "linux")]
 fn reap_orphaned_sp1_shm() {
     let Ok(dir) = std::fs::read_dir("/dev/shm") else {
@@ -1276,7 +1425,15 @@ fn sp1_measure_only() -> bool {
         == Some("1")
 }
 
+/// Why this worker cannot start its server through the confining shim, if it cannot
+/// (`confinement::route_server_through_shim`, at startup): such a worker proves nothing, so its
+/// handshake declines SP1.
+static SERVER_ROUTE_FAILURE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn sp1_usability() -> Result<(), String> {
+    if let Some(e) = SERVER_ROUTE_FAILURE.get() {
+        return Err(format!("sp1-gpu-server cannot be started confined: {e}"));
+    }
     // The SDK does `env::var("HOME").expect(...)` to locate the server (hemilabs/sp1 falls back to
     // USERPROFILE, which is all Windows sets), so an unset HOME is a panic rather than an error.
     // Systemd units routinely have no HOME.
@@ -1289,6 +1446,12 @@ fn sp1_usability() -> Result<(), String> {
             )
         }
     };
+
+    // The server this release ships beside the worker could not be installed: what runs instead is
+    // not the one this worker was built with (see `bundled_server::install_failure`).
+    if let Some(failure) = bundled_server::install_failure() {
+        return Err(failure.to_string());
+    }
 
     // SP1 here is CUDA-only: `.cuda()` is unconditional, there is no CPU path. With no
     // NVIDIA GPU at all, nothing this worker advertises can ever be proved.
@@ -1344,8 +1507,34 @@ fn sp1_usability() -> Result<(), String> {
     // What does NOT self-heal is a loader failure: the asset is pinned to the SDK's own
     // version, so a re-download reproduces the same libcudart.so.12 ABI gap. That, and a
     // binary that cannot be exec'd at all, is the only case worth declining.
+    let probed = Instant::now();
     match probe_server_version(&server, PROBE_TIMEOUT) {
-        Outcome::Ran { success: true, .. } => Ok(()),
+        // It runs. Then what it can do: see `server_capability`. Only here, where `--version` came
+        // back, so the two probes fit the handshake: the second has what is left of the first's
+        // budget, and at least a second (the binary is in the page cache by now).
+        #[cfg(target_os = "linux")]
+        Outcome::Ran { success: true, .. } => {
+            let timeout = PROBE_TIMEOUT
+                .saturating_sub(probed.elapsed())
+                .max(Duration::from_secs(1));
+            match server_capability(&server, timeout) {
+                Capability::Present => Ok(()),
+                Capability::Absent(why) => Err(why),
+                Capability::Unknown(why) => {
+                    tracing::warn!(
+                        "could not tell whether {} shares memory through descriptors ({why}); \
+                         leaving SP1 advertised, and checking again before its server starts",
+                        server.display()
+                    );
+                    Ok(())
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        Outcome::Ran { success: true, .. } => {
+            let _ = probed;
+            Ok(())
+        }
         // Never came back inside the budget. The verdict stays `Ok` because this function's
         // contract is to decline only what provably cannot work, and a timeout is also what a
         // transiently overloaded host produces. But the warning must not pretend this is an
@@ -1424,6 +1613,68 @@ fn sp1_usability() -> Result<(), String> {
         Outcome::SpawnFailed { err, .. } => {
             Err(format!("cannot execute {}: {err}", server.display()))
         }
+    }
+}
+
+/// What a worker needs of its server, which `sp1-gpu-server --capabilities` lists: its executor
+/// shares the guest's memory and trace ring with its runner process through file descriptors, never
+/// names in `/dev/shm`. The confinement gives no SP1 process `/dev/shm`, so a server without it
+/// fails every proof, after the job is claimed. A server built before the flag reports the same
+/// `--version` and refuses `--capabilities`.
+const SERVER_CAPABILITY: &str = "fd-shared-memory";
+
+/// Whether the server has [`SERVER_CAPABILITY`].
+#[derive(Debug, PartialEq)]
+enum Capability {
+    Present,
+    /// It answered without it, or refused the flag: why, to decline with.
+    Absent(String),
+    /// The probe did not settle it (it timed out, or could not run just now): why.
+    Unknown(String),
+}
+
+/// Runs `server --capabilities`, bounded by `timeout`, and looks for [`SERVER_CAPABILITY`].
+#[cfg(target_os = "linux")]
+fn server_capability(server: &std::path::Path, timeout: Duration) -> Capability {
+    let (outcome, stdout) = proc::output_with_timeout_capturing_stdout(
+        std::process::Command::new(server).arg("--capabilities"),
+        timeout,
+        PROBE_STDERR_CAP,
+    );
+    capability_of(server, outcome, &stdout)
+}
+
+/// [`server_capability`]'s verdict on what the probe gave.
+fn capability_of(server: &std::path::Path, outcome: Outcome, stdout: &str) -> Capability {
+    let lacks = |detail: String| {
+        Capability::Absent(format!(
+            "{} cannot share memory with its executor's runner except through /dev/shm, which no \
+             confined SP1 process may reach: {detail}. Install the sp1-gpu-server this release \
+             ships",
+            server.display()
+        ))
+    };
+    match outcome {
+        Outcome::Ran { success: true, .. } => {
+            if stdout.lines().any(|line| line.trim() == SERVER_CAPABILITY) {
+                Capability::Present
+            } else {
+                lacks(format!(
+                    "its --capabilities do not include {SERVER_CAPABILITY}"
+                ))
+            }
+        }
+        Outcome::Ran { stderr, .. } => lacks(format!(
+            "it is older than --capabilities ({})",
+            stderr.lines().next().unwrap_or("").trim()
+        )),
+        Outcome::SpawnFailed {
+            err,
+            transient: false,
+        } => lacks(format!("it cannot be run ({err})")),
+        Outcome::SpawnFailed { err, .. } => Capability::Unknown(err.to_string()),
+        Outcome::TimedOut { .. } => Capability::Unknown("--capabilities timed out".to_string()),
+        Outcome::Unsettled(e) => Capability::Unknown(e.to_string()),
     }
 }
 
@@ -1868,6 +2119,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             write_message(&mut stdout, &refused)?;
                             continue;
                         }
+                        canary_or_decline(&*p);
                         let run = run_benchmarks(
                             p,
                             &mut held.benchmark_keys,
@@ -1975,6 +2227,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     write_message(&mut stdout, &refused)?;
                     continue;
                 }
+                canary_or_decline(&*prover_for_proof);
                 // Announce proof START so the miner can move the job from Queued to Proving.
                 // Without this the job displays "Queued (waiting for GPU)" for the whole proof.
                 let started = WorkerResponse::Progress {
@@ -2011,12 +2264,25 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(_panic) => {
-                        let resp = WorkerResponse::Error {
-                            request_id,
-                            kind: ErrorKind::InvalidInput,
-                            message: "SP1 prover panicked on this ELF (malformed or hostile program)"
-                                .to_string(),
+                    Err(panic) => {
+                        let text = panic_text(&*panic);
+                        let resp = if is_executor_environment_fault(&text) {
+                            environment_fault_or_decline(&*prover_for_proof, &text);
+                            WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::Internal,
+                                message: format!(
+                                    "SP1's executor could not be set up for this proof: {text}"
+                                ),
+                            }
+                        } else {
+                            WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::InvalidInput,
+                                message: "SP1 prover panicked on this ELF (malformed or hostile \
+                                          program)"
+                                    .to_string(),
+                            }
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -2036,7 +2302,11 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         // `message` body, which nothing here does. Check them BEFORE is_gpu_oom so a
                         // permanent program-level mismatch is reported as such and never misread as a
                         // transient GPU OOM.
-                        let kind = if msg.contains("does not match job programId")
+                        let kind = if is_executor_environment_fault(&msg) {
+                            // Its executor could not be set up: this worker's fault, not the job's.
+                            environment_fault_or_decline(&*prover_for_proof, &msg);
+                            ErrorKind::Internal
+                        } else if msg.contains("does not match job programId")
                             || msg.contains("could not parse SP1 vkey hash")
                         {
                             // The served ELF's verifying key cannot match this job's programId. No job
@@ -2126,6 +2396,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     write_message(&mut stdout, &resp)?;
                     continue;
                 };
+                canary_or_decline(cpu);
                 // The ELF bytes are fully attacker-controlled, and SP1's parser/executor
                 // (`Elf::from` / `setup` / `execute().run()`) CAN panic on a malformed registered ELF
                 // rather than returning Err. A panic unwinding out of the loop would have the
@@ -2165,23 +2436,43 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         // (canonicalized to "exceeded cycle limit …", which the host classifies as
                         // too-heavy), fail the vkey bind, or simply error on this input. All are
                         // properties of the job, not of this worker, so report InvalidInput and keep
-                        // the healthy worker alive.
+                        // the healthy worker alive. Unless the executor itself could not be set up,
+                        // before the guest ran: that is this worker's.
+                        let kind = if is_executor_environment_fault(&msg) {
+                            environment_fault_or_decline(cpu, &msg);
+                            ErrorKind::Internal
+                        } else {
+                            ErrorKind::InvalidInput
+                        };
                         let resp = WorkerResponse::Error {
                             request_id,
-                            kind: ErrorKind::InvalidInput,
+                            kind,
                             message: msg,
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(_) => {
+                    Err(panic) => {
                         // A panic in the attacker-data path: same InvalidInput classification, worker
-                        // stays alive (the loop continues; the slot is not scored failed).
-                        let resp = WorkerResponse::Error {
-                            request_id,
-                            kind: ErrorKind::InvalidInput,
-                            message: "SP1 executor panicked while sizing this ELF (malformed or \
-                                      hostile program)"
-                                .to_string(),
+                        // stays alive (the loop continues; the slot is not scored failed). Unless the
+                        // executor itself could not be set up, as above.
+                        let text = panic_text(&*panic);
+                        let resp = if is_executor_environment_fault(&text) {
+                            environment_fault_or_decline(cpu, &text);
+                            WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::Internal,
+                                message: format!(
+                                    "SP1's executor could not be set up for sizing: {text}"
+                                ),
+                            }
+                        } else {
+                            WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::InvalidInput,
+                                message: "SP1 executor panicked while sizing this ELF (malformed \
+                                          or hostile program)"
+                                    .to_string(),
+                            }
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -2226,6 +2517,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     write_message(&mut stdout, &resp)?;
                     continue;
                 };
+                canary_or_decline(cpu);
                 let started = Instant::now();
                 // Submitter-controlled bytes reach `setup`, which can panic on a malformed ELF: a
                 // caught panic is a property of the ELF (InvalidInput), as on the Execute arm.
@@ -3684,6 +3976,186 @@ mod usability_tests {
     pub(super) fn env_lock() -> &'static std::sync::Mutex<()> {
         static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         L.get_or_init(|| std::sync::Mutex::new(()))
+    }
+}
+
+/// What the worker asks of its server and of its own executor before it offers SP1.
+#[cfg(all(test, target_os = "linux"))]
+mod capability_tests {
+    use super::{capability_of, Capability, Outcome};
+    use std::path::Path;
+
+    fn ran(success: bool, stderr: &str) -> Outcome {
+        Outcome::Ran {
+            success,
+            stderr: stderr.to_string(),
+        }
+    }
+
+    /// Only a server that lists `fd-shared-memory` has it; one older than `--capabilities`
+    /// refuses the flag (clap's exit 2), which is a no, as is one that cannot run at all. A probe
+    /// that did not settle it is neither.
+    #[test]
+    fn only_a_server_listing_fd_shared_memory_has_it() {
+        let server = Path::new("/x/sp1-gpu-server");
+        let listed = "fd-shared-memory\ncommit=fd8ecf573474c6fc49ccb8e249f14410a163bd33\n";
+        assert_eq!(
+            capability_of(server, ran(true, ""), listed),
+            Capability::Present
+        );
+        assert_eq!(
+            capability_of(server, ran(true, ""), "  fd-shared-memory  \n"),
+            Capability::Present
+        );
+        for stdout in ["", "fd-shared-memory-v2\n", "6.8.1\n", "commit=abc\n"] {
+            assert!(matches!(
+                capability_of(server, ran(true, ""), stdout),
+                Capability::Absent(_)
+            ));
+        }
+        let old = "error: unexpected argument '--capabilities' found\n\nUsage: sp1-gpu-server";
+        match capability_of(server, ran(false, old), "") {
+            Capability::Absent(why) => {
+                assert!(why.contains("/dev/shm") && why.contains("older"), "{why}")
+            }
+            other => panic!("an old server is not refused: {other:?}"),
+        }
+        // A server that prints the name but fails is not trusted with it either.
+        assert!(matches!(
+            capability_of(server, ran(false, ""), listed),
+            Capability::Absent(_)
+        ));
+        let not_exec = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            capability_of(
+                server,
+                Outcome::SpawnFailed {
+                    err: not_exec,
+                    transient: false
+                },
+                ""
+            ),
+            Capability::Absent(_)
+        ));
+        let busy = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        assert!(matches!(
+            capability_of(
+                server,
+                Outcome::SpawnFailed {
+                    err: busy,
+                    transient: true
+                },
+                ""
+            ),
+            Capability::Unknown(_)
+        ));
+        assert!(matches!(
+            capability_of(
+                server,
+                Outcome::TimedOut {
+                    stderr: String::new()
+                },
+                ""
+            ),
+            Capability::Unknown(_)
+        ));
+    }
+
+    /// A server built before `--capabilities`, which answers `--version` as the right one does,
+    /// is declined at the handshake (or on the no-GPU arm, on a host without one); one that lists
+    /// the capability is not declined for it.
+    #[test]
+    fn the_handshake_declines_a_server_without_the_capability() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let version = sp1_primitives::SP1_CRATE_VERSION;
+        let old = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo {version}; exit 0; fi\n\
+             echo \"error: unexpected argument '$1' found\" >&2\nexit 2\n"
+        );
+        let new = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo {version}; exit 0; fi\n\
+             if [ \"$1\" = --capabilities ]; then echo fd-shared-memory; exit 0; fi\nexit 2\n"
+        );
+        for (name, script, declined) in [("old", old, true), ("new", new, false)] {
+            let tmp = std::env::temp_dir().join(format!("sp1caps-{name}-{}", std::process::id()));
+            let bin = tmp.join(".sp1/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let server = bin.join("sp1-gpu-server");
+            std::fs::write(&server, script).unwrap();
+            std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let saved = std::env::var("HOME").ok();
+            unsafe { std::env::set_var("HOME", &tmp) };
+            let r = super::sp1_usability();
+            match saved {
+                Some(h) => unsafe { std::env::set_var("HOME", h) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+            match r {
+                Err(e) if e.contains("GPU") => {}
+                Err(e) => assert!(declined && e.contains("/dev/shm"), "{name}: {e}"),
+                Ok(()) => assert!(!declined, "{name}: an old server is offered"),
+            }
+        }
+    }
+
+    /// The canary's expected output is what the guest commits: fibonacci, wrapping, eight bytes
+    /// little-endian.
+    #[test]
+    fn the_canary_expects_fibonacci() {
+        assert_eq!(super::canary_public_values(0), 0u64.to_le_bytes());
+        assert_eq!(super::canary_public_values(10), 55u64.to_le_bytes());
+        assert_eq!(
+            super::canary_public_values(93),
+            12200160415121876738u64.to_le_bytes()
+        );
+        // Past u64, as the guest's `wrapping_add` does.
+        let (mut a, mut b) = (0u64, 1u64);
+        for _ in 0..super::CANARY_FIB_N {
+            (a, b) = (b, a.wrapping_add(b));
+        }
+        assert_eq!(
+            super::canary_public_values(super::CANARY_FIB_N),
+            a.to_le_bytes()
+        );
+    }
+
+    /// The canary runs the embedded guest through SP1's real executor (its runner process, and
+    /// the memory it shares with it) and accepts what it commits. CPU only, no server.
+    #[test]
+    fn the_canary_runs_on_the_real_executor() {
+        if super::FIBONACCI_SP1_GUEST_ELF.is_empty() {
+            eprintln!("skipping: fibonacci guest ELF is stubbed (SP1_SKIP_PROGRAM_BUILD)");
+            return;
+        }
+        let cpu = sp1_sdk::blocking::ProverClient::builder().cpu().build();
+        super::run_executor_canary(&cpu).expect("the canary runs");
+    }
+
+    /// The executor's own setup failures, in the fork's words, are the worker's; a guest's
+    /// failures are not.
+    #[test]
+    fn setup_failures_are_told_from_the_guests() {
+        for text in [
+            "task 7 panicked with message \"create shm file for memory: Os { code: 13, kind: \
+             PermissionDenied, message: \\\"Permission denied\\\" }\"",
+            "create shm file for traces: Os { code: 24 }",
+            "failed to create the child's stdin: Too many open files",
+            "failed to spawn child process: Resource temporarily unavailable",
+            "the executor runner exited before reading its input (Broken pipe)",
+        ] {
+            assert!(super::is_executor_environment_fault(text), "{text}");
+        }
+        for text in [
+            "exceeded cycle limit (SP1 executor: cycle limit reached)",
+            "Invalid memory access: LD 0x0",
+            "Child native executor terminated abnormally, code: Some(1), signal: None",
+            "the executor runner broke the trace ring's protocol: the trace ring's write index",
+            "",
+        ] {
+            assert!(!super::is_executor_environment_fault(text), "{text}");
+        }
     }
 }
 
