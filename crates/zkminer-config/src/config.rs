@@ -50,10 +50,13 @@ pub struct DevConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_id: Option<u64>,
     /// A fixed DA backlog reading, in estimated bytes, for witness-job claim gates and fulfils
-    /// (docs/witness-construction-jobs.md §5.5), in place of reading the chain. For a local test
-    /// network whose node serves no `l1GasUsed` in its receipts (anvil), where the reading is
-    /// otherwise always unknown and every witness job is held. Refused on Hemi mainnet. Default:
-    /// unset (read the chain).
+    /// (docs/witness-construction-jobs.md §5.5) and `zkminer artifact publish`, in place of reading
+    /// the chain. For a local test network whose node serves no `l1GasUsed` in its receipts
+    /// (anvil), where the reading is otherwise always unknown and every witness job is held. Only
+    /// on a chain with no HemiProve deployment ([`DEPLOYED_CHAIN_IDS`]), or on a deployment's chain
+    /// id when the RPC is on loopback (a local fork of it): never against the real testnet, whose
+    /// shared router the backlog rule protects, and never on Hemi mainnet. Default: unset (read the
+    /// chain).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub da_backlog_bytes: Option<u64>,
 }
@@ -206,6 +209,34 @@ fn parse_cidrs(key: &str, v: &[String]) -> Result<Vec<zkminer_netguard::Prefix>>
 /// (Hemi mainnet), whether the switch reaches netguard's mode, and what every start says while it
 /// is on. Defined in zkminer-netguard, so the witness broker refuses exactly the same chains.
 pub use zkminer_netguard::{is_production_chain, DEV_MODE_BANNER, PRODUCTION_CHAIN_IDS};
+
+/// Chains with a HemiProve deployment (or one meant for them): Hemi mainnet and Hemi testnet. A
+/// test setting that stands in for a chain reading (`[dev] da_backlog_bytes`) applies on these
+/// only against a node on loopback. `zkminer_chain::deployment::known_deployment` lists a subset.
+pub const DEPLOYED_CHAIN_IDS: &[u64] = &[43111, 743111];
+
+/// Whether `url`'s host is a loopback address written as one (`127.0.0.0/8`, `::1`, an
+/// IPv4-mapped loopback) or `localhost`: the address every connection to it is pinned to is this
+/// host's own. A name that merely resolves to loopback today is not enough.
+pub fn rpc_on_loopback(url: &str) -> bool {
+    let Ok(u) = zkminer_netguard::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = u.host_str() else {
+        return false;
+    };
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(a)) => a.is_loopback(),
+        Ok(std::net::IpAddr::V6(a)) => {
+            a.is_loopback() || a.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        Err(_) => bare.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainConfig {
@@ -754,16 +785,37 @@ impl ZkMinerConfig {
                 self.chain.chain_id
             );
         }
+        if self.dev.da_backlog_bytes.is_some()
+            && DEPLOYED_CHAIN_IDS.contains(&self.chain.chain_id)
+            && !rpc_on_loopback(&self.chain.rpc_url)
+        {
+            anyhow::bail!(
+                "[dev] da_backlog_bytes is refused on chain {} unless [chain] rpc_url is a loopback \
+                 address (a local fork): the HemiProve router there is shared, and its DA backlog \
+                 must be read from the chain",
+                self.chain.chain_id
+            );
+        }
         self.egress_deny()?;
         self.egress_facts_options()?;
         Ok(())
     }
 
-    /// `[dev] da_backlog_bytes`, honoured only off production chains (where validation refuses it).
+    /// `[dev] da_backlog_bytes` for the miner's own reads (`[chain] rpc_url`): see
+    /// [`Self::dev_da_backlog_bytes_for`].
     pub fn dev_da_backlog_bytes(&self) -> Option<u64> {
-        self.dev
-            .da_backlog_bytes
-            .filter(|_| !is_production_chain(self.chain.chain_id))
+        self.dev_da_backlog_bytes_for(&self.chain.rpc_url)
+    }
+
+    /// `[dev] da_backlog_bytes` for backlog reads through `rpc_url`: never on a production chain,
+    /// and on a chain with a HemiProve deployment only when `rpc_url` is on loopback
+    /// ([`rpc_on_loopback`]); validation refuses the configurations it ignores.
+    pub fn dev_da_backlog_bytes_for(&self, rpc_url: &str) -> Option<u64> {
+        let id = self.chain.chain_id;
+        self.dev.da_backlog_bytes.filter(|_| {
+            !is_production_chain(id)
+                && (!DEPLOYED_CHAIN_IDS.contains(&id) || rpc_on_loopback(rpc_url))
+        })
     }
 
     /// Validate that required fields are set for production use.
@@ -952,7 +1004,7 @@ mod validation_tests {
 
     #[test]
     fn a_fixed_da_backlog_is_a_test_network_setting() {
-        let c = parse("[chain]\nchain_id = 743111\n[dev]\nda_backlog_bytes = 0\n").unwrap();
+        let c = parse("[chain]\nchain_id = 743111\nrpc_url = \"http://127.0.0.1:8545\"\n[dev]\nda_backlog_bytes = 0\n").unwrap();
         assert!(c.validate_network().is_ok());
         assert_eq!(c.dev_da_backlog_bytes(), Some(0));
         // Alone, it does not turn on private-network access.
@@ -969,6 +1021,70 @@ mod validation_tests {
         let c = parse("[chain]\nchain_id = 743111\n").unwrap();
         assert_eq!(c.dev_da_backlog_bytes(), None);
         assert!(!toml::to_string_pretty(&c).unwrap().contains("[dev]"));
+    }
+
+    #[test]
+    fn a_fixed_da_backlog_reaches_a_deployments_chain_only_on_loopback() {
+        // The real testnet (the default URL, or any public one): refused, and never honoured.
+        for url in [
+            "",
+            "rpc_url = \"https://testnet.rpc.hemi.network/rpc\"\n",
+            "rpc_url = \"http://10.0.0.5:8545\"\n",
+        ] {
+            let text = format!("[chain]\nchain_id = 743111\n{url}[dev]\nda_backlog_bytes = 0\n");
+            let c = parse(&text).unwrap();
+            let err = c.validate_network().expect_err(&text).to_string();
+            assert!(err.contains("loopback"), "{err}");
+            assert_eq!(c.dev_da_backlog_bytes(), None, "{text}");
+        }
+        // A local fork of it: honoured.
+        let c = parse("[chain]\nchain_id = 743111\nrpc_url = \"http://[::1]:8545\"\n[dev]\nda_backlog_bytes = 7\n").unwrap();
+        assert!(c.validate_network().is_ok());
+        assert_eq!(c.dev_da_backlog_bytes(), Some(7));
+        // ... but not for reads through another RPC.
+        assert_eq!(
+            c.dev_da_backlog_bytes_for("https://testnet.rpc.hemi.network/rpc"),
+            None
+        );
+        assert_eq!(c.dev_da_backlog_bytes_for("http://127.0.0.1:9545"), Some(7));
+        // A chain with no deployment: honoured whatever the RPC.
+        let c = parse("[chain]\nchain_id = 31337\nrpc_url = \"https://rpc.example.com\"\n[dev]\nda_backlog_bytes = 3\n").unwrap();
+        assert!(c.validate_network().is_ok());
+        assert_eq!(c.dev_da_backlog_bytes(), Some(3));
+        assert_eq!(
+            c.dev_da_backlog_bytes_for("https://rpc.example.com"),
+            Some(3)
+        );
+        // Mainnet: never, loopback or not.
+        let c = parse("[chain]\nchain_id = 43111\nrpc_url = \"http://127.0.0.1:8545\"\n[dev]\nda_backlog_bytes = 3\n").unwrap();
+        assert!(c.validate_network().is_err());
+        assert_eq!(c.dev_da_backlog_bytes(), None);
+    }
+
+    #[test]
+    fn loopback_rpcs_are_loopback_addresses_as_written() {
+        for url in [
+            "http://127.0.0.1:8545",
+            "http://127.9.9.9",
+            "https://[::1]:8545/rpc",
+            "http://[::ffff:127.0.0.1]:8545",
+            "http://localhost:8545",
+            "http://LOCALHOST.:8545",
+        ] {
+            assert!(rpc_on_loopback(url), "{url}");
+        }
+        for url in [
+            "http://10.0.0.1:8545",
+            "http://127.0.0.1.nip.io:8545",
+            "http://localhost.example.com",
+            "http://[64:ff9b::7f00:1]:8545",
+            "http://0.0.0.0:8545",
+            "https://testnet.rpc.hemi.network/rpc",
+            "not a url",
+            "",
+        ] {
+            assert!(!rpc_on_loopback(url), "{url}");
+        }
     }
 
     #[test]
