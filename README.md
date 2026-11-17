@@ -672,29 +672,48 @@ inconclusive); the command exits non-zero unless it is `pass`.
 of at most 24,575 bytes as `0x00`-prefixed data contracts, then a manifest. It is permanent and
 public. The rules it follows are the format's own (§13.5 of the design):
 
-- the key is an encrypted keystore of its own (password from the terminal, or `--password-fd N`
-  for N ≥ 3), never the miner's key file, the environment or argv; it is refused when it is
+- the key is an encrypted keystore of its own (password from the terminal, or `--password-fd N`:
+  N ≥ 3, a pipe or a file the caller opened for the command, checked before anything else
+  starts), never the miner's key file, the environment or argv; it is refused when it is
   `[witness] prover_address`, staked as a prover, authorized as a prover's operator (read from the
-  chain), or has pending transactions it did not send. A stuck chunk blocks every later nonce of its
-  sender, so a prover key would stall its fulfils;
+  chain; an authorization voided by `revokeAllOperators` no longer counts), or has pending
+  transactions it did not send. A stuck chunk blocks every later nonce of its sender, so a prover
+  key would stall its fulfils. The keystore's parameters are checked before any work, and the
+  password, the derived key and the decrypted key are zeroed after use;
 - every request goes through the network guard with a rate limit of its own
-  (`--max-requests-per-sec`, default 4); a node on loopback or the LAN needs a configuration with
-  `[dev] private_network` for that very chain; `--rpc-url` may not be the miner's `[chain] rpc_url`
-  while a miner runs;
+  (`--max-requests-per-sec`, default 4); the RPC must be `https://` unless the configuration's
+  `[dev] private_network` is for that very chain (which also lets it be on loopback or the LAN);
+  `--rpc-url` may not be the miner's `[chain] rpc_url` while a miner runs. The URL can come from
+  `--rpc-url-file FILE` or `ZKMINER_PUBLISH_RPC_URL` instead of argv, where every local user sees
+  it (it may carry a provider key);
+- **the RPC is trusted**: the pacing gate's readings and the key checks are its answers, so a
+  lying one could open the gate or pass a prover key. Two things bound that. Sends are paced by
+  the local clock too, at least a block time apart whatever the RPC reports (12 s on Hemi, else
+  measured, never under 1 s outside developer mode; `--block-time-ms` sets it, never below a known
+  chain's). And `--verify-rpc-url URL` (or `--verify-rpc-url-file`) names a second provider:
+  each deployment must show there, in the same block and with the same code, before the next
+  chunk is signed, and the artifact is read back there too;
 - a cost preview (L2 gas at the chosen tip, the L1 data fee from `GasPriceOracle`, the balance one
   in-flight chunk needs) comes first, confirmed on the terminal or with `--yes`;
-- one chunk in flight, at most one send per block, and only while the DA backlog plus its own
-  unmined estimates is under 250 KB, the safe head lags at most 300 s, the router is not paused and
-  the head is at most 60 s old: about twenty minutes per MiB. Each chunk's transaction estimates at
-  most 19,500 DA bytes. A chunk unmined for 3 blocks with the gate open is replaced at its nonce
-  with both fee fields raised (never past 64 times the measured tip floor); a failed creation is
-  redeployed at a new nonce;
+- one chunk in flight, at most one send per block and per block time, and only while the DA
+  backlog plus its own unmined estimates is under 250 KB, the safe head lags at most 300 s, the
+  router is not paused and the head is at most 60 s old: about twenty minutes per MiB. Each chunk's
+  transaction estimates at most 19,500 DA bytes. A chunk unmined for 3 blocks with the gate open is
+  replaced at its nonce with both fee fields raised, at most 16 times, the tip never past 64 times
+  the measured tip floor and the max fee never past 8 times the starting base fee plus that; a
+  refused replacement leaves the pooled fees as they were; a failed creation is redeployed at a new
+  nonce;
 - it waits until every deploying block is at or below the safe head with its hash unchanged, reads
   the artifact back there with the miner's manifest, chunk and assembly checks, and only then
   prints the locator, sha256, length, addresses, total cost, and the `builderId` (or, for an ELF,
-  the `addStorageURI` arguments). Submit the job only after that. `--json` prints it as JSON.
+  the `addStorageURI` arguments). Submit the job only after that. `--json` prints it as JSON;
+- `--progress FILE` records each mined deployment; run the same command again after a failure
+  and it reuses the recorded chunks whose code is on chain, sending only the rest. Without it, a
+  run that stopped part-way is run again from the start: every chunk is sent (and paid) again.
 
-The router is the known deployment's on the chain, else `--router`.
+The router is the known deployment's on the chain, else `--router`. A configuration's `[dev]
+da_backlog_bytes` stands in for the backlog reading only in developer mode, and on Hemi testnet's
+chain id only against a node on loopback (a local fork).
 
 ## Layout
 
