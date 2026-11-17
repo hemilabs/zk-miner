@@ -683,8 +683,9 @@ pub const WORKER_EXIT_SERVER_LOST: i32 = 75;
 pub const WORKER_EXIT_DECLINED: i32 = 78;
 
 /// A worker exited [`WORKER_EXIT_DECLINED`] in the middle of a request: its backend cannot run on
-/// this host, its slot is declined for the rest of the process, and nothing about the job or program
-/// it was given is known. Only the dispatcher constructs it, from the worker's exit code.
+/// this host, its slot is declined (until a fresh worker is tried after a backoff), and nothing about
+/// the job or program it was given is known. Only the dispatcher constructs it, from the worker's exit
+/// code, or for a declined slot it will not respawn before then.
 #[derive(Debug, Clone)]
 pub struct WorkerDeclined {
     /// The declined slot, e.g. `sp1:cuda:0` or `sp1:measure:1`.

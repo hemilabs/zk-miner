@@ -339,20 +339,50 @@ struct WorkerSlot {
     consecutive_failures: u32,
     last_failure: Option<Instant>,
     /// Set when the worker SPOKE the protocol and declined: it cannot prove on this
-    /// host, and no retry will change that. Holds the reason for the operator.
+    /// host. Holds the reason for the operator.
     ///
     /// Distinct from `consecutive_failures` on purpose. A dead-but-eligible slot is
     /// deliberately still "healthy" (see `is_backend_healthy`) so a crashed worker
     /// respawns and claiming does not stall on a transient fault. A capability decline
     /// is not transient, so treating it the same way made the miner keep claiming jobs
     /// the worker had just said it could not prove -- and every ~RETIRE_COOLDOWN the
-    /// counter reset re-opened the window for the life of the process.
+    /// counter reset re-opened the window for the life of the process. So a declined slot is
+    /// never eligible: only a fresh worker that passes its handshake clears it, which
+    /// `retry_due_declines` tries after the slot's backoff (`decline_retry`).
     declined: Option<String>,
+    /// When a declined slot is next tried with a fresh worker, and the backoff that set it.
+    decline_retry: DeclineRetry,
     /// Number of proofs this worker instance has completed since it was (re)spawned.
     /// When it reaches `recycle_after_proofs()`, the worker is killed + respawned so
     /// the accumulated GPU context / buffer pool / persistent stream is reset to a
     /// clean slate. Reset to 0 on every (re)spawn.
     proofs_since_spawn: u32,
+}
+
+/// The first wait before a declined slot is tried again with a fresh worker.
+const DECLINE_RETRY_FIRST: Duration = Duration::from_secs(10 * 60);
+
+/// The longest wait between two tries of a declined slot.
+const DECLINE_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// How often the background thread looks for a declined slot due for its retry
+/// (`WorkerPool::start_decline_retries`).
+const DECLINE_RETRY_POLL: Duration = Duration::from_secs(30);
+
+/// The retry of a declined slot (`WorkerSlot::declined`). A decline is no longer for the life of
+/// the miner: a condition of the host that has since passed (a worker's executor that could not
+/// run its canary while the host was short of something, a server that could not be installed)
+/// must not take the backend off the slot for good. A worker that is still unable declines again
+/// at once, at its handshake (an old server) or before its first guest runs (the canary), so a
+/// retry never puts a claim on a slot that cannot prove it.
+#[derive(Clone, Copy, Debug, Default)]
+struct DeclineRetry {
+    /// When the slot may be tried again; `None` while it is not declined.
+    at: Option<Instant>,
+    /// The wait that set `at`: `DECLINE_RETRY_FIRST` for a first decline, doubled for each decline
+    /// after it, up to `DECLINE_RETRY_MAX`. Back to zero once a guest has run on the slot, which
+    /// its executor canary must have passed first (`note_guest_ran`).
+    backoff: Duration,
 }
 
 /// Wrapper that holds a worker slot and its PID accessible without locking.
@@ -2512,6 +2542,7 @@ impl WorkerPool {
                                 consecutive_failures: 0,
                                 last_failure: None,
                                 declined: None,
+                                decline_retry: DeclineRetry::default(),
                                 proofs_since_spawn: 0,
                             }),
                             vram_bytes: gpu_vram_bytes(
@@ -2538,12 +2569,7 @@ impl WorkerPool {
                     let declined = msg
                         .contains(zkminer_prover_protocol::types::WORKER_DECLINED)
                         .then(|| msg.clone());
-                    if declined.is_some() {
-                        tracing::error!(
-                            "Worker {key}{device_desc} DECLINED and will not be \
-                             advertised or respawned: {msg}"
-                        );
-                    } else {
+                    if declined.is_none() {
                         tracing::error!("Failed to start worker {key}{device_desc}: {msg}");
                     }
                     self.startup_problems.push(format!(
@@ -2554,23 +2580,28 @@ impl WorkerPool {
                     ));
                     let vram_bytes = gpu_vram_bytes(&gpu_tag, device_index, pci_bus_id.as_deref());
                     let entry_bus_id = pci_bus_id.clone().filter(|b| !b.is_empty());
+                    let mut slot = WorkerSlot {
+                        handle: None,
+                        path,
+                        backend,
+                        gpu_tag,
+                        device_index,
+                        pci_bus_id,
+                        gpu_name,
+                        spawn_env: env,
+                        consecutive_failures: 1,
+                        last_failure: Some(Instant::now()),
+                        declined: None,
+                        decline_retry: DeclineRetry::default(),
+                        proofs_since_spawn: 0,
+                    };
+                    if let Some(reason) = declined {
+                        Self::note_decline(&mut slot, &format!("{key}{device_desc}"), reason);
+                    }
                     self.workers.insert(
                         key,
                         WorkerEntry {
-                            slot: Mutex::new(WorkerSlot {
-                                handle: None,
-                                path,
-                                backend,
-                                gpu_tag,
-                                device_index,
-                                pci_bus_id,
-                                gpu_name,
-                                spawn_env: env,
-                                consecutive_failures: 1,
-                                last_failure: Some(Instant::now()),
-                                declined,
-                                proofs_since_spawn: 0,
-                            }),
+                            slot: Mutex::new(slot),
                             vram_bytes,
                             pci_bus_id: entry_bus_id,
                             pid: Arc::new(AtomicU32::new(0)),
@@ -2661,6 +2692,7 @@ impl WorkerPool {
                         consecutive_failures: failures,
                         last_failure,
                         declined: None,
+                        decline_retry: DeclineRetry::default(),
                         proofs_since_spawn: 0,
                     }),
                     vram_bytes: None,
@@ -2760,6 +2792,7 @@ impl WorkerPool {
                         consecutive_failures: failures,
                         last_failure,
                         declined: None,
+                        decline_retry: DeclineRetry::default(),
                         proofs_since_spawn: 0,
                     }),
                     vram_bytes: None,
@@ -4886,6 +4919,7 @@ impl WorkerPool {
                 host_entropy_reads,
                 ..
             } => {
+                Self::note_guest_ran(&mut slot, key);
                 tracing::debug!(
                     "cycle measurement on {key}: {cycles} cycles in {duration_secs:.2}s, \
                      {journal_len} journal bytes, peak host {} MiB",
@@ -7863,6 +7897,9 @@ impl WorkerPool {
         if proof_response.is_ok() {
             slot.proofs_since_spawn = slot.proofs_since_spawn.saturating_add(1);
         }
+        if matches!(proof_response, Ok(WorkerResponse::ProofResult { .. })) {
+            Self::note_guest_ran(&mut slot, key);
+        }
 
         match proof_response? {
             WorkerResponse::ProofResult {
@@ -8021,7 +8058,8 @@ impl WorkerPool {
 
     /// Records that the slot's worker exited declined (`WorkerHandle::exited_declined`): it cannot
     /// run its backend on this host, as a worker that declines its handshake cannot, so the slot is
-    /// never dispatched to or respawned again (`slot_eligible`), and clears it.
+    /// not dispatched to or respawned until a fresh worker is tried after its wait
+    /// (`retry_due_declines`), and clears it.
     fn decline_slot(slot: &mut WorkerSlot, pid: &impl PidSlot, key: &str) {
         let msg = format!(
             "{} Worker {key} found after its handshake that it cannot run {} here (exit code {}; \
@@ -8030,11 +8068,132 @@ impl WorkerPool {
             slot.backend,
             zkminer_prover_protocol::types::WORKER_EXIT_DECLINED,
         );
-        if slot.declined.is_none() {
-            tracing::error!("Worker {key} DECLINED and will no longer be used: {msg}");
-            slot.declined = Some(msg);
-        }
         Self::mark_slot_dead(slot, pid);
+        Self::note_decline(slot, key, msg);
+    }
+
+    /// Records a decline (`WorkerSlot::declined`) and when the slot is next tried with a fresh
+    /// worker (`DeclineRetry`): after `DECLINE_RETRY_FIRST` the first time, twice the last wait
+    /// after that, up to `DECLINE_RETRY_MAX`.
+    fn note_decline(slot: &mut WorkerSlot, key: &str, reason: String) {
+        let backoff = if slot.decline_retry.backoff.is_zero() {
+            DECLINE_RETRY_FIRST
+        } else {
+            slot.decline_retry
+                .backoff
+                .saturating_mul(2)
+                .min(DECLINE_RETRY_MAX)
+        };
+        tracing::warn!(
+            "Worker {key} DECLINED: not used until a fresh worker is tried in {} min: {reason}",
+            backoff.as_secs() / 60
+        );
+        slot.declined = Some(reason);
+        slot.decline_retry = DeclineRetry {
+            at: Some(Instant::now() + backoff),
+            backoff,
+        };
+    }
+
+    /// Whether a declined slot is due to be tried again with a fresh worker.
+    fn decline_retry_due(slot: &WorkerSlot, now: Instant) -> bool {
+        slot.declined.is_some()
+            && slot.handle.is_none()
+            && slot.decline_retry.at.is_some_and(|at| now >= at)
+    }
+
+    /// A guest ran on the slot: its worker's executor canary passed first, so a decline before it
+    /// is behind it, and the next one starts again from the first wait.
+    fn note_guest_ran(slot: &mut WorkerSlot, key: &str) {
+        if !slot.decline_retry.backoff.is_zero() {
+            tracing::warn!(
+                "Worker {key} ran a guest after its decline (its executor canary passes): the \
+                 decline backoff starts again"
+            );
+            slot.decline_retry = DeclineRetry::default();
+        }
+    }
+
+    /// Tries every declined slot whose wait is over (`DeclineRetry`) with a fresh worker. One that
+    /// passes its handshake is offered again; one that declines again (an old server at its
+    /// handshake), or cannot start, waits twice as long. A slot declined by its executor canary is
+    /// offered again after the handshake, and its worker runs the canary before its first guest,
+    /// declining again at once if it still fails, which neither the job nor its program is blamed
+    /// for. The number of slots tried.
+    pub fn retry_due_declines(&self) -> usize {
+        let now = Instant::now();
+        let prove = self.workers.iter().map(|(k, e)| (k.clone(), e));
+        let measure = self.measure_workers.iter().flat_map(|(backend, pool)| {
+            pool.iter()
+                .enumerate()
+                .map(move |(i, e)| (format!("{backend}:measure:{i}"), e))
+        });
+        let mut tried = 0;
+        for (key, entry) in prove.chain(measure) {
+            if self.closing.load(Ordering::SeqCst) {
+                break;
+            }
+            // A busy slot is not declined: it is proving or measuring.
+            let Ok(mut slot) = entry.slot.try_lock() else {
+                continue;
+            };
+            if !Self::decline_retry_due(&slot, now) {
+                continue;
+            }
+            tried += 1;
+            let reason = slot.declined.clone().unwrap_or_default();
+            tracing::warn!(
+                "Retrying declined worker {key} with a fresh worker (it declined: {reason})"
+            );
+            match WorkerHandle::spawn(&slot.backend, &slot.path, &slot.spawn_env) {
+                Ok(handle) => {
+                    if self.closing.load(Ordering::SeqCst) {
+                        // Dropped, which ends it: nothing starts once the miner is closing.
+                        break;
+                    }
+                    entry.publish_pid(handle.pid());
+                    entry.note_build(&handle);
+                    slot.handle = Some(handle);
+                    slot.declined = None;
+                    slot.decline_retry.at = None;
+                    slot.consecutive_failures = 0;
+                    slot.last_failure = None;
+                    slot.proofs_since_spawn = 0;
+                    tracing::warn!(
+                        "Worker {key} passed its handshake after its decline, and is offered again"
+                    );
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    let reason = if msg.contains(zkminer_prover_protocol::types::WORKER_DECLINED) {
+                        msg
+                    } else {
+                        format!("{reason} (and the retry could not start a worker: {msg})")
+                    };
+                    Self::note_decline(&mut slot, &key, reason);
+                }
+            }
+        }
+        tried
+    }
+
+    /// Starts the thread that tries declined slots again (`retry_due_declines`) every
+    /// `DECLINE_RETRY_POLL`, until the pool closes. For the pool that lives as long as the miner.
+    pub fn start_decline_retries(&'static self) {
+        let spawned = std::thread::Builder::new()
+            .name("zkminer-decline-retry".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(DECLINE_RETRY_POLL);
+                if self.closing.load(Ordering::SeqCst) {
+                    return;
+                }
+                self.retry_due_declines();
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                "no thread to retry declined workers ({e}): a decline lasts until restart"
+            );
+        }
     }
 
     /// True if a slot may be dispatched to: healthy, or retired-but-cooled-down so a
@@ -8162,15 +8321,9 @@ impl WorkerPool {
                 // for the life of the process. A decline is categorical: say so once and stop
                 // advertising the backend.
                 let msg = format!("{e:#}");
-                if msg.contains(zkminer_prover_protocol::types::WORKER_DECLINED)
-                    && slot.declined.is_none()
-                {
-                    tracing::error!(
-                        "Worker {}:{} DECLINED on respawn and will no longer be advertised: {msg}",
-                        slot.backend,
-                        slot.gpu_tag,
-                    );
-                    slot.declined = Some(msg);
+                if msg.contains(zkminer_prover_protocol::types::WORKER_DECLINED) {
+                    let key = format!("{}:{}", slot.backend, slot.gpu_tag);
+                    Self::note_decline(slot, &key, msg);
                 }
                 slot.consecutive_failures += 1;
                 slot.last_failure = Some(Instant::now());
@@ -8250,6 +8403,16 @@ impl WorkerPool {
         };
 
         if needs_respawn {
+            // A declined slot gets a fresh worker only from `retry_due_declines`, after its wait:
+            // dispatching to it (a single slot's shortcut takes even an ineligible one) must not
+            // respawn it sooner.
+            if slot.declined.is_some() {
+                return Err(anyhow::Error::new(
+                    zkminer_prover_protocol::types::WorkerDeclined {
+                        slot_key: format!("{}:{}", slot.backend, slot.gpu_tag),
+                    },
+                ));
+            }
             if self.closing.load(Ordering::SeqCst) {
                 bail!(
                     "not respawning {}: the miner is shutting down",
@@ -8463,6 +8626,7 @@ impl WorkerPool {
                     consecutive_failures: 0,
                     last_failure: None,
                     declined: None,
+                    decline_retry: DeclineRetry::default(),
                     proofs_since_spawn: 0,
                 }),
                 vram_bytes: None,
@@ -8476,6 +8640,23 @@ impl WorkerPool {
             },
         );
         Ok(())
+    }
+
+    /// The decline of prove slot `key`, if it is declined: its reason and the backoff it waits.
+    pub fn test_decline(&self, key: &str) -> Option<(String, Duration)> {
+        let slot = self.workers.get(key)?.slot.lock().ok()?;
+        Some((slot.declined.clone()?, slot.decline_retry.backoff))
+    }
+
+    /// Ends the wait of declined prove slot `key` now, as if its backoff had passed.
+    pub fn test_expire_decline(&self, key: &str) {
+        if let Some(e) = self.workers.get(key) {
+            if let Ok(mut slot) = e.slot.lock() {
+                if slot.decline_retry.at.is_some() {
+                    slot.decline_retry.at = Some(Instant::now());
+                }
+            }
+        }
     }
 
     /// Insert a mock worker into the dedicated MEASURE pool for `backend` (registered as
@@ -8504,6 +8685,7 @@ impl WorkerPool {
                 consecutive_failures: 0,
                 last_failure: None,
                 declined: None,
+                decline_retry: DeclineRetry::default(),
                 proofs_since_spawn: 0,
             }),
             vram_bytes: None,
@@ -8714,6 +8896,7 @@ mod tests {
                         consecutive_failures: 0,
                         last_failure: None,
                         declined: None,
+                        decline_retry: DeclineRetry::default(),
                         proofs_since_spawn: 0,
                     }),
                     vram_bytes: None,
@@ -10664,6 +10847,7 @@ mod tests {
             consecutive_failures: failures,
             last_failure: last_failure_ago.map(|d| Instant::now() - d),
             declined: None,
+            decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
         }
     }
@@ -10789,6 +10973,7 @@ mod tests {
             consecutive_failures: MAX_RESPAWN_FAILURES,
             last_failure: Some(Instant::now()),
             declined: None,
+            decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
         };
         let result = WorkerPool::respawn(&mut slot);
@@ -10814,6 +10999,7 @@ mod tests {
             consecutive_failures: 1,
             last_failure: Some(Instant::now()), // just failed
             declined: None,
+            decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
         };
         // With consecutive_failures=1, backoff is RESPAWN_BACKOFF[1] = 5s.
@@ -10838,6 +11024,7 @@ mod tests {
             consecutive_failures: 0,
             last_failure: None,
             declined: None,
+            decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
         };
         let result = WorkerPool::respawn(&mut slot);
@@ -10866,6 +11053,7 @@ mod tests {
             consecutive_failures: 0,
             last_failure: None,
             declined: None,
+            decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
         };
         let result = pool.ensure_alive(&mut slot, &pid);
@@ -10895,6 +11083,7 @@ mod tests {
             consecutive_failures: 0,
             last_failure: None,
             declined: None,
+            decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
         };
         let result = pool.ensure_alive(&mut slot, &pid);
@@ -11019,6 +11208,7 @@ mod declined_backend_tests {
             consecutive_failures: cf,
             last_failure: Some(Instant::now()),
             declined: declined.map(str::to_string),
+            decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
         }
     }
@@ -11042,6 +11232,66 @@ mod declined_backend_tests {
         let pool = pool_with(vec![("sp1:cuda:0", sl)]);
         assert!(pool.backend_declined("sp1").is_some());
         assert!(!pool.has_idle_or_revivable_worker("sp1"));
+    }
+
+    /// A decline lasts a backoff, not the life of the miner: ten minutes, then twice the last wait,
+    /// up to an hour, and the first wait again once a guest has run on the slot (its canary
+    /// passed). Until its wait is over the slot is out of use.
+    #[test]
+    fn a_decline_expires_after_a_backoff_that_doubles_to_an_hour() {
+        let min = |m: u64| Duration::from_secs(m * 60);
+        let mut sl = slot(None, 0);
+        let mut waits = Vec::new();
+        for _ in 0..5 {
+            let before = Instant::now();
+            WorkerPool::note_decline(&mut sl, "sp1:cuda:0", "it declined".to_string());
+            let at = sl.decline_retry.at.expect("a declined slot has a retry");
+            waits.push(sl.decline_retry.backoff);
+            assert!(at >= before + sl.decline_retry.backoff);
+            assert!(!WorkerPool::slot_eligible(&sl));
+            assert!(!WorkerPool::decline_retry_due(
+                &sl,
+                at - Duration::from_secs(1)
+            ));
+            assert!(WorkerPool::decline_retry_due(&sl, at));
+        }
+        assert_eq!(waits, [min(10), min(20), min(40), min(60), min(60)]);
+        WorkerPool::note_guest_ran(&mut sl, "sp1:cuda:0");
+        WorkerPool::note_decline(&mut sl, "sp1:cuda:0", "again".to_string());
+        assert_eq!(sl.decline_retry.backoff, min(10));
+        // A slot that has a worker is not retried, whatever its wait.
+        let at = sl.decline_retry.at.unwrap();
+        assert!(!WorkerPool::decline_retry_due(&slot(None, 0), at));
+    }
+
+    /// A declined slot whose wait is over is tried with a fresh worker; one whose worker still
+    /// cannot start stays declined and waits twice as long; one whose wait is not over is left
+    /// alone, and neither is ever eligible meanwhile.
+    #[test]
+    fn a_due_decline_is_retried_and_one_that_fails_again_waits_longer() {
+        let min = |m: u64| Duration::from_secs(m * 60);
+        let mut due = slot(None, 0);
+        WorkerPool::note_decline(&mut due, "sp1:cuda:0", "it declined".to_string());
+        due.decline_retry.at = Some(Instant::now());
+        let mut waiting = slot(None, 0);
+        WorkerPool::note_decline(&mut waiting, "sp1:cuda:1", "it declined".to_string());
+        let pool = pool_with(vec![("sp1:cuda:0", due), ("sp1:cuda:1", waiting)]);
+        // The slots' worker (`/nonexistent`) cannot start.
+        assert_eq!(pool.retry_due_declines(), 1);
+        let retried = pool.workers["sp1:cuda:0"].slot.lock().unwrap();
+        assert!(retried
+            .declined
+            .as_deref()
+            .is_some_and(|r| r.contains("it declined")));
+        assert_eq!(retried.decline_retry.backoff, min(20));
+        assert!(retried.decline_retry.at.unwrap() > Instant::now() + min(19));
+        assert!(!WorkerPool::slot_eligible(&retried));
+        drop(retried);
+        let untouched = pool.workers["sp1:cuda:1"].slot.lock().unwrap();
+        assert_eq!(untouched.decline_retry.backoff, min(10));
+        drop(untouched);
+        assert_eq!(pool.retry_due_declines(), 0, "nothing else is due");
+        assert!(pool.backend_declined("sp1").is_some());
     }
 
     fn measure_entry(sl: WorkerSlot) -> WorkerEntry {
@@ -11203,6 +11453,7 @@ impl WorkerSlot {
             consecutive_failures: self.consecutive_failures,
             last_failure: self.last_failure,
             declined: self.declined.clone(),
+            decline_retry: self.decline_retry,
             proofs_since_spawn: self.proofs_since_spawn,
         }
     }
@@ -11238,6 +11489,7 @@ mod bus_id_locking_tests {
                     consecutive_failures: 0,
                     last_failure: None,
                     declined: None,
+                    decline_retry: DeclineRetry::default(),
                     proofs_since_spawn: 0,
                 }),
                 vram_bytes: None,

@@ -683,7 +683,10 @@ no second one):
   way gives it nothing new. A worker
   offers SP1 only with a server whose executor shares memory this way (`sp1-gpu-server
   --capabilities` lists `fd-shared-memory`), and gives SP1 up on its slot if its own executor
-  cannot run a small guest once confined.
+  cannot run a small guest once confined. A declined slot is tried again with a fresh worker after
+  ten minutes, then after twice the last wait, up to an hour, so a passing condition of the host
+  does not take SP1 off it for good; a worker that still cannot run declines again before any job
+  reaches it (an old server at its handshake), or before its first guest runs (the canary).
 - **Workers without a cgroup of their own.** With neither a delegated cgroup nor a systemd user
   manager (a container without systemd, another init), the miner logs that a worker is in no cgroup
   of its own, and the worker and what it starts end by process group, which a confined process

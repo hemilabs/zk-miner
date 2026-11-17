@@ -879,3 +879,61 @@ fn a_normal_measurement_leaves_no_inflight_registration() {
     );
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
 }
+
+// ---- Declines expire ----
+
+/// A worker that exits `WORKER_EXIT_DECLINED` on its first guest (its executor canary failed) has its
+/// slot declined, out of use for ten minutes. Once that wait is over the slot is tried with a fresh
+/// worker, which passes its handshake and is offered again; a worker that still cannot run a guest
+/// declines again, for twice as long; and one that can proves.
+#[test]
+fn a_declined_slot_is_retried_with_a_fresh_worker() {
+    use zkminer_prover_protocol::types::{WorkerDeclined, WORKER_EXIT_DECLINED};
+    let min = |m: u64| Duration::from_secs(m * 60);
+    let declining = || {
+        let mut env = mock_env("", "prove");
+        env.insert(
+            "MOCK_CRASH_CODE".to_string(),
+            WORKER_EXIT_DECLINED.to_string(),
+        );
+        env
+    };
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), declining())
+        .expect("failed to spawn mock worker");
+    let prove = |pool: &WorkerPool| {
+        pool.prove(
+            "mock",
+            b"elf",
+            b"input",
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        )
+    };
+
+    let err = prove(&pool).expect_err("a declining worker proves nothing");
+    assert!(err.downcast_ref::<WorkerDeclined>().is_some(), "{err:#}");
+    let (_, wait) = pool.test_decline("mock:generic").expect("declined");
+    assert_eq!(wait, min(10));
+    assert!(!pool.is_backend_healthy("mock"));
+    assert_eq!(pool.retry_due_declines(), 0, "not before its wait is over");
+    assert!(prove(&pool).is_err(), "a declined slot takes no proof");
+
+    pool.test_expire_decline("mock:generic");
+    assert_eq!(pool.retry_due_declines(), 1);
+    assert!(pool.test_decline("mock:generic").is_none(), "offered again");
+    assert_eq!(pool.test_has_handle("mock:generic"), Some(true));
+    assert!(pool.is_backend_healthy("mock"));
+
+    let err = prove(&pool).expect_err("its worker still cannot run a guest");
+    assert!(err.downcast_ref::<WorkerDeclined>().is_some(), "{err:#}");
+    let (_, wait) = pool.test_decline("mock:generic").expect("declined again");
+    assert_eq!(wait, min(20));
+
+    pool.test_set_spawn_env("mock:generic", mock_env("", ""));
+    pool.test_expire_decline("mock:generic");
+    assert_eq!(pool.retry_due_declines(), 1);
+    prove(&pool).expect("a worker that can run a guest proves");
+    assert!(pool.test_decline("mock:generic").is_none());
+}
