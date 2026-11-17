@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::Interest;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use zkminer_netguard::{canonical_ip, NetMode, NetPolicy, Prefix};
 use zkminer_witness::ipc::SelfTestCheck;
@@ -104,13 +106,20 @@ pub enum CutOff {
     Malformed(Malformed),
     /// The broker sent a file descriptor.
     FdAttached,
-    /// More than [`MAX_INFLIGHT`] requests in flight.
+    /// More than [`MAX_INFLIGHT`] requests in flight (a request is in flight until its answer is
+    /// handed to the socket).
     Flood,
     /// A request id that is still in flight.
     DuplicateId,
     /// More than [`MAX_MISUSE`] requests for a missing index or the wrong role or port within
     /// [`MISUSE_WINDOW`].
     Misuse,
+    /// An answer could not be written for longer than the request budget: the broker stopped
+    /// reading its answers (and would leave their sockets with the miner).
+    AnswersStalled,
+    /// Writing an answer failed while the broker kept its sending side open: it shut its reading
+    /// side, so answers (and their sockets) can no longer reach it.
+    AnswersRefused,
 }
 
 impl std::fmt::Display for CutOff {
@@ -121,6 +130,8 @@ impl std::fmt::Display for CutOff {
             CutOff::Flood => write!(f, "more than {MAX_INFLIGHT} requests in flight"),
             CutOff::DuplicateId => f.write_str("a request id still in flight"),
             CutOff::Misuse => write!(f, "more than {MAX_MISUSE} requests for endpoints it does not have within {MISUSE_WINDOW:?}"),
+            CutOff::AnswersStalled => f.write_str("it stopped reading its answers"),
+            CutOff::AnswersRefused => f.write_str("it shut the reading side of its connector socket"),
         }
     }
 }
@@ -440,8 +451,8 @@ impl Connector {
     }
 
     /// Serves one broker session on the miner's end `sock` of the connector socketpair, until the
-    /// broker closes it or is cut off (the socket is then closed on it, and a page logged). Needs
-    /// a tokio runtime.
+    /// broker closes it or is cut off (the socket is then closed on it, and a page logged). Either
+    /// way, requests still being served are aborted before it returns. Needs a tokio runtime.
     pub async fn serve(self: Arc<Self>, sock: std::os::unix::net::UnixStream) -> SessionEnd {
         self.serve_session(sock, true).await
     }
@@ -454,45 +465,74 @@ impl Connector {
                 return SessionEnd::Closed;
             }
         };
-        let (tx, mut rx) = mpsc::channel::<(Response, Option<OwnedFd>)>(MAX_INFLIGHT + 8);
-        let writer = {
-            let sock = sock.clone();
-            tokio::spawn(async move {
-                while let Some((resp, fd)) = rx.recv().await {
-                    if let Err(e) = write_response(&sock, &resp.encode(), fd.as_ref()).await {
-                        tracing::debug!(error = %e, "connector: writing a response failed");
-                        return;
-                    }
-                }
-            })
-        };
+        // Answers written but not yet read wait in the broker's receive queue, charged to this
+        // end's send buffer: at the kernel's minimum it holds a few frames, so a broker that does
+        // not read cannot park the sockets of many answers there either.
+        if let Err(e) = shrink_send_buffer(&sock) {
+            tracing::warn!(error = %e, "connector: shrinking the socket's send buffer");
+        }
+        // Every request id stays in flight until its answer is handed to the socket, so requests
+        // being served, answers queued and the answer being written are all within
+        // MAX_INFLIGHT (+ the one being written): a broker that stops reading reaches the bound
+        // (a flood) or stalls the writer (both cut it off) instead of piling sockets up here.
         let in_flight: Arc<Mutex<HashSet<u64>>> = Arc::default();
+        // One slot per id in flight at most (reserved when the request is admitted), so the queue
+        // is never full while the bound holds.
+        let (tx, rx) = mpsc::channel::<Answer>(MAX_INFLIGHT);
+        let stall = request_budget(self.connect_timeout);
+        let mut writer = tokio::spawn(write_answers(sock.clone(), rx, in_flight.clone(), stall));
+        let mut writer_end: Option<Result<WriterEnd, tokio::task::JoinError>> = None;
+        // The requests being served: aborted when the session ends, so nothing is connected for
+        // a broker that is gone or cut off.
+        let mut tasks = JoinSet::new();
         let mut misuse: VecDeque<Instant> = VecDeque::new();
-        let end = loop {
-            let frame = match read_request(&sock).await {
+        enum Exit {
+            End(SessionEnd),
+            /// The answer writer stopped (its result is in `writer_end`, or it is about to be).
+            WriterGone,
+        }
+        let exit = loop {
+            while tasks.try_join_next().is_some() {}
+            // Reading first: a broker that exited is at end-of-file here before a failed write
+            // is looked at.
+            let read = tokio::select! {
+                biased;
+                r = read_request(&sock) => r,
+                w = &mut writer => {
+                    writer_end = Some(w);
+                    break Exit::WriterGone;
+                }
+            };
+            let frame = match read {
                 Ok(Some(f)) => f,
-                Ok(None) => break SessionEnd::Closed,
-                Err(ReadError::FdAttached) => break SessionEnd::CutOff(CutOff::FdAttached),
+                Ok(None) => break Exit::End(SessionEnd::Closed),
+                Err(ReadError::FdAttached) => break Exit::End(SessionEnd::CutOff(CutOff::FdAttached)),
                 Err(ReadError::Io(e)) => {
                     tracing::debug!(error = %e, "connector: reading a request failed");
-                    break SessionEnd::Closed;
+                    break Exit::End(SessionEnd::Closed);
                 }
             };
             let req = match Request::decode(&frame) {
                 Ok(r) => r,
-                Err(m) => break SessionEnd::CutOff(CutOff::Malformed(m)),
+                Err(m) => break Exit::End(SessionEnd::CutOff(CutOff::Malformed(m))),
             };
             self.stats.requests.fetch_add(1, Ordering::Relaxed);
             {
                 let mut f = lock(&in_flight);
                 if f.contains(&req.id) {
-                    break SessionEnd::CutOff(CutOff::DuplicateId);
+                    break Exit::End(SessionEnd::CutOff(CutOff::DuplicateId));
                 }
                 if f.len() >= MAX_INFLIGHT {
-                    break SessionEnd::CutOff(CutOff::Flood);
+                    break Exit::End(SessionEnd::CutOff(CutOff::Flood));
                 }
                 f.insert(req.id);
             }
+            // The answer's slot, before anything is done for the request.
+            let slot = match tx.clone().try_reserve_owned() {
+                Ok(p) => p,
+                Err(TrySendError::Full(_)) => break Exit::End(SessionEnd::CutOff(CutOff::Flood)),
+                Err(TrySendError::Closed(_)) => break Exit::WriterGone,
+            };
             let index = usize::try_from(req.endpoint).ok().filter(|i| *i < self.endpoints.len());
             let refusal = match index {
                 None => Some(Status::NoSuchEndpoint),
@@ -507,31 +547,42 @@ impl Connector {
                 }
                 tracing::warn!(id = req.id, endpoint = req.endpoint, ?status, "connector: the broker asked for an endpoint it does not have");
                 self.stats.refused.fetch_add(1, Ordering::Relaxed);
-                lock(&in_flight).remove(&req.id);
-                if tx.send((Response::refused(req.id, status), None)).await.is_err() {
-                    break SessionEnd::Closed;
-                }
+                // The bound before the answer: past it the broker is cut off whether or not it
+                // still reads.
                 if misuse.len() > MAX_MISUSE {
-                    break SessionEnd::CutOff(CutOff::Misuse);
+                    break Exit::End(SessionEnd::CutOff(CutOff::Misuse));
                 }
+                slot.send((Response::refused(req.id, status), None));
                 continue;
             }
-            let (me, tx, in_flight) = (self.clone(), tx.clone(), in_flight.clone());
+            let me = self.clone();
             let index = index.unwrap_or_default();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let (resp, fd) = me.clone().connect_for(index, req.id).await;
                 if resp.status == Status::Connected {
                     me.stats.connected.fetch_add(1, Ordering::Relaxed);
                 } else {
                     me.stats.refused.fetch_add(1, Ordering::Relaxed);
                 }
-                // Out of flight before the answer is written: a broker that waits for answers never
-                // exceeds the bound.
-                lock(&in_flight).remove(&req.id);
-                let _ = tx.send((resp, fd)).await;
+                slot.send((resp, fd));
             });
         };
         drop(tx);
+        // Requests still being served are aborted (a socket one already made is closed, never
+        // delivered), and gone before the session's end is reported.
+        tasks.shutdown().await;
+        let end = match exit {
+            Exit::End(end) => end,
+            Exit::WriterGone => {
+                let w = match writer_end.take() {
+                    Some(w) => w,
+                    None => (&mut writer).await,
+                };
+                let end = writer_gone(&sock, w).await;
+                writer_end = Some(Ok(WriterEnd::Done));
+                end
+            }
+        };
         match &end {
             SessionEnd::CutOff(why) => {
                 // Closed on the broker at once, whatever else still holds the socket.
@@ -545,7 +596,10 @@ impl Connector {
                 }
             }
             SessionEnd::Closed => {
-                let _ = writer.await;
+                // What is already queued is still written (each answer within the stall bound).
+                if writer_end.is_none() {
+                    let _ = writer.await;
+                }
             }
         }
         // The last reference to the socket goes with this task (the writer's is gone): the broker
@@ -656,6 +710,113 @@ async fn connect_tcp(addr: SocketAddr) -> io::Result<OwnedFd> {
     let sock = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
     let stream = sock.connect(addr).await?;
     Ok(OwnedFd::from(stream.into_std()?))
+}
+
+/// One answer and the socket it carries.
+type Answer = (Response, Option<OwnedFd>);
+
+/// Why the answer writer stopped.
+#[derive(Debug)]
+enum WriterEnd {
+    /// Every sender is gone and the queue is written: the session is over.
+    Done,
+    /// One answer could not be written within the stall bound: the broker is not reading.
+    Stalled,
+    /// A write failed: the broker shut its reading side, or its end is closed.
+    Failed(io::Error),
+}
+
+/// Writes the session's answers in order. An id leaves the in-flight set when its answer is
+/// handed to the socket (before the write: the broker may read it and send its next request
+/// before this task runs again). Each answer must be written within `stall`.
+async fn write_answers(
+    sock: Arc<tokio::net::UnixStream>,
+    mut rx: mpsc::Receiver<Answer>,
+    in_flight: Arc<Mutex<HashSet<u64>>>,
+    stall: Duration,
+) -> WriterEnd {
+    while let Some((resp, fd)) = rx.recv().await {
+        lock(&in_flight).remove(&resp.id);
+        match tokio::time::timeout(stall, write_response(&sock, &resp.encode(), fd.as_ref())).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return WriterEnd::Failed(e),
+            Err(_) => return WriterEnd::Stalled,
+        }
+        // `fd` closes here: the broker's copy travels in the kernel's queue.
+    }
+    WriterEnd::Done
+}
+
+/// How a session ends once its answer writer stopped: a stall is a cut-off; a failed write is
+/// the broker closing its end (it exited: its requests end at end-of-file within
+/// [`EXITED_WITHIN`]) or a cut-off (it shut only its reading side and kept sending, or sent a
+/// descriptor).
+async fn writer_gone(sock: &tokio::net::UnixStream, w: Result<WriterEnd, tokio::task::JoinError>) -> SessionEnd {
+    match w {
+        Ok(WriterEnd::Stalled) => SessionEnd::CutOff(CutOff::AnswersStalled),
+        Ok(WriterEnd::Failed(e)) => {
+            tracing::debug!(error = %e, "connector: writing an answer failed");
+            if read_side_ends(sock, EXITED_WITHIN).await {
+                SessionEnd::Closed
+            } else {
+                SessionEnd::CutOff(CutOff::AnswersRefused)
+            }
+        }
+        // Not while the session holds a sender.
+        Ok(WriterEnd::Done) => SessionEnd::Closed,
+        Err(e) => {
+            tracing::error!(error = %e, "connector: the answer writer failed");
+            SessionEnd::Closed
+        }
+    }
+}
+
+/// How soon after a failed write the requests of a broker that exited reach end-of-file.
+const EXITED_WITHIN: Duration = Duration::from_secs(1);
+
+/// Reads and discards what the broker still sends until end-of-file (`true`) or `within` passes,
+/// or it sends a descriptor (`false`).
+async fn read_side_ends(sock: &tokio::net::UnixStream, within: Duration) -> bool {
+    let drain = async {
+        let mut buf = [0u8; 4096];
+        loop {
+            let mut fds = Vec::new();
+            let n = sock
+                .async_io(Interest::READABLE, || retry_eintr(|| recvmsg_once(sock.as_raw_fd(), &mut buf, &mut fds)))
+                .await;
+            if !fds.is_empty() {
+                return false;
+            }
+            match n {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => return false,
+                // A reset is a closed end.
+                Err(_) => return true,
+            }
+        }
+    };
+    tokio::time::timeout(within, drain).await.unwrap_or(false)
+}
+
+/// Sets the socket's send buffer to the kernel's minimum (`SO_SNDBUF` 1 is raised to it).
+fn shrink_send_buffer(sock: &tokio::net::UnixStream) -> io::Result<()> {
+    let one: libc::c_int = 1;
+    // SAFETY: setsockopt with an int of the stated length on a socket this session owns.
+    let r = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&one as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 enum ReadError {

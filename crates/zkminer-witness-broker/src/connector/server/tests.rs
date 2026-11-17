@@ -302,3 +302,213 @@ async fn fuzz_the_reader() {
         }
     }
 }
+
+
+/// A listener that accepts every connection on a thread and keeps the accepted streams, so the
+/// connector's connects complete.
+struct Endpoint {
+    port: u16,
+    accepted: Arc<Mutex<Vec<std::net::TcpStream>>>,
+}
+
+impl Endpoint {
+    fn start() -> Self {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let accepted: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::default();
+        let a = accepted.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                match s {
+                    Ok(s) => lock(&a).push(s),
+                    Err(_) => return,
+                }
+            }
+        });
+        Endpoint { port, accepted }
+    }
+
+    fn count(&self) -> usize {
+        lock(&self.accepted).len()
+    }
+
+    /// Accepted connections whose other end (the connector's socket, wherever it is) is still
+    /// open: no end-of-file within `wait`.
+    fn still_open(&self, wait: Duration) -> usize {
+        let until = std::time::Instant::now() + wait;
+        let mut v = lock(&self.accepted);
+        let mut open = 0;
+        for s in v.iter_mut() {
+            let left = until.saturating_duration_since(std::time::Instant::now()).max(Duration::from_millis(1));
+            s.set_read_timeout(Some(left)).unwrap();
+            let mut b = [0u8; 64];
+            if let Err(e) = s.read(&mut b) {
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
+                    open += 1;
+                }
+            }
+        }
+        open
+    }
+}
+
+/// How many answers (each with its socket) the kernel queues for a broker that does not read
+/// them, at the connector's send buffer (the kernel's minimum holds about six 40-byte frames).
+const KERNEL_QUEUE_SLACK: u64 = 12;
+
+/// A broker that sends requests and never reads an answer: an id stays in flight until its answer
+/// is handed to the socket, so the broker reaches the in-flight bound and is cut off, having made
+/// the connector connect no more than the bound, the answer being written and the few the kernel
+/// queues. Every one of those sockets is closed once the broker's end is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_broker_that_never_reads_is_held_to_the_in_flight_bound() {
+    let ep = Endpoint::start();
+    let port = ep.port;
+    let (c, _d) = connector_for(
+        &evm("n", &format!("http://127.0.0.1:{port}"), "cidrs = [\"127.0.0.1/32\"]\nmax_concurrency = 1024"),
+        NetMode::DevPrivate,
+        vec![],
+    );
+    let (b, s) = session(&c);
+    // 20 a second, well under the bucket: only the in-flight bound can stop it.
+    let writer = std::thread::spawn(move || {
+        let mut sent = 0u64;
+        for id in 0..400u64 {
+            if (&b).write_all(&req(id, 0, port).encode()).is_err() {
+                break;
+            }
+            sent += 1;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        (sent, b)
+    });
+    let end = tokio::time::timeout(Duration::from_secs(15), s).await.expect("cut off in time").unwrap();
+    assert_eq!(end, SessionEnd::CutOff(CutOff::Flood));
+    let (sent, b) = blocking(move || writer.join().unwrap()).await;
+    let connected = c.stats.connected.load(Ordering::Relaxed);
+    println!("requests sent {sent}, connections made {connected}, endpoint accepts {}", ep.count());
+    assert!(connected <= MAX_INFLIGHT as u64 + 1 + KERNEL_QUEUE_SLACK, "{connected} connections for a broker that reads nothing");
+    assert!(sent <= MAX_INFLIGHT as u64 + 1 + KERNEL_QUEUE_SLACK + 2, "{sent} requests taken before the cut-off");
+    // The broker's end goes (the miner kills a broker it cut off): every socket made for it closes.
+    drop(b);
+    assert_eq!(ep.still_open(Duration::from_secs(2)), 0);
+}
+
+/// A broker that keeps fewer requests than the bound in flight but never reads: the writer stalls,
+/// and past the request budget the broker is cut off.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_answer_cuts_the_broker_off_after_the_request_budget() {
+    let ep = Endpoint::start();
+    let port = ep.port;
+    let text = format!(
+        "[timeouts]\nconnect_secs = 1\n{}",
+        evm("n", &format!("http://127.0.0.1:{port}"), "cidrs = [\"127.0.0.1/32\"]\nmax_concurrency = 1024")
+    );
+    let (c, _d) = connector_for(&text, NetMode::DevPrivate, vec![]);
+    let (mut b, s) = session(&c);
+    let n = 30u64;
+    let mut frames = Vec::new();
+    for id in 0..n {
+        frames.extend_from_slice(&req(id, 0, port).encode());
+    }
+    b.write_all(&frames).unwrap();
+    let started = std::time::Instant::now();
+    let end = tokio::time::timeout(Duration::from_secs(40), s).await.expect("cut off in time").unwrap();
+    let took = started.elapsed();
+    assert_eq!(end, SessionEnd::CutOff(CutOff::AnswersStalled));
+    let budget = request_budget(Duration::from_secs(1));
+    assert!(took >= budget && took < budget + Duration::from_secs(5), "cut off after {took:?}, budget {budget:?}");
+    assert!(c.stats.connected.load(Ordering::Relaxed) <= n);
+    drop(b);
+    assert_eq!(ep.still_open(Duration::from_secs(2)), 0);
+}
+
+/// A broker that shuts only the reading side of its socket: the first answer fails to write, and
+/// the session ends in a cut-off (never quietly closed), before any later request is connected or
+/// counted — misuse after it included.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_broker_that_shuts_its_reading_side_is_cut_off() {
+    let ep = Endpoint::start();
+    let port = ep.port;
+    let (c, _d) = connector_for(&evm("n", &format!("http://127.0.0.1:{port}"), "cidrs = [\"127.0.0.1/32\"]"), NetMode::DevPrivate, vec![]);
+    let (b, s) = session(&c);
+    let b = blocking(move || {
+        b.shutdown(std::net::Shutdown::Read).unwrap();
+        let mut w = &b;
+        w.write_all(&req(1, 0, port).encode()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        // More connections, then misuse past the bound.
+        for id in 2..7 {
+            let _ = w.write_all(&req(id, 0, port).encode());
+        }
+        for id in 100..100 + MAX_MISUSE as u64 + 3 {
+            let _ = w.write_all(&req(id, 999, port).encode());
+        }
+        b
+    })
+    .await;
+    let end = tokio::time::timeout(Duration::from_secs(10), s).await.expect("ended in time").unwrap();
+    assert_eq!(end, SessionEnd::CutOff(CutOff::AnswersRefused));
+    assert_eq!(c.stats.attempts.load(Ordering::Relaxed), 1, "only the first request was connected");
+    drop(b);
+    assert_eq!(ep.still_open(Duration::from_secs(2)), 0);
+}
+
+/// A broker that exits with requests in flight (its whole end closes) ends the session closed,
+/// not cut off, whether its answers were being written or not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_broker_that_exits_mid_request_ends_closed() {
+    let ep = Endpoint::start();
+    let port = ep.port;
+    let (c, _d) = connector_for(
+        &evm("n", &format!("http://127.0.0.1:{port}"), "cidrs = [\"127.0.0.1/32\"]\nmax_concurrency = 1024"),
+        NetMode::DevPrivate,
+        vec![],
+    );
+    for n in [1u64, 10, 40] {
+        let (mut b, s) = session(&c);
+        let mut frames = Vec::new();
+        for id in 0..n {
+            frames.extend_from_slice(&req(id, 0, port).encode());
+        }
+        b.write_all(&frames).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        drop(b);
+        let end = tokio::time::timeout(Duration::from_secs(10), s).await.expect("ended in time").unwrap();
+        assert_eq!(end, SessionEnd::Closed, "{n} requests");
+    }
+    assert_eq!(ep.still_open(Duration::from_secs(2)), 0);
+}
+
+/// Requests still being served when the broker is cut off are aborted: one waiting for a token of
+/// the bucket is never connected (and, without the cut-off, the same request is).
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_in_flight_at_a_cut_off_are_aborted() {
+    let ep = Endpoint::start();
+    let port = ep.port;
+    let (c, _d) = connector_for(&evm("n", &format!("http://127.0.0.1:{port}"), "cidrs = [\"127.0.0.1/32\"]"), NetMode::DevPrivate, vec![]);
+    let empty_the_bucket = |c: &Connector| {
+        let mut b = lock(&c.bucket);
+        // About 0.7 s until the next token.
+        b.tokens = -10.0;
+        b.at = Instant::now();
+    };
+    // Control: the request waits for its token, then connects.
+    empty_the_bucket(&c);
+    let (b, s) = session(&c);
+    let (r, fd) = blocking(move || request_blocking(&b, &req(1, 0, port)).unwrap()).await;
+    assert_eq!((r.status, fd.is_some()), (Status::Connected, true));
+    assert!(s.await.is_ok());
+    assert_eq!(c.stats.attempts.load(Ordering::Relaxed), 1);
+    // The same request with a malformed frame right behind it: cut off while it waits.
+    empty_the_bucket(&c);
+    let (mut b, s) = session(&c);
+    let mut frames = req(2, 0, port).encode().to_vec();
+    frames.extend_from_slice(&[0x41; REQUEST_LEN]);
+    b.write_all(&frames).unwrap();
+    let end = tokio::time::timeout(Duration::from_secs(10), s).await.expect("cut off in time").unwrap();
+    assert!(matches!(end, SessionEnd::CutOff(CutOff::Malformed(_))), "{end:?}");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(c.stats.attempts.load(Ordering::Relaxed), 1, "the request in flight at the cut-off was connected");
+    assert_eq!(ep.count(), 1);
+}

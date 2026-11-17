@@ -279,10 +279,16 @@ connected TCP socket (`SCM_RIGHTS`) or a refusal. The connector:
   hard budget of `64 + 16·t` connections in any `t` seconds; at most each endpoint's
   `max_concurrency` in flight);
 - treats the broker as hostile: strict fixed-size decoding, and a malformed frame, a file
-  descriptor sent to it, more than 64 requests in flight, a request id reused while in flight, or
-  more than 8 requests in a minute for an endpoint that does not exist **cut the broker off** —
-  the socket is closed, the miner pages `WITNESS-BROKER-CUT-OFF`, kills the broker's cgroup and
-  stops witness serving.
+  descriptor sent to it, more than 64 requests in flight, a request id reused while in flight,
+  more than 8 requests in a minute for an endpoint that does not exist (counted before the refusal
+  is answered), an answer left unread for longer than a request's budget (the connect timeout plus
+  12 seconds), or an answer that cannot be written while the broker keeps sending (it shut the
+  reading side of its socket) **cut the broker off** — the socket is closed, the requests still
+  being served are aborted (nothing more is connected for it), the miner pages
+  `WITNESS-BROKER-CUT-OFF`, kills the broker's cgroup and stops witness serving;
+- holds at most 64 sockets for a broker that stops reading: a request counts as in flight until
+  its answer is handed to the socket, and the socket's send buffer is the kernel's minimum (about
+  six written answers the broker has not read).
 
 So a broker an attacker controls can reach only the operator's configured endpoints, at addresses
 the miner's floor admits — the same set an honest broker reaches. The broker still checks every
