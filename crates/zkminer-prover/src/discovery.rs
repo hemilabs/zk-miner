@@ -2134,7 +2134,8 @@ mod tests {
     /// SP1's VRAM floor is a hard capability check, not a tunable risk — and the figure tracks which
     /// `sp1-gpu-server` is installed.
     ///
-    /// With the fork's server (built and installed 2026-10-05) the floor is 16 GB and BOTH cards here
+    /// With the fork's server as first built (2026-10-05) the floor was 16 GB (it is now more than
+    /// 11 GiB, see `min_vram_bytes_for_backend`) and BOTH cards here
     /// qualify. With the upstream binary the SDK downloads by default it is 24 GB and the 5080 is
     /// refused outright. The constant must match the installed server; see the doc on
     /// `min_vram_bytes_for_backend` for how to tell which one is in place.

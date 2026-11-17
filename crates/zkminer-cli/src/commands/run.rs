@@ -16472,7 +16472,7 @@ mod r2_sizing_tests {
         let slots = vec![
             slot(0, Some(24 * GIB)), // uncalibrated: the default size
             slot(1, Some(6 * GIB)),  // uncalibrated, too small for any size: none
-            slot(2, Some(12 * GIB)), // calibrated: its measured best
+            slot(2, Some(6 * GIB)),  // calibrated, too small for a default: its measured best
             slot(3, None),           // VRAM unknown: the default size
             slot(4, Some(8 * GIB)),  // a size set in Settings
             slot(5, Some(24 * GIB)), // a heuristic row, no samples: the default size

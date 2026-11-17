@@ -859,13 +859,14 @@ fn spawn_refusal(
         vram_bytes,
     ) {
         if have < floor {
+            const GIB: f64 = (1u64 << 30) as f64;
             return Some(format!(
-                "{backend} requires at least {:.1} GB of VRAM and this card has {:.1} GB. \
+                "{backend} requires more than {:.1} GiB of VRAM and this card has {:.1} GiB. \
                  Its prover refuses the device outright — this is not a tunable limit — so \
                  the slot is not advertised and {backend} jobs will be routed to a larger \
                  card.",
-                floor as f64 / 1e9,
-                have as f64 / 1e9,
+                (floor - 1) as f64 / GIB,
+                have as f64 / GIB,
             ));
         }
     }
@@ -9704,9 +9705,19 @@ mod tests {
             rtx4090,
             None
         ));
-        // On a 16 GB card the server never runs above 134M whatever it was told, so a worker spawned
-        // when the 5080 looked roomy is already at the tier it would be recycled to.
+        // On a 16 GB card the server never runs above 268M whatever it was told, so a worker spawned
+        // when the 5080 looked roomy is already at the tier an idle 5080 gives.
         assert!(!shrank(roomy, Some(24 * GIB), 15_878 * MIB, rtx5080));
+        // With the 5080's own floor, a display taking it below 268M's room brings it down to 134M.
+        let floor_16gb = Some(9_167 * MIB);
+        assert!(vram_tier_shrank(
+            roomy,
+            "sp1",
+            Some(24 * GIB),
+            10 * GIB,
+            rtx5080,
+            floor_16gb
+        ));
         // A host-capped worker is already at its host tier, whatever the card had.
         let host_134 = SizingCap::Host(Some(134_217_728));
         assert!(!shrank(host_134, Some(24 * GIB), 16 * GIB, rtx4090));
@@ -10111,7 +10122,7 @@ mod tests {
         );
         assert_eq!(room(op_402, 12 * 1024, None, floor, rtx4090), Hopeless);
 
-        // The OPERATOR's floor, on this box's host (5080 with a 700 MiB desktop: 15,178 emptied).
+        // The OPERATOR's floor, on a 5080 with a 700 MiB display (15,178 emptied).
         // Raised: room up to it, or the gate refuses what recycling allows.
         assert_eq!(
             room(this_box, 15_178, None, Some(15_000 * MIB), rtx5080),

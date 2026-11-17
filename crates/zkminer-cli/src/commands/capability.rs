@@ -128,9 +128,10 @@ fn running_verdict(
                 None => Verdict::Idle(format!(
                     "no segment size for a card under {:.1} GiB, so it proves no RISC Zero job. \
                      Run `zkminer benchmark --calibrate` with the miner stopped to measure one, or \
-                     set one (`[prover.risc0_job_po2]` {device} = 18; untested on cards this \
+                     set one (`[prover.risc0_job_po2]` {device} = {}; untested on cards this \
                      size).",
-                    zkminer_prover::benchmark::risc0_job_min_vram_bytes(&slot.gpu_tag) as f64 / GIB
+                    zkminer_prover::benchmark::risc0_job_min_vram_bytes(&slot.gpu_tag) as f64 / GIB,
+                    if slot.gpu_tag == "cuda" { 18 } else { 19 },
                 )),
             }
         }
