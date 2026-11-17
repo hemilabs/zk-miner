@@ -286,16 +286,25 @@ impl ProvePlan {
     }
 }
 
-/// The expected seconds of one proof attempt of a witness lock: its sized cycles at the plan's rate,
-/// times the safety margin (as the inline gate sizes a job), plus the execute allowance (three times
-/// the measured execute, as `execute_allowance_secs` grants inline jobs: the prove executes again and
-/// replays segments) and the fixed allowance (the Groth16 wrap).
+/// The expected seconds of one proof attempt of a witness lock: its sized cycles at the plan's rate
+/// plus the fixed allowance (the Groth16 wrap), both times the safety margin (as the inline gate
+/// sizes a job: the fixed part slows down on a loaded host as much as the rest), plus the execute
+/// allowance (three times the measured execute, as `execute_allowance_secs` grants inline jobs: the
+/// prove executes again and replays segments).
 pub(crate) fn estimate_prove_secs(cycles: u64, plan: &ProvePlan, execute_secs: u64) -> u64 {
     let cps = if plan.cps.is_finite() && plan.cps >= 1.0 { plan.cps } else { 1.0 };
-    let margin = if plan.margin.is_finite() && plan.margin >= 1.0 { plan.margin } else { 1.0 };
-    let proving = (cycles as f64 / cps * margin).ceil();
+    let proving = ((cycles as f64 / cps + plan.fixed_secs as f64) * plan_margin(plan)).ceil();
     let proving = if proving >= u64::MAX as f64 { u64::MAX } else { proving as u64 };
-    proving.saturating_add(execute_secs.saturating_mul(3)).saturating_add(plan.fixed_secs)
+    proving.saturating_add(execute_secs.saturating_mul(3))
+}
+
+/// The plan's safety margin, at least 1.
+fn plan_margin(plan: &ProvePlan) -> f64 {
+    if plan.margin.is_finite() && plan.margin >= 1.0 {
+        plan.margin
+    } else {
+        1.0
+    }
 }
 
 /// Whether one attempt of `prove_secs` finishes inside the per-attempt watchdog (the witness prove
@@ -318,17 +327,17 @@ pub(crate) fn deadline_fits(window_secs: u64, prove_secs: u64, fulfil_margin_sec
 }
 
 /// The host-derived maximum for `maxGuestCycles` when `[witness] max_guest_cycles` is unset: the
-/// sized cycles one attempt can prove inside the watchdog at the plan's rate and margin (beside its
-/// fixed allowance), at most an hour of proving, at most 2^34. Zero when the fixed allowance alone
-/// fills the watchdog: no witness job can be proven here, and every one is refused at the static
-/// gates rather than simulated. The claim gate then checks each job's measured cycles and execute.
+/// sized cycles one attempt can prove inside the watchdog at the plan's rate (beside its fixed
+/// allowance, both with the margin, as [`estimate_prove_secs`] counts them), at most an hour of
+/// proving, at most 2^34. Zero when the margined fixed allowance alone fills the watchdog: no witness
+/// job can be proven here, and every one is refused at the static gates rather than simulated. The
+/// claim gate then checks each job's measured cycles and execute.
 pub(crate) fn host_max_guest_cycles(plan: &ProvePlan, proving_timeout_secs: u64) -> u64 {
     const MAX: u64 = 1 << 34;
     let cps = if plan.cps.is_finite() && plan.cps > 0.0 { plan.cps } else { 0.0 };
-    let margin = if plan.margin.is_finite() && plan.margin >= 1.0 { plan.margin } else { 1.0 };
-    // The watchdog admits an estimate strictly below it.
-    let room = proving_timeout_secs.saturating_sub(plan.fixed_secs).saturating_sub(1) as f64;
-    let cycles = (room * cps / margin).min(cps * 3600.0);
+    // The watchdog admits an estimate strictly below it: (cycles / cps + fixed) x margin <= T - 1.
+    let room = proving_timeout_secs.saturating_sub(1) as f64 / plan_margin(plan) - plan.fixed_secs as f64;
+    let cycles = (room.max(0.0) * cps).min(cps * 3600.0);
     if cycles >= MAX as f64 {
         MAX
     } else {
@@ -689,7 +698,7 @@ mod tests {
     fn the_estimate_includes_the_margin_and_every_allowance() {
         let p = plan(400_000.0, RISC0_GROTH16_ALLOWANCE_SECS, 1.5);
         let prove = estimate_prove_secs(400_000 * 100, &p, 10);
-        assert_eq!(prove, 150 + 30 + RISC0_GROTH16_ALLOWANCE_SECS);
+        assert_eq!(prove, (100 + RISC0_GROTH16_ALLOWANCE_SECS) * 3 / 2 + 30);
         assert_eq!(estimate_prove_secs(10, &plan(0.0, 0, 1.0), 0), 10, "a bad rate is 1 c/s");
         assert_eq!(estimate_prove_secs(10, &plan(1.0, 0, f64::NAN), 0), 10, "a bad margin is 1");
         let need = prove + 60 + 30 + CLAIM_MINE_ALLOWANCE_SECS;
@@ -729,6 +738,25 @@ mod tests {
         assert!(watchdog_admits(est, 1_800));
     }
 
+    /// The fixed allowance (the Groth16 path: minutes on a CPU) slows down on a loaded host like the
+    /// rest of the proof, so the margin covers it too. Without it the CPU estimate of the localnet
+    /// guest was 908 s, 1.06x the 859 s the proof took on a loaded host, and a 950 s watchdog
+    /// admitted a lock that host could overrun on every attempt.
+    #[test]
+    fn the_margin_covers_the_fixed_allowance() {
+        let p = ProvePlan::over([(RISC0_CPU_CONSERVATIVE_CPS, fixed_allowance_secs(None, true))], 1.5).unwrap();
+        let est = estimate_prove_secs(32_768, &p, 1);
+        assert!(est as f64 >= 859.2 * 1.5, "{est}: the margin over the loaded host's proof");
+        assert!(!watchdog_admits(est, 950), "{est}");
+        let gpu = plan(1e6, RISC0_GROTH16_ALLOWANCE_SECS, 2.0);
+        assert_eq!(estimate_prove_secs(0, &gpu, 0), 2 * RISC0_GROTH16_ALLOWANCE_SECS);
+        // The host maximum counts the margined allowance: a job at it still fits the watchdog.
+        let max = host_max_guest_cycles(&gpu, 600);
+        assert_eq!(max, ((599.0 / 2.0 - 120.0) * 1e6) as u64);
+        assert!(watchdog_admits(estimate_prove_secs(max, &gpu, 0), 600));
+        assert!(!watchdog_admits(estimate_prove_secs(max + 1_000_000, &gpu, 0), 600));
+    }
+
     /// A 900M-cycle job on a 1M c/s card in a 3-hour window passed the deadline gate and was then
     /// killed by the 600 s watchdog on every attempt. The watchdog check refuses it, and the host
     /// maximum no longer admits it at the static gates.
@@ -748,8 +776,8 @@ mod tests {
 
     #[test]
     fn the_host_cycle_maximum_fits_the_watchdog() {
-        // (600 - 120 - 1) s x 400k c/s / 1.5.
-        assert_eq!(host_max_guest_cycles(&plan(400_000.0, 120, 1.5), 600), 127_733_333);
+        // ((600 - 1) s / 1.5 - 120 s) x 400k c/s.
+        assert_eq!(host_max_guest_cycles(&plan(400_000.0, 120, 1.5), 600), 111_733_333);
         // At most an hour of proving, at most 2^34.
         assert_eq!(host_max_guest_cycles(&plan(400_000.0, 0, 1.0), 1_000_000), 1_440_000_000);
         assert_eq!(host_max_guest_cycles(&plan(1e12, 0, 1.0), 1_000_000), 1 << 34);
