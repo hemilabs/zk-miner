@@ -342,8 +342,11 @@ executor:
   `lremovexattr`, `fremovexattr`, `removexattrat`, `utime`, `utimes`, `futimesat`, `utimensat`
   (with a path or without) and `file_setattr`. Traced, the CUDA, ROCm and Intel workers make none
   of these calls, kernel caches cold or warm included. SP1's executor unpacks a runner into the
-  private temporary directory and makes it executable with `chmod`: the worker does that before it
-  confines itself (it executes its own embedded test program once), and the server's mode changes
+  private temporary directory and makes it executable with `chmod`: the worker puts its runner
+  there itself before it confines itself, without running anything — it finds the runner in its own
+  executable (the one ELF image of the machine whose SHA-256, the name the SDK gives the file, the
+  executable also holds), writes it (mode `0755`), and the executor then finds exactly its bytes in
+  place and changes nothing; nothing executes before the confinement. The server's mode changes
   go to its supervisor, which makes the runner files in that directory executable itself — a
   regular file named as SP1 names it, opened without following a link, owned by the user, with a
   single link, in a directory closed to others — and refuses every other mode change. It decides

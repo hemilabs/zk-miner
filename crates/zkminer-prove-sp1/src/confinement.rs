@@ -24,9 +24,9 @@
 //! The server ends when the worker does.
 //!
 //! Neither may change a file's mode. The SDK's executor unpacks its runner into `TMPDIR` and makes
-//! it executable: the worker does so before it confines itself (`unpack_executor_runner`, in
-//! `main`), and the server's supervisor does it for the server (the runner directory given to
-//! `run_supervised`).
+//! it executable: the worker puts its runner there before it confines itself, without running
+//! anything (`place_executor_runner`, in `main`), and the server's supervisor makes the server's
+//! executable for it (the runner directory given to `run_supervised`).
 //!
 //! The one-time setup that needs the network (`Warmup`: the Groth16 circuit download) runs before;
 //! a `Warmup` after refuses rather than download. A server the SDK would download (absent, or another
