@@ -303,10 +303,10 @@ fn kinds<'a>(wit: &Arc<Witness<'a>>, bytes: ByteSelection) -> (Vec<Kind<'a>>, Ve
     let drop_proof: Kind<'a> = Box::new(each_proof().map(|r| S1::DropProof { proof: r }));
     let duplicate_proof: Kind<'a> = Box::new(each_proof().map(|r| S1::DuplicateProof { proof: r }));
     let swap_proofs: Kind<'a> = {
-        let proofs = proofs.clone();
-        let neighbours = (0..n_proofs.saturating_sub(1)).filter_map(move |i| {
-            same_list(proofs[i], proofs[i + 1]).then(|| S1::SwapProofs { a: proofs[i], b: proofs[i + 1] })
-        });
+        let (a, b) = (proofs.clone(), proofs.clone());
+        let neighbours = (0..n_proofs.saturating_sub(1))
+            .filter(move |&i| same_list(a[i], a[i + 1]))
+            .map(move |i| S1::SwapProofs { a: b[i], b: b[i + 1] });
         let accounts =
             (1..wit.accounts.len()).map(|a| S1::SwapProofs { a: ProofRef::Account(0), b: ProofRef::Account(a) });
         Box::new(neighbours.chain(accounts))
