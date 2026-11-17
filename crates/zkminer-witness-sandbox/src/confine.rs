@@ -295,9 +295,8 @@ impl std::fmt::Display for ConfinementReport {
 /// `PR_GET_NO_NEW_PRIVS == 1`, every thread in seccomp filter mode, sockets of every kind refused,
 /// `unshare` refused and `clone3` unimplemented (no namespace), the root directory unreadable
 /// (Landlock is on), the parent process unreachable by signal, and still no filesystem in reach
-/// that is not local. Then it
-/// fails if a socket the policy does not let the process keep is still open, which no filter can
-/// take back: the caller must not run a guest then.
+/// that is not local. Then it fails if a socket the policy does not let the process keep is still
+/// open, which no filter can take back: the caller must not run a guest then.
 ///
 /// Fails closed: on any error the caller must not run the guest. Once anything is applied it stays
 /// applied, error or not ([`is_active`]).

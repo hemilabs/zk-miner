@@ -224,8 +224,8 @@ executor:
   Every path it is granted must be on a local filesystem by `statfs`, and so must its working
   directory and every file or directory it holds open. The error names each mount, its type and
   its source. Two exceptions, where the kernel itself keeps the process out: another user's FUSE
-  mount without `allow_other` (the kernel refuses this user's lookups before the daemon sees them),
-  and a direct automount point whose target is local (systemd's for `binfmt_misc` or the EFI
+  mount without `allow_other` (the kernel refuses this user's lookups before the daemon sees them;
+  a `statx` of its root must fail to confirm it), and a direct automount point whose target is local (systemd's for `binfmt_misc` or the EFI
   partition; an idle one is triggered once to see what it mounts). The check runs again once the
   confinement is on, and the builder runner, the execute worker and the broker make it too, before
   their sandbox is applied (the broker's paths by `statfs` as well).
@@ -414,17 +414,18 @@ no second one):
 - **Your own endpoints are trusted.** The chain RPC and the fixed download URLs are not
   checked by the guard: requesters cannot change them, and a local chain node is a normal
   setup.
-- **What an escaped guest in an inline worker can still do.** It cannot open a socket or
-  connect anywhere, make a namespace or mount anything, but it keeps what the GPU stack needs: the GPU device nodes and their ioctls
-  (a kernel driver bug is outside this model), reading the system's files and `/proc` (other
-  processes' command lines and status, not their memory or environment), and writing the caches
-  listed above, which other GPU programs of the same user also load (a confined worker could
-  poison an Intel kernel cache or risc0's CUDA Groth16 cache for them). An SP1 worker and its
-  server can read and write any POSIX shared memory object and semaphore of the uid in `/dev/shm`
-  (SP1's executor needs it), the shared memory of unconfined programs of the same user included.
-  A witness proof's worker can read every bundle in the retention store, other requesters'
-  included. Its results go back to the miner over its pipe, and a guest controls its journal, so
-  anything it can read it can publish: keep secrets out of the readable paths.
+- **What an escaped guest in an inline worker can still do.** It cannot open a socket or connect
+  anywhere, make a namespace or mount anything, but it keeps what the GPU stack needs: the GPU
+  device nodes and their ioctls (a kernel driver bug is outside this model), reading the
+  system's files and `/proc` (other processes' command lines and status, not their memory or
+  environment), and writing the caches listed above, which other GPU programs of the same user
+  also load (a confined worker could poison an Intel kernel cache or risc0's CUDA Groth16 cache
+  for them). An SP1 worker and its server can read and write any POSIX shared memory object and
+  semaphore of the uid in `/dev/shm` (SP1's executor needs it), the shared memory of unconfined
+  programs of the same user included. A witness proof's worker can read every bundle in the
+  retention store, other requesters' included. Its results go back to the miner over its pipe,
+  and a guest controls its journal, so anything it can read it can publish: keep secrets out of
+  the readable paths.
 - **Filesystems mounted later, or remote underneath.** The check of the filesystems within reach
   runs when a process confines itself, and the process stays confined for the rest of its life. A
   network or FUSE filesystem mounted after that (by the operator, by a desktop session, a direct
@@ -450,8 +451,8 @@ no second one):
   Rust and glibc need it, and only a mount namespace (the system mode, not implemented) hides
   the filesystem from it, so a compromised builder can still tell whether a path exists and read
   its size, owner, mode and times, though never its contents. No such lookup leaves the host: the
-  sandbox is not applied while a network or FUSE filesystem, or an automount map, is within reach
-  (see "Filesystems within reach" above). They also may not read the mount
+  runner and the worker refuse to start while a network or FUSE filesystem, or an automount map,
+  is within reach (see "Filesystems within reach" above). They also may not read the mount
   table (`listmount`/`statmount`, which would show the internal host names of NFS or CIFS
   servers), the LSMs (`lsm_list_modules`, `lsm_get_self_attr`), `ustat` or `sysfs`, nor the
   session or process group of another process (`getsid`/`getpgid` of any pid but their own);

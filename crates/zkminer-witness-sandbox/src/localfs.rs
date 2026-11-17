@@ -18,10 +18,11 @@
 //!   filesystem type must be one known to be local ([`LOCAL_TYPES`]: disk, memory and kernel
 //!   filesystems); anything else is refused, unknown types included. Two exceptions, both because
 //!   the kernel itself keeps the process out: a FUSE mount without `allow_other` that belongs to
-//!   another user (the kernel refuses this user's lookups before the daemon sees them), and a
-//!   *direct* automount point (one fixed mount, such as systemd's for `binfmt_misc` or the EFI
-//!   system partition) whose target is a local filesystem; an idle one is triggered once to see
-//!   what it mounts. An indirect automount map (a lookup names what it mounts) is refused.
+//!   another user (the kernel refuses this user's lookups before the daemon sees them, which a
+//!   `statx` of its root confirms), and a *direct* automount point (one fixed mount, such as
+//!   systemd's for `binfmt_misc` or the EFI system partition) whose target is a local filesystem;
+//!   an idle one is triggered once to see what it mounts. An indirect automount map (a lookup names
+//!   what it mounts) is refused.
 //! - **every path the process is granted**: `statfs` must report a local filesystem
 //!   ([`LOCAL_MAGICS`]);
 //! - **its working directory and every regular file, directory or link it holds open**: on a
@@ -413,6 +414,19 @@ fn reachable(mounts: &[Mount], root_id: u32) -> Vec<bool> {
         .collect()
 }
 
+/// Whether `m` is a FUSE mount that, by its table entry, belongs to another user and is closed to
+/// this one (`euid`, not root): no `allow_other`, another `user_id`. The kernel then refuses this
+/// user's lookups before the daemon sees them. The table prints `user_id` as the mount's own user
+/// namespace sees it, so [`check_local_filesystems`] also asks the kernel before believing it.
+fn fuse_of_another_user(m: &Mount, euid: u32) -> bool {
+    kind_of(&m.fstype) == Kind::Fuse
+        && euid != 0
+        && !m.has_super_option("allow_other")
+        && m.super_option("user_id")
+            .and_then(|u| u.parse::<u32>().ok())
+            .is_some_and(|owner| owner != euid)
+}
+
 /// The reachable mounts of `mounts` that are not local, each with why (see the module docs), for a
 /// process whose root is the mount `root_id` and whose effective uid is `euid`.
 pub(crate) fn judge(mounts: &[Mount], root_id: u32, euid: u32) -> Vec<String> {
@@ -421,15 +435,8 @@ pub(crate) fn judge(mounts: &[Mount], root_id: u32, euid: u32) -> Vec<String> {
     for (m, _) in mounts.iter().zip(&reach).filter(|(_, r)| **r) {
         match kind_of(&m.fstype) {
             Kind::Local => {}
-            Kind::Fuse
-                if euid != 0
-                    && !m.has_super_option("allow_other")
-                    && m.super_option("user_id")
-                        .and_then(|u| u.parse::<u32>().ok())
-                        .is_some_and(|owner| owner != euid) =>
-            {
-                // The kernel refuses this user's lookups before its daemon sees them.
-            }
+            // The kernel refuses this user's lookups before its daemon sees them.
+            Kind::Fuse if fuse_of_another_user(m, euid) => {}
             Kind::Automount => {
                 let target = mounts
                     .iter()
@@ -581,6 +588,24 @@ pub fn check_local_filesystems(granted: &[PathBuf]) -> Result<LocalFsReport, San
     // SAFETY: geteuid has no arguments.
     let euid = unsafe { libc::geteuid() };
     let mut problems = judge(&mounts, root, euid);
+    // Another user's FUSE mount that `judge` let pass: the kernel must refuse this process's
+    // `statx` of its root (from cached attributes, so its daemon is not asked either way).
+    let reach = reachable(&mounts, root);
+    for (m, _) in mounts.iter().zip(&reach).filter(|(_, r)| **r) {
+        if !fuse_of_another_user(m, euid) {
+            continue;
+        }
+        let refused = cpath(&m.mount_point()).is_ok_and(|p| {
+            statx_mount(libc::AT_FDCWD, &p, 0)
+                .is_err_and(|e| e.raw_os_error() == Some(libc::EACCES))
+        });
+        if !refused {
+            problems.push(format!(
+                "{}: a FUSE filesystem of another user that this process can still reach",
+                m.describe()
+            ));
+        }
+    }
 
     let mut paths = 0;
     for p in granted {
