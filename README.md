@@ -374,9 +374,10 @@ Worth knowing:
   slower, which can cost a lock, so leave the card the room these figures say. The miner helps:
   a RISC Zero proof on an NVIDIA card starts only when its segment size's measured peak fits in
   what is free (else it waits, or goes to another card, and no RISC Zero job is claimed for that
-  card for 5 minutes; a job that waits about 2 minutes without room is released), and under
-  Windows a card that another program also uses (a display) is sized 1 GiB smaller, for that
-  program to grow into. `ZKMINER_MIN_AVAILABLE_VRAM_MB=0` turns all of this off.
+  card until a check every 5 minutes finds the room; a job that waits about 2 minutes without room
+  is released), and under Windows an NVIDIA card that another program also uses (a display) is
+  sized 1 GiB smaller, for that program to grow into. `ZKMINER_MIN_AVAILABLE_VRAM_MB=0` turns all
+  of this off.
 
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for

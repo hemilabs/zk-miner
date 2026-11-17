@@ -471,9 +471,9 @@ impl WorkerEntry {
     /// than as somebody else's.
     fn clear_pid(&self) {
         let pid = self.pid.swap(0, Ordering::AcqRel);
-        self.pid_starttime.store(0, Ordering::Release);
+        let started = self.pid_starttime.swap(0, Ordering::AcqRel);
         if pid != 0 {
-            retire_group(pid);
+            retire_group(pid, (started != 0).then_some(started));
         }
     }
 
@@ -1064,13 +1064,18 @@ type RetiredGroup = (u32, Option<u64>);
 static RETIRED_GROUPS: Mutex<Vec<(RetiredGroup, Instant)>> = Mutex::new(Vec::new());
 
 /// Record that the worker leading process group `pgid` is being torn down. See `WorkerEntry::clear_pid`.
-fn retire_group(pgid: u32) {
+///
+/// `started` is the worker's own start time as recorded at spawn, if it was: on Windows, what tells
+/// the worker from a stranger that has since been given its number.
+fn retire_group(pgid: u32, started: Option<u64>) {
     let mut groups = RETIRED_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
     groups.retain(|(_, at)| at.elapsed() < RETIRED_GROUP_WINDOW);
     groups.push(((pgid, boot_ticks_now()), Instant::now()));
     drop(groups);
     #[cfg(windows)]
-    retire_tree(pgid);
+    retire_tree(pgid, started);
+    #[cfg(not(windows))]
+    let _ = started;
 }
 
 /// Windows' stand-in for a retired process group, which it does not have: the processes of a worker
@@ -1083,8 +1088,8 @@ static RETIRED_PROCESSES: Mutex<Vec<((u32, u64), Instant)>> = Mutex::new(Vec::ne
 
 /// Record `worker`'s process tree as retired. See `RETIRED_PROCESSES`.
 #[cfg(windows)]
-fn retire_tree(worker: u32) {
-    let tree = crate::memory::process_tree(worker);
+fn retire_tree(worker: u32, started: Option<u64>) {
+    let tree = crate::memory::process_tree(worker, started);
     let mut retired = RETIRED_PROCESSES.lock().unwrap_or_else(|e| e.into_inner());
     retired.retain(|(_, at)| at.elapsed() < RETIRED_GROUP_WINDOW);
     let now = Instant::now();
@@ -1485,7 +1490,7 @@ fn read_card_occupancy(
     let known = apps_we_can_attribute(apps, &owner)?;
     let card = CardOccupancy::from_readings(used_mib, total_mib, reserved_mib, &known, owner);
     #[cfg(windows)]
-    let card = with_windows_growth_margin(card);
+    let card = with_windows_growth_margin(card, device_index);
     Some(card)
 }
 
@@ -1512,16 +1517,34 @@ const WINDOWS_SHARED_CARD_THRESHOLD: u64 = 64 * 1024 * 1024;
 /// and a worker sized on that moment would stay smaller until its next recycle. Nor with the
 /// free-VRAM checks off (`discovery::free_vram_checks_off`).
 #[cfg(windows)]
-fn with_windows_growth_margin(mut card: CardOccupancy) -> CardOccupancy {
-    if card.foreign() > WINDOWS_SHARED_CARD_THRESHOLD
-        && card.draining == 0
-        && card.unattributed == 0
-        && !crate::discovery::free_vram_checks_off()
+fn with_windows_growth_margin(mut card: CardOccupancy, device_index: u32) -> CardOccupancy {
+    if crate::discovery::free_vram_checks_off() {
+        return card;
+    }
+    let mut seen = WINDOWS_SHARED_SEEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if card.foreign() > WINDOWS_SHARED_CARD_THRESHOLD {
+        seen.insert(device_index, Instant::now());
+    }
+    if seen
+        .get(&device_index)
+        .is_some_and(|at| at.elapsed() < WINDOWS_SHARED_CARD_HOLD)
     {
         card.growth_margin = WINDOWS_SHARED_CARD_MARGIN;
     }
     card
 }
+
+/// When each Windows card was last seen shared with another program: the margin holds for
+/// [`WINDOWS_SHARED_CARD_HOLD`] after, so it does not come and go between the readings of one
+/// admission (whose room-making targets would then miss), or as a display's use dips.
+#[cfg(windows)]
+static WINDOWS_SHARED_SEEN: Mutex<std::collections::BTreeMap<u32, Instant>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(windows)]
+const WINDOWS_SHARED_CARD_HOLD: Duration = Duration::from_secs(600);
 
 /// How many charges of `each` bytes fit in `room` (all of it when a charge is 0).
 fn staging_capacity(room: u64, each: u64) -> usize {
@@ -1795,14 +1818,38 @@ impl SizingCap {
 }
 
 /// An SP1 slot lowered a tier for a program that ran out of GPU memory there, not yet recorded.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PendingSp1Cap {
     cap: u64,
     /// `program_hash` of the ELF that ran out.
     program: u64,
     /// The retry has not yet been steered back to this card (`take_sp1_retry_card`).
     retry_here: bool,
+    /// Record it for later runs once the program proves at `cap`: false when another program's
+    /// memory grew while it ran out.
+    record: bool,
+    /// The slot's cap before, to undo it if the smaller size does not help.
+    previous: Option<String>,
+    previous_cap: Option<SlotSp1Cap>,
 }
+
+/// A slot's SP1 shard-size cap and since when, for the planner.
+#[derive(Debug, Clone)]
+struct SlotSp1Cap {
+    cap: u64,
+    since_unix_secs: u64,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// More than this of growth in another program's memory, between a proof's admission and its
+/// running out, means the growth may be what ran out.
+const FOREIGN_GROWTH_TOLERANCE: u64 = 256 * 1024 * 1024;
 
 /// How long a card another program's memory kept a risc0 proof off claims no risc0 job
 /// (`WorkerPool::risc0_card_short`). The next proof there re-checks, and clears it if it fits.
@@ -2215,7 +2262,14 @@ pub struct WorkerPool {
     sp1_caps_pending: Mutex<HashMap<String, PendingSp1Cap>>,
     /// risc0 slots whose card another program's memory kept a proof off, until when: the claim side
     /// claims no risc0 job for them meanwhile (`risc0_card_short`).
-    risc0_short: Mutex<HashMap<String, Instant>>,
+    risc0_short: Mutex<HashMap<String, (Instant, u64)>>,
+    /// Each SP1 slot's shard-size cap, for the planner (`sp1_rate_factor`): a copy of what its
+    /// spawn environment carries, kept here because a proof holds the slot for its whole length.
+    sp1_slot_caps: Mutex<HashMap<String, SlotSp1Cap>>,
+    /// What another program held on each risc0/SP1 slot's card when its proof was admitted
+    /// (`check_vram_budget`), to tell an out-of-memory the size caused from one another program's
+    /// growth caused (`lower_sp1_shard_cap`).
+    admitted_foreign: Mutex<HashMap<String, u64>>,
     /// Set by `close` when the process is exiting: from then on no worker is spawned and no room is
     /// made. Without it, a dispatch in flight could respawn a worker after `shutdown_all` had swept
     /// the slots — and that window is up to tens of seconds, because
@@ -2309,6 +2363,8 @@ impl WorkerPool {
             sp1_shard_caps: Mutex::new(None),
             sp1_caps_pending: Mutex::new(HashMap::new()),
             risc0_short: Mutex::new(HashMap::new()),
+            sp1_slot_caps: Mutex::new(HashMap::new()),
+            admitted_foreign: Mutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
             last_measure_eviction: Mutex::new(None),
             shm_ledger: crate::memory::MemoryLedger::default(),
@@ -2335,55 +2391,98 @@ impl WorkerPool {
             .unwrap_or_else(|e| e.into_inner()) = Some(store);
     }
 
-    /// The cap recorded for an SP1 worker's card, if this pool keeps caps and has one for it.
+    /// The cap recorded for an SP1 worker's card, and when, if this pool keeps caps and has one for
+    /// it.
     fn sp1_shard_cap_for(
         &self,
         pci_bus_id: Option<&str>,
         gpu_name: Option<&str>,
         total: Option<u64>,
-    ) -> Option<u64> {
+    ) -> Option<(u64, u64)> {
         let (bus, name, total) = (pci_bus_id.filter(|b| !b.is_empty())?, gpu_name?, total?);
         self.sp1_shard_caps
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()?
             .cap_for(bus, name, total)
-            .map(|c| c.max_element_threshold)
+            .map(|c| (c.max_element_threshold, c.recorded_unix_secs))
     }
 
     /// An SP1 worker on `key` ran out of GPU memory proving `program`: lower its card one measured
     /// tier below the one it ran at, in the slot's spawn environment (the respawn and the rest of
-    /// this run), and mark it for the retry (`take_sp1_retry_card`) and for recording once
-    /// `program` proves there (`confirm_sp1_shard_cap`). Nothing for an operator's own threshold,
-    /// or one already at the smallest tier.
+    /// this run), and mark it for the retry (`take_sp1_retry_card`) and, if `record`, for recording
+    /// once `program` proves there (`confirm_sp1_shard_cap`). Returns whether it was lowered.
+    ///
+    /// Nothing for an operator's own threshold, or one already at the smallest tier. And when the
+    /// same program runs out again at the tier it was lowered to here, the smaller size did not
+    /// help: the lowering is undone, and the job goes elsewhere the usual way.
+    ///
+    /// `record` is false when another program's memory on the card grew while the proof ran: the
+    /// size was then not what ran out, so the card is lowered for this run but nothing is recorded.
     fn lower_sp1_shard_cap(
         &self,
         key: &str,
         slot: &mut WorkerSlot,
         total: Option<u64>,
         program: u64,
-    ) {
+        record: bool,
+    ) -> bool {
         use zkminer_prover_protocol::types as t;
         if !matches!(slot.gpu_tag.as_str(), "cuda" | "rocm" | "intel") {
-            return;
+            return false;
         }
         let cap = SizingCap::for_slot(&slot.backend, &slot.spawn_env);
         if matches!(cap, SizingCap::Operator(_) | SizingCap::NotSized) {
-            return;
+            return false;
         }
         let sizing = total.and_then(|v| sizing_total(key, v));
         let ran_at = cap.tier_at(&slot.backend, spawned_vram(&slot.spawn_env), sizing);
+        let undo = {
+            let pending = self
+                .sp1_caps_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            pending
+                .get(key)
+                .filter(|p| p.program == program && ran_at == Some(p.cap))
+                .cloned()
+        };
+        if let Some(p) = undo {
+            match &p.previous {
+                Some(v) => slot
+                    .spawn_env
+                    .insert(t::SP1_ELEMENT_THRESHOLD_CAP_ENV.to_string(), v.clone()),
+                None => slot.spawn_env.remove(t::SP1_ELEMENT_THRESHOLD_CAP_ENV),
+            };
+            self.sp1_caps_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(key);
+            self.set_slot_sp1_cap(key, slot, p.previous_cap);
+            tracing::warn!(
+                "{key}: the job ran out of GPU memory again at {}, so the smaller shard size did not \
+                 help; undone",
+                p.cap
+            );
+            return false;
+        }
         let Some(lower) = t::sp1_tier_below(ran_at, sizing) else {
             tracing::warn!(
                 "{key}: SP1 ran out of GPU memory at the smallest measured shard size; there is no \
                  smaller one to retry at"
             );
-            return;
+            return false;
         };
-        slot.spawn_env.insert(
+        let previous = slot.spawn_env.insert(
             t::SP1_ELEMENT_THRESHOLD_CAP_ENV.to_string(),
             lower.to_string(),
         );
+        let previous_cap = self
+            .sp1_slot_caps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned();
         self.sp1_caps_pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2393,20 +2492,46 @@ impl WorkerPool {
                     cap: lower,
                     program,
                     retry_here: true,
+                    record,
+                    previous,
+                    previous_cap,
                 },
             );
+        self.set_slot_sp1_cap(
+            key,
+            slot,
+            Some(SlotSp1Cap {
+                cap: lower,
+                since_unix_secs: unix_now(),
+            }),
+        );
         tracing::warn!(
             "{key}: SP1 ran out of GPU memory on {} at a shard size of {}; retrying at {lower}, the \
-             card's shard size for the rest of this run (recorded for later runs if the job proves \
-             there)",
+             card's shard size for the rest of this run{}",
             slot.gpu_name.as_deref().unwrap_or(key),
             ran_at.map_or_else(|| "the server's own".to_string(), |r| r.to_string()),
+            if record {
+                " (recorded for later runs if the job proves there)"
+            } else {
+                " (not recorded: another program's memory on the card grew while it ran)"
+            },
         );
+        true
+    }
+
+    /// Keep the planner's copy of a slot's SP1 cap (`sp1_slot_caps`), which it reads without the
+    /// slot lock a proof holds for its whole length.
+    fn set_slot_sp1_cap(&self, key: &str, _slot: &WorkerSlot, cap: Option<SlotSp1Cap>) {
+        let mut caps = self.sp1_slot_caps.lock().unwrap_or_else(|e| e.into_inner());
+        match cap {
+            Some(c) => caps.insert(key.to_string(), c),
+            None => caps.remove(key),
+        };
     }
 
     /// An SP1 proof of `program` succeeded on `key`: if the slot was lowered a tier when that
     /// program ran out of GPU memory there, the smaller size is what it needed, so record it for
-    /// later runs.
+    /// later runs (unless another program's memory was what ran out, see `lower_sp1_shard_cap`).
     fn confirm_sp1_shard_cap(
         &self,
         key: &str,
@@ -2428,6 +2553,14 @@ impl WorkerPool {
             return;
         };
         let card = slot.gpu_name.as_deref().unwrap_or(key);
+        if !pending.record {
+            tracing::warn!(
+                "{key}: the job that ran out of GPU memory on {card} proved at a shard size of {}; \
+                 not recorded for later runs, since another program's memory grew while it ran out",
+                pending.cap
+            );
+            return;
+        }
         let mut store = self
             .sp1_shard_caps
             .lock()
@@ -2439,11 +2572,7 @@ impl WorkerPool {
             total,
         ) {
             (Some(store), Some(bus), Some(name), Some(total)) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                match store.lower(bus, name, total, pending.cap, now) {
+                match store.lower(bus, name, total, pending.cap, unix_now()) {
                     Ok(cap) => format!(
                         "recorded: later runs keep {cap} (`zkminer doctor` lists it; with the \
                          miner stopped, removing the card's entry from {} lifts it)",
@@ -2456,7 +2585,8 @@ impl WorkerPool {
             _ => "the card's bus id or size is unknown; it holds for this run only".to_string(),
         };
         tracing::warn!(
-            "{key}: the job that ran out of GPU memory on {card} proved at a shard size of {}: {outcome}",
+            "{key}: the job that ran out of GPU memory on {card} proved at a shard size of {}: \
+             {outcome}",
             pending.cap
         );
     }
@@ -2475,12 +2605,18 @@ impl WorkerPool {
 
     /// What to scale a card's saved SP1 benchmark rate by, given that it was benchmarked at
     /// `benchmarked_unix_secs`: below 1 when the card's SP1 worker runs capped at a smaller shard
-    /// size than it was benchmarked at (`sp1_rate_factor_for_cap`), 1 otherwise. A cap recorded
-    /// after the benchmark, or set this run, means the benchmark ran larger.
+    /// size than it was benchmarked at (`sp1_rate_factor_for_cap`), 1 otherwise: no cap, or one set
+    /// before the benchmark (which ran at it). Reads `sp1_slot_caps`, never a slot: the planner
+    /// calls it every tick, and a proof holds its slot for its whole length.
     pub fn sp1_rate_factor(&self, pci_bus_id: &str, benchmarked_unix_secs: Option<u64>) -> f64 {
         use zkminer_prover_protocol::types as t;
         let bus = crate::discovery::normalize_pci_bus_id(pci_bus_id);
-        for key in self.keys_for_prefix(zkminer_prover_protocol::BACKEND_SP1) {
+        let caps = self
+            .sp1_slot_caps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for (key, cap) in caps {
             let Some(entry) = self.workers.get(&key) else {
                 continue;
             };
@@ -2492,65 +2628,75 @@ impl WorkerPool {
             {
                 continue;
             }
-            let slot = entry.slot.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(cap) = t::sp1_card_cap(
-                slot.spawn_env
-                    .get(t::SP1_ELEMENT_THRESHOLD_CAP_ENV)
-                    .map(String::as_str),
-            ) else {
-                return 1.0;
-            };
-            let recorded = self
-                .sp1_shard_caps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .and_then(|s| {
-                    s.cap_for(
-                        slot.pci_bus_id.as_deref().unwrap_or_default(),
-                        slot.gpu_name.as_deref().unwrap_or_default(),
-                        entry.vram_bytes.unwrap_or_default(),
-                    )
-                    .map(|c| (c.max_element_threshold, c.recorded_unix_secs))
-                });
-            let benchmarked_at_cap = match (recorded, benchmarked_unix_secs) {
-                (Some((recorded_cap, at)), Some(bench)) => recorded_cap == cap && bench >= at,
-                _ => false,
-            };
-            if benchmarked_at_cap {
+            if benchmarked_unix_secs.is_some_and(|bench| bench >= cap.since_unix_secs) {
                 return 1.0;
             }
             let sizing = entry.vram_bytes.and_then(|v| sizing_total(&key, v));
-            return t::sp1_rate_factor_for_cap(cap, sizing);
+            return t::sp1_rate_factor_for_cap(cap.cap, sizing);
         }
         1.0
     }
 
     /// Whether risc0 jobs should not be claimed for `key`'s card for now: a proof there was refused
-    /// within [`RISC0_SHORT_FOR`] because another program holds the memory it needs. Each job
-    /// claimed meanwhile would wait for that memory and, on a single card, be released.
+    /// for want of VRAM within [`RISC0_SHORT_FOR`]. Each job claimed meanwhile would wait for that
+    /// memory and, on a single card, be released. When the window ends the card is read again here
+    /// (`risc0_card_fits`) rather than with a real job: still short, and the window starts over.
     pub fn risc0_card_short(&self, key: &str) -> bool {
-        let mut short = self.risc0_short.lock().unwrap_or_else(|e| e.into_inner());
-        match short.get(key) {
-            Some(until) if Instant::now() < *until => true,
-            Some(_) => {
-                short.remove(key);
-                false
+        let need = {
+            let mut short = self.risc0_short.lock().unwrap_or_else(|e| e.into_inner());
+            match short.get(key) {
+                Some((until, _)) if Instant::now() < *until => return true,
+                Some((_, need)) => {
+                    let need = *need;
+                    short.remove(key);
+                    need
+                }
+                None => return false,
             }
-            None => false,
+        };
+        if self.risc0_card_fits(key, need) == Some(false) {
+            self.note_risc0_card_short(key, need);
+            return true;
         }
+        false
     }
 
-    fn note_risc0_card_short(&self, key: &str) {
+    /// Whether `need` bytes would be free to `key`'s risc0 proof if every sibling of ours the
+    /// proof's room-making recycles (`MIN_EVICTABLE_HOLDING` or more, on this card) were gone: what
+    /// another program holds, the driver's reservation, and our memory that does not move all count
+    /// against it. `None` when the card cannot be read.
+    fn risc0_card_fits(&self, key: &str, need: u64) -> Option<bool> {
+        let card = self.read_card(key)?;
+        let this_card = physical_gpu_id(key);
+        let unmovable = card
+            .by_slot
+            .iter()
+            .filter(|(k, held)| {
+                k.as_str() != key
+                    && (physical_gpu_id(k) != this_card || **held < MIN_EVICTABLE_HOLDING)
+            })
+            .fold(card.unattributed, |acc, (_, held)| {
+                acc.saturating_add(*held)
+            });
+        let free = card
+            .total
+            .saturating_sub(card.reserved)
+            .saturating_sub(card.foreign())
+            .saturating_sub(unmovable);
+        Some(free >= need)
+    }
+
+    fn note_risc0_card_short(&self, key: &str, need: u64) {
         let was = self
             .risc0_short
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key.to_string(), Instant::now() + RISC0_SHORT_FOR);
+            .insert(key.to_string(), (Instant::now() + RISC0_SHORT_FOR, need));
         if was.is_none() {
             tracing::warn!(
-                "{key}: another program holds the VRAM a risc0 proof needs here; claiming no risc0 \
-                 job for this card for {} minutes",
+                "{key}: not enough VRAM free for a risc0 proof here ({:.1} GiB needed); claiming no \
+                 risc0 job for this card for {} minutes, then checking again",
+                need as f64 / (1u64 << 30) as f64,
                 RISC0_SHORT_FOR.as_secs() / 60
             );
         }
@@ -2966,14 +3112,26 @@ impl WorkerPool {
                     self.sp1_shard_cap_for(pci_bus_id.as_deref(), gpu_name.as_deref(), vram_bytes)
                 {
                     tracing::info!(
-                        "{key}{device_desc}: SP1 shard size capped at {cap}, recorded when a proof \
-                         on this card ran out of GPU memory (delete {} to lift it)",
+                        "{key}{device_desc}: SP1 shard size capped at {}, recorded when a proof on \
+                         this card ran out of GPU memory (with the miner stopped, remove the card's \
+                         entry from {} to lift it)",
+                        cap.0,
                         crate::sp1_shard_caps::FILE_NAME
                     );
                     env.insert(
                         zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_CAP_ENV.to_string(),
-                        cap.to_string(),
+                        cap.0.to_string(),
                     );
+                    self.sp1_slot_caps
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(
+                            key.clone(),
+                            SlotSp1Cap {
+                                cap: cap.0,
+                                since_unix_secs: cap.1,
+                            },
+                        );
                 }
             }
 
@@ -7465,6 +7623,9 @@ impl WorkerPool {
         key: &str,
         backend: &str,
         available: u64,
+        // Kept back from `available` for sizing (`CardOccupancy::growth_margin`); the floor below
+        // is what must physically fit, so it is compared without it.
+        growth_margin: u64,
         total: Option<u64>,
         give_up_at: Option<Instant>,
     ) -> Result<()> {
@@ -7486,7 +7647,8 @@ impl WorkerPool {
         }
         let cap = SizingCap::for_slot(backend, &slot.spawn_env);
         let assumed = spawned_vram(&slot.spawn_env);
-        let floor = crate::discovery::min_available_vram_bytes_for_backend(backend, total);
+        let floor = crate::discovery::min_available_vram_bytes_for_backend(backend, total)
+            .map(|f| f.saturating_sub(growth_margin));
         if !vram_tier_shrank(cap, backend, assumed, available, total, floor) {
             return Ok(());
         }
@@ -7999,7 +8161,14 @@ impl WorkerPool {
         // card needs ~17.8 GiB. Re-sizing is the repair, not refusing — that is the whole point of
         // measuring instead of gating. After the room-making above, so a worker is never shrunk to
         // fit beside a sibling that was, or could have been, recycled.
-        self.resize_worker_if_vram_shrank(key, backend, budget.available, total, give_up_at)?;
+        self.resize_worker_if_vram_shrank(
+            key,
+            backend,
+            budget.available,
+            budget.growth_margin,
+            total,
+            give_up_at,
+        )?;
 
         let Some(needed) = floor else {
             return Ok(Some(budget));
@@ -8021,16 +8190,10 @@ impl WorkerPool {
                 total_bytes: budget.total,
             };
             tracing::warn!("not putting work on {key}: {shortage}");
-            // Another program's memory alone keeps a risc0 proof off this card: claim no more risc0
-            // jobs for it a while (`risc0_card_short`), as each would wait here and be released.
-            if risc0_proof
-                && card
-                    .total
-                    .saturating_sub(card.reserved)
-                    .saturating_sub(card.foreign())
-                    < needed
-            {
-                self.note_risc0_card_short(key);
+            // Room was made and it still does not fit: claim no more risc0 jobs for this card a
+            // while (`risc0_card_short`), as each would wait here and be released.
+            if risc0_proof {
+                self.note_risc0_card_short(key, needed);
             }
             return Err(anyhow::Error::new(shortage));
         }
@@ -8040,6 +8203,10 @@ impl WorkerPool {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(key);
         }
+        self.admitted_foreign
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), card.foreign());
         Ok(Some(budget))
     }
 
@@ -8635,22 +8802,42 @@ impl WorkerPool {
                 if matches!(kind, ErrorKind::ResourceExhausted) {
                     tracing::warn!("Worker {key} OOM — killing for respawn with clean GPU state");
                     // SP1: respawn one shard size smaller for the retry (and, once it proves
-                    // there, in every later run).
-                    if slot.backend == zkminer_prover_protocol::BACKEND_SP1 {
+                    // there, in every later run, unless another program's memory grew meanwhile).
+                    let lowered = slot.backend == zkminer_prover_protocol::BACKEND_SP1 && {
+                        let admitted = self
+                            .admitted_foreign
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(key)
+                            .copied();
+                        let grew = match (admitted, self.read_card(key)) {
+                            (Some(before), Some(now)) => {
+                                now.foreign() > before.saturating_add(FOREIGN_GROWTH_TOLERANCE)
+                            }
+                            _ => false,
+                        };
                         self.lower_sp1_shard_cap(
                             key,
                             &mut slot,
                             entry.vram_bytes,
                             program_hash(elf),
-                        );
-                    }
+                            !grew,
+                        )
+                    };
                     // PID first: `kill()` reaps, after which the number may be reused.
                     entry.clear_pid();
                     if let Some(h) = slot.handle.as_mut() {
                         h.kill();
                     }
-                    // OOM is a real failure — increment to prevent infinite loops
-                    Self::mark_slot_failed(&mut slot, entry);
+                    // OOM is a real failure — increment to prevent infinite loops. Except one that
+                    // lowered the card's shard size: its retry belongs here, at once, at the
+                    // smaller size (a respawn backoff would send it to another card at the size
+                    // that ran out); a second OOM there undoes the lowering and counts.
+                    if lowered {
+                        Self::mark_slot_dead(&mut slot, entry);
+                    } else {
+                        Self::mark_slot_failed(&mut slot, entry);
+                    }
                 }
                 Err(anyhow::Error::new(typed))
             }
@@ -9469,7 +9656,7 @@ mod tests {
         };
 
         let (heavy, other) = (program_hash(b"heavy"), program_hash(b"other"));
-        pool.lower_sp1_shard_cap(key, &mut slot, Some(total), heavy);
+        assert!(pool.lower_sp1_shard_cap(key, &mut slot, Some(total), heavy, true));
         // The respawn runs one tier down, as the dispatcher predicts it, and is planned so...
         assert_eq!(
             slot.spawn_env
@@ -9493,7 +9680,8 @@ mod tests {
         pool.confirm_sp1_shard_cap(key, &slot, Some(total), heavy);
         assert_eq!(recorded(), Some(134_217_728));
         assert_eq!(
-            pool.sp1_shard_cap_for(Some(bus), Some(name), Some(total)),
+            pool.sp1_shard_cap_for(Some(bus), Some(name), Some(total))
+                .map(|(cap, _)| cap),
             Some(134_217_728)
         );
         drop(slot);
@@ -9501,7 +9689,7 @@ mod tests {
         assert_eq!(pool.sp1_rate_factor(bus, Some(u64::MAX)), 1.0);
         // At the smallest measured tier there is nothing lower.
         let mut slot = entry.slot.lock().unwrap();
-        pool.lower_sp1_shard_cap(key, &mut slot, Some(total), heavy);
+        assert!(!pool.lower_sp1_shard_cap(key, &mut slot, Some(total), heavy, true));
         assert_eq!(tier(&slot), Some(134_217_728));
         assert_eq!(pool.take_sp1_retry_card(key), None);
         // An operator's own threshold is theirs: no cap over it.
@@ -9519,10 +9707,67 @@ mod tests {
             declined: None,
             proofs_since_spawn: 0,
         };
-        pool.lower_sp1_shard_cap(key, &mut operator, Some(total), heavy);
+        assert!(!pool.lower_sp1_shard_cap(key, &mut operator, Some(total), heavy, true));
         assert!(!operator
             .spawn_env
             .contains_key(t::SP1_ELEMENT_THRESHOLD_CAP_ENV));
+        drop(slot);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_smaller_sp1_size_that_does_not_help_is_undone_and_another_programs_growth_is_not_recorded()
+    {
+        use zkminer_prover_protocol::types as t;
+        const MIB: u64 = 1 << 20;
+        let dir = std::env::temp_dir().join(format!("zkminer-sp1-undo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(crate::sp1_shard_caps::FILE_NAME);
+        let key = "sp1:cuda:2";
+        let (bus, name, total) = ("0000:05:00.0", "NVIDIA GeForce RTX 4070", 12_282 * MIB);
+        let mut pool = pool_with_keys(&[key]);
+        pool.use_sp1_shard_caps(path.clone());
+        let e = pool.workers.get_mut(key).unwrap();
+        e.vram_bytes = Some(total);
+        e.pci_bus_id = Some(bus.into());
+        let entry = pool.workers.get(key).unwrap();
+        let mut slot = entry.slot.lock().unwrap();
+        slot.gpu_tag = "cuda".into();
+        slot.pci_bus_id = Some(bus.into());
+        slot.gpu_name = Some(name.into());
+        slot.spawn_env.insert(
+            t::CUDA_VRAM_AVAILABLE_BYTES_ENV.into(),
+            (12_010 * MIB).to_string(),
+        );
+        let tier = |slot: &WorkerSlot| {
+            SizingCap::for_slot("sp1", &slot.spawn_env).tier_at(
+                "sp1",
+                spawned_vram(&slot.spawn_env),
+                sizing_total(key, total),
+            )
+        };
+        let heavy = program_hash(b"too heavy at any size");
+        assert!(pool.lower_sp1_shard_cap(key, &mut slot, Some(total), heavy, true));
+        assert_eq!(tier(&slot), Some(134_217_728));
+        // It runs out at the smaller size too: undone, back at 268M, and the planner's copy with
+        // it.
+        assert!(!pool.lower_sp1_shard_cap(key, &mut slot, Some(total), heavy, true));
+        assert_eq!(tier(&slot), Some(268_435_456));
+        assert!(!slot
+            .spawn_env
+            .contains_key(t::SP1_ELEMENT_THRESHOLD_CAP_ENV));
+        drop(slot);
+        assert_eq!(pool.sp1_rate_factor(bus, Some(0)), 1.0);
+        assert_eq!(pool.take_sp1_retry_card(key), None);
+        // Another program's memory grew while it ran out: lowered for the run, never recorded.
+        let mut slot = entry.slot.lock().unwrap();
+        let squeezed = program_hash(b"squeezed by a display");
+        assert!(pool.lower_sp1_shard_cap(key, &mut slot, Some(total), squeezed, false));
+        pool.confirm_sp1_shard_cap(key, &slot, Some(total), squeezed);
+        assert_eq!(tier(&slot), Some(134_217_728));
+        assert!(crate::sp1_shard_caps::Store::load(path.clone())
+            .cap_for(bus, name, total)
+            .is_none());
         drop(slot);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9548,18 +9793,21 @@ mod tests {
     }
 
     #[test]
-    fn a_card_short_for_risc0_claims_none_until_the_window_ends() {
-        let pool = pool_with_keys(&["risc0:cuda:1"]);
-        assert!(!pool.risc0_card_short("risc0:cuda:1"));
-        pool.note_risc0_card_short("risc0:cuda:1");
-        assert!(pool.risc0_card_short("risc0:cuda:1"));
-        assert!(!pool.risc0_card_short("risc0:cuda:0"));
-        // Expired: claims resume (and the next proof there re-checks).
+    fn a_card_short_for_risc0_claims_none_until_a_check_finds_room() {
+        // A slot whose card cannot be read here (no CUDA index, no bus id): the check at the end of
+        // the window has no reading, and does not hold the card short on none.
+        let key = "risc0:rocm:7";
+        let pool = pool_with_keys(&[key]);
+        assert!(!pool.risc0_card_short(key));
+        pool.note_risc0_card_short(key, 8 << 30);
+        assert!(pool.risc0_card_short(key));
+        assert!(!pool.risc0_card_short("risc0:rocm:6"));
         pool.risc0_short.lock().unwrap().insert(
-            "risc0:cuda:1".into(),
-            Instant::now() - Duration::from_secs(1),
+            key.into(),
+            (Instant::now() - Duration::from_secs(1), 8 << 30),
         );
-        assert!(!pool.risc0_card_short("risc0:cuda:1"));
+        assert!(!pool.risc0_card_short(key));
+        assert!(pool.risc0_short.lock().unwrap().get(key).is_none());
     }
 
     #[cfg(windows)]
@@ -9572,20 +9820,19 @@ mod tests {
         };
         // Idle and headless: the whole figure.
         let alone =
-            with_windows_growth_margin(CardOccupancy::from_readings(0, 12_282, 272, &[], ours));
+            with_windows_growth_margin(CardOccupancy::from_readings(0, 12_282, 272, &[], ours), 11);
         assert_eq!(alone.available_to("risc0:cuda:1"), (12_282 - 272) * MIB);
         // Only our own worker on it: still the whole figure.
-        let ours_only = with_windows_growth_margin(CardOccupancy::from_readings(
-            1_806,
-            12_282,
-            272,
-            &[(200, 1_806)],
-            ours,
-        ));
+        let ours_only = with_windows_growth_margin(
+            CardOccupancy::from_readings(1_806, 12_282, 272, &[(200, 1_806)], ours),
+            12,
+        );
         assert_eq!(ours_only.available_to("risc0:cuda:1"), (12_282 - 272) * MIB);
         // A display holding 300 MiB: 1 GiB more is kept back, so SP1 sizes for 134M there.
-        let shared =
-            with_windows_growth_margin(CardOccupancy::from_readings(300, 12_282, 272, &[], ours));
+        let shared = with_windows_growth_margin(
+            CardOccupancy::from_readings(300, 12_282, 272, &[], ours),
+            13,
+        );
         assert_eq!(
             shared.available_to("sp1:cuda:1"),
             (12_282 - 272 - 300) * MIB - WINDOWS_SHARED_CARD_MARGIN
@@ -9601,9 +9848,21 @@ mod tests {
             ),
             Some(134_217_728)
         );
-        // Noise is not a program that may grow.
-        let noise =
-            with_windows_growth_margin(CardOccupancy::from_readings(40, 12_282, 272, &[], ours));
+        // Seen shared once, a card keeps the margin a while, so it does not come and go between
+        // readings as a display's use dips.
+        let dipped = with_windows_growth_margin(
+            CardOccupancy::from_readings(40, 12_282, 272, &[], ours),
+            13,
+        );
+        assert_eq!(
+            dipped.available_to("sp1:cuda:1"),
+            (12_282 - 272 - 40) * MIB - WINDOWS_SHARED_CARD_MARGIN
+        );
+        // Noise on a card never seen shared is not a program that may grow.
+        let noise = with_windows_growth_margin(
+            CardOccupancy::from_readings(40, 12_282, 272, &[], ours),
+            14,
+        );
         assert_eq!(noise.available_to("sp1:cuda:1"), (12_282 - 272 - 40) * MIB);
     }
 
@@ -9617,11 +9876,11 @@ mod tests {
             .spawn()
             .expect("start a child");
         let me = std::process::id();
-        let tree = crate::memory::process_tree(me);
+        let tree = crate::memory::process_tree(me, None);
         assert!(tree.iter().any(|(p, _)| *p == me), "{tree:?}");
         assert!(tree.iter().any(|(p, _)| *p == child.id()), "{tree:?}");
         assert!(!in_retired_tree(child.id()));
-        retire_tree(child.id());
+        retire_tree(child.id(), crate::memory::pid_starttime(child.id()));
         assert!(in_retired_tree(child.id()));
         // Its memory then reads as ours, draining, not as somebody else's.
         assert_eq!(
