@@ -1411,9 +1411,11 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>, total_vr
     });
     // A card whose SP1 proof once ran out of GPU memory carries a cap from the dispatcher
     // (`sp1_shard_caps`), which it also applies when it predicts this worker's tier (`SizingCap`).
-    let card_cap = std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_CAP_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok());
+    let card_cap = zkminer_prover_protocol::types::sp1_card_cap(
+        std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_CAP_ENV)
+            .ok()
+            .as_deref(),
+    );
     let computed = zkminer_prover_protocol::types::sp1_element_threshold_cap(
         scale,
         available_vram,
@@ -1917,9 +1919,13 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             // host negative-caches the program and stops claiming its jobs, instead of
                             // eating a release penalty per submitted job.
                             ErrorKind::ProgramMismatch
-                        } else if is_gpu_oom(&msg) {
+                        } else if is_gpu_oom(&msg) || msg.contains("allocation failed") {
                             // GPU OOM: tag as ResourceExhausted so the dispatcher kills +
-                            // respawns this worker (and its gpu-server) with clean VRAM.
+                            // respawns this worker (and its gpu-server) with clean VRAM, and
+                            // retries one shard size smaller. "allocation failed" is slop's panic
+                            // when the server's device allocator gives up. Matching text is safe
+                            // here: no guest-chosen string reaches an SP1 prove error (the
+                            // executor's are typed, guest output goes to the log).
                             ErrorKind::ResourceExhausted
                         } else if msg.contains("serialize") || msg.contains("bincode") {
                             ErrorKind::Internal

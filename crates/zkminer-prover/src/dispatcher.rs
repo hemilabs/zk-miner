@@ -1681,7 +1681,7 @@ impl SizingCap {
         let scale = t::sp1_memory_scale(budget, var(t::SP1_NO_AUTOTUNE_ENV).is_some());
         // The card's recorded cap (`sp1_shard_caps`) bounds it the same way the host's tier does:
         // the worker takes the smallest of them and its free-VRAM tier.
-        let card_cap = var(t::SP1_ELEMENT_THRESHOLD_CAP_ENV).and_then(|v| v.trim().parse().ok());
+        let card_cap = t::sp1_card_cap(var(t::SP1_ELEMENT_THRESHOLD_CAP_ENV).as_deref());
         SizingCap::Host(
             [t::sp1_element_threshold_for_host_scale(scale), card_cap]
                 .into_iter()
@@ -1716,6 +1716,24 @@ impl SizingCap {
         let own = total.map(t::sp1_fork_threshold_for_total_vram);
         [told, own].into_iter().flatten().min()
     }
+}
+
+/// An SP1 slot lowered a tier for a program that ran out of GPU memory there, not yet recorded.
+#[derive(Debug, Clone, Copy)]
+struct PendingSp1Cap {
+    cap: u64,
+    /// `program_hash` of the ELF that ran out.
+    program: u64,
+    /// The retry has not yet been steered back to this card (`take_sp1_retry_card`).
+    retry_here: bool,
+}
+
+/// A program's identity for `PendingSp1Cap`: a hash of its ELF.
+fn program_hash(elf: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    elf.hash(&mut h);
+    h.finish()
 }
 
 /// How much room a proof needs made for it on a card our other workers share.
@@ -2108,6 +2126,9 @@ pub struct WorkerPool {
     /// The per-card SP1 shard-size caps, when this pool keeps them (`use_sp1_shard_caps`; the miner
     /// and `zkminer benchmark` do, tests do not). Read at spawn, lowered on an out-of-memory.
     sp1_shard_caps: Mutex<Option<crate::sp1_shard_caps::Store>>,
+    /// SP1 slots lowered a tier this run, by slot key, until the program that ran out proves at the
+    /// lower tier there (`confirm_sp1_shard_cap`), which is when the cap is recorded.
+    sp1_caps_pending: Mutex<HashMap<String, PendingSp1Cap>>,
     /// Set by `close` when the process is exiting: from then on no worker is spawned and no room is
     /// made. Without it, a dispatch in flight could respawn a worker after `shutdown_all` had swept
     /// the slots — and that window is up to tens of seconds, because
@@ -2199,6 +2220,7 @@ impl WorkerPool {
             benchmark_timeout,
             gpu_locks: Mutex::new(HashMap::new()),
             sp1_shard_caps: Mutex::new(None),
+            sp1_caps_pending: Mutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
             last_measure_eviction: Mutex::new(None),
             shm_ledger: crate::memory::MemoryLedger::default(),
@@ -2238,12 +2260,21 @@ impl WorkerPool {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()?
             .cap_for(bus, name, total)
+            .map(|c| c.max_element_threshold)
     }
 
-    /// An SP1 worker on `key` ran out of GPU memory: lower its card one measured tier below the one
-    /// it ran at, in the slot's spawn environment (the respawn and this run) and in the record
-    /// (later runs). Nothing for an operator's own threshold, or one already at the smallest tier.
-    fn lower_sp1_shard_cap(&self, key: &str, slot: &mut WorkerSlot, total: Option<u64>) {
+    /// An SP1 worker on `key` ran out of GPU memory proving `program`: lower its card one measured
+    /// tier below the one it ran at, in the slot's spawn environment (the respawn and the rest of
+    /// this run), and mark it for the retry (`take_sp1_retry_card`) and for recording once
+    /// `program` proves there (`confirm_sp1_shard_cap`). Nothing for an operator's own threshold,
+    /// or one already at the smallest tier.
+    fn lower_sp1_shard_cap(
+        &self,
+        key: &str,
+        slot: &mut WorkerSlot,
+        total: Option<u64>,
+        program: u64,
+    ) {
         use zkminer_prover_protocol::types as t;
         if !matches!(slot.gpu_tag.as_str(), "cuda" | "rocm" | "intel") {
             return;
@@ -2265,12 +2296,56 @@ impl WorkerPool {
             t::SP1_ELEMENT_THRESHOLD_CAP_ENV.to_string(),
             lower.to_string(),
         );
-        let card = slot.gpu_name.as_deref().unwrap_or(key);
-        let kept = match (
-            self.sp1_shard_caps
+        self.sp1_caps_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                key.to_string(),
+                PendingSp1Cap {
+                    cap: lower,
+                    program,
+                    retry_here: true,
+                },
+            );
+        tracing::warn!(
+            "{key}: SP1 ran out of GPU memory on {} at a shard size of {}; retrying at {lower}, the \
+             card's shard size for the rest of this run (recorded for later runs if the job proves \
+             there)",
+            slot.gpu_name.as_deref().unwrap_or(key),
+            ran_at.map_or_else(|| "the server's own".to_string(), |r| r.to_string()),
+        );
+    }
+
+    /// An SP1 proof of `program` succeeded on `key`: if the slot was lowered a tier when that
+    /// program ran out of GPU memory there, the smaller size is what it needed, so record it for
+    /// later runs.
+    fn confirm_sp1_shard_cap(
+        &self,
+        key: &str,
+        slot: &WorkerSlot,
+        total: Option<u64>,
+        program: u64,
+    ) {
+        let pending = {
+            let mut pending = self
+                .sp1_caps_pending
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_mut(),
+                .unwrap_or_else(|e| e.into_inner());
+            match pending.get(key) {
+                Some(p) if p.program == program => pending.remove(key),
+                _ => None,
+            }
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+        let card = slot.gpu_name.as_deref().unwrap_or(key);
+        let mut store = self
+            .sp1_shard_caps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let outcome = match (
+            store.as_mut(),
             slot.pci_bus_id.as_deref().filter(|b| !b.is_empty()),
             slot.gpu_name.as_deref(),
             total,
@@ -2280,16 +2355,87 @@ impl WorkerPool {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                store.lower(bus, name, total, lower, now);
-                "recorded: later runs keep it"
+                match store.lower(bus, name, total, pending.cap, now) {
+                    Ok(cap) => format!(
+                        "recorded: later runs keep {cap} (`zkminer doctor` lists it; with the \
+                         miner stopped, removing the card's entry from {} lifts it)",
+                        crate::sp1_shard_caps::FILE_NAME
+                    ),
+                    Err(e) => format!("not recorded ({e}); it holds for this run only"),
+                }
             }
-            _ => "for this run",
+            (None, ..) => "this run keeps no record; it holds for this run only".to_string(),
+            _ => "the card's bus id or size is unknown; it holds for this run only".to_string(),
         };
         tracing::warn!(
-            "{key}: SP1 ran out of GPU memory on {card} at a shard size of {}; its shard size is now \
-             capped at {lower} ({kept})",
-            ran_at.map_or_else(|| "the server's own".to_string(), |r| r.to_string()),
+            "{key}: the job that ran out of GPU memory on {card} proved at a shard size of {}: {outcome}",
+            pending.cap
         );
+    }
+
+    /// The benchmark device id of an SP1 slot lowered a tier for a job that just ran out of GPU
+    /// memory there, once: its retry belongs on that card, at the lower tier, not on another card
+    /// still at the size that ran out.
+    pub fn take_sp1_retry_card(&self, key: &str) -> Option<String> {
+        let mut pending = self
+            .sp1_caps_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let p = pending.get_mut(key)?;
+        std::mem::take(&mut p.retry_here).then(|| Self::benchmark_device_id(key))
+    }
+
+    /// What to scale a card's saved SP1 benchmark rate by, given that it was benchmarked at
+    /// `benchmarked_unix_secs`: below 1 when the card's SP1 worker runs capped at a smaller shard
+    /// size than it was benchmarked at (`sp1_rate_factor_for_cap`), 1 otherwise. A cap recorded
+    /// after the benchmark, or set this run, means the benchmark ran larger.
+    pub fn sp1_rate_factor(&self, pci_bus_id: &str, benchmarked_unix_secs: Option<u64>) -> f64 {
+        use zkminer_prover_protocol::types as t;
+        let bus = crate::discovery::normalize_pci_bus_id(pci_bus_id);
+        for key in self.keys_for_prefix(zkminer_prover_protocol::BACKEND_SP1) {
+            let Some(entry) = self.workers.get(&key) else {
+                continue;
+            };
+            if entry
+                .pci_bus_id
+                .as_deref()
+                .map(crate::discovery::normalize_pci_bus_id)
+                != Some(bus.clone())
+            {
+                continue;
+            }
+            let slot = entry.slot.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(cap) = t::sp1_card_cap(
+                slot.spawn_env
+                    .get(t::SP1_ELEMENT_THRESHOLD_CAP_ENV)
+                    .map(String::as_str),
+            ) else {
+                return 1.0;
+            };
+            let recorded = self
+                .sp1_shard_caps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|s| {
+                    s.cap_for(
+                        slot.pci_bus_id.as_deref().unwrap_or_default(),
+                        slot.gpu_name.as_deref().unwrap_or_default(),
+                        entry.vram_bytes.unwrap_or_default(),
+                    )
+                    .map(|c| (c.max_element_threshold, c.recorded_unix_secs))
+                });
+            let benchmarked_at_cap = match (recorded, benchmarked_unix_secs) {
+                (Some((recorded_cap, at)), Some(bench)) => recorded_cap == cap && bench >= at,
+                _ => false,
+            };
+            if benchmarked_at_cap {
+                return 1.0;
+            }
+            let sizing = entry.vram_bytes.and_then(|v| sizing_total(&key, v));
+            return t::sp1_rate_factor_for_cap(cap, sizing);
+        }
+        1.0
     }
 
     /// Calls `report` with a short description of each step `discover_and_spawn` starts.
@@ -8300,6 +8446,9 @@ impl WorkerPool {
                     cycles,
                     duration_secs,
                 );
+                if slot.backend == zkminer_prover_protocol::BACKEND_SP1 {
+                    self.confirm_sp1_shard_cap(key, &slot, entry.vram_bytes, program_hash(elf));
+                }
                 Ok(ProofOutput {
                     journal,
                     seal,
@@ -8318,9 +8467,15 @@ impl WorkerPool {
                 };
                 if matches!(kind, ErrorKind::ResourceExhausted) {
                     tracing::warn!("Worker {key} OOM — killing for respawn with clean GPU state");
-                    // SP1: respawn one shard size smaller, here and in every later run.
+                    // SP1: respawn one shard size smaller for the retry (and, once it proves
+                    // there, in every later run).
                     if slot.backend == zkminer_prover_protocol::BACKEND_SP1 {
-                        self.lower_sp1_shard_cap(key, &mut slot, entry.vram_bytes);
+                        self.lower_sp1_shard_cap(
+                            key,
+                            &mut slot,
+                            entry.vram_bytes,
+                            program_hash(elf),
+                        );
                     }
                     // PID first: `kill()` reaps, after which the number may be reused.
                     entry.clear_pid();
@@ -9106,24 +9261,27 @@ mod tests {
 
     // ---- keys_for_prefix tests ----
 
-    /// Helper to create a WorkerPool with stub entries (no real workers).
     #[test]
-    fn an_sp1_out_of_memory_lowers_the_card_one_tier_for_good() {
+    fn an_sp1_out_of_memory_lowers_the_card_and_records_it_once_the_job_proves() {
         use zkminer_prover_protocol::types as t;
         const MIB: u64 = 1 << 20;
         let dir = std::env::temp_dir().join(format!("zkminer-sp1-cap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join(crate::sp1_shard_caps::FILE_NAME);
         let key = "sp1:cuda:1";
+        let bus = "0000:03:00.0";
+        let name = "NVIDIA GeForce RTX 4070";
         let total = 12_282 * MIB;
         let mut pool = pool_with_keys(&[key]);
         pool.use_sp1_shard_caps(path.clone());
-        pool.workers.get_mut(key).unwrap().vram_bytes = Some(total);
+        let e = pool.workers.get_mut(key).unwrap();
+        e.vram_bytes = Some(total);
+        e.pci_bus_id = Some(bus.into());
         let entry = pool.workers.get(key).unwrap();
         let mut slot = entry.slot.lock().unwrap();
         slot.gpu_tag = "cuda".into();
-        slot.pci_bus_id = Some("0000:03:00.0".into());
-        slot.gpu_name = Some("NVIDIA GeForce RTX 4070".into());
+        slot.pci_bus_id = Some(bus.into());
+        slot.gpu_name = Some(name.into());
         // An idle 12 GB card: spawned at 268M.
         slot.spawn_env.insert(
             t::CUDA_VRAM_AVAILABLE_BYTES_ENV.into(),
@@ -9137,9 +9295,15 @@ mod tests {
             )
         };
         assert_eq!(tier(&slot), Some(268_435_456));
+        let recorded = || {
+            crate::sp1_shard_caps::Store::load(path.clone())
+                .cap_for(bus, name, total)
+                .map(|c| c.max_element_threshold)
+        };
 
-        pool.lower_sp1_shard_cap(key, &mut slot, Some(total));
-        // The respawn runs one tier down, as the dispatcher predicts it...
+        let (heavy, other) = (program_hash(b"heavy"), program_hash(b"other"));
+        pool.lower_sp1_shard_cap(key, &mut slot, Some(total), heavy);
+        // The respawn runs one tier down, as the dispatcher predicts it, and is planned so...
         assert_eq!(
             slot.spawn_env
                 .get(t::SP1_ELEMENT_THRESHOLD_CAP_ENV)
@@ -9147,24 +9311,33 @@ mod tests {
             Some("134217728")
         );
         assert_eq!(tier(&slot), Some(134_217_728));
-        // ...and so does every later run on this card.
-        let store = crate::sp1_shard_caps::Store::load(path.clone());
+        drop(slot);
         assert_eq!(
-            store.cap_for("0000:03:00.0", "NVIDIA GeForce RTX 4070", total),
+            pool.sp1_rate_factor(bus, Some(0)),
+            t::SP1_TIER_STEP_RATE_FACTOR
+        );
+        // ...the retry goes back to this card, once...
+        assert_eq!(pool.take_sp1_retry_card(key).as_deref(), Some("gpu1"));
+        assert_eq!(pool.take_sp1_retry_card(key), None);
+        // ...but nothing is recorded until that program proves there: another one does not count.
+        let slot = entry.slot.lock().unwrap();
+        pool.confirm_sp1_shard_cap(key, &slot, Some(total), other);
+        assert_eq!(recorded(), None);
+        pool.confirm_sp1_shard_cap(key, &slot, Some(total), heavy);
+        assert_eq!(recorded(), Some(134_217_728));
+        assert_eq!(
+            pool.sp1_shard_cap_for(Some(bus), Some(name), Some(total)),
             Some(134_217_728)
         );
-        assert_eq!(
-            pool.sp1_shard_cap_for(
-                Some("0000:03:00.0"),
-                Some("NVIDIA GeForce RTX 4070"),
-                Some(total)
-            ),
-            Some(134_217_728)
-        );
-        // At the smallest measured tier there is nothing lower: the cap stays.
-        pool.lower_sp1_shard_cap(key, &mut slot, Some(total));
+        drop(slot);
+        // A benchmark taken after the record ran at the cap: its rate stands.
+        assert_eq!(pool.sp1_rate_factor(bus, Some(u64::MAX)), 1.0);
+        // At the smallest measured tier there is nothing lower.
+        let mut slot = entry.slot.lock().unwrap();
+        pool.lower_sp1_shard_cap(key, &mut slot, Some(total), heavy);
         assert_eq!(tier(&slot), Some(134_217_728));
-        // An operator's own threshold is theirs: no cap is recorded over it.
+        assert_eq!(pool.take_sp1_retry_card(key), None);
+        // An operator's own threshold is theirs: no cap over it.
         let mut operator = WorkerSlot {
             handle: None,
             path: PathBuf::from("/dev/null"),
@@ -9172,14 +9345,14 @@ mod tests {
             gpu_tag: "cuda".into(),
             device_index: Some(1),
             pci_bus_id: Some("0000:04:00.0".into()),
-            gpu_name: Some("NVIDIA GeForce RTX 4070".into()),
+            gpu_name: Some(name.into()),
             spawn_env: HashMap::from([(t::SP1_ELEMENT_THRESHOLD_ENV.into(), "268435456".into())]),
             consecutive_failures: 0,
             last_failure: None,
             declined: None,
             proofs_since_spawn: 0,
         };
-        pool.lower_sp1_shard_cap(key, &mut operator, Some(total));
+        pool.lower_sp1_shard_cap(key, &mut operator, Some(total), heavy);
         assert!(!operator
             .spawn_env
             .contains_key(t::SP1_ELEMENT_THRESHOLD_CAP_ENV));
@@ -9187,6 +9360,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Helper to create a WorkerPool with stub entries (no real workers).
     fn pool_with_keys(keys: &[&str]) -> WorkerPool {
         let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
         for &key in keys {
