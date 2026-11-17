@@ -27,10 +27,12 @@
 //!   `2001:1::/32` holds three anycast addresses (`2001:1::1` PCP, `2001:1::2` TURN, `2001:1::3`
 //!   DNS-SD SRP); `2001:3::/32` is AMT's relay discovery prefix (RFC 7450), an anycast prefix a
 //!   gateway uses to reach the nearest relay; `2001:4:112::/48` is AS112-v6 (RFC 7535), anycast DNS
-//!   sinks anyone may run locally. An anycast service answers from whichever instance is nearest,
-//!   which on a network that runs one (a PCP-capable router, a site's TURN relay, SRP registrar,
-//!   AMT relay or AS112 node) is a local box, and no program store lives there (review r2: AMT
-//!   had been admitted, against the `2001:1::/32` decision). ORCHIDv2 `2001:20::/28` and the DRIP
+//!   sinks anyone may run locally; and outside it, `2620:4f:8000::/48`, the Direct Delegation AS112
+//!   service (RFC 7534), the IPv6 twin of the refused `192.175.48.0/24`. An anycast service answers
+//!   from whichever instance is nearest, which on a network that runs one (a PCP-capable router, a
+//!   site's TURN relay, SRP registrar, AMT relay or AS112 node) is a local box, and no program
+//!   store lives there (review r2: AMT had been admitted, against the `2001:1::/32` decision).
+//!   ORCHIDv2 `2001:20::/28` and the DRIP
 //!   entity tags `2001:30::/28` (RFC 9374, ORCHIDv2-formatted) are identifiers, not routable
 //!   locators, and the blocklist refuses ORCHIDv2.
 //!
@@ -351,6 +353,7 @@ const V6_NOT_GLOBAL: &[(u128, u8)] = &[
     (0x2002 << 112, 16),     // 6to4, whatever it embeds
     (0x3fff << 112, 20),     // documentation (RFC 9637)
     (0x2001_0000 << 96, 23), // IETF protocol assignments (incl. Teredo, AMT, AS112-v6): all
+    (0x2620_004f_8000 << 80, 48), // Direct Delegation AS112 (RFC 7534), the twin of 192.175.48/24
 ];
 
 fn in4(a: u32, net: [u8; 4], len: u8) -> bool {
@@ -1190,5 +1193,69 @@ mod tests {
         assert_eq!(canonical_ip(ip("::1")), ip("::1"));
         assert_eq!(canonical_ip(ip("::")), ip("::"));
         assert_eq!(canonical_ip(ip("2001:db8::1")), ip("2001:db8::1"));
+    }
+    /// Every entry of IANA's IPv4 and IPv6 special-purpose address registries (2026), with an
+    /// address inside it: each is refused, the blocks IANA marks globally reachable included (the
+    /// anycast services, which the nearest instance answers, and identifiers that are not
+    /// locators).
+    #[test]
+    fn every_iana_special_purpose_block_is_refused() {
+        // (an address in the block, the block, IANA's "globally reachable")
+        let rows: &[(&str, &str, &str)] = &[
+            ("0.0.0.1", "0.0.0.0/8", "False"),
+            ("10.1.2.3", "10.0.0.0/8", "False"),
+            ("100.64.0.1", "100.64.0.0/10", "False"),
+            ("127.0.0.2", "127.0.0.0/8", "False"),
+            ("169.254.1.1", "169.254.0.0/16", "False"),
+            ("172.16.0.1", "172.16.0.0/12", "False"),
+            ("192.0.0.9", "192.0.0.9/32 PCP anycast", "True"),
+            ("192.0.0.10", "192.0.0.10/32 TURN anycast", "True"),
+            ("192.0.0.170", "192.0.0.170/32 NAT64 discovery", "False"),
+            ("192.0.2.1", "192.0.2.0/24", "False"),
+            ("192.31.196.1", "192.31.196.0/24 AS112-v4", "True"),
+            ("192.52.193.1", "192.52.193.0/24 AMT", "True"),
+            ("192.88.99.1", "192.88.99.0/24 6to4 relay (deprecated)", "-"),
+            ("192.168.0.1", "192.168.0.0/16", "False"),
+            ("192.175.48.1", "192.175.48.0/24 Direct Delegation AS112", "True"),
+            ("198.18.0.1", "198.18.0.0/15", "False"),
+            ("198.51.100.1", "198.51.100.0/24", "False"),
+            ("203.0.113.1", "203.0.113.0/24", "False"),
+            ("240.0.0.1", "240.0.0.0/4", "False"),
+            ("255.255.255.255", "255.255.255.255/32", "False"),
+            ("::1", "::1/128", "False"),
+            ("::", "::/128", "False"),
+            ("::ffff:10.0.0.1", "::ffff:0:0/96 (a private IPv4)", "False"),
+            ("64:ff9b::a00:1", "64:ff9b::/96 (a private IPv4)", "True"),
+            ("64:ff9b:1::1", "64:ff9b:1::/48 local-use NAT64", "False"),
+            ("100::1", "100::/64 discard", "False"),
+            ("100:0:0:1::1", "100:0:0:1::/64 dummy (RFC 9780)", "False"),
+            ("2001::1", "2001::/32 Teredo", "N/A"),
+            ("2001:1::1", "2001:1::1/128 PCP anycast", "True"),
+            ("2001:1::2", "2001:1::2/128 TURN anycast", "True"),
+            ("2001:1::3", "2001:1::3/128 DNS-SD SRP anycast", "True"),
+            ("2001:2::1", "2001:2::/48 benchmarking", "False"),
+            ("2001:3::1", "2001:3::/32 AMT", "True"),
+            ("2001:4:112::1", "2001:4:112::/48 AS112-v6", "True"),
+            ("2001:10::1", "2001:10::/28 ORCHID (deprecated)", "-"),
+            ("2001:20::1", "2001:20::/28 ORCHIDv2", "True"),
+            ("2001:30::1", "2001:30::/28 DRIP DETs", "True"),
+            ("2001:db8::1", "2001:db8::/32", "False"),
+            ("2002::1", "2002::/16 6to4", "N/A"),
+            ("2620:4f:8000::1", "2620:4f:8000::/48 Direct Delegation AS112", "True"),
+            ("2620:4f:8000:ffff::42", "2620:4f:8000::/48 Direct Delegation AS112", "True"),
+            ("3fff::1", "3fff::/20 documentation", "False"),
+            ("5f00::1", "5f00::/16 SRv6 SIDs", "False"),
+            ("fd00::1", "fc00::/7", "False"),
+            ("fe80::1", "fe80::/10", "False"),
+        ];
+        let admitted: Vec<String> = rows
+            .iter()
+            .filter(|(a, _, _)| is_global(ip(a)))
+            .map(|(a, block, reach)| format!("{a} ({block}, IANA globally reachable: {reach})"))
+            .collect();
+        assert!(admitted.is_empty(), "admitted: {admitted:?}");
+        // The neighbours of the Direct Delegation AS112 block stay global.
+        assert!(is_global(ip("2620:4f:7fff:ffff::1")));
+        assert!(is_global(ip("2620:4f:8001::1")));
     }
 }
