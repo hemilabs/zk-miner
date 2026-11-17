@@ -471,6 +471,41 @@ mod imp {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod private_dir_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(p: &std::path::Path) -> u32 {
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The default queue directory is made 0700, its parents too if missing, and an existing one
+    /// of the user's own that others could reach is made 0700; a link in its place is left alone.
+    #[test]
+    fn the_default_queue_directory_is_private() {
+        let tmp = std::env::temp_dir().join(format!("zkminer-locks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let made = tmp.join("home/.zkminer/locks");
+        super::private_dir(&made);
+        assert_eq!(mode(&made), 0o700);
+
+        let open = tmp.join("open");
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o775)).unwrap();
+        super::private_dir(&open);
+        assert_eq!(mode(&open), 0o700);
+
+        let target = tmp.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = tmp.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        super::private_dir(&link);
+        assert_eq!(mode(&target), 0o755, "a link's target is not changed");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) use imp::{confine, is_confined, prepare};
 

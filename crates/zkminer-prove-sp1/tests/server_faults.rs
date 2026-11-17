@@ -44,6 +44,15 @@ fn fake_server(mode: &str) {
         println!("{}", sp1_primitives::SP1_CRATE_VERSION);
         return;
     }
+    if std::env::args().any(|a| a == "--capabilities") {
+        // A server older than the flag refuses it, as clap does.
+        if mode == "old" {
+            eprintln!("error: unexpected argument '--capabilities' found");
+            std::process::exit(2);
+        }
+        println!("fd-shared-memory");
+        return;
+    }
     if mode.starts_with("probe-shm:") {
         probe_dev_shm();
     }
@@ -718,6 +727,42 @@ fn an_orphan_is_waited_for(elf: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// A server older than `--capabilities`, which answers `--version` as the right one does, cannot
+/// share memory with its executor's runner except through `/dev/shm`, which its confinement gives
+/// none of: the worker declines SP1 at its handshake, before any job could be claimed for it, and
+/// starts no server.
+fn an_old_server_is_declined_at_the_handshake() -> Result<(), String> {
+    let rig = Rig::new("old", CUDA_SERVER, "old");
+    let mut child = rig
+        .command()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut worker = Worker {
+        stdin: child.stdin.take().unwrap(),
+        stdout: child.stdout.take(),
+        child,
+    };
+    worker.send(&WorkerCommand::Hello {
+        protocol_version: PROTOCOL_VERSION,
+    });
+    let answer = worker.answer();
+    let _ = worker.child.wait();
+    match answer {
+        Some(WorkerResponse::Error { message, .. }) if message.contains("/dev/shm") => {}
+        Some(WorkerResponse::Error { message, .. }) if message.contains("GPU") => {
+            // A host with no NVIDIA card declines on that first.
+        }
+        other => return Err(format!("an old server was not declined: {other:?}")),
+    }
+    if rig.server_was_reached() {
+        return Err("a server was started".to_string());
+    }
+    rig.no_panic()
+}
+
 /// The reaper removes an orphan's socket whichever vendor's build it was, and only that.
 fn only_an_orphans_socket_is_removed() -> Result<(), String> {
     let rig = Rig::new("sockets", CUDA_SERVER, "err:boom");
@@ -880,6 +925,10 @@ fn main() {
         (
             "a confined server reaches nothing in /dev/shm, and its worker needs nothing there",
             Box::new(|| a_confined_server_reaches_nothing_in_dev_shm(&elf)),
+        ),
+        (
+            "a server older than --capabilities is declined at the handshake",
+            Box::new(an_old_server_is_declined_at_the_handshake),
         ),
     ];
     let mut failed = 0;

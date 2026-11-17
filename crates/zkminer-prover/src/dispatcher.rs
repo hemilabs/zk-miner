@@ -11023,6 +11023,27 @@ mod declined_backend_tests {
         }
     }
 
+    /// A worker that exited `WORKER_EXIT_DECLINED` after its handshake leaves its slot declined, as
+    /// a handshake decline does: cleared, never dispatchable or revived again, and the backend
+    /// reported declined when it was its only slot.
+    #[test]
+    fn a_slot_whose_worker_exited_declined_is_declined() {
+        let mut sl = slot(None, 0);
+        let pid = AtomicU32::new(4321);
+        WorkerPool::decline_slot(&mut sl, &pid, "sp1:cuda:0");
+        assert!(sl
+            .declined
+            .as_deref()
+            .is_some_and(|m| m.contains(zkminer_prover_protocol::types::WORKER_DECLINED)));
+        assert_eq!(pid.load(Ordering::Acquire), 0);
+        assert!(sl.handle.is_none());
+        assert!(!WorkerPool::slot_eligible(&sl));
+        assert!(!WorkerPool::slot_dispatchable(&sl));
+        let pool = pool_with(vec![("sp1:cuda:0", sl)]);
+        assert!(pool.backend_declined("sp1").is_some());
+        assert!(!pool.has_idle_or_revivable_worker("sp1"));
+    }
+
     fn measure_entry(sl: WorkerSlot) -> WorkerEntry {
         WorkerEntry {
             slot: Mutex::new(sl),

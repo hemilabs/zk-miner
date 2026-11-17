@@ -3979,6 +3979,186 @@ mod usability_tests {
     }
 }
 
+/// What the worker asks of its server and of its own executor before it offers SP1.
+#[cfg(all(test, target_os = "linux"))]
+mod capability_tests {
+    use super::{capability_of, Capability, Outcome};
+    use std::path::Path;
+
+    fn ran(success: bool, stderr: &str) -> Outcome {
+        Outcome::Ran {
+            success,
+            stderr: stderr.to_string(),
+        }
+    }
+
+    /// Only a server that lists `fd-shared-memory` has it; one older than `--capabilities`
+    /// refuses the flag (clap's exit 2), which is a no, as is one that cannot run at all. A probe
+    /// that did not settle it is neither.
+    #[test]
+    fn only_a_server_listing_fd_shared_memory_has_it() {
+        let server = Path::new("/x/sp1-gpu-server");
+        let listed = "fd-shared-memory\ncommit=fd8ecf573474c6fc49ccb8e249f14410a163bd33\n";
+        assert_eq!(
+            capability_of(server, ran(true, ""), listed),
+            Capability::Present
+        );
+        assert_eq!(
+            capability_of(server, ran(true, ""), "  fd-shared-memory  \n"),
+            Capability::Present
+        );
+        for stdout in ["", "fd-shared-memory-v2\n", "6.8.1\n", "commit=abc\n"] {
+            assert!(matches!(
+                capability_of(server, ran(true, ""), stdout),
+                Capability::Absent(_)
+            ));
+        }
+        let old = "error: unexpected argument '--capabilities' found\n\nUsage: sp1-gpu-server";
+        match capability_of(server, ran(false, old), "") {
+            Capability::Absent(why) => {
+                assert!(why.contains("/dev/shm") && why.contains("older"), "{why}")
+            }
+            other => panic!("an old server is not refused: {other:?}"),
+        }
+        // A server that prints the name but fails is not trusted with it either.
+        assert!(matches!(
+            capability_of(server, ran(false, ""), listed),
+            Capability::Absent(_)
+        ));
+        let not_exec = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            capability_of(
+                server,
+                Outcome::SpawnFailed {
+                    err: not_exec,
+                    transient: false
+                },
+                ""
+            ),
+            Capability::Absent(_)
+        ));
+        let busy = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        assert!(matches!(
+            capability_of(
+                server,
+                Outcome::SpawnFailed {
+                    err: busy,
+                    transient: true
+                },
+                ""
+            ),
+            Capability::Unknown(_)
+        ));
+        assert!(matches!(
+            capability_of(
+                server,
+                Outcome::TimedOut {
+                    stderr: String::new()
+                },
+                ""
+            ),
+            Capability::Unknown(_)
+        ));
+    }
+
+    /// A server built before `--capabilities`, which answers `--version` as the right one does,
+    /// is declined at the handshake (or on the no-GPU arm, on a host without one); one that lists
+    /// the capability is not declined for it.
+    #[test]
+    fn the_handshake_declines_a_server_without_the_capability() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let version = sp1_primitives::SP1_CRATE_VERSION;
+        let old = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo {version}; exit 0; fi\n\
+             echo \"error: unexpected argument '$1' found\" >&2\nexit 2\n"
+        );
+        let new = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo {version}; exit 0; fi\n\
+             if [ \"$1\" = --capabilities ]; then echo fd-shared-memory; exit 0; fi\nexit 2\n"
+        );
+        for (name, script, declined) in [("old", old, true), ("new", new, false)] {
+            let tmp = std::env::temp_dir().join(format!("sp1caps-{name}-{}", std::process::id()));
+            let bin = tmp.join(".sp1/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let server = bin.join("sp1-gpu-server");
+            std::fs::write(&server, script).unwrap();
+            std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let saved = std::env::var("HOME").ok();
+            unsafe { std::env::set_var("HOME", &tmp) };
+            let r = super::sp1_usability();
+            match saved {
+                Some(h) => unsafe { std::env::set_var("HOME", h) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+            match r {
+                Err(e) if e.contains("GPU") => {}
+                Err(e) => assert!(declined && e.contains("/dev/shm"), "{name}: {e}"),
+                Ok(()) => assert!(!declined, "{name}: an old server is offered"),
+            }
+        }
+    }
+
+    /// The canary's expected output is what the guest commits: fibonacci, wrapping, eight bytes
+    /// little-endian.
+    #[test]
+    fn the_canary_expects_fibonacci() {
+        assert_eq!(super::canary_public_values(0), 0u64.to_le_bytes());
+        assert_eq!(super::canary_public_values(10), 55u64.to_le_bytes());
+        assert_eq!(
+            super::canary_public_values(93),
+            12200160415121876738u64.to_le_bytes()
+        );
+        // Past u64, as the guest's `wrapping_add` does.
+        let (mut a, mut b) = (0u64, 1u64);
+        for _ in 0..super::CANARY_FIB_N {
+            (a, b) = (b, a.wrapping_add(b));
+        }
+        assert_eq!(
+            super::canary_public_values(super::CANARY_FIB_N),
+            a.to_le_bytes()
+        );
+    }
+
+    /// The canary runs the embedded guest through SP1's real executor (its runner process, and
+    /// the memory it shares with it) and accepts what it commits. CPU only, no server.
+    #[test]
+    fn the_canary_runs_on_the_real_executor() {
+        if super::FIBONACCI_SP1_GUEST_ELF.is_empty() {
+            eprintln!("skipping: fibonacci guest ELF is stubbed (SP1_SKIP_PROGRAM_BUILD)");
+            return;
+        }
+        let cpu = sp1_sdk::blocking::ProverClient::builder().cpu().build();
+        super::run_executor_canary(&cpu).expect("the canary runs");
+    }
+
+    /// The executor's own setup failures, in the fork's words, are the worker's; a guest's
+    /// failures are not.
+    #[test]
+    fn setup_failures_are_told_from_the_guests() {
+        for text in [
+            "task 7 panicked with message \"create shm file for memory: Os { code: 13, kind: \
+             PermissionDenied, message: \\\"Permission denied\\\" }\"",
+            "create shm file for traces: Os { code: 24 }",
+            "failed to create the child's stdin: Too many open files",
+            "failed to spawn child process: Resource temporarily unavailable",
+            "the executor runner exited before reading its input (Broken pipe)",
+        ] {
+            assert!(super::is_executor_environment_fault(text), "{text}");
+        }
+        for text in [
+            "exceeded cycle limit (SP1 executor: cycle limit reached)",
+            "Invalid memory access: LD 0x0",
+            "Child native executor terminated abnormally, code: Some(1), signal: None",
+            "the executor runner broke the trace ring's protocol: the trace ring's write index",
+            "",
+        ] {
+            assert!(!super::is_executor_environment_fault(text), "{text}");
+        }
+    }
+}
+
 /// The IPC descriptor must not survive an exec into a child.
 #[cfg(all(test, unix))]
 mod ipc_fd_tests {
