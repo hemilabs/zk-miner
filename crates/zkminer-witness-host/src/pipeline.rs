@@ -42,7 +42,7 @@ use std::future::Future;
 use std::io::{self, Read};
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -55,7 +55,7 @@ use zkminer_chain::auction::risc_zero_groth16_v1_id;
 use zkminer_chain::binding::{check_journal_binding, marker, JOURNAL_PREFIX_MARKER, PROOF_NONCE_MARKER};
 use zkminer_chain::descriptor::compute_descriptor_hash;
 use zkminer_contracts::bindings::JobDescriptor;
-use zkminer_prover::witness_exec::{run_witness_execute, CgroupSpec, WitnessExecError};
+use zkminer_prover::witness_exec::{run_witness_execute, witness_execute_build, CgroupSpec, WitnessExecError};
 use zkminer_prover_protocol::{
     sys_rand, WitnessExecuteFailure, WitnessExecuteRequest, WitnessExecuteResponse, GUEST_EXIT_HALTED,
     RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN,
@@ -91,6 +91,8 @@ pub type HookFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub const EXECUTE_PIDS_MAX: u32 = 4;
 /// The `cpu.weight` of simulation sandboxes (§10.2: a low-priority cgroup).
 pub const SIMULATION_CPU_WEIGHT: u32 = 20;
+/// `memory.max` of the execute worker's build handshake (it loads its binary and answers).
+const EXECUTE_BUILD_MEMORY_BYTES: u64 = 256 << 20;
 /// The longest diagnostic text a [`Skip`] carries.
 pub const MAX_DETAIL_BYTES: usize = 4_096;
 /// How often a fired abort token re-sends `cgroup.kill` until the execute worker is gone (the
@@ -118,9 +120,12 @@ pub struct HostContext {
     pub keccak_po2: u8,
     pub sys_rand_key: [u8; 32],
     /// The build id of every prove worker that may prove a bundle (§15.1), as
-    /// [`risc0_build_id`] names it. The bundle records these and the execute worker's own (from its
-    /// response).
+    /// [`risc0_build_id`] names it. The bundle records these and [`HostContext::execute_build`].
     pub worker_builds: Vec<String>,
+    /// The execute worker's build id, from its handshake before any guest ran in it
+    /// ([`execute_worker_build`]): what a bundle records as the build its journals came from. A
+    /// response naming another build (the binary replaced since) skips the job.
+    pub execute_build: String,
     /// `memory.max` of one execute (`[witness] execute_memory_bytes`).
     pub execute_memory_bytes: u64,
     /// Wall clock of one execute (all po2s); past it the worker's cgroup is killed.
@@ -738,6 +743,30 @@ fn execute_detail(e: &WitnessExecError) -> String {
 
 /// Runs the sandboxed execute on a thread of its own (the worker's `PR_SET_PDEATHSIG` is tied to the
 /// spawning thread, which stays until the worker is gone), killing its cgroup when the token fires.
+/// Asks the execute worker `binary` its build ([`witness_execute_build`]) on a thread of its own (the
+/// child dies with the thread that spawned it), and names it as [`risc0_build_id`] does: the
+/// [`HostContext::execute_build`] of later simulations. Call it before any guest runs in the binary.
+pub async fn execute_worker_build(binary: &Path, cgroup_root: &Path, timeout: Duration) -> Result<String, String> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let spec = CgroupSpec {
+        name: format!("wexec-build-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)),
+        memory_max: EXECUTE_BUILD_MEMORY_BYTES,
+        pids_max: EXECUTE_PIDS_MAX,
+        cpu_max: None,
+        cpu_weight: SIMULATION_CPU_WEIGHT,
+    };
+    let (binary, root) = (binary.to_path_buf(), cgroup_root.to_path_buf());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("witness-execute-build".into())
+        .spawn(move || {
+            let _ = tx.send(witness_execute_build(&binary, &root, spec, timeout));
+        })
+        .map_err(|e| format!("spawning the execute build thread: {e}"))?;
+    let build = rx.await.map_err(|_| "the execute build thread is gone".to_string())?.map_err(|e| format!("{e}"))?;
+    Ok(risc0_build_id(&build.sdk_version, &build.worker_version))
+}
+
 async fn execute(
     ctx: &HostContext,
     token: &AbortToken,
@@ -936,7 +965,15 @@ pub async fn simulate_witness_job(
     let resp = execute(ctx, token, req, w_file, format!("wexec-{}", short(job_key))).await?;
     let journal = check_execution(&resp, &po2s, program_id, limits.maxGuestCycles).map_err(|(r, d)| Skip::new(r, E, d))?;
     timings.execute = t.elapsed();
-    let execute_build = risc0_build_id(&resp.sdk_version, &resp.worker_version);
+    // The build recorded is the handshake's, never what the process that ran the guest says of itself.
+    if risc0_build_id(&resp.sdk_version, &resp.worker_version) != ctx.execute_build {
+        return Err(Skip::new(
+            SkipReason::HostInternal,
+            E,
+            "the execute worker named a build other than its handshake's (was its binary replaced?)",
+        ));
+    }
+    let execute_build = ctx.execute_build.clone();
     let mut worker_builds: Vec<String> = ctx.worker_builds.iter().cloned().chain([execute_build.clone()]).collect();
     worker_builds.sort();
     worker_builds.dedup();

@@ -17,7 +17,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use zkminer_prover::witness_exec::{run_witness_execute, CgroupSpec, WitnessExecError};
+use zkminer_prover::witness_exec::{
+    run_witness_execute, witness_execute_build, CgroupSpec, WitnessExecError,
+};
 use zkminer_prover_protocol::{WitnessExecuteFailure, WitnessExecuteRequest};
 use zkminer_witness_sandbox::{delegated_root, SandboxError};
 
@@ -132,6 +134,42 @@ fn the_child_gets_fds_0_to_3_an_empty_environment_and_its_own_cgroup() {
     assert!(log_tail.contains("w:hello"), "W at fd 3: {log_tail}");
     // The cgroup is gone after the run.
     assert!(!root.join(spec("report").name).exists());
+}
+
+/// The build handshake runs the worker with `--witness-execute --build`, an empty environment and no
+/// fd 3, in its own cgroup, and takes nothing but one well-formed build frame from it.
+#[test]
+fn the_build_handshake_asks_with_its_own_argument_and_takes_only_a_frame() {
+    let test = "the_build_handshake_asks_with_its_own_argument_and_takes_only_a_frame";
+    let Some(root) = delegated(test) else { return };
+    let dir = tempfile::tempdir().unwrap();
+    // Exit 0 (no frame) only when asked exactly so, with nothing at fd 3 and no environment (but the
+    // PWD the shell sets itself).
+    let worker = script(
+        dir.path(),
+        "asked",
+        "[ \"$1\" = --witness-execute ] && [ \"$2\" = --build ] && [ ! -e /proc/self/fd/3 ] \
+         && [ -z \"$(/usr/bin/env | /bin/grep -v '^PWD=')\" ] || exit 3\nexit 0",
+    );
+    let err = witness_execute_build(&worker, &root, spec("build-asked"), Duration::from_secs(30))
+        .expect_err("a stand-in sends no frame");
+    assert!(
+        matches!(err, WitnessExecError::MalformedOutput { .. }),
+        "{err}"
+    );
+    assert!(!root.join(spec("build-asked").name).exists());
+    // An old worker, which would read a request instead: its typed refusal, not a build.
+    let worker = script(dir.path(), "old", "exit 80");
+    let err = witness_execute_build(&worker, &root, spec("build-old"), Duration::from_secs(30))
+        .expect_err("refused");
+    assert!(matches!(err, WitnessExecError::Exit { code: 80, .. }), "{err}");
+    let worker = script(dir.path(), "garbage-build", "printf 'not a frame'");
+    let err = witness_execute_build(&worker, &root, spec("build-garbage"), Duration::from_secs(30))
+        .expect_err("garbage");
+    assert!(
+        matches!(err, WitnessExecError::MalformedOutput { .. }),
+        "{err}"
+    );
 }
 
 #[test]

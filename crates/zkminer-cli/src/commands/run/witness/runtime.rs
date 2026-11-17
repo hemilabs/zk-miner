@@ -85,8 +85,8 @@ use zkminer_witness_host::abort::{AbortReason, AbortToken};
 use zkminer_witness_host::broker_proc::BrokerProcess;
 use zkminer_witness_host::paths;
 use zkminer_witness_host::pipeline::{
-    descriptor_hash_of_abi, eviction_by_age, key_fingerprint, risc0_build_id, simulate_witness_job, HookFuture,
-    HostContext, ImageIdFn, JobInput, PipelineHooks, Simulated, Skip,
+    descriptor_hash_of_abi, eviction_by_age, execute_worker_build, key_fingerprint, risc0_build_id,
+    simulate_witness_job, HookFuture, HostContext, ImageIdFn, JobInput, PipelineHooks, Simulated, Skip,
 };
 use zkminer_witness_host::spawner::Spawner;
 use zkminer_witness_host::store_open::open_store;
@@ -114,6 +114,8 @@ use crate::journal::WitnessBundleRef;
 const MAX_ARTIFACT_BYTES: u64 = 4 << 20;
 /// Wall clock of one sandboxed execute (every po2 of the host's set).
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Wall clock of the execute worker's build handshake (it loads its binary and answers).
+const EXECUTE_BUILD_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often the sandbox and broker self-tests run again.
 const SELF_TEST_EVERY: Duration = Duration::from_secs(3600);
 /// Bound on one self-test (sandbox or broker): one that does not finish is a failure, so a wedged
@@ -468,7 +470,8 @@ pub(crate) struct WitnessRuntime {
     /// Jobs a one-off notice was logged for (not admitted, needs claim_predicate_jobs).
     noticed: Mutex<HashSet<(B256, &'static str)>>,
     store_pass_running: AtomicBool,
-    /// The execute worker's build, from its latest response here (`None` until one ran).
+    /// The execute worker's build, from its handshake when serving started, before any guest ran in
+    /// it (`None` until serving started): never from a response of a process that ran a guest.
     execute_build: Mutex<Option<String>>,
     /// The brain's view of the cards, each tick: inline jobs still needing a card, and the cap.
     cards: Mutex<Option<(usize, usize)>>,
@@ -743,6 +746,16 @@ impl WitnessRuntime {
         };
         if let Err(why) = bounded_self_test("sandbox", self.sandbox_self_test(&spawner, &probe_binary)).await {
             return self.disable(why);
+        }
+        // The execute worker's build, asked before any requester's guest runs in it: what every bundle
+        // records as the build its journals came from, and what a retained bundle is revalidated
+        // against (so one published before a restart is reused, not simulated again).
+        match execute_worker_build(&execute_binary, &root, EXECUTE_BUILD_TIMEOUT).await {
+            Ok(build) => {
+                tracing::info!("witness: the execute worker is {build}");
+                *lock(&self.execute_build) = Some(build);
+            }
+            Err(e) => return self.disable(format!("the execute worker's build handshake: {e}")),
         }
         let broker = match BrokerProcess::start(
             &spawner,
@@ -1238,8 +1251,8 @@ impl WitnessRuntime {
         (!builds.is_empty()).then_some(builds)
     }
 
-    /// [`Self::prove_worker_builds`] and the execute worker's build once one ran here (its journals
-    /// are the bundle's): what revalidation compares a bundle with (§15.2).
+    /// [`Self::prove_worker_builds`] and the execute worker's build (its handshake's; its journals are
+    /// the bundle's): what revalidation compares a bundle with (§15.2).
     fn worker_builds(&self) -> Option<Vec<String>> {
         let mut builds = self.prove_worker_builds()?;
         builds.extend(lock(&self.execute_build).clone());
@@ -1317,6 +1330,7 @@ impl WitnessRuntime {
         po2s: Vec<u8>,
         plan: &ProvePlan,
         worker_builds: Vec<String>,
+        execute_build: String,
     ) -> HostContext {
         let w = &self.witness;
         let c = &w.builder_clamps;
@@ -1344,6 +1358,7 @@ impl WitnessRuntime {
             keccak_po2: self.keccak_po2,
             sys_rand_key: self.sys_rand_key,
             worker_builds,
+            execute_build,
             execute_memory_bytes: w.execute_memory_bytes,
             execute_timeout: EXECUTE_TIMEOUT,
             max_artifact_bytes: MAX_ARTIFACT_BYTES,
@@ -1518,9 +1533,10 @@ impl WitnessRuntime {
     }
 
     /// A bundle already published for this job and prover that is current on this host: reused
-    /// instead of simulating again (§15.2 single flight; re-locks reuse their bundle). Not before the
-    /// execute worker's build is known here (a simulation in this process learns it), and never one
-    /// that does not record its execute time (the prove's execute allowance).
+    /// instead of simulating again (§15.2 single flight; re-locks and restarts reuse their bundle; no
+    /// builder or data source runs again). Not before the execute worker's build is known (its
+    /// handshake when serving starts), and never one that does not record its execute time (the
+    /// prove's execute allowance).
     async fn retained_candidate(&self, store: &Arc<Store>, jid: B256, dh: B256, po2s: &[u8]) -> Option<Candidate> {
         lock(&self.execute_build).as_ref()?;
         let profile = self.host_profile(po2s)?;
@@ -1661,6 +1677,7 @@ impl WitnessRuntime {
             tracing::debug!("witness job {}: no risc0 prove worker has named its build yet", short(jid));
             return None;
         };
+        let execute_build = lock(&self.execute_build).clone()?;
         let gate_input = ChainGateInput {
             job_id: jid,
             proof_system_id: d.proofSystemId,
@@ -1682,7 +1699,7 @@ impl WitnessRuntime {
                 }
             }
             None => {
-                let ctx = self.host_context(&serving, &store, po2s.clone(), &plan, prove_builds);
+                let ctx = self.host_context(&serving, &store, po2s.clone(), &plan, prove_builds, execute_build);
                 let hooks = Hooks {
                     rt: self.clone(),
                     gate: gate_input.clone(),
@@ -1715,7 +1732,6 @@ impl WitnessRuntime {
                             tracing::error!("witness job {}: simulated without a claimability quote or its ELF", short(jid));
                             return None;
                         };
-                        *lock(&self.execute_build) = Some(sim.execute_build.clone());
                         tracing::info!(
                             "witness job {}: simulated — bundle v{}, |W| {} bytes, journal {} bytes",
                             short(jid),

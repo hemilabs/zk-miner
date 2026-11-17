@@ -22,7 +22,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use zkminer_prover::witness_exec::{run_witness_execute, CgroupSpec, WitnessExecError};
+use zkminer_prover::witness_exec::{
+    run_witness_execute, witness_execute_build, CgroupSpec, WitnessExecError,
+};
 use zkminer_prover_protocol::{
     sys_rand::risc0_seed, write_message, WitnessExecuteFailure, WitnessExecuteRequest,
     GUEST_EXIT_HALTED, WITNESS_EXECUTE_ARG,
@@ -211,6 +213,32 @@ fn executes_at_every_po2_under_the_sandbox() {
         .results
         .iter()
         .all(|r| r.journal == 144u64.to_le_bytes()));
+}
+
+/// The build handshake (`--witness-execute --build`) names exactly the build every response of the
+/// binary names, without a request, a `W` or a guest: what the miner records, asked before any
+/// requester's guest runs in the binary.
+#[test]
+fn the_build_handshake_names_the_responses_build() {
+    let test = "the_build_handshake_names_the_responses_build";
+    let Some(root) = delegated(test) else { return };
+    let build = witness_execute_build(Path::new(WORKER), &root, spec("build"), TIMEOUT)
+        .unwrap_or_else(|e| panic!("{e}\n{}", e.log_tail().unwrap_or("")));
+    assert!(
+        build.sdk_version.starts_with("risc0-zkvm "),
+        "{build:?}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let (w, req) = job(dir.path(), &10u32.to_le_bytes(), &[], &[16], [1; 32]);
+    let resp = run(&root, "build-then", &w, &req).unwrap();
+    assert_eq!(
+        (resp.sdk_version, resp.worker_version),
+        (build.sdk_version, build.worker_version)
+    );
+    assert!(
+        !root.join(spec("build").name).exists(),
+        "its cgroup is removed"
+    );
 }
 
 /// An input that is not the request's is refused with its typed exit code, before any execution.

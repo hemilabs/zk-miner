@@ -519,6 +519,9 @@ pub(crate) use execute::execute_main;
 ///   only on success; fd 2: logs (guest text included: never parsed); fd 3: `W`, a read-only regular
 ///   file or a write-sealed memfd, read with `pread`.
 /// - Exit 0, or a [`WitnessExecuteFailure`] code.
+/// - With [`WITNESS_EXECUTE_BUILD_ARG`] after the mode argument: one [`WitnessExecuteBuild`] frame on
+///   fd 1 (what every response of this binary names as its build), exit 0; no request, no `W`, no
+///   guest, under the same restriction.
 /// - The first thing the process does is [`zkminer_witness_sandbox::restrict_self`] with
 ///   `Profile::ExecuteWorker`, while it has one thread: from then on it opens no file and keeps only
 ///   its inherited fds. It never loads the `sys_rand` key (no environment variable, no file): it uses
@@ -532,6 +535,8 @@ pub(crate) use execute::execute_main;
 /// [`WitnessExecuteRequest`]: zkminer_prover_protocol::WitnessExecuteRequest
 /// [`WitnessExecuteResponse`]: zkminer_prover_protocol::WitnessExecuteResponse
 /// [`WitnessExecuteFailure`]: zkminer_prover_protocol::WitnessExecuteFailure
+/// [`WITNESS_EXECUTE_BUILD_ARG`]: zkminer_prover_protocol::WITNESS_EXECUTE_BUILD_ARG
+/// [`WitnessExecuteBuild`]: zkminer_prover_protocol::WitnessExecuteBuild
 #[cfg(all(target_os = "linux", feature = "cpu"))]
 mod execute {
     use std::cell::RefCell;
@@ -545,9 +550,9 @@ mod execute {
 
     use risc0_zkvm::{CoprocessorCallback, ExitCode};
     use zkminer_prover_protocol::{
-        read_message, write_message, WitnessExecuteFailure as Failure, WitnessExecutePo2,
-        WitnessExecuteRequest, WitnessExecuteResponse, GUEST_EXIT_HALTED, RISC0_JOB_PO2_MAX,
-        RISC0_JOB_PO2_MIN, WITNESS_EXECUTE_W_FD,
+        read_message, write_message, WitnessExecuteBuild, WitnessExecuteFailure as Failure,
+        WitnessExecutePo2, WitnessExecuteRequest, WitnessExecuteResponse, GUEST_EXIT_HALTED,
+        RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN, WITNESS_EXECUTE_BUILD_ARG, WITNESS_EXECUTE_W_FD,
     };
 
     use super::super::{check_claim_output, dup_cloexec, KeccakAudit};
@@ -593,6 +598,14 @@ mod execute {
                     .unwrap_or_else(|_| "warn".into()),
             )
             .init();
+        // The build handshake: what this binary's responses name, before any guest runs in it.
+        if std::env::args_os().nth(2).as_deref()
+            == Some(std::ffi::OsStr::new(WITNESS_EXECUTE_BUILD_ARG))
+        {
+            let mut out = BufWriter::new(response);
+            let sent = write_message(&mut out, &build()).is_ok() && out.flush().is_ok();
+            std::process::exit(if sent { 0 } else { Failure::Internal.code() });
+        }
         let code = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(response))) {
             Ok(Ok(())) => 0,
             Ok(Err(failure)) => failure.code(),
@@ -600,6 +613,14 @@ mod execute {
             Err(_) => Failure::Panicked.code(),
         };
         std::process::exit(code)
+    }
+
+    /// This executor's build, as every response and the build handshake name it.
+    fn build() -> WitnessExecuteBuild {
+        WitnessExecuteBuild {
+            sdk_version: format!("risc0-zkvm {}", risc0_zkvm::VERSION),
+            worker_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
     }
 
     fn run(response: File) -> Result<(), Failure> {
@@ -626,14 +647,18 @@ mod execute {
                 break;
             }
         }
+        let WitnessExecuteBuild {
+            sdk_version,
+            worker_version,
+        } = build();
         let resp = WitnessExecuteResponse {
             image_id: image_id
                 .as_bytes()
                 .try_into()
                 .expect("a digest is 32 bytes"),
             results,
-            sdk_version: format!("risc0-zkvm {}", risc0_zkvm::VERSION),
-            worker_version: env!("CARGO_PKG_VERSION").to_string(),
+            sdk_version,
+            worker_version,
         };
         let mut out = BufWriter::new(response);
         write_message(&mut out, &resp)

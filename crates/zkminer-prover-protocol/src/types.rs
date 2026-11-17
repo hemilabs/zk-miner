@@ -460,6 +460,19 @@ pub const WITNESS_EXECUTE_ARG: &str = "--witness-execute";
 /// The fd a witness execute reads `W` from: a read-only regular file or a write-sealed memfd.
 pub const WITNESS_EXECUTE_W_FD: i32 = 3;
 
+/// After [`WITNESS_EXECUTE_ARG`]: answer one [`WitnessExecuteBuild`] frame on fd 1 and exit 0, under
+/// the same self-restriction, reading no request, no `W` and running no guest. The miner asks before
+/// any requester's guest runs in that binary: a witness bundle records this as the build its
+/// journals came from, never what a process that ran a guest says of itself.
+pub const WITNESS_EXECUTE_BUILD_ARG: &str = "--build";
+
+/// The execute worker's build, as [`WitnessExecuteResponse`] and the binary's `HelloAck` name it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessExecuteBuild {
+    pub sdk_version: String,
+    pub worker_version: String,
+}
+
 /// What a sandboxed witness execute runs: the guest on `prefix ‖ W` at each po2, with the given seed.
 ///
 /// One length-prefixed bincode frame on fd 0 (see [`crate::codec`]). `W` itself is not in the frame:

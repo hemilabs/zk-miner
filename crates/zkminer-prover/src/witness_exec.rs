@@ -25,9 +25,9 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use zkminer_prover_protocol::{
-    read_message, write_message, WitnessExecuteFailure, WitnessExecuteRequest,
-    WitnessExecuteResponse, EXECUTE_JOURNAL_MAX_BYTES, GUEST_EXIT_HALTED, WITNESS_EXECUTE_ARG,
-    WITNESS_EXECUTE_W_FD,
+    read_message, write_message, WitnessExecuteBuild, WitnessExecuteFailure,
+    WitnessExecuteRequest, WitnessExecuteResponse, EXECUTE_JOURNAL_MAX_BYTES, GUEST_EXIT_HALTED,
+    WITNESS_EXECUTE_ARG, WITNESS_EXECUTE_BUILD_ARG, WITNESS_EXECUTE_W_FD,
 };
 pub use zkminer_witness_sandbox::CgroupSpec;
 use zkminer_witness_sandbox::{prepare_command, Cgroup, SandboxError};
@@ -120,7 +120,7 @@ pub fn run_witness_execute(
     write_message(&mut frame, req).map_err(|e| WitnessExecError::Request(e.to_string()))?;
     let memory_max = spec.memory_max;
     let cgroup = Cgroup::create(cgroup_root, &spec)?;
-    let run = run_in(&cgroup, binary, frame, w_fd, timeout);
+    let run = run_in(&cgroup, binary, &[], frame, Some(w_fd), timeout);
     // Read before the cgroup goes.
     let oom_killed = cgroup.oom_killed();
     let memory_peak = cgroup.memory_peak();
@@ -161,6 +161,73 @@ pub fn run_witness_execute(
     }
 }
 
+/// Asks the execute worker `binary` which build it is: run as for an execute
+/// ([`run_witness_execute`]: its own cgroup, an empty environment, its self-restriction) with
+/// [`WITNESS_EXECUTE_BUILD_ARG`], it answers one [`WitnessExecuteBuild`] frame and exits, reading no
+/// request and running no guest. Ask before any requester's guest has run in the binary: that answer,
+/// not what a response from a process that ran a guest says, is the build a bundle records.
+///
+/// Spawn from a long-lived thread: see the module docs.
+pub fn witness_execute_build(
+    binary: &Path,
+    cgroup_root: &Path,
+    spec: CgroupSpec,
+    timeout: Duration,
+) -> Result<WitnessExecuteBuild, WitnessExecError> {
+    let memory_max = spec.memory_max;
+    let cgroup = Cgroup::create(cgroup_root, &spec)?;
+    let run = run_in(&cgroup, binary, &[WITNESS_EXECUTE_BUILD_ARG], Vec::new(), None, timeout);
+    let oom_killed = cgroup.oom_killed();
+    if let Err(e) = cgroup.remove() {
+        tracing::warn!("witness execute build: removing its cgroup: {e}");
+    }
+    let finished = run?;
+    let log_tail = finished.log_tail;
+    if finished.timed_out {
+        return Err(WitnessExecError::Timeout {
+            after: timeout,
+            log_tail,
+        });
+    }
+    if oom_killed {
+        return Err(WitnessExecError::OomKilled {
+            memory_max,
+            log_tail,
+        });
+    }
+    match finished.status.code() {
+        Some(0) => parse_build(&finished.stdout, finished.stdout_overflowed)
+            .map_err(|reason| WitnessExecError::MalformedOutput { reason, log_tail }),
+        Some(code) => Err(WitnessExecError::Exit {
+            code,
+            failure: WitnessExecuteFailure::from_code(code),
+            log_tail,
+        }),
+        None => Err(WitnessExecError::Signaled {
+            signal: finished.status.signal().unwrap_or(0),
+            log_tail,
+        }),
+    }
+}
+
+/// The build in `stdout`: exactly one frame, with fields a bundle may record.
+fn parse_build(stdout: &[u8], overflowed: bool) -> Result<WitnessExecuteBuild, String> {
+    if overflowed {
+        return Err(format!("more than {MAX_RESPONSE_BYTES} bytes on stdout"));
+    }
+    let mut cursor = Cursor::new(stdout);
+    let build: WitnessExecuteBuild =
+        read_message(&mut cursor).map_err(|e| format!("not a build frame: {e}"))?;
+    let rest = stdout.len() as u64 - cursor.position();
+    if rest != 0 {
+        return Err(format!("{rest} bytes after the build frame"));
+    }
+    if !build_field_ok(&build.sdk_version) || !build_field_ok(&build.worker_version) {
+        return Err("the build names fields a bundle cannot record".into());
+    }
+    Ok(build)
+}
+
 /// What one run of the worker left behind.
 struct Finished {
     status: ExitStatus,
@@ -174,19 +241,22 @@ struct Finished {
 fn run_in(
     cgroup: &Cgroup,
     binary: &Path,
+    args: &[&str],
     frame: Vec<u8>,
-    w_fd: BorrowedFd,
+    w_fd: Option<BorrowedFd>,
     timeout: Duration,
 ) -> Result<Finished, WitnessExecError> {
     let mut cmd = Command::new(binary);
     cmd.arg(WITNESS_EXECUTE_ARG)
+        .args(args)
         .env_clear()
         .current_dir("/")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // fds 0-2 are std's pipes (dup2'ed before the hook runs); the hook maps targets >= 3 only.
-    prepare_command(&mut cmd, cgroup, &[(w_fd, WITNESS_EXECUTE_W_FD)])?;
+    let fds: Vec<(BorrowedFd, i32)> = w_fd.map(|fd| (fd, WITNESS_EXECUTE_W_FD)).into_iter().collect();
+    prepare_command(&mut cmd, cgroup, &fds)?;
     let started = Instant::now();
     let mut child = cmd.spawn().map_err(WitnessExecError::Spawn)?;
     // The hook holds an fd to `cgroup.procs`.
