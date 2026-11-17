@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zkminer_netguard::nearhop::{NearProbe, ProbeOutcome, Verdict, PROBE_TIMEOUT};
+use zkminer_netguard::nearhop::{decide, NearProbe, ProbeOutcome, Verdict, PROBE_TIMEOUT};
 use zkminer_netguard::{
     guarded_client, DohLookup, GuardedResolver, Lookup, NetMode, NetPolicy, TtlProbe,
 };
@@ -88,14 +88,21 @@ async fn ordinary_public_hosts_are_admitted_on_this_host() {
 
 /// The near-hop probe for real, against public anycast resolvers: a probe limited to 2 hops dies
 /// on the way (far), one with the usual hop limit connects. Where a family has no route here the
-/// probe fails at once as unreachable, which also reads as far.
+/// probe fails at once as unreachable, which also reads as far. A router on the way may rate-limit
+/// its time-exceeded answers, so the 2-hop probe alone can time out; the decision is the guard's,
+/// which then makes its check connection.
 #[test]
 fn public_hosts_are_far_and_reachable() {
     for addr in ["1.1.1.1:443", "[2606:4700:4700::1111]:443"] {
         let addr: SocketAddr = addr.parse().unwrap();
         let near = TtlProbe.probe(addr, 2, PROBE_TIMEOUT);
         eprintln!("{addr} within 2 hops: {near:?}");
-        assert_eq!(near.verdict(), Verdict::Far, "{addr}: {near:?}");
+        let decided = decide(&TtlProbe, addr, 2);
+        assert_eq!(
+            decided,
+            Verdict::Far,
+            "{addr}: probe {near:?}, decided {decided:?}"
+        );
         let full = TtlProbe.probe(addr, 64, PROBE_TIMEOUT);
         eprintln!("{addr} within 64 hops: {full:?}");
         if full != ProbeOutcome::Unreachable {
