@@ -8,8 +8,12 @@
 //! - `binding compute`: `journalFields` and `expectedJournalHash` from the requester's own
 //!   parameters (§7.2: never from a prover's journal);
 //! - `binding check`: the automated mutation check of a binding: which statement bytes it leaves
-//!   free, judged by changing each byte and recomputing the router's hash, and a warning when the
-//!   header is not fully pinned.
+//!   free, judged by changing each byte and recomputing the router's hash. It fails unless the
+//!   header (its length given, or the words) is fully pinned, and on a binding the router refuses
+//!   at submit, a NONE binding without `--assigned`, or no `expectedJournalHash` to check.
+//!
+//! Text output escapes control characters (`printable`): an envelope's URIs are the requester's
+//! bytes, and must not reach the operator's terminal as escape sequences.
 //!
 //! Every encoder and hash is the miner's own (`zkminer_witness::requester`, `zkminer_witness::binding`,
 //! `zkminer_chain::binding::full_hash`): a spec the miner would skip is refused with its reason.
@@ -87,6 +91,8 @@ impl DescriptorFile {
         })
     }
 
+    /// Reads a descriptor file and refuses one the router would refuse at submit
+    /// ([`submit_binding_refusal`]): a simulation of a job that cannot exist would pass for nothing.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let f: DescriptorFile = if path.extension().is_some_and(|e| e == "toml") {
@@ -97,8 +103,87 @@ impl DescriptorFile {
         if f.schema != DESCRIPTOR_FILE_SCHEMA {
             bail!("{}: descriptor file schema {} (this build reads {DESCRIPTOR_FILE_SCHEMA})", path.display(), f.schema);
         }
+        f.check_submit_rules().with_context(|| format!("{}", path.display()))?;
         Ok(f)
     }
+
+    /// The router's submit rules for this descriptor's binding ([`submit_binding_refusal`]).
+    pub fn check_submit_rules(&self) -> Result<()> {
+        match submit_binding_refusal(
+            self.journal_fields,
+            self.expected_journal_hash,
+            self.proof_system_id,
+            self.assigned_prover,
+        ) {
+            None => Ok(()),
+            Some((code, why)) => {
+                bail!("the router refuses this binding at submit (InvalidJournalBinding({code})): {why}")
+            }
+        }
+    }
+}
+
+/// The router's submit rules for a journal binding (`HemiProveCore._bindingMode`, hemiprove-contracts
+/// 3bc441d), in its order: `Some((reason, why))` when `submitJob` would revert
+/// `InvalidJournalBinding(reason)`. A descriptor file carries no bid configuration, so reason 4 (NONE
+/// with an underbid window) is the caller's to avoid.
+pub fn submit_binding_refusal(
+    journal_fields: B256,
+    expected_journal_hash: B256,
+    proof_system_id: B256,
+    assigned_prover: Address,
+) -> Option<(u8, &'static str)> {
+    use zkminer_chain::auction::{openvm_halo2_v1_id, sp1_groth16_v1_id, sp1_plonk_v1_id};
+    let open_vm = proof_system_id == openvm_halo2_v1_id();
+    let mut room = if open_vm { 32 } else { MAX_JOURNAL_BYTES };
+    let mut fields = journal_fields;
+    if let Some(m) = marker(journal_fields) {
+        fields = clear_marker(journal_fields);
+        if m == JOURNAL_PREFIX_MARKER {
+            if open_vm {
+                return Some((7, "OpenVM's verifier takes 32 public-value bytes: no room for the journal prefix"));
+            }
+            room -= PREFIX_BYTES;
+        } else if proof_system_id != sp1_groth16_v1_id() && proof_system_id != sp1_plonk_v1_id() {
+            return Some((6, "a binding marker this proof system does not carry"));
+        }
+    }
+    if expected_journal_hash == B256::ZERO {
+        if fields != B256::ZERO {
+            return Some((1, "FIELDS ranges without an expectedJournalHash"));
+        }
+        if assigned_prover == Address::ZERO {
+            return Some((3, "NONE binds nothing: only with an assigned prover"));
+        }
+        return None;
+    }
+    if fields != B256::ZERO {
+        let slots = fields_slots(journal_fields);
+        if slots.is_empty() {
+            return Some((2, "FIELDS with no used slot binds the empty string"));
+        }
+        if slots.iter().any(|s| s.end() > room) {
+            return Some((if open_vm { 7 } else { 5 }, "a FIELDS range ends past the journal room"));
+        }
+    }
+    None
+}
+
+/// `s` with every control character (C0, DEL and C1: ESC, CSI, OSC, …) and the bidirectional
+/// formatting characters escaped as `\u{…}`: text from an envelope or a requester's file cannot move
+/// the cursor, rewrite earlier lines, write the clipboard or hide what follows on a terminal.
+pub fn printable(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let bidi =
+            matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+        if c.is_control() || bidi {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// The proof system by name (`risc0`, the only one witness jobs are served on in Phase 1) or id.
@@ -274,6 +359,8 @@ pub struct BindingReport {
     /// Statement bytes the router's hash covers, and those it leaves free (FULL: all, NONE: none).
     pub pinned: Vec<ByteRange>,
     pub free: Vec<ByteRange>,
+    /// The header's length `H` (the words given, `--header-bytes`, or a scheme-1 `W`'s
+    /// `32 × nWords`): `[0, H)` must be pinned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header_bytes: Option<usize>,
     /// Free bytes inside the header `[0, H)`: each is a soundness hole in the requester's statement.
@@ -283,7 +370,9 @@ pub struct BindingReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_hash_matches: Option<bool>,
     pub warnings: Vec<String>,
-    /// No header byte free, no range past the statement, and the expected hash (when given) matched.
+    /// The mode is known, the router would accept the binding at submit (NONE: assigned), the
+    /// header's length is known and within the statement, no header byte is free, no range ends past
+    /// the statement, and the expected hash matched.
     pub ok: bool,
 }
 
@@ -300,6 +389,8 @@ pub struct CheckInput<'a> {
     pub header_bytes: Option<usize>,
     /// The header words, for per-word results.
     pub words: &'a [String],
+    /// The job's assigned prover, for NONE (zero: an open job, which the router refuses with NONE).
+    pub assigned_prover: Address,
 }
 
 /// The mutation check: see the module docs.
@@ -309,26 +400,25 @@ pub fn check_binding(c: &CheckInput<'_>) -> BindingReport {
     let slots = fields_slots(c.journal_fields);
     let fields = clear_marker(c.journal_fields);
     let mut warnings = Vec::new();
-    let expected_zero = c.expected_journal_hash == Some(B256::ZERO);
-    let mode = if m == Some(PROOF_NONCE_MARKER) {
-        "sp1-proof-nonce"
-    } else if expected_zero {
-        "none"
-    } else if fields == B256::ZERO {
-        "full"
-    } else {
-        "fields"
+    // Without the expected hash, FULL and NONE look the same and nothing can be matched: never
+    // assume one.
+    let mode = match (m, c.expected_journal_hash) {
+        (Some(PROOF_NONCE_MARKER), _) => "sp1-proof-nonce",
+        (_, None) => "unknown",
+        (_, Some(h)) if h == B256::ZERO => "none",
+        _ if fields == B256::ZERO => "full",
+        _ => "fields",
     };
     let len = c.statement.len();
     let mut ok = true;
-    let mask: Vec<bool> = match mode {
-        "fields" => match pinned_by_mutation(c.statement, c.journal_fields) {
+    let fields_mask =
+        |ok: &mut bool, warnings: &mut Vec<String>| match pinned_by_mutation(c.statement, c.journal_fields) {
             Some(mask) => mask,
             None => {
-                ok = false;
+                *ok = false;
                 warnings.push(format!(
                     "a pinned range ends past this {len}-byte statement: the router rejects every journal this \
-                     short (a range past the journal is a mismatch, never a truncation)"
+                 short (a range past the journal is a mismatch, never a truncation)"
                 ));
                 let mut mask = vec![false; len];
                 for s in &slots {
@@ -338,7 +428,10 @@ pub fn check_binding(c: &CheckInput<'_>) -> BindingReport {
                 }
                 mask
             }
-        },
+        };
+    let mask: Vec<bool> = match mode {
+        "fields" => fields_mask(&mut ok, &mut warnings),
+        "unknown" if fields != B256::ZERO => fields_mask(&mut ok, &mut warnings),
         "full" => vec![true; len],
         _ => vec![false; len],
     };
@@ -354,7 +447,21 @@ pub fn check_binding(c: &CheckInput<'_>) -> BindingReport {
         ok = false;
         warnings.push("expectedJournalHash does not match this statement under these journalFields".into());
     }
+    if let Some(h) = c.expected_journal_hash {
+        if let Some((code, why)) = submit_binding_refusal(c.journal_fields, h, c.proof_system_id, c.assigned_prover) {
+            ok = false;
+            warnings.push(format!("the router refuses this binding at submit (InvalidJournalBinding({code})): {why}"));
+        }
+    }
     match mode {
+        "unknown" => {
+            ok = false;
+            warnings.push(
+                "no expectedJournalHash given (give it or --descriptor): FULL and NONE cannot be told apart and \
+                 nothing can be matched"
+                    .into(),
+            );
+        }
         "sp1-proof-nonce" => {
             ok = false;
             warnings.push("the SP1 proof-nonce marker: SP1 witness jobs are not served until Phase 2 (plan §7.2)".into());
@@ -392,13 +499,21 @@ pub fn check_binding(c: &CheckInput<'_>) -> BindingReport {
     }
     let header_bytes = c.header_bytes.or((!c.words.is_empty()).then_some(32 * c.words.len()));
     let header_free = match header_bytes {
-        Some(h) => {
-            let h = h.min(len);
-            ranges(runs(&mask[..h], false))
+        Some(h) if h > len => {
+            // The header is the start of the statement: one longer than it cannot have been checked.
+            ok = false;
+            warnings.push(format!(
+                "the header is {h} bytes, longer than this {len}-byte statement: check the whole statement \
+                 (--statement or --journal), or the header's own length"
+            ));
+            let mut free = ranges(runs(&mask, false));
+            free.push(ByteRange { start: len, end: h });
+            free
         }
+        Some(h) => ranges(runs(&mask[..h], false)),
         None => Vec::new(),
     };
-    if !header_free.is_empty() && mode != "none" {
+    if !header_free.is_empty() && mode != "none" && header_bytes.is_some_and(|h| h <= len) {
         ok = false;
         warnings.push(format!(
             "the header is not fully pinned: {} of its bytes are free ({:?}); every free header byte is a value the \
@@ -407,8 +522,13 @@ pub fn check_binding(c: &CheckInput<'_>) -> BindingReport {
             header_free.iter().map(|r| (r.start, r.end)).collect::<Vec<_>>()
         ));
     }
-    if header_bytes.is_none() && mode == "fields" {
-        warnings.push("the header length is unknown (give the words or --header-bytes): only ranges are reported".into());
+    if header_bytes.is_none() && (mode == "fields" || (mode == "unknown" && fields != B256::ZERO)) {
+        ok = false;
+        warnings.push(
+            "the header length is unknown (give the words, --header-bytes, or a scheme-1 W): a FIELDS binding \
+             cannot be shown to pin the whole header"
+                .into(),
+        );
     }
     let words = c
         .words
@@ -469,6 +589,9 @@ pub fn envelope_encode(
         let assigned = job.assigned_prover.unwrap_or(Address::ZERO);
         if b.mode == "none" && assigned == Address::ZERO {
             bail!("a NONE binding needs assigned_prover (plan §7.2)");
+        }
+        if let Some((code, why)) = submit_binding_refusal(b.journal_fields, b.expected_journal_hash, psid, assigned) {
+            bail!("the router would refuse this binding at submit (InvalidJournalBinding({code})): {why}");
         }
         let d = DescriptorFile {
             schema: DESCRIPTOR_FILE_SCHEMA,
@@ -539,19 +662,20 @@ pub fn envelope_decode(input: &str, chain_id: u64, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&r)?);
     } else {
+        // Every field through `printable`: the URIs and the spec are the requester's bytes.
         println!("inputData: {} bytes, keccak256 {}", r.input_bytes, r.input_keccak256);
         println!("witness job: {}", r.witness_job);
         if let Some(e) = &r.error {
-            println!("refused by the miner's decoder: {e}");
+            println!("refused by the miner's decoder: {}", printable(e));
         }
         for u in &r.uris {
-            println!("builderURI {}: {}", u.uri, u.status);
+            println!("builderURI {}: {}", printable(&u.uri), printable(&u.status));
         }
         if let Some(s) = &r.spec {
-            println!("--- spec (TOML) ---\n{}", toml::to_string_pretty(s)?);
+            println!("{}", spec_text(s)?);
         }
         for w in &r.warnings {
-            println!("warning: {w}");
+            println!("warning: {}", printable(w));
         }
     }
     if r.error.is_some() {
@@ -560,8 +684,29 @@ pub fn envelope_decode(input: &str, chain_id: u64, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The spec as `envelope decode` prints it: TOML, which `envelope encode` reads back; or, when a
+/// value is above 2^63 − 1 (the miner's decoder takes any u64, TOML holds only i64), JSON, which it
+/// reads back as well. Each line escaped.
+fn spec_text(s: &zkminer_witness::requester::EnvelopeSpec) -> Result<String> {
+    let (title, body) = match toml::to_string_pretty(s) {
+        Ok(t) => ("--- spec (TOML) ---".to_string(), t),
+        Err(_) => (
+            "--- spec (JSON: a value is above 2^63 - 1, which TOML cannot hold; `envelope encode` reads a .json spec) ---"
+                .to_string(),
+            serde_json::to_string_pretty(s)?,
+        ),
+    };
+    Ok(std::iter::once(title).chain(body.lines().map(printable)).collect::<Vec<_>>().join("\n"))
+}
+
 /// `zkminer witness binding compute`.
-pub fn binding_compute(b: &BindingSpec, proof_system: &str, program_id: Option<B256>, json: bool) -> Result<()> {
+pub fn binding_compute(
+    b: &BindingSpec,
+    proof_system: &str,
+    program_id: Option<B256>,
+    assigned: Option<Address>,
+    json: bool,
+) -> Result<()> {
     let psid = parse_proof_system(proof_system)?;
     if b.full_statement.is_some() && program_id.is_none() {
         bail!("FULL hashes the program id: give --program-id");
@@ -582,6 +727,7 @@ pub fn binding_compute(b: &BindingSpec, proof_system: &str, program_id: Option<B
         statement: &statement,
         header_bytes: c.header_bytes,
         words: &words,
+        assigned_prover: assigned.unwrap_or(Address::ZERO),
     });
     if json {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "binding": c, "check": report }))?);
@@ -602,7 +748,7 @@ pub fn binding_compute(b: &BindingSpec, proof_system: &str, program_id: Option<B
 
 fn print_warnings(r: &BindingReport) {
     for w in &r.warnings {
-        println!("warning: {w}");
+        println!("warning: {}", printable(w));
     }
 }
 
@@ -617,6 +763,8 @@ pub struct CheckArgs {
     pub journal: Option<String>,
     pub statement: Option<String>,
     pub header_bytes: Option<usize>,
+    /// The job's assigned prover (a NONE binding fails without one; default the descriptor's).
+    pub assigned: Option<Address>,
     pub json: bool,
 }
 
@@ -657,6 +805,7 @@ pub fn binding_check(a: CheckArgs) -> Result<()> {
         (None, None, false) => encode_words(&a.words).map_err(anyhow::Error::msg)?,
         _ => bail!("give the statement: --word … (the header), --statement, or --journal (a whole journal)"),
     };
+    let assigned = a.assigned.or(d.as_ref().map(|d| d.assigned_prover)).unwrap_or(Address::ZERO);
     let report = check_binding(&CheckInput {
         journal_fields,
         expected_journal_hash: expected,
@@ -665,6 +814,7 @@ pub fn binding_check(a: CheckArgs) -> Result<()> {
         statement: &statement,
         header_bytes: a.header_bytes,
         words: &a.words,
+        assigned_prover: assigned,
     });
     if a.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -675,9 +825,21 @@ pub fn binding_check(a: CheckArgs) -> Result<()> {
         }
         println!("pinned: {:?}", report.pinned.iter().map(|r| (r.start, r.end)).collect::<Vec<_>>());
         println!("free:   {:?}", report.free.iter().map(|r| (r.start, r.end)).collect::<Vec<_>>());
+        match report.header_bytes {
+            Some(h) => println!(
+                "header: {h} bytes, free {:?}",
+                report.header_free.iter().map(|r| (r.start, r.end)).collect::<Vec<_>>()
+            ),
+            None => println!("header: length unknown"),
+        }
         for w in &report.words {
             if !w.free_bytes.is_empty() {
-                println!("word {} ({}): free bytes {:?}", w.index, w.word, w.free_bytes.iter().map(|r| (r.start, r.end)).collect::<Vec<_>>());
+                println!(
+                    "word {} ({}): free bytes {:?}",
+                    w.index,
+                    printable(&w.word),
+                    w.free_bytes.iter().map(|r| (r.start, r.end)).collect::<Vec<_>>()
+                );
             }
         }
         if let Some(m) = report.expected_hash_matches {
@@ -746,6 +908,7 @@ mod tests {
             statement: &statement,
             header_bytes: None,
             words: &words(),
+            assigned_prover: Address::ZERO,
         });
         assert!(r.ok, "{:?}", r.warnings);
         assert_eq!(r.pinned, vec![ByteRange { start: 0, end: 160 }]);
@@ -767,6 +930,7 @@ mod tests {
             statement: &statement,
             header_bytes: None,
             words: &words(),
+            assigned_prover: Address::ZERO,
         });
         assert!(!r.ok);
         assert_eq!(r.header_free, vec![ByteRange { start: 128, end: 160 }]);
@@ -782,6 +946,7 @@ mod tests {
             statement: &statement,
             header_bytes: Some(160),
             words: &[],
+            assigned_prover: Address::ZERO,
         });
         assert!(!r.ok);
         assert!(r.warnings.iter().any(|w| w.contains("past this")));
@@ -809,6 +974,7 @@ mod tests {
             statement: &statement,
             header_bytes: None,
             words: &[],
+            assigned_prover: Address::ZERO,
         });
         assert_eq!(r.mode, "full");
         assert_eq!(r.expected_hash_matches, Some(true));
@@ -829,10 +995,200 @@ mod tests {
             statement: &statement,
             header_bytes: None,
             words: &[],
+            assigned_prover: Address::ZERO,
         });
         assert!(!r.ok && r.mode == "sp1-proof-nonce");
         // Exactly one binding form.
         assert!(compute_binding(&BindingSpec { prefix: true, header: Some(words()), full_statement: None, none: true }, psid, pid).is_err());
+    }
+
+    /// The §12 header (scheme, B, C, R, k) as `--word word:0x…` values.
+    fn section12_words() -> Vec<String> {
+        [
+            format!("{:064x}", 1),
+            "11".repeat(32),
+            format!("{:0>64}", "c0".repeat(20)),
+            format!("01{:062x}", 10),
+            format!("{:064x}", 3),
+        ]
+        .iter()
+        .map(|h| format!("word:0x{h}"))
+        .collect()
+    }
+
+    fn fields(h: usize) -> B256 {
+        journal_fields_for_header(h, true).unwrap()
+    }
+
+    fn check(
+        fields: B256,
+        expected: Option<B256>,
+        statement: &[u8],
+        header_bytes: Option<usize>,
+        words: &[String],
+        assigned: Address,
+    ) -> BindingReport {
+        check_binding(&CheckInput {
+            journal_fields: fields,
+            expected_journal_hash: expected,
+            proof_system_id: parse_proof_system("risc0").unwrap(),
+            program_id: B256::ZERO,
+            statement,
+            header_bytes,
+            words,
+            assigned_prover: assigned,
+        })
+    }
+
+    #[test]
+    fn bindings_that_leave_the_header_free_or_unknown_fail() {
+        let words = section12_words();
+        let h160 = encode_words(&words).unwrap();
+        let h96 = h160[..96].to_vec();
+        // A: only word 0 pinned, the header's length not given: unknown, so a failure.
+        let a = check(fields(32), Some(keccak256(&h160[..32])), &h160, None, &[], Address::ZERO);
+        assert!(!a.ok && a.warnings.iter().any(|w| w.contains("header length is unknown")), "{:?}", a.warnings);
+        // … and with the length, the 128 free bytes.
+        let a = check(fields(32), Some(keccak256(&h160[..32])), &h160, Some(160), &[], Address::ZERO);
+        assert!(!a.ok);
+        assert_eq!(a.header_free, vec![ByteRange { start: 32, end: 160 }]);
+        // B: five words but a 96-byte statement: the header is longer than the statement.
+        let b = check(fields(96), Some(keccak256(&h96)), &h96, None, &words, Address::ZERO);
+        assert!(
+            !b.ok && b.warnings.iter().any(|w| w.contains("longer than this 96-byte statement")),
+            "{:?}",
+            b.warnings
+        );
+        assert_eq!(b.header_free.last(), Some(&ByteRange { start: 96, end: 160 }));
+        // C: the same with --header-bytes 160.
+        let c = check(fields(96), Some(keccak256(&h96)), &h96, Some(160), &[], Address::ZERO);
+        assert!(!c.ok);
+        // Control: the 96-byte binding against the five words, as statement.
+        let ctl = check(fields(96), Some(keccak256(&h96)), &h160, None, &words, Address::ZERO);
+        assert!(!ctl.ok);
+        assert_eq!(ctl.header_free, vec![ByteRange { start: 96, end: 160 }]);
+        // And the whole header pinned passes.
+        let good = check(fields(160), Some(keccak256(&h160)), &h160, None, &words, Address::ZERO);
+        assert!(good.ok, "{:?}", good.warnings);
+    }
+
+    #[test]
+    fn none_needs_an_assigned_prover_and_no_hash_is_no_mode() {
+        let words = section12_words();
+        let h160 = encode_words(&words).unwrap();
+        let marker_only = clear_marker(fields(160)) ^ fields(160);
+        // D: NONE (expectedJournalHash 0) of an open job: the router refuses it, and so does the check.
+        let d = check(marker_only, Some(B256::ZERO), &h160, None, &words, Address::ZERO);
+        assert_eq!(d.mode, "none");
+        assert!(!d.ok && d.warnings.iter().any(|w| w.contains("InvalidJournalBinding(3)")), "{:?}", d.warnings);
+        // Assigned: bilateral trust, allowed (and still nothing pinned).
+        let assigned = check(marker_only, Some(B256::ZERO), &h160, None, &words, Address::repeat_byte(0xb0));
+        assert!(assigned.ok, "{:?}", assigned.warnings);
+        assert_eq!(assigned.header_free, vec![ByteRange { start: 0, end: 160 }]);
+        // E: no expectedJournalHash: neither FULL nor NONE assumed.
+        let e = check(marker_only, None, &h160, None, &words, Address::ZERO);
+        assert_eq!(e.mode, "unknown");
+        assert!(!e.ok && e.expected_hash_matches.is_none());
+        // FIELDS ranges without the hash: still unknown, ranges reported.
+        let e = check(fields(160), None, &h160, None, &words, Address::ZERO);
+        assert_eq!(e.mode, "unknown");
+        assert!(!e.ok);
+        assert_eq!(e.pinned, vec![ByteRange { start: 0, end: 160 }]);
+    }
+
+    #[test]
+    fn descriptors_follow_the_routers_submit_rules() {
+        let risc0 = parse_proof_system("risc0").unwrap();
+        let hash = B256::repeat_byte(1);
+        let none = clear_marker(fields(32)) ^ fields(32);
+        assert_eq!(submit_binding_refusal(none, B256::ZERO, risc0, Address::ZERO).map(|r| r.0), Some(3));
+        assert_eq!(submit_binding_refusal(none, B256::ZERO, risc0, Address::repeat_byte(2)), None);
+        assert_eq!(submit_binding_refusal(B256::ZERO, B256::ZERO, risc0, Address::ZERO).map(|r| r.0), Some(3));
+        assert_eq!(
+            submit_binding_refusal(fields(32), B256::ZERO, risc0, Address::repeat_byte(2)).map(|r| r.0),
+            Some(1)
+        );
+        assert_eq!(submit_binding_refusal(fields(32), hash, risc0, Address::ZERO), None);
+        assert_eq!(submit_binding_refusal(B256::ZERO, hash, risc0, Address::ZERO), None, "FULL");
+        // A used range past the room under the prefix.
+        let mut past = [0u8; 32];
+        past[..4].copy_from_slice(&JOURNAL_PREFIX_MARKER.to_be_bytes());
+        past[4..8].copy_from_slice(&((((MAX_STATEMENT_BYTES_WITH_PREFIX - 10) as u32) << 16) | 32).to_be_bytes());
+        assert_eq!(submit_binding_refusal(B256::from(past), hash, risc0, Address::ZERO).map(|r| r.0), Some(5));
+        // The proof-nonce marker outside SP1, and the prefix on OpenVM.
+        let mut nonce = [0u8; 32];
+        nonce[..4].copy_from_slice(&PROOF_NONCE_MARKER.to_be_bytes());
+        assert_eq!(submit_binding_refusal(B256::from(nonce), hash, risc0, Address::ZERO).map(|r| r.0), Some(6));
+        let openvm = zkminer_chain::auction::openvm_halo2_v1_id();
+        assert_eq!(submit_binding_refusal(fields(32), hash, openvm, Address::ZERO).map(|r| r.0), Some(7));
+        // A descriptor file with NONE and no assigned prover does not load.
+        let dir = tempfile::tempdir().unwrap();
+        let d = DescriptorFile {
+            schema: DESCRIPTOR_FILE_SCHEMA,
+            job_id: None,
+            caller: None,
+            program_id: B256::ZERO,
+            proof_system_id: risc0,
+            callback_contract: Address::ZERO,
+            assigned_prover: Address::ZERO,
+            tag: B256::ZERO,
+            input_data: Bytes::new(),
+            callback_extra_data: Bytes::new(),
+            extra_verifier_data: Bytes::new(),
+            expected_journal_hash: B256::ZERO,
+            journal_fields: none,
+        };
+        let path = dir.path().join("none.json");
+        std::fs::write(&path, serde_json::to_string(&d).unwrap()).unwrap();
+        let e = DescriptorFile::load(&path).unwrap_err();
+        assert!(format!("{e:#}").contains("InvalidJournalBinding(3)"), "{e:#}");
+        let assigned = DescriptorFile { assigned_prover: Address::repeat_byte(0xb0), ..d };
+        std::fs::write(&path, serde_json::to_string(&assigned).unwrap()).unwrap();
+        assert!(DescriptorFile::load(&path).is_ok());
+    }
+
+    #[test]
+    fn text_output_escapes_terminal_controls() {
+        let hostile = "hemi-code://1/0x00\x1b[1A\x1b[2Kwitness job: false\x1b]52;c;Y3VybA==\x07\u{9b}31m\u{202e}txt";
+        let p = printable(hostile);
+        assert!(!p.chars().any(|c| c.is_control()), "{p}");
+        assert!(
+            p.contains("\\u{1b}[1A") && p.contains("\\u{7}") && p.contains("\\u{9b}") && p.contains("\\u{202e}"),
+            "{p}"
+        );
+        assert_eq!(printable("plain ascii, ünïcode"), "plain ascii, ünïcode");
+    }
+
+    #[test]
+    fn a_u64_above_i64_max_prints_as_a_json_spec() {
+        let mut spec = zkminer_witness::requester::EnvelopeSpec {
+            builder_type: 1,
+            builder_id: Some(B256::repeat_byte(1)),
+            builder_uris: vec!["hemi-code://743111/0x00112233445566778899aabbccddeeff00112233".into()],
+            builder_params: Some("0x".into()),
+            builder_params_abi: None,
+            sources: vec![],
+            limits: zkminer_witness::requester::LimitsSpec {
+                max_fetches: 1,
+                max_fetch_bytes: 1,
+                max_request_bytes: 1,
+                max_response_bytes: 1,
+                max_builder_fuel: 1,
+                max_builder_memory_bytes: 1,
+                max_builder_seconds: 1,
+                max_witness_bytes: 1,
+                max_guest_cycles: 1,
+            },
+        };
+        assert!(spec_text(&spec).unwrap().starts_with("--- spec (TOML) ---"));
+        spec.limits.max_builder_fuel = u64::MAX;
+        let text = spec_text(&spec).unwrap();
+        assert!(text.starts_with("--- spec (JSON"), "{text}");
+        assert!(text.contains(&u64::MAX.to_string()));
+        // The JSON spec reads back.
+        let body: String = text.lines().skip(1).collect::<Vec<_>>().join("\n");
+        let back: zkminer_witness::requester::EnvelopeSpec = serde_json::from_str(&body).unwrap();
+        assert_eq!(back.limits.max_builder_fuel, u64::MAX);
     }
 
     #[test]

@@ -362,9 +362,12 @@ enum BindingCommand {
         /// FULL: the whole statement (the journal after any prefix), 0x hex.
         #[arg(long, conflicts_with_all = ["words", "none"])]
         full_statement: Option<String>,
-        /// NONE: nothing bound (only with an assigned prover).
+        /// NONE: nothing bound (only with an assigned prover: give it with --assigned).
         #[arg(long, conflicts_with = "words")]
         none: bool,
+        /// The job's assigned prover: a NONE binding without one fails (the router refuses it).
+        #[arg(long)]
+        assigned: Option<alloy::primitives::Address>,
         /// Without the journal-prefix marker (the marker is the default for open witness jobs).
         #[arg(long)]
         no_prefix: bool,
@@ -378,8 +381,10 @@ enum BindingCommand {
         json: bool,
     },
     /// The mutation check: change each byte of a statement in turn, recompute the router's hash, and
-    /// report which bytes the binding leaves free; non-zero exit when a header byte is free, a range
-    /// ends past the statement, or the expected hash does not match.
+    /// report which bytes the binding leaves free. Non-zero exit when a header byte is free, the
+    /// header's length is unknown (FIELDS) or longer than the statement, a range ends past the
+    /// statement, the expected hash does not match or is not given, the router would refuse the
+    /// binding at submit, or the binding is NONE without --assigned.
     Check {
         /// A descriptor file (its journalFields, expectedJournalHash and programId).
         #[arg(long)]
@@ -404,6 +409,9 @@ enum BindingCommand {
         /// The header's length in bytes (default: 32 × the words given).
         #[arg(long)]
         header_bytes: Option<usize>,
+        /// The job's assigned prover (default: the descriptor's): a NONE binding without one fails.
+        #[arg(long)]
+        assigned: Option<alloy::primitives::Address>,
         #[arg(long)]
         json: bool,
     },
@@ -681,6 +689,7 @@ async fn main() -> Result<()> {
                     words,
                     full_statement,
                     none,
+                    assigned,
                     no_prefix,
                     program_id,
                     proof_system,
@@ -692,7 +701,7 @@ async fn main() -> Result<()> {
                         full_statement,
                         none,
                     };
-                    commands::witness_tools::binding_compute(&spec, &proof_system, program_id, json)
+                    commands::witness_tools::binding_compute(&spec, &proof_system, program_id, assigned, json)
                 }
                 BindingCommand::Check {
                     descriptor,
@@ -704,6 +713,7 @@ async fn main() -> Result<()> {
                     journal,
                     statement,
                     header_bytes,
+                    assigned,
                     json,
                 } => commands::witness_tools::binding_check(commands::witness_tools::CheckArgs {
                     descriptor,
@@ -715,6 +725,7 @@ async fn main() -> Result<()> {
                     journal,
                     statement,
                     header_bytes,
+                    assigned,
                     json,
                 }),
             },

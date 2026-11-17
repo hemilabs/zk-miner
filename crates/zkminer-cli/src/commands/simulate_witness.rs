@@ -696,6 +696,7 @@ fn fill_success(r: &mut WitnessReport, s: &Simulated, d: &JobDescriptor, declare
         statement,
         header_bytes: None,
         words: &[],
+        assigned_prover: d.assignedProver,
     });
     r.journal = Some(JournalReport {
         bytes: s.journal.len(),
