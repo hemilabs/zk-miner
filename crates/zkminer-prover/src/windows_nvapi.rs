@@ -9,6 +9,10 @@
 //!
 //! Read only. NVAPI is loaded from the driver at run time (`nvapi64.dll`), so a host without an
 //! NVIDIA driver simply reads nothing.
+//!
+//! Not yet confirmed: that a value set in the NVIDIA Control Panel reads back through this id. NVAPI
+//! refuses to WRITE it (`NVAPI_SETTING_NOT_FOUND`), so it could not be set here to check, and on the
+//! machine it was written on it reads as not set. Hence "not set in any profile read here", never "off".
 
 use std::ffi::c_void;
 
@@ -20,7 +24,7 @@ const CUDA_SYSMEM_FALLBACK_POLICY_ID: u32 = 0x10EC_ECC9;
 /// A value of CUDA - Sysmem Fallback Policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SysmemFallback {
-    /// Not set in the profile read: the driver's default applies, which falls back.
+    /// Not set in any profile read here: the driver's default would apply, which falls back.
     NotSet,
     /// 0: "Driver Default", which falls back.
     DriverDefault,
@@ -42,16 +46,23 @@ impl SysmemFallback {
         }
     }
 
-    /// Whether an allocation that finds the card full goes to system memory.
-    pub fn falls_back(self) -> bool {
-        !matches!(self, Self::PreferNoFallback)
+    /// Whether an allocation that finds the card full goes to system memory; `None` for a value this
+    /// build does not know.
+    pub fn falls_back(self) -> Option<bool> {
+        match self {
+            Self::PreferNoFallback => Some(false),
+            Self::Other(_) => None,
+            _ => Some(true),
+        }
     }
 }
 
 impl std::fmt::Display for SysmemFallback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotSet => f.write_str("not set (driver default, falls back)"),
+            Self::NotSet => {
+                f.write_str("not set in any profile read here (the driver default falls back)")
+            }
             Self::DriverDefault => f.write_str("Driver Default (falls back)"),
             Self::PreferNoFallback => f.write_str("Prefer No Sysmem Fallback"),
             Self::PreferFallback => f.write_str("Prefer Sysmem Fallback"),
@@ -277,8 +288,11 @@ impl Nvapi {
                 &mut *setting,
             )
         };
+        /// `NVDRS_DWORD_TYPE`.
+        const DWORD: u32 = 0;
         match rc {
-            0 => Some(SysmemFallback::from_value(setting.current[0])),
+            0 if setting.kind == DWORD => Some(SysmemFallback::from_value(setting.current[0])),
+            0 => None,
             NVAPI_SETTING_NOT_FOUND => Some(SysmemFallback::NotSet),
             _ => None,
         }
@@ -310,7 +324,8 @@ mod tests {
             SysmemFallback::from_value(1),
             SysmemFallback::PreferNoFallback
         );
-        assert!(!SysmemFallback::PreferNoFallback.falls_back());
-        assert!(SysmemFallback::NotSet.falls_back());
+        assert_eq!(SysmemFallback::PreferNoFallback.falls_back(), Some(false));
+        assert_eq!(SysmemFallback::NotSet.falls_back(), Some(true));
+        assert_eq!(SysmemFallback::Other(7).falls_back(), None);
     }
 }

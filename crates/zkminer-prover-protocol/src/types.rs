@@ -487,7 +487,10 @@ const MIB: u64 = 1024 * 1024;
 const SP1_MEASURED_TIERS: &[(u64, u64)] =
     &[(268_435_456, 17_766 * MIB), (134_217_728, 15_092 * MIB)];
 
-/// Measured `(element threshold, peak VRAM)` for SP1 on a card of 16 GiB or less, largest first.
+/// Measured `(element threshold, peak VRAM)` for SP1 on a CUDA card of 16 GiB or less, largest
+/// first. Callers give an AMD or Intel card no total, so it is sized by the larger table: a SYCL
+/// server keeps its LDEs on a 13-16 GiB card (an A770 peaks around 14 GB at 134M), and nothing has
+/// measured a HIP one.
 ///
 /// The server sizes itself from the card's total (`local_gpu_opts`, `ceil(total GiB) + 4 <= 20`) and
 /// on these cards drops its LDE codewords after committing, recomputes the first GKR layer, keeps no
@@ -690,7 +693,8 @@ pub fn sp1_smallest_measured_threshold() -> u64 {
 /// prediction on the safe side (`tier_at` takes the minimum, so a higher figure here can only make
 /// the predicted tier, and so the room made for it, the larger): 402,653,184 above 16 GiB, whatever
 /// `FULL_SIZE_SHARDS` says, and 268,435,456 at or below 16 GiB on every backend — a HIP server there
-/// may choose `1 << 26` or 134,217,728 instead, depending on its arena and the video memory budget.
+/// may choose `1 << 26` or 134,217,728 instead, depending on its arena and the video memory budget,
+/// and a SYCL one 134,217,728.
 ///
 /// The dispatcher needs it to predict a worker's tier exactly where it matters: an operator's
 /// 402,653,184 on a 16 GB card runs at 268,435,456 and needs that tier's room, not an unmeasured one.

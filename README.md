@@ -371,16 +371,17 @@ Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
   or a po2 under Settings → Advanced, which applies for the session while Advanced mode is on.
   The config is read when the miner starts. The log lists each card's size whenever it changes,
   and names a configured card that isn't here;
-- else the largest measured size that fits the card with 1.9 GiB to spare: 20 from 14 GiB of
-  VRAM (po2 20 peaks around 12.1 GiB), 19 from 9.8 GiB (8.0 GiB), 18 from 6.5 GiB (4.6 GiB),
-  and none below that.
+- else, on an NVIDIA card, the largest measured size that fits it with 1.9 GiB to spare: 20
+  from 14 GiB of VRAM (po2 20 peaks around 12.1 GiB), 19 from 9.8 GiB (8.0 GiB), 18 from
+  6.5 GiB (4.6 GiB), and none below that; on an AMD or Intel card, whose sizes haven't been
+  measured, 20 from 14 GiB and none below.
   A card whose VRAM isn't known gets 20: an Intel card, a CUDA query that failed, or the card
   behind a risc0 worker named in `[prover.worker_binaries]` (which isn't pinned to a card);
 - `benchmark --calibrate` proves a 62M-cycle Groth16 job at each size, on a card whose VRAM
-  is known (NVIDIA; an AMD card under 6.5 GiB needs a size set for it). Run it with the miner
-  stopped. A card then uses its fastest size,
-  up to one step below the largest that proved when a larger one failed (or at 22, past which
-  the prover refuses). Calibration can raise a card above 20, or give a smaller card a size, but
+  is known (NVIDIA; an AMD card under 14 GiB needs a size set for it). Run it with
+  the miner stopped. A card then uses its fastest size, up to one step below the largest that
+  proved: the sweep stops at the first failure, at 22 (past which the prover refuses), or at
+  the size the card's free VRAM is expected to hold. Calibration can raise a card above 20, or give a smaller card a size, but
   never takes a card below 20 if 20 proved during calibration. A plain re-benchmark drops the
   calibration. A slow card may need a larger `benchmark_timeout_secs` at sizes below 18.
 
