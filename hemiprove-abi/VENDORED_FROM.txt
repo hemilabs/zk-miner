@@ -23,3 +23,13 @@ To re-vendor from the repo: copy abi/*.abi.json and the two .md files from a che
 crates/zkminer-contracts and crates/zkminer-chain/tests/abi_pins.rs then pin zkminer against them, and
 `ZKMINER_CONTRACTS_REPO=<checkout> cargo test -p zkminer-chain --lib the_pins_match_the_contracts_repo` checks the code
 pins against script/lib/ReleaseCorePins.sol and VerifierPins.sol.
+
+UPDATE 2026-11-17 (after B9-CHAIN, with repo access): checked against a checkout of max-sanchez/hemi-prove-contracts
+@ 8e1808b (and hemilabs/hemiprove-contracts @ 3bc441d; the trees differ only in LICENSE).
+- All 23 abi/*.abi.json files here are identical (as JSON) to the repo's abi/ at 8e1808b.
+- INTERACTION_GUIDE.md, CHANGELOG_ABI.md and README.md are now copied verbatim from abi/ at 8e1808b.
+- Every pin in crates/zkminer-chain/src/deployment.rs (proxy, 4 implementations, 5 facets, both adapters, the
+  risc0-ethereum v3.1.0 verifier 26e455ef..., the SP1 v6.1.0 verifier and its hash) appears under its matching
+  constant in script/lib/ReleaseCorePins.sol / VerifierPins.sol:
+  ZKMINER_CONTRACTS_REPO=<checkout> cargo test -p zkminer-chain --lib the_pins_match_the_contracts_repo passes.
+  The pins are therefore no longer trust-on-first-use.

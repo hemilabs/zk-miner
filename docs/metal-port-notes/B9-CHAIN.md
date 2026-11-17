@@ -432,3 +432,8 @@ admits an abandoned stack.
    asset's sha256 matches GitHub's published digest.
 7. Handoff section 13 tests 17 and 18 were not scripted end to end, and test 19 (pause drill) needs
    the team. Tests 7, 8, 9 and 12 do not apply to this build.
+
+
+## Contracts-repo verification (2026-11-17, after review)
+
+With GitHub access restored, the pins and ABIs were checked against max-sanchez/hemi-prove-contracts @ 8e1808b (same files as hemilabs/hemiprove-contracts @ 3bc441d apart from LICENSE): `the_pins_match_the_contracts_repo` passes, each pin maps to its matching constant in ReleaseCorePins.sol / VerifierPins.sol, all 23 vendored ABI JSON files equal the repo's, and INTERACTION_GUIDE.md, CHANGELOG_ABI.md and README.md were re-vendored. The trust-on-first-use caveat above is closed.
