@@ -518,6 +518,60 @@ async fn a_broker_that_exits_mid_request_ends_closed() {
     assert_eq!(ep.still_open(Duration::from_secs(2)), 0);
 }
 
+/// At a cut-off the broker's socket is shut, and the answer writer stopped, before anything else:
+/// answers still queued for a broker that was not reading (each with a socket connected for it)
+/// never reach it. Reading after the cut-off, it finds at most what the kernel already held, then
+/// the end of the stream; every socket made for it is closed once its end is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_off_delivers_no_queued_answer() {
+    let ep = Endpoint::start();
+    let port = ep.port;
+    let (c, _d) = connector_for(
+        &evm("n", &format!("http://127.0.0.1:{port}"), "cidrs = [\"127.0.0.1/32\"]\nmax_concurrency = 1024"),
+        NetMode::DevPrivate,
+        vec![],
+    );
+    let (b, s) = session(&c);
+    let n = 40u64;
+    let mut frames = Vec::new();
+    for id in 0..n {
+        frames.extend_from_slice(&req(id, 0, port).encode());
+    }
+    (&b).write_all(&frames).unwrap();
+    // Every request connected: their answers are written or queued, none read.
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while c.stats.connected.load(Ordering::Relaxed) < n && std::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(c.stats.connected.load(Ordering::Relaxed), n);
+    (&b).write_all(&[0x41; REQUEST_LEN]).unwrap();
+    let end = tokio::time::timeout(Duration::from_secs(10), s).await.expect("cut off in time").unwrap();
+    assert!(matches!(end, SessionEnd::CutOff(CutOff::Malformed(_))), "{end:?}");
+    let (bytes, fds) = blocking(move || {
+        use std::os::fd::AsRawFd;
+        let mut bytes = 0usize;
+        let mut fds = 0usize;
+        b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 4096];
+        loop {
+            let mut got = Vec::new();
+            match crate::fdpass::recvmsg_once(b.as_raw_fd(), &mut buf, &mut got) {
+                Ok(0) | Err(_) => break,
+                Ok(k) => {
+                    bytes += k;
+                    fds += got.len();
+                }
+            }
+        }
+        (bytes, fds)
+    })
+    .await;
+    let answers = (bytes / RESPONSE_LEN) as u64;
+    println!("answers read after the cut-off: {answers} ({fds} sockets), of {n}");
+    assert!(answers <= KERNEL_QUEUE_SLACK, "{answers} answers reached a broker after its cut-off");
+    assert_eq!(ep.still_open(Duration::from_secs(2)), 0);
+}
+
 /// Requests still being served when the broker is cut off are aborted: one waiting for a token of
 /// the bucket is never connected (and, without the cut-off, the same request is).
 #[tokio::test(flavor = "multi_thread")]
