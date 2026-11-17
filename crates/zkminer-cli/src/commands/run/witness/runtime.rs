@@ -117,8 +117,11 @@ const MAX_ARTIFACT_BYTES: u64 = 4 << 20;
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Wall clock of the execute worker's build handshake (it loads its binary and answers).
 const EXECUTE_BUILD_TIMEOUT: Duration = Duration::from_secs(60);
-/// How often the sandbox and broker self-tests run again.
+/// How often the sandbox and broker self-tests run again (and a serving start that failed is tried
+/// again).
 const SELF_TEST_EVERY: Duration = Duration::from_secs(3600);
+/// How often the configuration file is read again for `[witness] enabled` (the kill switch, §20.4).
+const CONFIG_CHECK_EVERY: Duration = Duration::from_secs(15);
 /// Bound on one self-test (sandbox or broker): one that does not finish is a failure, so a wedged
 /// broker or spawner never holds serving (or the miner's start) hostage.
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -491,6 +494,16 @@ pub(crate) struct WitnessRuntime {
     tallies: Mutex<HashMap<B256, (u8, u64)>>,
     /// The miner is shutting down ([`Self::shutdown`]): held locks are the drain's, nothing re-drives one.
     stopping: AtomicBool,
+    /// What a serving start needs, kept for a retry: the configuration the miner started with (when it
+    /// enables serving) and why its `sys_rand` key is unusable, if it is.
+    serve: Mutex<Option<(Arc<ZkMinerConfig>, Option<String>)>>,
+    /// A serving start is running.
+    starting: AtomicBool,
+    /// The configuration file says `[witness] enabled = false` now (the kill switch): serving stays
+    /// off whatever the self-tests say, until it says `true` again.
+    switched_off: AtomicBool,
+    /// A sandbox self-test thread is running (one that did not finish in its bound keeps it).
+    sandbox_test_running: Arc<AtomicBool>,
 }
 
 impl WitnessRuntime {
@@ -573,9 +586,11 @@ impl WitnessRuntime {
             // §19: the effective configuration, whether or not serving then starts.
             tracing::info!("{}", effective_summary(w, config.retention.as_ref(), config.broker.as_ref()));
             // In the background: the self-tests and the broker start take seconds (minutes, bounded,
-            // when something is wedged), and the brain and every inline job go on meanwhile.
-            let (rt2, config) = (rt.clone(), config.clone());
-            tokio::spawn(async move { rt2.start_serving(&config, key_err).await });
+            // when something is wedged), and the brain and every inline job go on meanwhile. A start
+            // that fails is tried again with the hourly self-tests.
+            *lock(&rt.serve) = Some((Arc::new(config.clone()), key_err.map(|e| e.to_string())));
+            let rt2 = rt.clone();
+            tokio::spawn(async move { rt2.try_start_serving().await });
         } else {
             tracing::info!(
                 "witness serving is off ([witness] enabled = false): witness jobs are not simulated; \
@@ -584,6 +599,7 @@ impl WitnessRuntime {
         }
         tokio::spawn(rt.clone().abort_loop());
         tokio::spawn(rt.clone().self_test_loop());
+        tokio::spawn(rt.clone().config_watch_loop());
         Some(rt)
     }
 
@@ -642,6 +658,10 @@ impl WitnessRuntime {
             post_lock_callers: Mutex::new(HashMap::new()),
             tallies: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
+            serve: Mutex::new(None),
+            starting: AtomicBool::new(false),
+            switched_off: AtomicBool::new(false),
+            sandbox_test_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -691,7 +711,19 @@ impl WitnessRuntime {
         }
     }
 
-    async fn start_serving(self: &Arc<Self>, config: &ZkMinerConfig, key_err: Option<std::io::Error>) {
+    /// Starts serving from the configuration the miner started with, unless a start is running, the
+    /// configuration file switched serving off, or it was never enabled. `true` when it ran.
+    async fn try_start_serving(self: &Arc<Self>) -> bool {
+        let Some((config, key_err)) = lock(&self.serve).clone() else { return false };
+        if self.switched_off.load(Ordering::SeqCst) || self.starting.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        self.start_serving(&config, key_err).await;
+        self.starting.store(false, Ordering::SeqCst);
+        true
+    }
+
+    async fn start_serving(self: &Arc<Self>, config: &ZkMinerConfig, key_err: Option<String>) {
         let w = &config.witness;
         if let Err(e) = validate(w, config.retention.as_ref(), config.broker.as_ref(), chrono::Utc::now().timestamp()) {
             return self.disable(e.to_string());
@@ -750,7 +782,7 @@ impl WitnessRuntime {
             Ok(b) => b,
             Err(e) => return self.disable(e),
         };
-        if let Err(why) = bounded_self_test("sandbox", self.sandbox_self_test(&spawner, &probe_binary)).await {
+        if let Err(why) = bounded_self_test("sandbox", self.sandbox_self_test(&probe_binary)).await {
             return self.disable(why);
         }
         // The execute worker's build, asked before any requester's guest runs in it: what every bundle
@@ -779,6 +811,10 @@ impl WitnessRuntime {
         if let Err(why) = bounded_self_test("broker", broker_self_test(&broker_client, &connector)).await {
             return self.disable(why);
         }
+        if self.switched_off.load(Ordering::SeqCst) {
+            tracing::warn!("witness serving did not start: [witness] enabled = false in the configuration now");
+            return;
+        }
         *lock(&self.serving) = Some(Arc::new(Serving {
             spawner,
             broker: Mutex::new(broker),
@@ -796,16 +832,30 @@ impl WitnessRuntime {
         );
     }
 
-    async fn sandbox_self_test(&self, spawner: &Spawner, probe: &Path) -> Result<(), String> {
+    /// The sandbox self-test, on a thread of its own (its probes die with that thread, which lives
+    /// until they are reaped): one that does not finish in its bound never holds the spawner thread,
+    /// which every builder, execute and broker start needs. While a test that did not finish still
+    /// runs, the next one fails at once instead of piling threads up.
+    async fn sandbox_self_test(&self, probe: &Path) -> Result<(), String> {
         let mode = match self.witness.sandbox_mode {
             SandboxModeConfig::System => zkminer_witness_sandbox::SandboxMode::System,
             SandboxModeConfig::Rootless => zkminer_witness_sandbox::SandboxMode::Rootless,
         };
-        let (probe, secret) = (probe.to_path_buf(), self.secret_path.clone());
-        let report = spawner
-            .run_async(move || zkminer_witness_sandbox::self_test(mode, &probe, &secret))
-            .await
-            .map_err(|e| format!("the spawner thread: {e}"))?;
+        if self.sandbox_test_running.swap(true, Ordering::SeqCst) {
+            return Err("the previous sandbox self-test has not finished".into());
+        }
+        let (probe, secret, running) = (probe.to_path_buf(), self.secret_path.clone(), self.sandbox_test_running.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let spawned = std::thread::Builder::new().name("witness-sandbox-self-test".into()).spawn(move || {
+            let report = zkminer_witness_sandbox::self_test(mode, &probe, &secret);
+            running.store(false, Ordering::SeqCst);
+            let _ = tx.send(report);
+        });
+        if let Err(e) = spawned {
+            self.sandbox_test_running.store(false, Ordering::SeqCst);
+            return Err(format!("the sandbox self-test thread: {e}"));
+        }
+        let report = rx.await.map_err(|_| "the sandbox self-test thread is gone".to_string())?;
         if report.passed() {
             tracing::info!("witness: sandbox self-test passed ({} checks)", report.checks.len());
             Ok(())
@@ -818,32 +868,120 @@ impl WitnessRuntime {
         }
     }
 
-    /// Re-runs both self-tests every hour; serving follows their result (§10.3).
+    /// Every hour, a [`Self::self_test_round`] (§10.3).
     async fn self_test_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(SELF_TEST_EVERY).await;
-            let Some(s) = lock(&self.serving).clone() else { continue };
-            let (exited, cut_off) = {
-                let mut b = lock(&s.broker);
-                (b.exited(), b.cut_off())
-            };
-            let result = match exited {
-                _ if cut_off => Err("the connector cut the broker off (it broke the connector protocol) and killed it".into()),
-                Some(status) => Err(format!("the broker exited ({status})")),
-                None => match bounded_self_test("sandbox", self.sandbox_self_test(&s.spawner, &s.probe_binary)).await {
-                    Err(why) => Err(why),
-                    Ok(()) => bounded_self_test("broker", broker_self_test(&s.broker_client, &s.connector)).await,
-                },
-            };
-            match result {
-                Ok(()) => {
-                    if !self.enabled.swap(true, Ordering::SeqCst) {
-                        tracing::warn!("witness serving is back on: the hourly self-tests passed");
-                    }
+            if self.stopping() {
+                return;
+            }
+            self.self_test_round().await;
+        }
+    }
+
+    /// Serving follows the self-tests: a start that failed (or never finished) is tried again; once
+    /// started, both self-tests run again and switch serving off or back on with their result.
+    /// Nothing while the configuration file switched serving off.
+    async fn self_test_round(self: &Arc<Self>) -> SelfTestRound {
+        if self.switched_off.load(Ordering::SeqCst) {
+            return SelfTestRound::SwitchedOff;
+        }
+        let Some(s) = lock(&self.serving).clone() else {
+            if lock(&self.serve).is_none() {
+                return SelfTestRound::NotEnabled;
+            }
+            tracing::warn!("witness serving did not start: trying again");
+            return if self.try_start_serving().await { SelfTestRound::StartRetried } else { SelfTestRound::Starting };
+        };
+        let (exited, cut_off) = {
+            let mut b = lock(&s.broker);
+            (b.exited(), b.cut_off())
+        };
+        let result = match exited {
+            _ if cut_off => Err("the connector cut the broker off (it broke the connector protocol) and killed it".into()),
+            Some(status) => Err(format!("the broker exited ({status})")),
+            None => match bounded_self_test("sandbox", self.sandbox_self_test(&s.probe_binary)).await {
+                Err(why) => Err(why),
+                Ok(()) => bounded_self_test("broker", broker_self_test(&s.broker_client, &s.connector)).await,
+            },
+        };
+        match result {
+            Ok(()) => {
+                // Not over a kill switch thrown while the tests ran.
+                if !self.switched_off.load(Ordering::SeqCst) && !self.enabled.swap(true, Ordering::SeqCst) {
+                    tracing::warn!("witness serving is back on: the self-tests passed");
                 }
-                Err(why) => self.disable(why),
+                SelfTestRound::Passed
+            }
+            Err(why) => {
+                self.disable(why);
+                SelfTestRound::Failed
             }
         }
+    }
+
+    /// Reads `[witness] enabled` from the configuration file again every [`CONFIG_CHECK_EVERY`]
+    /// (§20.4: the kill switch is hot). A file that is gone or does not parse changes nothing.
+    async fn config_watch_loop(self: Arc<Self>) {
+        let mut warned = false;
+        loop {
+            tokio::time::sleep(CONFIG_CHECK_EVERY).await;
+            if self.stopping() {
+                return;
+            }
+            let path = self.secret_path.clone();
+            match blocking(move || configured_witness_enabled(&path)).await {
+                Ok(Ok(enabled)) => {
+                    warned = false;
+                    self.apply_enabled(enabled);
+                }
+                Ok(Err(e)) => {
+                    if !warned {
+                        warned = true;
+                        tracing::warn!(
+                            "witness: the configuration file cannot be read again ({e:#}); [witness] enabled keeps \
+                             its last value"
+                        );
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// `[witness] enabled` as the configuration file says it now. `false` switches serving off at once
+    /// (no new admission, running simulations aborted, held locks continue) and keeps it off; `true`
+    /// again runs the self-tests (or the start) now and serves on their result, for a miner started
+    /// with serving enabled (one started with it off needs a restart).
+    fn apply_enabled(self: &Arc<Self>, enabled: bool) {
+        if !enabled {
+            if !self.switched_off.swap(true, Ordering::SeqCst) && lock(&self.serve).is_some() {
+                self.enabled.store(false, Ordering::SeqCst);
+                tracing::warn!(
+                    "witness serving switched off ([witness] enabled = false): no new witness job is admitted, \
+                     running simulations are aborted, held witness locks continue"
+                );
+                self.abort_simulations(AbortReason::Disabled);
+            }
+            return;
+        }
+        if !self.switched_off.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if lock(&self.serve).is_none() {
+            if self.notice(B256::ZERO, "enable-needs-restart") {
+                tracing::warn!(
+                    "[witness] enabled = true in the configuration, but this miner started with witness serving \
+                     off: restart it to serve witness jobs"
+                );
+            }
+            return;
+        }
+        tracing::warn!("witness serving switched back on ([witness] enabled = true): running the self-tests first");
+        let rt = self.clone();
+        tokio::spawn(async move {
+            rt.self_test_round().await;
+        });
     }
 
     fn serving(&self) -> Option<Arc<Serving>> {
@@ -3606,6 +3744,31 @@ fn free_bytes(dir: &Path) -> std::io::Result<u64> {
     Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
 }
 
+/// What one [`WitnessRuntime::self_test_round`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfTestRound {
+    /// The configuration file switched serving off.
+    SwitchedOff,
+    /// The miner did not start with serving enabled.
+    NotEnabled,
+    /// Serving had not started: the start was tried again.
+    StartRetried,
+    /// Serving had not started, and a start is running.
+    Starting,
+    Passed,
+    Failed,
+}
+
+/// `[witness] enabled` as the configuration file at `path` says it now; an error when the file is gone
+/// or does not parse (a missing file is not "the defaults": the kill switch never flips on a file
+/// that is merely absent).
+fn configured_witness_enabled(path: &Path) -> Result<bool> {
+    if !path.is_file() {
+        bail!("{} is not a file", path.display());
+    }
+    Ok(ZkMinerConfig::load(Some(path))?.witness.enabled)
+}
+
 /// A self-test bounded by [`SELF_TEST_TIMEOUT`]: one that does not finish is a failure.
 async fn bounded_self_test(name: &str, test: impl std::future::Future<Output = Result<(), String>>) -> Result<(), String> {
     match tokio::time::timeout(SELF_TEST_TIMEOUT, test).await {
@@ -3816,6 +3979,70 @@ mod tests {
         assert!(lock(&rt.undecided).contains(&undecided));
         rt.note_recovery_pass(true, vec![]);
         assert!(lock(&rt.undecided).is_empty(), "decided by a later pass");
+    }
+
+    /// `[witness] enabled = false` was read only at startup, although §20.4 calls it a hot kill
+    /// switch. The configuration file is read again: `false` switches serving off at once (running
+    /// simulations aborted) and keeps it off through the self-tests; `true` again resumes; a file that
+    /// is gone changes nothing.
+    #[tokio::test]
+    async fn the_kill_switch_is_hot() {
+        let (rt, _s) = test_runtime(false).await;
+        *lock(&rt.serve) = Some((Arc::new(ZkMinerConfig::default()), None));
+        rt.enabled.store(true, Ordering::SeqCst);
+        let sim = AbortToken::new();
+        lock(&rt.tasks).insert(B256::repeat_byte(0x91), Task { token: sim.clone(), phase: Phase::Simulating });
+        let held = AbortToken::new();
+        lock(&rt.tasks).insert(B256::repeat_byte(0x92), Task { token: held.clone(), phase: Phase::Locked });
+
+        let dir = std::env::temp_dir().join(format!("zkminer-killswitch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[witness]\nenabled = false\n").unwrap();
+        assert!(!configured_witness_enabled(&path).unwrap());
+        rt.apply_enabled(configured_witness_enabled(&path).unwrap());
+        assert!(!rt.enabled.load(Ordering::SeqCst), "switched off at once");
+        assert!(sim.is_aborted(), "a running simulation is aborted");
+        assert!(!held.is_aborted(), "a held lock continues");
+        assert_eq!(rt.self_test_round().await, SelfTestRound::SwitchedOff, "the self-tests do not switch it back on");
+        assert!(!rt.try_start_serving().await, "nor does a start");
+        std::fs::write(&path, "[witness]\nenabled = true\n").unwrap();
+        rt.apply_enabled(configured_witness_enabled(&path).unwrap());
+        assert!(!rt.switched_off.load(Ordering::SeqCst));
+        std::fs::remove_file(&path).unwrap();
+        assert!(configured_witness_enabled(&path).is_err(), "a missing file is not the defaults");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A serving start whose self-test timed out left serving off until a restart: the hourly loop
+    /// skipped while nothing was serving. It now tries the start again.
+    #[tokio::test]
+    async fn the_hourly_round_retries_a_failed_start() {
+        let (rt, _s) = test_runtime(false).await;
+        assert_eq!(rt.self_test_round().await, SelfTestRound::NotEnabled);
+        // A start that fails at once (this configuration does not validate): tried again each round.
+        *lock(&rt.serve) = Some((Arc::new(ZkMinerConfig::default()), None));
+        assert_eq!(rt.self_test_round().await, SelfTestRound::StartRetried);
+        assert!(!rt.enabled.load(Ordering::SeqCst));
+        assert_eq!(rt.self_test_round().await, SelfTestRound::StartRetried, "and again");
+        rt.starting.store(true, Ordering::SeqCst);
+        assert_eq!(rt.self_test_round().await, SelfTestRound::Starting, "never two starts at once");
+    }
+
+    /// A sandbox self-test that did not finish held the one spawner thread, so every later builder,
+    /// execute and broker start queued behind it. It runs on a thread of its own, and while one that
+    /// did not finish still runs, the next fails at once.
+    #[tokio::test]
+    async fn a_stuck_sandbox_self_test_holds_nothing_else() {
+        let (rt, _s) = test_runtime(false).await;
+        rt.sandbox_test_running.store(true, Ordering::SeqCst);
+        let r = tokio::time::timeout(Duration::from_secs(5), rt.sandbox_self_test(Path::new("/nonexistent"))).await;
+        assert_eq!(r.expect("returns at once"), Err("the previous sandbox self-test has not finished".to_string()));
+        rt.sandbox_test_running.store(false, Ordering::SeqCst);
+        // A probe that does not exist fails the test on its own thread, and frees it.
+        let r = rt.sandbox_self_test(Path::new("/nonexistent/zkminer-witness-sandbox-probe")).await;
+        assert!(r.is_err());
+        assert!(!rt.sandbox_test_running.load(Ordering::SeqCst));
     }
 
     /// A store pass running as shutdown began re-drove held locks beside the drain's releases. Once
