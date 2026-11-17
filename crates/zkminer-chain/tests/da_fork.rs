@@ -46,8 +46,9 @@ use zkminer_contracts::bindings::{
     IVerifierAdapter, JobDescriptor, GAS_PRICE_ORACLE, IERC20,
 };
 
-/// localnet.rs's fork block (after the c8333aa deployment's setup).
-const FORK_BLOCK: u64 = 7_116_900;
+/// localnet.rs's fork block (after the 2026-11-16 deployment's setup: its router exists from block
+/// 7226099 and its adapters are registered by 7226300). Keep it equal to localnet.rs's.
+const FORK_BLOCK: u64 = 7_226_550;
 const DEFAULT_FORK_URL: &str = "https://testnet.rpc.hemi.network/rpc";
 const HEMI: u128 = 1_000_000_000_000_000_000;
 /// localnet.rs's receipt fixture (risc0-ethereum v3.1.0 `TestReceiptV3_1.sol`).

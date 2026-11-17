@@ -1,5 +1,5 @@
 //! The governance watcher, the deployment-constants cache and the submission form against the REAL
-//! c8333aa stack: an anvil fork of Hemi testnet 743111, started as `zkminer-cli/tests/localnet.rs`
+//! stack zkminer pins (`deployment::HEMI_TESTNET_743111`): an anvil fork of Hemi testnet 743111, started as `zkminer-cli/tests/localnet.rs`
 //! starts it. The router is paused and unpaused by its owner (impersonated) to see the watcher follow
 //! a real `Paused`/`Unpaused` from the real router.
 //!
@@ -171,7 +171,7 @@ async fn catch_up(client: &ChainClient, watcher: &GovernanceWatcher) {
 
 #[tokio::test]
 #[ignore = "needs anvil and the 743111 RPC"]
-async fn the_watcher_and_the_gates_read_the_real_c8333aa_stack() {
+async fn the_watcher_and_the_gates_read_the_real_deployed_stack() {
     let anvil = start_anvil().await;
     let client = client(&anvil.url).await;
     let risc0 = ProofSystem::Risc0Groth16.id();
