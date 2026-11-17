@@ -3768,6 +3768,7 @@ name = "hemiprove-proxy-slots-methods"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "anyhow",
  "hemiprove-eth-prelude",
  "hemiprove-proxy-slots",
  "hex",
@@ -10595,6 +10596,7 @@ dependencies = [
  "hex",
  "libc",
  "rand 0.8.6",
+ "risc0-binfmt",
  "serde",
  "serde_json",
  "sha2",

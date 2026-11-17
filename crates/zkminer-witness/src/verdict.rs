@@ -21,6 +21,28 @@ pub enum Retry {
     Deferred,
 }
 
+impl Retry {
+    /// A stable name for reports (`zkminer simulate`): `never`, `once_jittered`, `backoff`,
+    /// `on_host_change`, `deferred`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Retry::Never => "never",
+            Retry::OnceJittered => "once_jittered",
+            Retry::Backoff { .. } => "backoff",
+            Retry::OnHostChange => "on_host_change",
+            Retry::Deferred => "deferred",
+        }
+    }
+
+    /// `Backoff`'s attempts; `None` for the others.
+    pub fn max_attempts(self) -> Option<u8> {
+        match self {
+            Retry::Backoff { max_attempts } => Some(max_attempts),
+            _ => None,
+        }
+    }
+}
+
 /// The policy for one reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Verdict {

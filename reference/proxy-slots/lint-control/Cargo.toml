@@ -11,3 +11,4 @@ publish = false
 
 [dependencies]
 risc0-zkvm = { version = "3.0", default-features = false, features = ["std"] }
+risc0-zkvm-platform = { version = "2.2", default-features = false }

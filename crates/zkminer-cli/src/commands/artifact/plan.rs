@@ -4,14 +4,17 @@
 use alloy::consensus::{SignableTransaction, TxEip1559};
 use alloy::primitives::{Bytes, TxKind, U256};
 use anyhow::{bail, Result};
-use zkminer_witness::manifest::{chunk_runtime_code, creation_code, MAX_CHUNK_BODY, MAX_MANIFEST_CHUNKS};
+use zkminer_witness::manifest::{
+    chunk_runtime_code, creation_code, ArtifactBudget, MAX_CHUNK_BODY, MAX_MANIFEST_CHUNKS, MIN_PLANNED_CHUNK_BODY,
+};
 
 /// What is published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// A type-1 witness builder (a WASM module).
     Builder,
-    /// A guest ELF (risc0, RV32IM).
+    /// A guest ELF (risc0, RV32IM): a risc0 3.x `R0BF` program binary (user and kernel ELF), as
+    /// the ProgramRegistry hashes it and miners derive its image id, or a bare RV32 ELF.
     Elf,
 }
 
@@ -48,19 +51,31 @@ pub fn check_input(bytes: &[u8], kind: Kind) -> Result<()> {
             }
             Ok(())
         }
-        Kind::Elf => {
-            if bytes.len() < 20 || &bytes[..4] != b"\x7fELF" {
-                bail!("--kind elf, but the file is not an ELF");
-            }
-            if bytes[4] != 1 || bytes[5] != 1 {
-                bail!("--kind elf, but the ELF is not 32-bit little-endian (a risc0 guest is RV32IM)");
-            }
-            if u16::from_le_bytes([bytes[18], bytes[19]]) != 0xf3 {
-                bail!("--kind elf, but the ELF is not for RISC-V");
-            }
+        Kind::Elf if bytes.starts_with(b"R0BF") => {
+            let p = risc0_binfmt::ProgramBinary::decode(bytes)
+                .map_err(|e| anyhow::anyhow!("--kind elf, but the risc0 program binary does not parse: {e}"))?;
+            check_rv32_elf(p.user_elf, "its user ELF")?;
+            check_rv32_elf(p.kernel_elf, "its kernel ELF")?;
+            // Load both as the executor does: what a miner derives the image id from.
+            p.compute_image_id()
+                .map_err(|e| anyhow::anyhow!("--kind elf, but the risc0 program binary does not load: {e:#}"))?;
             Ok(())
         }
+        Kind::Elf => check_rv32_elf(bytes, "the file"),
     }
+}
+
+fn check_rv32_elf(bytes: &[u8], what: &str) -> Result<()> {
+    if bytes.len() < 20 || &bytes[..4] != b"\x7fELF" {
+        bail!("--kind elf, but {what} is not an ELF (nor a risc0 R0BF program binary)");
+    }
+    if bytes[4] != 1 || bytes[5] != 1 {
+        bail!("--kind elf, but {what} is not 32-bit little-endian (a risc0 guest is RV32IM)");
+    }
+    if u16::from_le_bytes([bytes[18], bytes[19]]) != 0xf3 {
+        bail!("--kind elf, but {what} is not for RISC-V");
+    }
+    Ok(())
 }
 
 /// The creation input that deploys one chunk: `creation_code(0x00 ‖ body)`.
@@ -97,13 +112,26 @@ pub fn shrink(size: usize, estimate: u64) -> usize {
     scaled.saturating_sub(64).clamp(1, size.saturating_sub(1).max(1))
 }
 
-/// The chunk sizes are a plan the manifest can hold.
+/// The chunk sizes are a plan the manifest can hold, and one every miner whose artifact cap admits
+/// the bytes also admits: its per-job budget counts chunk reads from [`MIN_PLANNED_CHUNK_BODY`]
+/// (`ArtifactBudget`), and a manifest over it is `NotAdmitted`, deferred for ever, never served.
+/// Only an oracle pricing chunks far above their bytes makes such a plan.
 pub fn check_plan(chunks: usize, length: usize) -> Result<()> {
     if chunks == 0 || chunks > MAX_MANIFEST_CHUNKS as usize {
         bail!("{chunks} chunks: one manifest holds 1..={MAX_MANIFEST_CHUNKS}");
     }
     if chunks < length.div_ceil(MAX_CHUNK_BODY) || chunks > length {
         bail!("{chunks} chunks cannot hold {length} bytes");
+    }
+    let budget = ArtifactBudget::for_max_bytes((length as u64).max(DEFAULT_MAX_BUILDER_BYTES));
+    if !budget.admits(length as u64, chunks as u32) {
+        bail!(
+            "{length} bytes in {chunks} chunks: a miner's per-job budget admits at most {} chunk reads for an artifact \
+             up to {} bytes (chunks of at least {MIN_PLANNED_CHUNK_BODY} bytes but the last); this chain's \
+             GasPriceOracle priced the chunks too high to publish one miners serve",
+            budget.max_chunks,
+            budget.max_bytes
+        );
     }
     Ok(())
 }
@@ -237,6 +265,15 @@ mod tests {
         elf[18] = 0x3e;
         assert!(check_input(&elf, Kind::Elf).is_err(), "x86-64");
         assert!(check_input(&[], Kind::Builder).is_err());
+        // A risc0 program binary: its parts are checked too.
+        elf[18] = 0xf3;
+        let r0bf = risc0_binfmt::ProgramBinary::new(&elf, &[1, 2, 3, 4]).encode();
+        let e = check_input(&r0bf, Kind::Elf).unwrap_err().to_string();
+        assert!(e.contains("its kernel ELF is not an ELF"), "{e}");
+        let mut bad = r0bf.clone();
+        bad[4] ^= 0xff;
+        assert!(check_input(&bad, Kind::Elf).unwrap_err().to_string().contains("does not parse"));
+        assert!(check_input(&r0bf, Kind::Builder).is_err());
     }
 
     #[test]
@@ -287,6 +324,14 @@ mod tests {
         assert!(check_plan(1, 30_000).is_err(), "too few for the body cap");
         assert!(check_plan(5, 3).is_err(), "more chunks than bytes");
         assert!(check_plan(1_225, 1 << 30).is_err());
+        // Within a miner's artifact budget: 4 MiB in 23,000-byte chunks, or shrunk to 19,400, fits;
+        // chunks of 10,000 bytes need more reads than a miner admits for the bytes.
+        let four = 4usize << 20;
+        assert!(check_plan(four.div_ceil(23_000), four).is_ok());
+        assert!(check_plan(four.div_ceil(19_400), four).is_ok());
+        assert!(check_plan(3_956_001usize.div_ceil(23_000), 3_956_001).is_ok());
+        let e = check_plan(four.div_ceil(10_000), four).unwrap_err().to_string();
+        assert!(e.contains("at most 257 chunk reads"), "{e}");
         // The conservative transaction is never shorter than a real one.
         let input = chunk_creation(&[7u8; 100]);
         let real = unsigned_creation(743111, 5, 5_000_000, 3_000_000_000, 10, input.clone()).encoded_for_signing();

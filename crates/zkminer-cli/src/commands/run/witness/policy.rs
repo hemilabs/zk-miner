@@ -198,32 +198,9 @@ pub(crate) fn gate_refusal_reason(r: &GateRefusal) -> SkipReason {
 
 // ── the artifact budget ───────────────────────────────────────────────────────
 
-/// The per-job budget for a `hemi-code` artifact read (§13.4 step 3): its bytes and chunk reads,
-/// derived from the largest artifact this host reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ArtifactBudget {
-    pub max_bytes: u64,
-    pub max_chunks: u32,
-}
-
-impl ArtifactBudget {
-    /// `max_bytes` of artifact, in chunks of at most one contract's code each (plus one for a
-    /// chunking that does not fill every chunk), never more than a manifest can list.
-    pub(crate) fn for_max_bytes(max_bytes: u64) -> Self {
-        let per_chunk = zkminer_witness::manifest::MAX_CHUNK_BODY as u64;
-        let chunks = max_bytes.div_ceil(per_chunk).saturating_add(1);
-        Self {
-            max_bytes,
-            max_chunks: u32::try_from(chunks)
-                .unwrap_or(u32::MAX)
-                .min(zkminer_witness::manifest::MAX_MANIFEST_CHUNKS),
-        }
-    }
-
-    pub(crate) fn admits(&self, length: u64, chunks: u32) -> bool {
-        length <= self.max_bytes && chunks <= self.max_chunks
-    }
-}
+/// The per-job budget for a `hemi-code` artifact read (§13.4 step 3), shared with `zkminer
+/// simulate` and the publisher.
+pub(crate) use zkminer_witness::manifest::ArtifactBudget;
 
 // ── the reservation (§17.2, simplified) ───────────────────────────────────────
 
@@ -795,17 +772,6 @@ mod tests {
         assert_eq!(gate_refusal_reason(&GateRefusal::Stale), HostInternal);
         assert_eq!(gate_refusal_reason(&GateRefusal::RouterPaused), SkipReason::NotClaimable);
         assert_eq!(gate_refusal_reason(&GateRefusal::VerifierSwitch { ready_at: 1 }), SkipReason::NotClaimable);
-    }
-
-    #[test]
-    fn the_artifact_budget_counts_bytes_and_chunks() {
-        let b = ArtifactBudget::for_max_bytes(4 << 20);
-        assert_eq!(b.max_chunks, (4u64 << 20).div_ceil(24_575) as u32 + 1);
-        assert!(b.admits(4 << 20, b.max_chunks));
-        assert!(!b.admits((4 << 20) + 1, 1));
-        assert!(!b.admits(1, b.max_chunks + 1));
-        let huge = ArtifactBudget::for_max_bytes(u64::MAX);
-        assert_eq!(huge.max_chunks, zkminer_witness::manifest::MAX_MANIFEST_CHUNKS);
     }
 
     #[test]

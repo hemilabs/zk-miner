@@ -48,6 +48,7 @@ exclude = [
     # risc0 guests, each its own workspace and lockfile (built by reference/proxy-slots/methods).
     "reference/proxy-slots/guest",
     "reference/proxy-slots/lint-control",
+    "reference/proxy-slots/hostdep",
     # Its own workspace and lockfile: OpenVM 1.5.0-rc.1 pins p3-field =0.4.1 and SP1 6.8.1's slop
     # crates =0.4.3-succinct, and one workspace can hold only one 0.4.x. Build it with
     # `--manifest-path crates/zkminer-prove-openvm/Cargo.toml`.

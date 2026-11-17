@@ -6,6 +6,7 @@ use std::time::Duration;
 pub const DEFAULT_ADVERSARIAL_SECS: u64 = 600;
 pub const DEFAULT_FLIPS: usize = 32;
 pub const MAX_MUTATIONS: usize = 256;
+pub const DEFAULT_ADVERSARIAL_MAX_W_BYTES: u64 = 8 << 20;
 
 #[derive(Debug, Clone)]
 pub struct AdversarialOptions {
@@ -14,6 +15,7 @@ pub struct AdversarialOptions {
     pub max_mutations: usize,
     pub scheme: Option<u64>,
     pub providers: Option<Vec<String>>,
+    pub max_w_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +31,8 @@ pub struct WitnessSimOptions {
     pub cache_dir: Option<PathBuf>,
     pub execute_timeout: Duration,
     pub out: Option<PathBuf>,
+    pub max_guest_cycles: Option<u64>,
+    pub header_bytes: Option<usize>,
     pub adversarial: Option<AdversarialOptions>,
 }
 

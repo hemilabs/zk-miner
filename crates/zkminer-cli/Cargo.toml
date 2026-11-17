@@ -48,6 +48,9 @@ zkminer-witness-broker = { path = "../zkminer-witness-broker" }
 zkminer-netguard = { workspace = true, features = ["client"] }
 # `zkminer artifact publish --kind builder`: the file must parse as a WASM module (the builder's pin).
 wasmparser = { version = "=0.254.2", default-features = false, features = ["std"] }
+# `zkminer artifact publish --kind elf`: a risc0 3.x guest is a `R0BF` program binary, loaded as the
+# miners load it (the workspace's pinned fork).
+risc0-binfmt = "3.0"
 zeroize = { workspace = true }
 sha2 = "0.10"
 hex = { workspace = true }

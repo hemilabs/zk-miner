@@ -424,7 +424,7 @@ impl ProvenAccount {
         state::storage_root(&self.account)
     }
 
-    /// `EXTCODEHASH` semantics: 0 when absent.
+    /// `EXTCODEHASH` semantics: 0 when absent or empty under EIP-161 ([`state::extcodehash`]).
     pub fn extcodehash(&self) -> [u8; 32] {
         state::extcodehash(&self.account)
     }
@@ -641,7 +641,7 @@ pub enum Mutation {
     WordByte { word: usize, byte: usize, mask: u8 },
     /// XOR `mask` into a byte of a block header.
     HeaderByte { header: usize, byte: usize, mask: u8 },
-    /// Replace a block header (with its parent, a sibling, a header from another chain).
+    /// Replace a block header (with its parent, the next block's, a header from another chain).
     ReplaceHeader { header: usize, rlp: Vec<u8> },
     DropHeader { header: usize },
     /// XOR `mask` into a byte of a proof node.
@@ -697,7 +697,8 @@ pub enum ByteSelection {
 }
 
 impl ByteSelection {
-    fn positions(self, len: usize) -> Vec<usize> {
+    /// The byte positions of an item of `len` bytes this selection flips.
+    pub fn positions(self, len: usize) -> Vec<usize> {
         match self {
             Self::All => (0..len).collect(),
             Self::Sample(n) if len <= n => (0..len).collect(),
@@ -847,7 +848,7 @@ impl<'a> Witness<'a> {
     /// replaced by its truncation and by the empty proof, both claiming exclusion; every proof
     /// dropped and duplicated; adjacent proofs of a list swapped (reordered leaves); each storage
     /// proof replaced by the next slot's (another slot's proof); every header dropped; trailing bytes
-    /// appended and the last byte cut. Swapping in a parent or sibling header needs that header:
+    /// appended and the last byte cut. Swapping in the parent's or the next block's header needs it:
     /// add [`Mutation::ReplaceHeader`] for it.
     pub fn standard_mutations(&self, bytes: ByteSelection) -> Vec<Mutation> {
         let mut out = Vec::new();

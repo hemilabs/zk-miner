@@ -236,6 +236,22 @@ fn accounts_and_storage_from_eth_get_proof() {
     }
 }
 
+/// An account in the state trie that is empty under EIP-161 (nonce 0, balance 0, no code, but with
+/// storage), from anvil: the EVM's `EXTCODEHASH` of it is 0, and so is the prelude's.
+#[test]
+fn extcodehash_of_an_empty_account_in_the_trie_is_zero_as_in_the_evm() {
+    let f = fixture("anvil-empty-account");
+    let header = header_from_json(&f["block"]);
+    assert_eq!(keccak256(&header.encode().unwrap()), h32(&f["block"]["hash"]));
+    let address: [u8; 20] = hex(&f["proof"]["address"]).try_into().unwrap();
+    let nodes: Vec<Vec<u8>> = f["proof"]["accountProof"].as_array().unwrap().iter().map(hex).collect();
+    let account = state::verify_account(&header.state_root, &address, &nodes).unwrap();
+    let a = account.expect("the account is in the trie");
+    assert!(a.is_empty() && a.code_hash == KECCAK_EMPTY && a.storage_root != EMPTY_ROOT);
+    assert_eq!(state::extcodehash(&account), h32(&f["evmExtcodehash"]));
+    assert_eq!(state::extcodehash(&account), [0; 32]);
+}
+
 #[test]
 fn every_byte_flip_of_a_real_proof_is_rejected() {
     let f = fixture("base");

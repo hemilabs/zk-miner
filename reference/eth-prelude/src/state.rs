@@ -7,8 +7,10 @@
 //!   zeros and non-zero (a zero slot is deleted from the trie), then left-padded.
 //! - **Absence needs an exclusion proof.** An absent account is nonce 0, balance 0, empty storage
 //!   (root [`EMPTY_ROOT`], under which only the empty proof is accepted, so every slot reads 0) and
-//!   no code. [`extcodehash`] gives the EVM's `EXTCODEHASH` semantics: 0 for an absent account,
-//!   [`KECCAK_EMPTY`] for a present account without code.
+//!   no code. [`extcodehash`] gives the EVM's `EXTCODEHASH` semantics: 0 for an account that does
+//!   not exist or is empty under EIP-161 (nonce 0, balance 0, no code; such an account can still
+//!   sit in the trie, with storage, from a genesis allocation or a devnet's state edits),
+//!   [`KECCAK_EMPTY`] for any other account without code.
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -72,6 +74,11 @@ impl Account {
         Ok(Self { nonce: nonce.u64()?, balance: balance.u256()?, storage_root: storage_root.fixed()?, code_hash: code_hash.fixed()? })
     }
 
+    /// Empty under EIP-161: nonce 0, balance 0 and no code (storage does not count).
+    pub fn is_empty(&self) -> bool {
+        self.nonce == 0 && self.balance == [0; 32] && self.code_hash == KECCAK_EMPTY
+    }
+
     /// The leaf value's canonical encoding.
     pub fn encode(&self) -> Vec<u8> {
         let mut p = Vec::with_capacity(80);
@@ -85,9 +92,14 @@ impl Account {
     }
 }
 
-/// `EXTCODEHASH`: 0 for an absent account, its code hash otherwise ([`KECCAK_EMPTY`] without code).
+/// `EXTCODEHASH`: 0 for an absent account and for one that is empty under EIP-161 (the EVM treats
+/// both as non-existent: `EXTCODEHASH` of an account in the trie with nonce 0, balance 0 and no
+/// code is 0, whatever its storage), its code hash otherwise ([`KECCAK_EMPTY`] without code).
 pub fn extcodehash(account: &Option<Account>) -> [u8; 32] {
-    account.map(|a| a.code_hash).unwrap_or([0; 32])
+    match account {
+        Some(a) if !a.is_empty() => a.code_hash,
+        _ => [0; 32],
+    }
 }
 
 /// The storage root to read slots under: [`EMPTY_ROOT`] for an absent account.
@@ -185,7 +197,16 @@ mod tests {
     #[test]
     fn extcodehash_semantics() {
         assert_eq!(extcodehash(&None), [0; 32]);
-        assert_eq!(extcodehash(&Some(Account::ABSENT)), KECCAK_EMPTY);
+        // Empty under EIP-161 but in the trie (storage does not make it non-empty): 0, as the EVM.
+        assert!(Account::ABSENT.is_empty());
+        assert_eq!(extcodehash(&Some(Account::ABSENT)), [0; 32]);
+        assert_eq!(extcodehash(&Some(Account { storage_root: [9; 32], ..Account::ABSENT })), [0; 32]);
+        // A nonce or a balance makes it exist: keccak("") without code.
+        assert_eq!(extcodehash(&Some(Account { nonce: 1, ..Account::ABSENT })), KECCAK_EMPTY);
+        let mut wei = [0u8; 32];
+        wei[31] = 1;
+        assert_eq!(extcodehash(&Some(Account { balance: wei, ..Account::ABSENT })), KECCAK_EMPTY);
+        assert_eq!(extcodehash(&Some(Account { code_hash: [4; 32], ..Account::ABSENT })), [4; 32]);
         assert_eq!(storage_root(&None), EMPTY_ROOT);
     }
 }

@@ -599,30 +599,46 @@ max_guest_cycles = 67108864
 
 `zkminer witness envelope decode 0x…|FILE [--chain-id N]` explains an existing `inputData`: the
 decoder's verdict, each builder URI as a miner on that chain reads it (usable, or why it is
-ignored), size warnings, and the envelope as an editable spec. It exits non-zero when the miner
-would skip the job.
+ignored), size warnings, and the envelope as an editable spec (TOML; JSON when a value is above
+2^63 − 1, which TOML cannot hold). Control and bidirectional-format characters in what it prints are
+escaped (`\u{1b}`): an envelope's URIs are the requester's bytes. It exits non-zero when the miner
+would skip the job, and 0 for any envelope the miner decodes.
 
 **The binding.** `zkminer witness binding compute --word TYPE:VALUE …` derives `journalFields` and
 `expectedJournalHash` from your own parameters, FIELDS over the whole header (`H = 32 × words`,
 pinned at statement offset 0, with the journal-prefix marker unless `--no-prefix`); `--full-statement
-0x… --program-id …` is FULL, `--none` is NONE. Never take these from a prover's journal. Word types:
-`uintN`, `bool`, `address`, `bytesN`, `bytes32`, `word` (raw), `keccak:<text>`.
-`zkminer witness binding check` is the mutation check: give the binding (`--journal-fields`,
+0x… --program-id …` is FULL, `--none --assigned 0x…` is NONE. Never take these from a prover's
+journal. Word types: `uintN`, `bool`, `address`, `bytesN`, `bytes32`, `word` (raw), `keccak:<text>`.
+`zkminer witness binding check` is the mutation check: give the binding (`--journal-fields` and
 `--expected-journal-hash`, or `--descriptor`) and the statement (`--word …`, `--statement 0x…`, or a
 whole `--journal`), and it changes each byte in turn, recomputes the router's hash, and reports the
-pinned and free byte ranges, the free bytes of each header word, and whether the expected hash
-matches. It exits non-zero when a header byte is free (`--header-bytes` when not given as words), a
-range ends past the statement, or the hash does not match.
+pinned and free byte ranges, the header's free bytes, the free bytes of each header word, and
+whether the expected hash matches. It exits non-zero when:
+- a header byte is free; the header's length is `--header-bytes`, or 32 × the `--word`s;
+- the header's length is unknown under FIELDS (give it: a binding cannot be shown to pin a header of
+  unknown length), or it is longer than the statement given;
+- no expected hash is given (the mode is reported `unknown`: FULL and NONE look alike without it);
+- the binding is NONE without `--assigned` (or the descriptor's assigned prover);
+- the router would refuse the binding at submit (`InvalidJournalBinding`), a range ends past the
+  statement, or the hash does not match.
+
+A descriptor file whose binding the router would refuse at submit (NONE without an assigned prover,
+FIELDS without a hash, a range past the journal) does not load anywhere.
 
 **Simulate a job before submitting it.** `zkminer simulate --descriptor d.json` runs the job through
 the miner's own pre-claim pipeline: the static gates, the builder (from `--builder`, or fetched by
 the broker from the envelope's `hemi-code` locators exactly as a miner fetches it), the sandboxed
 builder and execute at every `--po2` (default `16..=22`; one size, a range or a list), the router's
-binding check, and a bundle published to a throwaway retention store under `--cache-dir` (removed at
-the end; it must not be tmpfs). The guest ELF is `--elf`, else the ProgramRegistry's. The broker uses
-your own endpoints: `--broker-config` (the broker's TOML; default `[broker] config`). The
-configuration's `[witness]` limits apply, and `[witness] sandbox_mode = "rootless"` on a host
-without root; the sandbox and broker self-tests must pass first. Run it in a delegated cgroup:
+binding check, a bundle published to a throwaway retention store under `--cache-dir` (removed at
+the end; it must not be tmpfs), and the claim gate's DA check (the exact fulfil against `[witness]
+fulfil_da_cap_bytes`). The guest ELF is `--elf`, else the ProgramRegistry's. The broker uses your own
+endpoints: `--broker-config` (the broker's TOML; default `[broker] config`), copied into the run's
+work directory with a spool of its own, so a simulation never shares a running miner's. The
+configuration's `[witness]` limits apply, the miner's per-job artifact budget (bytes and chunk reads)
+holds `hemi-code` reads, and `[witness] sandbox_mode = "rootless"` on a host without root; the
+sandbox and broker self-tests must pass first. A miner without `[witness] max_guest_cycles` derives
+its cycle maximum from its cards and proving timeout; give `--max-guest-cycles` to judge the job by
+one (else 2^34 applies, and the check is listed as not done). Run it in a delegated cgroup:
 
 ```bash
 systemd-run --user --scope -q -p Delegate=yes -- \
@@ -631,21 +647,33 @@ systemd-run --user --scope -q -p Delegate=yes -- \
 ```
 
 The report (one JSON document, `"kind": "witness"`) has the outcome (`simulated`, or `skipped` with
-the verdict, the step and its retry class, or `aborted`), the builder's fuel, fetches, fetched
-bytes, compile and run time and peak memory, `|W|` and its hashes, cycles per po2 in the
-`maxGuestCycles` unit, the journal, the pinned bytes and the binding's mutation check, the fulfil's
-estimated DA size (by the chain's `GasPriceOracle` when `[chain] rpc_url` answers, else an upper
-bound), this configuration's admission parameters, and `notChecked`: what only an on-chain job can
-be checked for (claimability, submission form, deployment pins, admission, reservation, deadline,
-prove resources). The `sys_rand` key is the run's own, and a journal-prefix job is reproduced
-exactly only with the real `jobId` (the file's `jobId`) and `--prover`. It exits non-zero when a
-miner with this configuration would skip the job. In `--job`/`--stdin` mode a witness job on chain
+the verdict, its step — `static_gates`, `artifact`, `builder`, `execute`, `binding`, `publish` or
+`claim_gate` — and its retry class — `never`, `once_jittered`, `backoff` with `retryMaxAttempts`,
+`on_host_change` or `deferred` — or `aborted`), the builder's fuel, fetches, fetched bytes, compile
+and run time and peak memory, `|W|` and its hashes, cycles per po2 in the `maxGuestCycles` unit,
+the journal, the pinned bytes and the binding's mutation check (the header's length from a scheme-1
+`W`'s word count, or `--header-bytes`), the fulfil's estimated DA size (by the chain's
+`GasPriceOracle` when `[chain] rpc_url` answers, else an upper bound) against the cap, this
+configuration's admission parameters, and `notChecked`: what was not checked and a miner would
+(claimability, submission form, deployment pins, admission, reservation, the DA backlog, deadline,
+prove resources; the builder's availability through its URIs or a mirror with `--builder`; the
+registry's ELF with `--elf`; a card-derived cycle maximum without `--max-guest-cycles`). The
+`sys_rand` key is the run's own, and a journal-prefix job is reproduced exactly only with the real
+`jobId` (the file's `jobId`) and `--prover`. It exits non-zero when a miner with this configuration
+would skip the job. In `--job`/`--stdin` mode a witness job on chain
 is reported `not_served`: its proven input is the builder's `W`, not its `inputData`.
 
 **`--adversarial`** then attacks the witness and the host inputs, within `--adversarial-secs`
-(default 600):
+(default 600; every execute and broker start gets what is left of it and is killed there):
 
-- **mutations of `W`**, each re-executed by the same sandboxed worker: byte flips at `--flips`
+- **the binding's coverage** first: it must pin the whole journal header `[0, H)` with a non-zero
+  `expectedJournalHash` (`H` from a scheme-1 `W`, or `--header-bytes`), else the verdict is `fail`.
+  A free header word is exploitable only with a consistent change of `W` (another block and its
+  header, another `k` and its proofs), which no mutation makes, so the mutations alone would pass it;
+- **mutations of `W`**, each made just before it runs (repeats recognised by their sha256) and
+  re-executed by the same sandboxed worker under this host's cycle maximum, not the job's (the
+  router does not check cycles: a run past `maxGuestCycles` is judged on its journal, and only one
+  stopped at the host's maximum is inconclusive, which under FULL decides nothing): byte flips at `--flips`
   sampled offsets (default 32; the first and last byte always), truncations, trailing bytes, and
   the drop, duplication and reordering of items in every length-delimited framing `W` parses as
   (u32/u64 length prefixes, risc0's word-padded `Vec<u8>`, a top-level RLP list), plus, first, the
@@ -658,14 +686,18 @@ is reported `not_served`: its proven input is the builder's `W`, not its `inputD
   `--max-mutations` run (default 256). Each must fail in the guest, give the same journal byte for
   byte, or change pinned bytes (which the router refuses); a changed journal that still satisfies
   the binding is a **soundness failure**, reported with the mutation that caused it;
-- **host inputs**: the same `W` under two `sys_rand` keys, two po2s and two keccak po2s; any journal
-  change is a dependence on an input the prover controls;
+- **host inputs**: the same `W` under two `sys_rand` keys, two po2s (the first `--po2` and the one
+  farthest from it, else the far end of 16..22; one request each) and two keccak po2s; any journal
+  change is a dependence on an input the prover controls (a run past the cycle maximum is reported as
+  such, not as a dependence);
 - **providers**: the whole pipeline against two `[[evm_rpc]]` endpoints of the broker configuration
   (`--providers a,b`, default the first two serving the job's chain), each alone; different
   journals that both satisfy the binding are a soundness failure.
 
 `adversarial.verdict` is `pass`, `fail`, or `incomplete` (something not run in time or
-inconclusive); the command exits non-zero unless it is `pass`.
+inconclusive); the command exits non-zero unless it is `pass`. A `W` above
+`--adversarial-max-w-bytes` (default 8 MiB) is not attacked (`refused`): the attack runs in this
+process, unsandboxed, and holds `W` and a few copies of it.
 
 **Publish a builder.** `zkminer artifact publish FILE --kind builder|elf --rpc-url URL --chain-id N
 --keystore KEY.json` stores the file on the HemiProve chain as contract code (`hemi-code`): chunks

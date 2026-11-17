@@ -1,6 +1,6 @@
-//! `sdk/build-reproducible.sh` rebuilds the example builder to exactly the sha256 the SDK README
-//! publishes, refuses a toolchain other than the pinned one, and passes the target features of
-//! `.cargo/config.toml` (which its flags replace) unchanged.
+//! `sdk/build-reproducible.sh` rebuilds the example builder and the reference builder of plan §12 to
+//! exactly the sha256 the SDK README publishes, refuses a toolchain other than the pinned one, and
+//! passes the target features of `.cargo/config.toml` (which its flags replace) unchanged.
 
 mod common;
 
@@ -12,11 +12,11 @@ use sha2::{Digest, Sha256};
 
 const CHECK: &str = env!("CARGO_BIN_EXE_zkminer-builder-check");
 
-/// The script, with the variables a caller might have set that it must ignore.
-fn script(target: &Path) -> Command {
+/// The script building `package`, with the variables a caller might have set that it must ignore.
+fn script(package: &str, target: &Path) -> Command {
     let mut cmd = Command::new("sh");
     cmd.arg(sdk_dir().join("build-reproducible.sh"))
-        .args(["-p", "latest-block", "--target-dir"])
+        .args(["-p", package, "--target-dir"])
         .arg(target)
         .env("ZKMINER_BUILDER_CHECK", CHECK)
         .env("RUSTUP_TOOLCHAIN", "1.93.0")
@@ -30,34 +30,47 @@ fn script(target: &Path) -> Command {
     cmd
 }
 
-/// The hash and size the README records for the script's build of `latest_block.wasm`.
-fn published() -> (String, usize) {
+/// The hash and size the README records for the script's build of `package`'s `file`.
+fn published(package: &str, file: &str) -> (String, usize) {
     let readme = std::fs::read_to_string(sdk_dir().join("README.md")).unwrap();
     let size = readme
-        .split("sha256 of `latest_block.wasm` (")
+        .split(&format!("sha256 of `{file}` ("))
         .nth(1)
         .and_then(|s| s.split(" bytes)").next())
         .map(|s| s.replace(',', "").parse().unwrap())
         .expect("the README's size column");
-    let line = readme.lines().find(|l| l.starts_with("| `./build-reproducible.sh -p latest-block`")).unwrap();
+    let line = readme.lines().find(|l| l.starts_with(&format!("| `./build-reproducible.sh -p {package}`"))).unwrap();
     let hash = line.split('`').nth(3).expect("the hash in backticks").to_string();
     assert_eq!(hash.len(), 64, "{line}");
     (hash, size)
 }
 
-#[test]
-fn the_script_rebuilds_the_published_example() {
-    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sdk-target-reproducible");
+/// Builds `package` with the script in a fresh target dir and checks its module against the README.
+fn rebuilds_the_published(package: &str, file: &str) {
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sdk-target-reproducible-{package}"));
     let _ = std::fs::remove_dir_all(&target);
-    let out = script(&target).output().unwrap();
+    let out = script(package, &target).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
     // The pre-pass ran on the module.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("latest_block.wasm: ok:"), "{stdout}");
-    let wasm = std::fs::read(target.join("wasm32-unknown-unknown/release/latest_block.wasm")).unwrap();
-    let (hash, size) = published();
+    assert!(stdout.contains(&format!("{file}: ok:")), "{stdout}");
+    let wasm = std::fs::read(target.join("wasm32-unknown-unknown/release").join(file)).unwrap();
+    let (hash, size) = published(package, file);
     assert_eq!((hex::encode(Sha256::digest(&wasm)), wasm.len()), (hash, size), "update sdk/README.md");
+    let _ = std::fs::remove_dir_all(&target);
+}
+
+#[test]
+fn the_script_rebuilds_the_published_example() {
+    rebuilds_the_published("latest-block", "latest_block.wasm");
+}
+
+/// The reference builder links the eth prelude and its statement through the `reference` symlink:
+/// its bytes must not depend on where the checkout is.
+#[test]
+fn the_script_rebuilds_the_published_reference_builder() {
+    rebuilds_the_published("proxy-slots-builder", "proxy_slots_builder.wasm");
 }
 
 #[test]

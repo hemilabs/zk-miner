@@ -7,8 +7,9 @@
 |---|---|
 | `statement/` | `hemiprove-proxy-slots`: the statement as one function, `run(input) -> journal`, plus the requester's helpers. `no_std`; shared by the guest, the builder and tooling. |
 | `guest/` | the risc0 guest: reads its input, runs the statement, commits the journal with one `commit_slice` or panics. Its own workspace and lockfile, like every guest in this repository. |
-| `methods/` | builds the guest (and the lint control) with risc0-build; the executor, end-to-end and lint tests. |
+| `methods/` | builds the guest (and the lint control and `hostdep`) with risc0-build; the executor, end-to-end, lint and `simulate --adversarial` tests. |
 | `lint-control/` | a guest that does everything the lints forbid, so the lint checks are shown to catch it. Never deployed. |
+| `hostdep/` | a test guest whose journal depends on host inputs (`sys_rand`, the keccak po2) or echoes `W`, for `simulate --adversarial`'s tests. Never deployed. |
 | `check-guest-lints.sh` | clippy with `guest/clippy.toml` for the zkVM target. |
 | `../../sdk/examples/proxy-slots/` | the builder (type 1, wasm32). |
 
@@ -21,7 +22,7 @@
 | 0 | 64 | `abi.encode(jobId, prover)`, copied from the input |
 | 64 | 160 | **header**, pinned: `schemeId = 1`, `B`, `C` (left-padded), `R`, `k` (≤ 255) |
 | 224 | 32 | `I`: the low 20 bytes of `C`'s slot `0x3608…2bbc`, as the proxy itself reads it |
-| 256 | 32 | `H`: `EXTCODEHASH(I)` (0 if `I` has no account, `keccak("")` if it has no code) |
+| 256 | 32 | `H`: `EXTCODEHASH(I)` (0 if `I` has no account or one that is empty under EIP-161, `keccak("")` if it has no code) |
 | 288 | 64 × k | `(slot, value)` in rule order; an unset slot reads 0 |
 
 **The binding:** `journalFields = 0xffffffff ‖ 0x000000a0 ‖ 0…` (the prefix marker, then 160 bytes at
@@ -80,16 +81,29 @@ the statement is the one you wanted.
 ## The guest lints (plan §21.1 item 4)
 
 No host input may reach the journal or a selection: no default-seeded `HashMap`/`HashSet`
-(`sys_rand` seeds them), `env::exit`/`pause`, environment, arguments, cycle count or `sys_rand`.
+(`sys_rand` seeds them), `env::exit`/`pause`, environment, arguments, cycle count, `sys_rand`, the
+raw keccak permutation's status (it shows the host's keccak po2), a file descriptor other than
+stdin, or any syscall made around the platform's wrappers (the raw `syscall_*_nr` entry points,
+`asm!`). And no `static`, `thread_local!`, `Cell` or `RefCell`: a derivation the guards accept
+captures nothing, but could read one of those.
 
-- `guest/clippy.toml` denies them; `./check-guest-lints.sh` runs clippy for the zkVM target with the
-  risc0 toolchain, and checks that the lint control's five violations are reported.
-- `methods/tests/guest_lints.rs` walks the built ELF's call graph (`sys_rand` only from risc0's
-  `env::init`, which draws the memory-image entropy every risc0 guest draws and which never reaches
-  the journal; nothing calling `sys_getenv`, `sys_argv`, `sys_argc`, `sys_cycle_count`, `env::exit`
-  or `env::pause`; no hash-map seed linked), and scans the sources of the guest, the statement and
-  the prelude; both are shown to catch the lint control. The ELF check sees calls through the
-  platform's syscall functions; a crate that issued the `ecall` itself would need review.
+- `guest/clippy.toml` denies what clippy can see; `./check-guest-lints.sh` runs clippy for the zkVM
+  target with the risc0 toolchain, and checks that the lint control's violations are reported.
+- `methods/tests/guest_lints.rs` checks the built ELF, which covers every crate the guest links:
+  an `ecall` only inside the platform's wrappers (`sys_*`, `syscall_*`) and risc0's keccak batcher,
+  and the raw entry points called only by those wrappers; `sys_rand` only from risc0's `env::init`
+  (the memory-image entropy every risc0 guest draws, which never reaches the journal); `sys_keccak`
+  only from the batcher; nothing calling `sys_getenv`, `sys_argv`, `sys_argc`, `sys_cycle_count`,
+  `env::exit` or `env::pause`; the syscall name strings (`nr::SYS_*`) referenced only by their
+  wrappers, and `SYS_GETENV`, `SYS_ARGV`, `SYS_ARGC`, `SYS_CYCLE_COUNT` by nothing; no hash-map seed
+  linked. It also scans the sources of the guest, the statement and the prelude for the banned names,
+  the `syscall_`/`SYS_` prefixes, `asm!`, `send_recv`, `FdReader`, `static`, `thread_local`, `Cell`,
+  `RefCell` and a `sys_read` of any fd but `fileno::STDIN`. Both are shown to catch the lint control,
+  which also reaches every host input around the names (a reviewer's bypass guest, folded in).
+- What no lint sees: a host input the guest reads by an `ecall` inside one of the platform's own
+  wrappers it is allowed to call, if the platform changed what that wrapper does. Pin the platform
+  crate, and `simulate --adversarial` reruns the guest under two `sys_rand` keys, two po2s and two
+  keccak po2s.
 
 The guest is `no_std`, so the standard hash maps, `std::env` and `std::process::exit` do not exist
 for it at all.

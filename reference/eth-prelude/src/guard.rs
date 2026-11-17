@@ -8,14 +8,59 @@
 //!   by [`JournalWriter::commit_pinned`].
 //! - [`Authenticated<T>`]: a value a verifier produced (a header that hashes to a pinned hash, a
 //!   leaf a trie proof reaches from an authenticated root), a pinned value
-//!   ([`Pinned::authenticated`]), a guest constant ([`constant!`](crate::constant)), or a function
-//!   of those ([`Authenticated::map`], [`Authenticated::zip`]).
+//!   ([`Pinned::authenticated`]), a guest constant ([`constant!`](crate::constant), plain data
+//!   only: [`AuthValue`]), or a function of those ([`Authenticated::map`], [`Authenticated::zip`]).
 //!
-//! Nothing outside this crate can construct either from raw bytes, so a value read from `W`
-//! without verification cannot reach a trie key or the journal by accident. The derivations take
-//! plain `fn` pointers: a closure that captures anything (a value from `W`, a counter) does not
-//! coerce to one, so a derivation cannot smuggle in an unauthenticated input. [`indices`] gives the
-//! loop counters a pinned count allows.
+//! Nothing outside this crate can construct either from a runtime value: the constructors are
+//! private, and the one public way in, [`constant!`](crate::constant), takes a `const` item of an
+//! [`AuthValue`] type (byte arrays, integers, `bool` and this crate's own types: nothing with
+//! interior mutability, so a constant cannot be filled in later). [`ToWord`], what an output may be,
+//! is sealed the same way, so a guest cannot define an output type that writes what it likes. So a
+//! value read from `W` without verification cannot reach a trie key or the journal by accident.
+//!
+//! The derivations take plain `fn` pointers, so a closure that captures a value (from `W`, a
+//! counter) does not compile into one. That alone does **not** stop smuggling: a non-capturing
+//! function can still read a `static`, a `thread_local!` or a `Cell` the guest filled from `W` or
+//! from a host input. Those are what the guest lints refuse in a guest's sources
+//! (`reference/proxy-slots/methods/tests/guest_lints.rs`); the types make accidents hard, and the
+//! lints and an audit of every derivation catch the rest. [`indices`] gives the loop counters a
+//! pinned count allows.
+//!
+//! What does not compile (each a way a guest once turned an unverified value into an output):
+//!
+//! ```compile_fail
+//! // No public constructor from a runtime value.
+//! use hemiprove_eth_prelude::guard::Authenticated;
+//! fn smuggle(hint: u64) -> Authenticated<u64> {
+//!     Authenticated::__from_guest_constant(hint)
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! // A constant with interior mutability, set at run time.
+//! use hemiprove_eth_prelude::constant;
+//! use std::cell::Cell;
+//! let cell = constant!(Cell<u64> = Cell::new(0));
+//! cell.get().set(7);
+//! ```
+//!
+//! ```compile_fail
+//! // An output type of the guest's own, which could write anything.
+//! use hemiprove_eth_prelude::guard::ToWord;
+//! struct FromAnywhere;
+//! impl ToWord for FromAnywhere {
+//!     fn to_word(&self) -> [u8; 32] {
+//!         [7; 32]
+//!     }
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! // A closure that captures a value is not a derivation.
+//! use hemiprove_eth_prelude::constant;
+//! let hint = 7u64;
+//! let a = constant!(u64 = 1).map(|x| x + hint);
+//! ```
 //!
 //! The journal ([`JournalWriter`]) is `prefix ‖ header ‖ outputs` (plan §7.2): the 64-byte
 //! `abi.encode(jobId, prover)` prefix copied from the guest input, every pinned word in order, then
@@ -108,26 +153,74 @@ impl<T> Authenticated<T> {
         f(self.0).map(Authenticated)
     }
 
+}
+
+impl<T: AuthValue> Authenticated<T> {
+    /// For [`constant!`](crate::constant): `C::VALUE` is an associated constant, evaluated when the
+    /// guest is compiled, so no runtime value (and nothing from `W`) can pass through; a guest
+    /// constant is part of the image, so it is as fixed as the binding. `T` is plain data
+    /// ([`AuthValue`]), so the constant cannot be changed afterwards either.
     #[doc(hidden)]
-    /// For [`constant!`](crate::constant) only, which passes a `const` item: a guest constant is part
-    /// of the image, so it is as fixed as the binding.
-    pub const fn __from_guest_constant(value: T) -> Self {
-        Self(value)
+    pub fn __constant<C: GuestConstant<Value = T>>() -> Self {
+        Self(C::VALUE)
     }
 }
 
+mod sealed {
+    /// Implemented only in this crate: what [`super::AuthValue`] and [`super::ToWord`] require.
+    pub trait Sealed {}
+}
+
+/// What a guest constant may be: plain data, with no interior mutability (a `Cell` constant could be
+/// set at run time, from `W`). Byte arrays, integers, `bool` and this crate's own value types.
+/// Sealed: a guest cannot add a type.
+pub trait AuthValue: sealed::Sealed {}
+
+macro_rules! auth_values {
+    ($($t:ty),*) => {$(
+        impl sealed::Sealed for $t {}
+        impl AuthValue for $t {}
+    )*};
+}
+auth_values!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, bool);
+auth_values!(crate::state::Account, crate::header::Header, crate::scheme1::ProofKind);
+impl<const N: usize> sealed::Sealed for [u8; N] {}
+impl<const N: usize> AuthValue for [u8; N] {}
+
+/// A guest constant: [`constant!`](crate::constant) implements it for a type of its own, with the
+/// expression as `VALUE`.
+#[doc(hidden)]
+pub trait GuestConstant {
+    type Value: AuthValue;
+    const VALUE: Self::Value;
+}
+
 /// A guest constant as an [`Authenticated`] value. The expression must be a constant expression
-/// (it initialises a `const` item), so no runtime value, and nothing from `W`, can pass through.
+/// (it is an associated `const`), so no runtime value, and nothing from `W`, can pass through; the
+/// type must be an [`AuthValue`].
 ///
 /// ```
 /// use hemiprove_eth_prelude::{constant, guard::Authenticated};
 /// let slot: Authenticated<[u8; 32]> = constant!([u8; 32] = [0x11; 32]);
 /// ```
+///
+/// A runtime value does not compile:
+///
+/// ```compile_fail
+/// use hemiprove_eth_prelude::constant;
+/// fn smuggle(hint: u64) {
+///     let _ = constant!(u64 = hint);
+/// }
+/// ```
 #[macro_export]
 macro_rules! constant {
     ($ty:ty = $value:expr) => {{
-        const VALUE: $ty = $value;
-        $crate::guard::Authenticated::<$ty>::__from_guest_constant(VALUE)
+        struct GuestConstant;
+        impl $crate::guard::GuestConstant for GuestConstant {
+            type Value = $ty;
+            const VALUE: $ty = $value;
+        }
+        $crate::guard::Authenticated::<$ty>::__constant::<GuestConstant>()
     }};
 }
 
@@ -144,7 +237,9 @@ pub fn indices(count: &Authenticated<u64>) -> impl Iterator<Item = Authenticated
 }
 
 /// A value that fills one 32-byte journal word, big-endian and left-padded like `abi.encode`.
-pub trait ToWord {
+/// Sealed: an output is one of these types, never a guest's own (whose `to_word` could read
+/// anything).
+pub trait ToWord: sealed::Sealed {
     fn to_word(&self) -> [u8; 32];
 }
 

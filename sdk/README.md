@@ -121,13 +121,15 @@ with `proxy-slots` compiles the SDK with feature `eth` for both, and `latest-blo
 
 A builder may share code with its guest (the reference builder links the eth prelude and its
 statement, so it derives the slot set with the guest's own rule and writes `W` with the guest's own
-codec). Cargo identifies a path dependency outside the workspace's directory by its absolute path,
-which reaches the module's bytes through symbol names and the optimiser's choices, so such a builder
-would rebuild to different bytes in another checkout. The shared crates therefore come in through the
-`reference` symlink: inside this directory, cargo identifies them by a path relative to it, and the
-script's `$PWD=/sdk` remapping covers their panic locations. The workspace excludes `reference`, so
-those crates are path dependencies, not members, and their host-only dev-dependencies stay out of
-this lockfile.
+codec). rustc records a panic location by the path cargo gives it for the source file, and the
+script remaps three prefixes only: this directory (`$PWD` → `/sdk`), the toolchain's sources and
+`$CARGO_HOME`. A path dependency outside this directory (`../reference/…`) would keep its absolute
+path in the module, so the builder would rebuild to different bytes in another checkout (a build of
+the reference builder that way was 98,859 bytes against 98,683, and its hash follows the checkout's
+path). The shared crates therefore come in through the `reference` symlink: cargo does not resolve
+it, so their source paths stay under this directory, where the `$PWD=/sdk` remapping rewrites them.
+The workspace excludes `reference`, so those crates are path dependencies, not members, and their
+host-only dev-dependencies stay out of this lockfile.
 
 ### Recorded on this host (2026-11-17)
 
@@ -143,11 +145,14 @@ Toolchain `rustc 1.97.1 (8bab26f4f 2026-07-14)`, LLVM 22.1.6, x86_64-unknown-lin
 of the scanner changes how the optimiser inlines it into the example, though the example does not
 call the new function.)
 
-| Build | sha256 of `proxy_slots_builder.wasm` (98,683 bytes) |
+| Build | sha256 of `proxy_slots_builder.wasm` (98,806 bytes) |
 |---|---|
-| `./build-reproducible.sh -p proxy-slots-builder`, clean target dir #1 | `9e9ca9692b6310792a18fc557315cf39d423a3b02df075dfcd799dceb788f2e4` |
-| same, clean target dir #2 | `9e9ca9692b6310792a18fc557315cf39d423a3b02df075dfcd799dceb788f2e4` |
-| same, from a copy of `sdk/` and `reference/` in another directory | `9e9ca9692b6310792a18fc557315cf39d423a3b02df075dfcd799dceb788f2e4` |
+| `./build-reproducible.sh -p proxy-slots-builder`, clean target dir #1 | `8aef79957460332b066cf14ba5c4ad8b23368a6203d7125a65449f2283e4cc3e` |
+| same, clean target dir #2 | `8aef79957460332b066cf14ba5c4ad8b23368a6203d7125a65449f2283e4cc3e` |
+| same, from a copy of `sdk/` and `reference/` in another directory | `8aef79957460332b066cf14ba5c4ad8b23368a6203d7125a65449f2283e4cc3e` |
+
+(It was `9e9ca969…88f2e4`, 98,683 bytes, until the prelude sealed its guards and gave `EXTCODEHASH`
+the EVM's answer for an account empty under EIP-161: the builder links the prelude.)
 
 A plain `cargo build --locked --release --target wasm32-unknown-unknown -p latest-block` (no
 remapping) was also identical across two clean target dirs, at

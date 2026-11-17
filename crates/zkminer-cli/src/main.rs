@@ -153,6 +153,19 @@ enum Commands {
         /// (default: the first two serving the job's chain).
         #[arg(long, value_delimiter = ',', requires = "adversarial")]
         providers: Option<Vec<String>>,
+        /// The largest W --adversarial attacks, in bytes: it runs in this process, unsandboxed, and
+        /// holds W and a few copies of it.
+        #[arg(long, default_value_t = commands::simulate_witness::DEFAULT_ADVERSARIAL_MAX_W_BYTES, requires = "adversarial")]
+        adversarial_max_w_bytes: u64,
+        /// With --descriptor, this host's maxGuestCycles maximum (over [witness] max_guest_cycles). A
+        /// miner with neither derives its own from its cards and proving timeout, which simulate
+        /// cannot: without one, the job is judged against 2^34 and that check is listed as not done.
+        #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
+        max_guest_cycles: Option<u64>,
+        /// With --descriptor, the journal header's length in bytes, which the binding must pin whole
+        /// (a scheme-1 W declares it; give it for a W of another layout, or --adversarial fails).
+        #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
+        header_bytes: Option<usize>,
         /// Then read requests from stdin until EOF, one per line: a job id, or
         /// {"jobId": "0x…", "submitTx": "0x…", "publicValues": "0x…"} (the submitting tx saves the
         /// descriptor's log scan; the fulfil's public values let the report say whether the measured
@@ -189,7 +202,10 @@ enum Commands {
         /// The SP1 worker binary (zkminer-prove-sp1); overrides the config.
         #[arg(long)]
         sp1_worker: Option<std::path::PathBuf>,
-        /// Where to keep the ELF and program-id caches (default ~/.zkminer/simulate).
+        /// Where to keep the ELF and program-id caches (default ~/.zkminer/simulate). With
+        /// --descriptor, where the run's throwaway retention store, broker spool and broker
+        /// configurations go (under witness-runs/, removed at the end): it must be on a real
+        /// filesystem, not tmpfs, which the store refuses.
         #[arg(long)]
         cache_dir: Option<std::path::PathBuf>,
     },
@@ -362,9 +378,12 @@ enum BindingCommand {
         /// FULL: the whole statement (the journal after any prefix), 0x hex.
         #[arg(long, conflicts_with_all = ["words", "none"])]
         full_statement: Option<String>,
-        /// NONE: nothing bound (only with an assigned prover).
+        /// NONE: nothing bound (only with an assigned prover: give it with --assigned).
         #[arg(long, conflicts_with = "words")]
         none: bool,
+        /// The job's assigned prover: a NONE binding without one fails (the router refuses it).
+        #[arg(long)]
+        assigned: Option<alloy::primitives::Address>,
         /// Without the journal-prefix marker (the marker is the default for open witness jobs).
         #[arg(long)]
         no_prefix: bool,
@@ -378,8 +397,10 @@ enum BindingCommand {
         json: bool,
     },
     /// The mutation check: change each byte of a statement in turn, recompute the router's hash, and
-    /// report which bytes the binding leaves free; non-zero exit when a header byte is free, a range
-    /// ends past the statement, or the expected hash does not match.
+    /// report which bytes the binding leaves free. Non-zero exit when a header byte is free, the
+    /// header's length is unknown (FIELDS) or longer than the statement, a range ends past the
+    /// statement, the expected hash does not match or is not given, the router would refuse the
+    /// binding at submit, or the binding is NONE without --assigned.
     Check {
         /// A descriptor file (its journalFields, expectedJournalHash and programId).
         #[arg(long)]
@@ -404,6 +425,9 @@ enum BindingCommand {
         /// The header's length in bytes (default: 32 × the words given).
         #[arg(long)]
         header_bytes: Option<usize>,
+        /// The job's assigned prover (default: the descriptor's): a NONE binding without one fails.
+        #[arg(long)]
+        assigned: Option<alloy::primitives::Address>,
         #[arg(long)]
         json: bool,
     },
@@ -530,6 +554,9 @@ async fn main() -> Result<()> {
             max_mutations,
             scheme,
             providers,
+            adversarial_max_w_bytes,
+            max_guest_cycles,
+            header_bytes,
             po2,
             execute_timeout_secs,
             risc0_worker,
@@ -550,12 +577,15 @@ async fn main() -> Result<()> {
                 cache_dir,
                 execute_timeout: simulate_bound("--execute-timeout-secs", execute_timeout_secs),
                 out,
+                max_guest_cycles,
+                header_bytes,
                 adversarial: adversarial.then(|| commands::simulate_witness::AdversarialOptions {
                     budget: std::time::Duration::from_secs(adversarial_secs),
                     flips,
                     max_mutations,
                     scheme,
                     providers,
+                    max_w_bytes: adversarial_max_w_bytes,
                 }),
             };
             commands::simulate_witness::run(config_path, opts).await
@@ -681,6 +711,7 @@ async fn main() -> Result<()> {
                     words,
                     full_statement,
                     none,
+                    assigned,
                     no_prefix,
                     program_id,
                     proof_system,
@@ -692,7 +723,7 @@ async fn main() -> Result<()> {
                         full_statement,
                         none,
                     };
-                    commands::witness_tools::binding_compute(&spec, &proof_system, program_id, json)
+                    commands::witness_tools::binding_compute(&spec, &proof_system, program_id, assigned, json)
                 }
                 BindingCommand::Check {
                     descriptor,
@@ -704,6 +735,7 @@ async fn main() -> Result<()> {
                     journal,
                     statement,
                     header_bytes,
+                    assigned,
                     json,
                 } => commands::witness_tools::binding_check(commands::witness_tools::CheckArgs {
                     descriptor,
@@ -715,6 +747,7 @@ async fn main() -> Result<()> {
                     journal,
                     statement,
                     header_bytes,
+                    assigned,
                     json,
                 }),
             },

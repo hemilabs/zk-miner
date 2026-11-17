@@ -243,6 +243,21 @@ pub enum Step {
     Publish,
 }
 
+impl Step {
+    /// A stable name for reports (`zkminer simulate`'s JSON): `static_gates`, `artifact`, `builder`,
+    /// `execute`, `binding`, `publish`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Step::StaticGates => "static_gates",
+            Step::Artifact => "artifact",
+            Step::Builder => "builder",
+            Step::Execute => "execute",
+            Step::Binding => "binding",
+            Step::Publish => "publish",
+        }
+    }
+}
+
 /// Why a simulation produced no bundle. Nothing was published; a bundle version that was being
 /// written was discarded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -833,6 +848,7 @@ async fn execute(
     req: WitnessExecuteRequest,
     w: File,
     cgroup_name: String,
+    timeout: Duration,
 ) -> Result<WitnessExecuteResponse, Skip> {
     const S: Step = Step::Execute;
     let kill_path = ctx.cgroup_root.join(&cgroup_name).join("cgroup.kill");
@@ -843,7 +859,7 @@ async fn execute(
         cpu_max: None,
         cpu_weight: SIMULATION_CPU_WEIGHT,
     };
-    let (binary, root, timeout) = (ctx.execute_binary.clone(), ctx.cgroup_root.clone(), ctx.execute_timeout);
+    let (binary, root) = (ctx.execute_binary.clone(), ctx.cgroup_root.clone());
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("witness-execute".into())
@@ -913,6 +929,9 @@ pub struct ExecuteOnce<'a> {
     /// (`sys_rand::risc0_seed(key, image id, sha256(prefix ‖ W))`).
     pub sys_rand_key: [u8; 32],
     pub max_cycles: u64,
+    /// A wall clock below [`HostContext::execute_timeout`] (a caller's own time bound): the worker's
+    /// cgroup is killed when it passes.
+    pub timeout: Option<Duration>,
 }
 
 /// Runs [`ExecuteOnce`] on `w` (sealed in a memfd) and returns the worker's response unjudged; the
@@ -940,7 +959,8 @@ pub async fn execute_once(
         max_cycles: Some(spec.max_cycles),
     };
     let name = format!("wexec-once-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
-    execute(ctx, token, req, file, name).await
+    let timeout = spec.timeout.map_or(ctx.execute_timeout, |t| t.min(ctx.execute_timeout));
+    execute(ctx, token, req, file, name, timeout).await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1092,7 +1112,7 @@ pub async fn simulate_witness_job(
         keccak_po2: ctx.keccak_po2,
         max_cycles: Some(limits.maxGuestCycles),
     };
-    let resp = execute(ctx, token, req, w_file, format!("wexec-{}", short(job_key))).await?;
+    let resp = execute(ctx, token, req, w_file, format!("wexec-{}", short(job_key)), ctx.execute_timeout).await?;
     let journal = check_execution(&resp, &po2s, program_id, limits.maxGuestCycles).map_err(|(r, d)| Skip::new(r, E, d))?;
     timings.execute = t.elapsed();
     // The build recorded is the handshake's, never what the process that ran the guest says of itself.

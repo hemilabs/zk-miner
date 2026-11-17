@@ -32,10 +32,11 @@ cd sdk
 sha256sum target/wasm32-unknown-unknown/release/proxy_slots_builder.wasm
 ```
 
-`9e9ca9692b6310792a18fc557315cf39d423a3b02df075dfcd799dceb788f2e4` (98,683 bytes) on the pinned
+`8aef79957460332b066cf14ba5c4ad8b23368a6203d7125a65449f2283e4cc3e` (98,806 bytes) on the pinned
 toolchain, from two clean target dirs and from a copy of the tree elsewhere. It shares the prelude
-and the statement with the guest through the SDK's `reference` symlink, which keeps those paths
-relative to the workspace (see the SDK README, "Shared code").
+and the statement with the guest through the SDK's `reference` symlink, which keeps their source
+paths under the SDK directory, where the build's path remapping rewrites them (see the SDK README,
+"Shared code").
 
 Limits it needs: 4 fetches; responses of a few tens of KB per proof on a large chain; the module
 has 17 initial memory pages (1.06 MiB), so `maxBuilderMemoryBytes` of 16 MiB leaves ample heap;

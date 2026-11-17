@@ -21,11 +21,12 @@ lint guest >/dev/null || { lint guest; echo "check-guest-lints.sh: the guest use
 
 out=$(lint lint-control || true)
 for expected in std::collections::HashMap risc0_zkvm::guest::env::cycle_count std::env::var std::env::args \
-    risc0_zkvm::guest::env::exit; do
+    risc0_zkvm::guest::env::exit risc0_zkvm_platform::syscall::syscall_0_nr risc0_zkvm_platform::syscall::syscall_2_nr \
+    risc0_zkvm_platform::syscall::sys_keccak risc0_zkvm::guest::env::FdReader::new core::cell::Cell; do
     if ! printf '%s\n' "$out" | grep -q "disallowed .* \`$expected\`"; then
         printf '%s\n' "$out" >&2
         echo "check-guest-lints.sh: the lint control's use of $expected was not reported" >&2
         exit 1
     fi
 done
-echo "check-guest-lints.sh: guest clean; the control's five violations reported"
+echo "check-guest-lints.sh: guest clean; the control's ten violations reported"
