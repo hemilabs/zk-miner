@@ -164,8 +164,8 @@ job there could then reach this host's private network.
 | `hemi-code` artifact reads | the operator's `[artifacts]` endpoint and mirror; the address from **the job** | the connector |
 | The connector's DNS resolver (in the miner) | the operator (`[dns] servers`, else `/etc/resolv.conf`) | dials only those servers, for the operator's endpoint names only; never a fetch destination |
 | Public-address discovery (miner and broker, at startup and every 5 minutes) | fixed in the build: `ns1.google.com` and `1.1.1.1` (and their IPv6 addresses), UDP port 53 | none needed: requesters cannot change them; `[egress] discover_public_addresses = false` turns it off |
-| The builder runner and the execute worker | none | seccomp denies `socket`, `socketpair` and `connect` |
-| The broker itself | none | seccomp denies `socket`, `connect`, `bind`, `listen`, `accept*` (and `socketpair` once its runtime is up); Landlock grants no TCP port |
+| The builder runner and the execute worker | none | seccomp denies `socket`, `socketpair`, `connect` and `setsockopt` |
+| The broker itself | none | seccomp denies `socket`, `connect`, `bind`, `listen`, `accept*` (and `socketpair` once its runtime is up), and every `setsockopt` but `TCP_NODELAY`; Landlock grants no TCP port |
 | The inline measure and prove workers (risc0, SP1, OpenVM) and `sp1-gpu-server` | none | confined before their first guest: no sockets, Unix ones included; Landlock (below) |
 | The miner's witness host (pipeline, builder runs, store) | none | talks to the broker over a Unix socket pair only |
 
@@ -249,7 +249,16 @@ process an attacker may get code execution in, and **it has no network of its ow
 filter denies `socket`, `connect`, `bind`, `listen` and `accept*`, Landlock grants it no TCP port,
 and once its runtime is up even `socketpair` is denied. Without `connect` it cannot disconnect a
 socket it holds (`connect(AF_UNSPEC)`) and aim it elsewhere, and TCP Fast Open to another address
-fails on a connected socket.
+fails on a connected socket. Nor can it re-route one at the IP layer: its only socket option is
+`setsockopt(IPPROTO_TCP, TCP_NODELAY)`, and any other level or option fails with `EPERM` (an IPv6
+routing header, which unprivileged would send later segments to the address it names; IPv4 source
+routing; `SO_BINDTODEVICE`/`SO_BINDTOIFINDEX`, `IP_UNICAST_IF`/`IPV6_UNICAST_IF`, `IPV6_NEXTHOP`,
+`IP_TRANSPARENT`, `SO_MARK`, the TTLs, `TCP_ULP`, …). Ancillary data on `sendmsg` is no way
+around it: TCP ignores `IPPROTO_IP` and `IPPROTO_IPV6` control messages (routing headers,
+`PKTINFO` interfaces, next hops, IP options), and the one `SOL_SOCKET` message that selects a
+route, a per-packet `SO_MARK`, needs `CAP_NET_ADMIN`; every sandbox drops all capabilities when it
+starts, whoever runs the miner. The builder runner and the execute worker may not call
+`setsockopt` at all.
 
 Every connection the broker uses is made by the **connector**, in the miner
 (`crates/zkminer-witness-broker/src/connector`, run by `zkminer-witness-host`): the broker sends a
@@ -305,7 +314,9 @@ no second one):
   route whole — at least what the miner's prefix model refuses.
 - **The self-test** (at startup and hourly) also checks, from inside the sandboxed broker, that
   `socket(AF_INET/AF_INET6)` fails and `connect`, `bind`, `listen` and `accept4` fail with the
-  filter's `EPERM`, and that the connector refuses an index past the configuration; and, in the
+  filter's `EPERM`, that every re-routing socket option fails with `EPERM` on fd -1 and on a
+  socket the connector hands it for its first endpoint while `TCP_NODELAY` works, and that the
+  connector refuses an index past the configuration; and, in the
   miner, that the connector refuses an address outside every role entry, a private address (public
   mode) and a malformed request.
 - **Keys** (`key_file`) travel only over `https` in public mode. In developer mode they may also
@@ -419,4 +430,7 @@ no second one):
   is reachable by a broker compromise; keep endpoint nodes minimal (§11.1 of the design: `eth`,
   `net`, `web3` only) and keys scoped. It can lie to the miner about fetch results (the guest
   re-checks everything it uses) and read its spool directory. It cannot reach any other host,
-  port, or address, private or public, nor resolve a name.
+  port, or address, private or public, nor resolve a name: every socket it holds was connected
+  by the miner to an admitted address, and it can neither reconnect one (no `connect`) nor
+  re-route one (no socket option but `TCP_NODELAY`, IP-level control messages ignored by TCP, no
+  capability). Bytes it writes go to the peer the connector chose and nowhere else.

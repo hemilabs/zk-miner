@@ -183,6 +183,7 @@ async fn the_broker_binary_serves_under_the_sandbox() {
         SelfTestCheck::EndpointsReachable,
         SelfTestCheck::InetSocketDenied,
         SelfTestCheck::ConnectDenied,
+        SelfTestCheck::SocketOptionsDenied,
         SelfTestCheck::ConnectorRefusesBadIndex,
     ] {
         assert!(r.checks.contains(&(c, true)), "{c:?}: {r:?}");

@@ -422,6 +422,11 @@ pub enum SelfTestCheck {
     InetSocketDenied,
     /// Inside the broker: `connect`, `bind`, `listen` and `accept4` fail with the filter's `EPERM`.
     ConnectDenied,
+    /// Inside the broker: every socket option that re-routes a socket (an IPv6 routing header,
+    /// IPv4 source routing, an interface, a next hop, a mark, a TTL) fails with the filter's
+    /// `EPERM`, on fd -1 and on a socket the connector handed it, while `TCP_NODELAY` is let
+    /// through.
+    SocketOptionsDenied,
     /// The connector, asked by the broker over its socket for an endpoint index past the
     /// miner's configuration, refuses.
     ConnectorRefusesBadIndex,

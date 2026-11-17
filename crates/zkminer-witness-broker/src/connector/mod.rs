@@ -36,7 +36,12 @@
 //!
 //! Host-name resolution lives here, not in the broker: the broker never resolves anything, so it
 //! needs no DNS server as a destination either. The connector can only ever produce a connection
-//! to a configured endpoint's admitted address.
+//! to a configured endpoint's admitted address, and the broker cannot point a socket it was handed
+//! anywhere else: its sandbox denies `connect` (no `connect(AF_UNSPEC)` and reconnect; TCP Fast
+//! Open to another address fails on a connected socket) and every `setsockopt` but
+//! `IPPROTO_TCP`/`TCP_NODELAY` (no IPv6 routing header, IPv4 source route, interface binding, next
+//! hop or mark), TCP ignores IP-level control messages on `sendmsg`, and the sandbox holds no
+//! capability (a per-packet `SO_MARK` needs `CAP_NET_ADMIN`).
 //!
 //! # Limits and cut-off
 //!
