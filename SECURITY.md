@@ -671,6 +671,19 @@ no second one):
   proof's worker can read every bundle in the retention store, other requesters' included.
   Its results go back to the miner over its pipe, and a guest controls its journal, so anything it
   can read it can publish: keep secrets out of the readable paths.
+- **SP1's shared memory.** SP1's executor shares the guest's memory and trace ring with its runner
+  process through memfds, which have no name. That hides them from confined processes only: an
+  unconfined process of the same uid (the miner, a worker before it confines itself, `rocm-smi`, or
+  anything else the user runs) can still open them through `/proc/<pid>/fd`, as it could the named
+  `/dev/shm` objects before. Run SP1 under a user that runs nothing else. The memory a process
+  allocates through such a descriptor is bounded by the worker's cgroup (`MemoryMax`) and the
+  host's RAM, not by the size of `/dev/shm`, and SP1's memory limit, which watches the runner's
+  resident memory, does not see pages written through a descriptor and never mapped. Like every process that runs a guest, the runner is confined, and memfds of its own were
+  already open to it (its seccomp filter does not refuse `memfd_create`), so sharing memory this
+  way gives it nothing new. A worker
+  offers SP1 only with a server whose executor shares memory this way (`sp1-gpu-server
+  --capabilities` lists `fd-shared-memory`), and gives SP1 up on its slot if its own executor
+  cannot run a small guest once confined.
 - **Workers without a cgroup of their own.** With neither a delegated cgroup nor a systemd user
   manager (a container without systemd, another init), the miner logs that a worker is in no cgroup
   of its own, and the worker and what it starts end by process group, which a confined process
