@@ -354,14 +354,28 @@ executor:
   kernel never runs the server's own call. Links, renames, removals, new directories and symlinks,
   and truncation outside the writable paths are Landlock's to refuse.
 - **Process control.** A confined process cannot leave its session or process group (`setsid`,
-  `setpgid`: the miner ends a worker and everything it started by killing the worker's process
-  group), nor change another process's limits, priority, I/O priority or scheduling
+  `setpgid`: where a worker has no cgroup of its own, the miner ends it and everything it started
+  by killing its process group), nor change another process's limits, priority, I/O priority or scheduling
   (`prlimit64` with a new limit, `setpriority`, `ioprio_set`, `sched_setaffinity`,
   `sched_setscheduler`, `sched_setparam`, `sched_setattr`; `PRIO_PGRP`, `PRIO_USER` and their I/O
   twins too), which Landlock does not scope: a CPU-time limit set on the miner would kill it. Its
   own stay open (pid 0). The ioctl forms of metadata writes (`FS_IOC_SETFLAGS`,
   `FS_IOC_FSSETXATTR`, `FS_IOC_SETVERSION`, their 32-bit twins, `FS_IOC_ENABLE_VERITY`) are
   refused like the rest.
+- **Ending.** Nothing a worker started outlives it. Where the miner runs in a cgroup delegated to
+  it (as witness jobs need: a systemd service with `Delegate=yes`, or
+  `systemd-run --user --scope -p Delegate=yes`), each worker starts in a cgroup of its own below
+  it (`zkminer-worker-<miner pid>-<n>`), joined before `exec`, with the worker's memory ceiling as
+  its `memory.max`. Elsewhere the user's systemd manager adopts the worker into a transient scope,
+  and the miner sends it nothing (so no guest runs in it) until the scope holds it. Every end of a
+  worker (a recycle, a timeout, a kill, its death, shutdown) writes that cgroup's `cgroup.kill`,
+  which reaches every process in it whatever its process group or session. If the miner dies,
+  however abruptly (SIGKILL, the OOM killer), a reaper it started with its first worker
+  (`/bin/sh` in a session of its own, reading a pipe only the miner writes) sees the pipe end and
+  kills every worker's cgroup and process group; no worker starts without it. A thread of the
+  miner, outside every confinement, watches the mount table and kills every worker when a mount
+  they could reach is not local, within microseconds of seeing the change; the workers that
+  replace them refuse guests until it is gone.
 - **Kernel surface.** No namespaces and no mounts: seccomp denies `unshare`, `setns`, `clone` with
   any `CLONE_NEW*` flag, `mount`, `umount2`, `pivot_root`, `chroot` and the new mount API
   (`fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `open_tree_attr`,
@@ -594,32 +608,39 @@ no second one):
   checked by the guard: requesters cannot change them, and a local chain node is a normal
   setup.
 - **What an escaped guest in an inline worker can still do.** It cannot open a socket or connect
-  anywhere, make a namespace, mount anything or change a file's metadata, but it keeps what the
-  GPU stack needs: the GPU device nodes and their ioctls (a kernel driver bug is outside this
-  model), reading the system's files and its own `/proc` entries (an SP1 worker or server all of
-  `/proc`: other processes' command lines and status, not their memory or environment), and
-  writing the caches listed above, which other GPU programs of
-  the same user also load (a confined worker could poison an Intel kernel cache or risc0's CUDA
-  Groth16 cache for them). An SP1 worker, its executor's runner and its server can read, write,
-  create and remove anything of the uid in `/dev/shm`, pending a change to SP1's executor (the
-  grant goes when that lands). SP1 needs it for the named shared memory between its executor and
-  the runner child (`/<id>_m` for the guest's memory, `/<id>_t` for the trace, the `_filled` and
-  `_empty` semaphores), and the server for its Groth16 files (the GPU proving key cache, about
-  9 GB, each proof's witness directory, the host-wide Groth16 queue). So a guest that escaped in
-  one SP1 process can read or change the guest memory and traces of another SP1 proof running at
-  the same time (its result or its failure, not the network), the server's Groth16 files, and
-  whatever other programs of the same user keep there: ROCm SMI's process-shared mutexes
-  (`rocm_smi_renderD*`, mode 0777, which `rocm-smi`, `amd-smi` and other ROCm SMI users lock, so
-  they can be made to hang; the miner's own `rocm-smi` query at discovery is bounded by a timeout), other programs' shared memory and semaphores (browsers, PulseAudio
-  and PipeWire, Python `multiprocessing`). Run SP1 under a user that runs nothing else. A witness proof's worker can read
-  every bundle in the retention store, other requesters' included. Its results go back to the
-  miner over its pipe, and a guest controls its journal, so anything it can read it can publish:
-  keep secrets out of the readable paths.
-- **Filesystems mounted later, or remote underneath.** A network or FUSE filesystem mounted after
-  a worker confined itself ends that worker (its mount watch) and refuses every later guest, but a
-  guest that already escaped its executor in that worker has the moment between the mount and the
-  watch's exit (milliseconds), and owns the worker's address space, watch thread included: mount
-  nothing of the kind while the miner runs. A builder runner, an execute worker or the broker
+  anywhere, make a namespace, mount anything or change a file's metadata, but it keeps what the GPU
+  stack needs: the GPU device nodes and their ioctls (a kernel driver bug is outside this model),
+  reading the system's files and its own `/proc` entries (an SP1 worker or server all of `/proc`:
+  other processes' command lines and status, not their memory or environment), and writing the
+  caches listed above, which other GPU programs of the same user also load (a confined worker could
+  poison an Intel kernel cache or risc0's CUDA Groth16 cache for them). An SP1 worker, its
+  executor's runner and its server can read, write, create and remove anything of the uid in
+  `/dev/shm`, pending a change to SP1's executor (the grant goes when that lands). SP1 needs it for
+  the named shared memory between its executor and the runner child (`/<id>_m` for the guest's
+  memory, `/<id>_t` for the trace, the `_filled` and `_empty` semaphores), and the server for its
+  Groth16 files (the GPU proving key cache, about 9 GB, each proof's witness directory, the
+  host-wide Groth16 queue). So a guest that escaped in one SP1 process can read or change the guest
+  memory and traces of another SP1 proof running at the same time (its result or its failure, not
+  the network), the server's Groth16 files, and whatever other programs of the same user keep there:
+  ROCm SMI's process-shared mutexes (`rocm_smi_renderD*`, mode 0777, which `rocm-smi`, `amd-smi` and
+  other ROCm SMI users lock, so they can be made to hang; the miner's own `rocm-smi` query at
+  discovery is bounded by a timeout), other programs' shared memory and semaphores (browsers,
+  PulseAudio and PipeWire, Python `multiprocessing`). Run SP1 under a user that runs nothing else. A
+  witness proof's worker can read every bundle in the retention store, other requesters' included.
+  Its results go back to the miner over its pipe, and a guest controls its journal, so anything it
+  can read it can publish: keep secrets out of the readable paths.
+- **Workers without a cgroup of their own.** With neither a delegated cgroup nor a systemd user
+  manager (a container without systemd, another init), the miner logs that a worker is in no cgroup
+  of its own, and the worker and what it starts end by process group, which a confined process
+  cannot leave (the reaper kills that group too). A scope adopts its worker after `exec`: what the
+  worker itself starts before the scope holds it (before its first command, so nothing a guest
+  started) stays outside the scope and ends by process group.
+- **Filesystems mounted later, or remote underneath.** A network or FUSE filesystem mounted while
+  workers run ends every worker and everything they started (the miner's mount watch; each
+  confined process also watches its own table) and refuses every later guest, but a guest that
+  already escaped its executor has the moment between the mount and the kill (the kernel's
+  notification, then microseconds) to look a name up on it: mount nothing of the kind while the
+  miner runs. A builder runner, an execute worker or the broker
   checks only when it starts (each runs briefly per job, the broker for as long as the miner).
   Filesystems are judged by their own
   type, so storage that is remote underneath a local type is not seen: a block device on iSCSI,

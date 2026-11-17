@@ -339,6 +339,19 @@ pub fn cap_unit_name(unit_hint: &str, pid: u32) -> String {
     )
 }
 
+/// The leaf name a worker's cgroup must have for the memory readers to trust its counters: the
+/// cgroup of its own the miner made for it (`containment`), else its scope ([`cap_unit_name`]).
+pub fn worker_cgroup_leaf(unit_hint: &str, pid: u32) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        crate::containment::cgroup_leaf(unit_hint, pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cap_unit_name(unit_hint, pid)
+    }
+}
+
 /// Windows has no resident-memory ceiling that kills: a Job Object limits COMMITTED memory, which
 /// for a CUDA process is no measure of what it holds (see the module docs), so a cap sized from RAM
 /// could kill a proof that fits. Until one is measured against real provers there is none, and

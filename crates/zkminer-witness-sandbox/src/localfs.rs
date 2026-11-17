@@ -639,10 +639,9 @@ pub struct LocalFsReport {
     pub open_files: usize,
 }
 
-/// Fails if this process can reach a filesystem that is not local (see the module docs), naming
-/// each one and its type. `granted`: the paths it is (or will be) granted; missing ones are skipped,
-/// as Landlock skips them.
-pub fn check_local_filesystems(granted: &[PathBuf]) -> Result<LocalFsReport, SandboxError> {
+/// The mount table and its root, and every reachable mount that is not local, by type and
+/// (another user's FUSE mount) by whether the kernel still lets this process reach its root.
+fn mount_problems() -> Result<(Vec<Mount>, u32, Vec<String>), SandboxError> {
     let (mut mounts, mut root) = mount_table()?;
     if trigger_idle_direct_automounts(&mounts, root) {
         (mounts, root) = mount_table()?;
@@ -668,6 +667,26 @@ pub fn check_local_filesystems(granted: &[PathBuf]) -> Result<LocalFsReport, San
             ));
         }
     }
+    Ok((mounts, root, problems))
+}
+
+/// The mount-table half of [`check_local_filesystems`], for a process that confines nothing itself
+/// but starts processes that do, in its own mount namespace: fails if a mount they could reach is
+/// not local. Returns how many mounts are reachable.
+pub fn check_mount_table() -> Result<usize, SandboxError> {
+    let (mounts, root, problems) = mount_problems()?;
+    if problems.is_empty() {
+        Ok(reachable(&mounts, root).iter().filter(|r| **r).count())
+    } else {
+        Err(SandboxError::NotLocal(problems.join("; ")))
+    }
+}
+
+/// Fails if this process can reach a filesystem that is not local (see the module docs), naming
+/// each one and its type. `granted`: the paths it is (or will be) granted; missing ones are skipped,
+/// as Landlock skips them.
+pub fn check_local_filesystems(granted: &[PathBuf]) -> Result<LocalFsReport, SandboxError> {
+    let (mounts, root, mut problems) = mount_problems()?;
 
     let mut paths = 0;
     for p in granted {

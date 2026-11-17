@@ -281,7 +281,12 @@ or exfat-fuse on a block device); a user's own FUSE mounts (gvfs, the document p
 rclone, ...) are not, whatever they call themselves. Unmount them, or run the miner as a dedicated
 user (another user's FUSE mount without `allow_other` is closed to it) or in a container or mount
 namespace that leaves them out. Confined workers also
-change no file's mode, owner, attributes or times. The CPU risc0 worker's Docker Groth16 wrap runs in
+change no file's mode, owner, attributes or times. Nothing a worker starts outlives it: each worker
+runs in a cgroup of its own, killed with `cgroup.kill` when the worker ends (below the miner's when
+the miner runs in a cgroup delegated to it, such as under `systemd-run --user --scope -p
+Delegate=yes zkminer run`, else in a scope of your systemd user manager); a small reaper process
+(`zkminer-worker-reaper`) kills every worker if the miner dies abruptly; and the miner kills every
+worker the moment a filesystem that is not local is mounted. The CPU risc0 worker's Docker Groth16 wrap runs in
 a helper process that accepts only a strictly checked prover input, with the image pinned by digest
 and `--network none`. See [SECURITY.md](SECURITY.md#inline-workers-confined).
 

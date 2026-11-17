@@ -5837,7 +5837,10 @@ impl WorkerPool {
             return None;
         }
         let backend = slot_key.split(':').next().unwrap_or(slot_key);
-        crate::memory::anon_memory_of_pid(pid, Some(&crate::memory::cap_unit_name(backend, pid)))
+        crate::memory::anon_memory_of_pid(
+            pid,
+            Some(&crate::memory::worker_cgroup_leaf(backend, pid)),
+        )
     }
 
     #[cfg(not(unix))]
@@ -6729,7 +6732,7 @@ impl WorkerPool {
         let backend = key.split(':').next().unwrap_or(key);
         if let Some(cgroup_peak) = crate::memory::peak_memory_of_pid(
             pid,
-            Some(&crate::memory::cap_unit_name(backend, pid)),
+            Some(&crate::memory::worker_cgroup_leaf(backend, pid)),
         ) {
             return Some(cgroup_peak);
         }

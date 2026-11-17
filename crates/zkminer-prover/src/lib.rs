@@ -1,4 +1,6 @@
 pub mod benchmark;
+#[cfg(target_os = "linux")]
+pub mod containment;
 pub mod descriptor;
 pub mod discovery;
 pub mod dispatcher;
