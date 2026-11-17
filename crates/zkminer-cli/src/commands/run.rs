@@ -12706,8 +12706,8 @@ async fn recover_claimed_jobs(
             }
             continue;
         }
-        // Terminal status check (Open=0, Locked=1, Fulfilled=2, Released=3, Cancelled=4): only a
-        // Locked job can be fulfilled or released.
+        // Terminal status check (Open=0, Locked=1, Fulfilled=2, Cancelled=3; a release reopens the job,
+        // so it reads Open): only a Locked job can be fulfilled or released.
         if view.status != 1 {
             tracing::info!(
                 "recover: {} has non-Locked status {} — dropping stale journal entry",
