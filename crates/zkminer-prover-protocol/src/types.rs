@@ -908,6 +908,18 @@ const SP1_16GB_CARD_MAX_TOTAL: u64 = 16 * 1024 * MIB;
 /// when `ceil(total GiB) + 4 < 16`, so on any card of 11 GiB or less.
 const SP1_UNSUPPORTED_CARD_MAX_TOTAL: u64 = 11 * 1024 * MIB;
 
+/// Whether the environment `get` reads switches off a memory saver `sp1-gpu-server` runs on a CUDA
+/// card of 16 GiB or less: dropping the LDEs (`SP1_GPU_DROP_LDES`, ~6 GiB at a 100K shard) or
+/// recomputing the first GKR layer (`SP1_GPU_RECOMPUTE_FIRST_LAYER`, ~2.8 GiB). The server reads
+/// both from the environment it inherits, and turns a saver off on "0" or "false".
+/// [`SP1_MEASURED_TIERS_16GB`] was measured with both on, so a card with either off is sized as a
+/// larger card (no total): its room is never under what its server takes.
+pub fn sp1_small_card_savers_off(get: impl Fn(&str) -> Option<String>) -> bool {
+    ["SP1_GPU_DROP_LDES", "SP1_GPU_RECOMPUTE_FIRST_LAYER"]
+        .iter()
+        .any(|var| matches!(get(var).as_deref(), Some("0" | "false")))
+}
+
 /// The measured tiers for a card of `total` bytes, largest first: none for a card the server refuses,
 /// and the larger card's table when the total is unknown, whose figures are the higher.
 fn sp1_measured_tiers(total: Option<u64>) -> &'static [(u64, u64)] {
@@ -1887,6 +1899,36 @@ mod zkop_mix_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_small_card_savers_are_off_only_when_set_to_off() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert!(!super::sp1_small_card_savers_off(env(&[])));
+        assert!(!super::sp1_small_card_savers_off(env(&[(
+            "SP1_GPU_DROP_LDES",
+            "1"
+        )])));
+        // The server reads anything else as unset, so keeps its default (on).
+        assert!(!super::sp1_small_card_savers_off(env(&[(
+            "SP1_GPU_DROP_LDES",
+            "no"
+        )])));
+        assert!(super::sp1_small_card_savers_off(env(&[(
+            "SP1_GPU_DROP_LDES",
+            "0"
+        )])));
+        assert!(super::sp1_small_card_savers_off(env(&[(
+            "SP1_GPU_RECOMPUTE_FIRST_LAYER",
+            "false"
+        )])));
+    }
     /// The cards the tier tests size: `nvidia-smi`'s `memory.total` for each.
     const RTX4090: Option<u64> = Some(24_564 * super::MIB);
     const RTX5080: Option<u64> = Some(16_303 * super::MIB);

@@ -217,15 +217,26 @@ impl Drop for Session<'_> {
 
 #[link(name = "kernel32")]
 extern "system" {
-    fn LoadLibraryW(name: *const u16) -> *mut c_void;
+    fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
 }
+
+/// `LoadLibraryExW`: search System32 only, where the driver installs `nvapi64.dll`. Not the default
+/// order, which tries the executable's directory first and the current one before `PATH`.
+const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
 
 impl Nvapi {
     fn load() -> Option<Self> {
         let dll: Vec<u16> = "nvapi64.dll".encode_utf16().chain([0]).collect();
-        // SAFETY: a NUL-terminated name; the module stays loaded for the life of the process.
-        let module = unsafe { LoadLibraryW(dll.as_ptr()) };
+        // SAFETY: a NUL-terminated name, no file handle (reserved); the module stays loaded for the
+        // life of the process.
+        let module = unsafe {
+            LoadLibraryExW(
+                dll.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
         if module.is_null() {
             return None;
         }

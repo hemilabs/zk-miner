@@ -5563,6 +5563,7 @@ fn synthetic_conservative_benchmark(
                 // that as "assume a conservative cost", not as "assume it is free".
                 host_peak_bytes: None,
                 benchmark_po2: None,
+                highest_proved_po2: None,
             },
         )
         .collect();
@@ -17345,6 +17346,7 @@ mod r2_sizing_tests {
             pci_bus_id: String::new(),
             host_peak_bytes: None,
             benchmark_po2: None,
+            highest_proved_po2: None,
         }
     }
 

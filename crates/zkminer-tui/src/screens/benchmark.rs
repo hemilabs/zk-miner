@@ -1151,6 +1151,7 @@ mod tests {
             po2_samples: Vec::new(),
             host_peak_bytes: None,
             benchmark_po2: None,
+            highest_proved_po2: None,
         };
         let mut state = MinerState::default();
         state.benchmark_selected_device = 7;
