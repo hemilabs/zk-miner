@@ -47,7 +47,9 @@ impl Store {
     /// a pin read back from disk is rewritten, since nothing proves it ever reached the disk. If the
     /// write fails, the key's pin is unknown ([`PinStatus::Unreadable`]: every version protected)
     /// until it is pinned or unpinned successfully, or a scan reads it back; a failure after the
-    /// rename also poisons the store.
+    /// rename also poisons the store. The key's pin before the failed write stays readable meanwhile
+    /// ([`Store::pins`], and reads of its version, a poisoned store's included): a crash leaves on
+    /// disk either it or the new one.
     pub fn pin(&self, rec: &PinRecord) -> Result<(), StoreError> {
         let inner = &self.inner;
         inner.check_usable()?;
@@ -73,15 +75,16 @@ impl Store {
                 Ok(())
             }
             Err(e) => {
-                st.pins.insert(key, PinState::Unknown);
+                let failed = PinState::after_failure(st.pins.get(&key));
+                st.pins.insert(key, failed);
                 Err(e)
             }
         }
     }
 
     /// Removes a key's pin (readable or not), durably. Returns whether one existed. A failure
-    /// leaves the key's pin unknown (every version protected); a failure after the unlink also
-    /// poisons the store.
+    /// leaves the key's pin unknown (every version protected, the pin it had still readable); a
+    /// failure after the unlink also poisons the store.
     pub fn unpin(&self, job_id: B256, descriptor_hash: B256, prover: Address) -> Result<bool, StoreError> {
         let inner = &self.inner;
         inner.check_usable()?;
@@ -104,19 +107,22 @@ impl Store {
                 st.pins.remove(&key);
                 return Ok(false);
             }
-            st.pins.insert(key, PinState::Unknown);
+            let failed = PinState::after_failure(st.pins.get(&key));
+            st.pins.insert(key, failed);
             return Err(inner.failed(e, &path, false));
         }
         st.durable.sub(s.usage());
         if let Err(e) = pins.fsync() {
-            st.pins.insert(key, PinState::Unknown);
+            let failed = PinState::after_failure(st.pins.get(&key));
+            st.pins.insert(key, failed);
             return Err(inner.failed(e, pins.path(), true));
         }
         st.pins.remove(&key);
         Ok(true)
     }
 
-    /// Every readable pin.
+    /// Every readable pin, the last readable one of a key whose later pin write or removal failed
+    /// included (that key is also in [`Store::unreadable_pins`]: every version of it stays protected).
     pub fn pins(&self) -> Vec<PinRecord> {
         self.inner.state().readable_pins()
     }
