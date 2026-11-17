@@ -267,22 +267,39 @@ enum ArtifactCommand {
     /// Publish FILE in the hemi-code format: chunks of at most 24,575 bytes deployed as `0x00`-
     /// prefixed data contracts, then a manifest; prints the locator only after every deployment is
     /// at or below the safe head and the artifact was read back there with the miner's checks.
-    /// Paced: one chunk in flight, and only while the DA backlog is under 250 KB, the safe-head lag
-    /// at most 300 s, the router not paused and the head fresh. About twenty minutes per MiB.
+    /// Paced: one chunk in flight, at most one send per block and per block time of wall clock, and
+    /// only while the DA backlog is under 250 KB, the safe-head lag at most 300 s, the router not
+    /// paused and the head fresh. About twenty minutes per MiB.
     ///
     /// The key is an encrypted keystore of its own (never the miner's): refused when it is staked
     /// as a prover, authorized as an operator, the configured prover, or has pending transactions
     /// it did not send. Every request goes through the network guard: a node on loopback or the LAN
-    /// is reachable only with `[dev] private_network` for this chain in the configuration.
+    /// is reachable only with `[dev] private_network` for this chain in the configuration. The RPC
+    /// is trusted for the pacing readings and the key checks (hence https://, and --verify-rpc-url
+    /// to check it against a second provider).
     Publish {
         /// The artifact: a WASM builder or a risc0 guest ELF.
         file: std::path::PathBuf,
         /// What FILE is; it must parse as one (publication is permanent).
         #[arg(long, value_parser = ["builder", "elf"])]
         kind: String,
-        /// The HemiProve chain's RPC (never the miner's [chain] rpc_url while it runs).
+        /// The HemiProve chain's RPC (never the miner's [chain] rpc_url while it runs): https:// unless
+        /// the configuration's developer mode is for this chain. The publisher trusts it for the
+        /// pacing gate's readings and the key checks. A URL carrying a provider key is better given
+        /// by --rpc-url-file or ZKMINER_PUBLISH_RPC_URL (argv is visible to every local user).
+        #[arg(long, conflicts_with = "rpc_url_file")]
+        rpc_url: Option<String>,
+        /// Read the RPC URL from this file (its first line).
         #[arg(long)]
-        rpc_url: String,
+        rpc_url_file: Option<std::path::PathBuf>,
+        /// A second RPC of the same chain, from another provider: each deployment's receipt must show
+        /// the same block there before the next chunk is signed, and the read-back is repeated
+        /// there, so one lying or intercepted RPC cannot collect the chunks unsent.
+        #[arg(long, conflicts_with = "verify_rpc_url_file")]
+        verify_rpc_url: Option<String>,
+        /// Read the second RPC's URL from this file (its first line).
+        #[arg(long)]
+        verify_rpc_url_file: Option<std::path::PathBuf>,
         /// The HemiProve chain id the RPC must serve.
         #[arg(long)]
         chain_id: u64,
@@ -305,6 +322,17 @@ enum ArtifactCommand {
         /// This command's own request rate limit.
         #[arg(long, default_value_t = 4)]
         max_requests_per_sec: u32,
+        /// The least wall-clock time between two sends, in milliseconds (default: the chain's block
+        /// time: 12 s on Hemi, else measured over the last 64 blocks; at least 1 s outside
+        /// developer mode, and never below a known chain's block time). Paces the publisher
+        /// whatever the RPC reports.
+        #[arg(long)]
+        block_time_ms: Option<u64>,
+        /// Record each mined deployment in this file, and on a later run of the same file to the
+        /// same chain reuse the chunks it lists (their code checked on chain) instead of sending
+        /// them again.
+        #[arg(long)]
+        progress: Option<std::path::PathBuf>,
         /// Send after the cost preview without asking.
         #[arg(long)]
         yes: bool,
@@ -641,6 +669,9 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
                     file,
                     kind,
                     rpc_url,
+                    rpc_url_file,
+                    verify_rpc_url,
+                    verify_rpc_url_file,
                     chain_id,
                     keystore,
                     password_fd: _,
@@ -648,18 +679,27 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
                     from_block,
                     tip_wei,
                     max_requests_per_sec,
+                    block_time_ms,
+                    progress,
                     yes,
                     json,
                 },
         } => {
-            use commands::artifact::{plan::Kind, PublishOptions};
+            use commands::artifact::{plan::Kind, rpc_url_from, PublishOptions, RPC_URL_ENV};
             let kind = if kind == "elf" { Kind::Elf } else { Kind::Builder };
+            let rpc_url = rpc_url_from(rpc_url, rpc_url_file.as_deref(), Some(RPC_URL_ENV))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("name the RPC with --rpc-url, --rpc-url-file or {RPC_URL_ENV}")
+                })?;
+            let verify_rpc_url =
+                rpc_url_from(verify_rpc_url, verify_rpc_url_file.as_deref(), None)?;
             commands::artifact::publish(
                 config_path,
                 PublishOptions {
                     file,
                     kind,
                     rpc_url,
+                    verify_rpc_url,
                     chain_id,
                     keystore,
                     password_fd: early.password_fd,
@@ -667,6 +707,8 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
                     from_block,
                     tip_wei,
                     max_requests_per_sec,
+                    block_time_ms,
+                    progress,
                     yes,
                     json,
                 },

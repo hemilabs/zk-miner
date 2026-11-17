@@ -5,28 +5,44 @@
 //! - **Input check:** `--kind` must match the bytes ([`plan::check_input`]) before anything is sent.
 //! - **Key** ([`keys`]): an encrypted keystore, its password from the terminal or `--password-fd`;
 //!   never the miner's key file, never the environment or argv; refused when it is the configured
-//!   prover, staked as a prover, authorized as a prover's operator, or has pending transactions it
-//!   did not send (all read from the chain before anything is sent).
-//! - **RPC:** `--rpc-url` required, refused when it is `[chain] rpc_url` while a miner holds its
-//!   instance lock; every request through the network guard ([`rpc`]); a limiter of its own; no
-//!   configuration needed (a configuration's `[dev]` section is what makes a local node reachable).
+//!   prover, staked as a prover, authorized as a prover's operator (under the prover's current
+//!   `proverAuthNonce`), or has pending transactions it did not send (all read from the chain
+//!   before anything is sent).
+//! - **RPC:** `--rpc-url` (or `--rpc-url-file`, or `ZKMINER_PUBLISH_RPC_URL`: argv is visible to
+//!   every local user, and the URL may carry a provider key) required, refused when it is `[chain]
+//!   rpc_url` while a miner holds its instance lock; every request through the network guard
+//!   ([`rpc`]); `https://` outside developer mode; a limiter of its own; no configuration needed (a
+//!   configuration's `[dev]` section is what makes a local node reachable).
+//! - **The RPC is trusted** for the pacing readings (heads, safe head, backlog, pause state) and the
+//!   key checks (stake, operator logs, pending nonces): a lying one could open the gate early. So
+//!   the local clock paces sends too ([`send_floor`]: at least the chain's block time between two
+//!   sends whatever the RPC reports), and `--verify-rpc-url` names a second provider that must show
+//!   each deployment in the same block, with the same code, before the next chunk is signed, and
+//!   must read the artifact back too.
 //! - **Cost preview** before sending ([`plan::CostPreview`]), confirmed on the terminal or by `--yes`.
-//! - **Pacing:** one chunk in flight, at most one send per block, and only while the DA backlog plus
-//!   this publisher's unmined estimates is under 250 KB, the safe-head lag at most 300 s, the router
-//!   not paused and the head at most 60 s old ([`plan::pace`]).
+//! - **Pacing:** one chunk in flight, at most one send per block and per [`send_floor`] of wall
+//!   clock, and only while the DA backlog plus this publisher's unmined estimates is under 250 KB,
+//!   the safe-head lag at most 300 s, the router not paused and the head at most 60 s old
+//!   ([`plan::pace`]).
 //! - **Chunk size and fees:** each chunk sized so `getL1GasUsed / 16` of its transaction is at most
 //!   19,500, against a transaction whose every variable field is at its longest; both fee fields
 //!   explicit, the tip the inclusion floor measured from recent blocks; a chunk unmined for
-//!   [`STUCK_BLOCKS`] blocks while the gate is open is replaced at its nonce with bumped fees, and
-//!   only an above-threshold backlog means waiting instead.
+//!   [`STUCK_BLOCKS`] blocks while the gate is open is replaced at its nonce with bumped fees (at most
+//!   [`MAX_REPLACEMENTS`] times, the tip and the max fee capped), and only an above-threshold backlog
+//!   means waiting instead.
 //! - **Deploy and verify:** chunks first, the manifest last, addresses from receipts; every
 //!   receipt's status checked, a failed creation (out of gas) redeployed at a new nonce; then the
 //!   wait until every deploying block is at or below `safe` with its hash unchanged, the §13.4 fetch
 //!   of the locator at the safe head (pinned by hash, with the miner's own manifest, chunk and
 //!   assembly checks), and only then the result.
+//! - **Resume:** with `--progress FILE` each mined deployment is recorded, and a later run of the
+//!   same artifact to the same chain reuses the recorded chunks whose code is on chain, sending only
+//!   the rest. Without it, a run that stopped part-way is simply run again: it sends every chunk
+//!   anew (paced the same, paid again), and the chunks of the first run stay on chain unused.
 
 pub mod keys;
 pub mod plan;
+mod progress;
 pub mod rpc;
 
 use std::os::fd::OwnedFd;
@@ -48,6 +64,7 @@ use zkminer_witness::locator::HemiCodeLocator;
 use zkminer_witness::manifest::{chunk_body, manifest_runtime_code, parse_manifest, Assembler, MAX_CODE_BYTES};
 
 use plan::{Kind, PaceInputs};
+use progress::Progress;
 use rpc::{data, qty, NodeError, Rpc};
 
 alloy::sol! {
@@ -56,6 +73,7 @@ alloy::sol! {
         function paused() external view returns (bool);
         function staking() external view returns (address);
         function operatorAuthorizations(address prover, address operator) external view returns (uint256 permissionBitmap, uint256 authorizationNonce, uint128 maxLockedCollateral);
+        function proverAuthNonce(address prover) external view returns (uint256);
         event OperatorAuthorized(address indexed prover, address indexed operator, uint256 permissions, uint128 maxLockedCollateral);
         function getProverStake(address prover) external view returns (uint128 totalStaked, uint128 lockedCollateral, uint128 unstakeAmount, uint40 unstakeRequestTime, uint40 depositBlock);
         function getL1GasUsed(bytes memory _data) external view returns (uint256);
@@ -70,6 +88,21 @@ pub const STUCK_BLOCKS: u64 = 3;
 /// into an open-ended fee escalation.
 const TIP_CAP_MULTIPLE: u128 = 64;
 const MIN_TIP_CAP_WEI: u128 = 1_000_000_000;
+/// No send carries a max fee above this multiple of the base fee when publishing began, plus the
+/// tip cap: past it (a base fee that rose that far) the publisher waits.
+const BASE_FEE_CAP_MULTIPLE: u128 = 8;
+/// Replacements sent (or refused) at one nonce, at most; then the publisher only waits.
+pub const MAX_REPLACEMENTS: u32 = 16;
+/// Hemi's block time (mainnet and testnet): the least time between two sends there.
+const HEMI_BLOCK_TIME: Duration = Duration::from_secs(12);
+/// The least time between two sends outside developer mode on any chain.
+const MIN_SEND_FLOOR: Duration = Duration::from_secs(1);
+/// Blocks a chain's block time is measured over.
+const BLOCK_TIME_SAMPLE: u64 = 64;
+/// How long `--verify-rpc-url` may take to show a deployment the publisher's RPC reported.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(600);
+/// `artifact publish` reads its RPC URL from this variable when no flag names one.
+pub const RPC_URL_ENV: &str = "ZKMINER_PUBLISH_RPC_URL";
 /// A creation that failed (out of gas) is redeployed at a new nonce at most this many times.
 const MAX_REDEPLOYS: u32 = 3;
 /// The gas limit's margin over `eth_estimateGas`.
@@ -91,6 +124,8 @@ pub struct PublishOptions {
     pub file: PathBuf,
     pub kind: Kind,
     pub rpc_url: String,
+    /// A second RPC of the same chain (another provider) every deployment is checked against.
+    pub verify_rpc_url: Option<String>,
     pub chain_id: u64,
     pub keystore: PathBuf,
     /// `--password-fd`, taken by [`keys::take_password_fd`] at the start of `main`; else the
@@ -103,8 +138,43 @@ pub struct PublishOptions {
     /// Override the measured inclusion floor.
     pub tip_wei: Option<u128>,
     pub max_requests_per_sec: u32,
+    /// The least wall-clock time between two sends ([`send_floor`]).
+    pub block_time_ms: Option<u64>,
+    /// Where mined deployments are recorded, and reused from ([`progress`]).
+    pub progress: Option<PathBuf>,
     pub yes: bool,
     pub json: bool,
+}
+
+/// An RPC URL from argv, else from `file` (its first line), else from the environment variable
+/// `env`; `None` when none names one. A URL may carry a provider key, which argv shows to every
+/// local user (`/proc/<pid>/cmdline`); a file or this process's environment does not.
+pub fn rpc_url_from(arg: Option<String>, file: Option<&Path>, env: Option<&str>) -> Result<Option<String>> {
+    if let Some(url) = arg {
+        return Ok(Some(url));
+    }
+    if let Some(f) = file {
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut std::io::Read::take(std::fs::File::open(f).with_context(|| format!("reading {}", f.display()))?, 64 << 10),
+            &mut text,
+        )
+        .with_context(|| format!("reading {}", f.display()))?;
+        let line = text.lines().next().unwrap_or("").trim();
+        if line.is_empty() {
+            bail!("{} holds no URL on its first line", f.display());
+        }
+        return Ok(Some(line.to_string()));
+    }
+    if let Some(name) = env {
+        if let Some(v) = std::env::var_os(name) {
+            let v = v.into_string().map_err(|_| anyhow::anyhow!("{name} is not UTF-8"))?;
+            if !v.trim().is_empty() {
+                return Ok(Some(v.trim().to_string()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// One mined deployment.
@@ -123,6 +193,9 @@ pub struct Deployed {
     pub replacements: u32,
     /// Failed creations (out of gas) before this one.
     pub redeploys: u32,
+    /// Deployed by an earlier run (`--progress`) and found on chain with this code: not sent again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reused: bool,
 }
 
 /// The published artifact, printed only after the §13.4 fetch read it back.
@@ -160,6 +233,11 @@ pub struct Faults {
     /// The first send is removed from the node's pool (`anvil_dropTransaction`) right after it is
     /// accepted, so it never mines.
     pub drop_first_send: bool,
+    /// The run stops (an error) once this many deployments mined, before the next send: a run that
+    /// died part-way.
+    pub stop_after: Option<usize>,
+    /// How long `--verify-rpc-url` may take (default [`VERIFY_TIMEOUT`]).
+    pub verify_timeout: Option<Duration>,
 }
 
 /// A block header as the publisher reads it.
@@ -213,6 +291,18 @@ impl Chain {
 
     async fn block_at(&self, n: u64) -> Result<Option<Header>> {
         self.header(json!(format!("0x{n:x}"))).await
+    }
+
+    /// The mean block time over the last [`BLOCK_TIME_SAMPLE`] blocks, from their timestamps (as
+    /// this RPC reports them); `None` without enough blocks.
+    async fn measured_block_time(&self, head: &Header) -> Result<Option<Duration>> {
+        let from = head.number.saturating_sub(BLOCK_TIME_SAMPLE);
+        if from == head.number {
+            return Ok(None);
+        }
+        let Some(first) = self.block_at(from).await? else { return Ok(None) };
+        let span_ms = head.timestamp.saturating_sub(first.timestamp).saturating_mul(1000);
+        Ok(Some(Duration::from_millis(span_ms / (head.number - from))))
     }
 
     async fn nonce(&self, a: Address, tag: &str) -> Result<u64> {
@@ -318,19 +408,78 @@ enum BacklogSource {
     Fixed(u64),
 }
 
+/// The least wall-clock time between two sends: `configured` (`--block-time-ms`) if given, else
+/// the chain's `known` block time, else the `measured` one. In developer mode that is all (a local
+/// node may mine on demand, so it may be zero). Elsewhere it is never below [`MIN_SEND_FLOOR`] nor
+/// a known chain's block time, whatever the RPC reports: a lying or intercepted RPC that reports a
+/// new head every few milliseconds still gets at most one chunk per block time, as an honest
+/// chain would.
+pub fn send_floor(configured: Option<Duration>, known: Option<Duration>, measured: Option<Duration>, dev: bool) -> Result<Duration> {
+    if dev {
+        return Ok(configured.or(known).or(measured).unwrap_or(Duration::ZERO));
+    }
+    let least = known.unwrap_or(MIN_SEND_FLOOR).max(MIN_SEND_FLOOR);
+    match configured {
+        Some(c) if c < least => bail!(
+            "--block-time-ms {} is below {} ms, the least time between sends here (the chain's block time, and at least 1 s \
+             outside developer mode)",
+            c.as_millis(),
+            least.as_millis()
+        ),
+        Some(c) => Ok(c),
+        None => Ok(measured.unwrap_or(least).max(least)),
+    }
+}
+
+/// A chain's block time when zkminer knows it (Hemi mainnet and testnet), not from any RPC.
+fn known_block_time(chain_id: u64) -> Option<Duration> {
+    zkminer_config::DEPLOYED_CHAIN_IDS.contains(&chain_id).then_some(HEMI_BLOCK_TIME)
+}
+
+/// Whether a replacement at `(tip, max_fee)` raises both fields of the pooled `(prev_tip,
+/// prev_max_fee)` by at least the tenth nodes require.
+fn raises_both(prev_tip: u128, prev_max_fee: u128, tip: u128, max_fee: u128) -> bool {
+    tip > prev_tip
+        && max_fee > prev_max_fee
+        && tip.saturating_mul(10) >= prev_tip.saturating_mul(11)
+        && max_fee.saturating_mul(10) >= prev_max_fee.saturating_mul(11)
+        && max_fee >= tip
+}
+
+/// Whether a refused send's error says the node already holds that very transaction (a send whose
+/// answer was lost, sent again): it is in the pool all the same.
+fn already_pooled(e: &anyhow::Error) -> bool {
+    e.chain().filter_map(|c| c.downcast_ref::<NodeError>()).any(|n| {
+        let m = n.message.to_ascii_lowercase();
+        m.contains("already known") || m.contains("known transaction") || m.contains("already imported")
+    })
+}
+
 /// One publication's state.
 struct Publisher {
     chain: Chain,
+    /// `--verify-rpc-url`: every deployment must show there too before the next send.
+    verify: Option<Chain>,
     signer: PrivateKeySigner,
     router: Address,
     backlog: BacklogSource,
     tip: u128,
     /// The highest tip a replacement may carry ([`TIP_CAP_MULTIPLE`] × the floor, at least 1 gwei).
     tip_cap: u128,
+    /// The highest max fee any send carries ([`BASE_FEE_CAP_MULTIPLE`] × the starting base fee +
+    /// the tip cap).
+    fee_cap: u128,
     /// The next nonce this publisher sends at.
     nonce: u64,
     /// The head number of the last send (at most one send per block).
     last_send_head: Option<u64>,
+    /// The least wall-clock time between two sends ([`send_floor`]), and when the last one went.
+    send_floor: Duration,
+    last_send_at: Option<Instant>,
+    /// `--progress`: each mined deployment is recorded here.
+    progress: Option<Progress>,
+    /// Deployments mined in this run.
+    mined: usize,
     quiet: bool,
     #[cfg_attr(not(test), allow(dead_code))]
     faults: Faults,
@@ -362,14 +511,30 @@ impl Publisher {
         Ok((head, plan::pace(&inputs)))
     }
 
-    /// Waits until the gate opens on a block after the last send's.
+    /// What is left of the wall-clock floor since the last send.
+    fn floor_left(&self) -> Duration {
+        self.last_send_at.map_or(Duration::ZERO, |t| self.send_floor.saturating_sub(t.elapsed()))
+    }
+
+    /// Waits until the gate opens on a block after the last send's, at least [`send_floor`] after
+    /// it by the local clock, with the base fee under the fee cap.
     async fn wait_to_send(&mut self) -> Result<Header> {
         let mut said = Instant::now() - Duration::from_secs(3600);
         loop {
-            let (head, verdict) = self.gate(0).await?;
+            let (head, mut verdict) = self.gate(0).await?;
+            if verdict.is_ok() && head.base_fee.saturating_add(self.tip) > self.fee_cap {
+                verdict = Err(format!("the base fee is {} wei, above this run's fee cap ({} wei)", head.base_fee, self.fee_cap));
+            }
             let new_block = self.last_send_head.is_none_or(|n| head.number > n);
             match verdict {
-                Ok(()) if new_block => return Ok(head),
+                Ok(()) if new_block => {
+                    let left = self.floor_left();
+                    if left.is_zero() {
+                        return Ok(head);
+                    }
+                    tokio::time::sleep(left).await;
+                    continue;
+                }
                 Ok(()) => {}
                 Err(why) if said.elapsed() >= Duration::from_secs(60) => {
                     self.say(format!("waiting to send: {why}"));
@@ -379,6 +544,70 @@ impl Publisher {
             }
             tokio::time::sleep(POLL).await;
         }
+    }
+
+    /// `--verify-rpc-url`: waits until the second RPC shows `d`'s transaction mined, successful, in
+    /// the same block as the publisher's RPC reports (followed through a reorg), with `runtime` at
+    /// its address there; fails after [`VERIFY_TIMEOUT`] (nothing more is signed).
+    async fn confirm_on_verify(&self, d: &mut Deployed, runtime: &[u8], label: &str) -> Result<()> {
+        let Some(v) = &self.verify else { return Ok(()) };
+        #[cfg(test)]
+        let timeout = self.faults.verify_timeout.unwrap_or(VERIFY_TIMEOUT);
+        #[cfg(not(test))]
+        let timeout = VERIFY_TIMEOUT;
+        let start = Instant::now();
+        let mut said = Instant::now();
+        loop {
+            if let Some(r) = v.receipt(d.tx_hash).await? {
+                let block: Option<B256> = r["blockHash"].as_str().and_then(|h| h.parse().ok());
+                let address: Option<Address> = r["contractAddress"].as_str().and_then(|a| a.parse().ok());
+                if qty(&r["status"]).unwrap_or(0) == 1 && block == Some(d.block_hash) && address == Some(d.address) {
+                    let code = v.code(d.address, json!({"blockHash": format!("{:#x}", d.block_hash)})).await?;
+                    if code == runtime {
+                        return Ok(());
+                    }
+                    bail!(
+                        "{label}: the second RPC ({}) shows other code at {}: the RPCs disagree; nothing more is sent",
+                        v.rpc.host(),
+                        d.address
+                    );
+                }
+            }
+            // The publisher's RPC may have followed a reorg meanwhile.
+            if let Some(r) = self.chain.receipt(d.tx_hash).await? {
+                if qty(&r["status"]).unwrap_or(0) == 1 {
+                    d.block_number = qty(&r["blockNumber"])? as u64;
+                    d.block_hash = r["blockHash"].as_str().context("a receipt without a block hash")?.parse()?;
+                }
+            }
+            if start.elapsed() >= timeout {
+                bail!(
+                    "{label}: the second RPC ({}) does not show {} in block {} after {} s: the publisher's RPC may be \
+                     lying or intercepted; nothing more is sent",
+                    v.rpc.host(),
+                    d.tx_hash,
+                    d.block_hash,
+                    timeout.as_secs()
+                );
+            }
+            if said.elapsed() >= Duration::from_secs(30) {
+                self.say(format!("{label}: waiting for the second RPC ({}) to show {}", v.rpc.host(), d.tx_hash));
+                said = Instant::now();
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    /// Records a mined deployment in `--progress`, if given.
+    fn record(&mut self, d: &Deployed, range: Option<std::ops::Range<usize>>) -> Result<()> {
+        if let Some(p) = &mut self.progress {
+            match range {
+                Some(r) => p.push_chunk(r, d),
+                None => p.set_manifest(d),
+            }
+            p.save()?;
+        }
+        Ok(())
     }
 
     /// No transaction of this key is pending that this publisher did not send.
@@ -409,6 +638,10 @@ impl Publisher {
 
     /// Deploys `runtime` verbatim (one chunk or the manifest), sizing nothing: the caller sized it.
     async fn deploy(&mut self, runtime: &[u8], label: &str) -> Result<Deployed> {
+        #[cfg(test)]
+        if self.faults.stop_after.is_some_and(|n| self.mined >= n) {
+            bail!("stopped by the test after {} deployment(s)", self.mined);
+        }
         let input = zkminer_witness::manifest::creation_code(runtime);
         let mut redeploys = 0u32;
         let mut gas_floor = 0u64;
@@ -422,11 +655,16 @@ impl Publisher {
             if let Some(g) = self.faults.first_gas_limit.take() {
                 gas = g;
             }
+            // The fees of the transaction the pool holds at this nonce: a refused replacement
+            // leaves them as they were.
             let (mut tip, mut max_fee) = plan::fees(head.base_fee, self.tip);
+            max_fee = max_fee.min(self.fee_cap);
             let nonce = self.nonce;
             let mut hashes = Vec::new();
             let mut replacements = 0u32;
+            let mut attempts = 0u32;
             let (hash, raw) = self.sign(plan::unsigned_creation(self.chain.chain_id, nonce, gas, max_fee, tip, input.clone()))?;
+            self.last_send_at = Some(Instant::now());
             self.send_raw(&raw).await.with_context(|| format!("sending {label}"))?;
             hashes.push(hash);
             self.last_send_head = Some(head.number);
@@ -451,7 +689,11 @@ impl Publisher {
                     break f;
                 }
                 let (now, verdict) = self.gate(0).await?;
-                if now.number >= sent_at + STUCK_BLOCKS && verdict.is_ok() {
+                if now.number >= sent_at + STUCK_BLOCKS && verdict.is_ok() && self.floor_left().is_zero() {
+                    // Never an open-ended fee escalation: past the caps or the count, only waiting
+                    // is left.
+                    let (next_tip, next_max) = plan::bump(tip, max_fee, now.base_fee, self.tip);
+                    let (next_tip, next_max) = (next_tip.min(self.tip_cap), next_max.min(self.fee_cap));
                     if self.chain.nonce(self.signer.address(), "latest").await? > nonce {
                         // The nonce is used: by one of ours, whose receipt the node shows shortly, or
                         // by a transaction this publisher never sent.
@@ -459,33 +701,43 @@ impl Publisher {
                         if used_without_receipt > 10 {
                             bail!("{label}: nonce {nonce} was used by a transaction this publisher did not send");
                         }
-                    } else if tip >= self.tip_cap {
-                        // Never an open-ended fee escalation: at the cap, only waiting is left.
+                    } else if attempts >= MAX_REPLACEMENTS || !raises_both(tip, max_fee, next_tip, next_max) {
                         if capped_said.elapsed() >= Duration::from_secs(60) {
                             self.say(format!(
-                                "{label}: unmined at the tip cap ({} wei); waiting (stop with Ctrl-C and publish again)",
-                                self.tip_cap
+                                "{label}: unmined after {attempts} replacement(s), at the caps (tip {} wei, max fee {} wei) or the \
+                                 count ({MAX_REPLACEMENTS}); waiting (stop with Ctrl-C and publish again)",
+                                self.tip_cap, self.fee_cap
                             ));
                             capped_said = Instant::now();
                         }
                         sent_at = now.number;
                     } else {
-                        (tip, max_fee) = plan::bump(tip, max_fee, now.base_fee, self.tip);
-                        tip = tip.min(self.tip_cap);
                         let (h2, raw2) =
-                            self.sign(plan::unsigned_creation(self.chain.chain_id, nonce, gas, max_fee, tip, input.clone()))?;
+                            self.sign(plan::unsigned_creation(self.chain.chain_id, nonce, gas, next_max, next_tip, input.clone()))?;
+                        self.last_send_at = Some(Instant::now());
+                        attempts += 1;
+                        // Watched for a receipt either way: a send whose answer was lost may be pooled.
+                        hashes.push(h2);
                         match self.send_raw(&raw2).await {
-                            Ok(_) => {
-                                replacements += 1;
-                                hashes.push(h2);
+                            Ok(_) => {}
+                            Err(e) if already_pooled(&e) => {}
+                            Err(e) => {
                                 self.say(format!(
-                                    "{label}: unmined after {} blocks with the gate open; replaced at nonce {nonce} by {h2} \
-                                     (tip {tip} wei, max fee {max_fee} wei)",
-                                    now.number - sent_at
+                                    "{label}: a replacement was refused ({e:#}); the pool keeps tip {tip} wei, max fee {max_fee} wei"
                                 ));
+                                sent_at = now.number;
+                                self.last_send_head = Some(now.number);
+                                tokio::time::sleep(POLL).await;
+                                continue;
                             }
-                            Err(e) => self.say(format!("{label}: a replacement was refused ({e:#}); bumping again")),
                         }
+                        (tip, max_fee) = (next_tip, next_max);
+                        replacements += 1;
+                        self.say(format!(
+                            "{label}: unmined after {} blocks with the gate open; replaced at nonce {nonce} by {h2} \
+                             (tip {tip} wei, max fee {max_fee} wei)",
+                            now.number - sent_at
+                        ));
                         sent_at = now.number;
                         self.last_send_head = Some(now.number);
                     }
@@ -511,7 +763,7 @@ impl Publisher {
                 continue;
             }
             let address: Address = r["contractAddress"].as_str().context("a creation receipt without contractAddress")?.parse()?;
-            return Ok(Deployed {
+            let mut d = Deployed {
                 address,
                 tx_hash,
                 nonce,
@@ -521,15 +773,20 @@ impl Publisher {
                 cost_wei: (gas_used.saturating_mul(price).saturating_add(l1)).to_string(),
                 replacements,
                 redeploys,
-            });
+                reused: false,
+            };
+            self.confirm_on_verify(&mut d, runtime, label).await?;
+            self.mined += 1;
+            return Ok(d);
         }
     }
 
     /// Waits until every deployment's block is at or below the safe head with its hash unchanged.
     async fn wait_safe(&self, deployed: &mut [Deployed]) -> Result<()> {
-        let last = deployed.iter().map(|d| d.block_number).max().unwrap_or(0);
         let mut said = Instant::now() - Duration::from_secs(3600);
         loop {
+            // Read again each time: a reorg may have moved a deployment to a later block.
+            let last = deployed.iter().map(|d| d.block_number).max().unwrap_or(0);
             let safe = self.chain.safe().await?;
             if safe.number >= last {
                 let mut moved = false;
@@ -656,17 +913,29 @@ async fn check_key(chain: &Chain, router: Address, from_block: u64, who: Address
             .await
             .context("router.operatorAuthorizations")?;
         let a = IPublishReads::operatorAuthorizationsCall::abi_decode_returns(&out).context("router.operatorAuthorizations")?;
-        if a.permissionBitmap != U256::ZERO {
+        if a.permissionBitmap == U256::ZERO {
+            continue;
+        }
+        // An authorization counts while its nonce is the prover's current one: `revokeAllOperators`
+        // moves the prover's on, and the old authorization never holds again (a new one is a new
+        // `OperatorAuthorized`). A frozen operator is still refused: the prover may unfreeze it.
+        let out = chain
+            .eth_call(router, IPublishReads::proverAuthNonceCall { prover: p }.abi_encode())
+            .await
+            .context("router.proverAuthNonce")?;
+        let current = IPublishReads::proverAuthNonceCall::abi_decode_returns(&out).context("router.proverAuthNonce")?;
+        if a.authorizationNonce == current {
             bail!("{who} is authorized as prover {p}'s operator: publish with a key of its own (§13.5)");
         }
     }
     Ok(())
 }
 
-/// Splits `bytes` into chunks whose creation transactions each estimate at most 19,500 DA bytes.
-async fn plan_chunks(chain: &Chain, bytes: &[u8], first: usize) -> Result<(Vec<std::ops::Range<usize>>, bool)> {
+/// Splits `bytes[from..]` into chunks whose creation transactions each estimate at most 19,500 DA
+/// bytes (ranges into `bytes`). The caller checks the whole plan.
+async fn plan_chunks(chain: &Chain, bytes: &[u8], from: usize, first: usize) -> Result<(Vec<std::ops::Range<usize>>, bool)> {
     let mut out = Vec::new();
-    let mut at = 0;
+    let mut at = from;
     let mut oracle = true;
     while at < bytes.len() {
         let mut size = first.min(bytes.len() - at);
@@ -682,7 +951,6 @@ async fn plan_chunks(chain: &Chain, bytes: &[u8], first: usize) -> Result<(Vec<s
         out.push(at..at + size);
         at += size;
     }
-    plan::check_plan(out.len(), bytes.len())?;
     Ok((out, oracle))
 }
 
@@ -717,12 +985,27 @@ pub async fn publish_with(config: &ZkMinerConfig, mut opts: PublishOptions, faul
         bail!("--rpc-url is the miner's [chain] rpc_url and a miner is running: publish through another endpoint (§13.5)");
     }
     let policy = policy_for(config, opts.chain_id)?;
+    let dev = policy.mode() == NetMode::DevPrivate;
     let rpc = Rpc::new(&policy, &opts.rpc_url, opts.max_requests_per_sec)?;
     let chain = Chain { rpc, chain_id: opts.chain_id };
     let reported = qty(&chain.rpc.call("eth_chainId", json!([])).await?)? as u64;
     if reported != opts.chain_id {
         bail!("the RPC at {} serves chain {reported}, not --chain-id {}", chain.rpc.host(), opts.chain_id);
     }
+    let verify = match &opts.verify_rpc_url {
+        Some(url) => {
+            let v = Chain { rpc: Rpc::new(&policy, url, opts.max_requests_per_sec)?, chain_id: opts.chain_id };
+            if v.rpc.host() == chain.rpc.host() {
+                warnings.push("--verify-rpc-url names the same host as --rpc-url: it checks little".into());
+            }
+            let id = qty(&v.rpc.call("eth_chainId", json!([])).await?)? as u64;
+            if id != opts.chain_id {
+                bail!("the second RPC at {} serves chain {id}, not --chain-id {}", v.rpc.host(), opts.chain_id);
+            }
+            Some(v)
+        }
+        None => None,
+    };
     let known = zkminer_chain::deployment::known_deployment(opts.chain_id);
     let router = match (opts.router, known) {
         (Some(r), _) => r,
@@ -733,6 +1016,20 @@ pub async fn publish_with(config: &ZkMinerConfig, mut opts: PublishOptions, faul
         bail!("no contract at the router {router} on chain {}", opts.chain_id);
     }
     let from_block = opts.from_block.or(known.map(|k| k.scan_from_block)).unwrap_or(0);
+    // The local clock's floor between sends, whatever the RPC reports.
+    let head = chain.head().await?;
+    let send_floor = send_floor(
+        opts.block_time_ms.map(Duration::from_millis),
+        known_block_time(opts.chain_id),
+        chain.measured_block_time(&head).await.ok().flatten(),
+        dev,
+    )?;
+    // `[dev] da_backlog_bytes` stands in for the backlog only in developer mode, and on a chain with
+    // a deployment only against a node on loopback (a local fork).
+    let backlog = match config.dev_da_backlog_bytes_for(&opts.rpc_url) {
+        Some(b) if dev => BacklogSource::Fixed(b),
+        _ => BacklogSource::Chain,
+    };
 
     // 3. The key, refused before anything is sent.
     let signer = keys::load(
@@ -751,12 +1048,40 @@ pub async fn publish_with(config: &ZkMinerConfig, mut opts: PublishOptions, faul
         bail!("{me} has {} pending transaction(s) it did not send here: let them settle, or use a key of its own (§13.5)", pending - latest);
     }
 
-    // 4. The plan and the cost preview.
-    let (chunks, oracle) = plan_chunks(&chain, &bytes, opts.kind_chunk_bytes()).await?;
+    // 4. What an earlier run left (`--progress`), the plan and the cost preview.
+    let mut progress = match &opts.progress {
+        Some(path) => Some(Progress::open(path, opts.chain_id, B256::from(sha256), bytes.len())?),
+        None => None,
+    };
+    let (mut deployed, reused_manifest) = match &progress {
+        Some(p) => p.reusable(&chain, &bytes).await?,
+        None => (Vec::new(), None),
+    };
+    let reused_to = deployed.last().map_or(0, |d: &(std::ops::Range<usize>, Deployed)| d.0.end);
+    if let Some(p) = &mut progress {
+        // Only what was found on chain stays recorded: the rest is sent again.
+        p.keep(deployed.len(), reused_manifest.is_some());
+        p.save()?;
+    }
+    if !deployed.is_empty() {
+        let s = format!(
+            "reusing {} chunk(s) ({} bytes){} from {}",
+            deployed.len(),
+            reused_to,
+            if reused_manifest.is_some() { " and the manifest" } else { "" },
+            opts.progress.as_deref().map(|p| p.display().to_string()).unwrap_or_default()
+        );
+        if opts.json {
+            warnings.push(s);
+        } else {
+            eprintln!("{s}");
+        }
+    }
+    let (chunks, oracle) = plan_chunks(&chain, &bytes, reused_to, opts.kind_chunk_bytes()).await?;
+    plan::check_plan(deployed.len() + chunks.len(), bytes.len())?;
     if !oracle {
         warnings.push("no GasPriceOracle on this chain: chunks were sized against the RPC-free upper bound".into());
     }
-    let head = chain.head().await?;
     let tip = match opts.tip_wei {
         Some(t) => t,
         None => match chain.measured_tip_floor(&head).await? {
@@ -764,10 +1089,29 @@ pub async fn publish_with(config: &ZkMinerConfig, mut opts: PublishOptions, faul
             None => qty(&chain.rpc.call("eth_maxPriorityFeePerGas", json!([])).await?)?.max(1),
         },
     };
+    let tip_cap = tip.saturating_mul(TIP_CAP_MULTIPLE).max(MIN_TIP_CAP_WEI);
+    let fee_cap = head.base_fee.saturating_mul(BASE_FEE_CAP_MULTIPLE).saturating_add(tip_cap);
     let (_, max_fee) = plan::fees(head.base_fee, tip);
     let largest = chunks.iter().map(|c| c.len()).max().unwrap_or(0);
-    let gas_largest = chain.estimate_gas(me, &plan::chunk_creation(&bytes[chunks.iter().find(|c| c.len() == largest).cloned().unwrap_or(0..0)])).await?;
-    let manifest_gas = chain.estimate_gas(me, &zkminer_witness::manifest::creation_code(&manifest_runtime_code(bytes.len() as u64, &sha256, &vec![Address::ZERO; chunks.len()]))).await?;
+    let gas_largest = match chunks.iter().find(|c| c.len() == largest) {
+        Some(c) => chain.estimate_gas(me, &plan::chunk_creation(&bytes[c.clone()])).await?,
+        None => 0,
+    };
+    let all_chunks = deployed.len() + chunks.len();
+    let manifest_gas = if reused_manifest.is_some() {
+        0
+    } else {
+        chain
+            .estimate_gas(
+                me,
+                &zkminer_witness::manifest::creation_code(&manifest_runtime_code(
+                    bytes.len() as u64,
+                    &sha256,
+                    &vec![Address::ZERO; all_chunks],
+                )),
+            )
+            .await?
+    };
     let l2_gas = gas_largest.saturating_mul(chunks.len() as u64).saturating_add(manifest_gas);
     let mut l1_total: Option<U256> = Some(U256::ZERO);
     let mut l1_largest = U256::ZERO;
@@ -781,7 +1125,8 @@ pub async fn publish_with(config: &ZkMinerConfig, mut opts: PublishOptions, faul
             _ => l1_total = None,
         }
     }
-    let gas_limit = gas_largest + gas_largest * GAS_MARGIN_PERCENT / 100 + 10_000;
+    let gas_limit = gas_largest.max(manifest_gas);
+    let gas_limit = gas_limit + gas_limit * GAS_MARGIN_PERCENT / 100 + 10_000;
     let in_flight = U256::from(gas_limit) * U256::from(max_fee) + l1_largest;
     let balance = chain.balance(me).await?;
     let preview = plan::CostPreview {
@@ -801,6 +1146,7 @@ pub async fn publish_with(config: &ZkMinerConfig, mut opts: PublishOptions, faul
         eprintln!("{}", serde_json::to_string(&preview)?);
     } else {
         eprintln!("{preview}");
+        eprintln!("  pacing:     at least {} ms between sends (the local clock)", send_floor.as_millis());
     }
     if balance < in_flight {
         bail!("{me} holds {balance} wei; one chunk in flight needs {in_flight} wei");
@@ -812,31 +1158,42 @@ pub async fn publish_with(config: &ZkMinerConfig, mut opts: PublishOptions, faul
     // 5. Send: the chunks, then the manifest.
     let mut p = Publisher {
         chain,
+        verify,
         signer,
         router,
-        backlog: match config.dev_da_backlog_bytes() {
-            Some(b) if policy.mode() == NetMode::DevPrivate => BacklogSource::Fixed(b),
-            _ => BacklogSource::Chain,
-        },
+        backlog,
         tip,
-        tip_cap: tip.saturating_mul(TIP_CAP_MULTIPLE).max(MIN_TIP_CAP_WEI),
+        tip_cap,
+        fee_cap,
         nonce: latest,
         last_send_head: None,
+        send_floor,
+        last_send_at: None,
+        progress,
+        mined: 0,
         quiet: opts.json,
         faults,
     };
-    let mut deployed = Vec::with_capacity(chunks.len() + 1);
-    for (i, c) in chunks.iter().enumerate() {
+    for c in &chunks {
         let runtime = zkminer_witness::manifest::chunk_runtime_code(&bytes[c.clone()]);
-        let d = p.deploy(&runtime, &format!("chunk {}/{}", i + 1, chunks.len())).await?;
-        deployed.push(d);
+        let d = p.deploy(&runtime, &format!("chunk {}/{}", deployed.len() + 1, all_chunks)).await?;
+        p.record(&d, Some(c.clone()))?;
+        deployed.push((c.clone(), d));
     }
+    let mut deployed: Vec<Deployed> = deployed.into_iter().map(|(_, d)| d).collect();
     let addresses: Vec<Address> = deployed.iter().map(|d| d.address).collect();
     let manifest_runtime = manifest_runtime_code(bytes.len() as u64, &sha256, &addresses);
-    let manifest = p.deploy(&manifest_runtime, "manifest").await?;
+    let manifest = match reused_manifest {
+        Some(m) => m,
+        None => {
+            let m = p.deploy(&manifest_runtime, "manifest").await?;
+            p.record(&m, None)?;
+            m
+        }
+    };
     deployed.push(manifest);
 
-    // 6. Safe, then the §13.4 fetch, then the result.
+    // 6. Safe, then the §13.4 fetch (on the second RPC too), then the result.
     p.say("all deployed; waiting until every deploying block is at or below the safe head");
     p.wait_safe(&mut deployed).await?;
     let manifest = deployed.pop().expect("the manifest");
@@ -844,10 +1201,17 @@ pub async fn publish_with(config: &ZkMinerConfig, mut opts: PublishOptions, faul
     if fetched != bytes {
         bail!("the artifact read back at the safe head is not the file");
     }
+    if let Some(v) = &p.verify {
+        let fetched = fetch_at_safe(v, manifest.address, sha256, u64::MAX).await.context("the read-back on the second RPC")?;
+        if fetched != bytes {
+            bail!("the artifact read back at the second RPC's safe head is not the file");
+        }
+    }
     let locator = HemiCodeLocator { chain_id: opts.chain_id, manifest: manifest.address }.to_uri();
     let total: U256 = deployed
         .iter()
         .chain(std::iter::once(&manifest))
+        .filter(|d| !d.reused)
         .map(|d| d.cost_wei.parse::<U256>().unwrap_or_default())
         .fold(U256::ZERO, |a, b| a + b);
     let keccak = keccak256(&bytes);
@@ -884,7 +1248,7 @@ fn print_published(p: &Published) {
     println!("length:    {}", p.length);
     println!("chunks:    {}", p.chunks.len());
     for c in &p.chunks {
-        println!("  {} ({} bytes, block {})", c.address, c.body_bytes, c.block_number);
+        println!("  {} ({} bytes, block {}{})", c.address, c.body_bytes, c.block_number, if c.reused { ", reused" } else { "" });
     }
     println!("manifest:  {} (block {})", p.manifest.address, p.manifest.block_number);
     println!("cost:      {} wei", p.total_cost_wei);
@@ -921,3 +1285,83 @@ fn confirm(question: &str) -> Result<()> {
 mod anvil_tests;
 #[cfg(test)]
 mod test_contracts;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_send_floor_is_the_block_time_whatever_the_rpc_reports() {
+        let ms = Duration::from_millis;
+        let hemi = known_block_time(743111);
+        assert_eq!(hemi, Some(ms(12_000)));
+        assert_eq!(known_block_time(43111), hemi);
+        assert_eq!(known_block_time(31337), None);
+        // Public mode on Hemi: a lying RPC's 100 ms blocks change nothing; a slower chain slows it.
+        assert_eq!(send_floor(None, hemi, Some(ms(100)), false).unwrap(), ms(12_000));
+        assert_eq!(send_floor(None, hemi, None, false).unwrap(), ms(12_000));
+        assert_eq!(send_floor(None, hemi, Some(ms(20_000)), false).unwrap(), ms(20_000));
+        assert!(send_floor(Some(ms(2_000)), hemi, None, false).unwrap_err().to_string().contains("12000 ms"));
+        assert_eq!(send_floor(Some(ms(15_000)), hemi, None, false).unwrap(), ms(15_000));
+        // Public mode elsewhere: never below a second.
+        assert_eq!(send_floor(None, None, Some(Duration::ZERO), false).unwrap(), ms(1_000));
+        assert_eq!(send_floor(None, None, None, false).unwrap(), ms(1_000));
+        assert_eq!(send_floor(None, None, Some(ms(2_500)), false).unwrap(), ms(2_500));
+        assert!(send_floor(Some(Duration::ZERO), None, None, false).is_err());
+        // Developer mode: what is configured, known or measured, zero included.
+        assert_eq!(send_floor(Some(Duration::ZERO), hemi, None, true).unwrap(), Duration::ZERO);
+        assert_eq!(send_floor(None, hemi, Some(ms(100)), true).unwrap(), ms(12_000));
+        assert_eq!(send_floor(None, None, Some(ms(100)), true).unwrap(), ms(100));
+        assert_eq!(send_floor(None, None, None, true).unwrap(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_replacement_must_raise_both_fees_by_a_tenth() {
+        assert!(raises_both(10, 2_010, 12, 2_262));
+        assert!(!raises_both(10, 2_010, 10, 2_262), "the tip did not rise");
+        assert!(!raises_both(10, 2_010, 12, 2_100), "the max fee rose by less than a tenth");
+        assert!(!raises_both(100, 2_000, 1_000, 900), "max fee below the tip");
+        // Capped: bump then clamp to the caps leaves nothing to send.
+        let (t, m) = plan::bump(64, 200, 50, 1);
+        assert!(!raises_both(64, 200, t.min(64), m.min(200)));
+        assert!(!raises_both(u128::MAX, u128::MAX, u128::MAX, u128::MAX));
+    }
+
+    #[test]
+    fn a_pooled_duplicate_is_recognized_through_context() {
+        let e = anyhow::Error::new(NodeError { code: -32000, message: "already known".into() }).context("eth_sendRawTransaction");
+        assert!(already_pooled(&e));
+        let e = anyhow::Error::new(NodeError { code: -32000, message: "replacement transaction underpriced".into() }).context("x");
+        assert!(!already_pooled(&e));
+        assert!(!already_pooled(&anyhow::anyhow!("already known (but not from the node)")));
+    }
+
+    #[test]
+    fn the_rpc_url_comes_from_argv_a_file_or_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("url");
+        std::fs::write(&f, "https://rpc.example.com/v1/s3cr3t\nignored\n").unwrap();
+        assert_eq!(rpc_url_from(Some("https://a".into()), Some(&f), None).unwrap().as_deref(), Some("https://a"));
+        assert_eq!(rpc_url_from(None, Some(&f), None).unwrap().as_deref(), Some("https://rpc.example.com/v1/s3cr3t"));
+        std::fs::write(&f, "\n").unwrap();
+        assert!(rpc_url_from(None, Some(&f), None).is_err());
+        assert!(rpc_url_from(None, Some(&dir.path().join("missing")), None).is_err());
+        // A variable no test sets.
+        assert_eq!(rpc_url_from(None, None, Some("ZKMINER_TEST_NO_SUCH_RPC_URL_VARIABLE")).unwrap(), None);
+        assert_eq!(rpc_url_from(None, None, None).unwrap(), None);
+    }
+
+    /// Every chain with a known deployment is one the stricter rules (`[dev] da_backlog_bytes`, the
+    /// send floor) apply to.
+    #[test]
+    fn known_deployments_are_deployed_chains() {
+        for id in [1u64, 43111, 743111, 31337, 11155111] {
+            if zkminer_chain::deployment::known_deployment(id).is_some() {
+                assert!(zkminer_config::DEPLOYED_CHAIN_IDS.contains(&id), "{id}");
+            }
+        }
+        for id in zkminer_config::PRODUCTION_CHAIN_IDS {
+            assert!(zkminer_config::DEPLOYED_CHAIN_IDS.contains(id), "{id}");
+        }
+    }
+}

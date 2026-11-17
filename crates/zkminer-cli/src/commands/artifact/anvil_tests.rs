@@ -117,6 +117,7 @@ alloy::sol! {
     interface IMocks {
         function setStake(address p, uint128 a) external;
         function authorize(address prover, address operator) external;
+        function revokeAllOperators(address prover) external;
     }
 }
 
@@ -184,6 +185,7 @@ fn options(file: PathBuf, url: &str, keystore: PathBuf, router: Address) -> Publ
         file,
         kind: Kind::Builder,
         rpc_url: url.to_string(),
+        verify_rpc_url: None,
         chain_id: 31337,
         keystore,
         password_fd: Some(keys::take_password_fd(password_fd()).unwrap()),
@@ -191,6 +193,8 @@ fn options(file: PathBuf, url: &str, keystore: PathBuf, router: Address) -> Publ
         from_block: Some(0),
         tip_wei: None,
         max_requests_per_sec: 1000,
+        block_time_ms: None,
+        progress: None,
         yes: true,
         json: true,
     }
@@ -210,7 +214,7 @@ async fn publishes_paced_chunks_redeploys_a_failed_creation_and_reads_them_back(
     let start = a.nonce(me).await;
     // The first creation runs out of gas (enough for the intrinsic cost and the calldata floor, not
     // for the code deposit): the nonce is spent and the chunk deployed again.
-    let faults = Faults { first_gas_limit: Some(2_000_000), drop_first_send: false };
+    let faults = Faults { first_gas_limit: Some(2_000_000), ..Default::default() };
     let p = bounded(publish_with(&dev_config(), options(file, &a.url, ks, router), faults)).await.unwrap();
     assert_eq!(p.length, wasm.len());
     assert_eq!(p.chunks.len(), 3, "50 KB in chunks below the 19,500-byte DA cap");
@@ -245,7 +249,7 @@ async fn a_chunk_that_never_mines_is_replaced_at_its_nonce() {
     let file = dir.path().join("b.wasm");
     std::fs::write(&file, &wasm).unwrap();
     let start = a.nonce(me).await;
-    let faults = Faults { first_gas_limit: None, drop_first_send: true };
+    let faults = Faults { drop_first_send: true, ..Default::default() };
     let p = bounded(publish_with(&dev_config(), options(file, &a.url, ks, router), faults)).await.unwrap();
     assert_eq!(p.chunks.len(), 1);
     assert!(p.chunks[0].replacements >= 1, "the dropped send was replaced");
@@ -325,4 +329,140 @@ async fn a_local_rpc_is_refused_outside_developer_mode() {
     o.kind = Kind::Elf;
     let e = publish_with(&dev_config(), o, Faults::default()).await.unwrap_err().to_string();
     assert!(e.contains("not an ELF"), "{e}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_operator_revoked_with_all_others_is_no_longer_refused() {
+    if !anvil_on_path() {
+        return;
+    }
+    let (a, router, _) = chain().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (ks, me) = keystore(dir.path());
+    let file = dir.path().join("b.wasm");
+    std::fs::write(&file, builder_wasm(1_000)).unwrap();
+    let start = a.nonce(me).await;
+    // Each run stops right before its first send.
+    let run = || {
+        let o = options(file.clone(), &a.url, ks.clone(), router);
+        async move {
+            bounded(publish_with(&dev_config(), o, Faults { stop_after: Some(0), ..Default::default() }))
+                .await
+                .map(|_| ())
+                .unwrap_err()
+                .to_string()
+        }
+    };
+    let prover = Address::repeat_byte(0x77);
+    a.call_from_dev(router, IMocks::authorizeCall { prover, operator: me }.abi_encode()).await;
+    assert!(run().await.contains("operator"));
+    // `revokeAllOperators` voids the authorization: the key is no operator any more.
+    a.call_from_dev(router, IMocks::revokeAllOperatorsCall { prover }.abi_encode()).await;
+    let e = run().await;
+    assert!(e.contains("stopped by the test after 0"), "{e}");
+    // Authorized again (under the prover's new nonce): refused again.
+    a.call_from_dev(router, IMocks::authorizeCall { prover, operator: me }.abi_encode()).await;
+    assert!(run().await.contains("operator"));
+    assert_eq!(a.nonce(me).await, start, "nothing was sent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_that_stopped_part_way_resumes_from_its_progress_file() {
+    if !anvil_on_path() {
+        return;
+    }
+    let (a, router, _) = chain().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (ks, me) = keystore(dir.path());
+    let wasm = builder_wasm(50_000);
+    let file = dir.path().join("b.wasm");
+    std::fs::write(&file, &wasm).unwrap();
+    let progress = dir.path().join("progress.json");
+    let with_progress = || {
+        let mut o = options(file.clone(), &a.url, ks.clone(), router);
+        o.progress = Some(progress.clone());
+        o
+    };
+    let start = a.nonce(me).await;
+    // The first run dies after two of the three chunks.
+    let e = bounded(publish_with(&dev_config(), with_progress(), Faults { stop_after: Some(2), ..Default::default() })).await.unwrap_err();
+    assert!(e.to_string().contains("stopped by the test"), "{e:#}");
+    let record: Value = serde_json::from_slice(&std::fs::read(&progress).unwrap()).unwrap();
+    assert_eq!(record["chunks"].as_array().unwrap().len(), 2, "{record:#}");
+    assert_eq!(a.nonce(me).await, start + 2);
+    // The second sends only the last chunk and the manifest.
+    let p = bounded(publish_with(&dev_config(), with_progress(), Faults::default())).await.unwrap();
+    assert_eq!(p.chunks.len(), 3);
+    assert!(p.chunks[0].reused && p.chunks[1].reused && !p.chunks[2].reused && !p.manifest.reused, "{p:#?}");
+    assert_eq!(p.chunks[2].nonce, start + 2);
+    assert_eq!(a.nonce(me).await, start + 4, "two sends");
+    // A third reuses everything, the manifest too, sends nothing, and reads it all back.
+    let again = bounded(publish_with(&dev_config(), with_progress(), Faults::default())).await.unwrap();
+    assert!(again.manifest.reused && again.chunks.iter().all(|c| c.reused));
+    assert_eq!(again.locator, p.locator);
+    assert_eq!(again.total_cost_wei, "0");
+    assert_eq!(a.nonce(me).await, start + 4, "nothing sent");
+    // A record whose chunk is not on chain as recorded (here: another address) is not reused from
+    // there on.
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&progress).unwrap()).unwrap();
+    record["chunks"][1]["address"] = json!(format!("{:#x}", Address::repeat_byte(9)));
+    std::fs::write(&progress, serde_json::to_vec(&record).unwrap()).unwrap();
+    let fourth = bounded(publish_with(&dev_config(), with_progress(), Faults { stop_after: Some(0), ..Default::default() })).await;
+    assert!(fourth.unwrap_err().to_string().contains("stopped by the test"));
+    let record: Value = serde_json::from_slice(&std::fs::read(&progress).unwrap()).unwrap();
+    assert_eq!(record["chunks"].as_array().unwrap().len(), 1, "only what was found is kept: {record:#}");
+    assert!(record["manifest"].is_null());
+    // Another artifact under the same record is refused.
+    std::fs::write(&file, builder_wasm(1_000)).unwrap();
+    let e = bounded(publish_with(&dev_config(), with_progress(), Faults::default())).await.unwrap_err();
+    assert!(e.to_string().contains("another publication"), "{e:#}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sends_are_paced_by_the_local_clock() {
+    if !anvil_on_path() {
+        return;
+    }
+    let (a, router, _) = chain().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (ks, _) = keystore(dir.path());
+    let file = dir.path().join("b.wasm");
+    std::fs::write(&file, builder_wasm(30_000)).unwrap();
+    // One block a second, and a floor of three seconds: three sends (two chunks, the manifest)
+    // take at least six, and land at least two blocks apart.
+    let mut o = options(file, &a.url, ks, router);
+    o.block_time_ms = Some(3_000);
+    let t = std::time::Instant::now();
+    let p = bounded(publish_with(&dev_config(), o, Faults::default())).await.unwrap();
+    assert_eq!(p.chunks.len(), 2);
+    let blocks: Vec<u64> = p.chunks.iter().chain([&p.manifest]).map(|d| d.block_number).collect();
+    assert!(blocks.windows(2).all(|w| w[1] >= w[0] + 2), "{blocks:?}");
+    assert!(t.elapsed() >= Duration::from_secs(6), "{:?}", t.elapsed());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_rpc_must_show_each_deployment_before_the_next_send() {
+    if !anvil_on_path() {
+        return;
+    }
+    let (a, router, _) = chain().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (ks, me) = keystore(dir.path());
+    let file = dir.path().join("b.wasm");
+    std::fs::write(&file, builder_wasm(1_000)).unwrap();
+    // The same node as the second RPC: everything shows there, and is read back there too.
+    let mut o = options(file.clone(), &a.url, ks.clone(), router);
+    o.verify_rpc_url = Some(a.url.clone());
+    let p = bounded(publish_with(&dev_config(), o, Faults::default())).await.unwrap();
+    assert!(p.warnings.iter().any(|w| w.contains("same host")), "{:?}", p.warnings);
+    // Another chain with the same id (what a lying first RPC would look like from the second): the
+    // first chunk never shows there, and nothing after it is sent.
+    let other = Anvil::start().await;
+    let start = a.nonce(me).await;
+    let mut o = options(file, &a.url, ks, router);
+    o.verify_rpc_url = Some(other.url.clone());
+    let faults = Faults { verify_timeout: Some(Duration::from_secs(5)), ..Default::default() };
+    let e = bounded(publish_with(&dev_config(), o, faults)).await.unwrap_err().to_string();
+    assert!(e.contains("does not show"), "{e}");
+    assert_eq!(a.nonce(me).await, start + 1, "the chunk, and nothing after it");
 }
