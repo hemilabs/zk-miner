@@ -504,6 +504,9 @@ pub(crate) struct WitnessRuntime {
     switched_off: AtomicBool,
     /// A sandbox self-test thread is running (one that did not finish in its bound keeps it).
     sandbox_test_running: Arc<AtomicBool>,
+    /// Held across one post-lock failure's tally updates (each a read and a write of store records),
+    /// so two failures recorded at once never both count the same caller as new on a device.
+    tally_updates: tokio::sync::Mutex<()>,
 }
 
 impl WitnessRuntime {
@@ -662,6 +665,7 @@ impl WitnessRuntime {
             starting: AtomicBool::new(false),
             switched_off: AtomicBool::new(false),
             sandbox_test_running: Arc::new(AtomicBool::new(false)),
+            tally_updates: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -904,6 +908,21 @@ impl WitnessRuntime {
                 Err(why) => Err(why),
                 Ok(()) => bounded_self_test("broker", broker_self_test(&s.broker_client, &s.connector)).await,
             },
+        };
+        // The execute worker's build again (its binary may have been replaced in place): new bundles
+        // record it, and retained ones are revalidated against it.
+        let result = match result {
+            Ok(()) => match execute_worker_build(&s.execute_binary, &s.cgroup_root, EXECUTE_BUILD_TIMEOUT).await {
+                Ok(build) => {
+                    let before = lock(&self.execute_build).replace(build.clone());
+                    if before.is_some_and(|b| b != build) {
+                        tracing::warn!("witness: the execute worker is now {build}");
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(format!("the execute worker's build handshake: {e}")),
+            },
+            Err(why) => Err(why),
         };
         match result {
             Ok(()) => {
@@ -2431,6 +2450,7 @@ impl WitnessRuntime {
         let class = f.class;
         let device = f.slot.as_deref().map(device_of_slot);
         self.record_verdict(jid, caller, SkipReason::PostLockFailure, &format!("{class:?}")).await;
+        let _updating = self.tally_updates.lock().await;
         let counted = if f.caller {
             let (n, until) = self.bump_tally(caller_tally_key(caller), true).await;
             lock(&self.post_lock_callers).insert(caller, (n, until));
