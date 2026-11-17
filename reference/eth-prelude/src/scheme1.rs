@@ -942,12 +942,19 @@ pub enum Verdict {
 }
 
 /// Judges a mutated run: `mutated` is the journal the guest produced, or `None` if it failed;
-/// `pinned_len` is the number of journal bytes the binding pins (prefix and header: 64 + 32 × k).
+/// `pinned_len` is the number of journal bytes the binding pins (prefix and header: 64 + 32 × k),
+/// for the plan's layout where they are a prefix of the journal.
 pub fn judge(honest: &[u8], mutated: Option<&[u8]>, pinned_len: usize) -> Verdict {
+    judge_with(honest, mutated, |j| j.get(..pinned_len) == honest.get(..pinned_len))
+}
+
+/// [`judge`] for any binding: `satisfies_binding(journal)` says whether the job's binding accepts a
+/// journal (for FIELDS, whether the router's fields hash of it equals `expectedJournalHash`).
+pub fn judge_with(honest: &[u8], mutated: Option<&[u8]>, satisfies_binding: impl Fn(&[u8]) -> bool) -> Verdict {
     match mutated {
         None => Verdict::Rejected,
         Some(j) if j == honest => Verdict::Identical,
-        Some(j) if j.get(..pinned_len) != honest.get(..pinned_len) => Verdict::BindingRejects,
+        Some(j) if !satisfies_binding(j) => Verdict::BindingRejects,
         Some(_) => Verdict::Unsound,
     }
 }
@@ -1059,6 +1066,10 @@ mod tests {
         assert_eq!(judge(&honest, Some(&[1, 2]), 3), Verdict::BindingRejects);
         assert_eq!(judge(&honest, Some(&[1, 2, 3, 5]), 2), Verdict::Unsound);
         assert_eq!(judge(&honest, Some(&[1, 2, 3, 4, 5]), 2), Verdict::Unsound);
+        // A binding over the last byte only.
+        let last_is_4 = |j: &[u8]| j.last() == Some(&4);
+        assert_eq!(judge_with(&honest, Some(&[9, 9, 9, 4]), last_is_4), Verdict::Unsound);
+        assert_eq!(judge_with(&honest, Some(&[1, 2, 3, 5]), last_is_4), Verdict::BindingRejects);
     }
 
     proptest! {
