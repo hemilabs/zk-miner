@@ -3,7 +3,7 @@
 //! when the job is deleted as terminal or once it expires.
 
 use alloy_primitives::B256;
-use zkminer_witness::verdict::VerdictRecord;
+use zkminer_witness::verdict::{SkipReason, VerdictRecord};
 
 use crate::error::{Defect, StoreError};
 use crate::fsutil::{is_enoent, read_capped, Kind, ReadError};
@@ -19,7 +19,11 @@ impl Inner {
 }
 
 impl Store {
-    /// Records (or replaces) a job's verdict, durably. Counted against the quota.
+    /// Records (or replaces) a job's verdict, durably. Counted against the quota, except a
+    /// post-lock failure's records ([`SkipReason::PostLockFailure`]: the verdict that keeps a job
+    /// whose lock failed from being locked again, and the per-caller and per-device tallies): like
+    /// pins, they protect stake, so only a full filesystem refuses them. They are few (one per
+    /// released lock, caller and device class) and small.
     pub fn put_verdict(&self, v: &VerdictRecord) -> Result<(), StoreError> {
         let inner = &self.inner;
         inner.check_usable()?;
@@ -34,7 +38,9 @@ impl Store {
             Ok(None) => Usage::new(json.len() as u64, 1),
             Err(e) => return Err(StoreError::io(e, &verdicts.child(&name))),
         };
-        inner.admit(&st, add)?;
+        if v.reason != SkipReason::PostLockFailure {
+            inner.admit(&st, add)?;
+        }
         inner.write_atomic(&mut st, &verdicts, &name, &json, 0o600)
     }
 

@@ -767,6 +767,33 @@ fn verdicts_persist_expire_and_stay_fixed() {
     assert_accounting(&s);
 }
 
+/// A job whose witness lock failed gets a post-lock verdict so that it is never locked again, and
+/// its caller and device get tallies; a full store refused them like any verdict, so after a
+/// restart the job could be locked again. Like pins, they are never refused for the quota (only a
+/// full filesystem refuses them); every other verdict still is.
+#[test]
+fn post_lock_records_are_written_on_a_full_store() {
+    let d = tmpdir();
+    let s = open_with(d.path(), StoreOptions { quota_bytes: 1, ..opts() });
+    let mk = |j: u8, reason| VerdictRecord {
+        job_id: job(j),
+        reason,
+        attempts: 1,
+        recorded_at: 100,
+        expires_at: u64::MAX,
+        wasmtime_version: None,
+    };
+    assert!(matches!(s.put_verdict(&mk(1, SkipReason::HostInternal)).unwrap_err(), StoreError::RetentionFull(_)));
+    s.put_verdict(&mk(2, SkipReason::PostLockFailure)).unwrap();
+    s.put_verdict(&VerdictRecord { attempts: 2, ..mk(2, SkipReason::PostLockFailure) }).unwrap();
+    drop(s);
+    let s = open_with(d.path(), StoreOptions { quota_bytes: 1, ..opts() });
+    assert_eq!(s.verdict(job(2)).unwrap().map(|v| (v.reason, v.attempts)), Some((SkipReason::PostLockFailure, 2)));
+    assert_eq!(s.verdict(job(1)).unwrap(), None);
+    s.scan().unwrap();
+    assert_accounting(&s);
+}
+
 #[test]
 fn scan_reports_layout_anomalies_pins_and_callers() {
     let d = tmpdir();
