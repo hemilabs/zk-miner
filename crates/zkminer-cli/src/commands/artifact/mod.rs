@@ -29,6 +29,7 @@ pub mod keys;
 pub mod plan;
 pub mod rpc;
 
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -85,14 +86,16 @@ const FETCH_BATCH: usize = 256;
 const POLL: Duration = Duration::from_secs(1);
 
 /// `zkminer artifact publish`'s options.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PublishOptions {
     pub file: PathBuf,
     pub kind: Kind,
     pub rpc_url: String,
     pub chain_id: u64,
     pub keystore: PathBuf,
-    pub password_fd: Option<i32>,
+    /// `--password-fd`, taken by [`keys::take_password_fd`] at the start of `main`; else the
+    /// terminal.
+    pub password_fd: Option<OwnedFd>,
     /// The HemiProve router (default: the known deployment's on `chain_id`).
     pub router: Option<Address>,
     /// The first block of the operator check's log scan (default: the known deployment's).
@@ -692,7 +695,7 @@ pub async fn publish(config_path: Option<&Path>, opts: PublishOptions) -> Result
 }
 
 /// [`publish`] with a configuration in hand (and, in tests, faults to inject).
-pub async fn publish_with(config: &ZkMinerConfig, opts: PublishOptions, faults: Faults) -> Result<Published> {
+pub async fn publish_with(config: &ZkMinerConfig, mut opts: PublishOptions, faults: Faults) -> Result<Published> {
     // 1. The input, before anything else.
     let bytes = std::fs::read(&opts.file).with_context(|| format!("reading {}", opts.file.display()))?;
     plan::check_input(&bytes, opts.kind)?;
@@ -734,7 +737,7 @@ pub async fn publish_with(config: &ZkMinerConfig, opts: PublishOptions, faults: 
     // 3. The key, refused before anything is sent.
     let signer = keys::load(
         &opts.keystore,
-        match opts.password_fd {
+        match opts.password_fd.take() {
             Some(fd) => keys::PasswordSource::Fd(fd),
             None => keys::PasswordSource::Tty,
         },

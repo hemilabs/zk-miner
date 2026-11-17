@@ -186,7 +186,7 @@ fn options(file: PathBuf, url: &str, keystore: PathBuf, router: Address) -> Publ
         rpc_url: url.to_string(),
         chain_id: 31337,
         keystore,
-        password_fd: Some(password_fd()),
+        password_fd: Some(keys::take_password_fd(password_fd()).unwrap()),
         router: Some(router),
         from_block: Some(0),
         tip_wei: None,

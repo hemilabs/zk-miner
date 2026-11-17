@@ -289,7 +289,8 @@ enum ArtifactCommand {
         /// The publisher's encrypted keystore (Web3 Secret Storage JSON).
         #[arg(long)]
         keystore: std::path::PathBuf,
-        /// Read the keystore password from this file descriptor (3 or above) instead of the terminal.
+        /// Read the keystore password from this file descriptor instead of the terminal: 3 or above,
+        /// a pipe or a regular file the caller opened for this command (`3<file`, or a pipe).
         #[arg(long)]
         password_fd: Option<i32>,
         /// The HemiProve router (default: the known deployment's on --chain-id).
@@ -409,8 +410,15 @@ enum BindingCommand {
     },
 }
 
-#[tokio::main(worker_threads = 4)]
-async fn main() -> Result<()> {
+/// What `main` takes from the process before the async runtime starts.
+#[derive(Default)]
+struct Early {
+    /// `artifact publish --password-fd N`, checked and owned.
+    #[cfg(target_os = "linux")]
+    password_fd: Option<std::os::fd::OwnedFd>,
+}
+
+fn main() -> Result<()> {
     // The miner holds the operator's signing key. Non-dumpable, its `/proc/<pid>` entries belong to
     // root, so no other process of this uid can read its memory or environment (`mem`, `environ`,
     // `maps`, `fd`), whatever the host's `ptrace_scope`, and it leaves no core dump. Its own reads of
@@ -422,7 +430,31 @@ async fn main() -> Result<()> {
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
     }
     let cli = Cli::parse();
+    // `--password-fd N` is taken now, while every open descriptor above 2 is one the caller passed:
+    // once the runtime, the network guard or a connection has opened its own, a number the caller
+    // did not open could name one of them (and reading it to the end would close it).
+    #[allow(unused_mut)]
+    let mut early = Early::default();
+    #[cfg(target_os = "linux")]
+    if let Commands::Artifact {
+        command:
+            ArtifactCommand::Publish {
+                password_fd: Some(fd),
+                ..
+            },
+    } = &cli.command
+    {
+        early.password_fd = Some(commands::artifact::keys::take_password_fd(*fd)?);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?
+        .block_on(run(cli, early))
+}
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+async fn run(cli: Cli, early: Early) -> Result<()> {
     // Only setup stderr tracing for headless/CLI modes.
     // In TUI mode, any stderr output (from any thread) corrupts the alternate screen.
     let is_tui = matches!(&cli.command,
@@ -611,7 +643,7 @@ async fn main() -> Result<()> {
                     rpc_url,
                     chain_id,
                     keystore,
-                    password_fd,
+                    password_fd: _,
                     router,
                     from_block,
                     tip_wei,
@@ -630,7 +662,7 @@ async fn main() -> Result<()> {
                     rpc_url,
                     chain_id,
                     keystore,
-                    password_fd,
+                    password_fd: early.password_fd,
                     router,
                     from_block,
                     tip_wei,
