@@ -64,7 +64,8 @@ fn main() {
 fn confine() -> Result<(), String> {
     use zkminer_witness_sandbox::confine::{self, Confinement, Rights, Sockets};
     if confine::report().is_some() {
-        return Ok(());
+        // Confined already: the sockets and the filesystems within reach, again.
+        return confine::recheck().map_err(|e| e.to_string());
     }
     let mut c = Confinement::with_system(Sockets::None);
     if let Some(dir) = std::env::current_exe()

@@ -93,6 +93,10 @@ fn start() -> Result<Helper> {
         std::env::current_exe().context("cannot locate this binary for the Groth16 helper")?;
     let mut child = Command::new(exe)
         .arg(HELPER_ARG)
+        // The helper works below the temporary directory this worker was started with, never
+        // below the worker's own, which the confined worker (and a guest that escaped in it) may
+        // write.
+        .env("TMPDIR", crate::confinement::original_tmpdir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -506,35 +510,77 @@ fn serve(
     }
 }
 
-/// One wrap in `dir` of a validated prover input: risc0-groth16's Docker path (`prove/docker.rs`),
-/// with the image pinned by digest and no network for the container.
+/// One wrap in `dir` (the helper's, below the temporary directory the worker was started with, which
+/// no confined process may write) of a validated prover input: risc0-groth16's Docker path
+/// (`prove/docker.rs`), with the image pinned by digest and no network for the container. The
+/// container sees its input read-only (`dir/in` at `/mnt`) and may write only the proof
+/// (`dir/out/proof.json` bound over `/mnt/proof.json`), which is read back without following a
+/// link and only as a regular file.
 fn docker_wrap(dir: &Path, prover_input: &str) -> Result<Vec<u8>> {
-    std::fs::create_dir_all(dir)?;
-    std::fs::write(dir.join("input.json"), prover_input)?;
-    let output = Command::new("docker")
-        .args(["run", "--rm", "--network", "none", "-v"])
-        .arg(format!("{}:/mnt", dir.display()))
+    let input = dir.join("in");
+    let output = dir.join("out");
+    for d in [dir, &input, &output] {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(d)?;
+    }
+    std::fs::write(input.join("input.json"), prover_input)?;
+    // The proof's mount point inside `/mnt`, and the file the container writes.
+    std::fs::write(input.join("proof.json"), b"")?;
+    std::fs::write(output.join("proof.json"), b"")?;
+    let mount = |src: &Path, dst: &str, readonly: bool| {
+        format!(
+            "type=bind,src={},dst={dst}{}",
+            src.display(),
+            if readonly { ",readonly" } else { "" }
+        )
+    };
+    let result = Command::new("docker")
+        .args(["run", "--rm", "--network", "none", "--mount"])
+        .arg(mount(&input, "/mnt", true))
+        .arg("--mount")
+        .arg(mount(&output.join("proof.json"), "/mnt/proof.json", false))
         .arg(IMAGE)
         .stdin(Stdio::null())
         .output()
         .context("cannot run docker")?;
-    if !output.status.success() {
+    if !result.status.success() {
         bail!(
             "the Groth16 prover image ({IMAGE_TAG}, pinned by digest) failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
+            result.status,
+            String::from_utf8_lossy(&result.stderr)
                 .lines()
                 .last()
                 .unwrap_or("")
         );
     }
-    let mut proof = String::new();
-    std::fs::File::open(dir.join("proof.json"))?
-        .take(MAX_PROOF_BYTES)
-        .read_to_string(&mut proof)?;
+    let proof = read_proof(&output)?;
     let proof: risc0_groth16::ProofJson = serde_json::from_str(&proof)?;
     let seal: risc0_groth16::Seal = proof.try_into()?;
     Ok(seal.to_vec())
+}
+
+/// `dir/proof.json`, opened without following a link, a regular file of at most
+/// [`MAX_PROOF_BYTES`].
+fn read_proof(dir: &Path) -> Result<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    );
+    let f = options
+        .open(dir.join("proof.json"))
+        .context("the prover image left no proof")?;
+    if !f.metadata()?.is_file() {
+        bail!("the prover image's proof is not a regular file");
+    }
+    let mut proof = String::new();
+    f.take(MAX_PROOF_BYTES).read_to_string(&mut proof)?;
+    Ok(proof)
 }
 
 #[cfg(test)]

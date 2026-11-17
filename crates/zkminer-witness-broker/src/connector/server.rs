@@ -613,10 +613,18 @@ impl Connector {
             });
         };
         drop(tx);
+        if let SessionEnd::CutOff(_) = &end {
+            // Closed on the broker at once, before anything else: whatever else still holds the
+            // socket, and whatever answers (sockets connected earlier included) are still queued
+            // for the writer, nothing more reaches the broker.
+            // SAFETY: shutdown of a socket this task owns.
+            unsafe { libc::shutdown(sock.as_raw_fd(), libc::SHUT_RDWR) };
+            writer.abort();
+        }
         // Requests still being served are aborted (a socket one already made is closed, never
         // delivered), and gone before the session's end is reported.
         tasks.shutdown().await;
-        if writer_gone_at.is_some() && writer_end.is_none() {
+        if writer_gone_at.is_some() && writer_end.is_none() && matches!(end, SessionEnd::Closed) {
             writer_end = Some((&mut writer).await);
         }
         if let Some(Err(e)) = &writer_end {
@@ -624,10 +632,6 @@ impl Connector {
         }
         match &end {
             SessionEnd::CutOff(why) => {
-                // Closed on the broker at once, whatever else still holds the socket.
-                // SAFETY: shutdown of a socket this task owns.
-                unsafe { libc::shutdown(sock.as_raw_fd(), libc::SHUT_RDWR) };
-                writer.abort();
                 if page {
                     tracing::error!("PAGE: WITNESS-BROKER-CUT-OFF: the connector closed the broker's socket: {why}");
                 } else {

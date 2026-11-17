@@ -24,9 +24,9 @@
 //! The server ends when the worker does.
 //!
 //! Neither may change a file's mode. The SDK's executor unpacks its runner into `TMPDIR` and makes
-//! it executable: the worker does so before it confines itself (`unpack_executor_runner`, in
-//! `main`), and the server's supervisor does it for the server (the runner directory given to
-//! `run_supervised`).
+//! it executable: the worker puts its runner there before it confines itself, without running
+//! anything (`place_executor_runner`, in `main`), and the server's supervisor makes the server's
+//! executable for it (the runner directory given to `run_supervised`).
 //!
 //! The one-time setup that needs the network (`Warmup`: the Groth16 circuit download) runs before;
 //! a `Warmup` after refuses rather than download. A server the SDK would download (absent, or another
@@ -159,7 +159,8 @@ mod imp {
     /// policy allows; a measuring worker has no connection to keep.
     pub fn confine(keep_server: bool) -> Result<(), String> {
         if confine::report().is_some() {
-            return Ok(());
+            // Confined already: the sockets and the filesystems within reach, again.
+            return confine::recheck().map_err(|e| e.to_string());
         }
         let tmp = TMPDIR
             .get()
@@ -197,6 +198,10 @@ mod imp {
         }
         // The SDK's executor extracts its runner here and runs it.
         c.allow(tmp, Rights::WRITE | Rights::EXEC);
+        // All of `/proc`, not only this process's: the executor's memory monitor (`sysinfo`) reads
+        // its runner child's `/proc/<pid>/{stat,statm,io,exe}`, and the worker its server's
+        // `/proc/<pid>/stat`, at pids no rule can name in advance.
+        c.allow("/proc", Rights::READ);
         // ...and keeps the guest's memory image and trace ring in shared memory.
         c.allow("/dev/shm", Rights::WRITE);
         if let Some(h) = home() {

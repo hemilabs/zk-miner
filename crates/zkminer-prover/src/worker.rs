@@ -745,12 +745,27 @@ impl WorkerHandle {
             RISC0_SYS_RAND_KEY.get(),
         ));
 
+        // The worker's memory ceiling, and (Linux) what ends everything it starts: a cgroup of its
+        // own below a delegated root, the reaper, the mount watch. See `containment`.
+        let ceiling =
+            crate::memory::worker_memory_ceiling_bytes(crate::memory::DEFAULT_HOST_RESERVE_BYTES);
+        #[cfg(target_os = "linux")]
+        let prepared = crate::containment::prepare(ceiling)
+            .map_err(|e| anyhow::anyhow!("worker {backend}: {e}"))?;
+        #[cfg(target_os = "linux")]
+        let join_cgroup = prepared.as_ref().map(|p| p.procs_fd());
+
         // Kill worker if parent process dies (prevents orphan GPU processes after host crash).
         // PR_SET_PDEATHSIG is Linux-specific.
         #[cfg(target_os = "linux")]
         unsafe {
             use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
+                // Into the worker's own cgroup before anything else, so everything it ever starts
+                // is in it too.
+                if let Some(fd) = join_cgroup {
+                    zkminer_witness_sandbox::join_cgroup_in_child(fd)?;
+                }
                 // Put the worker in its own process group (pgid == its own pid) so
                 // the dispatcher's watchdogs can SIGKILL the ENTIRE group via
                 // kill(-pgid) on timeout. Without this, a worker that forks a GPU
@@ -823,6 +838,8 @@ impl WorkerHandle {
                         self.1
                     );
                     let pid = child.id();
+                    #[cfg(target_os = "linux")]
+                    crate::containment::end(pid);
                     #[cfg(unix)]
                     if may_signal_group(pid) {
                         unsafe {
@@ -957,36 +974,80 @@ impl WorkerHandle {
                 .ok()
         }).flatten();
 
-        // Kernel-enforced ceiling on this worker, best effort. Adoption of a pid we already own,
-        // NOT a wrapper process — see `memory::cap_process_memory` for why that distinction is
-        // load-bearing for every pid-keyed path in this file.
         let pid_for_cap = spawn_guard.get().id();
-        match crate::memory::worker_memory_ceiling_bytes(crate::memory::DEFAULT_HOST_RESERVE_BYTES)
-        {
+        #[cfg(target_os = "linux")]
+        let prepared = match prepared {
+            Some(p) => {
+                let leaf = p.leaf();
+                crate::containment::started_in(pid_for_cap, p);
+                tracing::info!(
+                    "worker {backend} (PID {pid_for_cap}) runs in a cgroup of its own ({leaf}), \
+                     capped at {}, no swap",
+                    ceiling.map_or("no ceiling".to_string(), |c| format!(
+                        "{:.1} GiB of RAM",
+                        c as f64 / (1024.0 * 1024.0 * 1024.0)
+                    ))
+                );
+                true
+            }
+            None => false,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let prepared = false;
+        // Otherwise: a kernel-enforced ceiling on this worker, best effort. Adoption of a pid we
+        // already own, NOT a wrapper process — see `memory::cap_process_memory` for why that
+        // distinction is load-bearing for every pid-keyed path in this file.
+        let unit = match ceiling {
+            _ if prepared => None,
             Some(ceiling) => {
                 match crate::memory::cap_process_memory(pid_for_cap, backend, ceiling) {
-                    Ok(unit) => tracing::info!(
-                        "worker {backend} (PID {pid_for_cap}) capped at {:.1} GiB of RAM, no swap \
-                         ({unit})",
-                        ceiling as f64 / (1024.0 * 1024.0 * 1024.0)
-                    ),
+                    Ok(unit) => {
+                        tracing::info!(
+                            "worker {backend} (PID {pid_for_cap}) capped at {:.1} GiB of RAM, no \
+                             swap ({unit})",
+                            ceiling as f64 / (1024.0 * 1024.0 * 1024.0)
+                        );
+                        Some(unit)
+                    }
                     // Windows has neither layer; the dispatcher's memory admission still applies.
-                    Err(why) if cfg!(windows) => tracing::info!(
-                        "worker {backend} (PID {pid_for_cap}) runs without a memory ceiling ({why})"
-                    ),
+                    Err(why) if cfg!(windows) => {
+                        tracing::info!(
+                            "worker {backend} (PID {pid_for_cap}) runs without a memory ceiling \
+                             ({why})"
+                        );
+                        None
+                    }
                     // No cap is survivable: `oom_score_adj` still points the kernel at the prover.
-                    Err(why) => tracing::warn!(
-                        "worker {backend} (PID {pid_for_cap}) could NOT be memory-capped ({why}); \
-                         it can still be OOM-killed first thanks to oom_score_adj, but one runaway \
-                         prover could now stall the host"
-                    ),
+                    Err(why) => {
+                        tracing::warn!(
+                            "worker {backend} (PID {pid_for_cap}) could NOT be memory-capped \
+                             ({why}); it can still be OOM-killed first thanks to oom_score_adj, \
+                             but one runaway prover could now stall the host"
+                        );
+                        None
+                    }
                 }
             }
-            None => tracing::warn!(
-                "cannot size a memory ceiling for worker {backend}: /proc/meminfo unreadable or \
-                 the host reserve exceeds total RAM"
-            ),
+            None => {
+                tracing::warn!(
+                    "cannot size a memory ceiling for worker {backend}: /proc/meminfo unreadable \
+                     or the host reserve exceeds total RAM"
+                );
+                None
+            }
+        };
+        // The scope is the worker's own cgroup only once systemd has moved it there: wait for
+        // that before the worker is sent anything.
+        #[cfg(target_os = "linux")]
+        if !prepared && crate::containment::started_in_scope(pid_for_cap, unit.as_deref()).is_none()
+        {
+            tracing::warn!(
+                "worker {backend} (PID {pid_for_cap}) is in no cgroup of its own: it and what it \
+                 starts are ended by process group"
+            );
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = unit;
 
         // Baseline for attributing a later SIGKILL. See `WorkerHandle::died_of_host_oom`.
         let oom_kills_at_spawn = crate::memory::oom_kill_count();
@@ -1444,6 +1505,10 @@ impl WorkerHandle {
         // The cost of giving up is one zombie, which is bounded by the slot count and which
         // `Drop` tries again to collect. `reaped` records what actually happened: claiming a reap
         // that did not occur would let the group-kill guards believe the pid is free to recycle.
+        #[cfg(target_os = "linux")]
+        if !self.reaped {
+            crate::containment::end(pid);
+        }
         self.reaped = reap_within(&mut self.child, DROP_REAP_BUDGET);
         if !self.reaped {
             tracing::warn!(
@@ -1494,6 +1559,8 @@ impl WorkerHandle {
                 // Gone means somebody else reaped it; there is nothing left to sweep and
                 // the pid number is no longer ours to signal.
                 ExitProbe::Gone => {
+                    #[cfg(target_os = "linux")]
+                    crate::containment::end(pid);
                     self.reaped = true;
                     return;
                 }
@@ -1508,6 +1575,8 @@ impl WorkerHandle {
                 // Sweep BEFORE reaping, while the group number is still pinned.
                 #[cfg(unix)]
                 let _ = sweep_process_group(pid, &self.backend);
+                #[cfg(target_os = "linux")]
+                crate::containment::end(pid);
                 let _ = self.child.wait();
                 self.reaped = true;
                 return;
@@ -1638,6 +1707,9 @@ impl Drop for WorkerHandle {
         // land on a process in uninterruptible sleep (a GPU helper inside a driver ioctl, or
         // paging a 236MB image in from a stalled mount). This reap is bounded for that reason,
         // like `proc::reap_briefly`.
+        // Its cgroup, whatever is left in it, and its registration with the reaper.
+        #[cfg(target_os = "linux")]
+        crate::containment::end(pid);
         #[cfg(unix)]
         {
             // Record what actually happened, not what we attempted. `reaped` is the flag every

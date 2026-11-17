@@ -29,6 +29,9 @@
 //! - `MOCK_WITNESS_DIVERGE`: set to anything to answer a witness Prove with `JournalDiverged`: the
 //!   journal is the bundle's `input_path`, the hash the complement of the expected one, and the cycles
 //!   its `w_len`. Unset = a witness Prove is answered as an inline one.
+//! - `MOCK_LURKER`: a file name. On its first command (a guest can run only on a command) the worker
+//!   starts a `sleep` that leaves its process group and session (`setsid`), as nothing in a
+//!   confined worker can, and writes its pid there: what ends the worker's cgroup must end it too.
 
 use std::io::{self, BufReader, BufWriter};
 use std::time::Duration;
@@ -36,6 +39,33 @@ use std::time::Duration;
 use zkminer_prover_protocol::{
     read_message, write_message, FrameError, WorkerCommand, WorkerResponse, PROTOCOL_VERSION,
 };
+
+#[cfg(unix)]
+fn start_lurker() {
+    if let Some(file) = std::env::var_os("MOCK_LURKER") {
+        use std::os::unix::process::CommandExt;
+        let mut c = std::process::Command::new("sleep");
+        c.arg("600")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: setsid is async-signal-safe.
+        unsafe {
+            c.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let lurker = c.spawn().expect("MOCK_LURKER: spawn");
+        std::fs::write(&file, lurker.id().to_string()).expect("MOCK_LURKER: pid file");
+        std::mem::forget(lurker);
+    }
+}
+
+#[cfg(not(unix))]
+fn start_lurker() {}
 
 fn main() {
     if std::env::var_os("MOCK_BE_MEMORY_HOG").is_some() {
@@ -63,12 +93,16 @@ fn main() {
     let mut stdin = BufReader::new(io::stdin().lock());
     let mut stdout = BufWriter::new(io::stdout().lock());
 
+    let mut first = true;
     loop {
         let cmd: WorkerCommand = match read_message(&mut stdin) {
             Ok(cmd) => cmd,
             Err(FrameError::UnexpectedEof) => break,
             Err(_) => break,
         };
+        if std::mem::replace(&mut first, false) {
+            start_lurker();
+        }
 
         match cmd {
             WorkerCommand::Hello {

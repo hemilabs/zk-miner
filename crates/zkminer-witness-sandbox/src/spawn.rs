@@ -213,21 +213,11 @@ fn child_setup(
     identities: &[FdIdentity],
     scratch: &mut [RawFd],
 ) -> io::Result<()> {
-    // 0. `procs` must still be the job's `cgroup.procs`: std sets up fds 0-2 (stdin, stdout,
-    //    stderr) before this hook runs, and a write of "0" that lands in a pipe or /dev/null would
-    //    leave the child in the miner's cgroup, uncapped. `prepare_command` keeps it above 2; this
-    //    fails closed if anything else ever replaced it.
-    if !on_cgroup2(procs)? {
-        return Err(io::Error::from_raw_os_error(libc::EBADF));
-    }
+    // 0, 1. Join the job cgroup before anything else (failing closed if `procs` is no longer its
+    //    `cgroup.procs`: the write would leave the child in the miner's cgroup, uncapped).
+    join_cgroup_in_child(procs)?;
     // SAFETY (whole block): plain syscalls on integers and stack memory.
     unsafe {
-        // 1. Join the job cgroup ("0" = the writing process) before anything else.
-        match libc::write(procs, b"0".as_ptr().cast(), 1) {
-            1 => {}
-            0 => return Err(io::Error::from_raw_os_error(libc::EIO)),
-            _ => return Err(io::Error::last_os_error()),
-        }
         // 2. No core dumps, no privilege gain through exec.
         let core = libc::rlimit {
             rlim_cur: 0,
@@ -318,20 +308,10 @@ fn child_setup(
 ///   `exec` back to `spawn` through a close-on-exec socket that must stay open until then. If a
 ///   target happens to have that socket's number, an `exec` failure shows up as the child exiting
 ///   with status 1 instead of an error from `spawn`.
-pub fn prepare_command(
-    cmd: &mut Command,
-    cgroup: &Cgroup,
-    fds: &[(BorrowedFd<'_>, RawFd)],
-) -> Result<(), SandboxError> {
-    let pairs: Vec<(RawFd, RawFd)> = fds
-        .iter()
-        .map(|(src, dst)| (src.as_raw_fd(), *dst))
-        .collect();
-    let plan = FdPlan::new(&pairs)?;
-    let identities = pairs
-        .iter()
-        .map(|&(src, _)| fd_identity(src))
-        .collect::<io::Result<Vec<_>>>()?;
+/// For a command with a launch hook of its own: an fd to `cgroup`'s `cgroup.procs`, opened now, by
+/// the parent, above the standard descriptors and checked to be on cgroup2, for
+/// [`join_cgroup_in_child`]. Keep it open until the command has been spawned.
+pub fn cgroup_procs_fd(cgroup: &Cgroup) -> Result<OwnedFd, SandboxError> {
     let procs_path = cgroup.path().join("cgroup.procs");
     let cg_err = |e: io::Error| SandboxError::Cgroup(format!("{}: {e}", procs_path.display()));
     let procs: OwnedFd = std::fs::OpenOptions::new()
@@ -348,6 +328,41 @@ pub fn prepare_command(
             procs_path.display()
         )));
     }
+    Ok(procs)
+}
+
+/// In a launch hook, between `fork` and `exec`: the child joins the cgroup whose `cgroup.procs` is
+/// `procs` ([`cgroup_procs_fd`]) by writing "0" (the writing process). Async-signal-safe and
+/// allocation-free. Fails closed if `procs` is no longer on cgroup2: std sets up fds 0-2 before
+/// launch hooks run, and a write that lands in a pipe or /dev/null would leave the child where it
+/// was.
+pub fn join_cgroup_in_child(procs: RawFd) -> io::Result<()> {
+    if !on_cgroup2(procs)? {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+    // SAFETY: a write of a static byte to an fd.
+    match unsafe { libc::write(procs, b"0".as_ptr().cast(), 1) } {
+        1 => Ok(()),
+        0 => Err(io::Error::from_raw_os_error(libc::EIO)),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+pub fn prepare_command(
+    cmd: &mut Command,
+    cgroup: &Cgroup,
+    fds: &[(BorrowedFd<'_>, RawFd)],
+) -> Result<(), SandboxError> {
+    let pairs: Vec<(RawFd, RawFd)> = fds
+        .iter()
+        .map(|(src, dst)| (src.as_raw_fd(), *dst))
+        .collect();
+    let plan = FdPlan::new(&pairs)?;
+    let identities = pairs
+        .iter()
+        .map(|&(src, _)| fd_identity(src))
+        .collect::<io::Result<Vec<_>>>()?;
+    let procs = cgroup_procs_fd(cgroup)?;
     // Only what the caller set explicitly reaches the child (see "The environment").
     let explicit: Vec<(OsString, OsString)> = cmd
         .get_envs()

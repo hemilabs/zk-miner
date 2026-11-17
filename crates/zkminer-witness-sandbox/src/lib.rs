@@ -66,7 +66,7 @@ pub use restrict::{
     MIN_LANDLOCK_ABI, REFUSED_SOCKET_OPTIONS, SOCKET_TIMEOUT_OPTIONS,
 };
 pub use selftest::{self_test, self_test_profile};
-pub use spawn::prepare_command;
+pub use spawn::{cgroup_procs_fd, join_cgroup_in_child, prepare_command};
 
 /// Which mode the operator configured (`[witness] sandbox_mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

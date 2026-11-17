@@ -31,10 +31,22 @@ mod imp {
 
     /// The private temporary directory [`prepare`] made.
     static TMPDIR: OnceLock<PathBuf> = OnceLock::new();
+    /// The temporary directory before [`prepare`] pointed `TMPDIR` at the private one.
+    static ORIGINAL_TMPDIR: OnceLock<PathBuf> = OnceLock::new();
+
+    /// The temporary directory this process was started with: outside every path the confined
+    /// worker may write (the Docker Groth16 helper works there).
+    pub fn original_tmpdir() -> PathBuf {
+        ORIGINAL_TMPDIR
+            .get()
+            .cloned()
+            .unwrap_or_else(std::env::temp_dir)
+    }
 
     /// At startup, while the process has one thread: a private temporary directory, which `TMPDIR`
     /// then names for everything in this process (risc0's Groth16 work directories, SYCL's).
     pub fn prepare() {
+        let _ = ORIGINAL_TMPDIR.set(std::env::temp_dir());
         match confine::private_tmpdir("risc0") {
             Ok(dir) => {
                 // SAFETY: called from `main` before any thread exists.
@@ -55,7 +67,8 @@ mod imp {
 
     pub fn confine() -> Result<(), String> {
         if confine::report().is_some() {
-            return Ok(());
+            // Confined already: the sockets and the filesystems within reach, again.
+            return confine::recheck().map_err(|e| e.to_string());
         }
         let tmp = TMPDIR
             .get()
@@ -127,6 +140,10 @@ mod imp {
         if cfg!(any(feature = "cuda", feature = "rocm", feature = "intel")) {
             c.allow_gpu_devices();
         }
+        if cfg!(feature = "rocm") {
+            // ROCm starts its threads with a CPU set, which glibc applies by thread id.
+            c.allow_thread_affinity();
+        }
         if cfg!(feature = "cuda") {
             // The driver's JIT cache: read only. This build carries code for its cards, so nothing
             // is compiled; a write that fails is only not cached.
@@ -197,7 +214,7 @@ mod imp {
 }
 
 #[cfg(target_os = "linux")]
-pub use imp::{confine, is_confined, prepare};
+pub use imp::{confine, is_confined, original_tmpdir, prepare};
 
 /// No Landlock or seccomp off Linux: nothing to confine with.
 #[cfg(not(target_os = "linux"))]
@@ -212,3 +229,8 @@ pub fn is_confined() -> bool {
 
 #[cfg(not(target_os = "linux"))]
 pub fn prepare() {}
+
+#[cfg(not(target_os = "linux"))]
+pub fn original_tmpdir() -> std::path::PathBuf {
+    std::env::temp_dir()
+}

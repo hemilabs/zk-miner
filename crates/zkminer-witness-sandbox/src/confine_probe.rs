@@ -513,6 +513,40 @@ fn metadata_checks(scratch: &Path, key: &Path, mut report: impl FnMut(&str, bool
         add("futimens", &|| unsafe {
             libc::syscall(libc::SYS_utimensat, fd, null, null, 0)
         });
+        // The ioctl forms: the file's current inode flags written back, its current extended
+        // attributes written back (each a no-op unconfined), fs-verity.
+        let mut flags: libc::c_long = 0;
+        let flags_ptr = &mut flags as *mut libc::c_long;
+        // SAFETY: FS_IOC_GETFLAGS into a long; allowed.
+        unsafe { libc::ioctl(fd as libc::c_int, 0x8008_6601u64 as _, flags_ptr) };
+        let mut fsx = [0u8; 28];
+        let fsx_ptr = fsx.as_mut_ptr();
+        // SAFETY: FS_IOC_FSGETXATTR into a struct fsxattr; allowed.
+        unsafe { libc::ioctl(fd as libc::c_int, 0x801c_581fu64 as _, fsx_ptr) };
+        add("ioctl_setflags", &|| unsafe {
+            libc::syscall(
+                libc::SYS_ioctl,
+                fd,
+                crate::restrict::FS_IOC_SETFLAGS,
+                flags_ptr,
+            )
+        });
+        add("ioctl_fssetxattr", &|| unsafe {
+            libc::syscall(
+                libc::SYS_ioctl,
+                fd,
+                crate::restrict::FS_IOC_FSSETXATTR,
+                fsx_ptr,
+            )
+        });
+        add("ioctl_enable_verity", &|| unsafe {
+            libc::syscall(
+                libc::SYS_ioctl,
+                fd,
+                crate::restrict::FS_IOC_ENABLE_VERITY,
+                null,
+            )
+        });
         // SAFETY: closing the fd opened above.
         unsafe { libc::close(fd as libc::c_int) };
     }
@@ -528,15 +562,22 @@ fn metadata_checks(scratch: &Path, key: &Path, mut report: impl FnMut(&str, bool
     );
     // A key file outside every writable path: its mode stays.
     let k = cpath(key);
-    let key_before = metadata_of(key).0;
+    // A home without the key (the FUSE test's) only checks the refusal.
+    let key_mode = || {
+        std::fs::symlink_metadata(key).map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.mode() & 0o7777
+        })
+    };
+    let key_before = key_mode().ok();
     // SAFETY: a NUL-terminated path.
     let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_fchmodat, at, k.as_ptr(), 0o644) });
-    let key_after = metadata_of(key).0;
+    let key_after = key_mode().ok();
     let (ok, detail) = refused_with(r, e, libc::EPERM);
     report(
         "meta_chmod_key",
         ok && key_before == key_after,
-        format!("{detail}, mode {key_before:o} -> {key_after:o}"),
+        format!("{detail}, mode {key_before:?} -> {key_after:?}"),
     );
 }
 
@@ -606,6 +647,121 @@ fn namespace_checks(write: &Path, home: &Path, mut report: impl FnMut(&str, bool
     for (name, (r, e)) in calls {
         report(&format!("ns_{name}"), refused(r, e), detail(r, e));
     }
+}
+
+/// A child that runs `f` and exits with its errno (0 for success): for calls that would change this
+/// process itself unconfined (`setsid`, `setpgid`).
+fn in_child(f: impl FnOnce() -> libc::c_long) -> (libc::c_long, i32) {
+    // SAFETY: fork; the child makes one syscall and exits.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return (-1, errno());
+    }
+    if pid == 0 {
+        let r = f();
+        let e = if r < 0 { errno() } else { 0 };
+        unsafe { libc::_exit(e) };
+    }
+    let mut st = 0;
+    // SAFETY: waiting for the child just forked.
+    unsafe { libc::waitpid(pid, &mut st, 0) };
+    let e = if libc::WIFEXITED(st) {
+        libc::WEXITSTATUS(st)
+    } else {
+        -1
+    };
+    (if e == 0 { 0 } else { -1 }, e)
+}
+
+/// Leaving the session or process group, and changing `pid`'s (another process's) limits,
+/// priority, I/O priority and scheduling, each with the value it already has (a no-op unconfined):
+/// all refused. The same for the caller itself (pid 0) stays allowed.
+fn process_control_checks(pid: libc::pid_t, who: &str, mut report: impl FnMut(&str, bool, String)) {
+    let p = pid as libc::c_long;
+    let (r, e) = in_child(|| unsafe { libc::setsid() } as libc::c_long);
+    let (ok, d) = refused_with(r, e, libc::EPERM);
+    report("setsid", ok, d);
+    let (r, e) = in_child(|| unsafe { libc::setpgid(0, 0) } as libc::c_long);
+    let (ok, d) = refused_with(r, e, libc::EPERM);
+    report("setpgid", ok, d);
+    // SAFETY (every call): reading `pid`'s current values into local buffers, then writing them back.
+    let mut lim = [0u64; 2];
+    unsafe {
+        libc::syscall(
+            libc::SYS_prlimit64,
+            p,
+            libc::RLIMIT_NOFILE,
+            std::ptr::null::<u64>(),
+            lim.as_mut_ptr(),
+        )
+    };
+    let lim_ptr = lim.as_ptr();
+    let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) } as libc::c_long;
+    let ioprio = unsafe { libc::syscall(libc::SYS_ioprio_get, 1, p) };
+    let mut mask = [0u64; 16];
+    unsafe {
+        libc::syscall(
+            libc::SYS_sched_getaffinity,
+            p,
+            std::mem::size_of_val(&mask),
+            mask.as_mut_ptr(),
+        )
+    };
+    let mask_ptr = mask.as_ptr();
+    let param = [0i32; 1];
+    let param_ptr = param.as_ptr();
+    // struct sched_attr { u32 size; u32 policy; u64 flags; i32 nice; u32 priority; ... }, 48 bytes.
+    let mut attr = [0u32; 12];
+    attr[0] = 48;
+    attr[4] = nice as u32;
+    let attr_ptr = attr.as_ptr();
+    let calls: Vec<(&str, (libc::c_long, i32))> = vec![
+        (
+            "prlimit64",
+            sys(|| unsafe {
+                libc::syscall(
+                    libc::SYS_prlimit64,
+                    p,
+                    libc::RLIMIT_NOFILE,
+                    lim_ptr,
+                    std::ptr::null::<u64>(),
+                )
+            }),
+        ),
+        (
+            "setpriority",
+            sys(|| unsafe { libc::syscall(libc::SYS_setpriority, libc::PRIO_PROCESS, p, nice) }),
+        ),
+        (
+            "ioprio_set",
+            sys(|| unsafe { libc::syscall(libc::SYS_ioprio_set, 1, p, ioprio) }),
+        ),
+        (
+            "sched_setaffinity",
+            sys(|| unsafe { libc::syscall(libc::SYS_sched_setaffinity, p, 128usize, mask_ptr) }),
+        ),
+        (
+            "sched_setscheduler",
+            sys(|| unsafe { libc::syscall(libc::SYS_sched_setscheduler, p, 0, param_ptr) }),
+        ),
+        (
+            "sched_setparam",
+            sys(|| unsafe { libc::syscall(libc::SYS_sched_setparam, p, param_ptr) }),
+        ),
+        (
+            "sched_setattr",
+            sys(|| unsafe { libc::syscall(libc::SYS_sched_setattr, p, attr_ptr, 0) }),
+        ),
+    ];
+    for (name, (r, e)) in calls {
+        let (ok, d) = refused_with(r, e, libc::EPERM);
+        report(&format!("{name}_{who}"), ok, d);
+    }
+    // One's own: allowed.
+    let own_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) } as libc::c_long;
+    let (r, e) =
+        sys(|| unsafe { libc::syscall(libc::SYS_setpriority, libc::PRIO_PROCESS, 0, own_nice) });
+    report("setpriority_self", r == 0, format!("rc {r} errno {e}"));
 }
 
 static GOT_SIGUSR1: AtomicBool = AtomicBool::new(false);
@@ -767,6 +923,10 @@ pub fn run_confined(args: &[OsString]) -> i32 {
     let runner = a.write.join(runner_temp_name(std::process::id()));
     let _ = std::fs::write(&runner, b"runner\n");
     let mut c = Confinement::with_system(a.sockets);
+    if a.sockets == Sockets::KeepConnected {
+        // As an SP1 worker: all of `/proc` (its executor reads its runner child's entries).
+        c.allow("/proc", Rights::READ);
+    }
     c.allow(&a.write, Rights::WRITE);
     if let Some(exec) = &a.exec {
         c.allow(exec, Rights::EXEC);
@@ -940,6 +1100,36 @@ pub fn run_confined(args: &[OsString]) -> i32 {
             format!("{r:?}"),
         );
     }
+    // Without all of `/proc` (the inline workers but SP1's), another process's command line and
+    // status are out of reach too; this process's own entries are not.
+    if a.sockets == Sockets::None {
+        for f in ["cmdline", "status", "stat"] {
+            let r = try_open(Path::new(&format!("/proc/{parent}/{f}")), libc::O_RDONLY);
+            check(
+                &format!("proc_parent_{f}"),
+                r == Err(libc::EACCES),
+                format!("{r:?}"),
+            );
+        }
+        let r = try_open(Path::new("/proc/1/cmdline"), libc::O_RDONLY);
+        check(
+            "proc_init_cmdline",
+            r == Err(libc::EACCES),
+            format!("{r:?}"),
+        );
+    }
+    for f in [
+        "/proc/self/status",
+        "/proc/thread-self/stat",
+        "/proc/cpuinfo",
+    ] {
+        let r = try_open(Path::new(f), libc::O_RDONLY);
+        check(
+            &format!("read_{}", f.trim_start_matches('/').replace('/', "_")),
+            r.is_ok(),
+            format!("{r:?}"),
+        );
+    }
     // SAFETY: an invalid ptrace request; refused by the filter before the kernel looks.
     let rc = unsafe { libc::ptrace(libc::PTRACE_ATTACH, parent, 0, 0) };
     let e = errno();
@@ -949,6 +1139,7 @@ pub fn run_confined(args: &[OsString]) -> i32 {
         format!("errno {e}"),
     );
     signal_checks(parent, "parent", |n, ok, d| check(n, ok, d));
+    process_control_checks(parent, "parent", |n, ok, d| check(n, ok, d));
     // SAFETY: an io_uring setup with no params; refused by the filter.
     let rc = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1, std::ptr::null_mut::<u8>()) };
     let e = errno();
@@ -1039,6 +1230,8 @@ pub fn run_supervised_parent(args: &[OsString]) -> i32 {
         let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644));
     }
     let mut c = Confinement::with_system(Sockets::Supervised);
+    // As sp1-gpu-server: all of `/proc`.
+    c.allow("/proc", Rights::READ);
     c.allow(dir, Rights::MAKE_SOCK);
     c.allow(write, Rights::WRITE);
     c.allow(&exe, Rights::EXEC);
@@ -1247,6 +1440,7 @@ pub fn run_supervised_child(args: &[OsString]) -> i32 {
         format!("errno {e}"),
     );
     signal_checks(sup, "supervisor", &mut report);
+    process_control_checks(sup, "supervisor", &mut report);
     let r = try_open(Path::new(&format!("/proc/{sup}/environ")), libc::O_RDONLY);
     report(
         "proc_supervisor_environ",

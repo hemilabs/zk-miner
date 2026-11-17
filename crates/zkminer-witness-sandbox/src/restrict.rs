@@ -458,6 +458,11 @@ pub(crate) const PR_SET_PTRACER: libc::c_int = 0x5961_6d61;
 pub(crate) const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
 pub(crate) const FS_IOC32_SETFLAGS: u64 = 0x4004_6602;
 pub(crate) const FS_IOC_FSSETXATTR: u64 = 0x401c_5820;
+/// `FS_IOC_SETVERSION` / `FS_IOC32_SETVERSION`: an inode's generation number.
+pub(crate) const FS_IOC_SETVERSION: u64 = 0x4008_7602;
+pub(crate) const FS_IOC32_SETVERSION: u64 = 0x4004_7602;
+/// `FS_IOC_ENABLE_VERITY`: makes a file read-only for good, on fs-verity filesystems.
+pub(crate) const FS_IOC_ENABLE_VERITY: u64 = 0x4080_6685;
 /// `type & SOCK_TYPE_MASK` is the socket type; the bits above it are `SOCK_NONBLOCK`/`SOCK_CLOEXEC`.
 pub(crate) const SOCK_TYPE_MASK: u64 = 0xf;
 

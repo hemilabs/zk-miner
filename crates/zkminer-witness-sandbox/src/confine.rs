@@ -55,6 +55,12 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 static INSTALL: Mutex<()> = Mutex::new(());
 /// What [`confine_all_threads`] applied, once it succeeded.
 static REPORT: OnceLock<ConfinementReport> = OnceLock::new();
+/// The socket policy and granted paths [`confine_all_threads`] applied, for [`recheck`].
+static APPLIED: OnceLock<(Sockets, Vec<PathBuf>)> = OnceLock::new();
+
+/// The exit code of a confined process whose mount watch found a filesystem within reach that is
+/// not local ([`crate::localfs`]), mounted after it confined itself. 78 is `EX_CONFIG`.
+pub const EXIT_NOT_LOCAL: i32 = 78;
 
 /// What a confined process may do below one path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +134,7 @@ impl std::ops::BitOr for Rights {
 pub struct Confinement {
     sockets: Sockets,
     rules: Vec<(PathBuf, Rights)>,
+    thread_affinity: bool,
 }
 
 impl Confinement {
@@ -136,15 +143,21 @@ impl Confinement {
         Self {
             sockets,
             rules: Vec::new(),
+            thread_affinity: false,
         }
     }
 
-    /// `sockets`, with the host's system files readable ([`system_read_paths`]), the dynamic loader
-    /// executable ([`loader_paths`]), `/dev` listable and its harmless nodes (`null`, `zero`,
-    /// `full`, `random`, `urandom`) usable.
+    /// `sockets`, with the host's system files readable ([`system_read_paths`]) and the parts of
+    /// `/proc` GPU runtimes read ([`proc_read_paths`]: this process's own entries, not other
+    /// processes'), the dynamic loader executable ([`loader_paths`]), `/dev` listable and its
+    /// harmless nodes (`null`, `zero`, `full`, `random`, `urandom`) usable.
+    ///
+    /// `/proc/self` is resolved when the rules are applied, to the process that applies them: a
+    /// confinement built in one process for another ([`crate::supervise::run_supervised`]) must
+    /// grant what that one reads itself.
     pub fn with_system(sockets: Sockets) -> Self {
         let mut c = Self::new(sockets);
-        for p in system_read_paths() {
+        for p in system_read_paths().into_iter().chain(proc_read_paths()) {
             c.allow(p, Rights::READ);
         }
         for p in loader_paths() {
@@ -175,6 +188,17 @@ impl Confinement {
         for p in gpu_device_paths() {
             self.allow(p, Rights::DEVICE);
         }
+        self
+    }
+
+    /// `sched_setaffinity` of any thread, not only pid 0. ROCm's runtime starts its threads with a
+    /// CPU set (`pthread_attr_setaffinity_np`): glibc applies it from the creating thread by the
+    /// new thread's id, and `pthread_create` fails if that is refused. The seccomp filter cannot
+    /// tell this process's threads from another process of the user, so a process confined with
+    /// this can also pin another process of the user to some CPUs (scheduling only, nothing it can
+    /// reach or read).
+    pub fn allow_thread_affinity(&mut self) -> &mut Self {
+        self.thread_affinity = true;
         self
     }
 
@@ -310,6 +334,7 @@ pub fn confine_all_threads(c: &Confinement) -> Result<ConfinementReport, Sandbox
     let _install = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(report) = REPORT.get() {
         check_open_sockets(c.sockets)?;
+        localfs::check_local_filesystems(&c.granted_paths())?;
         return Ok(report.clone());
     }
     if INSTALLED.load(Ordering::Acquire) {
@@ -336,7 +361,12 @@ pub fn confine_all_threads(c: &Confinement) -> Result<ConfinementReport, Sandbox
     localfs::check_local_filesystems(&c.granted_paths())?;
     // Everything that allocates or opens a path happens before anything is applied.
     let ruleset = c.landlock_ruleset(tsync)?;
-    let filters = netdeny::filters(c.sockets)?;
+    let allowed: &[i64] = if c.thread_affinity {
+        &[libc::SYS_sched_setaffinity]
+    } else {
+        &[]
+    };
+    let filters = netdeny::filters(c.sockets, allowed)?;
 
     // SAFETY: plain prctl with valid arguments.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
@@ -368,8 +398,71 @@ pub fn confine_all_threads(c: &Confinement) -> Result<ConfinementReport, Sandbox
         kept_sockets: kept.iter().map(ToString::to_string).collect(),
         probes,
     };
+    let _ = APPLIED.set((c.sockets, c.granted_paths()));
+    watch_mounts(c.granted_paths())?;
     let _ = REPORT.set(report.clone());
     Ok(report)
+}
+
+/// Before each guest, in a process [`confine_all_threads`] confined: no socket open that the
+/// policy does not allow, and no filesystem within reach that is not local, again: something may
+/// have been mounted since. An error means the guest must not run.
+pub fn recheck() -> Result<(), SandboxError> {
+    let Some((sockets, granted)) = APPLIED.get() else {
+        return Err(SandboxError::InvalidArgument(
+            "this process has not confined itself".into(),
+        ));
+    };
+    check_open_sockets(*sockets)?;
+    localfs::check_local_filesystems(granted)?;
+    Ok(())
+}
+
+/// Watches this process's mount table (`/proc/self/mountinfo` signals every change with
+/// `POLLPRI`) from a thread of its own, and on each change checks the filesystems within reach
+/// again ([`crate::localfs`]); the process exits with [`EXIT_NOT_LOCAL`] if one is no longer local,
+/// whatever it is doing. A change that leaves everything local (a container started, a disk
+/// mounted) changes nothing.
+fn watch_mounts(granted: Vec<PathBuf>) -> Result<(), SandboxError> {
+    use std::io::{Read, Seek};
+    let mut table = std::fs::File::open("/proc/self/mountinfo")?;
+    let mut sink = Vec::new();
+    table.read_to_end(&mut sink)?;
+    std::thread::Builder::new()
+        .name("zkminer-mounts".into())
+        .spawn(move || {
+            use std::os::unix::io::AsRawFd;
+            loop {
+                let mut pfd = libc::pollfd {
+                    fd: table.as_raw_fd(),
+                    events: libc::POLLPRI,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd.
+                let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+                if rc < 0 && errno() == Some(libc::EINTR) {
+                    continue;
+                }
+                // Reading the table again from the start acknowledges the change.
+                sink.clear();
+                let reread = table.rewind().and_then(|()| table.read_to_end(&mut sink));
+                let verdict = match (rc, reread) {
+                    (rc, _) if rc < 0 => Err(format!("poll: {}", std::io::Error::last_os_error())),
+                    (_, Err(e)) => Err(format!("reading the mount table: {e}")),
+                    _ => localfs::check_local_filesystems(&granted)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                };
+                if let Err(e) = verdict {
+                    eprintln!(
+                        "zkminer: the mount table changed under a confined process: {e}; exiting"
+                    );
+                    // SAFETY: _exit is always safe; nothing of this process may run on.
+                    unsafe { libc::_exit(EXIT_NOT_LOCAL) };
+                }
+            }
+        })?;
+    Ok(())
 }
 
 /// Whether this process has applied (any part of) a confinement: it may no longer reach a network,
@@ -505,9 +598,35 @@ fn verify(c: &Confinement) -> Result<Vec<&'static str>, SandboxError> {
     Ok(passed)
 }
 
+/// The parts of `/proc` a confined process reads: its own entries (`/proc/self`, which a rule
+/// resolves to this process's `/proc/<pid>`, its threads' included) and the host-wide files GPU
+/// runtimes read (`cpuinfo`, `meminfo`, `stat`, `uptime`, `loadavg`, `version`, `devices`, the
+/// drivers' `driver` directory, `sys/vm/mmap_min_addr`, `sys/vm/overcommit_memory`). Not other
+/// processes' entries: their command lines and status would be a channel between confined
+/// processes, and they show the host's command lines. Those that exist.
+pub fn proc_read_paths() -> Vec<PathBuf> {
+    [
+        "/proc/self",
+        "/proc/cpuinfo",
+        "/proc/meminfo",
+        "/proc/stat",
+        "/proc/uptime",
+        "/proc/loadavg",
+        "/proc/version",
+        "/proc/devices",
+        "/proc/driver",
+        "/proc/sys/vm/mmap_min_addr",
+        "/proc/sys/vm/overcommit_memory",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .filter(|p| p.exists())
+    .collect()
+}
+
 /// The host's system files, readable by every confined process: `/usr`, `/etc`, `/opt`, the `lib`
-/// and `bin` directories, `/sys`, `/proc` (other processes' sensitive entries are guarded by
-/// Landlock's ptrace scoping) and udev's device database. Those that exist.
+/// and `bin` directories, `/sys` and udev's device database (`/proc` is [`proc_read_paths`]).
+/// Those that exist.
 pub fn system_read_paths() -> Vec<PathBuf> {
     [
         "/usr",
@@ -520,7 +639,6 @@ pub fn system_read_paths() -> Vec<PathBuf> {
         "/bin",
         "/sbin",
         "/sys",
-        "/proc",
         "/run/udev",
     ]
     .iter()

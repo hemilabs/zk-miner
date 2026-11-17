@@ -52,6 +52,14 @@
 //! executable. Links, renames, removals, directories, symlinks and truncation are Landlock's to
 //! refuse outside the writable paths.
 //!
+//! Every policy also refuses the ioctl forms of metadata writes (`FS_IOC_SETFLAGS`,
+//! `FS_IOC_FSSETXATTR`, `FS_IOC_SETVERSION`, their 32-bit twins, `FS_IOC_ENABLE_VERITY`), leaving
+//! its session or process group (`setsid`, `setpgid`: the miner ends a worker with everything it
+//! started by killing the worker's process group), and changing another process's limits,
+//! priority, I/O priority or scheduling (`prlimit64` with a new limit, `setpriority`,
+//! `ioprio_set`, `sched_setaffinity`, `sched_setscheduler`, `sched_setparam`, `sched_setattr`,
+//! unless aimed at the caller itself).
+//!
 //! The filters are installed with `SECCOMP_FILTER_FLAG_TSYNC` after `NO_NEW_PRIVS`: every thread
 //! the process has, and every thread and process it creates afterwards (across `exec` too),
 //! carries them.
@@ -65,8 +73,9 @@ use seccompiler::{
 };
 
 use crate::restrict::{
-    PR_SET_PTRACER, SOCK_TYPE_MASK, SYS_FILE_SETATTR, SYS_OPEN_TREE_ATTR, SYS_REMOVEXATTRAT,
-    SYS_SETXATTRAT,
+    FS_IOC32_SETFLAGS, FS_IOC32_SETVERSION, FS_IOC_ENABLE_VERITY, FS_IOC_FSSETXATTR,
+    FS_IOC_SETFLAGS, FS_IOC_SETVERSION, PR_SET_PTRACER, SOCK_TYPE_MASK, SYS_FILE_SETATTR,
+    SYS_OPEN_TREE_ATTR, SYS_REMOVEXATTRAT, SYS_SETXATTRAT,
 };
 use crate::SandboxError;
 
@@ -134,6 +143,10 @@ fn always_denied() -> Vec<(&'static str, i64)> {
         ("open_tree", SYS_open_tree),
         ("open_tree_attr", SYS_OPEN_TREE_ATTR),
         ("mount_setattr", SYS_mount_setattr),
+        // Its own session or process group: the miner ends a worker and everything it started
+        // by killing the worker's process group, which a process that left it would outlive.
+        ("setsid", SYS_setsid),
+        ("setpgid", SYS_setpgid),
         // Kernel surface no worker needs.
         ("userfaultfd", SYS_userfaultfd),
         ("perf_event_open", SYS_perf_event_open),
@@ -269,8 +282,55 @@ fn conditional_denials(sockets: Sockets) -> Result<Vec<(i64, Vec<SeccompRule>)>,
                 // Keystrokes into a terminal the process inherited (a worker run by hand).
                 rule(vec![cond(1, Eq, libc::TIOCSTI)?])?,
                 rule(vec![cond(1, Eq, libc::TIOCLINUX)?])?,
+                // The ioctl forms of metadata writes: inode flags (`chattr`), extended inode
+                // attributes (`file_setattr`), the generation number, fs-verity.
+                rule(vec![cond(1, Eq, FS_IOC_SETFLAGS)?])?,
+                rule(vec![cond(1, Eq, FS_IOC32_SETFLAGS)?])?,
+                rule(vec![cond(1, Eq, FS_IOC_FSSETXATTR)?])?,
+                rule(vec![cond(1, Eq, FS_IOC_SETVERSION)?])?,
+                rule(vec![cond(1, Eq, FS_IOC32_SETVERSION)?])?,
+                rule(vec![cond(1, Eq, FS_IOC_ENABLE_VERITY)?])?,
             ],
         ),
+        // Another process's limits, priority or scheduling: those of the same uid (the miner,
+        // other workers) would otherwise be open to change (a CPU-time limit kills). Reading
+        // limits (`prlimit64` with no new limit) stays; so does all of it for the caller itself
+        // (pid 0, `PRIO_PROCESS`/`IOPRIO_WHO_PROCESS` with who 0). `PRIO_PGRP`, `PRIO_USER` and
+        // their I/O twins are refused even with who 0: they reach the group or every process of
+        // the uid.
+        (
+            libc::SYS_prlimit64,
+            vec![rule(vec![
+                cond(0, Ne, 0)?,
+                SeccompCondition::new(2, SeccompCmpArgLen::Qword, Ne, 0)
+                    .map_err(|e| SandboxError::Seccomp(e.to_string()))?,
+            ])?],
+        ),
+        (
+            libc::SYS_setpriority,
+            vec![
+                rule(vec![cond(0, Ne, libc::PRIO_PROCESS as u64)?])?,
+                rule(vec![cond(1, Ne, 0)?])?,
+            ],
+        ),
+        (
+            libc::SYS_ioprio_set,
+            vec![
+                // IOPRIO_WHO_PROCESS
+                rule(vec![cond(0, Ne, 1)?])?,
+                rule(vec![cond(1, Ne, 0)?])?,
+            ],
+        ),
+        (
+            libc::SYS_sched_setaffinity,
+            vec![rule(vec![cond(0, Ne, 0)?])?],
+        ),
+        (
+            libc::SYS_sched_setscheduler,
+            vec![rule(vec![cond(0, Ne, 0)?])?],
+        ),
+        (libc::SYS_sched_setparam, vec![rule(vec![cond(0, Ne, 0)?])?]),
+        (libc::SYS_sched_setattr, vec![rule(vec![cond(0, Ne, 0)?])?]),
         (
             libc::SYS_prctl,
             vec![rule(vec![cond(0, Eq, PR_SET_PTRACER as u64)?])?],
@@ -333,7 +393,10 @@ fn denylist(sockets: Sockets, except: &[i64]) -> Result<BpfProgram, SandboxError
         // An empty rule list matches whatever the arguments.
         rules.insert(nr, Vec::new());
     }
-    for (nr, conds) in conditional_denials(sockets)? {
+    for (nr, conds) in conditional_denials(sockets)?
+        .into_iter()
+        .filter(|(nr, _)| !except.contains(nr))
+    {
         if rules.insert(nr, conds).is_some() {
             return Err(SandboxError::Seccomp(format!(
                 "syscall {nr} both denied and filtered"
@@ -443,9 +506,10 @@ pub(crate) fn notify_filter() -> BpfProgram {
 }
 
 /// The filters for `sockets`, in the order they are installed (the notifying filter of
-/// [`Sockets::Supervised`] is not among them: [`crate::supervise`] installs it itself).
-pub(crate) fn filters(sockets: Sockets) -> Result<Vec<BpfProgram>, SandboxError> {
-    Ok(vec![raw_filter(), denylist(sockets, &[])?])
+/// [`Sockets::Supervised`] is not among them: [`crate::supervise`] installs it itself), the
+/// denylist's rules for the syscalls in `allowed` left out.
+pub(crate) fn filters(sockets: Sockets, allowed: &[i64]) -> Result<Vec<BpfProgram>, SandboxError> {
+    Ok(vec![raw_filter(), denylist(sockets, allowed)?])
 }
 
 /// The supervisor's own filters: those of [`Sockets::None`], but with `fchmod`, which it uses to
@@ -720,7 +784,7 @@ pub(crate) mod tests {
     pub(crate) const ARCH: u32 = 183 | 0x8000_0000 | 0x4000_0000;
 
     fn all(sockets: Sockets) -> Vec<BpfProgram> {
-        let mut f = filters(sockets).unwrap();
+        let mut f = filters(sockets, &[]).unwrap();
         if sockets == Sockets::Supervised {
             f.push(notify_filter());
         }
@@ -1108,6 +1172,100 @@ pub(crate) mod tests {
         }
         assert_eq!(verdict(SYS_socket), RET_EPERM);
         assert_eq!(verdict(SYS_unshare), RET_EPERM);
+    }
+
+    #[test]
+    fn no_session_no_other_process_s_limits_scheduling_or_inode_flags() {
+        use libc::*;
+        let me = 0u64;
+        let other = 4242u64;
+        let ptr = 0x7f00_0000_1000u64;
+        for policy in POLICIES {
+            let c = |nr, args| call(policy, nr, args);
+            for nr in [SYS_setsid, SYS_setpgid] {
+                assert_eq!(c(nr, [0; 6]), RET_EPERM, "{policy:?} {nr}");
+            }
+            // prlimit64: reading anyone's, or setting one's own, stays.
+            assert_eq!(c(SYS_prlimit64, [me, 7, ptr, 0, 0, 0]), RET_ALLOW);
+            assert_eq!(c(SYS_prlimit64, [other, 7, 0, ptr, 0, 0]), RET_ALLOW);
+            assert_eq!(c(SYS_prlimit64, [other, 7, ptr, 0, 0, 0]), RET_EPERM);
+            assert_eq!(c(SYS_prlimit64, [other, 0, ptr, ptr, 0, 0]), RET_EPERM);
+            // The upper half of a pointer counts.
+            assert_eq!(
+                c(SYS_prlimit64, [other, 7, 0x7f00_0000_0000, 0, 0, 0]),
+                RET_EPERM
+            );
+            // setpriority / ioprio_set: only the caller itself.
+            let (process, pgrp, user) = (PRIO_PROCESS as u64, PRIO_PGRP as u64, PRIO_USER as u64);
+            assert_eq!(c(SYS_setpriority, [process, me, 10, 0, 0, 0]), RET_ALLOW);
+            for args in [
+                [process, other, 10, 0, 0, 0],
+                [pgrp, me, 10, 0, 0, 0],
+                [user, me, 10, 0, 0, 0],
+                [user, 1000, 10, 0, 0, 0],
+            ] {
+                assert_eq!(c(SYS_setpriority, args), RET_EPERM, "{args:?}");
+            }
+            assert_eq!(c(SYS_ioprio_set, [1, me, 0x4004, 0, 0, 0]), RET_ALLOW);
+            for args in [
+                [1, other, 0x4004, 0, 0, 0],
+                [2, me, 0x4004, 0, 0, 0],
+                [3, me, 0x4004, 0, 0, 0],
+            ] {
+                assert_eq!(c(SYS_ioprio_set, args), RET_EPERM, "{args:?}");
+            }
+            for nr in [
+                SYS_sched_setaffinity,
+                SYS_sched_setscheduler,
+                SYS_sched_setparam,
+                SYS_sched_setattr,
+            ] {
+                assert_eq!(c(nr, [me, 8, ptr, 0, 0, 0]), RET_ALLOW, "{nr} self");
+                assert_eq!(c(nr, [other, 8, ptr, 0, 0, 0]), RET_EPERM, "{nr} other");
+            }
+            // Reading them stays.
+            for nr in [SYS_getpriority, SYS_sched_getaffinity, SYS_ioprio_get] {
+                assert_eq!(c(nr, [1, other, ptr, 0, 0, 0]), RET_ALLOW, "{nr}");
+            }
+            // Inode flags and the like through ioctl, never.
+            for cmd in [
+                FS_IOC_SETFLAGS,
+                FS_IOC32_SETFLAGS,
+                FS_IOC_FSSETXATTR,
+                FS_IOC_SETVERSION,
+                FS_IOC32_SETVERSION,
+                FS_IOC_ENABLE_VERITY,
+            ] {
+                assert_eq!(c(SYS_ioctl, [3, cmd, ptr, 0, 0, 0]), RET_EPERM, "{cmd:#x}");
+            }
+            // FS_IOC_GETFLAGS (and a GPU driver's ioctls) stay.
+            assert_eq!(c(SYS_ioctl, [3, 0x8008_6601, ptr, 0, 0, 0]), RET_ALLOW);
+            assert_eq!(c(SYS_ioctl, [3, 0xc020_4602, ptr, 0, 0, 0]), RET_ALLOW);
+        }
+    }
+
+    /// `Confinement::allow_thread_affinity` leaves out only the `sched_setaffinity` rule.
+    #[test]
+    fn thread_affinity_can_be_allowed_alone() {
+        use libc::*;
+        let (me, other, ptr) = (0u64, 4242u64, 0x7f00_0000_1000u64);
+        let f = filters(Sockets::None, &[SYS_sched_setaffinity]).unwrap();
+        let c = |nr, args| verdict_of(&f, &seccomp_data(ARCH, nr, args));
+        assert_eq!(
+            c(SYS_sched_setaffinity, [other, 8, ptr, 0, 0, 0]),
+            RET_ALLOW
+        );
+        assert_eq!(c(SYS_sched_setaffinity, [me, 8, ptr, 0, 0, 0]), RET_ALLOW);
+        for nr in [
+            SYS_sched_setscheduler,
+            SYS_sched_setparam,
+            SYS_sched_setattr,
+        ] {
+            assert_eq!(c(nr, [other, 8, ptr, 0, 0, 0]), RET_EPERM, "{nr}");
+        }
+        assert_eq!(c(SYS_prlimit64, [other, 7, ptr, 0, 0, 0]), RET_EPERM);
+        assert_eq!(c(SYS_setsid, [0; 6]), RET_EPERM);
+        assert_eq!(c(SYS_socket, [AF_INET as u64, 1, 0, 0, 0, 0]), RET_EPERM);
     }
 
     #[test]

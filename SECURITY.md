@@ -298,7 +298,14 @@ executor:
   keeps that one connection. A socket left open from before that the policy does not allow fails
   the confinement.
 - **Files (Landlock).** Read the system's files (`/usr`, `/etc`, `/opt`, the `lib`/`bin`
-  directories, `/sys`, `/proc`), the worker's own directory, `LD_LIBRARY_PATH`, and what the
+  directories, `/sys`), of `/proc` only the process's own entries (`/proc/self`, its threads
+  included) and the host-wide files GPU runtimes read (`cpuinfo`, `meminfo`, `stat`, `uptime`,
+  `loadavg`, `version`, `devices`, `driver`, two `sys/vm` values) — traced, that is all the CUDA,
+  ROCm and Intel workers read once confined — so another process's command line, status or
+  anything else under `/proc/<pid>` is out of reach. The SP1 worker and its server keep all of
+  `/proc`: the executor's memory monitor reads its runner child's `/proc/<pid>/{stat,statm,io,exe}`
+  and the worker its server's `/proc/<pid>/stat`, at pids no rule can name ahead. Read also the
+  worker's own directory, `LD_LIBRARY_PATH`, and what the
   backend proves with (`~/.risc0` or `RISC0_HOME`, `~/.sp1`); for witness proofs, the retention
   store (read) and the segment directories (write). Write only a private temporary directory
   (`TMPDIR`, made per worker, mode 0700), the GPU caches the build needs (risc0's CUDA Groth16
@@ -325,30 +332,30 @@ executor:
   its source. The exceptions:
   - another user's FUSE mount without `allow_other`: the kernel refuses this user's lookups before
     the daemon sees them (a `statx` of its root must fail to confirm it);
-  - FUSE filesystems whose daemon serves only what is on this host, by construction, each
-    recognised by its subtype together with its owner (only root or this user can mount one under
-    their own id) and its source: xdg-document-portal (`fuse.portal`, this user's, at
-    `/run/user/<uid>/doc`: the documents the user handed to sandboxed apps, by id — a name it
-    does not know it answers itself, and the documents are the user's own files, whose
-    filesystems are judged in their own right); lxcfs (`fuse.lxcfs`, root's: containers' views of
-    `/proc` and `/sys` computed from this kernel's data); a FUSE driver of a block device
-    (`fuseblk`, whose source must be a block device: ntfs-3g, exfat-fuse; only root mounts one);
-    squashfuse (`fuse.squashfuse`, `fuse.squashfuse_ll`, this user's or root's: a read-only image
-    file) and an AppImage this user runs (its runtime mounts the image embedded in the file as
-    `fuse.<file name>` at `<tmp>/.mount_*`). Every FUSE filesystem that can stand for a remote
-    stays refused — gvfs (`gvfsd-fuse`), sshfs, rclone, s3fs, davfs, smbnetfs, curlftpfs, and the
-    encrypted views of a directory that may itself be remote (gocryptfs, encfs) — and so does any
-    other subtype;
+  - two FUSE filesystems that only root can mount and that serve only what is on this host: lxcfs
+    (`fuse.lxcfs`, root's, source `lxcfs`: containers' views of `/proc` and `/sys` computed from
+    this kernel's data) and a FUSE driver of a block device (`fuseblk`, root's, whose source must
+    be a block device: ntfs-3g, exfat-fuse; the kernel opens the device and `fusermount3` refuses
+    `blkdev` to users). Every FUSE mount of an unprivileged user is refused whatever its subtype
+    and source, since its program chooses both (`fusermount3 -o subtype=,fsname=`): an rclone
+    mount named like an AppImage is still an rclone mount. So the document portal (`fuse.portal`),
+    squashfuse and AppImage mounts of the user refuse guests too — gvfs, sshfs, rclone, s3fs,
+    davfs, smbnetfs, curlftpfs, gocryptfs and encfs as before;
   - a direct automount point whose target is local (systemd's for `binfmt_misc` or the EFI
     partition; an idle one is triggered once to see what it mounts).
 
   9p and virtiofs (a VM host's shares, WSL's drives) are refused: they carry lookups to another
   machine. On such a host, unmount the shares (WSL: `[automount] enabled = false` in
-  `/etc/wsl.conf`) or run the miner in a mount namespace or container without them. A GNOME
-  session's gvfs mount is refused too: run the miner as a dedicated user (another user's FUSE
-  mount without `allow_other` is closed to it), or without gvfs's FUSE bridge. The check runs again
-  once the confinement is on, and the builder runner, the execute worker and the broker make it
-  too, before their sandbox is applied (the broker's paths by `statfs` as well).
+  `/etc/wsl.conf`) or run the miner in a mount namespace or container without them. A desktop
+  session's FUSE mounts (gvfs, the document portal, AppImages) are refused too: run the miner as a
+  dedicated user (another user's FUSE mount without `allow_other` is closed to it). The check runs again
+  once the confinement is on and before every command that runs a guest, and a thread of each
+  confined worker watches its mount table (`/proc/self/mountinfo`, which signals every change) and
+  checks again on each change: the worker exits (status 78) as soon as a filesystem that is not
+  local comes within reach, whatever it is doing; `sp1-gpu-server`'s supervisor does the same for
+  the server and kills it. A change that leaves everything local (a container started, a disk
+  mounted) changes nothing. The builder runner, the execute worker and the broker make the check
+  before their sandbox is applied (the broker's paths by `statfs` as well).
 - **Other processes.** Landlock's signal and abstract-socket scoping, and its `ptrace` rules: a
   confined process cannot signal, trace or open `/proc/<pid>/mem`, `environ`, `maps` or `fd` of a
   process outside its domain (the miner, other workers, their servers): `kill`, `tgkill`,
@@ -363,14 +370,44 @@ executor:
   `lremovexattr`, `fremovexattr`, `removexattrat`, `utime`, `utimes`, `futimesat`, `utimensat`
   (with a path or without) and `file_setattr`. Traced, the CUDA, ROCm and Intel workers make none
   of these calls, kernel caches cold or warm included. SP1's executor unpacks a runner into the
-  private temporary directory and makes it executable with `chmod`: the worker does that before it
-  confines itself (it executes its own embedded test program once), and the server's mode changes
+  private temporary directory and makes it executable with `chmod`: the worker puts its runner
+  there itself before it confines itself, without running anything — it finds the runner in its own
+  executable (the one ELF image of the machine whose SHA-256, the name the SDK gives the file, the
+  executable also holds), writes it (mode `0755`), and the executor then finds exactly its bytes in
+  place and changes nothing; nothing executes before the confinement. The server's mode changes
   go to its supervisor, which makes the runner files in that directory executable itself — a
   regular file named as SP1 names it, opened without following a link, owned by the user, with a
   single link, in a directory closed to others — and refuses every other mode change. It decides
   on the call's registers (the syscall and the mode `0755`), never on the server's memory, and the
   kernel never runs the server's own call. Links, renames, removals, new directories and symlinks,
   and truncation outside the writable paths are Landlock's to refuse.
+- **Process control.** A confined process cannot leave its session or process group (`setsid`,
+  `setpgid`: where a worker has no cgroup of its own, the miner ends it and everything it started
+  by killing its process group), nor change another process's limits, priority, I/O priority or scheduling
+  (`prlimit64` with a new limit, `setpriority`, `ioprio_set`, `sched_setaffinity`,
+  `sched_setscheduler`, `sched_setparam`, `sched_setattr`; `PRIO_PGRP`, `PRIO_USER` and their I/O
+  twins too), which Landlock does not scope: a CPU-time limit set on the miner would kill it. Its
+  own stay open (pid 0). One exception: the ROCm worker may set the CPU affinity of any thread
+  (`sched_setaffinity`), because ROCm starts its threads with a CPU set, which glibc applies by the
+  new thread's id (refused, `pthread_create` fails and the runtime aborts), and the filter cannot
+  tell its own threads from another process of the user; an escaped guest there could pin another
+  process of the user to some CPUs. The ioctl forms of metadata writes (`FS_IOC_SETFLAGS`,
+  `FS_IOC_FSSETXATTR`, `FS_IOC_SETVERSION`, their 32-bit twins, `FS_IOC_ENABLE_VERITY`) are
+  refused like the rest.
+- **Ending.** Nothing a worker started outlives it. Where the miner runs in a cgroup delegated to
+  it (as witness jobs need: a systemd service with `Delegate=yes`, or
+  `systemd-run --user --scope -p Delegate=yes`), each worker starts in a cgroup of its own below
+  it (`zkminer-worker-<miner pid>-<n>`), joined before `exec`, with the worker's memory ceiling as
+  its `memory.max`. Elsewhere the user's systemd manager adopts the worker into a transient scope,
+  and the miner sends it nothing (so no guest runs in it) until the scope holds it. Every end of a
+  worker (a recycle, a timeout, a kill, its death, shutdown) writes that cgroup's `cgroup.kill`,
+  which reaches every process in it whatever its process group or session. If the miner dies,
+  however abruptly (SIGKILL, the OOM killer), a reaper it started with its first worker
+  (`/bin/sh` in a session of its own, reading a pipe only the miner writes) sees the pipe end and
+  kills every worker's cgroup and process group; no worker starts without it. A thread of the
+  miner, outside every confinement, watches the mount table and kills every worker when a mount
+  they could reach is not local, within microseconds of seeing the change; the workers that
+  replace them refuse guests until it is gone.
 - **Kernel surface.** No namespaces and no mounts: seccomp denies `unshare`, `setns`, `clone` with
   any `CLONE_NEW*` flag, `mount`, `umount2`, `pivot_root`, `chroot` and the new mount API
   (`fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `open_tree_attr`,
@@ -403,6 +440,11 @@ executor:
   BN254's scalar field for a digest) — and writes the prover's input from the numbers it checked.
   Anything else, or anything larger than such an input, is refused before Docker runs; a request
   that makes the helper fail is answered as an error and the helper serves the next one. The
+  helper works below the temporary directory the worker was started with (its own private
+  directory there, mode 0700), never below the worker's own `TMPDIR`, which the confined worker may
+  write, so nothing the worker runs can change an input after the helper checked it. The container
+  sees its input read-only (`/mnt`), may write only the proof file bound over `/mnt/proof.json`,
+  and the helper reads that back as a regular file without following a link. The
   prover image is pinned by digest
   (`risczero/risc0-groth16-prover@sha256:e8c2068fb34bbc41447255aa980a89cbb7d6e5a80c0d66041264431f2a955e47`,
   the tag the pinned `risc0-groth16` runs) and runs with `--network none`. The supported GPU paths
@@ -607,22 +649,41 @@ no second one):
   checked by the guard: requesters cannot change them, and a local chain node is a normal
   setup.
 - **What an escaped guest in an inline worker can still do.** It cannot open a socket or connect
-  anywhere, make a namespace, mount anything or change a file's metadata, but it keeps what the
-  GPU stack needs: the GPU device nodes and their ioctls (a kernel driver bug is outside this
-  model), reading the system's files and `/proc` (other processes' command lines and status, not
-  their memory or environment), and writing the caches listed above, which other GPU programs of
-  the same user also load (a confined worker could poison an Intel kernel cache or risc0's CUDA
-  Groth16 cache for them). An SP1 worker and its server can read and write any POSIX shared
-  memory object and semaphore of the uid in `/dev/shm` (SP1's executor needs it), the shared
-  memory of unconfined programs of the same user included. A witness proof's worker can read
-  every bundle in the retention store, other requesters' included. Its results go back to the
-  miner over its pipe, and a guest controls its journal, so anything it can read it can publish:
-  keep secrets out of the readable paths.
-- **Filesystems mounted later, or remote underneath.** The check of the filesystems within reach
-  runs when a process confines itself, and the process stays confined for the rest of its life. A
-  network or FUSE filesystem mounted after that (by the operator, by a desktop session, a direct
-  automount whose target changed) is within reach of the workers already running until they are
-  restarted: mount nothing of the kind while the miner runs. Filesystems are judged by their own
+  anywhere, make a namespace, mount anything or change a file's metadata, but it keeps what the GPU
+  stack needs: the GPU device nodes and their ioctls (a kernel driver bug is outside this model),
+  reading the system's files and its own `/proc` entries (an SP1 worker or server all of `/proc`:
+  other processes' command lines and status, not their memory or environment), and writing the
+  caches listed above, which other GPU programs of the same user also load (a confined worker could
+  poison an Intel kernel cache or risc0's CUDA Groth16 cache for them). An SP1 worker, its
+  executor's runner and its server can read, write, create and remove anything of the uid in
+  `/dev/shm`, pending a change to SP1's executor (the grant goes when that lands). SP1 needs it for
+  the named shared memory between its executor and the runner child (`/<id>_m` for the guest's
+  memory, `/<id>_t` for the trace, the `_filled` and `_empty` semaphores), and the server for its
+  Groth16 files (the GPU proving key cache, about 9 GB, each proof's witness directory, the
+  host-wide Groth16 queue). So a guest that escaped in one SP1 process can read or change the guest
+  memory and traces of another SP1 proof running at the same time (its result or its failure, not
+  the network), the server's Groth16 files, and whatever other programs of the same user keep there:
+  ROCm SMI's process-shared mutexes (`rocm_smi_renderD*`, mode 0777, which `rocm-smi`, `amd-smi` and
+  other ROCm SMI users lock, so they can be made to hang; the miner's own `rocm-smi` query at
+  discovery is bounded by a timeout), other programs' shared memory and semaphores (browsers,
+  PulseAudio and PipeWire, Python `multiprocessing`). Run SP1 under a user that runs nothing else. A
+  witness proof's worker can read every bundle in the retention store, other requesters' included.
+  Its results go back to the miner over its pipe, and a guest controls its journal, so anything it
+  can read it can publish: keep secrets out of the readable paths.
+- **Workers without a cgroup of their own.** With neither a delegated cgroup nor a systemd user
+  manager (a container without systemd, another init), the miner logs that a worker is in no cgroup
+  of its own, and the worker and what it starts end by process group, which a confined process
+  cannot leave (the reaper kills that group too). A scope adopts its worker after `exec`: what the
+  worker itself starts before the scope holds it (before its first command, so nothing a guest
+  started) stays outside the scope and ends by process group.
+- **Filesystems mounted later, or remote underneath.** A network or FUSE filesystem mounted while
+  workers run ends every worker and everything they started (the miner's mount watch; each
+  confined process also watches its own table) and refuses every later guest, but a guest that
+  already escaped its executor has the moment between the mount and the kill (the kernel's
+  notification, then microseconds) to look a name up on it: mount nothing of the kind while the
+  miner runs. A builder runner, an execute worker or the broker
+  checks only when it starts (each runs briefly per job, the broker for as long as the miner).
+  Filesystems are judged by their own
   type, so storage that is remote underneath a local type is not seen: a block device on iSCSI,
   NBD, Ceph RBD or a file on NFS holding an `ext4` (a cloud VM's network disk included: such I/O
   carries no name the process chose), or an `overlay`/`ecryptfs` with a layer on a network
