@@ -19,6 +19,7 @@ members = [
     "crates/zkminer-prove-risc0",
     "crates/zkminer-prove-sp1",
     "crates/zkminer-e2e",
+    "reference/eth-prelude",
 ]
 default-members = [
     "crates/zkminer-witness",
@@ -36,6 +37,7 @@ default-members = [
     "crates/zkminer-tui",
     "crates/zkminer-config",
     "crates/zkminer-cli",
+    "reference/eth-prelude",
 ]
 exclude = [
     "crates/zkminer-prover/guests",
