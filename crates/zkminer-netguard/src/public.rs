@@ -62,18 +62,22 @@ use std::time::{Duration, Instant};
 
 use crate::ip::Prefix;
 
-/// How long one reflector query may take.
-pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long one reflector query may take (the HTTPS one, on a slow link, a few round trips).
+pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Once one reflector of a family has answered, how much longer the others get (within
 /// [`DISCOVERY_TIMEOUT`]).
 pub const AGREEMENT_GRACE: Duration = Duration::from_millis(500);
 /// How long a call waits for a first discovery another thread is running.
-pub const FIRST_DISCOVERY_WAIT: Duration = Duration::from_secs(3);
+pub const FIRST_DISCOVERY_WAIT: Duration = Duration::from_secs(4);
 /// How long learned public addresses are trusted before they are learned again.
 pub const DISCOVERY_TTL: Duration = Duration::from_secs(300);
 /// How soon a failed discovery is tried again (a family whose address is unknown refuses every
 /// connection meanwhile).
 pub const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(15);
+/// How long a confirmed public address counts as known without being confirmed again: two
+/// discovery rounds. A family whose address no round has confirmed for this long is unknown again
+/// (its connections refused) until one does.
+pub const CONFIRMATION_LIFETIME: Duration = Duration::from_secs(600);
 /// Most NAT64 prefixes the IPv4 reflectors are asked through.
 const MAX_NAT64_PREFIXES: usize = 2;
 
@@ -147,6 +151,12 @@ struct FamilyAnswer {
 #[derive(Debug)]
 struct State {
     families: [FamilyAnswer; 2],
+    /// Per family: when its answer was last confirmed (see [`CONFIRMATION_LIFETIME`]).
+    confirmed_at: [Option<Instant>; 2],
+    /// Per family: the uplink its answer was learned on ([`learned_on`]).
+    uplink_of: [Option<u64>; 2],
+    /// The uplink the latest caller of [`learned_on`] is on.
+    uplink: Option<u64>,
     learned_at: Option<Instant>,
     attempted_at: Option<Instant>,
     running: bool,
@@ -169,6 +179,9 @@ static STATE: Mutex<State> = Mutex::new(State {
             via_nat64: Vec::new(),
         },
     ],
+    confirmed_at: [None, None],
+    uplink_of: [None, None],
+    uplink: None,
     learned_at: None,
     attempted_at: None,
     running: false,
@@ -190,15 +203,52 @@ pub fn public_addresses() -> Vec<IpAddr> {
 }
 
 /// This host's public addresses and the confirmed ones among them, from the process-wide cache;
-/// see the module doc for when this blocks and when it refreshes.
+/// see the module doc for when this blocks and when it refreshes. A confirmation older than
+/// [`CONFIRMATION_LIFETIME`] no longer counts.
 pub fn learned() -> Learned {
+    learned_inner(None)
+}
+
+/// [`learned`] for a host on uplink `uplink` (a value that changes with its default routes:
+/// [`crate::HostFacts`] computes it). When the uplink changes, discovery runs again at once, and
+/// until it has, nothing learned on another uplink counts as confirmed: a new default gateway or a
+/// VPN that came up can mean a new public address.
+pub fn learned_on(uplink: u64) -> Learned {
+    learned_inner(Some(uplink))
+}
+
+fn spawn_discovery(s: &mut State) {
+    s.running = true;
+    s.attempted_at = Some(Instant::now());
+    let uplink = s.uplink;
+    let spawned = std::thread::Builder::new()
+        .name("netguard-public-addr".into())
+        .spawn(move || learn(discover(), uplink));
+    if spawned.is_err() {
+        s.running = false;
+    }
+}
+
+fn learned_inner(uplink: Option<u64>) -> Learned {
     let mut s = state();
+    let changed = uplink.is_some() && uplink != s.uplink && s.uplink.is_some();
+    if uplink.is_some() {
+        if s.uplink.is_none() {
+            // The first caller to name the uplink: what was learned before (by a caller that
+            // named none) was learned on it, as far as anyone can tell.
+            for u in s.uplink_of.iter_mut().filter(|u| u.is_none()) {
+                *u = uplink;
+            }
+        }
+        s.uplink = uplink;
+    }
     if s.attempted_at.is_none() && !s.running {
         // The first call: discover on this thread.
         s.running = true;
         s.attempted_at = Some(Instant::now());
+        let uplink = s.uplink;
         drop(s);
-        learn(discover());
+        learn(discover(), uplink);
         s = state();
     } else if !s.first_done {
         // Review r2 R2-NG-6: the first discovery is running on another thread; wait for it
@@ -214,29 +264,44 @@ pub fn learned() -> Learned {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+    } else if changed && !s.running {
+        tracing::info!(
+            "network guard: this host's uplink changed; learning its public addresses again"
+        );
+        spawn_discovery(&mut s);
     } else {
         let stale = s.learned_at.is_none_or(|t| t.elapsed() >= DISCOVERY_TTL);
         let may_retry = s
             .attempted_at
             .is_none_or(|t| t.elapsed() >= RETRY_AFTER_FAILURE);
         if stale && may_retry && !s.running {
-            s.running = true;
-            s.attempted_at = Some(Instant::now());
-            let spawned = std::thread::Builder::new()
-                .name("netguard-public-addr".into())
-                .spawn(|| learn(discover()));
-            if spawned.is_err() {
-                s.running = false;
-            }
+            spawn_discovery(&mut s);
         }
     }
+    let now = Instant::now();
     let mut out = Learned::default();
-    for f in &s.families {
+    for (i, f) in s.families.iter().enumerate() {
         out.addresses.extend(&f.addresses);
-        out.confirmed.extend(&f.confirmed);
-        out.via_nat64.extend(&f.via_nat64);
+        if still_confirmed(s.confirmed_at[i], s.uplink_of[i], s.uplink, now) {
+            out.confirmed.extend(&f.confirmed);
+            out.via_nat64.extend(&f.via_nat64);
+        }
     }
     out
+}
+
+/// Whether a family's confirmation still counts at `now`: confirmed within
+/// [`CONFIRMATION_LIFETIME`], on the uplink the host is on (when the caller says which).
+fn still_confirmed(
+    confirmed_at: Option<Instant>,
+    learned_on: Option<u64>,
+    uplink: Option<u64>,
+    now: Instant,
+) -> bool {
+    let fresh =
+        confirmed_at.is_some_and(|t| now.saturating_duration_since(t) < CONFIRMATION_LIFETIME);
+    let same_uplink = uplink.is_none() || learned_on == uplink;
+    fresh && same_uplink
 }
 
 /// What one round of discovery found for a family: what its reflectors reported, `None` when the
@@ -244,12 +309,15 @@ pub fn learned() -> Learned {
 /// over it), or why every reflector failed.
 type FamilyFound = Result<Option<FamilyAnswer>, String>;
 
-fn learn((v4, v6): (FamilyFound, FamilyFound)) {
+fn learn((v4, v6): (FamilyFound, FamilyFound), uplink: Option<u64>) {
     let mut guard = state();
     let s = &mut *guard;
     s.running = false;
     s.first_done = true;
+    // A round started before any caller named the uplink ran on the one named since.
+    let uplink = uplink.or(s.uplink);
     let mut any = false;
+    let now = Instant::now();
     for (i, (got, family)) in [(v4, "IPv4"), (v6, "IPv6")].into_iter().enumerate() {
         match got {
             Ok(Some(answer)) => {
@@ -271,12 +339,15 @@ fn learn((v4, v6): (FamilyFound, FamilyFound)) {
                         );
                     }
                 }
+                s.confirmed_at[i] = (!answer.confirmed.is_empty()).then_some(now);
+                s.uplink_of[i] = uplink;
                 s.families[i] = answer;
                 s.warned[i] = false;
                 any = true;
             }
             Ok(None) => {
                 tracing::debug!("network guard: no {family} route, so no public {family} address");
+                s.uplink_of[i] = uplink;
                 any = true;
             }
             Err(e) if !s.warned[i] => {
@@ -286,7 +357,9 @@ fn learn((v4, v6): (FamilyFound, FamilyFound)) {
                      Until it is known, every requester connection over {family} is refused: \
                      behind NAT one at that address would reach this host or its router. Name it \
                      in [egress] public_addresses if the reflectors cannot be reached from here. \
-                     The last address learned stays refused; retrying in the background"
+                     The last address learned stays refused (and counts as known for at most \
+                     {} s after it was confirmed); retrying in the background",
+                    CONFIRMATION_LIFETIME.as_secs()
                 );
             }
             Err(e) => tracing::debug!("network guard: public {family} address: {e}"),
@@ -294,6 +367,10 @@ fn learn((v4, v6): (FamilyFound, FamilyFound)) {
     }
     if any {
         s.learned_at = Some(Instant::now());
+    }
+    // The uplink changed while this round ran: its answers are the old uplink's; ask again.
+    if uplink.is_some() && s.uplink.is_some() && uplink != s.uplink {
+        spawn_discovery(s);
     }
     drop(guard);
     FIRST_DONE.notify_all();
@@ -317,9 +394,16 @@ struct Answer {
 
 /// One family's answers as a [`FamilyAnswer`]: the union; confirmed, what the HTTPS reflector
 /// reported and what both DNS reflectors reported alike (a DNS answer that is one of `dns_servers`
-/// left out of the agreement); and the NAT64 prefixes something was confirmed through. Warns when
-/// they disagree.
-fn agree(family: &str, answers: &[Answer], dns_servers: &[IpAddr]) -> FamilyAnswer {
+/// left out of the agreement; and no DNS agreement at all through a path in `vetoed`, where the
+/// HTTPS reflector's TCP connection was made but its TLS or its answer failed: something on the
+/// path answers in its place, and could answer the DNS queries alike too); and the NAT64 prefixes
+/// something was confirmed through. Warns when they disagree.
+fn agree(
+    family: &str,
+    answers: &[Answer],
+    dns_servers: &[IpAddr],
+    vetoed: &[Option<Prefix>],
+) -> FamilyAnswer {
     let mut addresses: Vec<IpAddr> = answers.iter().map(|a| a.ip).collect();
     addresses.sort();
     addresses.dedup();
@@ -345,7 +429,7 @@ fn agree(family: &str, answers: &[Answer], dns_servers: &[IpAddr]) -> FamilyAnsw
         let mut dns_ips: Vec<IpAddr> = dns.iter().map(|a| a.ip).collect();
         dns_ips.sort();
         dns_ips.dedup();
-        if names.len() >= 2 && dns_ips.len() == 1 {
+        if names.len() >= 2 && dns_ips.len() == 1 && !vetoed.contains(&via) {
             sure.extend(dns_ips);
         }
         if !sure.is_empty() {
@@ -500,6 +584,9 @@ fn discover() -> (FamilyFound, FamilyFound) {
     let deadline = Instant::now() + DISCOVERY_TIMEOUT;
     // Per family: when its first answer came.
     let mut first_answer: [Option<Instant>; 2] = [None, None];
+    // Per family: the paths (native, or through a NAT64 prefix) where the HTTPS reflector's TCP
+    // connection was made but TLS or its answer failed.
+    let mut vetoed: [Vec<Option<Prefix>>; 2] = [Vec::new(), Vec::new()];
     let mut buf = [0u8; 1500];
     while !queries.is_empty() {
         let now = Instant::now();
@@ -509,7 +596,10 @@ fn discover() -> (FamilyFound, FamilyFound) {
         let mut progressed = false;
         queries.retain_mut(|q| {
             let fam = q.fam;
-            if first_answer[fam].is_some_and(|t| now >= t + AGREEMENT_GRACE) {
+            // The HTTPS reflector gets the whole time: on a slow link its handshake takes a few
+            // round trips more than a DNS answer, and its failure vetoes the DNS agreement.
+            if first_answer[fam].is_some_and(|t| now >= t + AGREEMENT_GRACE) && !is_tls(&q.pending)
+            {
                 errors[fam].push(format!("{}: no answer within the grace", q.what));
                 return false;
             }
@@ -548,6 +638,9 @@ fn discover() -> (FamilyFound, FamilyFound) {
                     false
                 }
                 Some(Err(e)) => {
+                    if tls_connected(&q.pending) {
+                        vetoed[fam].push(q.via);
+                    }
                     errors[fam].push(format!("{}: {e}", q.what));
                     false
                 }
@@ -558,12 +651,25 @@ fn discover() -> (FamilyFound, FamilyFound) {
         }
     }
     for q in &queries {
+        if tls_connected(&q.pending) {
+            vetoed[q.fam].push(q.via);
+        }
         errors[q.fam].push(format!("{}: no answer within the timeout", q.what));
+    }
+    for (fam, v) in vetoed.iter().enumerate() {
+        if !v.is_empty() {
+            tracing::warn!(
+                "network guard: the HTTPS reflector's connection for {} was made but TLS or its \
+                 answer failed (something on the path answers in its place), so no DNS reflector \
+                 answer confirms this host's public address over that path",
+                if fam == 0 { "IPv4" } else { "IPv6" }
+            );
+        }
     }
     let dns_servers = crate::system_resolvers();
     let result = |fam: usize, family: &str| -> FamilyFound {
         if !found[fam].is_empty() {
-            Ok(Some(agree(family, &found[fam], &dns_servers)))
+            Ok(Some(agree(family, &found[fam], &dns_servers, &vetoed[fam])))
         } else if unroutable[fam] && !(fam == 0 && nat64_asked) {
             Ok(None)
         } else {
@@ -571,6 +677,26 @@ fn discover() -> (FamilyFound, FamilyFound) {
         }
     };
     (result(0, "IPv4"), result(1, "IPv6"))
+}
+
+/// Whether `p` is an HTTPS reflector query.
+fn is_tls(p: &Pending) -> bool {
+    #[cfg(feature = "client")]
+    if let Pending::Tls(_) = p {
+        return true;
+    }
+    let _ = p;
+    false
+}
+
+/// Whether `p` is an HTTPS reflector query whose TCP connection was made.
+fn tls_connected(p: &Pending) -> bool {
+    #[cfg(feature = "client")]
+    if let Pending::Tls(t) = p {
+        return t.connected();
+    }
+    let _ = p;
+    false
 }
 
 /// A non-blocking UDP socket connected to `to` (`r`'s server, or its NAT64 synthesis), with `r`'s
@@ -663,6 +789,11 @@ mod tls {
                 connected: false,
                 response: Vec::new(),
             })
+        }
+
+        /// Whether its TCP connection was made.
+        pub(super) fn connected(&self) -> bool {
+            self.connected
         }
 
         /// Drives the query as far as it goes without blocking: `None` while it waits, else the
@@ -1008,20 +1139,31 @@ mod tests {
             "IPv6",
             &[dns(G, "2606:a300::5"), dns(C, "2606:a300::5")],
             &[],
+            &[],
         );
         assert_eq!(both.addresses, vec![a("2606:a300::5")]);
         assert_eq!(both.confirmed, vec![a("2606:a300::5")]);
-        let one = agree("IPv6", &[dns(C, "2606:4700:4700::64")], &[]);
+        let one = agree("IPv6", &[dns(C, "2606:4700:4700::64")], &[], &[]);
         assert_eq!(one.addresses, vec![a("2606:4700:4700::64")]);
         assert!(one.confirmed.is_empty());
-        let split = agree("IPv4", &[dns(G, "203.0.114.9"), dns(C, "198.51.99.7")], &[]);
+        let split = agree(
+            "IPv4",
+            &[dns(G, "203.0.114.9"), dns(C, "198.51.99.7")],
+            &[],
+            &[],
+        );
         assert_eq!(split.addresses, vec![a("198.51.99.7"), a("203.0.114.9")]);
         assert!(split.confirmed.is_empty());
         // The HTTPS reflector alone confirms; with a disagreeing DNS answer, both are refused and
         // only its answer is confirmed.
-        let t = agree("IPv4", &[tls("81.2.69.160")], &[]);
+        let t = agree("IPv4", &[tls("81.2.69.160")], &[], &[]);
         assert_eq!(t.confirmed, vec![a("81.2.69.160")]);
-        let t = agree("IPv4", &[dns(G, "203.0.114.9"), tls("81.2.69.160")], &[]);
+        let t = agree(
+            "IPv4",
+            &[dns(G, "203.0.114.9"), tls("81.2.69.160")],
+            &[],
+            &[],
+        );
         assert_eq!(t.addresses, vec![a("81.2.69.160"), a("203.0.114.9")]);
         assert_eq!(t.confirmed, vec![a("81.2.69.160")]);
     }
@@ -1036,6 +1178,7 @@ mod tests {
             "IPv4",
             &[dns(G, "203.0.114.53"), dns(C, "203.0.114.53")],
             &resolver,
+            &[],
         );
         assert_eq!(r.addresses, vec![a("203.0.114.53")]);
         assert!(r.confirmed.is_empty());
@@ -1051,10 +1194,11 @@ mod tests {
             "IPv4",
             &[via(dns(G, "81.2.69.160")), via(dns(C, "81.2.69.160"))],
             &[],
+            &[],
         );
         assert_eq!(r.confirmed, vec![a("81.2.69.160")]);
         assert_eq!(r.via_nat64, vec![p]);
-        let r = agree("IPv4", &[via(dns(G, "81.2.69.160"))], &[]);
+        let r = agree("IPv4", &[via(dns(G, "81.2.69.160"))], &[], &[]);
         assert!(r.confirmed.is_empty() && r.via_nat64.is_empty());
     }
 
@@ -1105,6 +1249,92 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Where the HTTPS reflector's TCP connection was made but TLS or its answer failed (a box on
+    /// the path answering for 1.1.1.1 with a certificate this host does not trust), both DNS
+    /// reflectors agreeing confirm nothing over that path: the same box could answer them alike.
+    /// Other paths are unaffected.
+    #[test]
+    fn a_failed_https_reflector_vetoes_the_dns_agreement() {
+        let a = |s: &str| s.parse::<IpAddr>().unwrap();
+        let forged = [dns(G, "81.2.69.160"), dns(C, "81.2.69.160")];
+        let r = agree("IPv4", &forged, &[], &[None]);
+        assert_eq!(r.addresses, vec![a("81.2.69.160")], "still refused");
+        assert!(r.confirmed.is_empty());
+        let p: Prefix = "64:ff9b::/96".parse().unwrap();
+        let through = |x: Answer| Answer { via: Some(p), ..x };
+        let r = agree(
+            "IPv4",
+            &[through(forged[0]), through(forged[1])],
+            &[],
+            &[None],
+        );
+        assert_eq!(r.confirmed, vec![a("81.2.69.160")], "another path");
+        assert_eq!(r.via_nat64, vec![p]);
+        let r = agree(
+            "IPv4",
+            &[through(forged[0]), through(forged[1])],
+            &[],
+            &[Some(p)],
+        );
+        assert!(r.confirmed.is_empty() && r.via_nat64.is_empty());
+    }
+
+    /// A confirmation counts for [`CONFIRMATION_LIFETIME`], and only on the uplink it was made
+    /// on.
+    #[test]
+    fn confirmations_expire_and_belong_to_their_uplink() {
+        let now = Instant::now();
+        let ago = |s: u64| now.checked_sub(Duration::from_secs(s));
+        assert!(still_confirmed(ago(10), Some(1), Some(1), now));
+        assert!(still_confirmed(ago(599), Some(1), Some(1), now));
+        assert!(!still_confirmed(ago(600), Some(1), Some(1), now), "expired");
+        assert!(
+            !still_confirmed(None, Some(1), Some(1), now),
+            "never confirmed"
+        );
+        assert!(
+            !still_confirmed(ago(10), Some(1), Some(2), now),
+            "another uplink"
+        );
+        assert!(
+            !still_confirmed(ago(10), None, Some(2), now),
+            "learned before the uplink was known"
+        );
+        assert!(
+            still_confirmed(ago(10), Some(1), None, now),
+            "a caller that names no uplink"
+        );
+        assert_eq!(CONFIRMATION_LIFETIME, DISCOVERY_TTL * 2);
+    }
+
+    /// An HTTPS reflector query that connects, to something that does not speak TLS for
+    /// 1.1.1.1, fails, and says it had connected (which vetoes the DNS agreement).
+    #[cfg(feature = "client")]
+    #[test]
+    fn an_https_reflector_answered_by_an_impostor_connects_and_fails() {
+        use std::io::Write;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let _ = c.write_all(b"HTTP/1.0 200 OK\r\n\r\nip=81.2.69.160\n");
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let mut q = tls::TlsQuery::start(addr, TLS_REFLECTORS[0]).unwrap();
+        let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+        let got = loop {
+            if let Some(r) = q.poll(false) {
+                break r;
+            }
+            assert!(Instant::now() < deadline, "no outcome");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(got.is_err(), "{got:?}");
+        assert!(q.connected());
+        assert!(tls_connected(&Pending::Tls(Box::new(q))));
+        server.join().unwrap();
     }
 
     /// The trace's `ip=` line, once complete, global and of the wanted family.
