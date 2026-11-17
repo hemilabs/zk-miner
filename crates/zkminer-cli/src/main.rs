@@ -153,6 +153,19 @@ enum Commands {
         /// (default: the first two serving the job's chain).
         #[arg(long, value_delimiter = ',', requires = "adversarial")]
         providers: Option<Vec<String>>,
+        /// The largest W --adversarial attacks, in bytes: it runs in this process, unsandboxed, and
+        /// holds W and a few copies of it.
+        #[arg(long, default_value_t = commands::simulate_witness::DEFAULT_ADVERSARIAL_MAX_W_BYTES, requires = "adversarial")]
+        adversarial_max_w_bytes: u64,
+        /// With --descriptor, this host's maxGuestCycles maximum (over [witness] max_guest_cycles). A
+        /// miner with neither derives its own from its cards and proving timeout, which simulate
+        /// cannot: without one, the job is judged against 2^34 and that check is listed as not done.
+        #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
+        max_guest_cycles: Option<u64>,
+        /// With --descriptor, the journal header's length in bytes, which the binding must pin whole
+        /// (a scheme-1 W declares it; give it for a W of another layout, or --adversarial fails).
+        #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
+        header_bytes: Option<usize>,
         /// Then read requests from stdin until EOF, one per line: a job id, or
         /// {"jobId": "0x…", "submitTx": "0x…", "publicValues": "0x…"} (the submitting tx saves the
         /// descriptor's log scan; the fulfil's public values let the report say whether the measured
@@ -189,7 +202,10 @@ enum Commands {
         /// The SP1 worker binary (zkminer-prove-sp1); overrides the config.
         #[arg(long)]
         sp1_worker: Option<std::path::PathBuf>,
-        /// Where to keep the ELF and program-id caches (default ~/.zkminer/simulate).
+        /// Where to keep the ELF and program-id caches (default ~/.zkminer/simulate). With
+        /// --descriptor, where the run's throwaway retention store, broker spool and broker
+        /// configurations go (under witness-runs/, removed at the end): it must be on a real
+        /// filesystem, not tmpfs, which the store refuses.
         #[arg(long)]
         cache_dir: Option<std::path::PathBuf>,
     },
@@ -538,6 +554,9 @@ async fn main() -> Result<()> {
             max_mutations,
             scheme,
             providers,
+            adversarial_max_w_bytes,
+            max_guest_cycles,
+            header_bytes,
             po2,
             execute_timeout_secs,
             risc0_worker,
@@ -558,12 +577,15 @@ async fn main() -> Result<()> {
                 cache_dir,
                 execute_timeout: simulate_bound("--execute-timeout-secs", execute_timeout_secs),
                 out,
+                max_guest_cycles,
+                header_bytes,
                 adversarial: adversarial.then(|| commands::simulate_witness::AdversarialOptions {
                     budget: std::time::Duration::from_secs(adversarial_secs),
                     flips,
                     max_mutations,
                     scheme,
                     providers,
+                    max_w_bytes: adversarial_max_w_bytes,
                 }),
             };
             commands::simulate_witness::run(config_path, opts).await

@@ -26,6 +26,8 @@ pub enum AbortReason {
     /// Witness serving was switched off (the kill switch, or a failed self-test), or the operator
     /// paused claiming: running simulations are abandoned, held locks continue.
     Disabled,
+    /// The caller's own time bound ran out (`zkminer simulate --adversarial-secs`).
+    Deadline,
 }
 
 /// A shared, fire-once abort signal. Cloning shares it.

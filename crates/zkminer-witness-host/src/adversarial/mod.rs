@@ -22,9 +22,21 @@
 //!   (two `sys_rand` seed keys, two po2s, two keccak po2s: any journal change is a dependence on a
 //!   prover-controlled host input). Both stop at a deadline and report what they did not run.
 //!
+//! **Memory.** `W` is the requester's, up to `[witness] max_witness_bytes`, and this runs outside any
+//! sandbox. A [`Mutation`] is a description; its changed `W` is made ([`Mutation::make`]) only just
+//! before it runs and dropped after, and repeats are recognised by the sha256 of what they made. So a
+//! run holds `W`, one changed `W` and the working copies that one change needs, whatever the number
+//! of mutations; the scheme mutators enumerate lazily too.
+//!
+//! **Cycles.** Every re-execution runs under this host's maximum, not the job's `maxGuestCycles`:
+//! the router never checks cycles at fulfil, so a changed `W` that runs longer than the job declares
+//! can still be proven by a prover with the hardware for it, and its journal is judged like any
+//! other. Only a run stopped at the host's maximum, with no journal to judge, is inconclusive.
+//!
 //! Every mutation is deterministic for a given `W` and run seed, so a failure reproduces.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use alloy_primitives::{Address, B256};
@@ -40,28 +52,58 @@ use zkminer_witness::verdict::SkipReason;
 use crate::abort::AbortToken;
 use crate::pipeline::{check_execution, execute_once, ExecuteOnce, HostContext, Skip};
 
-/// One changed `W`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Mutation {
+/// One change to `W`, described: [`Mutation::make`] builds the changed bytes only when they are
+/// about to run.
+pub struct Mutation<'a> {
     /// Unique within a run, and the same for the same `W` and seed: `flip@120^0x04`, `truncate@96`,
-    /// `u32le:drop#2`, `scheme1:parent-header`, …
+    /// `u32le:drop#2`, `scheme1:header0=parent`, …
     pub id: String,
     /// The family (`flip`, `truncate`, `append`, `item-drop`, `item-duplicate`, `item-swap`, or a
     /// scheme's own).
     pub kind: String,
     pub description: String,
-    pub w: Vec<u8>,
+    make: Box<dyn Fn() -> Option<Vec<u8>> + Send + Sync + 'a>,
 }
 
-impl Mutation {
-    pub fn new(id: impl Into<String>, kind: impl Into<String>, description: impl Into<String>, w: Vec<u8>) -> Self {
-        Mutation { id: id.into(), kind: kind.into(), description: description.into(), w }
+impl<'a> Mutation<'a> {
+    pub fn new(
+        id: impl Into<String>,
+        kind: impl Into<String>,
+        description: impl Into<String>,
+        make: impl Fn() -> Option<Vec<u8>> + Send + Sync + 'a,
+    ) -> Self {
+        Mutation { id: id.into(), kind: kind.into(), description: description.into(), make: Box::new(make) }
+    }
+
+    /// A mutation whose bytes are already made (a test, a small fixed change).
+    pub fn of_bytes(
+        id: impl Into<String>,
+        kind: impl Into<String>,
+        description: impl Into<String>,
+        w: Vec<u8>,
+    ) -> Self {
+        Self::new(id, kind, description, move || Some(w.clone()))
+    }
+
+    /// The changed `W`, or `None` when this mutation does not apply to it (it names nothing `W`
+    /// has, or changes nothing).
+    pub fn make(&self) -> Option<Vec<u8>> {
+        (self.make)()
     }
 }
 
+impl std::fmt::Debug for Mutation<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mutation").field("id", &self.id).field("kind", &self.kind).finish_non_exhaustive()
+    }
+}
+
+/// Mutations in the order they should run, made lazily.
+pub type Mutations<'a> = Box<dyn Iterator<Item = Mutation<'a>> + Send + 'a>;
+
 /// One JSON-RPC call a scheme's mutator wants answered through the job's own `evm-rpc/v1` source
-/// (§21.1: the parent or a sibling header to swap in), sent as a builder's fetch through the
-/// broker ([`fetch_through_job`]).
+/// (§21.1: the parent's or the next block's header to swap in), sent as a builder's fetch through
+/// the broker ([`fetch_through_job`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcCall {
     pub method: String,
@@ -93,9 +135,15 @@ pub trait SchemeMutator: Send + Sync {
     fn requests(&self, _w: &[u8]) -> Result<Vec<RpcCall>, String> {
         Ok(Vec::new())
     }
-    /// At most `max` mutations of `w`. `Err` when `w` does not decode as this scheme's witness (a
-    /// report line, not a failure of the run: the guest may use another layout).
-    fn mutations(&self, w: &[u8], ctx: &SchemeContext<'_>, max: usize) -> Result<Vec<Mutation>, String>;
+    /// The length of the journal header `w` declares (scheme 1: `32 × nWords`), the bytes a binding
+    /// must pin (§7.2); `None` when `w` is not this scheme's. `w` may be only the start of `W`.
+    fn header_bytes(&self, _w: &[u8]) -> Option<usize> {
+        None
+    }
+    /// This scheme's mutations of `w`, most telling first, made lazily: the caller takes as many as
+    /// its bound allows and makes each just before it runs. `Err` when `w` does not decode as this
+    /// scheme's witness (a report line, not a failure of the run: the guest may use another layout).
+    fn mutations<'a>(&self, w: &'a [u8], ctx: &SchemeContext<'_>) -> Result<Mutations<'a>, String>;
 }
 
 pub mod scheme1;
@@ -112,13 +160,14 @@ pub fn default_registry() -> SchemeRegistry {
 /// envelope's `sources` and a budget of exactly these calls, the request on the job socket naming
 /// capability `cap`), so they reach only the operator's endpoints for that source, through the
 /// miner's connector and network guard. Each answer is the call's `result`, `None` when the fetch
-/// or the call failed.
+/// or the call failed or `deadline` came first.
 pub async fn fetch_through_job(
     broker: &zkminer_witness_broker::client::BrokerClient,
     caller: Address,
     sources: Vec<(B256, Vec<u8>)>,
     cap: u32,
     calls: &[RpcCall],
+    deadline: Instant,
 ) -> Vec<Option<serde_json::Value>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use zkminer_witness::ipc::{
@@ -149,7 +198,8 @@ pub async fn fetch_through_job(
         },
         held_lock: false,
     };
-    if broker.register_job(reg, broker_end).await.is_err() {
+    let within = PER_CALL.min(deadline.saturating_duration_since(Instant::now()));
+    if !matches!(tokio::time::timeout(within, broker.register_job(reg, broker_end)).await, Ok(Ok(_))) {
         return out;
     }
     let sock = ours.set_nonblocking(true).ok().and_then(|()| tokio::net::UnixStream::from_std(ours).ok());
@@ -177,13 +227,14 @@ pub async fn fetch_through_job(
                 let v: serde_json::Value = serde_json::from_slice(body).ok()?;
                 v.get("result").filter(|r| !r.is_null()).cloned()
             };
-            match tokio::time::timeout(PER_CALL, exchange).await {
+            let within = PER_CALL.min(deadline.saturating_duration_since(Instant::now()));
+            match tokio::time::timeout(within, exchange).await {
                 Ok(answer) => out[i] = answer,
                 Err(_) => break,
             }
         }
     }
-    let _ = broker.end_job(job_key).await;
+    let _ = tokio::time::timeout(PER_CALL, broker.end_job(job_key)).await;
     out
 }
 
@@ -209,6 +260,12 @@ impl SchemeRegistry {
 
     pub fn ids(&self) -> Vec<u64> {
         self.by_id.keys().copied().collect()
+    }
+
+    /// The journal header's length a registered scheme reads from `w` (the start of `W` is
+    /// enough), with that scheme's id.
+    pub fn header_bytes(&self, w: &[u8]) -> Option<(u64, usize)> {
+        self.by_id.iter().find_map(|(id, m)| m.header_bytes(w).map(|h| (*id, h)))
     }
 }
 
@@ -377,6 +434,29 @@ pub fn framings(w: &[u8]) -> Vec<Framing> {
     out
 }
 
+/// One rearrangement of a framing's items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemOp {
+    Drop(usize),
+    Duplicate(usize),
+    Swap(usize, usize),
+}
+
+impl ItemOp {
+    /// The new item order for `n` items (indices into the framing's items, repeats allowed).
+    fn order(self, n: usize) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..n).collect();
+        match self {
+            ItemOp::Drop(i) => {
+                order.remove(i);
+            }
+            ItemOp::Duplicate(i) => order.insert(i + 1, i),
+            ItemOp::Swap(a, b) => order.swap(a, b),
+        }
+        order
+    }
+}
+
 /// `w` with its items rearranged as `order` says (indices into `f.items`, repeats allowed): the
 /// bytes before the first item and after the last kept as they are, an RLP list's header rewritten
 /// for the new payload.
@@ -400,30 +480,43 @@ fn reframe(w: &[u8], f: &Framing, order: &[usize]) -> Vec<u8> {
 }
 
 /// The item mutations of one framing: drop the first, a middle and the last item, duplicate the
-/// first and the last, swap the first two and the last two.
-fn item_mutations(w: &[u8], f: &Framing) -> Vec<Mutation> {
+/// first and the last, swap the first two and the last two (each once, however few the items).
+fn item_mutations<'a>(w: &'a [u8], f: Arc<Framing>) -> Vec<Mutation<'a>> {
     let n = f.items.len();
-    let all: Vec<usize> = (0..n).collect();
-    let mut out = Vec::new();
-    let mut push = |id: String, kind: &str, desc: String, order: Vec<usize>| {
-        let m = reframe(w, f, &order);
-        if m != w && !out.iter().any(|x: &Mutation| x.w == m) {
-            out.push(Mutation::new(id, kind, desc, m));
-        }
-    };
+    let mut ops = Vec::new();
     for i in [0, n / 2, n - 1] {
-        let order: Vec<usize> = all.iter().copied().filter(|&j| j != i).collect();
-        push(format!("{}:drop#{i}", f.name), "item-drop", format!("drop item {i} of {n} ({} framing)", f.name), order);
+        ops.push(ItemOp::Drop(i));
     }
     for i in [0, n - 1] {
-        let mut order = all.clone();
-        order.insert(i + 1, i);
-        push(format!("{}:duplicate#{i}", f.name), "item-duplicate", format!("duplicate item {i} of {n} ({} framing)", f.name), order);
+        ops.push(ItemOp::Duplicate(i));
     }
     for (a, b) in [(0, 1), (n - 2, n - 1)] {
-        let mut order = all.clone();
-        order.swap(a, b);
-        push(format!("{}:swap#{a}-{b}", f.name), "item-swap", format!("swap items {a} and {b} of {n} ({} framing)", f.name), order);
+        ops.push(ItemOp::Swap(a, b));
+    }
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for op in ops {
+        if seen.contains(&op) {
+            continue;
+        }
+        seen.push(op);
+        let (id, kind, desc) = match op {
+            ItemOp::Drop(i) => {
+                (format!("{}:drop#{i}", f.name), "item-drop", format!("drop item {i} of {n} ({} framing)", f.name))
+            }
+            ItemOp::Duplicate(i) => (
+                format!("{}:duplicate#{i}", f.name),
+                "item-duplicate",
+                format!("duplicate item {i} of {n} ({} framing)", f.name),
+            ),
+            ItemOp::Swap(a, b) => (
+                format!("{}:swap#{a}-{b}", f.name),
+                "item-swap",
+                format!("swap items {a} and {b} of {n} ({} framing)", f.name),
+            ),
+        };
+        let f = f.clone();
+        out.push(Mutation::new(id, kind, desc, move || Some(reframe(w, &f, &op.order(f.items.len())))));
     }
     out
 }
@@ -431,14 +524,10 @@ fn item_mutations(w: &[u8], f: &Framing) -> Vec<Mutation> {
 /// The generic mutations of `w`: `flips` single-byte changes at sampled offsets (the first and last
 /// byte always among them, the rest drawn from `seed`, each XOR a nonzero byte), truncations (to 0,
 /// half, all but one word and all but one byte), trailing bytes (one zero, one 0xff, a zero word),
-/// and the item mutations of every framing `w` parses as. Duplicates and no-ops are dropped.
-pub fn generic_mutations(w: &[u8], seed: u64, flips: usize) -> Vec<Mutation> {
-    let mut out: Vec<Mutation> = Vec::new();
-    let push = |m: Mutation, out: &mut Vec<Mutation>| {
-        if m.w != w && !out.iter().any(|x| x.w == m.w) {
-            out.push(m);
-        }
-    };
+/// and the item mutations of every framing `w` parses as. Each is made only when it runs; a
+/// mutation that makes `W` itself or a repeat is recognised then ([`run_mutations`]).
+pub fn generic_mutations(w: &[u8], seed: u64, flips: usize) -> Vec<Mutation<'_>> {
+    let mut out: Vec<Mutation<'_>> = Vec::new();
     let mut rng = SplitMix::new(seed);
     if !w.is_empty() {
         let mut offsets: Vec<usize> = vec![0];
@@ -457,9 +546,16 @@ pub fn generic_mutations(w: &[u8], seed: u64, flips: usize) -> Vec<Mutation> {
         offsets.sort_unstable();
         for o in offsets {
             let x = (rng.below(255) + 1) as u8;
-            let mut m = w.to_vec();
-            m[o] ^= x;
-            push(Mutation::new(format!("flip@{o}^{x:#04x}"), "flip", format!("byte {o} XOR {x:#04x}"), m), &mut out);
+            out.push(Mutation::new(
+                format!("flip@{o}^{x:#04x}"),
+                "flip",
+                format!("byte {o} XOR {x:#04x}"),
+                move || {
+                    let mut m = w.to_vec();
+                    m[o] ^= x;
+                    Some(m)
+                },
+            ));
         }
     }
     let mut cuts = vec![0, w.len() / 2, w.len().saturating_sub(32), w.len().saturating_sub(1)];
@@ -467,18 +563,24 @@ pub fn generic_mutations(w: &[u8], seed: u64, flips: usize) -> Vec<Mutation> {
     cuts.dedup();
     for c in cuts {
         if c < w.len() {
-            push(Mutation::new(format!("truncate@{c}"), "truncate", format!("W cut to its first {c} bytes"), w[..c].to_vec()), &mut out);
+            out.push(Mutation::new(
+                format!("truncate@{c}"),
+                "truncate",
+                format!("W cut to its first {c} bytes"),
+                move || Some(w[..c].to_vec()),
+            ));
         }
     }
     for (id, tail) in [("append:00", vec![0u8]), ("append:ff", vec![0xff]), ("append:32x00", vec![0u8; 32])] {
-        let mut m = w.to_vec();
-        m.extend_from_slice(&tail);
-        push(Mutation::new(id, "append", format!("{} trailing byte(s) appended", tail.len()), m), &mut out);
+        let desc = format!("{} trailing byte(s) appended", tail.len());
+        out.push(Mutation::new(id, "append", desc, move || {
+            let mut m = w.to_vec();
+            m.extend_from_slice(&tail);
+            Some(m)
+        }));
     }
     for f in framings(w) {
-        for m in item_mutations(w, &f) {
-            push(m, &mut out);
-        }
+        out.extend(item_mutations(w, Arc::new(f)));
     }
     out
 }
@@ -490,8 +592,7 @@ pub fn generic_mutations(w: &[u8], seed: u64, flips: usize) -> Vec<Mutation> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum MutationOutcome {
-    /// The guest refused it (a non-zero exit, a fault, a panic), or it ran past `maxGuestCycles`:
-    /// the miner skips such a job before any lock.
+    /// The guest refused it: a non-zero exit, a fault, a panic.
     RejectedInGuest { why: String },
     /// The guest committed the unchanged `W`'s journal, byte for byte.
     IdenticalJournal,
@@ -500,7 +601,8 @@ pub enum MutationOutcome {
     /// The journal changed and still satisfies the binding: the prover chose the statement. A
     /// soundness failure of the guest (or of the binding).
     SoundnessFailure { journal_sha256: B256, first_difference: usize },
-    /// This host could not run it (sandbox, worker, memory, time): says nothing about the guest.
+    /// This host could not run it to a journal (sandbox, worker, memory, time, or its own cycle
+    /// maximum): says nothing about the guest.
     Inconclusive { why: String },
     /// Not run: the run's time ran out first.
     NotRun,
@@ -522,6 +624,15 @@ pub struct Judge<'a> {
     pub baseline_journal: &'a [u8],
 }
 
+/// The cycle limits a re-execution is judged by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CycleLimits {
+    /// This host's maximum: the cap every re-execution runs under.
+    pub host: u64,
+    /// The job's `maxGuestCycles`: a run past it is reported as such, and judged all the same.
+    pub job: u64,
+}
+
 fn first_difference(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()))
 }
@@ -530,35 +641,54 @@ fn sha(b: &[u8]) -> B256 {
     B256::from(<[u8; 32]>::from(Sha256::digest(b)))
 }
 
-/// Classifies one execute of a changed `W` (see [`MutationOutcome`]).
-pub fn classify(judge: &Judge<'_>, result: Result<WitnessExecuteResponse, Skip>, po2s: &[u8], max_cycles: u64) -> MutationOutcome {
+fn over_host_cap(limits: CycleLimits) -> String {
+    format!(
+        "ran past this host's maximum of {} sized cycles (the job declares {}): no journal to judge",
+        limits.host, limits.job
+    )
+}
+
+/// Classifies one execute of a changed `W` (see [`MutationOutcome`]), with the largest sized cycle
+/// count of its po2s when it halted.
+pub fn classify(
+    judge: &Judge<'_>,
+    result: Result<WitnessExecuteResponse, Skip>,
+    po2s: &[u8],
+    limits: CycleLimits,
+) -> (MutationOutcome, Option<u64>) {
     let resp = match result {
         Ok(r) => r,
-        Err(Skip::Aborted { reason, .. }) => return MutationOutcome::Inconclusive { why: format!("aborted: {reason:?}") },
+        Err(Skip::Aborted { reason, .. }) => {
+            return (MutationOutcome::Inconclusive { why: format!("aborted: {reason:?}") }, None)
+        }
         Err(Skip::Verdict { reason, detail, .. }) => {
-            return match reason {
-                SkipReason::GuestFailed | SkipReason::GuestCyclesAboveLimit => {
+            let outcome = match reason {
+                SkipReason::GuestFailed => {
                     MutationOutcome::RejectedInGuest { why: format!("{reason:?}: {}", tail(&detail)) }
                 }
+                SkipReason::GuestCyclesAboveLimit => MutationOutcome::Inconclusive { why: over_host_cap(limits) },
                 _ => MutationOutcome::Inconclusive { why: format!("{reason:?}: {}", tail(&detail)) },
-            }
+            };
+            return (outcome, None);
         }
     };
     if resp.results.iter().any(|r| r.exit_kind != GUEST_EXIT_HALTED || r.exit_code != 0) {
-        return MutationOutcome::RejectedInGuest { why: "the guest did not halt with 0".into() };
+        return (MutationOutcome::RejectedInGuest { why: "the guest did not halt with 0".into() }, None);
     }
-    let journal = match check_execution(&resp, po2s, judge.descriptor.programId, max_cycles) {
+    let cycles = resp.results.iter().map(|r| r.cycles).max();
+    let journal = match check_execution(&resp, po2s, judge.descriptor.programId, limits.host) {
         Ok(j) => j,
-        Err((SkipReason::GuestCyclesAboveLimit, d)) | Err((SkipReason::GuestFailed, d)) => {
-            return MutationOutcome::RejectedInGuest { why: d };
+        Err((SkipReason::GuestCyclesAboveLimit, _)) => {
+            return (MutationOutcome::Inconclusive { why: over_host_cap(limits) }, cycles)
         }
-        Err((r, d)) => return MutationOutcome::Inconclusive { why: format!("{r:?}: {d}") },
+        Err((SkipReason::GuestFailed, d)) => return (MutationOutcome::RejectedInGuest { why: d }, cycles),
+        Err((r, d)) => return (MutationOutcome::Inconclusive { why: format!("{r:?}: {d}") }, cycles),
     };
     // The reference prelude's judgement, under the job's real binding as the router checks it.
     let verdict = judge_with(judge.baseline_journal, Some(&journal), |j| {
         check_journal_binding(judge.descriptor, j, judge.job_id, judge.prover).is_ok()
     });
-    match verdict {
+    let outcome = match verdict {
         Verdict::Identical => MutationOutcome::IdenticalJournal,
         Verdict::BindingRejects => MutationOutcome::BindingRejects { journal_sha256: sha(&journal) },
         Verdict::Unsound => MutationOutcome::SoundnessFailure {
@@ -566,7 +696,8 @@ pub fn classify(judge: &Judge<'_>, result: Result<WitnessExecuteResponse, Skip>,
             first_difference: first_difference(&journal, judge.baseline_journal),
         },
         Verdict::Rejected => MutationOutcome::RejectedInGuest { why: "no journal".into() },
-    }
+    };
+    (outcome, cycles)
 }
 
 fn tail(s: &str) -> String {
@@ -591,12 +722,21 @@ pub struct Baseline<'a> {
     pub w: &'a [u8],
     /// The po2 mutations execute at (one is enough to judge a journal).
     pub po2: u8,
+    /// The po2s the run was asked to execute at (`--po2`): the po2 check's alternative is one of
+    /// them when there are two.
+    pub po2s: &'a [u8],
     pub keccak_po2: u8,
     pub sys_rand_key: [u8; 32],
-    pub max_cycles: u64,
+    pub cycles: CycleLimits,
+    /// The run's time bound: every execute gets at most what is left of it, and is killed there.
+    pub deadline: Instant,
 }
 
 impl Baseline<'_> {
+    fn late(&self) -> bool {
+        Instant::now() >= self.deadline || self.token.reason().is_some()
+    }
+
     async fn execute(&self, w: &[u8], po2s: &[u8], keccak_po2: u8, key: [u8; 32]) -> Result<WitnessExecuteResponse, Skip> {
         let spec = ExecuteOnce {
             elf: self.elf,
@@ -605,7 +745,8 @@ impl Baseline<'_> {
             po2s,
             keccak_po2,
             sys_rand_key: key,
-            max_cycles: self.max_cycles,
+            max_cycles: self.cycles.host,
+            timeout: Some(self.deadline.saturating_duration_since(Instant::now())),
         };
         execute_once(self.ctx, self.token, w, &spec).await
     }
@@ -618,23 +759,60 @@ pub struct MutationResult {
     pub id: String,
     pub kind: String,
     pub description: String,
-    pub w_bytes: usize,
+    /// The changed `W`'s length (not known for one that did not run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub w_bytes: Option<usize>,
+    /// The largest sized cycle count over its po2s, when it halted (a decimal string).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cycles: Option<String>,
+    /// It ran past the job's `maxGuestCycles`: a miner skips such a `W`, but the router does not
+    /// check cycles, so its journal is judged all the same.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub over_job_cycles: bool,
     #[serde(flatten)]
     pub outcome: MutationOutcome,
 }
 
-/// Executes each mutation at the baseline's po2 until `deadline`; those left are [`MutationOutcome::NotRun`].
-pub async fn run_mutations(b: &Baseline<'_>, mutations: Vec<Mutation>, deadline: Instant) -> Vec<MutationResult> {
-    let mut out = Vec::with_capacity(mutations.len());
+/// Executes `mutations` in order at the baseline's po2 until `max` have a result or the deadline
+/// passes; those left after the deadline (up to `max`) are [`MutationOutcome::NotRun`]. Each is made
+/// just before it runs and dropped after. One that does not apply, or makes `W` or the bytes of an
+/// earlier one (by sha256), is skipped without a result.
+pub async fn run_mutations<'m>(
+    b: &Baseline<'_>,
+    mutations: impl IntoIterator<Item = Mutation<'m>>,
+    max: usize,
+) -> Vec<MutationResult> {
+    let mut seen: HashSet<B256> = HashSet::from([sha(b.w)]);
+    let mut out = Vec::new();
     for m in mutations {
-        let outcome = if Instant::now() >= deadline || b.token.reason().is_some() {
-            MutationOutcome::NotRun
-        } else {
-            let r = b.execute(&m.w, &[b.po2], b.keccak_po2, b.sys_rand_key).await;
-            classify(&b.judge, r, &[b.po2], b.max_cycles)
+        if out.len() >= max {
+            break;
+        }
+        let result = |w_bytes, cycles: Option<u64>, outcome: MutationOutcome| MutationResult {
+            id: m.id.clone(),
+            kind: m.kind.clone(),
+            description: m.description.clone(),
+            w_bytes,
+            over_job_cycles: cycles.is_some_and(|c| c > b.cycles.job),
+            cycles: cycles.map(|c| c.to_string()),
+            outcome,
         };
+        if b.late() {
+            out.push(result(None, None, MutationOutcome::NotRun));
+            continue;
+        }
+        let Some(bytes) = m.make() else { continue };
+        if !seen.insert(sha(&bytes)) {
+            continue;
+        }
+        let r = b.execute(&bytes, &[b.po2], b.keccak_po2, b.sys_rand_key).await;
+        // An execute the deadline cut short says nothing.
+        let cut =
+            Instant::now() >= b.deadline && matches!(&r, Err(Skip::Verdict { reason: SkipReason::ProveResources, .. }));
+        let (outcome, cycles) =
+            if cut { (MutationOutcome::NotRun, None) } else { classify(&b.judge, r, &[b.po2], b.cycles) };
         tracing::debug!(mutation = %m.id, ?outcome, "adversarial: mutation judged");
-        out.push(MutationResult { id: m.id, kind: m.kind, description: m.description, w_bytes: m.w.len(), outcome });
+        out.push(result(Some(bytes.len()), cycles, outcome));
     }
     out
 }
@@ -660,15 +838,19 @@ pub struct HostInputResult {
     pub values: [String; 2],
     /// Each value's journal sha256, when it ran to a journal.
     pub journal_sha256: [Option<B256>; 2],
-    /// The journals differ: the guest depends on this input, which the prover controls.
+    /// The journals differ, or the guest fails under one value only: the guest depends on this
+    /// input, which the prover controls.
     pub dependent: bool,
-    /// Why a value did not produce a journal (a failure under one value only is a dependence too).
+    /// What else there is to know: a value whose run passed the job's `maxGuestCycles` or this
+    /// host's maximum, or did not run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Both values were compared (a failure in the guest under one counts).
     pub ran: bool,
 }
 
-/// The alternative to `p` among the job po2s (16..=22), for the po2 check: the far end of the range.
+/// The alternative to `p` among the job po2s (16..=22), for the po2 check when the run was given
+/// one po2: the far end of the range.
 pub fn other_po2(p: u8) -> u8 {
     use zkminer_prover_protocol::{RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
     if p - RISC0_JOB_PO2_MIN >= RISC0_JOB_PO2_MAX - p {
@@ -676,6 +858,12 @@ pub fn other_po2(p: u8) -> u8 {
     } else {
         RISC0_JOB_PO2_MAX
     }
+}
+
+/// The po2 the po2 check compares `p` with: the one of `asked` farthest from it, else
+/// [`other_po2`].
+pub fn alternative_po2(p: u8, asked: &[u8]) -> u8 {
+    asked.iter().copied().filter(|&q| q != p).max_by_key(|&q| (q.abs_diff(p), q)).unwrap_or_else(|| other_po2(p))
 }
 
 /// The alternative keccak po2 to `k`, within 14..=18 (the range the pipeline accepts).
@@ -687,32 +875,78 @@ pub fn other_keccak_po2(k: u8) -> u8 {
     }
 }
 
-fn journal_of(resp: &Result<WitnessExecuteResponse, Skip>, i: usize) -> Result<(B256, Vec<u8>), String> {
+/// Why one value of a host-input pair produced no journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoJournal {
+    /// The guest refused it: under one value only, a dependence.
+    Guest(String),
+    /// It ran past this host's cycle maximum: no journal to compare, and no dependence shown.
+    CycleCap(String),
+    /// This host could not run it (time, memory, the sandbox, the deadline).
+    Host(String),
+}
+
+/// One value's journal and its largest sized cycle count.
+type Ran = Result<(B256, Vec<u8>, u64), NoJournal>;
+
+fn journal_of(resp: &Result<WitnessExecuteResponse, Skip>, i: usize) -> Ran {
     match resp {
         Ok(r) => match r.results.get(i) {
-            Some(p) if p.exit_kind == GUEST_EXIT_HALTED && p.exit_code == 0 => Ok((sha(&p.journal), p.journal.clone())),
-            Some(p) => Err(format!("po2 {}: exit kind {} code {}", p.po2, p.exit_kind, p.exit_code)),
-            None => Err("no result".into()),
+            Some(p) if p.exit_kind == GUEST_EXIT_HALTED && p.exit_code == 0 => {
+                Ok((sha(&p.journal), p.journal.clone(), p.cycles))
+            }
+            Some(p) => Err(NoJournal::Guest(format!("po2 {}: exit kind {} code {}", p.po2, p.exit_kind, p.exit_code))),
+            None => Err(NoJournal::Host("no result".into())),
         },
-        Err(s) => Err(s.to_string()),
+        Err(Skip::Verdict { reason: SkipReason::GuestFailed, detail, .. }) => Err(NoJournal::Guest(tail(detail))),
+        Err(Skip::Verdict { reason: SkipReason::GuestCyclesAboveLimit, detail, .. }) => {
+            Err(NoJournal::CycleCap(tail(detail)))
+        }
+        Err(s) => Err(NoJournal::Host(tail(&s.to_string()))),
     }
 }
 
-fn pair_result(input: HostInput, values: [String; 2], a: Result<(B256, Vec<u8>), String>, b: Result<(B256, Vec<u8>), String>) -> HostInputResult {
+fn pair_result(input: HostInput, values: [String; 2], a: Ran, b: Ran, limits: CycleLimits) -> HostInputResult {
     let (ja, jb) = (a.as_ref().ok().map(|x| x.0), b.as_ref().ok().map(|x| x.0));
-    let (dependent, note) = match (&a, &b) {
-        (Ok(x), Ok(y)) => (x.1 != y.1, None),
-        (Err(e), Ok(_)) => (true, Some(format!("only {} ran: {}", values[1], tail(e)))),
-        (Ok(_), Err(e)) => (true, Some(format!("only {} ran: {}", values[0], tail(e)))),
-        (Err(e), Err(_)) => (false, Some(format!("neither ran: {}", tail(e)))),
+    let mut notes = Vec::new();
+    for (v, r) in values.iter().zip([&a, &b]) {
+        match r {
+            Ok((_, _, c)) if *c > limits.job => notes.push(format!(
+                "{v}: {c} sized cycles, past the job's maxGuestCycles {} (a miner executing at it skips the job)",
+                limits.job
+            )),
+            Err(NoJournal::CycleCap(e)) => {
+                notes.push(format!("{v}: past this host's cycle maximum ({}): {e}", limits.host))
+            }
+            Err(NoJournal::Host(e)) => notes.push(format!("{v}: not run: {e}")),
+            _ => {}
+        }
+    }
+    let (dependent, ran) = match (&a, &b) {
+        (Ok(x), Ok(y)) => (x.1 != y.1, true),
+        (Err(NoJournal::Guest(e)), Ok(_)) => {
+            notes.push(format!("only {} ran: {e}", values[1]));
+            (true, true)
+        }
+        (Ok(_), Err(NoJournal::Guest(e))) => {
+            notes.push(format!("only {} ran: {e}", values[0]));
+            (true, true)
+        }
+        (Err(NoJournal::Guest(e)), Err(NoJournal::Guest(_))) => {
+            notes.push(format!("neither ran: {e}"));
+            (false, false)
+        }
+        _ => (false, false),
     };
-    HostInputResult { input, values, journal_sha256: [ja, jb], dependent, note, ran: a.is_ok() || b.is_ok() }
+    let note = (!notes.is_empty()).then(|| notes.join("; "));
+    HostInputResult { input, values, journal_sha256: [ja, jb], dependent, note, ran }
 }
 
 /// Re-executes the baseline `W` under two `sys_rand` seed keys, two po2s and two keccak po2s
-/// (§21.1), each pair compared by journal, until `deadline`. `other_key` is a key unrelated to the
-/// baseline's (the seed a different prover derives).
-pub async fn host_input_checks(b: &Baseline<'_>, other_key: [u8; 32], deadline: Instant) -> Vec<HostInputResult> {
+/// (§21.1), each value in a request of its own, each pair compared by journal, until the deadline.
+/// `other_key` is a key unrelated to the baseline's (the seed a different prover derives). The po2
+/// pair is the baseline's po2 and [`alternative_po2`] of the asked ones.
+pub async fn host_input_checks(b: &Baseline<'_>, other_key: [u8; 32]) -> Vec<HostInputResult> {
     let mut out = Vec::new();
     let skipped = |input, values: [String; 2]| HostInputResult {
         input,
@@ -722,37 +956,35 @@ pub async fn host_input_checks(b: &Baseline<'_>, other_key: [u8; 32], deadline: 
         note: Some("not run: the run's time ran out first".into()),
         ran: false,
     };
-    let late = || Instant::now() >= deadline || b.token.reason().is_some();
-    // The baseline's own execution at its po2, keccak po2 and key: the first value of the seed and
-    // keccak pairs.
-    let base = if late() { None } else { Some(journal_of(&b.execute(b.w, &[b.po2], b.keccak_po2, b.sys_rand_key).await, 0)) };
+    // The baseline's own execution at its po2, keccak po2 and key: the first value of every pair.
+    let base = if b.late() {
+        None
+    } else {
+        Some(journal_of(&b.execute(b.w, &[b.po2], b.keccak_po2, b.sys_rand_key).await, 0))
+    };
     let values = ["key A (this run's)".to_string(), "key B (another prover's)".to_string()];
     match &base {
-        Some(a) if !late() => {
+        Some(a) if !b.late() => {
             let c = b.execute(b.w, &[b.po2], b.keccak_po2, other_key).await;
-            out.push(pair_result(HostInput::SysRandSeed, values, a.clone(), journal_of(&c, 0)));
+            out.push(pair_result(HostInput::SysRandSeed, values, a.clone(), journal_of(&c, 0), b.cycles));
         }
         _ => out.push(skipped(HostInput::SysRandSeed, values)),
     }
-    // Two po2s in one request (the worker runs each in turn).
-    let p2 = other_po2(b.po2);
+    let p2 = alternative_po2(b.po2, b.po2s);
     let values = [b.po2.to_string(), p2.to_string()];
-    if late() {
-        out.push(skipped(HostInput::Po2, values));
-    } else {
-        let mut both = [b.po2, p2];
-        both.sort_unstable();
-        let r = b.execute(b.w, &both, b.keccak_po2, b.sys_rand_key).await;
-        let (ia, ib) = if both[0] == b.po2 { (0, 1) } else { (1, 0) };
-        out.push(pair_result(HostInput::Po2, values, journal_of(&r, ia), journal_of(&r, ib)));
+    match &base {
+        Some(a) if !b.late() => {
+            let c = b.execute(b.w, &[p2], b.keccak_po2, b.sys_rand_key).await;
+            out.push(pair_result(HostInput::Po2, values, a.clone(), journal_of(&c, 0), b.cycles));
+        }
+        _ => out.push(skipped(HostInput::Po2, values)),
     }
-    // Two keccak po2s.
     let k2 = other_keccak_po2(b.keccak_po2);
     let values = [b.keccak_po2.to_string(), k2.to_string()];
     match &base {
-        Some(a) if !late() => {
+        Some(a) if !b.late() => {
             let c = b.execute(b.w, &[b.po2], k2, b.sys_rand_key).await;
-            out.push(pair_result(HostInput::KeccakPo2, values, a.clone(), journal_of(&c, 0)));
+            out.push(pair_result(HostInput::KeccakPo2, values, a.clone(), journal_of(&c, 0), b.cycles));
         }
         _ => out.push(skipped(HostInput::KeccakPo2, values)),
     }
@@ -766,26 +998,35 @@ mod tests {
     use zkminer_prover_protocol::WitnessExecutePo2;
     use zkminer_witness::binding::{journal_fields_for_header, journal_prefix};
 
+    fn made(ms: &[Mutation<'_>]) -> Vec<(String, Option<Vec<u8>>)> {
+        ms.iter().map(|m| (m.id.clone(), m.make())).collect()
+    }
+
     #[test]
     fn generic_mutations_are_deterministic_distinct_and_never_the_original() {
         let w: Vec<u8> = (0..200u8).collect();
         let a = generic_mutations(&w, 7, 16);
         let b = generic_mutations(&w, 7, 16);
-        assert_eq!(a, b, "the same W and seed give the same mutations");
-        assert!(a.iter().all(|m| m.w != w));
+        assert_eq!(made(&a), made(&b), "the same W and seed give the same mutations");
+        let bytes: Vec<Vec<u8>> = a.iter().map(|m| m.make().unwrap()).collect();
+        assert!(bytes.iter().all(|m| *m != w));
         for (i, m) in a.iter().enumerate() {
-            assert!(a[..i].iter().all(|x| x.w != m.w && x.id != m.id), "{}", m.id);
+            assert!(a[..i].iter().all(|x| x.id != m.id), "{}", m.id);
+            assert!(bytes[..i].iter().all(|x| *x != bytes[i]), "{}", m.id);
         }
-        let flips: Vec<&Mutation> = a.iter().filter(|m| m.kind == "flip").collect();
+        let flips: Vec<(&Mutation<'_>, &Vec<u8>)> = a.iter().zip(&bytes).filter(|(m, _)| m.kind == "flip").collect();
         assert_eq!(flips.len(), 16);
-        assert!(flips.iter().any(|m| m.id.starts_with("flip@0^")) && flips.iter().any(|m| m.id.starts_with("flip@199^")));
-        for m in &flips {
-            assert_eq!(m.w.len(), w.len());
-            assert_eq!(m.w.iter().zip(&w).filter(|(x, y)| x != y).count(), 1);
+        assert!(
+            flips.iter().any(|(m, _)| m.id.starts_with("flip@0^"))
+                && flips.iter().any(|(m, _)| m.id.starts_with("flip@199^"))
+        );
+        for (_, m) in &flips {
+            assert_eq!(m.len(), w.len());
+            assert_eq!(m.iter().zip(&w).filter(|(x, y)| x != y).count(), 1);
         }
         assert!(a.iter().any(|m| m.id == "truncate@0") && a.iter().any(|m| m.id == "truncate@199"));
-        assert!(a.iter().any(|m| m.id == "append:32x00" && m.w.len() == 232));
-        assert_ne!(generic_mutations(&w, 8, 16), a, "another seed samples other offsets");
+        assert!(a.iter().zip(&bytes).any(|(m, b)| m.id == "append:32x00" && b.len() == 232));
+        assert_ne!(made(&generic_mutations(&w, 8, 16)), made(&a), "another seed samples other offsets");
         // A one-byte W: one flip, never two of the same byte.
         let one = generic_mutations(&[9], 3, 16);
         assert_eq!(one.iter().filter(|m| m.kind == "flip").count(), 1);
@@ -809,12 +1050,17 @@ mod tests {
         let f = framings(&w);
         assert_eq!(f[0].name, "u32le");
         assert_eq!(f[0].items.len(), 3);
-        let ms = item_mutations(&w, &f[0]);
-        let get = |id: &str| ms.iter().find(|m| m.id == id).unwrap().w.clone();
+        let ms = item_mutations(&w, Arc::new(f[0].clone()));
+        let get = |id: &str| ms.iter().find(|m| m.id == id).unwrap().make().unwrap();
         assert_eq!(get("u32le:drop#0"), u32le_items(&[b"node-a", b"node-bb"]));
         assert_eq!(get("u32le:drop#2"), u32le_items(&[b"header", b"node-a"]));
         assert_eq!(get("u32le:duplicate#2"), u32le_items(&[b"header", b"node-a", b"node-bb", b"node-bb"]));
         assert_eq!(get("u32le:swap#0-1"), u32le_items(&[b"node-a", b"header", b"node-bb"]));
+        // Two items: each operation once.
+        let two = u32le_items(&[b"a", b"b"]);
+        let ms = item_mutations(&two, Arc::new(framings(&two)[0].clone()));
+        let ids: Vec<&str> = ms.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["u32le:drop#0", "u32le:drop#1", "u32le:duplicate#0", "u32le:duplicate#1", "u32le:swap#0-1"]);
         // Something that does not tile is not framed.
         let mut bad = w.clone();
         bad.push(1);
@@ -837,9 +1083,9 @@ mod tests {
         let f = framings(&w);
         let rlp = f.iter().find(|f| f.name == "rlp-list").expect("an RLP list");
         assert_eq!(rlp.items, vec![1..5, 5..9, 9..10]);
-        let ms = item_mutations(&w, rlp);
-        let drop0 = &ms.iter().find(|m| m.id == "rlp-list:drop#0").unwrap().w;
-        assert_eq!(drop0, &vec![0xc5, 0x83, b'd', b'o', b'g', 0x05]);
+        let ms = item_mutations(&w, Arc::new(rlp.clone()));
+        let drop0 = ms.iter().find(|m| m.id == "rlp-list:drop#0").unwrap().make().unwrap();
+        assert_eq!(drop0, vec![0xc5, 0x83, b'd', b'o', b'g', 0x05]);
         // A long payload gets a long-form header.
         assert_eq!(rlp_list_header(56), vec![0xf8, 56]);
         assert_eq!(rlp_list_header(300), vec![0xf9, 0x01, 0x2c]);
@@ -864,8 +1110,11 @@ mod tests {
         fn name(&self) -> &'static str {
             "fake"
         }
-        fn mutations(&self, w: &[u8], _: &SchemeContext<'_>, max: usize) -> Result<Vec<Mutation>, String> {
-            Ok((0..max).map(|i| Mutation::new(format!("fake{i}"), "fake", "x", [w, &[i as u8]].concat())).collect())
+        fn mutations<'a>(&self, w: &'a [u8], _: &SchemeContext<'_>) -> Result<Mutations<'a>, String> {
+            Ok(Box::new(
+                (0..)
+                    .map(move |i: u8| Mutation::new(format!("fake{i}"), "fake", "x", move || Some([w, &[i]].concat()))),
+            ))
         }
     }
 
@@ -875,16 +1124,24 @@ mod tests {
         assert!(r.get(1).is_none());
         r.register(Box::new(Fake));
         assert_eq!(r.ids(), vec![1]);
-        let m = r.get(1).unwrap().mutations(b"w", &SchemeContext { statement: &[], seed: 0, answers: &[] }, 2).unwrap();
+        let m: Vec<_> = r
+            .get(1)
+            .unwrap()
+            .mutations(b"w", &SchemeContext { statement: &[], seed: 0, answers: &[] })
+            .unwrap()
+            .take(2)
+            .collect();
         assert_eq!(m.len(), 2);
+        assert_eq!(m[1].make(), Some(b"w\x01".to_vec()));
+        assert_eq!(r.header_bytes(b"w"), None);
     }
 
-    fn resp(journal: &[u8], exit_code: u32, id: B256) -> WitnessExecuteResponse {
+    fn resp(journal: &[u8], exit_code: u32, id: B256, cycles: u64) -> WitnessExecuteResponse {
         WitnessExecuteResponse {
             image_id: id.0,
             results: vec![WitnessExecutePo2 {
                 po2: 20,
-                cycles: 1 << 20,
+                cycles,
                 journal: journal.to_vec(),
                 journal_len: journal.len() as u32,
                 journal_sha256: Sha256::digest(journal).into(),
@@ -919,22 +1176,43 @@ mod tests {
         journal.extend_from_slice(&header);
         journal.extend_from_slice(b"out=1");
         let judge = Judge { descriptor: &d, job_id: job, prover, baseline_journal: &journal };
-        let run = |j: &[u8], code: u32| classify(&judge, Ok(resp(j, code, pid)), &[20], 1 << 30);
-        assert_eq!(run(&journal, 0), MutationOutcome::IdenticalJournal);
-        assert!(matches!(run(&journal, 1), MutationOutcome::RejectedInGuest { .. }));
+        let limits = CycleLimits { host: 1 << 30, job: 1 << 22 };
+        let run = |j: &[u8], code: u32, cycles: u64| classify(&judge, Ok(resp(j, code, pid, cycles)), &[20], limits);
+        assert_eq!(run(&journal, 0, 1 << 20), (MutationOutcome::IdenticalJournal, Some(1 << 20)));
+        assert!(matches!(run(&journal, 1, 1 << 20).0, MutationOutcome::RejectedInGuest { .. }));
         // The outputs changed under the same header: the prover chose them.
         let mut out2 = journal.clone();
         *out2.last_mut().unwrap() = b'2';
-        assert!(matches!(run(&out2, 0), MutationOutcome::SoundnessFailure { first_difference, .. } if first_difference == journal.len() - 1));
+        assert!(
+            matches!(run(&out2, 0, 1 << 20).0, MutationOutcome::SoundnessFailure { first_difference, .. } if first_difference == journal.len() - 1)
+        );
+        // … and so they did past the job's maxGuestCycles: the router does not check cycles.
+        assert!(matches!(run(&out2, 0, 1 << 25), (MutationOutcome::SoundnessFailure { .. }, Some(c)) if c == 1 << 25));
+        assert_eq!(
+            run(&journal, 0, 1 << 25).0,
+            MutationOutcome::IdenticalJournal,
+            "judged on its journal, never 'rejected'"
+        );
         // A changed header: the router refuses it.
         let mut hdr = journal.clone();
         hdr[70] ^= 1;
-        assert!(matches!(run(&hdr, 0), MutationOutcome::BindingRejects { .. }));
-        // Host trouble is inconclusive; a guest failure is a rejection.
+        assert!(matches!(run(&hdr, 0, 1 << 20).0, MutationOutcome::BindingRejects { .. }));
+        // Past the host's own maximum there is no journal to judge: inconclusive, never a rejection.
+        assert!(matches!(run(&out2, 0, (1 << 30) + 1).0, MutationOutcome::Inconclusive { .. }));
         let skip = |r| Err(Skip::Verdict { reason: r, step: crate::pipeline::Step::Execute, detail: "d".into() });
-        assert!(matches!(classify(&judge, skip(SkipReason::GuestFailed), &[20], 1), MutationOutcome::RejectedInGuest { .. }));
-        assert!(matches!(classify(&judge, skip(SkipReason::ProveResources), &[20], 1), MutationOutcome::Inconclusive { .. }));
-        assert!(matches!(classify(&judge, Ok(resp(&journal, 0, pid)), &[20], 1), MutationOutcome::RejectedInGuest { .. }), "cycles over the cap");
+        assert!(matches!(
+            classify(&judge, skip(SkipReason::GuestCyclesAboveLimit), &[20], limits).0,
+            MutationOutcome::Inconclusive { .. }
+        ));
+        // Host trouble is inconclusive; a guest failure is a rejection.
+        assert!(matches!(
+            classify(&judge, skip(SkipReason::GuestFailed), &[20], limits).0,
+            MutationOutcome::RejectedInGuest { .. }
+        ));
+        assert!(matches!(
+            classify(&judge, skip(SkipReason::ProveResources), &[20], limits).0,
+            MutationOutcome::Inconclusive { .. }
+        ));
     }
 
     #[test]
@@ -942,12 +1220,39 @@ mod tests {
         assert_eq!(other_po2(16), 22);
         assert_eq!(other_po2(22), 16);
         assert_eq!(other_po2(20), 16);
+        // From the asked po2s when there are two: the farthest.
+        assert_eq!(alternative_po2(16, &[16, 17, 18, 19, 20, 21, 22]), 22);
+        assert_eq!(alternative_po2(16, &[16, 20]), 20);
+        assert_eq!(alternative_po2(20, &[20]), 16);
         assert_eq!(other_keccak_po2(17), 16);
         assert_eq!(other_keccak_po2(14), 15);
-        let ok = |j: &[u8]| Ok((sha(j), j.to_vec()));
-        assert!(!pair_result(HostInput::Po2, ["a".into(), "b".into()], ok(b"x"), ok(b"x")).dependent);
-        assert!(pair_result(HostInput::Po2, ["a".into(), "b".into()], ok(b"x"), ok(b"y")).dependent);
-        assert!(pair_result(HostInput::Po2, ["a".into(), "b".into()], ok(b"x"), Err("boom".into())).dependent);
-        assert!(!pair_result(HostInput::Po2, ["a".into(), "b".into()], Err("a".into()), Err("b".into())).dependent);
+        let limits = CycleLimits { host: 1 << 30, job: 1 << 20 };
+        let ok = |j: &[u8]| -> Ran { Ok((sha(j), j.to_vec(), 1000)) };
+        let v = || ["a".to_string(), "b".to_string()];
+        assert!(!pair_result(HostInput::Po2, v(), ok(b"x"), ok(b"x"), limits).dependent);
+        assert!(pair_result(HostInput::Po2, v(), ok(b"x"), ok(b"y"), limits).dependent);
+        assert!(pair_result(HostInput::Po2, v(), ok(b"x"), Err(NoJournal::Guest("boom".into())), limits).dependent);
+        assert!(
+            !pair_result(
+                HostInput::Po2,
+                v(),
+                Err(NoJournal::Guest("a".into())),
+                Err(NoJournal::Guest("b".into())),
+                limits
+            )
+            .dependent
+        );
+        // A cycle cap at one po2 is reported as such: no dependence, not compared.
+        let cap = pair_result(HostInput::Po2, v(), ok(b"x"), Err(NoJournal::CycleCap("over".into())), limits);
+        assert!(!cap.dependent && !cap.ran);
+        assert!(cap.note.unwrap().contains("past this host's cycle maximum"));
+        // Past the job's cap at one po2, the journals still compare, with a note.
+        let over: Ran = Ok((sha(b"x"), b"x".to_vec(), 1 << 21));
+        let r = pair_result(HostInput::Po2, v(), ok(b"x"), over, limits);
+        assert!(r.ran && !r.dependent);
+        assert!(r.note.unwrap().contains("past the job's maxGuestCycles"));
+        // Host trouble is not a dependence.
+        let host = pair_result(HostInput::KeccakPo2, v(), ok(b"x"), Err(NoJournal::Host("timeout".into())), limits);
+        assert!(!host.dependent && !host.ran);
     }
 }

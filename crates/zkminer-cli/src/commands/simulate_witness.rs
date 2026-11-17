@@ -9,30 +9,37 @@
 //! `W` streamed into a retention store, the guest executed in the execute sandbox on `prefix ‖ W` at
 //! every po2 of `--po2` (the guest input from `guest_input_prefix`, the seed derived as the miner
 //! derives it), the router's binding check with the prover's address, and the bundle published and
-//! verified by the store. The limits are the miner's (`pipeline::host_maxima` of this
-//! configuration's `[witness]`), and so are the sandbox and broker self-tests, which must pass
-//! first. So a simulation cannot pass where a miner with this configuration would refuse; it can
-//! only check less: what depends on the chain (the claimability `eth_call`, the submission form, the
-//! deployment pins, admission, the reservation, the deadline margin, prove resources) is listed under
-//! `notChecked`, since the job is not on chain.
+//! verified by the store; then the claim gate's DA check, the exact fulfil against `[witness]
+//! fulfil_da_cap_bytes`. The limits are the miner's (`pipeline::host_maxima` of this configuration's
+//! `[witness]`, the artifact budget `manifest::ArtifactBudget`), and so are the sandbox and broker
+//! self-tests, which must pass first. So a simulation cannot pass where a miner with this
+//! configuration would refuse; it can only check less: what depends on the chain (the claimability
+//! `eth_call`, the submission form, the deployment pins, admission, the reservation, the DA backlog,
+//! the deadline margin, prove resources), what `--builder` and `--elf` replace, and a guest-cycle
+//! maximum a miner derives from its own cards are listed under `notChecked`.
 //!
 //! What differs, deliberately: the `sys_rand` key is this run's own (never `~/.zkminer`'s, §16); the
 //! retention store is a throwaway one under the cache directory (on a real filesystem: the store
-//! refuses tmpfs), removed at the end; the guest ELF's image id is checked by the execute worker
-//! (an ELF that is not the job's program skips at the execute step, `ElfImageIdMismatch`, where the
-//! miner's measure worker would skip it before the builder ran).
+//! refuses tmpfs), removed at the end, and so is the broker's spool (never a running miner's); the
+//! guest ELF's image id is checked by the execute worker (an ELF that is not the job's program skips
+//! at the execute step, `ElfImageIdMismatch`, where the miner's measure worker would skip it before
+//! the builder ran).
 //!
 //! **Outputs (§16):** fuel, fetches, bytes, the builder's peak memory, `|W|`, cycles in the
 //! `maxGuestCycles` unit and the journal per po2, the pinned bytes and the binding's mutation check,
 //! the estimated fulfil DA size, and this host's admission parameters; one JSON document.
 //!
-//! **`--adversarial`** (see `zkminer_witness_host::adversarial`): the generic mutations of `W` and
-//! the job's scheme's own (by the scheme id in the journal header, or `--scheme`), each re-executed;
-//! re-execution under two `sys_rand` keys, two po2s and two keccak po2s; and a differential run of
-//! the whole pipeline against two `evm-rpc` providers of the broker configuration (`--providers`,
-//! default the first two serving the job's chain), each from a broker configuration holding only
-//! that provider. All within `--adversarial-secs`; anything not run is reported, and makes the
-//! verdict `incomplete`.
+//! **`--adversarial`** (see `zkminer_witness_host::adversarial`): first the binding's coverage, which
+//! must pin the whole journal header `[0, H)` with a non-zero `expectedJournalHash` (`H` from a
+//! scheme-1 `W`'s word count, or `--header-bytes`), else the verdict is `fail`; then the generic
+//! mutations of `W` and the job's scheme's own (by the scheme id in the journal header, or
+//! `--scheme`), each re-executed under this host's cycle maximum; re-execution under two `sys_rand`
+//! keys, two po2s and two keccak po2s; and a differential run of the whole pipeline against two
+//! `evm-rpc` providers of the broker configuration (`--providers`, default the first two serving the
+//! job's chain), each from a broker configuration holding only that provider. All within
+//! `--adversarial-secs`, every execute and broker start bounded by what is left of it; anything not
+//! run is reported, and makes the verdict `incomplete`. A `W` above `--adversarial-max-w-bytes` is
+//! refused: the mutations are made one at a time, but this process still holds `W` and a few copies.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -44,7 +51,7 @@ use serde::Serialize;
 
 use zkminer_chain::client::ChainClient;
 use zkminer_chain::da::{
-    conservative_fulfil_tx, da_bytes_upper_bound, estimate_fulfil_da_bytes, SealSpec, DEFAULT_FULFIL_DA_CAP_BYTES,
+    conservative_fulfil_tx, da_bytes_upper_bound, estimate_fulfil_da_bytes, Backlog, DaCapPolicy, Decision, SealSpec,
     STANDARD_FULFIL_DA_BYTES,
 };
 use zkminer_chain::jobs::{fulfill_gas_formula, fulfill_job_hashed_calldata, HashedFulfil};
@@ -52,12 +59,14 @@ use zkminer_config::ZkMinerConfig;
 use zkminer_contracts::bindings::JobDescriptor;
 use zkminer_witness::binding::{guest_input_prefix, PREFIX_BYTES};
 use zkminer_witness::envelope::{decode, CapabilityKind, Limits};
+use zkminer_witness::manifest::ArtifactBudget;
 use zkminer_witness::verdict::SkipReason;
 use zkminer_witness_broker::client::ArtifactCharge;
 use zkminer_witness_host::abort::{AbortReason, AbortToken};
 use zkminer_witness_host::adversarial::{
     fetch_through_job, framings, generic_mutations, host_input_checks, run_mutations, scheme_id_of, seed_for, Baseline,
-    HostInputResult, Judge, MutationOutcome, MutationResult, RpcCall, SchemeContext, SchemeRegistry,
+    CycleLimits, HostInputResult, Judge, Mutation, MutationOutcome, MutationResult, RpcCall, SchemeContext,
+    SchemeRegistry,
 };
 use zkminer_witness_host::broker_proc::BrokerProcess;
 use zkminer_witness_host::paths;
@@ -71,6 +80,9 @@ use zkminer_witness_store::{ExpectedIdentity, Store, StoreIdentityInit, StoreOpt
 
 use super::simulate::redact_urls;
 use super::witness_tools::{check_binding, BindingReport, CheckInput, DescriptorFile};
+
+/// The default `--adversarial-max-w-bytes`.
+pub const DEFAULT_ADVERSARIAL_MAX_W_BYTES: u64 = 8 << 20;
 
 /// The witness report's schema version.
 pub const WITNESS_REPORT_SCHEMA: u32 = 1;
@@ -100,6 +112,8 @@ pub struct AdversarialOptions {
     pub scheme: Option<u64>,
     /// Two `[[evm_rpc]]` aliases of the broker configuration.
     pub providers: Option<Vec<String>>,
+    /// The largest `W` attacked (`--adversarial-max-w-bytes`).
+    pub max_w_bytes: u64,
 }
 
 /// One descriptor-file simulation.
@@ -116,6 +130,11 @@ pub struct WitnessSimOptions {
     pub cache_dir: Option<PathBuf>,
     pub execute_timeout: Duration,
     pub out: Option<PathBuf>,
+    /// This host's `maxGuestCycles` maximum (`--max-guest-cycles`), over `[witness]
+    /// max_guest_cycles`.
+    pub max_guest_cycles: Option<u64>,
+    /// The journal header's length (`--header-bytes`), for a `W` of no registered scheme.
+    pub header_bytes: Option<usize>,
     pub adversarial: Option<AdversarialOptions>,
 }
 
@@ -126,10 +145,30 @@ pub struct WitnessSimOptions {
 #[serde(rename_all = "camelCase")]
 pub struct VerdictReport {
     pub reason: SkipReason,
+    /// `static_gates`, `artifact`, `builder`, `execute`, `binding`, `publish` (`Step::as_str`), or
+    /// `claim_gate`.
     pub step: String,
+    /// `never`, `once_jittered`, `backoff`, `on_host_change`, `deferred` (`Retry::as_str`).
     pub retry: String,
+    /// `backoff`'s attempts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_max_attempts: Option<u8>,
     pub blames_caller: bool,
     pub detail: String,
+}
+
+impl VerdictReport {
+    fn new(reason: SkipReason, step: &str, detail: &str) -> Self {
+        let v = reason.verdict();
+        VerdictReport {
+            reason,
+            step: step.to_string(),
+            retry: v.retry.as_str().to_string(),
+            retry_max_attempts: v.retry.max_attempts(),
+            blames_caller: v.blames_caller,
+            detail: redact_urls(detail),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,9 +223,10 @@ pub struct FulfilReport {
     pub estimate_source: String,
     /// LARGE for the DA nonce rule (above the standard ~600 bytes, §5.5).
     pub large: bool,
-    /// Within the claim gate's default operator cap (§5.5).
-    pub within_default_cap: bool,
-    pub default_cap_bytes: u64,
+    /// Within this configuration's operator cap, `[witness] fulfil_da_cap_bytes` (§5.5): the claim
+    /// gate skips the job otherwise (`FulfilDaTooLarge`).
+    pub within_cap: bool,
+    pub cap_bytes: u64,
     /// The guide's fulfil gas, with the default callback gas (a descriptor file has no
     /// `callbackGasLimit`, which is a submit argument).
     pub gas: u64,
@@ -209,8 +249,13 @@ pub struct CyclesReport {
     /// The largest over the executed po2s.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub measured: Option<String>,
-    /// This host's maximum (`[witness] max_guest_cycles`, else the cap simulate uses).
+    /// The maximum this run was judged by (`--max-guest-cycles`, `[witness] max_guest_cycles`, or
+    /// 2^34 when neither names one).
     pub host_max_guest_cycles: String,
+    /// Where `hostMaxGuestCycles` came from: `--max-guest-cycles`, `[witness] max_guest_cycles`, or
+    /// `unset`: a miner without the setting derives its maximum from its cards and proving timeout
+    /// (a CPU slot about 3M), which is not checked here.
+    pub host_max_source: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,10 +322,29 @@ pub struct SchemeReport {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CoverageReport {
+    /// The journal header's length `H`, and where it came from (`scheme <id> W`, `--header-bytes`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_source: Option<String>,
+    /// `[0, H)` is pinned and `expectedJournalHash` is non-zero.
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AdversarialReport {
-    /// `pass`, `fail` (a soundness failure or a host-input dependence), or `incomplete` (something
-    /// not run or inconclusive).
+    /// `pass`, `fail` (a binding that leaves the header free, a soundness failure or a host-input
+    /// dependence), or `incomplete` (something not run or inconclusive, or the run refused).
     pub verdict: String,
+    /// Why nothing was attacked (`W` above `--adversarial-max-w-bytes`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    /// The binding's coverage of the journal header, checked first.
+    pub binding_coverage: CoverageReport,
     pub budget_secs: u64,
     pub elapsed_secs: f64,
     pub run_seed: String,
@@ -334,6 +398,7 @@ pub struct WitnessReport {
     pub admission: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<Timings>,
+    /// What this simulation did not check, and a miner would.
     pub not_checked: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adversarial: Option<AdversarialReport>,
@@ -343,33 +408,38 @@ pub struct WitnessReport {
 
 fn verdict_report(s: &Skip) -> Option<VerdictReport> {
     match s {
-        Skip::Verdict { reason, step, detail } => {
-            let v = reason.verdict();
-            Some(VerdictReport {
-                reason: *reason,
-                step: format!("{step:?}"),
-                retry: format!("{:?}", v.retry),
-                blames_caller: v.blames_caller,
-                detail: redact_urls(detail),
-            })
-        }
+        Skip::Verdict { reason, step, detail } => Some(VerdictReport::new(*reason, step.as_str(), detail)),
         Skip::Aborted { .. } => None,
     }
 }
 
 /// What a descriptor-file simulation cannot check, the job not being on chain (§5.3, §5.2 step 7).
-const NOT_CHECKED: [&str; 7] = [
+const NOT_CHECKED: [&str; 8] = [
     "claimability eth_call (exclusivity, bids, cooldown, pauses, stake)",
     "submission form",
     "deployment core pins",
     "admission (caller allowlist, lanes, credit)",
     "reservation against the price",
+    "the DA backlog at claim time (above the hold level the fulfil must also fit the live cap; only the operator cap is checked)",
     "deadline margin and proving time",
     "prove resources (segment disk, host RAM, VRAM)",
 ];
+/// With `--builder`: the artifact did not come the miner's way.
+const NOT_CHECKED_BUILDER: &str =
+    "builder availability via builderURIs or an operator mirror (--builder replaced the fetch)";
+/// With `--elf`: the ELF did not come the miner's way.
+const NOT_CHECKED_ELF: &str = "the ELF from the ProgramRegistry (--elf replaced the registry read and the download)";
+/// Without a configured maximum: the miner's own is card-derived.
+const NOT_CHECKED_CYCLES: &str =
+    "guest cycles against a miner's own maximum, derived from its cards and proving timeout \
+     (give --max-guest-cycles or [witness] max_guest_cycles)";
 
 /// The parts of the report that depend on this host's configuration only.
-fn admission_parameters(config: &ZkMinerConfig, maxima: &zkminer_witness::envelope::HostMaxima) -> serde_json::Value {
+fn admission_parameters(
+    config: &ZkMinerConfig,
+    maxima: &zkminer_witness::envelope::HostMaxima,
+    cycles_source: &str,
+) -> serde_json::Value {
     let w = &config.witness;
     serde_json::json!({
         "journalCapBytes": zkminer_witness::binding::MAX_JOURNAL_BYTES,
@@ -389,8 +459,11 @@ fn admission_parameters(config: &ZkMinerConfig, maxima: &zkminer_witness::envelo
             "maxBuilderMemoryBytes": maxima.max_builder_memory_bytes,
             "maxBuilderSeconds": maxima.max_builder_seconds,
         },
+        "maxGuestCyclesSource": cycles_source,
         "maxArtifactBytes": DEFAULT_MAX_ARTIFACT_BYTES,
-        "note": "this configuration's values (the published defaults unless it overrides them); other miners may differ"
+        "maxArtifactChunks": ArtifactBudget::for_max_bytes(DEFAULT_MAX_ARTIFACT_BYTES).max_chunks,
+        "note": "this configuration's values (the published defaults unless it overrides them), but maxGuestCycles \
+                 when maxGuestCyclesSource is `unset`; other miners may differ"
     })
 }
 
@@ -409,6 +482,8 @@ struct SimHost {
     execute_build: String,
     work: PathBuf,
     store: Arc<Store>,
+    /// This run's `maxGuestCycles` maximum (see [`CyclesReport::host_max_source`]).
+    max_guest_cycles: u64,
 }
 
 impl Drop for SimHost {
@@ -502,7 +577,20 @@ impl SimHost {
             execute_build,
             work,
             store: Arc::new(store),
+            max_guest_cycles: host_max_guest_cycles(config, opts).0,
         })
+    }
+
+    /// `broker_config` as this run's own, written into the work directory: `spool_dir` moved there
+    /// (a simulation never shares a running miner's spool, its quota or its held-lock reserve), and
+    /// with `alias` only that `[[evm_rpc]]` entry (a differential run's provider).
+    fn own_broker_config(&self, broker_config: &toml::Value, name: &str, alias: Option<&str>) -> Result<PathBuf> {
+        let dir = self.work.join(name);
+        std::fs::create_dir_all(dir.join("spool")).with_context(|| format!("creating {}", dir.display()))?;
+        let text = broker_config_for(broker_config, alias, &dir.join("spool"))?;
+        let path = dir.join("broker.toml");
+        write_private(&path, &text)?;
+        Ok(path)
     }
 
     /// A broker on `broker_config`, after its self-test (and the connector's) passed.
@@ -540,7 +628,7 @@ impl SimHost {
             cgroup_root: self.root.clone(),
             builder_binary: self.builder_binary.clone(),
             execute_binary: self.execute_binary.clone(),
-            host_maxima: host_maxima(w, w.max_guest_cycles.unwrap_or(MAX_HOST_GUEST_CYCLES)),
+            host_maxima: host_maxima(w, self.max_guest_cycles),
             po2s,
             keccak_po2,
             sys_rand_key,
@@ -559,10 +647,12 @@ impl SimHost {
 // The hooks.
 
 /// The pipeline's hooks for a job that is not on chain: no chain gates (they are `notChecked`), every
-/// artifact charge admitted and recorded, the ELF from the ProgramRegistry when no `--elf` is given.
+/// artifact charge recorded and held to the miner's per-job budget, the ELF from the ProgramRegistry
+/// when no `--elf` is given.
 struct SimHooks {
     token: AbortToken,
     charges: Mutex<Vec<ArtifactCharge>>,
+    budget: ArtifactBudget,
     client: Option<ChainClient>,
     program_id: B256,
     /// The ELF the run executes: `--elf`'s, or what [`PipelineHooks::guest_elf`] fetched.
@@ -574,9 +664,12 @@ impl PipelineHooks for SimHooks {
         Box::pin(async { Ok(()) })
     }
 
+    /// The miner's per-job artifact budget: a manifest of more chunks (or more bytes) than it admits
+    /// is `NotAdmitted` there, deferred for ever.
     fn admit_artifact_charge(&self, charge: ArtifactCharge) -> HookFuture<'_, bool> {
+        let ok = self.budget.admits(charge.length, charge.chunks);
         self.charges.lock().unwrap_or_else(|p| p.into_inner()).push(charge);
-        Box::pin(async { true })
+        Box::pin(async move { ok })
     }
 
     fn abort_token(&self) -> &AbortToken {
@@ -642,22 +735,89 @@ fn pick_providers(broker_config: &toml::Value, chain: Option<u64>, asked: Option
     }
 }
 
-/// `broker_config` with only the `[[evm_rpc]]` entry `alias`, and a spool directory of its own.
-fn single_provider_config(broker_config: &toml::Value, alias: &str, spool: &Path) -> Result<String> {
+/// `broker_config` with a spool directory of its own and, given `alias`, only that `[[evm_rpc]]`
+/// entry.
+fn broker_config_for(broker_config: &toml::Value, alias: Option<&str>, spool: &Path) -> Result<String> {
     let mut v = broker_config.clone();
     let t = v.as_table_mut().context("the broker configuration is not a table")?;
-    let kept: Vec<toml::Value> = t
-        .get("evm_rpc")
-        .and_then(|e| e.as_array())
-        .map(|a| a.iter().filter(|e| e.get("alias").and_then(|x| x.as_str()) == Some(alias)).cloned().collect())
-        .unwrap_or_default();
-    t.insert("evm_rpc".into(), toml::Value::Array(kept));
+    if let Some(alias) = alias {
+        let kept: Vec<toml::Value> = t
+            .get("evm_rpc")
+            .and_then(|e| e.as_array())
+            .map(|a| a.iter().filter(|e| e.get("alias").and_then(|x| x.as_str()) == Some(alias)).cloned().collect())
+            .unwrap_or_default();
+        t.insert("evm_rpc".into(), toml::Value::Array(kept));
+    }
     t.insert("spool_dir".into(), toml::Value::String(spool.display().to_string()));
     Ok(toml::to_string(&v)?)
 }
 
+/// Writes `text` to a new file only this user can read (a broker configuration may carry endpoint
+/// keys).
+fn write_private(path: &Path, text: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    f.write_all(text.as_bytes()).with_context(|| format!("writing {}", path.display()))
+}
+
+/// The broker configuration file, parsed.
+fn read_broker_config(path: &Path) -> Result<toml::Value> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("{} is not a broker configuration", path.display()))
+}
+
+/// This run's `maxGuestCycles` maximum and where it came from.
+fn host_max_guest_cycles(config: &ZkMinerConfig, opts: &WitnessSimOptions) -> (u64, &'static str) {
+    match (opts.max_guest_cycles, config.witness.max_guest_cycles) {
+        (Some(c), _) => (c, "--max-guest-cycles"),
+        (None, Some(c)) => (c, "[witness] max_guest_cycles"),
+        (None, None) => (MAX_HOST_GUEST_CYCLES, "unset"),
+    }
+}
+
+/// The journal header's length the binding must pin: a registered scheme's `W` declares it (read
+/// from its first bytes), else `--header-bytes`; with both, the larger. With its source.
+fn header_length(w_head: &[u8], asked: Option<usize>) -> (Option<usize>, Option<String>) {
+    let declared = scheme_registry().header_bytes(w_head);
+    match (declared, asked) {
+        (Some((id, h)), Some(a)) if a != h => {
+            (Some(h.max(a)), Some(format!("scheme {id} W ({h}) and --header-bytes ({a}): the larger")))
+        }
+        (Some((id, h)), _) => (Some(h), Some(format!("scheme {id} W"))),
+        (None, Some(a)) => (Some(a), Some("--header-bytes".into())),
+        (None, None) => (None, None),
+    }
+}
+
+/// The first bytes of the bundle's `W`, enough for a scheme's magic and counts.
+fn w_head(store: &Store, bundle: &zkminer_witness_store::BundleRef) -> Vec<u8> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(64);
+    if let Ok(f) = store.open_w(bundle) {
+        let _ = f.take(64).read_to_end(&mut head);
+    }
+    head
+}
+
+/// What a successful simulation is reported with besides itself.
+struct SuccessFacts<'a> {
+    declared: &'a Limits,
+    host_max_cycles: u64,
+    host_max_source: &'static str,
+    charges: Vec<(u64, u32)>,
+    /// The journal header's length the binding must pin ([`header_length`]).
+    header_bytes: Option<usize>,
+}
+
 /// Fills `r` from a published simulation.
-fn fill_success(r: &mut WitnessReport, s: &Simulated, d: &JobDescriptor, declared: &Limits, host_max_cycles: u64, charges: Vec<(u64, u32)>) {
+fn fill_success(r: &mut WitnessReport, s: &Simulated, d: &JobDescriptor, f: SuccessFacts<'_>) {
+    let SuccessFacts { declared, host_max_cycles, host_max_source, charges, header_bytes } = f;
     let b = &s.builder;
     r.builder = Some(BuilderReport {
         artifact_origin: match b.artifact_origin {
@@ -686,6 +846,7 @@ fn fill_success(r: &mut WitnessReport, s: &Simulated, d: &JobDescriptor, declare
         declared_max_guest_cycles: declared.maxGuestCycles.to_string(),
         measured: s.per_po2.iter().map(|p| p.cycles).max().map(|c| c.to_string()),
         host_max_guest_cycles: host_max_cycles.to_string(),
+        host_max_source,
     });
     let statement = if s.prefix { &s.journal[PREFIX_BYTES.min(s.journal.len())..] } else { &s.journal[..] };
     let report = check_binding(&CheckInput {
@@ -694,7 +855,7 @@ fn fill_success(r: &mut WitnessReport, s: &Simulated, d: &JobDescriptor, declare
         proof_system_id: d.proofSystemId,
         program_id: d.programId,
         statement,
-        header_bytes: None,
+        header_bytes,
         words: &[],
         assigned_prover: d.assignedProver,
     });
@@ -723,8 +884,17 @@ fn fill_success(r: &mut WitnessReport, s: &Simulated, d: &JobDescriptor, declare
 
 /// The exact `fulfillJobHashed` this job's fulfil would send (a placeholder seal of a Groth16
 /// seal's length), its DA estimate by the chain's `GasPriceOracle` when the configured RPC answers,
-/// else the RPC-free upper bound.
-async fn fulfil_report(client: Option<&ChainClient>, chain_id: u64, router: Address, job_id: B256, d: &JobDescriptor, journal: &[u8]) -> FulfilReport {
+/// else the RPC-free upper bound, held to the claim gate's operator cap `cap_bytes` as the miner's
+/// `DaCapPolicy` holds it (the backlog is not on this side: `notChecked`).
+async fn fulfil_report(
+    client: Option<&ChainClient>,
+    chain_id: u64,
+    router: Address,
+    job_id: B256,
+    d: &JobDescriptor,
+    journal: &[u8],
+    cap_bytes: u64,
+) -> FulfilReport {
     let fulfil = HashedFulfil::from_descriptor(d);
     let seal = SealSpec::risc0_groth16();
     let calldata = fulfill_job_hashed_calldata(job_id, &fulfil, journal, &seal.bytes());
@@ -743,15 +913,36 @@ async fn fulfil_report(client: Option<&ChainClient>, chain_id: u64, router: Addr
         estimated_da_bytes: estimated,
         estimate_source: source,
         large: estimated > STANDARD_FULFIL_DA_BYTES,
-        within_default_cap: estimated <= DEFAULT_FULFIL_DA_CAP_BYTES,
-        default_cap_bytes: DEFAULT_FULFIL_DA_CAP_BYTES,
+        within_cap: da_cap_check(cap_bytes, estimated).is_none(),
+        cap_bytes,
         gas: fulfill_gas_formula(0, calldata_bytes, journal.len()),
     }
 }
 
+/// The claim gate's DA check (`DaCapPolicy::fulfil_fits`) at a backlog below the hold level: `Some`
+/// with the miner's skip text when the fulfil is over the operator cap.
+fn da_cap_check(cap_bytes: u64, estimated: u64) -> Option<String> {
+    let policy = match DaCapPolicy::new(cap_bytes) {
+        Ok(p) => p,
+        Err(e) => return Some(format!("{e:#}")),
+    };
+    match policy.fulfil_fits(estimated, Backlog::Known(0)) {
+        Decision::Fits { .. } => None,
+        Decision::Skip(s) => Some(format!("{s:?}")),
+    }
+}
+
 /// The verdict of an adversarial run.
-fn adversarial_verdict(mutations: &[MutationResult], host: &[HostInputResult], diff: &DifferentialReport) -> &'static str {
-    let failed = mutations.iter().any(|m| m.outcome.is_soundness_failure()) || host.iter().any(|h| h.dependent) || diff.soundness_failure;
+fn adversarial_verdict(
+    coverage: &CoverageReport,
+    mutations: &[MutationResult],
+    host: &[HostInputResult],
+    diff: &DifferentialReport,
+) -> &'static str {
+    let failed = !coverage.ok
+        || mutations.iter().any(|m| m.outcome.is_soundness_failure())
+        || host.iter().any(|h| h.dependent)
+        || diff.soundness_failure;
     let incomplete = mutations.iter().any(|m| matches!(m.outcome, MutationOutcome::NotRun | MutationOutcome::Inconclusive { .. }))
         || host.iter().any(|h| !h.ran)
         || diff.runs.len() < 2
@@ -778,6 +969,39 @@ fn counts(m: &[MutationResult]) -> MutationCounts {
         }
     }
     c
+}
+
+/// The binding's coverage of the journal header, which an attack on `W` cannot judge: a header word
+/// the binding leaves free is exploitable only with a consistent change of the rest of `W` (another
+/// `k` and its proofs, another block and its header), which no mutation makes, so every mutation of
+/// such a job is rejected and the attack would pass. `[0, H)` must be pinned and the expected hash
+/// non-zero (§7.2).
+fn coverage(binding: &BindingReport, expected: B256, source: Option<String>) -> CoverageReport {
+    let h = binding.header_bytes;
+    let failure = if expected == B256::ZERO {
+        Some("NONE: expectedJournalHash is 0, so nothing binds the statement; any prover may prove any".to_string())
+    } else if binding.mode == "full" {
+        None
+    } else if let Some(h) = h.filter(|&h| h > binding.statement_bytes) {
+        Some(format!("the header is {h} bytes, longer than the {}-byte statement", binding.statement_bytes))
+    } else if !binding.header_free.is_empty() {
+        Some(format!(
+            "the binding leaves {} of the header's {} bytes free ({:?}): each is a value the prover chooses, with a \
+             W changed to match",
+            binding.header_free.iter().map(|r| r.end - r.start).sum::<usize>(),
+            h.unwrap_or(0),
+            binding.header_free.iter().map(|r| (r.start, r.end)).collect::<Vec<_>>()
+        ))
+    } else if h.is_none() {
+        Some(
+            "the journal header's length is unknown (W is of no registered scheme): give --header-bytes, so that a \
+             binding pinning fewer header words than the guest commits is caught"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    CoverageReport { header_bytes: h, header_source: source, ok: failure.is_none(), failure }
 }
 
 /// Everything one simulation needs, gathered before any process starts.
@@ -878,6 +1102,7 @@ fn hooks_and_context(
     let hooks = SimHooks {
         token: token.clone(),
         charges: Mutex::new(Vec::new()),
+        budget: ArtifactBudget::for_max_bytes(DEFAULT_MAX_ARTIFACT_BYTES),
         client,
         program_id: p.descriptor.programId,
         fetched_elf: slot.clone(),
@@ -910,6 +1135,7 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
         None => 0,
     };
     let host = SimHost::start(&p.config, &p.secret, &opts, p.router, p.prover).await?;
+    let broker_toml = read_broker_config(&p.broker_config)?;
     let sys_rand_key: [u8; 32] = rand::random();
     let token = AbortToken::new();
     {
@@ -921,7 +1147,17 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
         });
     }
     let w = &p.config.witness;
-    let host_max_cycles = w.max_guest_cycles.unwrap_or(MAX_HOST_GUEST_CYCLES);
+    let (host_max_cycles, host_max_source) = host_max_guest_cycles(&p.config, &opts);
+    let mut not_checked = NOT_CHECKED.to_vec();
+    if opts.builder.is_some() {
+        not_checked.push(NOT_CHECKED_BUILDER);
+    }
+    if opts.elf.is_some() {
+        not_checked.push(NOT_CHECKED_ELF);
+    }
+    if host_max_source == "unset" {
+        not_checked.push(NOT_CHECKED_CYCLES);
+    }
     let mut report = WitnessReport {
         schema: WITNESS_REPORT_SCHEMA,
         kind: "witness",
@@ -945,15 +1181,15 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
         journal: None,
         binding: None,
         fulfil: None,
-        admission: admission_parameters(&p.config, &host_maxima(w, host_max_cycles)),
+        admission: admission_parameters(&p.config, &host_maxima(w, host_max_cycles), host_max_source),
         timings: None,
-        not_checked: NOT_CHECKED.to_vec(),
+        not_checked,
         adversarial: None,
         zkminer_version: env!("CARGO_PKG_VERSION"),
         protocol_version: zkminer_prover_protocol::PROTOCOL_VERSION,
     };
 
-    let broker = host.broker(&p.config, &p.broker_config).await?;
+    let broker = host.broker(&p.config, &host.own_broker_config(&broker_toml, "main", None)?).await?;
     let (hooks, ctx) = hooks_and_context(
         &p,
         &host,
@@ -967,15 +1203,33 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
     );
     let result = run_pipeline(&p, &ctx, &hooks, current_block).await;
     let declared = decode(&p.descriptor.inputData).map(|e| e.job.limits).ok();
+    let mut header_source = None;
     let simulated = match result {
         Ok(s) => {
             report.outcome = "simulated";
             let charges = hooks.charges.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|c| (c.length, c.chunks)).collect();
+            let (header_bytes, source) = header_length(&w_head(&host.store, &s.bundle), opts.header_bytes);
+            header_source = source;
             if let Some(declared) = &declared {
-                fill_success(&mut report, &s, &p.descriptor, declared, host_max_cycles, charges);
+                let facts = SuccessFacts { declared, host_max_cycles, host_max_source, charges, header_bytes };
+                fill_success(&mut report, &s, &p.descriptor, facts);
             }
-            report.fulfil =
-                Some(fulfil_report(client.as_ref(), p.config.chain.chain_id, p.router, p.job_id, &p.descriptor, &s.journal).await);
+            let fulfil = fulfil_report(
+                client.as_ref(),
+                p.config.chain.chain_id,
+                p.router,
+                p.job_id,
+                &p.descriptor,
+                &s.journal,
+                w.fulfil_da_cap_bytes,
+            )
+            .await;
+            // The claim gate's DA check (§5.2 step 7): the miner skips a fulfil over its cap.
+            if let Some(why) = da_cap_check(fulfil.cap_bytes, fulfil.estimated_da_bytes) {
+                report.outcome = "skipped";
+                report.verdict = Some(VerdictReport::new(SkipReason::FulfilDaTooLarge, "claim_gate", &why));
+            }
+            report.fulfil = Some(fulfil);
             Some(s)
         }
         Err(skip) => {
@@ -985,14 +1239,27 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
         }
     };
 
-    if let (Some(adv), Some(s)) = (&opts.adversarial, &simulated) {
+    // A job the miner would skip is not attacked: its verdict is the answer.
+    if let (Some(adv), Some(s), "simulated") = (&opts.adversarial, &simulated, report.outcome) {
         let elf = hooks.fetched_elf.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        match elf {
-            Some(elf) => {
-                let a = Adversary { p: &p, host: &host, ctx: &ctx, token: &token, opts: &opts, client: client.as_ref(), current_block };
-                report.adversarial = Some(a.run(adv, s, &elf, sys_rand_key).await?);
+        let binding = report.binding.clone();
+        match (elf, binding) {
+            (Some(elf), Some(binding)) => {
+                let a = Adversary {
+                    p: &p,
+                    host: &host,
+                    ctx: &ctx,
+                    token: &token,
+                    opts: &opts,
+                    client: client.as_ref(),
+                    current_block,
+                    broker_toml: &broker_toml,
+                };
+                let coverage = coverage(&binding, p.descriptor.expectedJournalHash, header_source);
+                report.adversarial = Some(a.run(adv, s, &elf, sys_rand_key, coverage).await?);
             }
-            None => bail!("the ELF bytes the simulation executed were not kept"),
+            (None, _) => bail!("the ELF bytes the simulation executed were not kept"),
+            (_, None) => bail!("the simulation has no binding report"),
         }
     }
     drop(broker);
@@ -1030,13 +1297,74 @@ struct Adversary<'a> {
     opts: &'a WitnessSimOptions,
     client: Option<&'a ChainClient>,
     current_block: u64,
+    /// The broker configuration, parsed: each provider run writes its own from it.
+    broker_toml: &'a toml::Value,
+}
+
+/// A token that fires when `main` does or at `deadline`, whichever is first; the task watching for
+/// it is aborted with the returned handle.
+fn deadline_token(main: &AbortToken, deadline: Instant) -> (AbortToken, tokio::task::JoinHandle<()>) {
+    let t = AbortToken::new();
+    let (fire, main) = (t.clone(), main.clone());
+    let watcher = tokio::spawn(async move {
+        tokio::select! {
+            r = main.aborted() => {
+                fire.abort(r);
+            }
+            _ = tokio::time::sleep_until(deadline.into()) => {
+                fire.abort(AbortReason::Deadline);
+            }
+        }
+    });
+    (t, watcher)
 }
 
 impl Adversary<'_> {
-    async fn run(&self, adv: &AdversarialOptions, s: &Simulated, elf: &[u8], sys_rand_key: [u8; 32]) -> Result<AdversarialReport> {
+    async fn run(
+        &self,
+        adv: &AdversarialOptions,
+        s: &Simulated,
+        elf: &[u8],
+        sys_rand_key: [u8; 32],
+        coverage: CoverageReport,
+    ) -> Result<AdversarialReport> {
         let started = Instant::now();
         let deadline = started + adv.budget;
         let p = self.p;
+        let empty_differential = || DifferentialReport {
+            runs: Vec::new(),
+            w_same: None,
+            journal_same: None,
+            soundness_failure: false,
+            note: None,
+        };
+        let mut failures = Vec::new();
+        if let Some(f) = &coverage.failure {
+            failures.push(format!("binding: {f}"));
+        }
+        // A W too large to attack here: every mutation is made from it, in this unsandboxed process.
+        if s.w_len > adv.max_w_bytes {
+            let refused = format!(
+                "W is {} bytes, above --adversarial-max-w-bytes ({}): raise it to attack a W this large",
+                s.w_len, adv.max_w_bytes
+            );
+            return Ok(AdversarialReport {
+                verdict: if coverage.ok { "incomplete" } else { "fail" }.into(),
+                refused: Some(refused),
+                binding_coverage: coverage,
+                budget_secs: adv.budget.as_secs(),
+                elapsed_secs: started.elapsed().as_secs_f64(),
+                run_seed: String::new(),
+                scheme: SchemeReport { id: None, name: None, status: "not run".into() },
+                framings: Vec::new(),
+                counts: MutationCounts::default(),
+                mutations: Vec::new(),
+                host_inputs: Vec::new(),
+                differential: empty_differential(),
+                soundness_failures: failures,
+                notes: Vec::new(),
+            });
+        }
         // W as the bundle holds it: the bytes every attack starts from.
         let w = {
             let (store, bundle) = (self.host.store.clone(), s.bundle);
@@ -1056,31 +1384,37 @@ impl Adversary<'_> {
         let prefix = guest_input_prefix(p.descriptor.journalFields, p.job_id, p.prover);
         let statement = if prefix.is_some() { &s.journal[PREFIX_BYTES.min(s.journal.len())..] } else { &s.journal[..] };
         let seed = seed_for(&w, 0x7a6b_6d69_6e65_7231);
+        let max = adv.max_mutations.min(MAX_MUTATIONS);
 
-        // The mutations: the scheme's structured ones first (they say the most), then the generic.
-        let mut mutations = Vec::new();
+        // The mutations, made one at a time as they run: the scheme's structured ones first (they
+        // say the most), then the generic ones, which keep at least a quarter of the room so neither
+        // kind crowds the other out.
+        let generic = generic_mutations(&w, seed, adv.flips);
         let registry = scheme_registry();
         let scheme_id = adv.scheme.or_else(|| scheme_id_of(statement));
+        let mut structured: Option<zkminer_witness_host::adversarial::Mutations<'_>> = None;
         let scheme = match scheme_id {
             None => SchemeReport { id: None, name: None, status: "no scheme id in the header (pass --scheme)".into() },
             Some(id) => match registry.get(id) {
                 None => SchemeReport { id: Some(id), name: None, status: "no structured mutations registered for this scheme".into() },
                 Some(m) => {
-                    // What the scheme needs from outside W (a parent header), through the job's own
-                    // evm-rpc source, as a builder's fetches go.
+                    // What the scheme needs from outside W (the parent's header), through the job's
+                    // own evm-rpc source, as a builder's fetches go.
                     let answers = match m.requests(&w) {
-                        Ok(calls) if !calls.is_empty() => self.scheme_answers(&calls).await,
+                        Ok(calls) if !calls.is_empty() => self.scheme_answers(&calls, deadline).await,
                         _ => Vec::new(),
                     };
                     let fetched = answers.iter().filter(|a| a.is_some()).count();
-                    match m.mutations(&w, &SchemeContext { statement, seed, answers: &answers }, SCHEME_MUTATIONS) {
+                    match m.mutations(&w, &SchemeContext { statement, seed, answers: &answers }) {
                         Ok(ms) => {
-                            let n = ms.len();
-                            mutations.extend(ms);
+                            structured = Some(ms);
                             SchemeReport {
                                 id: Some(id),
                                 name: Some(m.name().into()),
-                                status: format!("{n} structured mutations ({fetched} of {} fetched answers used)", answers.len()),
+                                status: format!(
+                                    "structured mutations first ({fetched} of {} fetched answers used)",
+                                    answers.len()
+                                ),
                             }
                         }
                         Err(e) => SchemeReport { id: Some(id), name: Some(m.name().into()), status: e },
@@ -1088,14 +1422,11 @@ impl Adversary<'_> {
                 }
             },
         };
-        // The generic ones keep at least a quarter of the room, so neither kind crowds the other out.
-        let max = adv.max_mutations.min(MAX_MUTATIONS);
-        let generic = generic_mutations(&w, seed, adv.flips);
-        mutations.truncate(max.saturating_sub(generic.len().min(max / 4)));
-        mutations.extend(generic);
-        let mut seen = std::collections::HashSet::new();
-        mutations.retain(|m| seen.insert(m.w.clone()));
-        mutations.truncate(max);
+        let scheme_room = max.saturating_sub(generic.len().min(max / 4)).min(SCHEME_MUTATIONS);
+        let plan: Box<dyn Iterator<Item = Mutation<'_>> + Send + '_> = match structured {
+            Some(ms) => Box::new(ms.take(scheme_room).chain(generic)),
+            None => Box::new(generic.into_iter()),
+        };
         let judge = Judge { descriptor: &p.descriptor, job_id: p.job_id, prover: p.prover, baseline_journal: &s.journal };
         let baseline = Baseline {
             ctx: self.ctx,
@@ -1105,20 +1436,23 @@ impl Adversary<'_> {
             prefix,
             w: &w,
             po2: *self.opts.po2s.first().expect("a po2"),
+            po2s: &self.opts.po2s,
             keccak_po2: self.opts.keccak_po2,
             sys_rand_key,
-            max_cycles: s.limits.maxGuestCycles,
+            cycles: CycleLimits { host: self.host.max_guest_cycles, job: s.limits.maxGuestCycles },
+            deadline,
         };
-        let results = run_mutations(&baseline, mutations, deadline).await;
-        let host_inputs = host_input_checks(&baseline, rand::random(), deadline).await;
+        let results = run_mutations(&baseline, plan, max).await;
+        let host_inputs = host_input_checks(&baseline, rand::random()).await;
         let differential = self.differential(adv, s, deadline).await;
 
-        let mut failures = Vec::new();
         for m in &results {
             if let MutationOutcome::SoundnessFailure { first_difference, .. } = &m.outcome {
                 failures.push(format!(
-                    "mutation {} ({}): the journal changed at byte {first_difference} and still satisfies the binding",
-                    m.id, m.description
+                    "mutation {} ({}): the journal changed at byte {first_difference} and still satisfies the binding{}",
+                    m.id,
+                    m.description,
+                    if m.over_job_cycles { " (past the job's maxGuestCycles, which the router does not check)" } else { "" }
                 ));
             }
         }
@@ -1141,9 +1475,19 @@ impl Adversary<'_> {
                     .to_string(),
             );
         }
-        let verdict = adversarial_verdict(&results, &host_inputs, &differential).to_string();
+        let over = results.iter().filter(|m| m.over_job_cycles).count();
+        if over > 0 {
+            notes.push(format!(
+                "{over} mutation(s) ran past the job's maxGuestCycles ({}): a miner skips such a W, but the router does not \
+                 check cycles, so each was judged on its journal under this host's maximum ({})",
+                s.limits.maxGuestCycles, self.host.max_guest_cycles
+            ));
+        }
+        let verdict = adversarial_verdict(&coverage, &results, &host_inputs, &differential).to_string();
         Ok(AdversarialReport {
             verdict,
+            refused: None,
+            binding_coverage: coverage,
             budget_secs: adv.budget.as_secs(),
             elapsed_secs: started.elapsed().as_secs_f64(),
             run_seed: format!("{seed:#018x}"),
@@ -1159,37 +1503,28 @@ impl Adversary<'_> {
     }
 
     /// The answers to a scheme's calls, through the job's first `evm-rpc/v1` capability.
-    async fn scheme_answers(&self, calls: &[RpcCall]) -> Vec<Option<serde_json::Value>> {
+    async fn scheme_answers(&self, calls: &[RpcCall], deadline: Instant) -> Vec<Option<serde_json::Value>> {
         let Ok(env) = decode(&self.p.descriptor.inputData) else { return vec![None; calls.len()] };
         let Some(cap) = env.capabilities.iter().position(|c| matches!(c, CapabilityKind::EvmRpcV1 { .. })) else {
             return vec![None; calls.len()];
         };
         let sources = env.job.sources.iter().map(|c| (c.class, c.config.to_vec())).collect();
-        fetch_through_job(&self.ctx.broker, self.p.caller, sources, cap as u32, calls).await
+        fetch_through_job(&self.ctx.broker, self.p.caller, sources, cap as u32, calls, deadline).await
     }
 
     /// The whole pipeline against each of two providers (one po2: the journals are compared, not the
-    /// po2s), each from a broker configuration holding only that provider.
+    /// po2s), each from a broker configuration holding only that provider. Each run, its broker's
+    /// start included, ends at the deadline: a token fires there and kills the run's sandboxes.
     async fn differential(&self, adv: &AdversarialOptions, s: &Simulated, deadline: Instant) -> DifferentialReport {
         let p = self.p;
         let mut report = DifferentialReport { runs: Vec::new(), w_same: None, journal_same: None, soundness_failure: false, note: None };
-        let parsed = std::fs::read_to_string(&p.broker_config)
-            .map_err(|e| e.to_string())
-            .and_then(|t| toml::from_str::<toml::Value>(&t).map_err(|e| e.to_string()));
-        let parsed = match parsed {
-            Ok(v) => v,
-            Err(e) => {
-                report.note = Some(format!("the broker configuration could not be read: {e}"));
-                return report;
-            }
-        };
         let chain = decode(&p.descriptor.inputData).ok().and_then(|e| {
             e.capabilities.iter().find_map(|c| match c {
                 CapabilityKind::EvmRpcV1 { chain_id, .. } => Some(*chain_id),
                 _ => None,
             })
         });
-        let providers = match pick_providers(&parsed, chain, adv.providers.as_deref()) {
+        let providers = match pick_providers(self.broker_toml, chain, adv.providers.as_deref()) {
             Ok(v) => v,
             Err(e) => {
                 report.note = Some(format!("not run: {e}"));
@@ -1204,43 +1539,53 @@ impl Adversary<'_> {
                 outcomes.push(None);
                 continue;
             }
+            let (token, watcher) = deadline_token(self.token, deadline);
             let attempt = async {
-                let dir = self.host.work.join(format!("provider-{}", report.runs.len()));
-                std::fs::create_dir_all(dir.join("spool"))?;
-                let path = dir.join("broker.toml");
-                std::fs::write(&path, single_provider_config(&parsed, &alias, &dir.join("spool"))?)?;
-                let broker = self.host.broker(&p.config, &path).await?;
+                let path = self.host.own_broker_config(
+                    self.broker_toml,
+                    &format!("provider-{}", report.runs.len()),
+                    Some(&alias),
+                )?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let broker = tokio::time::timeout(remaining, self.host.broker(&p.config, &path))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("the broker did not start within the run's time"))??;
+                let remaining = deadline.saturating_duration_since(Instant::now());
                 let (hooks, ctx) = hooks_and_context(
                     p,
                     self.host,
                     &broker,
                     self.client.cloned(),
-                    self.token,
+                    &token,
                     vec![*self.opts.po2s.first().expect("a po2")],
                     self.opts.keccak_po2,
                     self.ctx.sys_rand_key,
-                    self.opts.execute_timeout,
+                    self.opts.execute_timeout.min(remaining),
                 );
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                let r = tokio::time::timeout(remaining, run_pipeline(p, &ctx, &hooks, self.current_block)).await;
+                let r = run_pipeline(p, &ctx, &hooks, self.current_block).await;
                 drop(broker);
                 Ok::<_, anyhow::Error>(r)
             };
-            match attempt.await {
-                Ok(Ok(Ok(sim))) => {
+            let attempt = attempt.await;
+            watcher.abort();
+            match attempt {
+                Ok(Ok(sim)) => {
                     run.outcome = "simulated".into();
                     run.w_sha256 = Some(sim.w_sha256);
                     run.journal_sha256 = Some(B256::from(zkminer_witness::manifest::sha256(&sim.journal)));
                     outcomes.push(Some((sim.w_sha256, sim.journal.clone(), true)));
                 }
-                Ok(Ok(Err(skip))) => {
-                    run.outcome = "skipped".into();
-                    run.verdict = verdict_report(&skip);
+                Ok(Err(Skip::Aborted { reason, .. })) => {
+                    run.outcome = "not_run".into();
+                    report.note = Some(match reason {
+                        AbortReason::Deadline => "the run's time ran out during a provider run".into(),
+                        r => format!("a provider run was aborted: {r:?}"),
+                    });
                     outcomes.push(None);
                 }
-                Ok(Err(_)) => {
-                    run.outcome = "not_run".into();
-                    report.note = Some("the run's time ran out during a provider run".into());
+                Ok(Err(skip)) => {
+                    run.outcome = "skipped".into();
+                    run.verdict = verdict_report(&skip);
                     outcomes.push(None);
                 }
                 Err(e) => {
@@ -1266,5 +1611,120 @@ impl Adversary<'_> {
             }
         }
         report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::witness_tools::ByteRange;
+    use zkminer_witness::binding::journal_fields_for_header;
+
+    fn binding(fields: B256, expected: B256, statement: &[u8], header_bytes: Option<usize>) -> BindingReport {
+        check_binding(&CheckInput {
+            journal_fields: fields,
+            expected_journal_hash: Some(expected),
+            proof_system_id: zkminer_chain::auction::risc_zero_groth16_v1_id(),
+            program_id: B256::ZERO,
+            statement,
+            header_bytes,
+            words: &[],
+            assigned_prover: Address::repeat_byte(0xb0),
+        })
+    }
+
+    #[test]
+    fn the_attack_fails_unless_the_whole_header_is_pinned() {
+        let header = [7u8; 160];
+        let mut statement = header.to_vec();
+        statement.extend_from_slice(&[1; 64]);
+        // The whole 160-byte header: covered.
+        let all = binding(journal_fields_for_header(160, true).unwrap(), keccak256(header), &statement, Some(160));
+        let c = coverage(&all, keccak256(header), Some("scheme 1 W".into()));
+        assert!(c.ok && c.failure.is_none(), "{c:?}");
+        // Only the scheme word: the other four words are the prover's.
+        let one =
+            binding(journal_fields_for_header(32, true).unwrap(), keccak256(&header[..32]), &statement, Some(160));
+        assert_eq!(one.header_free, vec![ByteRange { start: 32, end: 160 }]);
+        let c = coverage(&one, keccak256(&header[..32]), None);
+        assert!(!c.ok && c.failure.as_deref().unwrap().contains("128 of the header's 160 bytes free"), "{c:?}");
+        // The same binding, the header's length unknown: not shown to be covered.
+        let unknown = binding(journal_fields_for_header(32, true).unwrap(), keccak256(&header[..32]), &statement, None);
+        assert!(coverage(&unknown, keccak256(&header[..32]), None).failure.unwrap().contains("--header-bytes"));
+        // NONE (assigned): nothing binds the statement.
+        let marker = journal_fields_for_header(32, true).unwrap();
+        let marker_only = zkminer_witness::binding::clear_marker(marker) ^ marker;
+        let none = binding(marker_only, B256::ZERO, &statement, Some(160));
+        assert!(coverage(&none, B256::ZERO, None).failure.unwrap().starts_with("NONE"));
+        // FULL pins everything, whatever H.
+        let full = binding(B256::ZERO, B256::repeat_byte(3), &statement, None);
+        assert!(coverage(&full, B256::repeat_byte(3), None).ok);
+        // The verdict follows the coverage before anything else.
+        let diff = DifferentialReport {
+            runs: Vec::new(),
+            w_same: None,
+            journal_same: None,
+            soundness_failure: false,
+            note: None,
+        };
+        assert_eq!(adversarial_verdict(&coverage(&one, keccak256(&header[..32]), None), &[], &[], &diff), "fail");
+    }
+
+    #[test]
+    fn the_da_cap_is_the_configurations() {
+        assert_eq!(da_cap_check(2_048, 2_048), None);
+        let over = da_cap_check(2_048, 3_010).expect("over the cap");
+        assert!(over.contains("OverOperatorCap"), "{over}");
+        assert_eq!(da_cap_check(4_000, 3_010), None, "a raised cap admits it");
+    }
+
+    #[test]
+    fn the_header_length_comes_from_w_or_the_flag() {
+        let mut w = b"HPW\x01\x01\x00\x05".to_vec();
+        w.extend_from_slice(&[0; 32]);
+        assert_eq!(header_length(&w, None), (Some(160), Some("scheme 1 W".into())));
+        assert_eq!(header_length(&w, Some(192)).0, Some(192), "the larger");
+        assert_eq!(header_length(b"echo", Some(32)), (Some(32), Some("--header-bytes".into())));
+        assert_eq!(header_length(b"echo", None), (None, None));
+    }
+
+    #[test]
+    fn every_broker_configuration_gets_a_spool_of_its_own() {
+        let cfg: toml::Value = toml::from_str(
+            "spool_dir = \"/home/miner/.zkminer/spool\"\n[[evm_rpc]]\nalias = \"a\"\nurl = \"https://a.example\"\n\
+             [[evm_rpc]]\nalias = \"b\"\nurl = \"https://b.example\"\n",
+        )
+        .unwrap();
+        let main: toml::Value =
+            toml::from_str(&broker_config_for(&cfg, None, Path::new("/work/main/spool")).unwrap()).unwrap();
+        assert_eq!(main["spool_dir"].as_str(), Some("/work/main/spool"));
+        assert_eq!(main["evm_rpc"].as_array().unwrap().len(), 2);
+        let one: toml::Value =
+            toml::from_str(&broker_config_for(&cfg, Some("b"), Path::new("/work/p1/spool")).unwrap()).unwrap();
+        assert_eq!(one["spool_dir"].as_str(), Some("/work/p1/spool"));
+        assert_eq!(one["evm_rpc"].as_array().unwrap().len(), 1);
+        assert_eq!(one["evm_rpc"][0]["alias"].as_str(), Some("b"));
+        // Written for this user only, never over an existing file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broker.toml");
+        write_private(&path, "x").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(write_private(&path, "y").is_err());
+    }
+
+    #[test]
+    fn verdicts_use_stable_names() {
+        let v = VerdictReport::new(SkipReason::FulfilDaTooLarge, "claim_gate", "d");
+        assert_eq!((v.step.as_str(), v.retry.as_str(), v.retry_max_attempts), ("claim_gate", "backoff", Some(8)));
+        let s = Skip::Verdict {
+            reason: SkipReason::BindingMismatch,
+            step: zkminer_witness_host::pipeline::Step::Binding,
+            detail: "x".into(),
+        };
+        let v = verdict_report(&s).unwrap();
+        assert_eq!((v.step.as_str(), v.retry.as_str(), v.retry_max_attempts), ("binding", "once_jittered", None));
+        let json = serde_json::to_value(&v).unwrap();
+        assert!(json.get("retryMaxAttempts").is_none());
     }
 }
