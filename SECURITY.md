@@ -359,7 +359,11 @@ executor:
   (`prlimit64` with a new limit, `setpriority`, `ioprio_set`, `sched_setaffinity`,
   `sched_setscheduler`, `sched_setparam`, `sched_setattr`; `PRIO_PGRP`, `PRIO_USER` and their I/O
   twins too), which Landlock does not scope: a CPU-time limit set on the miner would kill it. Its
-  own stay open (pid 0). The ioctl forms of metadata writes (`FS_IOC_SETFLAGS`,
+  own stay open (pid 0). One exception: the ROCm worker may set the CPU affinity of any thread
+  (`sched_setaffinity`), because ROCm starts its threads with a CPU set, which glibc applies by the
+  new thread's id (refused, `pthread_create` fails and the runtime aborts), and the filter cannot
+  tell its own threads from another process of the user; an escaped guest there could pin another
+  process of the user to some CPUs. The ioctl forms of metadata writes (`FS_IOC_SETFLAGS`,
   `FS_IOC_FSSETXATTR`, `FS_IOC_SETVERSION`, their 32-bit twins, `FS_IOC_ENABLE_VERITY`) are
   refused like the rest.
 - **Ending.** Nothing a worker started outlives it. Where the miner runs in a cgroup delegated to

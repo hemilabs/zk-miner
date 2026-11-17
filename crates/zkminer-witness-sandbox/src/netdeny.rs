@@ -393,7 +393,10 @@ fn denylist(sockets: Sockets, except: &[i64]) -> Result<BpfProgram, SandboxError
         // An empty rule list matches whatever the arguments.
         rules.insert(nr, Vec::new());
     }
-    for (nr, conds) in conditional_denials(sockets)? {
+    for (nr, conds) in conditional_denials(sockets)?
+        .into_iter()
+        .filter(|(nr, _)| !except.contains(nr))
+    {
         if rules.insert(nr, conds).is_some() {
             return Err(SandboxError::Seccomp(format!(
                 "syscall {nr} both denied and filtered"
@@ -503,9 +506,10 @@ pub(crate) fn notify_filter() -> BpfProgram {
 }
 
 /// The filters for `sockets`, in the order they are installed (the notifying filter of
-/// [`Sockets::Supervised`] is not among them: [`crate::supervise`] installs it itself).
-pub(crate) fn filters(sockets: Sockets) -> Result<Vec<BpfProgram>, SandboxError> {
-    Ok(vec![raw_filter(), denylist(sockets, &[])?])
+/// [`Sockets::Supervised`] is not among them: [`crate::supervise`] installs it itself), the
+/// denylist's rules for the syscalls in `allowed` left out.
+pub(crate) fn filters(sockets: Sockets, allowed: &[i64]) -> Result<Vec<BpfProgram>, SandboxError> {
+    Ok(vec![raw_filter(), denylist(sockets, allowed)?])
 }
 
 /// The supervisor's own filters: those of [`Sockets::None`], but with `fchmod`, which it uses to
@@ -780,7 +784,7 @@ pub(crate) mod tests {
     pub(crate) const ARCH: u32 = 183 | 0x8000_0000 | 0x4000_0000;
 
     fn all(sockets: Sockets) -> Vec<BpfProgram> {
-        let mut f = filters(sockets).unwrap();
+        let mut f = filters(sockets, &[]).unwrap();
         if sockets == Sockets::Supervised {
             f.push(notify_filter());
         }
@@ -1238,6 +1242,30 @@ pub(crate) mod tests {
             assert_eq!(c(SYS_ioctl, [3, 0x8008_6601, ptr, 0, 0, 0]), RET_ALLOW);
             assert_eq!(c(SYS_ioctl, [3, 0xc020_4602, ptr, 0, 0, 0]), RET_ALLOW);
         }
+    }
+
+    /// `Confinement::allow_thread_affinity` leaves out only the `sched_setaffinity` rule.
+    #[test]
+    fn thread_affinity_can_be_allowed_alone() {
+        use libc::*;
+        let (me, other, ptr) = (0u64, 4242u64, 0x7f00_0000_1000u64);
+        let f = filters(Sockets::None, &[SYS_sched_setaffinity]).unwrap();
+        let c = |nr, args| verdict_of(&f, &seccomp_data(ARCH, nr, args));
+        assert_eq!(
+            c(SYS_sched_setaffinity, [other, 8, ptr, 0, 0, 0]),
+            RET_ALLOW
+        );
+        assert_eq!(c(SYS_sched_setaffinity, [me, 8, ptr, 0, 0, 0]), RET_ALLOW);
+        for nr in [
+            SYS_sched_setscheduler,
+            SYS_sched_setparam,
+            SYS_sched_setattr,
+        ] {
+            assert_eq!(c(nr, [other, 8, ptr, 0, 0, 0]), RET_EPERM, "{nr}");
+        }
+        assert_eq!(c(SYS_prlimit64, [other, 7, ptr, 0, 0, 0]), RET_EPERM);
+        assert_eq!(c(SYS_setsid, [0; 6]), RET_EPERM);
+        assert_eq!(c(SYS_socket, [AF_INET as u64, 1, 0, 0, 0, 0]), RET_EPERM);
     }
 
     #[test]

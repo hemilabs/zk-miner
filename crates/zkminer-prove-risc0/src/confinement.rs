@@ -140,6 +140,10 @@ mod imp {
         if cfg!(any(feature = "cuda", feature = "rocm", feature = "intel")) {
             c.allow_gpu_devices();
         }
+        if cfg!(feature = "rocm") {
+            // ROCm starts its threads with a CPU set, which glibc applies by thread id.
+            c.allow_thread_affinity();
+        }
         if cfg!(feature = "cuda") {
             // The driver's JIT cache: read only. This build carries code for its cards, so nothing
             // is compiled; a write that fails is only not cached.

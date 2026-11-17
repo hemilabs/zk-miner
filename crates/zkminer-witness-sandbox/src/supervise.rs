@@ -268,7 +268,7 @@ pub fn run_supervised(
     crate::localfs::check_local_filesystems(&granted)?;
     // Everything that allocates happens before the fork.
     let ruleset = confinement.landlock_ruleset(false)?;
-    let filters = netdeny::filters(Sockets::Supervised)?;
+    let filters = netdeny::filters(Sockets::Supervised, &[])?;
     let notify = netdeny::notify_filter();
     let own_filters = netdeny::supervisor_filters()?;
     let cstr = |b: &[u8]| {

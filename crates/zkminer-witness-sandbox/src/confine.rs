@@ -134,6 +134,7 @@ impl std::ops::BitOr for Rights {
 pub struct Confinement {
     sockets: Sockets,
     rules: Vec<(PathBuf, Rights)>,
+    thread_affinity: bool,
 }
 
 impl Confinement {
@@ -142,6 +143,7 @@ impl Confinement {
         Self {
             sockets,
             rules: Vec::new(),
+            thread_affinity: false,
         }
     }
 
@@ -186,6 +188,17 @@ impl Confinement {
         for p in gpu_device_paths() {
             self.allow(p, Rights::DEVICE);
         }
+        self
+    }
+
+    /// `sched_setaffinity` of any thread, not only pid 0. ROCm's runtime starts its threads with a
+    /// CPU set (`pthread_attr_setaffinity_np`): glibc applies it from the creating thread by the
+    /// new thread's id, and `pthread_create` fails if that is refused. The seccomp filter cannot
+    /// tell this process's threads from another process of the user, so a process confined with
+    /// this can also pin another process of the user to some CPUs (scheduling only, nothing it can
+    /// reach or read).
+    pub fn allow_thread_affinity(&mut self) -> &mut Self {
+        self.thread_affinity = true;
         self
     }
 
@@ -348,7 +361,12 @@ pub fn confine_all_threads(c: &Confinement) -> Result<ConfinementReport, Sandbox
     localfs::check_local_filesystems(&c.granted_paths())?;
     // Everything that allocates or opens a path happens before anything is applied.
     let ruleset = c.landlock_ruleset(tsync)?;
-    let filters = netdeny::filters(c.sockets)?;
+    let allowed: &[i64] = if c.thread_affinity {
+        &[libc::SYS_sched_setaffinity]
+    } else {
+        &[]
+    };
+    let filters = netdeny::filters(c.sockets, allowed)?;
 
     // SAFETY: plain prctl with valid arguments.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
