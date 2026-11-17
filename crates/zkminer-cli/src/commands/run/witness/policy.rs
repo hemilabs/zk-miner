@@ -393,6 +393,13 @@ pub(crate) fn funds_cover(balance: U256, fulfil_gas: u64, max_fee: u128, held: u
     balance >= U256::from(need)
 }
 
+/// The locks held besides `jid`'s, from the journal's entries (`held`): `jid`'s own entry (this
+/// claim's intent, or an earlier claim of it still unresolved) is this claim, whose fulfil
+/// [`funds_cover`] counts once.
+pub(crate) fn fulfils_besides(held: impl IntoIterator<Item = B256>, jid: B256) -> usize {
+    held.into_iter().filter(|j| *j != jid).count()
+}
+
 /// Whether a card is free for one more witness lock: the inline jobs still needing a card and the
 /// witness locks held here leave room under the concurrency cap. A witness proof has no priority at
 /// the dispatcher, so a lock queued behind a full look-ahead queue of inline work could wait out
@@ -805,6 +812,12 @@ mod tests {
         let need = 3 * 10_000_000u128 * 1_000_000_000 + 400_000 * 1_000_000_000;
         assert!(funds_cover(U256::from(need), 10_000_000, 1_000_000_000, 2));
         assert!(!funds_cover(U256::from(need - 1), 10_000_000, 1_000_000_000, 2));
+        // The re-check right before the claim runs after this claim's intent is journaled: two held
+        // locks plus this one's entry still need exactly the balance the first check needed.
+        let (a, b, this) = (B256::repeat_byte(1), B256::repeat_byte(2), B256::repeat_byte(3));
+        assert_eq!(fulfils_besides([a, b], this), 2, "before the intent");
+        assert_eq!(fulfils_besides([a, this, b], this), 2, "after it");
+        assert!(funds_cover(U256::from(need), 10_000_000, 1_000_000_000, fulfils_besides([a, this, b], this)));
         assert!(card_room(1, 0, 2));
         assert!(!card_room(1, 1, 2));
         assert!(!card_room(3, 0, 2), "a look-ahead queue of inline work");

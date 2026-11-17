@@ -96,7 +96,7 @@ use zkminer_witness_store::{
 use super::super as run;
 use super::policy::{
     caller_admitted, caller_tally_key, card_room, deadline_fits, device_tally_key, divergence_reusable,
-    estimate_prove_secs, fixed_allowance_secs, funds_cover, gate_refusal_reason, host_max_guest_cycles,
+    estimate_prove_secs, fixed_allowance_secs, fulfils_besides, funds_cover, gate_refusal_reason, host_max_guest_cycles,
     is_witness_input, not_claimable_reason, parse_session_cap, pin_lock_gone, proving_cutoff, rate_secs_left,
     reservation_wei, segment_need, segments_fit, session_cap_admits, short, tally_count, verdict_plan,
     verdict_set_aside, watchdog_admits, witness_prove_sizes, ArtifactBudget, Blame, PinFacts, PinRead, ProvePlan,
@@ -1608,7 +1608,7 @@ impl WitnessRuntime {
                 .max(self.client.fulfill_gas_limit);
             let (_, max_fee) = self.client.base_fees().await;
             if let Ok(bal) = self.client.get_eth_balance().await {
-                if !funds_cover(bal, fulfil_gas, max_fee, self.held_locks()) {
+                if !funds_cover(bal, fulfil_gas, max_fee, self.held_locks_besides(jid)) {
                     return Err((
                         SkipReason::NotAdmitted,
                         format!("ETH balance {bal} wei does not fund this claim and every held fulfil"),
@@ -1704,10 +1704,11 @@ impl WitnessRuntime {
         .await
     }
 
-    /// Locks held here, inline and witness, besides any being claimed now: the journal's entries
-    /// (each a claim of ours, pending or held).
-    fn held_locks(&self) -> usize {
-        lock(&self.journal).entries.len()
+    /// Locks held here, inline and witness, other than `jid`'s: the journal's entries (each a claim
+    /// of ours, pending or held) except its own, which this claim's intent (or an earlier claim of it
+    /// still unresolved) has put there. Its fulfil is counted once, as this claim's.
+    fn held_locks_besides(&self, jid: B256) -> usize {
+        fulfils_besides(lock(&self.journal).entries.keys().copied(), jid)
     }
 
     // ── the lock (§5.2 step 9) ────────────────────────────────────────────────
@@ -1746,7 +1747,7 @@ impl WitnessRuntime {
         }
         let (_, max_fee) = self.client.base_fees().await;
         match self.client.get_eth_balance().await {
-            Ok(bal) if !funds_cover(bal, fulfil_gas, max_fee, self.held_locks()) => {
+            Ok(bal) if !funds_cover(bal, fulfil_gas, max_fee, self.held_locks_besides(jid)) => {
                 return Some(format!("ETH balance {bal} wei does not fund this claim and every held fulfil"));
             }
             Ok(_) => {}
