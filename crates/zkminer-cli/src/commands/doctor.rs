@@ -435,10 +435,7 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
     if survey.gpus.iter().any(|g| g.gpu_tag == "cuda") {
         sysmem_fallback_check(report);
     }
-    sp1_shard_caps_check(
-        report,
-        &zkminer_prover::sp1_shard_caps::Store::load(zkminer_prover::sp1_shard_caps::default_path()),
-    );
+    sp1_shard_caps_check(report, zkminer_prover::sp1_shard_caps::default_path());
     report.say(
         Level::Info,
         "workers",
@@ -458,18 +455,30 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
 
 /// The cards whose SP1 shard size is capped because a proof there ran out of GPU memory
 /// (`zkminer_prover::sp1_shard_caps`), each on a line of its own. Nothing when there are none.
-fn sp1_shard_caps_check(report: &mut Report, store: &zkminer_prover::sp1_shard_caps::Store) {
+fn sp1_shard_caps_check(report: &mut Report, path: std::path::PathBuf) {
+    let store = match zkminer_prover::sp1_shard_caps::Store::load_checked(path.clone()) {
+        Ok(store) => store,
+        Err(e) => {
+            report.say(
+                Level::Warn,
+                "SP1 shard size",
+                format!("{e}: no card's cap is applied, and none is recorded until it is fixed or removed"),
+            );
+            return;
+        }
+    };
     for card in store.cards() {
         report.say(
             Level::Info,
             "SP1 shard size",
             format!(
-                "{} ({}) is capped at {} elements: an SP1 proof there ran out of GPU memory at a \
-                 larger size, so every run since sizes it no larger. Delete {} to lift the cap",
+                "{} ({}) is capped at {} elements: an SP1 job ran out of GPU memory at a larger \
+                 size there and proved at this one, so every run since sizes it no larger. To lift \
+                 it, stop the miner and remove the card's entry from {} (or the file)",
                 card.gpu_name,
                 card.pci_bus_id,
                 card.max_element_threshold,
-                zkminer_prover::sp1_shard_caps::default_path().display(),
+                path.display(),
             ),
         );
     }

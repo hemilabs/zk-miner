@@ -7874,6 +7874,15 @@ async fn miner_brain(
                         }
                         None => continue,
                     }
+                } else if d.prover_backend == zkminer_prover_protocol::BACKEND_SP1 {
+                    // A card whose SP1 shard size was capped after its benchmark proves slower than
+                    // the benchmark did.
+                    let benchmarked = chrono::DateTime::parse_from_rfc3339(&benchmarks.timestamp)
+                        .ok()
+                        .and_then(|t| u64::try_from(t.timestamp()).ok());
+                    let factor = zkminer_prover::engine::worker_pool()
+                        .map_or(1.0, |p| p.sp1_rate_factor(&d.pci_bus_id, benchmarked));
+                    d.throughput * factor
                 } else {
                     d.throughput
                 };
@@ -11350,6 +11359,10 @@ async fn process_job_lifecycle(
         );
     }
     let mut excluded: Vec<String> = Vec::new();
+    // The card an SP1 retry belongs on: the one whose shard size was just lowered after this job
+    // ran out of GPU memory there (`WorkerPool::take_sp1_retry_card`), preferred for the next
+    // attempt.
+    let mut retry_card: Option<String> = None;
 
     // Scale the proving-watchdog deadline to the job so a wedged GPU is
     // caught in minutes, not the full (large) configured timeout. Committed-cycle
@@ -11562,13 +11575,14 @@ async fn process_job_lifecycle(
             let disabled_for_prove = disabled_slots.clone();
             // The cards this job was admitted on (a hard filter) and the order to try them in: the card
             // it was planned for (benchmark id, e.g. "gpu1"), then the rest fastest first. After a
-            // host-memory refusal of a card, that card leaves the order (see `refused_admission`).
+            // host-memory refusal of a card, that card leaves the order (see `refused_admission`). An
+            // SP1 job whose card's shard size an out-of-memory lowered goes back there first.
             let eligible_for_prove = snapshot.eligible_devices.clone();
-            let order_for_prove = job_card_order(
-                snapshot.preferred_device.as_ref(),
-                &eligible_for_prove,
-                &refused_admission,
-            );
+            let planned = retry_card
+                .take()
+                .or_else(|| snapshot.preferred_device.clone());
+            let order_for_prove =
+                job_card_order(planned.as_ref(), &eligible_for_prove, &refused_admission);
             // This job's pre-claim measured execute PEAK (SP1 only; 0 otherwise), for the dispatcher's
             // RH2 prove reservation — charges the `server + execute` spike so a concurrent other-backend
             // proof is not admitted into memory the SP1 execute window will consume. Copy, so captured
@@ -11953,6 +11967,16 @@ async fn process_job_lifecycle(
                             short_id(job_id),
                         );
                     }
+                    // An SP1 OOM that lowered its card's shard size is retried THERE, at the
+                    // smaller size: another card is still at the size that ran out, and would run
+                    // out too.
+                    let sp1_smaller_here = if real_oom {
+                        used_slot
+                            .as_deref()
+                            .and_then(|k| pool.take_sp1_retry_card(k))
+                    } else {
+                        None
+                    };
                     if attempt < MAX_PROVE_ATTEMPTS {
                         // BOTH non-invalid classes steer OFF the card that just failed.
                         //
@@ -11967,7 +11991,9 @@ async fn process_job_lifecycle(
                         //
                         // Excluding cannot strand a job: `prove_min_vram` restores the
                         // full set when pruning empties it.
-                        if !invalid {
+                        if let Some(card) = sp1_smaller_here.clone() {
+                            retry_card = Some(card);
+                        } else if !invalid {
                             if let Some(k) = used_slot.clone() {
                                 if !excluded.contains(&k) {
                                     excluded.push(k);
@@ -11984,7 +12010,7 @@ async fn process_job_lifecycle(
                         // correctly on the first retry while a 30 GiB floor routes it
                         // nowhere. Falls back to the constant when the card's VRAM is
                         // unknown (non-CUDA, or nvidia-smi unavailable).
-                        if real_oom {
+                        if real_oom && sp1_smaller_here.is_none() {
                             // `used_slot`, NOT `proved_on`: the latter is assigned only on
                             // the success path, so reading it here always yields None and
                             // silently falls back to the inert constant.
@@ -12006,7 +12032,9 @@ async fn process_job_lifecycle(
                             } else {
                                 "worker unhealthy"
                             },
-                            if real_oom {
+                            if sp1_smaller_here.is_some() {
+                                " on the same GPU, one shard size smaller"
+                            } else if real_oom {
                                 " on a high-VRAM GPU"
                             } else if health_fail {
                                 " on a different GPU"

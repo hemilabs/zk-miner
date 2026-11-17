@@ -99,6 +99,8 @@ pub async fn run(headless: bool) -> Result<()> {
             Vec::new(),     // default search paths
             zkminer_config::config::ProverConfig::default().benchmark_timeout(),
         );
+        // Real SP1 workers, benchmarked into the miner's own benchmarks.json: the same caps.
+        pool.use_sp1_shard_caps(zkminer_prover::sp1_shard_caps::default_path());
         let status = splash.status_line();
         pool.set_progress(move |text| status.set(text));
         let connected = pool.discover_and_spawn();

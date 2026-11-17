@@ -992,6 +992,37 @@ pub fn sp1_tier_below(ran_at: Option<u64>, total: Option<u64>) -> Option<u64> {
         .find(|threshold| *threshold < ran_at)
 }
 
+/// A card's recorded cap as the worker and the dispatcher apply it: never below the smallest
+/// measured tier, which is all the dispatcher ever records (a hand-edited 0 would hand the server a
+/// shard size nothing has measured).
+pub fn sp1_card_cap(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|cap| cap.max(sp1_smallest_measured_threshold()))
+}
+
+/// SP1's proving rate one tier down, relative to the tier above: 4.6M c/s at 134M against 5.8M at
+/// 268M on the RTX 4070 (the suite's STARK rates).
+pub const SP1_TIER_STEP_RATE_FACTOR: f64 = 0.79;
+
+/// The factor to plan an SP1 card capped at `cap` with, when its benchmark ran before the cap: one
+/// [`SP1_TIER_STEP_RATE_FACTOR`] per tier above `cap` that the uncapped worker could have run at,
+/// up to the server's own tier for a card of `total` bytes (`None`: the fork's default).
+pub fn sp1_rate_factor_for_cap(cap: u64, total: Option<u64>) -> f64 {
+    let server = total.map_or(
+        SP1_FORK_DEFAULT_THRESHOLD,
+        sp1_fork_threshold_for_total_vram,
+    );
+    let mut above: Vec<u64> = sp1_measured_tiers(total)
+        .iter()
+        .map(|(t, _)| *t)
+        .chain([server])
+        .filter(|t| *t > cap && *t <= server)
+        .collect();
+    above.sort_unstable();
+    above.dedup();
+    SP1_TIER_STEP_RATE_FACTOR.powi(above.len() as i32)
+}
+
 /// Set to disable the SP1 worker's host-memory tuning, for bisecting a proving failure against stock
 /// SDK behaviour.
 pub const SP1_NO_AUTOTUNE_ENV: &str = "ZKMINER_SP1_NO_AUTOTUNE";
@@ -1673,6 +1704,8 @@ impl std::error::Error for WorkerProofError {}
 pub fn is_gpu_oom(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     m.contains("out of memory")
+        // sp1-gpu's own `CudaError::OutOfMemory`.
+        || m.contains("out of gpu memory")
         || m.contains("bad_alloc")
         || m.contains("cudaerrormemoryallocation")
         || m.contains("cuda_error_out_of_memory")
@@ -1932,6 +1965,25 @@ mod tests {
         assert!(super::sp1_savers_are_the_default(12_282 * MIB));
         assert!(super::sp1_savers_are_the_default(16 * 1024 * MIB));
         assert!(!super::sp1_savers_are_the_default(24_564 * MIB));
+    }
+
+    #[test]
+    fn a_capped_card_is_planned_a_tier_step_slower_per_tier_lost() {
+        const MIB: u64 = 1 << 20;
+        let rtx4070 = Some(12_282 * MIB);
+        let f = super::SP1_TIER_STEP_RATE_FACTOR;
+        // A 12 GB card ran at 268M, the server's own tier: one step.
+        assert_eq!(super::sp1_rate_factor_for_cap(134_217_728, rtx4070), f);
+        assert_eq!(super::sp1_rate_factor_for_cap(268_435_456, rtx4070), 1.0);
+        // A 24 GB card's server runs 402M: capped at 268M is one step, at 134M two.
+        let rtx4090 = Some(24_564 * MIB);
+        assert_eq!(super::sp1_rate_factor_for_cap(268_435_456, rtx4090), f);
+        assert_eq!(super::sp1_rate_factor_for_cap(134_217_728, rtx4090), f * f);
+        // A recorded cap is never below the smallest measured tier, and garbage is no cap.
+        assert_eq!(super::sp1_card_cap(Some("0")), Some(134_217_728));
+        assert_eq!(super::sp1_card_cap(Some("268435456")), Some(268_435_456));
+        assert_eq!(super::sp1_card_cap(Some("x")), None);
+        assert!(super::is_gpu_oom("Proving failed: out of GPU memory"));
     }
 
     #[test]
