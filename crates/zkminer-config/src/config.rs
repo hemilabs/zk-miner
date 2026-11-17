@@ -472,7 +472,8 @@ pub struct ProverConfig {
     pub risc0_groth16_selector: Option<String>,
     /// The segment size (po2) a card measures and proves risc0 jobs at, keyed by its benchmark device
     /// id (`gpu0`, `gpu1`, … for NVIDIA cards, `gpu-rocm0`, … for AMD; the log lists them), e.g.
-    /// `{ gpu1 = 19 }`: for a card the default (20, or nothing under 14 GiB of VRAM) or its
+    /// `{ gpu1 = 19 }`: for a card the default (20 from 14 GiB of VRAM, 19 from 9.8 GiB, 18 from
+    /// 6.5 GiB, nothing under that) or its
     /// calibration doesn't suit. Held to 16..=22. The Settings screen's Advanced rows override it for
     /// the session. Not written when empty, so `zkminer init` leaves no empty table at the end of the
     /// file for a later line to land in.

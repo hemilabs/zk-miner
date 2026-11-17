@@ -2770,7 +2770,7 @@ fn spawned_vram(spawn_env: &HashMap<String, String>) -> Option<u64> {
 impl SizingCap {
     fn for_slot(backend: &str, spawn_env: &HashMap<String, String>) -> Self {
         use zkminer_prover_protocol::types as t;
-        if crate::discovery::vram_sizing_tier(backend, u64::MAX).is_none() {
+        if crate::discovery::vram_sizing_tier(backend, u64::MAX, None).is_none() {
             return SizingCap::NotSized;
         }
         let var = |name: &str| worker_env_var(spawn_env, name);
@@ -2800,7 +2800,7 @@ impl SizingCap {
             SizingCap::Operator(value) => value,
             SizingCap::Host(host) => {
                 let from_vram = available.map(|a| {
-                    crate::discovery::vram_sizing_tier(backend, a)
+                    crate::discovery::vram_sizing_tier(backend, a, total)
                         .unwrap_or_else(t::sp1_smallest_measured_threshold)
                 });
                 [host, from_vram].into_iter().flatten().min()
@@ -2879,7 +2879,7 @@ fn room_needed(
         (Some(None) | None, Some(best)) => best,
         (Some(None) | None, None) => return unmeasured(),
     };
-    let Some(need) = crate::discovery::vram_required_for_tier(backend, tier) else {
+    let Some(need) = crate::discovery::vram_required_for_tier(backend, tier, total) else {
         return unmeasured();
     };
     let target = floor.map_or(need, |f| need.max(f));
@@ -9069,7 +9069,7 @@ impl WorkerPool {
         total: Option<u64>,
         give_up_at: Option<Instant>,
     ) -> Result<()> {
-        if crate::discovery::vram_sizing_tier(backend, u64::MAX).is_none() {
+        if crate::discovery::vram_sizing_tier(backend, u64::MAX, None).is_none() {
             return Ok(()); // no VRAM-derived knob for this backend
         }
         let Some(entry) = self.workers.get(key) else {
@@ -9087,7 +9087,7 @@ impl WorkerPool {
         }
         let cap = SizingCap::for_slot(backend, &slot.spawn_env);
         let assumed = spawned_vram(&slot.spawn_env);
-        let floor = crate::discovery::min_available_vram_bytes_for_backend(backend);
+        let floor = crate::discovery::min_available_vram_bytes_for_backend(backend, total);
         if !vram_tier_shrank(cap, backend, assumed, available, total, floor) {
             return Ok(());
         }
@@ -9451,7 +9451,7 @@ impl WorkerPool {
         if !own.dispatchable || self.closing.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        let floor = crate::discovery::min_available_vram_bytes_for_backend(backend);
+        let floor = crate::discovery::min_available_vram_bytes_for_backend(backend, total);
         let this_card = physical_gpu_id(key);
         // What of OURS stands on this card and could move: same-card siblings' workers — only they are
         // behind the guard we hold; a slot pinned to another card holding a context here is not — and
@@ -12835,28 +12835,31 @@ mod tests {
         // Read through the env only when the override is absent: these tests run in parallel with
         // others that may read the same variable.
         if std::env::var(crate::discovery::MIN_AVAILABLE_VRAM_MB_ENV).is_err() {
-            let floor = crate::discovery::min_available_vram_bytes_for_backend("sp1")
+            let total = Some(24_564 * 1024 * 1024);
+            let floor = crate::discovery::min_available_vram_bytes_for_backend("sp1", total)
                 .expect("sp1 must require free VRAM");
             assert_eq!(
                 floor,
-                zkminer_prover_protocol::types::sp1_min_available_vram_bytes(),
+                zkminer_prover_protocol::types::sp1_min_available_vram_bytes(total),
                 "the floor must come from the measured tier table, so the gate and the tier the \
                  worker is given cannot disagree about whether a card is usable"
             );
             // And a card clearing it must have a configuration to run.
             assert!(
-                zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(floor)
-                    .is_some()
+                zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(
+                    floor, total
+                )
+                .is_some()
             );
         }
         // risc0 and openvm size per segment from po2, which `calibrate_slot_po2` clamps per run. A
         // floor would refuse work that a smaller segment can do.
         assert_eq!(
-            crate::discovery::min_available_vram_bytes_for_backend("risc0"),
+            crate::discovery::min_available_vram_bytes_for_backend("risc0", None),
             None
         );
         assert_eq!(
-            crate::discovery::min_available_vram_bytes_for_backend("openvm"),
+            crate::discovery::min_available_vram_bytes_for_backend("openvm", None),
             None
         );
     }
@@ -13137,17 +13140,17 @@ mod tests {
     fn the_predicted_tier_is_what_worker_and_server_settle_on() {
         use zkminer_prover_protocol::types as t;
         const MIB: u64 = 1024 * 1024;
-        for total_mib in [16_303u64, 24_564] {
+        for total_mib in [12_282u64, 16_303, 24_564] {
             let total = total_mib * MIB;
             for budget_gib in [None, Some(12u64), Some(20), Some(25), Some(40)] {
                 let scale = t::sp1_memory_scale(budget_gib.map(|g| g << 30), false);
                 let cap = SizingCap::Host(t::sp1_element_threshold_for_host_scale(scale));
                 for avail_mib in (0..=total_mib)
                     .step_by(97)
-                    .chain([15_603, 15_604, 18_277, 18_278])
+                    .chain([9_166, 9_167, 11_888, 11_889, 15_603, 15_604, 18_277, 18_278])
                 {
                     let available = Some(avail_mib * MIB);
-                    let worker = t::sp1_element_threshold_cap(scale, available);
+                    let worker = t::sp1_element_threshold_cap(scale, available, Some(total));
                     let server = t::sp1_fork_threshold_for_total_vram(total);
                     let actual = worker.map_or(server, |w| w.min(server));
                     assert_eq!(
@@ -13158,10 +13161,10 @@ mod tests {
                 }
             }
         }
-        // The operator's value is capped by the server too: 268M on a 5080 runs at 134M.
+        // The operator's value is capped by the server too: the default on a 5080 runs at 268M.
         assert_eq!(
-            SizingCap::Operator(Some(268_435_456)).tier_at("sp1", None, Some(16_303 * MIB)),
-            Some(134_217_728)
+            SizingCap::Operator(Some(402_653_184)).tier_at("sp1", None, Some(16_303 * MIB)),
+            Some(268_435_456)
         );
         // An unparsable one is ignored by the server, which then uses its own tier.
         assert_eq!(
@@ -13366,12 +13369,21 @@ mod tests {
         );
         assert_eq!(card.held_elsewhere("sp1:cuda:0"), 1_808 * MIB);
         assert_eq!(card.available_to("sp1:cuda:0"), 14_072 * MIB);
+        // Beside an idle risc0 worker the 5080 still has room for SP1's 268M tier as the 16 GB
+        // card's server runs it (11,377 MiB + margin), but not for the larger card's 134M, which
+        // was the floor here before the server dropped its LDEs on these cards.
         assert!(
             card.available_to("sp1:cuda:0")
-                >= zkminer_prover_protocol::types::sp1_min_available_vram_bytes(),
-            "the available-to accounting still correctly withholds the sibling's held VRAM (14,072, \
-             not the full 15,878); on v6.1.0 that clears SP1's smallest tier (134M's 10,012), where \
-             on v6.0.0's 15,604 it did not — the point is the accounting, which is unchanged"
+                >= zkminer_prover_protocol::types::sp1_vram_required_for_threshold(
+                    268_435_456,
+                    Some(16_303 * MIB)
+                )
+                .unwrap()
+        );
+        assert!(
+            card.available_to("sp1:cuda:0")
+                < zkminer_prover_protocol::types::sp1_min_available_vram_bytes(None),
+            "the old all-ours credit read this card as roomier than it is"
         );
         assert_eq!(card.available_to("risc0:cuda:0"), 15_878 * MIB);
         // What a worker is SIZED against at spawn counts our own workers as free (they make room),
@@ -13404,19 +13416,38 @@ mod tests {
         const SMALL: u64 = 134_217_728;
         const LARGE: u64 = 268_435_456;
         let (rtx5080, rtx4090) = (Some(16_303 * MIB), Some(24_564 * MIB));
-        // v6.1.0 floor: the 134M tier's 9,500 MiB peak + 512 margin.
-        let floor = Some(10_012 * MIB);
+        // The default floors: a card above 16 GiB, and a 16 GB card, whose server runs leaner.
+        let floor = Some(15_604 * MIB);
+        let floor_16gb = Some(9_167 * MIB);
+        assert_eq!(
+            floor,
+            crate::discovery::min_available_vram_bytes_for_backend("sp1", rtx4090)
+        );
+        assert_eq!(
+            floor_16gb,
+            crate::discovery::min_available_vram_bytes_for_backend("sp1", rtx5080)
+        );
         let roomy = SizingCap::Host(None);
         let this_box = SizingCap::Host(Some(LARGE)); // ~25 GiB host budget
         let room = |cap, ceiling: u64, live, floor, total| {
             room_needed(cap, "sp1", ceiling * MIB, live, floor, total)
         };
 
-        // 5080, emptied: its VRAM now fits 268M (12,512), but the fork caps a 16 GiB card to 134M, so
-        // the room is 134M's 9,500 + 512.
+        // 5080, emptied (16,303 less 423 reserved and 2 of driver overhead): 268M, 11,377 + 512.
         assert_eq!(
-            room(roomy, 15_878, None, floor, rtx5080),
-            Bytes(10_012 * MIB)
+            room(roomy, 15_878, None, floor_16gb, rtx5080),
+            Bytes(11_889 * MIB)
+        );
+        // At the 134M tier a 16 GB card needs only 8,655 + 512.
+        assert_eq!(
+            room(
+                SizingCap::Host(Some(SMALL)),
+                15_878,
+                None,
+                floor_16gb,
+                rtx5080
+            ),
+            Bytes(9_167 * MIB)
         );
         // 4090, emptied: 268M, now 11,542 + 512 = 12,512 on v6.1.0.
         assert_eq!(
@@ -13453,13 +13484,19 @@ mod tests {
         // A 12,288 MiB ceiling now fits 134M (10,012) on v6.1.0, where on v6.0.0 nothing fit.
         assert_eq!(room(roomy, 12 * 1024, None, floor, rtx4090), Bytes(10_012 * MIB));
 
-        // The SERVER's own tier: an operator's 268M on a 5080 runs at 134M (the fork's 16 GiB cap),
-        // so 10,012 is the room — not 12,512.
-        let op_large = SizingCap::Operator(Some(LARGE));
+        // The SERVER's own tier: an operator's 402M on a 5080 runs at 268M, so 11,889 is the room,
+        // not the unknown requirement of a configuration the card never runs.
         assert_eq!(
-            room(op_large, 15_878, None, floor, rtx5080),
-            Bytes(10_012 * MIB)
+            room(
+                SizingCap::Operator(Some(402_653_184)),
+                15_878,
+                None,
+                floor_16gb,
+                rtx5080
+            ),
+            Bytes(11_889 * MIB)
         );
+        let op_large = SizingCap::Operator(Some(LARGE));
         assert_eq!(
             room(op_large, 24_107, None, floor, rtx4090),
             Bytes(12_512 * MIB)
@@ -13477,15 +13514,22 @@ mod tests {
         assert_eq!(room(op_402, 12 * 1024, None, floor, rtx4090), Unknown);
 
         // The OPERATOR's floor, on this box's host (5080 with a 700 MiB desktop: 15,178 emptied).
-        // Lowered: room up to it, or a card the floor admits is refused for want of a recycle.
+        // Raised: room up to it, or the gate refuses what recycling allows.
         assert_eq!(
             room(this_box, 15_178, None, Some(15_000 * MIB), rtx5080),
             Bytes(15_000 * MIB)
         );
-        // Disabled gate: 134M (10,012) now fits this 5080 ceiling, so the room is that tier's.
-        assert_eq!(room(this_box, 15_178, None, None, rtx5080), Bytes(10_012 * MIB));
-        // Default floor (10,012): reachable within 15,178, so the room is made.
-        assert_eq!(room(this_box, 15_178, None, floor, rtx5080), Bytes(10_012 * MIB));
+        // Disabled, or the default: the tier's own requirement.
+        assert_eq!(
+            room(this_box, 15_178, None, None, rtx5080),
+            Bytes(11_889 * MIB)
+        );
+        assert_eq!(
+            room(this_box, 15_178, None, floor_16gb, rtx5080),
+            Bytes(11_889 * MIB)
+        );
+        // A floor no emptied card reaches destroys nothing for it.
+        assert_eq!(room(this_box, 15_178, None, floor, rtx5080), Hopeless);
         // Raised above the tier: room up to the floor, or the gate refuses what recycling allows.
         assert_eq!(
             room(roomy, 24_107, None, Some(20_000 * MIB), rtx4090),
@@ -13518,21 +13562,26 @@ mod tests {
         let sib = |key: &str, mib: u64| vec![(key.to_string(), mib * MIB)];
         let sp1_room = |available: u64, siblings: &[(String, u64)], total_mib: u64| {
             let ceiling = siblings.iter().fold(available * MIB, |a, (_, h)| a + h);
+            let total = Some(total_mib * MIB);
             let room = room_needed(
                 SizingCap::Host(Some(268_435_456)),
                 "sp1",
                 ceiling,
                 None,
-                Some(10_012 * MIB),
-                Some(total_mib * MIB),
+                Some(zkminer_prover_protocol::types::sp1_min_available_vram_bytes(total)),
+                total,
             );
             (room, plan_room(room, available * MIB, siblings))
         };
 
-        // SP1 after risc0 on the 5080 (fork-capped to 134M, 10,012): 9,000 MiB free is short of it,
-        // and evicting the idle risc0 worker (1,806 MiB) clears it. It goes.
-        let (room, evict) = sp1_room(9_000, &sib("risc0:cuda:0", 1_806), 16_303);
-        assert_eq!(room, RoomNeeded::Bytes(10_012 * MIB));
+        // SP1 after risc0 on the 5080: the idle risc0 worker (1,806 MiB) leaves 14,072 MiB, which
+        // holds the 16 GB card's 268M tier (11,889). It stays.
+        let (room, evict) = sp1_room(14_072, &sib("risc0:cuda:0", 1_806), 16_303);
+        assert_eq!(room, RoomNeeded::Bytes(11_889 * MIB));
+        assert!(evict.is_empty());
+        // On a 4070 it does not: 12,010 less 1,806 is short of 11,889. It goes.
+        let (room, evict) = sp1_room(10_204, &sib("risc0:cuda:0", 1_806), 12_282);
+        assert_eq!(room, RoomNeeded::Bytes(11_889 * MIB));
         assert_eq!(evict, vec!["risc0:cuda:0".to_string()]);
         // SP1 after risc0 on the 4090 (268M, 12,512): 10,000 MiB free is short, and evicting the
         // risc0 worker holding its Groth16 cache (7,134 MiB) clears it. It goes.

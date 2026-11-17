@@ -1778,7 +1778,7 @@ fn sp1_element_threshold_for(scale: f64) -> Option<u64> {
 /// can do is leave performance on the table. That direction also matters for soundness: the shape
 /// allow-list is enumerated against the compile-time `PADDED_ELEMENT_THRESHOLD`, so a value below
 /// the constant yields shapes the circuit already accepts while one above it does not.
-fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>) {
+fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>, total_vram: Option<u64>) {
     // Never override what the operator set by hand.
     if std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_ENV).is_ok() {
         return;
@@ -1787,7 +1787,9 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>) {
     // function whose inputs the dispatcher reads too when it predicts this worker's tier.
     let from_host = sp1_element_threshold_for(scale);
     let from_vram = available_vram.map(|a| {
-        match zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(a) {
+        match zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(
+            a, total_vram,
+        ) {
             Some(t) => t.to_string(),
             None => format!(
                 "{} ({} MiB free is below every measured tier; using the smallest)",
@@ -1796,9 +1798,11 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>) {
             ),
         }
     });
-    let Some(threshold) =
-        zkminer_prover_protocol::types::sp1_element_threshold_cap(scale, available_vram)
-    else {
+    let Some(threshold) = zkminer_prover_protocol::types::sp1_element_threshold_cap(
+        scale,
+        available_vram,
+        total_vram,
+    ) else {
         return;
     };
     // Only say so when it lowers the fork's own default. With today's tables every computed value
@@ -1884,7 +1888,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             .map(|b| format!("{:.1} GB", b as f64 / 1e9))
             .unwrap_or_else(|| "unknown".into()),
     );
-    apply_sp1_worker_tuning(sp1_scale, available_vram);
+    apply_sp1_worker_tuning(sp1_scale, available_vram, vram_bytes);
     #[cfg(windows)]
     windows_tuning::apply_sycl_wrap_persistent_pk(vram_bytes);
     #[cfg(windows)]
@@ -1956,12 +1960,12 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     ///
     /// `set_var` is sound here: this runs once, before any prover or server exists, on the single
     /// thread that has not yet spawned anything.
-    fn apply_sp1_worker_tuning(scale: f64, available_vram: Option<u64>) {
+    fn apply_sp1_worker_tuning(scale: f64, available_vram: Option<u64>, total_vram: Option<u64>) {
         // The element threshold is settled FIRST and unconditionally, because the two inputs are
         // independent: a host with plenty of RAM gives `scale >= 1.0` and no host-derived threshold,
         // while the card it is attached to may still be half full. Returning early on `scale` alone —
         // which is what this did — skipped the VRAM cap in exactly the case it exists for.
-        apply_sp1_element_threshold(scale, available_vram);
+        apply_sp1_element_threshold(scale, available_vram, total_vram);
         if scale >= 1.0 {
             return;
         }
@@ -4389,6 +4393,8 @@ mod threshold_tests {
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
+    /// The card these were written against: an RTX 4090's `memory.total`.
+    const RTX4090: Option<u64> = Some(24_564 * 1024 * 1024);
     const SMALL: u64 = 134_217_728;
     /// The largest MEASURED configuration. The fork's own default is 402,653,184 and is deliberately
     /// absent from the measured table, so nothing here may select it.
@@ -4407,9 +4413,9 @@ mod threshold_tests {
         // A roomy HOST gives no host-derived limit, so a constrained CARD must still bind. On v6.1.0
         // 11 GiB is in the 134M band [10,012, 12,512) — a 16 GiB card now fits 268M.
         assert_eq!(super::sp1_element_threshold_for(1.0), None);
-        assert_eq!(from_vram(11 * GIB), Some(SMALL));
+        assert_eq!(from_vram(16 * GIB, RTX4090), Some(SMALL));
         // Through the function the worker actually calls, not a re-implementation of it.
-        let combined = cap(1.0, Some(11 * GIB));
+        let combined = cap(1.0, Some(16 * GIB), RTX4090);
         assert_eq!(
             combined,
             Some(SMALL),
@@ -4418,13 +4424,13 @@ mod threshold_tests {
         );
 
         // And the converse: a roomy CARD must not let a constrained host off.
-        assert_eq!(from_vram(24 * GIB), Some(LARGEST_MEASURED));
+        assert_eq!(from_vram(24 * GIB, RTX4090), Some(LARGEST_MEASURED));
         let host_bound = super::sp1_element_threshold_for(0.3);
         assert!(
             host_bound.is_some_and(|t| t < LARGEST_MEASURED),
             "a tight host budget must still produce a limit: {host_bound:?}"
         );
-        assert_eq!(cap(0.3, Some(24 * GIB)), host_bound);
+        assert_eq!(cap(0.3, Some(24 * GIB), RTX4090), host_bound);
     }
 
     /// Only ever a CAP. The fork treats `SP1_GPU_ELEMENT_THRESHOLD` as a bound on its own tier, and the
@@ -4434,8 +4440,16 @@ mod threshold_tests {
     fn no_computed_threshold_ever_exceeds_what_is_allowed() {
         // The VRAM path may only ever select a MEASURED configuration, which is stricter than the
         // fork's default: an unmeasured tier is one whose peak VRAM we cannot vouch for.
-        for gib in 0..=64u64 {
-            if let Some(t) = from_vram(gib * GIB) {
+        for (gib, total) in (0..=64u64).flat_map(|g| {
+            [
+                RTX4090,
+                Some(12_282 * 1024 * 1024),
+                Some(16_303 * 1024 * 1024),
+                None,
+            ]
+            .map(|t| (g, t))
+        }) {
+            if let Some(t) = from_vram(gib * GIB, total) {
                 assert!(
                     t <= LARGEST_MEASURED,
                     "{gib} GiB free produced {t}, above the largest measured configuration \

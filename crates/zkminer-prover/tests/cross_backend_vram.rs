@@ -83,7 +83,7 @@ fn risc0_and_sp1_alternate_on_one_card() {
     let (risc0, sp1) = (format!("risc0:cuda:{card}"), format!("sp1:cuda:{card}"));
 
     // Before any worker exists, so each is sized for the card as it will be.
-    let floor_mib = zkminer_prover::discovery::min_available_vram_bytes_for_backend("sp1")
+    let floor_mib = zkminer_prover::discovery::min_available_vram_bytes_for_backend("sp1", None)
         .expect("sp1 must require free VRAM for this test to mean anything")
         >> 20;
     let target_mib = std::env::var("ZKMINER_TEST_VRAM_TARGET_MIB")

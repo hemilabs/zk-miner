@@ -8376,7 +8376,7 @@ async fn miner_brain(
                         }
                     }
                     // No card here proves risc0 jobs: none has a size known to fit it (a card under
-                    // 14 GiB needs calibrating, or a size set for it), or each one that has is
+                    // 6.5 GiB needs calibrating, or a size set for it), or each one that has is
                     // switched off. The job could only be released. (With no risc0 card at all, the
                     // availability check below says so.)
                     if !sim_mode
@@ -8390,7 +8390,7 @@ async fn miner_brain(
                         {
                             last_no_risc0_card_warn = Some(now);
                             let detail = "Not claiming risc0 jobs: no enabled card here has a risc0 \
-                                          job size. A card with under 14 GiB of VRAM needs one: a \
+                                          job size. A card with under 6.5 GiB of VRAM needs one: a \
                                           po2 under Settings → Advanced for this session, or \
                                           `prover.risc0_job_po2` in the config or, on an NVIDIA \
                                           card, `zkminer benchmark --calibrate`, each read when the \
@@ -10251,7 +10251,7 @@ async fn watch_inspect(
         return Inspected::Done(
             "no card",
             format!(
-                "{head}: no enabled card here proves risc0 jobs (one with under 14 GiB of VRAM needs \
+                "{head}: no enabled card here proves risc0 jobs (one with under 6.5 GiB of VRAM needs \
                  a size: `prover.risc0_job_po2` in the config, or a calibration on an NVIDIA card)"
             ),
         );
@@ -17429,7 +17429,7 @@ mod r2_sizing_tests {
             |i: usize, vram: Option<u64>| (format!("risc0:cuda:{i}"), format!("gpu{i}"), vram);
         let slots = vec![
             slot(0, Some(24 * GIB)), // uncalibrated: the default size
-            slot(1, Some(12 * GIB)), // uncalibrated, too small for it: none
+            slot(1, Some(6 * GIB)),  // uncalibrated, too small for any size: none
             slot(2, Some(12 * GIB)), // calibrated: its measured best
             slot(3, None),           // VRAM unknown: the default size
             slot(4, Some(8 * GIB)),  // a size set in Settings

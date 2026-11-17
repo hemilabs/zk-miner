@@ -848,19 +848,15 @@ pub const CUDA_VRAM_AVAILABLE_BYTES_ENV: &str = "ZKMINER_CUDA_VRAM_AVAILABLE_BYT
 /// MiB, as `nvidia-smi` reports it.
 const MIB: u64 = 1024 * 1024;
 
-/// Measured `(element threshold, peak VRAM)` for SP1, largest first.
+/// Measured `(element threshold, peak VRAM)` for SP1 on a card of MORE than 16 GiB, largest first.
 ///
-/// Measured with a 1,912,954,985-cycle `sha256-chain` proof through to a compact Groth16 seal on SP1
-/// circuit **v6.1.0**: 11,542 MiB of a 16,311 MiB RTX 5060 Ti at the 268M threshold, and 8,884–8,957
-/// MiB at 134M (the same 5060 Ti, and a 12,282 MiB RTX 4070). Recorded conservatively above every
-/// observation (200 ms sampling). The peak is flat across job size — it is the shard working set plus
-/// the fixed Groth16-wrap recursion, not shard count — and the wrap itself is on the CPU (gnark) here,
-/// so it costs host RAM, not VRAM.
-///
-/// v6.1.0 is markedly more memory-efficient than v6.0.0, where this same 134M proof peaked at 15,092
-/// MiB and 268M at 17,766 MiB. The consequence that matters: **134M now fits a 12 GiB card** (~9 GiB
-/// peak), so 12 GiB cards run the standard tier rather than needing a smaller one; and a 16 GiB card
-/// can now run 268M (11,542 MiB fits) where before it was held to 134M.
+/// Both figures measured on this box with a 1,912,954,963-cycle `sha256-chain` proof
+/// through to a compact Groth16 seal: 17,766 MiB of a 24,564 MiB RTX 4090 at the 268M threshold, and
+/// 15,092 MiB of a 16,303 MiB RTX 5080 at 134M. The 5080's figure predates the current server and
+/// was taken on a 16 GB card, which the server now runs differently (see
+/// [`SP1_MEASURED_TIERS_16GB`]); nothing has measured 134M on a larger card under it, where the
+/// server keeps the memory the small-card table's savers drop, so it stays as this table's smaller
+/// tier rather than a smaller guess.
 ///
 /// `402_653_184` — the fork's own default — is deliberately ABSENT. Nothing here has measured its peak
 /// VRAM, and this table is used to decide what will fit. Its omission makes a roomy card slightly
@@ -870,6 +866,44 @@ const MIB: u64 = 1024 * 1024;
 const SP1_MEASURED_TIERS: &[(u64, u64)] =
     &[(268_435_456, 12_000 * MIB), (134_217_728, 9_500 * MIB)];
 
+/// Measured `(element threshold, peak VRAM)` for SP1 on a card of 16 GiB or less, largest first.
+///
+/// The server sizes itself from the card's total (`local_gpu_opts`, `ceil(total GiB) + 4 <= 20`) and
+/// on these cards drops its LDE codewords after committing, recomputes the first GKR layer, keeps no
+/// wrap or shrink key between proofs, and caches no preprocessed data — so the same threshold needs
+/// far less than on a 24 GB card, and the larger table above would refuse a 12 GB card outright.
+///
+/// Measured 2026-11-16 on a 12,282 MiB RTX 4070 under Windows, driving no display, with the SP1
+/// benchmark suite through to Groth16 seals (`nvidia-smi`'s figure, every program verified):
+/// 11,377 MiB at 268M (5.8M cycles/s), and 8,655 MiB at 134M (4.6M cycles/s), where the peak is the
+/// wrap's and the core STARK's was 8,399. The Groth16 proof itself ran on the CPU there; a 15-16 GiB
+/// CUDA card runs it on the GPU only when its own check finds the memory free beside the prover.
+///
+/// 268M fills a 12 GB card, and it needs to: with 1.5 GiB of the card taken by a test allocation
+/// first (standing in for a display), the same suite spilled into system memory and `sha256-chain` took 101 s instead
+/// of 33. So the figure is what the configuration needs, not what an allocator took because it was
+/// there.
+const SP1_MEASURED_TIERS_16GB: &[(u64, u64)] =
+    &[(268_435_456, 11_377 * MIB), (134_217_728, 8_655 * MIB)];
+
+/// The largest card total that `sp1-gpu-server` treats as a 16 GB card (see
+/// [`SP1_MEASURED_TIERS_16GB`]): `ceil(total GiB) + 4 <= 20`.
+const SP1_16GB_CARD_MAX_TOTAL: u64 = 16 * 1024 * MIB;
+
+/// The largest card total `sp1-gpu-server` refuses: it panics at start-up ("Unsupported GPU memory")
+/// when `ceil(total GiB) + 4 < 16`, so on any card of 11 GiB or less.
+const SP1_UNSUPPORTED_CARD_MAX_TOTAL: u64 = 11 * 1024 * MIB;
+
+/// The measured tiers for a card of `total` bytes, largest first: none for a card the server refuses,
+/// and the larger card's table when the total is unknown, whose figures are the higher.
+fn sp1_measured_tiers(total: Option<u64>) -> &'static [(u64, u64)] {
+    match total {
+        Some(t) if t <= SP1_UNSUPPORTED_CARD_MAX_TOTAL => &[],
+        Some(t) if t <= SP1_16GB_CARD_MAX_TOTAL => SP1_MEASURED_TIERS_16GB,
+        _ => SP1_MEASURED_TIERS,
+    }
+}
+
 /// Headroom required on top of a measured peak before that configuration is considered to fit.
 ///
 /// A CUDA context alone costs ~400 MiB here (measured: a process allocating 2,048 MiB showed as 2,444
@@ -877,8 +911,9 @@ const SP1_MEASURED_TIERS: &[(u64, u64)] =
 /// a little above them.
 const SP1_VRAM_MARGIN: u64 = 512 * MIB;
 
-/// The SP1 shard element threshold for a card with `available` bytes of VRAM free to us, or `None`
-/// when that is below what even the smallest measured configuration needs.
+/// The SP1 shard element threshold for a card of `total` bytes with `available` bytes of VRAM free to
+/// us, or `None` when that is below what even the smallest measured configuration needs there (or the
+/// server refuses the card). `total` picks the table (see [`sp1_measured_tiers`]).
 ///
 /// Why not SP1's own tier arithmetic, which is what this first did: `local_gpu_opts` computes
 /// `gpu_memory_gb = ceil(total / 1 GiB) + 4` and takes the larger tier above 20. That formula carries
@@ -893,8 +928,8 @@ const SP1_VRAM_MARGIN: u64 = 512 * MIB;
 /// own tier choice. That direction matters for soundness as well as memory: the shape allow-list is
 /// enumerated against the compile-time `PADDED_ELEMENT_THRESHOLD`, so a threshold below the constant
 /// yields shapes the circuit already accepts while one above it does not.
-pub fn sp1_element_threshold_for_available_vram(available: u64) -> Option<u64> {
-    SP1_MEASURED_TIERS
+pub fn sp1_element_threshold_for_available_vram(available: u64, total: Option<u64>) -> Option<u64> {
+    sp1_measured_tiers(total)
         .iter()
         .find(|(_, peak)| peak.saturating_add(SP1_VRAM_MARGIN) <= available)
         .map(|(threshold, _)| *threshold)
@@ -1018,15 +1053,20 @@ pub fn sp1_element_threshold_for_host_scale(scale: f64) -> Option<u64> {
 /// card's TOTAL (`sp1_fork_threshold_for_total_vram`), so the threshold actually used is that minimum.
 /// Ignores the operator's `SP1_ELEMENT_THRESHOLD_ENV`, which callers check first: when it is set the
 /// worker applies none of this.
-pub fn sp1_element_threshold_cap(scale: f64, available_vram: Option<u64>) -> Option<u64> {
+pub fn sp1_element_threshold_cap(
+    scale: f64,
+    available_vram: Option<u64>,
+    total_vram: Option<u64>,
+) -> Option<u64> {
     let from_host = sp1_element_threshold_for_host_scale(scale);
     let from_vram = available_vram.map(|a| {
-        sp1_element_threshold_for_available_vram(a).unwrap_or_else(sp1_smallest_measured_threshold)
+        sp1_element_threshold_for_available_vram(a, total_vram)
+            .unwrap_or_else(sp1_smallest_measured_threshold)
     });
     [from_host, from_vram].into_iter().flatten().min()
 }
 
-/// The smallest SP1 element threshold with a measured VRAM peak.
+/// The smallest SP1 element threshold with a measured VRAM peak. The same in both tables.
 pub fn sp1_smallest_measured_threshold() -> u64 {
     SP1_MEASURED_TIERS
         .last()
@@ -1036,50 +1076,56 @@ pub fn sp1_smallest_measured_threshold() -> u64 {
 
 /// The element threshold `sp1-gpu-server` picks for itself from the card's TOTAL VRAM, before any cap.
 ///
-/// Mirrors `local_gpu_opts` in the fork (`sp1-gpu/crates/prover_components/src/builder.rs`): it computes
-/// `gpu_memory_gb = ceil(total / 1 GiB) + 4`, takes `ELEMENT_THRESHOLD - (1 << 28)` = 134,217,728 when
-/// that is at most 20 and the full `ELEMENT_THRESHOLD` = 402,653,184 above it, and then uses the
-/// minimum of that and `SP1_GPU_ELEMENT_THRESHOLD` if the variable parses. So the 16,303 MiB RTX 5080
-/// (16 + 4 = 20) runs at most 134M whatever it is told, and the 24,564 MiB RTX 4090 (24 + 4 = 28) at
-/// most 402M.
+/// Mirrors `local_gpu_opts` in the pinned server (`sp1-gpu/crates/prover_components/src/builder.rs`):
+/// it computes `gpu_memory_gb = ceil(total / 1 GiB) + 4`; at most 20 (a card of 16 GiB or less) a CUDA
+/// server takes 268,435,456 (`1 << 28`), above that 285,212,672 up to 30 and the full
+/// `ELEMENT_THRESHOLD` = 402,653,184 above 30 or with `FULL_SIZE_SHARDS`, and then it uses the minimum
+/// of that and `SP1_GPU_ELEMENT_THRESHOLD` if the variable parses.
 ///
-/// The dispatcher needs it to predict a worker's tier exactly: without it, an operator's 268M on a
-/// 5080 read as needing 18,278 MiB — more than the card has — so the gate never made room for a
-/// worker that actually runs at 134M and needs 15,604.
+/// Returned as an UPPER bound where the server's choice is not knowable from here, which keeps every
+/// prediction on the safe side (`tier_at` takes the minimum, so a higher figure here can only make
+/// the predicted tier, and so the room made for it, the larger): 402,653,184 above 16 GiB, whatever
+/// `FULL_SIZE_SHARDS` says, and 268,435,456 at or below 16 GiB on every backend — a HIP server there
+/// may choose `1 << 26` or 134,217,728 instead, depending on its arena and the video memory budget.
+///
+/// The dispatcher needs it to predict a worker's tier exactly where it matters: an operator's
+/// 402,653,184 on a 16 GB card runs at 268,435,456 and needs that tier's room, not an unmeasured one.
 pub fn sp1_fork_threshold_for_total_vram(total: u64) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     let gpu_memory_gb = total.div_ceil(GIB) + 4;
     if gpu_memory_gb <= 20 {
-        SP1_FORK_DEFAULT_THRESHOLD - (1 << 28)
+        1 << 28
     } else {
         SP1_FORK_DEFAULT_THRESHOLD
     }
 }
 
-/// How much VRAM an SP1 worker sized at `threshold` needs free on its card: that configuration's
-/// measured peak plus [`SP1_VRAM_MARGIN`]. `None` for a threshold this table has not measured.
+/// How much VRAM an SP1 worker sized at `threshold` needs free on its card of `total` bytes: that
+/// configuration's measured peak plus [`SP1_VRAM_MARGIN`]. `None` for a threshold that card's table
+/// has not measured.
 ///
 /// The inverse of [`sp1_element_threshold_for_available_vram`], from the same table, so the two cannot
-/// disagree: `sp1_element_threshold_for_available_vram(sp1_vram_required_for_threshold(t))` is `t`.
-/// The dispatcher uses it to decide how much room an SP1 proof needs made for it on a card our other
-/// workers share.
-pub fn sp1_vram_required_for_threshold(threshold: u64) -> Option<u64> {
-    SP1_MEASURED_TIERS
+/// disagree: `sp1_element_threshold_for_available_vram(sp1_vram_required_for_threshold(t, c), c)` is
+/// `t`. The dispatcher uses it to decide how much room an SP1 proof needs made for it on a card our
+/// other workers share.
+pub fn sp1_vram_required_for_threshold(threshold: u64, total: Option<u64>) -> Option<u64> {
+    sp1_measured_tiers(total)
         .iter()
         .find(|(t, _)| *t == threshold)
         .map(|(_, peak)| peak.saturating_add(SP1_VRAM_MARGIN))
 }
 
-/// How much VRAM must be free before SP1 can be given work at all: what its smallest measured
-/// configuration needs, plus margin.
+/// How much VRAM must be free on a card of `total` bytes before SP1 can be given work there at all:
+/// what its smallest measured configuration needs, plus margin. `u64::MAX` for a card the server
+/// refuses.
 ///
-/// Derived from [`SP1_MEASURED_TIERS`] rather than written down separately, so this and
+/// Derived from the measured tables rather than written down separately, so this and
 /// [`sp1_element_threshold_for_available_vram`] cannot disagree about whether a card is usable. Two
 /// independent constants could disagree — a floor that admitted a card by ~350 MiB the tier function
 /// then had no configuration for would refuse the work one layer later, after the worker was already
 /// spawned.
-pub fn sp1_min_available_vram_bytes() -> u64 {
-    SP1_MEASURED_TIERS
+pub fn sp1_min_available_vram_bytes(total: Option<u64>) -> u64 {
+    sp1_measured_tiers(total)
         .last()
         .map(|(_, peak)| peak.saturating_add(SP1_VRAM_MARGIN))
         .unwrap_or(u64::MAX)
@@ -1826,6 +1872,11 @@ mod zkop_mix_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The cards the tier tests size: `nvidia-smi`'s `memory.total` for each.
+    const RTX4090: Option<u64> = Some(24_564 * super::MIB);
+    const RTX5080: Option<u64> = Some(16_303 * super::MIB);
+    const RTX4070: Option<u64> = Some(12_282 * super::MIB);
+
     /// The tier must never select a configuration whose MEASURED peak does not fit, and never exceed
     /// the fork's default, which it is only allowed to cap.
     #[test]
@@ -1834,41 +1885,84 @@ mod tests {
         const GIB: u64 = 1024 * 1024 * 1024;
         const FULL_DEFAULT: u64 = 402_653_184;
 
-        // An empty 4090 has room for the 268M configuration (v6.1.0: 11,542 MiB + margin = 12,512).
-        assert_eq!(tier(24 * GIB), Some(268_435_456));
-        // 16 GiB free now also fits 268M — v6.1.0 shrank it to fit a 16 GiB card, where v6.0.0's
-        // 17,766 MiB did not.
-        assert_eq!(tier(16 * GIB), Some(268_435_456));
+        // An empty 4090 has room for the 268M configuration (17,766 MiB + margin).
+        assert_eq!(tier(24 * GIB, RTX4090), Some(268_435_456));
+        // 16 GiB free steps down to 134M, whose 15,092 MiB peak fits.
+        assert_eq!(tier(16 * GIB, RTX4090), Some(134_217_728));
 
-        // THE REGRESSION THIS GUARDS: a card with room for 134M but not 268M must step down, not
-        // commit to a configuration that cannot fit and fail part-way through a claimed job. On
-        // v6.1.0 that band is [134M's 10,012 MiB, 268M's 12,512 MiB).
-        for mib in [10_100u64, 11_000, 12_000, 12_511] {
+        // THE REGRESSION THIS GUARDS. SP1's own rule — `ceil(gib) + 4 > 20` — takes the 268M tier from
+        // 16.4 GiB upward, but that tier peaks at 17,766 MiB. Everything in that band must step down,
+        // or we commit to a configuration that cannot fit and fail part-way through a claimed job.
+        for mib in [16_500u64, 17_000, 17_500, 18_000, 18_277] {
             assert_eq!(
-                tier(mib * MIB),
+                tier(mib * MIB, RTX4090),
                 Some(134_217_728),
                 "{mib} MiB free must take the 134M tier: 268M needs 12,512 MiB and will not fit"
             );
         }
-        // At the 268M requirement it steps back up.
-        assert_eq!(tier(12_512 * MIB), Some(268_435_456));
+        // Just above the 268M peak plus margin, it may step back up.
+        assert_eq!(tier(18_278 * MIB, RTX4090), Some(268_435_456));
 
-        // 134M now fits a 12 GiB card; one MiB below its 10,012 requirement there is nothing to offer.
-        assert_eq!(tier(12 * GIB), Some(134_217_728));
-        assert_eq!(tier(10_012 * MIB), Some(134_217_728));
-        assert_eq!(tier(10_011 * MIB), None);
-        assert_eq!(tier(8 * GIB), None);
-        assert_eq!(tier(0), None);
+        // Below the smallest measured configuration there is nothing to offer.
+        assert_eq!(tier(8 * GIB, RTX4090), None);
+        assert_eq!(tier(0, RTX4090), None);
+        // An unknown card is sized by the larger card's table, whose figures are the higher.
+        assert_eq!(tier(16 * GIB, None), Some(134_217_728));
+        assert_eq!(tier(12 * GIB, None), None);
 
         // Monotonic, and never above the default it may only cap.
-        let mut prev = 0u64;
-        for mib in (0..=49_152u64).step_by(128) {
-            if let Some(t) = tier(mib * MIB) {
-                assert!(t >= prev, "tier fell as free VRAM grew, at {mib} MiB");
-                assert!(t <= FULL_DEFAULT, "{t} exceeds the default {FULL_DEFAULT}");
-                prev = t;
+        for total in [RTX4090, RTX5080, RTX4070, None] {
+            let mut prev = 0u64;
+            for mib in (0..=49_152u64).step_by(128) {
+                if let Some(t) = tier(mib * MIB, total) {
+                    assert!(
+                        t >= prev,
+                        "tier fell as free VRAM grew, at {mib} MiB of {total:?}"
+                    );
+                    assert!(t <= FULL_DEFAULT, "{t} exceeds the default {FULL_DEFAULT}");
+                    prev = t;
+                }
             }
         }
+    }
+
+    /// A card of 16 GiB or less has its own table: the server runs differently there, and the larger
+    /// card's figures would refuse a 12 GB card that proves at 268M (measured on an RTX 4070).
+    #[test]
+    fn a_16gb_or_smaller_card_is_sized_by_its_own_measurements() {
+        use super::{sp1_element_threshold_for_available_vram as tier, MIB};
+        // An idle 4070: its total less the driver's 272 MiB reservation. 268M peaked at 11,377 MiB.
+        assert_eq!(tier(12_010 * MIB, RTX4070), Some(268_435_456));
+        // 1.5 GiB of it taken (a test allocation standing in for a display): 268M spilled into system memory there, so 134M, whose
+        // peak (the wrap's) was 8,655 MiB.
+        assert_eq!(tier(10_337 * MIB, RTX4070), Some(134_217_728));
+        assert_eq!(tier((8_655 + 512) * MIB, RTX4070), Some(134_217_728));
+        assert_eq!(tier((8_655 + 512) * MIB - 1, RTX4070), None);
+        // A 5080 is a 16 GB card to the server too: an idle one (less its 423 MiB) takes 268M.
+        assert_eq!(tier(15_880 * MIB, RTX5080), Some(268_435_456));
+        // Exactly 16 GiB is still a 16 GB card; a byte more is not.
+        assert_eq!(
+            tier(12 * 1024 * MIB, Some(16 * 1024 * MIB)),
+            Some(268_435_456)
+        );
+        assert_eq!(tier(12 * 1024 * MIB, Some(16 * 1024 * MIB + 1)), None);
+    }
+
+    /// The server panics at start-up on a card of 11 GiB or less (`ceil(total GiB) + 4 < 16`), so no
+    /// amount of free memory there buys a tier, and the floor is out of reach.
+    #[test]
+    fn a_card_the_server_refuses_has_no_tier() {
+        use super::{sp1_element_threshold_for_available_vram as tier, MIB};
+        let eleven = Some(11 * 1024 * MIB);
+        assert_eq!(tier(11 * 1024 * MIB, eleven), None);
+        assert_eq!(super::sp1_min_available_vram_bytes(eleven), u64::MAX);
+        assert_eq!(
+            super::sp1_vram_required_for_threshold(134_217_728, eleven),
+            None
+        );
+        // A byte over 11 GiB is a 12 GB card to the server.
+        let twelve = Some(11 * 1024 * MIB + 1);
+        assert_eq!(tier(11 * 1024 * MIB, twelve), Some(134_217_728));
     }
 
     /// The floor and the tier table must agree about whether a card is usable at all. Two independent
@@ -1876,15 +1970,17 @@ mod tests {
     /// configuration for, so the work would have been refused a layer later, after a worker spawn.
     #[test]
     fn the_floor_is_exactly_what_the_smallest_configuration_needs() {
-        let floor = super::sp1_min_available_vram_bytes();
-        assert!(
-            super::sp1_element_threshold_for_available_vram(floor).is_some(),
-            "a card that exactly clears the floor must have a configuration available"
-        );
-        assert!(
-            super::sp1_element_threshold_for_available_vram(floor - 1).is_none(),
-            "one byte below the floor there must be nothing on offer, or the two disagree"
-        );
+        for total in [RTX4090, RTX5080, RTX4070, None] {
+            let floor = super::sp1_min_available_vram_bytes(total);
+            assert!(
+                super::sp1_element_threshold_for_available_vram(floor, total).is_some(),
+                "a card that exactly clears the floor must have a configuration available"
+            );
+            assert!(
+                super::sp1_element_threshold_for_available_vram(floor - 1, total).is_none(),
+                "one byte below the floor there must be nothing on offer, or the two disagree"
+            );
+        }
     }
 
     /// What a tier needs and what tier a figure buys must be exact inverses, at every tier. The
@@ -1895,31 +1991,35 @@ mod tests {
     #[test]
     fn the_requirement_buys_exactly_its_own_tier() {
         use super::{
-            sp1_element_threshold_for_available_vram as tier,
-            sp1_vram_required_for_threshold as required, SP1_MEASURED_TIERS,
+            sp1_element_threshold_for_available_vram as tier, sp1_measured_tiers,
+            sp1_smallest_measured_threshold, sp1_vram_required_for_threshold as required,
         };
-        for (t, _) in SP1_MEASURED_TIERS {
-            let need = required(*t).expect("every measured tier has a requirement");
+        for total in [RTX4090, RTX5080, RTX4070, None] {
+            for (t, _) in sp1_measured_tiers(total) {
+                let need = required(*t, total).expect("every measured tier has a requirement");
+                assert_eq!(
+                    tier(need, total),
+                    Some(*t),
+                    "{need} bytes must buy exactly tier {t}"
+                );
+                assert_ne!(
+                    tier(need - 1, total),
+                    Some(*t),
+                    "one byte short of {need} must not buy tier {t}"
+                );
+            }
+            // The smallest tier's requirement IS the floor: the two are one rule, not two constants.
+            // And both tables share it, so "the smallest" means one threshold whatever the card.
+            let smallest = sp1_measured_tiers(total).last().unwrap().0;
+            assert_eq!(smallest, sp1_smallest_measured_threshold());
             assert_eq!(
-                tier(need),
-                Some(*t),
-                "{need} bytes must buy exactly tier {t}"
+                required(smallest, total),
+                Some(super::sp1_min_available_vram_bytes(total))
             );
-            assert_ne!(
-                tier(need - 1),
-                Some(*t),
-                "one byte short of {need} must not buy tier {t}"
-            );
+            // An unmeasured configuration has no requirement — never a guess.
+            assert_eq!(required(402_653_184, total), None);
+            assert_eq!(required(0, total), None);
         }
-        // The smallest tier's requirement IS the floor: the two are one rule, not two constants.
-        let smallest = SP1_MEASURED_TIERS.last().unwrap().0;
-        assert_eq!(
-            required(smallest),
-            Some(super::sp1_min_available_vram_bytes())
-        );
-        // An unmeasured configuration has no requirement — never a guess.
-        assert_eq!(required(402_653_184), None);
-        assert_eq!(required(0), None);
     }
 
     /// The host-memory half of SP1's sizing, which the worker applies to itself and the dispatcher
@@ -1944,15 +2044,22 @@ mod tests {
         assert_eq!(host(super::SP1_MIN_SCALE), Some(134_217_728));
         assert_eq!(host(1.0), None);
         // The two bounds combine as the smaller; neither present means the fork decides.
-        assert_eq!(cap(1.0, Some(24 * GIB)), Some(268_435_456));
-        assert_eq!(cap(0.6, Some(24 * GIB)), Some(134_217_728));
-        // 16 GiB free fits 268M on v6.1.0, and the 0.8 host scale also allows 268M, so neither bound
-        // lowers it.
-        assert_eq!(cap(0.8, Some(16 * GIB)), Some(268_435_456));
+        assert_eq!(cap(1.0, Some(24 * GIB), RTX4090), Some(268_435_456));
+        assert_eq!(cap(0.6, Some(24 * GIB), RTX4090), Some(134_217_728));
+        assert_eq!(cap(0.8, Some(16 * GIB), RTX4090), Some(134_217_728));
         // Too little free for any measured tier still bounds it — to the smallest, never to nothing,
         // which would hand a 24 GB card back to the fork's 402M.
-        assert_eq!(cap(1.0, Some(8 * GIB)), Some(134_217_728));
-        assert_eq!(cap(1.0, None), None);
+        assert_eq!(cap(1.0, Some(8 * GIB), RTX4090), Some(134_217_728));
+        assert_eq!(cap(1.0, None, RTX4090), None);
+        // A 12 GB card is sized by its own table: free, 268M; the host can still lower it.
+        assert_eq!(
+            cap(1.0, Some(12_010 * super::MIB), RTX4070),
+            Some(268_435_456)
+        );
+        assert_eq!(
+            cap(0.6, Some(12_010 * super::MIB), RTX4070),
+            Some(134_217_728)
+        );
     }
 
     /// These messages are operator-facing and go to a one-line log sink, so a wrapped literal must be
@@ -2053,15 +2160,21 @@ mod tests {
         }
     }
 
-    /// The server's own tier from the card's TOTAL, as `local_gpu_opts` computes it.
+    /// The server's own tier from the card's TOTAL, as the pinned server's `local_gpu_opts` computes
+    /// it for CUDA (an upper bound for the other backends).
     #[test]
     fn the_fork_tier_follows_the_cards_total() {
         use super::sp1_fork_threshold_for_total_vram as fork;
         const MIB: u64 = 1024 * 1024;
         assert_eq!(
             fork(16_303 * MIB),
-            134_217_728,
+            268_435_456,
             "RTX 5080: ceil(15.92) + 4 = 20"
+        );
+        assert_eq!(
+            fork(12_282 * MIB),
+            268_435_456,
+            "RTX 4070: ceil(11.99) + 4 = 16"
         );
         assert_eq!(
             fork(24_564 * MIB),
@@ -2070,7 +2183,7 @@ mod tests {
         );
         assert_eq!(
             fork(16 * 1024 * MIB),
-            134_217_728,
+            268_435_456,
             "exactly 16 GiB: 16 + 4 = 20"
         );
         assert_eq!(
