@@ -46,6 +46,7 @@ mod cgroup;
 pub mod confine;
 #[doc(hidden)]
 pub mod confine_probe;
+pub mod localfs;
 pub mod netdeny;
 #[doc(hidden)]
 pub mod probe;
@@ -114,6 +115,14 @@ pub enum SandboxError {
     Cgroup(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error(
+        "a filesystem this process can reach is not local: {0}. A lookup or `stat` there, which \
+         Landlock does not restrict, would reach another host or a user-space daemon, so this \
+         process runs no untrusted code. Unmount it, or run the miner where it is not mounted (as \
+         another user, for a FUSE mount without allow_other; in a container or a mount namespace \
+         that leaves it out)"
+    )]
+    NotLocal(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
