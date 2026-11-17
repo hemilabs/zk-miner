@@ -21,8 +21,9 @@ pub enum Kind {
 /// The cap on each chunk transaction's `GasPriceOracle.getL1GasUsed / 16` (§13.5): below the first
 /// throttled level's 20,000.
 pub const MAX_CHUNK_DA_BYTES: u64 = 19_500;
-/// The chunk body tried first: 23,000 bytes meets [`MAX_CHUNK_DA_BYTES`] for a bare creation
-/// transaction of incompressible bytes.
+/// The chunk body tried first, shrunk in proportion until the oracle's estimate fits
+/// [`MAX_CHUNK_DA_BYTES`]: a bare creation of 23,000 incompressible bytes estimates at about 19,900
+/// under Fjord, so such a chunk ends near 22,500 bytes.
 pub const DEFAULT_CHUNK_BYTES: usize = 23_000;
 /// Send only while the DA backlog plus this publisher's own unmined estimates is under this (a
 /// tenth of the backlog page level).
