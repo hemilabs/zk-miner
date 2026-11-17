@@ -18,7 +18,8 @@
 //!   length prefix carries answers up to 65,535 bytes); `NXDOMAIN` is an empty answer; other error
 //!   codes move to the next server;
 //! - only `A`/`AAAA` records of class `IN` owned by the queried name, or by a name a `CNAME` chain
-//!   (at most 8 hops) from it leads to, are taken; at most 32 addresses.
+//!   of at most 8 records (hops) from it leads to, are taken, whatever order the records come in;
+//!   at most 32 addresses.
 //!
 //! **Names are absolute.** A query carries the endpoint's host name exactly as configured, in wire
 //! form, which is always fully qualified: no `search` list, `domain` or `ndots` rule is ever
@@ -50,6 +51,7 @@ pub const DNS_PORT: u16 = 53;
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// The most addresses taken from one answer.
 pub const MAX_ADDRS: usize = 32;
+/// The longest `CNAME` chain followed, in records.
 const MAX_CNAME_HOPS: usize = 8;
 /// The OPT record's payload size: meaningless over TCP, kept at the common safe value.
 const EDNS_UDP_PAYLOAD: u16 = 1232;
@@ -253,12 +255,15 @@ pub fn parse_answer(msg: &[u8], id: u16, qname: &[u8], qtype: QType) -> Result<V
         records.push(Record { owner, rtype, class, rdata: (start, end) });
         off = end;
     }
-    // The names that stand for the query: it, and every CNAME target reached from it.
+    // The names that stand for the query: it, and every CNAME target at most MAX_CNAME_HOPS
+    // records from it. Each pass follows one hop, from the names the previous pass reached only
+    // (`names[frontier]`), so a chain listed in order is not followed further in one pass.
     let mut names = vec![qname.to_vec()];
+    let mut frontier = 0..1;
     for _ in 0..MAX_CNAME_HOPS {
-        let mut grew = false;
+        let reached = names.len();
         for r in records.iter().filter(|r| r.rtype == TYPE_CNAME && r.class == CLASS_IN) {
-            if !names.contains(&r.owner) {
+            if !names[frontier.clone()].contains(&r.owner) {
                 continue;
             }
             let Some((target, end)) = read_name(msg, r.rdata.0) else { return bad(DnsError::Malformed) };
@@ -267,12 +272,12 @@ pub fn parse_answer(msg: &[u8], id: u16, qname: &[u8], qtype: QType) -> Result<V
             }
             if !names.contains(&target) {
                 names.push(target);
-                grew = true;
             }
         }
-        if !grew {
+        if names.len() == reached {
             break;
         }
+        frontier = reached..names.len();
     }
     let mut out = Vec::new();
     for r in records.iter().filter(|r| r.rtype == qtype.code() && r.class == CLASS_IN && names.contains(&r.owner)) {
@@ -567,6 +572,38 @@ mod tests {
         stray.extend_from_slice(&[9, 9, 9, 9]);
         let m = answer(1, &q, QType::A, 0, 0, &[rr(TYPE_CNAME, &target), edge, stray]);
         assert_eq!(parse_answer(&m, 1, &q, QType::A).unwrap(), vec![IpAddr::from([8, 8, 4, 4])]);
+    }
+
+    /// A record owned by `owner` (written out, no compression).
+    fn owned(owner: &str, rtype: u16, data: &[u8]) -> Vec<u8> {
+        let mut r = encode_name(owner).unwrap();
+        r.extend_from_slice(&rr(rtype, data)[2..]);
+        r
+    }
+
+    /// A chain of `hops` CNAME records from the question to a name with an A record, listed in
+    /// order or reversed: followed up to MAX_CNAME_HOPS records, not one more, either way.
+    #[test]
+    fn cname_chains_are_limited_in_hops() {
+        let q = encode_name("rpc.example.com").unwrap();
+        let chain = |hops: usize, reversed: bool| {
+            let name = |i: usize| if i == 0 { "rpc.example.com".to_string() } else { format!("c{i}.cdn.net") };
+            let mut records: Vec<Vec<u8>> =
+                (0..hops).map(|i| owned(&name(i), TYPE_CNAME, &encode_name(&name(i + 1)).unwrap())).collect();
+            if reversed {
+                records.reverse();
+            }
+            records.push(owned(&name(hops), 1, &[8, 8, 4, 4]));
+            parse_answer(&answer(1, &q, QType::A, 0, 0, &records), 1, &q, QType::A).unwrap()
+        };
+        for reversed in [false, true] {
+            for hops in 1..=MAX_CNAME_HOPS {
+                assert_eq!(chain(hops, reversed), vec![IpAddr::from([8, 8, 4, 4])], "{hops} hops, reversed {reversed}");
+            }
+            for hops in [MAX_CNAME_HOPS + 1, MAX_CNAME_HOPS + 2, 20] {
+                assert_eq!(chain(hops, reversed), Vec::<IpAddr>::new(), "{hops} hops, reversed {reversed}");
+            }
+        }
     }
 
     #[test]
