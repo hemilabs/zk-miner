@@ -1963,10 +1963,14 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             // settles it.
             //
             // The theory: `TRACE_CHUNK_SLOTS` slots of a fixed 2 GiB each
-            // (`MINIMAL_TRACE_CHUNK_THRESHOLD = 2147483648 / size_of::<MemValue>()`, so slots × that ×
-            // size_of is exactly 2 GiB per slot), i.e. 10 GiB at the default 5. It survives the GPU
-            // override, unlike `SHARD_SIZE` — `local_gpu_opts` rewrites only `shard_size`,
-            // `sharding_threshold.element_threshold` and `global_dependencies_opt`.
+            // (`MINIMAL_TRACE_CHUNK_THRESHOLD = 2147483648 / size_of::<MemValue>()`, so slots ×
+            // that × size_of is exactly 2 GiB per slot), i.e. 10 GiB at the default 5. It survives
+            // the GPU override, unlike `SHARD_SIZE` — `local_gpu_opts` rewrites only `shard_size`,
+            // `sharding_threshold.element_threshold` and `global_dependencies_opt`. (That was an
+            // older SP1. At sp1 9a0de74 a proving slot is 256 MiB, `MINIMAL_TRACE_CHUNK_THRESHOLD`
+            // = 16,777,216 entries of 16 B, so about 1.4 GiB at the default 5; and the execute
+            // before the proof stages the gas-estimation ring, `GAS_TRACE_CHUNK_SLOTS` slots of
+            // ~2.2 GiB, which this knob does not reach.)
             //
             // The measurement, on the 4090 across three runs: `shmem-rss` in the OOM record was
             // 7,329,476 kB at slots=5, at slots=4, and at an explicit slots=2 — byte-identical every
@@ -2361,10 +2365,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // risc0's segment size; SP1 shards on its own.
                 po2: _,
             } => {
-                // Real cycle measurement for SP1, matching risc0's Execute
-                // arm, so the miner sizes SP1 jobs on a measured count rather than the
-                // submitter-declared `expectedCycles`. Runs on a lazily-built CPU executor (no
-                // gpu-server), so it is as cheap as risc0's sizing path.
+                // Real cycle measurement for SP1, matching risc0's Execute arm, so the miner sizes
+                // SP1 jobs on a measured count rather than the submitter-declared `expectedCycles`.
+                // Runs on the CPU executor (no gpu-server), built once per worker: by the host's
+                // `Warmup` before the first request (below), else here.
                 tracing::info!("Execute (sizing) request {request_id} ({} bytes ELF)", elf.len());
                 // A worker that proves starts its server before it confines itself (which takes
                 // `connect` away); one that only measures keeps no socket at all.
@@ -2427,6 +2431,9 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             // HINT_READ), the run itself, or a hook, which is a fixed function of what
                             // the guest wrote to it. The proof nonce is not visible to the guest.
                             host_entropy_reads: Some(0),
+                            // SP1 runs once: it has no segment size for a guest to steer on.
+                            user_cycles: None,
+                            keccak_cycles: None,
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -2551,9 +2558,11 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
 
             WorkerCommand::Warmup { request_id } if sp1_measure_only() => {
                 // A measure-only worker proves nothing, so it needs no Groth16 artifacts: its one
-                // setup is the CPU prover its `Execute` and `ProgramId` run on (~15 s on first use),
-                // built here, outside any request's watchdog, when the host asks (`zkminer simulate`
-                // does before READY and after a respawn).
+                // setup is the CPU prover its `Execute` and `ProgramId` run on, about 170
+                // CPU-seconds and a 7.4 GB peak (38 s with five free cores, 92 s with two, nearly
+                // three minutes with one), built here, outside any request's watchdog. The miner
+                // asks before the first sizing request of each spawn (`set_up_measure_slot`);
+                // `zkminer simulate` before READY and before a request whose worker was respawned.
                 let started = Instant::now();
                 let resp = if cpu_prover(&mut cpu_executor).is_some() {
                     WorkerResponse::WarmupDone {
@@ -2815,8 +2824,9 @@ fn with_peak_rss_sampling<T>(f: impl FnOnce() -> T) -> (T, u64) {
     (f(), 0)
 }
 
-/// The CPU prover the sizing paths (`Execute`, `ProgramId`) run on, built on first use: never the
-/// CUDA prover, so neither path starts `sp1-gpu-server`. Built defensively: a panic yields `None`, which
+/// The CPU prover the sizing paths (`Execute`, `ProgramId`) run on, built on first use (the measure
+/// worker's `Warmup`, which the host sends before a spawn's first sizing request): never the CUDA
+/// prover, so neither path starts `sp1-gpu-server`. Built defensively: a panic yields `None`, which
 /// the caller answers as `Internal` rather than letting it unwind out of the loop and have the
 /// dispatcher score a healthy slot as failed.
 fn cpu_prover(
@@ -4239,11 +4249,12 @@ mod threshold_tests {
     /// for — a roomy host attached to an occupied card.
     #[test]
     fn the_smaller_of_the_host_and_vram_bounds_wins() {
-        // A roomy HOST gives no host-derived limit, so a constrained CARD must still bind.
+        // A roomy HOST gives no host-derived limit, so a constrained CARD must still bind. On v6.1.0
+        // 11 GiB is in the 134M band [10,012, 12,512) — a 16 GiB card now fits 268M.
         assert_eq!(super::sp1_element_threshold_for(1.0), None);
-        assert_eq!(from_vram(16 * GIB), Some(SMALL));
+        assert_eq!(from_vram(11 * GIB), Some(SMALL));
         // Through the function the worker actually calls, not a re-implementation of it.
-        let combined = cap(1.0, Some(16 * GIB));
+        let combined = cap(1.0, Some(11 * GIB));
         assert_eq!(
             combined,
             Some(SMALL),
@@ -4325,15 +4336,17 @@ mod threshold_tests {
 #[cfg(test)]
 mod pin_tests {
     /// The SP1 sizing mirror in `zkminer_prover_protocol::types` (the fork's shard tiers and its
-    /// 402,653,184-element default) was measured against the pinned hemilabs `sp1`, whose circuit is
-    /// v6.0.0. Moving the pin must revisit it: v6.8.1's circuit is v6.1.0, and its tiers differ (a
-    /// 24 GB card defaults to 285,212,672 elements, and its Groth16 runs in a helper process with a
-    /// host-wide queue, which `warmup` and the dispatcher already handle).
+    /// 402,653,184-element default) was re-measured against the pinned hemilabs `sp1`, whose circuit
+    /// is v6.1.0: 134M peaks at ~9 GiB and 268M at ~11.5 GiB, both far below the v6.0.0 figures (v6.1.0
+    /// is much more memory-efficient). Moving the pin again must revisit it: re-measure the tiers and
+    /// update SP1_MEASURED_TIERS, then update this version. (v6.1.0's own default for a 24 GB card is
+    /// 285,212,672 elements rather than 402,653,184, but neither binds here — the measured tiers cap
+    /// SP1_GPU_ELEMENT_THRESHOLD at 268M, below both.)
     #[test]
     fn the_sizing_mirror_was_measured_for_the_pinned_sp1() {
         assert_eq!(
             sp1_sdk::SP1_CIRCUIT_VERSION,
-            "v6.0.0",
+            "v6.1.0",
             "the SP1 pin moved: re-measure and update the sizing mirror in \
              zkminer_prover_protocol::types, then update this test"
         );

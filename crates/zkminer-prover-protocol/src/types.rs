@@ -30,17 +30,21 @@ use serde::{Deserialize, Serialize};
 /// 12: `Benchmark` carries the programs to run (`BenchmarkProgramSpec`): the suite is the host's, and
 /// the zkOP/s scoring proofs are requests of their own. A v11 worker ran its own list. And
 /// `SetupProgress`, what a `Warmup` is doing (both in the same unreleased version).
-/// 13: witness-construction jobs (plan §15.3). `Prove` gained `witness` ([`WitnessProve`]): the input
+/// 13: no new field, a new meaning: the risc0 `sys_rand` seed is the public rule of `sys_rand.rs`, no key.
+/// A v12 worker would seed guests by its host's key, unlike a v13 one proving the same job. And
+/// `ExecuteResult` gained `user_cycles` and `keccak_cycles`, which `zkminer simulate` compares across
+/// segment sizes (both in the same unreleased version).
+/// 14: witness-construction jobs (plan §15.3). `Prove` gained `witness` ([`WitnessProve`]): the input
 /// is `prefix ‖ W`, read by the worker from a file and checked against the bundle's length and
 /// `sha256(prefix ‖ W)` (a mismatch is the new [`ErrorKind::InputMismatch`]), executed once with its
 /// segments under `segment_dir`, and proven only if its journal hashes to the bundle's; otherwise the
-/// worker answers with the new `WorkerResponse::JournalDiverged`. A v12 worker cannot decode the
+/// worker answers with the new `WorkerResponse::JournalDiverged`. A v13 worker cannot decode the
 /// field, so the handshake refuses it. The one-shot sandboxed execute
 /// ([`WitnessExecuteRequest`] / [`WitnessExecuteResponse`]) is not part of the IPC stream, but ships
 /// in the same version; so does its response's `sdk_version` / `worker_version` (in the same
 /// unreleased version: no handshake covers the one-shot execute, and a response from a binary built
 /// without them fails to decode rather than pass for one).
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -320,8 +324,8 @@ pub enum WorkerResponse {
         /// have run another path, and committed another journal, when its prover ran it, so a
         /// measurement with any is no evidence of the proven run.
         ///
-        /// risc0: the guest's `sys_rand` calls (the only syscall the host answers from entropy rather
-        /// than from the job's input or the run itself), less the one 4-word draw risc0's guest
+        /// risc0: the guest's `sys_rand` calls (the one syscall not answered from the job's input or
+        /// the run itself; the public seed answers it), less the one 4-word draw risc0's guest
         /// runtime makes before `main` for its memory-image entropy. A guest that reads that draw's
         /// bytes cannot be told from one that does not. `None` when the run drew nothing at all: a
         /// guest without risc0's runtime, or a count that does not work in this build.
@@ -330,6 +334,13 @@ pub enum WorkerResponse {
         /// `None` from any other worker: not counted.
         #[serde(default)]
         host_entropy_reads: Option<u64>,
+        /// The cycles the guest itself executed: no paging, no padding, so the same at every segment
+        /// size unless the guest steers on the size. `None` from a worker that has no such figure.
+        #[serde(default)]
+        user_cycles: Option<u64>,
+        /// The part of `cycles` that is keccak proof charges. `None` as for `user_cycles`.
+        #[serde(default)]
+        keccak_cycles: Option<u64>,
     },
     /// Progress update during proving.
     Progress {
@@ -772,9 +783,17 @@ const MIB: u64 = 1024 * 1024;
 
 /// Measured `(element threshold, peak VRAM)` for SP1, largest first.
 ///
-/// Both figures measured on this box with a 1,912,954,963-cycle `sha256-chain` proof
-/// through to a compact Groth16 seal: 17,766 MiB of a 24,564 MiB RTX 4090 at the 268M threshold, and
-/// 15,092 MiB of a 16,303 MiB RTX 5080 at 134M.
+/// Measured with a 1,912,954,985-cycle `sha256-chain` proof through to a compact Groth16 seal on SP1
+/// circuit **v6.1.0**: 11,542 MiB of a 16,311 MiB RTX 5060 Ti at the 268M threshold, and 8,884–8,957
+/// MiB at 134M (the same 5060 Ti, and a 12,282 MiB RTX 4070). Recorded conservatively above every
+/// observation (200 ms sampling). The peak is flat across job size — it is the shard working set plus
+/// the fixed Groth16-wrap recursion, not shard count — and the wrap itself is on the CPU (gnark) here,
+/// so it costs host RAM, not VRAM.
+///
+/// v6.1.0 is markedly more memory-efficient than v6.0.0, where this same 134M proof peaked at 15,092
+/// MiB and 268M at 17,766 MiB. The consequence that matters: **134M now fits a 12 GiB card** (~9 GiB
+/// peak), so 12 GiB cards run the standard tier rather than needing a smaller one; and a 16 GiB card
+/// can now run 268M (11,542 MiB fits) where before it was held to 134M.
 ///
 /// `402_653_184` — the fork's own default — is deliberately ABSENT. Nothing here has measured its peak
 /// VRAM, and this table is used to decide what will fit. Its omission makes a roomy card slightly
@@ -782,7 +801,7 @@ const MIB: u64 = 1024 * 1024;
 /// trade `sp1_element_threshold_for_host_scale` already makes for host memory: only ever a value
 /// measured to complete a proof.
 const SP1_MEASURED_TIERS: &[(u64, u64)] =
-    &[(268_435_456, 17_766 * MIB), (134_217_728, 15_092 * MIB)];
+    &[(268_435_456, 12_000 * MIB), (134_217_728, 9_500 * MIB)];
 
 /// Headroom required on top of a measured peak before that configuration is considered to fit.
 ///
@@ -1249,6 +1268,35 @@ impl std::fmt::Display for MeasurePreempted {
 
 impl std::error::Error for MeasurePreempted {}
 
+/// A measure worker could not be SET UP before a sizing request (`Execute`, `ProgramId`) ran on it:
+/// SP1's measure worker builds its CPU prover once per spawn, and the dispatcher runs that setup
+/// first, under its own bound, so the request's bound is the request's alone. The setup is the same
+/// work whatever the program (no guest has run), so this is TRANSIENT like `MeasureSlotsBusy`: no
+/// strike, no negative-cache, no retry TTL. The dispatcher has cleared the slot when the worker
+/// died or was killed at the bound, so the next request revives it.
+///
+/// Dispatcher-only: only its setup path constructs it, never from a `WorkerResponse::Error`
+/// carrying guest-controlled text, so a guest cannot forge it to win the lenient treatment.
+#[derive(Debug, Clone)]
+pub struct MeasureSetupFailed {
+    /// The measure slot whose worker could not be set up, e.g. `sp1:measure:0`.
+    pub slot_key: String,
+    /// Why: past the bound, died, or the worker's own answer.
+    pub message: String,
+}
+
+impl std::fmt::Display for MeasureSetupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "measure worker {} could not be set up ({}); nothing ran (transient)",
+            self.slot_key, self.message
+        )
+    }
+}
+
+impl std::error::Error for MeasureSetupFailed {}
+
 /// Not enough of this card's VRAM is free for this backend to be given work on it.
 ///
 /// Distinct from `HostMemoryShortage` (that is system RAM) and from a GPU OOM (that is the proof
@@ -1644,25 +1692,29 @@ mod tests {
         const GIB: u64 = 1024 * 1024 * 1024;
         const FULL_DEFAULT: u64 = 402_653_184;
 
-        // An empty 4090 has room for the 268M configuration (17,766 MiB + margin).
+        // An empty 4090 has room for the 268M configuration (v6.1.0: 11,542 MiB + margin = 12,512).
         assert_eq!(tier(24 * GIB), Some(268_435_456));
-        // 16 GiB free steps down to 134M, whose 15,092 MiB peak fits.
-        assert_eq!(tier(16 * GIB), Some(134_217_728));
+        // 16 GiB free now also fits 268M — v6.1.0 shrank it to fit a 16 GiB card, where v6.0.0's
+        // 17,766 MiB did not.
+        assert_eq!(tier(16 * GIB), Some(268_435_456));
 
-        // THE REGRESSION THIS GUARDS. SP1's own rule — `ceil(gib) + 4 > 20` — takes the 268M tier from
-        // 16.4 GiB upward, but that tier peaks at 17,766 MiB. Everything in that band must step down,
-        // or we commit to a configuration that cannot fit and fail part-way through a claimed job.
-        for mib in [16_500u64, 17_000, 17_500, 18_000, 18_277] {
+        // THE REGRESSION THIS GUARDS: a card with room for 134M but not 268M must step down, not
+        // commit to a configuration that cannot fit and fail part-way through a claimed job. On
+        // v6.1.0 that band is [134M's 10,012 MiB, 268M's 12,512 MiB).
+        for mib in [10_100u64, 11_000, 12_000, 12_511] {
             assert_eq!(
                 tier(mib * MIB),
                 Some(134_217_728),
-                "{mib} MiB free must take the 134M tier: 268M peaks at 17,766 MiB and will not fit"
+                "{mib} MiB free must take the 134M tier: 268M needs 12,512 MiB and will not fit"
             );
         }
-        // Just above the 268M peak plus margin, it may step back up.
-        assert_eq!(tier(18_278 * MIB), Some(268_435_456));
+        // At the 268M requirement it steps back up.
+        assert_eq!(tier(12_512 * MIB), Some(268_435_456));
 
-        // Below the smallest measured configuration there is nothing to offer.
+        // 134M now fits a 12 GiB card; one MiB below its 10,012 requirement there is nothing to offer.
+        assert_eq!(tier(12 * GIB), Some(134_217_728));
+        assert_eq!(tier(10_012 * MIB), Some(134_217_728));
+        assert_eq!(tier(10_011 * MIB), None);
         assert_eq!(tier(8 * GIB), None);
         assert_eq!(tier(0), None);
 
@@ -1752,7 +1804,9 @@ mod tests {
         // The two bounds combine as the smaller; neither present means the fork decides.
         assert_eq!(cap(1.0, Some(24 * GIB)), Some(268_435_456));
         assert_eq!(cap(0.6, Some(24 * GIB)), Some(134_217_728));
-        assert_eq!(cap(0.8, Some(16 * GIB)), Some(134_217_728));
+        // 16 GiB free fits 268M on v6.1.0, and the 0.8 host scale also allows 268M, so neither bound
+        // lowers it.
+        assert_eq!(cap(0.8, Some(16 * GIB)), Some(268_435_456));
         // Too little free for any measured tier still bounds it — to the smallest, never to nothing,
         // which would hand a 24 GB card back to the fork's 402M.
         assert_eq!(cap(1.0, Some(8 * GIB)), Some(134_217_728));
@@ -2038,6 +2092,25 @@ mod tests {
         });
         assert!(boxed.downcast_ref::<MeasurePreempted>().is_some());
         assert!(boxed.downcast_ref::<MeasureSlotsBusy>().is_none());
+        assert!(boxed.downcast_ref::<MeasureWallClockTimeout>().is_none());
+    }
+
+    /// `MeasureSetupFailed` names its slot and the cause, says "transient", and is its own type:
+    /// the measure path downcasts it to skip a strike, so it must not read as a timeout or a
+    /// preemption.
+    #[test]
+    fn measure_setup_failed_is_a_typed_transient() {
+        let e = MeasureSetupFailed {
+            slot_key: "sp1:measure:1".to_string(),
+            message: "not set up within 600 s".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("sp1:measure:1"), "names the slot: {msg}");
+        assert!(msg.contains("within 600 s"), "says why: {msg}");
+        assert!(msg.contains("transient"), "flagged transient: {msg}");
+        let boxed: Box<dyn std::error::Error> = Box::new(e);
+        assert!(boxed.downcast_ref::<MeasureSetupFailed>().is_some());
+        assert!(boxed.downcast_ref::<MeasurePreempted>().is_none());
         assert!(boxed.downcast_ref::<MeasureWallClockTimeout>().is_none());
     }
 }

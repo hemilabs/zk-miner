@@ -101,6 +101,30 @@ pub struct ExecuteMeasurement {
     /// How many times the guest read host-supplied nondeterministic input (risc0: `sys_rand` past its
     /// runtime's own draw), `None` = not counted; see `WorkerResponse::ExecuteResult`.
     pub host_entropy_reads: Option<u64>,
+    /// The cycles the guest itself executed, before paging and padding; `None` when the worker has no
+    /// such figure (SP1).
+    pub user_cycles: Option<u64>,
+    /// The keccak proof charges inside `cycles`; `None` as for `user_cycles`.
+    pub keccak_cycles: Option<u64>,
+}
+
+impl ExecuteMeasurement {
+    /// Whether `other`, the same (program, input) at another segment size, ran the same as far as a
+    /// measurement can see: the same journal, the same cycles of the guest's own, the same keccak
+    /// charges and the same random reads. `cycles` is left out on purpose, because padding and paging
+    /// legitimately move it with the size.
+    ///
+    /// Not a proof of one path: a guest can sense the size and keep all of these equal while changing
+    /// only which memory it reads, which moves `cycles` through paging alone. A figure a reader adds up
+    /// must therefore not come from one size on the strength of this check.
+    pub fn same_path(&self, other: &Self) -> bool {
+        self.user_cycles.is_some()
+            && self.user_cycles == other.user_cycles
+            && self.keccak_cycles == other.keccak_cycles
+            && self.host_entropy_reads == other.host_entropy_reads
+            && self.journal_len == other.journal_len
+            && self.journal == other.journal
+    }
 }
 
 /// What a `ProgramId` request derived (see [`WorkerPool::derive_program_id`]).
@@ -1858,6 +1882,15 @@ const SP1_GPU_SERVER_NAME_ENV: &str = "SP1_GPU_SERVER_NAME";
 /// Groth16 component 2.3 GB.
 pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
+/// The default bound on setting an SP1 measure worker up before a sizing request runs on it (see
+/// `set_up_measure_slot`): building the CPU prover its `Execute` and `ProgramId` run on, about 170
+/// CPU-seconds and a 7.4 GB peak (measured at sp1 9a0de74: 38 s with five free cores, 92 s with
+/// two, 160-173 s with one). The setup is the same for every program (no guest has run), so a long
+/// bound opens no lever to a submitter; it only bounds a wedged worker, while a bound below a slow
+/// host's setup would kill every setup there and never measure SP1 at all. `zkminer simulate` turns
+/// this off and sets its workers up itself (`WorkerPool::measure_setup_bound`).
+pub const SP1_MEASURE_SETUP_BOUND: Duration = Duration::from_secs(600);
+
 /// `~/.zkminer/locks` (`sp1_groth16_queue_dir`): on disk, owned by the miner, and the same for
 /// every worker it starts.
 fn sp1_queue_dir() -> Option<PathBuf> {
@@ -1878,8 +1911,11 @@ pub struct WorkerPool {
     /// Backends whose one-time setup has completed on this host; see `warm_up`.
     warmed: Mutex<HashSet<String>>,
     /// Measure slot key -> the pid of the worker in it whose setup has run; see
-    /// `warm_measure_worker`. A respawned worker has another pid, so it is set up again.
+    /// `set_up_measure_slot`. A respawned worker has another pid, so it is set up again.
     measure_warm_pids: Mutex<HashMap<String, u32>>,
+    /// The bound on that setup inside a sizing request, or `None` for no setup there; see
+    /// [`Self::measure_setup_bound`].
+    measure_setup_bound: Option<Duration>,
     /// Whether SP1's server proves Groth16 in a helper process, as its warm-up reported. A peak read
     /// from live processes must then add the helper's; see `host_peak_for_slot`.
     sp1_groth16_helper: AtomicBool,
@@ -1959,6 +1995,31 @@ fn zkvm_label(backend: &str) -> &str {
 /// Round-robin counter for load balancing across multiple GPU workers.
 static ROUND_ROBIN: AtomicUsize = AtomicUsize::new(0);
 
+/// Why `WorkerPool::set_up_measure_slot` left a measure worker not set up. `gone`: the worker was
+/// already dead when asked, so nothing was attempted (a request maps that to `MeasureWorkerGone`,
+/// as a failed send of its own would be); otherwise `MeasureSetupFailed`.
+struct MeasureSetupError {
+    gone: bool,
+    message: String,
+}
+
+impl MeasureSetupError {
+    /// The typed error a sizing request on `slot_key` returns for it.
+    fn into_request_error(self, slot_key: &str) -> anyhow::Error {
+        if self.gone {
+            anyhow::Error::new(zkminer_prover_protocol::types::MeasureWorkerGone {
+                slot_key: slot_key.to_string(),
+                message: self.message,
+            })
+        } else {
+            anyhow::Error::new(zkminer_prover_protocol::types::MeasureSetupFailed {
+                slot_key: slot_key.to_string(),
+                message: self.message,
+            })
+        }
+    }
+}
+
 impl WorkerPool {
     /// Create a new pool. Does NOT discover or spawn workers yet.
     /// `benchmark_timeout` sets the per-suite benchmark deadline (None = no timeout).
@@ -1972,6 +2033,7 @@ impl WorkerPool {
             memory_ledger: crate::memory::MemoryLedger::default(),
             warmed: Mutex::new(HashSet::new()),
             measure_warm_pids: Mutex::new(HashMap::new()),
+            measure_setup_bound: Some(SP1_MEASURE_SETUP_BOUND),
             sp1_groth16_helper: AtomicBool::new(false),
             workers: HashMap::new(),
             measure_workers: HashMap::new(),
@@ -2067,6 +2129,16 @@ impl WorkerPool {
         self.measure_only = true;
     }
 
+    /// The bound on setting a measure worker up inside a sizing request (`execute_cycles`,
+    /// `derive_program_id`; see `set_up_measure_slot`), outside the request's own bound. Default
+    /// [`SP1_MEASURE_SETUP_BOUND`]. `None`: a request does not set its worker up, and on a worker
+    /// that is not set up pays the setup inside its own bound; for a caller that sets workers up
+    /// itself (`warm_measure_worker`) and whose request bounds are long enough to hold the setup
+    /// when that fails (`zkminer simulate`: minutes, against the miner's 120 s measure bound).
+    pub fn measure_setup_bound(&mut self, bound: Option<Duration>) {
+        self.measure_setup_bound = bound;
+    }
+
     /// Start workers (prove and measure) for these backends only; the others are not spawned at
     /// all. For a process that serves a subset: a backend's worker can have host-wide startup side
     /// effects (SP1's installs its bundled `sp1-gpu-server` and reaps orphaned servers' sockets).
@@ -2105,18 +2177,21 @@ impl WorkerPool {
                 // index is the PCI-bus rank, which matches how we enumerate them.
                 let _ = pci_bus_id;
                 env.insert("CUDA_DEVICE_ORDER".into(), "PCI_BUS_ID".into());
-                // SP1 execute-memory cap + trace ring, set for EVERY SP1 prove worker INDEPENDENT of
-                // the device-index pin. These MUST equal the measure worker's values, or a guest that
-                // declines at measure would succeed at prove — finding F, and worse as claim-then-fail
-                // (collateral already bonded). `MEMORY_LIMIT` bounds the prove-phase execute CHILD's RSS
-                // exactly as on the measure worker; `TRACE_CHUNK_SLOTS=2` makes the prove trace ring
-                // the SAME ~4 GiB as measure, so equal `MEMORY_LIMIT` leaves equal guest-IMAGE headroom
-                // (asymmetric rings would otherwise pass a mid-size guest at measure and SIGKILL it at
-                // prove) and keeps the prove ring's shared memory modest. A worker pinned to an
-                // explicit `-cuda` binary has `device_index=None` but still proves on device 0, so this
-                // cannot live inside the `device_index` pin block below. SP1-only (`drives_cuda_…`), so
-                // risc0 and other cuda backends are untouched. A claimed job was measured under this
-                // cap, so its prove-phase execute never trips it — a pure safety backstop, not a limit.
+                // SP1 execute-memory cap + trace rings, set for EVERY SP1 prove worker INDEPENDENT
+                // of the device-index pin. These MUST equal the measure worker's values, or a guest
+                // that declines at measure would succeed at prove — finding F, and worse as
+                // claim-then-fail (collateral already bonded). `MEMORY_LIMIT` bounds the
+                // prove-phase execute CHILD's RSS exactly as on the measure worker;
+                // `GAS_TRACE_CHUNK_SLOTS=2` gives that execute (which `run_proof` runs before
+                // proving) the SAME ~4.4 GiB ring as the measure worker's `Execute`, so equal
+                // `MEMORY_LIMIT` leaves equal guest-IMAGE headroom (asymmetric rings would otherwise
+                // pass a mid-size guest at measure and SIGKILL it at prove).
+                // `TRACE_CHUNK_SLOTS=2` keeps the proving phase's own ring (~0.28 GiB slots) and its
+                // shared memory small. A worker pinned to an explicit `-cuda` binary has
+                // `device_index=None` but still proves on device 0, so this cannot live inside the
+                // `device_index` pin block below. SP1-only (`drives_cuda_…`), so risc0 and other
+                // cuda backends are untouched. A claimed job was measured under this cap, so its
+                // prove-phase execute never trips it — a pure safety backstop, not a limit.
                 if crate::discovery::drives_cuda_without_visibility_pin(backend) {
                     env.insert(
                         "MEMORY_LIMIT".into(),
@@ -2125,6 +2200,7 @@ impl WorkerPool {
                         )
                         .to_string(),
                     );
+                    env.insert("GAS_TRACE_CHUNK_SLOTS".into(), "2".into());
                     env.insert("TRACE_CHUNK_SLOTS".into(), "2".into());
                 }
                 if let Some(i) = device_index {
@@ -2280,6 +2356,7 @@ impl WorkerPool {
                 )
                 .to_string(),
             );
+            env.insert("GAS_TRACE_CHUNK_SLOTS".into(), "2".into());
             env.insert("TRACE_CHUNK_SLOTS".into(), "2".into());
             if let Some(i) = device_index {
                 env.insert(
@@ -2656,6 +2733,15 @@ impl WorkerPool {
                     "ZKMINER_RISC0_EXECUTE_MAX_RSS_BYTES".to_string(),
                     risc0_measure_rss.to_string(),
                 );
+                // A guest can see the keccak proof size (`sys_keccak` reports full by it), and the SDK
+                // reads it from the environment. A simulation measures the one run every reader can
+                // reproduce, whatever this host's environment says; a miner keeps its own setting.
+                if self.measure_only {
+                    menv.insert(
+                        zkminer_prover_protocol::sys_rand::RISC0_KECCAK_PO2_ENV.to_string(),
+                        zkminer_prover_protocol::sys_rand::RISC0_CANONICAL_KECCAK_PO2.to_string(),
+                    );
+                }
                 let mkey = format!("{backend}:measure:{i}");
                 let (handle, pid, starttime, failures, last_failure) =
                     match WorkerHandle::spawn(&backend, &path, &menv) {
@@ -2748,11 +2834,17 @@ impl WorkerPool {
                     "1".to_string(),
                 );
                 // Layer-B ring cap (locked #3). Pin the native executor's trace ring to 2 slots
-                // (~4 GiB of shared memory) on the measure worker instead of SP1's default 5
-                // (~10 GiB), which the host would hold for every measurement. Applied last by
-                // `WorkerHandle::spawn` (overrides any inherited value) and carried in `spawn_env`
-                // across respawns. Inert on the portable executor.
-                menv.insert("TRACE_CHUNK_SLOTS".to_string(), "2".to_string());
+                // (~4.4 GiB of shared memory, which the host holds for every measurement) on the
+                // measure worker. An `Execute` stages the gas-estimation ring, sized by
+                // `GAS_TRACE_CHUNK_SLOTS` (slots of ~2.2 GiB; sp1 9a0de74 `execute.rs`, unchanged at
+                // the pinned d20bbb645), not `TRACE_CHUNK_SLOTS`, which sizes only the proving phase's
+                // ring and is inert here (measured: at 1 and at 8 slots every Execute reported the
+                // same). 2 is SP1's default; pinning it means an inherited value cannot grow the
+                // ring, and it equals the prove workers' pin (`gpu_env`), so a guest measures in the
+                // ring its prove-phase execute will have. Applied last by `WorkerHandle::spawn`
+                // (overrides any inherited value) and carried in `spawn_env` across respawns. Inert on
+                // the portable executor.
+                menv.insert("GAS_TRACE_CHUNK_SLOTS".to_string(), "2".to_string());
                 // Layer-A enforced cap (locked #1/#2). SP1 reads `MEMORY_LIMIT` (bytes) and SIGKILLs the
                 // guest at that RSS via a 100 ms monitor, surfacing an in-band `TooMuchMemory` — the
                 // IMAGE balloon that is the real SIGBUS/OOM driver is bounded HERE. Explicit and
@@ -2910,16 +3002,17 @@ impl WorkerPool {
     }
 
     /// Runs the one-time setup of the measure worker `backend`'s next request will run on, now,
-    /// outside any request's watchdog, unless that worker has run it since it was (re)spawned:
-    /// for SP1, building the CPU prover its `Execute` and `ProgramId` run on (~15 s, and the memory it
-    /// then keeps). Without it the first request after each spawn pays that inside its own bound, so
-    /// a tight bound fails every request (each kill respawns a cold worker). The worker is the one
-    /// `measure_slot` picks: the first live one, else the first it would revive, revived (or
+    /// unless that worker has run it since it was (re)spawned: for SP1, building the CPU prover its
+    /// `Execute` and `ProgramId` run on (see [`SP1_MEASURE_SETUP_BOUND`] for what that costs),
+    /// outside any request's watchdog. A miner's sizing request sets its own worker up first anyway
+    /// (`set_up_measure_slot`); a pool with that off (`measure_setup_bound(None)`) relies on this,
+    /// or its first request after each spawn pays the setup inside its own bound. The worker is the
+    /// one `measure_slot` picks: the first live one, else the first it would revive, revived (or
     /// respawned, if it died idle) here. Only that one, so an idle second worker never holds a CPU
     /// prover it does not use. Charged to the host-RAM ledger as a measurement is, and bounded by
     /// `timeout` (a watchdog kill). Only SP1 has such a setup (risc0: true while one runs). For
-    /// `zkminer simulate`, which calls it before its READY line and before each SP1 request; the
-    /// miner keeps its SP1 measure worker lazy. Whether that worker is now set up.
+    /// `zkminer simulate`, which calls it before its READY line and before each SP1 request.
+    /// Whether that worker is now set up.
     pub fn warm_measure_worker(&self, backend: &str, timeout: Duration) -> bool {
         if backend != zkminer_prover_protocol::BACKEND_SP1 {
             return self.measure_workers_live(backend) > 0;
@@ -2955,13 +3048,7 @@ impl WorkerPool {
             return false;
         };
         entry.publish_pid(pid);
-        let warmed_pid = self
-            .measure_warm_pids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .copied();
-        if warmed_pid == Some(pid) {
+        if self.measure_slot_set_up(&key, pid) {
             return true;
         }
         let total = crate::memory::mem_total_bytes().unwrap_or(u64::MAX);
@@ -2970,23 +3057,73 @@ impl WorkerPool {
             tracing::debug!("{key}: no host memory to set it up in now; its first request will");
             return false;
         };
+        self.set_up_measure_slot(&key, &mut slot, entry, timeout, None)
+            .is_ok()
+    }
+
+    /// Whether the worker `pid` in measure slot `key` has run its setup (`set_up_measure_slot`).
+    fn measure_slot_set_up(&self, key: &str, pid: u32) -> bool {
+        self.measure_warm_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            == Some(&pid)
+    }
+
+    /// Runs the one-time setup of the SP1 measure worker in `slot` (`WorkerCommand::Warmup`, which
+    /// a measure-only SP1 worker answers by building its CPU prover), unless it has run since the
+    /// worker was (re)spawned; bounded by `timeout`, a watchdog kill. Without it the first request
+    /// after each spawn pays the setup inside its own bound, and on a host with one or two free
+    /// cores that is longer than the miner's 120 s measure bound: every first measurement timed
+    /// out, struck an honest job, and respawned a cold worker for the next one to fail on the same
+    /// way.
+    ///
+    /// The caller holds the slot and has charged the host memory the setup needs (a measurement's
+    /// charge covers it). On failure the slot is cleared if the worker died: `mark_slot_dead` when
+    /// the bound killed it (the setup's length is the host's, not the slot's ill-health) or a
+    /// claimed proof preempted it (`preempted`, the request's flag when it is registered as
+    /// preemptible), and `mark_slot_failed` when it died otherwise; the error says whether the
+    /// worker was already gone when asked.
+    fn set_up_measure_slot(
+        &self,
+        key: &str,
+        slot: &mut WorkerSlot,
+        entry: &WorkerEntry,
+        timeout: Duration,
+        preempted: Option<&AtomicBool>,
+    ) -> Result<(), MeasureSetupError> {
+        let Some(pid) = slot.handle.as_ref().map(|h| h.pid()) else {
+            return Err(MeasureSetupError {
+                gone: true,
+                message: "no live worker".to_string(),
+            });
+        };
+        if self.measure_slot_set_up(key, pid) {
+            return Ok(());
+        }
         static MEASURE_WARMUP_REQUEST: AtomicU64 = AtomicU64::new(1);
         // Disjoint from the other request ids (execute ids set the top bit, program-id ones the next).
         let request_id =
             MEASURE_WARMUP_REQUEST.fetch_add(1, Ordering::Relaxed) | 0x2000_0000_0000_0000;
         entry.intentional_kill.store(false, Ordering::Release);
         let Some(handle) = slot.handle.as_mut() else {
-            return false;
+            return Err(MeasureSetupError {
+                gone: true,
+                message: "no live worker".to_string(),
+            });
         };
-        if handle.send(&WorkerCommand::Warmup { request_id }).is_err() {
-            Self::mark_slot_dead(&mut slot, entry);
-            return false;
+        if let Err(e) = handle.send(&WorkerCommand::Warmup { request_id }) {
+            Self::mark_slot_dead(slot, entry);
+            return Err(MeasureSetupError {
+                gone: true,
+                message: format!("{e:#}"),
+            });
         }
         let watchdog = ProvingWatchdog::new(
             entry.pid.clone(),
             entry.pid_starttime.clone(),
             timeout,
-            key.clone(),
+            key.to_string(),
             entry.intentional_kill.clone(),
         );
         let response = handle.recv();
@@ -2997,21 +3134,32 @@ impl WorkerPool {
                 self.measure_warm_pids
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(key, pid);
-                true
+                    .insert(key.to_string(), pid);
+                Ok(())
             }
             Ok(other) => {
                 tracing::warn!("{key}: its set-up answered {other:?}");
-                false
+                Err(MeasureSetupError {
+                    gone: false,
+                    message: "the worker refused to set up".to_string(),
+                })
             }
             Err(e) => {
-                tracing::warn!("{key} died setting up: {e:#}");
-                if entry.intentional_kill.load(Ordering::Acquire) {
-                    Self::mark_slot_dead(&mut slot, entry);
+                let message = if preempted.is_some_and(|p| p.load(Ordering::Acquire)) {
+                    Self::mark_slot_dead(slot, entry);
+                    "killed to free its memory for a claimed proof".to_string()
+                } else if entry.intentional_kill.load(Ordering::Acquire) {
+                    Self::mark_slot_dead(slot, entry);
+                    format!("not set up within {} s", timeout.as_secs())
                 } else {
-                    Self::mark_slot_failed(&mut slot, entry);
-                }
-                false
+                    Self::mark_slot_failed(slot, entry);
+                    format!("died setting up: {e:#}")
+                };
+                tracing::warn!("{key}: {message}");
+                Err(MeasureSetupError {
+                    gone: false,
+                    message,
+                })
             }
         }
     }
@@ -4633,10 +4781,9 @@ impl WorkerPool {
         // A free measure slot (see `measure_slot`): typed `MeasureSlotsBusy` when none is.
         let (key, entry, mut slot) = self.measure_slot(backend)?;
         let key = key.as_str();
-        let handle = slot
-            .handle
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("worker '{key}' has no live handle"))?;
+        if slot.handle.is_none() {
+            anyhow::bail!("worker '{key}' has no live handle");
+        }
 
         static EXEC_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request_id =
@@ -4767,6 +4914,31 @@ impl WorkerPool {
             }
         };
 
+        // SP1's measure worker builds its CPU prover once per spawn: here, under its own bound,
+        // before this request's watchdog starts (see `set_up_measure_slot`). Inside the preemptible
+        // window, so a claimed proof that needs this memory can still kill it. A setup that fails
+        // says nothing about the program: typed transients only, never a strike.
+        if let Some(bound) = self
+            .measure_setup_bound
+            .filter(|_| backend == zkminer_prover_protocol::BACKEND_SP1)
+            .filter(|_| self.measure_workers.contains_key(backend))
+        {
+            if let Err(e) = self.set_up_measure_slot(key, &mut slot, entry, bound, Some(&preempt)) {
+                if preempt.load(Ordering::Acquire) {
+                    return Err(anyhow::Error::new(
+                        zkminer_prover_protocol::types::MeasurePreempted {
+                            slot_key: key.to_string(),
+                        },
+                    ));
+                }
+                return Err(e.into_request_error(key));
+            }
+            // The setup's watchdog is gone; this request's own starts below.
+            entry.intentional_kill.store(false, Ordering::Release);
+        }
+        let Some(handle) = slot.handle.as_mut() else {
+            anyhow::bail!("worker '{key}' has no live handle");
+        };
         if let Err(e) = handle.send(&WorkerCommand::Execute {
             request_id,
             elf: elf.to_vec(),
@@ -4917,6 +5089,8 @@ impl WorkerPool {
                 peak_host_bytes,
                 journal,
                 host_entropy_reads,
+                user_cycles,
+                keccak_cycles,
                 ..
             } => {
                 Self::note_guest_ran(&mut slot, key);
@@ -4949,6 +5123,8 @@ impl WorkerPool {
                     peak_host_bytes,
                     duration_secs,
                     host_entropy_reads,
+                    user_cycles,
+                    keccak_cycles,
                 })
             }
             WorkerResponse::Error { message, .. } => {
@@ -4982,10 +5158,9 @@ impl WorkerPool {
     ) -> anyhow::Result<ProgramIdDerivation> {
         let (key, entry, mut slot) = self.measure_slot(backend)?;
         let key = key.as_str();
-        let handle = slot
-            .handle
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("worker '{key}' has no live handle"))?;
+        if slot.handle.is_none() {
+            anyhow::bail!("worker '{key}' has no live handle");
+        }
 
         static PROGRAM_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
         // Disjoint from prove ids and from execute ids (which set the top bit).
@@ -5020,6 +5195,20 @@ impl WorkerPool {
             None
         };
 
+        // The setup the derivation runs on, first and under its own bound, as in `execute_cycles`.
+        if let Some(bound) = self
+            .measure_setup_bound
+            .filter(|_| backend == zkminer_prover_protocol::BACKEND_SP1)
+            .filter(|_| self.measure_workers.contains_key(backend))
+        {
+            if let Err(e) = self.set_up_measure_slot(key, &mut slot, entry, bound, None) {
+                return Err(e.into_request_error(key));
+            }
+            entry.intentional_kill.store(false, Ordering::Release);
+        }
+        let Some(handle) = slot.handle.as_mut() else {
+            anyhow::bail!("worker '{key}' has no live handle");
+        };
         if let Err(e) = handle.send(&WorkerCommand::ProgramId {
             request_id,
             elf: elf.to_vec(),
@@ -9625,14 +9814,15 @@ mod tests {
         const MIB: u64 = 1024 * 1024;
         let (rtx4090, rtx5080) = (Some(24_564 * MIB), Some(16_303 * MIB));
         let roomy = SizingCap::Host(None);
-        let floor = Some(15_604 * MIB);
+        let floor = Some(10_012 * MIB); // v6.1.0: 134M's 9,500 + 512
         let shrank =
             |cap, assumed, now, total| vram_tier_shrank(cap, "sp1", assumed, now, total, floor);
 
         // Spawned with the whole 4090 free (268M), now 20 GiB free — still 268M: left alone.
         assert!(!shrank(roomy, Some(24 * GIB), 20 * GIB, rtx4090));
-        // Now 16 GiB free, which is the 134M tier: the live worker is sized for more than it has.
-        assert!(shrank(roomy, Some(24 * GIB), 16 * GIB, rtx4090));
+        // Now 11 GiB free — in the 134M band [10,012, 12,512) on v6.1.0: the live 268M worker is sized
+        // for more than it has.
+        assert!(shrank(roomy, Some(24 * GIB), 11 * GIB, rtx4090));
         // The other direction must never trigger a recycle: VRAM being FREED is good news, and the
         // worker is merely conservative. Growing back costs a respawn for no correctness gain.
         assert!(!shrank(roomy, Some(16 * GIB), 24 * GIB, rtx4090));
@@ -9641,15 +9831,14 @@ mod tests {
         assert!(!shrank(roomy, Some(8 * GIB), 24 * GIB, rtx4090));
         // Nothing fits now and the floor is about to refuse: a recycle buys nothing.
         assert!(!shrank(roomy, Some(24 * GIB), 8 * GIB, rtx4090));
-        // But with the floor LOWERED or DISABLED the proof will run, and a fresh worker below every
-        // tier takes the smallest: a live 268M worker must come down to it, not run at 268M on
-        // 15,178 MiB — which is what `room_needed` already assumed it would.
-        let lowered = Some(15_000 * MIB);
+        // But with the floor LOWERED or DISABLED the proof will run, and a live 268M worker must come
+        // down to the 134M tier it now fits, not stay at 268M on 11,000 MiB (in the 134M band).
+        let lowered = Some(9_000 * MIB);
         assert!(vram_tier_shrank(
             roomy,
             "sp1",
             Some(24 * GIB),
-            15_178 * MIB,
+            11_000 * MIB,
             rtx4090,
             lowered
         ));
@@ -9657,7 +9846,7 @@ mod tests {
             roomy,
             "sp1",
             Some(24 * GIB),
-            15_178 * MIB,
+            11_000 * MIB,
             rtx4090,
             None
         ));
@@ -9936,9 +10125,10 @@ mod tests {
         assert_eq!(card.available_to("sp1:cuda:0"), 14_072 * MIB);
         assert!(
             card.available_to("sp1:cuda:0")
-                < zkminer_prover_protocol::types::sp1_min_available_vram_bytes(),
-            "beside an idle risc0 worker the 5080 cannot fit SP1's smallest tier — the old \
-             all-ours credit said it could, and the proof died"
+                >= zkminer_prover_protocol::types::sp1_min_available_vram_bytes(),
+            "the available-to accounting still correctly withholds the sibling's held VRAM (14,072, \
+             not the full 15,878); on v6.1.0 that clears SP1's smallest tier (134M's 10,012), where \
+             on v6.0.0's 15,604 it did not — the point is the accounting, which is unchanged"
         );
         assert_eq!(card.available_to("risc0:cuda:0"), 15_878 * MIB);
         // What a worker is SIZED against at spawn counts our own workers as free (they make room),
@@ -9971,73 +10161,77 @@ mod tests {
         const SMALL: u64 = 134_217_728;
         const LARGE: u64 = 268_435_456;
         let (rtx5080, rtx4090) = (Some(16_303 * MIB), Some(24_564 * MIB));
-        let floor = Some(15_604 * MIB);
+        // v6.1.0 floor: the 134M tier's 9,500 MiB peak + 512 margin.
+        let floor = Some(10_012 * MIB);
         let roomy = SizingCap::Host(None);
         let this_box = SizingCap::Host(Some(LARGE)); // ~25 GiB host budget
         let room = |cap, ceiling: u64, live, floor, total| {
             room_needed(cap, "sp1", ceiling * MIB, live, floor, total)
         };
 
-        // 5080, emptied (16,303 less 423 reserved and 2 of driver overhead): 134M, 15,092 + 512.
+        // 5080, emptied: its VRAM now fits 268M (12,512), but the fork caps a 16 GiB card to 134M, so
+        // the room is 134M's 9,500 + 512.
         assert_eq!(
             room(roomy, 15_878, None, floor, rtx5080),
-            Bytes(15_604 * MIB)
+            Bytes(10_012 * MIB)
         );
-        // 4090, emptied (24,564 less 455 and 2): 268M, 17,766 + 512.
+        // 4090, emptied: 268M, now 11,542 + 512 = 12,512 on v6.1.0.
         assert_eq!(
             room(roomy, 24_107, None, floor, rtx4090),
-            Bytes(18_278 * MIB)
+            Bytes(12_512 * MIB)
         );
         assert_eq!(
             room(this_box, 24_107, None, floor, rtx4090),
-            Bytes(18_278 * MIB)
+            Bytes(12_512 * MIB)
         );
         assert_eq!(
             room(roomy, 24_107, Some(Some(LARGE)), floor, rtx4090),
-            Bytes(18_278 * MIB)
+            Bytes(12_512 * MIB)
         );
         // A live worker at the small tier never grows; making 268M of room would recycle a sibling
         // for nothing.
         assert_eq!(
             room(roomy, 24_107, Some(Some(SMALL)), floor, rtx4090),
-            Bytes(15_604 * MIB)
+            Bytes(10_012 * MIB)
         );
-        // A live worker bigger than the card now allows is resized down after this, so the room to
-        // make is the smaller tier's.
+        // A live 268M worker on a 4090 whose ceiling is 15,878: 268M now fits (12,512), so it stays —
+        // no resize down, and the room is 268M's.
         assert_eq!(
             room(roomy, 15_878, Some(Some(LARGE)), floor, rtx4090),
-            Bytes(15_604 * MIB)
+            Bytes(12_512 * MIB)
         );
         // A host that caps SP1 at 134M: the 4090 needs only the small tier's room. Targeting 268M
         // would evict risc0 on every alternation for a configuration the worker never uses.
         let host_134 = SizingCap::Host(Some(SMALL));
         assert_eq!(
             room(host_134, 24_107, None, floor, rtx4090),
-            Bytes(15_604 * MIB)
+            Bytes(10_012 * MIB)
         );
-        // Nothing fits even emptied: making room cannot help.
-        assert_eq!(room(roomy, 12 * 1024, None, floor, rtx4090), Hopeless);
+        // A 12,288 MiB ceiling now fits 134M (10,012) on v6.1.0, where on v6.0.0 nothing fit.
+        assert_eq!(room(roomy, 12 * 1024, None, floor, rtx4090), Bytes(10_012 * MIB));
 
-        // The SERVER's own tier: an operator's 268M on a 5080 runs at 134M, so 15,604 is the room —
-        // not 18,278, which the card cannot have and which made the gate give up on recycling.
+        // The SERVER's own tier: an operator's 268M on a 5080 runs at 134M (the fork's 16 GiB cap),
+        // so 10,012 is the room — not 12,512.
         let op_large = SizingCap::Operator(Some(LARGE));
         assert_eq!(
             room(op_large, 15_878, None, floor, rtx5080),
-            Bytes(15_604 * MIB)
+            Bytes(10_012 * MIB)
         );
         assert_eq!(
             room(op_large, 24_107, None, floor, rtx4090),
-            Bytes(18_278 * MIB)
+            Bytes(12_512 * MIB)
         );
-        // An operator value nothing has measured — 402M on a 4090 needs more than even 268M's
-        // 17,766 — has no requirement to aim at, so ALL the room is made, not the floor's worth.
+        // An operator value nothing has measured — 402M on a 4090 — has no requirement to aim at, so
+        // ALL the room is made, not the floor's worth.
         let op_402 = SizingCap::Operator(Some(402_653_184));
         assert_eq!(room(op_402, 24_107, None, floor, rtx4090), Unknown);
         assert_eq!(
             room(SizingCap::Operator(None), 24_107, None, floor, rtx4090),
             Unknown
         );
-        assert_eq!(room(op_402, 12 * 1024, None, floor, rtx4090), Hopeless);
+        // 402M is unmeasured, so with a 12,288 ceiling above the 10,012 floor it is Unknown, not
+        // Hopeless (nothing to aim at, but the floor is reachable).
+        assert_eq!(room(op_402, 12 * 1024, None, floor, rtx4090), Unknown);
 
         // The OPERATOR's floor, on this box's host (5080 with a 700 MiB desktop: 15,178 emptied).
         // Lowered: room up to it, or a card the floor admits is refused for want of a recycle.
@@ -10045,10 +10239,10 @@ mod tests {
             room(this_box, 15_178, None, Some(15_000 * MIB), rtx5080),
             Bytes(15_000 * MIB)
         );
-        // Disabled: make all the room there is.
-        assert_eq!(room(this_box, 15_178, None, None, rtx5080), Unknown);
-        // Default: nothing reaches it, so nothing is destroyed for it.
-        assert_eq!(room(this_box, 15_178, None, floor, rtx5080), Hopeless);
+        // Disabled gate: 134M (10,012) now fits this 5080 ceiling, so the room is that tier's.
+        assert_eq!(room(this_box, 15_178, None, None, rtx5080), Bytes(10_012 * MIB));
+        // Default floor (10,012): reachable within 15,178, so the room is made.
+        assert_eq!(room(this_box, 15_178, None, floor, rtx5080), Bytes(10_012 * MIB));
         // Raised above the tier: room up to the floor, or the gate refuses what recycling allows.
         assert_eq!(
             room(roomy, 24_107, None, Some(20_000 * MIB), rtx4090),
@@ -10086,23 +10280,23 @@ mod tests {
                 "sp1",
                 ceiling,
                 None,
-                Some(15_604 * MIB),
+                Some(10_012 * MIB),
                 Some(total_mib * MIB),
             );
             (room, plan_room(room, available * MIB, siblings))
         };
 
-        // SP1 after risc0 on the 5080: the idle risc0 worker (1,806 MiB) leaves 14,072 MiB, short of
-        // the 134M tier's 15,604. It goes.
-        let (room, evict) = sp1_room(14_072, &sib("risc0:cuda:0", 1_806), 16_303);
-        assert_eq!(room, RoomNeeded::Bytes(15_604 * MIB));
+        // SP1 after risc0 on the 5080 (fork-capped to 134M, 10,012): 9,000 MiB free is short of it,
+        // and evicting the idle risc0 worker (1,806 MiB) clears it. It goes.
+        let (room, evict) = sp1_room(9_000, &sib("risc0:cuda:0", 1_806), 16_303);
+        assert_eq!(room, RoomNeeded::Bytes(10_012 * MIB));
         assert_eq!(evict, vec!["risc0:cuda:0".to_string()]);
-        // SP1 after risc0 on the 4090, whose risc0 worker keeps its Groth16 cache (7,134 MiB): the
-        // 268M tier's 18,278 does not fit in 16,973. It goes.
-        let (room, evict) = sp1_room(16_973, &sib("risc0:cuda:1", 7_134), 24_564);
-        assert_eq!(room, RoomNeeded::Bytes(18_278 * MIB));
+        // SP1 after risc0 on the 4090 (268M, 12,512): 10,000 MiB free is short, and evicting the
+        // risc0 worker holding its Groth16 cache (7,134 MiB) clears it. It goes.
+        let (room, evict) = sp1_room(10_000, &sib("risc0:cuda:1", 7_134), 24_564);
+        assert_eq!(room, RoomNeeded::Bytes(12_512 * MIB));
         assert_eq!(evict, vec!["risc0:cuda:1".to_string()]);
-        // A sibling holding ~2.4 GiB on the 4090 would leave room for 268M, so it would stay.
+        // Plenty free on the 4090: 268M fits without touching the sibling, so it stays.
         let (_, evict) = sp1_room(21_657, &sib("risc0:cuda:1", 2_450), 24_564);
         assert!(evict.is_empty());
 

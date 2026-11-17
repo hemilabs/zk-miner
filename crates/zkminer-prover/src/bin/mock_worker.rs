@@ -32,6 +32,9 @@
 //! - `MOCK_LURKER`: a file name. On its first command (a guest can run only on a command) the worker
 //!   starts a `sleep` that leaves its process group and session (`setsid`), as nothing in a
 //!   confined worker can, and writes its pid there: what ends the worker's cgroup must end it too.
+//! - `MOCK_SETUP_SECS`: a one-time setup of this many seconds (default 0), paid by the first
+//!   Warmup, Execute or ProgramId, as SP1's measure worker builds its CPU prover on first use.
+//! - `MOCK_WARMUP_LOG`: a file each Warmup appends a line to, so a test can count them.
 
 use std::io::{self, BufReader, BufWriter};
 use std::time::Duration;
@@ -89,6 +92,18 @@ fn main() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
     );
+    let mut setup = Some(Duration::from_secs(
+        std::env::var("MOCK_SETUP_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    ));
+    // Pays the one-time setup if it has not been paid yet.
+    let mut set_up = move || {
+        if let Some(d) = setup.take() {
+            std::thread::sleep(d);
+        }
+    };
 
     let mut stdin = BufReader::new(io::stdin().lock());
     let mut stdout = BufWriter::new(io::stdout().lock());
@@ -206,6 +221,7 @@ fn main() {
                 if crash_on == "execute" || crash_on == "both" {
                     std::process::exit(1);
                 }
+                set_up();
                 #[cfg(unix)]
                 if let Ok(name) = std::env::var("MOCK_HOLD_SHM") {
                     hold_shm(&name);
@@ -231,6 +247,8 @@ fn main() {
                         Ok(v) => Some(v.trim().parse().expect("MOCK_HOST_ENTROPY_READS")),
                         Err(_) => Some(0),
                     },
+                    user_cycles: Some(1000),
+                    keccak_cycles: Some(0),
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }
@@ -256,12 +274,22 @@ fn main() {
                 if crash_on == "warmup" {
                     std::process::exit(1);
                 }
+                if let Some(log) = std::env::var_os("MOCK_WARMUP_LOG") {
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(log)
+                        .unwrap();
+                    writeln!(f, "{}", std::process::id()).unwrap();
+                }
                 if hang_on == "warmup" {
                     // Hang forever — the watchdog will SIGKILL us
                     loop {
                         std::thread::sleep(Duration::from_secs(3600));
                     }
                 }
+                set_up();
                 let resp = WorkerResponse::WarmupDone {
                     request_id,
                     summary: "nothing to warm up".to_string(),
@@ -282,6 +310,7 @@ fn main() {
                         std::thread::sleep(Duration::from_secs(3600));
                     }
                 }
+                set_up();
                 let resp = if std::env::var_os("MOCK_PROGRAM_ID_FAIL").is_some() {
                     WorkerResponse::Error {
                         request_id,

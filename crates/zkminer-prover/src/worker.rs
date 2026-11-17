@@ -57,22 +57,12 @@ fn sanitize_worker_line(line: &str) -> String {
     out
 }
 
-/// The `sys_rand` key the miner hands every risc0 worker it spawns (see
-/// `zkminer_prover_protocol::sys_rand`), and whether it is for this run only. Unset (a benchmark, the
-/// tests): each worker reads the file.
-static RISC0_SYS_RAND_KEY: std::sync::OnceLock<([u8; 32], bool)> = std::sync::OnceLock::new();
-
-/// Set the key passed to risc0 workers spawned from now on (`ephemeral`: not the host's key file).
-/// Once per process.
-pub fn set_risc0_sys_rand_key(key: [u8; 32], ephemeral: bool) {
-    let _ = RISC0_SYS_RAND_KEY.set((key, ephemeral));
-}
-
-/// The key [`set_risc0_sys_rand_key`] set, and whether it is for this run only: the one key the
-/// miner's own seed derivations must use, so they agree with every risc0 worker it spawns.
-pub fn risc0_sys_rand_key() -> Option<([u8; 32], bool)> {
-    RISC0_SYS_RAND_KEY.get().copied()
-}
+/// Inherited variables a worker must never see because they change how a guest runs, not just how
+/// fast. `DUMP_ELF_OUTPUT`: SP1 reads it in the guest's `DUMP_ELF` syscall (a no-op when unset),
+/// and SP1's native executor aborts on that syscall when it is set (`JitContext::elf_info` is
+/// `unimplemented!()` at sp1 9a0de74), so a guest that makes the call would fail to measure or
+/// prove on a host that happens to export it, and on no other.
+const GUEST_VISIBLE_ENV: &[&str] = &["DUMP_ELF_OUTPUT"];
 
 /// The directories a risc0 worker's witness proofs use: the retention store (read) and the root of
 /// the segment directories (written). Passed to every risc0 worker spawned from now on
@@ -116,25 +106,20 @@ const REMOTE_PROVER_AND_DEV_ENV: &[&str] = &[
     "WITHOUT_VK_VERIFICATION",
 ];
 
-/// The environment a worker for `backend` starts with: `inherited` minus secret-named variables
-/// (and any inherited `sys_rand` key), then the dispatcher's `overrides`, all without
-/// [`REMOTE_PROVER_AND_DEV_ENV`]; then `RISC0_PROVER=local`, and for a risc0 worker the miner's
-/// `sys_rand` key (see [`set_risc0_sys_rand_key`]). Later entries win.
+/// The environment a worker for `backend` starts with: `inherited` minus secret-named variables and
+/// [`GUEST_VISIBLE_ENV`], then the dispatcher's `overrides`, all without
+/// [`REMOTE_PROVER_AND_DEV_ENV`]; then `RISC0_PROVER=local`, and for a risc0 worker the witness
+/// directories (see [`set_risc0_witness_dirs`]). Later entries win.
 fn worker_env(
     backend: &str,
     inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     overrides: &HashMap<String, String>,
-    sys_rand_key: Option<&([u8; 32], bool)>,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    use zkminer_prover_protocol::sys_rand::{
-        encode_key, SYS_RAND_KEY_ENV, SYS_RAND_KEY_EPHEMERAL_ENV,
-    };
     let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = inherited
         .into_iter()
         .filter(|(k, _)| {
-            !k.to_str().is_some_and(|n| {
-                is_secret_env_name(n) || n == SYS_RAND_KEY_ENV || n == SYS_RAND_KEY_EPHEMERAL_ENV
-            })
+            !k.to_str()
+                .is_some_and(|k| is_secret_env_name(k) || GUEST_VISIBLE_ENV.contains(&k))
         })
         .chain(overrides.iter().map(|(k, v)| (k.into(), v.into())))
         // Exact names: they are the SDKs' own, which read them case-sensitively.
@@ -151,12 +136,6 @@ fn worker_env(
             use zkminer_prover_protocol::types::{WITNESS_READ_DIR_ENV, WITNESS_SEGMENT_DIR_ENV};
             env.push((WITNESS_READ_DIR_ENV.into(), retention.into()));
             env.push((WITNESS_SEGMENT_DIR_ENV.into(), segments.into()));
-        }
-        if let Some((key, ephemeral)) = sys_rand_key {
-            env.push((SYS_RAND_KEY_ENV.into(), encode_key(key).into()));
-            if *ephemeral {
-                env.push((SYS_RAND_KEY_EPHEMERAL_ENV.into(), "1".into()));
-            }
         }
     }
     env
@@ -754,12 +733,7 @@ impl WorkerHandle {
         // `env_clear()` alone, so PATH / HOME / LD_LIBRARY_PATH / CUDA_* and everything the worker
         // genuinely needs are preserved. The dispatcher's explicit overrides are applied last.
         cmd.env_clear();
-        cmd.envs(worker_env(
-            backend,
-            std::env::vars_os(),
-            env_overrides,
-            RISC0_SYS_RAND_KEY.get(),
-        ));
+        cmd.envs(worker_env(backend, std::env::vars_os(), env_overrides));
 
         // The worker's memory ceiling, and (Linux) what ends everything it starts: a cgroup of its
         // own below a delegated root, the reaper, the mount watch. See `containment`.
@@ -2100,7 +2074,7 @@ mod tests {
     }
     use super::{
         comm_from_stat, is_secret_env_name, live_group_members, parse_stat_state_pgrp,
-        sanitize_worker_line,
+        sanitize_worker_line, worker_env,
     };
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -2117,65 +2091,6 @@ mod tests {
         let huge = "A".repeat(10_000);
         let out = sanitize_worker_line(&huge);
         assert!(out.len() < 10_000 && out.ends_with("…[truncated]"));
-    }
-
-    #[test]
-    fn only_a_risc0_worker_gets_the_miners_sys_rand_key() {
-        use zkminer_prover_protocol::sys_rand::{
-            encode_key, SYS_RAND_KEY_ENV, SYS_RAND_KEY_EPHEMERAL_ENV,
-        };
-        let inherited = || {
-            [
-                ("PATH", "/usr/bin"),
-                ("ZKMINER_PRIVATE_KEY", "0xdead"),
-                (SYS_RAND_KEY_ENV, "00"),
-                (SYS_RAND_KEY_EPHEMERAL_ENV, "1"),
-            ]
-            .map(|(k, v)| (k.into(), v.into()))
-        };
-        let overrides = std::collections::HashMap::from([(
-            "CUDA_VISIBLE_DEVICES".to_string(),
-            "1".to_string(),
-        )]);
-        let get = |env: &[(std::ffi::OsString, std::ffi::OsString)], k: &str| {
-            env.iter()
-                .rev()
-                .find(|(n, _)| n == k)
-                .map(|(_, v)| v.to_str().unwrap().to_string())
-        };
-        let key = [7u8; 32];
-        let risc0 = super::worker_env("risc0", inherited(), &overrides, Some(&(key, false)));
-        assert_eq!(get(&risc0, "PATH").as_deref(), Some("/usr/bin"));
-        assert_eq!(get(&risc0, "CUDA_VISIBLE_DEVICES").as_deref(), Some("1"));
-        assert_eq!(
-            get(&risc0, "ZKMINER_PRIVATE_KEY"),
-            None,
-            "the signing key never reaches a worker"
-        );
-        assert_eq!(
-            get(&risc0, SYS_RAND_KEY_ENV),
-            Some(encode_key(&key)),
-            "the miner's, not an inherited one"
-        );
-        assert_eq!(
-            get(&risc0, SYS_RAND_KEY_EPHEMERAL_ENV),
-            None,
-            "nor an inherited flag"
-        );
-        let ephemeral = super::worker_env("risc0", inherited(), &overrides, Some(&(key, true)));
-        assert_eq!(
-            get(&ephemeral, SYS_RAND_KEY_EPHEMERAL_ENV).as_deref(),
-            Some("1")
-        );
-        let sp1 = super::worker_env("sp1", inherited(), &overrides, Some(&(key, false)));
-        assert_eq!(get(&sp1, SYS_RAND_KEY_ENV), None, "no other worker gets it");
-        assert_eq!(get(&sp1, SYS_RAND_KEY_EPHEMERAL_ENV), None);
-        let unset = super::worker_env("risc0", inherited(), &overrides, None);
-        assert_eq!(
-            get(&unset, SYS_RAND_KEY_ENV),
-            None,
-            "no miner key: the worker reads the file"
-        );
     }
 
     /// No remote-prover, external-executor or developer-mode setting of the SDKs reaches a worker,
@@ -2233,7 +2148,7 @@ mod tests {
             ("RISC0_PROVER".into(), "local".into());
         for backend in ["risc0", "sp1", "openvm"] {
             for overrides in [&overrides, &std::collections::HashMap::new()] {
-                let env = super::worker_env(backend, inherited(), overrides, None);
+                let env = super::worker_env(backend, inherited(), overrides);
                 for (k, _) in knobs {
                     let values: Vec<_> = env.iter().filter(|(n, _)| n == k).collect();
                     if k == "RISC0_PROVER" {
@@ -2250,7 +2165,7 @@ mod tests {
                     assert_eq!(get(&env, k).as_deref(), Some(v), "{backend}: {k}");
                 }
             }
-            let env = super::worker_env(backend, inherited(), &overrides, None);
+            let env = super::worker_env(backend, inherited(), &overrides);
             assert_eq!(get(&env, "CUDA_VISIBLE_DEVICES").as_deref(), Some("1"));
         }
         assert!(knobs
@@ -2286,6 +2201,36 @@ mod tests {
             "TMPDIR",
         ] {
             assert!(!is_secret_env_name(s), "{s} must be preserved");
+        }
+    }
+
+    /// A worker inherits neither a secret nor `DUMP_ELF_OUTPUT` (SP1's native executor aborts on a
+    /// guest's `DUMP_ELF` call when it is set), keeps everything else, and the dispatcher's own
+    /// values win over an inherited one.
+    #[test]
+    fn worker_env_drops_secrets_and_guest_visible_variables() {
+        let inherited = [
+            ("PATH", "/usr/bin"),
+            ("DUMP_ELF_OUTPUT", "/tmp/elf"),
+            ("ZKMINER_PRIVATE_KEY", "0xsecret"),
+            ("MEMORY_LIMIT", "1"),
+        ]
+        .map(|(k, v)| (k.into(), v.into()));
+        let overrides =
+            std::collections::HashMap::from([("MEMORY_LIMIT".to_string(), "2".to_string())]);
+        for backend in ["risc0", "sp1"] {
+            let env = worker_env(backend, inherited.clone(), &overrides);
+            let names: Vec<_> = env.iter().map(|(k, _)| k.to_str().unwrap()).collect();
+            assert!(names.contains(&"PATH"), "{backend}: {names:?}");
+            assert!(!names.contains(&"DUMP_ELF_OUTPUT"), "{backend}: {names:?}");
+            assert!(
+                !names.contains(&"ZKMINER_PRIVATE_KEY"),
+                "{backend}: {names:?}"
+            );
+            // `Command::envs` applies them in order, so the last MEMORY_LIMIT is the one the worker
+            // gets.
+            let last = env.iter().rev().find(|(k, _)| k == "MEMORY_LIMIT").unwrap();
+            assert_eq!(last.1, "2", "{backend}");
         }
     }
 

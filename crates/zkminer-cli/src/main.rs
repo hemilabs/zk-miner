@@ -167,12 +167,13 @@ enum Commands {
         #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
         header_bytes: Option<usize>,
         /// Then read requests from stdin until EOF, one per line: a job id, or
-        /// {"jobId": "0x…", "submitTx": "0x…", "publicValues": "0x…"} (the submitting tx saves the
-        /// descriptor's log scan; the fulfil's public values let the report say whether the measured
-        /// journal is the proven one).
+        /// {"jobId": "0x…", "submitTx": "0x…", "publicValues": "0x…", "singleRun": true} (the submitting
+        /// tx saves the descriptor's log scan; the fulfil's public values let the report say whether
+        /// the measured journal is the proven one; `singleRun` measures a risc0 job once at `--po2`).
         #[arg(long)]
         stdin: bool,
-        /// The risc0 segment size to measure at (risc0 cycle counts are padded per segment). With
+        /// The risc0 segment size run first, reported on a tie, and the only one for `singleRun`.
+        /// Otherwise a risc0 job runs at all seven sizes and the lowest figure is reported. With
         /// --descriptor, the sizes to execute at, as one (`20`), a range (`16..22`) or a list
         /// (`16,20`); default every job size, 16..=22.
         #[arg(long)]

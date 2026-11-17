@@ -7,10 +7,5 @@ edition.workspace = true
 serde = { workspace = true }
 bincode = "1"
 thiserror = { workspace = true }
-getrandom = "0.3"
-# `sys_rand::risc0_seed`: the miner derives a witness execute's seed as the risc0 workers do.
-hmac = "0.12"
+# `sys_rand::risc0_seed` / `rule_id`: the one implementation of the public seed rule.
 sha2 = "0.10"
-
-[dev-dependencies]
-tempfile = "3"

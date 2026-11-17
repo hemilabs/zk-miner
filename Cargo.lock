@@ -10695,8 +10695,6 @@ dependencies = [
  "anyhow",
  "bincode",
  "dirs 6.0.0",
- "getrandom 0.3.4",
- "hmac",
  "libc",
  "liblzma",
  "reqwest",
@@ -10776,11 +10774,8 @@ name = "zkminer-prover-protocol"
 version = "0.1.0"
 dependencies = [
  "bincode",
- "getrandom 0.3.4",
- "hmac",
  "serde",
  "sha2",
- "tempfile",
  "thiserror 2.0.18",
 ]
 

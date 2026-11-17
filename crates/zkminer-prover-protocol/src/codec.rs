@@ -260,6 +260,8 @@ mod tests {
                     peak_host_bytes: 7,
                     journal: Some(vec![0xab, 0xcd]),
                     host_entropy_reads: reads,
+                    user_cycles: reads.map(|r| r ^ 1),
+                    keccak_cycles: reads,
                 },
             )
             .unwrap();
@@ -271,6 +273,8 @@ mod tests {
                     peak_host_bytes,
                     journal,
                     host_entropy_reads,
+                    user_cycles,
+                    keccak_cycles,
                     ..
                 } => {
                     assert_eq!(
@@ -279,6 +283,8 @@ mod tests {
                     );
                     assert_eq!(journal.as_deref(), Some(&[0xab, 0xcd][..]));
                     assert_eq!(host_entropy_reads, reads);
+                    assert_eq!(user_cycles, reads.map(|r| r ^ 1));
+                    assert_eq!(keccak_cycles, reads);
                 }
                 other => panic!("wrong variant: {other:?}"),
             }
