@@ -17,8 +17,8 @@
 //!   bind/connect, scoped signals and abstract Unix sockets), a seccomp denylist (no `socket`,
 //!   `connect`, `bind`, `listen` or `accept*` for any profile; no socket option but the broker's
 //!   `TCP_NODELAY`; SysV IPC; metadata writes through inherited fds; for the runner and the
-//!   worker, host metadata), `NO_NEW_PRIVS`, `PR_SET_DUMPABLE(0)` (locked) and `RLIMIT_CORE=0`.
-//!   The broker, whose only socket calls are
+//!   worker, host metadata), `NO_NEW_PRIVS`, `PR_SET_DUMPABLE(0)` (locked), `RLIMIT_CORE=0` and no
+//!   capabilities. The broker, whose only socket calls are
 //!   `socketpair(AF_UNIX, SOCK_STREAM)` for its runtime, then calls [`seal_socket_creation`] once
 //!   its runtime is up. Its network connections are made for it by the miner's connector.
 //!
@@ -136,6 +136,8 @@ pub struct RestrictReport {
     pub dumpable_cleared: bool,
     /// `RLIMIT_CORE` is 0 (soft and hard).
     pub core_dumps_disabled: bool,
+    /// `capget`: no effective, permitted or inheritable capability.
+    pub capabilities_cleared: bool,
 }
 
 /// Resource caps for one sandboxed process.

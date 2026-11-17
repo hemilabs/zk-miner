@@ -658,7 +658,8 @@ fn run_checks(a: &ProbeArgs) -> i32 {
             && report.seccomp
             && report.no_new_privs
             && report.dumpable_cleared
-            && report.core_dumps_disabled,
+            && report.core_dumps_disabled
+            && report.capabilities_cleared,
         format!("{report:?}"),
     );
 
@@ -685,10 +686,18 @@ fn run_checks(a: &ProbeArgs) -> i32 {
     let state = current_state(report.landlock_abi);
     out.check(
         "prctl_state",
-        state.seccomp && state.no_new_privs && state.dumpable_cleared && state.core_dumps_disabled,
+        state.seccomp
+            && state.no_new_privs
+            && state.dumpable_cleared
+            && state.core_dumps_disabled
+            && state.capabilities_cleared,
         format!(
-            "PR_GET_SECCOMP==2 {}, NO_NEW_PRIVS {}, !DUMPABLE {}, RLIMIT_CORE=0 {}",
-            state.seccomp, state.no_new_privs, state.dumpable_cleared, state.core_dumps_disabled
+            "PR_GET_SECCOMP==2 {}, NO_NEW_PRIVS {}, !DUMPABLE {}, RLIMIT_CORE=0 {}, no capabilities {}",
+            state.seccomp,
+            state.no_new_privs,
+            state.dumpable_cleared,
+            state.core_dumps_disabled,
+            state.capabilities_cleared
         ),
     );
 
