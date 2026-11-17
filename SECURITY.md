@@ -600,9 +600,18 @@ no second one):
   `/proc`: other processes' command lines and status, not their memory or environment), and
   writing the caches listed above, which other GPU programs of
   the same user also load (a confined worker could poison an Intel kernel cache or risc0's CUDA
-  Groth16 cache for them). An SP1 worker and its server can read and write any POSIX shared
-  memory object and semaphore of the uid in `/dev/shm` (SP1's executor needs it), the shared
-  memory of unconfined programs of the same user included. A witness proof's worker can read
+  Groth16 cache for them). An SP1 worker, its executor's runner and its server can read, write,
+  create and remove anything of the uid in `/dev/shm`, pending a change to SP1's executor (the
+  grant goes when that lands). SP1 needs it for the named shared memory between its executor and
+  the runner child (`/<id>_m` for the guest's memory, `/<id>_t` for the trace, the `_filled` and
+  `_empty` semaphores), and the server for its Groth16 files (the GPU proving key cache, about
+  9 GB, each proof's witness directory, the host-wide Groth16 queue). So a guest that escaped in
+  one SP1 process can read or change the guest memory and traces of another SP1 proof running at
+  the same time (its result or its failure, not the network), the server's Groth16 files, and
+  whatever other programs of the same user keep there: ROCm SMI's process-shared mutexes
+  (`rocm_smi_renderD*`, mode 0777, which `rocm-smi`, `amd-smi` and other ROCm SMI users lock, so
+  they can be made to hang; the miner's own `rocm-smi` query at discovery is bounded by a timeout), other programs' shared memory and semaphores (browsers, PulseAudio
+  and PipeWire, Python `multiprocessing`). Run SP1 under a user that runs nothing else. A witness proof's worker can read
   every bundle in the retention store, other requesters' included. Its results go back to the
   miner over its pipe, and a guest controls its journal, so anything it can read it can publish:
   keep secrets out of the readable paths.
