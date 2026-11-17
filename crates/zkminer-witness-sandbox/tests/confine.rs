@@ -410,6 +410,19 @@ fn supervised(
     tempfile::TempDir,
     tempfile::TempDir,
 ) {
+    supervised_with(linger, false)
+}
+
+fn supervised_with(
+    linger: bool,
+    affinity: bool,
+) -> (
+    Child,
+    PathBuf,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
     let home = fake_home();
     let write = tempfile::tempdir().unwrap();
     // Private, as the worker's temporary directory is (the supervisor makes runner files
@@ -433,10 +446,11 @@ fn supervised(
         c.arg("supervised");
         c
     };
-    cmd.arg(&socket)
-        .arg(home.path())
-        .arg(write.path())
-        .stdin(Stdio::null())
+    cmd.arg(&socket).arg(home.path()).arg(write.path());
+    if affinity {
+        cmd.arg("affinity");
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     (cmd.spawn().unwrap(), socket, home, write, sock_dir)
@@ -488,6 +502,7 @@ fn a_supervised_server_listens_until_its_first_connection_and_never_after() {
         "write_tmp",
         "stdin_is_dev_null",
         "spawn_own_helper",
+        "thread_affinity_own_thread_refused",
     ] {
         assert!(checked(&log, name), "{name} not checked:\n{log}");
     }
@@ -517,6 +532,41 @@ fn a_supervised_server_listens_until_its_first_connection_and_never_after() {
     }
     assert_eq!(code, Some(0), "{log}");
     assert!(!home.path().join(".config/autostart/zk.desktop").exists());
+}
+
+/// The HIP server's confinement (`allow_thread_affinity`) reaches the supervised server's filter:
+/// a CPU set for one of its own new threads is allowed, and every other process control is still
+/// refused.
+#[test]
+fn a_supervised_server_allowed_thread_affinity_may_place_its_threads() {
+    if !landlock_ok("a_supervised_server_allowed_thread_affinity_may_place_its_threads") {
+        return;
+    }
+    let (child, socket, _home, _write, _dir) = supervised_with(false, true);
+    let mut child = Killed(child);
+    let mut out = BufReader::new(child.0.stdout.take().unwrap());
+    let mut log = String::new();
+    assert!(read_until(&mut out, "LISTENING", &mut log), "{log}");
+    let mut conn = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut answer = String::new();
+    conn.read_to_string(&mut answer).unwrap();
+    let _ = out.read_to_string(&mut log);
+    let code = child.0.wait().unwrap().code();
+    say(&log);
+    assert!(answer.ends_with("DONE\n"), "{answer}");
+    assert!(failures(&log).is_empty(), "{:#?}\n{log}", failures(&log));
+    assert!(
+        checked(&log, "thread_affinity_own_thread_allowed"),
+        "not checked:\n{log}"
+    );
+    for name in signal_checks("supervisor") {
+        if name != "sched_setaffinity_supervisor" {
+            assert!(checked(&log, &name), "{name} not checked:\n{log}");
+        }
+    }
+    assert_eq!(code, Some(0), "{log}");
 }
 
 fn alive(pid: i32) -> bool {

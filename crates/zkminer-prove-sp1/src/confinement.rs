@@ -230,6 +230,11 @@ mod imp {
             c.allow(dir, Rights::READ);
         }
         c.allow_gpu_devices();
+        if crate::warmup::server_name().ends_with("-hip") {
+            // ROCm starts its threads with a CPU set, which glibc applies by thread id: without
+            // this the HIP server finds no device.
+            c.allow_thread_affinity();
+        }
         if let Some(h) = home() {
             // The CUDA driver's JIT cache, read only: the server carries code for its cards.
             c.allow(h.join(".nv"), Rights::READ);

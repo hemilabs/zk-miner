@@ -202,6 +202,16 @@ impl Confinement {
         self
     }
 
+    /// The syscalls the seccomp filter leaves out for this confinement (`netdeny::filters`), the
+    /// same whether the process confines itself or a supervisor confines it.
+    pub(crate) fn filter_allowances(&self) -> &'static [i64] {
+        if self.thread_affinity {
+            &[libc::SYS_sched_setaffinity]
+        } else {
+            &[]
+        }
+    }
+
     pub fn sockets(&self) -> Sockets {
         self.sockets
     }
@@ -361,12 +371,7 @@ pub fn confine_all_threads(c: &Confinement) -> Result<ConfinementReport, Sandbox
     localfs::check_local_filesystems(&c.granted_paths())?;
     // Everything that allocates or opens a path happens before anything is applied.
     let ruleset = c.landlock_ruleset(tsync)?;
-    let allowed: &[i64] = if c.thread_affinity {
-        &[libc::SYS_sched_setaffinity]
-    } else {
-        &[]
-    };
-    let filters = netdeny::filters(c.sockets, allowed)?;
+    let filters = netdeny::filters(c.sockets, c.filter_allowances())?;
 
     // SAFETY: plain prctl with valid arguments.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {

@@ -1201,12 +1201,17 @@ pub fn run_confined(args: &[OsString]) -> i32 {
     2
 }
 
-/// `supervised <socket> <home> <write>`: run this binary's `supervised-child` under the supervisor,
-/// as an SP1 worker runs `sp1-gpu-server`.
+/// `supervised <socket> <home> <write> [affinity]`: run this binary's `supervised-child` under the
+/// supervisor, as an SP1 worker runs `sp1-gpu-server`; `affinity` as it runs the HIP server
+/// ([`Confinement::allow_thread_affinity`]).
 pub fn run_supervised_parent(args: &[OsString]) -> i32 {
-    let [socket, home, write] = args else {
-        eprintln!("supervised: <socket> <home> <write>");
-        return 64;
+    let (socket, home, write, affinity) = match args {
+        [s, h, w] => (s, h, w, false),
+        [s, h, w, a] if a == "affinity" => (s, h, w, true),
+        _ => {
+            eprintln!("supervised: <socket> <home> <write> [affinity]");
+            return 64;
+        }
     };
     let socket = PathBuf::from(socket);
     let Some(dir) = socket.parent() else {
@@ -1235,19 +1240,19 @@ pub fn run_supervised_parent(args: &[OsString]) -> i32 {
     c.allow(dir, Rights::MAKE_SOCK);
     c.allow(write, Rights::WRITE);
     c.allow(&exe, Rights::EXEC);
+    let mut child_args = vec![
+        "supervised-child".into(),
+        socket.into_os_string(),
+        home.clone(),
+        write.clone(),
+    ];
+    if affinity {
+        c.allow_thread_affinity();
+        child_args.push("affinity".into());
+    }
     println!("SUPERVISOR {}", std::process::id());
     let _ = std::io::stdout().flush();
-    match crate::supervise::run_supervised(
-        &exe,
-        &[
-            "supervised-child".into(),
-            socket.into_os_string(),
-            home.clone(),
-            write.clone(),
-        ],
-        &c,
-        Some(Path::new(write)),
-    ) {
+    match crate::supervise::run_supervised(&exe, &child_args, &c, Some(Path::new(write))) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("supervised: {e}");
@@ -1256,12 +1261,15 @@ pub fn run_supervised_parent(args: &[OsString]) -> i32 {
     }
 }
 
-/// `supervised-child <socket> <home> <write>`: the server's part. Listens at `<socket>`, accepts
-/// one connection, then tries its way out and reports each check on stdout and on the connection.
-/// `<write>` is its writable directory, where its supervisor makes runner files executable.
+/// `supervised-child <socket> <home> <write> [affinity]`: the server's part. Listens at `<socket>`,
+/// accepts one connection, then tries its way out and reports each check on stdout and on the
+/// connection. `<write>` is its writable directory, where its supervisor makes runner files
+/// executable. With `affinity` its supervisor allowed thread affinity, as for the HIP server.
 pub fn run_supervised_child(args: &[OsString]) -> i32 {
-    let [socket, home, write] = args else {
-        return 64;
+    let (socket, home, write, affinity) = match args {
+        [s, h, w] => (s, h, w, false),
+        [s, h, w, a] if a == "affinity" => (s, h, w, true),
+        _ => return 64,
     };
     let socket = PathBuf::from(socket);
     let home = PathBuf::from(home);
@@ -1440,7 +1448,59 @@ pub fn run_supervised_child(args: &[OsString]) -> i32 {
         format!("errno {e}"),
     );
     signal_checks(sup, "supervisor", &mut report);
-    process_control_checks(sup, "supervisor", &mut report);
+    if affinity {
+        // Allowed by number, whoever it is aimed at (the filter cannot tell a thread of this
+        // process from another process of the user): the supervisor's is a note, not a check.
+        process_control_checks(sup, "supervisor", |name, ok, detail| {
+            if name == "sched_setaffinity_supervisor" {
+                note(name, detail);
+            } else {
+                report(name, ok, detail);
+            }
+        });
+    } else {
+        process_control_checks(sup, "supervisor", &mut report);
+    }
+    // A CPU set given to a new thread, as glibc applies `pthread_attr_setaffinity_np`: by the new
+    // thread's id, from the thread that creates it. ROCm starts its threads so.
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let t = std::thread::spawn(move || {
+        // SAFETY: gettid has no arguments.
+        let _ = tid_tx.send(unsafe { libc::syscall(libc::SYS_gettid) });
+        let _ = done_rx.recv();
+    });
+    let tid = tid_rx.recv().unwrap_or(-1);
+    let mut mask = [0u64; 16];
+    // SAFETY: reading this process's CPU set into a local buffer, then giving it to the thread.
+    unsafe {
+        libc::syscall(
+            libc::SYS_sched_getaffinity,
+            0,
+            std::mem::size_of_val(&mask),
+            mask.as_mut_ptr(),
+        )
+    };
+    let (r, e) = sys(|| unsafe {
+        libc::syscall(
+            libc::SYS_sched_setaffinity,
+            tid,
+            std::mem::size_of_val(&mask),
+            mask.as_ptr(),
+        )
+    });
+    let _ = done_tx.send(());
+    let _ = t.join();
+    if affinity {
+        report(
+            "thread_affinity_own_thread_allowed",
+            r == 0,
+            format!("rc {r} errno {e}"),
+        );
+    } else {
+        let (ok, d) = refused_with(r, e, libc::EPERM);
+        report("thread_affinity_own_thread_refused", ok, d);
+    }
     let r = try_open(Path::new(&format!("/proc/{sup}/environ")), libc::O_RDONLY);
     report(
         "proc_supervisor_environ",
