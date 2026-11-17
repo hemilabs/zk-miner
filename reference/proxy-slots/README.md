@@ -6,10 +6,11 @@
 | path | what |
 |---|---|
 | `statement/` | `hemiprove-proxy-slots`: the statement as one function, `run(input) -> journal`, plus the requester's helpers. `no_std`; shared by the guest, the builder and tooling. |
-| `guest/` | the risc0 guest: reads its input, runs the statement, commits the journal with one `commit_slice` or panics. Its own workspace and lockfile, like every guest in this repository. |
-| `methods/` | builds the guest (and the lint control and `hostdep`) with risc0-build; the executor, end-to-end, lint and `simulate --adversarial` tests. |
+| `guest/` | the risc0 guest: reads its input, runs the statement, commits the journal with one `commit_slice` or panics. Its own workspace and lockfile, like every guest in this repository, on risc0-zkvm 3.1.0 (see "The risc0 version"). |
+| `methods/` | builds the guests with risc0-build; the executor, end-to-end, lint, keccak-batch and `simulate --adversarial` tests. |
 | `lint-control/` | a guest that does everything the lints forbid, so the lint checks are shown to catch it. Never deployed. |
-| `hostdep/` | a test guest whose journal depends on host inputs (`sys_rand`, the keccak po2) or echoes `W`, for `simulate --adversarial`'s tests. Never deployed. |
+| `hostdep/` | a test guest whose journal depends on host inputs (`sys_rand`, the keccak po2) or echoes `W`, for `simulate --adversarial`'s tests, and runs keccak through the batcher. Never deployed. |
+| `keccak-3-0/` | a control still on risc0-zkvm 3.0.5, which the miner must refuse (see "The risc0 version"). Never deployed. |
 | `check-guest-lints.sh` | clippy with `guest/clippy.toml` for the zkVM target. |
 | `../../sdk/examples/proxy-slots/` | the builder (type 1, wasm32). |
 
@@ -62,7 +63,7 @@ The binding pins the header; everything else rests on the guest being what it cl
 1. **The guest and its image id.** `guest/src/main.rs` (50 lines), `statement/src/lib.rs` (`run` and
    the rule), and the prelude's README. Publish the image id of a reproducible build (risc0-build's
    Docker build); a local build embeds the checkout's paths, so its id differs from machine to
-   machine.
+   machine. Build it with risc0-zkvm 3.1.0, as below.
 2. **The parameters.** `B` must be canonical when you submit (take it from Base's `finalized` head,
    at least `safe`); `C`, `R` and `k` are what you mean. The binding then fixes the answer's
    question.
@@ -77,6 +78,24 @@ The guards guarantee (prelude README): every journal word after the header is a 
 verified against the pinned `B`, every trie key is computed from pinned or proven values, and the
 guest never finishes with unread witness data. They do not guarantee that `B` is canonical or that
 the statement is the one you wanted.
+
+## The risc0 version
+
+The guest (and the lint control and `hostdep`) is built with risc0-zkvm 3.1.0, what the miner proves
+with and the deployed verifier (risc0-ethereum v3.1.0) accepts, pinned exactly (`=3.1.0`) with the
+two crates whose control roots a guest's keccak assumptions name, risc0-circuit-recursion and
+risc0-circuit-keccak 4.1.0: risc0-zkvm requires them only by caret, so a `cargo update` could move
+them. The guest crates of crates.io's 3.1.0 are the fork's the miner pins (its differences are on
+the host side).
+
+It matters for any guest that hashes with keccak through risc0's accelerator (the batcher): two or
+more batches are rooted under risc0-circuit-recursion's `ALLOWED_CONTROL_ROOT`, and a guest built
+with risc0-zkvm 3.0 names 4.0's (`0xa54dc85a…`), which the 3.1 prover cannot resolve. Such a guest
+executes cleanly and fails every proof ("no receipt available for unresolved assumption"), and the
+miner refuses it before any claim. One batch (about 655 permutations at the miner's keccak po2, 17)
+is assumed under the keccak circuit's root, which both share. This guest hashes in software (the
+prelude's keccak), so it was never affected; `keccak-3-0` and `hostdep` show both sides
+(`methods/tests/keccak_batches.rs`).
 
 ## The guest lints (plan §21.1 item 4)
 
@@ -119,6 +138,9 @@ cargo test -p hemiprove-proxy-slots-methods --test guest_lints --test executor
 # End to end on anvil: real broker and runner binaries, sandboxed (needs a delegated cgroup).
 systemd-run --user --scope -q -p Delegate=yes -- env ZKMINER_SANDBOX_TESTS_REQUIRED=1 \
     cargo test -p hemiprove-proxy-slots-methods --test anvil_e2e
+# Keccak batches by risc0 version: the executor's claims, then real CPU proofs (ignored, slow).
+cargo test -p hemiprove-proxy-slots-methods --test keccak_batches
+cargo test -p hemiprove-proxy-slots-methods --test keccak_batches -- --ignored --test-threads=1
 ```
 
 Cycles on the risc0 3.1 executor (padded to segments of 2^20): Ethereum (k = 3, `W` 17 KB) 3.1 M,
