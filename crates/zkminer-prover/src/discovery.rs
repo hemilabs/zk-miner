@@ -1736,37 +1736,11 @@ pub const MIN_AVAILABLE_VRAM_MB_ENV: &str = "ZKMINER_MIN_AVAILABLE_VRAM_MB";
 /// for the configuration it will actually be given.
 ///
 /// risc0 and openvm have no floor here: a risc0 card proves jobs at its own segment size
-/// (`benchmark::risc0_job_po2`), and one too small for any proves none.
+/// (`benchmark::risc0_job_po2`), and one too small for any proves none. A risc0 PROOF has one of
+/// its own, by its segment size: [`risc0_proof_vram_bytes`].
 ///
 /// `total` is the card's capacity, which picks SP1's measured table (a 16 GB card's server runs
-/// differently, see `sp1_min_available_vram_bytes`); `None` when unknown. The VRAM a risc0 proof at
-/// segment size `po2` needs free on a card of vendor `gpu_tag` and `total` bytes before it starts:
-/// the size's measured peak (`benchmark::estimate_gpu_po2_memory`) plus
-/// [`RISC0_PROOF_VRAM_MARGIN`]. `None` — no floor — where nothing has measured the peak (another
-/// vendor), where the card could never hold it (refusing would release every job such a card
-/// claims, where today it proves them slowly; the planner already prices it so, see
-/// `benchmark::risc0_largest_fitting_po2`), and when the operator set [`MIN_AVAILABLE_VRAM_MB_ENV`]
-/// to 0, which turns every floor off.
-pub fn min_available_vram_bytes_for_risc0_proof(
-    po2: u8,
-    gpu_tag: &str,
-    total: Option<u64>,
-) -> Option<u64> {
-    if gpu_tag != "cuda" {
-        return None;
-    }
-    if std::env::var(MIN_AVAILABLE_VRAM_MB_ENV).is_ok_and(|v| v.trim() == "0") {
-        return None;
-    }
-    let need = crate::benchmark::estimate_gpu_po2_memory(po2, "risc0", gpu_tag)
-        .saturating_add(RISC0_PROOF_VRAM_MARGIN);
-    (need <= total?).then_some(need)
-}
-
-/// Headroom over a risc0 segment size's measured peak before a proof may start: as SP1's
-/// (`SP1_VRAM_MARGIN`), for what another workload of the same size holds over the measured one.
-pub const RISC0_PROOF_VRAM_MARGIN: u64 = 512 * 1024 * 1024;
-
+/// differently, see `sp1_min_available_vram_bytes`); `None` when unknown.
 pub fn min_available_vram_bytes_for_backend(backend: &str, total: Option<u64>) -> Option<u64> {
     let default = match backend {
         // Derived from the MEASURED tier table rather than from the installed-VRAM floor, so this and
@@ -1776,6 +1750,9 @@ pub fn min_available_vram_bytes_for_backend(backend: &str, total: Option<u64>) -
         "sp1" => zkminer_prover_protocol::types::sp1_min_available_vram_bytes(total),
         _ => return None,
     };
+    if free_vram_checks_off() {
+        return None;
+    }
     match std::env::var(MIN_AVAILABLE_VRAM_MB_ENV) {
         // 0 is an explicit opt-out, for an operator who knows the other occupant of their card is
         // harmless and would rather risk the work than have it refused.
@@ -1794,6 +1771,49 @@ pub fn min_available_vram_bytes_for_backend(backend: &str, total: Option<u64>) -
         Err(_) => Some(default),
     }
 }
+
+/// Whether the operator turned the free-VRAM checks off: [`MIN_AVAILABLE_VRAM_MB_ENV`] set to 0.
+pub fn free_vram_checks_off() -> bool {
+    std::env::var(MIN_AVAILABLE_VRAM_MB_ENV).is_ok_and(|v| v.trim().parse::<u64>() == Ok(0))
+}
+
+/// What a risc0 proof at segment size `po2` takes on a CUDA card of `total` bytes, as measured
+/// (`benchmark::RISC0_GPU_MEASURED_PEAK_MIB`), plus the Groth16 prover and SRS a worker keeps on a
+/// card of 20 GiB or more ([`RISC0_RESIDENT_GROTH16_BYTES`]): the room a proof must have before it
+/// starts, or it spills into system memory (Windows) or runs out (Linux). Not a margin: a proof
+/// that fits is never refused.
+///
+/// `None`, no requirement, for a size nothing measured (16 and 17, whose peaks are only bounded by
+/// 18's; 21 and up, which are extrapolated), another vendor's card, a card of unknown size or one
+/// that could never hold it (a refusal there would release every job such a card claims, where
+/// today it proves them slowly; the planner prices that, see
+/// `benchmark::risc0_largest_fitting_po2`), and with the checks off (`free_vram_checks_off`).
+pub fn risc0_proof_vram_bytes(po2: u8, gpu_tag: &str, total: Option<u64>) -> Option<u64> {
+    const MIB: u64 = 1024 * 1024;
+    if gpu_tag != "cuda" || free_vram_checks_off() {
+        return None;
+    }
+    let total = total?;
+    let peak = crate::benchmark::RISC0_GPU_MEASURED_PEAK_MIB
+        .iter()
+        .find(|(p, _)| *p == po2)
+        .map(|(_, mib)| mib * MIB)?;
+    let resident = if total >= RISC0_KEEPS_GROTH16_FROM_BYTES {
+        RISC0_RESIDENT_GROTH16_BYTES
+    } else {
+        0
+    };
+    let need = peak.saturating_add(resident);
+    (need <= total).then_some(need)
+}
+
+/// The card size from which a CUDA risc0 worker keeps its Groth16 prover and SRS on the card
+/// between proofs (`RELEASE_GROTH16_CACHE_BELOW_BYTES` in `zkminer-prove-risc0`).
+pub const RISC0_KEEPS_GROTH16_FROM_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// What the kept Groth16 cache adds to a risc0 proof's peak: 15,834 MiB at po2 20 with it kept,
+/// against 12,436 with it released (both on a 16 GB RTX 5080).
+pub const RISC0_RESIDENT_GROTH16_BYTES: u64 = (15_834 - 12_436) * 1024 * 1024;
 
 /// The sizing knob this backend should use on a card with `available` bytes of VRAM free, or `None`
 /// for a backend that has no such knob.
