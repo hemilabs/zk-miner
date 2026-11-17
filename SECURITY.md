@@ -433,8 +433,10 @@ executor:
   or seqpacket one are refused outright. The decision rests on the syscall and that moment, never
   on an argument in the server's memory. Landlock as for the worker, plus creating its socket under
   `/tmp` and executing itself (its Groth16 CPU helper), and writing the servers' host-wide Groth16
-  queue (lock files in `~/.zkminer/locks`, `SP1_GROTH16_QUEUE_DIR`, rather than SP1's own
-  `/run/lock` or `/dev/shm`); stdin is `/dev/null`. The supervisor kills the server when the
+  queue (lock files in `~/.zkminer/locks`, which the worker makes private to the user, mode 0700,
+  or in `SP1_GROTH16_QUEUE_DIR`, rather than SP1's own `/run/lock` or `/dev/shm`; a queue
+  directory that is, is in, or holds `/dev/shm` is refused, and SP1 is not offered); stdin is
+  `/dev/null`. The supervisor kills the server when the
   worker exits, and the server dies with the supervisor. Its socket is
   `/tmp/zkminer-confined-<name>-<device>.sock`.
 - **Docker.** The CPU risc0 worker (and an Intel worker with `RISC0_GROTH16_INTEL_PROVER=docker`)
@@ -663,7 +665,7 @@ no second one):
   other processes' command lines and status, not their memory or environment), and writing the
   caches listed above, which other GPU programs of the same user also load (a confined worker could
   poison an Intel kernel cache or risc0's CUDA Groth16 cache for them). An SP1 server can write the
-  host-wide Groth16 queue's lock files, which every SP1 server of the host shares: it can hold a
+  Groth16 queue's lock files, which every SP1 server of the user on the host shares: it can hold a
   slot, and so delay the others' final wraps. Nothing of the uid's in `/dev/shm` can be opened (the
   system's listing of `/dev` still shows the names there). A witness
   proof's worker can read every bundle in the retention store, other requesters' included.

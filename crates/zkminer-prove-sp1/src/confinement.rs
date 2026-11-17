@@ -105,14 +105,28 @@ pub(crate) fn route_server_through_shim() -> Result<(), String> {
     let dir = sp1_bin_dir().ok_or("$HOME is not set")?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     // The servers' host-wide Groth16 queue (lock files): the miner's (as the dispatcher sets it),
-    // never `/dev/shm`, which a confined server cannot reach. It must exist before the server is
-    // confined to it; where it cannot be made, SP1 proves without the queue, and says so.
+    // never `/dev/shm`, which a confined server cannot reach: an operator's directory there is
+    // refused, as the server's confinement would grant it. It must exist before the server is
+    // confined to it; where it cannot be made, SP1 proves without the queue, and says so. The
+    // default, `~/.zkminer/locks`, is private to this user.
     let queue = std::env::var_os("SP1_GROTH16_QUEUE_DIR")
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
         .or_else(|| home().map(|h| zkminer_prover_protocol::types::sp1_groth16_queue_dir(&h)))
         .ok_or("$HOME is not set")?;
-    let _ = std::fs::create_dir_all(&queue);
+    if imp::reaches_dev_shm(&queue) {
+        return Err(format!(
+            "SP1_GROTH16_QUEUE_DIR is {}, which is or holds /dev/shm: a confined SP1 server is \
+             given no part of /dev/shm. Point it at a directory on disk, or unset it for \
+             ~/.zkminer/locks",
+            queue.display()
+        ));
+    }
+    if home().is_some_and(|h| queue == zkminer_prover_protocol::types::sp1_groth16_queue_dir(&h)) {
+        private_dir(&queue);
+    } else {
+        let _ = std::fs::create_dir_all(&queue);
+    }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let link = dir.join(&shim_name);
     let current = std::fs::read_link(&link).ok();
@@ -130,6 +144,35 @@ pub(crate) fn route_server_through_shim() -> Result<(), String> {
         std::env::set_var("SP1_GROTH16_QUEUE_DIR", &queue);
     }
     server_routed_through_shim()
+}
+
+/// Makes `dir` (and its parents) with mode 0700, or makes an existing one of this user's 0700: the
+/// default Groth16 queue's lock files are this user's alone. Best effort, as making the queue is.
+#[cfg(target_os = "linux")]
+fn private_dir(dir: &Path) {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    if let Some(parent) = dir.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Not through a link: only a directory of this user's own is changed.
+            let Ok(meta) = std::fs::symlink_metadata(dir) else {
+                return;
+            };
+            // SAFETY: geteuid has no preconditions.
+            let me = unsafe { libc::geteuid() };
+            if meta.is_dir() && meta.uid() == me && meta.mode() & 0o077 != 0 {
+                if let Err(e) =
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                {
+                    tracing::warn!("cannot make {} private: {e}", dir.display());
+                }
+            }
+        }
+        Err(e) => tracing::warn!("cannot make {}: {e}", dir.display()),
+    }
 }
 
 /// `$HOME`, if set.
@@ -236,17 +279,50 @@ mod imp {
         }
     }
 
-    /// The server's confinement: see the module docs.
-    fn server_policy(real: &Path, tmp: &Path) -> Confinement {
+    /// Whether `path` is `/dev/shm`, is in it, or holds it, once resolved (through a symbolic link
+    /// such as `/run/shm` too, and for a path that does not exist yet, through its nearest existing
+    /// ancestor). No SP1 process is given any of it.
+    pub(crate) fn reaches_dev_shm(path: &Path) -> bool {
+        let shm = Path::new("/dev/shm");
+        let real_shm = std::fs::canonicalize(shm).unwrap_or_else(|_| shm.to_path_buf());
+        let resolved = resolve(path);
+        [path.to_path_buf(), resolved].iter().any(|p| {
+            [shm, real_shm.as_path()]
+                .iter()
+                .any(|s| s.starts_with(p) || p.starts_with(s))
+        })
+    }
+
+    /// `path` with every symbolic link resolved, as far as it exists; the rest as it is.
+    fn resolve(path: &Path) -> PathBuf {
+        let mut rest = Vec::new();
+        let mut at = path;
+        loop {
+            if let Ok(real) = std::fs::canonicalize(at) {
+                return rest.iter().rev().fold(real, |p, part| p.join(part));
+            }
+            match (at.parent(), at.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_os_string());
+                    at = parent;
+                }
+                _ => return path.to_path_buf(),
+            }
+        }
+    }
+
+    /// The server's confinement: see the module docs. `queue`: the host-wide Groth16 queue
+    /// (`SP1_GROTH16_QUEUE_DIR`, which `route_server_through_shim` names), never granted where it
+    /// reaches `/dev/shm`.
+    fn server_policy(real: &Path, tmp: &Path, queue: Option<&Path>) -> Confinement {
         let mut c = Confinement::with_system(Sockets::Supervised);
         common_rules(&mut c, tmp);
         // Its own listener, before its first connection (bind is the supervisor's to allow).
         c.allow("/tmp", Rights::MAKE_SOCK);
         // Its Groth16 CPU helper is itself, started again.
         c.allow(real, Rights::EXEC);
-        // The host-wide Groth16 queue (`route_server_through_shim` names it).
-        if let Some(dir) = std::env::var_os("SP1_GROTH16_QUEUE_DIR").filter(|d| !d.is_empty()) {
-            c.allow(PathBuf::from(dir), Rights::WRITE);
+        if let Some(dir) = queue.filter(|dir| !reaches_dev_shm(dir)) {
+            c.allow(dir, Rights::WRITE);
         }
         if let Some(dir) = real.parent() {
             c.allow(dir, Rights::READ);
@@ -310,7 +386,18 @@ mod imp {
         }) {
             let _ = std::fs::remove_file(&socket);
         }
-        let c = server_policy(real, &tmp);
+        let queue = std::env::var_os("SP1_GROTH16_QUEUE_DIR")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from);
+        if let Some(dir) = queue.as_deref().filter(|dir| reaches_dev_shm(dir)) {
+            eprintln!(
+                "zkminer: SP1_GROTH16_QUEUE_DIR ({}) is or holds /dev/shm, which no SP1 process \
+                 is given; refusing to start sp1-gpu-server",
+                dir.display()
+            );
+            return 1;
+        }
+        let c = server_policy(real, &tmp, queue.as_deref());
         let args: Vec<OsString> = Vec::new();
         // The executor in the server unpacks its runner into `TMPDIR` and makes it executable,
         // which the supervisor does for it (the server may not change a file's mode itself).
@@ -327,28 +414,48 @@ mod imp {
     mod tests {
         use super::*;
 
-        /// Whether a rule on `path` reaches `/dev/shm`: names it, a directory above it, or
-        /// anything in it (through a symlink too, such as `/run/shm`).
-        fn reaches_dev_shm(path: &Path) -> bool {
-            let shm = Path::new("/dev/shm");
-            let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-            shm.starts_with(&path) || path.starts_with(shm)
-        }
-
         /// Neither the worker (measuring or proving) nor its server may open, create or remove
-        /// anything in `/dev/shm`. The one rule above it is the system's listing of `/dev`, which
-        /// opens no file.
+        /// anything in `/dev/shm`, whatever queue directory an operator names. The one rule above
+        /// it is the system's listing of `/dev`, which opens no file.
         #[test]
         fn no_confinement_reaches_dev_shm() {
             let tmp =
                 std::env::temp_dir().join(format!("zkminer-sp1-policy-{}", std::process::id()));
             std::fs::create_dir_all(&tmp).unwrap();
             let server = std::env::current_exe().unwrap();
-            for (what, c) in [
+            let home_queue = tmp.join(".zkminer/locks");
+            let mut policies = vec![
                 ("measuring worker", worker_policy(&tmp, false)),
                 ("proving worker", worker_policy(&tmp, true)),
-                ("server", server_policy(&server, &tmp)),
-            ] {
+                ("server", server_policy(&server, &tmp, None)),
+                ("server", server_policy(&server, &tmp, Some(&home_queue))),
+            ];
+            // An operator's queue directory in /dev/shm, of it, above it, or through a link.
+            let link = tmp.join("shm-link");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink("/dev/shm", &link).unwrap();
+            let queues = [
+                PathBuf::from("/dev/shm"),
+                PathBuf::from("/dev/shm/"),
+                PathBuf::from("/dev/shm/zkminer-locks"),
+                PathBuf::from("/dev/shm/not/made/yet"),
+                PathBuf::from("/dev"),
+                PathBuf::from("/"),
+                link.clone(),
+                link.join("locks"),
+                PathBuf::from("/dev/./shm/../shm/locks"),
+            ];
+            for queue in &queues {
+                assert!(
+                    reaches_dev_shm(queue),
+                    "{} is not seen to reach /dev/shm",
+                    queue.display()
+                );
+                policies.push(("server", server_policy(&server, &tmp, Some(queue))));
+            }
+            assert!(!reaches_dev_shm(&home_queue));
+            assert!(!reaches_dev_shm(Path::new("/run/lock")));
+            for (what, c) in policies {
                 for (path, rights) in c.rules() {
                     if reaches_dev_shm(path) {
                         assert!(
