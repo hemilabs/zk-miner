@@ -66,6 +66,33 @@ impl Store {
         }
     }
 
+    /// Every verdict that reads back as a record for its job (an unreadable one is skipped:
+    /// [`Store::expire_verdicts`] drops it). For a caller that keeps some verdicts until an event
+    /// rather than a time (`expires_at = u64::MAX`) and must find them again.
+    pub fn verdicts(&self) -> Result<Vec<VerdictRecord>, StoreError> {
+        let inner = &self.inner;
+        inner.check_usable()?;
+        let verdicts = inner.verdicts()?;
+        let mut out = Vec::new();
+        for e in verdicts.entries().map_err(|e| StoreError::io(e, verdicts.path()))? {
+            let Some(name) = e.utf8() else { continue };
+            let Some(job_id) = parse_verdict_name(name) else { continue };
+            match read_capped(&verdicts, name, MAX_SMALL_RECORD_BYTES) {
+                Ok(b) => {
+                    if let Ok(v) = serde_json::from_slice::<VerdictRecord>(&b) {
+                        if v.job_id == job_id {
+                            out.push(v);
+                        }
+                    }
+                }
+                Err(ReadError::Io(err)) if is_enoent(&err) => {}
+                Err(ReadError::Io(err)) => return Err(StoreError::io(err, &verdicts.child(name))),
+                Err(ReadError::TooLarge | ReadError::NotRegular) => {}
+            }
+        }
+        Ok(out)
+    }
+
     /// Drops every verdict with `expires_at <= now_unix`, and every verdict file that does not read
     /// back as a record for its job (a verdict is advisory; an unreadable one is worth nothing).
     /// Returns how many were dropped.

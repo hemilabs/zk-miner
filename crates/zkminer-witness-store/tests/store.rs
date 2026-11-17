@@ -790,6 +790,12 @@ fn post_lock_records_are_written_on_a_full_store() {
     let s = open_with(d.path(), StoreOptions { quota_bytes: 1, ..opts() });
     assert_eq!(s.verdict(job(2)).unwrap().map(|v| (v.reason, v.attempts)), Some((SkipReason::PostLockFailure, 2)));
     assert_eq!(s.verdict(job(1)).unwrap(), None);
+    // A verdict kept until an event, not a time, is found again by listing; expiry never drops it.
+    assert_eq!(s.verdicts().unwrap(), vec![VerdictRecord { attempts: 2, ..mk(2, SkipReason::PostLockFailure) }]);
+    assert_eq!(s.expire_verdicts(u64::MAX - 1).unwrap(), 0);
+    // A terminal delete of its job drops it.
+    s.delete_job(job(2), &terminal(job(2))).unwrap();
+    assert!(s.verdicts().unwrap().is_empty());
     s.scan().unwrap();
     assert_accounting(&s);
 }
