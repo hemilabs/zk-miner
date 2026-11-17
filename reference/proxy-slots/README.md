@@ -21,7 +21,7 @@
 | 0 | 64 | `abi.encode(jobId, prover)`, copied from the input |
 | 64 | 160 | **header**, pinned: `schemeId = 1`, `B`, `C` (left-padded), `R`, `k` (≤ 255) |
 | 224 | 32 | `I`: the low 20 bytes of `C`'s slot `0x3608…2bbc`, as the proxy itself reads it |
-| 256 | 32 | `H`: `EXTCODEHASH(I)` (0 if `I` has no account, `keccak("")` if it has no code) |
+| 256 | 32 | `H`: `EXTCODEHASH(I)` (0 if `I` has no account or one that is empty under EIP-161, `keccak("")` if it has no code) |
 | 288 | 64 × k | `(slot, value)` in rule order; an unset slot reads 0 |
 
 **The binding:** `journalFields = 0xffffffff ‖ 0x000000a0 ‖ 0…` (the prefix marker, then 160 bytes at

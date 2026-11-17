@@ -20,7 +20,8 @@
 //! offset 224  outputs (free):
 //!               I         implementation: the low 20 bytes of C's slot
 //!                         0x3608…2bbc (EIP-1967), left-padded
-//!               H         EXTCODEHASH(I): 0 if I has no account, keccak("") if it has no code
+//!               H         EXTCODEHASH(I): 0 if I has no account or an EIP-161-empty one,
+//!                         keccak("") if it has no code
 //!               k × (slot, value)   in rule order; an unset slot reads 0
 //! ```
 //!
