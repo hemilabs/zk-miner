@@ -270,7 +270,14 @@ executor:
   keeps that one connection. A socket left open from before that the policy does not allow fails
   the confinement.
 - **Files (Landlock).** Read the system's files (`/usr`, `/etc`, `/opt`, the `lib`/`bin`
-  directories, `/sys`, `/proc`), the worker's own directory, `LD_LIBRARY_PATH`, and what the
+  directories, `/sys`), of `/proc` only the process's own entries (`/proc/self`, its threads
+  included) and the host-wide files GPU runtimes read (`cpuinfo`, `meminfo`, `stat`, `uptime`,
+  `loadavg`, `version`, `devices`, `driver`, two `sys/vm` values) — traced, that is all the CUDA,
+  ROCm and Intel workers read once confined — so another process's command line, status or
+  anything else under `/proc/<pid>` is out of reach. The SP1 worker and its server keep all of
+  `/proc`: the executor's memory monitor reads its runner child's `/proc/<pid>/{stat,statm,io,exe}`
+  and the worker its server's `/proc/<pid>/stat`, at pids no rule can name ahead. Read also the
+  worker's own directory, `LD_LIBRARY_PATH`, and what the
   backend proves with (`~/.risc0` or `RISC0_HOME`, `~/.sp1`); for witness proofs, the retention
   store (read) and the segment directories (write). Write only a private temporary directory
   (`TMPDIR`, made per worker, mode 0700), the GPU caches the build needs (risc0's CUDA Groth16
@@ -314,8 +321,13 @@ executor:
   `/etc/wsl.conf`) or run the miner in a mount namespace or container without them. A desktop
   session's FUSE mounts (gvfs, the document portal, AppImages) are refused too: run the miner as a
   dedicated user (another user's FUSE mount without `allow_other` is closed to it). The check runs again
-  once the confinement is on, and the builder runner, the execute worker and the broker make it
-  too, before their sandbox is applied (the broker's paths by `statfs` as well).
+  once the confinement is on and before every command that runs a guest, and a thread of each
+  confined worker watches its mount table (`/proc/self/mountinfo`, which signals every change) and
+  checks again on each change: the worker exits (status 78) as soon as a filesystem that is not
+  local comes within reach, whatever it is doing; `sp1-gpu-server`'s supervisor does the same for
+  the server and kills it. A change that leaves everything local (a container started, a disk
+  mounted) changes nothing. The builder runner, the execute worker and the broker make the check
+  before their sandbox is applied (the broker's paths by `statfs` as well).
 - **Other processes.** Landlock's signal and abstract-socket scoping, and its `ptrace` rules: a
   confined process cannot signal, trace or open `/proc/<pid>/mem`, `environ`, `maps` or `fd` of a
   process outside its domain (the miner, other workers, their servers): `kill`, `tgkill`,
@@ -576,8 +588,9 @@ no second one):
 - **What an escaped guest in an inline worker can still do.** It cannot open a socket or connect
   anywhere, make a namespace, mount anything or change a file's metadata, but it keeps what the
   GPU stack needs: the GPU device nodes and their ioctls (a kernel driver bug is outside this
-  model), reading the system's files and `/proc` (other processes' command lines and status, not
-  their memory or environment), and writing the caches listed above, which other GPU programs of
+  model), reading the system's files and its own `/proc` entries (an SP1 worker or server all of
+  `/proc`: other processes' command lines and status, not their memory or environment), and
+  writing the caches listed above, which other GPU programs of
   the same user also load (a confined worker could poison an Intel kernel cache or risc0's CUDA
   Groth16 cache for them). An SP1 worker and its server can read and write any POSIX shared
   memory object and semaphore of the uid in `/dev/shm` (SP1's executor needs it), the shared
@@ -585,11 +598,13 @@ no second one):
   every bundle in the retention store, other requesters' included. Its results go back to the
   miner over its pipe, and a guest controls its journal, so anything it can read it can publish:
   keep secrets out of the readable paths.
-- **Filesystems mounted later, or remote underneath.** The check of the filesystems within reach
-  runs when a process confines itself, and the process stays confined for the rest of its life. A
-  network or FUSE filesystem mounted after that (by the operator, by a desktop session, a direct
-  automount whose target changed) is within reach of the workers already running until they are
-  restarted: mount nothing of the kind while the miner runs. Filesystems are judged by their own
+- **Filesystems mounted later, or remote underneath.** A network or FUSE filesystem mounted after
+  a worker confined itself ends that worker (its mount watch) and refuses every later guest, but a
+  guest that already escaped its executor in that worker has the moment between the mount and the
+  watch's exit (milliseconds), and owns the worker's address space, watch thread included: mount
+  nothing of the kind while the miner runs. A builder runner, an execute worker or the broker
+  checks only when it starts (each runs briefly per job, the broker for as long as the miner).
+  Filesystems are judged by their own
   type, so storage that is remote underneath a local type is not seen: a block device on iSCSI,
   NBD, Ceph RBD or a file on NFS holding an `ext4` (a cloud VM's network disk included: such I/O
   carries no name the process chose), or an `overlay`/`ecryptfs` with a layer on a network

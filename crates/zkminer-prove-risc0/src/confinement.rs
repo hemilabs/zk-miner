@@ -55,7 +55,8 @@ mod imp {
 
     pub fn confine() -> Result<(), String> {
         if confine::report().is_some() {
-            return Ok(());
+            // Confined already: the sockets and the filesystems within reach, again.
+            return confine::recheck().map_err(|e| e.to_string());
         }
         let tmp = TMPDIR
             .get()

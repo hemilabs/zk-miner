@@ -159,7 +159,8 @@ mod imp {
     /// policy allows; a measuring worker has no connection to keep.
     pub fn confine(keep_server: bool) -> Result<(), String> {
         if confine::report().is_some() {
-            return Ok(());
+            // Confined already: the sockets and the filesystems within reach, again.
+            return confine::recheck().map_err(|e| e.to_string());
         }
         let tmp = TMPDIR
             .get()
@@ -197,6 +198,10 @@ mod imp {
         }
         // The SDK's executor extracts its runner here and runs it.
         c.allow(tmp, Rights::WRITE | Rights::EXEC);
+        // All of `/proc`, not only this process's: the executor's memory monitor (`sysinfo`) reads
+        // its runner child's `/proc/<pid>/{stat,statm,io,exe}`, and the worker its server's
+        // `/proc/<pid>/stat`, at pids no rule can name in advance.
+        c.allow("/proc", Rights::READ);
         // ...and keeps the guest's memory image and trace ring in shared memory.
         c.allow("/dev/shm", Rights::WRITE);
         if let Some(h) = home() {

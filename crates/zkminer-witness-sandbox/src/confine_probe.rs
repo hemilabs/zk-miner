@@ -562,15 +562,22 @@ fn metadata_checks(scratch: &Path, key: &Path, mut report: impl FnMut(&str, bool
     );
     // A key file outside every writable path: its mode stays.
     let k = cpath(key);
-    let key_before = metadata_of(key).0;
+    // A home without the key (the FUSE test's) only checks the refusal.
+    let key_mode = || {
+        std::fs::symlink_metadata(key).map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.mode() & 0o7777
+        })
+    };
+    let key_before = key_mode().ok();
     // SAFETY: a NUL-terminated path.
     let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_fchmodat, at, k.as_ptr(), 0o644) });
-    let key_after = metadata_of(key).0;
+    let key_after = key_mode().ok();
     let (ok, detail) = refused_with(r, e, libc::EPERM);
     report(
         "meta_chmod_key",
         ok && key_before == key_after,
-        format!("{detail}, mode {key_before:o} -> {key_after:o}"),
+        format!("{detail}, mode {key_before:?} -> {key_after:?}"),
     );
 }
 
@@ -916,6 +923,10 @@ pub fn run_confined(args: &[OsString]) -> i32 {
     let runner = a.write.join(runner_temp_name(std::process::id()));
     let _ = std::fs::write(&runner, b"runner\n");
     let mut c = Confinement::with_system(a.sockets);
+    if a.sockets == Sockets::KeepConnected {
+        // As an SP1 worker: all of `/proc` (its executor reads its runner child's entries).
+        c.allow("/proc", Rights::READ);
+    }
     c.allow(&a.write, Rights::WRITE);
     if let Some(exec) = &a.exec {
         c.allow(exec, Rights::EXEC);
@@ -1089,6 +1100,36 @@ pub fn run_confined(args: &[OsString]) -> i32 {
             format!("{r:?}"),
         );
     }
+    // Without all of `/proc` (the inline workers but SP1's), another process's command line and
+    // status are out of reach too; this process's own entries are not.
+    if a.sockets == Sockets::None {
+        for f in ["cmdline", "status", "stat"] {
+            let r = try_open(Path::new(&format!("/proc/{parent}/{f}")), libc::O_RDONLY);
+            check(
+                &format!("proc_parent_{f}"),
+                r == Err(libc::EACCES),
+                format!("{r:?}"),
+            );
+        }
+        let r = try_open(Path::new("/proc/1/cmdline"), libc::O_RDONLY);
+        check(
+            "proc_init_cmdline",
+            r == Err(libc::EACCES),
+            format!("{r:?}"),
+        );
+    }
+    for f in [
+        "/proc/self/status",
+        "/proc/thread-self/stat",
+        "/proc/cpuinfo",
+    ] {
+        let r = try_open(Path::new(f), libc::O_RDONLY);
+        check(
+            &format!("read_{}", f.trim_start_matches('/').replace('/', "_")),
+            r.is_ok(),
+            format!("{r:?}"),
+        );
+    }
     // SAFETY: an invalid ptrace request; refused by the filter before the kernel looks.
     let rc = unsafe { libc::ptrace(libc::PTRACE_ATTACH, parent, 0, 0) };
     let e = errno();
@@ -1189,6 +1230,8 @@ pub fn run_supervised_parent(args: &[OsString]) -> i32 {
         let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644));
     }
     let mut c = Confinement::with_system(Sockets::Supervised);
+    // As sp1-gpu-server: all of `/proc`.
+    c.allow("/proc", Rights::READ);
     c.allow(dir, Rights::MAKE_SOCK);
     c.allow(write, Rights::WRITE);
     c.allow(&exe, Rights::EXEC);

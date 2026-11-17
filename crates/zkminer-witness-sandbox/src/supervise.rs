@@ -384,7 +384,9 @@ pub fn run_supervised(
             return Err(SandboxError::Seccomp(e.to_string()));
         }
     }
-    Ok(supervise(notif_fd, parent_fd, child, child_fd, runner_dir))
+    Ok(supervise(
+        notif_fd, parent_fd, child, child_fd, runner_dir, &granted,
+    ))
 }
 
 /// The child's side: confine itself, hand the notification listener to the supervisor. 0 on
@@ -591,9 +593,20 @@ fn supervise(
     child: libc::pid_t,
     child_fd: RawFd,
     runner_dir: Option<&Path>,
+    granted: &[std::path::PathBuf],
 ) -> i32 {
+    use std::io::{Read, Seek};
     let mut armed = false;
     let mut refused = 0u64;
+    // The mount table, watched for the server: on a change that leaves a filesystem within reach
+    // that is not local (`crate::localfs`), the server is killed.
+    let Ok(mut table) = std::fs::File::open("/proc/self/mountinfo") else {
+        // SAFETY: killing our own child.
+        unsafe { libc::kill(child, libc::SIGKILL) };
+        return wait_child(child);
+    };
+    let mut sink = Vec::new();
+    let _ = table.read_to_end(&mut sink);
     let mut fds = [
         libc::pollfd {
             fd: notif_fd,
@@ -610,13 +623,18 @@ fn supervise(
             events: libc::POLLIN,
             revents: 0,
         },
+        libc::pollfd {
+            fd: std::os::unix::io::AsRawFd::as_raw_fd(&table),
+            events: libc::POLLPRI,
+            revents: 0,
+        },
     ];
     loop {
         for f in fds.iter_mut() {
             f.revents = 0;
         }
-        // SAFETY: `fds` is a valid array of three pollfds.
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
+        // SAFETY: `fds` is a valid array of four pollfds.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 4, -1) };
         if rc < 0 {
             if errno() == libc::EINTR {
                 continue;
@@ -633,6 +651,20 @@ fn supervise(
             // SAFETY: killing our own child.
             unsafe { libc::kill(child, libc::SIGKILL) };
             return wait_child(child);
+        }
+        if fds[3].revents != 0 {
+            // Reading the table again from the start acknowledges the change.
+            sink.clear();
+            let reread = table.rewind().and_then(|()| table.read_to_end(&mut sink));
+            let verdict = reread
+                .map_err(SandboxError::from)
+                .and_then(|_| crate::localfs::check_local_filesystems(granted));
+            if let Err(e) = verdict {
+                eprintln!("zkminer: the mount table changed under sp1-gpu-server: {e}; ending it");
+                // SAFETY: killing our own child.
+                unsafe { libc::kill(child, libc::SIGKILL) };
+                return wait_child(child);
+            }
         }
         if fds[0].revents & libc::POLLIN != 0 {
             // SAFETY: a zeroed notification buffer of the kernel's size.
