@@ -158,6 +158,12 @@ fn main() {
             tracing::info!("Metal budget: {}", plan.note);
             eprintln!("Metal budget: {}", plan.note);
         }
+        // P31-M9b: the pipelines and this Mac's specialized eval pipeline start building now, in
+        // the background (after the budget, which sets the segment po2).
+        #[cfg(feature = "metal")]
+        if gpu_refusal().is_none() {
+            metal_start::start_eval_prewarm(default_job_po2());
+        }
         // Not orphan-watched: run by hand, its parent is a shell.
         #[cfg(target_os = "macos")]
         mac_footprint::start_guard(false);
@@ -184,9 +190,13 @@ fn main() {
             if let Some(why) = power.reduced() {
                 eprintln!("WARNING: {why}: these results are below this Mac's full proving speed");
             }
-            // Pipelines, then the first job's warm state (M9), so the first program is measured
+            // Pipelines and the ctrl group now, the specialized eval pipeline before the first
+            // program that runs segments of its size (M9, P31-M9b), so every program is measured
             // at the speed every later job runs at.
-            eprintln!("{}", metal_start::prewarm_first_job(default_job_po2()));
+            eprintln!(
+                "{}",
+                metal_start::prewarm_before_benchmark(default_job_po2())
+            );
         }
         let results = run_benchmarks();
         for r in &results {
@@ -363,7 +373,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     #[cfg(feature = "metal")]
                     {
                         metal_start::log_power_state("benchmark");
-                        metal_start::prewarm_first_job(default_job_po2());
+                        metal_start::prewarm_before_benchmark(default_job_po2());
                     }
                     run_benchmarks_streaming(&mut stdout)?
                 };
@@ -1569,6 +1579,10 @@ fn run_proof(
     }
     // The seed the pre-claim measurement used, so every attempt runs the guest exactly as it did.
     let seed = sys_rand_seed(&sys_rand_key(), &image_id, input_data);
+    // P31-M9b: a Prove does not wait for the in-flight specialized eval pipeline (logged), unless
+    // ZKMINER_METAL_PREWARM_PROVE_JOIN=1.
+    #[cfg(feature = "metal")]
+    metal_start::before_prove(po2.unwrap_or_else(default_job_po2), elf, input_data, seed);
     // Retry-on-invalid mitigation for the rare (~1.5%) nondeterministic GPU
     // timing race on RTX 5090 / Blackwell (sm_120) — an intra-kernel race
     // produces an internally-invalid segment STARK, surfaced as
@@ -1981,6 +1995,10 @@ fn benchmark_program(
     // benchmark measured neither the recursion that folds segments together — whose cost scales with
     // segment count, i.e. with po2 — nor the wrap. `compress` consumes the previous receipt, so the
     // three stages below add up to the same work `prove_with_opts(groth16)` does in one call.
+    // P31-M9b: wait for the in-flight specialized eval pipeline when this program's segments are
+    // its size, outside the stopwatch.
+    #[cfg(feature = "metal")]
+    metal_start::before_benchmark_program(name, default_job_po2(), elf, input);
     let prover = local_prover();
     // W7-M11: the power state the program is measured under, read before and after it.
     let power_before = bench_power_state();
@@ -2244,7 +2262,7 @@ fn warm_up() -> Result<String> {
     }
     // A no-op if worker start already began it; starts it if this call just installed the component.
     metal_host::start_groth16_graph_preload("warm-up");
-    let pipelines = metal_start::prewarm_first_job(default_job_po2());
+    let pipelines = metal_start::prewarm_before_benchmark(default_job_po2());
     let start = Instant::now();
     let env = risc0_zkvm::ExecutorEnv::builder()
         .write_slice(&1000u32.to_le_bytes())
