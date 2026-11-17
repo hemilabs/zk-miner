@@ -38,9 +38,17 @@ pub struct DevConfig {
     /// reach non-public destinations: loopback, the LAN, link-local, the host's own addresses.
     /// For local test networks and test scripts only, which serve programs from this machine.
     /// The ONLY way to turn the network guard off: there is no environment variable or flag.
-    /// Refused on Hemi mainnet (43111); announced by a warning at every start. Default false.
+    /// Needs [`Self::chain_id`] equal to `[chain] chain_id` (which the RPC confirms at startup);
+    /// refused on Hemi mainnet (43111) whatever it says; announced by a warning at every start.
+    /// Default false.
     #[serde(default)]
     pub private_network: bool,
+    /// The test network `private_network` is meant for: it takes effect only on a config whose
+    /// `[chain] chain_id` is this id. A config copied to another network (or a production
+    /// deployment under a new chain id) then refuses to start instead of opening the guard there.
+    /// Default: unset (and `private_network = true` without it is refused).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<u64>,
     /// A fixed DA backlog reading, in estimated bytes, for witness-job claim gates and fulfils
     /// (docs/witness-construction-jobs.md §5.5), in place of reading the chain. For a local test
     /// network whose node serves no `l1GasUsed` in its receipts (anvil), where the reading is
@@ -52,7 +60,7 @@ pub struct DevConfig {
 
 impl DevConfig {
     fn is_off(&self) -> bool {
-        !self.private_network && self.da_backlog_bytes.is_none()
+        !self.private_network && self.chain_id.is_none() && self.da_backlog_bytes.is_none()
     }
 }
 
@@ -519,14 +527,18 @@ impl ZkMinerConfig {
     }
 
     /// The network guard's mode for connections a requester causes: [`NetMode::DevPrivate`] only
-    /// with `[dev] private_network = true` on a chain that is not a production market. On one,
-    /// this is [`NetMode::Public`] whatever the config says ([`Self::validate_for_chain`] refuses
-    /// that config outright; this holds even where validation was skipped).
+    /// with `[dev] private_network = true` and `[dev] chain_id` equal to `[chain] chain_id`, on a
+    /// chain that is not a production market. Otherwise this is [`NetMode::Public`] whatever the
+    /// config says ([`Self::validate_for_chain`] refuses such a config outright; this holds even
+    /// where validation was skipped).
     ///
     /// [`NetMode::DevPrivate`]: zkminer_netguard::NetMode::DevPrivate
     /// [`NetMode::Public`]: zkminer_netguard::NetMode::Public
     pub fn net_mode(&self) -> zkminer_netguard::NetMode {
-        if self.dev.private_network && !is_production_chain(self.chain.chain_id) {
+        if self.dev.private_network
+            && self.dev.chain_id == Some(self.chain.chain_id)
+            && !is_production_chain(self.chain.chain_id)
+        {
             zkminer_netguard::NetMode::DevPrivate
         } else {
             zkminer_netguard::NetMode::Public
@@ -586,7 +598,8 @@ impl ZkMinerConfig {
         (self.net_mode() == zkminer_netguard::NetMode::DevPrivate).then_some(DEV_MODE_BANNER)
     }
 
-    /// Refuses `[dev] private_network` on a production chain, malformed `[egress]` CIDRs, an
+    /// Refuses `[dev] private_network` on a production chain or without a matching `[dev]
+    /// chain_id`, malformed `[egress]` CIDRs, an
     /// `[egress] ipv6_site_prefix_len` outside 48..=64 and a malformed `nat64_prefixes` entry.
     pub fn validate_network(&self) -> Result<()> {
         if self.dev.private_network && is_production_chain(self.chain.chain_id) {
@@ -596,6 +609,24 @@ impl ZkMinerConfig {
                  test network",
                 self.chain.chain_id
             );
+        }
+        if self.dev.private_network {
+            match self.dev.chain_id {
+                None => anyhow::bail!(
+                    "[dev] private_network = true also needs `chain_id = {}` in [dev], naming the \
+                     test network it is meant for (this config's [chain] chain_id): developer mode \
+                     lets requesters reach this host's private network, so it takes effect only on \
+                     the network it names",
+                    self.chain.chain_id
+                ),
+                Some(id) if id != self.chain.chain_id => anyhow::bail!(
+                    "[dev] chain_id = {id} does not match [chain] chain_id = {}: [dev] \
+                     private_network = true is meant for chain {id} only. Point the config at that \
+                     network, or remove [dev] private_network",
+                    self.chain.chain_id
+                ),
+                Some(_) => {}
+            }
         }
         if self.dev.da_backlog_bytes.is_some() && is_production_chain(self.chain.chain_id) {
             anyhow::bail!(
@@ -740,7 +771,8 @@ mod validation_tests {
 
     #[test]
     fn dev_mode_on_a_test_network_is_announced() {
-        let c = parse("[chain]\nchain_id = 743111\n[dev]\nprivate_network = true\n").unwrap();
+        let c = parse("[chain]\nchain_id = 743111\n[dev]\nprivate_network = true\nchain_id = 743111\n")
+            .unwrap();
         assert!(c.validate_network().is_ok());
         assert_eq!(c.net_mode(), zkminer_netguard::NetMode::DevPrivate);
         let banner = c.dev_mode_banner().expect("a banner");
@@ -749,11 +781,54 @@ mod validation_tests {
         assert!(banner.contains("never run on a public market"));
         // It round-trips through the file, which is how the localnet test turns it on.
         let text = toml::to_string_pretty(&c).unwrap();
-        assert!(text.contains("[dev]\nprivate_network = true"), "{text}");
+        assert!(
+            text.contains("[dev]\nprivate_network = true\nchain_id = 743111"),
+            "{text}"
+        );
         assert_eq!(
             parse(&text).unwrap().net_mode(),
             zkminer_netguard::NetMode::DevPrivate
         );
+    }
+
+    /// Developer mode names the test network it is for: without `[dev] chain_id`, or with one
+    /// that is not the config's chain, the config is refused and the mode stays public (a
+    /// production deployment under a chain id zkminer does not know as one included).
+    #[test]
+    fn dev_mode_needs_the_chain_id_it_is_meant_for() {
+        for (text, why) in [
+            (
+                "[chain]\nchain_id = 743111\n[dev]\nprivate_network = true\n",
+                "chain_id = 743111",
+            ),
+            (
+                "[chain]\nchain_id = 743111\n[dev]\nprivate_network = true\nchain_id = 31337\n",
+                "does not match",
+            ),
+            (
+                "[chain]\nchain_id = 999\n[dev]\nprivate_network = true\nchain_id = 743111\n",
+                "does not match",
+            ),
+        ] {
+            let c = parse(text).unwrap();
+            let err = c.validate_network().expect_err(text).to_string();
+            assert!(err.contains(why), "{text}: {err}");
+            assert_eq!(c.net_mode(), zkminer_netguard::NetMode::Public, "{text}");
+            assert_eq!(c.dev_mode_banner(), None, "{text}");
+        }
+        // Mainnet stays refused even when the ids agree.
+        let c = parse("[chain]\nchain_id = 43111\n[dev]\nprivate_network = true\nchain_id = 43111\n")
+            .unwrap();
+        assert!(c.validate_network().unwrap_err().to_string().contains("43111"));
+        assert_eq!(c.net_mode(), zkminer_netguard::NetMode::Public);
+        // A chain id alone changes nothing.
+        let c = parse("[chain]\nchain_id = 31337\n[dev]\nchain_id = 31337\n").unwrap();
+        assert!(c.validate_network().is_ok());
+        assert_eq!(c.net_mode(), zkminer_netguard::NetMode::Public);
+        let c = parse("[chain]\nchain_id = 31337\n[dev]\nprivate_network = true\nchain_id = 31337\n")
+            .unwrap();
+        assert!(c.validate_network().is_ok());
+        assert_eq!(c.net_mode(), zkminer_netguard::NetMode::DevPrivate);
     }
 
     #[test]

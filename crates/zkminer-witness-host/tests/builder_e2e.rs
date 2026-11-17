@@ -173,6 +173,7 @@ fn dev_miner() -> zkminer_config::ZkMinerConfig {
     let mut c = zkminer_config::ZkMinerConfig::default();
     c.chain.chain_id = ANVIL_CHAIN;
     c.dev.private_network = true;
+    c.dev.chain_id = Some(ANVIL_CHAIN);
     assert_eq!(c.net_mode(), zkminer_netguard::NetMode::DevPrivate);
     c
 }
