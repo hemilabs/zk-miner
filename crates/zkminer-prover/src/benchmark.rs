@@ -394,6 +394,18 @@ pub fn risc0_job_po2(
     }
 }
 
+/// The largest job size whose peak (`risc0_gpu_peak`: measured to 20, extrapolated above) plus
+/// [`RISC0_JOB_VRAM_MARGIN`] fits a CUDA card of `vram` bytes, or `None` when that is unknown (VRAM
+/// not read, or another vendor's card, whose peaks nothing has measured). For pricing a size above
+/// it (`risc0_job_throughput`), never for choosing one: above 20 the figures are an extrapolation.
+pub fn risc0_largest_fitting_po2(vram: Option<u64>, gpu_tag: &str) -> Option<u8> {
+    use zkminer_prover_protocol::{RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
+    let vram = vram.filter(|_| gpu_tag == "cuda")?;
+    (RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX)
+        .rev()
+        .find(|p| risc0_gpu_peak(*p).saturating_add(RISC0_JOB_VRAM_MARGIN) <= vram)
+}
+
 /// Throughput factor per segment-size step below the smallest size a row was measured at.
 ///
 /// Recursion (lift/join) costs per segment, so it doubles per step down while the segments themselves
@@ -417,13 +429,15 @@ pub const RISC0_PO2_STEP_UP_UNFIT_FACTOR: f64 = 0.25;
 /// The row's throughput was measured at its `benchmark_po2` ([`RISC0_DEFAULT_JOB_PO2`] on a row
 /// without one). A calibrated card is held to the lower of that and its measured rate at `po2`
 /// (which includes the Groth16 wrap). Below the smallest size either was measured at, each step
-/// down is charged [`RISC0_PO2_STEP_DOWN_FACTOR`]. Above the largest, nothing is credited, and on a
-/// card measured only below [`RISC0_DEFAULT_JOB_PO2`] (one too small for it) each step up is
-/// charged [`RISC0_PO2_STEP_UP_UNFIT_FACTOR`]: an operator's size, or the default on a card whose
-/// VRAM could not be read, may not fit it.
+/// down is charged [`RISC0_PO2_STEP_DOWN_FACTOR`]. Above the largest, nothing is credited, and each
+/// step above a size the card is not known to hold is charged [`RISC0_PO2_STEP_UP_UNFIT_FACTOR`]:
+/// above the largest measured size on a card measured only below [`RISC0_DEFAULT_JOB_PO2`] (one too
+/// small for it), else above `largest_fit` (`risc0_largest_fitting_po2`, the card's VRAM against
+/// the peaks), or the largest size measured if that is higher. An operator's size, or the default
+/// on a card whose VRAM could not be read, may not fit the card.
 ///
 /// [`RISC0_DEFAULT_JOB_PO2`]: zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
-pub fn risc0_job_throughput(row: &DeviceBenchmark, po2: u8) -> f64 {
+pub fn risc0_job_throughput(row: &DeviceBenchmark, po2: u8, largest_fit: Option<u8>) -> f64 {
     let benchmarked = row
         .benchmark_po2
         .unwrap_or(zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2);
@@ -439,11 +453,12 @@ pub fn risc0_job_throughput(row: &DeviceBenchmark, po2: u8) -> f64 {
         }
         None => (row.throughput, benchmarked, benchmarked),
     };
-    let up = if highest < zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2 {
-        RISC0_PO2_STEP_UP_UNFIT_FACTOR.powi(i32::from(po2.saturating_sub(highest)))
+    let held = if highest < zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2 {
+        highest
     } else {
-        1.0
+        largest_fit.map_or(u8::MAX, |fit| fit.max(highest))
     };
+    let up = RISC0_PO2_STEP_UP_UNFIT_FACTOR.powi(i32::from(po2.saturating_sub(held)));
     rate * up * RISC0_PO2_STEP_DOWN_FACTOR.powi(i32::from(lowest.saturating_sub(po2)))
 }
 
@@ -4673,19 +4688,25 @@ mod tests {
     #[test]
     fn a_card_is_planned_at_the_rate_of_its_job_size() {
         let uncalibrated = risc0_row(Vec::new(), 18, 18);
-        assert_eq!(risc0_job_throughput(&uncalibrated, 20), 2_000_000.0);
+        assert_eq!(risc0_job_throughput(&uncalibrated, 20, None), 2_000_000.0);
         assert_eq!(
-            risc0_job_throughput(&uncalibrated, 21),
+            risc0_job_throughput(&uncalibrated, 21, None),
             2_000_000.0,
             "nothing credited"
         );
-        assert_eq!(risc0_job_throughput(&uncalibrated, 18), 2_000_000.0 * 0.25);
+        assert_eq!(
+            risc0_job_throughput(&uncalibrated, 18, None),
+            2_000_000.0 * 0.25
+        );
         // Calibrated: the lower of the row and its rate at the size; halved per step below its
         // samples.
         let calibrated = risc0_row(vec![sample(19, 32, 1.5e6), sample(20, 16, 2.5e6)], 20, 20);
-        assert_eq!(risc0_job_throughput(&calibrated, 20), 2_000_000.0);
-        assert_eq!(risc0_job_throughput(&calibrated, 19), 1_500_000.0);
-        assert_eq!(risc0_job_throughput(&calibrated, 17), 1_500_000.0 * 0.25);
+        assert_eq!(risc0_job_throughput(&calibrated, 20, None), 2_000_000.0);
+        assert_eq!(risc0_job_throughput(&calibrated, 19, None), 1_500_000.0);
+        assert_eq!(
+            risc0_job_throughput(&calibrated, 17, None),
+            1_500_000.0 * 0.25
+        );
         // A 12 GB card benchmarked at its own 19: that rate is its jobs' rate, with nothing
         // credited above it and the same charge per step below.
         let at_19 = DeviceBenchmark {
@@ -4693,21 +4714,52 @@ mod tests {
             highest_proved_po2: None,
             ..risc0_row(Vec::new(), 19, 19)
         };
-        assert_eq!(risc0_job_throughput(&at_19, 19), 2_000_000.0);
-        assert_eq!(risc0_job_throughput(&at_19, 18), 2_000_000.0 * 0.5);
+        assert_eq!(risc0_job_throughput(&at_19, 19, None), 2_000_000.0);
+        assert_eq!(risc0_job_throughput(&at_19, 18, None), 2_000_000.0 * 0.5);
         // Above it is a size its measurements say does not fit (an operator's 20, or 20 when its
         // VRAM could not be read): charged a quarter per step, not credited the rate of the size
         // that fits.
-        assert_eq!(risc0_job_throughput(&at_19, 20), 2_000_000.0 * 0.25);
-        assert_eq!(risc0_job_throughput(&at_19, 21), 2_000_000.0 * 0.25 * 0.25);
+        assert_eq!(risc0_job_throughput(&at_19, 20, None), 2_000_000.0 * 0.25);
+        assert_eq!(
+            risc0_job_throughput(&at_19, 21, None),
+            2_000_000.0 * 0.25 * 0.25
+        );
         // Calibrated only up to 19 (its free VRAM capped the sweep): the same.
         let capped = DeviceBenchmark {
             benchmark_po2: Some(19),
             ..risc0_row(vec![sample(18, 32, 1.0e6), sample(19, 16, 1.5e6)], 19, 19)
         };
-        assert_eq!(risc0_job_throughput(&capped, 20), 1_500_000.0 * 0.25);
-        // A card measured at 20 is not charged above it, as before.
-        assert_eq!(risc0_job_throughput(&uncalibrated, 22), 2_000_000.0);
+        assert_eq!(risc0_job_throughput(&capped, 20, None), 1_500_000.0 * 0.25);
+        // A card measured at 20 whose VRAM is unknown is not charged above it, as before...
+        assert_eq!(risc0_job_throughput(&uncalibrated, 22, None), 2_000_000.0);
+        // ...but one whose VRAM says the size does not fit is: an RTX 5080 (16 GB) set to 21, a
+        // 4090 (24 GB) set to 22. A 4090 at 21 and a 5090 (32 GB) at 21 are held.
+        const MIB: u64 = 1 << 20;
+        let fit = |mib: u64| risc0_largest_fitting_po2(Some(mib * MIB), "cuda");
+        assert_eq!(fit(16_303), Some(20));
+        assert_eq!(fit(24_564), Some(21));
+        assert_eq!(fit(32_607), Some(21));
+        assert_eq!(fit(12_282), Some(19));
+        assert_eq!(risc0_largest_fitting_po2(Some(16_303 * MIB), "rocm"), None);
+        assert_eq!(risc0_largest_fitting_po2(None, "cuda"), None);
+        assert_eq!(
+            risc0_job_throughput(&uncalibrated, 21, fit(16_303)),
+            2_000_000.0 * 0.25
+        );
+        assert_eq!(
+            risc0_job_throughput(&uncalibrated, 22, fit(24_564)),
+            2_000_000.0 * 0.25
+        );
+        assert_eq!(
+            risc0_job_throughput(&uncalibrated, 21, fit(24_564)),
+            2_000_000.0
+        );
+        // A calibration that proved 22 on a card the estimate says cannot hold it is believed.
+        let proved_22 = risc0_row(vec![sample(21, 8, 2.0e6), sample(22, 4, 2.2e6)], 22, 22);
+        assert_eq!(
+            risc0_job_throughput(&proved_22, 22, fit(32_607)),
+            2_000_000.0
+        );
     }
 
     #[test]

@@ -7499,6 +7499,15 @@ async fn miner_brain(
         let risc0_sizes = risc0_job_sizes(&risc0_cards);
 
         let device_backend_throughputs: Vec<(String, String, f64)> = {
+            // Each risc0 card's VRAM, so a size it is not known to hold is priced as such.
+            let risc0_vram: HashMap<String, Option<u64>> = zkminer_prover::engine::worker_pool()
+                .map(|p| {
+                    p.risc0_slots()
+                        .into_iter()
+                        .map(|(slot, _, vram)| (slot, vram))
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut v: Vec<(String, String, f64)> = Vec::new();
             for d in &benchmarks.device_benchmarks {
                 if !d.device_id.starts_with("gpu") {
@@ -7507,7 +7516,13 @@ async fn miner_brain(
                 // A risc0 row only for a card that proves risc0 jobs, at the rate of its job size.
                 let throughput = if d.prover_backend == zkminer_prover_protocol::BACKEND_RISC0 {
                     match risc0_cards.iter().find(|c| c.device == d.device_id) {
-                        Some(card) => zkminer_prover::benchmark::risc0_job_throughput(d, card.po2),
+                        Some(card) => {
+                            let fit = zkminer_prover::benchmark::risc0_largest_fitting_po2(
+                                risc0_vram.get(&card.slot).copied().flatten(),
+                                card.slot.split(':').nth(1).unwrap_or(""),
+                            );
+                            zkminer_prover::benchmark::risc0_job_throughput(d, card.po2, fit)
+                        }
                         None => continue,
                     }
                 } else {

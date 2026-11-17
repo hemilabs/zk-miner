@@ -540,6 +540,13 @@ pub fn sp1_small_card_savers_off(get: impl Fn(&str) -> Option<String>) -> bool {
         .any(|var| matches!(get(var).as_deref(), Some("0" | "false")))
 }
 
+/// Whether `sp1-gpu-server` runs its small-card memory savers by default on a CUDA card of `total`
+/// bytes: on one it accepts of 16 GiB or less (`ceil(GiB) + 4 <= 20`). Larger cards run without
+/// them, which the larger card's table measures.
+pub fn sp1_savers_are_the_default(total: u64) -> bool {
+    total > SP1_UNSUPPORTED_CARD_MAX_TOTAL && total <= SP1_16GB_CARD_MAX_TOTAL
+}
+
 /// The measured tiers for a card of `total` bytes, largest first: none for a card the server refuses,
 /// and the larger card's table when the total is unknown, whose figures are the higher.
 fn sp1_measured_tiers(total: Option<u64>) -> &'static [(u64, u64)] {
@@ -1392,6 +1399,15 @@ mod zkop_mix_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_server_runs_its_savers_on_cards_it_accepts_up_to_16_gib() {
+        const MIB: u64 = 1 << 20;
+        assert!(!super::sp1_savers_are_the_default(11 * 1024 * MIB));
+        assert!(super::sp1_savers_are_the_default(12_282 * MIB));
+        assert!(super::sp1_savers_are_the_default(16 * 1024 * MIB));
+        assert!(!super::sp1_savers_are_the_default(24_564 * MIB));
+    }
 
     #[test]
     fn the_small_card_savers_are_off_only_when_set_to_off() {
