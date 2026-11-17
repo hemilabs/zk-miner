@@ -428,13 +428,15 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             }
 
             WorkerCommand::Warmup { request_id } => {
-                let resp = match warm_up(&mut |status| {
+                let resp = match warm_up(&mut |status, done_bytes, total_bytes| {
                     // A closed pipe is reported by the final answer's write below.
                     let _ = write_message(
                         &mut stdout,
                         &WorkerResponse::SetupProgress {
                             request_id,
                             status: status.to_string(),
+                            done_bytes,
+                            total_bytes,
                         },
                     );
                 }) {
@@ -1720,9 +1722,13 @@ const CALIBRATION_ITERS: u32 = 6_000_000;
 /// full Groth16 pipeline compiles everything once for every later process. It is verified, so a
 /// broken card fails here, not on a job.
 #[cfg(feature = "intel")]
-fn warm_up(report: &mut dyn FnMut(&str)) -> Result<String> {
+fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<String> {
     let component = groth16_component::ensure_installed(report)?;
-    report("Preparing GPU kernels for this card (a first run can take several minutes)");
+    report(
+        "Preparing GPU kernels for this card (a first run can take several minutes)",
+        None,
+        None,
+    );
     let start = Instant::now();
     let env = risc0_zkvm::ExecutorEnv::builder()
         .write_slice(&1000u32.to_le_bytes())
@@ -1743,7 +1749,7 @@ fn warm_up(report: &mut dyn FnMut(&str)) -> Result<String> {
 }
 
 #[cfg(not(feature = "intel"))]
-fn warm_up(report: &mut dyn FnMut(&str)) -> Result<String> {
+fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<String> {
     groth16_component::ensure_installed(report)
 }
 

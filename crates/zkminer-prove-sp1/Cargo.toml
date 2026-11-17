@@ -24,6 +24,8 @@ sp1-sdk = { version = "6.0", features = ["blocking", "cuda"] }
 # Directly only for `build::groth16_circuit_artifacts_dir`, which sp1-sdk 6.8 no longer re-exports;
 # sp1-sdk depends on it already.
 sp1-prover = "6.0"
+# Asks the server how big SP1's circuit download is, for its progress bar.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [build-dependencies]
 sp1-build = "6.0"

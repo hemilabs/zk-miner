@@ -108,14 +108,14 @@ fn render_hardware(f: &mut Frame, area: Rect, state: &MinerState) {
         vec![
             Span::styled(" | ", theme::separator()),
             Span::styled(
-                format!("{} zkOP/s", format_compact(bench.zkops)),
+                zkminer_prover::benchmark::format_mzkops(bench.zkops),
                 theme::metric(),
             ),
         ]
     } else {
         vec![
             Span::styled(" | ", theme::separator()),
-            Span::styled("-- zkOP/s", theme::dim()),
+            Span::styled("-- MzkOP/s", theme::dim()),
         ]
     };
 
@@ -304,7 +304,7 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &MinerState) {
 
     let header = Row::new(vec![
         Cell::from("Name").style(theme::table_header()),
-        Cell::from("zkOP/s").style(theme::table_header()),
+        Cell::from("MzkOP/s").style(theme::table_header()),
         Cell::from("Core").style(theme::table_header()),
         Cell::from("GClk").style(theme::table_header()),
         Cell::from("MClk").style(theme::table_header()),
@@ -420,7 +420,7 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
         GpuVendor::Unknown => (" GPU ", theme::overlay()),
     };
 
-    // Per-GPU zkOP/s: the suite's score, scaled by this card's best throughput over the suite's mean
+    // This card's score: its SP1 and RISC Zero results blended (`benchmark::gpu_zkops`).
     let zkops_str = if let Some(suite) = &state.benchmark_results {
         // Join on physical identity, NOT on `gpu.index`. `gpu.index` is a display
         // ordinal over all DRM cards; benchmark rows are keyed in the prover's
@@ -428,23 +428,12 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
         // AMD GPU the two are off by one, and this column showed each card its
         // neighbour's score. `None` = no row for this card; render "--", never a
         // positional guess.
-        // This card's own SP1 score. A card with no row or no score shows "--", never a guess.
-        let card_zkops = gpu
-            .benchmark_device_id(suite)
-            .map(|device_id| {
-                suite
-                    .device_benchmarks
-                    .iter()
-                    .filter(|d| d.device_id == device_id && d.prover_backend == "sp1")
-                    .map(|d| d.zkops())
-                    .fold(0.0_f64, f64::max)
+        // A card with no row or no score shows "--", never a guess.
+        gpu.benchmark_device_id(suite)
+            .and_then(|device_id| {
+                zkminer_prover::benchmark::gpu_zkops(&suite.device_benchmarks, &device_id)
             })
-            .unwrap_or(0.0);
-        if card_zkops > 0.0 {
-            format_compact(card_zkops)
-        } else {
-            "--".to_string()
-        }
+            .map_or("--".to_string(), |score| format!("{:.2}", score / 1e6))
     } else {
         "--".to_string()
     };

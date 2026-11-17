@@ -13,6 +13,7 @@
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -34,8 +35,9 @@ const FILES: [&str; 4] = [
 ];
 
 /// Makes sure the component is where risc0 will look for it, installing it if it is not. What was
-/// done, for the log. `report` is told before each long step.
-pub fn ensure_installed(report: &mut dyn FnMut(&str)) -> Result<String> {
+/// done, for the log. `report(step, done bytes, total bytes)` is told before each long step, and every
+/// second during the download and the unpack.
+pub fn ensure_installed(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<String> {
     if let Some(dir) = std::env::var_os("RISC0_GROTH16_DIR") {
         let dir = PathBuf::from(dir);
         ensure!(
@@ -73,22 +75,42 @@ pub fn ensure_installed(report: &mut dyn FnMut(&str)) -> Result<String> {
         dir.display()
     );
     let archive = tmp.join(format!("risc0-groth16-{VERSION}.tar.xz"));
-    let label = "Downloading RISC Zero's Groth16 files (first run, 2.3 GB)";
-    report(label);
+    let archive_bytes = AtomicU64::new(0);
+    report(DOWNLOADING, Some(0), None);
     let part = archive.with_extension("xz.part");
-    with_size_progress(&part, label, report, || download(&archive))?;
-    let label = "Unpacking RISC Zero's Groth16 files (first run, 5 GB)";
-    report(label);
+    with_progress(
+        report,
+        || {
+            let total = archive_bytes.load(Ordering::Relaxed);
+            (
+                DOWNLOADING,
+                Some(size_on_disk(&part)),
+                (total > 0).then_some(total),
+            )
+        },
+        || download(&archive, &archive_bytes),
+    )?;
+    report(UNPACKING, Some(0), Some(UNPACKED_BYTES));
     let staging = tmp.join(format!("risc0-groth16-{VERSION}.{}", std::process::id()));
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging)?;
-    let unpacked = with_size_progress(&staging, label, report, || {
-        File::open(&archive)
-            .map(BufReader::new)
-            .map(liblzma::bufread::XzDecoder::new_parallel)
-            .map(tar::Archive::new)
-            .and_then(|mut a| a.unpack(&staging))
-    });
+    let unpacked = with_progress(
+        report,
+        || {
+            (
+                UNPACKING,
+                Some(size_on_disk(&staging)),
+                Some(UNPACKED_BYTES),
+            )
+        },
+        || {
+            File::open(&archive)
+                .map(BufReader::new)
+                .map(liblzma::bufread::XzDecoder::new_parallel)
+                .map(tar::Archive::new)
+                .and_then(|mut a| a.unpack(&staging))
+        },
+    );
     let _ = fs::remove_file(&archive);
     unpacked.with_context(|| {
         format!(
@@ -131,7 +153,8 @@ fn risc0_home() -> Result<PathBuf> {
 }
 
 /// Downloads the archive to `to`, checking its SHA-256 on the way.
-fn download(to: &Path) -> Result<()> {
+/// `total` is set to the archive's size once the server says it.
+fn download(to: &Path, total: &AtomicU64) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(None)
@@ -141,6 +164,9 @@ fn download(to: &Path) -> Result<()> {
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
         .with_context(|| format!("cannot download {ARCHIVE_URL}"))?;
+    if let Some(bytes) = response.content_length() {
+        total.store(bytes, Ordering::Relaxed);
+    }
     let part = to.with_extension("xz.part");
     let mut out =
         File::create(&part).with_context(|| format!("cannot write {}", part.display()))?;
@@ -171,15 +197,18 @@ fn download(to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// How often a long step's size is reported.
-const PROGRESS_EVERY: Duration = Duration::from_secs(2);
+const DOWNLOADING: &str = "Downloading the Groth16 files (first run)";
+const UNPACKING: &str = "Unpacking the Groth16 files (first run)";
+/// What the pinned component unpacks to, for the unpack's progress bar.
+const UNPACKED_BYTES: u64 = 5_314_631_872;
+/// How often a long step's progress is reported.
+const PROGRESS_EVERY: Duration = Duration::from_secs(1);
 
-/// Runs `step` on a thread of its own, telling `report` every few seconds how much `path` holds,
-/// as "<label>: 3.1 GB so far". For a download or an unpack whose library reports nothing itself.
-fn with_size_progress<T: Send>(
-    path: &Path,
-    label: &str,
-    report: &mut dyn FnMut(&str),
+/// Runs `step` on a thread of its own, passing `report` what `measure` says every second: the step
+/// and its bytes so far. For a download or an unpack whose library reports nothing itself.
+fn with_progress<T: Send>(
+    report: &mut dyn FnMut(&str, Option<u64>, Option<u64>),
+    measure: impl Fn() -> (&'static str, Option<u64>, Option<u64>),
     step: impl FnOnce() -> T + Send,
 ) -> T {
     std::thread::scope(|scope| {
@@ -189,8 +218,8 @@ fn with_size_progress<T: Send>(
             std::thread::sleep(Duration::from_millis(250));
             if reported.elapsed() >= PROGRESS_EVERY {
                 reported = Instant::now();
-                let gb = size_on_disk(path) as f64 / 1e9;
-                report(&format!("{label}: {gb:.1} GB so far"));
+                let (status, done, total) = measure();
+                report(status, done, total);
             }
         }
         running

@@ -3,8 +3,8 @@
 //! The structures mirror `igcl_api.h` (intel/drivers.gpu.control-library 1db55c36) field for
 //! field; the size and offset assertions below are the values MSVC computes for that header.
 
+use super::GpuTelemetry;
 use super::{bdf_key, pcie_speed_label, CounterSample};
-use crate::hardware::GpuInfo;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of};
@@ -300,7 +300,11 @@ impl Igcl {
         Ok(igcl)
     }
 
-    pub(super) fn refresh(&mut self, gpu: &mut GpuInfo) {
+    pub(super) fn knows(&self, pci_bus_id: &str) -> bool {
+        self.devices.contains_key(pci_bus_id)
+    }
+
+    pub(super) fn refresh(&mut self, gpu: &mut GpuTelemetry) {
         let Some(device) = self.devices.get_mut(&gpu.pci_bus_id) else {
             return;
         };
