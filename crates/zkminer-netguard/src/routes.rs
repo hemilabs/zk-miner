@@ -125,6 +125,9 @@ pub struct Route {
     pub kind: RouteType,
     /// The routing table ([`RT_TABLE_MAIN`] for the routes the constructors build).
     pub table: u32,
+    /// The nexthop object the route goes through (`RTA_NH_ID`; 0 when it names none). Its
+    /// gateway and interface are the nexthop's, which a route dump does not show.
+    pub nexthop: u32,
 }
 
 impl Route {
@@ -137,6 +140,7 @@ impl Route {
             loopback: false,
             kind: RouteType::Unicast,
             table: RT_TABLE_MAIN,
+            nexthop: 0,
         }
     }
 
@@ -149,6 +153,7 @@ impl Route {
             loopback: false,
             kind: RouteType::Unicast,
             table: RT_TABLE_MAIN,
+            nexthop: 0,
         }
     }
 
@@ -749,13 +754,16 @@ pub struct Link {
     pub kind: Option<String>,
 }
 
-/// The interface kinds that are tunnels: traffic sent into one comes out on another network (a
-/// VPN's, a company's), whose own hosts are then a few hops away and look like the internet. A
-/// `ppp` interface (a PPPoE uplink) is not one.
+/// The interface kinds known to be tunnels: traffic sent into one comes out on another network
+/// (a VPN's, a company's), whose own hosts are then a few hops away and look like the internet.
+/// Only for naming what was found: an uplink is judged against [`PHYSICAL_KINDS`], so a kind on
+/// neither list counts as a tunnel too.
 pub const TUNNEL_KINDS: &[&str] = &[
     "wireguard",
     "tun",
     "tap",
+    "ovpn",
+    "ovpn-dco",
     "ipip",
     "gre",
     "gretap",
@@ -770,17 +778,103 @@ pub const TUNNEL_KINDS: &[&str] = &[
     "ip6erspan",
     "geneve",
     "vxlan",
+    "bareudp",
+    "amt",
     "l2tpeth",
     "gtp",
 ];
 
+/// The interface kinds that carry traffic onto the network they are attached to, as a physical
+/// NIC does (a device with no kind): a bridge, a bond or team of NICs, a VLAN, a macvlan or ipvlan
+/// of a NIC, a container's veth, a VRF. Any other kind as an uplink — a tunnel, `ppp` that is not
+/// PPPoE, a kind this list does not know — makes a public-mode host state `[egress]
+/// internal_ranges` ([`crate::HostFacts::needs_internal_ranges`]).
+pub const PHYSICAL_KINDS: &[&str] = &[
+    "bridge", "bond", "team", "vlan", "macvlan", "ipvlan", "veth", "vrf",
+];
+
 impl Link {
-    /// Whether the interface is a tunnel ([`TUNNEL_KINDS`]).
+    /// Whether the interface is a known tunnel kind ([`TUNNEL_KINDS`]).
     pub fn is_tunnel(&self) -> bool {
         self.kind
             .as_deref()
             .is_some_and(|k| TUNNEL_KINDS.contains(&k))
     }
+
+    /// Whether the interface is physical or a known-physical kind ([`PHYSICAL_KINDS`]).
+    pub fn is_physical(&self) -> bool {
+        self.kind
+            .as_deref()
+            .is_none_or(|k| PHYSICAL_KINDS.contains(&k))
+    }
+
+    /// Whether it is a `ppp` interface.
+    pub fn is_ppp(&self) -> bool {
+        self.kind.as_deref() == Some("ppp")
+    }
+}
+
+/// A nexthop object (`ip nexthop`): its id, and either an interface, a group of other nexthops,
+/// or a blackhole.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Nexthop {
+    pub id: u32,
+    /// The device (`NHA_OIF`; 0 when it has none).
+    pub oif: u32,
+    /// The member nexthops of a group (`NHA_GROUP`).
+    pub group: Vec<u32>,
+    pub blackhole: bool,
+}
+
+/// The interfaces nexthop object `id` sends traffic out of (a group's, its members'), or `None`
+/// when it cannot be resolved (unknown id, a member that is unknown, a nexthop with no device,
+/// nesting deeper than a group of nexthops). A blackhole sends nothing anywhere: no interface.
+pub fn nexthop_interfaces(nexthops: &[Nexthop], id: u32) -> Option<Vec<u32>> {
+    fn walk(all: &[Nexthop], id: u32, depth: u8, out: &mut Vec<u32>) -> Option<()> {
+        let nh = all.iter().find(|n| n.id == id)?;
+        if nh.blackhole {
+            return Some(());
+        }
+        if !nh.group.is_empty() {
+            if depth > 0 {
+                return None;
+            }
+            for m in &nh.group {
+                walk(all, *m, depth + 1, out)?;
+            }
+            return Some(());
+        }
+        if nh.oif == 0 {
+            return None;
+        }
+        out.push(nh.oif);
+        Some(())
+    }
+    let mut out = Vec::new();
+    walk(nexthops, id, 0, &mut out)?;
+    out.sort();
+    out.dedup();
+    Some(out)
+}
+
+/// Every nexthop object (Linux 5.3 and later; none elsewhere, or where the kernel has none).
+pub(crate) fn read_nexthops() -> std::io::Result<Vec<Nexthop>> {
+    sys::nexthops()
+}
+
+/// How many PPPoE sessions this host has (`/proc/net/pppoe`, 0 when it does not exist).
+pub(crate) fn pppoe_sessions() -> usize {
+    std::fs::read_to_string("/proc/net/pppoe")
+        .map(|t| count_pppoe_sessions(&t))
+        .unwrap_or(0)
+}
+
+/// The sessions listed in a `/proc/net/pppoe` text: every line after the header.
+pub fn count_pppoe_sessions(text: &str) -> usize {
+    text.lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .count()
 }
 
 /// Every network interface, with its kind (Linux; elsewhere none).
@@ -814,7 +908,7 @@ mod sys {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    use super::{Hop, KernelAnswer, Link, Route, RouteType, Rule, RuleAction, RuleMatch};
+    use super::{Hop, KernelAnswer, Link, Nexthop, Route, RouteType, Rule, RuleAction, RuleMatch};
     use crate::ip::Prefix;
 
     const NLMSG_HDRLEN: usize = 16;
@@ -850,6 +944,13 @@ mod sys {
     const IFLA_IFNAME: u16 = 3;
     const IFLA_LINKINFO: u16 = 18;
     const IFLA_INFO_KIND: u16 = 1;
+    const RTM_NEWNEXTHOP: u16 = 104;
+    const RTM_GETNEXTHOP: u16 = 106;
+    const NHMSG_LEN: usize = 8;
+    const NHA_ID: u16 = 1;
+    const NHA_GROUP: u16 = 2;
+    const NHA_BLACKHOLE: u16 = 4;
+    const NHA_OIF: u16 = 5;
     const RTM_NEWRULE: u16 = 32;
     const RTM_GETRULE: u16 = 34;
     const FR_ACT_TO_TBL: u8 = 1;
@@ -1549,6 +1650,54 @@ mod sys {
         Ok(meta)
     }
 
+    /// Every nexthop object: an `RTM_GETNEXTHOP` dump (unprivileged). A kernel without nexthop
+    /// objects has none.
+    pub(super) fn nexthops() -> io::Result<Vec<Nexthop>> {
+        // `struct nhmsg`: family (AF_UNSPEC), scope, protocol, reserved, flags.
+        let hdr = [0u8; NHMSG_LEN];
+        match dump_consistent_with(RTM_GETNEXTHOP, RTM_NEWNEXTHOP, &hdr, parse_nexthop) {
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EOPNOTSUPP) | Some(libc::EINVAL)
+                ) =>
+            {
+                Ok(Vec::new())
+            }
+            r => r,
+        }
+    }
+
+    /// One `RTM_NEWNEXTHOP`: `NHA_ID`, `NHA_OIF`, `NHA_GROUP` (an array of `struct nexthop_grp`,
+    /// 8 bytes each, the id first), `NHA_BLACKHOLE`.
+    pub(super) fn parse_nexthop(p: &[u8], out: &mut Vec<Nexthop>) -> io::Result<()> {
+        if p.len() < NHMSG_LEN {
+            return Err(malformed());
+        }
+        let mut nh = Nexthop {
+            id: 0,
+            oif: 0,
+            group: Vec::new(),
+            blackhole: false,
+        };
+        for (ty, data) in attrs(&p[NHMSG_LEN..])? {
+            match ty {
+                NHA_ID => nh.id = u32_at(data, 0).ok_or_else(malformed)?,
+                NHA_OIF => nh.oif = u32_at(data, 0).ok_or_else(malformed)?,
+                NHA_BLACKHOLE => nh.blackhole = true,
+                NHA_GROUP => {
+                    if data.len() % 8 != 0 {
+                        return Err(malformed());
+                    }
+                    nh.group = data.chunks(8).map(|c| u32_at(c, 0).unwrap_or(0)).collect();
+                }
+                _ => {}
+            }
+        }
+        out.push(nh);
+        Ok(())
+    }
+
     /// Every network interface and its kind: an `RTM_GETLINK` dump (unprivileged).
     pub(super) fn links() -> io::Result<Vec<Link>> {
         // `struct ifinfomsg`: family (AF_UNSPEC), pad, type, index, flags, change.
@@ -1615,7 +1764,7 @@ mod sys {
         let mut dst = None;
         let mut gateway = None;
         let mut oif = 0u32;
-        let mut nh_object = false;
+        let mut nh_object = 0u32;
         let mut multipath: Vec<(Hop, u32)> = Vec::new();
         for (ty, data) in attrs(&p[RTMSG_LEN..])? {
             match ty {
@@ -1624,7 +1773,7 @@ mod sys {
                 RTA_VIA => gateway = via(data),
                 RTA_OIF => oif = u32_at(data, 0).unwrap_or(0),
                 RTA_TABLE => table = u32_at(data, 0).ok_or_else(malformed)?,
-                RTA_NH_ID => nh_object = true,
+                RTA_NH_ID => nh_object = u32_at(data, 0).unwrap_or(u32::MAX),
                 RTA_MULTIPATH => {
                     // struct rtnexthop { u16 len; u8 flags; u8 hops; i32 ifindex; } + attributes.
                     let mut m = data;
@@ -1665,6 +1814,7 @@ mod sys {
                 loopback: false,
                 kind,
                 table,
+                nexthop: nh_object,
             })
         };
         if !multipath.is_empty() {
@@ -1674,8 +1824,8 @@ mod sys {
         } else {
             let hop = match (gateway, nh_object) {
                 (Some(gw), _) => Hop::Via(gw),
-                (None, true) => Hop::Unknown,
-                (None, false) => Hop::OnLink,
+                (None, 0) => Hop::OnLink,
+                (None, _) => Hop::Unknown,
             };
             push(hop, oif);
         }
@@ -1820,6 +1970,7 @@ mod sys {
                         loopback: false,
                         kind: RouteType::Unicast,
                         table: 254,
+                        nexthop: 0,
                     },
                     Route {
                         prefix: p("172.17.0.0/16"),
@@ -1828,6 +1979,7 @@ mod sys {
                         loopback: false,
                         kind: RouteType::Unicast,
                         table: 254,
+                        nexthop: 0,
                     },
                     Route {
                         prefix: p("192.168.1.33/32"),
@@ -1836,6 +1988,7 @@ mod sys {
                         loopback: false,
                         kind: RouteType::Local,
                         table: 254,
+                        nexthop: 0,
                     },
                     Route {
                         prefix: p("2606:4700:1::/64"),
@@ -1844,6 +1997,7 @@ mod sys {
                         loopback: false,
                         kind: RouteType::Unicast,
                         table: 254,
+                        nexthop: 0,
                     },
                     Route {
                         prefix: p("::/0"),
@@ -1852,6 +2006,7 @@ mod sys {
                         loopback: false,
                         kind: RouteType::Unicast,
                         table: 254,
+                        nexthop: 7,
                     },
                     Route {
                         prefix: p("10.9.0.0/16"),
@@ -1860,6 +2015,7 @@ mod sys {
                         loopback: false,
                         kind: RouteType::Unicast,
                         table: 254,
+                        nexthop: 0,
                     },
                     Route {
                         prefix: p("10.9.0.0/16"),
@@ -1868,6 +2024,7 @@ mod sys {
                         loopback: false,
                         kind: RouteType::Unicast,
                         table: 254,
+                        nexthop: 0,
                     },
                 ]
             );
@@ -2644,6 +2801,70 @@ mod sys {
             assert!(parse_link(&[0u8; 4], &mut out).is_err());
         }
 
+        /// Nexthop messages parse to their id, device, group members and blackhole flag.
+        #[test]
+        fn nexthop_messages_parse() {
+            let mut out = Vec::new();
+            let mut p = vec![0u8; NHMSG_LEN];
+            p.extend(attr(NHA_ID, &7u32.to_ne_bytes()));
+            p.extend(attr(NHA_OIF, &9u32.to_ne_bytes()));
+            parse_nexthop(&p, &mut out).unwrap();
+            let mut g = vec![0u8; NHMSG_LEN];
+            g.extend(attr(NHA_ID, &8u32.to_ne_bytes()));
+            let mut members = Vec::new();
+            for id in [7u32, 3] {
+                members.extend_from_slice(&id.to_ne_bytes());
+                members.extend_from_slice(&[0, 0, 0, 0]);
+            }
+            g.extend(attr(NHA_GROUP, &members));
+            parse_nexthop(&g, &mut out).unwrap();
+            let mut b = vec![0u8; NHMSG_LEN];
+            b.extend(attr(NHA_ID, &3u32.to_ne_bytes()));
+            b.extend(attr(NHA_BLACKHOLE, &[]));
+            parse_nexthop(&b, &mut out).unwrap();
+            assert_eq!(
+                out,
+                vec![
+                    Nexthop {
+                        id: 7,
+                        oif: 9,
+                        group: vec![],
+                        blackhole: false
+                    },
+                    Nexthop {
+                        id: 8,
+                        oif: 0,
+                        group: vec![7, 3],
+                        blackhole: false
+                    },
+                    Nexthop {
+                        id: 3,
+                        oif: 0,
+                        group: vec![],
+                        blackhole: true
+                    },
+                ]
+            );
+            assert_eq!(super::super::nexthop_interfaces(&out, 8), Some(vec![9]));
+            assert_eq!(super::super::nexthop_interfaces(&out, 99), None);
+            let mut bad = vec![0u8; NHMSG_LEN];
+            bad.extend(attr(NHA_GROUP, &[1, 2, 3]));
+            assert!(parse_nexthop(&bad, &mut out).is_err());
+        }
+
+        /// This host's nexthop objects read, unprivileged; every route through one resolves to an
+        /// interface.
+        #[test]
+        fn this_hosts_nexthops_resolve() {
+            let nhs = nexthops().expect("an RTM_GETNEXTHOP dump");
+            let (routes, _) = dump().unwrap();
+            for r in routes.iter().filter(|r| r.nexthop != 0) {
+                let ifs = super::super::nexthop_interfaces(&nhs, r.nexthop);
+                assert!(ifs.is_some_and(|v| !v.is_empty()), "{r:?} in {nhs:?}");
+            }
+            eprintln!("{nhs:?}");
+        }
+
         /// This host's interfaces read (loopback among them, with no kind; `lo` is index 1), and
         /// the kernel names an interface for internet traffic of every family it routes.
         #[test]
@@ -2717,6 +2938,10 @@ mod sys {
     }
 
     pub(super) fn links() -> std::io::Result<Vec<super::Link>> {
+        Ok(Vec::new())
+    }
+
+    pub(super) fn nexthops() -> std::io::Result<Vec<super::Nexthop>> {
         Ok(Vec::new())
     }
 }

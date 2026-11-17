@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::facts::{EgressPath, FactsOptions, HostFacts};
 use crate::host::HostDenied;
 use crate::ip::{canonical_ip, is_global, prefix_is_global, Prefix};
-use crate::nearhop::{NearProbe, TtlProbe, Verdict, PROBE_TIMEOUT};
+use crate::nearhop::{NearProbe, TtlProbe, Verdict};
 
 /// Whether connections a requester causes may reach non-public destinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -77,6 +77,10 @@ pub enum Denied {
     /// This host's public address on the path a connection to `ip` takes is not known (see
     /// [`HostFacts::unknown_paths`]): it could be this host or its router, reached by hairpin.
     PublicAddressUnknown { ip: IpAddr, path: EgressPath },
+    /// The host's facts now need `[egress] internal_ranges` (a tunnel became the uplink, a global
+    /// IPv4 address appeared: [`HostFacts::needs_internal_ranges`]), which the configuration does
+    /// not state: every connection is refused until it does, or the condition clears.
+    InternalRangesUnstated { ip: IpAddr, why: String },
     /// The destination answered within `hops` hops of this host ([`crate::nearhop`]), or the
     /// probe that asks failed: `what` says which.
     NearHop {
@@ -229,6 +233,13 @@ impl Denied {
                     )
                 }
             }
+            Denied::InternalRangesUnstated { ip, why } => write!(
+                f,
+                "{ip} is not connected to: {why}, so this host now needs `internal_ranges = \
+                 [\"<cidr>\", ...]` in [egress] (the ranges of your own network that route reaches; \
+                 `[]` if there are none), which the config does not state. Every connection is \
+                 refused until it does"
+            ),
             Denied::NearHop { addr, hops, what } => write!(
                 f,
                 "{addr} is within {hops} hops of this host, on its own network (a probe limited \
@@ -263,6 +274,7 @@ impl Denied {
                 | Denied::OffDefaultRoute { .. }
                 | Denied::RouteQueryFailed { .. }
                 | Denied::PublicAddressUnknown { .. }
+                | Denied::InternalRangesUnstated { .. }
         )
     }
 }
@@ -279,7 +291,8 @@ impl Denied {
 /// kernel, asked how it would route a connection to `ip`, answers with the default path
 /// ([`crate::routes::RouteTable::judge`]; one netlink round trip per destination and facts
 /// snapshot). Last, the host's public address on the path the connection takes must be known
-/// ([`HostFacts::unknown_paths`]).
+/// ([`HostFacts::unknown_paths`]), and the facts must not need `[egress] internal_ranges` the
+/// configuration does not state ([`HostFacts::config_gaps`]).
 pub fn admit(
     mode: NetMode,
     ip: IpAddr,
@@ -349,7 +362,17 @@ fn admit_inner(
     facts.kernel_verdict(ip, dport)?;
     facts
         .path_known(ip)
-        .map_err(|path| Denied::PublicAddressUnknown { ip, path })
+        .map_err(|path| Denied::PublicAddressUnknown { ip, path })?;
+    // Re-judged with every snapshot: a tunnel that became the uplink after startup is refused
+    // like one there at startup.
+    let gaps = facts.config_gaps();
+    if !gaps.is_empty() {
+        return Err(Denied::InternalRangesUnstated {
+            ip,
+            why: crate::printable(&gaps.join("; "), 400),
+        });
+    }
+    Ok(())
 }
 
 /// [`admit`] for every address of a prefix at once (an operator's role entry, which admits
@@ -426,6 +449,8 @@ struct FactsCell {
     options: FactsOptions,
     /// The paths last warned about as unknown ([`HostFacts::unknown_paths`]).
     warned: std::sync::Mutex<Vec<EgressPath>>,
+    /// The configuration gaps last warned about ([`HostFacts::config_gaps`]).
+    warned_gaps: std::sync::Mutex<Vec<String>>,
 }
 
 impl FactsCell {
@@ -537,6 +562,27 @@ impl FactsCell {
             tracing::info!("network guard: this host's public addresses are known again");
         }
         *last = now;
+        drop(last);
+        let gaps = facts.config_gaps();
+        let mut last = self.warned_gaps.lock().unwrap_or_else(|e| e.into_inner());
+        if *last == gaps {
+            return;
+        }
+        if !gaps.is_empty() {
+            tracing::warn!(
+                "network guard: {}. This host now needs `internal_ranges = [\"<cidr>\", ...]` in \
+                 [egress] (the ranges of your own network that route reaches; `[]` if there are \
+                 none), which the config does not state: every requester-caused connection is \
+                 refused until it does, or this clears",
+                gaps.join("; ")
+            );
+        } else {
+            tracing::info!(
+                "network guard: this host no longer needs [egress] internal_ranges; connections \
+                 are admitted again"
+            );
+        }
+        *last = gaps;
     }
 }
 
@@ -614,6 +660,7 @@ impl NetPolicy {
                 refresh,
                 options,
                 warned: std::sync::Mutex::new(Vec::new()),
+                warned_gaps: std::sync::Mutex::new(Vec::new()),
             }),
             deny: deny.into(),
             probe: Arc::new(TtlProbe),
@@ -685,9 +732,10 @@ impl NetPolicy {
 
     /// The last check before a connection to `addr` is made, right before it (public mode;
     /// developer mode admits everything): [`Self::admit_to`], then the near-hop probe
-    /// ([`crate::nearhop`]): refused when the destination answers within `[egress]
-    /// near_hop_limit` hops, or the probe fails. Blocking (up to the probe's
-    /// [`PROBE_TIMEOUT`]): call it off an async runtime's worker threads.
+    /// ([`crate::nearhop::decide`]): refused when the destination answers within `[egress]
+    /// near_hop_limit` hops — to the probe, or, when the probe had no answer, to a check
+    /// connection's hop-limited FIN — or the probe fails. Blocking (up to the probe's timeout, plus
+    /// a check connection when it had no answer): call it off an async runtime's worker threads.
     pub fn vet_connection(&self, addr: SocketAddr) -> Result<(), Denied> {
         if self.mode == NetMode::DevPrivate {
             return Ok(());
@@ -701,7 +749,7 @@ impl NetPolicy {
             IpAddr::V4(_) => addr,
         };
         let hops = self.near_hop_limit();
-        match self.probe.probe(target, hops, PROBE_TIMEOUT).verdict() {
+        match crate::nearhop::decide(&*self.probe, target, hops) {
             Verdict::Far => Ok(()),
             Verdict::Near(how) => Err(Denied::NearHop {
                 addr,
@@ -712,6 +760,11 @@ impl NetPolicy {
                 addr,
                 hops,
                 what: format!("the probe failed: {why}"),
+            }),
+            Verdict::Undecided => Err(Denied::NearHop {
+                addr,
+                hops,
+                what: "no answer either way".into(),
             }),
         }
     }
@@ -974,7 +1027,7 @@ mod tests {
             a("2606:4700:1:5::1"),
             Err(Denied::SitePrefix { .. })
         ));
-        assert_eq!(a("2606:4700:2::1"), Ok(()));
+        assert_eq!(a("2606:4701::1"), Ok(()));
         // The NAT public address (learned) is the host's own.
         assert!(matches!(a("168.1.2.57"), Err(Denied::OwnAddress(_))));
         // The upstream DNS servers behind the stub.
@@ -1311,7 +1364,9 @@ mod tests {
         }
         assert_eq!(
             p.admit(ip("1.0.0.1")).is_ok(),
-            !f.resolvers().contains(&ip("1.0.0.1"))
+            !f.resolvers().contains(&ip("1.0.0.1")),
+            "{:?}",
+            p.admit(ip("1.0.0.1"))
         );
     }
 
@@ -1346,7 +1401,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(fixed.facts().gathered_at(), t);
         let bad = FactsOptions {
-            ipv6_site_prefix_len: 30,
+            ipv6_site_prefix_len: 15,
             ..offline()
         };
         assert!(NetPolicy::with_options(NetMode::Public, Vec::new(), bad).is_err());

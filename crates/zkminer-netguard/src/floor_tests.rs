@@ -204,7 +204,12 @@ fn a_campus_numbered_from_public_space_is_refused() {
         public_confirmed: vec![ip("128.112.5.10"), ip("2620:c4:0:5::10")],
         ..RawFacts::default()
     };
-    let f = HostFacts::assemble(raw.clone(), &FactsOptions::default());
+    // The operator has stated its ranges (none beyond the sites): the sites decide.
+    let stated = FactsOptions {
+        internal_ranges: Some(Vec::new()),
+        ..FactsOptions::default()
+    };
+    let f = HostFacts::assemble(raw.clone(), &stated);
     assert_eq!(
         admit(NetMode::Public, ip("128.112.200.5"), &f, &[]),
         Err(Denied::SitePrefix {
@@ -216,14 +221,26 @@ fn a_campus_numbered_from_public_space_is_refused() {
         admit(NetMode::Public, ip("2620:c4:0:9::5"), &f, &[]),
         Err(Denied::SitePrefix { .. })
     ));
+    // The default IPv6 site is the /32 an organisation holds: its other /48s too.
+    assert!(matches!(
+        admit(NetMode::Public, ip("2620:c4:1::5"), &f, &[]),
+        Err(Denied::SitePrefix { .. })
+    ));
     assert_eq!(admit(NetMode::Public, ip("128.113.0.1"), &f, &[]), Ok(()));
-    // A campus with a /32 of IPv6: the operator widens the site.
+    // Without the statement, nothing goes out (see also
+    // `a_condition_that_appears_after_startup_refuses_every_connection`).
+    let unstated = HostFacts::assemble(raw.clone(), &FactsOptions::default());
+    assert!(matches!(
+        admit(NetMode::Public, ip("128.113.0.1"), &unstated, &[]),
+        Err(Denied::InternalRangesUnstated { .. })
+    ));
+    // A larger campus: the operator widens the sites.
     let wide = HostFacts::assemble(
         raw,
         &FactsOptions {
-            ipv6_site_prefix_len: 32,
+            ipv6_site_prefix_len: 24,
             ipv4_site_prefix_len: 8,
-            ..FactsOptions::default()
+            ..stated
         },
     );
     assert!(matches!(
@@ -243,8 +260,8 @@ fn a_campus_numbered_from_public_space_is_refused() {
 }
 
 /// A host whose default route goes out of a tunnel (a full-tunnel VPN: WireGuard here) needs
-/// `[egress] internal_ranges` to start; a PPPoE uplink does not; a VPN reached only by
-/// specific routes does not either (its ranges are refused as off the default path).
+/// `[egress] internal_ranges`; a PPPoE uplink does not; a VPN reached only by specific routes
+/// does not either (its ranges are refused as off the default path).
 #[test]
 fn a_default_route_through_a_tunnel_needs_internal_ranges() {
     use crate::Link;
@@ -288,16 +305,26 @@ fn a_default_route_through_a_tunnel_needs_internal_ranges() {
         why[0].contains("wg0") && why[0].contains("wireguard"),
         "{why:?}"
     );
-    // A default route through a nexthop object: the kernel's interface for internet traffic.
+    // The kernel's interface for internet traffic is judged too.
     let nh = facts(
-        vec![Route {
-            hop: crate::Hop::Unknown,
-            ..Route::on_link(pfx("0.0.0.0/0"), 0)
-        }],
+        vec![Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 2)],
         vec![9],
     );
     assert!(nh.needs_internal_ranges()[0].contains("tun0"));
-    let pppoe = facts(vec![Route::on_link(pfx("0.0.0.0/0"), 8)], vec![8]);
+    // A ppp uplink is PPPoE only with a PPPoE session for it; else a VPN (L2TP, PPTP, …).
+    let ppp = facts(vec![Route::on_link(pfx("0.0.0.0/0"), 8)], vec![8]);
+    assert!(ppp.needs_internal_ranges()[0].contains("not a PPPoE session"));
+    let pppoe = HostFacts::assemble(
+        RawFacts {
+            routes: vec![Route::on_link(pfx("0.0.0.0/0"), 8)],
+            links: links.clone(),
+            internet_interfaces: vec![8],
+            pppoe_sessions: 1,
+            public_confirmed: vec![ip("81.2.69.160")],
+            ..RawFacts::default()
+        },
+        &FactsOptions::default(),
+    );
     assert!(pppoe.needs_internal_ranges().is_empty());
     let split = facts(
         vec![
@@ -307,6 +334,280 @@ fn a_default_route_through_a_tunnel_needs_internal_ranges() {
         vec![2],
     );
     assert!(split.needs_internal_ranges().is_empty());
+}
+
+/// The uplink is judged against what is known to be physical, so a VPN of a kind the guard has
+/// no name for is caught too: OpenVPN's data-channel offload (`ovpn`, `ovpn-dco`), `bareudp`,
+/// `amt`, a kind nobody listed; a `ppp` link that is not a PPPoE session (L2TP, PPTP, SSTP,
+/// openfortivpn); a policy-based IPsec full tunnel (strongSwan's table 220 routes through the
+/// physical uplink's own gateway); and a default route through a nexthop object, judged by the
+/// object's interface, or refused when it cannot be resolved.
+#[test]
+fn every_uplink_that_is_not_plainly_physical_needs_the_statement() {
+    use crate::routes::Nexthop;
+    use crate::{Hop, Link, Rule};
+    let host = |kind: Option<&str>,
+                routes: Vec<Route>,
+                rules: Vec<Rule>,
+                internet: Vec<u32>,
+                nexthops: Vec<Nexthop>,
+                pppoe: usize| {
+        HostFacts::assemble(
+            RawFacts {
+                interface_prefixes: vec![pfx("192.168.1.0/24"), pfx("10.8.0.2/32")],
+                interface_addresses: vec![ip("192.168.1.33"), ip("10.8.0.2")],
+                routes,
+                rules,
+                links: vec![
+                    Link {
+                        index: 1,
+                        name: "lo".into(),
+                        kind: None,
+                    },
+                    Link {
+                        index: 2,
+                        name: "eth0".into(),
+                        kind: None,
+                    },
+                    Link {
+                        index: 7,
+                        name: "vpn0".into(),
+                        kind: kind.map(Into::into),
+                    },
+                ],
+                internet_interfaces: internet,
+                nexthops,
+                pppoe_sessions: pppoe,
+                public_confirmed: vec![ip("81.2.69.160")],
+                ..RawFacts::default()
+            },
+            &FactsOptions::default(),
+        )
+    };
+    let def1 = || {
+        vec![
+            Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 2),
+            Route::on_link(pfx("192.168.1.0/24"), 2),
+            Route::via(pfx("203.0.113.7/32"), ip("192.168.1.1"), 2),
+            Route::on_link(pfx("0.0.0.0/1"), 7),
+            Route::on_link(pfx("128.0.0.0/1"), 7),
+        ]
+    };
+    let corp = ip("130.59.31.80");
+    for kind in [
+        "wireguard",
+        "tun",
+        "ovpn",
+        "ovpn-dco",
+        "bareudp",
+        "amt",
+        "ppp",
+        "some-new-vpn",
+    ] {
+        let f = host(Some(kind), def1(), vec![], vec![7], vec![], 0);
+        let why = f.needs_internal_ranges();
+        assert_eq!(why.len(), 1, "{kind}: {why:?}");
+        assert!(why[0].contains("vpn0"), "{kind}: {why:?}");
+        assert!(
+            matches!(
+                admit(NetMode::Public, corp, &f, &[]),
+                Err(Denied::InternalRangesUnstated { .. })
+            ),
+            "{kind}"
+        );
+    }
+    // Physical kinds and PPPoE need nothing.
+    for kind in [
+        None,
+        Some("bridge"),
+        Some("bond"),
+        Some("vlan"),
+        Some("veth"),
+    ] {
+        let f = host(kind, def1(), vec![], vec![7], vec![], 0);
+        assert!(f.needs_internal_ranges().is_empty(), "{kind:?}");
+    }
+    let pppoe = host(Some("ppp"), def1(), vec![], vec![7], vec![], 1);
+    assert!(pppoe.needs_internal_ranges().is_empty());
+    // strongSwan's road warrior: table 220 (`from all lookup 220`) through the uplink's gateway.
+    let mut rules = vec![
+        Rule::lookup(false, 255),
+        Rule {
+            priority: 220,
+            ..Rule::lookup(false, 220)
+        },
+        Rule::lookup(false, 254),
+        Rule::lookup(false, 253),
+    ];
+    rules.extend(Rule::stock(true));
+    let ipsec = host(
+        None,
+        vec![
+            Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 2),
+            Route::on_link(pfx("192.168.1.0/24"), 2),
+            Route::via(pfx("0.0.0.0/1"), ip("192.168.1.1"), 2).in_table(220),
+            Route::via(pfx("128.0.0.0/1"), ip("192.168.1.1"), 2).in_table(220),
+        ],
+        rules,
+        vec![2],
+        vec![],
+        0,
+    );
+    let why = ipsec.needs_internal_ranges();
+    assert!(why.iter().any(|w| w.contains("table 220")), "{why:?}");
+    // A default route through a nexthop object into the tunnel, with the fixed probes routed
+    // elsewhere: judged by the object's interface; an unresolvable object refuses.
+    let mut nh_default = Route::via(pfx("0.0.0.0/0"), ip("10.8.0.1"), 0);
+    nh_default.hop = Hop::Unknown;
+    nh_default.nexthop = 10;
+    let routes = vec![
+        nh_default,
+        Route::on_link(pfx("192.168.1.0/24"), 2),
+        Route::via(pfx("1.1.1.1/32"), ip("192.168.1.1"), 2),
+    ];
+    let into_wg = host(
+        Some("wireguard"),
+        routes.clone(),
+        vec![],
+        vec![2],
+        vec![Nexthop {
+            id: 10,
+            oif: 7,
+            group: vec![],
+            blackhole: false,
+        }],
+        0,
+    );
+    assert!(into_wg.needs_internal_ranges()[0].contains("vpn0"));
+    let unknown = host(Some("wireguard"), routes, vec![], vec![2], vec![], 0);
+    assert!(unknown.needs_internal_ranges()[0].contains("nexthop object 10"));
+}
+
+/// The conditions that need `[egress] internal_ranges` are judged on every facts snapshot, not
+/// only at startup: a full-tunnel VPN that comes up after the miner started (wg-quick here: table
+/// 51820 reached by `not fwmark`) refuses every connection until the operator states the ranges,
+/// and it says so once per change; when the tunnel goes down, connections are admitted again.
+#[test]
+fn a_condition_that_appears_after_startup_refuses_every_connection() {
+    use crate::{Link, Rule, RuleAction, RuleMatch};
+    let raw = |vpn_up: bool| {
+        let mut routes = vec![
+            Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 2),
+            Route::on_link(pfx("192.168.1.0/24"), 2),
+        ];
+        let mut rules = vec![
+            Rule::lookup(false, 255),
+            Rule::lookup(false, 254),
+            Rule::lookup(false, 253),
+        ];
+        let mut links = vec![Link {
+            index: 2,
+            name: "eth0".into(),
+            kind: None,
+        }];
+        let mut internet = vec![2];
+        if vpn_up {
+            routes.push(Route::on_link(pfx("0.0.0.0/0"), 9).in_table(51820));
+            rules.insert(
+                1,
+                Rule {
+                    priority: 32764,
+                    action: RuleAction::Lookup(51820),
+                    to: None,
+                    invert: true,
+                    matches: RuleMatch::Never,
+                    v6: false,
+                },
+            );
+            links.push(Link {
+                index: 9,
+                name: "wg0".into(),
+                kind: Some("wireguard".into()),
+            });
+            internet = vec![9];
+        }
+        rules.extend(Rule::stock(true));
+        RawFacts {
+            interface_prefixes: vec![pfx("192.168.1.0/24")],
+            interface_addresses: vec![ip("192.168.1.33")],
+            routes,
+            rules,
+            links,
+            internet_interfaces: internet,
+            public_addresses: vec![ip("81.2.69.160")],
+            public_confirmed: vec![ip("81.2.69.160")],
+            ..RawFacts::default()
+        }
+    };
+    let corp: SocketAddr = "130.59.31.80:443".parse().unwrap();
+    let before = HostFacts::assemble(raw(false), &FactsOptions::default());
+    assert!(before.config_gaps().is_empty());
+    assert_eq!(admit(NetMode::Public, corp.ip(), &before, &[]), Ok(()));
+    let after = HostFacts::assemble(raw(true), &FactsOptions::default());
+    let gaps = after.config_gaps();
+    assert!(gaps.iter().any(|g| g.contains("wg0")), "{gaps:?}");
+    let e = admit(NetMode::Public, corp.ip(), &after, &[]).unwrap_err();
+    assert!(matches!(e, Denied::InternalRangesUnstated { .. }), "{e:?}");
+    assert!(e.depends_on_facts(), "re-read: the tunnel may be gone");
+    assert!(e.to_string().contains("internal_ranges = ["), "{e}");
+    let p =
+        NetPolicy::with_facts(NetMode::Public, after, vec![]).with_near_probe(FixedProbe::far());
+    assert!(matches!(
+        p.vet_connection(corp),
+        Err(Denied::InternalRangesUnstated { .. })
+    ));
+    // Stated, the facts need nothing more.
+    let stated = HostFacts::assemble(
+        raw(true),
+        &FactsOptions {
+            internal_ranges: Some(vec![pfx("130.59.0.0/16")]),
+            ..FactsOptions::default()
+        },
+    );
+    assert!(stated.config_gaps().is_empty());
+    assert_eq!(admit(NetMode::Public, ip("8.8.8.8"), &stated, &[]), Ok(()));
+}
+
+/// An organisation with private IPv4 (NAT) and a /32 of global IPv6: the default site is that
+/// /32, so its other /48s are refused; a host that does not want that sets a longer site.
+#[test]
+fn an_ipv6_organisation_wider_than_a_48_is_refused_by_default() {
+    let r = RawFacts {
+        interface_prefixes: vec![pfx("10.20.5.0/24"), pfx("2001:620:0:5::/64")],
+        interface_addresses: vec![ip("10.20.5.10"), ip("2001:620:0:5::10")],
+        routes: vec![
+            Route::via(pfx("0.0.0.0/0"), ip("10.20.5.1"), 2),
+            Route::on_link(pfx("10.20.5.0/24"), 2),
+            Route::via(pfx("::/0"), ip("fe80::1"), 2),
+            Route::on_link(pfx("2001:620:0:5::/64"), 2),
+        ],
+        public_addresses: vec![ip("130.59.1.1"), ip("2001:620:0:5::10")],
+        public_confirmed: vec![ip("130.59.1.1"), ip("2001:620:0:5::10")],
+        ..RawFacts::default()
+    };
+    let f = HostFacts::assemble(r.clone(), &FactsOptions::default());
+    assert_eq!(f.site_prefixes(), &[pfx("2001:620::/32")]);
+    for a in ["2001:620:0:9::5", "2001:620:8:1::5", "2001:620:ff::5"] {
+        assert!(
+            matches!(
+                admit(NetMode::Public, ip(a), &f, &[]),
+                Err(Denied::SitePrefix { .. })
+            ),
+            "{a}"
+        );
+    }
+    assert_eq!(admit(NetMode::Public, ip("2001:621::5"), &f, &[]), Ok(()));
+    let narrow = HostFacts::assemble(
+        r,
+        &FactsOptions {
+            ipv6_site_prefix_len: 48,
+            ..FactsOptions::default()
+        },
+    );
+    assert_eq!(
+        admit(NetMode::Public, ip("2001:620:8:1::5"), &narrow, &[]),
+        Ok(())
+    );
 }
 
 /// On this host: a public-mode start needs `[egress] internal_ranges` exactly when the host has a

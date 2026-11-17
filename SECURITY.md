@@ -49,9 +49,15 @@ Every connection a requester can cause goes through one guard
     disagree). The names and servers are compiled in: nothing a requester sends chooses them,
     and an answer can only add an address to refuse. An address is **confirmed** when the HTTPS
     reflector reports it (a box that intercepts DNS cannot forge that answer) or both DNS
-    reflectors report it alike (a DNS answer that is one of the host's own DNS servers — an
-    intercepting resolver reporting itself — confirms nothing); only a confirmed address gives
-    its IPv6 site (below), so one forged answer cannot refuse someone else's whole /48. Facts
+    reflectors report it alike — unless the HTTPS reflector's TCP connection was made but TLS or
+    its answer failed (something on the path answers for `1.1.1.1`, and could answer the DNS
+    queries alike too: then DNS confirms nothing for that family), and a DNS answer that is one
+    of the host's own DNS servers (an intercepting resolver reporting itself) confirms nothing
+    either. A confirmation lasts 10 minutes (two discovery rounds): a family no round has
+    confirmed for that long is unknown again. Discovery also runs again at once when the host's
+    uplink changes (its default routes, or the interface its internet traffic leaves by), and
+    until it has, nothing confirmed on the old uplink counts. Only a confirmed address gives
+    its IPv6 site (below), so one forged answer cannot refuse someone else's whole site. Facts
     read while the first discovery runs wait for it. `[egress] public_addresses` states the
     public addresses instead (or as well); `[egress] discover_public_addresses = false` turns the
     queries off, and then `public_addresses` must name an address of every family the host
@@ -105,20 +111,35 @@ Every connection a requester can cause goes through one guard
     another table than the first lookup used is refused. (IPv6 looks the route up once, matching
     source rules inside that lookup, and is asked once.) Answers are reused for the life of one
     facts snapshot (about a second). Linux only;
-  - **the site around each of the host's global IPv6 addresses**: its enclosing `/48`
-    (`[egress] ipv6_site_prefix_len`, 32 to 64), the most a home, office or small site is
-    usually delegated, whose other /64s hold your other machines; and **the site around each
+  - **the site around each of the host's global IPv6 addresses**: its enclosing `/32`
+    (`[egress] ipv6_site_prefix_len`, 16 to 64), what an organisation (a campus, a company)
+    usually holds, whose other networks hold its other machines. This also refuses the rest of
+    the host's own ISP's `/32` over IPv6 (a name there that also has an IPv4 address still
+    connects over IPv4); an operator whose site is no wider can set 48 or 56. And **the site around each
     global IPv4 address on its interfaces**: its enclosing `/16` (`[egress]
     ipv4_site_prefix_len`, 8 to 32), since a host numbered from public IPv4 space sits in a
     network (a campus, a data centre) whose other subnets the default gateway reaches;
   - **your own network's ranges, where the host cannot see them** (`[egress]
     internal_ranges`, refused like `deny_cidrs`). A host with a global IPv4 address on an
-    interface, or whose default route goes out of a tunnel interface (WireGuard, `tun`/`tap`,
-    `ipip`, `gre`/`gretap`, `ip6tnl`, `ip6gre`, `sit`, `vti`/`vti6`, `xfrm`, …; not `ppp`, an
-    ordinary PPPoE uplink), reaches other hosts of its own organisation by the same route as
-    the internet: in public mode such a host **refuses to start** until `internal_ranges` lists
-    them (`internal_ranges = []` is the statement that there are none), and the error names
-    which of the two applies;
+    interface, or whose uplink is not plainly physical, reaches other hosts of its own
+    organisation (or a VPN's far side) by the same route as the internet. The uplink is judged
+    **fail closed**, against what is known to be physical: every interface a default route of an
+    ordinary table goes out of, and the one the kernel sends internet traffic out of, must have
+    no kind (a NIC) or be a `bridge`, `bond`, `team`, `vlan`, `macvlan`, `ipvlan`, `veth` or `vrf`.
+    Anything else needs the statement: a tunnel (WireGuard, OpenVPN's `tun` and data-channel
+    offload `ovpn`/`ovpn-dco`, `tap`, `ipip`, `gre`, `sit`, `vti`, `xfrm`, `bareudp`, `amt`, …), a
+    kind nobody listed, and `ppp` unless `/proc/net/pppoe` lists a PPPoE session for every `ppp`
+    link (else it is a VPN: L2TP, PPTP, SSTP, openfortivpn). So does a default route in an
+    ordinary routing table other than `main` and `default` (a policy-based IPsec client's, such
+    as strongSwan's table 220: the IPsec policies themselves are not readable without
+    privileges), and a default route through a nexthop object whose interface cannot be read
+    (it is resolved with `RTM_GETNEXTHOP`). In public mode such a host **refuses to start**
+    until `internal_ranges` lists those ranges (`internal_ranges = []` is the statement that
+    there are none), and the error names what applies. The conditions are **judged again with
+    every facts snapshot**: when one appears after startup (a VPN that comes up later, a global
+    address acquired later) and the config has no statement, **every** requester-caused
+    connection is refused until it does or the condition clears; the miner warns once per change
+    and `zkminer status` says so;
   - **the DNS servers the host uses**: the `nameserver`s of `/etc/resolv.conf` and of
     systemd-resolved's `/run/systemd/resolve/resolv.conf` (the upstream servers behind its
     `127.0.0.53` stub), which may answer only their own customers.
@@ -137,9 +158,16 @@ Every connection a requester can cause goes through one guard
   side, which many routers serve their admin page, DNS and UPnP on; a NAT router or NAT64
   translator hairpinning its own public address; a neighbour in the same cloud VPC; the far
   side of a tunnel) and is refused. If the probe runs out of hops (Linux reports the router's
-  "time exceeded" as host unreachable) or nothing answers in time, the destination is farther
-  and the real connection is made, on a new socket with the usual hop limit. Any other probe
-  error (a local firewall's) refuses. Unprivileged; developer mode sends no probe.
+  "time exceeded" as host unreachable), the destination is farther and the real connection is
+  made, on a new socket with the usual hop limit. **No answer in time decides nothing** (a path
+  that filters ICMP, or a near host dropping SYNs for a while: a full accept queue, a SYN rate
+  limit, a device waking up): a **check connection** is made with the usual hop limit, and once
+  it is established its hop limit is lowered to the probe's and it is half-closed, without a
+  byte written. Its FIN reaches the peer only if the peer is within the limit, and a peer that
+  gets it acknowledges it: acknowledged (or reset) within a few round trips, refused; a "time
+  exceeded" or no acknowledgement, farther, and the real connection is made. A check connection
+  that does not connect refuses. Any other probe error (a local firewall's) refuses.
+  Unprivileged; developer mode sends no probe.
 - **Host-name hygiene** before any lookup: single-label names, `localhost` and `*.localhost`,
   and names under `local`, `internal` (`metadata.google.internal`), `lan`, `home`, `arpa`
   (`home.arpa`), `corp`, `intranet`, `private`, `localdomain`, `svc`, `consul`, `test`,
@@ -234,7 +262,7 @@ job there could then reach this host's private network.
 | The connector's DNS resolver (in the miner) | the operator (`[dns] servers`, else `/etc/resolv.conf`) | dials only those servers, for the operator's endpoint names only; never a fetch destination |
 | Public-address discovery (miner and broker, at startup and every 5 minutes; every 15 seconds while a family is unknown) | fixed in the build: `ns1.google.com` and `1.1.1.1` (and their IPv6 addresses), UDP port 53; `https://1.1.1.1/cdn-cgi/trace` and its IPv6 twin (the miner); on an IPv6-only host, the same IPv4 reflectors through the NAT64 prefix | none needed: requesters cannot change them; `[egress] discover_public_addresses = false` turns it off |
 | DNS-over-HTTPS resolution of requester names (public mode) | fixed in the build (Cloudflare, Google, Quad9 by IP literal), or the operator's `[egress] doh_resolvers`; the **name** from the requester | the resolver's address must pass the floor (being one of the host's DNS servers is allowed); certificate verified for the IP literal |
-| The near-hop probe (public mode, right before each guarded connection) | the destination being vetted, with at most `near_hop_limit` hops | a SYN with no data, closed without data |
+| The near-hop probe (public mode, right before each guarded connection) | the destination being vetted, with at most `near_hop_limit` hops | a SYN with no data, closed without data; when it gets no answer, a check connection to the same address and port (a handshake, then a FIN and a reset limited to `near_hop_limit` hops; never data) |
 | The builder runner and the execute worker | none | seccomp denies `socket`, `socketpair`, `connect`, and every `setsockopt` but the socket timeouts |
 | The broker itself | none | seccomp denies `socket`, `connect`, `bind`, `listen`, `accept*` (and `socketpair` once its runtime is up), and every `setsockopt` but `TCP_NODELAY`; Landlock grants no TCP port |
 | The inline measure and prove workers (risc0, SP1, OpenVM) and `sp1-gpu-server` | none | confined before their first guest: no sockets, Unix ones included; Landlock (below) |
@@ -513,25 +541,28 @@ no second one):
   answers is observable to the requester; the guard bounds where connections go, not what can
   be inferred from public ones.
 - **Global addresses inside your own network, farther than two hops.** The guard sees the
-  host's interfaces, routes, sites and public addresses, refuses the IPv6 /48 and the IPv4 /16
-  around them, makes a host with a public IPv4 interface address or a tunnel uplink list its
-  `internal_ranges` before it starts, and refuses whatever answers within `near_hop_limit` hops.
-  What remains is your organisation's own space beyond all of that: a VPC neighbour or campus
-  subnet more than two hops away and outside the sites and the ranges you listed, an IPv6 site
-  larger than `ipv6_site_prefix_len` on a host without a public IPv4 address, or a service
-  that trusts this host's public address by allowlist. List such ranges in `[egress]
+  host's interfaces, routes, sites and public addresses, refuses the IPv6 /32 and the IPv4 /16
+  around them, makes a host with a public IPv4 interface address or an uplink that is not
+  plainly physical list its `internal_ranges` (at startup and whenever that appears later), and
+  refuses whatever answers within `near_hop_limit` hops. What remains is your organisation's own
+  space beyond all of that: a VPC neighbour or campus subnet more than two hops away and outside
+  the sites and the ranges you listed, an IPv6 organisation wider than `ipv6_site_prefix_len`
+  on a host without a public IPv4 address, a policy-based IPsec tunnel that installs no routing
+  table of its own (its policies are not readable without privileges), or a service that
+  trusts this host's public address by allowlist. List such ranges in `[egress]
   internal_ranges` or `deny_cidrs` (and raise `near_hop_limit` where your network is deeper).
   On a cloud host, also block the metadata service inside the instance (IMDSv2 required, hop
   limit 1, or the endpoint off) as defense in depth.
-- **The near-hop probe's own limits.** The probe is a SYN with no data, but a near host does
-  receive it (and, if it accepts, a connection that is reset at once) before the connection is
-  refused. A near host that silently drops the probe reads as far, and the real connection,
-  which differs only in its hop limit, then reaches it if it answers that one: a firewall that
-  filters by hop count could tell them apart. A transparent proxy within the limit answers for
-  every destination, so every connection through it is refused. A router that does not
-  decrement the hop count is invisible to the probe, and a far destination whose path drops
-  ICMP costs the probe's 1.5 seconds per address. The probe and the connection are two
-  connects a moment apart; a route that changes in between is not followed.
+- **The near-hop probe's own limits.** The probe is a SYN with no data, and the check
+  connection a handshake, a FIN and a reset with no data, but a near host does receive them
+  before the connection is refused. A near host that drops the probe's SYNs **and** the check
+  connection's FIN (but answers the real connection) reads as far: a firewall that filters by
+  hop count could do that. A transparent proxy within the limit answers for every destination,
+  so every connection through it is refused. A router that does not decrement the hop count is
+  invisible to the probe. A far destination whose path drops ICMP costs the probe's 1.5 seconds
+  plus a check connection (a round trip and a few hundred milliseconds) per address, and leaves
+  that destination a half-open connection. The probe and the connection are connects a moment
+  apart; a route that changes in between is not followed.
 - **What the routing checks cannot see.** The kernel is asked as a connection's route
   lookups are made: with the destination port and (IPv4) the source address the kernel picks,
   firewall mark 0, and no source port (one is chosen after these lookups; a rule that selects by
@@ -546,10 +577,16 @@ no second one):
 - **Public-address discovery depends on outside services.** If the reflectors cannot confirm
   a family's address (a firewall blocking outbound DNS and HTTPS to them, an outage), no
   requester connection goes out over that family until they can or `[egress]
-  public_addresses` names it: the miner stays safe and stops fetching. A box that intercepts
-  DNS **and** HTTPS to `1.1.1.1` (with a certificate this host trusts) could still answer for
-  both DNS reflectors alike. A host whose public address changes is caught at the next
-  discovery, at most 5 minutes later (the last confirmed address stays in force meanwhile).
+  public_addresses` names it: the miner stays safe and stops fetching. Where TCP to the HTTPS
+  reflector is **blocked outright** (refused or filtered, never answered by an impostor), the two
+  DNS reflectors agreeing still confirm, so a box that blocks it and answers both DNS queries
+  alike with a forged address (or a transparent DNS proxy that forwards both from its own
+  address) has that address confirmed; the near-hop probe still catches a home router behind
+  it, not a carrier-grade NAT pool farther away. A box that answers the HTTPS connection itself
+  (any certificate this host does not trust) makes the DNS agreement count for nothing. A host
+  whose public address changes without any change on the host (a new address from the ISP) is
+  caught at the next discovery, at most 5 minutes later; while the reflectors are unreachable,
+  the last confirmed address counts for at most 10 minutes after it was confirmed.
 - **The facts can be a second stale.** A host that just joined a network is judged on facts at
   most a second old (a refusal re-reads them at once).
 - **NAT64 prefixes the host cannot learn.** A network-specific NAT64 prefix is learned from
