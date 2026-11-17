@@ -170,7 +170,7 @@ const CLASS_IN: u16 = 1;
 /// Most answer records read, and most addresses kept, per answer.
 const MAX_RECORDS: usize = 64;
 const MAX_ADDRESSES: usize = 32;
-/// Most `CNAME` links followed.
+/// Most `CNAME` links a name's chain may have (a longer one is an error).
 const MAX_CNAME_LINKS: usize = 16;
 
 /// A DNS query for `name` (no trailing dot) of type `qtype`, id 0 (RFC 8484 §4.1), recursion
@@ -223,6 +223,10 @@ pub(crate) fn read_name(m: &[u8], off: usize) -> Option<(String, usize)> {
             }
             0 => {
                 let label = m.get(at + 1..at + 1 + usize::from(len))?;
+                // A dot inside a label would read as a label boundary: another name's text.
+                if label.contains(&b'.') {
+                    return None;
+                }
                 if !name.is_empty() {
                     name.push('.');
                 }
@@ -256,6 +260,10 @@ pub(crate) fn parse_response(
     name: &str,
     qtype: u16,
 ) -> Result<Option<Vec<IpAddr>>, String> {
+    // The query's id is 0 (RFC 8484 §4.1): the answer's must be too.
+    if u16_at(m, 0) != Some(0) {
+        return Err("an answer to another query".into());
+    }
     let flags = u16_at(m, 2).ok_or("a short answer")?;
     if flags & 0x8000 == 0 {
         return Err("not a response".into());
@@ -292,14 +300,18 @@ pub(crate) fn parse_response(
             records.push((owner, rtype, start, rdlen));
         }
     }
-    // The name, and every name a CNAME of a name already in the chain points to.
+    // The name, and every name a CNAME of a name already in the chain points to: at most
+    // MAX_CNAME_LINKS links, however the records are ordered.
     let mut chain = vec![name.to_string()];
-    for _ in 0..MAX_CNAME_LINKS {
+    loop {
         let mut grew = false;
         for (owner, rtype, start, _) in &records {
             if *rtype == TYPE_CNAME && chain.contains(owner) {
                 let (target, _) = read_name(m, *start).ok_or("a malformed CNAME")?;
                 if !chain.contains(&target) {
+                    if chain.len() > MAX_CNAME_LINKS {
+                        return Err(format!("a CNAME chain longer than {MAX_CNAME_LINKS} links"));
+                    }
                     chain.push(target);
                     grew = true;
                 }
@@ -684,6 +696,60 @@ mod tests {
         assert!(build_query("", TYPE_A).is_err());
         assert!(build_query("a..b", TYPE_A).is_err());
         assert!(build_query(&"a".repeat(64), TYPE_A).is_err());
+    }
+
+    /// A chain of at most 16 links is followed whatever the records' order; a longer one is an
+    /// error. An owner name with a dot inside a label (its text the asked name's) is malformed. An
+    /// answer whose id is not the query's 0 is not an answer to it.
+    #[test]
+    fn chains_are_bounded_by_links_and_labels_hold_no_dots() {
+        let q = build_query("a.example.com", TYPE_A).unwrap();
+        let link = |i: usize| format!("l{i}.example.net");
+        let chain = |n: usize| {
+            let mut rrs: Vec<(String, u16, Vec<u8>)> = Vec::new();
+            rrs.push(("a.example.com".into(), TYPE_CNAME, wire(&link(1))));
+            for i in 1..n {
+                rrs.push((link(i), TYPE_CNAME, wire(&link(i + 1))));
+            }
+            rrs.push((link(n), TYPE_A, vec![9, 9, 9, 9]));
+            rrs
+        };
+        fn as_refs(v: &[(String, u16, Vec<u8>)]) -> Vec<(&str, u16, Vec<u8>)> {
+            v.iter()
+                .map(|(o, t, d)| (o.as_str(), *t, d.clone()))
+                .collect()
+        }
+        let ok = chain(16);
+        assert_eq!(
+            parse_response(&response(&q, 0, &as_refs(&ok)), "a.example.com", TYPE_A).unwrap(),
+            Some(vec!["9.9.9.9".parse().unwrap()])
+        );
+        let mut reversed = ok.clone();
+        reversed.reverse();
+        assert!(parse_response(
+            &response(&q, 0, &as_refs(&reversed)),
+            "a.example.com",
+            TYPE_A
+        )
+        .unwrap()
+        .is_some_and(|v| v.len() == 1));
+        let long = chain(17);
+        assert!(
+            parse_response(&response(&q, 0, &as_refs(&long)), "a.example.com", TYPE_A).is_err()
+        );
+        // `a.example.com` as one label of an owner name ("a\x2eexample", "com").
+        let mut m = response(&q, 0, &[]);
+        m[6..8].copy_from_slice(&1u16.to_be_bytes());
+        m.extend_from_slice(&[9]);
+        m.extend_from_slice(b"a.example");
+        m.extend_from_slice(&[3]);
+        m.extend_from_slice(b"com");
+        m.push(0);
+        m.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 6, 6, 6, 6]);
+        assert!(parse_response(&m, "a.example.com", TYPE_A).is_err());
+        let mut other_id = response(&q, 0, &as_refs(&ok));
+        other_id[0..2].copy_from_slice(&0x1234u16.to_be_bytes());
+        assert!(parse_response(&other_id, "a.example.com", TYPE_A).is_err());
     }
 
     /// The addresses of the name and its CNAME chain are read; records of other names (which a
