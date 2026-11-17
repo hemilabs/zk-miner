@@ -2969,7 +2969,9 @@ impl WitnessRuntime {
     }
 
     /// `fulfillJobHashed` under the DA rules (§5.5), retried by class until the job settles or its
-    /// window closes, as the inline fulfil is.
+    /// window closes, as the inline fulfil is, and never past a pending verifier swap's `readyAt` for
+    /// its proof system (a proof for the old verifier can then only be released): every attempt is
+    /// budgeted by [`Self::proving_cutoff`], as the proof was.
     async fn fulfil(self: &Arc<Self>, l: &mut LockCtx, proved: Proved) -> Result<()> {
         use zkminer_chain::revert::{FulfilClass, FulfilFailure};
         let jid = l.job_id;
@@ -3014,11 +3016,25 @@ impl WitnessRuntime {
         let psid = l.descriptor.proofSystemId;
         let public_values = Bytes::from(proof.journal.clone());
         let seal = Bytes::from(seal);
+        // A release because a verifier swap's readyAt comes first is governance's: no caller's.
+        let swap_cut = Some(LockFailure::host(PostLockFailureClass::GasOrRpc));
         loop {
             run::refresh_lock_deadline(&self.client, &self.journal, jid, &mut l.lock_deadline).await;
             let min = Duration::from_secs(run::MIN_ATTEMPT_BUDGET_SECS);
-            let budget = match run::deadline_proof_budget(l.lock_deadline) {
+            let cutoff = self.proving_cutoff(l);
+            let swap = cutoff < l.lock_deadline;
+            let budget = match run::deadline_proof_budget(cutoff) {
                 None => None,
+                Some(b) if b < min && swap => {
+                    clear_submitting("verifier swap pending — releasing").await;
+                    l.failure = swap_cut.clone();
+                    bail!(
+                        "a verifier swap for witness lock {}'s proof system is ready in {} s: its proof can only be \
+                         released then; releasing",
+                        short(jid),
+                        b.as_secs()
+                    );
+                }
                 Some(b) if b < min && run::clock_stopped_or_unknown(&self.client, psid, b).await => {
                     if self.client.job_clock_stopped(psid).await {
                         Some(min * 2)
@@ -3088,6 +3104,14 @@ impl WitnessRuntime {
             if shutting_down() && matches!(class, FulfilClass::Keep | FulfilClass::VerifierFailed) {
                 clear_submitting("shutdown during a held fulfil").await;
                 return Err(run::HandBack(format!("shutdown while the fulfil is held: {reason}")).into());
+            }
+            let cutoff = self.proving_cutoff(l);
+            if cutoff < l.lock_deadline
+                && run::deadline_proof_budget(cutoff).is_some_and(|b| b <= run::FULFIL_RETRY_WAIT + min)
+            {
+                clear_submitting("verifier swap pending — releasing").await;
+                l.failure = swap_cut.clone();
+                bail!("a verifier swap for witness lock {}'s proof system is ready before a retry could land; releasing", short(jid));
             }
             match run::deadline_proof_budget(l.lock_deadline) {
                 Some(b) if b <= run::FULFIL_RETRY_WAIT + min => {
