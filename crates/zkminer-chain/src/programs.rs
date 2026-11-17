@@ -1232,6 +1232,26 @@ mod fetch_tests {
         assert!(format!("{e:#}").contains("not an IPFS CID"), "{e:#}");
     }
 
+    /// A real ELF from a public https URL, downloaded as the miner downloads one in public mode:
+    /// the name resolved over DNS-over-HTTPS, every address vetted (the kernel's route with the
+    /// port, the near-hop probe) right before the pinned connection.
+    #[tokio::test]
+    #[ignore = "needs the network"]
+    async fn a_real_elf_downloads_in_public_mode() {
+        let fetcher = real(NetMode::Public);
+        let elf = download_elf(
+            &fetcher,
+            &[http(
+                "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox".into(),
+            )],
+            None,
+        )
+        .await
+        .expect("a public ELF downloads");
+        assert_eq!(&elf[..4], b"\x7fELF");
+        eprintln!("downloaded {} bytes of ELF in public mode", elf.len());
+    }
+
     /// The stores the redirect handling was written for, for real, in public mode: neither redirect
     /// stays on the host asked for (Arweave to a subdomain of its own, GitHub to its asset host).
     #[tokio::test]
