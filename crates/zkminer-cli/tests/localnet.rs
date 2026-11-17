@@ -54,6 +54,9 @@
 //!   `mines_the_claimable_jobs`, `mines_on_every_gpu`) report SKIPPED until the deployment carries a
 //!   verifier for this build's selector (and zkminer-chain pins it); set
 //!   `ZKMINER_LOCALNET_FORCE_RISC0=1` to run them anyway (on a fork where one was registered).
+//!   While `pins::RISC0_V3_1_GROTH16_VERIFIER` is empty (B9-ZK: no 3.1 verifier deployed yet), the
+//!   miner refuses a 3.1 verifier by its code pin too, so such a run also needs
+//!   `ZKMINER_SKIP_CODE_PINS=1` in the miner's environment.
 //!
 //! All are ignored by default: they need anvil (Foundry), the workers, and the testnet RPC, which
 //! must serve state at the fork block (it does: it is an archive node). anvil caches what it

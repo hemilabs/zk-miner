@@ -872,6 +872,10 @@ mod capture_tests {
     /// open for writing makes every `execve` fail with ETXTBSY, so this exercises the retry path
     /// AND the classification that keeps a transient failure from permanently declining a
     /// backend.
+    ///
+    /// Linux only: macOS executes a file that is open for writing (no ETXTBSY), so there the spawn
+    /// succeeds and the test has nothing to drive (P31-19 open issue 8).
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_persistently_busy_executable_is_reported_transient() {
         let dir = std::env::temp_dir().join(format!(

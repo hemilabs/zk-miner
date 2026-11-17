@@ -2354,7 +2354,7 @@ const SP1_QUEUE_DIR_ENV: &str = "SP1_GROTH16_QUEUE_DIR";
 const SP1_GPU_SERVER_NAME_ENV: &str = "SP1_GPU_SERVER_NAME";
 
 /// How long a backend's warm-up may take: SP1's circuit artifacts are ~8 GB to download, risc0's
-/// Groth16 component 2.3 GB.
+/// Groth16 component (v0.2.0, risc0 3.1) 2.4 GB (5.4 GB installed).
 pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// `~/.zkminer/locks`: on disk, owned by the miner, and the same for every worker it starts.

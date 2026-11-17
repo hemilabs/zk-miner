@@ -33,12 +33,30 @@ export PATH="$HOME/.risc0/bin:$PATH"
 rzup install rust
 ```
 
-Running needs RISC Zero's `risc0-groth16` component (the Groth16 proving key, 5 GB), but not
-`rzup`: the risc0 worker installs it in its one-time setup, before the miner claims any risc0 job,
-when `~/.risc0/extensions/v0.1.0-risc0-groth16` (or `RISC0_GROTH16_DIR`) does not hold it. It
-downloads the 2.3 GB archive rzup itself uses from RISC Zero's artifact store and checks its
-SHA-256 (`crates/zkminer-prove-risc0/src/groth16_component.rs`). `rzup install risc0-groth16`
-installs the same files.
+Running needs RISC Zero's `risc0-groth16` component, version 0.2.0 for risc0 3.1 (the Groth16
+proving key of the 2026-10-20 setup; 5.4 GB installed), but not `rzup`: the risc0 worker installs
+it in its one-time setup, before the miner claims any risc0 job, when
+`~/.risc0/extensions/v0.2.0-risc0-groth16` (or `RISC0_GROTH16_DIR`) does not hold it. It downloads
+the 2.4 GB archive rzup itself uses from RISC Zero's artifact store and checks its SHA-256
+(`crates/zkminer-prove-risc0/src/groth16_component.rs`). `rzup install risc0-groth16` installs the
+same files. risc0 3.1 refuses the 3.0 component (`v0.1.0-risc0-groth16`), which can be deleted.
+
+### risc0 3.1 and the on-chain verifier
+
+zk-miner builds against risc0 **3.1** (the GHSA-g6qg-9j8p-7j87 circuit and verifier fixes). Its
+Groth16 seals carry the selector `0xe71e6620`, and only a risc0-ethereum 3.1
+`RiscZeroGroth16Verifier` accepts them; 3.0 receipts (selector `0x73c457ba`) are not compatible in
+either direction. As of 2026-11-17 no 3.1 verifier is deployed on Hemi testnet (743111), so:
+
+- the miner logs `PAGE: risczero.groth16.v1 cannot be served yet — ...` at startup, naming what is
+  missing, and claims no risc0 job (locks it already holds are still driven; SP1 is unaffected);
+- the audited pin for the 3.1 verifier, `RISC0_V3_1_GROTH16_VERIFIER` in
+  `crates/zkminer-chain/src/deployment.rs`, is empty (`None`). Once the verifier is deployed and
+  routed by the `risczero.groth16.v1` adapter, fill it with the verifier's runtime keccak from the
+  audited deployment's `VerifierPins.sol` and rebuild. Never fill it from anything else.
+
+Workers and the CLI must come from the same tree: the CLI refuses a worker with another protocol
+version or another risc0 (`risc0-zkvm 3.0.x`) at the handshake.
 
 ## Build
 
@@ -185,8 +203,9 @@ process group the dispatcher relies on.
 ## macOS (Apple Silicon, Metal)
 
 The RISC Zero worker also runs on Apple Silicon Macs, on the GPU through Metal:
-`zkminer-prove-risc0-metal`. It is built from the Metal port of the risc0 fork, which
-`Cargo.toml`'s `[patch.crates-io]` takes from `../deps/risc0` (branch `zkminer/metal`). The
+`zkminer-prove-risc0-metal`. It is built from the Metal port of the risc0 3.1 fork, which
+`Cargo.toml`'s `[patch.crates-io]` takes from `../deps/risc0-3.1` (branch `zkminer/metal-3.1`:
+hemilabs `release-3.1`, risc0 v3.1.0, with the Metal port merged onto it). The
 segment proofs, the recursion and the Groth16 wrap run on the GPU (two steps still run on the CPU
 for now: the rv32im witness generation and the last recursion step before the wrap), and neither
 Docker nor a CUDA/ROCm toolkit is involved. SP1 and OpenVM have no Mac worker; the miner never gives an Apple
@@ -197,7 +216,7 @@ GPU an SP1 slot.
 | Tier | Hardware | What to expect |
 |---|---|---|
 | Not supported | Intel Macs; any Mac with 8 GB (including the A18 Pro MacBook Neo); an x86_64 build or a shell under Rosetta | The worker refuses, with the reason in its log: Capabilities reports no GPU, Prove, Warmup and Benchmark answer with the refusal, and `--benchmark` exits 2. Executing guests (job measurement) still works. |
-| Minimum | M1–M6 base chip with 16 GB (7–10 GPU cores) | Small segments (po2 17–18). Not practical yet, see the footprint limitation below. |
+| Minimum | M1–M6 base chip with 16 GB (7–10 GPU cores) | po2 19 at the 8 GiB tier the miner gives it (po2 18 under a 4 GiB budget). Simulated on the M5 Max only, see the limitations below. |
 | Primary target | M4/M5 base (10 cores) with 24 GB; M4/M5 Pro with 24–48 GB | po2 19–20 |
 | High end | Max (36–128 GB), Ultra | po2 20 |
 
@@ -209,19 +228,23 @@ sizes everything from the device's `recommendedMaxWorkingSetSize` (about 75% of 
 (`hw.memsize` minus an 8 GiB host reserve). Only a 36 GB M5 Max has been measured so far; the rows
 for smaller Macs come from budget runs on it.
 
-Default segment size (po2) when the job names none, and the peak GPU memory measured at that size
-for the STARK (segments / recursion) on the M5 Max:
+Default segment size (po2) when the job names none, and what risc0 3.1 measured at that size on
+the M5 Max (`--benchmark` of memory-merkle under `RISC0_METAL_MAX_WORKING_SET_BYTES`; Metal peak per
+phase, segments / recursion / Groth16 wrap; process peak footprint):
 
-| Working-set limit | po2 | Peak GPU memory, MiB | Typical Mac |
-|---|---|---|---|
-| < 6 GiB | 17 | 2082 / 3971 | 16 GB under a ~4 GB budget |
-| 6 to < 12 GiB | 18 | 2700 / 4390 | 16 GB |
-| 12 to < 20 GiB | 19 | 4976 / 6668 | 24 GB |
-| ≥ 20 GiB | 20 | 9473 / 11169 (up to ~12 000) | 32 GB and up |
+| Working-set limit | po2 | STARK, memory-merkle | Wrap | Peak GPU memory, MiB | Footprint | Typical Mac |
+|---|---|---|---|---|---|---|
+| < 6 GiB (4 GiB measured) | 18 | 13.9 s (602K c/s) | 1.72 s | 2404 / 2199 / 3944 | 4.9 GB | 16 GB under a ~4 GB budget |
+| 6 to < 10 GiB (8 GiB) | 19 | 10.2 s (770K c/s) | 1.74 s | 4738 / 4337 / 5635 | 7.3 GB | 16 / 18 GB |
+| ≥ 10 GiB (28.1 GiB) | 20 | 8.35 s (879K c/s) | 1.58 s | 9437 / 9437 / 5635 | 13.2 GB | 24 GB and up |
 
-The Groth16 wrap needs about 7.4 GB of GPU memory on its own (the 5.7 GB proving key plus the
-last recursion step). A po2 larger than the limit allows is refused as ResourceExhausted instead of
-being swapped through (`ZKMINER_METAL_NO_PO2_CEILING=1` disables that, for diagnostics only).
+(The footprint model can keep a smaller po2 than the limit allows on a Mac with little RAM: a
+simulated 18 GB Mac proves at po2 19.) The full six-program `--benchmark` at po2 20 proves 154.5M
+cycles in 169.6 s of STARK (911K c/s) and wraps each program in 1.57-1.59 s. Below a 20 GiB limit
+the worker loads the Groth16 proving key for each wrap and frees it after (it logs `Groth16 proving
+key released: ... MiB of device memory freed (prover layout ...)` per proof); from 20 GiB up it keeps
+the key loaded. A po2 larger than the limit allows is refused as ResourceExhausted instead of being
+swapped through (`ZKMINER_METAL_NO_PO2_CEILING=1` disables that, for diagnostics only).
 
 ### Prerequisites
 
@@ -311,10 +334,11 @@ job's deadline (it allows the warm-up an hour); `mac-install-worker` does the sa
 
 The Metal worker wraps STARKs in Groth16 natively on the GPU (no Docker, no x86 emulation). It needs
 RISC Zero's `risc0-groth16` component, which it downloads in its one-time setup like the other
-workers (`~/.risc0/extensions/v0.1.0-risc0-groth16`, or `RISC0_GROTH16_DIR`). A wrap takes
-about 16 s on the M5 Max and peaks at ~7.4 GB of GPU memory; the worker keeps the 5.7 GB proving key
-loaded between proofs only when the working-set limit has room for it beside a full STARK and the
-host's own state. `RISC0_GROTH16_METAL_PROVER=docker` switches to RISC Zero's Docker prover. The
+workers (`~/.risc0/extensions/v0.2.0-risc0-groth16`, or `RISC0_GROTH16_DIR`). A wrap takes
+1.58 s on the M5 Max (1.72-1.74 s under a 4 or 8 GiB budget) and peaks at 5.6 GB of GPU memory
+(3.9 GB under a 4 GiB budget, where the prover takes its smallest layout); the worker keeps the
+~4.1 GB proving key loaded between proofs only when the working-set limit has room for it beside a
+full STARK and the host's own state (20 GiB and up). `RISC0_GROTH16_METAL_PROVER=docker` switches to RISC Zero's Docker prover. The
 CPU-only worker (`--features cpu`) has no native wrap and needs Docker for it.
 
 ### Environment knobs
@@ -333,17 +357,21 @@ Read at run time by the worker (they pass through the miner's environment):
 | `RISC0_METAL_REC_KERNELS` | `monolith` (default) or `split`: which recursion eval_check kernels to use. |
 | `RISC0_METAL_ARCHIVE=0`, `RISC0_METAL_ARCHIVE_DIR` | Disable or move the keccak pipeline archive. |
 | `RISC0_METAL_DEBUG=1` (with `MTL_DEBUG_LAYER=1`) | Metal API validation and extra checks; slow, for debugging. |
+| `ZKMINER_METAL_PREWARM_KECCAK` | `auto` (default): build the keccak pipelines at start unless the Groth16 prover would then not fit the limit beside them (it fits from 4 GiB up); `on` / `off` force it. |
 | `ZKMINER_METAL_NO_PO2_CEILING=1` | Let a po2 above what the working-set limit allows run anyway. Diagnostics. |
 | `ZKMINER_CUDA_VRAM_BYTES` | Set by the miner for each Mac worker (`hw.memsize` − 8 GiB); also caps the worker's limit. |
 
 ### Known limitations
 
-- **Memory footprint on 16 GB Macs.** Besides the GPU allocations the budget counts, the worker's
-  process carries several GB of driver and host memory (measured: about 16 GB of process footprint
-  for a small proof at po2 18 under an 8 GiB budget). Until that is reduced, a 16 GB Mac does not
-  have the room to prove; 24 GB and up do.
-- Under a 4 GiB budget the STARK proves but the Groth16 wrap is refused (the key alone is 5.7 GB),
-  so the worker's warm-up fails and it takes no jobs.
+- **Not yet run on a real 16 GB Mac.** The 16 GB rows above come from budget runs on a 36 GB M5 Max
+  (`RISC0_METAL_MAX_WORKING_SET_BYTES`, and `ZKMINER_METAL_HOST_RAM_BYTES` for the footprint model);
+  a simulated 16 GB Mac proves memory-merkle at po2 19 with a 7.4 GB process footprint. Fewer GPU
+  cores and less memory bandwidth will make it slower than these numbers.
+- Under a 4 GiB budget every job wraps, keccak jobs included (since risc0 B9-4G the Groth16 prover
+  plans 3885 MiB there and leaves ~150 MiB of headroom beside the worker's pipelines). It relies on
+  the worker freeing the key after each proof; two wraps with the key kept do not fit.
+- **Beta.** The Mac build is a beta: unsigned (no Developer ID, not notarized), so macOS may ask
+  before running a downloaded binary; building it yourself avoids that.
 - The rv32im GPU witness generation is disabled by default (see the knob above).
 - The six-program benchmark takes ~19 minutes at po2 20 on an M5 Max, longer on smaller Macs.
 - GPU power is not read on macOS; the miner's cost model assumes its 300 W default.

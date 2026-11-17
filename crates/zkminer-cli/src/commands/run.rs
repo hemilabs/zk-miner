@@ -223,6 +223,19 @@ fn risc0_selector_override_acknowledged() -> bool {
     )
 }
 
+/// What is missing before this build's risc0 seals can be checked against an audited verifier
+/// (`zkminer_chain::deployment::risc0_verifier_pin`), or `None`. A refused selector override is
+/// reported by [`risc0_selector_refusal`] instead.
+fn risc0_verifier_pin_startup_notice(selector: [u8; 4]) -> Option<String> {
+    if RISC0_SELECTOR_REFUSAL.get().is_some() {
+        return None;
+    }
+    zkminer_chain::deployment::risc0_verifier_pin_notice(
+        selector,
+        zkminer_chain::deployment::code_pins_skipped(),
+    )
+}
+
 /// The RISC Zero seal selector to prefix onto seals (config override or default).
 fn risc0_seal_selector() -> [u8; 4] {
     match SEAL_SELECTOR.get() {
@@ -2549,6 +2562,12 @@ pub async fn run(
             alloy::hex::encode(sel),
             alloy::hex::encode(risc0_groth16_default_selector())
         );
+    }
+    // B9-ZK: a build whose seals have no audited verifier pin (risc0 3.1 until its verifier is
+    // deployed and pinned) says what is missing up front, whatever the chain answers below; the
+    // check itself then refuses the adapter with the same text on every re-check.
+    if let Some(missing) = risc0_verifier_pin_startup_notice(risc0_seal_selector()) {
+        tracing::error!("PAGE: risczero.groth16.v1 cannot be served yet — {missing}");
     }
     // NOT fatal: a held lock must still be recovered (fulfilled, kept through a Disabled window, or
     // released) when the adapter is disabled, swapped, or fails a pin. Exiting here would leave every
@@ -12853,6 +12872,29 @@ mod tests {
         assert_eq!(parse_seal_selector("0xe71e66206"), None);
         assert_eq!(parse_seal_selector("0xé71e662"), None);
         assert_eq!(parse_seal_selector("0xg71e6620"), None);
+    }
+
+    /// B9-ZK: zkminer-chain's 3.1 selector constant is this build's derived selector, and until the
+    /// 3.1 verifier pin is filled the startup notice names what is missing (no address or hash is
+    /// invented: the pin is `None`).
+    #[test]
+    fn the_3_1_verifier_pin_slot_matches_the_linked_risc0() {
+        use zkminer_chain::deployment::pins;
+        assert_eq!(pins::RISC0_V3_1_SELECTOR, risc0_groth16_default_selector());
+        let notice = risc0_verifier_pin_startup_notice(risc0_groth16_default_selector());
+        match pins::RISC0_V3_1_GROTH16_VERIFIER {
+            None if !zkminer_chain::deployment::code_pins_skipped()
+                && RISC0_SELECTOR_REFUSAL.get().is_none() =>
+            {
+                let notice = notice.expect("a notice while the 3.1 pin is empty");
+                assert!(
+                    notice.contains("RISC0_V3_1_GROTH16_VERIFIER") && notice.contains("0xe71e6620"),
+                    "{notice}"
+                );
+            }
+            None => {}
+            Some(_) => assert_eq!(notice, None),
+        }
     }
 
     /// The risc0 this CLI derives its selector from is the one the protocol makes a risc0 worker
