@@ -210,6 +210,25 @@ executor:
   --user` units, `environment.d`), `~/.ssh`, `~/.zkminer` (keys, config, the provers); `~/.risc0`
   and `~/.sp1` (the server binaries included) are read-only. TCP bind and connect are denied by
   Landlock as well.
+- **Filesystems within reach.** Landlock decides what may be opened, read, written or executed,
+  but not the path walk: `stat`, `access`, `readlink`, `getxattr`, `statfs`, and the lookups of
+  an `open` that Landlock then refuses, go through every directory on the way. On a network
+  filesystem each lookup is a request to its server carrying a name the process chose; on a FUSE
+  filesystem, to a user-space daemon (sshfs, rclone, gvfs) that may go anywhere; on an automount
+  map, a mount of whatever the name says (autofs `/net/<host>`). So a worker (and the server's
+  supervisor, before it starts the server) refuses to confine itself, and runs no guest, while any
+  filesystem it can reach is not local: every mount of its mount table that a path reaches (not
+  only below the paths it is granted; a mount hidden under another is left out) must be of a type
+  known to be local — disk, memory and kernel filesystems (`ext4`, `xfs`, `btrfs`, `zfs`, `tmpfs`,
+  `overlay`, `squashfs`, `proc`, `sysfs`, ...); anything else is refused, unknown types included.
+  Every path it is granted must be on a local filesystem by `statfs`, and so must its working
+  directory and every file or directory it holds open. The error names each mount, its type and
+  its source. Two exceptions, where the kernel itself keeps the process out: another user's FUSE
+  mount without `allow_other` (the kernel refuses this user's lookups before the daemon sees them),
+  and a direct automount point whose target is local (systemd's for `binfmt_misc` or the EFI
+  partition; an idle one is triggered once to see what it mounts). The check runs again once the
+  confinement is on, and the builder runner, the execute worker and the broker make it too, before
+  their sandbox is applied (the broker's paths by `statfs` as well).
 - **Other processes.** Landlock's signal and abstract-socket scoping, and its `ptrace` rules: a
   confined process cannot signal, trace or open `/proc/<pid>/mem`, `environ`, `maps` or `fd` of a
   process outside its domain (the miner, other workers, their servers): `kill`, `tgkill`,
@@ -406,6 +425,15 @@ no second one):
   A witness proof's worker can read every bundle in the retention store, other requesters'
   included. Its results go back to the miner over its pipe, and a guest controls its journal, so
   anything it can read it can publish: keep secrets out of the readable paths.
+- **Filesystems mounted later, or remote underneath.** The check of the filesystems within reach
+  runs when a process confines itself, and the process stays confined for the rest of its life. A
+  network or FUSE filesystem mounted after that (by the operator, by a desktop session, a direct
+  automount whose target changed) is within reach of the workers already running until they are
+  restarted: mount nothing of the kind while the miner runs. Filesystems are judged by their own
+  type, so storage that is remote underneath a local type is not seen: a block device on iSCSI,
+  NBD, Ceph RBD or a file on NFS holding an `ext4` (a cloud VM's network disk included: such I/O
+  carries no name the process chose), or an `overlay`/`ecryptfs` with a layer on a network
+  filesystem that is not in the mount table.
 - **Descriptors passed between confined processes.** `SCM_RIGHTS` over a Unix connection hands
   over an open socket, network ones included. The only connection a confined process keeps is an
   SP1 worker's to its own server, and both ends are confined from before either runs a guest, so
@@ -421,7 +449,9 @@ no second one):
   `chdir`/`fchdir`; `statx` fails as unimplemented. `stat` by path (`newfstatat`) stays open:
   Rust and glibc need it, and only a mount namespace (the system mode, not implemented) hides
   the filesystem from it, so a compromised builder can still tell whether a path exists and read
-  its size, owner, mode and times, though never its contents. They also may not read the mount
+  its size, owner, mode and times, though never its contents. No such lookup leaves the host: the
+  sandbox is not applied while a network or FUSE filesystem, or an automount map, is within reach
+  (see "Filesystems within reach" above). They also may not read the mount
   table (`listmount`/`statmount`, which would show the internal host names of NFS or CIFS
   servers), the LSMs (`lsm_list_modules`, `lsm_get_self_attr`), `ustat` or `sysfs`, nor the
   session or process group of another process (`getsid`/`getpgid` of any pid but their own);

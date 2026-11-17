@@ -26,6 +26,10 @@
 //! themselves with [`confine`] before their first guest: Landlock and seccomp, no sockets. An SP1
 //! worker's `sp1-gpu-server` runs under [`supervise`].
 //!
+//! Every one of them refuses to start while a network or FUSE filesystem, or an automount map, is
+//! within reach ([`localfs`]): Landlock does not restrict the path walk, and a lookup there would
+//! query that filesystem's server.
+//!
 //! [`self_test`] checks the resulting *properties* (plan §10.3) by running the
 //! `zkminer-witness-sandbox-probe` binary inside each sandbox profile, not just that calls
 //! succeeded.
