@@ -203,6 +203,12 @@ enum Commands {
         #[command(subcommand)]
         command: WitnessCommand,
     },
+    /// Store a witness builder (or a guest ELF) on the HemiProve chain as contract code
+    /// (`hemi-code`), paced so it never pushes the chain's DA backlog toward a router pause
+    Artifact {
+        #[command(subcommand)]
+        command: ArtifactCommand,
+    },
     /// Initialize config file with defaults
     Init {
         /// Overwrite existing config
@@ -250,6 +256,57 @@ enum WitnessCommand {
     Binding {
         #[command(subcommand)]
         command: BindingCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ArtifactCommand {
+    /// Publish FILE in the hemi-code format: chunks of at most 24,575 bytes deployed as `0x00`-
+    /// prefixed data contracts, then a manifest; prints the locator only after every deployment is
+    /// at or below the safe head and the artifact was read back there with the miner's checks.
+    /// Paced: one chunk in flight, and only while the DA backlog is under 250 KB, the safe-head lag
+    /// at most 300 s, the router not paused and the head fresh. About twenty minutes per MiB.
+    ///
+    /// The key is an encrypted keystore of its own (never the miner's): refused when it is staked
+    /// as a prover, authorized as an operator, the configured prover, or has pending transactions
+    /// it did not send. Every request goes through the network guard: a node on loopback or the LAN
+    /// is reachable only with `[dev] private_network` for this chain in the configuration.
+    Publish {
+        /// The artifact: a WASM builder or a risc0 guest ELF.
+        file: std::path::PathBuf,
+        /// What FILE is; it must parse as one (publication is permanent).
+        #[arg(long, value_parser = ["builder", "elf"])]
+        kind: String,
+        /// The HemiProve chain's RPC (never the miner's [chain] rpc_url while it runs).
+        #[arg(long)]
+        rpc_url: String,
+        /// The HemiProve chain id the RPC must serve.
+        #[arg(long)]
+        chain_id: u64,
+        /// The publisher's encrypted keystore (Web3 Secret Storage JSON).
+        #[arg(long)]
+        keystore: std::path::PathBuf,
+        /// Read the keystore password from this file descriptor (3 or above) instead of the terminal.
+        #[arg(long)]
+        password_fd: Option<i32>,
+        /// The HemiProve router (default: the known deployment's on --chain-id).
+        #[arg(long)]
+        router: Option<alloy::primitives::Address>,
+        /// The first block of the operator check's log scan (default: the known deployment's).
+        #[arg(long)]
+        from_block: Option<u64>,
+        /// The tip in wei (default: the inclusion floor measured from recent blocks).
+        #[arg(long)]
+        tip_wei: Option<u128>,
+        /// This command's own request rate limit.
+        #[arg(long, default_value_t = 4)]
+        max_requests_per_sec: u32,
+        /// Send after the cost preview without asking.
+        #[arg(long)]
+        yes: bool,
+        /// Print the preview on stderr and the result on stdout as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -540,6 +597,47 @@ async fn main() -> Result<()> {
         }
         #[cfg(feature = "sp1-demo")]
         Commands::Sp1Demo { input } => commands::sp1_demo::run(config_path, input).await,
+        #[cfg(target_os = "linux")]
+        Commands::Artifact {
+            command:
+                ArtifactCommand::Publish {
+                    file,
+                    kind,
+                    rpc_url,
+                    chain_id,
+                    keystore,
+                    password_fd,
+                    router,
+                    from_block,
+                    tip_wei,
+                    max_requests_per_sec,
+                    yes,
+                    json,
+                },
+        } => {
+            use commands::artifact::{plan::Kind, PublishOptions};
+            let kind = if kind == "elf" { Kind::Elf } else { Kind::Builder };
+            commands::artifact::publish(
+                config_path,
+                PublishOptions {
+                    file,
+                    kind,
+                    rpc_url,
+                    chain_id,
+                    keystore,
+                    password_fd,
+                    router,
+                    from_block,
+                    tip_wei,
+                    max_requests_per_sec,
+                    yes,
+                    json,
+                },
+            )
+            .await
+        }
+        #[cfg(not(target_os = "linux"))]
+        Commands::Artifact { .. } => anyhow::bail!("zkminer artifact publish runs on Linux only"),
         Commands::Init {
             force,
             network,

@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+pub mod artifact;
 pub mod benchmark;
 pub mod init;
 pub mod mock;

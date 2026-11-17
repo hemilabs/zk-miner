@@ -17,9 +17,12 @@ zkminer-tui = { workspace = true }
 zkminer-config = { workspace = true }
 alloy = { workspace = true }
 alloy-primitives = { workspace = true }
+# `zkminer artifact publish` signs with an encrypted keystore (Web3 Secret Storage), never a raw key.
+alloy-signer-local = { version = "1", features = ["keystore"] }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
@@ -42,7 +45,10 @@ zkminer-witness-host = { path = "../zkminer-witness-host" }
 zkminer-witness-store = { workspace = true }
 zkminer-witness-sandbox = { workspace = true }
 zkminer-witness-broker = { path = "../zkminer-witness-broker" }
-zkminer-netguard = { workspace = true }
+zkminer-netguard = { workspace = true, features = ["client"] }
+# `zkminer artifact publish --kind builder`: the file must parse as a WASM module (the builder's pin).
+wasmparser = { version = "=0.254.2", default-features = false, features = ["std"] }
+zeroize = { workspace = true }
 sha2 = "0.10"
 hex = { workspace = true }
 libc = "0.2"
@@ -51,6 +57,7 @@ libc = "0.2"
 # The localnet test: signals and parent-death signals for the processes it starts.
 libc = "0.2"
 tempfile = "3"
+wat = "1"
 
 [features]
 default = []
