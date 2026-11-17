@@ -68,7 +68,7 @@ pub struct ChainConfig {
     pub fee_ceiling_gwei: Option<f64>,
     /// First block of every HemiProve log scan (job discovery, lock recovery, descriptor
     /// reconstruction): the deployment's `fromBlock`. None = the known deployment's value for this
-    /// chain (743111: 7095745), else no floor.
+    /// chain (743111: 7226094), else no floor.
     #[serde(default)]
     pub scan_from_block: Option<u64>,
     /// Whether to claim journal-bound jobs: a non-zero `expectedJournalHash` (FULL or FIELDS
@@ -232,9 +232,9 @@ pub struct ProverConfig {
     #[serde(default)]
     pub worker_binaries: HashMap<String, String>,
     /// Override for the RISC Zero groth16 seal selector (4-byte hex, e.g.
-    /// "0x73c457ba"). The miner prepends this to each seal for on-chain
+    /// "0xe71e6620"). The miner prepends this to each seal for on-chain
     /// verification; it must equal the target chain's verifier `SELECTOR` for
-    /// the risc0 version in use. Defaults to the risc0 v3.0.x value when unset.
+    /// the risc0 version in use. Defaults to the risc0 v3.1.x value when unset.
     #[serde(default)]
     pub risc0_groth16_selector: Option<String>,
     /// The segment size (po2) a card measures and proves risc0 jobs at, keyed by its benchmark device
@@ -292,7 +292,28 @@ fn default_proving_timeout() -> u64 {
     600
 }
 fn default_benchmark_timeout() -> u64 {
-    600 // 10 minutes
+    // The suite plus the zkOP/s proofs is about 10 minutes on an Arc A770's RISC Zero worker.
+    BENCHMARK_TIMEOUT_DEFAULT_SECS
+}
+
+const BENCHMARK_TIMEOUT_DEFAULT_SECS: u64 = 1800;
+/// The default before the zkOP/s proofs were added, which `zkminer init` wrote into config files.
+const BENCHMARK_TIMEOUT_OLD_DEFAULT_SECS: u64 = 600;
+
+impl ProverConfig {
+    /// The per-worker benchmark deadline, or `None` for no deadline.
+    ///
+    /// A config still carrying the old default gets the new one: that value was never a choice, and
+    /// the worker would be killed partway through scoring a slower card.
+    pub fn benchmark_timeout(&self) -> Option<std::time::Duration> {
+        match self.benchmark_timeout_secs {
+            0 => None,
+            BENCHMARK_TIMEOUT_OLD_DEFAULT_SECS => Some(std::time::Duration::from_secs(
+                BENCHMARK_TIMEOUT_DEFAULT_SECS,
+            )),
+            secs => Some(std::time::Duration::from_secs(secs)),
+        }
+    }
 }
 fn default_token_price() -> f64 {
     0.80

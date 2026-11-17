@@ -1,0 +1,12 @@
+[package]
+name = "ocloc-shim"
+version = "0.1.0"
+edition = "2021"
+description = "Stands in for Intel's ocloc in the Windows CI build: replays device images compiled on Linux"
+publish = false
+
+# Not part of zk-miner's workspace: a build tool for build-windows.yml, with no dependencies.
+[workspace]
+
+[profile.release]
+opt-level = 3

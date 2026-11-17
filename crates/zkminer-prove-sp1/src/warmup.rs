@@ -51,12 +51,23 @@ pub(crate) struct WarmupReport {
 }
 
 /// Installs the Groth16 circuit artifacts if they are not installed, and builds the stripped
-/// circuit where the server supports it.
-pub(crate) fn warm_up() -> Result<WarmupReport> {
+/// circuit where the server supports it. `report(step, done bytes, total bytes)` is told before
+/// each long step, and every second during a download or an unpack.
+pub(crate) fn warm_up(
+    report: &mut dyn FnMut(&str, Option<u64>, Option<u64>),
+) -> Result<WarmupReport> {
     let dir = sp1_prover::build::groth16_circuit_artifacts_dir()
         .context("cannot locate the Groth16 circuit artifacts directory")?;
     let started = Instant::now();
-    let installed = ensure_installed(&dir, download)?;
+    let installed = ensure_installed(&dir, |staging| {
+        let archive_bytes = archive_size();
+        report(DOWNLOADING, Some(0), archive_bytes);
+        with_progress(
+            report,
+            || sdk_progress(staging, archive_bytes),
+            || download(staging),
+        )
+    })?;
     let mut summary = format!(
         "Groth16 circuit artifacts {} ({}, {:.0?})",
         installed.describe(),
@@ -68,6 +79,11 @@ pub(crate) fn warm_up() -> Result<WarmupReport> {
     let groth16_helper = server.exists() && server_hosts_groth16_helper(&server);
     if groth16_helper {
         let started = Instant::now();
+        report(
+            "Preparing the Groth16 circuit (about 30 s on a first run)",
+            None,
+            None,
+        );
         prepare_stripped_circuit(&server, &dir)?;
         summary.push_str(&format!(
             "; stripped circuit ready ({:.0?})",
@@ -82,12 +98,16 @@ pub(crate) fn warm_up() -> Result<WarmupReport> {
     })
 }
 
-/// `~/.sp1/bin/sp1-gpu-server`, where the SDK runs it from.
+/// `~/.sp1/bin/sp1-gpu-server` (`.exe` on Windows), where the SDK runs it from. The home directory
+/// is found as the SDK finds it: `HOME`, or on Windows, which does not set it, `USERPROFILE`.
 pub(crate) fn server_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|home| !home.is_empty()))
         .ok_or_else(|| anyhow!("$HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".sp1/bin").join(server_name()))
+    Ok(PathBuf::from(home)
+        .join(".sp1/bin")
+        .join(format!("{}{}", server_name(), std::env::consts::EXE_SUFFIX)))
 }
 
 /// The build of `sp1-gpu-server` this worker's SDK runs: `SP1_GPU_SERVER_NAME` (set by the dispatcher
@@ -200,6 +220,124 @@ pub(crate) fn ensure_installed(
     Ok(Installed::Downloaded)
 }
 
+const DOWNLOADING: &str = "Downloading the Groth16 circuit (first run)";
+const UNPACKING: &str = "Unpacking the Groth16 circuit (first run)";
+/// How often a long step's progress is reported.
+const PROGRESS_EVERY: Duration = Duration::from_secs(1);
+
+/// Runs `step` on a thread of its own, passing `report` what `measure` says every second: the step
+/// and its bytes so far. For a download or an unpack whose library reports nothing itself.
+fn with_progress<T: Send>(
+    report: &mut dyn FnMut(&str, Option<u64>, Option<u64>),
+    measure: impl Fn() -> (&'static str, Option<u64>, Option<u64>),
+    step: impl FnOnce() -> T + Send,
+) -> T {
+    std::thread::scope(|scope| {
+        let running = scope.spawn(step);
+        let mut reported = Instant::now();
+        while !running.is_finished() {
+            std::thread::sleep(Duration::from_millis(250));
+            if reported.elapsed() >= PROGRESS_EVERY {
+                reported = Instant::now();
+                let (status, done, total) = measure();
+                report(status, done, total);
+            }
+        }
+        running
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// Where the SDK's install into `staging` is. It downloads `artifacts.tar.gz` into a sibling
+/// `<staging>.incomplete.*` folder, unpacks it there, then renames that folder to `staging`.
+fn sdk_progress(
+    staging: &Path,
+    archive_bytes: Option<u64>,
+) -> (&'static str, Option<u64>, Option<u64>) {
+    let prefix = format!(
+        "{}.incomplete.",
+        staging
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    );
+    let work = staging
+        .parent()
+        .and_then(|parent| fs::read_dir(parent).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|entry| entry.path());
+    let Some(work) = work else {
+        return (DOWNLOADING, Some(0), archive_bytes);
+    };
+    let archive = work.join("artifacts.tar.gz");
+    let archive_done = size_on_disk(&archive);
+    let unpacking = fs::read_dir(&work)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| entry.file_name() != "artifacts.tar.gz");
+    if unpacking {
+        let unpacked = size_on_disk(&work).saturating_sub(archive_done);
+        (UNPACKING, Some(unpacked), None)
+    } else {
+        (DOWNLOADING, Some(archive_done), archive_bytes)
+    }
+}
+
+/// The size of the archive the SDK downloads, asked of the server, for a progress bar.
+fn archive_size() -> Option<u64> {
+    let url = format!(
+        "{}/{}-groth16.tar.gz",
+        sp1_prover::build::CIRCUIT_ARTIFACTS_URL_BASE,
+        sp1_prover::SP1_CIRCUIT_VERSION.trim()
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .ok()?;
+        let response = client
+            .head(&url)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?;
+        // The header, not `content_length()`: for a HEAD reply that is the empty body's size, 0.
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()
+    })
+}
+
+/// Bytes in `path`, a file or a directory tree; what cannot be read counts as nothing.
+fn size_on_disk(path: &Path) -> u64 {
+    let Ok(meta) = fs::metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| size_on_disk(&entry.path()))
+        .sum()
+}
+
 /// The SDK's download and extraction, into `staging`.
 fn download(staging: &Path) -> Result<()> {
     tracing::info!(
@@ -216,8 +354,10 @@ fn download(staging: &Path) -> Result<()> {
     ))
 }
 
-/// An exclusive `flock` on `path`, held until the file is dropped.
+/// An exclusive lock on `path`, held until the file is dropped: `flock` on Unix, `LockFileEx` on
+/// Windows (std's `File::lock`).
 fn lock(path: &Path) -> Result<File> {
+    #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
     let file = fs::OpenOptions::new()
         .create(true)
@@ -225,6 +365,7 @@ fn lock(path: &Path) -> Result<File> {
         .write(true)
         .open(path)
         .with_context(|| format!("cannot open {}", path.display()))?;
+    #[cfg(unix)]
     loop {
         // SAFETY: flock on a descriptor we own.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
@@ -234,6 +375,12 @@ fn lock(path: &Path) -> Result<File> {
         if err.kind() != std::io::ErrorKind::Interrupted {
             return Err(err).with_context(|| format!("cannot lock {}", path.display()));
         }
+    }
+    #[cfg(windows)]
+    {
+        file.lock()
+            .with_context(|| format!("cannot lock {}", path.display()))?;
+        Ok(file)
     }
 }
 
@@ -298,6 +445,15 @@ impl Drop for TestDir {
 
 #[cfg(test)]
 mod tests {
+    /// The size the progress bar divides by, from the real server. Run by hand:
+    /// `cargo test -p zkminer-prove-sp1 archive_size -- --ignored`.
+    #[test]
+    #[ignore = "asks SP1's download server"]
+    fn the_archive_size_comes_from_the_server() {
+        let bytes = super::archive_size().expect("the server gives the archive's size");
+        assert!(bytes > 1_000_000_000, "{bytes} bytes");
+    }
+
     use super::*;
     use std::cell::Cell;
 
@@ -406,6 +562,7 @@ mod tests {
 
     /// The probe tells a helper-hosting server from one that rejects the argument, as the pinned
     /// v6.0.2 server does, without starting either as a server.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_helper_probe_reads_the_servers_answer() {
         // Other tests in this binary briefly point PATH elsewhere, and the scripts are written with

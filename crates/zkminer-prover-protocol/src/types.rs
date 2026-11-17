@@ -27,11 +27,14 @@ use serde::{Deserialize, Serialize};
 /// image id, the SP1 verifying-key hash), derived without executing it. A v10 worker cannot decode the
 /// command, so the handshake refuses it. And `ExecuteResult` gained `host_entropy_reads`, whether the
 /// guest read host-supplied nondeterministic input (both in the same unreleased version).
-/// 12: no new field, a new meaning: the risc0 `sys_rand` seed is the public rule of `sys_rand.rs`, no key.
-/// A v11 worker would seed guests by its host's key, unlike a v12 one proving the same job. And
+/// 12: `Benchmark` carries the programs to run (`BenchmarkProgramSpec`): the suite is the host's, and
+/// the zkOP/s scoring proofs are requests of their own. A v11 worker ran its own list. And
+/// `SetupProgress`, what a `Warmup` is doing (both in the same unreleased version).
+/// 13: no new field, a new meaning: the risc0 `sys_rand` seed is the public rule of `sys_rand.rs`, no key.
+/// A v12 worker would seed guests by its host's key, unlike a v13 one proving the same job. And
 /// `ExecuteResult` gained `user_cycles` and `keccak_cycles`, which `zkminer simulate` compares across
 /// segment sizes (both in the same unreleased version).
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -66,13 +69,90 @@ pub const BACKEND_RISC0: &str = "risc0";
 pub const BACKEND_SP1: &str = "sp1";
 pub const BACKEND_OPENVM: &str = "openvm";
 
-// Canonical benchmark program names — must match BENCHMARK_PROGRAMS in benchmark.rs.
-pub const BENCH_FIBONACCI: &str = "fibonacci";
+// Benchmark program names. The suite itself is `crate::suite::BENCHMARK_PROGRAMS`.
 pub const BENCH_SHA256_CHAIN: &str = "sha256-chain";
 pub const BENCH_ECDSA_VERIFY: &str = "ecdsa-verify";
 pub const BENCH_BIGINT_MUL: &str = "bigint-mul";
 pub const BENCH_MEMORY_MERKLE: &str = "memory-merkle";
 pub const BENCH_CHACHA_MIX: &str = "chacha-mix";
+/// The discarded proof each card runs before the suite (see `crate::suite::warmup_spec`). Not one
+/// of the suite's programs, and never reported.
+pub const BENCH_WARMUP: &str = "fibonacci";
+/// The program behind zkOP/s: one source file, built for every zkVM, so proofs on any of them do
+/// the same work. Mixed arithmetic, bit mixing, multiplication, branching and memory access, with
+/// no precompiles.
+pub const BENCH_ZKOP_MIX: &str = "zkop-mix";
+
+/// `zkop-mix` input for one scored proof.
+pub const ZKOP_MIX_ITERATIONS: u32 = 3202;
+/// What [`ZKOP_MIX_ITERATIONS`] costs in SP1 cycles. This is the numerator of zkOP/s on every zkVM.
+pub const ZKOP_MIX_SP1_CYCLES: u64 = 50_007_139;
+/// Input for the discarded proof before scoring. Small, so a slow card does not pay for a full one.
+const ZKOP_MIX_WARMUP_ITERATIONS: u32 = 200;
+/// At most this many scored proofs.
+const ZKOP_MIX_MAX_RUNS: usize = 3;
+/// No further scored proof starts once this much proving time has been spent.
+const ZKOP_MIX_BUDGET_SECS: f64 = 60.0;
+
+/// zkOP/s for a `zkop-mix` proof that took `stark_secs`: SP1 cycles of that program per second of
+/// STARK proving. One zkOP is one SP1 cycle of it, so the zkVMs share a unit even though their own
+/// cycle counts cannot be compared. 0 for a time that is not a measurement.
+pub fn zkops_from_stark_secs(stark_secs: f64) -> f64 {
+    if stark_secs.is_finite() && stark_secs > 0.0 {
+        ZKOP_MIX_SP1_CYCLES as f64 / stark_secs
+    } else {
+        0.0
+    }
+}
+
+/// A typical GPU's SP1 zkOP/s over its RISC Zero zkOP/s, across a blend of hardware: the geometric
+/// mean of five cards measured in November 2026 (RTX 5090 2.91, RTX 4090 3.35, Arc Pro B70 3.82,
+/// RX 9060 XT 4.05, Arc A770 4.63). It puts a RISC Zero measurement in SP1 terms. Provisional: it
+/// may be set again from more hardware before the first public release.
+pub const ZKOP_SP1_PER_RISC0: f64 = 3.71;
+
+/// A GPU's score: the geometric mean, weighted equally, of its SP1 zkOP/s and its RISC Zero zkOP/s
+/// in SP1 terms (`ZKOP_SP1_PER_RISC0` times), over whichever of the two it measured. A card exactly
+/// as much slower at RISC Zero as a typical one scores its SP1 figure; one weaker at RISC Zero
+/// scores below it, one stronger above. `None` when it measured neither.
+pub fn blended_zkops(sp1: Option<f64>, risc0: Option<f64>) -> Option<f64> {
+    let parts: Vec<f64> = [sp1, risc0.map(|r| r * ZKOP_SP1_PER_RISC0)]
+        .into_iter()
+        .flatten()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .collect();
+    // A single zkVM scores exactly its own figure: `x.powf(1.0)` is `x`.
+    (!parts.is_empty()).then(|| parts.iter().product::<f64>().powf(1.0 / parts.len() as f64))
+}
+
+/// Runs the scoring measurement, given a closure that proves `zkop-mix` at some iteration count:
+/// one discarded warm-up, then up to three scored proofs inside the time budget, reporting the
+/// median. Other work on the GPU shows up as slow runs, which a median ignores; a slow card stops
+/// after one proof. `None` if any proof failed.
+pub fn measure_zkop_mix(
+    mut prove: impl FnMut(u32) -> Option<BenchmarkEntry>,
+) -> Option<BenchmarkEntry> {
+    prove(ZKOP_MIX_WARMUP_ITERATIONS)?;
+    let mut runs: Vec<BenchmarkEntry> = Vec::new();
+    let mut spent = 0.0;
+    while runs.len() < ZKOP_MIX_MAX_RUNS && (runs.is_empty() || spent < ZKOP_MIX_BUDGET_SECS) {
+        let run = prove(ZKOP_MIX_ITERATIONS)?;
+        spent += run.duration_secs;
+        runs.push(run);
+    }
+    runs.sort_by(|a, b| a.duration_secs.total_cmp(&b.duration_secs));
+    let mid = runs.len() / 2;
+    let median = if runs.len() % 2 == 1 {
+        runs[mid].duration_secs
+    } else {
+        (runs[mid - 1].duration_secs + runs[mid].duration_secs) / 2.0
+    };
+    let mut entry = runs.swap_remove(mid);
+    entry.duration_secs = median;
+    entry.throughput = entry.cycles as f64 / median;
+    entry.wrap_secs = None;
+    Some(entry)
+}
 
 /// Commands sent from host to worker via stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,8 +161,10 @@ pub enum WorkerCommand {
     Hello { protocol_version: u32 },
     /// Request worker capabilities.
     Capabilities,
-    /// Run the full benchmark suite. Worker runs all programs it supports.
-    Benchmark,
+    /// Prove each of `programs`, in order, sending a `BenchmarkProgress` after each and then one
+    /// `BenchmarkResult` with a row per program that proved. A program this worker has no guest for
+    /// is skipped with a warning.
+    Benchmark { programs: Vec<BenchmarkProgramSpec> },
     /// Generate a proof for the given ELF and input data.
     Prove {
         request_id: u64,
@@ -289,6 +371,52 @@ pub enum WorkerResponse {
         /// How long the derivation took.
         duration_secs: f64,
     },
+    /// What a `Warmup` is doing now, sent before each long step: a first run can spend many minutes
+    /// downloading or compiling. Any number of these come before its `WarmupDone` or `Error`.
+    /// Appended last, so every earlier variant keeps its bincode index.
+    SetupProgress {
+        request_id: u64,
+        /// The step, for the operator, e.g. "Downloading the Groth16 circuit (first run)".
+        status: String,
+        /// Bytes of a download or an unpack done so far, for a step that has them.
+        done_bytes: Option<u64>,
+        /// What `done_bytes` is heading for, where it is known.
+        total_bytes: Option<u64>,
+    },
+}
+
+/// What a worker's one-time setup is doing (`WorkerResponse::SetupProgress`), for display.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetupStep {
+    pub status: String,
+    pub done_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+}
+
+impl SetupStep {
+    /// How far through the step, 0 to 1, where both byte counts are known.
+    pub fn fraction(&self) -> Option<f64> {
+        let total = self.total_bytes.filter(|&t| t > 0)?;
+        Some((self.done_bytes? as f64 / total as f64).clamp(0.0, 1.0))
+    }
+
+    /// The bytes so far, "2.6 of 6.2 GB" or "2.6 GB so far", for a step that counts them.
+    pub fn amount(&self) -> Option<String> {
+        let done = self.done_bytes? as f64 / 1e9;
+        Some(match self.total_bytes.filter(|&t| t > 0) {
+            Some(total) => format!("{done:.1} of {:.1} GB", total as f64 / 1e9),
+            None => format!("{done:.1} GB so far"),
+        })
+    }
+
+    /// One line: the step, then its bytes and how far through.
+    pub fn describe(&self) -> String {
+        match (self.amount(), self.fraction()) {
+            (Some(amount), Some(f)) => format!("{}: {amount} ({:.0}%)", self.status, f * 100.0),
+            (Some(amount), None) => format!("{}: {amount}", self.status),
+            _ => self.status.clone(),
+        }
+    }
 }
 
 /// Classification of worker errors.
@@ -354,9 +482,17 @@ const MIB: u64 = 1024 * 1024;
 
 /// Measured `(element threshold, peak VRAM)` for SP1, largest first.
 ///
-/// Both figures measured on this box with a 1,912,954,963-cycle `sha256-chain` proof
-/// through to a compact Groth16 seal: 17,766 MiB of a 24,564 MiB RTX 4090 at the 268M threshold, and
-/// 15,092 MiB of a 16,303 MiB RTX 5080 at 134M.
+/// Measured with a 1,912,954,985-cycle `sha256-chain` proof through to a compact Groth16 seal on SP1
+/// circuit **v6.1.0**: 11,542 MiB of a 16,311 MiB RTX 5060 Ti at the 268M threshold, and 8,884–8,957
+/// MiB at 134M (the same 5060 Ti, and a 12,282 MiB RTX 4070). Recorded conservatively above every
+/// observation (200 ms sampling). The peak is flat across job size — it is the shard working set plus
+/// the fixed Groth16-wrap recursion, not shard count — and the wrap itself is on the CPU (gnark) here,
+/// so it costs host RAM, not VRAM.
+///
+/// v6.1.0 is markedly more memory-efficient than v6.0.0, where this same 134M proof peaked at 15,092
+/// MiB and 268M at 17,766 MiB. The consequence that matters: **134M now fits a 12 GiB card** (~9 GiB
+/// peak), so 12 GiB cards run the standard tier rather than needing a smaller one; and a 16 GiB card
+/// can now run 268M (11,542 MiB fits) where before it was held to 134M.
 ///
 /// `402_653_184` — the fork's own default — is deliberately ABSENT. Nothing here has measured its peak
 /// VRAM, and this table is used to decide what will fit. Its omission makes a roomy card slightly
@@ -364,7 +500,7 @@ const MIB: u64 = 1024 * 1024;
 /// trade `sp1_element_threshold_for_host_scale` already makes for host memory: only ever a value
 /// measured to complete a proof.
 const SP1_MEASURED_TIERS: &[(u64, u64)] =
-    &[(268_435_456, 17_766 * MIB), (134_217_728, 15_092 * MIB)];
+    &[(268_435_456, 12_000 * MIB), (134_217_728, 9_500 * MIB)];
 
 /// Headroom required on top of a measured peak before that configuration is considered to fit.
 ///
@@ -1057,6 +1193,22 @@ pub fn is_gpu_oom(message: &str) -> bool {
         || m.contains("out of device memory")
 }
 
+/// One program of a benchmark request: the worker proves its own build of the guest `name` on
+/// `input`. The suite these come from is the miner's; see `crate::suite`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchmarkProgramSpec {
+    /// One of the BENCH_* names.
+    pub name: String,
+    /// The guest's input, as it reads it.
+    pub input: Vec<u8>,
+    /// Copied into the result row.
+    pub weight: f64,
+    /// Copied into the result row.
+    pub precompile: bool,
+    /// Also time the Groth16 wrap on this program (`BenchmarkEntry::wrap_secs`).
+    pub measure_wrap: bool,
+}
+
 /// A single benchmark measurement from a worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkEntry {
@@ -1095,6 +1247,118 @@ pub struct BenchmarkEntry {
 }
 
 #[cfg(test)]
+mod zkop_mix_tests {
+    use super::*;
+
+    fn entry(duration_secs: f64) -> BenchmarkEntry {
+        BenchmarkEntry {
+            program_name: BENCH_ZKOP_MIX.to_string(),
+            prover_backend: BACKEND_SP1.to_string(),
+            cycles: ZKOP_MIX_SP1_CYCLES,
+            duration_secs,
+            throughput: 0.0,
+            weight: 0.0,
+            precompile: false,
+            wrap_secs: None,
+        }
+    }
+
+    /// Plays back `times`, recording the iteration count of each call.
+    fn measure(times: &[f64]) -> (Option<BenchmarkEntry>, Vec<u32>) {
+        let mut calls = Vec::new();
+        let mut times = times.iter();
+        let result = measure_zkop_mix(|iterations| {
+            calls.push(iterations);
+            times.next().map(|secs| entry(*secs))
+        });
+        (result, calls)
+    }
+
+    #[test]
+    fn a_setup_step_describes_its_bytes() {
+        let step = |done, total| SetupStep {
+            status: "Downloading".to_string(),
+            done_bytes: done,
+            total_bytes: total,
+        };
+        assert_eq!(
+            step(Some(2_600_000_000), Some(6_200_000_000)).describe(),
+            "Downloading: 2.6 of 6.2 GB (42%)"
+        );
+        assert_eq!(
+            step(Some(2_600_000_000), None).describe(),
+            "Downloading: 2.6 GB so far"
+        );
+        assert_eq!(step(None, None).describe(), "Downloading");
+        assert_eq!(step(Some(7), Some(5)).fraction(), Some(1.0));
+        assert_eq!(step(Some(1), Some(0)).fraction(), None);
+    }
+
+    #[test]
+    fn a_gpu_scores_the_geometric_mean_of_its_zkvms_in_sp1_terms() {
+        let close = |a: f64, b: f64| (a - b).abs() / b < 1e-9;
+        // At the typical ratio, a card scores its SP1 figure.
+        let typical = blended_zkops(Some(10e6), Some(10e6 / ZKOP_SP1_PER_RISC0)).unwrap();
+        assert!(close(typical, 10e6), "{typical}");
+        // Weaker at RISC Zero than typical: below its SP1 figure.
+        let weak = blended_zkops(Some(10e6), Some(1.5e6)).unwrap();
+        assert!(
+            close(weak, (10e6 * 1.5e6 * ZKOP_SP1_PER_RISC0).sqrt()),
+            "{weak}"
+        );
+        assert!(weak < 10e6);
+        // Only the zkVMs it measured count.
+        assert_eq!(blended_zkops(Some(10e6), None), Some(10e6));
+        let risc0_only = blended_zkops(None, Some(2e6)).unwrap();
+        assert!(close(risc0_only, 2e6 * ZKOP_SP1_PER_RISC0));
+        assert_eq!(blended_zkops(None, None), None);
+        assert_eq!(blended_zkops(Some(0.0), Some(f64::NAN)), None);
+    }
+
+    #[test]
+    fn the_warm_up_is_small_and_not_scored() {
+        let (result, calls) = measure(&[1000.0, 5.0, 6.0, 7.0]);
+        assert_eq!(calls[0], ZKOP_MIX_WARMUP_ITERATIONS);
+        assert_eq!(result.unwrap().duration_secs, 6.0);
+    }
+
+    #[test]
+    fn a_fast_card_gets_three_runs_and_a_slow_outlier_is_ignored() {
+        let (result, calls) = measure(&[1.0, 18.0, 24.7, 18.1]);
+        assert_eq!(calls.len(), 4);
+        assert_eq!(result.unwrap().duration_secs, 18.1);
+    }
+
+    #[test]
+    fn a_slow_card_stops_after_one_run() {
+        let (result, calls) = measure(&[10.0, 157.0, 157.0, 157.0]);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(result.unwrap().duration_secs, 157.0);
+    }
+
+    #[test]
+    fn two_runs_report_their_midpoint() {
+        let (result, calls) = measure(&[4.0, 33.0, 35.0, 40.0]);
+        assert_eq!(calls.len(), 3);
+        let entry = result.unwrap();
+        assert_eq!(entry.duration_secs, 34.0);
+        assert_eq!(entry.throughput, ZKOP_MIX_SP1_CYCLES as f64 / 34.0);
+    }
+
+    #[test]
+    fn a_failed_proof_produces_no_score() {
+        assert!(measure(&[1.0, 18.0]).0.is_none());
+    }
+
+    #[test]
+    fn a_zkop_is_one_sp1_cycle_of_the_program() {
+        assert_eq!(zkops_from_stark_secs(10.0), ZKOP_MIX_SP1_CYCLES as f64 / 10.0);
+        assert_eq!(zkops_from_stark_secs(0.0), 0.0);
+        assert_eq!(zkops_from_stark_secs(f64::NAN), 0.0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     /// The tier must never select a configuration whose MEASURED peak does not fit, and never exceed
     /// the fork's default, which it is only allowed to cap.
@@ -1104,25 +1368,29 @@ mod tests {
         const GIB: u64 = 1024 * 1024 * 1024;
         const FULL_DEFAULT: u64 = 402_653_184;
 
-        // An empty 4090 has room for the 268M configuration (17,766 MiB + margin).
+        // An empty 4090 has room for the 268M configuration (v6.1.0: 11,542 MiB + margin = 12,512).
         assert_eq!(tier(24 * GIB), Some(268_435_456));
-        // 16 GiB free steps down to 134M, whose 15,092 MiB peak fits.
-        assert_eq!(tier(16 * GIB), Some(134_217_728));
+        // 16 GiB free now also fits 268M — v6.1.0 shrank it to fit a 16 GiB card, where v6.0.0's
+        // 17,766 MiB did not.
+        assert_eq!(tier(16 * GIB), Some(268_435_456));
 
-        // THE REGRESSION THIS GUARDS. SP1's own rule — `ceil(gib) + 4 > 20` — takes the 268M tier from
-        // 16.4 GiB upward, but that tier peaks at 17,766 MiB. Everything in that band must step down,
-        // or we commit to a configuration that cannot fit and fail part-way through a claimed job.
-        for mib in [16_500u64, 17_000, 17_500, 18_000, 18_277] {
+        // THE REGRESSION THIS GUARDS: a card with room for 134M but not 268M must step down, not
+        // commit to a configuration that cannot fit and fail part-way through a claimed job. On
+        // v6.1.0 that band is [134M's 10,012 MiB, 268M's 12,512 MiB).
+        for mib in [10_100u64, 11_000, 12_000, 12_511] {
             assert_eq!(
                 tier(mib * MIB),
                 Some(134_217_728),
-                "{mib} MiB free must take the 134M tier: 268M peaks at 17,766 MiB and will not fit"
+                "{mib} MiB free must take the 134M tier: 268M needs 12,512 MiB and will not fit"
             );
         }
-        // Just above the 268M peak plus margin, it may step back up.
-        assert_eq!(tier(18_278 * MIB), Some(268_435_456));
+        // At the 268M requirement it steps back up.
+        assert_eq!(tier(12_512 * MIB), Some(268_435_456));
 
-        // Below the smallest measured configuration there is nothing to offer.
+        // 134M now fits a 12 GiB card; one MiB below its 10,012 requirement there is nothing to offer.
+        assert_eq!(tier(12 * GIB), Some(134_217_728));
+        assert_eq!(tier(10_012 * MIB), Some(134_217_728));
+        assert_eq!(tier(10_011 * MIB), None);
         assert_eq!(tier(8 * GIB), None);
         assert_eq!(tier(0), None);
 
@@ -1212,7 +1480,9 @@ mod tests {
         // The two bounds combine as the smaller; neither present means the fork decides.
         assert_eq!(cap(1.0, Some(24 * GIB)), Some(268_435_456));
         assert_eq!(cap(0.6, Some(24 * GIB)), Some(134_217_728));
-        assert_eq!(cap(0.8, Some(16 * GIB)), Some(134_217_728));
+        // 16 GiB free fits 268M on v6.1.0, and the 0.8 host scale also allows 268M, so neither bound
+        // lowers it.
+        assert_eq!(cap(0.8, Some(16 * GIB)), Some(268_435_456));
         // Too little free for any measured tier still bounds it — to the smallest, never to nothing,
         // which would hand a 24 GB card back to the fork's 402M.
         assert_eq!(cap(1.0, Some(8 * GIB)), Some(134_217_728));

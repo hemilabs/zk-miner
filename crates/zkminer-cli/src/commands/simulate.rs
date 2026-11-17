@@ -29,7 +29,7 @@
 //!    run to the proven one: the chain never checks the input, so a requester who is also the prover can
 //!    prove another input with the same journal, and choose a count up to `--max-cycles`.
 //!
-//! risc0 guests' `sys_rand` is seeded by the public rule zkminer's proofs use from protocol 12
+//! risc0 guests' `sys_rand` is seeded by the public rule zkminer's proofs use from protocol 13
 //! (`zkminer_prover_protocol::sys_rand`), so this run takes the path such a proof took, up to the
 //! segment size: the count is the cost of that run at the size the report names. A prover on other software, or a job
 //! proven before the rule, was seeded otherwise; the proof does not bind it.

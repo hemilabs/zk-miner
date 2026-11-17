@@ -17,11 +17,16 @@
 //! still held at least 1 GiB of its own — so a run where nothing needed recycling cannot pass
 //! vacuously.
 //!
-//! Assumes nothing else on the card: on the 5080 SP1's smallest tier leaves only 276 MiB to spare
-//! (15,880 MiB allocatable against 15,604), so a desktop session fails the SP1 step for reasons that
-//! have nothing to do with this fix. The 4090 step assumes a host budget that allows the 268M tier
-//! (at least 21⅓ GiB, two thirds of the 32 GiB reference), which is what makes its idle risc0 worker
-//! stand in the way.
+//! A card with more room than that is first made to look like a 16 GB one: a separate process, not
+//! ours, holds device memory until what is allocatable is SP1's floor plus 1.5 GiB (or
+//! `ZKMINER_TEST_VRAM_TARGET_MIB`), whatever else the card already carries. To the miner it is
+//! foreign, like a display or another program, so nothing can reclaim it; on a 32 GB card the idle risc0
+//! worker would otherwise never stand in SP1's way and the run could not exercise the fix. A card
+//! already that tight is used as it is: on the 5080 SP1's smallest tier leaves only 276 MiB to spare
+//! (15,880 MiB allocatable against 15,604), so there a desktop session fails the SP1 step for reasons
+//! that have nothing to do with this fix. The 4090 step assumes a host budget that allows the 268M
+//! tier (at least 21⅓ GiB, two thirds of the 32 GiB reference), which is what makes its idle risc0
+//! worker stand in the way.
 //!
 //! `#[ignore]`d — real GPU proofs. `ZKMINER_TEST_CARD` picks the card (default 0); both backends must
 //! have a slot on it. Run with:
@@ -76,6 +81,32 @@ fn risc0_and_sp1_alternate_on_one_card() {
 
     let card = std::env::var("ZKMINER_TEST_CARD").unwrap_or_else(|_| "0".into());
     let (risc0, sp1) = (format!("risc0:cuda:{card}"), format!("sp1:cuda:{card}"));
+
+    // Before any worker exists, so each is sized for the card as it will be.
+    let floor_mib = zkminer_prover::discovery::min_available_vram_bytes_for_backend("sp1")
+        .expect("sp1 must require free VRAM for this test to mean anything")
+        >> 20;
+    let target_mib = std::env::var("ZKMINER_TEST_VRAM_TARGET_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(floor_mib + 1536);
+    let _ballast = match allocatable_mib(&card) {
+        Some(allocatable) if allocatable >= target_mib + 1024 => {
+            let ballast = Ballast::start(&card, allocatable - target_mib);
+            eprintln!(
+                "RESULT card {card}: {allocatable} MiB allocatable; ballast holds {} MiB of it, \
+                 leaving ~{} MiB against SP1's {floor_mib} MiB floor",
+                ballast.held_mib,
+                allocatable - ballast.held_mib
+            );
+            Some(ballast)
+        }
+        allocatable => {
+            eprintln!("RESULT card {card}: {allocatable:?} MiB allocatable; no ballast");
+            None
+        }
+    };
+
     let mut pool = WorkerPool::new(HashMap::new(), vec![], Some(Duration::from_secs(900)));
     let connected = pool.discover_and_spawn();
     if !connected.contains(&risc0) || !connected.contains(&sp1) {
@@ -187,5 +218,198 @@ fn risc0_and_sp1_alternate_on_one_card() {
              exercise making room for risc0",
             held_by_sp1 >> 20
         );
+    }
+}
+
+/// What the card has free to allocate, in MiB: its capacity less the driver's reservation and
+/// everything in use.
+fn allocatable_mib(card: &str) -> Option<u64> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            "-i",
+            card,
+            "--query-gpu=memory.total,memory.reserved,memory.used",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    let row = String::from_utf8_lossy(&out.stdout);
+    let mut f = row.trim().split(',').map(|v| v.trim().parse::<u64>().ok());
+    let (total, reserved, used) = (f.next()??, f.next()?.unwrap_or(0), f.next()??);
+    Some(total.saturating_sub(reserved).saturating_sub(used))
+}
+
+const BALLAST_MIB_ENV: &str = "ZKMINER_TEST_VRAM_BALLAST_MIB";
+const BALLAST_CARD_ENV: &str = "ZKMINER_TEST_VRAM_BALLAST_CARD";
+const BALLAST_REPORT_ENV: &str = "ZKMINER_TEST_VRAM_BALLAST_REPORT";
+
+/// Device memory held by a process that is not ours, for as long as this lives.
+///
+/// Started detached, so it is not a descendant of the test process: one of ours would be credited to
+/// us (`attribute_pid`), and what this stands in for is memory the miner cannot reclaim. It runs this
+/// test binary's `vram_ballast_process`.
+struct Ballast {
+    pid: u32,
+    held_mib: u64,
+}
+
+impl Ballast {
+    fn start(card: &str, mib: u64) -> Self {
+        let report =
+            std::env::temp_dir().join(format!("zkminer-vram-ballast-{}", std::process::id()));
+        let _ = std::fs::remove_file(&report);
+        let exe = std::env::current_exe().unwrap();
+        let args = [
+            "--exact",
+            "vram_ballast_process",
+            "--ignored",
+            "--test-threads=1",
+        ];
+        #[cfg(windows)]
+        let mut launcher = {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "start", "", "/B"]).arg(&exe).args(args);
+            c
+        };
+        #[cfg(unix)]
+        let mut launcher = {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", r#""$0" "$@" >/dev/null 2>&1 &"#])
+                .arg(&exe)
+                .args(args);
+            c
+        };
+        let status = launcher
+            .env(BALLAST_MIB_ENV, mib.to_string())
+            .env(BALLAST_CARD_ENV, card)
+            .env(BALLAST_REPORT_ENV, &report)
+            // CUDA ordinals in nvidia-smi's order, and every card visible to it.
+            .env("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+            .env_remove("CUDA_VISIBLE_DEVICES")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("launch the VRAM ballast");
+        assert!(status.success(), "VRAM ballast launcher: {status}");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some((pid, held_mib)) = std::fs::read_to_string(&report).ok().and_then(|r| {
+                let (pid, held) = r.trim().split_once(' ')?;
+                Some((pid.parse().ok()?, held.parse().ok()?))
+            }) {
+                let _ = std::fs::remove_file(&report);
+                return Ballast { pid, held_mib };
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the VRAM ballast never reported holding its memory"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+impl Drop for Ballast {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &self.pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .status();
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(self.pid as i32, libc::SIGKILL);
+        }
+    }
+}
+
+/// The ballast itself: holds the asked-for device memory, reports it, and waits to be killed. Exits
+/// on its own after 30 minutes in case its owner died first. Does nothing when run any other way.
+#[test]
+#[ignore = "helper process for risc0_and_sp1_alternate_on_one_card"]
+fn vram_ballast_process() {
+    let (Some(mib), Some(card), Some(report)) = (
+        std::env::var(BALLAST_MIB_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok()),
+        std::env::var(BALLAST_CARD_ENV)
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok()),
+        std::env::var_os(BALLAST_REPORT_ENV),
+    ) else {
+        return;
+    };
+    let held = cuda_driver::hold(card, mib).expect("hold device memory");
+    std::fs::write(report, format!("{} {held}", std::process::id())).unwrap();
+    std::thread::sleep(Duration::from_secs(30 * 60));
+}
+
+/// Just enough of the CUDA driver API, loaded at run time, to hold device memory.
+mod cuda_driver {
+    use std::ffi::c_void;
+
+    type CuInit = unsafe extern "system" fn(u32) -> i32;
+    type CuDeviceGet = unsafe extern "system" fn(*mut i32, i32) -> i32;
+    type CuCtxCreate = unsafe extern "system" fn(*mut *mut c_void, u32, i32) -> i32;
+    type CuMemAlloc = unsafe extern "system" fn(*mut u64, usize) -> i32;
+    type CuMemsetD8 = unsafe extern "system" fn(u64, u8, usize) -> i32;
+
+    #[cfg(windows)]
+    fn symbol(name: &str) -> Option<*mut c_void> {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryA(name: *const u8) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        }
+        let lib = unsafe { LoadLibraryA(b"nvcuda.dll\0".as_ptr()) };
+        let name = format!("{name}\0");
+        let f = (!lib.is_null()).then(|| unsafe { GetProcAddress(lib, name.as_ptr()) })?;
+        (!f.is_null()).then_some(f)
+    }
+
+    #[cfg(unix)]
+    fn symbol(name: &str) -> Option<*mut c_void> {
+        let lib = unsafe { libc::dlopen(c"libcuda.so.1".as_ptr(), libc::RTLD_NOW) };
+        let name = std::ffi::CString::new(name).ok()?;
+        let f = (!lib.is_null()).then(|| unsafe { libc::dlsym(lib, name.as_ptr()) })?;
+        (!f.is_null()).then_some(f)
+    }
+
+    /// Allocates up to `mib` MiB on device `ordinal` in 256 MiB pieces and writes to all of it, so it
+    /// is resident and in `memory.used`. Returns how much it holds; it stays held until the process
+    /// exits.
+    pub fn hold(ordinal: i32, mib: u64) -> Result<u64, String> {
+        const PIECE_MIB: u64 = 256;
+        let get = |name| symbol(name).ok_or_else(|| format!("CUDA driver has no {name}"));
+        unsafe {
+            let init: CuInit = std::mem::transmute(get("cuInit")?);
+            let device_get: CuDeviceGet = std::mem::transmute(get("cuDeviceGet")?);
+            let ctx_create: CuCtxCreate = std::mem::transmute(get("cuCtxCreate_v2")?);
+            let mem_alloc: CuMemAlloc = std::mem::transmute(get("cuMemAlloc_v2")?);
+            let memset: CuMemsetD8 = std::mem::transmute(get("cuMemsetD8_v2")?);
+            let check = |what: &str, r: i32| {
+                (r == 0)
+                    .then_some(())
+                    .ok_or_else(|| format!("{what}: CUDA error {r}"))
+            };
+            check("cuInit", init(0))?;
+            let mut device = 0;
+            check("cuDeviceGet", device_get(&mut device, ordinal))?;
+            let mut ctx = std::ptr::null_mut();
+            check("cuCtxCreate", ctx_create(&mut ctx, 0, device))?;
+            let mut held = 0;
+            while held + PIECE_MIB <= mib {
+                let bytes = (PIECE_MIB << 20) as usize;
+                let mut ptr = 0u64;
+                if mem_alloc(&mut ptr, bytes) != 0 {
+                    break;
+                }
+                check("cuMemsetD8", memset(ptr, 0xa5, bytes))?;
+                held += PIECE_MIB;
+            }
+            Ok(held)
+        }
     }
 }

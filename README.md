@@ -32,10 +32,10 @@ export PATH="$HOME/.risc0/bin:$PATH"
 rzup install rust
 ```
 
-Running needs RISC Zero's `risc0-groth16` component (the Groth16 proving key, 5 GB), but not
+Running needs RISC Zero's `risc0-groth16` component (the Groth16 proving key, 5.8 GB), but not
 `rzup`: the risc0 worker installs it in its one-time setup, before the miner claims any risc0 job,
-when `~/.risc0/extensions/v0.1.0-risc0-groth16` (or `RISC0_GROTH16_DIR`) does not hold it. It
-downloads the 2.3 GB archive rzup itself uses from RISC Zero's artifact store and checks its
+when `~/.risc0/extensions/v0.2.0-risc0-groth16` (or `RISC0_GROTH16_DIR`) does not hold it. It
+downloads the 2.4 GB archive rzup itself uses from RISC Zero's artifact store and checks its
 SHA-256 (`crates/zkminer-prove-risc0/src/groth16_component.rs`). `rzup install risc0-groth16`
 installs the same files.
 
@@ -208,7 +208,10 @@ against the deployment you intend to use** before running against a live market.
 chain zkminer knows (743111), `run` checks the addresses, their wiring and their code
 against the live deployment; a mismatch starts the miner without claiming anything (it
 still drives locks it already holds) and logs a `PAGE:` line naming the difference, so
-fix `[contracts]` and restart.
+fix `[contracts]` and restart. On 743111 the live deployment is the 2026-11-16 one (router
+`0xD931725db336B57dBB9A3123F2238A4FE3c6Ed58`, risc0 3.1 verifier); a config written for the
+2026-10-29 stack (router `0xE1a492Dc…470e`) names an abandoned deployment, so rewrite it with
+`zkminer init --network testnet --force`.
 
 ## Run
 
@@ -248,6 +251,9 @@ stderr, so `zkminer benchmark --json` on stdout stays machine-readable.
 
 Worth knowing:
 
+- **The miner benchmarks itself at startup when it has to.** If the saved results don't cover
+  every card and prover it started, `zkminer run` benchmarks the GPUs, shows the results on the
+  Benchmark screen, and claims no jobs until that finishes. `--watch-only` skips it.
 - **Don't run `benchmark` while the miner is running.** Both spawn a worker per GPU and
   the GPU lock is per-process, so they will double-book VRAM.
 - **If the miner sits idle with jobs available, suspect collateral.** Available
@@ -278,8 +284,8 @@ Worth knowing:
   something else, and that lock is released at the job's release penalty (5% by default). So for such a release let the locks finish first
   (SIGINT, and wait), not SIGINT then SIGKILL. A restart that finds such a lock says so on a `PAGE:` line.
 - **Escape hatches, for after you've checked by hand:** `ZKMINER_SKIP_CODE_PINS=1` skips
-  the audited-code checks (router, Staking, Registry, facets, and the risc0 adapter and
-  verifier), `ZKMINER_ALLOW_UNKNOWN_DEPLOYMENT=1` accepts contract addresses that aren't
+  the audited-code checks (router, Staking, Registry, facets, and the risc0 and SP1 adapters
+  and verifiers), `ZKMINER_ALLOW_UNKNOWN_DEPLOYMENT=1` accepts contract addresses that aren't
   the known deployment's, `ZKMINER_RISC0_SKIP_PROGRAM_ID_CHECK=1` proves an ELF whose image
   id isn't the job's program id. Each one turns off a guard against losing collateral.
 - **Rebuild every worker with the miner.** A worker built for another protocol version is

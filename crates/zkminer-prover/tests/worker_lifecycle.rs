@@ -6,7 +6,7 @@
 //! - `MOCK_CRASH_ON`: exit(1) on "benchmark", "prove", or "both"
 //!
 //! Run with: `cargo test -p zkminer-prover --features testing --test worker_lifecycle`
-#![cfg(all(unix, feature = "testing"))]
+#![cfg(feature = "testing")]
 
 use std::collections::HashMap;
 use std::path::PathBuf;

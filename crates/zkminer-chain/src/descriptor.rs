@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(compute_descriptor_hash(&d), keccak256(&reference_encoded));
     }
 
-    /// The c8333aa Solidity test suite's pinned vector (test/utils/SP1PlonkNonceScenario.sol, asserted
+    /// The 3bc441d Solidity test suite's pinned vector (test/utils/SP1PlonkNonceScenario.sol, asserted
     /// in test/integration/SP1PlonkProofs.t.sol `test_scenario_pinnedDerivations`): an SP1 PLONK job
     /// with a FULL expectedJournalHash AND the proof-nonce marker in journalFields slot 0. The
     /// expected values were produced by the deployed contracts' own code (and re-derived independently

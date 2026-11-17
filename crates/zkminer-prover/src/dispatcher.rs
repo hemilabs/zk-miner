@@ -56,12 +56,33 @@ pub struct BenchmarkProgressEvent {
     pub pci_bus_id: Option<String>,
     /// GPU tag: "cuda", "rocm", "generic"
     pub gpu_tag: String,
-    /// The benchmark entry that just completed
-    pub entry: zkminer_prover_protocol::BenchmarkEntry,
-    /// 1-based program index
-    pub program_index: u32,
-    /// Total programs in suite
-    pub total_programs: u32,
+    /// What just happened on this slot.
+    pub kind: BenchmarkProgressKind,
+}
+
+/// The stages of one slot's benchmark, in the order they are reported.
+#[derive(Debug, Clone)]
+pub enum BenchmarkProgressKind {
+    /// This slot will run. Every slot is announced before the first one starts, so a progress view
+    /// knows the whole queue rather than discovering cards as their first results arrive.
+    Queued,
+    /// This slot is now running. Sent before its setup, which on SP1 is a long wait, and its warm-up
+    /// proof: the slot is warming up until `WarmedUp`.
+    Started,
+    /// The slot's warm-up proof is done (whether or not it proved; its result is never reported) and
+    /// the suite's first program is starting.
+    WarmedUp,
+    /// One program finished on this slot.
+    ProgramDone {
+        /// The benchmark entry that just completed
+        entry: zkminer_prover_protocol::BenchmarkEntry,
+        /// 1-based program index
+        program_index: u32,
+        /// Total programs in suite
+        total_programs: u32,
+    },
+    /// This slot is finished. `succeeded` is false when it produced no results.
+    Finished { succeeded: bool },
 }
 
 /// What a pre-claim `Execute` measured (see [`WorkerPool::execute_cycles`]).
@@ -131,7 +152,7 @@ fn whole_journal(journal: Option<Vec<u8>>, journal_len: u64) -> Option<Vec<u8>> 
 use anyhow::{bail, Result};
 use zkminer_prover_protocol::{BenchmarkEntry, ErrorKind, WorkerCommand, WorkerResponse};
 
-use crate::discovery::{discover_workers, DiscoveredWorker};
+use crate::discovery::{discover_workers_reporting, DiscoveredWorker};
 use crate::engine::ProofOutput;
 use crate::worker::{WorkerDied, WorkerHandle};
 
@@ -575,6 +596,21 @@ impl ProvingWatchdog {
                                 );
                             }
                         }
+                        // Windows has no process groups; the worker itself is terminated, under the
+                        // same identity check (see `memory::terminate_if_our_worker`).
+                        #[cfg(windows)]
+                        {
+                            let expected_start = starttime_ref.load(Ordering::Acquire);
+                            if !crate::memory::terminate_if_our_worker(
+                                current_pid,
+                                (expected_start != 0).then_some(expected_start),
+                            ) {
+                                tracing::warn!(
+                                    "not killing PID {current_pid} for {slot_key}: it is no longer \
+                                     our worker (exited, and the number may have been reused)"
+                                );
+                            }
+                        }
                     }
                 })
                 .ok()
@@ -645,6 +681,10 @@ fn gpu_vram_bytes(
         return amd_vram_bytes(pci_bus_id?);
     }
     if gpu_tag == "intel" {
+        // Windows has no xe query: the size comes from the adapter's driver key (discovery).
+        if cfg!(windows) {
+            return crate::discovery::intel_vram_bytes(idx);
+        }
         // The xe driver's own count of the card's device memory (sysfs has none): see
         // `discovery::intel_vram`. Unknown on i915, which keeps the unsized behaviour.
         return crate::discovery::intel_vram(pci_bus_id?).map(|(total, _)| total);
@@ -690,6 +730,10 @@ const ROCM_SCRATCH_LIMIT_FALLBACK: u64 = 16 * 1024 * 1024 * 1024;
 
 /// An AMD card's total VRAM in bytes, from the amdgpu driver's sysfs entry for its PCI bus id.
 fn amd_vram_bytes(pci_bus_id: &str) -> Option<u64> {
+    // Windows has no amdgpu sysfs: the size the HIP runtime reported at discovery.
+    if cfg!(windows) {
+        return crate::discovery::amd_hip_vram_bytes(pci_bus_id);
+    }
     amd_mem_info(pci_bus_id, "vram_total").filter(|v| *v > 0)
 }
 
@@ -841,12 +885,21 @@ enum PidOwner {
 }
 
 /// Parent pid of `pid` from `/proc`, or `None` when the process is gone or there is no `/proc`.
+#[cfg(not(windows))]
 fn proc_parent(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     match crate::memory::parent_of_stat(&stat)? {
         ppid if ppid > 0 => Some(ppid as u32),
         _ => None,
     }
+}
+
+/// Parent pid of `pid`, or `None` when the process is gone or its parent cannot be confirmed (see
+/// `memory::parent_pid`). Without it nothing on a card attributes to a slot, so our own warm
+/// `sp1-gpu-server` read as foreign and its slot refused its own next proof.
+#[cfg(windows)]
+fn proc_parent(pid: u32) -> Option<u32> {
+    crate::memory::parent_pid(pid)
 }
 
 /// Walk `pid`'s parent chain to find whose it is.
@@ -1098,11 +1151,12 @@ fn apps_we_can_attribute(
 /// `slot_pids` maps each live worker's PUBLISHED pid to its slot key. With an empty map, everything of
 /// ours reads as `unattributed` (or `draining`) — still ours, never foreign.
 ///
-/// Also `None` when a context of OURS is on the card but the driver will not say how much it holds —
-/// every process under Windows' WDDM reports "[N/A]". Its memory is then inside `memory.used` with no
-/// way to credit it, so our own warm worker would read as somebody else's and its slot would refuse
-/// its own next proof, indefinitely, telling the operator to close a process that is ours. No opinion
-/// is the honest answer, as for any other unreadable card.
+/// Also `None` when a context of OURS is on the card but the driver will not say how much it holds.
+/// Its memory is then inside `memory.used` with no way to credit it, so our own warm worker would read
+/// as somebody else's and its slot would refuse its own next proof, indefinitely, telling the operator
+/// to close a process that is ours. No opinion is the honest answer, as for any other unreadable card.
+/// Windows' WDDM reports "[N/A]" for every process, so there the figures come from Windows' own
+/// per-process accounting instead (`windows_gpu_memory`).
 fn read_card_occupancy(
     device_index: u32,
     slot_pids: &HashMap<u32, String>,
@@ -1126,6 +1180,8 @@ fn read_card_occupancy(
     let apps = nvidia_smi_query("--query-compute-apps=pid,used_gpu_memory", device_index)
         .map(|out| parse_compute_apps(&out))
         .unwrap_or_default();
+    #[cfg(windows)]
+    let apps = crate::windows_gpu_memory::fill_unreported(apps);
     let miner = std::process::id();
     let retired = retired_groups();
     let owner = |pid: u32| owner_of(pid, miner, slot_pids, &retired);
@@ -1813,9 +1869,33 @@ pub struct WorkerPool {
     /// When set, `discover_and_spawn` starts workers for these backends only (see
     /// [`Self::only_backends`]).
     only_backends: Option<HashSet<String>>,
+    /// Told what `discover_and_spawn` is doing, for a startup display.
+    progress: Option<Box<dyn Fn(String) + Send + Sync>>,
     /// When set, `discover_and_spawn` starts the dedicated measure pools only, and no prove worker
     /// (see [`Self::measure_only`]).
     measure_only: bool,
+    /// Why workers could not start, in words for the operator. See [`Self::startup_problems`].
+    startup_problems: Vec<String>,
+    /// What each slot's one-time setup is doing now, by slot key. See [`Self::setup_status`].
+    setup_status: Mutex<HashMap<String, zkminer_prover_protocol::SetupStep>>,
+}
+
+/// What `WorkerPool::run_benchmark_requests` got from a worker.
+struct BenchmarkRequests {
+    results: Result<Vec<BenchmarkEntry>>,
+    /// The worker stopped answering (its pipe broke, or the watchdog killed it), so its slot must
+    /// be marked. `results` can still hold the programs' rows, when it was the scoring that broke.
+    broken: bool,
+}
+
+/// A zkVM's name as an operator knows it.
+fn zkvm_label(backend: &str) -> &str {
+    match backend {
+        zkminer_prover_protocol::BACKEND_RISC0 => "RISC Zero",
+        zkminer_prover_protocol::BACKEND_SP1 => "SP1",
+        zkminer_prover_protocol::BACKEND_OPENVM => "OpenVM",
+        other => other,
+    }
 }
 
 /// Round-robin counter for load balancing across multiple GPU workers.
@@ -1872,7 +1952,76 @@ impl WorkerPool {
             shm_ledger: crate::memory::MemoryLedger::default(),
             inflight_measures: Mutex::new(HashMap::new()),
             only_backends: None,
+            progress: None,
             measure_only: false,
+            startup_problems: Vec::new(),
+            setup_status: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Calls `report` with a short description of each step `discover_and_spawn` starts.
+    pub fn set_progress(&mut self, report: impl Fn(String) + Send + Sync + 'static) {
+        self.progress = Some(Box::new(report));
+    }
+
+    /// Why workers could not start in `discover_and_spawn`, in words for the operator: without
+    /// this a card missing a zkVM has no explanation outside the log file.
+    pub fn startup_problems(&self) -> &[String] {
+        &self.startup_problems
+    }
+
+    /// What `key`'s one-time setup is doing now, if it is in one. Falls back to any slot of the same
+    /// backend: the setup is per host, so one slot does it while the others wait for it, and it may
+    /// be running on a background thread rather than for the caller.
+    pub fn setup_status(&self, key: &str) -> Option<zkminer_prover_protocol::SetupStep> {
+        let statuses = self.setup_status.lock().unwrap_or_else(|e| e.into_inner());
+        let backend = key.split(':').next().unwrap_or(key);
+        statuses.get(key).cloned().or_else(|| {
+            statuses
+                .iter()
+                .find(|(k, _)| k.split(':').next() == Some(backend))
+                .map(|(_, status)| status.clone())
+        })
+    }
+
+    fn set_setup_status(&self, key: &str, status: Option<zkminer_prover_protocol::SetupStep>) {
+        let mut statuses = self.setup_status.lock().unwrap_or_else(|e| e.into_inner());
+        match status {
+            Some(status) => statuses.insert(key.to_string(), status),
+            None => statuses.remove(key),
+        };
+    }
+
+    /// The (backend, card name) of each prove worker that is running, sorted.
+    pub fn started_provers(&self) -> Vec<(String, Option<String>)> {
+        let mut provers: Vec<_> = self
+            .workers
+            .iter()
+            .filter_map(|(key, entry)| {
+                let slot = entry.slot.try_lock().ok()?;
+                slot.handle.as_ref()?;
+                let backend = key.split(':').next().unwrap_or(key).to_string();
+                Some((backend, slot.gpu_name.clone()))
+            })
+            .collect();
+        provers.sort();
+        provers
+    }
+
+    /// Records that a `backend` measure worker did not start, unless that zkVM's prove worker
+    /// already explains it: both fail for the same reasons.
+    fn note_measure_problem(&mut self, backend: &str, e: &anyhow::Error) {
+        let zkvm = zkvm_label(backend);
+        if !self.startup_problems.iter().any(|p| p.starts_with(zkvm)) {
+            self.startup_problems.push(format!(
+                "{zkvm} cycle-measuring worker could not start: {e:#}"
+            ));
+        }
+    }
+
+    fn report_progress(&self, text: String) {
+        if let Some(report) = &self.progress {
+            report(text);
         }
     }
 
@@ -2082,6 +2231,16 @@ impl WorkerPool {
                         env.insert("ONEAPI_DEVICE_SELECTOR".into(), "level_zero:*".into());
                     }
                 }
+                // On Windows, the card's capacity, as for CUDA above: the risc0 worker keeps its
+                // Groth16 proving key cached on the GPU between proofs only on a card it knows has
+                // room (`release_groth16_cache_if_tight`).
+                #[cfg(windows)]
+                if let Some(vram) = gpu_vram_bytes(gpu_tag, device_index, pci_bus_id) {
+                    env.insert(
+                        zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
+                        vram.to_string(),
+                    );
+                }
             }
             _ => {}
         }
@@ -2137,7 +2296,10 @@ impl WorkerPool {
     /// Discover and spawn all available worker binaries.
     /// Returns the list of compound keys that were successfully connected.
     pub fn discover_and_spawn(&mut self) -> Vec<String> {
-        let mut discovered = discover_workers(&self.explicit_binaries, &self.search_dirs);
+        let mut discovered =
+            discover_workers_reporting(&self.explicit_binaries, &self.search_dirs, &|text| {
+                self.report_progress(text.to_string())
+            });
         if let Some(only) = &self.only_backends {
             discovered.retain(|w| only.contains(&w.backend));
         }
@@ -2170,6 +2332,10 @@ impl WorkerPool {
                 // Only the binary path is wanted: the measure pools below are spawned from it.
                 continue;
             }
+            self.report_progress(match &gpu_name {
+                Some(gpu) => format!("Starting the {backend} prover on {gpu}"),
+                None => format!("Starting the {backend} prover"),
+            });
             let key = slot_key(&backend, &gpu_tag, device_index);
             let env = Self::gpu_env(&backend, &gpu_tag, pci_bus_id.as_deref(), device_index);
 
@@ -2391,6 +2557,12 @@ impl WorkerPool {
                     } else {
                         tracing::error!("Failed to start worker {key}{device_desc}: {msg}");
                     }
+                    self.startup_problems.push(format!(
+                        "{} could not start on {}: {}",
+                        zkvm_label(&backend),
+                        gpu_name.as_deref().unwrap_or("this machine"),
+                        msg.lines().next().unwrap_or_default(),
+                    ));
                     let vram_bytes = gpu_vram_bytes(&gpu_tag, device_index, pci_bus_id.as_deref());
                     let entry_bus_id = pci_bus_id.clone().filter(|b| !b.is_empty());
                     self.workers.insert(
@@ -2439,6 +2611,7 @@ impl WorkerPool {
         // /dev/shm — must NOT be collateral-skipped by that, or risc0 would silently fall back to the
         // measure-kills-warm-prover in-process path on small-/dev/shm hosts.
         if let Some(path) = risc0_measure_path {
+            self.report_progress("Starting the risc0 cycle-measuring workers".to_string());
             let backend = zkminer_prover_protocol::BACKEND_RISC0.to_string();
             // Default 2 (like SP1): a single measure worker lets one slow/stuck ~120 s measurement
             // serialize ALL risc0 sizing until its watchdog fires. A POOL keeps a second measurement
@@ -2495,6 +2668,7 @@ impl WorkerPool {
                             // keep risc0 on the dedicated pool and let `ensure_alive` revive it, exactly
                             // like the SP1 spawn-failure path.
                             tracing::error!("Failed to start risc0 measure worker {mkey}: {e:#}");
+                            self.note_measure_problem(zkminer_prover_protocol::BACKEND_RISC0, &e);
                             (None, 0u32, 0u64, 1u32, Some(Instant::now()))
                         }
                     };
@@ -2536,6 +2710,7 @@ impl WorkerPool {
         // multi-threaded tokio runtime), and they run concurrent CPU executions alongside GPU proofs;
         // host-RAM admission on the measure path (added separately) bounds the aggregate.
         if let Some(path) = sp1_measure_path {
+            self.report_progress("Starting the sp1 cycle-measuring workers".to_string());
             // Layer-B /dev/shm guard (locked #3). The SP1 native executor stages its trace ring and
             // memory image in /dev/shm; a tmpfs too small to hold even the 2-slot (~4.4 GiB) ring
             // an `Execute` uses makes every measure SIGBUS the instant it is touched — the 64 MiB
@@ -2657,6 +2832,7 @@ impl WorkerPool {
                             // re-open the server-teardown DoS). Register a DOWN entry so `ensure_alive`
                             // can revive it later, mirroring the prove-slot spawn-failure path.
                             tracing::error!("Failed to start SP1 measure worker {mkey}: {e:#}");
+                            self.note_measure_problem(zkminer_prover_protocol::BACKEND_SP1, &e);
                             (None, 0u32, 0u64, 1u32, Some(Instant::now()))
                         }
                     };
@@ -2773,6 +2949,19 @@ impl WorkerPool {
     /// exceeded the pool on >=3-GPU rigs (over-spawning into the "all slots busy" race).
     pub fn measure_worker_count(&self, backend: &str) -> Option<usize> {
         self.measure_workers.get(backend).map(|p| p.len())
+    }
+
+    /// The (benchmark device id, backend) pair of every GPU prove worker: the rows a complete
+    /// benchmark suite has. Reads only the slot keys, so it never waits on a running proof.
+    pub fn benchmark_targets(&self) -> Vec<(String, String)> {
+        self.workers
+            .keys()
+            .filter_map(|key| {
+                let parts: Vec<&str> = key.split(':').collect();
+                (parts.len() == 3 && matches!(parts[1], "cuda" | "rocm" | "intel"))
+                    .then(|| (Self::benchmark_device_id(key), parts[0].to_string()))
+            })
+            .collect()
     }
 
     /// Runs the one-time setup of the measure worker `backend`'s next request will run on, now,
@@ -3356,7 +3545,34 @@ impl WorkerPool {
             key.to_string(),
             entry.intentional_kill.clone(),
         );
-        let response = handle.recv();
+        let mut logged_step: Option<String> = None;
+        let response = loop {
+            match handle.recv() {
+                Ok(WorkerResponse::SetupProgress {
+                    status,
+                    done_bytes,
+                    total_bytes,
+                    ..
+                }) => {
+                    // A download repeats its step every second with its bytes so far: the log
+                    // takes each step once.
+                    if logged_step.as_deref() != Some(status.as_str()) {
+                        tracing::info!("{key}: {status}");
+                        logged_step = Some(status.clone());
+                    }
+                    self.set_setup_status(
+                        key,
+                        Some(zkminer_prover_protocol::SetupStep {
+                            status,
+                            done_bytes,
+                            total_bytes,
+                        }),
+                    );
+                }
+                other => break other,
+            }
+        };
+        self.set_setup_status(key, None);
         if response.is_err() {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);
@@ -3379,6 +3595,122 @@ impl WorkerPool {
             WorkerResponse::Error { message, .. } => bail!("warm-up of {key} failed: {message}"),
             other => bail!("Unexpected response from {key} to Warmup: {other:?}"),
         }
+    }
+
+    /// Benchmarks the worker behind `handle` on the miner's suite for its zkVM
+    /// (`zkminer_prover_protocol::benchmark_suite`): the programs in one request, then the zkOP/s
+    /// scoring proofs one request each (`measure_zkop_mix`), the score's row after the programs'.
+    /// The worker proves what it is sent, so the suite changes with the miner alone.
+    ///
+    /// First a warm-up proof whose result is thrown away (`warmup_spec`), then `on_warmed`.
+    /// `on_done(row, 1-based program index, total)` counts the score as the last program. A scoring
+    /// proof that fails leaves the score out and keeps the rows.
+    fn run_benchmark_requests(
+        handle: &mut WorkerHandle,
+        key: &str,
+        on_done: &dyn Fn(&BenchmarkEntry, u32, u32),
+        on_warmed: &dyn Fn(),
+    ) -> BenchmarkRequests {
+        use zkminer_prover_protocol::{
+            benchmark_suite, measure_zkop_mix, warmup_spec, zkop_mix_spec, BACKEND_SP1,
+            BENCH_ZKOP_MIX, ZKOP_MIX_SP1_CYCLES,
+        };
+        let backend = handle.backend.clone();
+        // The worker's one-off first-proof costs land here, not on the first program's row. A
+        // warm-up that fails costs only that; the suite still runs.
+        match Self::benchmark_request(handle, vec![warmup_spec(&backend)], &|_, _, _| {}) {
+            Err(e) => {
+                return BenchmarkRequests {
+                    results: Err(e),
+                    broken: true,
+                }
+            }
+            Ok(Err(message)) => tracing::warn!("{key}: the warm-up proof failed: {message}"),
+            Ok(Ok(_)) => {}
+        }
+        on_warmed();
+        let programs = benchmark_suite(&backend);
+        let total = programs.len() as u32 + 1;
+        let mut results = match Self::benchmark_request(handle, programs, &|row, index, _| {
+            on_done(row, index, total)
+        }) {
+            Err(e) => {
+                return BenchmarkRequests {
+                    results: Err(e),
+                    broken: true,
+                }
+            }
+            Ok(Err(message)) => {
+                return BenchmarkRequests {
+                    results: Err(anyhow::anyhow!("Benchmark error from {key}: {message}")),
+                    broken: false,
+                }
+            }
+            Ok(Ok(results)) => results,
+        };
+        // A worker that proved none of the programs (or one with no guests, like the mock) has
+        // nothing to score with.
+        if results.is_empty() {
+            return BenchmarkRequests {
+                results: Ok(results),
+                broken: false,
+            };
+        }
+
+        let mut lost: Option<anyhow::Error> = None;
+        let scored = measure_zkop_mix(|iterations| {
+            let rows = vec![zkop_mix_spec(iterations)];
+            match Self::benchmark_request(handle, rows, &|_, _, _| {}) {
+                Ok(Ok(mut rows)) => rows.pop().filter(|r| r.program_name == BENCH_ZKOP_MIX),
+                Ok(Err(message)) => {
+                    tracing::error!("{key}: {BENCH_ZKOP_MIX}: {message}");
+                    None
+                }
+                Err(e) => {
+                    lost = Some(e);
+                    None
+                }
+            }
+        });
+        match scored {
+            // The score divides SP1's cycle count for this program by the proof's time, so on SP1
+            // it only means anything for the program that count was measured on.
+            Some(row) if backend == BACKEND_SP1 && row.cycles != ZKOP_MIX_SP1_CYCLES => {
+                tracing::error!(
+                    "{key}: {BENCH_ZKOP_MIX}: {} cycles where {ZKOP_MIX_SP1_CYCLES} were expected;                      not reporting a zkOP/s score",
+                    row.cycles
+                );
+            }
+            Some(row) => {
+                on_done(&row, total, total);
+                results.push(row);
+            }
+            None => match &lost {
+                Some(e) => tracing::error!(
+                    "{key}: the worker stopped answering while scoring: {e:#}; no zkOP/s score"
+                ),
+                None => tracing::error!("{key}: {BENCH_ZKOP_MIX} did not prove; no zkOP/s score"),
+            },
+        }
+        BenchmarkRequests {
+            results: Ok(results),
+            broken: lost.is_some(),
+        }
+    }
+
+    /// Sends one `Benchmark` request and waits for its answer: `Err` when the worker stopped
+    /// answering, `Ok(Err)` with its message when it answered with an error.
+    fn benchmark_request(
+        handle: &mut WorkerHandle,
+        programs: Vec<zkminer_prover_protocol::BenchmarkProgramSpec>,
+        on_progress: &dyn Fn(&BenchmarkEntry, u32, u32),
+    ) -> Result<std::result::Result<Vec<BenchmarkEntry>, String>> {
+        handle.send(&WorkerCommand::Benchmark { programs })?;
+        Ok(match handle.recv_benchmark(on_progress)? {
+            WorkerResponse::BenchmarkResult { results } => Ok(results),
+            WorkerResponse::Error { message, .. } => Err(message),
+            other => Err(format!("unexpected response {other:?}")),
+        })
     }
 
     fn benchmark_slot(&self, key: &str) -> Result<Vec<BenchmarkEntry>> {
@@ -3503,11 +3835,6 @@ impl WorkerPool {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Worker not available for {key}"))?;
 
-        if let Err(e) = handle.send(&WorkerCommand::Benchmark) {
-            Self::mark_slot_failed(&mut slot, entry);
-            return Err(e);
-        }
-
         // Start benchmark timeout watchdog if configured.
         let _watchdog = self.benchmark_timeout.map(|t| {
             ProvingWatchdog::new(
@@ -3519,23 +3846,15 @@ impl WorkerPool {
             )
         });
 
-        let bench_response = handle.recv_benchmark(&|_, _, _| {});
-
-        if let Err(ref _e) = bench_response {
+        let requests = Self::run_benchmark_requests(handle, key, &|_, _, _| {}, &|| {});
+        if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);
             } else {
                 Self::mark_slot_failed(&mut slot, entry);
             }
         }
-
-        match bench_response? {
-            WorkerResponse::BenchmarkResult { results } => Ok(results),
-            WorkerResponse::Error { message, .. } => {
-                bail!("Benchmark error from {key}: {message}")
-            }
-            other => bail!("Unexpected response from {key}: {other:?}"),
-        }
+        requests.results
     }
 
     /// Run benchmarks on a backend. Accepts logical name, vendor-level, or full compound key.
@@ -3917,11 +4236,6 @@ impl WorkerPool {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Worker not available for {key}"))?;
 
-        if let Err(e) = handle.send(&WorkerCommand::Benchmark) {
-            Self::mark_slot_failed(&mut slot, entry);
-            return Err(e);
-        }
-
         // Start benchmark timeout watchdog if configured.
         let _watchdog = self.benchmark_timeout.map(|t| {
             ProvingWatchdog::new(
@@ -3934,42 +4248,61 @@ impl WorkerPool {
         });
 
         let key_owned = key.to_string();
+        let event = |kind: BenchmarkProgressKind| BenchmarkProgressEvent {
+            slot_key: key_owned.clone(),
+            gpu_name: gpu_name.clone(),
+            device_index,
+            pci_bus_id: slot_pci_bus_id.clone(),
+            gpu_tag: gpu_tag.clone(),
+            kind,
+        };
         let cb = |entry: &zkminer_prover_protocol::BenchmarkEntry, idx: u32, total: u32| {
-            on_progress(BenchmarkProgressEvent {
-                slot_key: key_owned.clone(),
-                gpu_name: gpu_name.clone(),
-                device_index,
-                pci_bus_id: slot_pci_bus_id.clone(),
-                gpu_tag: gpu_tag.clone(),
+            on_progress(event(BenchmarkProgressKind::ProgramDone {
                 entry: entry.clone(),
                 program_index: idx,
                 total_programs: total,
-            });
+            }));
         };
+        let warmed = || on_progress(event(BenchmarkProgressKind::WarmedUp));
 
-        let bench_response = handle.recv_benchmark(&cb);
-
-        if let Err(ref _e) = bench_response {
+        let requests = Self::run_benchmark_requests(handle, key, &cb, &warmed);
+        if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);
             } else {
                 Self::mark_slot_failed(&mut slot, entry);
             }
         }
+        requests.results
+    }
 
-        match bench_response? {
-            WorkerResponse::BenchmarkResult { results } => Ok(results),
-            WorkerResponse::Error { message, .. } => {
-                bail!("Benchmark error from {key}: {message}")
-            }
-            other => bail!("Unexpected response from {key}: {other:?}"),
-        }
+    /// A progress event for `key`, carrying that slot's card details.
+    fn benchmark_event(
+        &self,
+        key: &str,
+        kind: BenchmarkProgressKind,
+    ) -> Option<BenchmarkProgressEvent> {
+        let slot = self
+            .workers
+            .get(key)?
+            .slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Some(BenchmarkProgressEvent {
+            slot_key: key.to_string(),
+            gpu_name: slot.gpu_name.clone(),
+            device_index: slot.device_index,
+            pci_bus_id: slot.pci_bus_id.clone(),
+            gpu_tag: slot.gpu_tag.clone(),
+            kind,
+        })
     }
 
     /// Run benchmarks on all connected workers with per-program streaming progress.
     ///
     /// Same as `benchmark_all_with_device_info` but sends `BenchmarkProgressEvent`
-    /// through the callback as each benchmark program completes on each GPU.
+    /// through the callback as each slot is queued, starts and finishes, and as each
+    /// benchmark program completes on each GPU.
     pub fn benchmark_all_streaming(
         &self,
         on_progress: &dyn Fn(BenchmarkProgressEvent),
@@ -4009,6 +4342,19 @@ impl WorkerPool {
             })
             .collect();
 
+        // Announce the whole queue first, applying the same skip as the loop below.
+        for key in &keys {
+            let skipped = self.workers.get(key).is_some_and(|entry| {
+                let slot = entry.slot.lock().unwrap_or_else(|e| e.into_inner());
+                slot.gpu_tag == "generic" && gpu_backends.contains(&slot.backend)
+            });
+            if !skipped {
+                if let Some(event) = self.benchmark_event(key, BenchmarkProgressKind::Queued) {
+                    on_progress(event);
+                }
+            }
+        }
+
         let mut recycled_keys: Vec<String> = Vec::new();
 
         for key in keys {
@@ -4036,7 +4382,16 @@ impl WorkerPool {
                 continue;
             }
 
+            if let Some(event) = self.benchmark_event(&key, BenchmarkProgressKind::Started) {
+                on_progress(event);
+            }
             let outcome = self.benchmark_slot_streaming(&key, on_progress);
+            let succeeded = matches!(&outcome, Ok(entries) if !entries.is_empty());
+            if let Some(event) =
+                self.benchmark_event(&key, BenchmarkProgressKind::Finished { succeeded })
+            {
+                on_progress(event);
+            }
             // See `benchmark_all_with_device_info`.
             let card_was_busy = outcome.as_ref().err().is_some_and(|e| {
                 e.downcast_ref::<zkminer_prover_protocol::types::ProofDeadlineReached>()
@@ -7874,6 +8229,12 @@ impl WorkerPool {
                                     "not killing PID {pid} for {key}: it is no longer our worker"
                                 );
                             }
+                            #[cfg(windows)]
+                            if !crate::memory::terminate_if_our_worker(pid, expected_start) {
+                                tracing::warn!(
+                                    "not killing PID {pid} for {key}: it is no longer our worker"
+                                );
+                            }
                         }
                     }
                 }
@@ -8180,6 +8541,10 @@ impl WorkerPool {
             let Some((pid, expected_start)) = entry.signal_target() else {
                 continue;
             };
+            // Unix only: Windows has no SIGTERM, so its workers are terminated in phase 3.
+            #[cfg(not(unix))]
+            let _ = (key, pid, expected_start);
+            #[cfg(unix)]
             if crate::memory::pid_is_our_worker(pid, expected_start) {
                 tracing::info!("Sending SIGTERM to worker {key} (PID {pid})");
                 // The SP1 worker has no SIGTERM handler, so its executor's cleanup is skipped by this
@@ -8217,6 +8582,9 @@ impl WorkerPool {
                     libc::kill(pid as i32, libc::SIGKILL);
                 }
             }
+            // Windows: no SIGTERM in phase 2, so survivors are every worker still running.
+            #[cfg(windows)]
+            crate::memory::terminate_if_our_worker(pid, expected_start);
         }
 
         // Brief pause for EOF to propagate through pipes
@@ -8244,6 +8612,8 @@ impl WorkerPool {
                                     libc::kill(pid as i32, libc::SIGKILL);
                                 }
                             }
+                            #[cfg(windows)]
+                            crate::memory::terminate_if_our_worker(pid, expected_start);
                         }
                         std::thread::sleep(Duration::from_millis(100));
                     }
@@ -9329,14 +9699,15 @@ mod tests {
         const MIB: u64 = 1024 * 1024;
         let (rtx4090, rtx5080) = (Some(24_564 * MIB), Some(16_303 * MIB));
         let roomy = SizingCap::Host(None);
-        let floor = Some(15_604 * MIB);
+        let floor = Some(10_012 * MIB); // v6.1.0: 134M's 9,500 + 512
         let shrank =
             |cap, assumed, now, total| vram_tier_shrank(cap, "sp1", assumed, now, total, floor);
 
         // Spawned with the whole 4090 free (268M), now 20 GiB free — still 268M: left alone.
         assert!(!shrank(roomy, Some(24 * GIB), 20 * GIB, rtx4090));
-        // Now 16 GiB free, which is the 134M tier: the live worker is sized for more than it has.
-        assert!(shrank(roomy, Some(24 * GIB), 16 * GIB, rtx4090));
+        // Now 11 GiB free — in the 134M band [10,012, 12,512) on v6.1.0: the live 268M worker is sized
+        // for more than it has.
+        assert!(shrank(roomy, Some(24 * GIB), 11 * GIB, rtx4090));
         // The other direction must never trigger a recycle: VRAM being FREED is good news, and the
         // worker is merely conservative. Growing back costs a respawn for no correctness gain.
         assert!(!shrank(roomy, Some(16 * GIB), 24 * GIB, rtx4090));
@@ -9345,15 +9716,14 @@ mod tests {
         assert!(!shrank(roomy, Some(8 * GIB), 24 * GIB, rtx4090));
         // Nothing fits now and the floor is about to refuse: a recycle buys nothing.
         assert!(!shrank(roomy, Some(24 * GIB), 8 * GIB, rtx4090));
-        // But with the floor LOWERED or DISABLED the proof will run, and a fresh worker below every
-        // tier takes the smallest: a live 268M worker must come down to it, not run at 268M on
-        // 15,178 MiB — which is what `room_needed` already assumed it would.
-        let lowered = Some(15_000 * MIB);
+        // But with the floor LOWERED or DISABLED the proof will run, and a live 268M worker must come
+        // down to the 134M tier it now fits, not stay at 268M on 11,000 MiB (in the 134M band).
+        let lowered = Some(9_000 * MIB);
         assert!(vram_tier_shrank(
             roomy,
             "sp1",
             Some(24 * GIB),
-            15_178 * MIB,
+            11_000 * MIB,
             rtx4090,
             lowered
         ));
@@ -9361,7 +9731,7 @@ mod tests {
             roomy,
             "sp1",
             Some(24 * GIB),
-            15_178 * MIB,
+            11_000 * MIB,
             rtx4090,
             None
         ));
@@ -9640,9 +10010,10 @@ mod tests {
         assert_eq!(card.available_to("sp1:cuda:0"), 14_072 * MIB);
         assert!(
             card.available_to("sp1:cuda:0")
-                < zkminer_prover_protocol::types::sp1_min_available_vram_bytes(),
-            "beside an idle risc0 worker the 5080 cannot fit SP1's smallest tier — the old \
-             all-ours credit said it could, and the proof died"
+                >= zkminer_prover_protocol::types::sp1_min_available_vram_bytes(),
+            "the available-to accounting still correctly withholds the sibling's held VRAM (14,072, \
+             not the full 15,878); on v6.1.0 that clears SP1's smallest tier (134M's 10,012), where \
+             on v6.0.0's 15,604 it did not — the point is the accounting, which is unchanged"
         );
         assert_eq!(card.available_to("risc0:cuda:0"), 15_878 * MIB);
         // What a worker is SIZED against at spawn counts our own workers as free (they make room),
@@ -9675,73 +10046,77 @@ mod tests {
         const SMALL: u64 = 134_217_728;
         const LARGE: u64 = 268_435_456;
         let (rtx5080, rtx4090) = (Some(16_303 * MIB), Some(24_564 * MIB));
-        let floor = Some(15_604 * MIB);
+        // v6.1.0 floor: the 134M tier's 9,500 MiB peak + 512 margin.
+        let floor = Some(10_012 * MIB);
         let roomy = SizingCap::Host(None);
         let this_box = SizingCap::Host(Some(LARGE)); // ~25 GiB host budget
         let room = |cap, ceiling: u64, live, floor, total| {
             room_needed(cap, "sp1", ceiling * MIB, live, floor, total)
         };
 
-        // 5080, emptied (16,303 less 423 reserved and 2 of driver overhead): 134M, 15,092 + 512.
+        // 5080, emptied: its VRAM now fits 268M (12,512), but the fork caps a 16 GiB card to 134M, so
+        // the room is 134M's 9,500 + 512.
         assert_eq!(
             room(roomy, 15_878, None, floor, rtx5080),
-            Bytes(15_604 * MIB)
+            Bytes(10_012 * MIB)
         );
-        // 4090, emptied (24,564 less 455 and 2): 268M, 17,766 + 512.
+        // 4090, emptied: 268M, now 11,542 + 512 = 12,512 on v6.1.0.
         assert_eq!(
             room(roomy, 24_107, None, floor, rtx4090),
-            Bytes(18_278 * MIB)
+            Bytes(12_512 * MIB)
         );
         assert_eq!(
             room(this_box, 24_107, None, floor, rtx4090),
-            Bytes(18_278 * MIB)
+            Bytes(12_512 * MIB)
         );
         assert_eq!(
             room(roomy, 24_107, Some(Some(LARGE)), floor, rtx4090),
-            Bytes(18_278 * MIB)
+            Bytes(12_512 * MIB)
         );
         // A live worker at the small tier never grows; making 268M of room would recycle a sibling
         // for nothing.
         assert_eq!(
             room(roomy, 24_107, Some(Some(SMALL)), floor, rtx4090),
-            Bytes(15_604 * MIB)
+            Bytes(10_012 * MIB)
         );
-        // A live worker bigger than the card now allows is resized down after this, so the room to
-        // make is the smaller tier's.
+        // A live 268M worker on a 4090 whose ceiling is 15,878: 268M now fits (12,512), so it stays —
+        // no resize down, and the room is 268M's.
         assert_eq!(
             room(roomy, 15_878, Some(Some(LARGE)), floor, rtx4090),
-            Bytes(15_604 * MIB)
+            Bytes(12_512 * MIB)
         );
         // A host that caps SP1 at 134M: the 4090 needs only the small tier's room. Targeting 268M
         // would evict risc0 on every alternation for a configuration the worker never uses.
         let host_134 = SizingCap::Host(Some(SMALL));
         assert_eq!(
             room(host_134, 24_107, None, floor, rtx4090),
-            Bytes(15_604 * MIB)
+            Bytes(10_012 * MIB)
         );
-        // Nothing fits even emptied: making room cannot help.
-        assert_eq!(room(roomy, 12 * 1024, None, floor, rtx4090), Hopeless);
+        // A 12,288 MiB ceiling now fits 134M (10,012) on v6.1.0, where on v6.0.0 nothing fit.
+        assert_eq!(room(roomy, 12 * 1024, None, floor, rtx4090), Bytes(10_012 * MIB));
 
-        // The SERVER's own tier: an operator's 268M on a 5080 runs at 134M, so 15,604 is the room —
-        // not 18,278, which the card cannot have and which made the gate give up on recycling.
+        // The SERVER's own tier: an operator's 268M on a 5080 runs at 134M (the fork's 16 GiB cap),
+        // so 10,012 is the room — not 12,512.
         let op_large = SizingCap::Operator(Some(LARGE));
         assert_eq!(
             room(op_large, 15_878, None, floor, rtx5080),
-            Bytes(15_604 * MIB)
+            Bytes(10_012 * MIB)
         );
         assert_eq!(
             room(op_large, 24_107, None, floor, rtx4090),
-            Bytes(18_278 * MIB)
+            Bytes(12_512 * MIB)
         );
-        // An operator value nothing has measured — 402M on a 4090 needs more than even 268M's
-        // 17,766 — has no requirement to aim at, so ALL the room is made, not the floor's worth.
+        // An operator value nothing has measured — 402M on a 4090 — has no requirement to aim at, so
+        // ALL the room is made, not the floor's worth.
         let op_402 = SizingCap::Operator(Some(402_653_184));
         assert_eq!(room(op_402, 24_107, None, floor, rtx4090), Unknown);
         assert_eq!(
             room(SizingCap::Operator(None), 24_107, None, floor, rtx4090),
             Unknown
         );
-        assert_eq!(room(op_402, 12 * 1024, None, floor, rtx4090), Hopeless);
+        // 402M is unmeasured, so with a 12,288 ceiling above the 10,012 floor it is Unknown, not
+        // Hopeless (nothing to aim at, but the floor is reachable).
+        assert_eq!(room(op_402, 12 * 1024, None, floor, rtx4090), Unknown);
 
         // The OPERATOR's floor, on this box's host (5080 with a 700 MiB desktop: 15,178 emptied).
         // Lowered: room up to it, or a card the floor admits is refused for want of a recycle.
@@ -9749,10 +10124,10 @@ mod tests {
             room(this_box, 15_178, None, Some(15_000 * MIB), rtx5080),
             Bytes(15_000 * MIB)
         );
-        // Disabled: make all the room there is.
-        assert_eq!(room(this_box, 15_178, None, None, rtx5080), Unknown);
-        // Default: nothing reaches it, so nothing is destroyed for it.
-        assert_eq!(room(this_box, 15_178, None, floor, rtx5080), Hopeless);
+        // Disabled gate: 134M (10,012) now fits this 5080 ceiling, so the room is that tier's.
+        assert_eq!(room(this_box, 15_178, None, None, rtx5080), Bytes(10_012 * MIB));
+        // Default floor (10,012): reachable within 15,178, so the room is made.
+        assert_eq!(room(this_box, 15_178, None, floor, rtx5080), Bytes(10_012 * MIB));
         // Raised above the tier: room up to the floor, or the gate refuses what recycling allows.
         assert_eq!(
             room(roomy, 24_107, None, Some(20_000 * MIB), rtx4090),
@@ -9790,23 +10165,23 @@ mod tests {
                 "sp1",
                 ceiling,
                 None,
-                Some(15_604 * MIB),
+                Some(10_012 * MIB),
                 Some(total_mib * MIB),
             );
             (room, plan_room(room, available * MIB, siblings))
         };
 
-        // SP1 after risc0 on the 5080: the idle risc0 worker (1,806 MiB) leaves 14,072 MiB, short of
-        // the 134M tier's 15,604. It goes.
-        let (room, evict) = sp1_room(14_072, &sib("risc0:cuda:0", 1_806), 16_303);
-        assert_eq!(room, RoomNeeded::Bytes(15_604 * MIB));
+        // SP1 after risc0 on the 5080 (fork-capped to 134M, 10,012): 9,000 MiB free is short of it,
+        // and evicting the idle risc0 worker (1,806 MiB) clears it. It goes.
+        let (room, evict) = sp1_room(9_000, &sib("risc0:cuda:0", 1_806), 16_303);
+        assert_eq!(room, RoomNeeded::Bytes(10_012 * MIB));
         assert_eq!(evict, vec!["risc0:cuda:0".to_string()]);
-        // SP1 after risc0 on the 4090, whose risc0 worker keeps its Groth16 cache (7,134 MiB): the
-        // 268M tier's 18,278 does not fit in 16,973. It goes.
-        let (room, evict) = sp1_room(16_973, &sib("risc0:cuda:1", 7_134), 24_564);
-        assert_eq!(room, RoomNeeded::Bytes(18_278 * MIB));
+        // SP1 after risc0 on the 4090 (268M, 12,512): 10,000 MiB free is short, and evicting the
+        // risc0 worker holding its Groth16 cache (7,134 MiB) clears it. It goes.
+        let (room, evict) = sp1_room(10_000, &sib("risc0:cuda:1", 7_134), 24_564);
+        assert_eq!(room, RoomNeeded::Bytes(12_512 * MIB));
         assert_eq!(evict, vec!["risc0:cuda:1".to_string()]);
-        // A sibling holding ~2.4 GiB on the 4090 would leave room for 268M, so it would stay.
+        // Plenty free on the 4090: 268M fits without touching the sibling, so it stays.
         let (_, evict) = sp1_room(21_657, &sib("risc0:cuda:1", 2_450), 24_564);
         assert!(evict.is_empty());
 
