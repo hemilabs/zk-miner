@@ -67,6 +67,8 @@ libc = "0.2"
 alloy-signer-local = { version = "1", features = ["keystore"] }
 # The localnet test: signals and parent-death signals for the processes it starts.
 libc = "0.2"
+# The localnet test's plan §12 job: the reference statement's header, binding and journal.
+hemiprove-proxy-slots = { workspace = true }
 tempfile = "3"
 wat = "1"
 

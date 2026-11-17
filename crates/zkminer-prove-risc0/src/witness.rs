@@ -555,7 +555,7 @@ mod execute {
         RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN, WITNESS_EXECUTE_BUILD_ARG, WITNESS_EXECUTE_W_FD,
     };
 
-    use super::super::{check_claim_output, dup_cloexec, KeccakAudit};
+    use super::super::{check_claim_output, dup_cloexec, GuestBuiltWithOldRisc0, KeccakAudit};
     use super::{exit_parts, journal_parts, read_prefixed, WitnessRefusal, PREFIX_BYTES};
 
     pub(crate) fn execute_main() -> ! {
@@ -911,7 +911,11 @@ mod execute {
             })?;
             check_claim_output(Some(&claim), keccak.audit.root().as_ref()).map_err(|e| {
                 tracing::error!("po2 {po2}: {e:#}");
-                Failure::Unprovable
+                if e.downcast_ref::<GuestBuiltWithOldRisc0>().is_some() {
+                    Failure::OldRisc0Guest
+                } else {
+                    Failure::Unprovable
+                }
             })?;
         }
         let (exit_kind, exit_code) = exit_parts(session.exit_code);

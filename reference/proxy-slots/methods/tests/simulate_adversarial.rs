@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use alloy_primitives::keccak256;
 use hemiprove_proxy_slots::{decode_journal, Rule, RuleKind, Statement, EIP1967_IMPLEMENTATION_SLOT};
-use hemiprove_proxy_slots_methods::{HOSTDEP_ELF, PROXY_SLOTS_ELF};
+use hemiprove_proxy_slots_methods::{HOSTDEP_ELF, KECCAK_3_0_ELF, PROXY_SLOTS_ELF};
 use serde_json::Value;
 
 const ANVIL_CHAIN: u64 = 31337;
@@ -298,6 +298,30 @@ impl World {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     }
 
+    /// `zkminer simulate --descriptor d.json` with the job's builder and guest, at po2 20, no
+    /// attacks; the output and the report.
+    fn simulate(&self) -> (Output, Value) {
+        let _ = std::fs::remove_file(self.path("report.json"));
+        let out = self.run(&[
+            "simulate",
+            "--descriptor",
+            "d.json",
+            "--builder",
+            "builder.wasm",
+            "--elf",
+            "guest.elf",
+            "--po2",
+            "20",
+            "--cache-dir",
+            "cache",
+            "--out",
+            "report.json",
+        ]);
+        let report =
+            serde_json::from_slice(&std::fs::read(self.path("report.json")).unwrap_or_default()).unwrap_or(Value::Null);
+        (out, report)
+    }
+
     /// `zkminer simulate --descriptor d.json --adversarial` with the job's builder and guest, at po2
     /// 20, with two providers; the output and the report.
     fn attack(&self, extra: &[&str]) -> (Output, Value) {
@@ -547,4 +571,42 @@ fn providers_that_disagree_are_a_soundness_failure() {
         .iter()
         .any(|f| f.as_str().unwrap().starts_with("differential:")));
     assert!(!out.status.success());
+}
+
+/// A guest built with risc0-zkvm 3.0 that needs two keccak batches (1000 permutations at the miner's
+/// keccak po2, 17) executes cleanly and fails every proof here (methods/tests/keccak_batches.rs). The
+/// miner refuses it before any claim, and its report says why and what to do: rebuild with 3.1.0.
+/// The same work in a guest on 3.1.0 (hostdep) simulates.
+#[test]
+fn a_guest_built_with_risc0_3_0_is_refused_by_name() {
+    let _g = serial();
+    if !delegated("a_guest_built_with_risc0_3_0_is_refused_by_name") {
+        return;
+    }
+    let anvil = Anvil::start();
+    let w = World::new(zkminer(), &anvil, &anvil);
+    let echo = sdk_wasm("params-echo", "params_echo.wasm");
+    let n = 1000u32.to_le_bytes();
+    w.job(KECCAK_3_0_ELF, &echo, &format!("prefix = false\nfull_statement = \"0x{}\"", hex::encode(n)), &n);
+    let (out, report) = w.simulate();
+    assert!(!out.status.success(), "a skipped job exits non-zero");
+    assert_eq!(report["outcome"], "skipped", "{}\n{report:#}", String::from_utf8_lossy(&out.stderr));
+    let v = &report["verdict"];
+    assert_eq!(v["reason"], "GuestFailed", "{v:#}");
+    assert_eq!(v["step"], "execute", "{v:#}");
+    let detail = v["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("the guest was built with risc0-zkvm older than 3.1")
+            && detail.contains("Rebuild the guest with risc0-zkvm 3.1.0"),
+        "{detail}"
+    );
+    eprintln!("the 3.0 guest's verdict: {detail}");
+
+    // hostdep's mode 0xA2: the same 1000 permutations through the batcher, on 3.1.0.
+    let mut a2 = vec![0xa2];
+    a2.extend_from_slice(&1000u16.to_le_bytes());
+    w.job(HOSTDEP_ELF, &echo, "prefix = false\nheader = [\"uint256:0x77\"]", &a2);
+    let (out, report) = w.simulate();
+    assert_eq!(report["outcome"], "simulated", "{}\n{report:#}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }

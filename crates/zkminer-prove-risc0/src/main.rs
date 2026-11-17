@@ -1366,7 +1366,11 @@ fn check_claim_output(
         .as_value()
         .map_err(|_| anyhow::anyhow!("execute: the session's assumptions are pruned"))?;
     for a in &assumptions.0 {
-        if a.as_value().ok() != keccak_root {
+        let a = a.as_value().ok();
+        if a != keccak_root {
+            if a.is_some_and(|a| a.control_root.to_string() == RECURSION_4_0_CONTROL_ROOT) {
+                return Err(GuestBuiltWithOldRisc0.into());
+            }
             anyhow::bail!(
                 "execute: the guest assumes a claim no proof here resolves — every proof of this \
                  program+input would fail"
@@ -1375,6 +1379,39 @@ fn check_claim_output(
     }
     Ok(assumptions.0.len())
 }
+
+/// risc0-circuit-recursion 4.0's `ALLOWED_CONTROL_ROOT`, the root risc0-zkvm 3.0.x guests name.
+///
+/// A guest's keccak batcher assumes the root of two or more batches under the
+/// `ALLOWED_CONTROL_ROOT` of the recursion crate its own risc0-zkvm links. This prover is risc0-zkvm
+/// 3.1 (recursion 4.1, whose root is `risc0_zkvm::ALLOWED_CONTROL_ROOT`) and resolves those under its
+/// own root only, so a 3.0 guest that needs two batches executes cleanly and fails every proof ("no
+/// receipt available for unresolved assumption"). Its requester can fix that by rebuilding the guest,
+/// which [`GuestBuiltWithOldRisc0`] says.
+const RECURSION_4_0_CONTROL_ROOT: &str =
+    "a54dc85ac99f851c92d7c96d7318af41dbe7c0194edfcc37eb4d422a998c1f56";
+
+/// The refusal of a guest that assumes a claim under [`RECURSION_4_0_CONTROL_ROOT`]: it was built with
+/// risc0-zkvm older than 3.1. Typed, so the sandboxed witness execute reports it by an exit code of
+/// its own (`WitnessExecuteFailure::OldRisc0Guest`) and the host can name the cause without reading
+/// the worker's log.
+#[derive(Debug)]
+pub(crate) struct GuestBuiltWithOldRisc0;
+
+impl std::fmt::Display for GuestBuiltWithOldRisc0 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "execute: the guest was built with risc0-zkvm older than 3.1: it assumes a claim under \
+             risc0-circuit-recursion 4.0's control root 0x{RECURSION_4_0_CONTROL_ROOT} (what a \
+             risc0-zkvm 3.0 guest's keccak batcher names for two or more batches), which this \
+             risc0-zkvm 3.1 prover cannot resolve, so every proof of this program+input would fail. \
+             Rebuild the guest with risc0-zkvm 3.1.0 (its image id changes)"
+        )
+    }
+}
+
+impl std::error::Error for GuestBuiltWithOldRisc0 {}
 
 /// Cards with less VRAM than this release the Groth16 SRS cache after every proof.
 ///
@@ -2127,6 +2164,65 @@ mod keccak_audit_tests {
             cycles: 0,
         };
         assert_eq!(swapped.root(), audit(2).root());
+    }
+
+    /// A halted claim with a journal and these assumptions.
+    fn claim_assuming(assumptions: Vec<risc0_zkvm::Assumption>) -> risc0_zkvm::ReceiptClaim {
+        let mut claim = risc0_zkvm::ReceiptClaim::ok(risc0_zkvm::Digest::ZERO, vec![1u8, 2, 3]);
+        claim.output = Some(risc0_zkvm::Output {
+            journal: vec![1u8, 2, 3].into(),
+            assumptions: risc0_zkvm::Assumptions(assumptions.into_iter().map(Into::into).collect())
+                .into(),
+        })
+        .into();
+        claim
+    }
+
+    #[test]
+    fn a_keccak_root_under_recursion_4_0_is_refused_as_a_guest_built_before_3_1() {
+        let audit = KeccakAudit {
+            requests: vec![request(1), request(2)],
+            cycles: 0,
+        };
+        let root = audit.root().expect("two requests");
+        assert_eq!(
+            check_claim_output(Some(&claim_assuming(vec![root.clone()])), Some(&root)).unwrap(),
+            1,
+            "the root this prover makes"
+        );
+        // The same union, as a risc0-zkvm 3.0 guest's batcher names it.
+        let mut root_3_0 = root.clone();
+        root_3_0.control_root = risc0_zkvm::Digest::try_from(
+            &(0..32)
+                .map(|i| {
+                    u8::from_str_radix(&RECURSION_4_0_CONTROL_ROOT[2 * i..2 * i + 2], 16).unwrap()
+                })
+                .collect::<Vec<u8>>()[..],
+        )
+        .unwrap();
+        assert_eq!(
+            root_3_0.control_root.to_string(),
+            RECURSION_4_0_CONTROL_ROOT
+        );
+        assert_ne!(root_3_0.control_root, risc0_zkvm::ALLOWED_CONTROL_ROOT);
+        let e = check_claim_output(Some(&claim_assuming(vec![root_3_0])), Some(&root)).unwrap_err();
+        assert!(
+            e.downcast_ref::<GuestBuiltWithOldRisc0>().is_some(),
+            "{e:#}"
+        );
+        let text = format!("{e:#}");
+        assert!(
+            text.contains("built with risc0-zkvm older than 3.1")
+                && text.contains("Rebuild the guest with risc0-zkvm 3.1.0")
+                && text.contains("0xa54dc85a"),
+            "{text}"
+        );
+        // Any other claim no proof here resolves keeps the general refusal.
+        let mut other = root.clone();
+        other.control_root = risc0_zkvm::Digest::from([9u32; 8]);
+        let e = check_claim_output(Some(&claim_assuming(vec![other])), Some(&root)).unwrap_err();
+        assert!(e.downcast_ref::<GuestBuiltWithOldRisc0>().is_none());
+        assert!(format!("{e:#}").contains("no proof here resolves"), "{e:#}");
     }
 }
 

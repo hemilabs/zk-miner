@@ -555,6 +555,10 @@ pub enum WitnessExecuteFailure {
     /// The guest halted with code 0, but no proof of the run can verify: no output, or an
     /// assumption other than its keccak root.
     Unprovable,
+    /// [`Self::Unprovable`] for a known cause: an assumption under risc0-circuit-recursion 4.0's
+    /// control root, which a guest built with risc0-zkvm older than 3.1 names for two or more keccak
+    /// batches and the 3.1 prover cannot resolve. Its requester rebuilds the guest with 3.1.0.
+    OldRisc0Guest,
     /// `max_cycles` was exceeded.
     CycleLimit,
     /// The sandbox could not be applied; nothing was read.
@@ -568,12 +572,13 @@ pub enum WitnessExecuteFailure {
 }
 
 impl WitnessExecuteFailure {
-    const ALL: [WitnessExecuteFailure; 10] = [
+    const ALL: [WitnessExecuteFailure; 11] = [
         Self::BadRequest,
         Self::InputMismatch,
         Self::InvalidElf,
         Self::GuestFault,
         Self::Unprovable,
+        Self::OldRisc0Guest,
         Self::CycleLimit,
         Self::Sandbox,
         Self::Panicked,
@@ -581,7 +586,7 @@ impl WitnessExecuteFailure {
         Self::Unsupported,
     ];
 
-    /// The process exit code: 80..=89, clear of 1 (a generic failure), 2 (usage), 101 (an uncaught
+    /// The process exit code: 80..=90, clear of 1 (a generic failure), 2 (usage), 101 (an uncaught
     /// Rust panic), 126/127 (exec failures) and [`WORKER_EXIT_SERVER_LOST`].
     pub const fn code(self) -> i32 {
         match self {
@@ -595,6 +600,36 @@ impl WitnessExecuteFailure {
             Self::Panicked => 87,
             Self::Internal => 88,
             Self::Unsupported => 89,
+            Self::OldRisc0Guest => 90,
+        }
+    }
+
+    /// What the failure means, in the host's words: a requester reads it in simulate's report and an
+    /// operator in the miner's log, never the worker's stderr (which a guest can write to).
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::BadRequest => "the request or W's descriptor is malformed",
+            Self::InputMismatch => "W's length or sha256(prefix ‖ W) is not the request's",
+            Self::InvalidElf => "risc0 refused the ELF",
+            Self::GuestFault => {
+                "the execution failed: a guest panic or trap, an execution no proof of which could \
+                 verify, or a keccak request that does not match its input"
+            }
+            Self::Unprovable => {
+                "the guest halted with code 0, but no proof of the run can verify: it has no output, \
+                 or assumes a claim no proof here resolves"
+            }
+            Self::OldRisc0Guest => {
+                "the guest was built with risc0-zkvm older than 3.1: it assumes a claim under \
+                 risc0-circuit-recursion 4.0's control root (what a 3.0 guest's keccak batcher names \
+                 for two or more batches), which this risc0-zkvm 3.1 prover cannot resolve, so no \
+                 proof of it can verify. Rebuild the guest with risc0-zkvm 3.1.0 (its image id changes)"
+            }
+            Self::CycleLimit => "the execution went over its cycle cap",
+            Self::Sandbox => "the execute worker could not apply its sandbox",
+            Self::Panicked => "the executor panicked (a malformed or hostile ELF)",
+            Self::Internal => "the execute worker failed internally",
+            Self::Unsupported => "this worker binary has no witness execute mode",
         }
     }
 
@@ -1875,7 +1910,8 @@ mod tests {
             .collect();
         for f in WitnessExecuteFailure::ALL {
             assert_eq!(WitnessExecuteFailure::from_code(f.code()), Some(f));
-            assert!((80..=89).contains(&f.code()), "{f:?}");
+            assert!((80..=90).contains(&f.code()), "{f:?}");
+            assert!(!f.describe().is_empty());
         }
         let mut unique = codes.clone();
         unique.sort_unstable();
@@ -1884,6 +1920,13 @@ mod tests {
         for other in [0, 1, 2, 75, 101, 126, 127, 137] {
             assert_eq!(WitnessExecuteFailure::from_code(other), None, "{other}");
         }
+        // The one a requester can fix themselves says how.
+        let old = WitnessExecuteFailure::OldRisc0Guest.describe();
+        assert!(
+            old.contains("older than 3.1")
+                && old.contains("Rebuild the guest with risc0-zkvm 3.1.0"),
+            "{old}"
+        );
     }
 
     #[test]

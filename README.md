@@ -846,6 +846,17 @@ cargo test -p zkminer-cli --test localnet -- --ignored --nocapture --test-thread
   dispatched).
 - **`mines_the_claimable_jobs`** (`ZKMINER_LOCALNET_MINE=1`, needs a GPU) is the replay test with
   real risc0 proofs of the fibonacci guest.
+- **`serves_witness_jobs`** (Linux, CPU only, a delegated cgroup) serves witness-construction jobs
+  with the real broker, builder runner and CPU worker under the rootless sandbox: one simulated,
+  claimed, proven and fulfilled with `fulfillJobHashed`; one whose binding the guest does not meet,
+  never claimed; one from a caller not allowed, never simulated.
+- **`serves_the_proxy_slots_witness_job`** (Linux, a delegated cgroup, the risc0 toolchain) runs the
+  plan's §12 job: an EIP-1967 proxy changed by real transactions on a second anvil (the `evm-rpc`
+  chain), the reference builder published with `zkminer artifact publish`, the job made with
+  `zkminer witness envelope encode` and `binding compute` (FIELDS over its 160-byte header, the
+  journal-prefix marker, an exclusivity window), proven on the CPU worker, and `publicValues`
+  checked against the second chain's state at the job's block. **`..._on_a_gpu`** proves it on
+  `ZKMINER_LOCALNET_RISC0_WORKER` (default the release CUDA worker).
 
 The tests need Foundry's `anvil` and the testnet RPC, which serves archive state; anvil caches
 what it fetches. Settings (fork URL and block, worker paths, echoing the log) are in the file's

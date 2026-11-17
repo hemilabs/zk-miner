@@ -10,5 +10,12 @@ publish = false
 [workspace]
 
 [dependencies]
-risc0-zkvm = { version = "3.0", default-features = false, features = ["std"] }
-risc0-zkvm-platform = { version = "2.2", default-features = false }
+# risc0-zkvm 3.1.0, what the miner proves with and the deployed verifier (risc0-ethereum v3.1.0)
+# accepts. Exactly, with the two crates whose control roots the guest's keccak assumptions name: a
+# guest's keccak batcher roots two or more batches under risc0-circuit-recursion's
+# ALLOWED_CONTROL_ROOT, and a 3.0 guest (recursion 4.0, 0xa54dc85a…) names a root the 3.1 prover
+# cannot resolve. Both are required by risc0-zkvm only by caret, so a `cargo update` could move them.
+risc0-zkvm = { version = "=3.1.0", default-features = false, features = ["std"] }
+risc0-zkvm-platform = { version = "=2.2.3", default-features = false }
+risc0-circuit-recursion = { version = "=4.1.0", default-features = false }
+risc0-circuit-keccak = { version = "=4.1.0", default-features = false }

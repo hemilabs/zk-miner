@@ -61,8 +61,11 @@ pub enum WitnessExecError {
     )]
     OomKilled { memory_max: u64, log_tail: String },
     /// The worker exited with a non-zero code: a [`WitnessExecuteFailure`] when it is one of
-    /// theirs (an uncaught panic is 101, a launch failure 127).
-    #[error("the witness execute worker exited with code {code} ({failure:?})")]
+    /// theirs (an uncaught panic is 101, a launch failure 127), described in the host's words.
+    #[error(
+        "the witness execute worker exited with code {code}: {}",
+        .failure.map_or("not a witness execute failure code", WitnessExecuteFailure::describe)
+    )]
     Exit {
         code: i32,
         failure: Option<WitnessExecuteFailure>,
