@@ -330,6 +330,11 @@ pub struct CoverageReport {
     pub header_source: Option<String>,
     /// `[0, H)` is pinned and `expectedJournalHash` is non-zero.
     pub ok: bool,
+    /// FULL: the router hashes the whole journal, so a changed `W` gives the honest journal or one
+    /// it refuses, whatever the guest does; a mutation this host could not run to a journal (its
+    /// cycle maximum, the execute timeout) leaves nothing undecided.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub whole_journal: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
 }
@@ -943,7 +948,11 @@ fn adversarial_verdict(
         || mutations.iter().any(|m| m.outcome.is_soundness_failure())
         || host.iter().any(|h| h.dependent)
         || diff.soundness_failure;
-    let incomplete = mutations.iter().any(|m| matches!(m.outcome, MutationOutcome::NotRun | MutationOutcome::Inconclusive { .. }))
+    let incomplete = mutations.iter().any(|m| match m.outcome {
+        MutationOutcome::NotRun => true,
+        MutationOutcome::Inconclusive { .. } => !coverage.whole_journal,
+        _ => false,
+    })
         || host.iter().any(|h| !h.ran)
         || diff.runs.len() < 2
         || diff.runs.iter().any(|r| r.outcome != "simulated");
@@ -1001,7 +1010,13 @@ fn coverage(binding: &BindingReport, expected: B256, source: Option<String>) -> 
     } else {
         None
     };
-    CoverageReport { header_bytes: h, header_source: source, ok: failure.is_none(), failure }
+    CoverageReport {
+        header_bytes: h,
+        header_source: source,
+        ok: failure.is_none(),
+        failure,
+        whole_journal: binding.mode == "full" && expected != B256::ZERO,
+    }
 }
 
 /// Everything one simulation needs, gathered before any process starts.
@@ -1483,6 +1498,13 @@ impl Adversary<'_> {
                 s.limits.maxGuestCycles, self.host.max_guest_cycles
             ));
         }
+        let undecided = results.iter().filter(|m| matches!(m.outcome, MutationOutcome::Inconclusive { .. })).count();
+        if coverage.whole_journal && undecided > 0 {
+            notes.push(format!(
+                "{undecided} mutation(s) did not run to a journal here; under FULL the router refuses every journal but the \
+                 honest one, so they leave nothing undecided"
+            ));
+        }
         let verdict = adversarial_verdict(&coverage, &results, &host_inputs, &differential).to_string();
         Ok(AdversarialReport {
             verdict,
@@ -1668,6 +1690,46 @@ mod tests {
             note: None,
         };
         assert_eq!(adversarial_verdict(&coverage(&one, keccak256(&header[..32]), None), &[], &[], &diff), "fail");
+        // A mutation this host could not run to a journal decides nothing under FULL, and leaves
+        // FIELDS incomplete.
+        let host = HostInputResult {
+            input: zkminer_witness_host::adversarial::HostInput::SysRandSeed,
+            values: ["a".into(), "b".into()],
+            journal_sha256: [None, None],
+            dependent: false,
+            note: None,
+            ran: true,
+        };
+        let hosts = [host];
+        let run = |alias: &str| ProviderRun {
+            alias: alias.into(),
+            outcome: "simulated".into(),
+            verdict: None,
+            w_sha256: None,
+            journal_sha256: None,
+        };
+        let agreed = DifferentialReport {
+            runs: vec![run("a"), run("b")],
+            w_same: Some(true),
+            journal_same: Some(true),
+            soundness_failure: false,
+            note: None,
+        };
+        let capped = MutationResult {
+            id: "flip@3^0x80".into(),
+            kind: "flip".into(),
+            description: "d".into(),
+            w_bytes: Some(4),
+            cycles: None,
+            over_job_cycles: false,
+            outcome: MutationOutcome::Inconclusive { why: "ran past this host's maximum".into() },
+        };
+        let full_cov = coverage(&full, B256::repeat_byte(3), None);
+        assert!(full_cov.whole_journal);
+        assert_eq!(adversarial_verdict(&full_cov, std::slice::from_ref(&capped), &hosts, &agreed), "pass");
+        let fields_cov = coverage(&all, keccak256(header), None);
+        assert_eq!(adversarial_verdict(&fields_cov, std::slice::from_ref(&capped), &hosts, &agreed), "incomplete");
+        assert_eq!(adversarial_verdict(&fields_cov, &[], &hosts, &agreed), "pass");
     }
 
     #[test]

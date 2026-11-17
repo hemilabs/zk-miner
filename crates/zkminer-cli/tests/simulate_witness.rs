@@ -246,6 +246,15 @@ impl Env {
         self.dir.path().join(name)
     }
 
+    /// The miner's configuration with `lines` added to its `[witness]` table.
+    fn witness_config(&self, lines: &str) {
+        let path = self.path("config.toml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let at = "[witness]\nsandbox_mode = \"rootless\"\n";
+        assert!(text.contains(at));
+        std::fs::write(&path, text.replace(at, &format!("{at}{lines}\n"))).unwrap();
+    }
+
     fn zkminer(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_zkminer"));
         c.arg("-c").arg(self.path("config.toml")).args(args).env("HOME", self.dir.path());
@@ -330,7 +339,22 @@ fn a_descriptor_job_runs_the_miners_pipeline_and_survives_the_attacks() {
     let env = Env::new();
     let d = env.descriptor("full", 10, &full_binding(10), &[], "");
     let wasm = env.path("echo.wasm");
-    let (out, r) = env.simulate(&d, &["--builder", wasm.to_str().unwrap(), "--po2", "16,20", "--adversarial", "--flips", "8"]);
+    // Flipping n's high byte makes billions of iterations: this host's maximum, not the job's
+    // maxGuestCycles, bounds the re-executions, so keep it small here.
+    let (out, r) = env.simulate(
+        &d,
+        &[
+            "--builder",
+            wasm.to_str().unwrap(),
+            "--po2",
+            "16,20",
+            "--adversarial",
+            "--flips",
+            "8",
+            "--max-guest-cycles",
+            "67108864",
+        ],
+    );
     assert!(out.status.success(), "{}\n{r:#}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(r["kind"], "witness");
     assert_eq!(r["outcome"], "simulated");
@@ -342,11 +366,20 @@ fn a_descriptor_job_runs_the_miners_pipeline_and_survives_the_attacks() {
     assert_eq!(r["binding"]["mode"], "full");
     assert_eq!(r["binding"]["ok"], true);
     assert!(r["fulfil"]["estimatedDaBytes"].as_u64().unwrap() > 0);
-    assert!(r["notChecked"].as_array().unwrap().len() >= 5);
+    assert_eq!(r["fulfil"]["withinCap"], true);
+    let not_checked: Vec<&str> = r["notChecked"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert!(not_checked.len() >= 8, "{not_checked:?}");
+    assert!(not_checked.iter().any(|n| n.contains("--builder replaced")), "{not_checked:?}");
+    assert!(not_checked.iter().any(|n| n.contains("--elf replaced")), "{not_checked:?}");
+    assert!(not_checked.iter().any(|n| n.contains("DA backlog")), "{not_checked:?}");
+    assert!(!not_checked.iter().any(|n| n.contains("guest cycles against")), "--max-guest-cycles was given");
+    assert_eq!(r["cycles"]["hostMaxSource"], "--max-guest-cycles");
     // The attacks: every mutation rejected, refused by the binding or harmless; no host input
     // changes the journal; both providers agree.
     let a = &r["adversarial"];
     assert_eq!(a["verdict"], "pass", "{a:#}");
+    assert_eq!(a["bindingCoverage"]["ok"], true);
+    assert_eq!(a["bindingCoverage"]["wholeJournal"], true);
     assert_eq!(a["counts"]["soundnessFailures"], 0);
     assert!(a["counts"]["total"].as_u64().unwrap() >= 8);
     assert!(a["counts"]["bindingRejects"].as_u64().unwrap() >= 1, "a changed n changes fib(n)");
@@ -371,15 +404,34 @@ fn a_none_bound_job_fails_the_attack_and_names_the_mutation() {
     let wasm = env.path("echo.wasm");
     let (out, r) = env.simulate(
         &d,
-        &["--builder", wasm.to_str().unwrap(), "--po2", "20", "--prover", prover, "--adversarial", "--flips", "2", "--providers", "anvil-a,anvil-b"],
+        &[
+            "--builder",
+            wasm.to_str().unwrap(),
+            "--po2",
+            "20",
+            "--prover",
+            prover,
+            "--adversarial",
+            "--flips",
+            "2",
+            "--providers",
+            "anvil-a,anvil-b",
+            // n's high byte flipped: this host's maximum bounds the run.
+            "--max-guest-cycles",
+            "67108864",
+        ],
     );
     assert!(!out.status.success(), "a soundness failure exits non-zero");
     assert_eq!(r["outcome"], "simulated");
     let a = &r["adversarial"];
     assert_eq!(a["verdict"], "fail");
-    let failures = a["soundnessFailures"].as_array().unwrap();
-    assert!(!failures.is_empty());
-    assert!(failures.iter().all(|f| f.as_str().unwrap().starts_with("mutation flip@")), "{failures:?}");
+    // NONE binds nothing: the coverage fails first, and the flips show it.
+    assert_eq!(a["bindingCoverage"]["ok"], false);
+    let failures: Vec<&str> = a["soundnessFailures"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).collect();
+    assert!(failures[0].starts_with("binding: NONE"), "{failures:?}");
+    let mutations: Vec<&&str> = failures.iter().filter(|f| f.starts_with("mutation ")).collect();
+    assert!(!mutations.is_empty());
+    assert!(mutations.iter().all(|f| f.starts_with("mutation flip@")), "{failures:?}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("verdict is fail"));
 }
 
@@ -397,7 +449,8 @@ fn a_job_the_miner_would_skip_reports_its_verdict() {
     assert!(!out.status.success());
     assert_eq!(r["outcome"], "skipped");
     assert_eq!(r["verdict"]["reason"], "BindingMismatch");
-    assert_eq!(r["verdict"]["step"], "Binding");
+    assert_eq!(r["verdict"]["step"], "binding");
+    assert_eq!(r["verdict"]["retry"], "once_jittered");
     // A --builder that is not the envelope's builderId is the job's fault, as a decoy manifest is.
     let other = env.path("other.wasm");
     std::fs::write(&other, wat::parse_str("(module (memory (export \"memory\") 1) (func (export \"run\") (result i32) i32.const 0))").unwrap())
@@ -405,6 +458,31 @@ fn a_job_the_miner_would_skip_reports_its_verdict() {
     let (out, r) = env.simulate(&d, &["--builder", other.to_str().unwrap(), "--po2", "20"]);
     assert!(!out.status.success());
     assert_eq!(r["verdict"]["reason"], "ArtifactAllSourcesBad");
+}
+
+#[test]
+fn a_fulfil_over_the_configured_da_cap_is_skipped() {
+    let _g = serial();
+    if unavailable("a_fulfil_over_the_configured_da_cap_is_skipped") {
+        return;
+    }
+    let env = Env::new();
+    // Below any proof-carrying fulfil: the claim gate's operator cap skips it.
+    env.witness_config("fulfil_da_cap_bytes = 200");
+    let d = env.descriptor("full", 10, &full_binding(10), &[], "");
+    let wasm = env.path("echo.wasm");
+    let (out, r) = env.simulate(&d, &["--builder", wasm.to_str().unwrap(), "--po2", "20", "--adversarial"]);
+    assert!(!out.status.success(), "a miner on this configuration skips it");
+    assert_eq!(r["outcome"], "skipped");
+    assert_eq!(r["verdict"]["reason"], "FulfilDaTooLarge");
+    assert_eq!(r["verdict"]["step"], "claim_gate");
+    assert_eq!(r["fulfil"]["capBytes"], 200);
+    assert_eq!(r["fulfil"]["withinCap"], false);
+    assert!(r["journal"]["hex"].is_string(), "the simulation itself ran");
+    assert!(r["adversarial"].is_null(), "a job the miner skips is not attacked");
+    // Without --max-guest-cycles or [witness] max_guest_cycles, the card-derived maximum is unchecked.
+    assert_eq!(r["cycles"]["hostMaxSource"], "unset");
+    assert!(r["notChecked"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("guest cycles against")));
 }
 
 #[test]
@@ -472,6 +550,61 @@ fn a_published_builder_is_fetched_by_the_miners_hemi_code_reader() {
     assert_eq!(origin, format!("hemi-code:{}", published["manifest"]["address"].as_str().unwrap().parse::<Address>().unwrap()));
     assert_eq!(r["builder"]["artifactCharges"][0][0], params_echo().len());
     assert_eq!(r["journal"]["hex"], format!("0x{}", alloy::hex::encode(fib(12).to_le_bytes())));
+}
+
+/// `zkminer artifact publish --kind elf` takes a real risc0 guest, the worker's fibonacci program
+/// binary (`R0BF`), past its input check (it then stops at the RPC, which nothing answers); a WASM
+/// builder is refused as an ELF.
+#[test]
+fn an_elf_publish_takes_a_risc0_program_binary() {
+    let _g = serial();
+    let (elf, _) = setup();
+    assert_eq!(&elf[..4], b"R0BF");
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    std::fs::write(dir.path().join("fib.bin"), elf).unwrap();
+    std::fs::write(dir.path().join("echo.wasm"), params_echo()).unwrap();
+    // A closed port: the run ends at its first request, after the input check.
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "[chain]\nchain_id = {ANVIL_CHAIN}\nrpc_url = \"http://127.0.0.1:{port}\"\n\
+             [contracts]\nhemi_prove = \"0x000000000000000000000000000000000000a11c\"\n\
+             hemi_prove_staking = \"0x000000000000000000000000000000000000a11d\"\n\
+             hemi_prove_registry = \"0x000000000000000000000000000000000000a11e\"\n\
+             hemi_token = \"0x000000000000000000000000000000000000a11f\"\n\
+             [dev]\nprivate_network = true\nchain_id = {ANVIL_CHAIN}\n"
+        ),
+    )
+    .unwrap();
+    let publish = |file: &str| {
+        Command::new(env!("CARGO_BIN_EXE_zkminer"))
+            .args(["-c", "config.toml", "artifact", "publish", file, "--kind", "elf"])
+            .args(["--rpc-url", &format!("http://127.0.0.1:{port}")])
+            .args([
+                "--chain-id",
+                "31337",
+                "--keystore",
+                "none",
+                "--router",
+                "0x000000000000000000000000000000000000a11c",
+            ])
+            .args(["--from-block", "0", "--yes"])
+            .current_dir(dir.path())
+            .env("HOME", dir.path())
+            .output()
+            .unwrap()
+    };
+    let out = publish("fib.bin");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(!err.contains("--kind elf, but"), "{err}");
+    let out = publish("echo.wasm");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--kind elf, but"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn sha256(b: &[u8]) -> [u8; 32] {

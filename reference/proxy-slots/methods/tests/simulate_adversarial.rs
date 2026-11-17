@@ -7,6 +7,12 @@
 //! source), the generic ones, the host inputs and two providers. None may change the answer under
 //! the pinned header.
 //!
+//! And what those attacks must catch, each shown here end to end:
+//! - a binding that pins fewer header words than the guest commits (a free header word is
+//!   exploitable only with a consistent change of `W`, so the mutations alone never see it);
+//! - a journal that depends on the `sys_rand` seed or on the keccak po2 (the `hostdep` guest);
+//! - two providers that disagree (the SDK's `latest-block` builder against two anvils).
+//!
 //! Needs a delegated cgroup, anvil, the risc0 toolchain and the SDK's pinned toolchain:
 //!
 //! ```text
@@ -17,12 +23,13 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use alloy_primitives::keccak256;
 use hemiprove_proxy_slots::{decode_journal, Rule, RuleKind, Statement, EIP1967_IMPLEMENTATION_SLOT};
-use hemiprove_proxy_slots_methods::PROXY_SLOTS_ELF;
+use hemiprove_proxy_slots_methods::{HOSTDEP_ELF, PROXY_SLOTS_ELF};
 use serde_json::Value;
 
 const ANVIL_CHAIN: u64 = 31337;
@@ -40,6 +47,12 @@ fn delegated(test: &str) -> bool {
             false
         }
     }
+}
+
+/// One test at a time: they share the delegated cgroup, and each starts brokers and sandboxes.
+fn serial() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 fn repo() -> PathBuf {
@@ -80,12 +93,13 @@ fn sdk_tool(tool: &str) -> std::ffi::OsString {
     }
 }
 
-/// The reference builder, built with the SDK's pinned toolchain.
-fn builder_wasm() -> Vec<u8> {
-    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sdk-target-proxy-slots");
+/// An SDK builder (`package`, its module `file`), built with the SDK's pinned toolchain, one package
+/// per invocation.
+fn sdk_wasm(package: &str, file: &str) -> Vec<u8> {
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sdk-target-{package}"));
     let mut cmd = Command::new(sdk_tool("cargo"));
     cmd.current_dir(repo().join("sdk"))
-        .args(["build", "--locked", "--release", "--target", "wasm32-unknown-unknown", "-p", "proxy-slots-builder", "--target-dir"])
+        .args(["build", "--locked", "--release", "--target", "wasm32-unknown-unknown", "-p", package, "--target-dir"])
         .arg(&target)
         .env("RUSTC", sdk_tool("rustc"));
     for v in ["RUSTUP_TOOLCHAIN", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS", "CARGO_TARGET_DIR"] {
@@ -93,7 +107,12 @@ fn builder_wasm() -> Vec<u8> {
     }
     let out = cmd.output().expect("cargo runs");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    std::fs::read(target.join("wasm32-unknown-unknown/release/proxy_slots_builder.wasm")).unwrap()
+    std::fs::read(target.join(format!("wasm32-unknown-unknown/release/{file}"))).unwrap()
+}
+
+/// The reference builder.
+fn builder_wasm() -> Vec<u8> {
+    sdk_wasm("proxy-slots-builder", "proxy_slots_builder.wasm")
 }
 
 struct Anvil {
@@ -187,16 +206,139 @@ fn word(n: u64) -> [u8; 32] {
     w
 }
 
-#[test]
-fn simulate_adversarial_attacks_the_real_scheme1_witness() {
-    if !delegated("simulate_adversarial_attacks_the_real_scheme1_witness") {
-        return;
-    }
-    let zkminer = zkminer();
-    let wasm = builder_wasm();
-    let anvil = Anvil::start();
+/// A work directory: the miner's configuration (developer mode on anvil's chain) and the broker's,
+/// with `a` as provider `anvil-a` and `b` as `anvil-b`.
+struct World {
+    dir: tempfile::TempDir,
+    zkminer: PathBuf,
+}
 
-    // The proxy: slots 10–12 under rule 1, pointing at the implementation.
+impl World {
+    fn new(zkminer: PathBuf, a: &Anvil, b: &Anvil) -> Self {
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("spool")).unwrap();
+        let rpc = |alias: &str, url: &str| {
+            format!(
+                "[[evm_rpc]]\nalias = \"{alias}\"\nurl = \"{url}\"\nchain_id = {ANVIL_CHAIN}\narchive = true\n\
+                 max_proof_age = 1000000\nmethod_sets = [\"state-read\"]\ncidrs = [\"127.0.0.1/32\"]\n"
+            )
+        };
+        std::fs::write(
+            d.join("broker.toml"),
+            format!(
+                "chain_rpc_host = \"chain-rpc.invalid\"\nspool_dir = \"{}\"\n{}{}",
+                d.join("spool").display(),
+                rpc("anvil-a", &a.url),
+                rpc("anvil-b", &b.url)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("config.toml"),
+            format!(
+                "[chain]\nchain_id = {ANVIL_CHAIN}\nrpc_url = \"{}\"\n[contracts]\nhemi_prove = \"0x000000000000000000000000000000000000a11c\"\n\
+                 hemi_prove_staking = \"0x000000000000000000000000000000000000a11d\"\n\
+                 hemi_prove_registry = \"0x000000000000000000000000000000000000a11e\"\n\
+                 hemi_token = \"0x000000000000000000000000000000000000a11f\"\n[dev]\nprivate_network = true\nchain_id = {ANVIL_CHAIN}\n\
+                 [witness]\nsandbox_mode = \"rootless\"\n[broker]\nconfig = \"{}\"\n",
+                a.url,
+                d.join("broker.toml").display()
+            ),
+        )
+        .unwrap();
+        World { dir, zkminer }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.path().join(name)
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        let d = self.dir.path();
+        Command::new(&self.zkminer)
+            .arg("-c")
+            .arg(d.join("config.toml"))
+            .args(args)
+            .env("HOME", d)
+            .current_dir(d)
+            .output()
+            .unwrap()
+    }
+
+    /// `job.toml` for `elf` (its image id) built by `wasm` with `params`, bound by `binding` (a
+    /// `[binding]` body), encoded into the descriptor file `d.json`; the guest saved as `guest.elf`.
+    fn job(&self, elf: &[u8], wasm: &[u8], binding: &str, params: &[u8]) {
+        let image_id = risc0_zkvm::compute_image_id(elf).unwrap();
+        std::fs::write(
+            self.path("job.toml"),
+            format!(
+                "program_id = \"0x{}\"\n[binding]\n{binding}\n[envelope]\nbuilder_params = \"0x{}\"\n\
+                 [[envelope.sources]]\nclass = \"evm-rpc/v1\"\nchain_id = {ANVIL_CHAIN}\narchive = true\nmethod_set = \"state-read\"\n\
+                 max_proof_age = 1000\n[envelope.limits]\nmax_fetches = 8\nmax_fetch_bytes = 4194304\nmax_request_bytes = 65536\n\
+                 max_response_bytes = 1048576\nmax_builder_fuel = 5000000000\nmax_builder_memory_bytes = 67108864\n\
+                 max_builder_seconds = 60\nmax_witness_bytes = 1048576\nmax_guest_cycles = 67108864\n",
+                hex::encode(image_id.as_bytes()),
+                hex::encode(params)
+            ),
+        )
+        .unwrap();
+        std::fs::write(self.path("builder.wasm"), wasm).unwrap();
+        std::fs::write(self.path("guest.elf"), elf).unwrap();
+        let out = self.run(&[
+            "witness",
+            "envelope",
+            "encode",
+            "job.toml",
+            "--builder",
+            "builder.wasm",
+            "--descriptor-out",
+            "d.json",
+        ]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// `zkminer simulate --descriptor d.json --adversarial` with the job's builder and guest, at po2
+    /// 20, with two providers; the output and the report.
+    fn attack(&self, extra: &[&str]) -> (Output, Value) {
+        let _ = std::fs::remove_file(self.path("report.json"));
+        let mut args = vec![
+            "simulate",
+            "--descriptor",
+            "d.json",
+            "--builder",
+            "builder.wasm",
+            "--elf",
+            "guest.elf",
+            "--po2",
+            "20",
+            "--prover",
+            PROVER,
+            "--cache-dir",
+            "cache",
+            "--out",
+            "report.json",
+            "--adversarial",
+            "--adversarial-secs",
+            "1500",
+            "--providers",
+            "anvil-a,anvil-b",
+        ];
+        args.extend_from_slice(extra);
+        let started = std::time::Instant::now();
+        let out = self.run(&args);
+        eprintln!("simulate --adversarial took {:.0} s", started.elapsed().as_secs_f64());
+        let report =
+            serde_json::from_slice(&std::fs::read(self.path("report.json")).unwrap_or_default()).unwrap_or(Value::Null);
+        (out, report)
+    }
+}
+
+/// anvil with an EIP-1967 proxy (slots 10–12 under rule 1, pointing at the implementation), the
+/// statement of k = 3 slots at a block B, and a block after it (the "next block" header the
+/// scheme's mutations swap in).
+fn proxy_world() -> (Anvil, Statement, [u8; 20]) {
+    let anvil = Anvil::start();
     let implementation = anvil.deploy(&creation(&[], &IMPLEMENTATION_RUNTIME));
     let mut imp_word = [0u8; 32];
     imp_word[12..].copy_from_slice(&implementation);
@@ -205,73 +347,46 @@ fn simulate_adversarial_attacks_the_real_scheme1_witness() {
     anvil.rpc("anvil_mine", "[\"0x3\"]");
     let b = anvil.rpc("eth_getBlockByNumber", "[\"latest\",false]");
     let block_hash: [u8; 32] = hex::decode(&b["hash"].as_str().unwrap()[2..]).unwrap().try_into().unwrap();
-    // A block after B, for the "next block" header the scheme's mutations swap in.
     anvil.rpc("anvil_mine", "[\"0x2\"]");
-    let statement = Statement { block_hash, proxy, rule: Rule::new(RuleKind::Consecutive, &word(10)).unwrap(), k: 3 };
+    (
+        anvil,
+        Statement { block_hash, proxy, rule: Rule::new(RuleKind::Consecutive, &word(10)).unwrap(), k: 3 },
+        implementation,
+    )
+}
 
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let d = dir.path();
-    std::fs::create_dir_all(d.join("spool")).unwrap();
-    let rpc = |alias: &str| {
-        format!(
-            "[[evm_rpc]]\nalias = \"{alias}\"\nurl = \"{}\"\nchain_id = {ANVIL_CHAIN}\narchive = true\nmax_proof_age = 1000000\n\
-             method_sets = [\"state-read\"]\ncidrs = [\"127.0.0.1/32\"]\n",
-            anvil.url
-        )
-    };
-    std::fs::write(
-        d.join("broker.toml"),
-        format!("chain_rpc_host = \"chain-rpc.invalid\"\nspool_dir = \"{}\"\n{}{}", d.join("spool").display(), rpc("anvil-a"), rpc("anvil-b")),
-    )
-    .unwrap();
-    std::fs::write(
-        d.join("config.toml"),
-        format!(
-            "[chain]\nchain_id = {ANVIL_CHAIN}\nrpc_url = \"{}\"\n[contracts]\nhemi_prove = \"0x000000000000000000000000000000000000a11c\"\n\
-             hemi_prove_staking = \"0x000000000000000000000000000000000000a11d\"\n\
-             hemi_prove_registry = \"0x000000000000000000000000000000000000a11e\"\n\
-             hemi_token = \"0x000000000000000000000000000000000000a11f\"\n[dev]\nprivate_network = true\nchain_id = {ANVIL_CHAIN}\n\
-             [witness]\nsandbox_mode = \"rootless\"\n[broker]\nconfig = \"{}\"\n",
-            anvil.url,
-            d.join("broker.toml").display()
-        ),
-    )
-    .unwrap();
-    let image_id = risc0_zkvm::compute_image_id(PROXY_SLOTS_ELF).unwrap();
-    let words: Vec<String> = statement.header_words().iter().map(|w| format!("\"word:0x{}\"", hex::encode(w))).collect();
-    std::fs::write(
-        d.join("job.toml"),
-        format!(
-            "program_id = \"0x{}\"\n[binding]\nprefix = true\nheader = [{}]\n[envelope]\nbuilder_params = \"0x{}\"\n\
-             [[envelope.sources]]\nclass = \"evm-rpc/v1\"\nchain_id = {ANVIL_CHAIN}\narchive = true\nmethod_set = \"state-read\"\n\
-             max_proof_age = 1000\n[envelope.limits]\nmax_fetches = 8\nmax_fetch_bytes = 4194304\nmax_request_bytes = 65536\n\
-             max_response_bytes = 1048576\nmax_builder_fuel = 5000000000\nmax_builder_memory_bytes = 67108864\n\
-             max_builder_seconds = 60\nmax_witness_bytes = 1048576\nmax_guest_cycles = 67108864\n",
-            hex::encode(image_id.as_bytes()),
-            words.join(", "),
-            hex::encode(statement.builder_params(ANVIL_CHAIN))
-        ),
-    )
-    .unwrap();
-    std::fs::write(d.join("builder.wasm"), &wasm).unwrap();
-    std::fs::write(d.join("guest.elf"), PROXY_SLOTS_ELF).unwrap();
-    let run = |args: &[&str]| {
-        Command::new(&zkminer).arg("-c").arg(d.join("config.toml")).args(args).env("HOME", d).current_dir(d).output().unwrap()
-    };
-    let out = run(&["witness", "envelope", "encode", "job.toml", "--builder", "builder.wasm", "--descriptor-out", "d.json"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    // The binding pins the whole header, by the requester's own tool.
-    let out = run(&["witness", "binding", "check", "--descriptor", "d.json", "--statement", &format!("0x{}", hex::encode(statement.header()))]);
+fn header_words(statement: &Statement, n: usize) -> String {
+    let words: Vec<String> =
+        statement.header_words().iter().take(n).map(|w| format!("\"word:0x{}\"", hex::encode(w))).collect();
+    format!("prefix = true\nheader = [{}]", words.join(", "))
+}
+
+#[test]
+fn simulate_adversarial_attacks_the_real_scheme1_witness() {
+    let _g = serial();
+    if !delegated("simulate_adversarial_attacks_the_real_scheme1_witness") {
+        return;
+    }
+    let (anvil, statement, implementation) = proxy_world();
+    let w = World::new(zkminer(), &anvil, &anvil);
+    w.job(PROXY_SLOTS_ELF, &builder_wasm(), &header_words(&statement, 5), &statement.builder_params(ANVIL_CHAIN));
+    // The binding pins the whole header, by the requester's own tool (the header's length given:
+    // without it the check cannot know the header is whole).
+    let header = format!("0x{}", hex::encode(statement.header()));
+    let out = w.run(&[
+        "witness",
+        "binding",
+        "check",
+        "--descriptor",
+        "d.json",
+        "--statement",
+        &header,
+        "--header-bytes",
+        "160",
+    ]);
     assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 
-    let started = std::time::Instant::now();
-    let out = run(&[
-        "simulate", "--descriptor", "d.json", "--builder", "builder.wasm", "--elf", "guest.elf", "--po2", "20", "--prover", PROVER,
-        "--cache-dir", "cache", "--out", "report.json", "--adversarial", "--adversarial-secs", "1500", "--flips", "4",
-        "--max-mutations", "64", "--providers", "anvil-a,anvil-b",
-    ]);
-    let report: Value = serde_json::from_slice(&std::fs::read(d.join("report.json")).unwrap_or_default()).unwrap_or(Value::Null);
-    eprintln!("simulate --adversarial took {:.0} s", started.elapsed().as_secs_f64());
+    let (out, report) = w.attack(&["--flips", "4", "--max-mutations", "64"]);
     assert_eq!(report["outcome"], "simulated", "{}\n{report:#}", String::from_utf8_lossy(&out.stderr));
 
     // The honest run answers the statement at B.
@@ -281,11 +396,14 @@ fn simulate_adversarial_attacks_the_real_scheme1_witness() {
     assert_eq!(j.outputs.code_hash, keccak256(IMPLEMENTATION_RUNTIME).0);
     assert_eq!(j.outputs.slots.iter().map(|(_, v)| *v).collect::<Vec<_>>(), vec![word(100), word(101), word(102)]);
     assert_eq!(report["binding"]["ok"], true);
+    assert_eq!(report["binding"]["headerBytes"], 160, "from the scheme-1 W's word count");
     assert_eq!(report["builder"]["fetches"], 4, "header, implementation slot, two proofs");
 
     // The attacks.
     let a = &report["adversarial"];
     eprintln!("adversarial: {}", serde_json::to_string(&a["counts"]).unwrap());
+    assert_eq!(a["bindingCoverage"]["ok"], true, "{:#}", a["bindingCoverage"]);
+    assert_eq!(a["bindingCoverage"]["headerSource"], "scheme 1 W");
     assert_eq!(a["scheme"]["id"], 1);
     assert_eq!(a["scheme"]["name"], "eth-block");
     assert!(a["scheme"]["status"].as_str().unwrap().contains("2 of 2 fetched answers used"), "{}", a["scheme"]);
@@ -299,8 +417,134 @@ fn simulate_adversarial_attacks_the_real_scheme1_witness() {
     assert!(mutations.iter().any(|m| m["kind"] == "flip"), "the generic mutations ran too");
     assert_eq!(a["counts"]["soundnessFailures"], 0, "{a:#}");
     assert_eq!(a["counts"]["notRun"], 0, "within the bound");
-    assert!(a["hostInputs"].as_array().unwrap().iter().all(|h| h["dependent"] == false && h["ran"] == true));
+    assert!(
+        a["hostInputs"].as_array().unwrap().iter().all(|h| h["dependent"] == false && h["ran"] == true),
+        "{:#}",
+        a["hostInputs"]
+    );
     assert_eq!(a["differential"]["journalSame"], true, "{:#}", a["differential"]);
     assert_eq!(a["verdict"], "pass", "{a:#}");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A binding that pins only the scheme word of the five the guest commits. No mutation of `W`
+/// finds it (another k, block or rule needs a consistent `W`, which the prover makes and a mutation
+/// does not), so the requester's tools judge the binding itself: `binding check` fails, simulate's
+/// binding report shows the free words, and the attack's verdict is `fail` before any mutation.
+#[test]
+fn a_binding_that_leaves_header_words_free_fails() {
+    let _g = serial();
+    if !delegated("a_binding_that_leaves_header_words_free_fails") {
+        return;
+    }
+    let (anvil, statement, _) = proxy_world();
+    let w = World::new(zkminer(), &anvil, &anvil);
+    w.job(PROXY_SLOTS_ELF, &builder_wasm(), &header_words(&statement, 1), &statement.builder_params(ANVIL_CHAIN));
+    let header = format!("0x{}", hex::encode(statement.header()));
+    // The reviewer's invocation (the header's length unknown), and with the length.
+    let out = w.run(&["witness", "binding", "check", "--descriptor", "d.json", "--statement", &header]);
+    assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("header length is unknown"));
+    let out = w.run(&[
+        "witness",
+        "binding",
+        "check",
+        "--descriptor",
+        "d.json",
+        "--statement",
+        &header,
+        "--header-bytes",
+        "160",
+        "--json",
+    ]);
+    assert!(!out.status.success());
+    let check: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(check["headerFree"], serde_json::json!([{"start": 32, "end": 160}]));
+
+    let (out, report) = w.attack(&["--flips", "2", "--max-mutations", "16"]);
+    assert!(!out.status.success(), "the verdict is fail");
+    assert_eq!(report["outcome"], "simulated", "{report:#}");
+    assert_eq!(report["binding"]["ok"], false);
+    assert_eq!(report["binding"]["headerFree"], serde_json::json!([{"start": 32, "end": 160}]));
+    let a = &report["adversarial"];
+    assert_eq!(a["verdict"], "fail", "{a:#}");
+    assert_eq!(a["bindingCoverage"]["ok"], false);
+    assert!(
+        a["soundnessFailures"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("binding: the binding leaves 128 of the header's 160 bytes free"),
+        "{a:#}"
+    );
+}
+
+/// The hostdep guest's journal follows the `sys_rand` seed (W = 0xA1) and the keccak po2 (W = 0xA4,
+/// the raw permutation's batch status): the reruns under another key and another keccak po2 catch
+/// each, and nothing else is reported dependent.
+#[test]
+fn host_inputs_a_prover_controls_are_caught() {
+    let _g = serial();
+    if !delegated("host_inputs_a_prover_controls_are_caught") {
+        return;
+    }
+    let anvil = Anvil::start();
+    let w = World::new(zkminer(), &anvil, &anvil);
+    let echo = sdk_wasm("params-echo", "params_echo.wasm");
+    for (mode, input) in [(0xa1u8, "sys_rand_seed"), (0xa4, "keccak_po2")] {
+        w.job(HOSTDEP_ELF, &echo, "prefix = false\nheader = [\"uint256:0x77\"]", &[mode]);
+        let (out, report) = w.attack(&["--flips", "1", "--max-mutations", "1", "--header-bytes", "32"]);
+        assert_eq!(report["outcome"], "simulated", "{}\n{report:#}", String::from_utf8_lossy(&out.stderr));
+        let a = &report["adversarial"];
+        let hosts = a["hostInputs"].as_array().unwrap();
+        for h in hosts {
+            assert_eq!(h["dependent"], h["input"] == input, "mode {mode:#x}: {h:#}");
+        }
+        assert!(
+            a["soundnessFailures"].as_array().unwrap().iter().any(|f| f.as_str().unwrap().starts_with(&format!(
+                "host input {}",
+                match input {
+                    "sys_rand_seed" => "SysRandSeed",
+                    _ => "KeccakPo2",
+                }
+            ))),
+            "{a:#}"
+        );
+        assert_eq!(a["verdict"], "fail");
+        assert!(!out.status.success());
+    }
+}
+
+/// Two providers at different heads: the latest-block builder makes a different W from each, and the
+/// hostdep guest (which echoes W) commits it: both journals satisfy the binding, so the job's
+/// statement depends on which provider a prover asks.
+#[test]
+fn providers_that_disagree_are_a_soundness_failure() {
+    let _g = serial();
+    if !delegated("providers_that_disagree_are_a_soundness_failure") {
+        return;
+    }
+    let (a, b) = (Anvil::start(), Anvil::start());
+    a.rpc("anvil_mine", "[\"0x100\"]");
+    b.rpc("anvil_mine", "[\"0x80\"]");
+    let w = World::new(zkminer(), &a, &b);
+    w.job(
+        HOSTDEP_ELF,
+        &sdk_wasm("latest-block", "latest_block.wasm"),
+        "prefix = false\nheader = [\"uint256:0x77\"]",
+        &[],
+    );
+    let (out, report) = w.attack(&["--flips", "1", "--max-mutations", "1", "--header-bytes", "32"]);
+    assert_eq!(report["outcome"], "simulated", "{}\n{report:#}", String::from_utf8_lossy(&out.stderr));
+    let d = &report["adversarial"]["differential"];
+    assert_eq!(d["runs"][0]["outcome"], "simulated", "{d:#}");
+    assert_eq!(d["runs"][1]["outcome"], "simulated", "{d:#}");
+    assert_eq!(d["wSame"], false, "{d:#}");
+    assert_eq!(d["journalSame"], false);
+    assert_eq!(d["soundnessFailure"], true);
+    assert!(report["adversarial"]["soundnessFailures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f.as_str().unwrap().starts_with("differential:")));
+    assert!(!out.status.success());
 }
